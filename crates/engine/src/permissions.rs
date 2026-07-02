@@ -52,14 +52,30 @@ const WORKER_DENY: &[&str] = &[
 ];
 
 /// Git inspection patterns shared by the orchestrator and both validators.
+///
+/// `git branch` and `git tag` are deliberately NOT allowed as bare `*`
+/// prefixes: `Bash(git branch*)` would also match mutating invocations such
+/// as `git branch -D main` or `git branch -f`, and `Bash(git tag*)` would
+/// match `git tag -d v1` and tag creation. Only the read-only listing/query
+/// forms are enumerated instead (exact match unless the entry ends in `*`).
 const GIT_INSPECT: &[&str] = &[
     "Bash(git log*)",
     "Bash(git diff*)",
     "Bash(git show*)",
     "Bash(git status*)",
     "Bash(git rev-parse*)",
-    "Bash(git branch*)",
-    "Bash(git tag*)",
+    // Read-only `git branch` forms.
+    "Bash(git branch)",
+    "Bash(git branch --list*)",
+    "Bash(git branch --show-current)",
+    "Bash(git branch -a)",
+    "Bash(git branch -r)",
+    "Bash(git branch --contains*)",
+    // Read-only `git tag` forms.
+    "Bash(git tag)",
+    "Bash(git tag --list*)",
+    "Bash(git tag -l*)",
+    "Bash(git tag --contains*)",
 ];
 
 /// Deny list for the read-only roles (orchestrator, validators).

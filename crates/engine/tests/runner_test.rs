@@ -203,8 +203,16 @@ fn orchestrator_profile_is_read_only() {
         "Bash(git show*)",
         "Bash(git status*)",
         "Bash(git rev-parse*)",
-        "Bash(git branch*)",
-        "Bash(git tag*)",
+        "Bash(git branch)",
+        "Bash(git branch --list*)",
+        "Bash(git branch --show-current)",
+        "Bash(git branch -a)",
+        "Bash(git branch -r)",
+        "Bash(git branch --contains*)",
+        "Bash(git tag)",
+        "Bash(git tag --list*)",
+        "Bash(git tag -l*)",
+        "Bash(git tag --contains*)",
     ] {
         assert!(
             profile.allowed_tools.iter().any(|a| a == expected),
@@ -218,6 +226,71 @@ fn orchestrator_profile_is_read_only() {
             profile.disallowed_tools.iter().any(|d| d == expected),
             "orchestrator deny list missing {expected:?}"
         );
+    }
+}
+
+/// Mirror of the CLI's `Bash(...)` tool-rule matching used by the allow
+/// lists in this crate: a rule ending in `*` prefix-matches the command,
+/// otherwise the command must match exactly. Non-Bash rules never match.
+fn bash_rule_covers(rule: &str, command: &str) -> bool {
+    let Some(inner) = rule.strip_prefix("Bash(").and_then(|r| r.strip_suffix(')')) else {
+        return false;
+    };
+    match inner.strip_suffix('*') {
+        Some(prefix) => command.starts_with(prefix),
+        None => command == inner,
+    }
+}
+
+/// Regression test: `Bash(git branch*)` / `Bash(git tag*)` used to be in the
+/// read-only allow lists and prefix-matched ref-mutating commands like
+/// `git branch -D main` and `git tag -d v1`. The allow lists must cover the
+/// read-only listing forms without covering any mutating form.
+#[test]
+fn read_only_git_allows_cover_listing_but_not_ref_mutation() {
+    let cfg = MissionConfig::default();
+    for role in [Role::Orchestrator, Role::ValidatorScrutiny, Role::ValidatorFunctional] {
+        let profile = permissions::for_role(role, &cfg, &[]);
+
+        for mutating in [
+            "git branch -D x",
+            "git branch -d topic",
+            "git branch -f main abc123",
+            "git branch -m old new",
+            "git branch --force main abc123",
+            "git branch new-branch",
+            "git tag -d v1",
+            "git tag v2",
+            "git tag -f v1 abc123",
+            "git tag -a v3 -m msg",
+        ] {
+            assert!(
+                !profile.allowed_tools.iter().any(|a| bash_rule_covers(a, mutating)),
+                "{role:?} allow list covers mutating command {mutating:?}: {:?}",
+                profile.allowed_tools
+            );
+        }
+
+        for listing in [
+            "git branch",
+            "git branch --list",
+            "git branch --list kranz/*",
+            "git branch --show-current",
+            "git branch -a",
+            "git branch -r",
+            "git branch --contains abc123",
+            "git tag",
+            "git tag --list",
+            "git tag --list v1.*",
+            "git tag -l v1.*",
+            "git tag --contains abc123",
+        ] {
+            assert!(
+                profile.allowed_tools.iter().any(|a| bash_rule_covers(a, listing)),
+                "{role:?} allow list does not cover read-only command {listing:?}: {:?}",
+                profile.allowed_tools
+            );
+        }
     }
 }
 
