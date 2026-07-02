@@ -13,7 +13,7 @@ use crate::events::{Event, EventKind};
 use crate::paths::MissionPaths;
 use chrono::Utc;
 use std::fs::{File, OpenOptions};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -22,6 +22,19 @@ use std::time::{Duration, Instant};
 struct BufferedLine {
     buffered_at: Instant,
     line: String,
+}
+
+/// Result of validating a log file, including how many leading bytes hold
+/// successfully parsed lines (so `acquire` can truncate a torn tail).
+#[derive(Debug)]
+struct ParsedLog {
+    events: Vec<Event>,
+    /// Byte length of the valid prefix: the end of the last successfully
+    /// parsed line, including its trailing newline when present.
+    valid_len: u64,
+    /// False only when the last parsed line lacked a trailing newline (a torn
+    /// write that cut exactly at the terminator).
+    terminated: bool,
 }
 
 /// Single-writer, append-only handle on a mission's `events.jsonl`.
@@ -47,6 +60,9 @@ impl EventLog {
     /// fails with [`EngineError::LockHeld`] naming the holder's pid; with
     /// `force` the stale lock is replaced. Existing events are loaded to
     /// resume the seq counter and to verify `mission_id` matches the log.
+    /// Any torn final line left by a crash is repaired (truncated, or
+    /// newline-terminated if the line itself is intact) before the append
+    /// handle opens, so new events never glue onto a partial line.
     pub fn acquire(
         paths: &MissionPaths,
         mission_id: &str,
@@ -84,8 +100,8 @@ impl EventLog {
 
             let events_path = paths.events_file();
             let last_seq = if events_path.exists() {
-                let existing = Self::read_events(&events_path)?;
-                if let Some(first) = existing.first() {
+                let parsed = Self::parse_log(&events_path)?;
+                if let Some(first) = parsed.events.first() {
                     if first.mission_id != mission_id {
                         return Err(EngineError::InvalidState(format!(
                             "event log {} belongs to mission '{}', not '{}'",
@@ -95,7 +111,25 @@ impl EventLog {
                         )));
                     }
                 }
-                existing.last().map(|e| e.seq).unwrap_or(0)
+                // Repair torn writes from a crashed predecessor BEFORE opening
+                // the append handle. A torn final line is tolerated on read,
+                // but if left in place the next append glues onto it; once a
+                // further event lands the spliced garbage is no longer final
+                // and every read fails with LogCorruption forever.
+                let file_len = std::fs::metadata(&events_path)?.len();
+                if parsed.valid_len < file_len {
+                    // Unparseable garbage past the last good line: cut it off.
+                    let repair = OpenOptions::new().write(true).open(&events_path)?;
+                    repair.set_len(parsed.valid_len)?;
+                    repair.sync_data()?;
+                } else if !parsed.terminated {
+                    // The final line parsed but the tear ate its trailing
+                    // newline; terminate it so the next append starts fresh.
+                    let mut repair = OpenOptions::new().append(true).open(&events_path)?;
+                    repair.write_all(b"\n")?;
+                    repair.sync_data()?;
+                }
+                parsed.events.last().map(|e| e.seq).unwrap_or(0)
             } else {
                 0
             };
@@ -195,19 +229,39 @@ impl EventLog {
     /// write from a crash and is dropped with a warning; an unparseable line
     /// anywhere else is corruption.
     pub fn read_events(path: &Path) -> Result<Vec<Event>> {
-        let mut content = String::new();
-        File::open(path)?.read_to_string(&mut content)?;
-        let lines: Vec<&str> = content.lines().collect();
+        Ok(Self::parse_log(path)?.events)
+    }
 
-        let mut events = Vec::with_capacity(lines.len());
-        for (i, line) in lines.iter().enumerate() {
-            let event: Event = match serde_json::from_str(line) {
+    /// Parse and validate the log at `path`, tracking how many leading bytes
+    /// form the valid prefix so [`EventLog::acquire`] can truncate torn tails.
+    ///
+    /// Works on raw bytes (decoding each line lossily) because a torn write
+    /// can split a multi-byte UTF-8 character, which must not render the
+    /// whole log unreadable.
+    fn parse_log(path: &Path) -> Result<ParsedLog> {
+        let bytes = std::fs::read(path)?;
+
+        let mut events = Vec::new();
+        let mut valid_len: usize = 0;
+        let mut terminated = true;
+        let mut offset: usize = 0;
+        let mut line_no: usize = 0;
+        while offset < bytes.len() {
+            line_no += 1;
+            let rest = &bytes[offset..];
+            let (line_end, step) = match rest.iter().position(|&b| b == b'\n') {
+                Some(nl) => (nl, nl + 1),
+                None => (rest.len(), rest.len()),
+            };
+            let is_final = offset + step == bytes.len();
+            let line = String::from_utf8_lossy(&rest[..line_end]);
+            let event: Event = match serde_json::from_str(&line) {
                 Ok(e) => e,
                 Err(err) => {
-                    if i + 1 == lines.len() {
+                    if is_final {
                         tracing::warn!(
                             path = %path.display(),
-                            line = i + 1,
+                            line = line_no,
                             error = %err,
                             "dropping unparseable final event line (torn write)"
                         );
@@ -216,7 +270,7 @@ impl EventLog {
                     return Err(EngineError::LogCorruption(format!(
                         "unparseable event at {}:{}: {err}",
                         path.display(),
-                        i + 1
+                        line_no
                     )));
                 }
             };
@@ -225,13 +279,16 @@ impl EventLog {
                 return Err(EngineError::LogCorruption(format!(
                     "seq discontinuity at {}:{}: expected {expected}, found {}",
                     path.display(),
-                    i + 1,
+                    line_no,
                     event.seq
                 )));
             }
             events.push(event);
+            offset += step;
+            valid_len = offset;
+            terminated = step > line_end;
         }
-        Ok(events)
+        Ok(ParsedLog { events, valid_len: valid_len as u64, terminated })
     }
 
     /// Read events with `seq > after_seq` (WS reconnect / tailing). The whole

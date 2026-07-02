@@ -347,6 +347,142 @@ fn empty_log_reads_as_no_events() {
     assert!(EventLog::read_events(&p.events_file()).unwrap().is_empty());
 }
 
+// ---------------------------------------------------------------------------
+// Torn-write repair on acquire
+// ---------------------------------------------------------------------------
+
+/// Append raw bytes to an existing log, simulating a torn (partial) write
+/// from a crashed engine process.
+fn append_raw_bytes(path: &std::path::Path, bytes: &[u8]) {
+    let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+    f.write_all(bytes).unwrap();
+}
+
+#[test]
+fn reacquire_truncates_torn_final_line_without_newline() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    {
+        let mut log = EventLog::acquire(&p, MISSION, NEVER, false).unwrap();
+        log.append(lifecycle("one")).unwrap();
+        log.append(lifecycle("two")).unwrap();
+    }
+    // Crash mid-append: a partial line with no trailing newline.
+    append_raw_bytes(&p.events_file(), br#"{"seq":3,"ts":"2026-01-01T00:0"#);
+
+    let mut log = EventLog::acquire(&p, MISSION, NEVER, false).unwrap();
+    assert_eq!(log.last_seq(), 2, "torn line must not count toward seq");
+    log.append(lifecycle("three")).unwrap();
+    log.append(lifecycle("four")).unwrap();
+    drop(log);
+
+    // Without truncation the first append would glue onto the torn line,
+    // making it a non-final garbage line and poisoning every future read.
+    let events = EventLog::read_events(&p.events_file()).unwrap();
+    assert_eq!(events.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+}
+
+#[test]
+fn reacquire_truncates_torn_final_line_with_newline() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    {
+        let mut log = EventLog::acquire(&p, MISSION, NEVER, false).unwrap();
+        log.append(lifecycle("one")).unwrap();
+        log.append(lifecycle("two")).unwrap();
+    }
+    // Garbage final line that did get its newline out before the crash.
+    append_raw_bytes(&p.events_file(), b"{\"seq\":3,\"ts\":\"2026-01-01T00:0\n");
+
+    let mut log = EventLog::acquire(&p, MISSION, NEVER, false).unwrap();
+    assert_eq!(log.last_seq(), 2);
+    log.append(lifecycle("three")).unwrap();
+    log.append(lifecycle("four")).unwrap();
+    drop(log);
+
+    let events = EventLog::read_events(&p.events_file()).unwrap();
+    assert_eq!(events.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+}
+
+#[test]
+fn reacquire_repairs_valid_final_line_missing_its_newline() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    // A tear can cut exactly at the terminator: the final line is complete,
+    // valid JSON but has no trailing newline. It must be kept (not truncated)
+    // and terminated so the next append does not glue onto it.
+    std::fs::create_dir_all(p.events_file().parent().unwrap()).unwrap();
+    let mut f = std::fs::File::create(p.events_file()).unwrap();
+    writeln!(f, "{}", raw_event(1, lifecycle("a"))).unwrap();
+    write!(f, "{}", raw_event(2, lifecycle("b"))).unwrap(); // no '\n'
+    drop(f);
+
+    let mut log = EventLog::acquire(&p, MISSION, NEVER, false).unwrap();
+    assert_eq!(log.last_seq(), 2, "unterminated valid line must survive");
+    log.append(lifecycle("c")).unwrap();
+    drop(log);
+
+    let events = EventLog::read_events(&p.events_file()).unwrap();
+    assert_eq!(events.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2, 3]);
+}
+
+#[test]
+fn reacquire_truncates_log_that_is_only_a_torn_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    std::fs::create_dir_all(p.events_file().parent().unwrap()).unwrap();
+    std::fs::write(p.events_file(), b"{\"seq\":1,\"ts").unwrap();
+
+    let mut log = EventLog::acquire(&p, MISSION, NEVER, false).unwrap();
+    assert_eq!(log.last_seq(), 0);
+    log.append(lifecycle("first")).unwrap();
+    drop(log);
+
+    let events = EventLog::read_events(&p.events_file()).unwrap();
+    assert_eq!(events.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1]);
+}
+
+// ---------------------------------------------------------------------------
+// Torn writes splitting multi-byte UTF-8
+// ---------------------------------------------------------------------------
+
+#[test]
+fn torn_final_line_splitting_multibyte_char_is_dropped_on_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    {
+        let mut log = EventLog::acquire(&p, MISSION, NEVER, false).unwrap();
+        log.append(lifecycle("one")).unwrap();
+    }
+    // Tear mid multi-byte character: 0xE2 is the first byte of a 3-byte UTF-8
+    // sequence. The file is now invalid UTF-8; the reader must still return
+    // the valid events instead of failing wholesale.
+    append_raw_bytes(&p.events_file(), b"{\"seq\":2,\"ts\":\"2026\xE2");
+
+    let events = EventLog::read_events(&p.events_file()).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].seq, 1);
+}
+
+#[test]
+fn reacquire_truncates_torn_line_splitting_multibyte_char() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    {
+        let mut log = EventLog::acquire(&p, MISSION, NEVER, false).unwrap();
+        log.append(lifecycle("one")).unwrap();
+    }
+    append_raw_bytes(&p.events_file(), b"{\"seq\":2,\"ts\":\"2026\xE2");
+
+    let mut log = EventLog::acquire(&p, MISSION, NEVER, false).unwrap();
+    assert_eq!(log.last_seq(), 1);
+    log.append(lifecycle("two")).unwrap();
+    drop(log);
+
+    let events = EventLog::read_events(&p.events_file()).unwrap();
+    assert_eq!(events.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2]);
+}
+
 #[test]
 fn read_events_after_returns_suffix() {
     let dir = tempfile::tempdir().unwrap();
