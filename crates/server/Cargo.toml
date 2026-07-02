@@ -1,0 +1,20 @@
+[package]
+name = "kranz-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kranz-engine.workspace = true
+axum.workspace = true
+tower-http.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

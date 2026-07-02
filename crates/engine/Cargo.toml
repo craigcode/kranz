@@ -1,0 +1,22 @@
+[package]
+name = "kranz-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+chrono.workspace = true
+sha2.workspace = true
+regex.workspace = true
+uuid.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest = "1"

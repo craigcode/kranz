@@ -1,0 +1,11 @@
+/target
+node_modules/
+dist/
+.DS_Store
+
+# per-repo mission data (plan.json is committed on the mission branch, not here)
+.kranz/missions/*/events.jsonl
+.kranz/missions/*/events.jsonl.lock
+.kranz/missions/*/state.json
+.kranz/missions/*/runs/
+.kranz/missions/*/control/

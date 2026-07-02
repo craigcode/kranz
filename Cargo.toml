@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = ["crates/engine", "crates/cli", "crates/server"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+kranz-engine = { path = "crates/engine" }
+kranz-server = { path = "crates/server" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
+regex = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tempfile = "3"
+clap = { version = "4", features = ["derive"] }
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+futures = "0.3"
