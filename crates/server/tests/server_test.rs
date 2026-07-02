@@ -274,7 +274,7 @@ async fn control_post_enqueues_a_drainable_command() {
 
     let commands = control::drain(&paths).unwrap();
     assert_eq!(commands.len(), 1);
-    match &commands[0] {
+    match &commands[0].1 {
         ControlCommand::Msg { text, interrupt } => {
             assert_eq!(text, "focus on tests");
             assert!(!interrupt);

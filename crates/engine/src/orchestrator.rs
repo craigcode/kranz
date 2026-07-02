@@ -347,6 +347,19 @@ impl MissionEngine {
         Ok(event)
     }
 
+    /// Append one `orchestrator.decision`, credential-scrubbing both fields:
+    /// summary and detail carry (snippets of) model-authored turn text, which
+    /// must never reach events.jsonl unredacted. The summary is additionally
+    /// truncated to [`DECISION_SUMMARY_MAX`] (scrub first, so truncation can
+    /// never split a secret into an unrecognized prefix).
+    fn emit_decision(&mut self, summary: &str, detail: Option<String>) -> Result<()> {
+        self.emit(EventKind::OrchestratorDecision {
+            summary: scrub::scrub_and_truncate(summary, DECISION_SUMMARY_MAX),
+            detail: detail.map(|d| scrub::scrub(&d)),
+        })?;
+        Ok(())
+    }
+
     /// Fold events appended by `runner::run_*` (which writes to the log
     /// directly) into engine state. Must be called immediately after every
     /// runner invocation, before any further `emit`.
@@ -501,8 +514,15 @@ impl MissionEngine {
     /// duplicates don't spam the log; a config patch that would not
     /// deserialize/validate is skipped with a warning (appending it would
     /// poison the reducer for every future reader).
+    ///
+    /// Each inbox file is deleted only AFTER its command was durably applied
+    /// (the `emit` appended the event). A crash between apply and delete
+    /// re-processes the file on the next drain — a tolerated duplicate:
+    /// Pause/Resume are idempotence-guarded above, and a repeated user
+    /// message/config patch is benign, whereas deleting first would lose the
+    /// command outright.
     fn drain_control(&mut self) -> Result<()> {
-        for cmd in control::drain(&self.paths)? {
+        for (path, cmd) in control::drain(&self.paths)? {
             match cmd {
                 ControlCommand::Pause => {
                     if self.state.mission.status != MissionStatus::Paused {
@@ -516,15 +536,18 @@ impl MissionEngine {
                 }
                 ControlCommand::ConfigChange { patch } => {
                     if let Err(e) = preview_config_patch(&self.state.config, &patch) {
+                        // Invalid patch: warn and fall through to the delete —
+                        // re-processing it forever would only spam the log.
                         tracing::warn!(error = %e, "skipping invalid config patch");
-                        continue;
+                    } else {
+                        self.emit(EventKind::ConfigChanged { patch })?;
                     }
-                    self.emit(EventKind::ConfigChanged { patch })?;
                 }
                 ControlCommand::Msg { text, interrupt } => {
                     self.emit(EventKind::UserMessage { text, interrupt })?;
                 }
             }
+            std::fs::remove_file(&path)?;
         }
         Ok(())
     }
@@ -546,11 +569,8 @@ impl MissionEngine {
                  Decide how to proceed; you may adjust remaining work. Reply in plain text."
             ))
             .await?;
-        let summary = first_nonempty_line(&text);
-        self.emit(EventKind::OrchestratorDecision {
-            summary: scrub::truncate_chars(summary, DECISION_SUMMARY_MAX),
-            detail: Some(text),
-        })?;
+        let summary = first_nonempty_line(&text).to_string();
+        self.emit_decision(&summary, Some(text))?;
         Ok(())
     }
 
@@ -578,13 +598,7 @@ impl MissionEngine {
             Some(d) => (d.action.trim().to_ascii_lowercase(), d.note),
             None => ("stay-blocked".to_string(), "unparseable unblock decision".to_string()),
         };
-        self.emit(EventKind::OrchestratorDecision {
-            summary: scrub::truncate_chars(
-                &format!("unblock decision for {milestone_id}: {action}"),
-                DECISION_SUMMARY_MAX,
-            ),
-            detail: Some(text),
-        })?;
+        self.emit_decision(&format!("unblock decision for {milestone_id}: {action}"), Some(text))?;
 
         match action.as_str() {
             "unblock-raise-cap" | "unblock-skip-findings" => {
@@ -736,13 +750,7 @@ impl MissionEngine {
             Some(d) => (d.action.trim().to_ascii_lowercase(), d.note),
             None => ("commit-as-is".to_string(), "unparseable dirty-tree decision".to_string()),
         };
-        self.emit(EventKind::OrchestratorDecision {
-            summary: scrub::truncate_chars(
-                &format!("dirty tree after {feature_id}: {action}"),
-                DECISION_SUMMARY_MAX,
-            ),
-            detail: Some(text),
-        })?;
+        self.emit_decision(&format!("dirty tree after {feature_id}: {action}"), Some(text))?;
         if action == "fail-feature" {
             self.emit(EventKind::FeatureFailed {
                 feature_id: feature_id.to_string(),
@@ -800,13 +808,7 @@ impl MissionEngine {
                 "judgement unparseable; conservative default (respawn/fail)".to_string(),
             ),
         };
-        self.emit(EventKind::OrchestratorDecision {
-            summary: scrub::truncate_chars(
-                &format!("judgement for {feature_id}: {summary}"),
-                DECISION_SUMMARY_MAX,
-            ),
-            detail: Some(text),
-        })?;
+        self.emit_decision(&format!("judgement for {feature_id}: {summary}"), Some(text))?;
 
         Ok(match verdict.as_str() {
             "complete" => JudgementOutcome::Complete,
@@ -954,21 +956,26 @@ impl MissionEngine {
                 })
                 .collect();
         }
-        self.emit(EventKind::OrchestratorDecision {
-            summary: scrub::truncate_chars(
-                &format!("{} fix feature(s) for {milestone_id}: {summary}", specs.len()),
-                DECISION_SUMMARY_MAX,
-            ),
-            detail: Some(text),
-        })?;
+        self.emit_decision(
+            &format!("{} fix feature(s) for {milestone_id}: {summary}", specs.len()),
+            Some(text),
+        )?;
 
         let cycle = self.state.mission.milestones[mi].fix_cycles + 1;
         for (i, spec) in specs.into_iter().enumerate() {
+            // Belt and braces: both sources (the orchestrator turn text and
+            // validator findings) are already scrubbed, but these strings are
+            // model-authored and land verbatim in `fixfeature.created` events,
+            // so scrub them once more at the emit boundary.
             let feature = Feature {
                 id: format!("{milestone_id}-fix-{cycle}-{}", i + 1),
-                title: spec.title,
-                spec: spec.spec,
-                validation_criteria: spec.validation_criteria,
+                title: scrub::scrub(&spec.title),
+                spec: scrub::scrub(&spec.spec),
+                validation_criteria: spec
+                    .validation_criteria
+                    .iter()
+                    .map(|c| scrub::scrub(c))
+                    .collect(),
                 origin: FeatureOrigin::Fix,
                 status: FeatureStatus::Pending,
                 worker_runs: Vec::new(),
@@ -1130,13 +1137,7 @@ impl MissionEngine {
                 "unparseable verdicts; all judgement assertions failed conservatively".to_string()
             }
         };
-        self.emit(EventKind::OrchestratorDecision {
-            summary: scrub::truncate_chars(
-                &format!("final gate verdicts: {summary}"),
-                DECISION_SUMMARY_MAX,
-            ),
-            detail: Some(text),
-        })?;
+        self.emit_decision(&format!("final gate verdicts: {summary}"), Some(text))?;
         Ok(findings)
     }
 
@@ -1340,7 +1341,10 @@ impl MissionEngine {
     /// and folding the turn's usage into totals via `worker.completed`.
     ///
     /// Returns the turn's text: the `Result` text when non-empty, else the
-    /// concatenated assistant `Text` blocks.
+    /// concatenated assistant `Text` blocks — credential-scrubbed at this
+    /// single choke point, so everything derived from a turn (decision
+    /// details, parsed JSON decisions, fix-feature specs, verdict evidence)
+    /// is redacted before it can reach events.jsonl.
     async fn pump_turn(&mut self) -> Result<String> {
         let run_id = self.orch_run_id.clone().ok_or_else(|| {
             EngineError::InvalidState("pump_turn without a live orchestrator run".to_string())
@@ -1385,10 +1389,12 @@ impl MissionEngine {
                     })?;
                     if is_error {
                         return Err(EngineError::Backend(format!(
-                            "orchestrator turn returned an error result: {text}"
+                            "orchestrator turn returned an error result: {}",
+                            scrub::scrub(&text)
                         )));
                     }
-                    return Ok(if text.trim().is_empty() { texts.join("\n") } else { text });
+                    let turn_text = if text.trim().is_empty() { texts.join("\n") } else { text };
+                    return Ok(scrub::scrub(&turn_text));
                 }
                 _ => {}
             }
@@ -1601,9 +1607,25 @@ fn preview_config_patch(current: &MissionConfig, patch: &serde_json::Value) -> R
 /// DELIBERATE shell usage (the one place in the engine): contract commands
 /// are user-authored shell lines ("npm test -- --grep auth") that need real
 /// shell semantics — argument splitting here would corrupt them. `cmd /C` on
-/// Windows, `sh -c` elsewhere; cwd = repo root; 10-minute cap (the child is
-/// killed on timeout via kill_on_drop).
+/// Windows, `sh -c` elsewhere; cwd = repo root; 10-minute cap.
 async fn run_shell_command(cwd: &std::path::Path, command: &str) -> (bool, String) {
+    run_shell_command_with_timeout(cwd, command, COMMAND_TIMEOUT).await
+}
+
+/// [`run_shell_command`] with an explicit timeout (separated so tests can
+/// exercise the timeout path without waiting ten minutes).
+///
+/// Timeout kill semantics: on unix the shell is started as the leader of a
+/// new process group and the WHOLE group gets SIGKILL — killing only the
+/// wrapper (kill_on_drop) would leave `sleep 300 &`-style descendants running
+/// (and holding the output pipes) long after the gate gave up. The killed
+/// shell itself is reaped by tokio's background orphan reaper (kill_on_drop);
+/// group members are re-parented to init and reaped there.
+async fn run_shell_command_with_timeout(
+    cwd: &std::path::Path,
+    command: &str,
+    timeout: Duration,
+) -> (bool, String) {
     #[cfg(windows)]
     let mut cmd = {
         let mut c = tokio::process::Command::new("cmd");
@@ -1621,10 +1643,36 @@ async fn run_shell_command(cwd: &std::path::Path, command: &str) -> (bool, Strin
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    // Unix: new process group with the shell as leader, so the timeout path
+    // can kill the entire command tree, not just the `sh -c` wrapper.
+    #[cfg(unix)]
+    cmd.process_group(0);
 
-    match tokio::time::timeout(COMMAND_TIMEOUT, cmd.output()).await {
-        Err(_elapsed) => (false, format!("timed out after {}s", COMMAND_TIMEOUT.as_secs())),
-        Ok(Err(e)) => (false, format!("failed to spawn shell: {e}")),
+    let child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => return (false, format!("failed to spawn shell: {e}")),
+    };
+    #[cfg(unix)]
+    let group_pid = child.id();
+
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Err(_elapsed) => {
+            // The dropped wait future already killed the shell wrapper via
+            // kill_on_drop; SIGKILL the whole group so its descendants die
+            // too (a still-live member keeps the pgid valid, and the leader
+            // zombie pins it until reaped).
+            #[cfg(unix)]
+            if let Some(pid) = group_pid {
+                // Negative pid targets every process in the group.
+                unsafe {
+                    libc::kill(-(pid as i32), libc::SIGKILL);
+                }
+            }
+            // TODO(windows): kill_on_drop terminates only the `cmd /C`
+            // wrapper; killing the whole tree needs Job Objects.
+            (false, format!("timed out after {}s", timeout.as_secs()))
+        }
+        Ok(Err(e)) => (false, format!("failed waiting for shell: {e}")),
         Ok(Ok(output)) => {
             let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1784,6 +1832,46 @@ mod tests {
         assert!(preview_config_patch(&cfg, &bad).is_err());
         let good = serde_json::json!({ "worker": { "model": "haiku" } });
         assert!(preview_config_patch(&cfg, &good).is_ok());
+    }
+
+    /// Timeout kill discipline: the whole process GROUP dies, not just the
+    /// `sh -c` wrapper — a backgrounded child must not survive the gate
+    /// giving up (unix only; Windows still kills only the wrapper, see the
+    /// TODO in `run_shell_command_with_timeout`).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_command_timeout_kills_the_whole_process_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("child.pid");
+        // A background child that would outlive the wrapper by minutes; its
+        // pid is written out before the shell parks in `wait`.
+        let command = format!("sleep 300 & echo $! > '{}'; wait", pidfile.display());
+
+        let (ok, output) = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_shell_command_with_timeout(dir.path(), &command, Duration::from_millis(500)),
+        )
+        .await
+        .expect("timed-out command must return promptly");
+        assert!(!ok, "command must be reported failed: {output}");
+        assert!(output.contains("timed out"), "got: {output}");
+
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .expect("shell wrote the background pid before the timeout")
+            .trim()
+            .parse()
+            .expect("pidfile contains a pid");
+
+        // The group SIGKILL must take the background child down: poll until
+        // kill(pid, 0) no longer reports it (dead + reaped by init), bounded.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background child {pid} survived the group kill"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     #[test]

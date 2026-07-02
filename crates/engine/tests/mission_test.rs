@@ -593,6 +593,74 @@ async fn pause_resume_and_user_message_flow() {
         &e.kind,
         EventKind::UserMessage { text, interrupt: false } if text == "swap feature"
     )));
+
+    // Delete-after-apply: every applied control file was removed once its
+    // event hit the log — the normal path leaves an empty inbox.
+    let leftover: Vec<String> = std::fs::read_dir(paths.control_dir())
+        .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+        .unwrap_or_default();
+    assert!(leftover.is_empty(), "control inbox must be empty after apply: {leftover:?}");
+}
+
+// ---------------------------------------------------------------------------
+// 5b. Scrubbing: orchestrator decision detail (structured-field leak)
+// ---------------------------------------------------------------------------
+
+/// Regression: the orchestrator's raw turn text becomes the
+/// `orchestrator.decision` detail (and its summary feeds the decision
+/// summary). A credential in that model-authored text must be redacted
+/// before the event reaches events.jsonl.
+#[tokio::test(flavor = "multi_thread")]
+async fn orchestrator_decision_detail_is_scrubbed() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let token = "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123";
+    let leaky_judgement = json!({
+        "decision": "complete",
+        "guidance": "",
+        "summary": format!("looks good; noticed {token} in the env"),
+    })
+    .to_string();
+
+    // One feature, validators skipped, empty contract; orchestrator turns:
+    // seed, then the leaky judgement.
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![leaky_judgement]),
+    ]));
+
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run()).await.expect("run must not hang").unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    // The raw log never carries the token; the judgement decision is redacted
+    // in both summary and detail.
+    let raw_log = std::fs::read_to_string(paths.events_file()).unwrap();
+    assert!(!raw_log.contains(token), "events.jsonl leaked the token");
+
+    let events = read_log(&paths);
+    let (summary, detail) = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::OrchestratorDecision { summary, detail: Some(detail) }
+                if summary.starts_with("judgement for") =>
+            {
+                Some((summary.clone(), detail.clone()))
+            }
+            _ => None,
+        })
+        .expect("a judgement orchestrator.decision with detail exists");
+    assert!(summary.contains("[REDACTED]"), "summary: {summary}");
+    assert!(detail.contains("[REDACTED]"), "detail: {detail}");
+    assert!(!detail.contains(token));
 }
 
 // ---------------------------------------------------------------------------
