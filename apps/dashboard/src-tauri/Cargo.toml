@@ -1,14 +1,16 @@
 [package]
-name = "app"
+name = "kranz-dashboard"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
-license = ""
-repository = ""
+description = "Kranz Mission Control — Tauri desktop shell embedding the kranz server"
+authors = ["Kranz"]
+license = "MIT"
 edition = "2021"
 rust-version = "1.77.2"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+# Standalone workspace: keeps the heavy Tauri dependency tree out of the root
+# cargo workspace's builds (the root workspace does not list this package as a
+# member; without this table cargo would refuse to build it at all).
+[workspace]
 
 [lib]
 name = "app_lib"
@@ -18,8 +20,11 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2.6.3" }
 
 [dependencies]
-serde_json = "1.0"
-serde = { version = "1.0", features = ["derive"] }
+kranz-server = { path = "../../../crates/server" }
+kranz-engine = { path = "../../../crates/engine" }
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
 log = "0.4"
 tauri = { version = "2.11.3" }
 tauri-plugin-log = "2"
