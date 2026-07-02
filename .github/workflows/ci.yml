@@ -1,0 +1,47 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Configure git identity (git_ops tests)
+        run: |
+          git config --global user.name kranz-ci
+          git config --global user.email ci@kranz.local
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  dashboard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/dashboard/package-lock.json
+      - run: npm ci
+        working-directory: apps/dashboard
+      - run: npx tsc --noEmit
+        working-directory: apps/dashboard
+      - run: npm run build
+        working-directory: apps/dashboard
+
+  # One real-model smoke mission, manual trigger only (costs tokens).
+  smoke:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "wire ANTHROPIC_API_KEY + kranz plan/run against a sample repo here"
