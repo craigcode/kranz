@@ -62,15 +62,33 @@ fn enqueue_drain_round_trip_preserves_order() {
 
     let drained = control::drain(&paths).unwrap();
     assert_eq!(
-        drained.iter().map(as_json).collect::<Vec<_>>(),
+        drained.iter().map(|(_, cmd)| as_json(cmd)).collect::<Vec<_>>(),
         cmds.iter().map(as_json).collect::<Vec<_>>(),
         "drain must return commands in enqueue order"
     );
 
-    // Drain consumed everything (no .json left, no tmp litter).
-    assert!(control_entries(&paths).is_empty(), "drain must empty the inbox");
+    // Drain is NON-destructive: every file survives until the caller has
+    // durably applied its command and deletes it. A crash between drain and
+    // apply therefore re-processes commands instead of losing them.
+    for (path, _) in &drained {
+        assert!(path.exists(), "drained file must survive drain: {}", path.display());
+    }
+    assert_eq!(control_entries(&paths).len(), cmds.len(), "inbox untouched by drain");
 
-    // Second drain is empty.
+    // Processing stopped before any delete (simulated crash): a second drain
+    // sees the exact same queue again.
+    let again = control::drain(&paths).unwrap();
+    assert_eq!(
+        again.iter().map(|(_, cmd)| as_json(cmd)).collect::<Vec<_>>(),
+        cmds.iter().map(as_json).collect::<Vec<_>>(),
+        "undeleted files drain again after a crash"
+    );
+
+    // The normal path — caller deletes after applying — empties the inbox.
+    for (path, _) in drained {
+        std::fs::remove_file(path).unwrap();
+    }
+    assert!(control_entries(&paths).is_empty(), "inbox empty once the caller deletes");
     assert!(control::drain(&paths).unwrap().is_empty());
 }
 
@@ -113,19 +131,29 @@ fn corrupt_file_is_quarantined_and_never_blocks_the_queue() {
 
     let drained = control::drain(&paths).unwrap();
     assert_eq!(
-        drained.iter().map(as_json).collect::<Vec<_>>(),
+        drained.iter().map(|(_, cmd)| as_json(cmd)).collect::<Vec<_>>(),
         vec![as_json(&ControlCommand::Pause), as_json(&ControlCommand::Resume)],
         "valid commands drain despite the corrupt file"
     );
 
     let entries = control_entries(&paths);
+    assert!(
+        entries.contains(&format!("{corrupt_name}.bad")),
+        "corrupt file renamed .bad: {entries:?}"
+    );
+    assert!(entries.contains(&"notes.txt".to_string()), "stray file untouched: {entries:?}");
     assert_eq!(
-        entries,
-        vec![format!("{corrupt_name}.bad"), "notes.txt".to_string()],
-        "corrupt file renamed .bad, stray file untouched, valid files consumed"
+        entries.len(),
+        4,
+        "both valid files still queued (drain is non-destructive): {entries:?}"
     );
 
-    // The .bad quarantine never comes back on later drains.
+    // The .bad quarantine never comes back on later drains; the (undeleted)
+    // valid files do.
+    assert_eq!(control::drain(&paths).unwrap().len(), 2);
+    for (path, _) in drained {
+        std::fs::remove_file(path).unwrap();
+    }
     assert!(control::drain(&paths).unwrap().is_empty());
 }
 
@@ -153,9 +181,9 @@ fn peek_interrupt_only_on_interrupt_msg_and_is_non_destructive() {
     let drained = control::drain(&paths).unwrap();
     assert_eq!(drained.len(), 3);
     assert!(
-        matches!(&drained[2], ControlCommand::Msg { text, interrupt: true } if text == "stop"),
+        matches!(&drained[2].1, ControlCommand::Msg { text, interrupt: true } if text == "stop"),
         "interrupt message survived the peeks: {:?}",
-        drained[2]
+        drained[2].1
     );
 }
 
@@ -191,7 +219,37 @@ async fn wait_for_interrupt_fires_notify_within_bounded_time() {
     // The watcher peeks; the interrupt message is still queued for drain.
     let drained = control::drain(&paths).unwrap();
     assert_eq!(drained.len(), 1);
-    assert!(matches!(drained[0], ControlCommand::Msg { interrupt: true, .. }));
+    assert!(matches!(drained[0].1, ControlCommand::Msg { interrupt: true, .. }));
+}
+
+/// Regression (interrupt loss): the watcher must fire `notify_one`, which
+/// stores a permit when nobody is registered yet. With `notify_waiters` a
+/// fire during `backend.start()` (or between two `notified()` registrations
+/// of the run loop) woke nobody, stored nothing, and the interrupt was lost
+/// forever.
+#[tokio::test]
+async fn wait_for_interrupt_permit_survives_until_a_late_waiter() {
+    let (_dir, paths) = temp_paths();
+    control::enqueue(&paths, &ControlCommand::Msg { text: "abort".into(), interrupt: true })
+        .unwrap();
+
+    // Run the watcher TO COMPLETION with nobody listening.
+    let notify = Arc::new(Notify::new());
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        ControlWatcher::wait_for_interrupt(
+            paths.clone(),
+            Duration::from_millis(10),
+            Arc::clone(&notify),
+        ),
+    )
+    .await
+    .expect("watcher must fire and return within 5s");
+
+    // A waiter that registers only AFTER the fire must still observe it.
+    tokio::time::timeout(Duration::from_secs(5), notify.notified())
+        .await
+        .expect("the stored permit must complete a late notified()");
 }
 
 #[tokio::test]

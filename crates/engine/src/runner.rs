@@ -113,7 +113,8 @@ pub struct RunOutcome {
     pub result: RunResult,
     pub usage: TokenUsage,
     pub cost_usd: Option<f64>,
-    /// Text of the last `Result` event (report JSON lives here).
+    /// Text of the last `Result` event (report JSON lives here), credential-
+    /// scrubbed like every other model-authored string the engine persists.
     pub final_text: String,
     /// Parsed from `final_text` when the role is [`Role::Worker`].
     pub report: Option<WorkerReport>,
@@ -233,6 +234,15 @@ pub async fn run_session(
             SessionExit::Failed("session stream closed without an exit status".to_string())
         }
     });
+
+    // Scrub the final text BEFORE parsing reports: report string fields
+    // (summary, testEvidence, finding evidence, …) are stored verbatim in
+    // `worker.completed` events and consumed by the orchestrator, so a secret
+    // inside the raw result text would otherwise bypass the transcript/
+    // message scrubbing and land in events.jsonl unredacted. Scrubbing
+    // replaces token-shaped substrings only, so valid report JSON stays
+    // parseable. The outcome's `final_text` is the scrubbed form too.
+    let final_text = scrub::scrub(&final_text);
 
     let mut report: Option<WorkerReport> = None;
     let mut validator_report: Option<ValidatorReport> = None;

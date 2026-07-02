@@ -5,6 +5,7 @@ use kranz_engine::backend::{PromptMode, SessionExit, SessionSpec};
 use kranz_engine::backend_mock::{
     mock_denied, mock_init, mock_result_text, mock_text, mock_tool_use, MockBackend, MockScript,
 };
+use kranz_engine::control::{self, ControlWatcher};
 use kranz_engine::event_log::EventLog;
 use kranz_engine::events::{Event, EventKind};
 use kranz_engine::paths::MissionPaths;
@@ -13,8 +14,8 @@ use kranz_engine::runner::{
     parse_validator_report, parse_worker_report, run_session, run_validator, run_worker, RunMeta,
 };
 use kranz_engine::types::{
-    Assertion, AssertionCheck, Feature, FeatureOrigin, FeatureStatus, Milestone, MilestoneStatus,
-    MissionConfig, Role, RunResult, TokenUsage,
+    Assertion, AssertionCheck, ControlCommand, Feature, FeatureOrigin, FeatureStatus, Milestone,
+    MilestoneStatus, MissionConfig, Role, RunResult, TokenUsage,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -546,6 +547,50 @@ async fn run_session_cancellation_aborts_and_reports_partial() {
     }
 }
 
+/// Regression (interrupt loss): the ControlWatcher fires BEFORE run_session
+/// ever polls the cancel notify — modelling a fire while `backend.start()`
+/// is still in flight. The `notify_one` permit must be stored so the run
+/// still aborts; with `notify_waiters` the fire woke nobody and the run hung
+/// forever on the never-ending stream.
+#[tokio::test]
+async fn interrupt_fired_before_first_poll_still_aborts_the_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    let mut log = seeded_log(&p);
+
+    control::enqueue(&p, &ControlCommand::Msg { text: "stop".into(), interrupt: true }).unwrap();
+    let cancel = Arc::new(Notify::new());
+    // Run the watcher to completion first: it fires and returns while nobody
+    // is registered on the notify.
+    timeout(
+        HANG_PROOF,
+        ControlWatcher::wait_for_interrupt(
+            p.clone(),
+            Duration::from_millis(10),
+            Arc::clone(&cancel),
+        ),
+    )
+    .await
+    .expect("watcher must fire and return");
+
+    // Never-ending streaming session: only the stored permit can end it.
+    let script =
+        MockScript::streaming(vec![mock_init("mock-session"), mock_text("working...")]);
+    let backend = MockBackend::with_scripts(vec![script]);
+    let spec = session_spec(PromptMode::Streaming("keep working".to_string()));
+
+    let outcome = timeout(
+        HANG_PROOF,
+        run_session(&backend, spec, &mut log, &p, worker_meta("run-pre"), Some(cancel)),
+    )
+    .await
+    .expect("a pre-fired interrupt must abort the run, not hang")
+    .unwrap();
+
+    assert_eq!(outcome.exit, SessionExit::Aborted);
+    assert_eq!(outcome.result, RunResult::Partial);
+}
+
 #[tokio::test]
 async fn run_session_scrubs_credentials_from_log_and_transcript() {
     let dir = tempfile::tempdir().unwrap();
@@ -582,6 +627,53 @@ async fn run_session_scrubs_credentials_from_log_and_transcript() {
     let transcript = std::fs::read_to_string(p.transcript_file("run-s")).unwrap();
     assert!(!transcript.contains(token), "transcript leaked the token");
     assert!(transcript.contains("[REDACTED]"));
+}
+
+/// Regression (structured-field leak): a credential inside a WorkerReport
+/// field (testEvidence etc.) must be redacted BEFORE the report is parsed —
+/// otherwise it lands verbatim in the `worker.completed` event on
+/// events.jsonl, bypassing the transcript/message scrubbing.
+#[tokio::test]
+async fn run_session_scrubs_worker_report_structured_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    let mut log = seeded_log(&p);
+
+    let token = "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123";
+    let report = json!({
+        "result": "pass",
+        "summary": format!("done; used {token} for the API"),
+        "testEvidence": format!("curl with {token} returned 200"),
+    });
+    let backend = MockBackend::with_scripts(vec![MockScript::single_shot_json(&report)]);
+    let spec = session_spec(PromptMode::SingleShot("build".to_string()));
+    let outcome =
+        run_session(&backend, spec, &mut log, &p, worker_meta("run-r"), None).await.unwrap();
+
+    // The parsed report is redacted (it feeds worker.completed and the
+    // orchestrator judgement turn); so is the outcome's final text.
+    let parsed = outcome.report.expect("report parses from scrubbed text");
+    assert_eq!(parsed.result, RunResult::Pass);
+    assert!(parsed.summary.contains("[REDACTED]"), "summary: {}", parsed.summary);
+    assert!(
+        parsed.test_evidence.contains("[REDACTED]"),
+        "testEvidence: {}",
+        parsed.test_evidence
+    );
+    assert!(!parsed.test_evidence.contains(token));
+    assert!(!outcome.final_text.contains(token), "final_text must be scrubbed");
+
+    // Nothing on events.jsonl carries the raw token.
+    drop(log);
+    let raw_log = std::fs::read_to_string(p.events_file()).unwrap();
+    assert!(!raw_log.contains(token), "event log leaked the token");
+    let events = read_log(&p);
+    match &events.last().unwrap().kind {
+        EventKind::WorkerCompleted { report: Some(r), .. } => {
+            assert!(r.test_evidence.contains("[REDACTED]"), "event report: {r:?}");
+        }
+        other => panic!("expected worker.completed with a report, got {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -51,13 +51,21 @@ pub fn enqueue(paths: &MissionPaths, cmd: &ControlCommand) -> Result<PathBuf> {
     Ok(final_path)
 }
 
-/// Drain the inbox: parse and DELETE every queued `.json` file, oldest first.
+/// Drain the inbox: parse every queued `.json` file, oldest first,
+/// NON-destructively.
+///
+/// Each parsed command is returned together with the file it came from; the
+/// caller deletes each file only AFTER the command has been durably applied
+/// (e.g. appended to the event log). Deleting up front would lose commands if
+/// the process crashed between the drain and the apply — re-processing a file
+/// on the next drain is the safe failure mode (duplicates are tolerated
+/// downstream).
 ///
 /// A file that fails to parse is renamed to `<name>.bad` (with a warning) and
 /// skipped so a corrupt file can never block the queue. Non-`.json` files
-/// (tmp files, `.bad` quarantines) are ignored. Returns the parsed commands
-/// in filename (== chronological) order.
-pub fn drain(paths: &MissionPaths) -> Result<Vec<ControlCommand>> {
+/// (tmp files, `.bad` quarantines) are ignored. Returns the commands in
+/// filename (== chronological) order.
+pub fn drain(paths: &MissionPaths) -> Result<Vec<(PathBuf, ControlCommand)>> {
     let mut commands = Vec::new();
     for path in queued_files(&paths.control_dir())? {
         let content = match std::fs::read_to_string(&path) {
@@ -69,10 +77,7 @@ pub fn drain(paths: &MissionPaths) -> Result<Vec<ControlCommand>> {
             }
         };
         match serde_json::from_str::<ControlCommand>(&content) {
-            Ok(cmd) => {
-                std::fs::remove_file(&path)?;
-                commands.push(cmd);
-            }
+            Ok(cmd) => commands.push((path, cmd)),
             Err(e) => quarantine(&path, &e),
         }
     }
@@ -138,9 +143,16 @@ pub struct ControlWatcher;
 
 impl ControlWatcher {
     /// Loop [`peek_interrupt`] every `poll` interval; when an interrupt is
-    /// seen, fire `notify.notify_waiters()` once and return. Poll errors are
+    /// seen, fire `notify.notify_one()` once and return. Poll errors are
     /// logged and treated as "no interrupt yet" — the watcher never dies on a
     /// transient filesystem hiccup.
+    ///
+    /// `notify_one` (never `notify_waiters`) is load-bearing: it stores a
+    /// permit when nobody is waiting, so a fire while the run loop is between
+    /// `notified()` registrations (or still inside `backend.start()`) is
+    /// consumed by the NEXT waiter instead of being lost forever. Tokio also
+    /// re-stores/passes on the permit when a woken `Notified` future is
+    /// dropped unconsumed, so a `select!` race cannot swallow it either.
     pub async fn wait_for_interrupt(
         paths: MissionPaths,
         poll: std::time::Duration,
@@ -149,7 +161,7 @@ impl ControlWatcher {
         loop {
             match peek_interrupt(&paths) {
                 Ok(true) => {
-                    notify.notify_waiters();
+                    notify.notify_one();
                     return;
                 }
                 Ok(false) => {}
