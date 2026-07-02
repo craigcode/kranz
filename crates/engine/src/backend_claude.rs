@@ -432,6 +432,14 @@ impl AgentBackend for ClaudeBackend {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // Unix: make the child the leader of a fresh process group so aborts
+        // can kill the whole tree — tool subprocesses (test runners, builds)
+        // die with the CLI instead of surviving an interrupt/turn-budget
+        // abort. See [`ClaudeSession::kill_child`].
+        // TODO(windows): no group equivalent without Job Objects; only the
+        // direct child is killed there and descendants may survive an abort.
+        #[cfg(unix)]
+        command.process_group(0);
 
         let mut child = command.spawn().map_err(|e| {
             EngineError::Backend(format!(
@@ -495,6 +503,16 @@ impl AgentBackend for ClaudeBackend {
 // Session
 // ---------------------------------------------------------------------------
 
+/// Send SIGKILL to the process group `pgid`. Returns whether the signal was
+/// delivered to at least one process (false means the group is gone).
+#[cfg(unix)]
+fn kill_group(pgid: i32) -> bool {
+    debug_assert!(pgid > 0, "kill_group needs a positive group id");
+    // SAFETY: kill(2) takes a pid and a signal number; no pointers or shared
+    // state are involved. A negative pid targets the whole process group.
+    unsafe { libc::kill(-pgid, libc::SIGKILL) == 0 }
+}
+
 /// A live `claude` CLI session (the [`AgentSession`] impl).
 pub struct ClaudeSession {
     /// Updated by the last `system/init` seen; defaults to the spec value.
@@ -551,12 +569,48 @@ impl ClaudeSession {
     }
 
     /// Kill the child and reap it, best-effort; also closes stdin and joins
-    /// the stderr capture task. Uses `start_kill`/`wait` (works on Windows —
-    /// no POSIX signal assumptions).
+    /// the stderr capture task.
+    ///
+    /// Unix: the child was spawned as the leader of its own process group
+    /// (`process_group(0)` in [`ClaudeBackend::start`]), so SIGKILL is sent
+    /// to the whole group via `kill(-pid, SIGKILL)` — tool subprocesses
+    /// (test runners, builds) die with the CLI. A first group kill can race
+    /// a concurrent `fork` inside the group (the mid-fork child misses the
+    /// signal), so after reaping the leader — membership is stable then —
+    /// the group is swept with a second SIGKILL. When the group kill fails
+    /// (e.g. the child is already reaped), the direct `start_kill` is the
+    /// fallback.
+    ///
+    /// TODO(windows): only the direct child is killed; descendants survive.
+    /// A proper tree kill needs Job Objects.
     async fn kill_child(&mut self) {
         self.stdin = None;
-        let _ = self.child.start_kill();
-        let _ = self.child.wait().await;
+        #[cfg(unix)]
+        {
+            // `id()` is None once the child has been reaped; the leader's
+            // pid doubles as the group id (`process_group(0)` at spawn).
+            let pgid = self
+                .child
+                .id()
+                .and_then(|pid| i32::try_from(pid).ok())
+                .filter(|pid| *pid > 0);
+            let group_killed = matches!(pgid, Some(pgid) if kill_group(pgid));
+            if !group_killed {
+                let _ = self.child.start_kill();
+            }
+            let _ = self.child.wait().await;
+            if group_killed {
+                if let Some(pgid) = pgid {
+                    // Sweep stragglers that raced the first kill mid-fork.
+                    let _ = kill_group(pgid);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = self.child.start_kill();
+            let _ = self.child.wait().await;
+        }
         if let Some(task) = self.stderr_task.take() {
             let _ = task.await;
         }
