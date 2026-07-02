@@ -672,6 +672,66 @@ mod fake_cli {
         assert!(matches!(err, EngineError::Backend(_)), "got {err:?}");
     }
 
+    /// Fake CLI that spawns a background subprocess (stand-in for a tool
+    /// child like a test runner), reports that child's pid as a JSON line on
+    /// stdout, then streams forever until killed.
+    const SPAWN_TOOL_CHILD_THEN_HANG: &str = "#!/bin/sh\n\
+        sleep 300 &\n\
+        tool_pid=$!\n\
+        printf '{\"type\":\"system\",\"subtype\":\"fake_tool_child\",\"pid\":%s}\\n' \"$tool_pid\"\n\
+        sleep 300\n";
+
+    /// True while `pid` exists (kill-0 probe).
+    fn process_alive(pid: i32) -> bool {
+        // SAFETY: signal 0 performs error checking only; nothing is sent.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// Regression: abort() must kill the child's whole process tree, not
+    /// just the CLI process — tool subprocesses used to survive an
+    /// interrupt/turn-budget abort.
+    #[tokio::test]
+    async fn abort_kills_the_whole_process_tree_not_just_the_cli() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = write_script(dir.path(), "fake-claude.sh", SPAWN_TOOL_CHILD_THEN_HANG);
+        let backend = ClaudeBackend::new(script);
+        let mut spec = base_spec(PromptMode::SingleShot("ignored".to_string()));
+        spec.cwd = dir.path().to_path_buf();
+
+        let mut session = backend.start(spec).await.unwrap();
+
+        // The first stream line carries the pid of the fake tool subprocess.
+        let event = next_event(&mut session).await.expect("pid event");
+        let AgentEvent::Other { raw } = &event else {
+            panic!("expected Other pid event, got {event:?}");
+        };
+        let tool_pid =
+            i32::try_from(raw["pid"].as_i64().expect("pid field")).expect("pid fits i32");
+        assert!(tool_pid > 0, "pid was {tool_pid}");
+        assert!(process_alive(tool_pid), "tool child must be alive before abort");
+
+        // Bounded: abort joins the stderr capture task, which only finishes
+        // when every pipe holder is dead — a surviving tool subprocess would
+        // otherwise stall this for the full sleep and pass spuriously.
+        tokio::time::timeout(Duration::from_secs(10), session.abort())
+            .await
+            .expect("abort hung: a tool subprocess survived and held the pipes")
+            .unwrap();
+        assert_eq!(session.exit_status(), Some(SessionExit::Aborted));
+        assert!(next_event(&mut session).await.is_none(), "stream closed after abort");
+
+        // The tool subprocess must die with the CLI. Bounded wait: SIGKILL
+        // delivery and init reaping the reparented orphan are asynchronous.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while process_alive(tool_pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "tool subprocess {tool_pid} survived abort for 5s"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     #[tokio::test]
     async fn send_user_message_errors_on_single_shot_sessions() {
         let dir = tempfile::tempdir().unwrap();
