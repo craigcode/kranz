@@ -947,3 +947,31 @@ proptest! {
         );
     }
 }
+
+/// Final-gate findings are attributed to the reserved engine run id, which
+/// must fold without a matching WorkerRun (any other unknown run id refuses).
+#[test]
+fn validation_finding_accepts_reserved_engine_run_id() {
+    let finding = |run: &str| {
+        EventKind::ValidationFinding {
+            milestone_id: "ms-1".to_string(),
+            run_id: run.to_string(),
+            finding: Finding {
+                subject: "a-1".to_string(),
+                severity: "major".to_string(),
+                evidence: "command failed".to_string(),
+                suggested_fix: String::new(),
+            },
+        }
+    };
+
+    let events = vec![
+        ev(1, created()),
+        ev(2, EventKind::PlanApproved { plan: plan() }),
+        ev(3, finding(kranz_engine::reducer::ENGINE_RUN_ID)),
+    ];
+    fold(&events).expect("engine run id must fold cleanly");
+
+    let events = vec![ev(1, created()), ev(2, EventKind::PlanApproved { plan: plan() }), ev(3, finding("r-77"))];
+    assert!(matches!(fold(&events), Err(EngineError::InvalidState(_))));
+}

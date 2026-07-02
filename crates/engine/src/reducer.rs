@@ -11,6 +11,10 @@ use crate::types::*;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+/// Reserved `run_id` for `validation.finding` events produced by the engine
+/// itself (final contract gate command failures) rather than a validator run.
+pub const ENGINE_RUN_ID: &str = "engine";
+
 /// Fold a contiguous event slice into a state. The first event MUST be
 /// `mission.created`.
 pub fn fold(events: &[Event]) -> Result<MissionState> {
@@ -169,8 +173,13 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
 
         EventKind::ValidationFinding { milestone_id, run_id, .. } => {
             // No structural change; validate references as a corruption guard.
+            // run_id "engine" is reserved for findings the engine itself
+            // produces (final contract gate command failures) — no session
+            // exists behind them, so the run lookup is skipped.
             milestone_mut(state, milestone_id)?;
-            run_mut(state, run_id)?;
+            if run_id != ENGINE_RUN_ID {
+                run_mut(state, run_id)?;
+            }
         }
 
         EventKind::FixFeatureCreated { milestone_id, feature } => {

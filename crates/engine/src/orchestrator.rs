@@ -1035,11 +1035,18 @@ impl MissionEngine {
             return Ok(Some(MissionStatus::Complete));
         }
 
-        // Fix path on the last milestone. No `validation.finding` events here:
-        // gate findings have no validator run to attribute them to, and the
-        // reducer (correctly) refuses unknown run ids; the findings reach the
-        // orchestrator and the fix features carry them into state.
+        // Surface gate findings on the event feed (dashboard visibility),
+        // attributed to the reserved engine run id since no validator session
+        // exists behind them.
         let li = self.state.mission.milestones.len() - 1;
+        let last_milestone_id = self.state.mission.milestones[li].id.clone();
+        for finding in &findings {
+            self.emit(EventKind::ValidationFinding {
+                milestone_id: last_milestone_id.clone(),
+                run_id: crate::reducer::ENGINE_RUN_ID.to_string(),
+                finding: finding.clone(),
+            })?;
+        }
         if self.fix_cycle_exhausted(li) {
             let milestone_id = self.state.mission.milestones[li].id.clone();
             self.emit(EventKind::MilestoneBlocked {
