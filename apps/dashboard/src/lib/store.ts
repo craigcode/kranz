@@ -24,6 +24,13 @@ interface KranzStore {
   missionId: string | null;
   state: MissionState | null;
   events: MissionEvent[];
+  /**
+   * Uncapped mission.paused / mission.resumed history, kept apart from the
+   * capped `events` ring so elapsed-time pause accounting never loses spans
+   * to eviction. Seeded from the REST event fetch, appended on matching WS
+   * frames, deduped by seq.
+   */
+  pauseEvents: MissionEvent[];
   connection: ConnectionStatus;
   selectedRun: string | null;
   /** Last seq seen over the wire (frames or seeded events). */
@@ -52,6 +59,32 @@ function mergeEvents(a: MissionEvent[], b: MissionEvent[]): MissionEvent[] {
   return capEvents([...bySeq.values()].sort((x, y) => x.seq - y.seq));
 }
 
+export function isPauseEvent(e: MissionEvent): boolean {
+  return e.type === 'mission.paused' || e.type === 'mission.resumed';
+}
+
+/**
+ * Fold pause/resume events from `incoming` into the uncapped `existing`
+ * list: seq-deduped, seq-ordered. Returns `existing` unchanged (same
+ * reference) when `incoming` adds nothing, so subscribers don't re-render.
+ */
+export function mergePauseEvents(
+  existing: MissionEvent[],
+  incoming: MissionEvent[],
+): MissionEvent[] {
+  const bySeq = new Map<number, MissionEvent>();
+  for (const e of existing) bySeq.set(e.seq, e);
+  let added = false;
+  for (const e of incoming) {
+    if (isPauseEvent(e) && !bySeq.has(e.seq)) {
+      bySeq.set(e.seq, e);
+      added = true;
+    }
+  }
+  if (!added) return existing;
+  return [...bySeq.values()].sort((x, y) => x.seq - y.seq);
+}
+
 export const useKranzStore = create<KranzStore>()((set, get) => {
   function applyFrame(frame: WsFrame): void {
     switch (frame.type) {
@@ -69,7 +102,10 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
             frame.event.seq > last
               ? capEvents([...s.events, frame.event])
               : mergeEvents(s.events, [frame.event]);
-          return { events, lastSeq: Math.max(s.lastSeq ?? 0, frame.seq) };
+          const pauseEvents = isPauseEvent(frame.event)
+            ? mergePauseEvents(s.pauseEvents, [frame.event])
+            : s.pauseEvents;
+          return { events, pauseEvents, lastSeq: Math.max(s.lastSeq ?? 0, frame.seq) };
         });
         break;
       case 'pong':
@@ -83,6 +119,7 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
     missionId: null,
     state: null,
     events: [],
+    pauseEvents: [],
     connection: 'connecting',
     selectedRun: null,
     lastSeq: null,
@@ -105,18 +142,24 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
         missionId: id,
         state: null,
         events: [],
+        pauseEvents: [],
         connection: 'connecting',
         selectedRun: null,
         lastSeq: null,
       });
 
       // Seed the event log over REST so history predating the WS snapshot
-      // is visible; overlaps with replayed frames are deduped by seq.
+      // is visible; overlaps with replayed frames are deduped by seq. Pause
+      // events are folded into the uncapped pause history before the ring
+      // cap can evict them.
       api
         .events(id)
         .then((seeded) => {
           if (get().missionId !== id) return;
-          set((s) => ({ events: mergeEvents(seeded, s.events) }));
+          set((s) => ({
+            events: mergeEvents(seeded, s.events),
+            pauseEvents: mergePauseEvents(s.pauseEvents, seeded),
+          }));
         })
         .catch(() => {
           /* the WS snapshot still gives us live state */
@@ -143,6 +186,22 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
                     ? { state: fresh, lastSeq: Math.max(s.lastSeq ?? 0, fresh.lastSeq) }
                     : {},
                 );
+                // A large-gap reconnect yields a fresh snapshot with no event
+                // replay, which would leave a permanent hole in the ring
+                // between the old buffer tail and the snapshot seq. Backfill
+                // the missing range over REST; overlaps with any replayed
+                // frames are deduped by seq and the ring cap still applies.
+                const buffered = get().events;
+                const bufTail = buffered.length > 0 ? buffered[buffered.length - 1].seq : 0;
+                if (fresh.lastSeq > bufTail) {
+                  return api.events(id, bufTail).then((missing) => {
+                    if (get().missionId !== id) return;
+                    set((s) => ({
+                      events: mergeEvents(s.events, missing),
+                      pauseEvents: mergePauseEvents(s.pauseEvents, missing),
+                    }));
+                  });
+                }
               })
               .catch(() => {});
           }
@@ -154,7 +213,14 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
     disconnect: () => {
       socket?.close();
       socket = null;
-      set({ missionId: null, state: null, events: [], selectedRun: null, lastSeq: null });
+      set({
+        missionId: null,
+        state: null,
+        events: [],
+        pauseEvents: [],
+        selectedRun: null,
+        lastSeq: null,
+      });
     },
 
     selectRun: (runId) => set({ selectedRun: runId }),

@@ -6,7 +6,7 @@ import { useNow } from '../lib/useNow';
 
 export function TopBar() {
   const state = useKranzStore((s) => s.state);
-  const events = useKranzStore((s) => s.events);
+  const pauseEvents = useKranzStore((s) => s.pauseEvents);
   const connection = useKranzStore((s) => s.connection);
   const now = useNow(1000);
 
@@ -23,7 +23,9 @@ export function TopBar() {
   const { mission, totals, totalCostUsd } = state;
   const features = mission.milestones.flatMap((m) => m.features);
   const done = features.filter((f) => f.status === 'complete').length;
-  const elapsed = now - Date.parse(mission.createdAt) - pausedMs(events, now);
+  // Pause spans come from the store's uncapped pauseEvents list — the capped
+  // events ring may have evicted older mission.paused/resumed pairs.
+  const elapsed = now - Date.parse(mission.createdAt) - pausedMs(pauseEvents, now);
 
   return (
     <header className="topbar">
