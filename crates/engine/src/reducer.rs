@@ -1,1 +1,351 @@
-//! STUB — implemented in a later phase. Replace this file entirely.
+//! Pure, deterministic fold of the event log into [`MissionState`].
+//!
+//! `state.json` is only a cache of `fold(events)`; the log is the source of
+//! truth. `fold` == `fold(first)` + repeated [`apply`] (property-tested), so
+//! the engine can maintain state incrementally while any reader can rebuild
+//! it from scratch and get byte-identical JSON.
+
+use crate::error::{EngineError, Result};
+use crate::events::{Event, EventKind};
+use crate::types::*;
+use std::collections::BTreeMap;
+use std::path::Path;
+
+/// Fold a contiguous event slice into a state. The first event MUST be
+/// `mission.created`.
+pub fn fold(events: &[Event]) -> Result<MissionState> {
+    let first = events.first().ok_or_else(|| {
+        EngineError::InvalidState("cannot fold an empty event log".to_string())
+    })?;
+    let mut state = initial_state(first)?;
+    for event in &events[1..] {
+        apply(&mut state, event)?;
+    }
+    Ok(state)
+}
+
+/// Apply one event on top of an existing state. `event.seq` must be exactly
+/// `state.last_seq + 1` (fold passes contiguous events; anything else is a
+/// caller bug or log corruption).
+pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
+    if event.seq != state.last_seq + 1 {
+        return Err(EngineError::InvalidState(format!(
+            "non-contiguous apply: state at seq {}, event seq {}",
+            state.last_seq, event.seq
+        )));
+    }
+
+    match &event.kind {
+        EventKind::MissionCreated { .. } => {
+            return Err(EngineError::InvalidState(format!(
+                "mission.created at seq {} is only valid as the first event",
+                event.seq
+            )));
+        }
+
+        EventKind::PlanApproved { plan } => {
+            state.mission.goal = plan.goal.clone();
+            state.mission.validation_contract = plan.validation_contract.clone();
+            state.mission.milestones = plan
+                .milestones
+                .iter()
+                .enumerate()
+                .map(|(mi, pm)| Milestone {
+                    id: format!("ms-{}", mi + 1),
+                    title: pm.title.clone(),
+                    features: pm
+                        .features
+                        .iter()
+                        .enumerate()
+                        .map(|(fi, pf)| Feature {
+                            id: format!("f-{}-{}", mi + 1, fi + 1),
+                            title: pf.title.clone(),
+                            spec: pf.spec.clone(),
+                            validation_criteria: pf.validation_criteria.clone(),
+                            origin: FeatureOrigin::Plan,
+                            status: FeatureStatus::Pending,
+                            worker_runs: Vec::new(),
+                            commits: Vec::new(),
+                            respawns: 0,
+                        })
+                        .collect(),
+                    status: MilestoneStatus::Pending,
+                    fix_cycles: 0,
+                    start_sha: None,
+                })
+                .collect();
+            state.mission.status = MissionStatus::Running;
+        }
+
+        EventKind::MilestoneStarted { milestone_id, start_sha } => {
+            let ms = milestone_mut(state, milestone_id)?;
+            ms.status = MilestoneStatus::Active;
+            ms.start_sha = Some(start_sha.clone());
+        }
+
+        EventKind::FeatureStarted { feature_id } => {
+            feature_mut(state, feature_id)?.status = FeatureStatus::Active;
+        }
+
+        EventKind::WorkerSpawned {
+            run_id,
+            role,
+            feature_id,
+            milestone_id,
+            sdk_session_id,
+            model,
+            prompt_hash,
+            transcript_path,
+        } => {
+            if state.runs.contains_key(run_id) {
+                return Err(EngineError::InvalidState(format!(
+                    "duplicate worker.spawned for run '{run_id}'"
+                )));
+            }
+            if let Some(mid) = milestone_id {
+                milestone_mut(state, mid)?; // existence check
+            }
+            if let Some(fid) = feature_id {
+                let feature = feature_mut(state, fid)?;
+                feature.worker_runs.push(run_id.clone());
+                // A 2nd+ run on the same feature is a respawn.
+                if feature.worker_runs.len() > 1 {
+                    feature.respawns += 1;
+                }
+            }
+            state.runs.insert(
+                run_id.clone(),
+                WorkerRun {
+                    id: run_id.clone(),
+                    role: *role,
+                    feature_id: feature_id.clone(),
+                    milestone_id: milestone_id.clone(),
+                    sdk_session_id: sdk_session_id.clone(),
+                    model: model.clone(),
+                    started_at: event.ts,
+                    ended_at: None,
+                    tokens: TokenUsage::default(),
+                    cost_usd: None,
+                    transcript_path: transcript_path.clone(),
+                    result: None,
+                    report: None,
+                    prompt_hash: prompt_hash.clone(),
+                },
+            );
+        }
+
+        EventKind::WorkerMessage { run_id, .. } => {
+            run_mut(state, run_id)?; // stream delta: existence check only
+        }
+
+        EventKind::WorkerCompleted { run_id, result, tokens, cost_usd, report } => {
+            let run = run_mut(state, run_id)?;
+            run.result = Some(*result);
+            run.tokens = tokens.clone();
+            run.cost_usd = *cost_usd;
+            run.report = report.clone();
+            run.ended_at = Some(event.ts);
+            state.totals.add(tokens);
+            state.total_cost_usd += cost_usd.unwrap_or(0.0);
+        }
+
+        EventKind::FeatureCompleted { feature_id, commits } => {
+            let feature = feature_mut(state, feature_id)?;
+            feature.status = FeatureStatus::Complete;
+            feature.commits.extend(commits.iter().cloned());
+        }
+
+        EventKind::FeatureFailed { feature_id, .. } => {
+            feature_mut(state, feature_id)?.status = FeatureStatus::Failed;
+        }
+
+        EventKind::FeatureSkipped { feature_id, .. } => {
+            feature_mut(state, feature_id)?.status = FeatureStatus::Skipped;
+        }
+
+        EventKind::MilestoneValidating { milestone_id } => {
+            milestone_mut(state, milestone_id)?.status = MilestoneStatus::Validating;
+        }
+
+        EventKind::ValidationFinding { milestone_id, run_id, .. } => {
+            // No structural change; validate references as a corruption guard.
+            milestone_mut(state, milestone_id)?;
+            run_mut(state, run_id)?;
+        }
+
+        EventKind::FixFeatureCreated { milestone_id, feature } => {
+            let ms = milestone_mut(state, milestone_id)?;
+            // One fix-cycle increment per validation round: the first
+            // fixfeature after milestone.validating flips the milestone back
+            // to Active; later fixfeatures in the same round arrive while
+            // Active and do not increment.
+            if ms.status == MilestoneStatus::Validating {
+                ms.fix_cycles += 1;
+                ms.status = MilestoneStatus::Active;
+            }
+            ms.features.push(feature.clone());
+        }
+
+        EventKind::MilestoneBlocked { milestone_id, .. } => {
+            milestone_mut(state, milestone_id)?.status = MilestoneStatus::Blocked;
+            state.mission.status = MissionStatus::Blocked;
+        }
+
+        EventKind::MilestoneUnblocked { milestone_id, .. } => {
+            milestone_mut(state, milestone_id)?.status = MilestoneStatus::Active;
+            state.mission.status = MissionStatus::Running;
+        }
+
+        EventKind::MilestoneCompleted { milestone_id, .. } => {
+            milestone_mut(state, milestone_id)?.status = MilestoneStatus::Complete;
+        }
+
+        EventKind::MissionValidating {} => {
+            state.mission.status = MissionStatus::Validating;
+        }
+
+        EventKind::MissionPaused {} => {
+            state.mission.status = MissionStatus::Paused;
+        }
+
+        EventKind::MissionResumed {} => {
+            state.mission.status = MissionStatus::Running;
+        }
+
+        EventKind::UserMessage { text, .. } => {
+            state.pending_user_messages.push(text.clone());
+        }
+
+        EventKind::OrchestratorDecision { summary, .. } => {
+            state.recent_decisions.push(summary.clone());
+            while state.recent_decisions.len() > MAX_RECENT_DECISIONS {
+                state.recent_decisions.remove(0);
+            }
+            // A decision marks the queued user messages as consumed.
+            state.pending_user_messages.clear();
+        }
+
+        EventKind::ConfigChanged { patch } => {
+            let mut value = serde_json::to_value(&state.config)?;
+            deep_merge(&mut value, patch);
+            state.config = serde_json::from_value(value).map_err(|e| {
+                EngineError::Config(format!("config.changed patch produced invalid config: {e}"))
+            })?;
+        }
+
+        EventKind::MissionCompleted {} => {
+            state.mission.status = MissionStatus::Complete;
+        }
+
+        EventKind::MissionFailed { .. } => {
+            state.mission.status = MissionStatus::Failed;
+        }
+    }
+
+    state.last_seq = event.seq;
+    Ok(())
+}
+
+/// Newest-last cap on `MissionState::recent_decisions`.
+const MAX_RECENT_DECISIONS: usize = 10;
+
+fn initial_state(event: &Event) -> Result<MissionState> {
+    let EventKind::MissionCreated { goal, base_branch, mission_branch, config } = &event.kind
+    else {
+        return Err(EngineError::InvalidState(format!(
+            "first event must be mission.created, found '{}'",
+            event.kind.type_name()
+        )));
+    };
+    Ok(MissionState {
+        mission: Mission {
+            id: event.mission_id.clone(),
+            goal: goal.clone(),
+            validation_contract: Vec::new(),
+            milestones: Vec::new(),
+            status: MissionStatus::Planning,
+            created_at: event.ts,
+            base_branch: base_branch.clone(),
+            mission_branch: mission_branch.clone(),
+        },
+        runs: BTreeMap::new(),
+        totals: TokenUsage::default(),
+        total_cost_usd: 0.0,
+        pending_user_messages: Vec::new(),
+        recent_decisions: Vec::new(),
+        config: config.clone(),
+        last_seq: event.seq,
+    })
+}
+
+fn milestone_mut<'a>(state: &'a mut MissionState, id: &str) -> Result<&'a mut Milestone> {
+    state.mission.milestones.iter_mut().find(|m| m.id == id).ok_or_else(|| {
+        EngineError::InvalidState(format!("event references unknown milestone '{id}'"))
+    })
+}
+
+fn feature_mut<'a>(state: &'a mut MissionState, id: &str) -> Result<&'a mut Feature> {
+    state
+        .mission
+        .milestones
+        .iter_mut()
+        .flat_map(|m| m.features.iter_mut())
+        .find(|f| f.id == id)
+        .ok_or_else(|| {
+            EngineError::InvalidState(format!("event references unknown feature '{id}'"))
+        })
+}
+
+fn run_mut<'a>(state: &'a mut MissionState, id: &str) -> Result<&'a mut WorkerRun> {
+    state.runs.get_mut(id).ok_or_else(|| {
+        EngineError::InvalidState(format!("event references unknown run '{id}'"))
+    })
+}
+
+/// Recursive JSON merge: objects merge key-by-key, anything else in the patch
+/// replaces the base value wholesale.
+fn deep_merge(base: &mut serde_json::Value, patch: &serde_json::Value) {
+    use serde_json::Value;
+    match (base, patch) {
+        (Value::Object(base_map), Value::Object(patch_map)) => {
+            for (key, patch_value) in patch_map {
+                deep_merge(
+                    base_map.entry(key.clone()).or_insert(Value::Null),
+                    patch_value,
+                );
+            }
+        }
+        (base_slot, patch_value) => *base_slot = patch_value.clone(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot cache (state.json)
+// ---------------------------------------------------------------------------
+
+/// Serialize the state pretty-printed to a sibling tmp file, then atomically
+/// rename over `path` so readers never observe a half-written snapshot.
+pub fn write_snapshot(state: &MissionState, path: &Path) -> Result<()> {
+    let file_name = path.file_name().ok_or_else(|| {
+        EngineError::InvalidState(format!(
+            "snapshot path {} has no file name",
+            path.display()
+        ))
+    })?;
+    let tmp = path.with_file_name(format!("{}.tmp", file_name.to_string_lossy()));
+
+    let json = serde_json::to_string_pretty(state)?;
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        std::io::Write::write_all(&mut file, json.as_bytes())?;
+        file.sync_data()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Read a snapshot previously written by [`write_snapshot`].
+pub fn read_snapshot(path: &Path) -> Result<MissionState> {
+    let content = std::fs::read_to_string(path)?;
+    Ok(serde_json::from_str(&content)?)
+}

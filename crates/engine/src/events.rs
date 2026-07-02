@@ -27,6 +27,10 @@ pub struct Event {
 }
 
 /// Serialized as `"type": "<dotted.name>", "payload": { ... }`.
+// large_enum_variant: MissionCreated carries the full MissionConfig (~456B).
+// It occurs once per mission and events are I/O-bound; boxing would ripple
+// through every construction/match site for no measurable win.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum EventKind {
