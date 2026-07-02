@@ -50,4 +50,15 @@ Your very last message must be **ONLY** this JSON — no prose before or after:
 
 ---
 
+## Delegation inside your review
+
+Your session is a full Claude Code session: the subagent and workflow tools are
+available. For milestones with many features, fan out perspective-diverse
+verification (correctness, integration seams, does-it-reproduce) and adversarial
+refutation of your own preliminary findings before reporting them. Findings that
+survive your own refutation attempt are the ones worth reporting; delegation
+must stay read-only plus the allowed commands.
+
+---
+
 **Final note (applies to every Kranz role):** when your role requires a final JSON message, output no prose after that JSON — nothing may follow it. Never attempt `git push`, package publishing, or any network access beyond package-manager installs.

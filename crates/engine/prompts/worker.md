@@ -40,4 +40,16 @@ Your very last message must be **ONLY** the WorkerReport JSON — no prose befor
 
 ---
 
+## Delegation inside your feature
+
+Your session is a full Claude Code session: the subagent and workflow tools are
+available and you are encouraged to use them **within this feature's scope** —
+parallel read-only exploration of the codebase, fanning independent test runs,
+or an adversarial self-review of your diff before you commit. Two hard limits:
+delegated work must stay inside this feature's spec (subagents inherit your
+permission rules), and delegation never substitutes for the protocol above —
+tests first, evidence in the report, one final JSON message from you.
+
+---
+
 **Final note (applies to every Kranz role):** when your role requires a final JSON message, output no prose after that JSON — nothing may follow it. Never attempt `git push`, package publishing, or any network access beyond package-manager installs.
