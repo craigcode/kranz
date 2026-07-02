@@ -72,6 +72,8 @@ export function truncate(text: string, max: number): string {
 /**
  * Total milliseconds the mission has spent paused, derived from
  * mission.paused / mission.resumed pairs; an unmatched pause counts up to now.
+ * Feed this the store's uncapped `pauseEvents` list, not the capped event
+ * ring — eviction there would silently drop pause spans.
  */
 export function pausedMs(events: MissionEvent[], nowMs: number): number {
   let total = 0;
