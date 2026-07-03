@@ -99,5 +99,10 @@ pub enum Command {
         /// binary, then the embedded dashboard bundled into the CLI.
         #[arg(long, value_name = "DIR")]
         dashboard: Option<std::path::PathBuf>,
+
+        /// Pin the mutation token instead of generating one (scripting).
+        /// Every POST /api/... must carry it in the x-kranz-token header.
+        #[arg(long, value_name = "TOKEN")]
+        token: Option<String>,
     },
 }

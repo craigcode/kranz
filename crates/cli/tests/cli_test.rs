@@ -162,9 +162,18 @@ fn parses_missions() {
 #[test]
 fn parses_serve() {
     let cli = Cli::try_parse_from(["kranz", "serve"]).unwrap();
-    assert!(matches!(cli.command, Command::Serve { port: 4560, open: false, dashboard: None }));
+    assert!(matches!(
+        cli.command,
+        Command::Serve { port: 4560, open: false, dashboard: None, token: None }
+    ));
     let cli = Cli::try_parse_from(["kranz", "serve", "--port", "5001", "--open"]).unwrap();
     assert!(matches!(cli.command, Command::Serve { port: 5001, open: true, .. }));
+    // --token pins the mutation token (scripting).
+    let cli = Cli::try_parse_from(["kranz", "serve", "--token", "sesame"]).unwrap();
+    match cli.command {
+        Command::Serve { token, .. } => assert_eq!(token.as_deref(), Some("sesame")),
+        other => panic!("expected Serve, got {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------

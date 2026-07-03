@@ -77,6 +77,10 @@ pub fn run() {
             let repo_root = resolve_repo_root();
             let port = pick_free_port();
             let url = format!("http://127.0.0.1:{port}");
+            // Per-launch mutation token (protocol "Authority: mutation
+            // token"): every POST /api/... must carry it, so other local
+            // processes cannot steer missions through our embedded server.
+            let token = kranz_server::generate_token();
             log::info!(
                 "starting embedded kranz server on {url} (repo root: {})",
                 repo_root.display()
@@ -87,8 +91,10 @@ pub fn run() {
             // server for /api only.
             {
                 let repo_root = repo_root.clone();
+                let token = token.clone();
                 tauri::async_runtime::spawn(async move {
-                    if let Err(err) = kranz_server::serve(repo_root, port, None).await {
+                    if let Err(err) = kranz_server::serve(repo_root, port, None, Some(token)).await
+                    {
                         log::error!("embedded kranz server exited: {err:#}");
                     }
                 });
@@ -103,8 +109,9 @@ pub fn run() {
             // here (not in tauri.conf.json) to attach an initialization
             // script that runs before any frontend code.
             let init_script = format!(
-                "window.__KRANZ_SERVER__ = {};",
-                serde_json::to_string(&url).expect("a string always serializes")
+                "window.__KRANZ_SERVER__ = {}; window.__KRANZ_TOKEN__ = {};",
+                serde_json::to_string(&url).expect("a string always serializes"),
+                serde_json::to_string(&token).expect("a string always serializes")
             );
             WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
                 .title("Kranz Mission Control")
