@@ -60,6 +60,19 @@ used to build the binary, before falling back to the embedded bundle).
 Desktop app: `cd apps/dashboard && npm install && npm run build && npx tauri dev`
 (reads `KRANZ_REPO`; see `apps/dashboard/README.md`).
 
+## The four roles
+
+| Role | Job | Lifetime | Sees | Touches | Default |
+|---|---|---|---|---|---|
+| Orchestrator | Plans contract-first; judges worker reports; converts or waives findings; decides respawns, dirty trees, unblocks; judges `agent-judgement` assertions at the final gate | One long-lived session per mission (resumable/re-seedable) | Digest, plan, reports, findings — never raw transcripts | Nothing — read + git-inspect only; the engine writes/commits `plan.json`/`plan.md` | opus · high |
+| Worker | Implements exactly one feature: tests first, implement until green, lint/build, commit `[feature-id]`-prefixed, end with a `WorkerReport` | Fresh per feature (bounded respawns) | Its spec + criteria + goal — never the mission transcript | Edits + Bash in the repo; denied push/publish/network/sudo | sonnet · medium |
+| Validator · scrutiny | Adversarial review of the milestone diff: tests asserting implementation, dead criteria, integration seams, out-of-intent regressions | Fresh per validation round | Milestone spec, contract, `start-sha..HEAD` diff | Read-only + inspect commands | opus · high |
+| Validator · functional | Actually **runs** the contract's commands + configured test/build/lint scripts; reports pass/fail with verbatim output as evidence | Fresh per validation round | Contract commands + milestone criteria | Read-only + exactly those commands | sonnet · medium |
+
+Two validators because they catch different failures: functional catches "it
+doesn't run"; scrutiny catches "it runs but it's wrong" — passing tests that
+assert the implementation, unwired criteria, broken seams between features.
+
 ## How it works
 
 - **Contract first.** Planning defines behavioural assertions *before* any
