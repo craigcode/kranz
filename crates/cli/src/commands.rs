@@ -490,54 +490,80 @@ async fn cmd_run(
         )?;
     }
 
-    let mut engine = MissionEngine::resume(backend, repo, &mission, force_lock)?;
+    loop {
+        let mut engine =
+            MissionEngine::resume(Arc::clone(&backend), repo.clone(), &mission, force_lock)?;
 
-    // Live printer: tail events.jsonl from the pre-run head seq.
-    let color = std::io::stderr().is_terminal();
-    let renderer = EventRenderer::seeded(engine.state(), color);
-    let stop = Arc::new(AtomicBool::new(false));
-    let printer = tokio::spawn(tail::tail_events(
-        engine.paths().events_file(),
-        engine.state().last_seq,
-        renderer,
-        Arc::clone(&stop),
-    ));
+        // Live printer: tail events.jsonl from the pre-run head seq.
+        let color = std::io::stderr().is_terminal();
+        let renderer = EventRenderer::seeded(engine.state(), color);
+        let stop = Arc::new(AtomicBool::new(false));
+        let printer = tokio::spawn(tail::tail_events(
+            engine.paths().events_file(),
+            engine.state().last_seq,
+            renderer,
+            Arc::clone(&stop),
+        ));
 
-    let run_result = engine.run().await;
-    // Drop the engine first: it flushes buffered stream deltas and releases
-    // the lock, so the printer's final catch-up read sees every event.
-    drop(engine);
-    stop.store(true, Ordering::Relaxed);
-    let _ = printer.await;
+        let run_result = engine.run().await;
+        // Drop the engine first: it flushes buffered stream deltas and releases
+        // the lock, so the printer's final catch-up read sees every event.
+        drop(engine);
+        stop.store(true, Ordering::Relaxed);
+        let _ = printer.await;
 
-    match run_result? {
-        MissionStatus::Complete => {
-            println!("mission {mission} COMPLETE");
-            Ok(0)
-        }
-        MissionStatus::Blocked => {
-            eprintln!(
-                "\n\
-                 ==================== MILESTONE BLOCKED ====================\n\
-                 A milestone is blocked (fix-cycle cap reached or blocked by\n\
-                 the orchestrator). Inspect it with `kranz status`, then\n\
-                 unblock it by sending guidance via `kranz msg \"<text>\"`\n\
-                 and re-running `kranz run`.\n\
-                 ==========================================================="
-            );
-            println!("mission {mission} BLOCKED");
-            Ok(2)
-        }
-        MissionStatus::Failed => {
-            println!("mission {mission} FAILED");
-            Ok(1)
-        }
-        other => {
-            println!(
-                "mission {mission} ended as {}",
-                output::mission_status_label(other)
-            );
-            Ok(1)
+        match run_result? {
+            MissionStatus::Complete => {
+                println!("mission {mission} COMPLETE");
+                return Ok(0);
+            }
+            MissionStatus::Blocked => {
+                eprintln!(
+                    "\n\
+                     ==================== MILESTONE BLOCKED ====================\n\
+                     A milestone is blocked (fix-cycle cap reached or blocked by\n\
+                     the orchestrator). Inspect it with `kranz status`.\n\
+                     ==========================================================="
+                );
+                // Interactive recovery: ask for guidance right here instead of
+                // demanding the kranz msg / kranz run two-step.
+                if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+                    print!(
+                        "guidance for the orchestrator (what to do about the block; \
+                         empty line or Ctrl-D exits)\nguidance> "
+                    );
+                    let _ = std::io::stdout().flush();
+                    let mut lines = StdinLines::spawn();
+                    if let Some(text) = lines.next().await {
+                        let text = text.trim().to_string();
+                        if !text.is_empty() {
+                            control::enqueue(
+                                &paths,
+                                &ControlCommand::Msg { text, interrupt: false },
+                            )?;
+                            println!("guidance queued — resuming the mission…");
+                            continue;
+                        }
+                    }
+                }
+                eprintln!(
+                    "unblock later by sending guidance via `kranz msg \"<text>\"` \
+                     and re-running `kranz run`."
+                );
+                println!("mission {mission} BLOCKED");
+                return Ok(2);
+            }
+            MissionStatus::Failed => {
+                println!("mission {mission} FAILED");
+                return Ok(1);
+            }
+            other => {
+                println!(
+                    "mission {mission} ended as {}",
+                    output::mission_status_label(other)
+                );
+                return Ok(1);
+            }
         }
     }
 }
