@@ -24,6 +24,10 @@ impl ApiError {
         Self { status: StatusCode::BAD_REQUEST, message: message.into() }
     }
 
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self { status: StatusCode::CONFLICT, message: message.into() }
+    }
+
     pub fn internal(message: impl Into<String>) -> Self {
         Self { status: StatusCode::INTERNAL_SERVER_ERROR, message: message.into() }
     }
@@ -41,6 +45,15 @@ impl From<EngineError> for ApiError {
             EngineError::Io(io) if io.kind() == ErrorKind::NotFound => {
                 ApiError::not_found(error.to_string())
             }
+            // Another engine (CLI or a hosted run) holds the single-writer
+            // lock, or the mission is in the wrong lifecycle state for the
+            // requested transition: conflicts, not server failures.
+            EngineError::LockHeld(_) | EngineError::InvalidState(_) => {
+                ApiError::conflict(error.to_string())
+            }
+            // Config errors surface from user-supplied patches (and from
+            // config files the message names) — the request is at fault.
+            EngineError::Config(_) => ApiError::bad_request(error.to_string()),
             _ => ApiError::internal(error.to_string()),
         }
     }

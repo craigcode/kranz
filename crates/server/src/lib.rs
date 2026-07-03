@@ -1,20 +1,28 @@
 //! kranz-server — axum REST + WebSocket layer over a repo's mission data
 //! (docs/protocol.md is authoritative for every route and frame shape).
 //!
-//! The server NEVER writes `events.jsonl` (single-writer rule §4.3): the only
-//! write path is the control inbox (`POST /api/missions/:id/control` →
-//! [`kranz_engine::control::enqueue`]). Every handler re-reads from disk on
-//! each request — the engine process owns truth and requests are
-//! localhost-cheap at human timescales, so there is no in-memory cache to
-//! invalidate.
+//! The read/steer routes NEVER write `events.jsonl` (single-writer rule
+//! §4.3): their only write path is the control inbox
+//! (`POST /api/missions/:id/control` → [`kranz_engine::control::enqueue`]).
+//! Every read handler re-reads from disk on each request — the engine owns
+//! truth and requests are localhost-cheap at human timescales, so there is
+//! no in-memory cache to invalidate.
+//!
+//! Missions created via `POST /api/missions` are HOSTED (M2.5): for those,
+//! this process holds the [`MissionEngine`](kranz_engine::orchestrator) —
+//! and therefore the single-writer lock — in [`MissionHost`], which is the
+//! engine writing `events.jsonl`. See [`host`].
 
 mod error;
+mod host;
 mod rest;
 mod ws;
 
+pub use host::MissionHost;
+
 use axum::body::Body;
-use axum::extract::Request;
-use axum::http::{header, HeaderValue, Method, StatusCode, Uri};
+use axum::extract::{Request, State};
+use axum::http::{header, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -25,6 +33,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
+
+/// Header carrying the per-serve mutation token (docs/protocol.md
+/// "Authority: mutation token").
+pub const TOKEN_HEADER: &str = "x-kranz-token";
+
+/// A fresh mutation token: uuid v4 as simple hex. Exposed so embedding
+/// shells (the CLI, the Tauri app) mint tokens without their own uuid dep.
+pub fn generate_token() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
 
 /// A single dashboard file embedded into a caller's binary.
 #[derive(Clone, Copy, Debug)]
@@ -40,14 +58,18 @@ pub enum DashboardStatic {
     Embedded(&'static [EmbeddedFile]),
 }
 
-/// Shared handler state. Only the repo root is held; all mission data is
-/// re-read from disk per request.
+/// Shared handler state: the repo root for the read-only routes (all mission
+/// data is re-read from disk per request) plus the hosted-engine registry.
 pub struct ServerState {
     pub repo_root: PathBuf,
+    pub host: MissionHost,
 }
 
 /// Build the full router (public so tests can drive it with
 /// `tower::ServiceExt::oneshot` without binding a port).
+///
+/// Back-compat wrapper: NO mutation token gate (tests only — the real
+/// `kranz serve` / Tauri paths always pass a token).
 ///
 /// When `static_dir` is `Some`, non-`/api` paths are served from it with an
 /// SPA fallback to its `index.html`; otherwise `/` returns a minimal
@@ -57,11 +79,37 @@ pub fn router(repo_root: PathBuf, static_dir: Option<PathBuf>) -> Router {
 }
 
 /// Build the full router with either filesystem or embedded dashboard assets.
+/// Back-compat wrapper: NO mutation token gate (tests only).
 pub fn router_with_static(repo_root: PathBuf, static_assets: Option<DashboardStatic>) -> Router {
-    let state = Arc::new(ServerState { repo_root });
+    router_with_token(repo_root, static_assets, None)
+}
+
+/// Build the full router with an optional mutation token gating every
+/// `POST /api/...` (`None` disables the gate — back-compat test wrappers
+/// only; real serving always passes `Some`).
+pub fn router_with_token(
+    repo_root: PathBuf,
+    static_assets: Option<DashboardStatic>,
+    token: Option<String>,
+) -> Router {
+    router_with_host(MissionHost::new(repo_root), static_assets, token)
+}
+
+/// The real router constructor: an explicit [`MissionHost`] (tests inject a
+/// mock agent backend via [`MissionHost::with_backend`]) plus the optional
+/// mutation token.
+pub fn router_with_host(
+    host: MissionHost,
+    static_assets: Option<DashboardStatic>,
+    token: Option<String>,
+) -> Router {
+    let state = Arc::new(ServerState { repo_root: host.repo_root().clone(), host });
     let app = Router::new()
         .route("/api/health", get(rest::health))
-        .route("/api/missions", get(rest::list_missions))
+        .route(
+            "/api/missions",
+            get(rest::list_missions).post(host::create_mission),
+        )
         .route("/api/missions/{id}/state", get(rest::mission_state))
         .route("/api/missions/{id}/events", get(rest::mission_events))
         .route("/api/missions/{id}/plan", get(rest::mission_plan))
@@ -70,6 +118,13 @@ pub fn router_with_static(repo_root: PathBuf, static_assets: Option<DashboardSta
             get(rest::run_transcript),
         )
         .route("/api/missions/{id}/control", post(rest::post_control))
+        .route("/api/missions/{id}/planning/turn", post(host::planning_turn))
+        .route(
+            "/api/missions/{id}/planning/request-plan",
+            post(host::request_plan),
+        )
+        .route("/api/missions/{id}/approve", post(host::approve_mission))
+        .route("/api/missions/{id}/start", post(host::start_mission))
         .route("/api/missions/{id}/ws", get(ws::ws_handler))
         .with_state(state);
 
@@ -84,9 +139,11 @@ pub fn router_with_static(repo_root: PathBuf, static_assets: Option<DashboardSta
         None => app.route("/", get(root_info)),
     };
 
-    // The JSON gate runs on every request; the CORS layer wraps it so even
-    // rejections carry CORS headers for approved origins.
-    app.layer(middleware::from_fn(require_json_api_posts))
+    // Layer order (outermost last): the CORS layer wraps the JSON gate wraps
+    // the token gate, so even rejections carry CORS headers for approved
+    // origins and a non-JSON POST is rejected before the token is examined.
+    app.layer(middleware::from_fn_with_state(token, require_mutation_token))
+        .layer(middleware::from_fn(require_json_api_posts))
         .layer(cors_layer())
 }
 
@@ -139,7 +196,7 @@ fn cors_layer() -> CorsLayer {
             |origin: &HeaderValue, _request_parts| origin.to_str().is_ok_and(origin_allowed),
         ))
         .allow_methods([Method::GET, Method::POST])
-        .allow_headers([header::CONTENT_TYPE])
+        .allow_headers([header::CONTENT_TYPE, HeaderName::from_static(TOKEN_HEADER)])
 }
 
 /// Trusted origins: `http://localhost:<any port>`, `http://127.0.0.1:<any
@@ -190,6 +247,37 @@ async fn require_json_api_posts(request: Request, next: Next) -> Response {
     next.run(request).await
 }
 
+/// Require the per-serve mutation token on every `POST /api/...` (protocol
+/// "Authority: mutation token"). GETs and the WS upgrade stay tokenless —
+/// read-only observation. `None` (back-compat test wrappers only) disables
+/// the gate.
+///
+/// Rationale: the 127.0.0.1 bind + CORS allowlist stop the network and the
+/// browser; the token stops other local processes and link-borne CSRF from
+/// creating or steering missions that spend money.
+async fn require_mutation_token(
+    State(token): State<Option<String>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if let Some(expected) = token.as_deref() {
+        if request.method() == Method::POST && request.uri().path().starts_with("/api/") {
+            let presented = request
+                .headers()
+                .get(TOKEN_HEADER)
+                .and_then(|value| value.to_str().ok());
+            if presented != Some(expected) {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({ "error": "missing or invalid token" })),
+                )
+                    .into_response();
+            }
+        }
+    }
+    next.run(request).await
+}
+
 /// `GET /` when no dashboard bundle is configured.
 async fn root_info() -> &'static str {
     "kranz server is running (no dashboard bundle configured).\n\
@@ -197,12 +285,15 @@ async fn root_info() -> &'static str {
 }
 
 /// Bind `127.0.0.1:<port>` and serve the router until the process exits.
+/// `token` gates every `POST /api/...` — real callers (the CLI, the Tauri
+/// shell) always pass `Some`.
 pub async fn serve(
     repo_root: PathBuf,
     port: u16,
     static_dir: Option<PathBuf>,
+    token: Option<String>,
 ) -> anyhow::Result<()> {
-    serve_with_static(repo_root, port, static_dir.map(DashboardStatic::Dir)).await
+    serve_with_static(repo_root, port, static_dir.map(DashboardStatic::Dir), token).await
 }
 
 /// Bind `127.0.0.1:<port>` and serve the router until the process exits.
@@ -210,8 +301,9 @@ pub async fn serve_with_static(
     repo_root: PathBuf,
     port: u16,
     static_assets: Option<DashboardStatic>,
+    token: Option<String>,
 ) -> anyhow::Result<()> {
-    let app = router_with_static(repo_root, static_assets);
+    let app = router_with_token(repo_root, static_assets, token);
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local_addr = listener.local_addr()?;

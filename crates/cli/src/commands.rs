@@ -95,7 +95,8 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             port,
             open,
             dashboard,
-        } => cmd_serve(repo, port, open, dashboard).await,
+            token,
+        } => cmd_serve(repo, port, open, dashboard, token).await,
     }
 }
 
@@ -734,16 +735,24 @@ pub fn cmd_missions(repo: &Path) -> Result<String> {
 
 /// `kranz serve`: run the REST/WS server, serving the dashboard build from
 /// the first location that exists (see [`resolve_dashboard_dist`]).
+///
+/// Every `POST /api/...` requires the mutation token (protocol "Authority:
+/// mutation token"): generated per serve (or pinned via `--token` for
+/// scripting), printed for the operator, and handed to `--open`'s browser as
+/// a `#token=<t>` fragment the dashboard stores.
 async fn cmd_serve(
     repo: PathBuf,
     port: u16,
     open: bool,
     dashboard: Option<PathBuf>,
+    token: Option<String>,
 ) -> Result<i32> {
     let dashboard_assets = resolve_dashboard_assets(&repo, dashboard);
     let url = format!("http://127.0.0.1:{port}/");
+    let token = token.unwrap_or_else(kranz_server::generate_token);
 
     println!("kranz server on {url}");
+    println!("mutation token: {token}");
     match &dashboard_assets {
         Some(DashboardAssets::Embedded) => println!(
             "serving embedded dashboard ({})",
@@ -766,14 +775,16 @@ async fn cmd_serve(
 
     if open {
         // Give the server a moment to bind before pointing a browser at it.
-        let url = url.clone();
+        // The fragment hands the token to the dashboard without it ever
+        // appearing in a request line or server log.
+        let url = format!("{url}#token={token}");
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(600)).await;
             open_browser(&url);
         });
     }
 
-    match kranz_server::serve_with_static(repo, port, static_assets).await {
+    match kranz_server::serve_with_static(repo, port, static_assets, Some(token)).await {
         Ok(()) => Ok(0),
         Err(e) => Err(anyhow!("server failed: {e}")),
     }
