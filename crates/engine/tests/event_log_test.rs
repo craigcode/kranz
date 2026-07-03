@@ -501,3 +501,29 @@ fn read_events_after_returns_suffix() {
     let none = EventLog::read_events_after(&p.events_file(), 5).unwrap();
     assert!(none.is_empty());
 }
+
+/// A lock whose recorded holder is provably dead is stale: acquire succeeds
+/// without force. A lock held by a live pid (our own) still refuses.
+#[cfg(unix)]
+#[test]
+fn stale_lock_from_dead_holder_is_stolen_without_force() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = MissionPaths::new(tmp.path(), "m-lock");
+    std::fs::create_dir_all(paths.mission_dir()).unwrap();
+
+    // i32::MAX exceeds every real pid space: kill(_, 0) -> ESRCH -> dead.
+    std::fs::write(paths.lock_file(), i32::MAX.to_string()).unwrap();
+    let log = EventLog::acquire(&paths, "m-lock", Duration::from_millis(50), false)
+        .expect("dead holder means stale lock; acquire must steal it");
+    drop(log);
+
+    // Our own (live) pid is honored: LockHeld without force.
+    std::fs::write(paths.lock_file(), std::process::id().to_string()).unwrap();
+    let err = EventLog::acquire(&paths, "m-lock", Duration::from_millis(50), false).unwrap_err();
+    assert!(matches!(err, kranz_engine::error::EngineError::LockHeld(_)));
+
+    // Unparseable holder stays conservative too.
+    std::fs::write(paths.lock_file(), "not-a-pid").unwrap();
+    let err = EventLog::acquire(&paths, "m-lock", Duration::from_millis(50), false).unwrap_err();
+    assert!(matches!(err, kranz_engine::error::EngineError::LockHeld(_)));
+}

@@ -78,14 +78,27 @@ impl EventLog {
         {
             Ok(f) => f,
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                if !force {
+                let holder = read_lock_pid(&lock_path);
+                // A lock whose holder is provably dead is stale (e.g. the
+                // engine was Ctrl-C'd — SIGINT skips destructors): steal it
+                // without demanding --force-lock. Liveness is only probeable
+                // on unix; elsewhere the conservative refusal stands.
+                let stale = lock_pid_is_dead(&holder);
+                if !force && !stale {
                     return Err(EngineError::LockHeld(format!(
-                        "lock file {} exists (held by pid {})",
+                        "lock file {} exists (held by pid {}); if that process \
+                         is truly gone, re-run with --force-lock",
                         lock_path.display(),
-                        read_lock_pid(&lock_path)
+                        holder
                     )));
                 }
-                // Steal: replace the stale lock with our own pid.
+                if stale && !force {
+                    tracing::warn!(
+                        lock = %lock_path.display(),
+                        holder,
+                        "stale engine lock (holder is dead); taking over"
+                    );
+                }
                 std::fs::remove_file(&lock_path)?;
                 OpenOptions::new().write(true).create_new(true).open(&lock_path)?
             }
@@ -322,5 +335,29 @@ fn read_lock_pid(lock_path: &Path) -> String {
     match std::fs::read_to_string(lock_path) {
         Ok(s) if !s.trim().is_empty() => s.trim().to_string(),
         _ => "unknown".to_string(),
+    }
+}
+
+/// True only when the lock holder is PROVABLY dead. Anything uncertain
+/// (unparseable pid, our own pid, non-unix platform, permission errors)
+/// reports false so the lock is honored — false positives here would let two
+/// engines write one log.
+fn lock_pid_is_dead(holder: &str) -> bool {
+    let Ok(pid) = holder.parse::<i32>() else {
+        return false;
+    };
+    if pid <= 0 || pid as u32 == std::process::id() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        // kill(pid, 0): 0 = alive; EPERM = alive but not ours; ESRCH = dead.
+        let alive = unsafe { libc::kill(pid, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        !alive
+    }
+    #[cfg(not(unix))]
+    {
+        false
     }
 }
