@@ -144,6 +144,143 @@ fn multiple_secrets_in_one_text() {
 }
 
 // ---------------------------------------------------------------------------
+// M5: new vendor-specific patterns — one positive per pattern.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn google_api_key_redacted() {
+    // Google API keys are AIza + exactly 35 chars (39 total).
+    let out = scrub("key AIzaSyA1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6z end");
+    assert!(!out.contains("AIzaSy"), "{out}");
+    assert!(out.contains(MARKER));
+    assert!(out.starts_with("key "));
+    assert!(out.ends_with(" end"));
+}
+
+#[test]
+fn gcp_service_account_private_key_json_redacted() {
+    let input =
+        r#"{"type":"service_account","private_key":"-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBg\n-----END PRIVATE KEY-----\n","client_email":"x@y.iam"}"#;
+    let out = scrub(input);
+    assert!(!out.contains("MIIEvQIBADANBg"), "PEM body survived: {out}");
+    assert!(!out.contains("BEGIN PRIVATE KEY"), "{out}");
+    assert!(out.contains("private_key"), "field name must survive: {out}");
+    assert!(out.contains(MARKER));
+    // Non-secret sibling fields are untouched.
+    assert!(out.contains("service_account"), "{out}");
+    assert!(out.contains("client_email"), "{out}");
+}
+
+#[test]
+fn stripe_live_keys_redacted() {
+    let input = "secret sk_live_4eC39HqLyjWDarjtT1zdp7dc \
+                 restricted rk_live_51H8xAbCdEfGhIjKlMnOpQrS \
+                 pub pk_live_9zYxWvUtSrQpOnMlKjIhGfEd done";
+    let out = scrub(input);
+    assert!(!out.contains("sk_live_"), "{out}");
+    assert!(!out.contains("rk_live_"), "{out}");
+    assert!(!out.contains("pk_live_"), "{out}");
+    assert_eq!(out.matches(MARKER).count(), 3, "{out}");
+    assert!(out.starts_with("secret "));
+    assert!(out.ends_with(" done"));
+}
+
+#[test]
+fn npm_token_redacted() {
+    let out = scrub("npm token npm_abcdefghijklmnopqrstuvwxyz0123456789 done");
+    assert!(!out.contains("npm_abcdef"), "{out}");
+    assert!(out.contains(MARKER));
+    assert!(out.starts_with("npm token "));
+    assert!(out.ends_with(" done"));
+}
+
+#[test]
+fn openai_project_key_redacted() {
+    let out = scrub("key sk-proj-AbCd1234_efGh5678-ijKl90mnOpQr end");
+    assert!(!out.contains("sk-proj-"), "{out}");
+    assert!(out.contains(MARKER));
+    assert!(out.starts_with("key "));
+    assert!(out.ends_with(" end"));
+}
+
+#[test]
+fn basic_auth_header_redacted_scheme_kept() {
+    let out = scrub("Authorization: Basic dXNlcm5hbWU6cGFzc3dvcmQxMjM=\nnext line");
+    assert!(!out.contains("dXNlcm5hbWU6cGFzc3dvcmQxMjM="), "{out}");
+    assert!(out.contains("Basic [REDACTED]"), "scheme word must survive: {out}");
+    assert!(out.contains("Authorization"));
+    assert!(out.ends_with("next line"));
+}
+
+#[test]
+fn connection_string_password_redacted_user_host_kept() {
+    let out = scrub("postgres://appuser:s3cr3tP@ssw0rd@db.internal:5432/prod");
+    assert!(!out.contains("s3cr3tP"), "password survived: {out}");
+    assert!(out.contains("appuser"), "user must survive: {out}");
+    assert!(out.contains("db.internal:5432/prod"), "host must survive: {out}");
+    assert!(out.contains("postgres://appuser:[REDACTED]@"), "{out}");
+}
+
+// ---------------------------------------------------------------------------
+// M5: entropy-gated redaction and its guards.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn entropy_rule_redacts_bare_high_entropy_value_in_key_context() {
+    // access_token is only in the entropy pass's name list (not the generic
+    // rule), so this exercises the entropy heuristic specifically: a 40-char
+    // base64 blob with no recognizable vendor prefix.
+    let out = scrub("access_token = aB3xQ9zK7mP2wR5tY8uV1nJ4kL6dF0sGhWqZ7xC");
+    assert!(!out.contains("aB3xQ9zK7mP2wR5tY8uV1nJ4kL6dF0sGhWqZ7xC"), "{out}");
+    assert!(out.contains("access_token"), "key name must survive: {out}");
+    assert!(out.contains(MARKER));
+}
+
+#[test]
+fn entropy_rule_declines_low_entropy_value() {
+    // A long but low-entropy value under an entropy-only key name ("auth",
+    // which contains no generic secret substring) is NOT redacted — it does
+    // not clear the 4.0 bits/char bar.
+    let text = "auth = abababababababababababababababab";
+    let out = scrub(text);
+    assert!(out.contains("abababababababababababababababab"), "low-entropy redacted: {out}");
+    assert!(!out.contains(MARKER), "{out}");
+}
+
+#[test]
+fn entropy_rule_leaves_high_entropy_looking_word_in_prose() {
+    // No key-name context: the entropy pass must not fire, even though the
+    // word is longish and mixed-case.
+    let prose = "The Supercalifragilisticexpialidocious algorithm ran overnight.";
+    assert_eq!(scrub(prose), prose, "prose was modified: {}", scrub(prose));
+}
+
+#[test]
+fn entropy_rule_leaves_git_sha_after_commit() {
+    // A 40-hex git SHA after "commit" is allowlisted and must survive even
+    // though it is long and hex.
+    let text = "commit da39a3ee5e6b4b0d3255bfef95601890afd80709 landed the fix";
+    assert_eq!(scrub(text), text, "git SHA was redacted: {}", scrub(text));
+}
+
+#[test]
+fn entropy_rule_leaves_uuid_in_key_context() {
+    // Even assigned to a token-ish name, a canonical UUID is allowlisted.
+    let text = "session_token: 550e8400-e29b-41d4-a716-446655440000";
+    let out = scrub(text);
+    assert!(out.contains("550e8400-e29b-41d4-a716-446655440000"), "UUID redacted: {out}");
+    assert!(!out.contains(MARKER), "{out}");
+}
+
+#[test]
+fn entropy_rule_leaves_placeholder_in_key_context() {
+    // Placeholder value assigned to api_key: allowlisted, not redacted.
+    let text = "api_key = REPLACE_ME_WITH_YOUR_KEY_1234567890";
+    let out = scrub(text);
+    assert!(out.contains("REPLACE_ME_WITH_YOUR_KEY_1234567890"), "{out}");
+}
+
+// ---------------------------------------------------------------------------
 // truncate_chars
 // ---------------------------------------------------------------------------
 
