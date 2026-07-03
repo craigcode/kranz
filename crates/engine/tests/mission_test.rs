@@ -1249,10 +1249,18 @@ async fn plan_approval_writes_plan_branch_and_commit() {
     assert_eq!(
         files,
         vec![
+            ".kranz/missions/index.md".to_string(),
             format!(".kranz/missions/{mission_id}/plan.json"),
             format!(".kranz/missions/{mission_id}/plan.md"),
         ],
-        "the approval commit contains exactly plan.json + plan.md"
+        "the approval commit contains plan.json + plan.md + the missions index"
+    );
+    let index =
+        std::fs::read_to_string(root.join(".kranz").join("missions").join("index.md")).unwrap();
+    assert!(index.starts_with("# Kranz missions"), "{index}");
+    assert!(
+        index.contains(&format!("[{mission_id}]({mission_id}/plan.md)")),
+        "{index}"
     );
     let md = std::fs::read_to_string(
         root.join(".kranz").join("missions").join(&mission_id).join("plan.md"),
@@ -1288,4 +1296,26 @@ async fn plan_approval_writes_plan_branch_and_commit() {
     let mut engine = MissionEngine::resume(backend_dyn, &root, &mission_id, false).unwrap();
     let err = engine.approve_plan(simple_plan(1, vec![])).unwrap_err();
     assert!(err.to_string().contains("Planning"), "got: {err}");
+}
+
+/// The missions catalog upserts by mission id: appends new entries newest
+/// last, replaces on re-approval, never duplicates.
+#[test]
+fn mission_index_upserts_by_id() {
+    use kranz_engine::orchestrator::upsert_mission_index;
+    let d1 = chrono::NaiveDate::from_ymd_opt(2026, 7, 2).unwrap();
+    let d2 = chrono::NaiveDate::from_ymd_opt(2026, 7, 3).unwrap();
+
+    let one = upsert_mission_index("", "m-aaa", "first goal", d1);
+    assert!(one.starts_with("# Kranz missions"), "{one}");
+    assert!(one.contains("- 2026-07-02 · [m-aaa](m-aaa/plan.md) — first goal"), "{one}");
+
+    let two = upsert_mission_index(&one, "m-bbb", "second goal\nwith newline", d2);
+    assert!(two.contains("[m-aaa]("), "{two}");
+    assert!(two.contains("- 2026-07-03 · [m-bbb](m-bbb/plan.md) — second goal with newline"), "{two}");
+    assert!(two.find("[m-aaa](").unwrap() < two.find("[m-bbb](").unwrap(), "newest last");
+
+    let re = upsert_mission_index(&two, "m-aaa", "first goal, re-planned", d2);
+    assert_eq!(re.matches("[m-aaa](").count(), 1, "no duplicate on re-approval: {re}");
+    assert!(re.contains("first goal, re-planned"), "{re}");
 }

@@ -504,8 +504,18 @@ impl MissionEngine {
         // and diffable across re-plans (plan.json stays the durable source).
         let plan_md = plan_file.with_file_name("plan.md");
         std::fs::write(&plan_md, render_plan_markdown(&plan, &self.state.mission))?;
+        // Browsable catalog: date + goal-as-title + link per mission. The
+        // canonical plan path stays stable; discovery lives here.
+        let index = self.paths.missions_dir().join("index.md");
+        let index_body = upsert_mission_index(
+            &std::fs::read_to_string(&index).unwrap_or_default(),
+            &self.state.mission.id,
+            &plan.goal,
+            chrono::Utc::now().date_naive(),
+        );
+        std::fs::write(&index, index_body)?;
         self.repo.commit_paths(
-            &[plan_file.as_path(), plan_md.as_path()],
+            &[plan_file.as_path(), plan_md.as_path(), index.as_path()],
             &format!("[kranz] approved plan for {}", self.state.mission.id),
         )?;
 
@@ -1733,6 +1743,39 @@ fn next_feature(milestone: &Milestone) -> Option<usize> {
         .features
         .iter()
         .position(|f| matches!(f.status, FeatureStatus::Pending | FeatureStatus::Active))
+}
+
+/// Upsert one mission's line in the missions catalog (`missions/index.md`):
+/// `- <date> · [<id>](<id>/plan.md) — <goal>`. Newest last; a re-approval
+/// replaces the mission's existing line instead of appending a duplicate.
+pub fn upsert_mission_index(
+    existing: &str,
+    mission_id: &str,
+    goal: &str,
+    date: chrono::NaiveDate,
+) -> String {
+    const HEADER: &str = "# Kranz missions\n\nApproved plans, newest last.\n";
+    let goal = crate::scrub::truncate_chars(goal.trim(), 120).replace('\n', " ");
+    let line = format!("- {date} · [{mission_id}]({mission_id}/plan.md) — {goal}");
+    let marker = format!("[{mission_id}](");
+
+    let mut out = String::new();
+    let mut replaced = false;
+    let body = if existing.trim().is_empty() { HEADER } else { existing };
+    for l in body.lines() {
+        if l.contains(&marker) {
+            out.push_str(&line);
+            replaced = true;
+        } else {
+            out.push_str(l);
+        }
+        out.push('\n');
+    }
+    if !replaced {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
 }
 
 /// Render the approved plan as human-readable markdown — committed to the
