@@ -533,6 +533,31 @@ fn select_planning_mission_prefers_newest_planning_only() {
     assert!(err.to_string().contains("no mission is currently in planning"));
 }
 
+// ---------------------------------------------------------------------------
+// Line-mode plan approval → run-now decision
+// ---------------------------------------------------------------------------
+
+/// The interactive line-mode "start execution now? [Y/n]" decision after a
+/// plan approval: empty input takes the default (yes), n/no decline, and EOF
+/// (Ctrl-D / closed stdin) declines — execution spend never starts without a
+/// live answer. Piped stdin never reaches this prompt at all: the scripted
+/// planning path keeps its historical approve-then-exit behavior.
+#[test]
+fn run_now_answer_default_yes_explicit_no_eof_no() {
+    assert!(commands::run_now_answer(Some("")));
+    assert!(commands::run_now_answer(Some("   ")));
+    assert!(commands::run_now_answer(Some("y")));
+    assert!(commands::run_now_answer(Some("Yes")));
+    assert!(commands::run_now_answer(Some(" y ")));
+
+    assert!(!commands::run_now_answer(Some("n")));
+    assert!(!commands::run_now_answer(Some("N")));
+    assert!(!commands::run_now_answer(Some("no")));
+    assert!(!commands::run_now_answer(Some("NO")));
+    assert!(!commands::run_now_answer(Some(" no ")));
+    assert!(!commands::run_now_answer(None));
+}
+
 /// Usage-limit backend errors get an actionable hint; other errors pass through.
 #[test]
 fn limit_errors_gain_resume_hint() {

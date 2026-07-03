@@ -5,9 +5,10 @@
 
 use crossterm::event::KeyCode;
 use kranz_cli::planning_tui::{
-    approval_key, busy_status_line, classify_submission, wrap_text, ApprovalKey, BusyKind,
-    InputEditor, PendingQueue, ScrollState, SubmitDisposition, APPROVAL_BAR, IDLE_STATUS,
-    PLAN_NOT_READY_NOTICE, SPINNER_FRAMES,
+    approval_key, busy_status_line, classify_submission, post_approval_key, wrap_text,
+    ApprovalKey, BusyKind, InputEditor, PendingQueue, PlanningOutcome, ScrollState,
+    SubmitDisposition, APPROVAL_BAR, IDLE_STATUS, PLAN_NOT_READY_NOTICE, POST_APPROVAL_BAR,
+    SPINNER_FRAMES,
 };
 
 // ---------------------------------------------------------------------------
@@ -334,6 +335,28 @@ fn approval_mode_filters_keys() {
 }
 
 // ---------------------------------------------------------------------------
+// Post-approval mode ("start execution now?") key filtering
+// ---------------------------------------------------------------------------
+
+#[test]
+fn post_approval_mode_filters_keys() {
+    // y starts the run, n exits with the plan committed.
+    assert_eq!(post_approval_key(KeyCode::Char('y')), Some(PlanningOutcome::ApprovedRun));
+    assert_eq!(post_approval_key(KeyCode::Char('Y')), Some(PlanningOutcome::ApprovedRun));
+    assert_eq!(post_approval_key(KeyCode::Char('n')), Some(PlanningOutcome::ApprovedExit));
+    assert_eq!(post_approval_key(KeyCode::Char('N')), Some(PlanningOutcome::ApprovedExit));
+
+    // Everything else is ignored — starting execution spend must be an
+    // explicit keypress; Enter/type-ahead must never trigger it.
+    assert_eq!(post_approval_key(KeyCode::Enter), None);
+    assert_eq!(post_approval_key(KeyCode::Esc), None);
+    assert_eq!(post_approval_key(KeyCode::Char('q')), None);
+    assert_eq!(post_approval_key(KeyCode::Char(' ')), None);
+    assert_eq!(post_approval_key(KeyCode::Char('r')), None);
+    assert_eq!(post_approval_key(KeyCode::Up), None);
+}
+
+// ---------------------------------------------------------------------------
 // Status line formatting
 // ---------------------------------------------------------------------------
 
@@ -373,6 +396,12 @@ fn fixed_status_texts_mention_their_keys() {
     assert!(IDLE_STATUS.contains("/quit"));
     assert!(APPROVAL_BAR.contains("[y]"));
     assert!(APPROVAL_BAR.contains("[n]"));
+    // The post-approval bar states the commit already happened, asks the
+    // spend question explicitly, and names both keys.
+    assert!(POST_APPROVAL_BAR.contains("plan committed"));
+    assert!(POST_APPROVAL_BAR.contains("start execution now?"));
+    assert!(POST_APPROVAL_BAR.contains("[y]"));
+    assert!(POST_APPROVAL_BAR.contains("[n]"));
     // The plan-not-ready notice points back at the conversation and the
     // retry command — plain guidance, no error language.
     assert!(PLAN_NOT_READY_NOTICE.contains("/plan"));

@@ -7,6 +7,7 @@
 
 use crate::cli::{Cli, Command};
 use crate::output::{self, ansi};
+use crate::planning_tui::PlanningOutcome;
 use crate::tail::{self, EventRenderer};
 use anyhow::{anyhow, bail, Context, Result};
 use kranz_engine::backend::AgentBackend;
@@ -245,44 +246,64 @@ pub fn print_danger_banner() {
     );
 }
 
-/// One blocking line from stdin (spawn_blocking keeps the tokio runtime
-/// responsive). `None` means EOF or a read error.
 /// Stdin as a channel of lines, so prompts can DISCARD type-ahead: a line
 /// typed while an orchestrator turn was running must not silently answer the
 /// next prompt (an early "/quit" once ate the plan-approval "y").
+///
+/// The blocking reader thread and its channel are a process-global
+/// singleton shared by every instance. A per-instance thread would sit
+/// blocked in `read_line` (holding the stdin lock) long after its receiver
+/// is gone and steal the first line meant for a later prompt — exactly what
+/// would happen when the plan-approval "start execution now" handoff reaches
+/// the run loop's blocked-guidance prompt with the planning prompt's reader
+/// still alive.
 struct StdinLines {
-    rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<String>>>,
 }
 
 impl StdinLines {
     fn spawn() -> Self {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        std::thread::spawn(move || {
-            let mut buf = String::new();
-            loop {
-                buf.clear();
-                match std::io::stdin().read_line(&mut buf) {
-                    Ok(0) | Err(_) => break, // EOF: channel closes on tx drop
-                    Ok(_) => {
-                        if tx.send(buf.trim_end_matches(['\r', '\n']).to_string()).is_err() {
-                            break;
+        static CHANNEL: std::sync::OnceLock<
+            Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<String>>>,
+        > = std::sync::OnceLock::new();
+        let rx = CHANNEL
+            .get_or_init(|| {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                std::thread::spawn(move || {
+                    let mut buf = String::new();
+                    loop {
+                        buf.clear();
+                        match std::io::stdin().read_line(&mut buf) {
+                            Ok(0) | Err(_) => break, // EOF: channel closes on tx drop
+                            Ok(_) => {
+                                let line = buf.trim_end_matches(['\r', '\n']).to_string();
+                                if tx.send(line).is_err() {
+                                    break;
+                                }
+                            }
                         }
                     }
-                }
-            }
-        });
+                });
+                Arc::new(tokio::sync::Mutex::new(rx))
+            })
+            .clone();
         StdinLines { rx }
     }
 
     /// Next line; `None` on EOF.
     async fn next(&mut self) -> Option<String> {
-        self.rx.recv().await
+        self.rx.lock().await.recv().await
     }
 
     /// Drop everything already typed (returns how many lines were discarded).
     fn drain(&mut self) -> usize {
+        // Prompts are strictly sequential, so the lock is always free; if it
+        // ever were held, draining nothing is the safe answer.
+        let Ok(mut rx) = self.rx.try_lock() else {
+            return 0;
+        };
         let mut n = 0;
-        while self.rx.try_recv().is_ok() {
+        while rx.try_recv().is_ok() {
             n += 1;
         }
         n
@@ -323,13 +344,13 @@ async fn cmd_plan(
     let backend = build_backend(&cfg)?;
     let (mut engine, intro) = match goal {
         Some(goal) => {
-            let engine = MissionEngine::create(backend, repo, &goal, cfg)?;
+            let engine = MissionEngine::create(backend, repo.clone(), &goal, cfg)?;
             let intro = format!("mission {} created (planning)", engine.mission_id());
             (engine, intro)
         }
         None => {
             let mission = select_planning_mission(&repo, explicit_mission)?;
-            let engine = MissionEngine::resume(backend, repo, &mission, force_lock)?;
+            let engine = MissionEngine::resume(backend, repo.clone(), &mission, force_lock)?;
             if engine.state().mission.status != MissionStatus::Planning {
                 return Err(anyhow!(
                     "mission {mission} is {:?}, not in planning — use 'kranz run' \
@@ -351,7 +372,14 @@ async fn cmd_plan(
     // concurrently with it. Piped/scripted stdio keeps the line-mode REPL
     // unchanged: lines arrive up-front by design and are never discarded.
     if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-        return crate::planning_tui::run(engine, intro).await;
+        let mission_id = engine.mission_id().to_string();
+        // The TUI tears down completely before returning (terminal restored,
+        // engine dropped, mission lock released), so the run path below
+        // starts on a clean main screen and can re-acquire the lock.
+        return match crate::planning_tui::run(engine, intro).await? {
+            PlanningOutcome::ApprovedRun => start_run_after_plan(repo, mission_id).await,
+            PlanningOutcome::ApprovedExit | PlanningOutcome::NotApproved => Ok(0),
+        };
     }
     println!("{intro}");
     let tty = std::io::stdout().is_terminal();
@@ -367,6 +395,7 @@ async fn cmd_plan(
         Arc::clone(&stop),
     ));
     let mut approved = false;
+    let mut run_now = false;
     let mut stdin_lines = StdinLines::spawn();
 
     println!("talk to the orchestrator to shape the plan:");
@@ -427,11 +456,29 @@ async fn cmd_plan(
                 if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
                     match engine.approve_plan(plan) {
                         Ok(()) => {
-                            println!(
-                                "plan approved and committed on {}. run 'kranz run' to execute.",
-                                engine.state().mission.mission_branch
-                            );
+                            let branch = engine.state().mission.mission_branch.clone();
                             approved = true;
+                            // Interactive stdin gets the run-now offer;
+                            // piped/scripted stdin keeps the historical
+                            // output and never starts execution — scripts
+                            // depend on `kranz plan` exiting after approval.
+                            if std::io::stdin().is_terminal() {
+                                println!("plan approved and committed on {branch}.");
+                                stdin_lines.drain_noisily(tty);
+                                print!("start execution now? [Y/n] ");
+                                let _ = std::io::stdout().flush();
+                                let reply = stdin_lines.next().await;
+                                if run_now_answer(reply.as_deref()) {
+                                    run_now = true;
+                                } else {
+                                    println!("run 'kranz run' to execute.");
+                                }
+                            } else {
+                                println!(
+                                    "plan approved and committed on {branch}. \
+                                     run 'kranz run' to execute."
+                                );
+                            }
                             break;
                         }
                         Err(e) => eprintln!("kranz: plan approval failed: {e}"),
@@ -466,12 +513,40 @@ async fn cmd_plan(
             engine.mission_id()
         );
     }
+    let mission_id = engine.mission_id().to_string();
     // Engine drop flushes buffered deltas and releases the lock; the
     // printer's final catch-up read then sees every event.
     drop(engine);
     stop.store(true, Ordering::Relaxed);
     let _ = printer.await;
+    if run_now {
+        // The planning engine (and its mission lock) is gone; the run path
+        // re-acquires the lock itself.
+        return start_run_after_plan(repo, mission_id).await;
+    }
     Ok(0)
+}
+
+/// Parse the answer to the line-mode "start execution now? [Y/n]" prompt.
+/// Empty input takes the default (yes); `n`/`no` (any case) decline; EOF
+/// (`None`, e.g. Ctrl-D) declines too — execution spend must never start
+/// without a live keyboard behind the consent.
+pub fn run_now_answer(answer: Option<&str>) -> bool {
+    match answer {
+        None => false,
+        Some(text) => !matches!(text.trim().to_ascii_lowercase().as_str(), "n" | "no"),
+    }
+}
+
+/// Shared plan→run handoff: announce the transition, then drive the mission
+/// loop exactly like `kranz run`. The planning engine must already be
+/// dropped — [`run_mission_loop`] re-acquires the mission lock.
+async fn start_run_after_plan(repo: PathBuf, mission_id: String) -> Result<i32> {
+    println!(
+        "starting mission {mission_id} — live event feed follows \
+         (Ctrl-C safe; resume with 'kranz run')"
+    );
+    run_mission_loop(repo, mission_id, false).await
 }
 
 /// Print an orchestrator reply, each line under a dim `orchestrator>` prefix.
@@ -490,22 +565,18 @@ fn print_orchestrator_reply(text: &str, tty: bool) {
 // run
 // ---------------------------------------------------------------------------
 
-/// `kranz run`: resume the mission, tail its events live, drive the loop to
-/// a terminal state, and map it to an exit code (0 complete / 2 blocked /
-/// 1 failed).
+/// `kranz run`: apply the `--dangerously-allow-all` opt-in (recorded as a
+/// config.changed event via the control inbox), then drive the mission loop.
 async fn cmd_run(
     repo: PathBuf,
     mission: String,
     force_lock: bool,
     dangerously_allow_all: bool,
 ) -> Result<i32> {
-    let cfg = load_config(&repo, dangerously_allow_all)?;
-    let backend = build_backend(&cfg)?;
-    let paths = require_mission(&repo, &mission)?;
-
     // The mission's own config lives in the event log; the flag opts in via
     // the control inbox so the change is recorded as a config.changed event.
     if dangerously_allow_all {
+        let paths = require_mission(&repo, &mission)?;
         control::enqueue(
             &paths,
             &ControlCommand::ConfigChange {
@@ -513,6 +584,20 @@ async fn cmd_run(
             },
         )?;
     }
+    run_mission_loop(repo, mission, force_lock).await
+}
+
+/// Resume the mission, tail its events live, drive the loop to a terminal
+/// state, and map it to an exit code (0 complete / 2 blocked / 1 failed).
+/// Shared by `kranz run` and the plan-approval "start execution now" path.
+pub(crate) async fn run_mission_loop(
+    repo: PathBuf,
+    mission: String,
+    force_lock: bool,
+) -> Result<i32> {
+    let cfg = load_config(&repo, false)?;
+    let backend = build_backend(&cfg)?;
+    let paths = require_mission(&repo, &mission)?;
 
     loop {
         let mut engine =

@@ -15,7 +15,10 @@
 //! runs. Submitting while busy echoes the message immediately (tagged
 //! `(queued)`) and sends it as the next turn when the current one finishes —
 //! never discarded, never leaking into an unrelated prompt. `/plan` renders
-//! the plan + cost estimate and enters a single-key approval mode.
+//! the plan + cost estimate and enters a single-key approval mode. A
+//! successful approval commits the plan, then enters a second single-key
+//! prompt — start execution now, or exit — because approving the plan and
+//! starting the spend are separate consent steps ([`PlanningOutcome`]).
 //!
 //! ## Terminal safety
 //!
@@ -34,7 +37,8 @@
 //!
 //! Everything that can be tested headless is a pure, engine-free piece:
 //! [`InputEditor`], [`PendingQueue`], [`ScrollState`], [`classify_submission`],
-//! [`approval_key`], [`busy_status_line`], [`wrap_text`].
+//! [`approval_key`], [`post_approval_key`], [`busy_status_line`],
+//! [`wrap_text`].
 
 use crate::commands::augment_limit_hint;
 use crate::output::{self, one_line};
@@ -413,6 +417,34 @@ pub fn approval_key(code: KeyCode) -> ApprovalKey {
 }
 
 // ---------------------------------------------------------------------------
+// Post-approval mode (plan committed — start execution now?)
+// ---------------------------------------------------------------------------
+
+/// How planning ended. Returned by [`run`] after the TUI has torn down, so
+/// the caller can chain straight into execution instead of telling the user
+/// to quit and type `kranz run`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanningOutcome {
+    /// Plan approved + committed; the user chose to start execution now.
+    ApprovedRun,
+    /// Plan approved + committed; the user exits (execute via `kranz run`).
+    ApprovedExit,
+    /// Planning ended without an approved plan.
+    NotApproved,
+}
+
+/// Single-key filter for the post-approval "start execution now?" prompt:
+/// `y`/`Y` starts the run, `n`/`N` exits, everything else is ignored —
+/// starting spend must be an explicit keypress, never type-ahead.
+pub fn post_approval_key(code: KeyCode) -> Option<PlanningOutcome> {
+    match code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => Some(PlanningOutcome::ApprovedRun),
+        KeyCode::Char('n') | KeyCode::Char('N') => Some(PlanningOutcome::ApprovedExit),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Status line formatting
 // ---------------------------------------------------------------------------
 
@@ -433,6 +465,11 @@ pub const IDLE_STATUS: &str =
 /// Approval-mode bar (replaces the status line).
 pub const APPROVAL_BAR: &str =
     "approve this plan? [y] approve & commit   [n] back to conversation";
+
+/// Post-approval bar: the plan is committed; starting execution (spend) is
+/// its own explicit consent step.
+pub const POST_APPROVAL_BAR: &str =
+    "plan committed — start execution now? [y] run   [n] exit";
 
 /// Detached-scroll marker shown on the transcript's bottom row.
 pub const DETACHED_MARKER: &str = "▼ new output below — End to follow";
@@ -650,6 +687,10 @@ enum Phase {
     },
     /// Plan rendered; waiting for a single y/n key.
     Approval { engine: Box<MissionEngine>, plan: Plan },
+    /// Plan committed; waiting for the single-key run-now/exit choice. The
+    /// engine is never used again but must stay alive until teardown (it
+    /// flushes buffered events and releases the mission lock on drop).
+    PostApproval { _engine: Box<MissionEngine> },
     /// Transient placeholder during phase swaps; never observed by draw.
     Transitioning,
 }
@@ -659,6 +700,7 @@ enum PhaseView {
     Idle,
     Busy { kind: BusyKind, elapsed_secs: u64 },
     Approval,
+    PostApproval,
 }
 
 impl PhaseView {
@@ -669,6 +711,7 @@ impl PhaseView {
                 elapsed_secs: started.elapsed().as_secs(),
             },
             Phase::Approval { .. } => PhaseView::Approval,
+            Phase::PostApproval { .. } => PhaseView::PostApproval,
             Phase::Idle(_) | Phase::Transitioning => PhaseView::Idle,
         }
     }
@@ -825,13 +868,18 @@ struct TuiRun {
     quit: bool,
     /// Set on successful approval: the mission branch for the exit message.
     approved_branch: Option<String>,
+    /// Set in post-approval mode when the user picks `y`: start execution
+    /// immediately after teardown instead of exiting.
+    run_now: bool,
 }
 
 /// Run the full-screen planning TUI to completion. Owns the whole
-/// interaction: conversation turns, live activity, `/plan` + approval, and
-/// the exit hints printed AFTER the terminal is restored. Returns the
-/// process exit code.
-pub async fn run(engine: MissionEngine, intro: String) -> Result<i32> {
+/// interaction: conversation turns, live activity, `/plan` + approval, the
+/// post-approval "start execution now?" prompt, and the exit hints printed
+/// AFTER the terminal is restored. Returns how planning ended — on
+/// [`PlanningOutcome::ApprovedRun`] the caller starts execution on a fully
+/// restored terminal (engine dropped, mission lock released).
+pub async fn run(engine: MissionEngine, intro: String) -> Result<PlanningOutcome> {
     let mission_id = engine.mission_id().to_string();
     let title = format!(
         "KRANZ PLANNING — {} — {}",
@@ -867,6 +915,7 @@ pub async fn run(engine: MissionEngine, intro: String) -> Result<i32> {
         dims: (80, 20),
         quit: false,
         approved_branch: None,
+        run_now: false,
     };
 
     let loop_result = state.run_loop(&mut terminal, &mut keys).await;
@@ -874,8 +923,11 @@ pub async fn run(engine: MissionEngine, intro: String) -> Result<i32> {
     // Teardown order matters: drop the in-flight/idle engine first (flushes
     // buffered events, kills any live session, releases the lock), then
     // restore the terminal, then reap the input thread — and only then print
-    // the exit hints onto the restored main screen.
+    // the exit hints onto the restored main screen. A run-now choice starts
+    // execution only after all of this: the mission lock is free again and
+    // the live event feed prints onto the main screen, never the TUI's.
     let approved_branch = state.approved_branch.take();
+    let run_now = state.run_now;
     let leftover: Vec<String> = std::iter::from_fn(|| state.app.queue.pop()).collect();
     drop(state); // drops Phase (and the engine, wherever it lives)
     drop(terminal);
@@ -883,7 +935,15 @@ pub async fn run(engine: MissionEngine, intro: String) -> Result<i32> {
     input_thread.shutdown().await;
 
     loop_result?;
-    match approved_branch {
+    let outcome = match (&approved_branch, run_now) {
+        (None, _) => PlanningOutcome::NotApproved,
+        (Some(_), true) => PlanningOutcome::ApprovedRun,
+        (Some(_), false) => PlanningOutcome::ApprovedExit,
+    };
+    match &approved_branch {
+        Some(branch) if run_now => {
+            println!("plan approved and committed on {branch}.");
+        }
         Some(branch) => {
             println!("plan approved and committed on {branch}. run 'kranz run' to execute.");
         }
@@ -906,7 +966,7 @@ pub async fn run(engine: MissionEngine, intro: String) -> Result<i32> {
             println!("  - {message}");
         }
     }
-    Ok(0)
+    Ok(outcome)
 }
 
 impl TuiRun {
@@ -948,7 +1008,7 @@ impl TuiRun {
                 LoopEvent::Done(engine, out) => self.on_turn_done(engine, out),
             }
 
-            if self.quit || self.approved_branch.is_some() {
+            if self.quit {
                 return Ok(());
             }
         }
@@ -986,13 +1046,22 @@ impl TuiRun {
     }
 
     fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) {
-        // Ctrl-C: the same clean exit path as /quit, in every mode.
+        // Ctrl-C: the same clean exit path as /quit, in every mode. In
+        // post-approval mode the plan stays committed — Ctrl-C just declines
+        // the run-now offer.
         if code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL) {
             self.quit = true;
             return;
         }
         if matches!(self.phase, Phase::Approval { .. }) {
             self.on_approval_key(code);
+            return;
+        }
+        if matches!(self.phase, Phase::PostApproval { .. }) {
+            if let Some(outcome) = post_approval_key(code) {
+                self.run_now = outcome == PlanningOutcome::ApprovedRun;
+                self.quit = true;
+            }
             return;
         }
         self.app.error = None;
@@ -1136,9 +1205,14 @@ impl TuiRun {
                     Phase::Approval { mut engine, plan } => {
                         match engine.approve_plan(plan.clone()) {
                             Ok(()) => {
-                                self.approved_branch =
-                                    Some(engine.state().mission.mission_branch.clone());
-                                Phase::Idle(engine) // loop exits via approved_branch
+                                let branch = engine.state().mission.mission_branch.clone();
+                                self.app.push(TranscriptEntry::Notice(format!(
+                                    "plan approved and committed on {branch}."
+                                )));
+                                self.approved_branch = Some(branch);
+                                // The commit is done; whether to start the
+                                // spend is a separate explicit consent step.
+                                Phase::PostApproval { _engine: engine }
                             }
                             Err(e) => {
                                 self.app.push(TranscriptEntry::Error(format!(
@@ -1288,6 +1362,11 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App, view: &PhaseView) {
             Style::new().add_modifier(Modifier::BOLD),
         ))
         .style(Style::new().bg(Color::Yellow).fg(Color::Black)),
+        PhaseView::PostApproval => Paragraph::new(Span::styled(
+            POST_APPROVAL_BAR,
+            Style::new().add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::new().bg(Color::Yellow).fg(Color::Black)),
         PhaseView::Busy { kind, elapsed_secs } => Paragraph::new(Span::styled(
             busy_status_line(*kind, *elapsed_secs, app.spinner, app.queue.depth()),
             Style::new().fg(Color::Yellow),
@@ -1304,7 +1383,7 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App, view: &PhaseView) {
 }
 
 fn draw_input(frame: &mut Frame, area: Rect, app: &App, view: &PhaseView) {
-    if matches!(view, PhaseView::Approval) {
+    if matches!(view, PhaseView::Approval | PhaseView::PostApproval) {
         frame.render_widget(
             Paragraph::new(Span::styled(
                 "(input paused — press y or n)",
@@ -1312,7 +1391,7 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App, view: &PhaseView) {
             )),
             area,
         );
-        return; // no cursor: the input line is inactive in approval mode
+        return; // no cursor: the input line is inactive in these modes
     }
     let prompt = "> ";
     let window = (area.width as usize).saturating_sub(prompt.len()).max(1);
