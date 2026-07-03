@@ -1,0 +1,35 @@
+# Kranz Slack app manifest — paste into api.slack.com/apps →
+# "Create New App" → "From an app manifest" → pick your workspace → paste.
+# This encodes every scope, event, slash command, and Socket Mode setting the
+# bridge needs, so there are no checkboxes to hunt for afterwards.
+display_information:
+  name: Kranz
+  description: Mission notifications and control for Kranz.
+features:
+  bot_user:
+    display_name: kranz
+    always_online: true
+  slash_commands:
+    - command: /kranz
+      description: Kranz backlog commands
+      usage_hint: ticket <title>
+      should_escape: false
+oauth_config:
+  scopes:
+    bot:
+      # post mission updates + button/thread replies
+      - chat:write
+      # the /kranz slash command
+      - commands
+      # read threaded human replies (→ orchestrator guidance)
+      - channels:history
+settings:
+  event_subscriptions:
+    bot_events:
+      # deliver messages in public channels the bot is in (thread replies)
+      - message.channels
+  interactivity:
+    is_enabled: true # the approve button (block_actions over the socket)
+  socket_mode_enabled: true # outbound websocket — no public URL needed
+  org_deploy_enabled: false
+  token_rotation_enabled: false
