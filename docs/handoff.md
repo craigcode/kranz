@@ -1,0 +1,94 @@
+# Kranz handoff
+
+State as of 2026-07-03. Everything below is built, merged to `main`, and
+verified as far as this dev host (macOS) allows: **360 workspace tests green,
+`clippy -D warnings` clean, dashboard tsc+build clean, Windows kill code
+cross-compile-verified against the real `windows` 0.58 API**. Two live
+acceptance missions completed end-to-end (opus and Fable orchestrators).
+
+## Shipped
+
+- **v1 (plan phases 1–3)** — engine, resumability, CLI + planning TUI,
+  dashboard + Tauri, hardened by live missions + adversarial review.
+- **M1** — `report.md` at completion, estimate calibration from actuals,
+  §5 acceptance proven twice.
+- **M2.5** — full mission lifecycle from the web UI (create/plan/approve/
+  start) behind a per-serve mutation token.
+- **M2.75** — mission backlog (`kranz ticket`/`draft`/`queue`/`work`) +
+  Slack Socket Mode bridge (`kranz serve --slack`).
+- **M4** — Windows process-tree kill (Job Objects), release workflow,
+  Homebrew formula, Tauri bundle config, [releasing runbook](releasing.md).
+
+## Three gates only you can close
+
+Each is a one-time setup step; everything up to it is done and tested.
+
+### 1. Git remote → CI + Windows validation (M4)
+
+The Windows Job-Object kill compiles and type-checks against the real API here
+but has **never run on Windows**. The CI matrix
+([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) already targets
+ubuntu + windows; it just needs a remote to run against.
+
+```sh
+# create a repo (gh, or the web UI), then:
+git remote add origin https://github.com/<OWNER>/kranz.git
+git push -u origin main
+```
+
+Then: watch the Actions tab. Windows-latest runs the full suite including the
+`#[cfg(windows)]` process-tree-kill regression test — that's the real
+validation. Fix whatever windows-latest surfaces (likely none; it's clean on
+`x86_64-pc-windows-gnu` locally). Replace the `OWNER` placeholder in
+`Cargo.toml`, `packaging/homebrew/kranz.rb`, and README at the same time.
+
+### 2. Slack app + tokens → the bridge (M2.75)
+
+The bridge is built and pure-tested but **inert until configured** (opt-in by
+design). To activate:
+
+1. Create a Slack app (api.slack.com/apps) with **Socket Mode** enabled.
+   Scopes: `chat:write`, `commands`, `channels:history` (+ `groups:history`
+   for private channels). Create a `/kranz` slash command. Install to the
+   workspace.
+2. Put the tokens in `~/.kranz/config.json` (never the repo):
+   ```json
+   { "slack": { "botToken": "xoxb-…", "appToken": "xapp-…", "channel": "C0123456789" } }
+   ```
+   or export `KRANZ_SLACK_BOT_TOKEN` / `KRANZ_SLACK_APP_TOKEN` / `KRANZ_SLACK_CHANNEL`.
+3. `kranz serve --slack`. Unconfigured, `--slack` is a harmless no-op with a
+   log line.
+
+Then missions post plan-ready / blocked / complete to the channel, one thread
+each; approve buttons queue, threaded replies become orchestrator guidance,
+`/kranz ticket <title>` scaffolds a ticket. See
+[docs/backlog-and-slack.md](backlog-and-slack.md).
+
+### 3. First public release (M4 distribution)
+
+crates.io + Homebrew paths are prepared but not live. Follow
+[docs/releasing.md](releasing.md): bump version, tag `vX.Y.Z`, push the tag →
+`release.yml` builds and attaches per-platform binaries; then update the
+Homebrew `sha256` and `cargo publish` in the order engine → server, slack → cli.
+
+## Try the new surfaces now (no gates needed)
+
+```sh
+# Backlog pipeline (in any git repo):
+kranz ticket new rate-limit --title "Rate-limit the API" --goal "per-token limits"
+kranz ticket list                 # NEW
+kranz draft rate-limit            # orchestrator drafts a plan → plan.md → REVIEW
+kranz ticket approve rate-limit   # → QUEUED
+kranz work --once                 # runs it (per-repo serialized)
+
+# Web lifecycle:
+kranz serve --open                # + new-mission / plan / approve / start in-browser
+```
+
+## Suggested next (from the roadmap)
+
+- **M2** — mission hygiene (`kranz clean`/`abandon`), mid-mission re-planning,
+  environment preflight. The natural **first dogfood mission** (additive,
+  low-risk) once you want Kranz building itself.
+- **M3** — parallel workers (the marquee deferred capability).
+- **M6** — cloud missions; M2.5's HTTP lifecycle is already its control plane.

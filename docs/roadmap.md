@@ -70,7 +70,7 @@ Done when: a mission goes goal → conversation → approved plan → COMPLETE
 without a terminal ever opening, killing the server mid-mission loses
 nothing, and a foreign browser origin cannot create or start anything.
 
-## M2.75 — Mission backlog + Slack bridge
+## M2.75 — Mission backlog + Slack bridge ✅ (shipped 2026-07-03)
 
 Tickets as markdown in the repo → async plan drafting → review/approve (web,
 CLI, or Slack) → per-repo execution queue → Slack notifications with
@@ -101,7 +101,7 @@ Done when: a 2-milestone mission with independent features completes in
 materially less wall-clock than sequential at comparable cost, with zero
 event-log corruption across 20 repeated runs.
 
-## M4 — Windows first-class + distribution
+## M4 — Windows first-class + distribution ◑ (built; user-gated on git remote)
 
 The code is path-safe and lock-file based per §9, but never proven on Windows,
 and the project has no distribution story.
