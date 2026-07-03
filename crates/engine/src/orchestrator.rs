@@ -127,13 +127,37 @@ struct FixFeatureSpec {
     validation_criteria: Vec<String>,
 }
 
+/// One finding the orchestrator waived instead of converting (conversion
+/// turn, §4.5 g).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WaivedFinding {
+    subject: String,
+    #[serde(default)]
+    reason: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct FixFeaturesDecision {
     #[serde(default)]
     fix_features: Vec<FixFeatureSpec>,
+    /// Findings waived with a justification instead of fixed. Defaulted so
+    /// old-shape answers (fixFeatures + summary only) still parse.
+    #[serde(default)]
+    waived: Vec<WaivedFinding>,
     #[serde(default)]
     summary: String,
+}
+
+/// What the findings-conversion turn decided (see [`MissionEngine::convert_findings`]).
+enum FindingsConversion {
+    /// Convert into fix features. Unparseable answers and answers that
+    /// neither fix nor waive land here with specs synthesized 1:1 from the
+    /// findings — the conservative default.
+    Fix { specs: Vec<FixFeatureSpec>, summary: String, text: String },
+    /// Every finding waived, each with a one-line justification.
+    Waive { waived: Vec<WaivedFinding> },
 }
 
 #[derive(Debug, Deserialize)]
@@ -823,8 +847,9 @@ impl MissionEngine {
     // -----------------------------------------------------------------------
 
     /// Milestone validation: scrutiny then functional validators (v1:
-    /// sequential; each skippable by config), findings → fix features or a
-    /// clean tag + completion.
+    /// sequential; each skippable by config). Findings go to the conversion
+    /// turn, where the orchestrator turns each into a fix feature or waives
+    /// it; no findings — or all findings waived — means a tag + completion.
     async fn validation_round(&mut self, mi: usize) -> Result<()> {
         let milestone_id = self.state.mission.milestones[mi].id.clone();
         self.emit(EventKind::MilestoneValidating { milestone_id: milestone_id.clone() })?;
@@ -888,24 +913,46 @@ impl MissionEngine {
             return Ok(());
         }
 
+        // The conversion turn runs even with the fix-cycle cap exhausted:
+        // the cap bounds fix ROUNDS, not the orchestrator's right to judge
+        // findings — an all-waived answer completes the milestone where the
+        // old flow would have blocked on trivia.
         let findings: Vec<Finding> = findings.into_iter().map(|(_, f)| f).collect();
-        if self.fix_cycle_exhausted(mi) {
-            self.emit(EventKind::MilestoneBlocked {
-                milestone_id,
-                reason: format!(
-                    "{} validation finding(s) but the fix-cycle cap ({}) is reached",
-                    findings.len(),
-                    self.state.config.max_fix_cycles_per_milestone
-                ),
-            })?;
-            return Ok(());
+        match self.convert_findings(&milestone_id, &findings).await? {
+            FindingsConversion::Waive { waived } => {
+                self.emit_waive_decision(&waived)?;
+                let tag = self.tag_milestone(&milestone_id);
+                self.emit(EventKind::MilestoneCompleted { milestone_id, tag })?;
+            }
+            FindingsConversion::Fix { specs, summary, text } => {
+                if self.fix_cycle_exhausted(mi) {
+                    self.emit_decision(
+                        &format!(
+                            "fix-cycle cap reached; {} fix feature(s) wanted for {milestone_id}: {summary}",
+                            specs.len()
+                        ),
+                        Some(text),
+                    )?;
+                    self.emit(EventKind::MilestoneBlocked {
+                        milestone_id,
+                        reason: format!(
+                            "{} validation finding(s) but the fix-cycle cap ({}) is reached",
+                            findings.len(),
+                            self.state.config.max_fix_cycles_per_milestone
+                        ),
+                    })?;
+                    return Ok(());
+                }
+                self.emit_fix_features(mi, specs, &summary, text)?;
+            }
         }
-        self.create_fix_features(mi, &findings).await
+        Ok(())
     }
 
     /// Would one more fix round exceed `max_fix_cycles_per_milestone`?
-    /// Checked *before* consulting the orchestrator (§4.5 g: never create the
-    /// features first).
+    /// Checked after the conversion turn (waivable findings must reach the
+    /// orchestrator even at the cap) but before any `fixfeature.created` is
+    /// emitted (§4.5 g: never create the features first).
     fn fix_cycle_exhausted(&self, mi: usize) -> bool {
         self.state.mission.milestones[mi].fix_cycles + 1
             > self.state.config.max_fix_cycles_per_milestone
@@ -925,26 +972,46 @@ impl MissionEngine {
         }
     }
 
-    /// Findings → fix-features orchestrator turn → `fixfeature.created`
-    /// events. If the answer is unparseable (after retry) or empty, fix
-    /// features are synthesized 1:1 from the findings — an empty round would
+    /// The findings-conversion turn (§4.5 g): every finding is put to the
+    /// orchestrator, which converts each into a fix feature or waives it
+    /// with a one-line justification. The contract is the bar — severity
+    /// alone decides nothing.
+    ///
+    /// Conservative fallbacks: an unparseable answer (after retry) and an
+    /// answer that neither fixes nor waives are both treated as
+    /// convert-everything, with specs synthesized 1:1 from the findings — a
+    /// parse failure must never silently waive, and an empty round would
     /// re-validate immediately and spin without ever bumping `fix_cycles`.
-    async fn create_fix_features(&mut self, mi: usize, findings: &[Finding]) -> Result<()> {
-        let milestone_id = self.state.mission.milestones[mi].id.clone();
+    async fn convert_findings(
+        &mut self,
+        milestone_id: &str,
+        findings: &[Finding],
+    ) -> Result<FindingsConversion> {
         let findings_json = serde_json::to_string_pretty(findings)?;
         let message = format!(
             "Validation of milestone {milestone_id} produced these findings:\n{findings_json}\n\n\
-             Convert them into fix features (fresh worker sessions will implement them). \
-             Respond with ONLY this JSON:\n\
-             {{\"fixFeatures\":[{{\"title\":\"string\",\"spec\":\"string\",\"validationCriteria\":[\"string\"]}}],\"summary\":\"string\"}}"
+             For each finding decide: convert it to a fix-feature (it violates or endangers \
+             the validation contract / feature criteria; fresh worker sessions will implement \
+             fix features) or WAIVE it with a one-line justification (cosmetic, \
+             out-of-contract, or not worth a fresh worker session). The contract is the bar; \
+             minor severity is not automatically waivable and major severity is not \
+             automatically fixable — judge. Respond with ONLY this JSON:\n\
+             {{\"fixFeatures\":[{{\"title\":\"string\",\"spec\":\"string\",\"validationCriteria\":[\"string\"]}}],\"waived\":[{{\"subject\":\"string\",\"reason\":\"string\"}}],\"summary\":\"string\"}}"
         );
         let (decision, text) = self.json_decision::<FixFeaturesDecision>(&message).await?;
-        let (mut specs, summary) = match decision {
-            Some(d) => (d.fix_features, d.summary),
-            None => (Vec::new(), "unparseable fix-features decision; synthesized from findings".to_string()),
+        let (specs, waived, summary) = match decision {
+            Some(d) => (d.fix_features, d.waived, d.summary),
+            None => (
+                Vec::new(),
+                Vec::new(),
+                "unparseable fix-features decision; synthesized from findings".to_string(),
+            ),
         };
-        if specs.is_empty() {
-            specs = findings
+        if specs.is_empty() && !waived.is_empty() {
+            return Ok(FindingsConversion::Waive { waived });
+        }
+        let specs = if specs.is_empty() {
+            findings
                 .iter()
                 .map(|f| FixFeatureSpec {
                     title: format!("Fix finding: {}", f.subject),
@@ -954,8 +1021,42 @@ impl MissionEngine {
                     ),
                     validation_criteria: vec![format!("finding '{}' no longer reproduces", f.subject)],
                 })
-                .collect();
-        }
+                .collect()
+        } else {
+            specs
+        };
+        Ok(FindingsConversion::Fix { specs, summary, text })
+    }
+
+    /// Emit the all-waived `orchestrator.decision`: summary names the waived
+    /// subjects, detail carries the justifications. Both fields are
+    /// credential-scrubbed by [`Self::emit_decision`] — waiver reasons are
+    /// model-authored text.
+    fn emit_waive_decision(&mut self, waived: &[WaivedFinding]) -> Result<()> {
+        let subjects =
+            waived.iter().map(|w| w.subject.as_str()).collect::<Vec<_>>().join(", ");
+        let reasons = waived
+            .iter()
+            .map(|w| format!("- {}: {}", w.subject, w.reason))
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.emit_decision(
+            &format!("waived {} finding(s): {subjects}", waived.len()),
+            Some(reasons),
+        )
+    }
+
+    /// Emit the fix-features decision plus one `fixfeature.created` per spec
+    /// (the fix path of a conversion turn; the caller has already checked
+    /// the fix-cycle cap).
+    fn emit_fix_features(
+        &mut self,
+        mi: usize,
+        specs: Vec<FixFeatureSpec>,
+        summary: &str,
+        text: String,
+    ) -> Result<()> {
+        let milestone_id = self.state.mission.milestones[mi].id.clone();
         self.emit_decision(
             &format!("{} fix feature(s) for {milestone_id}: {summary}", specs.len()),
             Some(text),
@@ -996,7 +1097,9 @@ impl MissionEngine {
 
     /// All milestones complete: run every `command` assertion ourselves and
     /// put `agent-judgement` assertions to the orchestrator. Failures become
-    /// findings routed through the fix-feature path on the LAST milestone.
+    /// findings routed through the same conversion turn as a validation
+    /// round, on the LAST milestone: fix features reopen it, an all-waived
+    /// answer completes the mission.
     /// Returns `Some(status)` to end `run()`, `None` to continue the loop.
     async fn final_gate(&mut self) -> Result<Option<MissionStatus>> {
         if self.state.mission.status != MissionStatus::Validating {
@@ -1054,25 +1157,45 @@ impl MissionEngine {
                 finding: finding.clone(),
             })?;
         }
-        if self.fix_cycle_exhausted(li) {
-            let milestone_id = self.state.mission.milestones[li].id.clone();
-            self.emit(EventKind::MilestoneBlocked {
-                milestone_id,
-                reason: format!(
-                    "{} final-gate finding(s) but the fix-cycle cap ({}) is reached",
-                    findings.len(),
-                    self.state.config.max_fix_cycles_per_milestone
-                ),
-            })?;
-            return Ok(None); // loop → blocked branch → Blocked
+        // Gate findings go through the same conversion turn as a milestone
+        // validation round: the orchestrator may waive them all, in which
+        // case the mission proceeds to completion.
+        match self.convert_findings(&last_milestone_id, &findings).await? {
+            FindingsConversion::Waive { waived } => {
+                self.emit_waive_decision(&waived)?;
+                self.emit(EventKind::MissionCompleted {})?;
+                Ok(Some(MissionStatus::Complete))
+            }
+            FindingsConversion::Fix { specs, summary, text } => {
+                if self.fix_cycle_exhausted(li) {
+                    self.emit_decision(
+                        &format!(
+                            "fix-cycle cap reached; {} fix feature(s) wanted for {last_milestone_id}: {summary}",
+                            specs.len()
+                        ),
+                        Some(text),
+                    )?;
+                    self.emit(EventKind::MilestoneBlocked {
+                        milestone_id: last_milestone_id,
+                        reason: format!(
+                            "{} final-gate finding(s) but the fix-cycle cap ({}) is reached",
+                            findings.len(),
+                            self.state.config.max_fix_cycles_per_milestone
+                        ),
+                    })?;
+                    return Ok(None); // loop → blocked branch → Blocked
+                }
+                // Reopen the last milestone: milestone.validating makes the
+                // following fixfeature.created bump fix_cycles and flip it
+                // back to Active (reducer semantics) so the main loop picks
+                // the fix features up.
+                self.emit(EventKind::MilestoneValidating {
+                    milestone_id: last_milestone_id,
+                })?;
+                self.emit_fix_features(li, specs, &summary, text)?;
+                Ok(None)
+            }
         }
-        // Reopen the last milestone: milestone.validating makes the following
-        // fixfeature.created bump fix_cycles and flip it back to Active
-        // (reducer semantics) so the main loop picks the fix features up.
-        let milestone_id = self.state.mission.milestones[li].id.clone();
-        self.emit(EventKind::MilestoneValidating { milestone_id })?;
-        self.create_fix_features(li, &findings).await?;
-        Ok(None)
     }
 
     /// One verdicts turn for all agent-judgement assertions. Unparseable

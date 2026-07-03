@@ -186,7 +186,9 @@ fn judgement(decision: &str, guidance: &str) -> String {
         .to_string()
 }
 
-/// Fix-features-turn reply with `n` fix features (§4.5 g).
+/// Conversion-turn reply with `n` fix features (§4.5 g). Deliberately the
+/// OLD shape — no "waived" key — proving pre-waive answers still parse
+/// (serde defaults the field).
 fn fix_features(n: usize) -> String {
     let features: Vec<serde_json::Value> = (1..=n)
         .map(|i| {
@@ -198,6 +200,16 @@ fn fix_features(n: usize) -> String {
         })
         .collect();
     json!({ "fixFeatures": features, "summary": format!("{n} fix feature(s)") }).to_string()
+}
+
+/// Conversion-turn reply that waives the one finding instead of fixing it.
+fn waive_reply(subject: &str, reason: &str) -> String {
+    json!({
+        "fixFeatures": [],
+        "waived": [{ "subject": subject, "reason": reason }],
+        "summary": "not worth a fix round"
+    })
+    .to_string()
 }
 
 /// Final-gate verdicts reply: every listed assertion id passes (§4.5 h).
@@ -421,14 +433,16 @@ async fn loop_guard_blocks_milestone_after_max_fix_cycles() {
     }]);
 
     // Round 1 finds a problem (fix cycle 1 allowed by cap=1); the fix worker
-    // "passes" but round 2 finds a problem again → cap exceeded → blocked.
-    // The guard fires BEFORE any fix-features turn, so no fourth orch batch.
+    // "passes" but round 2 finds a problem again. The conversion turn still
+    // runs at the cap (the orchestrator could waive), but here it wants
+    // ANOTHER fix — cap exceeded → blocked, no fixfeature.created.
     let backend = Arc::new(MockBackend::with_scripts(vec![
         worker_pass(),
         orch_script(vec![
             judgement("complete", ""),
             fix_features(1),
             judgement("complete", ""),
+            fix_features(1), // round 2 conversion: fixes wanted at the cap
         ]),
         validator_with(finding.clone()),
         worker_pass(),
@@ -455,6 +469,202 @@ async fn loop_guard_blocks_milestone_after_max_fix_cycles() {
     assert!(events.iter().any(|e| matches!(
         &e.kind,
         EventKind::MilestoneBlocked { reason, .. } if reason.contains("fix-cycle cap")
+    )));
+    // Round 2's conversion turn wanted fixes but the cap was spent: nothing
+    // beyond round 1's single fix feature was ever created.
+    assert_eq!(
+        event_types(&events).iter().filter(|t| **t == "fixfeature.created").count(),
+        1,
+        "only round 1 created a fix feature"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 3b. Waive: all findings waived → milestone completes, no fix cycle
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn waive_completes_milestone() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let finding = json!([{
+        "subject": "part 1 works",
+        "severity": "minor",
+        "evidence": "the new helper's docstring omits the error case",
+        "suggestedFix": "extend the docstring"
+    }]);
+
+    // Session order: worker f-1-1, orchestrator, functional validator (one
+    // minor finding). Orchestrator turns: seed, judgement f-1-1, conversion —
+    // which waives the finding: no fix worker, no second validation round.
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            judgement("complete", ""),
+            waive_reply("part 1 works", "docstring nitpick"),
+        ]),
+        validator_with(finding),
+    ]));
+
+    let cfg = MissionConfig { skip_functional: false, ..test_cfg() };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run()).await.expect("run must not hang").unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+
+    // No fix cycle consumed, no fix feature materialized.
+    let ms = &engine.state().mission.milestones[0];
+    assert_eq!(ms.status, MilestoneStatus::Complete);
+    assert_eq!(ms.fix_cycles, 0, "a waived round consumes no fix cycle");
+    assert!(ms.features.iter().all(|f| f.origin == FeatureOrigin::Plan));
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+    let types = event_types(&events);
+    assert!(types.contains(&"validation.finding"), "finding still surfaced: {types:?}");
+    assert!(!types.contains(&"fixfeature.created"), "no fix feature: {types:?}");
+    assert_eq!(
+        types.iter().filter(|t| **t == "milestone.validating").count(),
+        1,
+        "exactly one validation round: {types:?}"
+    );
+    assert!(types.contains(&"mission.completed"), "mission completed: {types:?}");
+
+    // The waiver is on the log as an orchestrator decision: summary names
+    // the subject, detail carries the one-line justification.
+    let (summary, detail) = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::OrchestratorDecision { summary, detail: Some(detail) }
+                if summary.starts_with("waived") =>
+            {
+                Some((summary.clone(), detail.clone()))
+            }
+            _ => None,
+        })
+        .expect("a waive orchestrator.decision exists");
+    assert!(summary.contains("waived 1 finding(s)"), "summary: {summary}");
+    assert!(summary.contains("part 1 works"), "summary names the subject: {summary}");
+    assert!(detail.contains("docstring nitpick"), "detail carries the reason: {detail}");
+}
+
+// ---------------------------------------------------------------------------
+// 3c. Waive at the cap: the live scenario — a spent fix-cycle cap must not
+//     block a milestone whose only remaining findings the orchestrator waives
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn waive_at_cap_completes_instead_of_blocking() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let major = json!([{
+        "subject": "part 1 works",
+        "severity": "major",
+        "evidence": "the endpoint returns 500 on empty input",
+        "suggestedFix": "guard empty input"
+    }]);
+    let minor = json!([{
+        "subject": "helper docs",
+        "severity": "minor",
+        "evidence": "docstring omits the error case",
+        "suggestedFix": "extend the docstring"
+    }]);
+
+    // Round 1: a real finding consumes the only fix cycle (cap=1); the fix
+    // worker passes. Round 2: one leftover nitpick with the cap spent. The
+    // conversion turn must still run, and the waive must COMPLETE the
+    // milestone — the old flow blocked here without ever asking.
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            judgement("complete", ""),
+            fix_features(1),
+            judgement("complete", ""),
+            waive_reply("helper docs", "cosmetic; outside the contract"),
+        ]),
+        validator_with(major),
+        worker_pass(),
+        validator_with(minor),
+    ]));
+
+    let cfg = MissionConfig {
+        skip_functional: false,
+        max_fix_cycles_per_milestone: 1,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run()).await.expect("run must not hang").unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+    let ms = &engine.state().mission.milestones[0];
+    assert_eq!(ms.status, MilestoneStatus::Complete);
+    assert_eq!(ms.fix_cycles, 1, "the waived round consumed no extra cycle");
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+    let types = event_types(&events);
+    assert!(!types.contains(&"milestone.blocked"), "must not block: {types:?}");
+    assert!(types.contains(&"mission.completed"), "mission completed: {types:?}");
+    assert!(events.iter().any(|e| matches!(
+        &e.kind,
+        EventKind::OrchestratorDecision { summary, .. }
+            if summary.starts_with("waived 1 finding(s)") && summary.contains("helper docs")
+    )));
+}
+
+// ---------------------------------------------------------------------------
+// 3d. Waive at the final gate: all-waived gate findings complete the mission
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn waive_at_final_gate_completes_mission() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    // One command assertion that fails portably (`cd` into a missing dir
+    // errors under both `sh -c` and `cmd /C`) → one final-gate finding.
+    let contract = vec![assertion("a-1", "the build succeeds", Some("cd kranz-no-such-dir"))];
+
+    // Orchestrator turns: seed, judgement f-1-1, gate conversion (waive).
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            judgement("complete", ""),
+            waive_reply("a-1", "command not runnable in this environment"),
+        ]),
+    ]));
+
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(simple_plan(1, contract)).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run()).await.expect("run must not hang").unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+    let types = event_types(&events);
+    assert!(types.contains(&"validation.finding"), "gate finding surfaced: {types:?}");
+    assert!(!types.contains(&"fixfeature.created"), "no fix feature: {types:?}");
+    assert!(!types.contains(&"milestone.blocked"), "must not block: {types:?}");
+    assert!(types.contains(&"mission.completed"), "mission completed: {types:?}");
+    assert!(seq_of(&events, "mission.validating") < seq_of(&events, "mission.completed"));
+    assert!(events.iter().any(|e| matches!(
+        &e.kind,
+        EventKind::OrchestratorDecision { summary, .. }
+            if summary.starts_with("waived 1 finding(s)") && summary.contains("a-1")
     )));
 }
 
