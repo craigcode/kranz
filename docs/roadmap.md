@@ -83,6 +83,20 @@ plan → Slack approve → queued run → blocked-to-unblocked entirely in a
 thread; underspecified tickets bounce back with the orchestrator's actual
 questions; per-repo serialization holds).
 
+## M2.9 — Slack as a full control surface
+
+Extend the Slack bridge from notifications+light-steering to FULL management:
+create, plan (thread conversation), review, approve, start, steer, configure,
+and run the backlog from Slack; deep transcript forensics hand off to the web
+UI via a deep link. Rides on M2.5's hosted-engine registry — Slack becomes a
+second client of MissionHost alongside the browser. Full design:
+docs/slack-management.md. Ship in slices (lifecycle → control/status → App
+Home). Requires a Slack-user spend allowlist and an always-on `serve --slack`.
+
+Done when: a mission goes goal → planning → approve → start → complete entirely
+in Slack; `/kranz` fully operates the backlog; unauthorized users cannot spend;
+transcripts are one tap from the thread.
+
 ## M3 — Parallel workers (plan Phase 4, flagged off by default)
 
 The marquee deferred capability. Correctness groundwork exists (single-writer
