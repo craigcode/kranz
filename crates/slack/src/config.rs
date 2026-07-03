@@ -52,6 +52,29 @@ pub struct SlackConfig {
     pub channel: String,
     /// Which event classes to post.
     pub notify: NotifyFlags,
+    /// Slack user ids (`Uxxxx`) allowed to run money-spending actions
+    /// (new / approve / start). See docs/slack-management.md must-have #1.
+    /// Empty = solo default: allow anyone (the plumbing exists regardless so
+    /// a workspace can lock spend down by listing its operators).
+    pub allow_users: Vec<String>,
+}
+
+impl SlackConfig {
+    /// Whether `user_id` may run a money-spending action (new / approve /
+    /// start). Pure gate so the authorization policy is unit-tested without a
+    /// socket. An empty allowlist is the solo default — anyone is authorized;
+    /// a non-empty allowlist authorizes only its listed users. A blank/absent
+    /// `user_id` (Slack omitted it) is denied whenever an allowlist is set, so
+    /// a spoofed-empty user can't slip past a configured gate.
+    pub fn is_authorized(&self, user_id: Option<&str>) -> bool {
+        if self.allow_users.is_empty() {
+            return true;
+        }
+        match user_id.map(str::trim).filter(|u| !u.is_empty()) {
+            Some(u) => self.allow_users.iter().any(|allowed| allowed == u),
+            None => false,
+        }
+    }
 }
 
 /// On-disk shape of the `slack` object inside `~/.kranz/config.json`. Every
@@ -68,6 +91,9 @@ struct SlackFileConfig {
     channel: Option<String>,
     #[serde(default)]
     notify: Option<NotifyFlags>,
+    /// Optional spend allowlist (`allowUsers: ["Uxxxx"]`). Absent = empty.
+    #[serde(default)]
+    allow_users: Vec<String>,
 }
 
 /// Top-level shape we deserialize `~/.kranz/config.json` into — only the
@@ -154,6 +180,14 @@ fn resolve(file: SlackFileConfig, env: EnvVars) -> Option<SlackConfig> {
             app_token,
             channel,
             notify: file.notify.unwrap_or_default(),
+            // Trim each id and drop blanks so a stray "" in the file can't turn
+            // a configured allowlist into an all-allow (empty) one by accident.
+            allow_users: file
+                .allow_users
+                .into_iter()
+                .map(|u| u.trim().to_string())
+                .filter(|u| !u.is_empty())
+                .collect(),
         }),
         _ => None,
     }
@@ -195,6 +229,7 @@ mod tests {
             app_token: Some("xapp-file".into()),
             channel: Some("Cfile".into()),
             notify: Some(NotifyFlags { plan_ready: false, ..NotifyFlags::default() }),
+            ..SlackFileConfig::default()
         };
         let cfg = resolve(file, EnvVars::default()).expect("full file triple resolves");
         assert_eq!(cfg.bot_token, "xoxb-file");
@@ -209,6 +244,7 @@ mod tests {
             app_token: Some("xapp-file".into()),
             channel: Some("Cfile".into()),
             notify: None,
+            ..SlackFileConfig::default()
         };
         let cfg = resolve(
             file,
@@ -228,6 +264,7 @@ mod tests {
                 app_token: Some("xapp".into()),
                 channel: None,
                 notify: None,
+                ..SlackFileConfig::default()
             },
             EnvVars::default(),
         )
@@ -243,6 +280,7 @@ mod tests {
                 app_token: Some("xapp".into()),
                 channel: Some("   ".into()),
                 notify: None,
+                ..SlackFileConfig::default()
             },
             EnvVars::default(),
         )
@@ -252,5 +290,56 @@ mod tests {
     #[test]
     fn empty_is_none() {
         assert!(resolve(SlackFileConfig::default(), EnvVars::default()).is_none());
+    }
+
+    #[test]
+    fn allow_users_flow_through_and_are_trimmed() {
+        let file = SlackFileConfig {
+            bot_token: Some("xoxb".into()),
+            app_token: Some("xapp".into()),
+            channel: Some("C1".into()),
+            notify: None,
+            allow_users: vec![" U123 ".into(), "".into(), "  ".into(), "U456".into()],
+        };
+        let cfg = resolve(file, EnvVars::default()).expect("Some");
+        // Blank entries dropped; surviving ids trimmed.
+        assert_eq!(cfg.allow_users, vec!["U123".to_string(), "U456".to_string()]);
+    }
+
+    #[test]
+    fn empty_allowlist_authorizes_anyone() {
+        let cfg = resolve(
+            SlackFileConfig {
+                bot_token: Some("xoxb".into()),
+                app_token: Some("xapp".into()),
+                channel: Some("C1".into()),
+                notify: None,
+                allow_users: vec![],
+            },
+            EnvVars::default(),
+        )
+        .unwrap();
+        assert!(cfg.is_authorized(Some("U999")), "solo default: anyone allowed");
+        assert!(cfg.is_authorized(None), "even a missing user id is allowed with no list");
+    }
+
+    #[test]
+    fn nonempty_allowlist_gates_by_id() {
+        let cfg = resolve(
+            SlackFileConfig {
+                bot_token: Some("xoxb".into()),
+                app_token: Some("xapp".into()),
+                channel: Some("C1".into()),
+                notify: None,
+                allow_users: vec!["U123".into()],
+            },
+            EnvVars::default(),
+        )
+        .unwrap();
+        assert!(cfg.is_authorized(Some("U123")), "listed user authorized");
+        assert!(cfg.is_authorized(Some(" U123 ")), "surrounding whitespace tolerated");
+        assert!(!cfg.is_authorized(Some("U999")), "unlisted user denied");
+        assert!(!cfg.is_authorized(None), "missing user id denied when a list is set");
+        assert!(!cfg.is_authorized(Some("   ")), "blank user id denied when a list is set");
     }
 }

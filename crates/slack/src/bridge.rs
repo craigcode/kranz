@@ -29,7 +29,7 @@ use futures_util::{SinkExt, StreamExt};
 use kranz_engine::event_log::EventLog;
 use kranz_engine::paths::MissionPaths;
 use kranz_engine::reducer;
-use kranz_engine::types::{ControlCommand, MissionState};
+use kranz_engine::types::{ControlCommand, MissionState, MissionStatus};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -354,8 +354,8 @@ async fn connect_once(
 /// envelope wouldn't fix a local write error, and leaving it un-acked would make
 /// Slack redeliver it indefinitely.
 async fn handle_envelope(
-    _cfg: &SlackConfig,
-    _client: &SlackClient,
+    cfg: &SlackConfig,
+    client: &SlackClient,
     repo_root: &Path,
     threads: &SharedThreads,
     text: &str,
@@ -368,37 +368,261 @@ async fn handle_envelope(
         }
     };
     let routed = route(&envelope, threads);
-    match &routed.action {
-        // Help replies over the network (the slash `response_url`), so it can't
-        // go through the sync `apply_action` path — handle it here in async.
+    dispatch_action(cfg, client, repo_root, threads, &routed.action).await;
+    // Ack whatever carried an envelope_id, even Ignore, so Slack stops retrying.
+    routed.envelope_id.map(|id| json!({ "envelope_id": id }).to_string())
+}
+
+/// Ephemeral reply to the slash `response_url`, best-effort (a failed reply
+/// must never wedge the ack). No-op when the action carried no `response_url`.
+async fn reply_ephemeral(client: &SlackClient, response_url: Option<&str>, blocks: &[Value]) {
+    if let Some(url) = response_url {
+        if let Err(e) = client.post_response(url, blocks, true).await {
+            tracing::warn!(error = %e, "failed to post ephemeral Slack reply");
+        }
+    }
+}
+
+/// A one-line ephemeral "not authorized" reply for a spend-gated action from an
+/// unlisted user (docs/slack-management.md must-have #1).
+fn not_authorized_blocks() -> Vec<Value> {
+    vec![json!({
+        "type": "section",
+        "text": {
+            "type": "mrkdwn",
+            "text": ":no_entry: You're not authorized to spend on missions here. \
+                     Ask an admin to add you to `slack.allowUsers` in `~/.kranz/config.json`."
+        }
+    })]
+}
+
+/// Route one inbound action to its handler. The async actions (help, status,
+/// new-mission, request-plan, approve-from-slash) reply over the slash
+/// `response_url`, so they can't go through the sync [`apply_action`] path;
+/// the button/thread actions (approve button, guidance, ticket) are pure local
+/// filesystem writes and go through [`apply_action`].
+///
+/// ## What is WIRED vs. STUBBED in this slice (M2.9 slice 1)
+/// - **Status** — fully wired: folds the mission's event log and posts a status
+///   block. Read-only, so no allowlist gate. Unit-tested end-to-end.
+/// - **ApproveMission** (`/kranz approve <id>`) — fully wired: allowlist-gated,
+///   then the same queue-insert as the approve button ([`approve_mission`]).
+/// - **NewMission** (`/kranz new <goal>`) — allowlist-gated, then create +
+///   one seeding planning turn via [`new_mission`], which builds the real
+///   backend (`ClaudeBackend::discover`) and spawns `claude`. That spawn is why
+///   it is guarded and never exercised in tests; the parse/gate/render around
+///   it are fully tested. Subsequent multi-turn planning is a follow-up.
+/// - **RequestPlan** (`/kranz plan <id>`) — allowlist-gated, but demanding the
+///   plan needs the *same* live `MissionEngine` that ran planning held across
+///   async turns (the M2.5 host's `MissionHost` registry). That registry is in
+///   `kranz_server`, which this crate must not touch in this slice, so
+///   request-plan replies with an ephemeral pointing at `kranz plan <id>` /
+///   the web UI. Documented handoff, not silently dropped.
+///
+/// ## Known limitation (ack budget, docs must-have #3)
+/// This handler runs inline in the socket read loop (see [`handle_envelope`] /
+/// `connect_once`), so the `NewMission` seeding `planning_turn` — a real
+/// `claude` turn — blocks the ack past Slack's 3 s budget, and Slack will
+/// redeliver. For this slice that is an accepted rough edge (the seed turn is
+/// idempotent-ish: a redelivery creates a *second* mission thread, which is
+/// noise, not corruption). The follow-up that lands `RequestPlan` also moves
+/// these spend actions off the read path (ack first, then do the work on a
+/// spawned task, deduped by envelope id) to satisfy the fast-ack + idempotency
+/// must-haves. The read-only actions (status/help) and the pure-local
+/// approve/queue all finish well inside the budget today.
+async fn dispatch_action(
+    cfg: &SlackConfig,
+    client: &SlackClient,
+    repo_root: &Path,
+    threads: &SharedThreads,
+    action: &Action,
+) {
+    match action {
         Action::Help { response_url } => {
-            if let Some(url) = response_url {
-                if let Err(e) = _client.post_response(url, &crate::format::build_help(), true).await
-                {
-                    tracing::warn!(error = %e, "failed to post /kranz help reply");
+            reply_ephemeral(client, response_url.as_deref(), &crate::format::build_help()).await;
+        }
+
+        Action::Status { mission_id, response_url } => {
+            match build_status_reply(repo_root, mission_id.as_deref()) {
+                Ok(blocks) => reply_ephemeral(client, response_url.as_deref(), &blocks).await,
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to build Slack status reply");
+                    reply_ephemeral(
+                        client,
+                        response_url.as_deref(),
+                        &error_blocks(&format!("Couldn't read that mission: {e}")),
+                    )
+                    .await;
                 }
             }
         }
+
+        Action::NewMission { goal, user_id, response_url, channel } => {
+            if !cfg.is_authorized(user_id.as_deref()) {
+                reply_ephemeral(client, response_url.as_deref(), &not_authorized_blocks()).await;
+                return;
+            }
+            match new_mission(client, repo_root, threads, goal, channel).await {
+                Ok(blocks) => reply_ephemeral(client, response_url.as_deref(), &blocks).await,
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to create mission from Slack");
+                    reply_ephemeral(
+                        client,
+                        response_url.as_deref(),
+                        &error_blocks(&format!("Couldn't create the mission: {e}")),
+                    )
+                    .await;
+                }
+            }
+        }
+
+        Action::RequestPlan { mission_id, user_id, response_url } => {
+            if !cfg.is_authorized(user_id.as_deref()) {
+                reply_ephemeral(client, response_url.as_deref(), &not_authorized_blocks()).await;
+                return;
+            }
+            // Documented handoff (see dispatch_action docs): request-plan needs
+            // the live planning engine held across turns (the M2.5 host), which
+            // lives in kranz_server — out of scope for this slice.
+            reply_ephemeral(
+                client,
+                response_url.as_deref(),
+                &error_blocks(&format!(
+                    "Requesting a plan over Slack needs the hosted planning engine \
+                     (coming in a follow-up). For now: `kranz plan --mission {mission_id}`, \
+                     or the web UI via `kranz serve --open`."
+                )),
+            )
+            .await;
+        }
+
+        Action::ApproveMission { mission_id, user_id, response_url } => {
+            if !cfg.is_authorized(user_id.as_deref()) {
+                reply_ephemeral(client, response_url.as_deref(), &not_authorized_blocks()).await;
+                return;
+            }
+            match approve_mission(repo_root, mission_id) {
+                Ok(()) => {
+                    reply_ephemeral(
+                        client,
+                        response_url.as_deref(),
+                        &error_blocks(&format!(":white_check_mark: Queued `{mission_id}`.")),
+                    )
+                    .await
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to approve mission from Slack");
+                    reply_ephemeral(
+                        client,
+                        response_url.as_deref(),
+                        &error_blocks(&format!("Couldn't queue `{mission_id}`: {e}")),
+                    )
+                    .await
+                }
+            }
+        }
+
+        // Button/thread actions: pure local writes, no network reply.
         action => {
             if let Err(e) = apply_action(repo_root, action) {
                 tracing::warn!(error = %e, "failed to apply inbound Slack action");
             }
         }
     }
-    // Ack whatever carried an envelope_id, even Ignore, so Slack stops retrying.
-    routed.envelope_id.map(|id| json!({ "envelope_id": id }).to_string())
 }
 
-/// Apply a routed inbound action to the local mission machinery. `Help` is
-/// handled in [`handle_envelope`] (it needs the async client), so it is a
-/// no-op here for exhaustiveness.
+/// A single mrkdwn section block for a short status / error / confirmation
+/// ephemeral. (Not every reply warrants the full header/section/context frame.)
+fn error_blocks(msg: &str) -> Vec<Value> {
+    vec![json!({ "type": "section", "text": { "type": "mrkdwn", "text": msg } })]
+}
+
+/// Apply a routed inbound action to the local mission machinery. The actions
+/// that reply over the slash `response_url` (Help, Status, NewMission,
+/// RequestPlan, ApproveMission) are handled in [`dispatch_action`] because they
+/// need the async client; they are no-ops here for exhaustiveness.
 fn apply_action(repo_root: &Path, action: &Action) -> Result<()> {
     match action {
         Action::Approve { mission_id } => approve_mission(repo_root, mission_id),
         Action::Guidance { mission_id, text } => guidance(repo_root, mission_id, text),
         Action::NewTicket { title, .. } => scaffold_ticket(repo_root, title),
-        Action::Help { .. } | Action::Ignore => Ok(()),
+        Action::Help { .. }
+        | Action::Status { .. }
+        | Action::NewMission { .. }
+        | Action::RequestPlan { .. }
+        | Action::ApproveMission { .. }
+        | Action::Ignore => Ok(()),
     }
+}
+
+/// Build the status-summary blocks for a mission by folding its event log —
+/// fully wired and read-only (no allowlist gate, no backend). When
+/// `mission_id` is `None`, the most-recently-created mission is chosen. An
+/// unknown/absent mission is a plain error the caller turns into an ephemeral.
+fn build_status_reply(repo_root: &Path, mission_id: Option<&str>) -> Result<Vec<Value>> {
+    let mission_id = match mission_id {
+        Some(id) => id.to_string(),
+        None => most_recent_mission(repo_root)
+            .ok_or_else(|| anyhow::anyhow!("no missions yet — create one with `/kranz new <goal>`"))?,
+    };
+    let paths = MissionPaths::new(repo_root, &mission_id);
+    let events_path = paths.events_file();
+    if !events_path.is_file() {
+        return Err(anyhow::anyhow!("unknown mission `{mission_id}`"));
+    }
+    let events = EventLog::read_events(&events_path)?;
+    let state = reducer::fold(&events)?;
+    let summary = crate::format::StatusSummary {
+        mission_id: mission_id.clone(),
+        status: status_word(state.mission.status),
+        summary: render_status_body(&state),
+    };
+    Ok(crate::format::build_status(&summary))
+}
+
+/// The most-recently-created mission id under `repo_root`, if any. Missions are
+/// listed by [`MissionPaths::list_missions`]; "most recent" is the one whose
+/// event log was modified last (creation writes `mission.created`), which is a
+/// good-enough "the mission you just made" heuristic for a bare `/kranz status`.
+fn most_recent_mission(repo_root: &Path) -> Option<String> {
+    MissionPaths::list_missions(repo_root)
+        .into_iter()
+        .filter_map(|id| {
+            let events = MissionPaths::new(repo_root, &id).events_file();
+            let mtime = std::fs::metadata(&events).and_then(|m| m.modified()).ok()?;
+            Some((id, mtime))
+        })
+        .max_by_key(|(_, mtime)| *mtime)
+        .map(|(id, _)| id)
+}
+
+/// A short status word for the header pill (the `MissionStatus` Debug name,
+/// e.g. `Planning`, `Running`, `Complete`).
+fn status_word(status: MissionStatus) -> String {
+    format!("{status:?}")
+}
+
+/// A compact multi-line status body: goal excerpt, milestone tally, and cost.
+fn render_status_body(state: &MissionState) -> String {
+    let total = state.mission.milestones.len();
+    let done = state
+        .mission
+        .milestones
+        .iter()
+        .filter(|m| matches!(m.status, kranz_engine::types::MilestoneStatus::Complete))
+        .count();
+    let mut body = String::new();
+    let goal = state.mission.goal.trim();
+    if !goal.is_empty() {
+        body.push_str("*Goal*\n");
+        body.push_str(goal);
+        body.push_str("\n\n");
+    }
+    body.push_str(&format!("{done}/{total} milestone{} complete", if total == 1 { "" } else { "s" }));
+    if state.total_cost_usd > 0.0 {
+        body.push_str(&format!(" · cost ${:.2}", state.total_cost_usd));
+    }
+    body
 }
 
 /// Approve-and-queue a mission from a Slack button: enqueue it in the per-repo
@@ -431,6 +655,83 @@ fn guidance(repo_root: &Path, mission_id: &str, text: &str) -> Result<()> {
     .context("enqueue guidance message")?;
     tracing::info!(mission = %mission_id, "guidance enqueued from Slack thread");
     Ok(())
+}
+
+/// `/kranz new <goal>` → create a mission and seed planning (M2.9 slice 1).
+///
+/// WIRED but NOT unit-tested: this builds the REAL backend
+/// (`ClaudeBackend::discover`) and runs one `planning_turn`, which spawns a
+/// `claude` child — exactly the same create + first-turn path the M2.5 host and
+/// the CLI take. Tests never call it (they would spawn `claude`); the parsing,
+/// allowlist gate, and rendering around it are all tested.
+///
+/// Flow (mirrors `kranz_server::MissionHost::create` + one planning turn):
+/// 1. `config::load(repo_root)` → the layered `MissionConfig`.
+/// 2. `ClaudeBackend::discover(cfg.claude_binary)` → the agent backend.
+/// 3. `MissionEngine::create(backend, repo_root, goal, cfg)` → the mission id.
+/// 4. one `planning_turn(goal)` to seed the ticket/goal and draw out the
+///    orchestrator's opening scoping questions.
+/// 5. post the ack (id + goal + opening reply) to a NEW Slack thread, and
+///    record the mission↔thread mapping so in-thread replies route back
+///    (subsequent multi-turn planning is a follow-up; the mapping is the hook
+///    it will build on).
+///
+/// Returns the ack blocks the caller sends ephemerally to the invoker; the
+/// public thread root is posted here.
+async fn new_mission(
+    client: &SlackClient,
+    repo_root: &Path,
+    threads: &SharedThreads,
+    goal: &str,
+    channel: &str,
+) -> Result<Vec<Value>> {
+    use kranz_engine::backend_claude::ClaudeBackend;
+    use kranz_engine::config;
+    use kranz_engine::orchestrator::MissionEngine;
+    use std::sync::Arc;
+
+    let cfg_engine = config::load(repo_root).context("loading mission config")?;
+    let backend = ClaudeBackend::discover(cfg_engine.claude_binary.as_deref())
+        .context("discovering claude backend")?;
+    let mut engine =
+        MissionEngine::create(Arc::new(backend), repo_root.to_path_buf(), goal, cfg_engine)
+            .context("creating mission")?;
+    let mission_id = engine.mission_id().to_string();
+
+    // One seeding planning turn: give the orchestrator the goal so its opening
+    // scoping questions come back to post in-thread. A captured seed reply
+    // (fresh session) happened first in the conversation, so prepend it.
+    let reply = engine.planning_turn(goal).await.context("seeding planning turn")?;
+    let opening = prepend_seed(engine.take_seed_reply(), reply);
+    let opening = opening.trim();
+    let opening_reply = (!opening.is_empty()).then(|| opening.to_string());
+
+    let blocks = crate::format::build_new_mission_ack(&crate::format::NewMissionAck {
+        mission_id: mission_id.clone(),
+        goal: goal.to_string(),
+        opening_reply,
+    });
+
+    // Post the planning thread root publicly, then record the mapping so
+    // in-thread replies route back to this mission.
+    let posted_ts = client
+        .post_message(channel, &blocks, None)
+        .await
+        .context("posting new-mission thread root")?;
+    threads.set(&mission_id, &posted_ts);
+
+    Ok(blocks)
+}
+
+/// Prepend a captured seed reply (fresh orchestrator session / re-seed) to a
+/// turn's reply — the seed happened first in the conversation. Mirrors the
+/// server host's `prepend_seed`.
+fn prepend_seed(seed: Option<String>, reply: String) -> String {
+    match seed.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        Some(seed) if !reply.trim().is_empty() => format!("{seed}\n\n{reply}"),
+        Some(seed) => seed,
+        None => reply,
+    }
 }
 
 /// `/kranz ticket <title>` → scaffold a ticket markdown file the human can then
@@ -555,6 +856,99 @@ mod tests {
         assert!(queue::list(tmp.path()).is_empty());
     }
 
+    #[test]
+    fn async_handled_actions_are_noops_in_apply_action() {
+        // Status / NewMission / RequestPlan / ApproveMission all reply over the
+        // network in dispatch_action; apply_action must not double-handle them.
+        let tmp = TempDir::new().unwrap();
+        apply_action(
+            tmp.path(),
+            &Action::Status { mission_id: None, response_url: None },
+        )
+        .unwrap();
+        apply_action(
+            tmp.path(),
+            &Action::RequestPlan {
+                mission_id: "m-1".into(),
+                user_id: None,
+                response_url: None,
+            },
+        )
+        .unwrap();
+        // Neither queued anything nor created a mission dir.
+        assert!(queue::list(tmp.path()).is_empty());
+    }
+
+    /// Seed a mission's `events.jsonl` with a single `mission.created` event,
+    /// built from public engine types so it folds exactly like a real log —
+    /// no git, no backend. Returns the mission id.
+    fn seed_mission(repo_root: &Path, mission_id: &str, goal: &str) {
+        use kranz_engine::events::{Event, EventKind};
+        use kranz_engine::types::MissionConfig;
+        let paths = MissionPaths::new(repo_root, mission_id);
+        std::fs::create_dir_all(paths.mission_dir()).unwrap();
+        let event = Event {
+            seq: 1,
+            ts: chrono::Utc::now(),
+            mission_id: mission_id.to_string(),
+            kind: EventKind::MissionCreated {
+                goal: goal.to_string(),
+                base_branch: "main".into(),
+                mission_branch: format!("kranz/mission-{mission_id}"),
+                config: MissionConfig::default(),
+            },
+        };
+        let line = serde_json::to_string(&event).unwrap();
+        std::fs::write(paths.events_file(), format!("{line}\n")).unwrap();
+    }
+
+    #[test]
+    fn build_status_reply_folds_the_log() {
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-abc", "Rate-limit the notes API");
+        let blocks = build_status_reply(tmp.path(), Some("m-abc")).unwrap();
+        let text = serde_json::to_string(&blocks).unwrap();
+        assert!(text.contains("m-abc"), "status carries the mission id");
+        assert!(text.contains("Rate-limit the notes API"), "status carries the goal");
+        // A freshly-created mission is in Planning.
+        assert!(text.contains("Planning"), "status pill reflects the folded state");
+    }
+
+    #[test]
+    fn build_status_reply_unknown_mission_is_error() {
+        let tmp = TempDir::new().unwrap();
+        let err = build_status_reply(tmp.path(), Some("m-nope")).unwrap_err().to_string();
+        assert!(err.contains("m-nope"), "error names the unknown mission");
+    }
+
+    #[test]
+    fn build_status_reply_no_missions_is_error() {
+        let tmp = TempDir::new().unwrap();
+        // No mission id and no missions on disk → a helpful error.
+        assert!(build_status_reply(tmp.path(), None).is_err());
+    }
+
+    #[test]
+    fn most_recent_mission_picks_a_seeded_mission() {
+        let tmp = TempDir::new().unwrap();
+        // No missions → None.
+        assert!(most_recent_mission(tmp.path()).is_none());
+        seed_mission(tmp.path(), "m-one", "first goal");
+        seed_mission(tmp.path(), "m-two", "second goal");
+        // With missions present, a bare status resolves to one of them (which
+        // exact one depends on filesystem mtime resolution, so don't pin it).
+        let picked = most_recent_mission(tmp.path()).expect("a mission is picked");
+        assert!(picked == "m-one" || picked == "m-two");
+        // And build_status_reply(None) succeeds by folding that mission.
+        assert!(build_status_reply(tmp.path(), None).is_ok());
+    }
+
+    #[test]
+    fn status_word_reflects_mission_status() {
+        assert_eq!(status_word(MissionStatus::Planning), "Planning");
+        assert_eq!(status_word(MissionStatus::Complete), "Complete");
+    }
+
     #[tokio::test]
     async fn handle_envelope_acks_with_envelope_id() {
         let tmp = TempDir::new().unwrap();
@@ -564,6 +958,7 @@ mod tests {
             app_token: "xapp".into(),
             channel: "C1".into(),
             notify: NotifyFlags::default(),
+            allow_users: vec![],
         };
         let client = SlackClient::new(&cfg).unwrap();
         let frame = json!({
@@ -590,6 +985,7 @@ mod tests {
             app_token: "xapp".into(),
             channel: "C1".into(),
             notify: NotifyFlags::default(),
+            allow_users: vec![],
         };
         let client = SlackClient::new(&cfg).unwrap();
         let hello = json!({ "type": "hello" }).to_string();
