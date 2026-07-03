@@ -150,6 +150,23 @@ struct FixFeaturesDecision {
     summary: String,
 }
 
+/// Outcome of a [`MissionEngine::request_plan`] turn.
+///
+/// "Not ready to emit, wants to keep talking" is a normal conversational
+/// state during planning — the orchestrator may still have open questions —
+/// so it is a variant here, not an [`EngineError`]. Only genuine transport/
+/// session failures surface as `Err`.
+#[derive(Debug)]
+pub enum PlanRequest {
+    /// The plan parsed; returned unapproved.
+    Ready(Plan),
+    /// Neither the plan turn nor the JSON-only retry produced parseable plan
+    /// JSON. Carries the orchestrator's reply text (scrubbed): the retry
+    /// turn's text, or the first turn's when the retry's is empty — so the
+    /// caller can show the user what the model actually said.
+    NotReady(String),
+}
+
 /// What the findings-conversion turn decided (see [`MissionEngine::convert_findings`]).
 enum FindingsConversion {
     /// Convert into fix features. Unparseable answers and answers that
@@ -202,6 +219,11 @@ pub struct MissionEngine {
     orch_transcript: Option<std::fs::File>,
     /// See [`DEFAULT_ORCH_STALL_TIMEOUT`]; shrunk by tests.
     orch_stall_timeout: Duration,
+    /// Reply text of the most recent seed turn (fresh session, resume-ack, or
+    /// re-seed), captured instead of discarded so the UI can surface it — the
+    /// planning seed's reply routinely ends with scoping questions the user
+    /// must see. Drained by [`MissionEngine::take_seed_reply`].
+    pending_seed_reply: Option<String>,
 }
 
 impl MissionEngine {
@@ -255,6 +277,7 @@ impl MissionEngine {
             orch_run_id: None,
             orch_transcript: None,
             orch_stall_timeout: DEFAULT_ORCH_STALL_TIMEOUT,
+            pending_seed_reply: None,
         })
     }
 
@@ -308,6 +331,7 @@ impl MissionEngine {
             orch_run_id: None,
             orch_transcript: None,
             orch_stall_timeout: DEFAULT_ORCH_STALL_TIMEOUT,
+            pending_seed_reply: None,
         })
     }
 
@@ -408,18 +432,37 @@ impl MissionEngine {
         self.orch_turn(user_text).await
     }
 
+    /// Take (and clear) the reply text of the most recent orchestrator seed
+    /// turn. `None` when no seed turn ran since the last take, or when its
+    /// reply was trivially empty. Callers surface this BEFORE the turn's own
+    /// output — the seed reply happened first in the conversation.
+    pub fn take_seed_reply(&mut self) -> Option<String> {
+        self.pending_seed_reply.take()
+    }
+
     /// Demand the plan JSON (types::Plan, camelCase). Lenient parse with one
-    /// retry; the plan is returned unapproved.
-    pub async fn request_plan(&mut self) -> Result<Plan> {
+    /// retry demanding bare JSON; a plan parses to [`PlanRequest::Ready`]
+    /// (unapproved). When the retry ALSO answers with prose, the orchestrator
+    /// is simply not ready to emit (it wants answers first) — that text comes
+    /// back as [`PlanRequest::NotReady`], never as an error.
+    pub async fn request_plan(&mut self) -> Result<PlanRequest> {
         let message = format!(
             "Emit the plan now. Output ONLY a JSON object conforming exactly to this JSON \
              Schema — no prose before or after:\n{}\n",
             plan_schema()
         );
-        let (plan, _text) = self.json_decision::<Plan>(&message).await?;
-        plan.ok_or_else(|| {
-            EngineError::Backend("orchestrator did not produce a parseable plan JSON".to_string())
-        })
+        let text = self.orch_turn(&message).await?;
+        if let Some(plan) = runner::parse_report::<Plan>(&text) {
+            return Ok(PlanRequest::Ready(plan));
+        }
+        let retry = self.orch_turn(JSON_RETRY_MSG).await?;
+        match runner::parse_report::<Plan>(&retry) {
+            Some(plan) => Ok(PlanRequest::Ready(plan)),
+            // Prefer the retry's text (the model's latest word); fall back to
+            // the first turn's when the retry came back empty. Both are
+            // already scrubbed by pump_turn.
+            None => Ok(PlanRequest::NotReady(if retry.trim().is_empty() { text } else { retry })),
+        }
     }
 
     /// Approve a plan: normalize it, create + check out the mission branch,
@@ -1460,9 +1503,16 @@ impl MissionEngine {
 
         // The seed is a full turn (the backend sends the streaming initial
         // prompt as the first user message); consume its Result so every
-        // later send/pump pair stays aligned.
+        // later send/pump pair stays aligned. The reply is captured (already
+        // scrubbed by pump_turn) rather than discarded: the planning seed's
+        // answer routinely ends with questions the user must see.
         match self.pump_turn().await {
-            Ok(_ack) => Ok(()),
+            Ok(ack) => {
+                if !ack.trim().is_empty() {
+                    self.pending_seed_reply = Some(ack);
+                }
+                Ok(())
+            }
             Err(e) => {
                 self.orch = None;
                 self.orch_run_id = None;
