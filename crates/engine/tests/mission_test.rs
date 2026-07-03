@@ -1238,18 +1238,31 @@ async fn plan_approval_writes_plan_branch_and_commit() {
     assert_eq!(ids, vec!["a-1", "a-2"]);
 
     // Mission branch created from main and checked out; the approval commit
-    // contains exactly plan.json.
+    // contains exactly plan.json + its human-readable plan.md twin.
     let branch = raw_git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]);
     assert_eq!(branch.trim(), format!("kranz/mission-{mission_id}"));
     let subject = raw_git(&root, &["log", "-1", "--format=%s"]);
     assert_eq!(subject.trim(), format!("[kranz] approved plan for {mission_id}"));
     let files = raw_git(&root, &["show", "--name-only", "--format=", "HEAD"]);
-    let files: Vec<&str> = files.lines().filter(|l| !l.trim().is_empty()).collect();
+    let mut files: Vec<&str> = files.lines().filter(|l| !l.trim().is_empty()).collect();
+    files.sort_unstable();
     assert_eq!(
         files,
-        vec![format!(".kranz/missions/{mission_id}/plan.json")],
-        "the approval commit contains exactly plan.json"
+        vec![
+            format!(".kranz/missions/{mission_id}/plan.json"),
+            format!(".kranz/missions/{mission_id}/plan.md"),
+        ],
+        "the approval commit contains exactly plan.json + plan.md"
     );
+    let md = std::fs::read_to_string(
+        root.join(".kranz").join("missions").join(&mission_id).join("plan.md"),
+    )
+    .expect("plan.md written");
+    assert!(md.starts_with(&format!("# Mission plan — {mission_id}")), "{md}");
+    assert!(md.contains("## Validation contract"), "{md}");
+    assert!(md.contains("**[a-1]**"), "{md}");
+    assert!(md.contains("## Milestone 1 —"), "{md}");
+    assert!(md.contains("Done when:"), "{md}");
     // main itself did not move: it still points at the seed commit.
     let main_subject = raw_git(&root, &["log", "-1", "--format=%s", "main"]);
     assert_eq!(main_subject.trim(), "seed");

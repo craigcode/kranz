@@ -500,8 +500,12 @@ impl MissionEngine {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&plan_file, serde_json::to_string_pretty(&plan)?)?;
+        // Human-readable twin, committed alongside: reviewable in any git UI
+        // and diffable across re-plans (plan.json stays the durable source).
+        let plan_md = plan_file.with_file_name("plan.md");
+        std::fs::write(&plan_md, render_plan_markdown(&plan, &self.state.mission))?;
         self.repo.commit_paths(
-            &[plan_file.as_path()],
+            &[plan_file.as_path(), plan_md.as_path()],
             &format!("[kranz] approved plan for {}", self.state.mission.id),
         )?;
 
@@ -1729,6 +1733,51 @@ fn next_feature(milestone: &Milestone) -> Option<usize> {
         .features
         .iter()
         .position(|f| matches!(f.status, FeatureStatus::Pending | FeatureStatus::Active))
+}
+
+/// Render the approved plan as human-readable markdown — committed to the
+/// mission branch beside plan.json for later review and reference. Pure and
+/// deterministic (no timestamps; git history carries the when).
+pub fn render_plan_markdown(plan: &Plan, mission: &Mission) -> String {
+    use std::fmt::Write as _;
+    let mut md = String::new();
+    let _ = writeln!(md, "# Mission plan — {}", mission.id);
+    let _ = writeln!(md, "\n**Goal:** {}\n", plan.goal);
+    let _ = writeln!(
+        md,
+        "Branch `{}` (from `{}`). Approved plan of record; the machine-readable \
+         twin is [plan.json](plan.json). Live status: `kranz status` or the dashboard.\n",
+        mission.mission_branch, mission.base_branch
+    );
+
+    let _ = writeln!(md, "## Validation contract\n");
+    let _ = writeln!(md, "Defined before any feature; gates mission completion.\n");
+    for a in &plan.validation_contract {
+        match (&a.check, &a.command) {
+            (AssertionCheck::Command, Some(cmd)) => {
+                let _ = writeln!(md, "- **[{}]** {} \n  `{}`", a.id, a.statement, cmd);
+            }
+            _ => {
+                let _ = writeln!(md, "- **[{}]** {} *(agent judgement)*", a.id, a.statement);
+            }
+        }
+    }
+
+    for (mi, m) in plan.milestones.iter().enumerate() {
+        let _ = writeln!(md, "\n## Milestone {} — {}\n", mi + 1, m.title);
+        for (fi, f) in m.features.iter().enumerate() {
+            let _ = writeln!(md, "### {}.{} {}\n", mi + 1, fi + 1, f.title);
+            let _ = writeln!(md, "{}\n", f.spec.trim());
+            if !f.validation_criteria.is_empty() {
+                let _ = writeln!(md, "Done when:");
+                for c in &f.validation_criteria {
+                    let _ = writeln!(md, "- {c}");
+                }
+                let _ = writeln!(md);
+            }
+        }
+    }
+    md
 }
 
 /// Assign `a-1..` ids to contract assertions with missing ids and
