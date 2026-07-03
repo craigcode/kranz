@@ -7,7 +7,7 @@ use crossterm::event::KeyCode;
 use kranz_cli::planning_tui::{
     approval_key, busy_status_line, classify_submission, wrap_text, ApprovalKey, BusyKind,
     InputEditor, PendingQueue, ScrollState, SubmitDisposition, APPROVAL_BAR, IDLE_STATUS,
-    SPINNER_FRAMES,
+    PLAN_NOT_READY_NOTICE, SPINNER_FRAMES,
 };
 
 // ---------------------------------------------------------------------------
@@ -373,6 +373,11 @@ fn fixed_status_texts_mention_their_keys() {
     assert!(IDLE_STATUS.contains("/quit"));
     assert!(APPROVAL_BAR.contains("[y]"));
     assert!(APPROVAL_BAR.contains("[n]"));
+    // The plan-not-ready notice points back at the conversation and the
+    // retry command — plain guidance, no error language.
+    assert!(PLAN_NOT_READY_NOTICE.contains("/plan"));
+    assert!(!PLAN_NOT_READY_NOTICE.to_lowercase().contains("error"));
+    assert!(!PLAN_NOT_READY_NOTICE.to_lowercase().contains("fail"));
 }
 
 // ---------------------------------------------------------------------------

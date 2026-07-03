@@ -23,7 +23,7 @@ use kranz_engine::backend_mock::{mock_init, mock_result_text, mock_text, MockBac
 use kranz_engine::control;
 use kranz_engine::event_log::EventLog;
 use kranz_engine::events::{Event, EventKind};
-use kranz_engine::orchestrator::MissionEngine;
+use kranz_engine::orchestrator::{MissionEngine, PlanRequest};
 use kranz_engine::paths::MissionPaths;
 use kranz_engine::reducer;
 use kranz_engine::types::*;
@@ -1013,10 +1013,14 @@ async fn force_reseed_reseeds_with_digest_and_plan() {
         .expect("planning turn must not hang")
         .unwrap();
     assert!(reply.contains("no open questions"));
-    let plan = timeout(TEST_TIMEOUT, engine.request_plan())
+    let plan = match timeout(TEST_TIMEOUT, engine.request_plan())
         .await
         .expect("request_plan must not hang")
-        .unwrap();
+        .unwrap()
+    {
+        PlanRequest::Ready(plan) => plan,
+        PlanRequest::NotReady(text) => panic!("scripted plan JSON must parse, got: {text}"),
+    };
     assert_eq!(plan.milestones.len(), 1);
     engine.approve_plan(plan).unwrap();
 
@@ -1060,6 +1064,147 @@ async fn force_reseed_reseeds_with_digest_and_plan() {
         &e.kind,
         EventKind::OrchestratorDecision { summary, .. } if summary.contains("re-seeded")
     )));
+}
+
+// ---------------------------------------------------------------------------
+// 7b. Planning conversation: plan-not-ready prose and seed-reply capture
+// ---------------------------------------------------------------------------
+
+/// An orchestrator that answers the plan demand AND the JSON-only retry with
+/// prose is not ready to emit — a conversational state, not a backend error:
+/// `request_plan` returns Ok(NotReady(<the prose>)), the mission stays in
+/// Planning, and the SAME session can still produce the plan on a later
+/// request (the conversation continued).
+#[tokio::test(flavor = "multi_thread")]
+async fn plan_not_ready_returns_prose() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let plan_json = json!({
+        "goal": GOAL,
+        "validationContract": [],
+        "milestones": [{
+            "title": "M1",
+            "features": [
+                { "title": "feature 1", "spec": "build part 1", "validationCriteria": ["part 1 works"] }
+            ]
+        }]
+    })
+    .to_string();
+    let prose_first =
+        "Before I emit the plan I still need an answer: which database should the demo target?"
+            .to_string();
+    let prose_retry =
+        "I cannot emit the plan yet — please answer the database question first.".to_string();
+
+    // One streaming orchestrator session; turns in order: plan demand →
+    // prose, JSON-only retry → prose again, second plan demand → plan JSON.
+    let backend = Arc::new(MockBackend::with_scripts(vec![orch_script(vec![
+        prose_first,
+        prose_retry,
+        plan_json,
+    ])]));
+
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    let request = timeout(TEST_TIMEOUT, engine.request_plan())
+        .await
+        .expect("request_plan must not hang")
+        .expect("prose replies are a conversational state, not a backend error");
+    match request {
+        PlanRequest::NotReady(text) => assert!(
+            text.contains("database question"),
+            "NotReady carries the retry turn's prose: {text}"
+        ),
+        PlanRequest::Ready(plan) => panic!("prose must not parse as a plan: {plan:?}"),
+    }
+    assert_eq!(
+        engine.state().mission.status,
+        MissionStatus::Planning,
+        "a not-ready plan request leaves the mission in Planning"
+    );
+
+    // The conversation continued on the same session: the next request
+    // parses the scripted plan JSON.
+    let request = timeout(TEST_TIMEOUT, engine.request_plan())
+        .await
+        .expect("second request_plan must not hang")
+        .unwrap();
+    match request {
+        PlanRequest::Ready(plan) => assert_eq!(plan.milestones.len(), 1),
+        PlanRequest::NotReady(text) => panic!("scripted plan JSON must parse, got: {text}"),
+    }
+}
+
+/// The seed turn's reply (the orchestrator's first words — often scoping
+/// questions) is captured instead of discarded: `take_seed_reply` returns it
+/// exactly once after the first turn of a fresh session, and again for the
+/// resume-ack seed when a restarted engine resumes the sdk session.
+#[tokio::test(flavor = "multi_thread")]
+async fn seed_reply_is_captured_once_for_fresh_and_resumed_sessions() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    // --- Fresh session: the planning seed's reply ends in questions -------
+    let seed_text = "Two questions before I plan: which auth flows are in scope, and is the \
+                     dashboard part of this mission?";
+    let backend = Arc::new(MockBackend::with_scripts(vec![MockScript::streaming(vec![
+        mock_init("orch-session"),
+        mock_text(seed_text),
+        mock_result_text(seed_text),
+    ])
+    .responding(vec![vec![mock_text("noted"), mock_result_text("noted")]])]));
+
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    let reply = timeout(TEST_TIMEOUT, engine.planning_turn("hello"))
+        .await
+        .expect("planning turn must not hang")
+        .unwrap();
+    assert_eq!(reply, "noted");
+    assert_eq!(
+        engine.take_seed_reply().as_deref(),
+        Some(seed_text),
+        "the seed turn's reply is captured, not discarded"
+    );
+    assert_eq!(engine.take_seed_reply(), None, "the seed reply is taken exactly once");
+
+    let mission_id = engine.mission_id().to_string();
+    drop(engine); // releases the lock; the sdk session id is on the log
+
+    // --- Resume path: the resume-ack seed reply is captured too -----------
+    let ack_text = "Acknowledged — resuming the planning conversation.";
+    let backend2 = Arc::new(MockBackend::with_scripts(vec![MockScript::streaming(vec![
+        mock_init("orch-session"),
+        mock_text(ack_text),
+        mock_result_text(ack_text),
+    ])
+    .responding(vec![vec![mock_text("continuing"), mock_result_text("continuing")]])]));
+    let backend2_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend2) as Arc<dyn AgentBackend>;
+    let mut engine =
+        MissionEngine::resume(backend2_dyn, &root, &mission_id, false).expect("resume mission");
+
+    let reply = timeout(TEST_TIMEOUT, engine.planning_turn("go on"))
+        .await
+        .expect("resumed planning turn must not hang")
+        .unwrap();
+    assert_eq!(reply, "continuing");
+    assert_eq!(
+        engine.take_seed_reply().as_deref(),
+        Some(ack_text),
+        "the resume-ack seed reply is captured"
+    );
+    assert_eq!(engine.take_seed_reply(), None);
+
+    // And that second session really was a --resume of the first.
+    let specs = backend2.started_specs();
+    let orch_spec = specs
+        .iter()
+        .find(|s| matches!(s.prompt, PromptMode::Streaming(_)))
+        .expect("the resumed engine started a streaming orchestrator session");
+    assert!(orch_spec.resume.is_some(), "resume-ack path expected (--resume set)");
 }
 
 // ---------------------------------------------------------------------------

@@ -15,7 +15,7 @@ use kranz_engine::config;
 use kranz_engine::control;
 use kranz_engine::cost;
 use kranz_engine::event_log::EventLog;
-use kranz_engine::orchestrator::MissionEngine;
+use kranz_engine::orchestrator::{MissionEngine, PlanRequest};
 use kranz_engine::paths::MissionPaths;
 use kranz_engine::reducer;
 use kranz_engine::types::{ControlCommand, MissionConfig, MissionState, MissionStatus};
@@ -389,8 +389,24 @@ async fn cmd_plan(
         match line.as_str() {
             "/quit" => break,
             "/plan" => {
-                let plan = match engine.request_plan().await {
-                    Ok(plan) => plan,
+                let request = engine.request_plan().await;
+                // A seed turn may have run inside this request (fresh session
+                // or resume-ack); its reply came first — show it first.
+                if let Some(seed) = engine.take_seed_reply() {
+                    print_orchestrator_reply(&seed, tty);
+                }
+                let plan = match request {
+                    Ok(PlanRequest::Ready(plan)) => plan,
+                    Ok(PlanRequest::NotReady(text)) => {
+                        // A conversational state, not an error: the
+                        // orchestrator wants answers before emitting.
+                        print_orchestrator_reply(&text, tty);
+                        println!(
+                            "the orchestrator isn't ready to emit the plan yet — answer it \
+                             above, then /plan again."
+                        );
+                        continue;
+                    }
                     Err(e) => {
                         eprintln!("kranz: plan request failed: {:#}", augment_limit_hint(e.into()));
                         continue;
@@ -427,13 +443,21 @@ async fn cmd_plan(
             _ if line.starts_with('/') => {
                 println!("unknown command {line}; use /plan or /quit");
             }
-            _ => match engine.planning_turn(&line).await {
-                Ok(reply) => print_orchestrator_reply(&reply, tty),
-                Err(e) => eprintln!(
-                    "kranz: orchestrator turn failed: {:#}",
-                    augment_limit_hint(e.into())
-                ),
-            },
+            _ => {
+                let result = engine.planning_turn(&line).await;
+                // Surface a captured seed reply (session start / re-seed)
+                // before this turn's own output — it happened first.
+                if let Some(seed) = engine.take_seed_reply() {
+                    print_orchestrator_reply(&seed, tty);
+                }
+                match result {
+                    Ok(reply) => print_orchestrator_reply(&reply, tty),
+                    Err(e) => eprintln!(
+                        "kranz: orchestrator turn failed: {:#}",
+                        augment_limit_hint(e.into())
+                    ),
+                }
+            }
         }
     }
     if !approved {

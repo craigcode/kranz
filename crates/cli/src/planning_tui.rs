@@ -51,7 +51,7 @@ use crossterm::terminal::{
 use kranz_engine::cost;
 use kranz_engine::error::EngineError;
 use kranz_engine::event_log::EventLog;
-use kranz_engine::orchestrator::MissionEngine;
+use kranz_engine::orchestrator::{MissionEngine, PlanRequest};
 use kranz_engine::types::Plan;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
@@ -437,6 +437,11 @@ pub const APPROVAL_BAR: &str =
 /// Detached-scroll marker shown on the transcript's bottom row.
 pub const DETACHED_MARKER: &str = "▼ new output below — End to follow";
 
+/// Notice shown when `/plan` resolves to [`PlanRequest::NotReady`]: the
+/// orchestrator wants answers before emitting — a normal conversational
+/// state, rendered as a plain notice (no error styling, no approval mode).
+pub const PLAN_NOT_READY_NOTICE: &str = "not ready to emit — answer above, then /plan again";
+
 /// Busy status line: spinner frame + activity + elapsed + queue depth.
 pub fn busy_status_line(
     kind: BusyKind,
@@ -631,7 +636,7 @@ type TurnFut = Pin<Box<dyn Future<Output = (Box<MissionEngine>, TurnOutput)>>>;
 
 enum TurnOutput {
     Reply(std::result::Result<String, EngineError>),
-    Plan(std::result::Result<Plan, EngineError>),
+    Plan(std::result::Result<PlanRequest, EngineError>),
 }
 
 enum Phase {
@@ -1072,7 +1077,14 @@ impl TuiRun {
         }
     }
 
-    fn on_turn_done(&mut self, engine: Box<MissionEngine>, out: TurnOutput) {
+    fn on_turn_done(&mut self, mut engine: Box<MissionEngine>, out: TurnOutput) {
+        // A seed turn may have run inside this turn (fresh session, resume
+        // ack, or re-seed). Its reply — often the orchestrator's scoping
+        // questions — happened first in the conversation, so it enters the
+        // transcript before the turn's own output.
+        if let Some(seed) = engine.take_seed_reply() {
+            self.app.push(TranscriptEntry::Orch(seed));
+        }
         match out {
             TurnOutput::Reply(Ok(text)) => {
                 self.app.push(TranscriptEntry::Orch(text));
@@ -1085,7 +1097,14 @@ impl TuiRun {
                 self.app.error = Some(format!("orchestrator turn failed: {message}"));
                 self.phase = Phase::Idle(engine);
             }
-            TurnOutput::Plan(Ok(plan)) => {
+            TurnOutput::Plan(Ok(PlanRequest::NotReady(text))) => {
+                // Conversational, not an error: show what the orchestrator
+                // said and return to idle — no approval mode, no red.
+                self.app.push(TranscriptEntry::Orch(text));
+                self.app.push(TranscriptEntry::Notice(PLAN_NOT_READY_NOTICE.to_string()));
+                self.phase = Phase::Idle(engine);
+            }
+            TurnOutput::Plan(Ok(PlanRequest::Ready(plan))) => {
                 self.app
                     .push(TranscriptEntry::Block(output::render_plan(&plan).trim_end().to_string()));
                 let estimate = cost::estimate(
