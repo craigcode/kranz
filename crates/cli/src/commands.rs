@@ -321,11 +321,11 @@ async fn cmd_plan(
     force_lock: bool,
 ) -> Result<i32> {
     let backend = build_backend(&cfg)?;
-    let mut engine = match goal {
+    let (mut engine, intro) = match goal {
         Some(goal) => {
             let engine = MissionEngine::create(backend, repo, &goal, cfg)?;
-            println!("mission {} created (planning)", engine.mission_id());
-            engine
+            let intro = format!("mission {} created (planning)", engine.mission_id());
+            (engine, intro)
         }
         None => {
             let mission = select_planning_mission(&repo, explicit_mission)?;
@@ -337,13 +337,23 @@ async fn cmd_plan(
                     engine.state().mission.status
                 ));
             }
-            println!(
+            let intro = format!(
                 "resuming planning for mission {mission} — the conversation continues \
                  where it left off"
             );
-            engine
+            (engine, intro)
         }
     };
+
+    // A real terminal on both ends gets the full-screen planning TUI, which
+    // owns the whole interaction (conversation, live activity, /plan +
+    // approval, exit hints) — the event-tail printer below must never run
+    // concurrently with it. Piped/scripted stdio keeps the line-mode REPL
+    // unchanged: lines arrive up-front by design and are never discarded.
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        return crate::planning_tui::run(engine, intro).await;
+    }
+    println!("{intro}");
     let tty = std::io::stdout().is_terminal();
 
     // Live activity feed: without it, a long orchestrator turn (opus reading
