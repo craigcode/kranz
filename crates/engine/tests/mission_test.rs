@@ -346,6 +346,46 @@ async fn happy_path_completes_mission_with_tag_and_contract_gate() {
         .features
         .iter()
         .all(|f| f.status == FeatureStatus::Complete));
+
+    // M1 completion report: report.md exists in the mission dir with the
+    // documented sections, and the report commit landed on the mission
+    // branch BEFORE mission.completed was emitted (it is HEAD — nothing
+    // commits after it).
+    let report = std::fs::read_to_string(
+        root.join(".kranz").join("missions").join(&mission_id).join("report.md"),
+    )
+    .expect("report.md written at completion");
+    assert!(report.starts_with(&format!("# Mission report — {mission_id}")), "{report}");
+    assert!(report.contains("## What shipped"), "{report}");
+    assert!(report.contains("feature 1"), "{report}");
+    assert!(report.contains("## Validation history"), "{report}");
+    assert!(report.contains("actual vs"), "{report}");
+    assert!(report.contains("## Contract outcomes"), "{report}");
+    assert!(report.contains("**[a-2]**"), "both assertions listed: {report}");
+
+    let subject = raw_git(&root, &["log", "-1", "--format=%s"]);
+    assert_eq!(subject.trim(), format!("[kranz] mission report for {mission_id}"));
+    let files = raw_git(&root, &["show", "--name-only", "--format=", "HEAD"]);
+    let mut files: Vec<&str> = files.lines().filter(|l| !l.trim().is_empty()).collect();
+    files.sort_unstable();
+    assert_eq!(
+        files,
+        vec![
+            ".kranz/missions/index.md".to_string(),
+            format!(".kranz/missions/{mission_id}/report.md"),
+        ],
+        "the report commit carries report.md + the refreshed index"
+    );
+
+    // The mission's index line kept its format and gained the report link.
+    let index =
+        std::fs::read_to_string(root.join(".kranz").join("missions").join("index.md")).unwrap();
+    let line = index
+        .lines()
+        .find(|l| l.contains(&format!("[{mission_id}](")))
+        .expect("mission line in index.md");
+    assert!(line.contains(&format!("({mission_id}/plan.md)")), "plan link kept: {line}");
+    assert!(line.contains(&format!("[report]({mission_id}/report.md)")), "report link: {line}");
 }
 
 // ---------------------------------------------------------------------------
@@ -522,6 +562,7 @@ async fn waive_completes_milestone() {
     assert_eq!(ms.fix_cycles, 0, "a waived round consumes no fix cycle");
     assert!(ms.features.iter().all(|f| f.origin == FeatureOrigin::Plan));
 
+    let mission_id = engine.mission_id().to_string();
     let paths = engine.paths().clone();
     drop(engine);
     let events = read_log(&paths);
@@ -551,6 +592,18 @@ async fn waive_completes_milestone() {
     assert!(summary.contains("waived 1 finding(s)"), "summary: {summary}");
     assert!(summary.contains("part 1 works"), "summary names the subject: {summary}");
     assert!(detail.contains("docstring nitpick"), "detail carries the reason: {detail}");
+
+    // The completion report replays the round: the waived finding is listed
+    // with its severity/subject/evidence and the waiver's justification.
+    let report = std::fs::read_to_string(
+        root.join(".kranz").join("missions").join(&mission_id).join("report.md"),
+    )
+    .expect("report.md written at completion");
+    assert!(report.contains("## Validation history"), "{report}");
+    assert!(report.contains("[minor] part 1 works"), "finding listed: {report}");
+    assert!(report.contains("docstring omits the error case"), "evidence listed: {report}");
+    assert!(report.contains("Disposition: waived."), "{report}");
+    assert!(report.contains("part 1 works: docstring nitpick"), "waiver reason: {report}");
 }
 
 // ---------------------------------------------------------------------------
@@ -784,7 +837,16 @@ async fn pause_resume_and_user_message_flow() {
 
     let (engine, result) = timeout(TEST_TIMEOUT, handle).await.expect("run must not hang").unwrap();
     assert_eq!(result.unwrap(), MissionStatus::Complete);
+    let mission_id = engine.mission_id().to_string();
     drop(engine);
+
+    // The completion report folds the paused span out of the elapsed time
+    // and says so (mission.paused → mission.resumed is > 1s in this test).
+    let report = std::fs::read_to_string(
+        root.join(".kranz").join("missions").join(&mission_id).join("report.md"),
+    )
+    .expect("report.md written at completion");
+    assert!(report.contains("paused)"), "paused time surfaced: {report}");
 
     let events = read_log(&paths);
     let paused = seq_of(&events, "mission.paused");
@@ -1318,4 +1380,26 @@ fn mission_index_upserts_by_id() {
     let re = upsert_mission_index(&two, "m-aaa", "first goal, re-planned", d2);
     assert_eq!(re.matches("[m-aaa](").count(), 1, "no duplicate on re-approval: {re}");
     assert!(re.contains("first goal, re-planned"), "{re}");
+}
+
+/// The completion-report link appends to exactly the named mission's line,
+/// idempotently, without disturbing the line format.
+#[test]
+fn mission_index_report_link_appends_once() {
+    use kranz_engine::orchestrator::{mark_mission_index_report, upsert_mission_index};
+    let d = chrono::NaiveDate::from_ymd_opt(2026, 7, 3).unwrap();
+    let index = upsert_mission_index("", "m-aaa", "goal", d);
+    let index = upsert_mission_index(&index, "m-bbb", "other goal", d);
+
+    let marked = mark_mission_index_report(&index, "m-aaa");
+    assert!(
+        marked.contains("- 2026-07-03 · [m-aaa](m-aaa/plan.md) — goal · [report](m-aaa/report.md)"),
+        "{marked}"
+    );
+    assert!(!marked.contains("[report](m-bbb/report.md)"), "only the named mission: {marked}");
+
+    let again = mark_mission_index_report(&marked, "m-aaa");
+    assert_eq!(again, marked, "idempotent");
+    let unknown = mark_mission_index_report(&marked, "m-zzz");
+    assert_eq!(unknown, marked, "unknown id leaves the index unchanged");
 }
