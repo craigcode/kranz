@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/engine", "crates/cli", "crates/server"]
+members = ["crates/engine", "crates/cli", "crates/server", "crates/slack"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,6 +12,7 @@ readme = "README.md"
 [workspace.dependencies]
 kranz-engine = { version = "0.1.0", path = "crates/engine" }
 kranz-server = { version = "0.1.0", path = "crates/server" }
+kranz-slack = { version = "0.1.0", path = "crates/slack" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -29,5 +30,8 @@ clap = { version = "4", features = ["derive"] }
 axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["fs", "cors"] }
 futures = "0.3"
+futures-util = "0.3"
 ratatui = "0.29"
 crossterm = "0.28"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

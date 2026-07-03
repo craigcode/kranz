@@ -23,8 +23,10 @@ pub mod cost;
 pub mod event_log;
 pub mod git_ops;
 pub mod prompts;
+pub mod queue;
 pub mod reducer;
 pub mod scrub;
+pub mod ticket;
 
 pub mod backend_claude;
 pub mod backend_mock;
