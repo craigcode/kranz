@@ -1403,3 +1403,102 @@ fn mission_index_report_link_appends_once() {
     let unknown = mark_mission_index_report(&marked, "m-zzz");
     assert_eq!(unknown, marked, "unknown id leaves the index unchanged");
 }
+
+// ---------------------------------------------------------------------------
+// 9. Mission hygiene: abandon (roadmap M2)
+// ---------------------------------------------------------------------------
+
+/// Abandoning a freshly-created (planning) mission appends exactly one
+/// `mission.abandoned` event on a still-contiguous log, and the reducer folds
+/// the log to `Abandoned`. The snapshot is refreshed to match.
+#[tokio::test(flavor = "multi_thread")]
+async fn abandon_planning_mission_sets_abandoned_status() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let backend = Arc::new(MockBackend::new());
+    let engine = make_engine(&backend, &root, test_cfg());
+    let mission_id = engine.mission_id().to_string();
+    let paths = engine.paths().clone();
+    // Drop the engine so its lock is released before abandon re-acquires it.
+    drop(engine);
+
+    let before = read_log(&paths);
+    assert_eq!(reducer::fold(&before).unwrap().mission.status, MissionStatus::Planning);
+
+    kranz_engine::orchestrator::abandon_mission(&root, &mission_id, "no longer needed", false)
+        .expect("abandon a planning mission");
+
+    // Exactly one new event, of the right kind, carrying the reason.
+    let after = read_log(&paths);
+    assert_eq!(after.len(), before.len() + 1, "one event appended");
+    assert_eq!(after.first().unwrap().seq, 1);
+    assert_eq!(after.last().unwrap().seq, after.len() as u64, "contiguous seq");
+    assert!(matches!(
+        &after.last().unwrap().kind,
+        EventKind::MissionAbandoned { reason } if reason == "no longer needed"
+    ));
+
+    // The reducer folds to Abandoned, and the on-disk snapshot matches.
+    assert_eq!(reducer::fold(&after).unwrap().mission.status, MissionStatus::Abandoned);
+    let snapshot = reducer::read_snapshot(&paths.state_file()).expect("state.json");
+    assert_eq!(snapshot.mission.status, MissionStatus::Abandoned);
+    assert_eq!(snapshot.last_seq, after.last().unwrap().seq);
+}
+
+/// Abandoning an already-terminal mission errors without touching the log.
+#[tokio::test(flavor = "multi_thread")]
+async fn abandon_already_terminal_mission_errors() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let backend = Arc::new(MockBackend::new());
+    let engine = make_engine(&backend, &root, test_cfg());
+    let mission_id = engine.mission_id().to_string();
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    // First abandon succeeds and makes the mission terminal.
+    kranz_engine::orchestrator::abandon_mission(&root, &mission_id, "first", false).unwrap();
+    let after_first = read_log(&paths);
+
+    // A second abandon is rejected: the mission is already terminal.
+    let err = kranz_engine::orchestrator::abandon_mission(&root, &mission_id, "again", false)
+        .expect_err("abandoning a terminal mission must error");
+    assert!(
+        err.to_string().contains("already terminal"),
+        "error should name the terminal state: {err}"
+    );
+
+    // The rejected call appended nothing.
+    let after_second = read_log(&paths);
+    assert_eq!(after_second.len(), after_first.len(), "no event appended on the rejected abandon");
+}
+
+/// A live engine holding the mission lock makes abandon fail with LockHeld
+/// (the CLI turns this into "stop the running mission or pass --force-lock").
+#[tokio::test(flavor = "multi_thread")]
+async fn abandon_fails_while_engine_holds_lock() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let backend = Arc::new(MockBackend::new());
+    // Keep the engine ALIVE: it still holds the single-writer lock.
+    let engine = make_engine(&backend, &root, test_cfg());
+    let mission_id = engine.mission_id().to_string();
+
+    let err = kranz_engine::orchestrator::abandon_mission(&root, &mission_id, "x", false)
+        .expect_err("abandon must fail while the lock is held");
+    assert!(
+        matches!(err, kranz_engine::error::EngineError::LockHeld(_)),
+        "expected LockHeld, got: {err}"
+    );
+
+    drop(engine);
+}

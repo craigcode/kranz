@@ -617,3 +617,185 @@ fn limit_errors_gain_resume_hint() {
     let msg = format!("{:#}", commands::augment_limit_hint(other));
     assert!(!msg.contains("usage window"), "{msg}");
 }
+
+// ---------------------------------------------------------------------------
+// Mission hygiene: abandon / clean parsing + cleanable classifier (roadmap M2)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parses_abandon() {
+    // Bare abandon: id via the global --mission, default reason.
+    let cli = Cli::try_parse_from(["kranz", "abandon"]).unwrap();
+    assert!(matches!(cli.command, Command::Abandon { id: None, reason: None }));
+
+    // Positional id + explicit reason.
+    let cli = Cli::try_parse_from(["kranz", "abandon", "m-42", "--reason", "cut from scope"])
+        .unwrap();
+    match cli.command {
+        Command::Abandon { id, reason } => {
+            assert_eq!(id.as_deref(), Some("m-42"));
+            assert_eq!(reason.as_deref(), Some("cut from scope"));
+        }
+        other => panic!("expected Abandon, got {other:?}"),
+    }
+
+    // The global --mission also feeds abandon (id positional stays None).
+    let cli = Cli::try_parse_from(["kranz", "--mission", "m-7", "abandon"]).unwrap();
+    assert_eq!(cli.mission.as_deref(), Some("m-7"));
+    assert!(matches!(cli.command, Command::Abandon { id: None, .. }));
+}
+
+#[test]
+fn parses_clean() {
+    let cli = Cli::try_parse_from(["kranz", "clean"]).unwrap();
+    assert!(matches!(cli.command, Command::Clean { yes: false, all: false }));
+
+    let cli = Cli::try_parse_from(["kranz", "clean", "--yes", "--all"]).unwrap();
+    assert!(matches!(cli.command, Command::Clean { yes: true, all: true }));
+
+    let cli = Cli::try_parse_from(["kranz", "clean", "--yes"]).unwrap();
+    assert!(matches!(cli.command, Command::Clean { yes: true, all: false }));
+}
+
+/// The pure status→class classifier (in the engine) selects exactly the right
+/// set for each combination of folded status and plan.json presence.
+#[test]
+fn cleanable_class_selects_the_right_missions() {
+    use kranz_engine::orchestrator::{cleanable_class, CleanClass};
+
+    // Terminal-not-complete is always stale.
+    assert_eq!(cleanable_class(MissionStatus::Failed, true), CleanClass::Stale);
+    assert_eq!(cleanable_class(MissionStatus::Abandoned, false), CleanClass::Stale);
+
+    // Planning: a husk (no plan) is stale; with a plan it is live work.
+    assert_eq!(cleanable_class(MissionStatus::Planning, false), CleanClass::Stale);
+    assert_eq!(cleanable_class(MissionStatus::Planning, true), CleanClass::Keep);
+
+    // Complete is kept by default, removed only with --all.
+    assert_eq!(cleanable_class(MissionStatus::Complete, true), CleanClass::CompleteKeepByDefault);
+    assert!(!cleanable_class(MissionStatus::Complete, true).is_cleaned(false));
+    assert!(cleanable_class(MissionStatus::Complete, true).is_cleaned(true));
+
+    // Live non-terminal states are always kept.
+    for status in [
+        MissionStatus::Running,
+        MissionStatus::Paused,
+        MissionStatus::Blocked,
+        MissionStatus::Validating,
+    ] {
+        assert_eq!(cleanable_class(status, true), CleanClass::Keep, "{status:?}");
+        assert!(!cleanable_class(status, false).is_cleaned(true), "{status:?} with --all");
+    }
+}
+
+/// Write a plan.json for a mission (marks it "past planning" for the classifier).
+fn write_plan_json(repo: &Path, mission_id: &str) {
+    let dir = repo.join(".kranz").join("missions").join(mission_id);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("plan.json"), serde_json::to_string(&sample_plan()).unwrap()).unwrap();
+}
+
+/// Write a lock file recording `pid` for a mission (a live current-process pid
+/// makes the mission read as "running").
+fn write_lock(repo: &Path, mission_id: &str, pid: u32) {
+    let dir = repo.join(".kranz").join("missions").join(mission_id);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("events.jsonl.lock"), pid.to_string()).unwrap();
+}
+
+/// `select_cleanable` over a tempdir of hand-written missions: it picks the
+/// terminal + planning-husk missions, never the planning-with-plan mission,
+/// and never a mission whose lock is held by a live pid.
+#[test]
+fn select_cleanable_over_mixed_missions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+
+    // Failed: terminal → stale.
+    write_events(
+        repo,
+        "m-failed",
+        vec![created_kind("g", "m-failed"), EventKind::MissionFailed { reason: "x".into() }],
+    );
+    // Abandoned: terminal → stale.
+    write_events(
+        repo,
+        "m-abandoned",
+        vec![created_kind("g", "m-abandoned"), EventKind::MissionAbandoned { reason: "x".into() }],
+    );
+    // Planning husk: still Planning, NO plan.json → stale.
+    write_events(repo, "m-husk", vec![created_kind("g", "m-husk")]);
+    // Planning WITH a plan.json → live work, keep.
+    write_events(repo, "m-planned", vec![created_kind("g", "m-planned")]);
+    write_plan_json(repo, "m-planned");
+    // Complete: kept by default, removed only with --all.
+    write_events(
+        repo,
+        "m-complete",
+        vec![created_kind("g", "m-complete"), EventKind::MissionCompleted {}],
+    );
+    // Failed but its lock is held by THIS live process → never cleaned.
+    write_events(
+        repo,
+        "m-running",
+        vec![created_kind("g", "m-running"), EventKind::MissionFailed { reason: "x".into() }],
+    );
+    write_lock(repo, "m-running", std::process::id());
+
+    // Default (no --all): failed + abandoned + husk, but not planned/complete/running.
+    let ids: Vec<String> = commands::select_cleanable(repo, false)
+        .into_iter()
+        .map(|e| e.id)
+        .collect();
+    assert!(ids.contains(&"m-failed".to_string()), "{ids:?}");
+    assert!(ids.contains(&"m-abandoned".to_string()), "{ids:?}");
+    assert!(ids.contains(&"m-husk".to_string()), "{ids:?}");
+    assert!(!ids.contains(&"m-planned".to_string()), "planning-with-plan kept: {ids:?}");
+    assert!(!ids.contains(&"m-complete".to_string()), "complete kept by default: {ids:?}");
+    assert!(!ids.contains(&"m-running".to_string()), "live-locked never cleaned: {ids:?}");
+
+    // --all additionally includes the Complete mission (still never running).
+    let ids_all: Vec<String> = commands::select_cleanable(repo, true)
+        .into_iter()
+        .map(|e| e.id)
+        .collect();
+    assert!(ids_all.contains(&"m-complete".to_string()), "--all includes complete: {ids_all:?}");
+    assert!(!ids_all.contains(&"m-running".to_string()), "live-locked still safe: {ids_all:?}");
+    assert!(!ids_all.contains(&"m-planned".to_string()), "planning-with-plan still kept: {ids_all:?}");
+}
+
+/// The removal path deletes exactly the selected mission directories and leaves
+/// everything else — the kept missions and the missions/index.md — in place.
+#[test]
+fn remove_missions_deletes_selected_and_keeps_index_and_others() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+
+    write_events(
+        repo,
+        "m-failed",
+        vec![created_kind("g", "m-failed"), EventKind::MissionFailed { reason: "x".into() }],
+    );
+    write_events(repo, "m-planned", vec![created_kind("g", "m-planned")]);
+    write_plan_json(repo, "m-planned");
+
+    // A missions index.md must survive cleaning (never removed).
+    let missions_dir = repo.join(".kranz").join("missions");
+    fs::write(missions_dir.join("index.md"), "# Kranz missions\n").unwrap();
+
+    let entries = commands::select_cleanable(repo, false);
+    let removed = commands::remove_missions(repo, &entries, false);
+    assert_eq!(removed, vec!["m-failed".to_string()], "only the failed mission removed");
+
+    assert!(!missions_dir.join("m-failed").exists(), "failed mission dir gone");
+    assert!(missions_dir.join("m-planned").exists(), "planning-with-plan mission kept");
+    assert!(missions_dir.join("index.md").is_file(), "missions index.md untouched");
+    // Nothing else lingering: exactly the kept mission dir + the index remain.
+    let mut remaining: Vec<String> = fs::read_dir(&missions_dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    remaining.sort();
+    assert_eq!(remaining, vec!["index.md".to_string(), "m-planned".to_string()]);
+}

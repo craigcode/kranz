@@ -2306,6 +2306,150 @@ fn write_kranz_gitignore(paths: &MissionPaths) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Mission hygiene (roadmap M2): abandon + clean classification
+//
+// These are lifecycle helpers kept deliberately OUTSIDE the run loop — they
+// never touch the orchestrator session and only ever append the terminal
+// `mission.abandoned` event or classify a directory for removal.
+// ---------------------------------------------------------------------------
+
+/// Retire a mission as [`MissionStatus::Abandoned`] — a terminal, operator-
+/// initiated end-of-life that is *not* a failure (§ roadmap M2 "mission
+/// hygiene"; the contract already defines the event + reducer mapping).
+///
+/// Acquires the single-writer lock via [`EventLog::acquire`], so a live engine
+/// holding it surfaces as [`EngineError::LockHeld`] (the CLI then tells the
+/// operator to stop the running mission or pass `--force-lock`). A mission that
+/// is already terminal (Complete/Failed/Abandoned) is rejected with
+/// [`EngineError::InvalidState`] — abandoning is only meaningful for live work.
+/// On success one `mission.abandoned` event is appended, the state snapshot is
+/// refreshed, and the lock released on drop.
+///
+/// A ticket that points at this mission is left untouched: the reverse mapping
+/// (`.kranz/tickets/<slug>.status` → mission id) is not cheaply invertible, and
+/// abandoning the mission is the operator's intent regardless.
+pub fn abandon_mission(
+    repo_root: impl Into<PathBuf>,
+    mission_id: &str,
+    reason: &str,
+    force_lock: bool,
+) -> Result<()> {
+    let repo_root = canonical_root(repo_root.into());
+    let paths = MissionPaths::new(&repo_root, mission_id);
+
+    // Fold the existing log first so we can reject an already-terminal mission
+    // before writing anything.
+    let events = EventLog::read_events(&paths.events_file())?;
+    let state = reducer::fold(&events)?;
+    if is_terminal_status(state.mission.status) {
+        return Err(EngineError::InvalidState(format!(
+            "mission '{mission_id}' is already terminal ({:?}); nothing to abandon",
+            state.mission.status
+        )));
+    }
+
+    // Acquire the lock (LockHeld ⇒ a live engine owns this mission).
+    let mut log = EventLog::acquire(
+        &paths,
+        mission_id,
+        Duration::from_millis(state.config.event_stream_throttle_ms),
+        force_lock,
+    )?;
+    let event = log.append(EventKind::MissionAbandoned { reason: reason.to_string() })?;
+    // Fold the one new event on top of the state we already have and snapshot,
+    // so state.json matches the log without a full re-fold.
+    let mut state = state;
+    reducer::apply(&mut state, &event)?;
+    reducer::write_snapshot(&state, &paths.state_file())?;
+    // `log` drops here: buffer flushed, lock released.
+    Ok(())
+}
+
+/// Terminal mission statuses (no further work will ever run against them).
+pub fn is_terminal_status(status: MissionStatus) -> bool {
+    matches!(
+        status,
+        MissionStatus::Complete | MissionStatus::Failed | MissionStatus::Abandoned
+    )
+}
+
+/// How a mission directory classifies for `kranz clean`. The decision is a
+/// pure function of the folded status and whether a `plan.json` exists, so it
+/// is trivially testable in isolation from the filesystem walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanClass {
+    /// Retire by default (`kranz clean`): the mission failed, was abandoned, or
+    /// is an abandoned-in-planning husk (still Planning with no plan.json).
+    Stale,
+    /// Only removed with `--all`: a Complete mission whose branch/report may
+    /// still be under review.
+    CompleteKeepByDefault,
+    /// Never cleaned: the mission is live (Planning-with-plan, Running, Paused,
+    /// Blocked, Validating).
+    Keep,
+}
+
+impl CleanClass {
+    /// Whether this class is removed given the `--all` opt-in.
+    pub fn is_cleaned(self, all: bool) -> bool {
+        match self {
+            CleanClass::Stale => true,
+            CleanClass::CompleteKeepByDefault => all,
+            CleanClass::Keep => false,
+        }
+    }
+}
+
+/// Classify a mission for cleaning from its folded `status` and whether a
+/// `plan.json` is present. Liveness (a held lock) is handled separately by the
+/// caller — a running mission is *never* cleaned regardless of this class.
+pub fn cleanable_class(status: MissionStatus, has_plan: bool) -> CleanClass {
+    match status {
+        MissionStatus::Failed | MissionStatus::Abandoned => CleanClass::Stale,
+        // An abandoned-in-planning husk: never approved a plan, so nothing on a
+        // branch to lose.
+        MissionStatus::Planning if !has_plan => CleanClass::Stale,
+        MissionStatus::Complete => CleanClass::CompleteKeepByDefault,
+        // Planning-with-plan, Running, Paused, Blocked, Validating: live work.
+        _ => CleanClass::Keep,
+    }
+}
+
+/// True when a mission's lock file records a pid that is still alive (a running
+/// engine). A local re-implementation of the liveness probe — the event-log
+/// module owns the canonical one, but the hygiene helpers must not reach into
+/// its internals. On unix `kill(pid, 0)` returning 0 or `EPERM` means the
+/// process exists; a present-but-unreadable/unparseable lock is treated as
+/// live (conservative — a false "alive" only spares a directory from cleaning,
+/// while a false "dead" could delete a mission out from under a running
+/// engine). Non-unix platforms cannot probe, so an existing lock reads as live.
+pub fn mission_lock_is_live(paths: &MissionPaths) -> bool {
+    let lock = paths.lock_file();
+    let Ok(contents) = std::fs::read_to_string(&lock) else {
+        // read_to_string errors both when the lock is missing and when it
+        // exists but can't be read. A missing lock is not live; a present-but-
+        // unreadable one is treated as live (conservative).
+        return lock.exists();
+    };
+    let Ok(pid) = contents.trim().parse::<i32>() else {
+        return true; // present but unparseable ⇒ conservatively live
+    };
+    if pid <= 0 {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        let rc = unsafe { libc::kill(pid, 0) };
+        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
 /// Pre-flight a `config.changed` patch: the merged result must deserialize
 /// and validate, or the event must not be appended (the reducer would poison
 /// every future fold of the log).

@@ -17,7 +17,7 @@ use kranz_engine::config;
 use kranz_engine::control;
 use kranz_engine::cost;
 use kranz_engine::event_log::EventLog;
-use kranz_engine::orchestrator::{MissionEngine, PlanRequest};
+use kranz_engine::orchestrator::{self, MissionEngine, PlanRequest};
 use kranz_engine::paths::MissionPaths;
 use kranz_engine::reducer;
 use kranz_engine::types::{ControlCommand, MissionConfig, MissionState, MissionStatus};
@@ -92,6 +92,16 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             print!("{}", cmd_missions(&repo)?);
             Ok(0)
         }
+        Command::Abandon { id, reason } => {
+            // A positional id wins over the global --mission; otherwise fall
+            // back to the usual auto-selection.
+            let mission = select_mission(&repo, id.as_deref().or(cli.mission.as_deref()))?;
+            let reason = reason.as_deref().unwrap_or("abandoned by operator");
+            cmd_abandon(&repo, &mission, reason, cli.force_lock)?;
+            println!("mission {mission} ABANDONED ({reason})");
+            Ok(0)
+        }
+        Command::Clean { yes, all } => cmd_clean(&repo, yes, all),
         Command::Ticket { command } => dispatch_ticket(&repo, command, cli.mission.as_deref()),
         Command::Draft { slug, yes } => backlog::cmd_draft(repo, &slug, yes, cli.dangerously_allow_all)
             .await
@@ -767,6 +777,146 @@ pub fn cmd_missions(repo: &Path) -> Result<String> {
         }
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// abandon / clean (mission hygiene, roadmap M2)
+// ---------------------------------------------------------------------------
+
+/// Retire a mission via the engine's abandon path. Maps the engine's
+/// `LockHeld` error to an actionable hint (stop the running mission or pass
+/// --force-lock) since that is the common operator mistake.
+pub fn cmd_abandon(repo: &Path, mission_id: &str, reason: &str, force_lock: bool) -> Result<()> {
+    require_mission(repo, mission_id)?;
+    orchestrator::abandon_mission(repo, mission_id, reason, force_lock).map_err(|e| {
+        if matches!(e, kranz_engine::error::EngineError::LockHeld(_)) {
+            anyhow!(
+                "cannot abandon mission '{mission_id}' — a running engine still holds its \
+                 lock. Stop the running `kranz run` first, or pass --force-lock if you are \
+                 sure the process is gone.\n  (underlying: {e})"
+            )
+        } else {
+            anyhow::Error::new(e).context(format!("abandoning mission '{mission_id}'"))
+        }
+    })
+}
+
+/// One mission the cleaner would remove, resolved to a printable row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanEntry {
+    pub id: String,
+    pub status_label: String,
+    pub goal: String,
+}
+
+/// Decide which missions under `repo` are cleanable given the `--all` opt-in.
+///
+/// Never selects a mission whose lock is held by a live engine, nor one whose
+/// log is unreadable (a corrupt log is left for the operator to inspect, not
+/// silently deleted). The pure status→class decision lives in
+/// [`orchestrator::cleanable_class`]; this function layers the filesystem facts
+/// (plan.json presence, lock liveness) on top.
+pub fn select_cleanable(repo: &Path, all: bool) -> Vec<CleanEntry> {
+    let mut out = Vec::new();
+    for id in MissionPaths::list_missions(repo) {
+        let paths = MissionPaths::new(repo, &id);
+        // A live engine owns this directory: never touch it.
+        if orchestrator::mission_lock_is_live(&paths) {
+            continue;
+        }
+        let Ok(state) = load_state(repo, &id) else {
+            continue; // unreadable/corrupt log: leave it for inspection
+        };
+        let has_plan = paths.plan_file().is_file();
+        if orchestrator::cleanable_class(state.mission.status, has_plan).is_cleaned(all) {
+            out.push(CleanEntry {
+                id,
+                status_label: output::mission_status_label(state.mission.status).to_string(),
+                goal: state.mission.goal,
+            });
+        }
+    }
+    out
+}
+
+/// Render the "would remove" listing: one `<STATUS>  <id>  <goal>` row per
+/// entry, or a single "nothing to clean" line when empty.
+pub fn render_clean_listing(entries: &[CleanEntry]) -> String {
+    if entries.is_empty() {
+        return "nothing to clean\n".to_string();
+    }
+    let mut out = String::new();
+    for e in entries {
+        out.push_str(&format!("{:<10}  {}  {}\n", e.status_label, e.id, e.goal));
+    }
+    out
+}
+
+/// `kranz clean [--yes] [--all]`: list cleanable mission directories, confirm
+/// (unless `--yes`), then `remove_dir_all` each. Only mission directories are
+/// removed — branches, tags, and `missions/index.md` are never touched.
+fn cmd_clean(repo: &Path, yes: bool, all: bool) -> Result<i32> {
+    let entries = select_cleanable(repo, all);
+    if entries.is_empty() {
+        print!("{}", render_clean_listing(&entries));
+        return Ok(0);
+    }
+
+    print!("{}", render_clean_listing(&entries));
+    println!(
+        "\n{} mission director{} above would be removed.{}",
+        entries.len(),
+        if entries.len() == 1 { "y" } else { "ies" },
+        if all { "" } else { " (Complete missions are kept; pass --all to include them.)" }
+    );
+
+    if !yes && !confirm_clean()? {
+        println!("clean aborted; nothing removed.");
+        return Ok(0);
+    }
+
+    let removed = remove_missions(repo, &entries, true);
+    println!(
+        "cleaned {} mission director{}",
+        removed.len(),
+        if removed.len() == 1 { "y" } else { "ies" }
+    );
+    Ok(0)
+}
+
+/// `remove_dir_all` each entry's `.kranz/missions/<id>` directory (nothing
+/// else — never a git branch/tag, never the missions index). Returns the ids
+/// actually removed; `verbose` echoes each removal. Removal failures are
+/// reported on stderr and skipped, never aborting the batch.
+pub fn remove_missions(repo: &Path, entries: &[CleanEntry], verbose: bool) -> Vec<String> {
+    let mut removed = Vec::new();
+    for e in entries {
+        let dir = MissionPaths::new(repo, &e.id).mission_dir();
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => {
+                if verbose {
+                    println!("removed {}", dir.display());
+                }
+                removed.push(e.id.clone());
+            }
+            Err(err) => eprintln!("kranz: could not remove {}: {err}", dir.display()),
+        }
+    }
+    removed
+}
+
+/// Read a `[y/N]` answer from stdin. Anything other than y/yes (any case) —
+/// including EOF — declines, so a piped/closed stdin never deletes by default.
+fn confirm_clean() -> Result<bool> {
+    use std::io::BufRead;
+    print!("proceed? [y/N] ");
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    let n = std::io::stdin().lock().read_line(&mut line)?;
+    if n == 0 {
+        return Ok(false); // EOF
+    }
+    Ok(matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
 }
 
 // ---------------------------------------------------------------------------

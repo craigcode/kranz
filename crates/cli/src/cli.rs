@@ -83,6 +83,38 @@ pub enum Command {
     /// List this repo's missions
     Missions,
 
+    /// Retire a mission: mark it ABANDONED (a terminal state, not a failure).
+    ///
+    /// Appends `mission.abandoned` to the event log and stops here — git
+    /// branches, tags, and the deliverable are left untouched. A mission that
+    /// is already terminal (Complete/Failed/Abandoned) is rejected. If a live
+    /// engine still holds the mission lock, stop it first or pass --force-lock.
+    Abandon {
+        /// The mission id (defaults to the global --mission / auto-selection)
+        id: Option<String>,
+
+        /// Why the mission is being retired (recorded on the event)
+        #[arg(long, value_name = "TEXT")]
+        reason: Option<String>,
+    },
+
+    /// Remove stale mission directories under .kranz/missions/.
+    ///
+    /// Cleans Failed, Abandoned, and abandoned-in-planning husks (Planning
+    /// with no plan.json) by default; --all additionally removes Complete
+    /// missions. A mission whose lock is held by a live engine is never
+    /// cleaned. Only mission directories are removed — git branches/tags and
+    /// the missions index.md are left intact.
+    Clean {
+        /// Skip the confirmation prompt (assume yes)
+        #[arg(long)]
+        yes: bool,
+
+        /// Also remove Complete missions (kept by default for review)
+        #[arg(long)]
+        all: bool,
+    },
+
     /// Work with mission tickets (the backlog): list, show, new, approve
     Ticket {
         #[command(subcommand)]
