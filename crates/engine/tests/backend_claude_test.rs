@@ -816,11 +816,13 @@ mod win_process_tree {
             assert!(std::time::Instant::now() < deadline, "pidfile never appeared");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        let tool_pid: u32 = std::fs::read_to_string(&pidfile)
-            .expect("read pidfile")
-            .trim()
-            .parse()
-            .expect("pidfile holds a pid");
+        // The Windows .cmd writes the pid with a CRLF/BOM and occasionally
+        // stray batch output, so extract the digit run rather than parse the
+        // raw contents (POSIX `echo $!` is already clean; harmless there).
+        let raw = std::fs::read_to_string(&pidfile).expect("read pidfile");
+        let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
+        let tool_pid: u32 =
+            digits.parse().unwrap_or_else(|e| panic!("pidfile holds a pid (raw={raw:?}): {e}"));
         assert!(process_alive(tool_pid), "tool grandchild alive before abort");
 
         // Abort must terminate the Job Object (cmd + ping grandchild). Bounded:
