@@ -72,6 +72,9 @@ async fn next_event(
 }
 
 /// Drain the session stream to closure, collecting every event.
+// Only the unix `fake_cli` module drains; the windows tree-kill test consumes
+// events one at a time. Silence dead_code off-unix without masking it on unix.
+#[cfg_attr(not(unix), allow(dead_code))]
 async fn drain(session: &mut Box<dyn AgentSession>) -> Vec<AgentEvent> {
     let mut events = Vec::new();
     while let Some(event) = next_event(session).await {
@@ -746,6 +749,98 @@ mod fake_cli {
         assert!(matches!(err, EngineError::Backend(_)), "got {err:?}");
         drain(&mut session).await;
         assert_eq!(session.exit_status(), Some(SessionExit::Completed));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Windows process-tree kill (Job Object) — compiled & run only on Windows CI
+// ---------------------------------------------------------------------------
+//
+// The unix `abort_kills_the_whole_process_tree_not_just_the_cli` test above
+// proves the process-GROUP kill. This module is its Windows twin: it proves
+// the kill-on-close Job Object created at spawn (see `backend_claude::win_job`)
+// takes a tool GRANDCHILD down on abort — the exact behaviour the old
+// direct-child `start_kill` could not. It compiles and runs only under
+// `cfg(windows)` and is exercised by the `windows-latest` CI job, never on the
+// macOS/Linux dev host, so it cannot regress the cross-platform build here.
+#[cfg(windows)]
+mod win_process_tree {
+    use super::*;
+
+    /// A fake `claude` CLI as a `.cmd` batch file. It launches a long-lived
+    /// grandchild (a detached `ping -n 300 localhost`), writes that
+    /// grandchild's PID to `%KRANZ_TOOL_PIDFILE%`, emits one JSON stdout line
+    /// so the harness sees a live stream, then blocks so `abort()` must kill
+    /// it. The grandchild is what must die with the CLI via the Job Object.
+    const SPAWN_TOOL_CHILD_THEN_HANG_CMD: &str = concat!(
+        "@echo off\r\n",
+        // Launch a detached long runner and capture its PID via WMIC.
+        "for /f \"tokens=2 delims=;=\" %%P in ('wmic process call create \"ping -n 300 localhost\" ^| find \"ProcessId\"') do set TOOLPID=%%P\r\n",
+        "echo %TOOLPID% > \"%KRANZ_TOOL_PIDFILE%\"\r\n",
+        "echo {\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"win-tree\",\"model\":\"fake\"}\r\n",
+        // Block indefinitely until the Job Object terminates this cmd tree.
+        "ping -n 300 localhost >nul\r\n",
+    );
+
+    /// True while the process with `pid` is listed by `tasklist`.
+    fn process_alive(pid: u32) -> bool {
+        let out = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+            .expect("run tasklist");
+        String::from_utf8_lossy(&out.stdout).contains(&pid.to_string())
+    }
+
+    #[tokio::test]
+    async fn abort_kills_the_whole_process_tree_not_just_the_cli() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("tool.pid");
+        let script = dir.path().join("fake-claude.cmd");
+        std::fs::write(&script, SPAWN_TOOL_CHILD_THEN_HANG_CMD).unwrap();
+
+        let backend = ClaudeBackend::new(script);
+        let mut spec = base_spec(PromptMode::SingleShot("ignored".to_string()));
+        spec.cwd = dir.path().to_path_buf();
+        spec.env.insert(
+            "KRANZ_TOOL_PIDFILE".to_string(),
+            pidfile.display().to_string(),
+        );
+
+        let mut session = backend.start(spec).await.unwrap();
+
+        // Pull events until the pidfile exists (the CLI wrote it before its
+        // init line was consumed). Bounded so a broken script can't hang CI.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let _init = next_event(&mut session).await.expect("init event");
+        while !pidfile.exists() {
+            assert!(std::time::Instant::now() < deadline, "pidfile never appeared");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let tool_pid: u32 = std::fs::read_to_string(&pidfile)
+            .expect("read pidfile")
+            .trim()
+            .parse()
+            .expect("pidfile holds a pid");
+        assert!(process_alive(tool_pid), "tool grandchild alive before abort");
+
+        // Abort must terminate the Job Object (cmd + ping grandchild). Bounded:
+        // it joins the stderr task, which only finishes when every pipe holder
+        // is dead — a surviving grandchild would stall this.
+        tokio::time::timeout(Duration::from_secs(15), session.abort())
+            .await
+            .expect("abort hung: a tool subprocess survived and held the pipes")
+            .unwrap();
+        assert_eq!(session.exit_status(), Some(SessionExit::Aborted));
+
+        // The grandchild must die with the CLI via KILL_ON_JOB_CLOSE.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while process_alive(tool_pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "tool grandchild {tool_pid} survived abort"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 }
 

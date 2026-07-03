@@ -2336,6 +2336,13 @@ async fn run_shell_command(cwd: &std::path::Path, command: &str) -> (bool, Strin
 /// (and holding the output pipes) long after the gate gave up. The killed
 /// shell itself is reaped by tokio's background orphan reaper (kill_on_drop);
 /// group members are re-parented to init and reaped there.
+///
+/// Windows has no process groups; the equivalent is a Job Object with
+/// `KILL_ON_JOB_CLOSE` (see [`crate::backend_claude::win_job`]). The `cmd /C`
+/// wrapper is assigned to such a job right after spawn, so on timeout
+/// `TerminateJobObject` takes the whole `cmd` tree down — not just the
+/// wrapper. That path compiles and is validated only on windows-latest CI,
+/// never on the dev host.
 async fn run_shell_command_with_timeout(
     cwd: &std::path::Path,
     command: &str,
@@ -2370,6 +2377,23 @@ async fn run_shell_command_with_timeout(
     #[cfg(unix)]
     let group_pid = child.id();
 
+    // Windows: assign the `cmd /C` wrapper to a kill-on-close Job Object so the
+    // timeout path can kill the whole command tree. Held across the await; on
+    // timeout it is killed explicitly and, either way, dropped at scope end
+    // (CloseHandle → KILL_ON_JOB_CLOSE). Job setup failure is non-fatal — the
+    // command still runs, timeout just falls back to killing the wrapper only.
+    // Compiled and validated only on windows-latest CI.
+    #[cfg(windows)]
+    let job = match child.raw_handle() {
+        Some(handle) => crate::backend_claude::win_job::JobHandle::create_and_assign(handle)
+            .map_err(|e| {
+                tracing::warn!(error = %e, "failed to create Job Object for shell command; \
+                    timeout will kill only the cmd wrapper");
+            })
+            .ok(),
+        None => None,
+    };
+
     match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Err(_elapsed) => {
             // The dropped wait future already killed the shell wrapper via
@@ -2383,8 +2407,13 @@ async fn run_shell_command_with_timeout(
                     libc::kill(-(pid as i32), libc::SIGKILL);
                 }
             }
-            // TODO(windows): kill_on_drop terminates only the `cmd /C`
-            // wrapper; killing the whole tree needs Job Objects.
+            // Windows: TerminateJobObject kills the whole `cmd` tree now
+            // (dropping `job` at scope end would also do it via
+            // KILL_ON_JOB_CLOSE, but the explicit kill is deterministic).
+            #[cfg(windows)]
+            if let Some(job) = &job {
+                job.kill();
+            }
             (false, format!("timed out after {}s", timeout.as_secs()))
         }
         Ok(Err(e)) => (false, format!("failed waiting for shell: {e}")),
@@ -2551,8 +2580,9 @@ mod tests {
 
     /// Timeout kill discipline: the whole process GROUP dies, not just the
     /// `sh -c` wrapper — a backgrounded child must not survive the gate
-    /// giving up (unix only; Windows still kills only the wrapper, see the
-    /// TODO in `run_shell_command_with_timeout`).
+    /// giving up. Unix-only test (`kill(-pgid)`); the Windows equivalent uses
+    /// a kill-on-close Job Object (see `run_shell_command_with_timeout`) and
+    /// is validated by windows-latest CI, not on this host.
     #[cfg(unix)]
     #[tokio::test]
     async fn shell_command_timeout_kills_the_whole_process_tree() {

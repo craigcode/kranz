@@ -29,6 +29,152 @@ const SUMMARY_MAX_CHARS: usize = 200;
 const STDERR_TAIL_CHARS: usize = 500;
 
 // ---------------------------------------------------------------------------
+// Windows process-tree kill via Job Objects
+// ---------------------------------------------------------------------------
+
+/// Windows process-tree kill, mirroring the unix process-group approach.
+///
+/// COMPILES AND RUNS ONLY UNDER `cfg(windows)`. This whole module is
+/// `#[cfg(windows)]`, so it is absent from the macOS/Linux build entirely and
+/// is validated exclusively by the `windows-latest` CI job — never by the dev
+/// host. Keep the unsafe surface tiny and every `HANDLE` closed exactly once.
+///
+/// Windows has no process groups. The equivalent is a **Job Object** with
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`: every process assigned to the job —
+/// and every descendant it spawns, which inherit job membership — is
+/// terminated the moment the last handle to the job closes. So a `claude` CLI
+/// (or `sh`/`cmd` wrapper) assigned to such a job takes its whole tool-child
+/// tree (test runners, builds) down with it on abort, timeout, or a plain
+/// drop of the job handle.
+///
+/// Usage: [`JobHandle::create_and_assign`] right after spawn, store the
+/// returned guard alongside the child, then either call [`JobHandle::kill`]
+/// (explicit `TerminateJobObject`) or just drop the guard (`CloseHandle` +
+/// `KILL_ON_JOB_CLOSE`) — both kill the tree.
+///
+/// Assignment happens *after* `spawn()` (tokio's `Command` exposes no
+/// `CREATE_SUSPENDED`), so there is a microsecond window in which the child
+/// could `spawn` a grandchild before it is assigned — that grandchild would
+/// escape the job. In practice `claude`/`cmd` has not forked a tool child in
+/// the gap between `spawn()` and the assign, so this matches the unix
+/// process-group approach (which has an analogous fork race) closely enough.
+#[cfg(windows)]
+pub(crate) mod win_job {
+    use std::os::windows::io::RawHandle;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::System::JobObjects::{
+        AssignProcessToJobObject, SetInformationJobObject, TerminateJobObject,
+        JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    // `windows` 0.58 gates its `CreateJobObjectW` wrapper behind the
+    // `Win32_Security` feature (its signature names `SECURITY_ATTRIBUTES`),
+    // and this crate's manifest deliberately does not enable that feature. We
+    // only ever pass a null security descriptor and null name, so we declare
+    // the raw kernel32 import ourselves — no `SECURITY_ATTRIBUTES` type is
+    // needed. The ungated `SetInformationJobObject`/`AssignProcessToJobObject`/
+    // `TerminateJobObject`/`CloseHandle` wrappers are used as-is above.
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateJobObjectW(
+            lpjobattributes: *const core::ffi::c_void,
+            lpname: *const u16,
+        ) -> *mut core::ffi::c_void;
+    }
+
+    /// RAII owner of a Job Object `HANDLE`. `Drop` calls `CloseHandle` exactly
+    /// once, which (because the job was created with
+    /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) also terminates every process
+    /// still assigned to the job.
+    #[derive(Debug)]
+    pub(crate) struct JobHandle {
+        job: HANDLE,
+    }
+
+    // The stored HANDLE is a kernel object handle owned solely by this guard;
+    // it is safe to move across threads (the child is polled from tokio tasks).
+    // SAFETY: a Job Object HANDLE is not tied to any thread; Win32 permits use
+    // and close from any thread. We own it exclusively (closed once on Drop).
+    unsafe impl Send for JobHandle {}
+    unsafe impl Sync for JobHandle {}
+
+    impl JobHandle {
+        /// Create a kill-on-close job, assign the process behind `child_handle`
+        /// to it, and return the owning guard. The process's descendants inherit
+        /// membership, so the whole tree dies when this guard is killed or
+        /// dropped.
+        ///
+        /// `child_handle` is the child process's raw handle — on Windows,
+        /// `tokio::process::Child::raw_handle()`. It is borrowed for the
+        /// assignment only: it stays owned by the `Child` and is never closed
+        /// here.
+        ///
+        /// Errors carry the failing Win32 call so a CI failure is diagnosable;
+        /// the caller treats a job-setup failure as non-fatal (the child still
+        /// runs, just without tree-kill — same as the pre-job behaviour).
+        pub(crate) fn create_and_assign(
+            child_handle: RawHandle,
+        ) -> windows::core::Result<Self> {
+            // SAFETY: CreateJobObjectW with a null SECURITY_ATTRIBUTES pointer
+            // and a null name creates an unnamed, default-security job. It
+            // returns a null handle on failure (GetLastError set), which we map
+            // to a windows Error via `from_win32`.
+            let raw_job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if raw_job.is_null() {
+                return Err(windows::core::Error::from_win32());
+            }
+            let job = HANDLE(raw_job);
+            // Wrap immediately so any early return below still closes the job.
+            let guard = JobHandle { job };
+
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            // SAFETY: `job` is a valid job handle; we pass a pointer to a
+            // correctly typed, fully initialized info struct together with its
+            // exact byte length, as the API requires.
+            unsafe {
+                SetInformationJobObject(
+                    guard.job,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const core::ffi::c_void,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )?;
+            }
+
+            // `RawHandle` is already `*mut c_void`, exactly HANDLE's field type.
+            // SAFETY: `guard.job` is valid; `child_handle` is the child's live
+            // process handle (borrowed — not closed here). AssignProcessToJobObject
+            // only reads it.
+            unsafe {
+                AssignProcessToJobObject(guard.job, HANDLE(child_handle))?;
+            }
+            Ok(guard)
+        }
+
+        /// Terminate every process in the job now (explicit kill path). Dropping
+        /// the guard would achieve the same via `KILL_ON_JOB_CLOSE`, but the
+        /// explicit call makes the kill deterministic even while the guard is
+        /// still held.
+        pub(crate) fn kill(&self) {
+            // SAFETY: `self.job` is a valid job handle owned by this guard;
+            // TerminateJobObject takes it plus an exit code and returns a
+            // Result we deliberately ignore (best-effort kill).
+            let _ = unsafe { TerminateJobObject(self.job, 1) };
+        }
+    }
+
+    impl Drop for JobHandle {
+        fn drop(&mut self) {
+            // SAFETY: `self.job` was returned by CreateJobObjectW and is closed
+            // exactly once, here. Closing the last handle to a
+            // KILL_ON_JOB_CLOSE job also terminates any surviving members.
+            let _ = unsafe { CloseHandle(self.job) };
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Binary discovery
 // ---------------------------------------------------------------------------
 
@@ -436,8 +582,8 @@ impl AgentBackend for ClaudeBackend {
         // can kill the whole tree — tool subprocesses (test runners, builds)
         // die with the CLI instead of surviving an interrupt/turn-budget
         // abort. See [`ClaudeSession::kill_child`].
-        // TODO(windows): no group equivalent without Job Objects; only the
-        // direct child is killed there and descendants may survive an abort.
+        // Windows has no process groups; the equivalent (a Job Object with
+        // KILL_ON_JOB_CLOSE) is created *after* spawn, below.
         #[cfg(unix)]
         command.process_group(0);
 
@@ -447,6 +593,27 @@ impl AgentBackend for ClaudeBackend {
                 self.binary.display()
             ))
         })?;
+
+        // Windows: assign the child to a kill-on-close Job Object so its whole
+        // descendant tree (tool children — test runners, builds) dies on
+        // abort/turn-budget kill, mirroring the unix process-group behaviour.
+        // Job setup failure is non-fatal: the child still runs, just without
+        // tree-kill (identical to the pre-Job-Object behaviour). Behind
+        // cfg(windows); compiled and validated only on windows-latest CI.
+        #[cfg(windows)]
+        let job = match child.raw_handle() {
+            Some(handle) => match win_job::JobHandle::create_and_assign(handle) {
+                Ok(job) => Some(job),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to create Job Object for claude child; \
+                        tree-kill on abort will be unavailable");
+                    None
+                }
+            },
+            // The child already exited between spawn and here — nothing to
+            // assign; kill_child falls back to the direct reap.
+            None => None,
+        };
 
         let stdout = child.stdout.take().ok_or_else(|| {
             EngineError::Backend("claude child has no stdout pipe".to_string())
@@ -486,6 +653,8 @@ impl AgentBackend for ClaudeBackend {
             streaming,
             max_turns: spec.max_turns,
             child,
+            #[cfg(windows)]
+            job,
             stdin,
             lines: BufReader::new(stdout).lines(),
             stderr_buf,
@@ -520,6 +689,15 @@ pub struct ClaudeSession {
     streaming: bool,
     max_turns: Option<u32>,
     child: Child,
+    /// Windows only: the kill-on-close Job Object owning the child's process
+    /// tree. Ordered *after* `child` so `child` drops first (Rust drops fields
+    /// top-to-bottom); either order is safe, but killing the tree after the
+    /// child's own `kill_on_drop` is the tidier sequence. Dropping this guard
+    /// closes the job handle, which (via `KILL_ON_JOB_CLOSE`) also terminates
+    /// any surviving descendants. `None` if job setup failed at spawn.
+    /// Compiled and validated only on windows-latest CI.
+    #[cfg(windows)]
+    job: Option<win_job::JobHandle>,
     /// Held open for streaming-input sessions; dropped to close stdin.
     stdin: Option<ChildStdin>,
     lines: Lines<BufReader<ChildStdout>>,
@@ -581,8 +759,12 @@ impl ClaudeSession {
     /// (e.g. the child is already reaped), the direct `start_kill` is the
     /// fallback.
     ///
-    /// TODO(windows): only the direct child is killed; descendants survive.
-    /// A proper tree kill needs Job Objects.
+    /// Windows: the child was assigned to a kill-on-close Job Object at spawn
+    /// (see [`ClaudeBackend::start`]). `TerminateJobObject` kills every process
+    /// in the job — the CLI and its whole tool-child tree — then the child is
+    /// reaped. If job setup had failed (`job == None`) this degrades to the
+    /// old direct-child `start_kill`. The Job Object block compiles and is
+    /// validated only on windows-latest CI, never on the dev host.
     async fn kill_child(&mut self) {
         self.stdin = None;
         #[cfg(unix)]
@@ -606,7 +788,22 @@ impl ClaudeSession {
                 }
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            // Kill the whole tree via the job; fall back to the direct child
+            // if job setup had failed at spawn. Then reap the CLI so its pipes
+            // (and the stderr capture task below) close.
+            match &self.job {
+                Some(job) => job.kill(),
+                None => {
+                    let _ = self.child.start_kill();
+                }
+            }
+            let _ = self.child.wait().await;
+        }
+        // Any other (hypothetical) non-unix, non-windows target: direct child
+        // kill only, no tree semantics available.
+        #[cfg(all(not(unix), not(windows)))]
         {
             let _ = self.child.start_kill();
             let _ = self.child.wait().await;
