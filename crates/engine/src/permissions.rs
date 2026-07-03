@@ -152,10 +152,7 @@ pub fn for_role(role: Role, cfg: &MissionConfig, validator_commands: &[String]) 
             for command in
                 validator_commands.iter().chain(cfg.allow_validator_commands.iter())
             {
-                let command = command.trim();
-                if !command.is_empty() {
-                    allowed.push(format!("Bash({command}*)"));
-                }
+                allowed.extend(command_allow_patterns(command));
             }
             dedup_preserving_order(&mut allowed);
             PermissionProfile {
@@ -175,6 +172,51 @@ pub fn apply(profile: PermissionProfile, spec: &mut SessionSpec) {
     spec.permission_mode = profile.permission_mode;
     spec.allowed_tools = profile.allowed_tools;
     spec.disallowed_tools = profile.disallowed_tools;
+}
+
+/// Allow patterns for one contract/validator command.
+///
+/// A verbatim `Bash(<full command>*)` alone is far too brittle in practice
+/// (observed live): a contract command `python3 extract_links.py && echo
+/// EXIT_OK` never matches the validator's natural `python3 extract_links.py`,
+/// and heredoc commands never re-match at all — the validator gets denied its
+/// own checks, denials surface as findings, and the fix-cycle guard blocks
+/// the milestone on what is really a permissions artifact.
+///
+/// So each command yields, besides the verbatim prefix rule:
+/// - one rule per `&&` / `||` / `;` / `|` segment (trimmed, `*`-suffixed);
+/// - for every segment, a leading-two-token prefix rule (`python3
+///   extract_links.py*`, `python3 -m*`) so natural reinvocations and heredoc
+///   forms (`python3 -`) match.
+///
+/// This deliberately widens what a validator may execute (e.g. `python3 -*`
+/// admits arbitrary interpreter use when the contract itself runs the
+/// interpreter). That is the §4.7 intent — validators run the mapped checks —
+/// and the read-only guarantee continues to rest on the denied Write/Edit
+/// tools and the deny list, not on Bash pattern precision.
+pub fn command_allow_patterns(command: &str) -> Vec<String> {
+    let command = command.trim();
+    if command.is_empty() {
+        return Vec::new();
+    }
+    let mut patterns = vec![format!("Bash({command}*)")];
+    for segment in command
+        .split("&&")
+        .flat_map(|s| s.split("||"))
+        .flat_map(|s| s.split(';'))
+        .flat_map(|s| s.split('|'))
+    {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+        patterns.push(format!("Bash({segment}*)"));
+        let head: Vec<&str> = segment.split_whitespace().take(2).collect();
+        if !head.is_empty() {
+            patterns.push(format!("Bash({}*)", head.join(" ")));
+        }
+    }
+    patterns
 }
 
 /// Wrap a config `deny_patterns` entry as `Bash(<pattern>)` unless it already

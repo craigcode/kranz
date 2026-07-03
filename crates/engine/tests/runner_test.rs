@@ -883,3 +883,42 @@ async fn run_validator_rejects_non_validator_roles() {
     .unwrap_err();
     assert!(err.to_string().contains("validator role"), "got: {err}");
 }
+
+/// Contract commands must admit their natural reinvocations (observed live:
+/// verbatim-only prefixes denied the validator its own checks and blocked a
+/// milestone on a permissions artifact).
+#[test]
+fn validator_command_patterns_cover_natural_variations() {
+    use kranz_engine::permissions::command_allow_patterns;
+
+    let pats = command_allow_patterns("python3 extract_links.py && echo EXIT_OK");
+    let covers = |cmd: &str| {
+        pats.iter().any(|p| {
+            let inner = p.strip_prefix("Bash(").and_then(|s| s.strip_suffix(")")).unwrap();
+            match inner.strip_suffix('*') {
+                Some(prefix) => cmd.starts_with(prefix),
+                None => cmd == inner,
+            }
+        })
+    };
+    // Verbatim, bare segment, and heredoc-ish/arg-extended reinvocations.
+    assert!(covers("python3 extract_links.py && echo EXIT_OK"));
+    assert!(covers("python3 extract_links.py"));
+    assert!(covers("python3 extract_links.py operator@example.com out.txt"));
+    assert!(covers("echo EXIT_OK"));
+    // Heredoc contract command: leading-two-token rule admits `python3 -`.
+    let heredoc = command_allow_patterns("python3 - <<'PY'\nprint('ok')\nPY");
+    assert!(heredoc.iter().any(|p| p == "Bash(python3 -*)"));
+    // Unrelated programs stay uncovered.
+    assert!(!covers("curl https://example.com"));
+    assert!(!covers("rm -rf /"));
+
+    // And the profile carries them through for validators.
+    let cfg = MissionConfig::default();
+    let profile = kranz_engine::permissions::for_role(
+        Role::ValidatorFunctional,
+        &cfg,
+        &["python3 -m pytest test_x.py -v".to_string()],
+    );
+    assert!(profile.allowed_tools.iter().any(|p| p == "Bash(python3 -m*)"));
+}
