@@ -589,7 +589,10 @@ mod tests {
         let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
         let host = MissionHost::with_backend(root, backend);
 
-        let patch = json!({ "maxParallelWorkers": 4 });
+        // 9 is out of the 1..=8 range config::validate allows (M3), so the
+        // create must be rejected as a bad request. (2..=8 is now valid — it
+        // opts into parallel workers — so an out-of-range value is used here.)
+        let patch = json!({ "maxParallelWorkers": 9 });
         let err = host.create("ship it", Some(&patch)).await.expect_err("must reject");
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }

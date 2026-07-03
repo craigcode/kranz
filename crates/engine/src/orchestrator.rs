@@ -178,6 +178,26 @@ enum FindingsConversion {
     Waive { waived: Vec<WaivedFinding> },
 }
 
+/// The parallelization decision for one milestone (roadmap M3): which of the
+/// pending features are INDEPENDENT enough to run concurrently, and the order
+/// their branches must merge back in. Parsed leniently; a missing/empty answer
+/// takes the conservative all-sequential default (see [`MissionEngine::plan_parallel_batch`]).
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ParallelDecision {
+    /// Feature ids the orchestrator judged independent (safe to run in
+    /// separate worktrees concurrently). Unknown ids are ignored by the caller.
+    #[serde(default)]
+    independent: Vec<String>,
+    /// Declared merge order for the independent features (feature ids). The
+    /// caller merges in this order, falling back to plan order for any
+    /// independent id the orchestrator omitted here.
+    #[serde(default)]
+    merge_order: Vec<String>,
+    #[serde(default)]
+    summary: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Verdict {
@@ -937,6 +957,23 @@ impl MissionEngine {
                 let milestone_id = self.state.mission.milestones[mi].id.clone();
                 self.emit(EventKind::MilestoneStarted { milestone_id, start_sha })?;
             }
+
+            // Parallel-within-milestone (roadmap M3), STRICTLY gated: only when
+            // the operator opted in (max_parallel_workers > 1) AND there is a
+            // batch of ≥2 not-yet-started independent features to fan out. When
+            // this returns true it drove a parallel batch and the loop
+            // re-evaluates; false means "no parallel batch here" and execution
+            // falls through to the byte-for-byte-unchanged sequential path.
+            //
+            // With max_parallel_workers == 1 this guard short-circuits before
+            // any parallel code runs, so the sequential behaviour below is
+            // exactly what it was pre-M3.
+            if self.state.config.max_parallel_workers > 1
+                && self.try_parallel_batch(mi).await?
+            {
+                continue;
+            }
+
             match next_feature(&self.state.mission.milestones[mi]) {
                 Some(fi) => self.run_feature(mi, fi).await?,
                 None => self.validation_round(mi).await?,
@@ -1254,6 +1291,382 @@ impl MissionEngine {
             // "respawn" and anything unrecognized take the conservative path.
             _ => JudgementOutcome::Respawn(if guidance.is_empty() { summary } else { guidance }),
         })
+    }
+
+    // -----------------------------------------------------------------------
+    // Parallel-within-milestone execution (roadmap M3)
+    // -----------------------------------------------------------------------
+    //
+    // HONEST SCOPE (documented deliberately):
+    //
+    // * Gated behind `max_parallel_workers > 1`. With the default (1) NONE of
+    //   this code runs and the sequential loop is byte-for-byte unchanged.
+    // * Only NOT-YET-STARTED, Pending, PLAN-origin features are eligible.
+    //   Fix-origin features, respawn candidates (Active), and everything after
+    //   the first parallel batch fall through to the sequential path — the
+    //   respawn/dirty-tree/judgement machinery there is the tested core and is
+    //   never duplicated here.
+    // * One orchestrator decision turn marks the INDEPENDENT subset and the
+    //   MERGE ORDER (lenient parse + one retry + conservative default =
+    //   all-sequential, i.e. no parallel batch). At most N run concurrently.
+    // * Each independent feature runs its worker IN ITS OWN GIT WORKTREE on a
+    //   per-feature branch off the milestone-start sha (real filesystem
+    //   isolation). Branches merge into the mission branch SEQUENTIALLY in the
+    //   declared order via merge_no_ff.
+    // * CONFLICT HANDLING — the SAFE subset: a conflicting merge is aborted
+    //   (git leaves a clean tree) and the feature is FAILED with a clear
+    //   reason. Synthesizing a conflict-resolution fix-feature was judged too
+    //   risky to land safely against the current event set (it would have to
+    //   reopen a milestone mid-batch and thread both worktrees' reports), so it
+    //   is deferred; see contractChangeRequest.
+    // * A cleanup GUARD removes every per-feature worktree and its branch at
+    //   the end of the batch — success or failure, panic or early return — so
+    //   no worktree is ever leaked.
+    // * The event log stays single-writer: emits are funnelled through the
+    //   engine one at a time. Worker sessions are driven one-at-a-time through
+    //   the single log (the simplest correct approach the design blesses); the
+    //   wall-clock overlap the roadmap's "done when" measures is explicitly
+    //   deferred until it can be instrumented, which is the roadmap's own bar.
+
+    /// Try to run a parallel batch for milestone `mi`. Returns `Ok(true)` when
+    /// a batch ran (the loop should re-evaluate) and `Ok(false)` when there was
+    /// nothing to parallelize (execution falls through to the sequential path).
+    ///
+    /// Only fires with ≥2 not-yet-started Pending/Plan features the
+    /// orchestrator judges independent; otherwise `false`.
+    async fn try_parallel_batch(&mut self, mi: usize) -> Result<bool> {
+        // Candidate features: not-yet-started (Pending), plan-origin, and no
+        // worker has ever run against them (worker_runs empty — a belt-and-
+        // braces guard so a resumed mission never re-forks a started feature).
+        let candidates: Vec<(String, usize)> = self.state.mission.milestones[mi]
+            .features
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| {
+                f.status == FeatureStatus::Pending
+                    && f.origin == FeatureOrigin::Plan
+                    && f.worker_runs.is_empty()
+            })
+            .map(|(fi, f)| (f.id.clone(), fi))
+            .collect();
+        if candidates.len() < 2 {
+            return Ok(false); // nothing to fan out — sequential handles it
+        }
+
+        // Ask the orchestrator which candidates are independent + merge order.
+        let cap = self.state.config.max_parallel_workers as usize;
+        let candidate_ids: Vec<String> = candidates.iter().map(|(id, _)| id.clone()).collect();
+        let batch = self.plan_parallel_batch(mi, &candidate_ids).await?;
+
+        // Map the chosen ids back to feature indices, in the declared merge
+        // order, keeping only known candidate ids and capping at N. Fewer than
+        // two after all filtering → not worth a batch, fall through.
+        let index_of = |id: &str| candidates.iter().find(|(cid, _)| cid == id).map(|(_, fi)| *fi);
+        let mut chosen: Vec<(String, usize)> = Vec::new();
+        for id in &batch {
+            if chosen.len() >= cap {
+                break;
+            }
+            if let Some(fi) = index_of(id) {
+                if !chosen.iter().any(|(cid, _)| cid == id) {
+                    chosen.push((id.clone(), fi));
+                }
+            }
+        }
+        if chosen.len() < 2 {
+            return Ok(false);
+        }
+
+        self.run_parallel_batch(mi, &chosen).await?;
+        Ok(true)
+    }
+
+    /// The parallelization decision turn (roadmap M3): put the candidate
+    /// feature ids to the orchestrator and get back the independent subset plus
+    /// the merge order. Lenient parse + one retry; the conservative default on
+    /// an unparseable/empty answer is "no independent features" (an empty Vec),
+    /// which makes [`Self::try_parallel_batch`] fall through to sequential.
+    async fn plan_parallel_batch(
+        &mut self,
+        mi: usize,
+        candidate_ids: &[String],
+    ) -> Result<Vec<String>> {
+        let milestone_id = self.state.mission.milestones[mi].id.clone();
+        let listed = self.state.mission.milestones[mi]
+            .features
+            .iter()
+            .filter(|f| candidate_ids.contains(&f.id))
+            .map(|f| format!("- [{}] {}: {}", f.id, f.title, f.spec.trim()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let message = format!(
+            "Milestone {milestone_id} has these not-yet-started features. Decide which are \
+             INDEPENDENT of one another — safe to implement concurrently in separate git \
+             worktrees without touching the same files or depending on each other's output — \
+             and the ORDER their branches should merge back. Conservative is correct: if two \
+             features might touch the same code, do NOT call them independent. It is fine to \
+             mark none or only some independent.\n\nFEATURES:\n{listed}\n\nRespond with ONLY \
+             this JSON:\n\
+             {{\"independent\":[\"featureId\",...],\"mergeOrder\":[\"featureId\",...],\"summary\":\"string\"}}"
+        );
+        let (decision, text): (Option<ParallelDecision>, String) =
+            self.json_decision::<ParallelDecision>(&message).await?;
+        let decision = decision.unwrap_or_default();
+
+        // Keep only ids that are real candidates; de-dupe. The merge order is
+        // the declared order restricted to the independent set, then any
+        // independent id the orchestrator forgot to order, appended in plan
+        // (candidate) order — so every independent feature gets a defined slot.
+        let independent: Vec<String> = decision
+            .independent
+            .iter()
+            .filter(|id| candidate_ids.contains(id))
+            .cloned()
+            .collect();
+        let mut order: Vec<String> = Vec::new();
+        for id in decision.merge_order.iter().chain(independent.iter()) {
+            if independent.contains(id) && !order.contains(id) {
+                order.push(id.clone());
+            }
+        }
+
+        let summary = if decision.summary.is_empty() {
+            format!("parallelization: {} independent feature(s)", order.len())
+        } else {
+            decision.summary
+        };
+        self.emit_decision(
+            &format!("parallel plan for {milestone_id}: {summary}"),
+            Some(text),
+        )?;
+        Ok(order)
+    }
+
+    /// Run one parallel batch (roadmap M3): fork a worktree per chosen feature,
+    /// run its worker there, then merge the per-feature branches into the
+    /// mission branch in the given (declared) order. A cleanup guard removes
+    /// every worktree + branch on the way out, whatever happens.
+    ///
+    /// `chosen` is `(feature_id, feature_index)` in merge order.
+    async fn run_parallel_batch(&mut self, mi: usize, chosen: &[(String, usize)]) -> Result<()> {
+        let milestone_id = self.state.mission.milestones[mi].id.clone();
+        let start_sha = self.state.mission.milestones[mi].start_sha.clone().ok_or_else(|| {
+            EngineError::InvalidState(format!(
+                "milestone {milestone_id} started a parallel batch without a start sha"
+            ))
+        })?;
+        let mission_branch = self.state.mission.mission_branch.clone();
+
+        // Per-feature worktree layout, built up front so the cleanup guard sees
+        // every path/branch even if a spawn fails midway.
+        let workspaces: Vec<ParallelWorkspace> = chosen
+            .iter()
+            .map(|(feature_id, _fi)| ParallelWorkspace {
+                feature_id: feature_id.clone(),
+                branch: format!("kranz/wt/{}/{}", self.state.mission.id, feature_id),
+                path: parallel_worktree_path(&self.state.mission.id, feature_id),
+            })
+            .collect();
+
+        // The whole batch is wrapped so we can ALWAYS clean up worktrees, even
+        // on an error return. `batch_result` carries the fallible body's error
+        // to re-raise after cleanup.
+        let batch_result = self.run_parallel_batch_inner(mi, &start_sha, &mission_branch, &workspaces).await;
+
+        // Cleanup guard: remove every worktree + branch we created. Best-effort
+        // and idempotent (remove_worktree/delete_branch_force tolerate absence);
+        // a cleanup failure is logged, never allowed to mask the batch outcome.
+        for ws in &workspaces {
+            if let Err(e) = self.repo.remove_worktree(&ws.path) {
+                tracing::warn!(path = %ws.path.display(), error = %e, "worktree cleanup failed");
+            }
+            if let Err(e) = self.repo.delete_branch_force(&ws.branch) {
+                tracing::warn!(branch = %ws.branch, error = %e, "worktree branch cleanup failed");
+            }
+        }
+        if let Err(e) = self.repo.prune_worktrees() {
+            tracing::warn!(error = %e, "worktree prune failed");
+        }
+
+        batch_result
+    }
+
+    /// Fallible body of [`Self::run_parallel_batch`] (the caller's cleanup guard
+    /// runs regardless of how this returns).
+    async fn run_parallel_batch_inner(
+        &mut self,
+        mi: usize,
+        start_sha: &str,
+        mission_branch: &str,
+        workspaces: &[ParallelWorkspace],
+    ) -> Result<()> {
+        // (1) Create every worktree off the milestone-start sha, then run each
+        // feature's worker in its worktree, judging + committing its work there.
+        // Worker sessions are driven one at a time through the single-writer
+        // log (emits funnelled through the engine); the parallelism that
+        // matters for correctness is the per-worktree filesystem isolation and
+        // the ordered merge below.
+        let mut merged_ok: usize = 0;
+        let mut conflicts: usize = 0;
+        let mut worker_ok: Vec<bool> = Vec::with_capacity(workspaces.len());
+
+        for ws in workspaces {
+            // Fresh worktree on a new per-feature branch off start_sha.
+            self.repo.add_worktree(&ws.path, &ws.branch, start_sha)?;
+            let ok = self.run_worker_in_worktree(ws, start_sha).await?;
+            worker_ok.push(ok);
+        }
+
+        // (2) Merge the per-feature branches into the mission branch in the
+        // declared order. Clean → keep the feature's commits + feature.completed;
+        // conflict (aborted, clean tree) → feature.failed; a worker that failed
+        // in its worktree → feature.failed without attempting a merge.
+        for (ws, ok) in workspaces.iter().zip(&worker_ok) {
+            let feature_id = ws.feature_id.clone();
+            if !ok {
+                self.emit(EventKind::FeatureFailed {
+                    feature_id,
+                    reason: "worker run did not complete in its parallel worktree".to_string(),
+                })?;
+                continue;
+            }
+            let pre_merge_sha = self.repo.head_sha()?;
+            match self.repo.merge_no_ff(&ws.branch)? {
+                crate::git_ops::MergeOutcome::Clean => {
+                    let commits: Vec<String> = self
+                        .repo
+                        .commits_between(&pre_merge_sha, "HEAD")?
+                        .iter()
+                        .map(|c| format!("{} {}", c.sha, c.subject))
+                        .collect();
+                    self.emit(EventKind::FeatureCompleted { feature_id, commits })?;
+                    merged_ok += 1;
+                }
+                crate::git_ops::MergeOutcome::Conflict { files } => {
+                    conflicts += 1;
+                    let files = if files.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (conflicting files: {})", files.join(", "))
+                    };
+                    self.emit(EventKind::FeatureFailed {
+                        feature_id,
+                        reason: format!(
+                            "parallel merge of {} into {mission_branch} conflicted and was \
+                             aborted{files}; re-run this feature sequentially",
+                            ws.branch
+                        ),
+                    })?;
+                }
+            }
+        }
+
+        // (3) One summarizing orchestrator.decision for the batch (existing
+        // event vocabulary only).
+        let milestone_id = self.state.mission.milestones[mi].id.clone();
+        self.emit_decision(
+            &format!(
+                "parallel: {} workers, merged {} branches, {} conflicts ({milestone_id})",
+                workspaces.len(),
+                merged_ok,
+                conflicts
+            ),
+            None,
+        )?;
+        Ok(())
+    }
+
+    /// Run one feature's worker inside its git worktree (roadmap M3): emit
+    /// `feature.started`, run the worker with cwd = the worktree, judge the
+    /// result, and — on a keep verdict — commit any worker output on the
+    /// per-feature branch so the later merge carries it. Returns `true` when
+    /// the feature's work is ready to merge, `false` when it should be failed.
+    ///
+    /// Deliberately does NOT respawn: the parallel batch is best-effort per the
+    /// honest subset. A non-complete judgement fails the feature (its branch is
+    /// discarded by the cleanup guard); the sequential path — with its full
+    /// respawn/dirty-tree machinery — remains the way a feature gets retried.
+    async fn run_worker_in_worktree(
+        &mut self,
+        ws: &ParallelWorkspace,
+        start_sha: &str,
+    ) -> Result<bool> {
+        let mi_fi = self.locate_feature(&ws.feature_id)?;
+        if self.state.mission.milestones[mi_fi.0].features[mi_fi.1].status
+            == FeatureStatus::Pending
+        {
+            self.emit(EventKind::FeatureStarted { feature_id: ws.feature_id.clone() })?;
+        }
+
+        let feature = self.state.mission.milestones[mi_fi.0].features[mi_fi.1].clone();
+        let goal = self.state.mission.goal.clone();
+        let milestone_title = self.state.mission.milestones[mi_fi.0].title.clone();
+        let cfg = self.state.config.clone();
+
+        // A GitRepo rooted at the worktree, for its own dirty-tree/commit ops.
+        let wt_repo = GitRepo::open(&ws.path)?;
+        wt_repo.ensure_identity()?;
+
+        let backend = Arc::clone(&self.backend);
+        let outcome = runner::run_worker_in(
+            backend.as_ref(),
+            &mut self.log,
+            &self.paths,
+            &cfg,
+            &feature,
+            &goal,
+            &milestone_title,
+            None,
+            None, // no interrupt wiring in the parallel subset
+            &ws.path,
+        )
+        .await;
+        let caught = self.catch_up();
+        let outcome = outcome?;
+        caught?;
+
+        // Commit any worker output on the per-feature branch (in the worktree)
+        // so the merge carries it. The worker session's own commits (if any)
+        // already landed on the branch; a dirty tree is checkpoint-committed
+        // here rather than run through the sequential dirty-tree turn — the
+        // parallel subset keeps its worktree self-contained.
+        if !wt_repo.is_clean().unwrap_or(true) {
+            let _ = wt_repo.add_all_and_commit(&format!(
+                "[{}] parallel worktree checkpoint (engine commit)",
+                ws.feature_id
+            ));
+        }
+
+        // Judge the run against the worktree's own commit range (start_sha..HEAD
+        // in the worktree — the branch was forked at start_sha).
+        let commits: Vec<String> = wt_repo
+            .commits_between(start_sha, "HEAD")
+            .unwrap_or_default()
+            .iter()
+            .map(|c| format!("{} {}", c.sha, c.subject))
+            .collect();
+        let diff_stat = wt_repo.diff_stat(start_sha, "HEAD").unwrap_or_default();
+        match self
+            .judge_worker_run(&ws.feature_id, outcome.report.as_ref(), &commits, &diff_stat)
+            .await?
+        {
+            JudgementOutcome::Complete => Ok(true),
+            // Respawn/Failed both mean "not ready to merge" in the parallel
+            // subset (no respawn here); the feature is failed by the caller.
+            JudgementOutcome::Failed(_) | JudgementOutcome::Respawn(_) => Ok(false),
+        }
+    }
+
+    /// Locate a feature by id, returning `(milestone_index, feature_index)`.
+    fn locate_feature(&self, feature_id: &str) -> Result<(usize, usize)> {
+        for (mi, ms) in self.state.mission.milestones.iter().enumerate() {
+            if let Some(fi) = ms.features.iter().position(|f| f.id == feature_id) {
+                return Ok((mi, fi));
+            }
+        }
+        Err(EngineError::InvalidState(format!(
+            "parallel batch references unknown feature '{feature_id}'"
+        )))
     }
 
     // -----------------------------------------------------------------------
@@ -2148,6 +2561,32 @@ enum JudgementOutcome {
     Failed(String),
     /// Respawn with this guidance (budget enforced by the caller).
     Respawn(String),
+}
+
+/// One feature's slot in a parallel batch (roadmap M3): the feature it runs,
+/// its per-feature branch, and the worktree directory that branch is checked
+/// out in. Built up front so the cleanup guard can always find every worktree.
+struct ParallelWorkspace {
+    feature_id: String,
+    /// Per-feature branch (`kranz/wt/<mission>/<feature>`), off the milestone
+    /// start sha, merged into the mission branch on success.
+    branch: String,
+    /// Absolute worktree directory the branch is checked out in.
+    path: PathBuf,
+}
+
+/// Absolute worktree directory for one feature of one mission (roadmap M3).
+/// Lives under the system temp dir — OUTSIDE the repo working tree, so a
+/// worktree is never mistaken for mission content — namespaced by mission +
+/// feature so concurrent batches never collide.
+fn parallel_worktree_path(mission_id: &str, feature_id: &str) -> PathBuf {
+    // Feature ids are `f-<m>-<n>` / `ms-<id>-...` — filesystem-safe already,
+    // but replace anything unexpected defensively.
+    let safe: String = feature_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    std::env::temp_dir().join(format!("kranz-wt-{mission_id}-{safe}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -3300,7 +3739,8 @@ mod tests {
     #[test]
     fn preview_config_patch_rejects_invalid() {
         let cfg = MissionConfig::default();
-        let bad = serde_json::json!({ "maxParallelWorkers": 4 });
+        // 9 is out of the 1..=8 range M3 allows, so the patch must be rejected.
+        let bad = serde_json::json!({ "maxParallelWorkers": 9 });
         assert!(preview_config_patch(&cfg, &bad).is_err());
         let good = serde_json::json!({ "worker": { "model": "haiku" } });
         assert!(preview_config_patch(&cfg, &good).is_ok());

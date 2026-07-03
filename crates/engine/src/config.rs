@@ -128,10 +128,16 @@ pub fn validate(cfg: &MissionConfig) -> Result<()> {
         )));
     }
 
-    // Parallel workers are Phase 4; v1 hard-requires sequential execution.
-    if cfg.max_parallel_workers != 1 {
+    // Parallel workers (roadmap M3): `1` (the default) keeps the sequential
+    // run loop byte-for-byte; `2..=8` opts into parallel-within-milestone
+    // execution (independent features run concurrently, each in its own git
+    // worktree, then merge in declared order). `0` is meaningless (no worker
+    // can ever run) and anything above 8 is well past any useful fan-out for a
+    // single repo, so both are rejected.
+    if !(1..=8).contains(&cfg.max_parallel_workers) {
         return Err(EngineError::Config(format!(
-            "maxParallelWorkers must be 1 in v1 (parallelism is Phase 4), got {}",
+            "maxParallelWorkers must be in 1..=8 (1 = sequential; >1 opts into M3 \
+             parallel workers), got {}",
             cfg.max_parallel_workers
         )));
     }

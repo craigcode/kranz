@@ -133,10 +133,22 @@ fn invalid_reasoning_effort_rejected() {
 }
 
 #[test]
-fn parallel_workers_must_be_one_in_v1() {
-    let cfg = cfg_with(|c| c.max_parallel_workers = 2);
-    let err = config::validate(&cfg).unwrap_err();
-    assert!(matches!(err, EngineError::Config(_)), "got: {err:?}");
+fn max_parallel_workers_bounds() {
+    // roadmap M3: 1 (default, sequential) through 8 validate; >1 opts into
+    // parallel workers. 0 (no worker can ever run) and 9 (past useful fan-out)
+    // are rejected.
+    for n in 1..=8 {
+        let cfg = cfg_with(|c| c.max_parallel_workers = n);
+        assert!(config::validate(&cfg).is_ok(), "maxParallelWorkers={n} must validate");
+    }
+    for bad in [0, 9] {
+        let cfg = cfg_with(|c| c.max_parallel_workers = bad);
+        let err = config::validate(&cfg).unwrap_err();
+        assert!(
+            matches!(err, EngineError::Config(_)),
+            "maxParallelWorkers={bad} must be rejected, got: {err:?}"
+        );
+    }
 }
 
 #[test]

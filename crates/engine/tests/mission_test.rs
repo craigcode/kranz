@@ -23,6 +23,7 @@ use kranz_engine::backend_mock::{mock_init, mock_result_text, mock_text, MockBac
 use kranz_engine::control;
 use kranz_engine::event_log::EventLog;
 use kranz_engine::events::{Event, EventKind};
+use kranz_engine::git_ops::GitRepo;
 use kranz_engine::orchestrator::{MissionEngine, PlanRequest};
 use kranz_engine::paths::MissionPaths;
 use kranz_engine::reducer;
@@ -208,6 +209,17 @@ fn waive_reply(subject: &str, reason: &str) -> String {
         "fixFeatures": [],
         "waived": [{ "subject": subject, "reason": reason }],
         "summary": "not worth a fix round"
+    })
+    .to_string()
+}
+
+/// Parallelization decision reply (roadmap M3): the listed feature ids are
+/// independent and merge in the given order.
+fn parallel_plan(ids: &[&str]) -> String {
+    json!({
+        "independent": ids,
+        "mergeOrder": ids,
+        "summary": format!("{} features are independent", ids.len())
     })
     .to_string()
 }
@@ -1858,4 +1870,180 @@ async fn approve_revised_plan_rejects_dropping_a_completed_milestone() {
         .approve_revised_plan(alters_completed)
         .expect_err("altering a completed milestone's features must be rejected");
     assert!(err.to_string().contains("alters"), "error explains the alteration: {err}");
+}
+
+// ---------------------------------------------------------------------------
+// 12. Parallel workers (roadmap M3, flag-gated)
+// ---------------------------------------------------------------------------
+
+/// With max_parallel_workers=2 a 1-milestone / 2-independent-feature mission
+/// completes: the orchestrator marks both features independent, BOTH run
+/// (2 worker.spawned), their per-feature branches merge into the mission branch
+/// in the declared order, the milestone and mission complete, and NO worktree
+/// is leaked (git worktree list is back to just the primary tree).
+#[tokio::test(flavor = "multi_thread")]
+async fn parallel_batch_runs_both_features_and_leaks_no_worktrees() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    // Session start order (FIFO): the orchestrator streaming session is needed
+    // FIRST for the parallelization decision (before any worker), then the two
+    // feature workers.
+    //   1. orchestrator (streaming)
+    //   2. worker f-1-1
+    //   3. worker f-1-2
+    // Orchestrator turns, in order:
+    //   seed, parallel-plan (both independent), judgement f-1-1, judgement f-1-2.
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        orch_script(vec![
+            parallel_plan(&["f-1-1", "f-1-2"]),
+            judgement("complete", ""),
+            judgement("complete", ""),
+        ]),
+        worker_pass(),
+        worker_pass(),
+    ]));
+
+    let cfg = MissionConfig { max_parallel_workers: 2, ..test_cfg() };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(2, vec![])).unwrap();
+    let mission_id = engine.mission_id().to_string();
+
+    let status = timeout(TEST_TIMEOUT, engine.run()).await.expect("run must not hang").unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+
+    // Both plan features completed.
+    let ms = &engine.state().mission.milestones[0];
+    assert_eq!(ms.features[0].status, FeatureStatus::Complete, "f-1-1 complete");
+    assert_eq!(ms.features[1].status, FeatureStatus::Complete, "f-1-2 complete");
+
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    // Two feature workers spawned (one per feature) plus the orchestrator.
+    let events = read_log(&paths);
+    let worker_spawns = events
+        .iter()
+        .filter(|e| matches!(&e.kind, EventKind::WorkerSpawned { role: Role::Worker, .. }))
+        .count();
+    assert_eq!(worker_spawns, 2, "both features ran a worker");
+
+    // feature.started for both, feature.completed for both, in the log.
+    let types = event_types(&events);
+    assert_eq!(
+        types.iter().filter(|t| **t == "feature.completed").count(),
+        2,
+        "both features completed: {types:?}"
+    );
+    assert!(types.contains(&"milestone.completed"), "milestone completed: {types:?}");
+    assert!(types.contains(&"mission.completed"), "mission completed: {types:?}");
+
+    // The parallel batch summary decision is on the log (existing event vocab).
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::OrchestratorDecision { summary, .. }
+                if summary.starts_with("parallel:") && summary.contains("2 workers")
+        )),
+        "a parallel summary decision naming 2 workers exists"
+    );
+    // And the parallel-plan decision fired before any worker spawn.
+    let plan_seq = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::OrchestratorDecision { summary, .. } if summary.starts_with("parallel plan for") => {
+                Some(e.seq)
+            }
+            _ => None,
+        })
+        .expect("parallel plan decision exists");
+    let first_worker_spawn = events
+        .iter()
+        .find(|e| matches!(&e.kind, EventKind::WorkerSpawned { role: Role::Worker, .. }))
+        .expect("a worker spawned")
+        .seq;
+    assert!(plan_seq < first_worker_spawn, "parallel plan precedes the first worker");
+
+    // NO leaked worktrees: git worktree list is back to a single (primary)
+    // working tree. The per-feature worktree dirs are gone from disk too.
+    let repo = GitRepo::open(&root).unwrap();
+    let worktrees = repo.list_worktrees().unwrap();
+    assert_eq!(worktrees.len(), 1, "only the primary worktree remains: {worktrees:?}");
+    // The per-feature branches were cleaned up as well.
+    assert!(
+        !repo.branch_exists(&format!("kranz/wt/{mission_id}/f-1-1")).unwrap_or(false),
+        "per-feature worktree branch must be deleted"
+    );
+    assert!(
+        !repo.branch_exists(&format!("kranz/wt/{mission_id}/f-1-2")).unwrap_or(false),
+        "per-feature worktree branch must be deleted"
+    );
+    // No worktree dir for THIS mission leaked into the temp dir.
+    let leak_prefix = format!("kranz-wt-{mission_id}-");
+    for entry in std::fs::read_dir(std::env::temp_dir()).unwrap().flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        assert!(
+            !name.starts_with(&leak_prefix),
+            "a parallel worktree dir leaked into temp: {name}"
+        );
+    }
+}
+
+/// Sequential invariance: the SAME 1-milestone / 2-feature mission run with
+/// max_parallel_workers=1 behaves exactly as it does today — no parallelization
+/// decision turn, no worktree branches, and the features run one at a time via
+/// the sequential path (worker → judgement → worker → judgement).
+#[tokio::test(flavor = "multi_thread")]
+async fn max_parallel_one_is_the_unchanged_sequential_path() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    // Sequential session order: worker f-1-1 runs first, THEN the orchestrator
+    // is started for the first judgement, then worker f-1-2. (Identical to the
+    // pre-M3 happy path shape.)
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![judgement("complete", ""), judgement("complete", "")]),
+        worker_pass(),
+    ]));
+
+    let cfg = MissionConfig { max_parallel_workers: 1, ..test_cfg() };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(2, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run()).await.expect("run must not hang").unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+
+    // No parallelization decision was ever taken (the gate short-circuits at
+    // max_parallel_workers == 1 before any parallel code runs).
+    assert!(
+        !events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::OrchestratorDecision { summary, .. }
+                if summary.starts_with("parallel plan for") || summary.starts_with("parallel:")
+        )),
+        "no parallel decisions with max_parallel_workers=1"
+    );
+
+    // Both features completed, mission complete, exactly two feature workers.
+    let types = event_types(&events);
+    assert_eq!(
+        types.iter().filter(|t| **t == "feature.completed").count(),
+        2,
+        "both features completed sequentially: {types:?}"
+    );
+    assert!(types.contains(&"mission.completed"));
+
+    // No worktree branches were ever created; a single primary worktree.
+    let repo = GitRepo::open(&root).unwrap();
+    assert_eq!(repo.list_worktrees().unwrap().len(), 1, "no extra worktrees in sequential mode");
 }

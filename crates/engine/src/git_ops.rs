@@ -22,6 +22,20 @@ pub struct CommitInfo {
     pub subject: String,
 }
 
+/// Outcome of a [`GitRepo::merge_no_ff`] into the current branch (roadmap M3).
+///
+/// A `Conflict` merge is always rolled back with `git merge --abort` before it
+/// is returned, so the working tree is left clean either way — the caller never
+/// has to clean up a half-merged tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeOutcome {
+    /// The branch merged cleanly; the merge commit is on the current branch.
+    Clean,
+    /// The merge hit conflicts and was aborted. `files` lists the conflicting
+    /// paths git reported (best-effort; empty when git named none).
+    Conflict { files: Vec<String> },
+}
+
 /// Handle to a local git repository rooted at a working-tree directory.
 #[derive(Debug, Clone)]
 pub struct GitRepo {
@@ -159,6 +173,177 @@ impl GitRepo {
     pub fn tag(&self, name: &str, message: &str) -> Result<()> {
         self.run(&["tag", "-a", name, "-m", message])?;
         Ok(())
+    }
+
+    // -- worktrees (roadmap M3 parallel workers) ---------------------------
+    //
+    // Parallel-within-milestone execution runs each independent feature's
+    // worker in its own git worktree checked out to a per-feature branch off
+    // the milestone-start sha, then merges those branches back into the mission
+    // branch in declared order. The worktrees share this repo's object store
+    // but have their own working directories, so concurrent workers never step
+    // on each other's files. All operations shell out with explicit arg vectors
+    // and std::path, so they stay Windows-safe like the rest of GitRepo.
+
+    /// Create a new worktree at `path`, checked out to a NEW branch `branch`
+    /// created at `from_sha` (`git worktree add -b <branch> <path> <from_sha>`).
+    ///
+    /// `path` may be absolute or relative to the repo root; git records the
+    /// absolute path either way. The branch must not already exist (git's `-b`
+    /// fails otherwise) — callers use a fresh per-feature branch name.
+    pub fn add_worktree(&self, path: &Path, branch: &str, from_sha: &str) -> Result<()> {
+        // Guard against a caller sneaking a flag through the branch/sha slots.
+        for slot in [branch, from_sha] {
+            if slot.starts_with('-') {
+                return Err(EngineError::Git(format!(
+                    "refusing worktree add with flag-shaped argument {slot:?}"
+                )));
+            }
+        }
+        let args: Vec<OsString> = vec![
+            "worktree".into(),
+            "add".into(),
+            "-b".into(),
+            branch.into(),
+            path.as_os_str().to_os_string(),
+            from_sha.into(),
+        ];
+        self.run_os(&args)?;
+        Ok(())
+    }
+
+    /// Remove a worktree at `path` (`git worktree remove --force <path>`),
+    /// tolerating a worktree that is already gone.
+    ///
+    /// `--force` is used so a worktree with a dirty tree (a worker that left
+    /// uncommitted changes, or a merge that has already consumed its commits)
+    /// is still removed — leaked worktrees are the failure mode this guards
+    /// against. When git reports the worktree is not registered / does not
+    /// exist, that is treated as success (idempotent cleanup). Any OTHER git
+    /// failure surfaces as [`EngineError::Git`].
+    pub fn remove_worktree(&self, path: &Path) -> Result<()> {
+        let args: Vec<OsString> = vec![
+            "worktree".into(),
+            "remove".into(),
+            "--force".into(),
+            path.as_os_str().to_os_string(),
+        ];
+        let out = self.probe_os(&args)?;
+        if out.status.success() {
+            return Ok(());
+        }
+        // Already-gone worktrees are fine: git says "is not a working tree" or
+        // "No such file or directory" / "not a valid path". Match leniently on
+        // the combined output so cleanup is idempotent across git versions.
+        let detail = failure_detail(&out).to_lowercase();
+        let already_gone = detail.contains("is not a working tree")
+            || detail.contains("not a working tree")
+            || detail.contains("no such file")
+            || detail.contains("is not a valid path")
+            || detail.contains("not a valid path");
+        if already_gone {
+            Ok(())
+        } else {
+            Err(EngineError::Git(format!(
+                "git worktree remove {} failed ({}): {}",
+                path.display(),
+                out.status,
+                failure_detail(&out)
+            )))
+        }
+    }
+
+    /// Merge `branch` into the current branch with an explicit merge commit
+    /// (`git merge --no-ff --no-edit <branch>`), reporting clean vs conflict.
+    ///
+    /// A clean merge returns [`MergeOutcome::Clean`] with the merge commit on
+    /// the current branch. On conflict the merge is rolled back with
+    /// `git merge --abort` (so the working tree is left CLEAN — the porcelain
+    /// status is empty afterwards) and [`MergeOutcome::Conflict`] is returned,
+    /// carrying the conflicting paths git named. Only a genuine git failure
+    /// (git could not be spawned, or the abort itself failed) is an `Err`.
+    pub fn merge_no_ff(&self, branch: &str) -> Result<MergeOutcome> {
+        if branch.starts_with('-') {
+            return Err(EngineError::Git(format!(
+                "refusing to merge flag-shaped ref {branch:?}"
+            )));
+        }
+        if self.probe(&["merge", "--no-ff", "--no-edit", branch])?.status.success() {
+            return Ok(MergeOutcome::Clean);
+        }
+        // A conflicting merge leaves the tree mid-merge; collect the unmerged
+        // paths (best-effort) BEFORE aborting, then abort to restore a clean
+        // tree so the caller never inherits a half-merged working directory.
+        let files = self.unmerged_paths().unwrap_or_default();
+        // `git merge --abort` must succeed to honour the clean-tree contract;
+        // a failure here is a real error (the tree is left mid-merge).
+        self.run(&["merge", "--abort"]).map_err(|e| {
+            EngineError::Git(format!(
+                "merge of {branch:?} conflicted and `git merge --abort` also failed: {e}"
+            ))
+        })?;
+        Ok(MergeOutcome::Conflict { files })
+    }
+
+    /// Paths with unmerged (conflicted) entries in the index
+    /// (`git diff --name-only --diff-filter=U`). Empty when there are none.
+    fn unmerged_paths(&self) -> Result<Vec<String>> {
+        let out = self.run(&["diff", "--name-only", "--diff-filter=U"])?;
+        Ok(out
+            .lines()
+            .map(|l| l.trim_end_matches('\r').trim())
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// Absolute paths of every registered worktree (`git worktree list`),
+    /// including the primary working tree. Used by cleanup to detect leaks.
+    pub fn list_worktrees(&self) -> Result<Vec<String>> {
+        // `--porcelain` emits `worktree <abs-path>` lines (plus HEAD/branch
+        // detail we ignore); parse just the paths for a stable, quoting-free
+        // listing across git versions.
+        let out = self.run(&["worktree", "list", "--porcelain"])?;
+        let mut paths = Vec::new();
+        for line in out.lines() {
+            let line = line.trim_end_matches('\r');
+            if let Some(rest) = line.strip_prefix("worktree ") {
+                paths.push(rest.trim().to_string());
+            }
+        }
+        Ok(paths)
+    }
+
+    /// Prune administrative records of worktrees whose directories are gone
+    /// (`git worktree prune`). Safe to call unconditionally after cleanup.
+    pub fn prune_worktrees(&self) -> Result<()> {
+        self.run(&["worktree", "prune"])?;
+        Ok(())
+    }
+
+    /// Delete a local branch, force (`git branch -D <name>`), tolerating a
+    /// branch that is already gone. Used to tidy per-feature worktree branches
+    /// after their worktrees are removed (roadmap M3 cleanup).
+    pub fn delete_branch_force(&self, name: &str) -> Result<()> {
+        if name.starts_with('-') {
+            return Err(EngineError::Git(format!(
+                "refusing to delete flag-shaped branch {name:?}"
+            )));
+        }
+        let out = self.probe(&["branch", "-D", name])?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let detail = failure_detail(&out).to_lowercase();
+        if detail.contains("not found") || detail.contains("no branch") {
+            Ok(())
+        } else {
+            Err(EngineError::Git(format!(
+                "git branch -D {name} failed ({}): {}",
+                out.status,
+                failure_detail(&out)
+            )))
+        }
     }
 
     /// Whether a remote named `name` is configured (`git remote get-url`).

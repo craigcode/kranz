@@ -7,7 +7,7 @@
 //! `ensure_identity` behaves deterministically.
 
 use kranz_engine::error::EngineError;
-use kranz_engine::git_ops::{CommitInfo, GitRepo};
+use kranz_engine::git_ops::{CommitInfo, GitRepo, MergeOutcome};
 use std::path::Path;
 use std::process::Command;
 use std::sync::Once;
@@ -443,4 +443,178 @@ fn ensure_identity_keeps_existing_identity() {
         raw_git(dir.path(), &["config", "--get", "user.email"]).trim(),
         "alice@example.com"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Worktrees (roadmap M3 parallel workers)
+// ---------------------------------------------------------------------------
+
+/// A worktree directory OUTSIDE the repo working tree (git worktrees must not
+/// nest inside the primary tree, or the primary `git status` reports the
+/// worktree dir as an untracked path). Lives under a dedicated tempdir whose
+/// drop cleans it up. Mirrors the engine's use of the system temp dir.
+fn worktree_dir(base: &TempDir, name: &str) -> std::path::PathBuf {
+    base.path().join(format!("wt-{name}"))
+}
+
+/// add_worktree makes a worktree on a NEW branch off a specific sha; a commit
+/// made in it advances that branch; the primary tree is untouched; and
+/// merge_no_ff clean-merges the branch back into the primary branch.
+#[test]
+fn add_worktree_new_branch_then_clean_merge_back() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo, seed) = seeded_repo();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    let wt = worktree_dir(&wt_base, "feat");
+    repo.add_worktree(&wt, "kranz/wt/m/f-1", &seed).unwrap();
+
+    // git worktree list now names our worktree path (canonicalized on macOS).
+    let listed = repo.list_worktrees().unwrap();
+    let wt_canon = std::fs::canonicalize(&wt).unwrap();
+    assert!(
+        listed.iter().any(|p| std::fs::canonicalize(p).map(|c| c == wt_canon).unwrap_or(false)),
+        "worktree not in list: {listed:?}"
+    );
+    // The new branch exists and is checked out in the worktree at the seed sha.
+    assert!(repo.branch_exists("kranz/wt/m/f-1").unwrap());
+    assert_eq!(raw_git(&wt, &["rev-parse", "HEAD"]).trim(), seed);
+
+    // Commit work IN the worktree (a GitRepo rooted there).
+    let wt_repo = GitRepo::open(&wt).unwrap();
+    std::fs::write(wt.join("feature.txt"), "worktree work\n").unwrap();
+    let on_branch = wt_repo.add_all_and_commit("feature work in worktree").unwrap();
+    assert_ne!(on_branch, seed);
+    // The primary tree (still on main) has not moved.
+    assert_eq!(repo.head_sha().unwrap(), seed, "primary branch untouched");
+
+    // Merge the branch into main via merge_no_ff → clean, and main now carries
+    // the feature file through an explicit merge commit.
+    assert_eq!(repo.current_branch().unwrap(), "main");
+    let outcome = repo.merge_no_ff("kranz/wt/m/f-1").unwrap();
+    assert_eq!(outcome, MergeOutcome::Clean);
+    assert!(repo.is_clean().unwrap(), "clean tree after a clean merge");
+    assert_ne!(repo.head_sha().unwrap(), seed, "main advanced by the merge");
+    let merged = repo.commits_between(&seed, "HEAD").unwrap();
+    assert!(
+        merged.iter().any(|c| c.subject.contains("feature work in worktree")),
+        "the worktree commit is now on main: {merged:?}"
+    );
+
+    // remove_worktree tears it down; list no longer names it.
+    repo.remove_worktree(&wt).unwrap();
+    repo.prune_worktrees().unwrap();
+    let after = repo.list_worktrees().unwrap();
+    assert!(
+        !after.iter().any(|p| std::fs::canonicalize(p).map(|c| c == wt_canon).unwrap_or(false)),
+        "worktree still listed after remove: {after:?}"
+    );
+    // remove is idempotent: a second remove of a gone worktree is Ok.
+    repo.remove_worktree(&wt).expect("second remove tolerates absence");
+}
+
+/// Two branches that change the SAME file differently: the first merges clean,
+/// the second conflicts. merge_no_ff reports the conflict, names the file, and
+/// LEAVES THE TREE CLEAN (git merge --abort ran) — porcelain empty afterwards.
+#[test]
+fn conflicting_merge_reports_conflict_and_leaves_tree_clean() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, _seed) = seeded_repo();
+    let wt_base = tempfile::tempdir().unwrap();
+    // A shared file both branches will edit incompatibly.
+    std::fs::write(dir.path().join("shared.txt"), "base\n").unwrap();
+    let base = repo.add_all_and_commit("add shared file").unwrap();
+
+    // Branch A (in a worktree) rewrites shared.txt.
+    let wt_a = worktree_dir(&wt_base, "a");
+    repo.add_worktree(&wt_a, "kranz/wt/m/a", &base).unwrap();
+    let a_repo = GitRepo::open(&wt_a).unwrap();
+    std::fs::write(wt_a.join("shared.txt"), "A's version\n").unwrap();
+    a_repo.add_all_and_commit("A edits shared").unwrap();
+
+    // Branch B (in another worktree) rewrites the SAME line differently.
+    let wt_b = worktree_dir(&wt_base, "b");
+    repo.add_worktree(&wt_b, "kranz/wt/m/b", &base).unwrap();
+    let b_repo = GitRepo::open(&wt_b).unwrap();
+    std::fs::write(wt_b.join("shared.txt"), "B's version\n").unwrap();
+    b_repo.add_all_and_commit("B edits shared").unwrap();
+
+    // First merge (A) is clean.
+    assert_eq!(repo.merge_no_ff("kranz/wt/m/a").unwrap(), MergeOutcome::Clean);
+    assert!(repo.is_clean().unwrap());
+
+    // Second merge (B) conflicts on shared.txt; merge_no_ff aborts it.
+    match repo.merge_no_ff("kranz/wt/m/b").unwrap() {
+        MergeOutcome::Conflict { files } => {
+            assert!(
+                files.iter().any(|f| f.contains("shared.txt")),
+                "conflict must name shared.txt: {files:?}"
+            );
+        }
+        MergeOutcome::Clean => panic!("B must conflict against A's change"),
+    }
+    // The crucial post-condition: the tree is CLEAN (aborted), not mid-merge.
+    assert!(
+        repo.is_clean().unwrap(),
+        "merge --abort must leave a clean tree: {}",
+        raw_git(dir.path(), &["status", "--porcelain"])
+    );
+    // And MERGE_HEAD is gone (no merge in progress).
+    let merge_head = Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", "MERGE_HEAD"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(!merge_head.status.success(), "no merge should be in progress after abort");
+    // A's change survived; B's was rolled back.
+    assert_eq!(std::fs::read_to_string(dir.path().join("shared.txt")).unwrap(), "A's version\n");
+
+    // Cleanup.
+    repo.remove_worktree(&wt_a).unwrap();
+    repo.remove_worktree(&wt_b).unwrap();
+    repo.prune_worktrees().unwrap();
+}
+
+/// merge_no_ff of a branch with no new commits (the branch == HEAD) is a clean
+/// no-op — the mock-worker parallel path relies on this: workers that touch no
+/// files leave their per-feature branch at the milestone-start sha.
+#[test]
+fn merge_no_ff_of_up_to_date_branch_is_clean() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo, seed) = seeded_repo();
+    let wt_base = tempfile::tempdir().unwrap();
+    let wt = worktree_dir(&wt_base, "noop");
+    // Worktree/branch off the seed sha, no commits made in it.
+    repo.add_worktree(&wt, "kranz/wt/m/noop", &seed).unwrap();
+
+    let outcome = repo.merge_no_ff("kranz/wt/m/noop").unwrap();
+    assert_eq!(outcome, MergeOutcome::Clean, "an up-to-date merge is clean");
+    assert!(repo.is_clean().unwrap());
+    assert_eq!(repo.head_sha().unwrap(), seed, "HEAD unchanged by a no-op merge");
+
+    repo.remove_worktree(&wt).unwrap();
+    repo.prune_worktrees().unwrap();
+}
+
+/// add_worktree refuses flag-shaped arguments before spawning git.
+#[test]
+fn add_worktree_rejects_flag_shaped_arguments() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo, seed) = seeded_repo();
+    let wt_base = tempfile::tempdir().unwrap();
+    let wt = worktree_dir(&wt_base, "x");
+    let err = repo
+        .add_worktree(&wt, "--force", &seed)
+        .expect_err("flag-shaped branch must be refused");
+    assert!(matches!(err, EngineError::Git(_)), "expected EngineError::Git, got: {err:?}");
+    // No worktree was created.
+    assert!(!wt.exists(), "no worktree dir should exist after a refused add");
 }

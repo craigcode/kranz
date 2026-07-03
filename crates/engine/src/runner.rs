@@ -396,6 +396,11 @@ pub fn validator_report_schema() -> serde_json::Value {
 /// The rendered role prompt goes to `append_system_prompt`; the single-shot
 /// prompt is a short task statement (feature id/title/spec/criteria/guidance)
 /// so the role text and the task stay separable in transcripts.
+///
+/// The worker session's `cwd` is the mission repo root (`paths.repo_root`).
+/// For M3 parallel-within-milestone execution — where each worker runs in its
+/// own git worktree — use [`run_worker_in`] to override just the session cwd
+/// while the run's transcript and events stay under the real mission dir.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_worker(
     backend: &dyn AgentBackend,
@@ -407,6 +412,43 @@ pub async fn run_worker(
     milestone_title: &str,
     extra_guidance: Option<&str>,
     cancel: Option<Arc<Notify>>,
+) -> Result<RunOutcome> {
+    let cwd = paths.repo_root.clone();
+    run_worker_in(
+        backend,
+        log,
+        paths,
+        cfg,
+        feature,
+        plan_goal,
+        milestone_title,
+        extra_guidance,
+        cancel,
+        &cwd,
+    )
+    .await
+}
+
+/// [`run_worker`] with an explicit session working directory (roadmap M3).
+///
+/// Identical to [`run_worker`] except the spawned worker session's `cwd` is
+/// `session_cwd` instead of `paths.repo_root`. The run's transcript and every
+/// event it appends still live under `paths` (the real mission dir), so a
+/// worker running in a per-feature git worktree writes its code there while its
+/// bookkeeping stays with the mission. `run_worker` is the thin wrapper that
+/// passes `paths.repo_root`, keeping the sequential path byte-for-byte.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_worker_in(
+    backend: &dyn AgentBackend,
+    log: &mut EventLog,
+    paths: &MissionPaths,
+    cfg: &MissionConfig,
+    feature: &Feature,
+    plan_goal: &str,
+    milestone_title: &str,
+    extra_guidance: Option<&str>,
+    cancel: Option<Arc<Notify>>,
+    session_cwd: &std::path::Path,
 ) -> Result<RunOutcome> {
     let role = Role::Worker;
     let role_cfg = cfg.role(role);
@@ -445,7 +487,7 @@ pub async fn run_worker(
     }
 
     let mut spec = SessionSpec {
-        cwd: paths.repo_root.clone(),
+        cwd: session_cwd.to_path_buf(),
         prompt: PromptMode::SingleShot(task),
         append_system_prompt: Some(role_prompt),
         model: role_cfg.model.clone(),
