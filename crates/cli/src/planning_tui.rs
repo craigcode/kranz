@@ -1176,13 +1176,15 @@ impl TuiRun {
             TurnOutput::Plan(Ok(PlanRequest::Ready(plan))) => {
                 self.app
                     .push(TranscriptEntry::Block(output::render_plan(&plan).trim_end().to_string()));
-                let estimate = cost::estimate(
-                    &plan,
-                    &engine.state().config,
-                    &cost::EstimateParams::default(),
-                );
-                self.app
-                    .push(TranscriptEntry::Block(output::render_cost_estimate(&estimate)));
+                // Estimate with params calibrated from this repo's completed
+                // missions (built-in defaults when there are none yet).
+                let calibration = cost::calibrate(&engine.paths().repo_root);
+                let estimate =
+                    cost::estimate(&plan, &engine.state().config, &calibration.params);
+                self.app.push(TranscriptEntry::Block(output::render_cost_estimate(
+                    &estimate,
+                    calibration.missions_used,
+                )));
                 self.phase = Phase::Approval { engine, plan };
                 return; // queued messages wait for the approval decision
             }

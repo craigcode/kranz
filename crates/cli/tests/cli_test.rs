@@ -309,6 +309,41 @@ fn status_icons_cover_terminal_states() {
 }
 
 // ---------------------------------------------------------------------------
+// Cost estimate rendering (shared by /plan line mode and the planning TUI)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cost_estimate_renders_range_and_calibration_provenance() {
+    let estimate = kranz_engine::cost::CostEstimate {
+        worker_runs: 8.4,
+        validator_runs: 6.0,
+        low_usd: 9.175,
+        expected_usd: 18.35,
+        high_usd: 45.875,
+    };
+
+    // Calibrated from completed missions: says how many.
+    let rendered = output::render_cost_estimate(&estimate, 2);
+    assert!(rendered.contains("estimated $9.18-$45.88"), "range in: {rendered}");
+    assert!(rendered.contains("expected ~$18.35"), "expected in: {rendered}");
+    assert!(
+        rendered.contains("based on 2 completed mission(s)"),
+        "provenance in: {rendered}"
+    );
+
+    // No completed missions yet: says the params are the built-in defaults.
+    let rendered = output::render_cost_estimate(&estimate, 0);
+    assert!(
+        rendered.contains("built-in defaults — no completed missions yet"),
+        "default provenance in: {rendered}"
+    );
+    assert!(
+        !rendered.contains("based on"),
+        "no mission count without missions: {rendered}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Control enqueueing (msg / pause / resume)
 // ---------------------------------------------------------------------------
 

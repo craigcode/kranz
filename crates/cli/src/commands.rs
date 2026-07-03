@@ -443,12 +443,15 @@ async fn cmd_plan(
                     }
                 };
                 println!("{}", output::render_plan(&plan));
-                let estimate = cost::estimate(
-                    &plan,
-                    &engine.state().config,
-                    &cost::EstimateParams::default(),
+                // Estimate with params calibrated from this repo's completed
+                // missions (built-in defaults when there are none yet).
+                let calibration = cost::calibrate(&repo);
+                let estimate =
+                    cost::estimate(&plan, &engine.state().config, &calibration.params);
+                println!(
+                    "{}",
+                    output::render_cost_estimate(&estimate, calibration.missions_used)
                 );
-                println!("{}", output::render_cost_estimate(&estimate));
 
                 stdin_lines.drain_noisily(tty);
                 print!("approve? [y/N] ");
