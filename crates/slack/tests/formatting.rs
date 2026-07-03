@@ -3,8 +3,8 @@
 //! the mission id / reason / branch / questions a reader needs.
 
 use kranz_slack::format::{
-    build_blocked, build_complete, build_needs_context, build_plan_ready, Blocked, Complete,
-    NeedsContext, Outcome, PlanReady, APPROVE_ACTION_ID,
+    build_blocked, build_complete, build_help, build_needs_context, build_plan_ready, Blocked,
+    Complete, NeedsContext, Outcome, PlanReady, APPROVE_ACTION_ID,
 };
 use serde_json::Value;
 
@@ -127,4 +127,15 @@ fn failed_block_kit_reads_failed() {
     let text = all_text(&blocks);
     assert!(text.contains("failed"));
     assert!(text.contains("worker exhausted respawns"));
+}
+
+#[test]
+fn help_lists_the_commands() {
+    let blocks = build_help();
+    assert_valid_blocks(&blocks);
+    let text = serde_json::to_string(&blocks).unwrap();
+    assert!(text.contains("/kranz ticket"), "help lists the ticket command");
+    assert!(text.contains("/kranz help"), "help lists itself");
+    assert!(text.to_lowercase().contains("approve"), "help mentions the approve button");
+    assert!(text.to_lowercase().contains("guidance"), "help mentions thread-reply guidance");
 }

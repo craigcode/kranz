@@ -24,7 +24,9 @@
 //! - `events_api` `message` in a thread we know (its `thread_ts` maps to a
 //!   mission) → [`Action::Guidance`]. Bot's own messages, thread roots, and
 //!   messages in unknown threads are ignored (else the bridge echoes itself).
-//! - `slash_commands` `/kranz ticket <title>` → [`Action::NewTicket`].
+//! - `slash_commands` `/kranz ticket <title>` → [`Action::NewTicket`];
+//!   `/kranz help`, bare `/kranz`, or any unrecognized subcommand →
+//!   [`Action::Help`] (the command list).
 //! - anything else → [`Action::Ignore`].
 
 use crate::format::APPROVE_ACTION_ID;
@@ -41,6 +43,10 @@ pub enum Action {
     Guidance { mission_id: String, text: String },
     /// `/kranz ticket <title>` → scaffold a new ticket file.
     NewTicket { title: String, channel: String, thread_ts: Option<String> },
+    /// `/kranz help`, bare `/kranz`, or an unrecognized subcommand → reply with
+    /// the command list. `response_url` (from the slash payload) is where the
+    /// ephemeral help is posted.
+    Help { response_url: Option<String> },
     /// Nothing to do (hello, disconnect, unknown thread, bot echo, …).
     Ignore,
 }
@@ -165,21 +171,26 @@ fn route_slash(payload: &Value) -> Action {
         return Action::Ignore;
     }
     let text = payload.get("text").and_then(Value::as_str).unwrap_or("").trim();
-    let Some(rest) = strip_ci_prefix(text, "ticket") else {
-        return Action::Ignore;
-    };
-    let title = rest.trim();
-    if title.is_empty() {
-        return Action::Ignore;
+    let response_url = payload.get("response_url").and_then(Value::as_str).map(str::to_string);
+
+    // `ticket <title>` scaffolds a ticket; everything else (help, bare, or an
+    // unrecognized subcommand) shows the command list — a typo lands on help
+    // rather than silence, which is what makes the command discoverable.
+    if let Some(rest) = strip_ci_prefix(text, "ticket") {
+        let title = rest.trim();
+        if !title.is_empty() {
+            let channel = payload
+                .get("channel_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            // Slash commands can be invoked from a thread; `thread_ts` is present then.
+            let thread_ts = payload.get("thread_ts").and_then(Value::as_str).map(str::to_string);
+            return Action::NewTicket { title: title.to_string(), channel, thread_ts };
+        }
+        // `ticket` with no title → fall through to help.
     }
-    let channel = payload
-        .get("channel_id")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    // Slash commands can be invoked from a thread; `thread_ts` is present then.
-    let thread_ts = payload.get("thread_ts").and_then(Value::as_str).map(str::to_string);
-    Action::NewTicket { title: title.to_string(), channel, thread_ts }
+    Action::Help { response_url }
 }
 
 /// Strip a leading case-insensitive word `prefix` from `text`, requiring a word
@@ -388,22 +399,35 @@ mod tests {
     }
 
     #[test]
-    fn slash_ticket_without_title_is_ignored() {
+    fn slash_ticket_without_title_falls_through_to_help() {
         let env = json!({
             "type": "slash_commands",
-            "payload": { "command": "/kranz", "text": "ticket   ", "channel_id": "C1" }
+            "payload": { "command": "/kranz", "text": "ticket   ", "channel_id": "C1",
+                         "response_url": "https://hooks.slack/x" }
         });
-        assert_eq!(route(&env, &lookup_none()).action, Action::Ignore);
+        assert_eq!(
+            route(&env, &lookup_none()).action,
+            Action::Help { response_url: Some("https://hooks.slack/x".into()) }
+        );
     }
 
     #[test]
-    fn slash_unknown_subcommand_is_ignored() {
-        let env = json!({
-            "type": "slash_commands",
-            "payload": { "command": "/kranz", "text": "ticketing system", "channel_id": "C1" }
-        });
-        // "ticketing" must not match "ticket".
-        assert_eq!(route(&env, &lookup_none()).action, Action::Ignore);
+    fn slash_help_bare_and_unknown_all_route_to_help() {
+        for text in ["help", "", "  ", "ticketing system", "wat"] {
+            let env = json!({
+                "type": "slash_commands",
+                "envelope_id": "env-h",
+                "payload": { "command": "/kranz", "text": text,
+                             "response_url": "https://hooks.slack/r" }
+            });
+            let routed = route(&env, &lookup_none());
+            assert_eq!(routed.envelope_id.as_deref(), Some("env-h"), "text={text:?}");
+            assert_eq!(
+                routed.action,
+                Action::Help { response_url: Some("https://hooks.slack/r".into()) },
+                "text={text:?} should route to help"
+            );
+        }
     }
 
     #[test]

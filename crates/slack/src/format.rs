@@ -163,6 +163,31 @@ pub fn build_complete(c: &Complete) -> Vec<Value> {
     ]
 }
 
+/// `/kranz help` reply — the command list. Honest about what works TODAY: the
+/// bridge currently drives tickets + interactive steering; the full lifecycle
+/// (new/plan/approve/start from Slack) is M2.9 and this list grows as it lands.
+pub fn build_help() -> Vec<Value> {
+    vec![
+        header(":sparkles: Kranz — Slack commands"),
+        section(
+            "*Slash commands*\n\
+             • `/kranz ticket <title>` — file a new backlog ticket\n\
+             • `/kranz help` — show this message",
+        ),
+        section(
+            "*In a mission thread*\n\
+             • *Approve* button on a plan-ready message — queue the mission\n\
+             • *Reply in the thread* — your message becomes orchestrator guidance \
+             (unblocks a blocked milestone, steers a running one)",
+        ),
+        context(
+            "Full lifecycle from Slack (create · plan · approve · start) is on the \
+             way. Today, plan and run missions with `kranz plan` / `kranz run`, or \
+             the web UI via `kranz serve --open`.",
+        ),
+    ]
+}
+
 // -- block primitives -------------------------------------------------------
 
 fn header(text: &str) -> Value {

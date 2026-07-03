@@ -69,6 +69,30 @@ impl SlackClient {
     }
 
     /// `chat.postMessage` with the bot token. `blocks` is the Block Kit array;
+    /// Reply to a slash command via its `response_url`. The URL is pre-signed
+    /// by Slack (no bearer auth needed), valid ~30 min / 5 uses. `ephemeral`
+    /// shows the reply only to the invoking user (the norm for `help`).
+    pub async fn post_response(
+        &self,
+        response_url: &str,
+        blocks: &[Value],
+        ephemeral: bool,
+    ) -> Result<()> {
+        let payload = serde_json::json!({
+            "response_type": if ephemeral { "ephemeral" } else { "in_channel" },
+            "blocks": blocks,
+        });
+        self.http
+            .post(response_url)
+            .json(&payload)
+            .send()
+            .await
+            .context("slash response_url request failed")?
+            .error_for_status()
+            .context("slash response_url returned an error status")?;
+        Ok(())
+    }
+
     /// `thread_ts` threads the message under an existing root when `Some`.
     /// Returns the new message's `ts`.
     pub async fn post_message(

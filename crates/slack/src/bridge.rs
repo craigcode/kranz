@@ -368,20 +368,36 @@ async fn handle_envelope(
         }
     };
     let routed = route(&envelope, threads);
-    if let Err(e) = apply_action(repo_root, &routed.action) {
-        tracing::warn!(error = %e, "failed to apply inbound Slack action");
+    match &routed.action {
+        // Help replies over the network (the slash `response_url`), so it can't
+        // go through the sync `apply_action` path — handle it here in async.
+        Action::Help { response_url } => {
+            if let Some(url) = response_url {
+                if let Err(e) = _client.post_response(url, &crate::format::build_help(), true).await
+                {
+                    tracing::warn!(error = %e, "failed to post /kranz help reply");
+                }
+            }
+        }
+        action => {
+            if let Err(e) = apply_action(repo_root, action) {
+                tracing::warn!(error = %e, "failed to apply inbound Slack action");
+            }
+        }
     }
     // Ack whatever carried an envelope_id, even Ignore, so Slack stops retrying.
     routed.envelope_id.map(|id| json!({ "envelope_id": id }).to_string())
 }
 
-/// Apply a routed inbound action to the local mission machinery.
+/// Apply a routed inbound action to the local mission machinery. `Help` is
+/// handled in [`handle_envelope`] (it needs the async client), so it is a
+/// no-op here for exhaustiveness.
 fn apply_action(repo_root: &Path, action: &Action) -> Result<()> {
     match action {
         Action::Approve { mission_id } => approve_mission(repo_root, mission_id),
         Action::Guidance { mission_id, text } => guidance(repo_root, mission_id, text),
         Action::NewTicket { title, .. } => scaffold_ticket(repo_root, title),
-        Action::Ignore => Ok(()),
+        Action::Help { .. } | Action::Ignore => Ok(()),
     }
 }
 

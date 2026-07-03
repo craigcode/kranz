@@ -11,8 +11,8 @@ features:
     always_online: true
   slash_commands:
     - command: /kranz
-      description: Kranz backlog commands
-      usage_hint: ticket <title>
+      description: Kranz mission commands — try /kranz help
+      usage_hint: help | ticket <title>
       should_escape: false
 oauth_config:
   scopes:
