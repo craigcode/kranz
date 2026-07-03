@@ -11,6 +11,10 @@
 //! - [`output`] — pure rendering (status tree, plan review, cost estimate)
 //! - [`tail`] — the live event printer used by `kranz run`
 
+mod embedded_dashboard {
+    include!(concat!(env!("OUT_DIR"), "/embedded_dashboard.rs"));
+}
+
 pub mod cli;
 pub mod commands;
 pub mod output;

@@ -1,6 +1,10 @@
 /target
 node_modules/
 dist/
+!crates/cli/assets/
+!crates/cli/assets/dashboard/
+!crates/cli/assets/dashboard/dist/
+!crates/cli/assets/dashboard/dist/**
 .DS_Store
 
 # per-repo mission data (plan.json is committed on the mission branch, not here)

@@ -50,10 +50,12 @@ kranz pause | kranz resume
 kranz serve --open                # Mission Control dashboard (browser)
 ```
 
-The dashboard is a one-time build: `cd <kranz checkout>/apps/dashboard &&
-npm install && npm run build`. `kranz serve` then finds it automatically
-(searching `--dashboard DIR`, `$KRANZ_DASHBOARD_DIST`,
-`<repo>/apps/dashboard/dist`, then the kranz checkout the binary was built in).
+`kranz serve` includes an embedded dashboard bundle. When developing the UI,
+run `cd <kranz checkout>/apps/dashboard && npm install && npm run build`;
+`kranz serve` will prefer that fresh build automatically (searching
+`--dashboard DIR`, `$KRANZ_DASHBOARD_DIST`, `<repo>/apps/dashboard/dist`,
+installed asset dirs such as `~/.kranz/dashboard/dist`, then the kranz checkout
+used to build the binary, before falling back to the embedded bundle).
 
 Desktop app: `cd apps/dashboard && npm install && npm run build && npx tauri dev`
 (reads `KRANZ_REPO`; see `apps/dashboard/README.md`).

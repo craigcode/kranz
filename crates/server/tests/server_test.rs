@@ -4,7 +4,7 @@
 //! `kranz_engine::event_log::EventLog`.
 
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::{header, Request, StatusCode};
 use futures::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use kranz_engine::control;
@@ -509,6 +509,50 @@ async fn static_dir_serves_files_with_spa_fallback() {
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     assert!(std::str::from_utf8(&bytes).unwrap().contains("kranz dashboard"));
+}
+
+#[tokio::test]
+async fn embedded_static_serves_files_with_spa_fallback() {
+    static FILES: [kranz_server::EmbeddedFile; 2] = [
+        kranz_server::EmbeddedFile {
+            path: "index.html",
+            bytes: b"<html>embedded kranz dashboard</html>",
+            content_type: "text/html; charset=utf-8",
+        },
+        kranz_server::EmbeddedFile {
+            path: "assets/app.js",
+            bytes: b"console.log('embedded')",
+            content_type: "application/javascript",
+        },
+    ];
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_root = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+    let app = kranz_server::router_with_static(
+        repo_root,
+        Some(kranz_server::DashboardStatic::Embedded(&FILES)),
+    );
+
+    let response = app
+        .clone()
+        .oneshot(Request::builder().uri("/assets/app.js").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/javascript"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(Request::builder().uri("/missions/m-01").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(std::str::from_utf8(&bytes).unwrap().contains("embedded kranz dashboard"));
 }
 
 // ---------------------------------------------------------------------------

@@ -3,6 +3,8 @@ name = "kranz-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description.workspace = true
+readme.workspace = true
 
 [dependencies]
 kranz-engine.workspace = true

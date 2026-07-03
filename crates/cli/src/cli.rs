@@ -91,8 +91,8 @@ pub enum Command {
 
         /// Directory holding the built dashboard (index.html + assets).
         /// Default search order: $KRANZ_DASHBOARD_DIST, <repo>/apps/dashboard/dist,
-        /// then apps/dashboard/dist relative to the kranz executable's checkout
-        /// (covers running a dev build from the Kranz source tree).
+        /// installed asset dirs, the kranz source checkout used to build the
+        /// binary, then the embedded dashboard bundled into the CLI.
         #[arg(long, value_name = "DIR")]
         dashboard: Option<std::path::PathBuf>,
     },

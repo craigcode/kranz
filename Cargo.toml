@@ -6,10 +6,12 @@ members = ["crates/engine", "crates/cli", "crates/server"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+description = "Local mission-control harness for Claude Code."
+readme = "README.md"
 
 [workspace.dependencies]
-kranz-engine = { path = "crates/engine" }
-kranz-server = { path = "crates/server" }
+kranz-engine = { version = "0.1.0", path = "crates/engine" }
+kranz-server = { version = "0.1.0", path = "crates/server" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

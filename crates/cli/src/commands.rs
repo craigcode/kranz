@@ -86,7 +86,11 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             print!("{}", cmd_missions(&repo)?);
             Ok(0)
         }
-        Command::Serve { port, open, dashboard } => cmd_serve(repo, port, open, dashboard).await,
+        Command::Serve {
+            port,
+            open,
+            dashboard,
+        } => cmd_serve(repo, port, open, dashboard).await,
     }
 }
 
@@ -273,7 +277,10 @@ async fn cmd_plan(repo: PathBuf, goal: String, cfg: MissionConfig) -> Result<i32
             },
         }
     }
-    println!("leaving planning; mission {} was not approved.", engine.mission_id());
+    println!(
+        "leaving planning; mission {} was not approved.",
+        engine.mission_id()
+    );
     Ok(0)
 }
 
@@ -360,7 +367,10 @@ async fn cmd_run(
             Ok(1)
         }
         other => {
-            println!("mission {mission} ended as {}", output::mission_status_label(other));
+            println!(
+                "mission {mission} ended as {}",
+                output::mission_status_label(other)
+            );
             Ok(1)
         }
     }
@@ -385,7 +395,10 @@ pub fn cmd_resume(repo: &Path, mission_id: &str) -> Result<PathBuf> {
 /// Enqueue a Msg control command. Returns the queued file path.
 pub fn cmd_msg(repo: &Path, mission_id: &str, text: &str, interrupt: bool) -> Result<PathBuf> {
     let paths = require_mission(repo, mission_id)?;
-    let cmd = ControlCommand::Msg { text: text.to_string(), interrupt };
+    let cmd = ControlCommand::Msg {
+        text: text.to_string(),
+        interrupt,
+    };
     Ok(control::enqueue(&paths, &cmd)?)
 }
 
@@ -420,18 +433,35 @@ pub fn cmd_missions(repo: &Path) -> Result<String> {
 
 /// `kranz serve`: run the REST/WS server, serving the dashboard build from
 /// the first location that exists (see [`resolve_dashboard_dist`]).
-async fn cmd_serve(repo: PathBuf, port: u16, open: bool, dashboard: Option<PathBuf>) -> Result<i32> {
-    let static_dir = resolve_dashboard_dist(&repo, dashboard);
+async fn cmd_serve(
+    repo: PathBuf,
+    port: u16,
+    open: bool,
+    dashboard: Option<PathBuf>,
+) -> Result<i32> {
+    let dashboard_assets = resolve_dashboard_assets(&repo, dashboard);
     let url = format!("http://127.0.0.1:{port}/");
 
     println!("kranz server on {url}");
-    match &static_dir {
-        Some(dir) => println!("serving dashboard from {}", dir.display()),
+    match &dashboard_assets {
+        Some(DashboardAssets::Embedded) => println!(
+            "serving embedded dashboard ({})",
+            crate::embedded_dashboard::EMBEDDED_DASHBOARD_SOURCE
+        ),
+        Some(DashboardAssets::Dir(dir)) => println!("serving dashboard from {}", dir.display()),
         None => println!(
             "no dashboard build found (--dashboard, $KRANZ_DASHBOARD_DIST, \
-             <repo>/apps/dashboard/dist, or the kranz checkout); serving API only"
+             <repo>/apps/dashboard/dist, installed asset dirs, or the kranz checkout) \
+             and no embedded dashboard is available; serving API only"
         ),
     }
+
+    let static_assets = dashboard_assets.map(|assets| match assets {
+        DashboardAssets::Dir(dir) => kranz_server::DashboardStatic::Dir(dir),
+        DashboardAssets::Embedded => {
+            kranz_server::DashboardStatic::Embedded(crate::embedded_dashboard::EMBEDDED_DASHBOARD)
+        }
+    });
 
     if open {
         // Give the server a moment to bind before pointing a browser at it.
@@ -442,48 +472,155 @@ async fn cmd_serve(repo: PathBuf, port: u16, open: bool, dashboard: Option<PathB
         });
     }
 
-    match kranz_server::serve(repo, port, static_dir).await {
+    match kranz_server::serve_with_static(repo, port, static_assets).await {
         Ok(()) => Ok(0),
         Err(e) => Err(anyhow!("server failed: {e}")),
     }
 }
 
-/// Locate a built dashboard (`index.html` + assets). Search order:
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DashboardAssets {
+    Dir(PathBuf),
+    Embedded,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DashboardResolutionInputs {
+    env_dist: Option<PathBuf>,
+    home: Option<PathBuf>,
+    exe: Option<PathBuf>,
+    manifest_dir: Option<PathBuf>,
+    embedded_available: bool,
+}
+
+impl DashboardResolutionInputs {
+    fn runtime() -> Self {
+        Self {
+            env_dist: std::env::var_os("KRANZ_DASHBOARD_DIST").map(PathBuf::from),
+            home: std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+                .map(PathBuf::from),
+            exe: std::env::current_exe().ok(),
+            manifest_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
+            embedded_available: !crate::embedded_dashboard::EMBEDDED_DASHBOARD.is_empty(),
+        }
+    }
+}
+
+fn resolve_dashboard_assets(repo: &Path, explicit: Option<PathBuf>) -> Option<DashboardAssets> {
+    resolve_dashboard_assets_from(repo, explicit, &DashboardResolutionInputs::runtime())
+}
+
+/// Search order:
 /// 1. explicit `--dashboard DIR`
 /// 2. `$KRANZ_DASHBOARD_DIST`
 /// 3. `<repo>/apps/dashboard/dist` (mission repo IS the kranz checkout)
-/// 4. `apps/dashboard/dist` relative to the running executable's checkout
-///    (`target/{debug,release}/kranz` in the Kranz source tree) — this makes
-///    `kranz serve` from any mission repo find the UI without configuration.
-pub fn resolve_dashboard_dist(repo: &Path, explicit: Option<PathBuf>) -> Option<PathBuf> {
-    let has_index = |d: &Path| d.join("index.html").is_file();
-
+/// 4. installed asset dirs (`~/.kranz/dashboard/dist`, `<prefix>/share/kranz/...`)
+/// 5. `apps/dashboard/dist` in the kranz source checkout used to build the binary
+/// 6. packaged embedded dashboard assets (future crates.io/source installs)
+fn resolve_dashboard_assets_from(
+    repo: &Path,
+    explicit: Option<PathBuf>,
+    inputs: &DashboardResolutionInputs,
+) -> Option<DashboardAssets> {
     if let Some(d) = explicit {
         // Explicitly requested: honor it even without index.html so the user
         // sees their own path in the log line (the server 404s clearly).
-        return Some(d);
+        return Some(DashboardAssets::Dir(d));
     }
-    if let Some(d) = std::env::var_os("KRANZ_DASHBOARD_DIST").map(PathBuf::from) {
-        if has_index(&d) {
-            return Some(d);
-        }
+
+    if let Some(d) = first_dashboard_dir(dashboard_dir_candidates(repo, inputs)) {
+        return Some(DashboardAssets::Dir(d));
     }
-    let repo_dist = repo.join("apps").join("dashboard").join("dist");
-    if has_index(&repo_dist) {
-        return Some(repo_dist);
+
+    inputs
+        .embedded_available
+        .then_some(DashboardAssets::Embedded)
+}
+
+/// Locate a built dashboard (`index.html` + assets) on disk. This excludes the
+/// embedded dashboard fallback used by `kranz serve`.
+pub fn resolve_dashboard_dist(repo: &Path, explicit: Option<PathBuf>) -> Option<PathBuf> {
+    match resolve_dashboard_assets(repo, explicit) {
+        Some(DashboardAssets::Dir(dir)) => Some(dir),
+        Some(DashboardAssets::Embedded) | None => None,
     }
-    if let Ok(exe) = std::env::current_exe() {
-        // target/<profile>/kranz -> checkout root is two levels above target.
-        if let Some(target_dir) = exe.parent().and_then(|p| p.parent()) {
-            if let Some(checkout) = target_dir.parent() {
-                let d = checkout.join("apps").join("dashboard").join("dist");
-                if has_index(&d) {
-                    return Some(d);
-                }
-            }
-        }
+}
+
+fn dashboard_dir_candidates(repo: &Path, inputs: &DashboardResolutionInputs) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    candidates.extend(inputs.env_dist.clone());
+    candidates.push(repo.join("apps").join("dashboard").join("dist"));
+
+    if let Some(home) = &inputs.home {
+        candidates.push(home.join(".kranz").join("dashboard").join("dist"));
+        candidates.push(home.join(".kranz").join("dashboard"));
     }
-    None
+
+    if let Some(exe) = &inputs.exe {
+        candidates.extend(installed_dashboard_dirs(exe));
+        candidates.extend(source_checkout_dist_from_exe(exe));
+    }
+
+    if let Some(manifest_dir) = &inputs.manifest_dir {
+        candidates.extend(source_checkout_dist_from_manifest(manifest_dir));
+        candidates.push(manifest_dir.join("assets").join("dashboard").join("dist"));
+    }
+
+    candidates
+}
+
+fn first_dashboard_dir(candidates: Vec<PathBuf>) -> Option<PathBuf> {
+    candidates
+        .into_iter()
+        .find(|d| d.join("index.html").is_file())
+}
+
+fn installed_dashboard_dirs(exe: &Path) -> Vec<PathBuf> {
+    let Some(bin_dir) = exe.parent() else {
+        return Vec::new();
+    };
+    let mut dirs = vec![
+        bin_dir.join("dashboard").join("dist"),
+        bin_dir.join("dashboard"),
+    ];
+    if let Some(prefix) = bin_dir.parent() {
+        dirs.push(
+            prefix
+                .join("share")
+                .join("kranz")
+                .join("dashboard")
+                .join("dist"),
+        );
+        dirs.push(prefix.join("share").join("kranz").join("dashboard"));
+    }
+    dirs
+}
+
+fn source_checkout_dist_from_exe(exe: &Path) -> Option<PathBuf> {
+    let profile_dir = exe.parent()?;
+    let target_dir = profile_dir.parent()?;
+    if target_dir.file_name()? != "target" {
+        return None;
+    }
+    Some(
+        target_dir
+            .parent()?
+            .join("apps")
+            .join("dashboard")
+            .join("dist"),
+    )
+}
+
+fn source_checkout_dist_from_manifest(manifest_dir: &Path) -> Option<PathBuf> {
+    Some(
+        manifest_dir
+            .parent()?
+            .parent()?
+            .join("apps")
+            .join("dashboard")
+            .join("dist"),
+    )
 }
 
 /// Best-effort browser launch via the platform opener.
@@ -516,5 +653,121 @@ fn open_browser(url: &str) {
             });
         }
         Err(e) => eprintln!("kranz: could not open the browser: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn dashboard_at(path: PathBuf) -> PathBuf {
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("index.html"), "<!doctype html>").unwrap();
+        path
+    }
+
+    fn inputs() -> DashboardResolutionInputs {
+        DashboardResolutionInputs {
+            embedded_available: false,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn dashboard_resolution_honors_explicit_path_verbatim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let explicit = tmp.path().join("missing-dashboard");
+
+        assert_eq!(
+            resolve_dashboard_assets_from(&repo, Some(explicit.clone()), &inputs()),
+            Some(DashboardAssets::Dir(explicit))
+        );
+    }
+
+    #[test]
+    fn dashboard_resolution_env_precedes_repo_and_invalid_env_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let repo_dist = dashboard_at(repo.join("apps").join("dashboard").join("dist"));
+        let env_dist = dashboard_at(tmp.path().join("env-dist"));
+
+        let mut with_env = inputs();
+        with_env.env_dist = Some(env_dist.clone());
+        assert_eq!(
+            resolve_dashboard_assets_from(&repo, None, &with_env),
+            Some(DashboardAssets::Dir(env_dist))
+        );
+
+        let mut with_invalid_env = inputs();
+        with_invalid_env.env_dist = Some(tmp.path().join("missing-env-dist"));
+        assert_eq!(
+            resolve_dashboard_assets_from(&repo, None, &with_invalid_env),
+            Some(DashboardAssets::Dir(repo_dist))
+        );
+    }
+
+    #[test]
+    fn dashboard_resolution_finds_installed_asset_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let exe = tmp.path().join("prefix").join("bin").join("kranz");
+        let installed = dashboard_at(
+            tmp.path()
+                .join("prefix")
+                .join("share")
+                .join("kranz")
+                .join("dashboard")
+                .join("dist"),
+        );
+
+        let mut inputs = inputs();
+        inputs.exe = Some(exe);
+        assert_eq!(
+            resolve_dashboard_assets_from(&repo, None, &inputs),
+            Some(DashboardAssets::Dir(installed))
+        );
+    }
+
+    #[test]
+    fn dashboard_resolution_finds_checkout_used_to_build_installed_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("mission-repo");
+        let checkout = tmp.path().join("kranz");
+        let manifest_dir = checkout.join("crates").join("cli");
+        let checkout_dist = dashboard_at(checkout.join("apps").join("dashboard").join("dist"));
+
+        let mut inputs = inputs();
+        inputs.manifest_dir = Some(manifest_dir);
+        inputs.exe = Some(tmp.path().join("cargo-home").join("bin").join("kranz"));
+        assert_eq!(
+            resolve_dashboard_assets_from(&repo, None, &inputs),
+            Some(DashboardAssets::Dir(checkout_dist))
+        );
+    }
+
+    #[test]
+    fn dashboard_resolution_falls_back_to_embedded_assets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let mut inputs = inputs();
+        inputs.embedded_available = true;
+
+        assert_eq!(
+            resolve_dashboard_assets_from(&repo, None, &inputs),
+            Some(DashboardAssets::Embedded)
+        );
+    }
+
+    #[test]
+    fn embedded_dashboard_bundle_contains_index() {
+        assert!(
+            crate::embedded_dashboard::EMBEDDED_DASHBOARD
+                .iter()
+                .any(|file| file.path == "index.html"),
+            "embedded dashboard source: {}",
+            crate::embedded_dashboard::EMBEDDED_DASHBOARD_SOURCE
+        );
     }
 }

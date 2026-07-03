@@ -12,8 +12,9 @@ mod error;
 mod rest;
 mod ws;
 
+use axum::body::Body;
 use axum::extract::Request;
-use axum::http::{header, HeaderValue, Method, StatusCode};
+use axum::http::{header, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -24,6 +25,20 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
+
+/// A single dashboard file embedded into a caller's binary.
+#[derive(Clone, Copy, Debug)]
+pub struct EmbeddedFile {
+    pub path: &'static str,
+    pub bytes: &'static [u8],
+    pub content_type: &'static str,
+}
+
+/// Static dashboard source for the catch-all frontend routes.
+pub enum DashboardStatic {
+    Dir(PathBuf),
+    Embedded(&'static [EmbeddedFile]),
+}
 
 /// Shared handler state. Only the repo root is held; all mission data is
 /// re-read from disk per request.
@@ -38,6 +53,11 @@ pub struct ServerState {
 /// SPA fallback to its `index.html`; otherwise `/` returns a minimal
 /// informational text response.
 pub fn router(repo_root: PathBuf, static_dir: Option<PathBuf>) -> Router {
+    router_with_static(repo_root, static_dir.map(DashboardStatic::Dir))
+}
+
+/// Build the full router with either filesystem or embedded dashboard assets.
+pub fn router_with_static(repo_root: PathBuf, static_assets: Option<DashboardStatic>) -> Router {
     let state = Arc::new(ServerState { repo_root });
     let app = Router::new()
         .route("/api/health", get(rest::health))
@@ -53,17 +73,44 @@ pub fn router(repo_root: PathBuf, static_dir: Option<PathBuf>) -> Router {
         .route("/api/missions/{id}/ws", get(ws::ws_handler))
         .with_state(state);
 
-    let app = match static_dir {
-        Some(dir) => {
+    let app = match static_assets {
+        Some(DashboardStatic::Dir(dir)) => {
             let index = dir.join("index.html");
             app.fallback_service(ServeDir::new(&dir).fallback(ServeFile::new(index)))
+        }
+        Some(DashboardStatic::Embedded(files)) => {
+            app.fallback(move |uri: Uri| async move { embedded_static_response(uri, files) })
         }
         None => app.route("/", get(root_info)),
     };
 
     // The JSON gate runs on every request; the CORS layer wraps it so even
     // rejections carry CORS headers for approved origins.
-    app.layer(middleware::from_fn(require_json_api_posts)).layer(cors_layer())
+    app.layer(middleware::from_fn(require_json_api_posts))
+        .layer(cors_layer())
+}
+
+fn embedded_static_response(uri: Uri, files: &'static [EmbeddedFile]) -> Response {
+    let requested = uri.path().trim_start_matches('/');
+    let requested = if requested.is_empty() {
+        "index.html"
+    } else {
+        requested
+    };
+    let file = files
+        .iter()
+        .find(|file| file.path == requested)
+        .or_else(|| files.iter().find(|file| file.path == "index.html"));
+
+    let Some(file) = file else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, file.content_type)
+        .body(Body::from(file.bytes))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 /// CORS for localhost tooling (dashboard dev server, Tauri webview).
@@ -88,9 +135,9 @@ pub fn router(repo_root: PathBuf, static_dir: Option<PathBuf>) -> Router {
 /// pass through untouched — CORS is a browser-enforced mechanism.
 fn cors_layer() -> CorsLayer {
     CorsLayer::new()
-        .allow_origin(AllowOrigin::predicate(|origin: &HeaderValue, _request_parts| {
-            origin.to_str().is_ok_and(origin_allowed)
-        }))
+        .allow_origin(AllowOrigin::predicate(
+            |origin: &HeaderValue, _request_parts| origin.to_str().is_ok_and(origin_allowed),
+        ))
         .allow_methods([Method::GET, Method::POST])
         .allow_headers([header::CONTENT_TYPE])
 }
@@ -108,7 +155,9 @@ fn origin_allowed(origin: &str) -> bool {
     ["http://localhost", "http://127.0.0.1"].iter().any(|base| {
         origin.strip_prefix(base).is_some_and(|rest| {
             rest.is_empty()
-                || rest.strip_prefix(':').is_some_and(|port| port.parse::<u16>().is_ok())
+                || rest
+                    .strip_prefix(':')
+                    .is_some_and(|port| port.parse::<u16>().is_ok())
         })
     })
 }
@@ -153,7 +202,16 @@ pub async fn serve(
     port: u16,
     static_dir: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    let app = router(repo_root, static_dir);
+    serve_with_static(repo_root, port, static_dir.map(DashboardStatic::Dir)).await
+}
+
+/// Bind `127.0.0.1:<port>` and serve the router until the process exits.
+pub async fn serve_with_static(
+    repo_root: PathBuf,
+    port: u16,
+    static_assets: Option<DashboardStatic>,
+) -> anyhow::Result<()> {
+    let app = router_with_static(repo_root, static_assets);
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local_addr = listener.local_addr()?;
