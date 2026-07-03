@@ -197,6 +197,24 @@ export interface MissionSummary {
 }
 
 // ---------------------------------------------------------------------------
+// Mission lifecycle (server-hosted engine; M2.5) — docs/protocol.md
+// ---------------------------------------------------------------------------
+
+/** Mirror of crates/engine/src/cost.rs CostEstimate (camelCase). */
+export interface CostEstimate {
+  workerRuns: number;
+  validatorRuns: number;
+  lowUsd: number;
+  expectedUsd: number;
+  highUsd: number;
+}
+
+/** POST /api/missions/:id/planning/request-plan response. */
+export type PlanRequestResponse =
+  | { ready: true; plan: Plan; estimate: CostEstimate }
+  | { ready: false; reply: string };
+
+// ---------------------------------------------------------------------------
 // Events (envelope flattens the kind: { seq, ts, missionId, type, payload })
 // ---------------------------------------------------------------------------
 
