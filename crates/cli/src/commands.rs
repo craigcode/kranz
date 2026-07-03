@@ -247,17 +247,63 @@ pub fn print_danger_banner() {
 
 /// One blocking line from stdin (spawn_blocking keeps the tokio runtime
 /// responsive). `None` means EOF or a read error.
-async fn read_stdin_line() -> Option<String> {
-    tokio::task::spawn_blocking(|| {
-        let mut buf = String::new();
-        match std::io::stdin().read_line(&mut buf) {
-            Ok(0) => None,
-            Ok(_) => Some(buf.trim_end_matches(['\r', '\n']).to_string()),
-            Err(_) => None,
+/// Stdin as a channel of lines, so prompts can DISCARD type-ahead: a line
+/// typed while an orchestrator turn was running must not silently answer the
+/// next prompt (an early "/quit" once ate the plan-approval "y").
+struct StdinLines {
+    rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+}
+
+impl StdinLines {
+    fn spawn() -> Self {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            loop {
+                buf.clear();
+                match std::io::stdin().read_line(&mut buf) {
+                    Ok(0) | Err(_) => break, // EOF: channel closes on tx drop
+                    Ok(_) => {
+                        if tx.send(buf.trim_end_matches(['\r', '\n']).to_string()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        StdinLines { rx }
+    }
+
+    /// Next line; `None` on EOF.
+    async fn next(&mut self) -> Option<String> {
+        self.rx.recv().await
+    }
+
+    /// Drop everything already typed (returns how many lines were discarded).
+    fn drain(&mut self) -> usize {
+        let mut n = 0;
+        while self.rx.try_recv().is_ok() {
+            n += 1;
         }
-    })
-    .await
-    .unwrap_or(None)
+        n
+    }
+
+    /// Drain + warn: call right before showing a prompt. Interactive
+    /// terminals only — piped stdin (scripted planning) delivers all lines
+    /// up-front by design and must never be discarded.
+    fn drain_noisily(&mut self, tty: bool) {
+        if !std::io::stdin().is_terminal() {
+            return;
+        }
+        let n = self.drain();
+        if n > 0 {
+            let (dim, reset) = if tty { (ansi::DIM, ansi::RESET) } else { ("", "") };
+            eprintln!(
+                "{dim}(ignored {n} line(s) typed while the orchestrator was working — \
+                 the prompt below wants fresh input){reset}"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -311,17 +357,19 @@ async fn cmd_plan(
         Arc::clone(&stop),
     ));
     let mut approved = false;
+    let mut stdin_lines = StdinLines::spawn();
 
     println!("talk to the orchestrator to shape the plan:");
     println!("  /plan   request the plan + cost estimate and review it for approval");
     println!("  /quit   exit planning (Ctrl-D works too)");
 
     loop {
+        stdin_lines.drain_noisily(tty);
         if tty {
             print!("you> ");
             let _ = std::io::stdout().flush();
         }
-        let Some(line) = read_stdin_line().await else {
+        let Some(line) = stdin_lines.next().await else {
             break; // EOF = /quit
         };
         let line = line.trim().to_string();
@@ -346,9 +394,10 @@ async fn cmd_plan(
                 );
                 println!("{}", output::render_cost_estimate(&estimate));
 
+                stdin_lines.drain_noisily(tty);
                 print!("approve? [y/N] ");
                 let _ = std::io::stdout().flush();
-                let answer = read_stdin_line().await.unwrap_or_default();
+                let answer = stdin_lines.next().await.unwrap_or_default();
                 if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
                     match engine.approve_plan(plan) {
                         Ok(()) => {
