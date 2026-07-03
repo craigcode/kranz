@@ -134,7 +134,7 @@ a new machine goes from nothing to `kranz plan` without cloning the repo.
 
 - Functional QA via browser/computer-use driven by the validator, for target
   repos with a scriptable run harness (same prerequisite Factory imposes).
-- `kranz exec -f mission.md` — fully headless missions for CI (plan file in,
+- [x] `kranz exec -f mission.md` — fully headless missions for CI (plan file in,
   exit code out; no interactive approval, contract gates only).
 - Skill capture: orchestrator proposes `.claude/skills` entries from repeated
   worker patterns; human approves before write.

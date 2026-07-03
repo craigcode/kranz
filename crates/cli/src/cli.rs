@@ -138,6 +138,31 @@ pub enum Command {
         yes: bool,
     },
 
+    /// Run a mission fully headlessly from a plan file (CI: plan in, exit code out).
+    ///
+    /// The file is a ticket-shaped markdown (`## Goal`, `## Context`, `##
+    /// Scoping answers`, `## Acceptance hints`). exec seeds the orchestrator
+    /// with the whole file, auto-approves the returned plan (no human), and
+    /// runs the mission to a terminal state. Events stream to stderr; the only
+    /// line on stdout is `kranz exec <id> <STATUS> cost=$X.XX branch=<b>`.
+    ///
+    /// Exit codes: 0 complete, 1 failed, 2 blocked, 3 underspecified (the
+    /// orchestrator wanted clarification a headless run cannot provide — make
+    /// the plan file self-sufficient and re-run). stdin is never read.
+    Exec {
+        /// The mission plan file (ticket-shaped markdown)
+        #[arg(short = 'f', long = "file", value_name = "MISSION.md")]
+        file: std::path::PathBuf,
+
+        /// Accepted for symmetry; headless runs always auto-approve (no-op)
+        #[arg(long)]
+        yes: bool,
+
+        /// Override maxFixCyclesPerMilestone for this run (bounds CI spend)
+        #[arg(long, value_name = "N")]
+        max_cycles: Option<u32>,
+    },
+
     /// Show the per-repo execution queue
     Queue,
 

@@ -8,6 +8,7 @@
 //! Module map:
 //! - [`cli`] — the clap derive types (`kranz <subcommand>`)
 //! - [`commands`] — one function per subcommand + shared helpers
+//! - [`exec`] — `kranz exec -f mission.md`, fully headless missions for CI
 //! - [`output`] — pure rendering (status tree, plan review, cost estimate)
 //! - [`tail`] — the live event printer used by `kranz run`
 //! - [`planning_tui`] — the full-screen interactive planning UI
@@ -19,6 +20,7 @@ mod embedded_dashboard {
 pub mod backlog;
 pub mod cli;
 pub mod commands;
+pub mod exec;
 pub mod output;
 pub mod planning_tui;
 pub mod tail;
