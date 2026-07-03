@@ -1381,9 +1381,21 @@ impl MissionEngine {
                 Ok(result) => result?,
             };
             let Some(event) = event else {
-                return Err(EngineError::Backend(
-                    "orchestrator stream closed mid-turn".to_string(),
-                ));
+                // Surface WHY the process died (exit code + stderr tail) —
+                // without this the failure is undiagnosable from the outside.
+                let detail = self
+                    .orch
+                    .as_ref()
+                    .and_then(|s| s.exit_status())
+                    .map(|e| format!("{e:?}"))
+                    .unwrap_or_else(|| "no exit status".to_string());
+                let msg = format!("orchestrator stream closed mid-turn ({detail})");
+                let _ = self.emit(EventKind::WorkerMessage {
+                    run_id: run_id.clone(),
+                    tag: "system".to_string(),
+                    content: scrub::scrub(&msg),
+                });
+                return Err(EngineError::Backend(msg));
             };
             self.mirror_orch_event(&run_id, &event)?;
             match event {

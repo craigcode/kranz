@@ -34,11 +34,22 @@ struct RunTag {
 pub struct EventRenderer {
     color: bool,
     runs: HashMap<String, RunTag>,
+    /// Planning REPL mode: orchestrator text replies are printed in full by
+    /// the REPL itself, so the tail suppresses `text` deltas and shows only
+    /// activity (tool use, results, denials, system notes).
+    suppress_text: bool,
 }
 
 impl EventRenderer {
     pub fn new(color: bool) -> Self {
-        EventRenderer { color, runs: HashMap::new() }
+        EventRenderer { color, runs: HashMap::new(), suppress_text: false }
+    }
+
+    /// Renderer for the planning REPL (see `suppress_text`).
+    pub fn planning(state: &MissionState, color: bool) -> Self {
+        let mut renderer = Self::seeded(state, color);
+        renderer.suppress_text = true;
+        renderer
     }
 
     /// Renderer pre-seeded with the runs already in `state`, so messages of
@@ -115,6 +126,9 @@ impl EventRenderer {
                 (tag, color, format!("spawned ({model})"))
             }
             EventKind::WorkerMessage { run_id, tag: kind, content } => {
+                if self.suppress_text && kind == "text" {
+                    return String::new();
+                }
                 let (tag, mut color) = self.run_tag(run_id);
                 let body = match kind.as_str() {
                     "text" => content.clone(),

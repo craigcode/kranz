@@ -300,6 +300,18 @@ async fn cmd_plan(
     };
     let tty = std::io::stdout().is_terminal();
 
+    // Live activity feed: without it, a long orchestrator turn (opus reading
+    // the repo, extended thinking) is indistinguishable from a hang.
+    let color = std::io::stderr().is_terminal();
+    let stop = Arc::new(AtomicBool::new(false));
+    let printer = tokio::spawn(tail::tail_events(
+        engine.paths().events_file(),
+        engine.state().last_seq,
+        EventRenderer::planning(engine.state(), color),
+        Arc::clone(&stop),
+    ));
+    let mut approved = false;
+
     println!("talk to the orchestrator to shape the plan:");
     println!("  /plan   request the plan + cost estimate and review it for approval");
     println!("  /quit   exit planning (Ctrl-D works too)");
@@ -344,7 +356,8 @@ async fn cmd_plan(
                                 "plan approved and committed on {}. run 'kranz run' to execute.",
                                 engine.state().mission.mission_branch
                             );
-                            return Ok(0);
+                            approved = true;
+                            break;
                         }
                         Err(e) => eprintln!("kranz: plan approval failed: {e}"),
                     }
@@ -364,10 +377,17 @@ async fn cmd_plan(
             },
         }
     }
-    println!(
-        "leaving planning; mission {} was not approved. Resume anytime with `kranz plan`.",
-        engine.mission_id()
-    );
+    if !approved {
+        println!(
+            "leaving planning; mission {} was not approved. Resume anytime with `kranz plan`.",
+            engine.mission_id()
+        );
+    }
+    // Engine drop flushes buffered deltas and releases the lock; the
+    // printer's final catch-up read then sees every event.
+    drop(engine);
+    stop.store(true, Ordering::Relaxed);
+    let _ = printer.await;
     Ok(0)
 }
 
