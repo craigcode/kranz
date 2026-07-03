@@ -162,9 +162,17 @@ impl MissionHost {
         let seed = engine.take_seed_reply();
         match request {
             PlanRequest::Ready(plan) => {
+                // Estimate with params calibrated from this repo's completed
+                // missions (built-in defaults when there are none yet).
+                let calibration = cost::calibrate(&self.repo_root);
                 let estimate =
-                    cost::estimate(&plan, &engine.state().config, &cost::EstimateParams::default());
-                Ok(json!({ "ready": true, "plan": plan, "estimate": estimate_json(&estimate) }))
+                    cost::estimate(&plan, &engine.state().config, &calibration.params);
+                Ok(json!({
+                    "ready": true,
+                    "plan": plan,
+                    "estimate": estimate_json(&estimate),
+                    "calibration": { "missionsUsed": calibration.missions_used },
+                }))
             }
             PlanRequest::NotReady(reply) => {
                 Ok(json!({ "ready": false, "reply": prepend_seed(seed, reply) }))

@@ -170,11 +170,19 @@ pub fn render_plan(plan: &Plan) -> String {
     out
 }
 
-/// The one-line cost estimate shown at plan review time. The range is wide
-/// on purpose; live usage is always authoritative.
-pub fn render_cost_estimate(estimate: &CostEstimate) -> String {
+/// The one-line cost estimate shown at plan review time, with the provenance
+/// of its params: calibrated from `missions_used` completed missions, or the
+/// built-in defaults when there are none. The range is wide on purpose; live
+/// usage is always authoritative.
+pub fn render_cost_estimate(estimate: &CostEstimate, missions_used: usize) -> String {
+    let provenance = if missions_used == 0 {
+        "built-in defaults — no completed missions yet".to_string()
+    } else {
+        format!("based on {missions_used} completed mission(s)")
+    };
     format!(
-        "estimated ${:.2}-${:.2} (expected ~${:.2}; rough estimate — live usage is authoritative)",
+        "estimated ${:.2}-${:.2} (expected ~${:.2}; rough estimate — live usage is \
+         authoritative; {provenance})",
         estimate.low_usd, estimate.high_usd, estimate.expected_usd
     )
 }

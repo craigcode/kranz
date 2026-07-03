@@ -1,14 +1,18 @@
-//! Integration tests for config layering, cost estimation, and role prompts.
+//! Integration tests for config layering, cost estimation (including
+//! calibration from recorded actuals), and role prompts.
 
+use chrono::Utc;
 use kranz_engine::config;
 use kranz_engine::cost::{self, EstimateParams};
 use kranz_engine::error::EngineError;
+use kranz_engine::events::{Event, EventKind};
 use kranz_engine::prompts;
 use kranz_engine::types::{
-    MissionConfig, Plan, PlanFeature, PlanMilestone, Role, TokenUsage,
+    Feature, FeatureOrigin, FeatureStatus, Finding, MissionConfig, Plan, PlanFeature,
+    PlanMilestone, Role, RunResult, TokenUsage,
 };
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn approx(actual: f64, expected: f64) {
     assert!(
@@ -275,6 +279,241 @@ fn estimate_respects_skip_scrutiny() {
     let est = cost::estimate(&plan, &cfg, &EstimateParams::default());
     approx(est.validator_runs, 0.0);
     approx(est.expected_usd, 12.6 + 1.25);
+}
+
+// ---------------------------------------------------------------------------
+// cost: calibration from recorded actuals
+// ---------------------------------------------------------------------------
+
+/// Write a hand-built events.jsonl for `mission_id` under `repo` (seq
+/// assigned 1..; same shape the engine's single writer produces).
+fn write_events(repo: &Path, mission_id: &str, kinds: Vec<EventKind>) {
+    let dir = repo.join(".kranz").join("missions").join(mission_id);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut lines = String::new();
+    for (i, kind) in kinds.into_iter().enumerate() {
+        let event = Event {
+            seq: (i + 1) as u64,
+            ts: Utc::now(),
+            mission_id: mission_id.to_string(),
+            kind,
+        };
+        lines.push_str(&serde_json::to_string(&event).unwrap());
+        lines.push('\n');
+    }
+    std::fs::write(dir.join("events.jsonl"), lines).unwrap();
+}
+
+fn created(mission_id: &str) -> EventKind {
+    EventKind::MissionCreated {
+        goal: "calibration fixture".to_string(),
+        base_branch: "main".to_string(),
+        mission_branch: format!("kranz/mission-{mission_id}"),
+        config: MissionConfig::default(),
+    }
+}
+
+fn spawned(run_id: &str, role: Role, feature_id: Option<&str>, milestone_id: Option<&str>) -> EventKind {
+    EventKind::WorkerSpawned {
+        run_id: run_id.to_string(),
+        role,
+        feature_id: feature_id.map(str::to_string),
+        milestone_id: milestone_id.map(str::to_string),
+        sdk_session_id: format!("sess-{run_id}"),
+        model: "sonnet".to_string(),
+        prompt_hash: "hash".to_string(),
+        transcript_path: format!("runs/{run_id}.jsonl"),
+    }
+}
+
+fn completed(run_id: &str, cost_usd: Option<f64>, tokens: TokenUsage) -> EventKind {
+    EventKind::WorkerCompleted {
+        run_id: run_id.to_string(),
+        result: RunResult::Pass,
+        tokens,
+        cost_usd,
+        report: None,
+    }
+}
+
+fn fix_feature(id: &str) -> Feature {
+    Feature {
+        id: id.to_string(),
+        title: "fix it".to_string(),
+        spec: "address the finding".to_string(),
+        validation_criteria: vec![],
+        origin: FeatureOrigin::Fix,
+        status: FeatureStatus::Pending,
+        worker_runs: vec![],
+        commits: vec![],
+        respawns: 0,
+    }
+}
+
+/// Mission A: 2 planned features + 1 fix feature over 1 milestone.
+/// Worker costs 1.0, 2.0, 3.0 (usage fallback), 2.0 → avg 2.0; validator
+/// costs 0.6, 1.0 → avg 0.8; 1 respawn / 2 planned → r 0.5; 1 fix cycle /
+/// 1 milestone → x 1.0; 1 fix feature / 1 cycle → f 1.0; orchestrator 0.9 /
+/// 3 features → 0.3.
+fn mission_a_events() -> Vec<EventKind> {
+    vec![
+        created("m-a"),
+        EventKind::PlanApproved { plan: plan_with(&[2]) },
+        EventKind::MilestoneStarted { milestone_id: "ms-1".into(), start_sha: "aaa".into() },
+        EventKind::FeatureStarted { feature_id: "f-1-1".into() },
+        spawned("w-1", Role::Worker, Some("f-1-1"), None),
+        completed("w-1", Some(1.0), TokenUsage::default()),
+        EventKind::FeatureCompleted { feature_id: "f-1-1".into(), commits: vec![] },
+        EventKind::FeatureStarted { feature_id: "f-1-2".into() },
+        spawned("w-2", Role::Worker, Some("f-1-2"), None),
+        completed("w-2", Some(2.0), TokenUsage::default()),
+        // Respawn on f-1-2 (2nd run on the same feature)...
+        spawned("w-3", Role::Worker, Some("f-1-2"), None),
+        // ...whose cost is unreported: falls back to usage pricing
+        // (1 MTok sonnet input = $3.00).
+        completed(
+            "w-3",
+            None,
+            TokenUsage { input: 1_000_000, output: 0, cache_read: 0, cache_write: 0 },
+        ),
+        EventKind::FeatureCompleted { feature_id: "f-1-2".into(), commits: vec![] },
+        EventKind::MilestoneValidating { milestone_id: "ms-1".into() },
+        spawned("v-1", Role::ValidatorScrutiny, None, Some("ms-1")),
+        completed("v-1", Some(0.6), TokenUsage::default()),
+        EventKind::ValidationFinding {
+            milestone_id: "ms-1".into(),
+            run_id: "v-1".into(),
+            finding: Finding {
+                subject: "a-1".into(),
+                severity: "major".into(),
+                evidence: "it broke".into(),
+                suggested_fix: "fix it".into(),
+            },
+        },
+        // First fix-feature after milestone.validating: fix cycle #1.
+        EventKind::FixFeatureCreated {
+            milestone_id: "ms-1".into(),
+            feature: fix_feature("f-fix-1"),
+        },
+        EventKind::FeatureStarted { feature_id: "f-fix-1".into() },
+        spawned("w-4", Role::Worker, Some("f-fix-1"), None),
+        completed("w-4", Some(2.0), TokenUsage::default()),
+        EventKind::FeatureCompleted { feature_id: "f-fix-1".into(), commits: vec![] },
+        EventKind::MilestoneValidating { milestone_id: "ms-1".into() },
+        spawned("v-2", Role::ValidatorFunctional, None, Some("ms-1")),
+        completed("v-2", Some(1.0), TokenUsage::default()),
+        EventKind::MilestoneCompleted { milestone_id: "ms-1".into(), tag: None },
+        spawned("o-1", Role::Orchestrator, None, None),
+        completed("o-1", Some(0.9), TokenUsage::default()),
+        EventKind::MissionCompleted {},
+    ]
+}
+
+/// Mission B: the trivial clean run. Worker avg 1.0; validator avg 0.4; no
+/// respawns, no fix cycles, no fix features; orchestrator 0.5 / 1 feature.
+fn mission_b_events() -> Vec<EventKind> {
+    vec![
+        created("m-b"),
+        EventKind::PlanApproved { plan: plan_with(&[1]) },
+        EventKind::MilestoneStarted { milestone_id: "ms-1".into(), start_sha: "bbb".into() },
+        EventKind::FeatureStarted { feature_id: "f-1-1".into() },
+        spawned("w-1", Role::Worker, Some("f-1-1"), None),
+        completed("w-1", Some(1.0), TokenUsage::default()),
+        EventKind::FeatureCompleted { feature_id: "f-1-1".into(), commits: vec![] },
+        EventKind::MilestoneValidating { milestone_id: "ms-1".into() },
+        spawned("v-1", Role::ValidatorScrutiny, None, Some("ms-1")),
+        completed("v-1", Some(0.4), TokenUsage::default()),
+        EventKind::MilestoneCompleted { milestone_id: "ms-1".into(), tag: None },
+        spawned("o-1", Role::Orchestrator, None, None),
+        completed("o-1", Some(0.5), TokenUsage::default()),
+        EventKind::MissionCompleted {},
+    ]
+}
+
+#[test]
+fn calibrate_averages_actuals_across_completed_missions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+
+    write_events(repo, "m-a", mission_a_events());
+    write_events(repo, "m-b", mission_b_events());
+    // Distractors, none of which may count or fail the calibration:
+    // an in-flight mission (folds fine, but is not Complete)...
+    write_events(
+        repo,
+        "m-running",
+        vec![created("m-running"), EventKind::PlanApproved { plan: plan_with(&[1]) }],
+    );
+    // ...an unreadable log (corruption mid-file)...
+    let bad = repo.join(".kranz").join("missions").join("m-bad");
+    std::fs::create_dir_all(&bad).unwrap();
+    std::fs::write(bad.join("events.jsonl"), "not json\nalso not json\n").unwrap();
+    // ...and a mission directory with no log at all.
+    std::fs::create_dir_all(repo.join(".kranz").join("missions").join("m-empty")).unwrap();
+
+    let calibration = cost::calibrate(repo);
+
+    assert_eq!(calibration.missions_used, 2);
+    let p = calibration.params;
+    // Simple means of the two missions' hand-computed actuals (see the
+    // fixture doc comments): A=(2.0, 0.8, 0.5, 1.0, 1.0, 0.3), B=(1.0, 0.4,
+    // 0.0, 0.0, 0.0, 0.5).
+    approx(p.avg_worker_run_usd, 1.5);
+    approx(p.avg_validator_run_usd, 0.6);
+    approx(p.respawn_allowance, 0.25);
+    approx(p.fix_cycles_per_milestone, 0.5);
+    approx(p.fix_features_per_cycle, 0.5);
+    approx(p.orchestrator_overhead_usd_per_feature, 0.4);
+}
+
+#[test]
+fn calibrate_without_completed_missions_returns_defaults() {
+    // A repo with no missions at all.
+    let tmp = tempfile::tempdir().unwrap();
+    let calibration = cost::calibrate(tmp.path());
+    assert_eq!(calibration.missions_used, 0);
+    assert_eq!(calibration.params, EstimateParams::default());
+
+    // A repo whose only mission log is unreadable: skipped → defaults again.
+    let tmp = tempfile::tempdir().unwrap();
+    let bad = tmp.path().join(".kranz").join("missions").join("m-bad");
+    std::fs::create_dir_all(&bad).unwrap();
+    std::fs::write(bad.join("events.jsonl"), "garbage\nmore garbage\n").unwrap();
+    let calibration = cost::calibrate(tmp.path());
+    assert_eq!(calibration.missions_used, 0);
+    assert_eq!(calibration.params, EstimateParams::default());
+}
+
+#[test]
+fn calibrate_clamps_zero_costs_to_floor() {
+    // A completed mission that reported $0 for everything (and had no
+    // validator or orchestrator runs) must not zero future estimates.
+    let tmp = tempfile::tempdir().unwrap();
+    write_events(
+        tmp.path(),
+        "m-zero",
+        vec![
+            created("m-zero"),
+            EventKind::PlanApproved { plan: plan_with(&[1]) },
+            EventKind::MilestoneStarted { milestone_id: "ms-1".into(), start_sha: "ccc".into() },
+            EventKind::FeatureStarted { feature_id: "f-1-1".into() },
+            spawned("w-1", Role::Worker, Some("f-1-1"), None),
+            completed("w-1", Some(0.0), TokenUsage::default()),
+            EventKind::FeatureCompleted { feature_id: "f-1-1".into(), commits: vec![] },
+            EventKind::MilestoneCompleted { milestone_id: "ms-1".into(), tag: None },
+            EventKind::MissionCompleted {},
+        ],
+    );
+
+    let calibration = cost::calibrate(tmp.path());
+    assert_eq!(calibration.missions_used, 1);
+    let p = calibration.params;
+    approx(p.avg_worker_run_usd, 0.01);
+    approx(p.avg_validator_run_usd, 0.01);
+    approx(p.orchestrator_overhead_usd_per_feature, 0.01);
+    approx(p.respawn_allowance, 0.0);
+    approx(p.fix_cycles_per_milestone, 0.0);
+    approx(p.fix_features_per_cycle, 0.0);
 }
 
 // ---------------------------------------------------------------------------

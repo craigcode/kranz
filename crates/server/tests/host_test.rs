@@ -352,6 +352,9 @@ async fn hosted_lifecycle_reaches_complete_without_a_terminal() {
         body["estimate"]["lowUsd"].as_f64().unwrap()
             < body["estimate"]["highUsd"].as_f64().unwrap()
     );
+    // Estimate provenance: a fresh repo has no completed missions, so the
+    // params are the built-in defaults.
+    assert_eq!(body["calibration"]["missionsUsed"], 0, "{body}");
     let plan = body["plan"].clone();
 
     // Start before approval is refused with advice.

@@ -5,7 +5,13 @@
 //! CLI (and folded into `MissionState.total_cost_usd`) is always
 //! authoritative; nothing in this module gates or bills anything.
 
-use crate::types::{MissionConfig, Plan, TokenUsage};
+use crate::event_log::EventLog;
+use crate::paths::MissionPaths;
+use crate::reducer;
+use crate::types::{
+    FeatureOrigin, MissionConfig, MissionState, MissionStatus, Plan, Role, TokenUsage, WorkerRun,
+};
+use std::path::Path;
 
 const TOKENS_PER_MTOK: f64 = 1_000_000.0;
 
@@ -139,5 +145,120 @@ pub fn estimate(plan: &Plan, cfg: &MissionConfig, p: &EstimateParams) -> CostEst
         low_usd: 0.5 * expected_usd,
         expected_usd,
         high_usd: 2.5 * expected_usd,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Calibration from recorded actuals (roadmap M1)
+// ---------------------------------------------------------------------------
+
+/// [`EstimateParams`] derived from the repo's completed missions, plus how
+/// many missions informed them. `missions_used == 0` means the params are the
+/// built-in defaults (nothing to calibrate against yet).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Calibration {
+    pub params: EstimateParams,
+    pub missions_used: usize,
+}
+
+/// Derive [`EstimateParams`] from the actuals recorded in this repo's
+/// COMPLETED missions (live estimates ran ~10x above actuals on the built-in
+/// defaults — real per-run costs are the fix).
+///
+/// Every mission under `.kranz/missions` is folded from its event log;
+/// unreadable or corrupt logs are skipped, as is any mission whose final
+/// status is not `Complete` (an in-flight or failed mission's actuals are not
+/// representative). Each surviving mission yields one set of per-mission
+/// actuals (see [`mission_actuals`]); the calibration is their simple mean.
+///
+/// With zero usable missions the built-in [`EstimateParams::default`] is
+/// returned with `missions_used == 0`. Derived costs are floored at $0.01 and
+/// rates at 0.0 so one weird mission (e.g. all-zero reported costs) cannot
+/// zero out future estimates.
+pub fn calibrate(repo_root: &Path) -> Calibration {
+    let mut per_mission: Vec<EstimateParams> = Vec::new();
+    for mission_id in MissionPaths::list_missions(repo_root) {
+        let paths = MissionPaths::new(repo_root, &mission_id);
+        let Ok(events) = EventLog::read_events(&paths.events_file()) else {
+            continue; // missing or unreadable log: not calibration data
+        };
+        let Ok(state) = reducer::fold(&events) else {
+            continue; // corrupt / empty log: skip, never fail the estimate
+        };
+        if state.mission.status != MissionStatus::Complete {
+            continue;
+        }
+        per_mission.push(mission_actuals(&state));
+    }
+
+    if per_mission.is_empty() {
+        return Calibration { params: EstimateParams::default(), missions_used: 0 };
+    }
+
+    let n = per_mission.len() as f64;
+    let mean = |get: fn(&EstimateParams) -> f64| per_mission.iter().map(get).sum::<f64>() / n;
+    let params = EstimateParams {
+        respawn_allowance: mean(|p| p.respawn_allowance).max(0.0),
+        fix_cycles_per_milestone: mean(|p| p.fix_cycles_per_milestone).max(0.0),
+        fix_features_per_cycle: mean(|p| p.fix_features_per_cycle).max(0.0),
+        avg_worker_run_usd: mean(|p| p.avg_worker_run_usd).max(0.01),
+        avg_validator_run_usd: mean(|p| p.avg_validator_run_usd).max(0.01),
+        orchestrator_overhead_usd_per_feature: mean(|p| p.orchestrator_overhead_usd_per_feature)
+            .max(0.01),
+    };
+    Calibration { params, missions_used: per_mission.len() }
+}
+
+/// One completed mission's actuals, expressed in [`EstimateParams`] terms so
+/// [`calibrate`] can average them directly:
+///
+/// - avg worker / validator run cost: mean over runs of that role of the
+///   CLI-reported `cost_usd`, falling back to [`usage_cost_usd`];
+/// - respawn allowance: total respawns / planned (origin `Plan`) features;
+/// - fix cycles per milestone: total fix cycles / milestones;
+/// - fix features per cycle: origin-`Fix` features / max(total fix cycles, 1);
+/// - orchestrator overhead per feature: total orchestrator run cost / total
+///   features.
+fn mission_actuals(state: &MissionState) -> EstimateParams {
+    let run_cost =
+        |run: &WorkerRun| run.cost_usd.unwrap_or_else(|| usage_cost_usd(&run.tokens, &run.model));
+    let mean_run_cost = |roles: &[Role]| -> f64 {
+        let costs: Vec<f64> = state
+            .runs
+            .values()
+            .filter(|r| roles.contains(&r.role))
+            .map(run_cost)
+            .collect();
+        if costs.is_empty() { 0.0 } else { costs.iter().sum::<f64>() / costs.len() as f64 }
+    };
+
+    let features = || state.mission.milestones.iter().flat_map(|m| m.features.iter());
+    let total_features = features().count() as f64;
+    let planned_features = features().filter(|f| f.origin == FeatureOrigin::Plan).count() as f64;
+    let fix_features = features().filter(|f| f.origin == FeatureOrigin::Fix).count() as f64;
+    let total_respawns = features().map(|f| f.respawns as f64).sum::<f64>();
+    let milestones = state.mission.milestones.len() as f64;
+    let total_fix_cycles =
+        state.mission.milestones.iter().map(|m| m.fix_cycles as f64).sum::<f64>();
+
+    let orchestrator_total = state
+        .runs
+        .values()
+        .filter(|r| r.role == Role::Orchestrator)
+        .map(run_cost)
+        .sum::<f64>();
+
+    let safe_div = |num: f64, den: f64| if den > 0.0 { num / den } else { 0.0 };
+
+    EstimateParams {
+        respawn_allowance: safe_div(total_respawns, planned_features),
+        fix_cycles_per_milestone: safe_div(total_fix_cycles, milestones),
+        fix_features_per_cycle: fix_features / total_fix_cycles.max(1.0),
+        avg_worker_run_usd: mean_run_cost(&[Role::Worker]),
+        avg_validator_run_usd: mean_run_cost(&[
+            Role::ValidatorScrutiny,
+            Role::ValidatorFunctional,
+        ]),
+        orchestrator_overhead_usd_per_feature: safe_div(orchestrator_total, total_features),
     }
 }
