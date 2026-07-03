@@ -20,7 +20,7 @@ use kranz_engine::types::MissionStatus;
 fn parses_exec_with_short_file_flag() {
     let cli = Cli::try_parse_from(["kranz", "exec", "-f", "mission.md"]).unwrap();
     match cli.command {
-        Command::Exec { file, yes, max_cycles } => {
+        Command::Exec { file, yes, max_cycles, .. } => {
             assert_eq!(file.to_str(), Some("mission.md"));
             assert!(!yes);
             assert_eq!(max_cycles, None);
@@ -42,7 +42,7 @@ fn parses_exec_with_long_file_flag_and_all_options() {
     ])
     .unwrap();
     match cli.command {
-        Command::Exec { file, yes, max_cycles } => {
+        Command::Exec { file, yes, max_cycles, .. } => {
             assert_eq!(file.to_str(), Some("plans/ci.md"));
             assert!(yes);
             assert_eq!(max_cycles, Some(5));

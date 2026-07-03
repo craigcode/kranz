@@ -161,6 +161,12 @@ pub enum Command {
         /// Override maxFixCyclesPerMilestone for this run (bounds CI spend)
         #[arg(long, value_name = "N")]
         max_cycles: Option<u32>,
+
+        /// After a COMPLETE run, push the mission's `kranz/*` branch to this
+        /// git remote (the cloud-mission handoff: a human reviews the branch
+        /// and opens the PR). Refuses to push anything but a kranz/* ref.
+        #[arg(long, value_name = "REMOTE")]
+        push: Option<String>,
     },
 
     /// Show the per-repo execution queue

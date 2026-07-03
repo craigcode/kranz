@@ -26,7 +26,7 @@ Done when: the acceptance mission completes unattended with every §5 criterion
 checked off; a fresh mission's estimate lands within 2× of its actual; every
 completed mission ends with a committed report.md.
 
-## M2 — Mission lifecycle completeness
+## M2 — Mission lifecycle completeness ◑ (hygiene+preflight shipped; re-planning = safe subset)
 
 Live use exposed the lifecycle edges v1 cut.
 
@@ -97,7 +97,7 @@ Done when: a mission goes goal → planning → approve → start → complete e
 in Slack; `/kranz` fully operates the backlog; unauthorized users cannot spend;
 transcripts are one tap from the thread.
 
-## M3 — Parallel workers (plan Phase 4, flagged off by default)
+## M3 — Parallel workers ◑ (worktree-isolated, flag-gated; conflict-resolver + true overlap deferred)
 
 The marquee deferred capability. Correctness groundwork exists (single-writer
 log, engine-serialized appends); the work is orchestration.
@@ -130,7 +130,7 @@ and the project has no distribution story.
 Done when: CI is green on both platforms including the kill/resume test, and
 a new machine goes from nothing to `kranz plan` without cloning the repo.
 
-## M5 — Deeper validation & automation (plan Phase 5)
+## M5 — Deeper validation & automation ◑ (kranz exec + scrub shipped; QA/skill-capture/OTEL deferred)
 
 - Functional QA via browser/computer-use driven by the validator, for target
   repos with a scriptable run harness (same prerequisite Factory imposes).
@@ -140,7 +140,7 @@ a new machine goes from nothing to `kranz plan` without cloning the repo.
   worker patterns; human approves before write.
 - OTEL export of engine events; real secret scanning replacing the regex scrub.
 
-## M6 — Cloud missions (the plan's "v3 idea", unblocked by M2.5)
+## M6 — Cloud missions ◑ (scoped push, Dockerfile, deploy docs, exec --push shipped; live deploy user-gated)
 
 Run missions on rented compute; the event-sourced core and the M2.5 HTTP
 lifecycle already make Kranz location-independent. Two shapes, in order:

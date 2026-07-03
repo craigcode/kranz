@@ -87,6 +87,7 @@ pub async fn cmd_exec(
     file: PathBuf,
     _yes: bool,
     max_cycles: Option<u32>,
+    push: Option<String>,
     dangerously_allow_all: bool,
 ) -> Result<i32> {
     let ticket = read_mission_file(&file)?;
@@ -181,9 +182,28 @@ pub async fn cmd_exec(
 
     let status = run_result.map_err(|e| augment_limit_hint(e.into()))?;
     let code = exit_code_for(status);
+
+    // Cloud handoff: on a COMPLETE run, push the mission's kranz/* branch to the
+    // requested remote so a human reviews it and opens the PR. GitRepo enforces
+    // the kranz/* guard — this never pushes main or force-pushes. Failure to
+    // push is surfaced but does not change the mission's own exit code (the work
+    // is done and committed locally; the push is a delivery step).
+    let mut pushed = false;
+    if let (Some(remote), MissionStatus::Complete) = (&push, status) {
+        match kranz_engine::git_ops::GitRepo::open(&repo)
+            .and_then(|r| r.push_mission_branch(remote, &branch))
+        {
+            Ok(()) => {
+                pushed = true;
+                eprintln!("kranz exec: pushed {branch} to {remote}");
+            }
+            Err(e) => eprintln!("kranz exec: WARNING failed to push {branch} to {remote}: {e}"),
+        }
+    }
+
     // The only line on stdout: machine-readable, one line, always emitted.
     println!(
-        "kranz exec {mission_id} {} cost=${cost:.2} branch={branch}",
+        "kranz exec {mission_id} {} cost=${cost:.2} branch={branch} pushed={pushed}",
         output::mission_status_label(status)
     );
     Ok(code)
