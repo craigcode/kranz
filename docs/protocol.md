@@ -22,6 +22,39 @@ the engine's serde shapes.
 Static dashboard files served from a configurable dir at `/` (SPA fallback to
 index.html).
 
+## Mission lifecycle (server-hosted engine; M2.5)
+
+`kranz serve` can HOST missions: for missions it creates, the server process
+IS the single-writer engine (it holds the mission lock; a concurrent
+`kranz run` correctly refuses, and either side can resume what the other
+started — the event log is the source of truth).
+
+| Method/Path | Behavior |
+|---|---|
+| `POST /api/missions` | body `{"goal":"...", "config": {optional partial MissionConfig patch}}` → creates the mission (engine held in the server registry) → `201 {"id":"m-…"}` |
+| `POST /api/missions/:id/planning/turn` | body `{"text":"..."}` → runs one planning turn → `200 {"reply":"..."}`. Seed replies are prepended. Activity streams over the WS feed as usual. `409` if the mission is not hosted here, not in planning, or a turn is already in flight |
+| `POST /api/missions/:id/planning/request-plan` | → `200 {"ready":true, "plan":{...}, "estimate":{...CostEstimate}}` or `200 {"ready":false, "reply":"<orchestrator prose>"}` (NotReady returns to conversation) |
+| `POST /api/missions/:id/approve` | body `{"plan":{...}}` (the plan previously returned) → commits plan.json/plan.md/index.md exactly like the CLI → `200 {"branch":"kranz/mission-…"}` |
+| `POST /api/missions/:id/start` | spawns `engine.run()` as a background task → `202 {"running":true}`. Re-invocable when the mission is Blocked (after queueing guidance via control) or after a server restart (`resume` semantics). `409` while already running |
+
+Hosted-engine rules: planning endpoints serialize per mission (one turn at a
+time); `start` consumes the hosted engine into the run task; when the run
+ends (Complete/Blocked/Failed) the registry entry is dropped and the lock
+released — the mission is then observable/resumable from anywhere.
+
+## Authority: mutation token
+
+Every `POST /api/...` requires the per-serve session token via the
+`x-kranz-token` header (WS and GETs stay tokenless — read-only observation).
+The token is generated at serve start (or passed in by the embedding Tauri
+shell), printed to the operator, and appended by `--open` as `#token=<t>` in
+the launched URL; the dashboard stores it (sessionStorage) and shows a
+paste-token field when a mutation is attempted without one. Missing/wrong
+token → `401 {"error":"missing or invalid token"}`. Rationale: 127.0.0.1
+binding + CORS stop the network and the browser; the token stops other local
+processes and link-borne CSRF from creating or steering missions that spend
+money.
+
 ## WebSocket `GET /api/missions/:id/ws?since=<seq>`
 
 Server → client messages (JSON text frames):
