@@ -449,12 +449,12 @@ pub fn busy_status_line(
         BusyKind::Turn => "orchestrator working…",
         BusyKind::PlanRequest => "requesting plan…",
     };
-    let queue = if queued > 0 {
-        format!(" — {queued} queued")
-    } else {
-        String::new()
+    let queue = match queued {
+        0 => String::new(),
+        1 => " — 1 message queued, sends when this turn finishes".to_string(),
+        n => format!(" — {n} messages queued, send in order when this turn finishes"),
     };
-    format!("{frame} {doing} {elapsed_secs}s (nothing is cancelled; your input queues){queue}")
+    format!("{frame} {doing} {elapsed_secs}s — typing is safe, Enter queues your message{queue}")
 }
 
 // ---------------------------------------------------------------------------

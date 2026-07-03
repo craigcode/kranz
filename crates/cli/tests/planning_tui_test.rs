@@ -343,14 +343,18 @@ fn busy_status_shows_spinner_elapsed_and_queue_depth() {
     assert!(line.starts_with(SPINNER_FRAMES[0]), "{line}");
     assert!(line.contains("orchestrator working…"), "{line}");
     assert!(line.contains("12s"), "{line}");
-    assert!(line.contains("input queues"), "{line}");
-    assert!(!line.contains("queued"), "{line}");
+    assert!(line.contains("typing is safe"), "{line}");
+    assert!(line.contains("Enter queues your message"), "{line}");
+    assert!(!line.contains("queued,"), "{line}");
 
     let line = busy_status_line(BusyKind::PlanRequest, 3, 1, 2);
     assert!(line.starts_with(SPINNER_FRAMES[1]), "{line}");
     assert!(line.contains("requesting plan…"), "{line}");
     assert!(line.contains("3s"), "{line}");
-    assert!(line.contains("— 2 queued"), "{line}");
+    assert!(line.contains("2 messages queued, send in order when this turn finishes"), "{line}");
+
+    let line = busy_status_line(BusyKind::Turn, 5, 0, 1);
+    assert!(line.contains("1 message queued, sends when this turn finishes"), "{line}");
 }
 
 #[test]
