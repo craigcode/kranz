@@ -1502,3 +1502,360 @@ async fn abandon_fails_while_engine_holds_lock() {
 
     drop(engine);
 }
+
+// ---------------------------------------------------------------------------
+// 10. Environment preflight (roadmap M2)
+// ---------------------------------------------------------------------------
+
+/// preflight() flags a contract command whose leading program is plainly
+/// missing from PATH (a `warn`), and stays silent for commands whose program
+/// resolves — a bare shell builtin (`cd .`) or the ubiquitous `true`.
+#[tokio::test(flavor = "multi_thread")]
+async fn preflight_flags_missing_program_and_ignores_present_ones() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let backend = Arc::new(MockBackend::new());
+
+    // A mission whose contract command uses a program that cannot exist.
+    let missing = vec![assertion(
+        "a-1",
+        "the check passes",
+        Some("definitely-not-a-real-program-xyz --check"),
+    )];
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(simple_plan(1, missing)).unwrap();
+    let issues = engine.preflight();
+    let warn = issues
+        .iter()
+        .find(|i| i.message.contains("definitely-not-a-real-program-xyz"))
+        .expect("the missing program is flagged");
+    assert_eq!(warn.severity, "warn", "a missing program is a warning, not an error");
+    // No spurious hard-error issues: this IS a git repo with a writable .kranz.
+    assert!(
+        !issues.iter().any(|i| i.severity == "error"),
+        "no false hard errors: {issues:?}"
+    );
+    drop(engine);
+
+    // A mission whose contract commands both resolve → no issues at all.
+    let (_dir2, root2) = init_repo();
+    let backend2 = Arc::new(MockBackend::new());
+    let present = vec![
+        assertion("a-1", "trivially true", Some("true")),
+        assertion("a-2", "a builtin", Some("cd .")),
+    ];
+    let mut engine2 = make_engine(&backend2, &root2, test_cfg());
+    engine2.approve_plan(simple_plan(1, present)).unwrap();
+    assert!(
+        engine2.preflight().is_empty(),
+        "true / cd . resolve, so preflight is clean: {:?}",
+        engine2.preflight()
+    );
+}
+
+/// run() emits exactly one `orchestrator.decision` summarizing preflight
+/// issues (before any worker spawns) when the contract names a missing
+/// program, and the mission still completes — preflight never blocks.
+#[tokio::test(flavor = "multi_thread")]
+async fn run_emits_preflight_decision_when_issues_exist() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    // The one command assertion names a program that cannot resolve, so its
+    // final-gate command would fail — so we WAIVE it at the gate to let the
+    // mission complete (preflight is orthogonal to the gate; we are asserting
+    // the preflight decision fires, not the gate outcome).
+    let contract = vec![assertion(
+        "a-1",
+        "the check passes",
+        Some("definitely-not-a-real-program-xyz --check"),
+    )];
+
+    // Orchestrator turns: seed, judgement f-1-1, then the final-gate conversion
+    // turn waives the failing command assertion.
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            judgement("complete", ""),
+            waive_reply("a-1", "command program unavailable in this environment"),
+        ]),
+    ]));
+
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(simple_plan(1, contract)).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run()).await.expect("run must not hang").unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+
+    // Exactly one preflight decision, and it precedes the first worker spawn.
+    let preflight_seqs: Vec<u64> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::OrchestratorDecision { summary, .. } if summary.starts_with("preflight:") => {
+                Some(e.seq)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(preflight_seqs.len(), 1, "exactly one preflight decision: {preflight_seqs:?}");
+    let preflight_seq = preflight_seqs[0];
+    let first_spawn = seq_of(&events, "worker.spawned");
+    assert!(
+        preflight_seq < first_spawn,
+        "preflight decision {preflight_seq} precedes the first worker spawn {first_spawn}"
+    );
+    // The summary names the missing program.
+    assert!(events.iter().any(|e| matches!(
+        &e.kind,
+        EventKind::OrchestratorDecision { summary, .. }
+            if summary.starts_with("preflight:")
+                && summary.contains("definitely-not-a-real-program-xyz")
+    )));
+}
+
+// ---------------------------------------------------------------------------
+// 11. Mid-mission re-planning (roadmap M2)
+// ---------------------------------------------------------------------------
+
+/// request_revised_plan returns a Ready proposal (streaming orchestrator turn,
+/// same as request_plan); approve_revised_plan then commits revised-plan.md,
+/// records an orchestrator.decision, skips a dropped pending feature, and adds
+/// a new feature to the active milestone as a fix-origin feature.
+#[tokio::test(flavor = "multi_thread")]
+async fn request_and_approve_revised_plan_drops_and_adds_features() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    // The revised plan the orchestrator proposes: same single milestone "M1",
+    // but the remaining features are { feature 1 (kept), a brand-new feature }
+    // — i.e. "feature 2" and "feature 3" are dropped, and "extra feature" is
+    // added.
+    let revised_json = json!({
+        "goal": GOAL,
+        "validationContract": [],
+        "milestones": [{
+            "title": "M1",
+            "features": [
+                { "title": "feature 1", "spec": "build part 1", "validationCriteria": ["part 1 works"] },
+                { "title": "extra feature", "spec": "build the newly-needed part", "validationCriteria": ["extra works"] }
+            ]
+        }]
+    })
+    .to_string();
+
+    // One streaming orchestrator session; the single turn is the revised-plan
+    // demand → the revised plan JSON.
+    let backend = Arc::new(MockBackend::with_scripts(vec![orch_script(vec![revised_json])]));
+
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    // Approve a 3-feature plan: mission goes Running, milestone ms-1 Pending
+    // with features f-1-1, f-1-2, f-1-3 (all pending, none started).
+    engine.approve_plan(simple_plan(3, vec![])).unwrap();
+    assert_eq!(engine.state().mission.status, MissionStatus::Running);
+
+    // Propose the revision.
+    let request = timeout(TEST_TIMEOUT, engine.request_revised_plan())
+        .await
+        .expect("request_revised_plan must not hang")
+        .expect("scripted plan JSON is not a backend error");
+    let plan = match request {
+        PlanRequest::Ready(plan) => plan,
+        PlanRequest::NotReady(text) => panic!("scripted revised plan must parse: {text}"),
+    };
+    assert_eq!(plan.milestones[0].features.len(), 2);
+
+    // Apply it.
+    engine.approve_revised_plan(plan).expect("apply the revised plan");
+
+    // f-1-2 and f-1-3 are dropped (skipped); f-1-1 untouched; one fix-origin
+    // feature added to ms-1 with the re-plan id shape.
+    let ms = &engine.state().mission.milestones[0];
+    let by_id = |id: &str| ms.features.iter().find(|f| f.id == id).cloned();
+    assert_eq!(by_id("f-1-1").unwrap().status, FeatureStatus::Pending, "kept feature untouched");
+    assert_eq!(by_id("f-1-2").unwrap().status, FeatureStatus::Skipped, "dropped feature skipped");
+    assert_eq!(by_id("f-1-3").unwrap().status, FeatureStatus::Skipped, "dropped feature skipped");
+    let added = by_id("ms-1-replan-1").expect("added feature exists with re-plan id");
+    assert_eq!(added.origin, FeatureOrigin::Fix, "added feature is fix-origin");
+    assert_eq!(added.status, FeatureStatus::Pending);
+    assert_eq!(added.title, "extra feature");
+
+    // revised-plan.md was written + committed on the mission branch.
+    let mission_id = engine.mission_id().to_string();
+    let md = std::fs::read_to_string(
+        root.join(".kranz").join("missions").join(&mission_id).join("revised-plan.md"),
+    )
+    .expect("revised-plan.md written");
+    assert!(md.starts_with(&format!("# Revised mission plan — {mission_id}")), "{md}");
+    assert!(md.contains("## Re-plan changes applied"), "{md}");
+    assert!(md.contains("extra feature"), "{md}");
+    let subject = raw_git(&root, &["log", "-1", "--format=%s"]);
+    assert_eq!(subject.trim(), format!("[kranz] revised plan for {mission_id}"));
+
+    // The log carries the re-plan decision, two feature.skipped, one
+    // fixfeature.created.
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+    assert!(events.iter().any(|e| matches!(
+        &e.kind,
+        EventKind::OrchestratorDecision { summary, .. } if summary.starts_with("re-plan for ms-1")
+    )));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(&e.kind, EventKind::FeatureSkipped { reason, .. }
+                if reason.contains("re-plan")))
+            .count(),
+        2,
+        "both dropped features skipped by the re-plan"
+    );
+    assert_eq!(
+        event_types(&events).iter().filter(|t| **t == "fixfeature.created").count(),
+        1,
+        "exactly one feature added by the re-plan"
+    );
+
+    // The revised mission still folds cleanly (contiguous log, no corruption).
+    let state = reducer::fold(&events).unwrap();
+    assert_eq!(state.mission.milestones[0].features.len(), 4, "3 planned + 1 added");
+}
+
+/// approve_revised_plan rejects a revision that drops (or reorders away) an
+/// already-Complete milestone: completed work must reappear first, unchanged.
+#[tokio::test(flavor = "multi_thread")]
+async fn approve_revised_plan_rejects_dropping_a_completed_milestone() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    // Two milestones, one feature each. M1 completes cleanly (worker pass, no
+    // validators); M2's single feature "passes", round 1 finds a problem (fix
+    // cycle 1, allowed by cap=1), the fix worker "passes", but round 2 finds a
+    // problem again → cap exceeded → M2 blocks and run() returns Blocked with
+    // M1 Complete.
+    let finding = json!([{
+        "subject": "part 2 works",
+        "severity": "major",
+        "evidence": "still failing",
+        "suggestedFix": ""
+    }]);
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        // Session order: worker M1-f1, orchestrator, functional validator M1
+        // (clean), worker M2-f1, functional validator M2 round 1 (finding),
+        // fix worker M2, functional validator M2 round 2 (finding again).
+        worker_pass(),
+        orch_script(vec![
+            judgement("complete", ""), // M1 f-1-1
+            judgement("complete", ""), // M2 f-2-1
+            fix_features(1),            // M2 round 1 conversion → one fix
+            judgement("complete", ""), // M2 fix worker
+            fix_features(1),            // M2 round 2 conversion at the cap → wants another
+        ]),
+        validator_with(json!([])),       // M1 validation: clean → M1 completes
+        worker_pass(),                    // M2 f-2-1
+        validator_with(finding.clone()),  // M2 round 1: finding (fix cycle 1)
+        worker_pass(),                    // M2 fix worker
+        validator_with(finding),          // M2 round 2: finding again → blocked
+    ]));
+
+    let cfg = MissionConfig {
+        skip_functional: false,
+        max_fix_cycles_per_milestone: 1, // round-2 findings exceed the cap → blocked
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    // Two milestones, one feature each.
+    let plan = Plan {
+        goal: GOAL.to_string(),
+        validation_contract: vec![],
+        milestones: vec![
+            PlanMilestone {
+                title: "M1".to_string(),
+                features: vec![PlanFeature {
+                    title: "feature 1".to_string(),
+                    spec: "build part 1".to_string(),
+                    validation_criteria: vec!["part 1 works".to_string()],
+                }],
+            },
+            PlanMilestone {
+                title: "M2".to_string(),
+                features: vec![PlanFeature {
+                    title: "feature 2".to_string(),
+                    spec: "build part 2".to_string(),
+                    validation_criteria: vec!["part 2 works".to_string()],
+                }],
+            },
+        ],
+    };
+    engine.approve_plan(plan).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run()).await.expect("run must not hang").unwrap();
+    assert_eq!(status, MissionStatus::Blocked, "M2 blocked at the fix-cycle cap");
+    assert_eq!(
+        engine.state().mission.milestones[0].status,
+        MilestoneStatus::Complete,
+        "M1 is complete"
+    );
+
+    // A revised plan that DROPS the completed M1 (only lists M2) must be
+    // rejected — completed work cannot be discarded.
+    let drops_completed = Plan {
+        goal: GOAL.to_string(),
+        validation_contract: vec![],
+        milestones: vec![PlanMilestone {
+            title: "M2".to_string(),
+            features: vec![PlanFeature {
+                title: "feature 2".to_string(),
+                spec: "build part 2".to_string(),
+                validation_criteria: vec!["part 2 works".to_string()],
+            }],
+        }],
+    };
+    let err = engine
+        .approve_revised_plan(drops_completed)
+        .expect_err("dropping a completed milestone must be rejected");
+    assert!(
+        matches!(err, kranz_engine::error::EngineError::InvalidState(_)),
+        "expected InvalidState, got: {err}"
+    );
+    assert!(err.to_string().contains("M1"), "error names the dropped completed milestone: {err}");
+
+    // A revised plan that ALTERS the completed M1's features is also rejected.
+    let alters_completed = Plan {
+        goal: GOAL.to_string(),
+        validation_contract: vec![],
+        milestones: vec![
+            PlanMilestone {
+                title: "M1".to_string(),
+                features: vec![PlanFeature {
+                    title: "feature 1 RENAMED".to_string(),
+                    spec: "build part 1".to_string(),
+                    validation_criteria: vec!["part 1 works".to_string()],
+                }],
+            },
+            PlanMilestone {
+                title: "M2".to_string(),
+                features: vec![PlanFeature {
+                    title: "feature 2".to_string(),
+                    spec: "build part 2".to_string(),
+                    validation_criteria: vec!["part 2 works".to_string()],
+                }],
+            },
+        ],
+    };
+    let err = engine
+        .approve_revised_plan(alters_completed)
+        .expect_err("altering a completed milestone's features must be rejected");
+    assert!(err.to_string().contains("alters"), "error explains the alteration: {err}");
+}

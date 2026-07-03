@@ -197,6 +197,23 @@ struct VerdictsDecision {
 }
 
 // ---------------------------------------------------------------------------
+// Environment preflight (roadmap M2)
+// ---------------------------------------------------------------------------
+
+/// One environment-preflight issue surfaced at run start (roadmap M2).
+///
+/// Preflight is advisory only: it never blocks a mission (the final contract
+/// gate stays authoritative). `severity` is `"warn"` for a probably-missing
+/// prerequisite and `"error"` for a hard environment defect (not a git repo,
+/// `.kranz` not writable) that will almost certainly break the run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreflightIssue {
+    /// `"warn"` | `"error"`.
+    pub severity: &'static str,
+    pub message: String,
+}
+
+// ---------------------------------------------------------------------------
 // MissionEngine
 // ---------------------------------------------------------------------------
 
@@ -375,6 +392,70 @@ impl MissionEngine {
     }
 
     // -----------------------------------------------------------------------
+    // Environment preflight (roadmap M2)
+    // -----------------------------------------------------------------------
+
+    /// Best-effort check of obvious prerequisites of the validation contract's
+    /// `command` assertions, run once at the start of [`Self::run`] before the
+    /// first worker spawns (roadmap M2). Advisory only: the returned issues are
+    /// surfaced as a single `orchestrator.decision`, never as a block — the
+    /// contract gate at mission completion is still the authoritative check.
+    ///
+    /// For each `command` assertion the leading program token is extracted (the
+    /// interpreter for `sh -c` / `python3 -c` shapes, else the first word) and
+    /// probed on PATH; a clearly-missing program is a `warn`. Two hard
+    /// environment defects are `error`s: the repo not being a git repo, and
+    /// `.kranz` not being writable. The probe is intentionally lenient — only
+    /// programs that plainly do not resolve are flagged, so a shell builtin or
+    /// an odd-but-valid command never produces a false warning.
+    pub fn preflight(&self) -> Vec<PreflightIssue> {
+        let mut issues = Vec::new();
+
+        // Hard defects first (an "error" severity): a run against a non-repo or
+        // a read-only .kranz is almost certainly doomed.
+        if !is_git_repo(self.paths.repo_root.as_path()) {
+            issues.push(PreflightIssue {
+                severity: "error",
+                message: format!(
+                    "{} is not a git repository",
+                    self.paths.repo_root.display()
+                ),
+            });
+        }
+        if !kranz_dir_is_writable(&self.paths) {
+            issues.push(PreflightIssue {
+                severity: "error",
+                message: ".kranz directory is not writable".to_string(),
+            });
+        }
+
+        // Contract command programs: probe the leading token of each distinct
+        // command, flagging only ones that clearly do not resolve on PATH.
+        let mut probed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for assertion in &self.state.mission.validation_contract {
+            if assertion.check != AssertionCheck::Command {
+                continue;
+            }
+            let Some(command) = assertion.command.as_deref() else { continue };
+            let Some(program) = leading_program(command) else { continue };
+            if !probed.insert(program.clone()) {
+                continue; // already reported/checked this program
+            }
+            if !program_resolves(&program) {
+                issues.push(PreflightIssue {
+                    severity: "warn",
+                    message: format!(
+                        "command assertion [{}] uses '{program}', which was not found on PATH",
+                        assertion.id
+                    ),
+                });
+            }
+        }
+
+        issues
+    }
+
+    // -----------------------------------------------------------------------
     // emit / catch_up — the log/state/snapshot lockstep
     // -----------------------------------------------------------------------
 
@@ -525,6 +606,261 @@ impl MissionEngine {
     }
 
     // -----------------------------------------------------------------------
+    // Mid-mission re-planning (roadmap M2)
+    // -----------------------------------------------------------------------
+    //
+    // CONTRACT NOTE — what re-planning CAN and cannot express today.
+    //
+    // Re-planning a mission that is already Running/Blocked must NOT lose
+    // completed work. The obvious approach — re-emit `plan.approved` with the
+    // full revised plan — is unusable here: the reducer rebuilds `milestones`
+    // from `plan.approved` wholesale (ms-<n>/f-<n>-<m> ids reassigned, every
+    // status reset to Pending), which would clobber completed milestones and
+    // features. And there is no first-class "add a milestone" or "revise the
+    // plan" event in the contract (events.rs) — the ONLY event that adds work
+    // is `fixfeature.created`, and it only appends a feature to an EXISTING
+    // milestone.
+    //
+    // So re-planning is deliberately scoped to what the existing event
+    // vocabulary can express honestly, on the FIRST not-yet-complete milestone
+    // (the one work is actively flowing through):
+    //   (i)  DROP a still-pending planned feature the revision removed
+    //        (`feature.skipped`), and
+    //   (ii) ADD a feature the revision introduced (`fixfeature.created`,
+    //        origin=fix — the same mechanism validation fixes use).
+    // Completed milestones/features and already-started features are left
+    // untouched; the revision is rejected if it tries to alter them. The full
+    // revised plan is committed as `revised-plan.md` for human review (the
+    // engine writes + commits it, like plan.md), and an `orchestrator.decision`
+    // records the revision so it appears in the replayed history and digest.
+    //
+    // What this CANNOT express (see contractChangeRequest below): adding a
+    // brand-new milestone, reordering remaining milestones, or revising a
+    // not-yet-started LATER milestone's feature set. Those need a first-class
+    // `milestone.added` / `plan.revised` event.
+    //
+    // contractChangeRequest: add a `plan.revised { plan }` (or a narrower
+    // `milestone.added { milestone }`) event whose reducer semantics MERGE the
+    // revised remainder onto the existing milestones — preserving completed
+    // milestones and their ids by title/order and only materializing genuinely
+    // new milestones/features. That would let re-planning cover new and later
+    // milestones, which the fixfeature-only subset here cannot.
+
+    /// Propose a REVISED plan for the not-yet-complete work of a running or
+    /// blocked mission (roadmap M2). An orchestrator turn — digest + the
+    /// current milestone/feature status + a revise-the-remainder instruction —
+    /// that returns a full [`Plan`] (completed milestones unchanged and first,
+    /// then the revised remainder). Reuses the streaming orchestrator, the
+    /// lenient JSON parse, and the [`PlanRequest`] `Ready`/`NotReady` enum
+    /// exactly like [`Self::request_plan`]; prose (the orchestrator wants to
+    /// discuss first) comes back as `NotReady`, never an error.
+    ///
+    /// This only PROPOSES; [`Self::approve_revised_plan`] validates and applies
+    /// the subset the event vocabulary can express (see the contract note
+    /// above).
+    pub async fn request_revised_plan(&mut self) -> Result<PlanRequest> {
+        let message = format!(
+            "The mission is already underway. Propose a REVISED plan for the work that is \
+             NOT yet complete. Rules: keep every already-COMPLETE milestone exactly as it is \
+             and list those completed milestones FIRST and unchanged (same title, same \
+             features, same order); then revise the remaining milestones' features as the \
+             current situation warrants (drop features no longer needed, add features now \
+             required). Output ONLY a JSON object conforming exactly to this JSON Schema — \
+             no prose before or after:\n{}\n",
+            plan_schema()
+        );
+        let text = self.orch_turn(&message).await?;
+        if let Some(plan) = runner::parse_report::<Plan>(&text) {
+            return Ok(PlanRequest::Ready(plan));
+        }
+        let retry = self.orch_turn(JSON_RETRY_MSG).await?;
+        match runner::parse_report::<Plan>(&retry) {
+            Some(plan) => Ok(PlanRequest::Ready(plan)),
+            None => Ok(PlanRequest::NotReady(if retry.trim().is_empty() { text } else { retry })),
+        }
+    }
+
+    /// Apply a revised plan to a running or blocked mission (roadmap M2),
+    /// preserving all completed work. See the contract note above for the full
+    /// rationale and the honest scope of what this expresses.
+    ///
+    /// Validation (rejects with [`EngineError::InvalidState`]):
+    /// - the mission must be Running or Blocked (re-planning a Planning mission
+    ///   is [`Self::approve_plan`]; a terminal mission cannot be revised);
+    /// - every already-Complete milestone must appear in the revised plan,
+    ///   FIRST and in the same order, with its title and full feature set
+    ///   (titles, specs, criteria) UNCHANGED — a dropped or altered completed
+    ///   milestone is rejected.
+    ///
+    /// Application (existing events only): on the FIRST not-yet-complete
+    /// milestone, pending planned features the revision drops are
+    /// `feature.skipped`, and features the revision adds are appended via
+    /// `fixfeature.created`. The full revised plan is written + committed as
+    /// `revised-plan.md`, and an `orchestrator.decision` summarizes the change.
+    pub fn approve_revised_plan(&mut self, plan: Plan) -> Result<()> {
+        // State gate: re-planning is for live missions only.
+        match self.state.mission.status {
+            MissionStatus::Running | MissionStatus::Blocked => {}
+            other => {
+                return Err(EngineError::InvalidState(format!(
+                    "approve_revised_plan requires a Running or Blocked mission, mission is {other:?}"
+                )));
+            }
+        }
+        if plan.milestones.is_empty() {
+            return Err(EngineError::InvalidState(
+                "revised plan has no milestones".to_string(),
+            ));
+        }
+
+        // (1) The completed milestones, in current order, must be reproduced
+        // unchanged and first in the revised plan.
+        let completed: Vec<&Milestone> = self
+            .state
+            .mission
+            .milestones
+            .iter()
+            .filter(|m| m.status == MilestoneStatus::Complete)
+            .collect();
+        for (i, done) in completed.iter().enumerate() {
+            let revised = plan.milestones.get(i).ok_or_else(|| {
+                EngineError::InvalidState(format!(
+                    "revised plan drops completed milestone '{}' (must appear first, unchanged)",
+                    done.title
+                ))
+            })?;
+            if revised.title.trim() != done.title.trim() {
+                return Err(EngineError::InvalidState(format!(
+                    "revised plan milestone {} is '{}' but completed milestone '{}' must appear \
+                     there unchanged",
+                    i + 1,
+                    revised.title,
+                    done.title
+                )));
+            }
+            if !completed_features_unchanged(done, revised) {
+                return Err(EngineError::InvalidState(format!(
+                    "revised plan alters the features of completed milestone '{}'",
+                    done.title
+                )));
+            }
+        }
+
+        // (2) Locate the first not-yet-complete milestone (the active target)
+        // and the revised milestone that positionally maps to it (the one right
+        // after the completed prefix).
+        let Some(target_mi) = self
+            .state
+            .mission
+            .milestones
+            .iter()
+            .position(|m| m.status != MilestoneStatus::Complete)
+        else {
+            return Err(EngineError::InvalidState(
+                "no incomplete milestone to revise (all milestones are complete)".to_string(),
+            ));
+        };
+        // The revised milestone aligned with the target is at the target's
+        // index (completed milestones occupy indices 0..completed.len(), and
+        // the target is the first index past them = completed.len()).
+        let revised_target = plan.milestones.get(target_mi).ok_or_else(|| {
+            EngineError::InvalidState(
+                "revised plan is missing the milestone that maps to the active one".to_string(),
+            )
+        })?;
+
+        // (3) Diff the target milestone's features by title:
+        //   - a still-Pending planned feature absent from the revision → skip;
+        //   - a revised feature title absent from the milestone → add (fix).
+        // Titles are compared trimmed/case-insensitively so trivial editorial
+        // differences do not spuriously drop or duplicate a feature.
+        let target = &self.state.mission.milestones[target_mi];
+        let revised_titles: Vec<String> =
+            revised_target.features.iter().map(|f| norm_title(&f.title)).collect();
+        let current_titles: Vec<String> =
+            target.features.iter().map(|f| norm_title(&f.title)).collect();
+
+        let to_skip: Vec<String> = target
+            .features
+            .iter()
+            .filter(|f| {
+                f.status == FeatureStatus::Pending
+                    && f.origin == FeatureOrigin::Plan
+                    && !revised_titles.contains(&norm_title(&f.title))
+            })
+            .map(|f| f.id.clone())
+            .collect();
+        let to_add: Vec<PlanFeature> = revised_target
+            .features
+            .iter()
+            .filter(|f| !current_titles.contains(&norm_title(&f.title)))
+            .cloned()
+            .collect();
+
+        // (4) Write + commit the human-reviewable revised plan (the engine
+        // writes and commits — the orchestrator never touches files, like
+        // approve_plan). Git first: a failure here leaves no event emitted, so
+        // approve_revised_plan can simply be retried.
+        let revised_md = self.paths.mission_dir().join("revised-plan.md");
+        if let Some(parent) = revised_md.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(
+            &revised_md,
+            render_revised_plan_markdown(&plan, &self.state.mission, &to_skip, &to_add),
+        )?;
+        self.repo.commit_paths(
+            &[revised_md.as_path()],
+            &format!("[kranz] revised plan for {}", self.state.mission.id),
+        )?;
+
+        // (5) Record the revision, then apply the expressible subset.
+        let target_id = target.id.clone();
+        self.emit_decision(
+            &format!(
+                "re-plan for {target_id}: {} feature(s) dropped, {} added",
+                to_skip.len(),
+                to_add.len()
+            ),
+            Some(format!(
+                "Revised plan committed to revised-plan.md. Dropped {} pending feature(s); \
+                 added {} feature(s) to {target_id}. Completed milestones preserved unchanged.",
+                to_skip.len(),
+                to_add.len()
+            )),
+        )?;
+
+        for feature_id in to_skip {
+            self.emit(EventKind::FeatureSkipped {
+                feature_id,
+                reason: "dropped by mid-mission re-plan".to_string(),
+            })?;
+        }
+        // Added features enter as fix-origin features on the target milestone —
+        // the only event that can add a feature. Ids reuse the fix-feature
+        // shape but on a "re-plan" cycle namespace so they never collide with
+        // validation fix ids (which are ms-<id>-fix-<cycle>-<n>).
+        for (i, pf) in to_add.into_iter().enumerate() {
+            let feature = Feature {
+                id: format!("{target_id}-replan-{}", i + 1),
+                title: scrub::scrub(&pf.title),
+                spec: scrub::scrub(&pf.spec),
+                validation_criteria: pf.validation_criteria.iter().map(|c| scrub::scrub(c)).collect(),
+                origin: FeatureOrigin::Fix,
+                status: FeatureStatus::Pending,
+                worker_runs: Vec::new(),
+                commits: Vec::new(),
+                respawns: 0,
+            };
+            self.emit(EventKind::FixFeatureCreated {
+                milestone_id: target_id.clone(),
+                feature,
+            })?;
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
     // run() — THE LOOP (plan §4.5)
     // -----------------------------------------------------------------------
 
@@ -538,6 +874,26 @@ impl MissionEngine {
                 "cannot run a mission whose plan is not approved".to_string(),
             ));
         }
+
+        // Environment preflight (roadmap M2): surface obvious missing
+        // prerequisites of the contract commands as ONE advisory decision
+        // before the first worker spawns. Never blocks — the contract gate at
+        // completion stays authoritative. Emitted only once per run() call, and
+        // only when there is something to report.
+        let issues = self.preflight();
+        if !issues.is_empty() {
+            let summary = format!(
+                "preflight: {} issue(s): {}",
+                issues.len(),
+                issues
+                    .iter()
+                    .map(|i| format!("[{}] {}", i.severity, i.message))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
+            self.emit_decision(&summary, None)?;
+        }
+
         loop {
             // (a) drain the control inbox.
             self.drain_control()?;
@@ -1894,6 +2250,93 @@ pub fn render_plan_markdown(plan: &Plan, mission: &Mission) -> String {
     md
 }
 
+/// Whether a completed milestone's feature set is reproduced UNCHANGED in the
+/// revised plan milestone (roadmap M2 re-planning guard): same feature count,
+/// same titles/specs/validation-criteria in the same order. Titles/specs are
+/// compared trimmed; criteria compared exactly-trimmed element-wise. A
+/// completed milestone whose work is done must not be silently rewritten.
+fn completed_features_unchanged(done: &Milestone, revised: &PlanMilestone) -> bool {
+    if done.features.len() != revised.features.len() {
+        return false;
+    }
+    done.features.iter().zip(&revised.features).all(|(a, b)| {
+        a.title.trim() == b.title.trim()
+            && a.spec.trim() == b.spec.trim()
+            && a.validation_criteria.len() == b.validation_criteria.len()
+            && a.validation_criteria
+                .iter()
+                .zip(&b.validation_criteria)
+                .all(|(x, y)| x.trim() == y.trim())
+    })
+}
+
+/// Normalize a feature title for matching across a re-plan (trim + lowercase):
+/// trivial editorial differences must not spuriously drop or re-add a feature.
+fn norm_title(title: &str) -> String {
+    title.trim().to_lowercase()
+}
+
+/// Render the revised plan as human-readable markdown for review (roadmap M2),
+/// committed to the mission branch as `revised-plan.md`. Shows the full revised
+/// plan plus a "Re-plan changes" section spelling out exactly what the engine
+/// applied under the current event set (dropped/added features) and what it
+/// could not express — so a reviewer sees the honest scope of the revision.
+pub fn render_revised_plan_markdown(
+    plan: &Plan,
+    mission: &Mission,
+    dropped_feature_ids: &[String],
+    added_features: &[PlanFeature],
+) -> String {
+    use std::fmt::Write as _;
+    let mut md = String::new();
+    let _ = writeln!(md, "# Revised mission plan — {}", mission.id);
+    let _ = writeln!(md, "\n**Goal:** {}\n", plan.goal);
+    let _ = writeln!(
+        md,
+        "Branch `{}` (from `{}`). Mid-mission revision of the plan of record \
+         ([plan.md](plan.md)); completed milestones are preserved unchanged.\n",
+        mission.mission_branch, mission.base_branch
+    );
+
+    let _ = writeln!(md, "## Re-plan changes applied\n");
+    let _ = writeln!(
+        md,
+        "Under the current event set a mid-mission re-plan can only DROP a still-pending \
+         planned feature and ADD a feature to the active milestone. Completed milestones, \
+         already-started features, and later milestones are not altered here.\n"
+    );
+    if dropped_feature_ids.is_empty() {
+        let _ = writeln!(md, "- Dropped features: none");
+    } else {
+        let _ = writeln!(md, "- Dropped (skipped) features: {}", dropped_feature_ids.join(", "));
+    }
+    if added_features.is_empty() {
+        let _ = writeln!(md, "- Added features: none");
+    } else {
+        let titles: Vec<String> =
+            added_features.iter().map(|f| f.title.trim().to_string()).collect();
+        let _ = writeln!(md, "- Added features: {}", titles.join(", "));
+    }
+    let _ = writeln!(md);
+
+    let _ = writeln!(md, "## Full revised plan\n");
+    for (mi, m) in plan.milestones.iter().enumerate() {
+        let _ = writeln!(md, "### Milestone {} — {}\n", mi + 1, m.title);
+        for (fi, f) in m.features.iter().enumerate() {
+            let _ = writeln!(md, "#### {}.{} {}\n", mi + 1, fi + 1, f.title);
+            let _ = writeln!(md, "{}\n", f.spec.trim());
+            if !f.validation_criteria.is_empty() {
+                let _ = writeln!(md, "Done when:");
+                for c in &f.validation_criteria {
+                    let _ = writeln!(md, "- {c}");
+                }
+                let _ = writeln!(md);
+            }
+        }
+    }
+    md
+}
+
 /// Add a completion-report link to one mission's line in the missions
 /// catalog, turning
 /// `- <date> · [<id>](<id>/plan.md) — <goal>` into
@@ -2280,6 +2723,147 @@ fn first_nonempty_line(text: &str) -> &str {
 /// under /var → /private/var; git pathspec matching needs the real path).
 fn canonical_root(root: PathBuf) -> PathBuf {
     std::fs::canonicalize(&root).unwrap_or(root)
+}
+
+// ---------------------------------------------------------------------------
+// Preflight helpers (roadmap M2) — all pure/best-effort, no engine state
+// ---------------------------------------------------------------------------
+
+/// Extract the leading program token of a contract `command` line for a PATH
+/// probe (roadmap M2 preflight). Best-effort by design:
+///
+/// - `sh -c '…'` / `bash -c '…'` / `python3 -c '…'`-style forms name the
+///   INTERPRETER as the program (the thing that must exist), so the first
+///   token is returned rather than trying to parse the embedded script.
+/// - Otherwise the first whitespace-delimited token is returned, with common
+///   leading `VAR=value` environment assignments skipped and a leading path
+///   (`./scripts/check.sh`) reduced to its final component only for the
+///   presence check semantics of [`program_resolves`].
+///
+/// Returns `None` when no plausible program token can be found (empty command,
+/// or a line that is only environment assignments) — the caller then skips the
+/// probe rather than emit a spurious warning.
+fn leading_program(command: &str) -> Option<String> {
+    // Skip leading `VAR=value` assignments ("FOO=bar cmd …" is common in
+    // contract lines); the program is the first token that is not an
+    // assignment.
+    let mut token = None;
+    for tok in command.split_whitespace() {
+        if is_env_assignment(tok) {
+            continue;
+        }
+        token = Some(tok);
+        break;
+    }
+    let token = token?;
+    if token.is_empty() {
+        return None;
+    }
+    Some(token.to_string())
+}
+
+/// A `VAR=value` leading environment assignment (`FOO=bar`): an identifier,
+/// then `=`. Used to skip past them when finding the program token.
+fn is_env_assignment(token: &str) -> bool {
+    match token.split_once('=') {
+        Some((name, _)) if !name.is_empty() => {
+            let mut chars = name.chars();
+            chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        _ => false,
+    }
+}
+
+/// Whether a program token plausibly resolves to something runnable
+/// (roadmap M2 preflight). LENIENT: this only ever produces a warning, so it
+/// errs heavily toward "resolves" to avoid false positives.
+///
+/// - A program containing a path separator is checked as a filesystem path
+///   (it names its own location; PATH does not apply).
+/// - A bare name is looked up across every `PATH` entry.
+/// - Common POSIX shell builtins that have no on-disk binary (`cd`, `:`,
+///   `true`, `false`, `echo`, `test`, `[`) always resolve — a contract line
+///   like `cd . && …` must never warn.
+///
+/// On non-unix hosts the executable-bit check is skipped (mere existence in a
+/// PATH dir counts), and `.exe`/`.bat`/`.cmd` variants are also accepted.
+fn program_resolves(program: &str) -> bool {
+    // Shell builtins with no backing binary — never a missing prerequisite.
+    const BUILTINS: &[&str] =
+        &["cd", ":", "true", "false", "echo", "test", "[", "set", "export", "unset"];
+    if BUILTINS.contains(&program) {
+        return true;
+    }
+
+    // A path-bearing program names its own location; PATH does not apply.
+    if program.contains('/') || program.contains('\\') {
+        return path_is_executable(std::path::Path::new(program));
+    }
+
+    let Some(path) = std::env::var_os("PATH") else {
+        // No PATH to scan: cannot disprove existence, so do not warn.
+        return true;
+    };
+    for dir in std::env::split_paths(&path) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        if path_is_executable(&dir.join(program)) {
+            return true;
+        }
+        // Windows: accept the usual executable extensions.
+        #[cfg(windows)]
+        for ext in ["exe", "bat", "cmd", "com"] {
+            if path_is_executable(&dir.join(format!("{program}.{ext}"))) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether `path` is a regular file that is executable (unix: any execute bit;
+/// other platforms: mere existence as a file).
+fn path_is_executable(path: &std::path::Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else { return false };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Whether `root` looks like a git repository — a `.git` entry exists (a dir
+/// for a normal repo, a file for a worktree/submodule gitlink). Best-effort:
+/// only a plainly-absent `.git` produces the preflight error.
+fn is_git_repo(root: &std::path::Path) -> bool {
+    root.join(".git").exists()
+}
+
+/// Whether the mission's `.kranz` directory is writable: create it if needed,
+/// then probe with a temp file. Conservative — any error other than a clean
+/// write is reported as "not writable".
+fn kranz_dir_is_writable(paths: &MissionPaths) -> bool {
+    let dir = paths.kranz_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return false;
+    }
+    let probe = dir.join(format!(".preflight-{}", uuid::Uuid::new_v4().simple()));
+    match std::fs::write(&probe, b"") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// Write `.kranz/.gitignore` (module docs: keep engine churn out of the §4.4
