@@ -5,18 +5,69 @@
 // frames append to a capped ring buffer used by the log/conversation views.
 
 import { create } from 'zustand';
-import { api, httpOrigin } from './api';
+import { api, httpOrigin, isNotHosted } from './api';
 import { MissionSocket } from './ws';
 import type {
   ConnectionStatus,
   ControlCommand,
+  CostEstimate,
   MissionEvent,
   MissionState,
   MissionSummary,
+  Plan,
   WsFrame,
 } from './types';
 
 export const EVENT_BUFFER_CAP = 2000;
+
+// ---------------------------------------------------------------------------
+// Planning (server-hosted lifecycle; M2.5)
+// ---------------------------------------------------------------------------
+
+/** Chat entries that only this client knows about (optimistic user turns and
+ *  POST replies). The WS feed remains authoritative: PlanningView hides a
+ *  local item once an identical event arrives. */
+export interface PlanningLocalItem {
+  id: number;
+  kind: 'user' | 'reply' | 'notice';
+  ts: string;
+  text: string;
+}
+
+export type PlanningBusy = 'turn' | 'plan-request' | null;
+
+export interface PlanningSlice {
+  localItems: PlanningLocalItem[];
+  /** What the engine is busy doing (mirrors the TUI's BusyKind), or null. */
+  busy: PlanningBusy;
+  /** Epoch ms when the in-flight request started (for the elapsed counter). */
+  busySince: number | null;
+  /** Client-side queue: typing is safe — sends when the current turn finishes. */
+  queued: string[];
+  /** 409 "not hosted": this mission is being planned from a terminal. */
+  notHosted: boolean;
+  /** request-plan came back ready:true — the PlanReview panel takes over. */
+  review: { plan: Plan; estimate: CostEstimate } | null;
+  /** Branch returned by approve; consent #2 (start) is still pending. */
+  approvedBranch: string | null;
+  /** True while POST start is in flight. */
+  starting: boolean;
+  error: string | null;
+}
+
+const PLANNING_RESET: PlanningSlice = {
+  localItems: [],
+  busy: null,
+  busySince: null,
+  queued: [],
+  notHosted: false,
+  review: null,
+  approvedBranch: null,
+  starting: false,
+  error: null,
+};
+
+let nextLocalId = 1;
 
 interface KranzStore {
   missions: MissionSummary[];
@@ -35,12 +86,26 @@ interface KranzStore {
   selectedRun: string | null;
   /** Last seq seen over the wire (frames or seeded events). */
   lastSeq: number | null;
+  planning: PlanningSlice;
 
   loadMissions: () => Promise<void>;
   connectMission: (id: string) => void;
   disconnect: () => void;
   selectRun: (runId: string | null) => void;
   sendControl: (command: ControlCommand) => Promise<void>;
+
+  /** Enter send in the planning composer: runs a turn, or queues it while one
+   *  is in flight (typing is safe — sends when the current turn finishes). */
+  sendPlanningMessage: (text: string) => void;
+  /** POST planning/request-plan — ready:false flows back into the chat,
+   *  ready:true opens the PlanReview panel. */
+  requestPlan: () => void;
+  /** Consent #1: POST approve with the reviewed plan; stores the branch. */
+  approvePlan: () => void;
+  /** Consent #2: POST start; the live mission view takes over via WS. */
+  startMission: () => void;
+  /** Back to conversation from the review panel (either step). */
+  planningBack: () => void;
 }
 
 let socket: MissionSocket | null = null;
@@ -85,7 +150,66 @@ export function mergePauseEvents(
   return [...bySeq.values()].sort((x, y) => x.seq - y.seq);
 }
 
+/** Web adaptation of the TUI's PLAN_NOT_READY_NOTICE ("/plan" → the button). */
+export const PLAN_NOT_READY_NOTICE = 'not ready to emit — answer above, then request the plan again';
+
 export const useKranzStore = create<KranzStore>()((set, get) => {
+  function patchPlanning(partial: Partial<PlanningSlice>): void {
+    set((s) => ({ planning: { ...s.planning, ...partial } }));
+  }
+
+  function pushLocal(kind: PlanningLocalItem['kind'], text: string): void {
+    set((s) => ({
+      planning: {
+        ...s.planning,
+        localItems: [
+          ...s.planning.localItems,
+          { id: nextLocalId++, kind, ts: new Date().toISOString(), text },
+        ],
+      },
+    }));
+  }
+
+  /** Common failure path: 409 "not hosted" flips the terminal-planning
+   *  notice; anything else surfaces as a plain error line. */
+  function failPlanning(err: unknown): void {
+    if (isNotHosted(err)) {
+      patchPlanning({ notHosted: true, busy: null, busySince: null, queued: [] });
+      return;
+    }
+    patchPlanning({
+      error: err instanceof Error ? err.message : String(err),
+      busy: null,
+      busySince: null,
+    });
+  }
+
+  /** Send queued messages in order once the current turn finishes. */
+  function drainPlanningQueue(): void {
+    const p = get().planning;
+    if (p.busy !== null || p.notHosted || p.queued.length === 0) return;
+    const [next, ...rest] = p.queued;
+    patchPlanning({ queued: rest });
+    void runPlanningTurn(next);
+  }
+
+  async function runPlanningTurn(text: string): Promise<void> {
+    const id = get().missionId;
+    if (id === null) return;
+    patchPlanning({ busy: 'turn', busySince: Date.now(), error: null });
+    pushLocal('user', text);
+    try {
+      const { reply } = await api.planningTurn(id, text);
+      if (get().missionId !== id) return;
+      if (reply.trim() !== '') pushLocal('reply', reply);
+      patchPlanning({ busy: null, busySince: null });
+      drainPlanningQueue();
+    } catch (err) {
+      if (get().missionId !== id) return;
+      failPlanning(err);
+    }
+  }
+
   function applyFrame(frame: WsFrame): void {
     switch (frame.type) {
       case 'snapshot':
@@ -123,6 +247,7 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
     connection: 'connecting',
     selectedRun: null,
     lastSeq: null,
+    planning: PLANNING_RESET,
 
     loadMissions: async () => {
       set({ missionsError: null });
@@ -146,6 +271,7 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
         connection: 'connecting',
         selectedRun: null,
         lastSeq: null,
+        planning: PLANNING_RESET,
       });
 
       // Seed the event log over REST so history predating the WS snapshot
@@ -220,6 +346,7 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
         pauseEvents: [],
         selectedRun: null,
         lastSeq: null,
+        planning: PLANNING_RESET,
       });
     },
 
@@ -230,5 +357,86 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
       if (!id) throw new Error('no mission selected');
       await api.control(id, command);
     },
+
+    sendPlanningMessage: (text) => {
+      const trimmed = text.trim();
+      if (trimmed === '') return;
+      const p = get().planning;
+      if (p.notHosted) return;
+      if (p.busy !== null) {
+        // Typing is safe — the message queues and sends when the current
+        // turn finishes (mirrors the TUI's busy affordance).
+        patchPlanning({ queued: [...p.queued, trimmed] });
+        return;
+      }
+      void runPlanningTurn(trimmed);
+    },
+
+    requestPlan: () => {
+      const id = get().missionId;
+      if (id === null) return;
+      const p = get().planning;
+      if (p.busy !== null || p.notHosted) return;
+      patchPlanning({ busy: 'plan-request', busySince: Date.now(), error: null });
+      api
+        .requestPlan(id)
+        .then((res) => {
+          if (get().missionId !== id) return;
+          if (res.ready) {
+            patchPlanning({
+              busy: null,
+              busySince: null,
+              review: { plan: res.plan, estimate: res.estimate },
+            });
+            return;
+          }
+          // NotReady returns to conversation: the orchestrator's prose flows
+          // into the chat with a notice (no error styling).
+          if (res.reply.trim() !== '') pushLocal('reply', res.reply);
+          pushLocal('notice', PLAN_NOT_READY_NOTICE);
+          patchPlanning({ busy: null, busySince: null });
+          drainPlanningQueue();
+        })
+        .catch((err: unknown) => {
+          if (get().missionId === id) failPlanning(err);
+        });
+    },
+
+    approvePlan: () => {
+      const id = get().missionId;
+      const review = get().planning.review;
+      if (id === null || review === null) return;
+      patchPlanning({ error: null });
+      api
+        .approvePlan(id, review.plan)
+        .then(({ branch }) => {
+          if (get().missionId !== id) return;
+          patchPlanning({ approvedBranch: branch });
+        })
+        .catch((err: unknown) => {
+          if (get().missionId === id) failPlanning(err);
+        });
+    },
+
+    startMission: () => {
+      const id = get().missionId;
+      if (id === null) return;
+      patchPlanning({ starting: true, error: null });
+      api
+        .startMission(id)
+        .then(() => {
+          if (get().missionId !== id) return;
+          // The WS state frame flips mission.status to running; the live
+          // mission view takes over from there.
+          patchPlanning({ starting: false, review: null, approvedBranch: null });
+        })
+        .catch((err: unknown) => {
+          if (get().missionId !== id) return;
+          patchPlanning({ starting: false });
+          failPlanning(err);
+        });
+    },
+
+    planningBack: () => patchPlanning({ review: null, approvedBranch: null, error: null }),
   };
 });

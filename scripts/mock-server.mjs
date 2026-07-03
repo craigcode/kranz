@@ -17,6 +17,30 @@
 //          canned state and broadcast, so the UI is fully interactive.
 //   - WS   /:id/ws?since — snapshot or replay per the protocol; a ticker
 //          emits a worker.message every few seconds to demo live tailing.
+//
+// Mission lifecycle (M2.5, docs/protocol.md "Mission lifecycle"):
+//   - Every POST /api/... requires a NON-EMPTY x-kranz-token header (any
+//     value accepted — this fakes the per-serve mutation token); missing or
+//     empty → 401 {"error":"missing or invalid token"}.
+//   - POST /api/missions {goal, config?}       → 201 {id} — creates a hosted
+//     planning mission (config is a partial MissionConfig patch over the
+//     canned defaults).
+//   - POST /:id/planning/turn {text}           → 200 {reply} with canned
+//     replies (cycling); emits user.message + orchestrator worker.message
+//     over the WS feed. 409 when not hosted here (the canned demo mission),
+//     not in planning, or a turn is already in flight.
+//   - POST /:id/planning/request-plan          → first call 200 {ready:false,
+//     reply} (NotReady returns to conversation); later calls 200 {ready:true,
+//     plan, estimate} with a small plan + CostEstimate.
+//   - POST /:id/approve {plan}                 → 200 {branch}; materializes
+//     the plan into state milestones and emits plan.approved.
+//   - POST /:id/start                          → 202 {running:true}; then
+//     flips the mission through running → complete over a few ticks
+//     (milestone/feature/worker events streaming over the WS feed).
+//     409 while already running.
+//   - Canned mission m-term-01 stays in "planning" but is NOT hosted here
+//     (as if `kranz plan` runs in a terminal): its planning mutations 409
+//     with "not hosted", exercising the dashboard's terminal-planning notice.
 
 import { createServer } from 'node:http';
 import { createHash } from 'node:crypto';
@@ -435,24 +459,111 @@ const transcripts = {
 };
 
 // ---------------------------------------------------------------------------
+// Mission registry (canned demo + hosted M2.5 missions)
+// ---------------------------------------------------------------------------
+
+// Each mission record: { id, state, events, seq, transcripts, plan,
+//   hostedHere, planRequests, turns, inFlight }
+const demoMission = {
+  id: MISSION_ID,
+  state,
+  events,
+  seq,
+  transcripts,
+  plan,
+  hostedHere: false, // planning endpoints 409 — "planned from a terminal"
+  planRequests: 0,
+  turns: 0,
+  inFlight: false,
+};
+
+/** id → every non-demo mission (hosted ones from POST /api/missions, plus
+ *  the canned terminal-planned mission below). */
+const extraMissions = new Map();
+let hostedCounter = 0;
+
+function findMission(id) {
+  if (id === MISSION_ID) return demoMission;
+  return extraMissions.get(id) ?? null;
+}
+
+function allMissions() {
+  return [demoMission, ...extraMissions.values()];
+}
+
+// A planning mission NOT hosted here — as if `kranz plan` runs in a terminal.
+// Planning mutations 409 ("not hosted") so the dashboard shows its notice;
+// the conversation still streams read-only from the event log.
+const termMission = {
+  id: 'm-term-01',
+  state: {
+    mission: {
+      id: 'm-term-01',
+      goal: 'Migrate the config loader to TOML',
+      validationContract: [],
+      milestones: [],
+      status: 'planning',
+      createdAt: at(20),
+      baseBranch: 'main',
+      missionBranch: 'kranz/mission-m-term-01',
+    },
+    runs: {
+      'r-orch': {
+        id: 'r-orch',
+        role: 'orchestrator',
+        sdkSessionId: 'mock-m-term-01-orch',
+        model: 'opus',
+        startedAt: at(19),
+        tokens: { input: 12_000, output: 900, cacheRead: 0, cacheWrite: 0 },
+        transcriptPath: 'runs/r-orch.jsonl',
+        promptHash: 'sha256:mock',
+      },
+    },
+    totals: { input: 12_000, output: 900, cacheRead: 0, cacheWrite: 0 },
+    totalCostUsd: 0.09,
+    pendingUserMessages: [],
+    recentDecisions: [],
+    config,
+    lastSeq: 4,
+  },
+  events: [
+    { seq: 1, ts: at(20), missionId: 'm-term-01', type: 'mission.created', payload: { goal: 'Migrate the config loader to TOML', baseBranch: 'main', missionBranch: 'kranz/mission-m-term-01', config } },
+    { seq: 2, ts: at(19), missionId: 'm-term-01', type: 'worker.spawned', payload: { runId: 'r-orch', role: 'orchestrator', sdkSessionId: 'mock-m-term-01-orch', model: 'opus', promptHash: 'sha256:mock', transcriptPath: 'runs/r-orch.jsonl' } },
+    { seq: 3, ts: at(18), missionId: 'm-term-01', type: 'user.message', payload: { text: 'Keep backwards compatibility with the JSON config.', interrupt: false } },
+    { seq: 4, ts: at(17), missionId: 'm-term-01', type: 'worker.message', payload: { runId: 'r-orch', tag: 'text', content: 'Understood — the loader will read TOML first and fall back to JSON with a deprecation warning.' } },
+  ],
+  seq: 4,
+  transcripts: {},
+  plan: null,
+  hostedHere: false,
+  planRequests: 0,
+  turns: 0,
+  inFlight: false,
+};
+extraMissions.set(termMission.id, termMission);
+
+// ---------------------------------------------------------------------------
 // Live tail + control handling
 // ---------------------------------------------------------------------------
 
-const sockets = new Set();
+const sockets = new Set(); // { sock, missionId }
 
-function broadcast(frame) {
+function broadcast(missionId, frame) {
   const data = wsEncode(JSON.stringify(frame));
-  for (const sock of sockets) sock.write(data);
+  for (const entry of sockets) {
+    if (entry.missionId === missionId) entry.sock.write(data);
+  }
 }
 
 /** Append a live event; broadcast it (+ a state re-fold for lifecycle events). */
-function appendLive(type, payload) {
-  const event = { seq: ++seq, ts: new Date().toISOString(), missionId: MISSION_ID, type, payload };
-  events.push(event);
-  state.lastSeq = seq;
-  broadcast({ type: 'event', seq, event });
+function appendLive(m, type, payload) {
+  const seqNo = ++m.seq;
+  const event = { seq: seqNo, ts: new Date().toISOString(), missionId: m.id, type, payload };
+  m.events.push(event);
+  m.state.lastSeq = seqNo;
+  broadcast(m.id, { type: 'event', seq: seqNo, event });
   if (type !== 'worker.message') {
-    broadcast({ type: 'state', seq, state });
+    broadcast(m.id, { type: 'state', seq: seqNo, state: m.state });
   }
 }
 
@@ -465,38 +576,294 @@ const TICKS = [
 let tick = 0;
 setInterval(() => {
   const [tag, content] = TICKS[tick++ % TICKS.length];
-  appendLive('worker.message', { runId: 'r-3', tag, content });
+  appendLive(demoMission, 'worker.message', { runId: 'r-3', tag, content });
 }, 6000).unref();
 
-function handleControl(cmd) {
+function handleControl(m, cmd) {
   switch (cmd.kind) {
     case 'msg':
-      state.pendingUserMessages.push(cmd.text);
-      appendLive('user.message', { text: cmd.text, interrupt: Boolean(cmd.interrupt) });
+      m.state.pendingUserMessages.push(cmd.text);
+      appendLive(m, 'user.message', { text: cmd.text, interrupt: Boolean(cmd.interrupt) });
       break;
     case 'pause':
-      if (state.mission.status === 'running') {
-        state.mission.status = 'paused';
-        appendLive('mission.paused', {});
+      if (m.state.mission.status === 'running') {
+        m.state.mission.status = 'paused';
+        appendLive(m, 'mission.paused', {});
       }
       break;
     case 'resume':
-      if (state.mission.status === 'paused') {
-        state.mission.status = 'running';
-        appendLive('mission.resumed', {});
+      if (m.state.mission.status === 'paused') {
+        m.state.mission.status = 'running';
+        appendLive(m, 'mission.resumed', {});
       }
       break;
     case 'config-change':
       for (const [role, patch] of Object.entries(cmd.patch ?? {})) {
-        if (state.config[role] && typeof patch === 'object' && patch !== null) {
-          Object.assign(state.config[role], patch);
+        if (m.state.config[role] && typeof patch === 'object' && patch !== null) {
+          Object.assign(m.state.config[role], patch);
         }
       }
-      appendLive('config.changed', { patch: cmd.patch ?? {} });
+      appendLive(m, 'config.changed', { patch: cmd.patch ?? {} });
       break;
     default:
       break;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Mission lifecycle handlers (M2.5)
+// ---------------------------------------------------------------------------
+
+/** Deep-ish merge of a partial MissionConfig patch over the canned defaults. */
+function mergeConfig(patch) {
+  const merged = structuredClone(config);
+  if (typeof patch !== 'object' || patch === null) return merged;
+  for (const [key, value] of Object.entries(patch)) {
+    if (typeof value === 'object' && value !== null && typeof merged[key] === 'object') {
+      Object.assign(merged[key], value);
+    } else {
+      merged[key] = value;
+    }
+  }
+  return merged;
+}
+
+function createHostedMission(goal, configPatch) {
+  hostedCounter += 1;
+  const id = `m-web-${String(hostedCounter).padStart(2, '0')}`;
+  const m = {
+    id,
+    state: {
+      mission: {
+        id,
+        goal,
+        validationContract: [],
+        milestones: [],
+        status: 'planning',
+        createdAt: new Date().toISOString(),
+        baseBranch: 'main',
+        missionBranch: `kranz/mission-${id}`,
+      },
+      runs: {},
+      totals: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      totalCostUsd: 0,
+      pendingUserMessages: [],
+      recentDecisions: [],
+      config: mergeConfig(configPatch),
+      lastSeq: 0,
+    },
+    events: [],
+    seq: 0,
+    transcripts: {},
+    plan: null, // set on approve
+    hostedHere: true,
+    planRequests: 0,
+    turns: 0,
+    inFlight: false,
+  };
+  appendLive(m, 'mission.created', {
+    goal,
+    baseBranch: 'main',
+    missionBranch: m.state.mission.missionBranch,
+    config: m.state.config,
+  });
+  extraMissions.set(id, m);
+  return m;
+}
+
+/** 409 body when a planning mutation cannot run; null when it can. */
+function planningGate(m) {
+  if (!m.hostedHere) return `mission '${m.id}' is not hosted by this server`;
+  if (m.state.mission.status !== 'planning') return 'mission is not in planning';
+  if (m.inFlight) return 'a planning turn is already in flight';
+  return null;
+}
+
+/** Lazily create the hosted planning orchestrator run (r-orch). */
+function ensureOrchRun(m) {
+  if (m.state.runs['r-orch']) return;
+  m.state.runs['r-orch'] = {
+    id: 'r-orch',
+    role: 'orchestrator',
+    sdkSessionId: `mock-${m.id}-orch`,
+    model: m.state.config.orchestrator.model,
+    startedAt: new Date().toISOString(),
+    tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    transcriptPath: 'runs/r-orch.jsonl',
+    promptHash: 'sha256:mock',
+  };
+  appendLive(m, 'worker.spawned', {
+    runId: 'r-orch',
+    role: 'orchestrator',
+    sdkSessionId: `mock-${m.id}-orch`,
+    model: m.state.config.orchestrator.model,
+    promptHash: 'sha256:mock',
+    transcriptPath: 'runs/r-orch.jsonl',
+  });
+}
+
+const PLANNING_REPLIES = [
+  'Understood. Before I draft the plan, two questions:\n\n1. Is there an existing test command the validation contract should gate on?\n2. Any part of the goal that is explicitly out of scope?',
+  'Good — noted. I would split this into a **foundation** milestone and a **hardening** milestone. Anything you want pulled forward?',
+  'Noted. The scope feels settled — request the plan whenever you are ready.',
+];
+
+function handlePlanningTurn(m, text, res) {
+  ensureOrchRun(m);
+  m.inFlight = true;
+  appendLive(m, 'user.message', { text, interrupt: false });
+  const reply = PLANNING_REPLIES[Math.min(m.turns, PLANNING_REPLIES.length - 1)];
+  m.turns += 1;
+  // Simulated model latency so the dashboard's busy/queue affordance shows.
+  setTimeout(() => {
+    appendLive(m, 'worker.message', { runId: 'r-orch', tag: 'text', content: reply });
+    m.inFlight = false;
+    sendJson(res, 200, { reply });
+  }, 900);
+}
+
+const NOT_READY_REPLY =
+  'Not ready yet — one thing first: should the functional validator run the FULL test suite ' +
+  'per milestone, or a smoke subset? Answer and request the plan again.';
+
+function mockPlanFor(goal) {
+  return {
+    goal,
+    validationContract: [
+      { id: 'a-1', statement: 'npm test passes', check: 'command', command: 'npm test' },
+      {
+        id: 'a-2',
+        statement: 'The goal works end-to-end as described',
+        check: 'agent-judgement',
+      },
+    ],
+    milestones: [
+      {
+        title: 'Foundation',
+        features: [
+          {
+            title: 'Scaffolding',
+            spec: 'module layout, wiring, config plumbing',
+            validationCriteria: ['builds clean'],
+          },
+          {
+            title: 'Core behavior',
+            spec: 'implement the primary flow of the goal',
+            validationCriteria: ['happy path works end-to-end'],
+          },
+        ],
+      },
+      {
+        title: 'Hardening',
+        features: [
+          {
+            title: 'Edge cases and tests',
+            spec: 'cover failure modes with regression tests',
+            validationCriteria: ['npm test passes', 'no known gaps left'],
+          },
+        ],
+      },
+    ],
+  };
+}
+
+const MOCK_ESTIMATE = {
+  workerRuns: 3.8,
+  validatorRuns: 4,
+  lowUsd: 2.1,
+  expectedUsd: 4.2,
+  highUsd: 10.5,
+};
+
+function handleRequestPlan(m, res) {
+  m.inFlight = true;
+  m.planRequests += 1;
+  const notReady = m.planRequests === 1;
+  setTimeout(() => {
+    m.inFlight = false;
+    if (notReady) {
+      appendLive(m, 'worker.message', { runId: 'r-orch', tag: 'text', content: NOT_READY_REPLY });
+      sendJson(res, 200, { ready: false, reply: NOT_READY_REPLY });
+    } else {
+      sendJson(res, 200, { ready: true, plan: mockPlanFor(m.state.mission.goal), estimate: MOCK_ESTIMATE });
+    }
+  }, 700);
+}
+
+function handleApprove(m, plan, res) {
+  m.plan = plan;
+  m.state.mission.validationContract = plan.validationContract ?? [];
+  m.state.mission.milestones = (plan.milestones ?? []).map((ms, mi) => ({
+    id: `ms-${mi + 1}`,
+    title: ms.title,
+    status: 'pending',
+    fixCycles: 0,
+    features: (ms.features ?? []).map((f, fi) => ({
+      id: `f-${mi + 1}-${fi + 1}`,
+      title: f.title,
+      spec: f.spec,
+      validationCriteria: f.validationCriteria ?? [],
+      origin: 'plan',
+      status: 'pending',
+      workerRuns: [],
+      commits: [],
+      respawns: 0,
+    })),
+  }));
+  appendLive(m, 'plan.approved', { plan });
+  sendJson(res, 200, { branch: m.state.mission.missionBranch });
+}
+
+/** start: 202, then walk the mission running → complete over a few ticks. */
+function handleStart(m, res) {
+  m.state.mission.status = 'running';
+  appendLive(m, 'orchestrator.decision', {
+    summary: 'Execution started: walking milestones sequentially.',
+  });
+  sendJson(res, 202, { running: true });
+
+  const steps = [];
+  for (const [mi, ms] of m.state.mission.milestones.entries()) {
+    steps.push(() => {
+      ms.status = 'active';
+      appendLive(m, 'milestone.started', { milestoneId: ms.id, startSha: `mock${mi}00` });
+    });
+    for (const f of ms.features) {
+      steps.push(() => {
+        f.status = 'active';
+        appendLive(m, 'feature.started', { featureId: f.id });
+      });
+      steps.push(() => {
+        appendLive(m, 'worker.message', {
+          runId: 'r-orch',
+          tag: 'text',
+          content: `Working on ${f.id}: ${f.title}…`,
+        });
+      });
+      steps.push(() => {
+        f.status = 'complete';
+        appendLive(m, 'feature.completed', { featureId: f.id, commits: [`c${f.id}`] });
+      });
+    }
+    steps.push(() => {
+      ms.status = 'complete';
+      appendLive(m, 'milestone.completed', { milestoneId: ms.id });
+    });
+  }
+  steps.push(() => {
+    m.state.mission.status = 'complete';
+    appendLive(m, 'mission.completed', {});
+  });
+
+  let i = 0;
+  const timer = setInterval(() => {
+    if (i >= steps.length) {
+      clearInterval(timer);
+      return;
+    }
+    steps[i++]();
+  }, 1200);
+  timer.unref();
 }
 
 // ---------------------------------------------------------------------------
@@ -519,10 +886,25 @@ function sendJson(res, code, body) {
   res.writeHead(code, {
     'content-type': 'application/json',
     'access-control-allow-origin': '*',
-    'access-control-allow-headers': 'content-type',
+    'access-control-allow-headers': 'content-type, x-kranz-token',
     'access-control-allow-methods': 'GET, POST, OPTIONS',
   });
   res.end(data);
+}
+
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', (chunk) => (body += chunk));
+    req.on('end', () => {
+      try {
+        resolve(body === '' ? {} : JSON.parse(body));
+      } catch (err) {
+        reject(err);
+      }
+    });
+    req.on('error', reject);
+  });
 }
 
 function serveStatic(res, pathname) {
@@ -549,63 +931,148 @@ const server = createServer((req, res) => {
     return;
   }
 
+  // Authority (docs/protocol.md): every POST /api/... needs the mutation
+  // token. The mock accepts ANY non-empty x-kranz-token value.
+  if (req.method === 'POST' && path.startsWith('/api/')) {
+    const token = req.headers['x-kranz-token'];
+    if (typeof token !== 'string' || token.trim() === '') {
+      sendJson(res, 401, { error: 'missing or invalid token' });
+      return;
+    }
+  }
+
   if (path === '/api/health') {
     sendJson(res, 200, { ok: true, version: 'mock-0.1.0' });
     return;
   }
   if (path === '/api/missions') {
-    sendJson(res, 200, [
-      {
-        id: MISSION_ID,
-        status: state.mission.status,
-        goal: state.mission.goal,
-        createdAt: state.mission.createdAt,
-      },
-    ]);
+    if (req.method === 'POST') {
+      readJsonBody(req)
+        .then((body) => {
+          if (typeof body.goal !== 'string' || body.goal.trim() === '') {
+            sendJson(res, 400, { error: 'goal is required' });
+            return;
+          }
+          const m = createHostedMission(body.goal.trim(), body.config);
+          sendJson(res, 201, { id: m.id });
+        })
+        .catch(() => sendJson(res, 400, { error: 'bad JSON body' }));
+      return;
+    }
+    sendJson(
+      res,
+      200,
+      allMissions().map((m) => ({
+        id: m.id,
+        status: m.state.mission.status,
+        goal: m.state.mission.goal,
+        createdAt: m.state.mission.createdAt,
+      })),
+    );
     return;
   }
 
   const mission = path.match(/^\/api\/missions\/([^/]+)(\/.*)?$/);
   if (mission) {
-    if (decodeURIComponent(mission[1]) !== MISSION_ID) {
+    const m = findMission(decodeURIComponent(mission[1]));
+    if (m === null) {
       sendJson(res, 404, { error: 'unknown mission' });
       return;
     }
     const rest = mission[2] ?? '';
     if (rest === '/state') {
-      sendJson(res, 200, state);
+      sendJson(res, 200, m.state);
       return;
     }
     if (rest === '/events') {
       const since = url.searchParams.get('since');
       const from = since === null ? 0 : Number(since);
-      sendJson(res, 200, events.filter((e) => e.seq > from));
+      sendJson(res, 200, m.events.filter((e) => e.seq > from));
       return;
     }
     if (rest === '/plan') {
-      sendJson(res, 200, plan);
+      if (m.plan) sendJson(res, 200, m.plan);
+      else sendJson(res, 404, { error: 'no approved plan yet' });
       return;
     }
     const run = rest.match(/^\/runs\/([^/]+)\/transcript$/);
     if (run) {
-      const t = transcripts[decodeURIComponent(run[1])];
+      const t = m.transcripts[decodeURIComponent(run[1])];
       if (t) sendJson(res, 200, t);
       else sendJson(res, 404, { error: 'no transcript' });
       return;
     }
     if (rest === '/control' && req.method === 'POST') {
-      let body = '';
-      req.on('data', (chunk) => (body += chunk));
-      req.on('end', () => {
-        try {
-          handleControl(JSON.parse(body));
+      readJsonBody(req)
+        .then((cmd) => {
+          handleControl(m, cmd);
           sendJson(res, 202, { queued: true });
-        } catch {
-          sendJson(res, 400, { error: 'bad control command' });
-        }
-      });
+        })
+        .catch(() => sendJson(res, 400, { error: 'bad control command' }));
       return;
     }
+
+    // --- mission lifecycle (M2.5) -----------------------------------------
+    if (rest === '/planning/turn' && req.method === 'POST') {
+      const gate = planningGate(m);
+      if (gate !== null) {
+        sendJson(res, 409, { error: gate });
+        return;
+      }
+      readJsonBody(req)
+        .then((body) => {
+          if (typeof body.text !== 'string' || body.text.trim() === '') {
+            sendJson(res, 400, { error: 'text is required' });
+            return;
+          }
+          handlePlanningTurn(m, body.text, res);
+        })
+        .catch(() => sendJson(res, 400, { error: 'bad JSON body' }));
+      return;
+    }
+    if (rest === '/planning/request-plan' && req.method === 'POST') {
+      const gate = planningGate(m);
+      if (gate !== null) {
+        sendJson(res, 409, { error: gate });
+        return;
+      }
+      handleRequestPlan(m, res);
+      return;
+    }
+    if (rest === '/approve' && req.method === 'POST') {
+      const gate = planningGate(m);
+      if (gate !== null) {
+        sendJson(res, 409, { error: gate });
+        return;
+      }
+      readJsonBody(req)
+        .then((body) => {
+          if (typeof body.plan !== 'object' || body.plan === null) {
+            sendJson(res, 400, { error: 'plan is required' });
+            return;
+          }
+          handleApprove(m, body.plan, res);
+        })
+        .catch(() => sendJson(res, 400, { error: 'bad JSON body' }));
+      return;
+    }
+    if (rest === '/start' && req.method === 'POST') {
+      if (!m.hostedHere) {
+        sendJson(res, 409, { error: `mission '${m.id}' is not hosted by this server` });
+        return;
+      }
+      if (m.state.mission.status === 'running') {
+        sendJson(res, 409, { error: 'mission is already running' });
+        return;
+      }
+      if (!m.plan) {
+        sendJson(res, 409, { error: 'no approved plan — approve before starting' });
+        return;
+      }
+      handleStart(m, res);
+      return;
+    }
+
     sendJson(res, 404, { error: 'not found' });
     return;
   }
@@ -669,7 +1136,8 @@ function wsDecode(buf) {
 server.on('upgrade', (req, socket) => {
   const url = new URL(req.url, `http://127.0.0.1:${PORT}`);
   const match = url.pathname.match(/^\/api\/missions\/([^/]+)\/ws$/);
-  if (!match || decodeURIComponent(match[1]) !== MISSION_ID) {
+  const m = match ? findMission(decodeURIComponent(match[1])) : null;
+  if (m === null) {
     socket.destroy();
     return;
   }
@@ -681,18 +1149,19 @@ server.on('upgrade', (req, socket) => {
       'Upgrade: websocket\r\nConnection: Upgrade\r\n' +
       `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
   );
-  sockets.add(socket);
+  const entry = { sock: socket, missionId: m.id };
+  sockets.add(entry);
 
   // Protocol: ?since with a small gap → replay events (no snapshot);
   // otherwise a fresh snapshot at head.
   const sinceParam = url.searchParams.get('since');
   const since = sinceParam === null ? NaN : Number(sinceParam);
-  if (Number.isFinite(since) && since <= seq && seq - since <= 5000) {
-    for (const e of events) {
+  if (Number.isFinite(since) && since <= m.seq && m.seq - since <= 5000) {
+    for (const e of m.events) {
       if (e.seq > since) socket.write(wsEncode(JSON.stringify({ type: 'event', seq: e.seq, event: e })));
     }
   } else {
-    socket.write(wsEncode(JSON.stringify({ type: 'snapshot', seq, state })));
+    socket.write(wsEncode(JSON.stringify({ type: 'snapshot', seq: m.seq, state: m.state })));
   }
 
   let pending = Buffer.alloc(0);
@@ -716,7 +1185,7 @@ server.on('upgrade', (req, socket) => {
       }
     }
   });
-  const drop = () => sockets.delete(socket);
+  const drop = () => sockets.delete(entry);
   socket.on('close', drop);
   socket.on('error', drop);
 });

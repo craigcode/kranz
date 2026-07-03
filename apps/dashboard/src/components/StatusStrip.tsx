@@ -18,6 +18,8 @@ export function StatusStrip() {
   const state = useKranzStore((s) => s.state);
   const events = useKranzStore((s) => s.events);
   const sendControl = useKranzStore((s) => s.sendControl);
+  const selectedRun = useKranzStore((s) => s.selectedRun);
+  const selectRun = useKranzStore((s) => s.selectRun);
 
   if (!state) return <div className="status-strip status-planning" />;
 
@@ -49,6 +51,20 @@ export function StatusStrip() {
         {STATUS_LABEL[status]}
       </span>
 
+      {status === 'planning' && (
+        <>
+          <button
+            type="button"
+            className="strip-btn"
+            title="show the planning conversation in the centre pane"
+            onClick={() => selectRun(null)}
+            disabled={selectedRun === null}
+          >
+            open planning
+          </button>
+          <span className="strip-hint">conversation → plan → approve → start</span>
+        </>
+      )}
       {status === 'paused' && (
         <button
           type="button"

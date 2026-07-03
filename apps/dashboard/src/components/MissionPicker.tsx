@@ -20,6 +20,15 @@ export function MissionPicker() {
         <div className="picker-title">
           <span className="picker-brand mono">KRANZ</span>
           <span className="section-label">Missions</span>
+          <button
+            type="button"
+            className="btn-small new-mission-btn"
+            onClick={() => {
+              window.location.hash = '#/new';
+            }}
+          >
+            + new mission
+          </button>
         </div>
         {missionsError !== null && (
           <div className="picker-error" role="alert">
