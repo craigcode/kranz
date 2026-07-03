@@ -327,6 +327,108 @@ fn ensure_identity_sets_local_identity_when_missing() {
 }
 
 #[test]
+fn has_remote_reports_presence() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, _) = seeded_repo();
+
+    // No remotes configured on a fresh repo.
+    assert!(!repo.has_remote("origin").unwrap(), "fresh repo has no origin");
+
+    // Add a fake remote (URL is never contacted — has_remote only reads config).
+    raw_git(dir.path(), &["remote", "add", "origin", "https://example.invalid/repo.git"]);
+    assert!(repo.has_remote("origin").unwrap(), "origin must be visible after remote add");
+    assert!(!repo.has_remote("upstream").unwrap(), "unadded remote must report absent");
+}
+
+#[test]
+fn push_mission_branch_rejects_non_kranz_ref_without_network() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo, _) = seeded_repo();
+
+    // main / arbitrary names / a bare branch are all refused up front. There is
+    // no remote configured at all, so if the guard failed to short-circuit the
+    // call would still fail — but the error message proves the guard fired
+    // first (it names the ref and never mentions a missing remote).
+    for bad in ["main", "master", "HEAD", "feature/x", "kranz", "kranzish"] {
+        let err = repo
+            .push_mission_branch("origin", bad)
+            .expect_err("non-kranz ref must be refused");
+        match err {
+            EngineError::Git(msg) => {
+                assert!(
+                    msg.contains("refusing to push"),
+                    "guard message expected for {bad:?}, got: {msg}"
+                );
+                assert!(msg.contains(bad), "message should name the rejected ref {bad:?}: {msg}");
+            }
+            other => panic!("expected EngineError::Git for {bad:?}, got: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn push_mission_branch_rejects_refspec_and_flag_smuggling() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo, _) = seeded_repo();
+
+    // Even a kranz/* prefix must not carry a refspec, a flag, or whitespace
+    // that could push a second ref or force. Refused before git runs.
+    for bad in ["kranz/mission-1:main", "kranz/mission-1 --force", "kranz/ mission"] {
+        let err = repo
+            .push_mission_branch("origin", bad)
+            .expect_err("malformed kranz ref must be refused");
+        assert!(
+            matches!(err, EngineError::Git(_)),
+            "expected EngineError::Git for {bad:?}, got: {err:?}"
+        );
+    }
+    // A leading-dash ref is refused by the malformed guard (it isn't kranz/*
+    // either, but this pins the flag-injection intent explicitly).
+    let err = repo
+        .push_mission_branch("origin", "--force")
+        .expect_err("flag-shaped ref must be refused");
+    assert!(matches!(err, EngineError::Git(_)));
+}
+
+#[test]
+fn push_mission_branch_attempts_push_and_surfaces_git_error() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, _) = seeded_repo();
+    // A kranz/* branch clears the guard and reaches `git push`. Point origin at
+    // a path that is not a repo so git fails locally *without* touching the
+    // network (a file:// path to a non-repo errors before any transport).
+    let bogus = dir.path().join("no-such-remote-repo");
+    raw_git(
+        dir.path(),
+        &["remote", "add", "origin", &format!("file://{}", bogus.display())],
+    );
+    repo.create_branch("kranz/mission-1", None).unwrap();
+
+    let err = repo
+        .push_mission_branch("origin", "kranz/mission-1")
+        .expect_err("push to a bogus remote must fail");
+    match err {
+        EngineError::Git(msg) => {
+            // The guard did NOT fire — this is git's own failure, surfaced.
+            assert!(
+                !msg.contains("refusing to push"),
+                "kranz/* ref must pass the guard and reach git: {msg}"
+            );
+            assert!(msg.contains("push"), "error should carry the push command context: {msg}");
+        }
+        other => panic!("expected EngineError::Git, got: {other:?}"),
+    }
+}
+
+#[test]
 fn ensure_identity_keeps_existing_identity() {
     if !setup() {
         return;

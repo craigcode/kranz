@@ -145,3 +145,11 @@ node scripts/mock-server.mjs    # dashboard dev harness with a canned mission
 
 Born from a v3 build plan cloning Factory.ai's opinionated core; deviations
 are documented in [docs/design.md](docs/design.md).
+
+## Cloud (preview)
+
+Kranz is local-first and **never pushes** on your machine. Cloud missions (M6,
+preview — not yet exercised end-to-end) run the same binary in a container and
+publish the mission branch as a reviewable `kranz/*` ref only — never `main`,
+never a merge. See the [`Dockerfile`](Dockerfile) and the
+[cloud deploy runbook](docs/deploy.md).

@@ -161,6 +161,75 @@ impl GitRepo {
         Ok(())
     }
 
+    /// Whether a remote named `name` is configured (`git remote get-url`).
+    ///
+    /// A probe, not an assertion: returns `Ok(false)` when the remote is
+    /// absent and only errors when git itself cannot be spawned. Callers use
+    /// this to decide whether a cloud mission has anywhere to push to before
+    /// calling [`GitRepo::push_mission_branch`].
+    pub fn has_remote(&self, name: &str) -> Result<bool> {
+        let out = self.probe(&["remote", "get-url", name])?;
+        Ok(out.status.success())
+    }
+
+    /// Push a single `kranz/*` mission ref to `remote` — **the one and only
+    /// push path in Kranz, and it is cloud-opt-in.**
+    ///
+    /// ## Local default: Kranz never pushes (plan §4.4)
+    ///
+    /// Git is the source of truth, but on a local host Kranz writes only to the
+    /// working tree and local refs — it never contacts a remote. No mission
+    /// loop, no CLI verb, and nothing in the server calls this method today; it
+    /// exists as the primitive that M6 cloud-mission wiring will call
+    /// explicitly. Nothing about the local default changes by this method
+    /// merely existing (roadmap M6, "Scoped push").
+    ///
+    /// ## Guard rails (why this is safe to expose)
+    ///
+    /// - The branch **must** begin with `kranz/` — mission branches are
+    ///   `kranz/mission-<id>` and mission tags live under `kranz/<id>/…`.
+    ///   Anything else (`main`, `master`, `HEAD`, a bare sha, `--force`, or a
+    ///   refspec smuggling a second ref) is rejected with
+    ///   [`EngineError::Git`] **before any git process runs** — no network.
+    /// - The push is a plain `git push <remote> <branch>`: never `--force`,
+    ///   never a `src:dst` refspec, never `main`, never a merge. The human
+    ///   still reviews the `kranz/*` branch and opens the PR (roadmap M6).
+    /// - On failure git's stderr is surfaced verbatim via [`EngineError::Git`],
+    ///   so a bad deploy key or a rejected non-fast-forward shows up in the
+    ///   mission log with git's own words.
+    ///
+    /// The deploy key / GitHub App backing `remote` should itself be scoped to
+    /// `kranz/*` refs (see docs/deploy.md); this guard is defence in depth, not
+    /// the only line of defence.
+    pub fn push_mission_branch(&self, remote: &str, branch: &str) -> Result<()> {
+        // Defence in depth: refuse anything that is not a mission ref *before*
+        // spawning git, so a mis-wired caller can never push main or a merge.
+        // `kranz/` (with the slash) is required so a branch literally named
+        // "kranz" or "kranzfoo" cannot slip through.
+        if !branch.starts_with("kranz/") {
+            return Err(EngineError::Git(format!(
+                "refusing to push non-kranz ref {branch:?}: push_mission_branch \
+                 only pushes kranz/* mission refs, never main or merges"
+            )));
+        }
+        // Reject characters that could turn a single branch name into extra
+        // arguments or a src:dst refspec. A legitimate mission ref never
+        // contains whitespace, a colon, or a leading dash.
+        if branch.contains(':')
+            || branch.starts_with('-')
+            || branch.chars().any(char::is_whitespace)
+        {
+            return Err(EngineError::Git(format!(
+                "refusing to push malformed ref {branch:?}: a mission branch is \
+                 a plain kranz/* name with no refspec, flags, or whitespace"
+            )));
+        }
+        // Plain push of one local branch to the same-named remote branch.
+        // Never --force; never a refspec; never main.
+        self.run(&["push", remote, branch])?;
+        Ok(())
+    }
+
     /// Guarantee commits can be made: when `user.name` / `user.email` resolve
     /// to nothing for this repo (any config scope), set a local identity of
     /// `kranz <kranz@localhost>`. Existing identities are never overwritten,
