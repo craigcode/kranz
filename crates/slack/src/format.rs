@@ -17,6 +17,12 @@ use serde_json::{json, Value};
 /// [`crate::inbound`].
 pub const APPROVE_ACTION_ID: &str = "kranz_approve";
 
+/// `action_id` of the "approve & start" button on a plan-review message
+/// ([`build_plan_review`]). Distinct from [`APPROVE_ACTION_ID`] (approve &
+/// queue) so the two paths can be told apart when button wiring lands; the
+/// button `value` carries the mission id, same as approve.
+pub const START_ACTION_ID: &str = "kranz_start";
+
 /// A mission whose plan is ready for review. The `value` carried by the approve
 /// button is the mission id, so a click round-trips back to the right mission.
 #[derive(Debug, Clone)]
@@ -62,6 +68,44 @@ pub struct Complete {
     pub branch: String,
     /// Total cost in USD, if known (rendered to cents).
     pub cost_usd: Option<f64>,
+}
+
+/// A just-created mission whose planning conversation opened in a thread. The
+/// ack tells the user what was created and how to drive planning from here.
+#[derive(Debug, Clone)]
+pub struct NewMissionAck {
+    pub mission_id: String,
+    pub goal: String,
+    /// The orchestrator's opening reply (its scoping questions), if the seed
+    /// planning turn produced one. Rendered so the user can answer in-thread.
+    pub opening_reply: Option<String>,
+}
+
+/// A folded status summary for one mission (built from the reduced state, then
+/// rendered here). `summary` is the caller's already-rendered status body (a
+/// short multi-line mrkdwn string); this builder frames it with a header.
+#[derive(Debug, Clone)]
+pub struct StatusSummary {
+    pub mission_id: String,
+    /// Short status word (e.g. `Planning`, `Running`, `Complete`) for the
+    /// header pill.
+    pub status: String,
+    /// Pre-rendered status body (milestone tally, cost, goal excerpt, …).
+    pub summary: String,
+}
+
+/// A plan awaiting review, with the pieces a reviewer needs before spending:
+/// the goal, milestone list, and validation-assertion count. Renders with
+/// **Approve & start** / **Approve & queue** buttons carrying the mission id.
+#[derive(Debug, Clone)]
+pub struct PlanReview {
+    pub mission_id: String,
+    pub goal: String,
+    pub milestone_titles: Vec<String>,
+    pub assertion_count: usize,
+    /// Optional one-line calibrated cost/time estimate string (rendered as
+    /// context when present).
+    pub estimate: Option<String>,
 }
 
 /// Slack truncates and mis-renders very long single strings; keep any one field
@@ -163,6 +207,91 @@ pub fn build_complete(c: &Complete) -> Vec<Value> {
     ]
 }
 
+/// New-mission ack (M2.9 slice 1): confirms the mission id + goal and, when the
+/// seed planning turn produced opening questions, surfaces them with a nudge to
+/// answer in-thread (each reply becomes a planning turn). This is the thread
+/// root of the mission's planning conversation.
+pub fn build_new_mission_ack(a: &NewMissionAck) -> Vec<Value> {
+    let mut blocks = vec![
+        header(&format!("Planning {} — new mission", a.mission_id)),
+        section(&format!("*Goal*\n{}", clip(a.goal.trim()))),
+    ];
+    if let Some(reply) = a.opening_reply.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+        blocks.push(section(&format!("*Orchestrator*\n{}", clip(reply))));
+        blocks.push(context(
+            "Reply in this thread to answer — each reply is a planning turn. \
+             When you're ready, run `/kranz plan` to see the plan.",
+        ));
+    } else {
+        blocks.push(context(
+            "Reply in this thread to plan (each reply is a planning turn). \
+             When you're ready, run `/kranz plan` to see the plan.",
+        ));
+    }
+    blocks
+}
+
+/// Status summary: a header carrying the mission id + status pill, then the
+/// caller's pre-rendered status body.
+pub fn build_status(s: &StatusSummary) -> Vec<Value> {
+    vec![
+        header(&format!("{} — {}", s.mission_id, s.status)),
+        section(&clip(s.summary.trim())),
+        context(&format!("mission `{}`", s.mission_id)),
+    ]
+}
+
+/// Plan-review message: goal + milestones + assertion count + optional
+/// estimate, then an actions block with **Approve & start** ([`START_ACTION_ID`])
+/// and **Approve & queue** ([`APPROVE_ACTION_ID`]) buttons, both carrying the
+/// mission id in `value`.
+pub fn build_plan_review(p: &PlanReview) -> Vec<Value> {
+    let mut milestones = String::new();
+    for title in &p.milestone_titles {
+        milestones.push_str("• ");
+        milestones.push_str(title.trim());
+        milestones.push('\n');
+    }
+    if milestones.is_empty() {
+        milestones.push_str("_(no milestones listed)_");
+    }
+
+    let mut blocks = vec![
+        header(&format!("Review plan — {}", p.mission_id)),
+        section(&format!("*Goal*\n{}", clip(p.goal.trim()))),
+        section(&format!("*Milestones*\n{}", clip(milestones.trim_end()))),
+    ];
+    let mut meta = format!(
+        "{} validation assertion{} · mission `{}`",
+        p.assertion_count,
+        plural(p.assertion_count),
+        p.mission_id
+    );
+    if let Some(est) = p.estimate.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
+        meta.push_str(&format!(" · {est}"));
+    }
+    blocks.push(context(&meta));
+    blocks.push(json!({
+        "type": "actions",
+        "elements": [
+            {
+                "type": "button",
+                "style": "primary",
+                "text": { "type": "plain_text", "text": "Approve & start" },
+                "action_id": START_ACTION_ID,
+                "value": p.mission_id,
+            },
+            {
+                "type": "button",
+                "text": { "type": "plain_text", "text": "Approve & queue" },
+                "action_id": APPROVE_ACTION_ID,
+                "value": p.mission_id,
+            }
+        ]
+    }));
+    blocks
+}
+
 /// `/kranz help` reply — the command list. Honest about what works TODAY: the
 /// bridge currently drives tickets + interactive steering; the full lifecycle
 /// (new/plan/approve/start from Slack) is M2.9 and this list grows as it lands.
@@ -171,19 +300,24 @@ pub fn build_help() -> Vec<Value> {
         header(":sparkles: Kranz — Slack commands"),
         section(
             "*Slash commands*\n\
+             • `/kranz new <goal>` — create a mission and open its planning thread\n\
+             • `/kranz plan <id>` — request the plan for review\n\
+             • `/kranz approve <id>` — approve the plan and queue the mission\n\
+             • `/kranz status [<id>]` — show a mission's status\n\
              • `/kranz ticket <title>` — file a new backlog ticket\n\
              • `/kranz help` — show this message",
         ),
         section(
             "*In a mission thread*\n\
-             • *Approve* button on a plan-ready message — queue the mission\n\
-             • *Reply in the thread* — your message becomes orchestrator guidance \
+             • *Approve & start* / *Approve & queue* buttons on a plan-review message\n\
+             • *Reply in the thread* — during planning your message is a planning turn; \
+             on a running mission it becomes orchestrator guidance \
              (unblocks a blocked milestone, steers a running one)",
         ),
         context(
-            "Full lifecycle from Slack (create · plan · approve · start) is on the \
-             way. Today, plan and run missions with `kranz plan` / `kranz run`, or \
-             the web UI via `kranz serve --open`.",
+            "Money-spending actions (`new` · `plan` · `approve`) are gated by the \
+             `slack.allowUsers` allowlist. Deep forensic inspection (full transcripts, \
+             the four-pane live view) lives in the web UI via `kranz serve --open`.",
         ),
     ]
 }
@@ -395,5 +529,103 @@ mod tests {
             }
         }
         None
+    }
+
+    /// All `button` elements across every `actions` block.
+    fn all_buttons(blocks: &[Value]) -> Vec<Value> {
+        let mut out = Vec::new();
+        for b in blocks {
+            if b["type"] == "actions" {
+                if let Some(elems) = b["elements"].as_array() {
+                    for e in elems {
+                        if e["type"] == "button" {
+                            out.push(e.clone());
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn new_mission_ack_carries_id_goal_and_opening_reply() {
+        let blocks = build_new_mission_ack(&NewMissionAck {
+            mission_id: "m-42".into(),
+            goal: "Rate-limit the notes API".into(),
+            opening_reply: Some("What is the test command?".into()),
+        });
+        let text = all_text(&blocks);
+        assert!(text.contains("m-42"), "mission id present");
+        assert!(text.contains("Rate-limit the notes API"), "goal present");
+        assert!(text.contains("What is the test command?"), "opening reply present");
+        assert!(text.to_lowercase().contains("reply in this thread"));
+        assert!(text.contains("/kranz plan"), "nudges toward request-plan");
+    }
+
+    #[test]
+    fn new_mission_ack_without_reply_still_nudges_planning() {
+        let blocks = build_new_mission_ack(&NewMissionAck {
+            mission_id: "m-1".into(),
+            goal: "g".into(),
+            opening_reply: None,
+        });
+        let text = all_text(&blocks);
+        assert!(text.contains("m-1"));
+        assert!(text.to_lowercase().contains("planning turn"));
+        // No empty "Orchestrator" section when there's no reply.
+        assert!(!text.contains("*Orchestrator*"));
+    }
+
+    #[test]
+    fn status_frames_the_summary_with_id_and_pill() {
+        let blocks = build_status(&StatusSummary {
+            mission_id: "m-7".into(),
+            status: "Running".into(),
+            summary: "2/3 milestones complete\ncost $1.20".into(),
+        });
+        let text = all_text(&blocks);
+        assert!(text.contains("m-7"), "mission id present");
+        assert!(text.contains("Running"), "status pill present");
+        assert!(text.contains("2/3 milestones complete"), "summary body present");
+        assert!(text.contains("cost $1.20"));
+    }
+
+    #[test]
+    fn plan_review_has_two_buttons_carrying_mission_id() {
+        let blocks = build_plan_review(&PlanReview {
+            mission_id: "m-42".into(),
+            goal: "Rate-limit the notes API".into(),
+            milestone_titles: vec!["Token bucket".into(), "429 responses".into()],
+            assertion_count: 3,
+            estimate: Some("~$4.50 · ~12 min".into()),
+        });
+        let text = all_text(&blocks);
+        assert!(text.contains("m-42"), "mission id present");
+        assert!(text.contains("Rate-limit the notes API"), "goal present");
+        assert!(text.contains("Token bucket") && text.contains("429 responses"));
+        assert!(text.contains("3 validation assertions"), "assertion count present");
+        assert!(text.contains("~$4.50 · ~12 min"), "estimate rendered");
+
+        let buttons = all_buttons(&blocks);
+        assert_eq!(buttons.len(), 2, "approve & start plus approve & queue");
+        let start = buttons.iter().find(|b| b["action_id"] == START_ACTION_ID).expect("start btn");
+        let queue = buttons.iter().find(|b| b["action_id"] == APPROVE_ACTION_ID).expect("queue btn");
+        assert_eq!(start["value"], "m-42");
+        assert_eq!(queue["value"], "m-42");
+    }
+
+    #[test]
+    fn plan_review_omits_estimate_when_absent() {
+        let blocks = build_plan_review(&PlanReview {
+            mission_id: "m-1".into(),
+            goal: "g".into(),
+            milestone_titles: vec![],
+            assertion_count: 1,
+            estimate: None,
+        });
+        let text = all_text(&blocks);
+        assert!(text.contains("1 validation assertion "), "singular assertion");
+        assert!(text.contains("no milestones listed"));
     }
 }

@@ -6,7 +6,7 @@
 //! an `envelope_id` yields it for acking.
 
 use kranz_slack::inbound::{route, Action, ThreadLookup};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 fn fixture(name: &str) -> Value {
     let path = concat_fixture(name);
@@ -88,4 +88,85 @@ fn unknown_thread_message_fixture_is_ignored() {
     // Same fixture, but the lookup knows no mission for the thread.
     let routed = route(&fixture("message_thread_reply.json"), &no_lookup());
     assert_eq!(routed.action, Action::Ignore);
+}
+
+// --- M2.9 slice 1 lifecycle subcommands ------------------------------------
+
+#[test]
+fn slash_command_new_fixture_routes_to_new_mission() {
+    let routed = route(&fixture("slash_command_new.json"), &no_lookup());
+    assert_eq!(
+        routed.envelope_id.as_deref(),
+        Some("f5c9db06-3d7b-8e54-cf6f-1c0d4b5e6f70")
+    );
+    assert_eq!(
+        routed.action,
+        Action::NewMission {
+            goal: "Rate-limit the notes API".into(),
+            user_id: Some("U0263M3QW".into()),
+            response_url: Some("https://hooks.slack.com/commands/T024BE7LD/1234/newurl".into()),
+            channel: "C0G9QF9GW".into(),
+        }
+    );
+}
+
+#[test]
+fn slash_command_approve_fixture_routes_to_approve_mission() {
+    let routed = route(&fixture("slash_command_approve.json"), &no_lookup());
+    assert_eq!(
+        routed.envelope_id.as_deref(),
+        Some("a6d0ec17-4e8c-9f65-d070-2d1e5c6f7081")
+    );
+    assert_eq!(
+        routed.action,
+        Action::ApproveMission {
+            mission_id: "m-42".into(),
+            user_id: Some("U0263M3QW".into()),
+            response_url: Some("https://hooks.slack.com/commands/T024BE7LD/1234/approveurl".into()),
+        }
+    );
+}
+
+#[test]
+fn slash_status_and_plan_route_at_the_boundary() {
+    // status with an id
+    let status = json!({
+        "type": "slash_commands",
+        "envelope_id": "env-status",
+        "payload": {
+            "command": "/kranz",
+            "text": "status m-9",
+            "channel_id": "C1",
+            "user_id": "U1",
+            "response_url": "https://hooks.slack/s"
+        }
+    });
+    assert_eq!(
+        route(&status, &no_lookup()).action,
+        Action::Status {
+            mission_id: Some("m-9".into()),
+            response_url: Some("https://hooks.slack/s".into())
+        }
+    );
+
+    // plan <id>
+    let plan = json!({
+        "type": "slash_commands",
+        "envelope_id": "env-plan",
+        "payload": {
+            "command": "/kranz",
+            "text": "plan m-9",
+            "channel_id": "C1",
+            "user_id": "U1",
+            "response_url": "https://hooks.slack/p"
+        }
+    });
+    assert_eq!(
+        route(&plan, &no_lookup()).action,
+        Action::RequestPlan {
+            mission_id: "m-9".into(),
+            user_id: Some("U1".into()),
+            response_url: Some("https://hooks.slack/p".into())
+        }
+    );
 }

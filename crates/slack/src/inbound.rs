@@ -43,6 +43,26 @@ pub enum Action {
     Guidance { mission_id: String, text: String },
     /// `/kranz ticket <title>` → scaffold a new ticket file.
     NewTicket { title: String, channel: String, thread_ts: Option<String> },
+    /// `/kranz new <goal>` → create a mission and seed planning (M2.9 slice 1).
+    /// A money-spending action: gated by the spend allowlist. `user_id` is the
+    /// invoking Slack user (for the gate); `response_url` is where an
+    /// ack / not-authorized ephemeral is posted; `channel` roots the mission
+    /// thread.
+    NewMission {
+        goal: String,
+        user_id: Option<String>,
+        response_url: Option<String>,
+        channel: String,
+    },
+    /// `/kranz status [<id>]` → post a folded status summary. `mission_id`
+    /// absent = "the most recent mission". Read-only, so not spend-gated.
+    Status { mission_id: Option<String>, response_url: Option<String> },
+    /// `/kranz plan <id>` → demand the plan for a mission (request-plan turn).
+    /// A money-spending action (it runs an orchestrator turn): spend-gated.
+    RequestPlan { mission_id: String, user_id: Option<String>, response_url: Option<String> },
+    /// `/kranz approve <id>` → approve the plan and queue the mission. The
+    /// slash-command twin of the [`Action::Approve`] button; spend-gated.
+    ApproveMission { mission_id: String, user_id: Option<String>, response_url: Option<String> },
     /// `/kranz help`, bare `/kranz`, or an unrecognized subcommand → reply with
     /// the command list. `response_url` (from the slash payload) is where the
     /// ephemeral help is posted.
@@ -160,10 +180,16 @@ fn route_event(payload: &Value, lookup: &impl ThreadLookup) -> Action {
     Action::Guidance { mission_id, text: text.to_string() }
 }
 
-/// `slash_commands` → `/kranz ticket <title>`. Only the `ticket` subcommand is
-/// recognized; anything else (or a bare `/kranz`) is ignored so a typo doesn't
-/// scaffold a garbage ticket. Channel + thread are captured so the scaffolder
-/// can seed the ticket from the thread and reply in place.
+/// `slash_commands` → the `/kranz` subcommand router. Recognized subcommands:
+/// `ticket <title>`, `new <goal>`, `status [<id>]`, `plan <id>`, `approve <id>`.
+/// A bare `/kranz`, `help`, or an unrecognized/incomplete subcommand shows the
+/// command list — a typo lands on help rather than silently doing something
+/// surprising, which is what keeps the surface discoverable.
+///
+/// The spend-gated subcommands (`new`, `plan`, `approve`) carry the invoking
+/// `user_id` so [`crate::bridge`] can consult the allowlist before acting; the
+/// gate itself lives in [`crate::config::SlackConfig::is_authorized`], not here
+/// (routing stays pure and config-free).
 fn route_slash(payload: &Value) -> Action {
     // Slack sends the invoked command; accept `/kranz` regardless of the exact
     // registration but require it to be our command.
@@ -172,24 +198,63 @@ fn route_slash(payload: &Value) -> Action {
     }
     let text = payload.get("text").and_then(Value::as_str).unwrap_or("").trim();
     let response_url = payload.get("response_url").and_then(Value::as_str).map(str::to_string);
+    let user_id = payload.get("user_id").and_then(Value::as_str).map(str::to_string);
+    let channel =
+        payload.get("channel_id").and_then(Value::as_str).unwrap_or("").to_string();
 
-    // `ticket <title>` scaffolds a ticket; everything else (help, bare, or an
-    // unrecognized subcommand) shows the command list — a typo lands on help
-    // rather than silence, which is what makes the command discoverable.
+    // `ticket <title>` scaffolds a ticket; the thread is captured so the
+    // scaffolder can seed from it and reply in place.
     if let Some(rest) = strip_ci_prefix(text, "ticket") {
         let title = rest.trim();
         if !title.is_empty() {
-            let channel = payload
-                .get("channel_id")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
             // Slash commands can be invoked from a thread; `thread_ts` is present then.
             let thread_ts = payload.get("thread_ts").and_then(Value::as_str).map(str::to_string);
             return Action::NewTicket { title: title.to_string(), channel, thread_ts };
         }
         // `ticket` with no title → fall through to help.
     }
+
+    // `new <goal>` → create + seed a mission (spend-gated in the bridge).
+    if let Some(rest) = strip_ci_prefix(text, "new") {
+        let goal = rest.trim();
+        if !goal.is_empty() {
+            return Action::NewMission {
+                goal: goal.to_string(),
+                user_id,
+                response_url,
+                channel,
+            };
+        }
+        // `new` with no goal → help.
+    }
+
+    // `status [<id>]` → folded status summary; the optional id selects a
+    // mission, otherwise the bridge picks the most recent one.
+    if let Some(rest) = strip_ci_prefix(text, "status") {
+        let id = rest.trim();
+        let mission_id = (!id.is_empty()).then(|| id.to_string());
+        return Action::Status { mission_id, response_url };
+    }
+
+    // `plan <id>` → demand the plan (spend-gated: runs an orchestrator turn).
+    if let Some(rest) = strip_ci_prefix(text, "plan") {
+        let id = rest.trim();
+        if !id.is_empty() {
+            return Action::RequestPlan { mission_id: id.to_string(), user_id, response_url };
+        }
+        // `plan` with no id → help.
+    }
+
+    // `approve <id>` → approve + queue (spend-gated). The slash twin of the
+    // approve button.
+    if let Some(rest) = strip_ci_prefix(text, "approve") {
+        let id = rest.trim();
+        if !id.is_empty() {
+            return Action::ApproveMission { mission_id: id.to_string(), user_id, response_url };
+        }
+        // `approve` with no id → help.
+    }
+
     Action::Help { response_url }
 }
 
@@ -409,6 +474,124 @@ mod tests {
             route(&env, &lookup_none()).action,
             Action::Help { response_url: Some("https://hooks.slack/x".into()) }
         );
+    }
+
+    #[test]
+    fn slash_new_routes_to_new_mission() {
+        let env = json!({
+            "type": "slash_commands",
+            "envelope_id": "env-n",
+            "payload": {
+                "command": "/kranz",
+                "text": "new Rate-limit the notes API",
+                "channel_id": "C123",
+                "user_id": "U777",
+                "response_url": "https://hooks.slack/n"
+            }
+        });
+        let routed = route(&env, &lookup_none());
+        assert_eq!(routed.envelope_id.as_deref(), Some("env-n"));
+        assert_eq!(
+            routed.action,
+            Action::NewMission {
+                goal: "Rate-limit the notes API".into(),
+                user_id: Some("U777".into()),
+                response_url: Some("https://hooks.slack/n".into()),
+                channel: "C123".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn slash_new_without_goal_falls_through_to_help() {
+        let env = json!({
+            "type": "slash_commands",
+            "payload": { "command": "/kranz", "text": "new   ",
+                         "response_url": "https://hooks.slack/x" }
+        });
+        assert_eq!(
+            route(&env, &lookup_none()).action,
+            Action::Help { response_url: Some("https://hooks.slack/x".into()) }
+        );
+    }
+
+    #[test]
+    fn slash_status_with_id_routes_to_status() {
+        let env = json!({
+            "type": "slash_commands",
+            "payload": { "command": "/kranz", "text": "status m-42",
+                         "response_url": "https://hooks.slack/s" }
+        });
+        assert_eq!(
+            route(&env, &lookup_none()).action,
+            Action::Status {
+                mission_id: Some("m-42".into()),
+                response_url: Some("https://hooks.slack/s".into())
+            }
+        );
+    }
+
+    #[test]
+    fn slash_status_bare_routes_to_status_without_id() {
+        let env = json!({
+            "type": "slash_commands",
+            "payload": { "command": "/kranz", "text": "status",
+                         "response_url": "https://hooks.slack/s" }
+        });
+        assert_eq!(
+            route(&env, &lookup_none()).action,
+            Action::Status { mission_id: None, response_url: Some("https://hooks.slack/s".into()) }
+        );
+    }
+
+    #[test]
+    fn slash_plan_routes_to_request_plan() {
+        let env = json!({
+            "type": "slash_commands",
+            "payload": { "command": "/kranz", "text": "PLAN  m-7 ", "user_id": "U9",
+                         "response_url": "https://hooks.slack/p" }
+        });
+        assert_eq!(
+            route(&env, &lookup_none()).action,
+            Action::RequestPlan {
+                mission_id: "m-7".into(),
+                user_id: Some("U9".into()),
+                response_url: Some("https://hooks.slack/p".into())
+            }
+        );
+    }
+
+    #[test]
+    fn slash_approve_routes_to_approve_mission() {
+        let env = json!({
+            "type": "slash_commands",
+            "payload": { "command": "/kranz", "text": "approve m-7", "user_id": "U9",
+                         "response_url": "https://hooks.slack/a" }
+        });
+        assert_eq!(
+            route(&env, &lookup_none()).action,
+            Action::ApproveMission {
+                mission_id: "m-7".into(),
+                user_id: Some("U9".into()),
+                response_url: Some("https://hooks.slack/a".into())
+            }
+        );
+    }
+
+    #[test]
+    fn slash_plan_and_approve_without_id_fall_through_to_help() {
+        for text in ["plan", "plan   ", "approve", "approve  "] {
+            let env = json!({
+                "type": "slash_commands",
+                "payload": { "command": "/kranz", "text": text,
+                             "response_url": "https://hooks.slack/h" }
+            });
+            assert_eq!(
+                route(&env, &lookup_none()).action,
+                Action::Help { response_url: Some("https://hooks.slack/h".into()) },
+                "text={text:?} with no id should route to help"
+            );
+        }
     }
 
     #[test]

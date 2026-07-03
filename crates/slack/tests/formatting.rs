@@ -3,8 +3,10 @@
 //! the mission id / reason / branch / questions a reader needs.
 
 use kranz_slack::format::{
-    build_blocked, build_complete, build_help, build_needs_context, build_plan_ready, Blocked,
-    Complete, NeedsContext, Outcome, PlanReady, APPROVE_ACTION_ID,
+    build_blocked, build_complete, build_help, build_needs_context, build_new_mission_ack,
+    build_plan_ready, build_plan_review, build_status, Blocked, Complete, NeedsContext,
+    NewMissionAck, Outcome, PlanReady, PlanReview, StatusSummary, APPROVE_ACTION_ID,
+    START_ACTION_ID,
 };
 use serde_json::Value;
 
@@ -138,4 +140,73 @@ fn help_lists_the_commands() {
     assert!(text.contains("/kranz help"), "help lists itself");
     assert!(text.to_lowercase().contains("approve"), "help mentions the approve button");
     assert!(text.to_lowercase().contains("guidance"), "help mentions thread-reply guidance");
+    // M2.9 slice 1 lifecycle commands are now listed.
+    assert!(text.contains("/kranz new"), "help lists new");
+    assert!(text.contains("/kranz plan"), "help lists plan");
+    assert!(text.contains("/kranz approve"), "help lists approve");
+    assert!(text.contains("/kranz status"), "help lists status");
+}
+
+#[test]
+fn new_mission_ack_block_kit() {
+    let blocks = build_new_mission_ack(&NewMissionAck {
+        mission_id: "m-42".into(),
+        goal: "Rate-limit the notes API".into(),
+        opening_reply: Some("Which endpoints are in scope?".into()),
+    });
+    assert_valid_blocks(&blocks);
+    let text = all_text(&blocks);
+    assert!(text.contains("m-42"), "ack carries the mission id");
+    assert!(text.contains("Rate-limit the notes API"), "ack carries the goal");
+    assert!(text.contains("Which endpoints are in scope?"), "opening questions surfaced");
+    assert!(text.to_lowercase().contains("reply in this thread"));
+}
+
+#[test]
+fn status_block_kit() {
+    let blocks = build_status(&StatusSummary {
+        mission_id: "m-7".into(),
+        status: "Running".into(),
+        summary: "2/3 milestones complete · cost $1.20".into(),
+    });
+    assert_valid_blocks(&blocks);
+    let text = all_text(&blocks);
+    assert!(text.contains("m-7"), "status carries the mission id");
+    assert!(text.contains("Running"), "status pill present");
+    assert!(text.contains("2/3 milestones complete"), "summary body present");
+}
+
+#[test]
+fn plan_review_block_kit_has_start_and_queue_buttons() {
+    let blocks = build_plan_review(&PlanReview {
+        mission_id: "m-42".into(),
+        goal: "Rate-limit the notes API".into(),
+        milestone_titles: vec!["Token bucket".into(), "429 responses".into()],
+        assertion_count: 2,
+        estimate: Some("~$3.10 · ~9 min".into()),
+    });
+    assert_valid_blocks(&blocks);
+    let text = all_text(&blocks);
+    assert!(text.contains("m-42"));
+    assert!(text.contains("Rate-limit the notes API"));
+    assert!(text.contains("Token bucket") && text.contains("429 responses"));
+    assert!(text.contains("2 validation assertions"));
+    assert!(text.contains("~$3.10 · ~9 min"), "estimate rendered");
+
+    // Two buttons, both carrying the mission id under their distinct action ids.
+    let actions = blocks.iter().find(|b| b["type"] == "actions").expect("actions block");
+    let elements = actions["elements"].as_array().expect("button elements");
+    assert_eq!(elements.len(), 2, "approve & start plus approve & queue");
+    let start = elements
+        .iter()
+        .find(|e| e["action_id"] == START_ACTION_ID)
+        .expect("approve & start button");
+    let queue = elements
+        .iter()
+        .find(|e| e["action_id"] == APPROVE_ACTION_ID)
+        .expect("approve & queue button");
+    assert_eq!(start["value"], "m-42");
+    assert_eq!(queue["value"], "m-42");
+    // The whole thing must serialize (it goes straight into a postMessage body).
+    assert!(serde_json::to_string(&blocks).is_ok());
 }
