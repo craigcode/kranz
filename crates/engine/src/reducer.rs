@@ -249,6 +249,10 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
         EventKind::MissionFailed { .. } => {
             state.mission.status = MissionStatus::Failed;
         }
+
+        EventKind::MissionAbandoned { .. } => {
+            state.mission.status = MissionStatus::Abandoned;
+        }
     }
 
     state.last_seq = event.seq;

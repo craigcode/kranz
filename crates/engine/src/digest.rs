@@ -117,6 +117,7 @@ fn mission_status(status: MissionStatus) -> &'static str {
         MissionStatus::Validating => "validating",
         MissionStatus::Complete => "complete",
         MissionStatus::Failed => "failed",
+        MissionStatus::Abandoned => "abandoned",
     }
 }
 

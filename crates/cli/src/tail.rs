@@ -203,6 +203,9 @@ impl EventRenderer {
             EventKind::MissionFailed { reason } => {
                 ("mission".to_string(), ansi::RED, format!("FAILED: {reason}"))
             }
+            EventKind::MissionAbandoned { reason } => {
+                ("mission".to_string(), ansi::DIM, format!("ABANDONED: {reason}"))
+            }
         };
 
         // Budget: "[tag] body" must fit LINE_MAX visible chars.

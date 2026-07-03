@@ -30,6 +30,7 @@ pub fn mission_status_label(status: MissionStatus) -> &'static str {
         MissionStatus::Validating => "VALIDATING",
         MissionStatus::Complete => "COMPLETE",
         MissionStatus::Failed => "FAILED",
+        MissionStatus::Abandoned => "ABANDONED",
     }
 }
 

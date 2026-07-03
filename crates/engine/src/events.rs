@@ -198,6 +198,10 @@ pub enum EventKind {
 
     #[serde(rename = "mission.failed")]
     MissionFailed { reason: String },
+
+    /// Operator retired the mission (`kranz abandon`) — terminal, not a failure.
+    #[serde(rename = "mission.abandoned")]
+    MissionAbandoned { reason: String },
 }
 
 impl EventKind {
@@ -228,6 +232,7 @@ impl EventKind {
             EventKind::ConfigChanged { .. } => "config.changed",
             EventKind::MissionCompleted {} => "mission.completed",
             EventKind::MissionFailed { .. } => "mission.failed",
+            EventKind::MissionAbandoned { .. } => "mission.abandoned",
         }
     }
 

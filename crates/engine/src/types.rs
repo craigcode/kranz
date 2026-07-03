@@ -24,6 +24,9 @@ pub enum MissionStatus {
     Validating,
     Complete,
     Failed,
+    /// Explicitly retired by the operator (`kranz abandon`) — a terminal state
+    /// distinct from Failed (the mission didn't fail, it was called off).
+    Abandoned,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
