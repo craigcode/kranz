@@ -39,6 +39,7 @@
 use crate::backend::{AgentBackend, AgentEvent, AgentSession, PromptMode, SessionSpec};
 use crate::config;
 use crate::control;
+use crate::cost;
 use crate::digest;
 use crate::error::{EngineError, Result};
 use crate::event_log::EventLog;
@@ -1198,6 +1199,10 @@ impl MissionEngine {
         }
 
         if findings.is_empty() {
+            // Completion report (roadmap M1): written + committed just before
+            // mission.completed so a completed mission always carries its
+            // report. Best-effort — see write_mission_report.
+            self.write_mission_report();
             self.emit(EventKind::MissionCompleted {})?;
             return Ok(Some(MissionStatus::Complete));
         }
@@ -1220,6 +1225,9 @@ impl MissionEngine {
         match self.convert_findings(&last_milestone_id, &findings).await? {
             FindingsConversion::Waive { waived } => {
                 self.emit_waive_decision(&waived)?;
+                // Report AFTER the waive decision (so the gate waiver is in
+                // the replayed history) and BEFORE mission.completed.
+                self.write_mission_report();
                 self.emit(EventKind::MissionCompleted {})?;
                 Ok(Some(MissionStatus::Complete))
             }
@@ -1319,6 +1327,69 @@ impl MissionEngine {
         };
         self.emit_decision(&format!("final gate verdicts: {summary}"), Some(text))?;
         Ok(findings)
+    }
+
+    // -----------------------------------------------------------------------
+    // Completion report (roadmap M1)
+    // -----------------------------------------------------------------------
+
+    /// Write, commit, and index the mission completion report.
+    ///
+    /// Best-effort BY DESIGN: the report is derived data, regenerable from
+    /// the event log at any time, so a render/write/git failure here must
+    /// never strand a mission that just passed its final gate — every error
+    /// is downgraded to a warning and the caller proceeds to emit
+    /// `mission.completed` regardless.
+    fn write_mission_report(&mut self) {
+        if let Err(e) = self.try_write_mission_report() {
+            tracing::warn!(error = %e, "mission report failed; completing the mission without it");
+        }
+    }
+
+    /// Fallible body of [`Self::write_mission_report`]: render `report.md`
+    /// from the (flushed) event log, write it beside plan.md, add a report
+    /// link to this mission's line in `missions/index.md`, and commit both
+    /// in one `[kranz] mission report for <id>` commit.
+    fn try_write_mission_report(&mut self) -> Result<()> {
+        // Flush buffered stream deltas so the replayed history is complete.
+        self.log.flush()?;
+        let events = EventLog::read_events(&self.paths.events_file())?;
+        let plan: Plan = serde_json::from_str(&self.plan_json()?)?;
+        let estimate =
+            cost::estimate(&plan, &self.state.config, &cost::EstimateParams::default());
+        let report = render_mission_report(&self.state, &events, &plan, &estimate);
+
+        let report_file = self.paths.mission_dir().join("report.md");
+        if let Some(parent) = report_file.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&report_file, report)?;
+
+        // Index line: append " · [report](<id>/report.md)" to this mission's
+        // entry; the line format is otherwise kept stable (see
+        // upsert_mission_index). A missing index or line is tolerated — the
+        // report itself is the deliverable.
+        let index = self.paths.missions_dir().join("index.md");
+        let mut commit: Vec<&std::path::Path> = vec![report_file.as_path()];
+        let index_changed = match std::fs::read_to_string(&index) {
+            Ok(existing) => {
+                let updated = mark_mission_index_report(&existing, &self.state.mission.id);
+                let changed = updated != existing;
+                if changed {
+                    std::fs::write(&index, updated)?;
+                }
+                changed
+            }
+            Err(_) => false,
+        };
+        if index_changed {
+            commit.push(index.as_path());
+        }
+        self.repo.commit_paths(
+            &commit,
+            &format!("[kranz] mission report for {}", self.state.mission.id),
+        )?;
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1821,6 +1892,360 @@ pub fn render_plan_markdown(plan: &Plan, mission: &Mission) -> String {
         }
     }
     md
+}
+
+/// Add a completion-report link to one mission's line in the missions
+/// catalog, turning
+/// `- <date> · [<id>](<id>/plan.md) — <goal>` into
+/// `- <date> · [<id>](<id>/plan.md) — <goal> · [report](<id>/report.md)`.
+///
+/// Idempotent; every other line — and the line format itself — stays
+/// untouched. When the mission has no line, the index comes back unchanged.
+pub fn mark_mission_index_report(existing: &str, mission_id: &str) -> String {
+    let marker = format!("[{mission_id}](");
+    let link = format!("[report]({mission_id}/report.md)");
+    let mut out = String::new();
+    for l in existing.lines() {
+        out.push_str(l);
+        if l.contains(&marker) && !l.contains(&link) {
+            out.push_str(" · ");
+            out.push_str(&link);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Render the mission completion report (roadmap M1): elapsed time and cost
+/// vs the pre-mission estimate, what shipped per feature, the validation
+/// history including waived findings with their justifications, and the
+/// contract outcomes. Committed beside plan.md at mission completion and
+/// linked from missions/index.md.
+///
+/// Deterministic given its inputs: every timestamp derives from `events`
+/// (no wall clock — the completion instant is the mission.completed ts when
+/// present, else the last event's, since the engine renders the report just
+/// before emitting mission.completed). No scrubbing happens here: all
+/// model-authored text in `state`/`events` was scrubbed at emit time.
+pub fn render_mission_report(
+    state: &MissionState,
+    events: &[Event],
+    plan: &Plan,
+    estimate: &cost::CostEstimate,
+) -> String {
+    use std::fmt::Write as _;
+    let mission = &state.mission;
+    let mut md = String::new();
+    let _ = writeln!(md, "# Mission report — {}", mission.id);
+    let _ = writeln!(md, "\n**Goal:** {}\n", mission.goal);
+    let _ = writeln!(
+        md,
+        "Branch `{}` (from `{}`). Plan of record: [plan.md](plan.md).\n",
+        mission.mission_branch, mission.base_branch
+    );
+
+    // Elapsed wall clock: created → completed, minus paused spans.
+    let completed_ts = events
+        .iter()
+        .rev()
+        .find_map(|e| matches!(e.kind, EventKind::MissionCompleted {}).then_some(e.ts))
+        .or_else(|| events.last().map(|e| e.ts))
+        .unwrap_or(mission.created_at);
+    let paused = paused_time(events, completed_ts);
+    let elapsed =
+        std::cmp::max(completed_ts - mission.created_at - paused, chrono::Duration::zero());
+    let _ = write!(md, "**Elapsed:** {}", format_duration(elapsed));
+    if paused > chrono::Duration::zero() {
+        let _ = write!(md, " ({} paused)", format_duration(paused));
+    }
+    let _ = writeln!(md);
+    let t = &state.totals;
+    let _ = writeln!(
+        md,
+        "**Tokens:** {} in / {} out / {} cache read / {} cache write",
+        t.input, t.output, t.cache_read, t.cache_write
+    );
+    let _ = writeln!(
+        md,
+        "**Cost:** ${:.2} actual vs ${:.2}–${:.2} estimated (expected ${:.2})",
+        state.total_cost_usd, estimate.low_usd, estimate.high_usd, estimate.expected_usd
+    );
+
+    // What shipped — per milestone, per feature (fix features included, in
+    // the order the reducer materialized them).
+    let _ = writeln!(md, "\n## What shipped");
+    for (mi, m) in mission.milestones.iter().enumerate() {
+        let _ = writeln!(
+            md,
+            "\n### Milestone {} — {} {}\n",
+            mi + 1,
+            m.title,
+            milestone_icon(m.status)
+        );
+        for f in &m.features {
+            let runs = f.worker_runs.len();
+            let _ = write!(
+                md,
+                "- {} **{}**{} — {} run{}",
+                feature_icon(f.status),
+                f.title,
+                if f.origin == FeatureOrigin::Fix { " *(fix)*" } else { "" },
+                runs,
+                if runs == 1 { "" } else { "s" },
+            );
+            if f.respawns > 0 {
+                let _ = write!(
+                    md,
+                    ", {} respawn{}",
+                    f.respawns,
+                    if f.respawns == 1 { "" } else { "s" }
+                );
+            }
+            let _ = writeln!(md);
+            for commit in &f.commits {
+                let _ = writeln!(md, "  - {}", short_commit(commit));
+            }
+        }
+    }
+
+    // Validation history — replayed from the event log.
+    let _ = writeln!(md, "\n## Validation history");
+    let rounds = collect_validation_rounds(events);
+    let mut per_milestone_round: HashMap<&str, usize> = HashMap::new();
+    let mut rendered_any = false;
+    for round in &rounds {
+        // Rounds with neither findings nor a clean completion are reopening
+        // bookkeeping (the gate's fix path re-emits milestone.validating
+        // before fixfeature.created), not validation rounds.
+        if round.findings.is_empty() && !round.clean {
+            continue;
+        }
+        rendered_any = true;
+        match round.milestone_id {
+            Some(id) => {
+                let n = per_milestone_round.entry(id).or_insert(0);
+                *n += 1;
+                let title = mission
+                    .milestones
+                    .iter()
+                    .find(|m| m.id == id)
+                    .map(|m| m.title.as_str())
+                    .unwrap_or("");
+                let _ = writeln!(md, "\n### {id} round {n} — {title}\n");
+            }
+            None => {
+                let _ = writeln!(md, "\n### Final gate\n");
+            }
+        }
+        if round.findings.is_empty() {
+            let _ = writeln!(md, "No findings.");
+            continue;
+        }
+        for (run_id, finding) in &round.findings {
+            let gate =
+                if *run_id == crate::reducer::ENGINE_RUN_ID { " *(final gate)*" } else { "" };
+            let evidence = scrub::truncate_chars(
+                &finding.evidence.split_whitespace().collect::<Vec<_>>().join(" "),
+                200,
+            );
+            let _ =
+                writeln!(md, "- [{}] {}{gate} — {evidence}", finding.severity, finding.subject);
+        }
+        if round.fix_features > 0 {
+            let _ = writeln!(md, "\nDisposition: {} fix feature(s) created.", round.fix_features);
+        }
+        if !round.waived.is_empty() {
+            let _ = writeln!(md, "\nDisposition: waived.");
+            for reasons in &round.waived {
+                for line in reasons.lines() {
+                    let _ = writeln!(md, "{line}");
+                }
+            }
+        }
+        if let Some(reason) = round.blocked {
+            let _ = writeln!(md, "\nDisposition: milestone blocked — {reason}");
+        }
+    }
+    if !rendered_any {
+        let _ = writeln!(md, "\nNo validation rounds were recorded.");
+    }
+
+    // Contract outcomes — the mission completed, so every assertion passed
+    // the final gate (or was explicitly waived; waivers are recorded above).
+    let _ = writeln!(md, "\n## Contract outcomes");
+    if plan.validation_contract.is_empty() {
+        let _ = writeln!(md, "\nNo contract assertions were defined.");
+    } else {
+        let _ = writeln!(md);
+        for a in &plan.validation_contract {
+            let check = match (&a.check, &a.command) {
+                (AssertionCheck::Command, Some(cmd)) => format!("command: `{cmd}`"),
+                (AssertionCheck::Command, None) => "command".to_string(),
+                _ => "agent judgement".to_string(),
+            };
+            let _ = writeln!(md, "- ✅ **[{}]** {} *({check})*", a.id, a.statement);
+        }
+        let _ = writeln!(
+            md,
+            "\nAll assertions passed at the final contract gate (waivers, if any, appear in \
+             the validation history)."
+        );
+    }
+    md
+}
+
+/// One validation round replayed from the event log: a `milestone.validating`
+/// round, or the final contract gate (`mission.validating` / engine-attributed
+/// findings).
+struct ValidationRound<'a> {
+    /// `None` marks the final gate.
+    milestone_id: Option<&'a str>,
+    /// `(run_id, finding)` in emit order.
+    findings: Vec<(&'a str, &'a Finding)>,
+    fix_features: usize,
+    /// Waiver reason blocks: the detail of "waived …" orchestrator decisions
+    /// (one `- subject: reason` line per finding), falling back to the summary.
+    waived: Vec<&'a str>,
+    blocked: Option<&'a str>,
+    /// The round produced no findings and the milestone completed directly.
+    clean: bool,
+}
+
+/// Group the log's validation traffic into [`ValidationRound`]s. Dispositions
+/// (fix features, waivers, blocks) always follow the findings they answer, so
+/// they attach to the last round that has findings — which also covers the
+/// gate's fix path, where the reopening `milestone.validating` arrives between
+/// the gate findings and their `fixfeature.created` events.
+fn collect_validation_rounds(events: &[Event]) -> Vec<ValidationRound<'_>> {
+    fn round(milestone_id: Option<&str>) -> ValidationRound<'_> {
+        ValidationRound {
+            milestone_id,
+            findings: Vec::new(),
+            fix_features: 0,
+            waived: Vec::new(),
+            blocked: None,
+            clean: false,
+        }
+    }
+    let mut rounds: Vec<ValidationRound<'_>> = Vec::new();
+    for event in events {
+        match &event.kind {
+            EventKind::MilestoneValidating { milestone_id } => {
+                rounds.push(round(Some(milestone_id)));
+            }
+            EventKind::MissionValidating {} => rounds.push(round(None)),
+            EventKind::ValidationFinding { milestone_id, run_id, finding } => {
+                // Engine-attributed findings belong to a gate round; the
+                // second gate pass runs without a fresh mission.validating
+                // (the status is already Validating), so open one on demand.
+                let gate = run_id == crate::reducer::ENGINE_RUN_ID;
+                let fits = rounds.last().is_some_and(|r| !gate || r.milestone_id.is_none());
+                if !fits {
+                    rounds.push(round(if gate { None } else { Some(milestone_id) }));
+                }
+                rounds.last_mut().expect("pushed above").findings.push((run_id, finding));
+            }
+            EventKind::FixFeatureCreated { .. } => {
+                if let Some(r) = rounds.iter_mut().rev().find(|r| !r.findings.is_empty()) {
+                    r.fix_features += 1;
+                }
+            }
+            EventKind::OrchestratorDecision { summary, detail }
+                if summary.starts_with("waived") =>
+            {
+                if let Some(r) = rounds.iter_mut().rev().find(|r| !r.findings.is_empty()) {
+                    r.waived.push(detail.as_deref().unwrap_or(summary));
+                }
+            }
+            EventKind::MilestoneBlocked { reason, .. } => {
+                if let Some(r) = rounds.iter_mut().rev().find(|r| !r.findings.is_empty()) {
+                    r.blocked = Some(reason);
+                }
+            }
+            EventKind::MilestoneCompleted { milestone_id, .. } => {
+                if let Some(r) = rounds.last_mut() {
+                    if r.milestone_id == Some(milestone_id.as_str()) && r.findings.is_empty() {
+                        r.clean = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    rounds
+}
+
+/// Total time the mission spent paused: fold `mission.paused`/`mission.resumed`
+/// spans; a pause still open at `end` counts up to `end` (defensive — a
+/// completed mission always resumed).
+fn paused_time(events: &[Event], end: chrono::DateTime<chrono::Utc>) -> chrono::Duration {
+    let mut total = chrono::Duration::zero();
+    let mut paused_at: Option<chrono::DateTime<chrono::Utc>> = None;
+    for event in events {
+        match &event.kind {
+            EventKind::MissionPaused {} => {
+                if paused_at.is_none() {
+                    paused_at = Some(event.ts);
+                }
+            }
+            EventKind::MissionResumed {} => {
+                if let Some(start) = paused_at.take() {
+                    total += event.ts - start;
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(start) = paused_at {
+        total += end - start;
+    }
+    total
+}
+
+/// `4h 02m 09s` / `4m 02s` / `42s` (whole seconds; sub-second missions say 0s).
+fn format_duration(d: chrono::Duration) -> String {
+    let secs = d.num_seconds().max(0);
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if h > 0 {
+        format!("{h}h {m:02}m {s:02}s")
+    } else if m > 0 {
+        format!("{m}m {s:02}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// One `feature.completed` commit entry (`<sha> <subject>`) as markdown:
+/// short sha in backticks + the subject. Entries that don't look like a sha
+/// pass through verbatim.
+fn short_commit(entry: &str) -> String {
+    let (sha, subject) = match entry.split_once(' ') {
+        Some((sha, subject)) => (sha, subject.trim()),
+        None => (entry, ""),
+    };
+    let looks_sha = sha.len() >= 7 && sha.chars().all(|c| c.is_ascii_hexdigit());
+    match (looks_sha, subject.is_empty()) {
+        (true, false) => format!("`{}` {}", &sha[..7], subject),
+        (true, true) => format!("`{}`", &sha[..7]),
+        _ => entry.to_string(),
+    }
+}
+
+fn feature_icon(status: FeatureStatus) -> &'static str {
+    match status {
+        FeatureStatus::Complete => "✅",
+        FeatureStatus::Failed => "❌",
+        FeatureStatus::Skipped => "⏭",
+        FeatureStatus::Active | FeatureStatus::Pending => "⏳",
+    }
+}
+
+fn milestone_icon(status: MilestoneStatus) -> &'static str {
+    match status {
+        MilestoneStatus::Complete => "✅",
+        MilestoneStatus::Blocked => "⛔",
+        _ => "⏳",
+    }
 }
 
 /// Assign `a-1..` ids to contract assertions with missing ids and
