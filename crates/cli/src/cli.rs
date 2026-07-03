@@ -83,6 +83,40 @@ pub enum Command {
     /// List this repo's missions
     Missions,
 
+    /// Work with mission tickets (the backlog): list, show, new, approve
+    Ticket {
+        #[command(subcommand)]
+        command: TicketCommand,
+    },
+
+    /// Draft a plan for a ticket non-interactively (orchestrator only).
+    ///
+    /// Seeds the orchestrator with the whole ticket, requests the plan, and
+    /// either parks a committed plan.md for review (default) or, with --yes,
+    /// approves and queues it immediately. If the orchestrator needs more
+    /// context, its questions are appended to the ticket and the ticket is
+    /// flagged NEEDS-CONTEXT. Spend is bounded by the orchestrator budget cap.
+    Draft {
+        /// The ticket slug (file stem under .kranz/tickets/)
+        slug: String,
+
+        /// Approve and enqueue the plan immediately instead of parking it for
+        /// review
+        #[arg(long)]
+        yes: bool,
+    },
+
+    /// Show the per-repo execution queue
+    Queue,
+
+    /// Drain the execution queue: run queued missions one at a time per repo
+    Work {
+        /// Process exactly one front entry (exit 0 if the repo is busy)
+        /// instead of draining until the queue is empty
+        #[arg(long)]
+        once: bool,
+    },
+
     /// Serve the REST/WebSocket API (and the dashboard, if built)
     Serve {
         /// TCP port to bind on 127.0.0.1
@@ -104,5 +138,42 @@ pub enum Command {
         /// Every POST /api/... must carry it in the x-kranz-token header.
         #[arg(long, value_name = "TOKEN")]
         token: Option<String>,
+    },
+}
+
+/// Subcommands under `kranz ticket` — the backlog surface.
+#[derive(Subcommand, Debug)]
+pub enum TicketCommand {
+    /// List tickets with slug, priority, pipeline state, and title
+    List,
+
+    /// Show one ticket: parsed fields, its state, and any needs-context block
+    Show {
+        /// The ticket slug (file stem under .kranz/tickets/)
+        slug: String,
+    },
+
+    /// Scaffold a new ticket at .kranz/tickets/<slug>.md (refuses to overwrite)
+    New {
+        /// The ticket slug (used as the file stem)
+        slug: String,
+
+        /// The ticket title (frontmatter `title`)
+        #[arg(long)]
+        title: String,
+
+        /// An optional one-paragraph goal to pre-fill the `## Goal` section
+        #[arg(long)]
+        goal: Option<String>,
+    },
+
+    /// Approve a drafted (REVIEW) ticket: enqueue its mission and mark it QUEUED
+    Approve {
+        /// The ticket slug
+        slug: String,
+
+        /// The drafted mission id (auto-detected from the ticket goal if omitted)
+        #[arg(long, value_name = "ID")]
+        mission: Option<String>,
     },
 }

@@ -5,7 +5,8 @@
 //! agent sessions, so `status`/`msg`/`pause`/`resume`/`missions`/`serve`
 //! work on machines without a `claude` binary installed.
 
-use crate::cli::{Cli, Command};
+use crate::backlog;
+use crate::cli::{Cli, Command, TicketCommand};
 use crate::output::{self, ansi};
 use crate::planning_tui::PlanningOutcome;
 use crate::tail::{self, EventRenderer};
@@ -91,12 +92,46 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             print!("{}", cmd_missions(&repo)?);
             Ok(0)
         }
+        Command::Ticket { command } => dispatch_ticket(&repo, command, cli.mission.as_deref()),
+        Command::Draft { slug, yes } => backlog::cmd_draft(repo, &slug, yes, cli.dangerously_allow_all)
+            .await
+            .map_err(augment_limit_hint),
+        Command::Queue => {
+            print!("{}", backlog::cmd_queue(&repo));
+            Ok(0)
+        }
+        Command::Work { once } => backlog::cmd_work(repo, once).await.map_err(augment_limit_hint),
         Command::Serve {
             port,
             open,
             dashboard,
             token,
         } => cmd_serve(repo, port, open, dashboard, token).await,
+    }
+}
+
+/// Dispatch the backend-free `kranz ticket …` subcommands. The global
+/// `--mission` flag supplies the mission id to `ticket approve` when the ticket
+/// goal can't be matched automatically.
+fn dispatch_ticket(repo: &Path, command: TicketCommand, mission: Option<&str>) -> Result<i32> {
+    match command {
+        TicketCommand::List => {
+            print!("{}", backlog::cmd_ticket_list(repo));
+            Ok(0)
+        }
+        TicketCommand::Show { slug } => {
+            print!("{}", backlog::cmd_ticket_show(repo, &slug)?);
+            Ok(0)
+        }
+        TicketCommand::New { slug, title, goal } => {
+            let path = backlog::cmd_ticket_new(repo, &slug, &title, goal.as_deref())?;
+            println!("created ticket '{slug}' at {}", path.display());
+            Ok(0)
+        }
+        TicketCommand::Approve { slug, mission: explicit } => {
+            // A `ticket approve --mission` wins over the global `--mission`.
+            backlog::cmd_ticket_approve(repo, &slug, explicit.as_deref().or(mission))
+        }
     }
 }
 
@@ -115,8 +150,9 @@ pub fn load_config(repo: &Path, dangerously_allow_all: bool) -> Result<MissionCo
     Ok(cfg)
 }
 
-/// Construct the real backend. Called lazily — only by `plan` and `run`.
-fn build_backend(cfg: &MissionConfig) -> Result<Arc<dyn AgentBackend>> {
+/// Construct the real backend. Called lazily — only by `plan`, `run`, and the
+/// backlog `draft` handler.
+pub(crate) fn build_backend(cfg: &MissionConfig) -> Result<Arc<dyn AgentBackend>> {
     let backend = ClaudeBackend::discover(cfg.claude_binary.as_deref())?;
     Ok(Arc::new(backend))
 }

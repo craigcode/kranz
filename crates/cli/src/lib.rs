@@ -16,6 +16,7 @@ mod embedded_dashboard {
     include!(concat!(env!("OUT_DIR"), "/embedded_dashboard.rs"));
 }
 
+pub mod backlog;
 pub mod cli;
 pub mod commands;
 pub mod output;
