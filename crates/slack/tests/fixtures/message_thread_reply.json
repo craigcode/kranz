@@ -1,0 +1,24 @@
+{
+  "type": "events_api",
+  "envelope_id": "c2f6b8d3-0a4e-5b21-9d3c-8f7a1e2b3c4d",
+  "accepts_response_payload": false,
+  "retry_attempt": 0,
+  "retry_reason": "",
+  "payload": {
+    "token": "verification-token-redacted",
+    "team_id": "T024BE7LD",
+    "api_app_id": "A0123456789",
+    "type": "event_callback",
+    "event_id": "Ev0PV52K21",
+    "event_time": 1700000200,
+    "event": {
+      "type": "message",
+      "channel": "C0G9QF9GW",
+      "user": "U0263M3QW",
+      "text": "use a token bucket, cap requests at 100 per minute per token",
+      "ts": "1700000200.000200",
+      "thread_ts": "1700000000.000100",
+      "channel_type": "channel"
+    }
+  }
+}
