@@ -70,6 +70,19 @@ Done when: a mission goes goal → conversation → approved plan → COMPLETE
 without a terminal ever opening, killing the server mid-mission loses
 nothing, and a foreign browser origin cannot create or start anything.
 
+## M2.75 — Mission backlog + Slack bridge
+
+Tickets as markdown in the repo → async plan drafting → review/approve (web,
+CLI, or Slack) → per-repo execution queue → Slack notifications with
+threaded steering. Full design: docs/backlog-and-slack.md. Turns Kranz from
+a sit-and-watch tool into scheduled work; multiplies with M6 (a hosted
+backlog is a team's autonomous dev queue).
+
+Done when: see the design doc's done-when list (merged ticket → drafted
+plan → Slack approve → queued run → blocked-to-unblocked entirely in a
+thread; underspecified tickets bounce back with the orchestrator's actual
+questions; per-repo serialization holds).
+
 ## M3 — Parallel workers (plan Phase 4, flagged off by default)
 
 The marquee deferred capability. Correctness groundwork exists (single-writer
