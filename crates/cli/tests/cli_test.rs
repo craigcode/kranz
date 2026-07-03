@@ -83,11 +83,12 @@ fn write_events(repo: &Path, mission_id: &str, kinds: Vec<EventKind>) -> PathBuf
 fn parses_plan() {
     let cli = Cli::try_parse_from(["kranz", "plan", "build the thing"]).unwrap();
     match cli.command {
-        Command::Plan { goal } => assert_eq!(goal, "build the thing"),
+        Command::Plan { goal } => assert_eq!(goal.as_deref(), Some("build the thing")),
         other => panic!("expected Plan, got {other:?}"),
     }
-    // goal is required
-    assert!(Cli::try_parse_from(["kranz", "plan"]).is_err());
+    // No goal = resume the latest in-planning mission.
+    let cli = Cli::try_parse_from(["kranz", "plan"]).unwrap();
+    assert!(matches!(cli.command, Command::Plan { goal: None }));
 }
 
 #[test]
@@ -491,4 +492,59 @@ fn renderer_tags_worker_lines_and_truncates() {
     assert!(!line.contains('\n'));
     assert!(line.chars().count() <= 160, "len {} in: {line}", line.chars().count());
     assert!(line.ends_with('…'));
+}
+
+/// `kranz plan` (no goal) resumes only missions still in planning, newest
+/// first; approved/running missions are never picked; explicit --mission wins.
+#[test]
+fn select_planning_mission_prefers_newest_planning_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+
+    // m-old: planning. m-run: past planning. m-new: planning, newest.
+    write_events(repo, "m-old", vec![created_kind("old goal", "m-old")]);
+    write_events(
+        repo,
+        "m-run",
+        vec![
+            created_kind("running goal", "m-run"),
+            EventKind::PlanApproved { plan: sample_plan() },
+        ],
+    );
+    let newest = write_events(repo, "m-new", vec![created_kind("new goal", "m-new")]);
+    let future = SystemTime::now() + Duration::from_secs(60);
+    let times = fs::FileTimes::new().set_modified(future);
+    fs::File::options().append(true).open(&newest).unwrap().set_times(times).unwrap();
+
+    assert_eq!(commands::select_planning_mission(repo, None).unwrap(), "m-new");
+    assert_eq!(commands::select_planning_mission(repo, Some("m-old")).unwrap(), "m-old");
+
+    // With only non-planning missions, there is nothing to resume.
+    let tmp2 = tempfile::tempdir().unwrap();
+    write_events(
+        tmp2.path(),
+        "m-run",
+        vec![
+            created_kind("g", "m-run"),
+            EventKind::PlanApproved { plan: sample_plan() },
+        ],
+    );
+    let err = commands::select_planning_mission(tmp2.path(), None).unwrap_err();
+    assert!(err.to_string().contains("no mission is currently in planning"));
+}
+
+/// Usage-limit backend errors get an actionable hint; other errors pass through.
+#[test]
+fn limit_errors_gain_resume_hint() {
+    let limit = anyhow::anyhow!(
+        "orchestrator turn returned an error result: You've hit your session limit \
+         · resets 6pm (America/Los_Angeles)"
+    );
+    let msg = format!("{:#}", commands::augment_limit_hint(limit));
+    assert!(msg.contains("usage window, not a Kranz failure"), "{msg}");
+    assert!(msg.contains("`kranz plan` (no goal) resumes planning"), "{msg}");
+
+    let other = anyhow::anyhow!("git operation failed: nothing to commit");
+    let msg = format!("{:#}", commands::augment_limit_hint(other));
+    assert!(!msg.contains("usage window"), "{msg}");
 }

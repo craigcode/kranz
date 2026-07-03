@@ -1231,7 +1231,20 @@ impl MissionEngine {
                 // re-seed — a tested property, not an emergency (§4.8).
                 tracing::warn!(error = %e, "orchestrator resume failed; re-seeding fresh");
                 self.force_reseed();
-                let seed = digest::render_reseed(&self.state, &self.plan_json()?);
+                // During planning there is no plan to re-seed from: restart
+                // the planning conversation from the goal instead.
+                let seed = if planning {
+                    format!(
+                        "MISSION GOAL:\n{}\n\nYou are in the planning phase; a previous \
+                         planning conversation was lost. Re-establish context from the \
+                         repository (read-only), then continue shaping the validation \
+                         contract, milestones and features with the user. Do not emit \
+                         the plan JSON until asked.",
+                        self.state.mission.goal
+                    )
+                } else {
+                    digest::render_reseed(&self.state, &self.plan_json()?)
+                };
                 self.start_orchestrator(seed, None).await?;
                 self.emit(EventKind::OrchestratorDecision {
                     summary: "orchestrator session re-seeded".to_string(),

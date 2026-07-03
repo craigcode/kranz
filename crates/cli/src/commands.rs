@@ -39,11 +39,15 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
     match cli.command {
         Command::Plan { goal } => {
             let cfg = load_config(&repo, cli.dangerously_allow_all)?;
-            cmd_plan(repo, goal, cfg).await
+            cmd_plan(repo, goal, cfg, cli.mission.as_deref(), cli.force_lock)
+                .await
+                .map_err(augment_limit_hint)
         }
         Command::Run => {
             let mission = select_mission(&repo, cli.mission.as_deref())?;
-            cmd_run(repo, mission, cli.force_lock, cli.dangerously_allow_all).await
+            cmd_run(repo, mission, cli.force_lock, cli.dangerously_allow_all)
+                .await
+                .map_err(augment_limit_hint)
         }
         Command::Status { json } => {
             let mission = select_mission(&repo, cli.mission.as_deref())?;
@@ -149,6 +153,58 @@ pub fn select_mission(repo: &Path, explicit: Option<&str>) -> Result<String> {
     }
 }
 
+/// Pick the mission to resume planning: the explicit `--mission` (validated
+/// to be in planning), or the newest-by-mtime mission whose folded status is
+/// still `Planning`.
+pub fn select_planning_mission(repo: &Path, explicit: Option<&str>) -> Result<String> {
+    if let Some(id) = explicit {
+        require_mission(repo, id)?;
+        return Ok(id.to_string());
+    }
+    let mut best: Option<(SystemTime, String)> = None;
+    for id in MissionPaths::list_missions(repo) {
+        let Ok(state) = load_state(repo, &id) else {
+            continue; // corrupt/foreign logs never block resume of a healthy one
+        };
+        if state.mission.status != MissionStatus::Planning {
+            continue;
+        }
+        let events = MissionPaths::new(repo, &id).events_file();
+        let mtime = std::fs::metadata(&events)
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        if best.as_ref().is_none_or(|(t, _)| mtime >= *t) {
+            best = Some((mtime, id));
+        }
+    }
+    best.map(|(_, id)| id).ok_or_else(|| {
+        anyhow!(
+            "no mission is currently in planning under {} — start one with \
+             `kranz plan \"<goal>\"`",
+            repo.join(".kranz").join("missions").display()
+        )
+    })
+}
+
+/// When an error is really Claude's subscription usage window (session/rate
+/// limit), say so and tell the user how to pick the work back up — the raw
+/// backend error reads like a Kranz failure otherwise.
+pub fn augment_limit_hint(e: anyhow::Error) -> anyhow::Error {
+    let msg = format!("{e:#}").to_ascii_lowercase();
+    if ["session limit", "usage limit", "rate limit", "hit your limit"]
+        .iter()
+        .any(|s| msg.contains(s))
+    {
+        e.context(
+            "this is your Claude subscription's usage window, not a Kranz failure. \
+             The mission and its conversation are saved: when the limit resets, \
+             `kranz plan` (no goal) resumes planning and `kranz run` resumes execution",
+        )
+    } else {
+        e
+    }
+}
+
 /// A mission exists iff its `events.jsonl` does.
 fn require_mission(repo: &Path, mission_id: &str) -> Result<MissionPaths> {
     let paths = MissionPaths::new(repo, mission_id);
@@ -208,14 +264,42 @@ async fn read_stdin_line() -> Option<String> {
 // plan
 // ---------------------------------------------------------------------------
 
-/// `kranz plan <goal>`: create the mission and run the interactive planning
+/// `kranz plan [<goal>]`: create a mission (goal given) or resume the most
+/// recent in-planning mission (no goal), then run the interactive planning
 /// conversation until a plan is approved or the user quits.
-async fn cmd_plan(repo: PathBuf, goal: String, cfg: MissionConfig) -> Result<i32> {
+async fn cmd_plan(
+    repo: PathBuf,
+    goal: Option<String>,
+    cfg: MissionConfig,
+    explicit_mission: Option<&str>,
+    force_lock: bool,
+) -> Result<i32> {
     let backend = build_backend(&cfg)?;
-    let mut engine = MissionEngine::create(backend, repo, &goal, cfg)?;
+    let mut engine = match goal {
+        Some(goal) => {
+            let engine = MissionEngine::create(backend, repo, &goal, cfg)?;
+            println!("mission {} created (planning)", engine.mission_id());
+            engine
+        }
+        None => {
+            let mission = select_planning_mission(&repo, explicit_mission)?;
+            let engine = MissionEngine::resume(backend, repo, &mission, force_lock)?;
+            if engine.state().mission.status != MissionStatus::Planning {
+                return Err(anyhow!(
+                    "mission {mission} is {:?}, not in planning — use 'kranz run' \
+                     to execute it, or 'kranz plan \"<goal>\"' to start a new mission",
+                    engine.state().mission.status
+                ));
+            }
+            println!(
+                "resuming planning for mission {mission} — the conversation continues \
+                 where it left off"
+            );
+            engine
+        }
+    };
     let tty = std::io::stdout().is_terminal();
 
-    println!("mission {} created (planning)", engine.mission_id());
     println!("talk to the orchestrator to shape the plan:");
     println!("  /plan   request the plan + cost estimate and review it for approval");
     println!("  /quit   exit planning (Ctrl-D works too)");
@@ -238,7 +322,7 @@ async fn cmd_plan(repo: PathBuf, goal: String, cfg: MissionConfig) -> Result<i32
                 let plan = match engine.request_plan().await {
                     Ok(plan) => plan,
                     Err(e) => {
-                        eprintln!("kranz: plan request failed: {e}");
+                        eprintln!("kranz: plan request failed: {:#}", augment_limit_hint(e.into()));
                         continue;
                     }
                 };
@@ -273,12 +357,15 @@ async fn cmd_plan(repo: PathBuf, goal: String, cfg: MissionConfig) -> Result<i32
             }
             _ => match engine.planning_turn(&line).await {
                 Ok(reply) => print_orchestrator_reply(&reply, tty),
-                Err(e) => eprintln!("kranz: orchestrator turn failed: {e}"),
+                Err(e) => eprintln!(
+                    "kranz: orchestrator turn failed: {:#}",
+                    augment_limit_hint(e.into())
+                ),
             },
         }
     }
     println!(
-        "leaving planning; mission {} was not approved.",
+        "leaving planning; mission {} was not approved. Resume anytime with `kranz plan`.",
         engine.mission_id()
     );
     Ok(0)

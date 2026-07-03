@@ -42,10 +42,14 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Create a mission and shape its plan in an interactive conversation
+    /// Create a mission and shape its plan in an interactive conversation.
+    ///
+    /// With no goal, resumes the most recent mission still in planning
+    /// (e.g. after a Claude usage-limit interruption) — the orchestrator
+    /// session is resumed with its full conversation context.
     Plan {
-        /// The mission goal, in plain language
-        goal: String,
+        /// The mission goal, in plain language (omit to resume planning)
+        goal: Option<String>,
     },
 
     /// Execute the mission loop (also crash-resumes an interrupted mission)
