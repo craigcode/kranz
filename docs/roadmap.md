@@ -113,6 +113,37 @@ a new machine goes from nothing to `kranz plan` without cloning the repo.
   worker patterns; human approves before write.
 - OTEL export of engine events; real secret scanning replacing the regex scrub.
 
+## M6 — Cloud missions (the plan's "v3 idea", unblocked by M2.5)
+
+Run missions on rented compute; the event-sourced core and the M2.5 HTTP
+lifecycle already make Kranz location-independent. Two shapes, in order:
+
+1. **Ephemeral (CI-shaped)**: container per mission — clone repo → `kranz
+   exec -f mission.md` (M5 headless mode) → push the mission branch → exit.
+   Fits GitHub Actions, Railway cron jobs, any container runner. Smallest
+   new surface.
+2. **Persistent host**: `kranz serve` on Railway/Fly/VPS with a volume for
+   `.kranz`; full M2.5 lifecycle from the browser against a remote URL.
+
+Design changes required (eyes open):
+- **Scoped push**: amend §4.4's "never pushes" to "pushes `kranz/*` refs
+  only" via a deploy key/GitHub App — never main, never merges; the human
+  still reviews. Locally the rule stands unchanged.
+- **Auth grows up**: token required on reads too (transcripts are source
+  code), TLS via platform, `ANTHROPIC_API_KEY` instead of local OAuth.
+- **Workspace provisioning**: clone-on-create (mission carries repo URL +
+  ref); toolchain via `devcontainer.json` when present, one fat default
+  image otherwise. This is the messy part — timebox it.
+- Platform notes: Railway/Fly/VPS are the right shape; RunPod CPU pods only
+  (API-bound workload, no GPU); Lambda is a non-fit (hours-long stateful
+  processes vs 15-minute stateless invocations).
+
+Done when: a mission file pushed to a repo runs unattended in a throwaway
+container and delivers a reviewable `kranz/*` branch; a Railway-hosted
+`kranz serve` takes a mission from browser conversation to COMPLETE with no
+local Kranz install; a leaked dashboard URL without the token reveals
+nothing and mutates nothing.
+
 ## Continuous UX backlog (no milestone, picked up opportunistically)
 
 - `kranz run` status header / richer TUI (dashboard remains the primary
