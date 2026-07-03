@@ -106,7 +106,8 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             open,
             dashboard,
             token,
-        } => cmd_serve(repo, port, open, dashboard, token).await,
+            slack,
+        } => cmd_serve(repo, port, open, dashboard, token, slack).await,
     }
 }
 
@@ -785,7 +786,24 @@ async fn cmd_serve(
     open: bool,
     dashboard: Option<PathBuf>,
     token: Option<String>,
+    slack: bool,
 ) -> Result<i32> {
+    // Opt-in Slack bridge, spawned alongside the server and stopped when the
+    // process exits. serve_slack is a no-op (logs) when Slack is unconfigured,
+    // so `--slack` is safe to pass unconditionally.
+    if slack {
+        let repo_slack = repo.clone();
+        tokio::spawn(async move {
+            // No graceful-shutdown wiring for the CLI's long-lived server:
+            // this future never resolves, so the bridge runs until the
+            // process is killed (same lifetime as the server below).
+            let never = std::future::pending::<()>();
+            if let Err(e) = kranz_slack::serve_slack(&repo_slack, never).await {
+                tracing::error!(error = %e, "slack bridge exited with an error");
+            }
+        });
+    }
+
     let dashboard_assets = resolve_dashboard_assets(&repo, dashboard);
     let url = format!("http://127.0.0.1:{port}/");
     let token = token.unwrap_or_else(kranz_server::generate_token);

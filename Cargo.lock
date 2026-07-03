@@ -968,6 +968,7 @@ dependencies = [
  "crossterm",
  "kranz-engine",
  "kranz-server",
+ "kranz-slack",
  "ratatui",
  "serde",
  "serde_json",

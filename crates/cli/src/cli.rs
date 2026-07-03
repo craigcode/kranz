@@ -138,6 +138,12 @@ pub enum Command {
         /// Every POST /api/... must carry it in the x-kranz-token header.
         #[arg(long, value_name = "TOKEN")]
         token: Option<String>,
+
+        /// Also run the Slack bridge (Socket Mode). Requires bot/app tokens +
+        /// channel in ~/.kranz/config.json or KRANZ_SLACK_* env vars; a no-op
+        /// with a log line when unconfigured. See docs/backlog-and-slack.md.
+        #[arg(long)]
+        slack: bool,
     },
 }
 

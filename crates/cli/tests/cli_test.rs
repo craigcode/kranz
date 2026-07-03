@@ -164,7 +164,7 @@ fn parses_serve() {
     let cli = Cli::try_parse_from(["kranz", "serve"]).unwrap();
     assert!(matches!(
         cli.command,
-        Command::Serve { port: 4560, open: false, dashboard: None, token: None }
+        Command::Serve { port: 4560, open: false, dashboard: None, token: None, slack: false }
     ));
     let cli = Cli::try_parse_from(["kranz", "serve", "--port", "5001", "--open"]).unwrap();
     assert!(matches!(cli.command, Command::Serve { port: 5001, open: true, .. }));
