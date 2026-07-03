@@ -47,6 +47,29 @@ without losing completed work; `kranz missions` in a long-lived repo shows
 only meaningful entries; the imsg2notion FDA failure mode is caught before
 spend, not after.
 
+## M2.5 — Full mission lifecycle from the web UI
+
+The dashboard graduates from observer/steerer to complete surface: create,
+plan, approve, and start missions from the browser (and therefore the Tauri
+app), matching the Factory reference where mission creation lives in the UI.
+
+- `kranz serve` becomes an optional mission host: it holds a MissionEngine
+  per mission it created (the single-writer lock already arbitrates server
+  vs CLI ownership; either can resume what the other started).
+- Endpoints: create (goal+config), planning turn, request-plan
+  (Ready→review / NotReady→chat), approve (same plan.json/plan.md/index
+  commit), start (engine.run() as a server background task). Steering stays
+  on the existing control inbox; the WS feed already carries everything the
+  planning chat needs.
+- UI: new-mission form on the picker, planning chat pane (the composer
+  pattern exists), plan review + two-consent approve/start panel.
+- Authority: mutating endpoints require a per-serve session token printed at
+  startup — spending money from a browser needs more than CORS.
+
+Done when: a mission goes goal → conversation → approved plan → COMPLETE
+without a terminal ever opening, killing the server mid-mission loses
+nothing, and a foreign browser origin cannot create or start anything.
+
 ## M3 — Parallel workers (plan Phase 4, flagged off by default)
 
 The marquee deferred capability. Correctness groundwork exists (single-writer
