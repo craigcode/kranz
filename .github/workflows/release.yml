@@ -1,0 +1,61 @@
+name: release
+
+# Additive to ci.yml (which gates PRs with clippy + tests + dashboard build).
+# This workflow only *builds* release binaries and attaches them to the GitHub
+# release for a pushed tag — it does not re-run the test suite.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # required for softprops/action-gh-release to create/update the release
+
+jobs:
+  build:
+    name: build ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: kranz-linux-x86_64
+            bin: kranz
+          - os: macos-latest
+            asset: kranz-macos-aarch64
+            bin: kranz
+          - os: windows-latest
+            asset: kranz-windows-x86_64
+            bin: kranz.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build kranz (release)
+        run: cargo build --release --locked -p kranz-cli --bin kranz
+
+      # Rename the produced binary to a per-OS/arch asset name and stage it.
+      # macos-latest runners are Apple Silicon (aarch64); the linux/windows
+      # hosted runners are x86_64. Update the matrix if that ever changes.
+      - name: Stage asset (unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp "target/release/${{ matrix.bin }}" "dist/${{ matrix.asset }}"
+
+      - name: Stage asset (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target/release/${{ matrix.bin }}" "dist/${{ matrix.asset }}.exe"
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ matrix.asset }}*
+          fail_on_unmatched_files: true

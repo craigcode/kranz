@@ -60,6 +60,33 @@ used to build the binary, before falling back to the embedded bundle).
 Desktop app: `cd apps/dashboard && npm install && npm run build && npx tauri dev`
 (reads `KRANZ_REPO`; see `apps/dashboard/README.md`).
 
+## Install
+
+**From source (available today).** With a Rust toolchain on your machine:
+
+```sh
+cargo install --path crates/cli   # builds and installs the `kranz` binary
+```
+
+**Prebuilt binaries.** Every tagged release (`vX.Y.Z`) ships binaries built by
+CI ([`.github/workflows/release.yml`](.github/workflows/release.yml)) for
+Linux, macOS, and Windows, attached to the GitHub release as
+`kranz-<os>-<arch>`. Download the one for your platform, `chmod +x` it (Unix),
+and drop it on your `PATH`.
+
+**Once published (planned).**
+
+```sh
+cargo install kranz-cli            # from crates.io
+
+brew tap OWNER/kranz               # Homebrew (from-source formula)
+brew install kranz
+```
+
+The crates.io and Homebrew paths are not live yet — they wait on the first
+public release. `OWNER` is the GitHub org/user that owns the repo; the
+maintainer fills it in at release time (see [docs/releasing.md](docs/releasing.md)).
+
 ## The four roles
 
 | Role | Job | Lifetime | Sees | Touches | Default |
