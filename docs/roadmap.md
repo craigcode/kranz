@@ -47,7 +47,7 @@ without losing completed work; `kranz missions` in a long-lived repo shows
 only meaningful entries; the imsg2notion FDA failure mode is caught before
 spend, not after.
 
-## M2.5 — Full mission lifecycle from the web UI
+## M2.5 — Full mission lifecycle from the web UI ✅ (shipped 2026-07-03)
 
 The dashboard graduates from observer/steerer to complete surface: create,
 plan, approve, and start missions from the browser (and therefore the Tauri
