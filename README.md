@@ -25,9 +25,13 @@ every mission `kill -9`-safe.
 
 ## Quick start
 
+Prerequisites: Rust 1.85+, git, and the [Claude Code CLI](https://claude.com/claude-code)
+(`claude`) installed and authenticated — Kranz discovers it on PATH and in the
+usual install locations, or set `KRANZ_CLAUDE_BIN` / `claudeBinary` in config.
+
 ```sh
-cargo build --release
-cd /path/to/your/repo
+cargo install --path crates/cli   # puts `kranz` on your PATH (~/.cargo/bin)
+cd /path/to/your/repo             # must be a git repo
 
 # 1. Plan interactively — contract first, then milestones/features.
 #    /plan renders the proposal + cost estimate; approval commits plan.json
@@ -45,6 +49,11 @@ kranz msg --interrupt "stop"      # aborts the current worker first
 kranz pause | kranz resume
 kranz serve --open                # Mission Control dashboard (browser)
 ```
+
+The dashboard is a one-time build: `cd <kranz checkout>/apps/dashboard &&
+npm install && npm run build`. `kranz serve` then finds it automatically
+(searching `--dashboard DIR`, `$KRANZ_DASHBOARD_DIST`,
+`<repo>/apps/dashboard/dist`, then the kranz checkout the binary was built in).
 
 Desktop app: `cd apps/dashboard && npm install && npm run build && npx tauri dev`
 (reads `KRANZ_REPO`; see `apps/dashboard/README.md`).
@@ -87,7 +96,7 @@ model aliases (`opus`, `sonnet`) so they track the latest releases.
 ## Development
 
 ```sh
-cargo test --workspace          # 183 tests, no model calls (mock backend seam)
+cargo test --workspace          # 200+ tests, no model calls (mock backend seam)
 cargo test -p kranz-engine -- --ignored   # + live smoke test (spawns claude)
 node scripts/mock-server.mjs    # dashboard dev harness with a canned mission
 ```

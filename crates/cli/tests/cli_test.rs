@@ -161,9 +161,9 @@ fn parses_missions() {
 #[test]
 fn parses_serve() {
     let cli = Cli::try_parse_from(["kranz", "serve"]).unwrap();
-    assert!(matches!(cli.command, Command::Serve { port: 4560, open: false }));
+    assert!(matches!(cli.command, Command::Serve { port: 4560, open: false, dashboard: None }));
     let cli = Cli::try_parse_from(["kranz", "serve", "--port", "5001", "--open"]).unwrap();
-    assert!(matches!(cli.command, Command::Serve { port: 5001, open: true }));
+    assert!(matches!(cli.command, Command::Serve { port: 5001, open: true, .. }));
 }
 
 // ---------------------------------------------------------------------------
@@ -491,4 +491,39 @@ fn renderer_tags_worker_lines_and_truncates() {
     assert!(!line.contains('\n'));
     assert!(line.chars().count() <= 160, "len {} in: {line}", line.chars().count());
     assert!(line.ends_with('…'));
+}
+
+/// resolve_dashboard_dist search order: explicit wins; then env; then
+/// <repo>/apps/dashboard/dist; exe-relative is environment-dependent and not
+/// asserted here.
+#[test]
+fn dashboard_dist_resolution_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let repo_dist = repo.join("apps/dashboard/dist");
+    std::fs::create_dir_all(&repo_dist).unwrap();
+    std::fs::write(repo_dist.join("index.html"), "<!doctype html>").unwrap();
+
+    // Explicit path is honored verbatim, even without an index.html.
+    let explicit = tmp.path().join("elsewhere");
+    assert_eq!(
+        kranz_cli::commands::resolve_dashboard_dist(&repo, Some(explicit.clone())),
+        Some(explicit)
+    );
+
+    // Repo-relative dist is found when nothing explicit is given.
+    // (KRANZ_DASHBOARD_DIST is intentionally not set by this test; setting
+    // env vars in-process races other tests.)
+    assert_eq!(
+        kranz_cli::commands::resolve_dashboard_dist(&repo, None),
+        Some(repo_dist)
+    );
+
+    // A repo without a build yields None or an exe-relative checkout path
+    // (present when tests run inside the Kranz source tree) — never the repo path.
+    let bare = tmp.path().join("bare");
+    std::fs::create_dir_all(&bare).unwrap();
+    if let Some(found) = kranz_cli::commands::resolve_dashboard_dist(&bare, None) {
+        assert!(!found.starts_with(&bare));
+    }
 }

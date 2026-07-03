@@ -88,5 +88,12 @@ pub enum Command {
         /// Open the dashboard in the default browser
         #[arg(long)]
         open: bool,
+
+        /// Directory holding the built dashboard (index.html + assets).
+        /// Default search order: $KRANZ_DASHBOARD_DIST, <repo>/apps/dashboard/dist,
+        /// then apps/dashboard/dist relative to the kranz executable's checkout
+        /// (covers running a dev build from the Kranz source tree).
+        #[arg(long, value_name = "DIR")]
+        dashboard: Option<std::path::PathBuf>,
     },
 }

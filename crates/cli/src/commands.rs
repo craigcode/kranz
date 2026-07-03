@@ -86,7 +86,7 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             print!("{}", cmd_missions(&repo)?);
             Ok(0)
         }
-        Command::Serve { port, open } => cmd_serve(repo, port, open).await,
+        Command::Serve { port, open, dashboard } => cmd_serve(repo, port, open, dashboard).await,
     }
 }
 
@@ -418,17 +418,19 @@ pub fn cmd_missions(repo: &Path) -> Result<String> {
 // serve
 // ---------------------------------------------------------------------------
 
-/// `kranz serve`: run the REST/WS server; serves the dashboard build if the
-/// repo has one at `apps/dashboard/dist`.
-async fn cmd_serve(repo: PathBuf, port: u16, open: bool) -> Result<i32> {
-    let dist = repo.join("apps").join("dashboard").join("dist");
-    let static_dir = dist.is_dir().then_some(dist);
+/// `kranz serve`: run the REST/WS server, serving the dashboard build from
+/// the first location that exists (see [`resolve_dashboard_dist`]).
+async fn cmd_serve(repo: PathBuf, port: u16, open: bool, dashboard: Option<PathBuf>) -> Result<i32> {
+    let static_dir = resolve_dashboard_dist(&repo, dashboard);
     let url = format!("http://127.0.0.1:{port}/");
 
     println!("kranz server on {url}");
     match &static_dir {
         Some(dir) => println!("serving dashboard from {}", dir.display()),
-        None => println!("no dashboard build found (apps/dashboard/dist); serving API only"),
+        None => println!(
+            "no dashboard build found (--dashboard, $KRANZ_DASHBOARD_DIST, \
+             <repo>/apps/dashboard/dist, or the kranz checkout); serving API only"
+        ),
     }
 
     if open {
@@ -444,6 +446,44 @@ async fn cmd_serve(repo: PathBuf, port: u16, open: bool) -> Result<i32> {
         Ok(()) => Ok(0),
         Err(e) => Err(anyhow!("server failed: {e}")),
     }
+}
+
+/// Locate a built dashboard (`index.html` + assets). Search order:
+/// 1. explicit `--dashboard DIR`
+/// 2. `$KRANZ_DASHBOARD_DIST`
+/// 3. `<repo>/apps/dashboard/dist` (mission repo IS the kranz checkout)
+/// 4. `apps/dashboard/dist` relative to the running executable's checkout
+///    (`target/{debug,release}/kranz` in the Kranz source tree) — this makes
+///    `kranz serve` from any mission repo find the UI without configuration.
+pub fn resolve_dashboard_dist(repo: &Path, explicit: Option<PathBuf>) -> Option<PathBuf> {
+    let has_index = |d: &Path| d.join("index.html").is_file();
+
+    if let Some(d) = explicit {
+        // Explicitly requested: honor it even without index.html so the user
+        // sees their own path in the log line (the server 404s clearly).
+        return Some(d);
+    }
+    if let Some(d) = std::env::var_os("KRANZ_DASHBOARD_DIST").map(PathBuf::from) {
+        if has_index(&d) {
+            return Some(d);
+        }
+    }
+    let repo_dist = repo.join("apps").join("dashboard").join("dist");
+    if has_index(&repo_dist) {
+        return Some(repo_dist);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        // target/<profile>/kranz -> checkout root is two levels above target.
+        if let Some(target_dir) = exe.parent().and_then(|p| p.parent()) {
+            if let Some(checkout) = target_dir.parent() {
+                let d = checkout.join("apps").join("dashboard").join("dist");
+                if has_index(&d) {
+                    return Some(d);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Best-effort browser launch via the platform opener.
