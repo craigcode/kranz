@@ -341,7 +341,7 @@ fn enqueue_is_idempotent_per_mission() {
 }
 
 #[test]
-fn is_repo_busy_detects_a_live_lock_and_ignores_a_dead_one() {
+fn is_repo_busy_detects_a_live_lock() {
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     let missions = root.join(".kranz").join("missions");
@@ -349,31 +349,33 @@ fn is_repo_busy_detects_a_live_lock_and_ignores_a_dead_one() {
     // No missions dir yet: not busy.
     assert_eq!(queue::is_repo_busy(root), None);
 
-    // A mission whose lock records a DEAD pid (i32::MAX is not a live process).
-    let dead_dir = missions.join("dead-mission");
-    fs::create_dir_all(&dead_dir).unwrap();
-    fs::write(
-        dead_dir.join("events.jsonl.lock"),
-        i32::MAX.to_string(),
-    )
-    .unwrap();
-    assert_eq!(
-        queue::is_repo_busy(root),
-        None,
-        "a lock held by a dead pid must not count as busy"
-    );
-
-    // A mission whose lock records THIS process (guaranteed alive).
+    // A lock recording THIS process (guaranteed alive) is busy on every
+    // platform.
     let live_dir = missions.join("live-mission");
     fs::create_dir_all(&live_dir).unwrap();
-    fs::write(
-        live_dir.join("events.jsonl.lock"),
-        std::process::id().to_string(),
-    )
-    .unwrap();
+    fs::write(live_dir.join("events.jsonl.lock"), std::process::id().to_string()).unwrap();
     assert_eq!(
         queue::is_repo_busy(root).as_deref(),
         Some("live-mission"),
         "a lock held by a live pid identifies the running mission"
+    );
+}
+
+/// Dead-pid detection is a unix capability today (`libc::kill(pid, 0)`). On
+/// Windows `is_repo_busy` is conservative — any lock counts as busy — until a
+/// Windows liveness probe lands (tracked as an M4 follow-up), matching the
+/// event-log stale-lock posture where Windows needs `--force-lock`.
+#[cfg(unix)]
+#[test]
+fn is_repo_busy_ignores_a_dead_lock() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let dead_dir = root.join(".kranz").join("missions").join("dead-mission");
+    fs::create_dir_all(&dead_dir).unwrap();
+    fs::write(dead_dir.join("events.jsonl.lock"), i32::MAX.to_string()).unwrap();
+    assert_eq!(
+        queue::is_repo_busy(root),
+        None,
+        "a lock held by a dead pid must not count as busy (unix)"
     );
 }
