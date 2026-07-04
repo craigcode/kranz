@@ -204,6 +204,66 @@ fn slash_command_config_fixture_routes_to_config() {
     );
 }
 
+// --- M2.9 steering slice: pause / resume / work ----------------------------
+
+/// A `/kranz <text>` slash envelope with a user id + response url (the shape the
+/// steering commands carry through to the gate + reply).
+fn steer_env(text: &str) -> Value {
+    json!({
+        "type": "slash_commands",
+        "envelope_id": "env-steer",
+        "payload": {
+            "command": "/kranz",
+            "text": text,
+            "channel_id": "C1",
+            "user_id": "Uop",
+            "response_url": "https://hooks.slack/steer"
+        }
+    })
+}
+
+#[test]
+fn slash_pause_and_resume_route_with_optional_id() {
+    // Explicit id.
+    assert_eq!(
+        route(&steer_env("pause m-7"), &no_lookup()).action,
+        Action::Pause {
+            mission_id: Some("m-7".into()),
+            user_id: Some("Uop".into()),
+            response_url: Some("https://hooks.slack/steer".into()),
+        }
+    );
+    // Bare (no id) → target the single active mission (resolved in the bridge).
+    assert_eq!(
+        route(&steer_env("resume"), &no_lookup()).action,
+        Action::Resume {
+            mission_id: None,
+            user_id: Some("Uop".into()),
+            response_url: Some("https://hooks.slack/steer".into()),
+        }
+    );
+}
+
+#[test]
+fn slash_work_routes_to_work() {
+    assert_eq!(
+        route(&steer_env("work"), &no_lookup()).action,
+        Action::Work { response_url: Some("https://hooks.slack/steer".into()) }
+    );
+}
+
+#[test]
+fn slash_pause_resume_work_bad_input_routes_to_help() {
+    // Extra tokens on pause/resume, or any argument on work, are typos → help.
+    for text in ["pause a b", "resume x y", "work drain", "work m-1"] {
+        assert_eq!(
+            route(&steer_env(text), &no_lookup()).action,
+            Action::Help { response_url: Some("https://hooks.slack/steer".into()) },
+            "text={text:?} should route to help"
+        );
+    }
+}
+
 #[test]
 fn app_home_opened_fixture_routes_to_app_home() {
     let routed = route(&fixture("app_home_opened.json"), &no_lookup());

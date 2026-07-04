@@ -353,6 +353,9 @@ pub fn build_help() -> Vec<Value> {
              • `/kranz approve <id>` — approve the plan and queue the mission\n\
              • `/kranz config [<id>] <role> <model> [effort]` — change a role's model/effort \
              (roles: orchestrator·worker·scrutiny·functional; effort: low·medium·high·xhigh·max)\n\
+             • `/kranz pause [<id>]` — pause a running mission (between worker runs)\n\
+             • `/kranz resume [<id>]` — resume a paused mission\n\
+             • `/kranz work` — show the execution queue (drain it with the `kranz work` dispatcher)\n\
              • `/kranz status [<id>]` — show a mission's status\n\
              • `/kranz ticket <title>` — file a new backlog ticket\n\
              • `/kranz help` — show this message",
@@ -365,9 +368,10 @@ pub fn build_help() -> Vec<Value> {
              (unblocks a blocked milestone, steers a running one)",
         ),
         context(
-            "Money-spending actions (`new` · `plan` · `approve` · `config`) are gated by the \
-             `slack.allowUsers` allowlist. Deep forensic inspection (full transcripts, \
-             the four-pane live view) lives in the web UI via `kranz serve --open`.",
+            "Money-spending actions (`new` · `plan` · `approve` · `config`) and disruptive \
+             steering (`pause` · `resume`) are gated by the `slack.allowUsers` allowlist. \
+             Deep forensic inspection (full transcripts, the four-pane live view) lives in \
+             the web UI via `kranz serve --open`.",
         ),
     ]
 }

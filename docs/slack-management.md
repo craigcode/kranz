@@ -80,10 +80,16 @@ Slack; forensics one tap away in the browser.
   Reuses MissionHost + the existing plan-render + the built approve/queue paths.
 - **Slice 2 — control & status** (DONE): `/kranz status` (slice 1) plus
   `/kranz config`, deep-link buttons, and the spend allowlist (which now also
-  gates the approve *button*, not just `/kranz approve`). `pause`/`resume` remain
-  a follow-up (they need the hosted-engine registry, same as `request_plan`).
+  gates the approve *button*, not just `/kranz approve`).
 - **Slice 3 — App Home** (DONE): the dashboard tab (missions + queue + tickets),
   published on `app_home_opened`.
+- **Slice 4 — steering** (DONE): `/kranz pause [<id>]`, `/kranz resume [<id>]`,
+  and `/kranz work`. `pause`/`resume` enqueue a `ControlCommand::Pause`/`Resume`
+  on the target mission's control inbox — the **same mechanism** `kranz pause` /
+  `kranz resume` use — so they need **no hosted engine**, just a control-command
+  file write (LOW RISK). `work` is **report-only**: it reads the queue and points
+  at the `kranz work` dispatcher (the bridge never runs a mission on the socket
+  loop). See "Slice 4 implementation notes" below.
 
 ## Slice 2 & 3 implementation notes
 
@@ -142,6 +148,44 @@ the only prerequisite is the Home tab being enabled — so reinstalling does not
 re-prompt for broader permissions. If a workspace hasn't reinstalled, Slack
 returns `{"ok":false,"error":…}` from `views.publish`; the bridge logs it and
 carries on (a missing Home tab never wedges the socket loop).
+
+## Slice 4 implementation notes (steering)
+
+### `/kranz pause [<id>]` · `/kranz resume [<id>]`
+
+Enqueue `ControlCommand::Pause` / `Resume` onto the target mission's control
+inbox (`kranz_engine::control::enqueue`) — the identical mechanism `kranz pause`
+/ `kranz resume` use. **No hosted engine** is needed (unlike `request_plan`),
+just a control-command file write, which is why this slice is LOW RISK and lands
+without touching `kranz_server`.
+
+- **Gating**: these are STEERING, not spend — but a stray pause disrupts a
+  running mission, so they are gated on the `slack.allowUsers` allowlist exactly
+  like `/kranz config` (consistent, and honest about who can perturb a run).
+  Unlisted users get the same "not authorized" ephemeral.
+- **Mission targeting**: the id is optional and resolved by the same
+  `resolve_active_config_target` helper `/kranz config` uses — an explicit id
+  must exist and be **active** (a terminal mission's control inbox is never
+  drained, so pausing it would be a silent no-op reported as success → rejected);
+  a bare command needs **exactly one** active mission (several → an honest error
+  asking for an explicit id; none → an error). A bad/ambiguous/terminal target
+  **enqueues nothing** and returns an ephemeral error. Extra tokens
+  (`pause m-1 extra`) fall through to `/kranz help`.
+- **Confirmation**: an ephemeral "paused `m-xxx` (takes effect between worker
+  runs)" — the pause/resume, like the CLI, is applied by the engine between
+  worker runs, not instantly.
+
+### `/kranz work` (report-only)
+
+Reports the per-repo execution queue (`queue::list`) and whether the repo is
+currently busy (`queue::is_repo_busy`) as an ephemeral, and points at the
+`kranz work` dispatcher for actually draining it. **The bridge must never spawn
+`claude` on the socket read loop**, so it does not run missions inline — it
+reports and hands off. Read-only, so no allowlist gate. (Draining runs via the
+external `kranz work` CLI: `kranz work` drains the whole queue, `kranz work
+--once` the front entry. There is no "please run the queue" signal file the
+dispatcher watches — it polls the queue on its own timer — so report-only is the
+correct and safe surface here.)
 
 ## Done when
 

@@ -312,3 +312,14 @@ fn help_lists_the_config_command() {
     let text = serde_json::to_string(&build_help()).unwrap();
     assert!(text.contains("/kranz config"), "help lists the config command");
 }
+
+#[test]
+fn help_lists_the_steering_commands() {
+    // M2.9 steering slice: pause / resume / work are now discoverable in help.
+    let text = serde_json::to_string(&build_help()).unwrap();
+    assert!(text.contains("/kranz pause"), "help lists pause");
+    assert!(text.contains("/kranz resume"), "help lists resume");
+    assert!(text.contains("/kranz work"), "help lists work");
+    // work points at the dispatcher, not an inline drain.
+    assert!(text.contains("kranz work"), "help names the dispatcher");
+}

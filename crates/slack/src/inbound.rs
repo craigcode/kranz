@@ -82,6 +82,21 @@ pub enum Action {
         user_id: Option<String>,
         response_url: Option<String>,
     },
+    /// `/kranz pause [<id>]` → enqueue a `Pause` control command on the target
+    /// mission. STEERING (not spend), but it disrupts a running mission, so it is
+    /// gated on the allowlist exactly like `config`. `mission_id` absent = the
+    /// single active mission (resolved via `resolve_active_config_target`, which
+    /// refuses when ambiguous/terminal).
+    Pause { mission_id: Option<String>, user_id: Option<String>, response_url: Option<String> },
+    /// `/kranz resume [<id>]` → enqueue a `Resume` control command on the target
+    /// mission. The twin of [`Action::Pause`]; same gating and targeting.
+    Resume { mission_id: Option<String>, user_id: Option<String>, response_url: Option<String> },
+    /// `/kranz work` → report the queue state (entries + whether the repo is
+    /// busy) as an ephemeral, and point at the `kranz work` dispatcher for
+    /// actually draining it. REPORT-ONLY: the bridge must never spawn a mission
+    /// on the socket loop, so this reads the queue and hands off. Read-only, so
+    /// not gated (`response_url` delivers the ephemeral).
+    Work { response_url: Option<String> },
     /// `app_home_opened` events_api envelope → publish this user's App Home tab
     /// (active missions + queue + open tickets). Read-only, so not spend-gated.
     AppHome { user_id: String },
@@ -226,10 +241,11 @@ fn route_event(payload: &Value, lookup: &impl ThreadLookup) -> Action {
 }
 
 /// `slash_commands` → the `/kranz` subcommand router. Recognized subcommands:
-/// `ticket <title>`, `new <goal>`, `status [<id>]`, `plan <id>`, `approve <id>`.
-/// A bare `/kranz`, `help`, or an unrecognized/incomplete subcommand shows the
-/// command list — a typo lands on help rather than silently doing something
-/// surprising, which is what keeps the surface discoverable.
+/// `ticket <title>`, `new <goal>`, `status [<id>]`, `plan <id>`, `approve <id>`,
+/// `config [<id>] <role> <model> [effort]`, `pause [<id>]`, `resume [<id>]`,
+/// `work`. A bare `/kranz`, `help`, or an unrecognized/incomplete subcommand
+/// shows the command list — a typo lands on help rather than silently doing
+/// something surprising, which is what keeps the surface discoverable.
 ///
 /// The spend-gated subcommands (`new`, `plan`, `approve`) carry the invoking
 /// `user_id` so [`crate::bridge`] can consult the allowlist before acting; the
@@ -310,6 +326,34 @@ fn route_slash(payload: &Value) -> Action {
         // Malformed config → help.
     }
 
+    // `pause [<id>]` / `resume [<id>]` → enqueue a Pause/Resume control command
+    // on the target mission (allowlist-gated in the bridge, disruptive steering).
+    // The id is optional; a bare command targets the single active mission (the
+    // bridge resolves it and refuses when ambiguous/terminal). More than one
+    // trailing token is a typo → help.
+    if let Some(rest) = strip_ci_prefix(text, "pause") {
+        if let Some(mission_id) = parse_optional_id(rest) {
+            return Action::Pause { mission_id, user_id, response_url };
+        }
+        // Too many tokens → help.
+    }
+    if let Some(rest) = strip_ci_prefix(text, "resume") {
+        if let Some(mission_id) = parse_optional_id(rest) {
+            return Action::Resume { mission_id, user_id, response_url };
+        }
+        // Too many tokens → help.
+    }
+
+    // `work` → report the queue state and point at the `kranz work` dispatcher.
+    // Read-only (report-only): the bridge never drains the queue on the socket
+    // loop. Any trailing token is a typo → help.
+    if let Some(rest) = strip_ci_prefix(text, "work") {
+        if rest.trim().is_empty() {
+            return Action::Work { response_url };
+        }
+        // `work <anything>` → help.
+    }
+
     Action::Help { response_url }
 }
 
@@ -380,6 +424,25 @@ fn parse_config_args(
         user_id,
         response_url,
     })
+}
+
+/// Parse the arguments after a `pause` / `resume` subcommand into an optional
+/// mission id. The id is optional (a bare command targets the single active
+/// mission), so:
+/// - no tokens         → `Some(None)`     (target the single active mission)
+/// - exactly one token → `Some(Some(id))` (explicit id)
+/// - two or more tokens → `None`          (a typo → routes to help)
+///
+/// The outer `Option` distinguishes "valid, resolve later" (`Some`) from
+/// "malformed, show help" (`None`); the inner `Option<String>` is the id itself.
+fn parse_optional_id(rest: &str) -> Option<Option<String>> {
+    let mut tokens = rest.split_whitespace();
+    match (tokens.next(), tokens.next()) {
+        (None, _) => Some(None),
+        (Some(id), None) => Some(Some(id.to_string())),
+        // A second token means the input isn't a clean `pause`/`resume [<id>]`.
+        (Some(_), Some(_)) => None,
+    }
 }
 
 /// Build the camelCase `config-change` patch for a canonical `role` (as parsed
@@ -881,6 +944,93 @@ mod tests {
             "no effort → only model in the patch"
         );
         assert!(config_patch("nope", "sonnet", None).is_none(), "unknown role → None");
+    }
+
+    // --- /kranz pause | resume | work --------------------------------------
+
+    /// Build a `/kranz <text>` slash envelope carrying a user id + response url.
+    fn steer_env(text: &str) -> Value {
+        json!({
+            "type": "slash_commands",
+            "envelope_id": "env-steer",
+            "payload": {
+                "command": "/kranz",
+                "text": text,
+                "user_id": "Usteer",
+                "response_url": "https://hooks.slack/steer"
+            }
+        })
+    }
+
+    #[test]
+    fn slash_pause_with_id_routes_to_pause() {
+        assert_eq!(
+            route(&steer_env("pause m-7"), &lookup_none()).action,
+            Action::Pause {
+                mission_id: Some("m-7".into()),
+                user_id: Some("Usteer".into()),
+                response_url: Some("https://hooks.slack/steer".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn slash_pause_bare_routes_to_pause_without_id() {
+        // A bare `pause` targets the single active mission (resolved in the
+        // bridge), so it routes with mission_id None — NOT to help.
+        assert_eq!(
+            route(&steer_env("PAUSE"), &lookup_none()).action,
+            Action::Pause {
+                mission_id: None,
+                user_id: Some("Usteer".into()),
+                response_url: Some("https://hooks.slack/steer".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn slash_resume_with_and_without_id_routes_to_resume() {
+        assert_eq!(
+            route(&steer_env("resume m-9"), &lookup_none()).action,
+            Action::Resume {
+                mission_id: Some("m-9".into()),
+                user_id: Some("Usteer".into()),
+                response_url: Some("https://hooks.slack/steer".into()),
+            }
+        );
+        assert_eq!(
+            route(&steer_env("resume"), &lookup_none()).action,
+            Action::Resume {
+                mission_id: None,
+                user_id: Some("Usteer".into()),
+                response_url: Some("https://hooks.slack/steer".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn slash_work_routes_to_work() {
+        assert_eq!(
+            route(&steer_env("work"), &lookup_none()).action,
+            Action::Work { response_url: Some("https://hooks.slack/steer".into()) }
+        );
+        // Trailing whitespace is still a bare `work`.
+        assert_eq!(
+            route(&steer_env("WORK   "), &lookup_none()).action,
+            Action::Work { response_url: Some("https://hooks.slack/steer".into()) }
+        );
+    }
+
+    #[test]
+    fn slash_pause_resume_work_with_extra_tokens_fall_through_to_help() {
+        // Two-token pause/resume, or work with an argument, are typos → help.
+        for text in ["pause m-1 extra", "resume a b", "work now", "work m-1"] {
+            assert_eq!(
+                route(&steer_env(text), &lookup_none()).action,
+                Action::Help { response_url: Some("https://hooks.slack/steer".into()) },
+                "text={text:?} should route to help"
+            );
+        }
     }
 
     // --- app_home_opened ---------------------------------------------------

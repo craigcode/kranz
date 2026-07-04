@@ -509,6 +509,20 @@ fn not_authorized_blocks() -> Vec<Value> {
 ///   the Home view via `views.publish` ([`build_home_view`]). One Web API call,
 ///   no allowlist gate; a publish failure is logged, never surfaced.
 ///
+/// ## M2.9 slice — steering (pause / resume / work)
+/// - **Pause** / **Resume** (`/kranz pause|resume [<id>]`) — STEERING, not
+///   spend, but they disrupt a running mission, so they are gated on the
+///   allowlist exactly like `config`. On authorization the bridge enqueues
+///   `ControlCommand::Pause` / `Resume` on the target mission's control inbox
+///   (the same mechanism `kranz pause`/`kranz resume` use), resolved via
+///   [`resolve_active_config_target`] so a terminal/ambiguous target is an honest
+///   ephemeral error that enqueues NOTHING. A pure local write ([`steer`]), so
+///   it stays inline (fast ack).
+/// - **Work** (`/kranz work`) — REPORT-ONLY: the bridge must never spawn a
+///   mission on the socket read loop, so it reports the queue state
+///   (`queue::list` + `is_repo_busy`, [`build_work_reply`]) and points at the
+///   `kranz work` CLI / dispatcher for actually draining it. Read-only, no gate.
+///
 /// ## Known limitation (ack budget, docs must-have #3)
 /// This handler runs inline in the socket read loop (see [`handle_envelope`] /
 /// `connect_once`), so the `NewMission` seeding `planning_turn` — a real
@@ -646,6 +660,28 @@ async fn dispatch_action(
             }
         }
 
+        // Pause / resume: STEERING (not spend), but they disrupt a running
+        // mission, so they are gated on the allowlist exactly like `config`. On
+        // authorization, enqueue the Pause/Resume control command on the target
+        // mission (resolved via the same active-mission resolver config uses, so
+        // a terminal/ambiguous target is an honest error that enqueues NOTHING).
+        // A pure local write, so it stays inline (fast ack).
+        Action::Pause { mission_id, user_id, response_url } => {
+            steer(cfg, client, repo_root, mission_id.as_deref(), user_id.as_deref(),
+                  response_url.as_deref(), ControlCommand::Pause, "paused").await;
+        }
+        Action::Resume { mission_id, user_id, response_url } => {
+            steer(cfg, client, repo_root, mission_id.as_deref(), user_id.as_deref(),
+                  response_url.as_deref(), ControlCommand::Resume, "resumed").await;
+        }
+
+        // Queue report. READ-ONLY and REPORT-ONLY: the bridge never drains the
+        // queue on the socket loop (that would spawn `claude`); it reads the
+        // queue state and points at the `kranz work` dispatcher.
+        Action::Work { response_url } => {
+            reply_ephemeral(client, response_url.as_deref(), &build_work_reply(repo_root)).await;
+        }
+
         // App Home tab: fold the repo read-only and publish this user's home
         // view. Read-only (no allowlist gate); a publish failure is logged, not
         // surfaced (there's no response_url — the user just opened a tab).
@@ -707,6 +743,9 @@ fn apply_action(repo_root: &Path, action: &Action) -> Result<()> {
         | Action::RequestPlan { .. }
         | Action::ApproveMission { .. }
         | Action::Config { .. }
+        | Action::Pause { .. }
+        | Action::Resume { .. }
+        | Action::Work { .. }
         | Action::AppHome { .. }
         | Action::Ignore => Ok(()),
     }
@@ -871,6 +910,100 @@ fn config_change(
         .context("enqueue config change")?;
     tracing::info!(mission = %mission_id, role, model, "config change enqueued from Slack");
     Ok(mission_id)
+}
+
+/// `/kranz pause|resume [<id>]` handler: allowlist-gate, resolve the target
+/// active mission, enqueue the control command, and reply ephemerally. Shared by
+/// both the pause and resume arms — only the `ControlCommand` and the verb (for
+/// the confirmation) differ. A bad/ambiguous/terminal target is an honest
+/// ephemeral error that enqueues NOTHING (the resolver refuses those).
+#[allow(clippy::too_many_arguments)]
+async fn steer(
+    cfg: &SlackConfig,
+    client: &SlackClient,
+    repo_root: &Path,
+    mission_id: Option<&str>,
+    user_id: Option<&str>,
+    response_url: Option<&str>,
+    cmd: ControlCommand,
+    verb: &str,
+) {
+    if !cfg.is_authorized(user_id) {
+        reply_ephemeral(client, response_url, &not_authorized_blocks()).await;
+        return;
+    }
+    match enqueue_steer(repo_root, mission_id, cmd) {
+        Ok(applied_to) => {
+            reply_ephemeral(
+                client,
+                response_url,
+                &error_blocks(&format!(
+                    ":pause_button: {verb} `{applied_to}` (takes effect between worker runs)."
+                )),
+            )
+            .await
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to enqueue steering command from Slack");
+            reply_ephemeral(
+                client,
+                response_url,
+                &error_blocks(&format!("Couldn't {verb} that mission: {e}")),
+            )
+            .await
+        }
+    }
+}
+
+/// Resolve the target ACTIVE mission (same policy as `/kranz config`: an
+/// explicit id must exist and be non-terminal; a bare command needs exactly one
+/// active mission) and enqueue `cmd` on its control inbox. Returns the mission
+/// id the command was applied to (for the reply). Pure local write, so it is
+/// unit-tested directly. A terminal/ambiguous/unknown target returns an error
+/// and enqueues NOTHING (the resolver refuses before any file is written) — a
+/// terminal mission's control inbox is never drained, so enqueuing there would
+/// be a silent no-op reported as success.
+fn enqueue_steer(
+    repo_root: &Path,
+    mission_id: Option<&str>,
+    cmd: ControlCommand,
+) -> Result<String> {
+    let mission_id = resolve_active_config_target(repo_root, mission_id)?;
+    let paths = MissionPaths::new(repo_root, &mission_id);
+    kranz_engine::control::enqueue(&paths, &cmd).context("enqueue steering command")?;
+    tracing::info!(mission = %mission_id, ?cmd, "steering command enqueued from Slack");
+    Ok(mission_id)
+}
+
+/// `/kranz work` reply: report the per-repo execution queue (from
+/// [`kranz_engine::queue::list`]) and whether the repo is currently busy
+/// ([`kranz_engine::queue::is_repo_busy`]), then point at the `kranz work`
+/// dispatcher for actually draining it. REPORT-ONLY: the bridge never runs a
+/// mission on the socket loop, so this reads state and hands off. Pure read +
+/// render, so it is unit-tested directly.
+fn build_work_reply(repo_root: &Path) -> Vec<Value> {
+    let queue = kranz_engine::queue::list(repo_root);
+    let busy = kranz_engine::queue::is_repo_busy(repo_root);
+
+    let mut body = String::new();
+    match &busy {
+        Some(running) => body.push_str(&format!(":running: Running `{running}` now.\n\n")),
+        None => body.push_str(":white_circle: No mission is running.\n\n"),
+    }
+    if queue.is_empty() {
+        body.push_str("The execution queue is empty.");
+    } else {
+        body.push_str(&format!("*Queue* ({} waiting)\n", queue.len()));
+        for (i, e) in queue.iter().enumerate() {
+            body.push_str(&format!("{}. `{}` · priority {}\n", i + 1, e.mission_id, e.priority));
+        }
+    }
+    body.push_str(
+        "\n\nDraining runs via the `kranz work` dispatcher \
+         (`kranz work` drains the whole queue, `kranz work --once` the front entry). \
+         The Slack bridge reports the queue; it does not run missions.",
+    );
+    error_blocks(&body)
 }
 
 /// Fold the repo read-only into an App Home view: active (non-terminal)
@@ -1352,6 +1485,208 @@ mod tests {
                 .is_empty(),
             "no control file leaked into a terminal mission"
         );
+    }
+
+    // --- /kranz pause | resume (steering via the control inbox) ------------
+
+    #[test]
+    fn enqueue_steer_enqueues_exactly_one_pause_on_the_resolved_mission() {
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-steer", "goal");
+        // Explicit id, active mission → one Pause on that mission.
+        let applied =
+            enqueue_steer(tmp.path(), Some("m-steer"), ControlCommand::Pause).unwrap();
+        assert_eq!(applied, "m-steer");
+        let drained = kranz_engine::control::drain(&MissionPaths::new(tmp.path(), "m-steer")).unwrap();
+        assert_eq!(drained.len(), 1, "exactly one control command enqueued");
+        assert!(
+            matches!(drained[0].1, ControlCommand::Pause),
+            "the command is Pause, got {:?}",
+            drained[0].1
+        );
+    }
+
+    #[test]
+    fn enqueue_steer_bare_resume_targets_the_single_active_mission() {
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-only", "goal");
+        // No id, exactly one active mission → resolved to it; one Resume enqueued.
+        let applied = enqueue_steer(tmp.path(), None, ControlCommand::Resume).unwrap();
+        assert_eq!(applied, "m-only");
+        let drained = kranz_engine::control::drain(&MissionPaths::new(tmp.path(), "m-only")).unwrap();
+        assert_eq!(drained.len(), 1);
+        assert!(matches!(drained[0].1, ControlCommand::Resume), "got {:?}", drained[0].1);
+    }
+
+    #[test]
+    fn enqueue_steer_refuses_ambiguous_target_and_enqueues_nothing() {
+        // Two active missions, no explicit id → error asking for an id; NOTHING
+        // enqueued on either (never silently guess which running mission to pause).
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-a", "goal a");
+        seed_mission(tmp.path(), "m-b", "goal b");
+        let err = enqueue_steer(tmp.path(), None, ControlCommand::Pause).unwrap_err().to_string();
+        assert!(err.contains("several active missions"), "asks for an explicit id: {err}");
+        for id in ["m-a", "m-b"] {
+            assert!(
+                kranz_engine::control::drain(&MissionPaths::new(tmp.path(), id)).unwrap().is_empty(),
+                "nothing enqueued on {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn enqueue_steer_refuses_a_terminal_mission_and_enqueues_nothing() {
+        // A completed mission's control inbox is never drained, so a Pause there
+        // would be a silent no-op reported as success. Reject it, enqueue nothing.
+        let tmp = TempDir::new().unwrap();
+        seed_completed_mission(tmp.path(), "m-done");
+        let err = enqueue_steer(tmp.path(), Some("m-done"), ControlCommand::Resume)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("active missions"), "honest error, not false success: {err}");
+        assert!(
+            kranz_engine::control::drain(&MissionPaths::new(tmp.path(), "m-done"))
+                .unwrap()
+                .is_empty(),
+            "no control file leaked into a terminal mission"
+        );
+    }
+
+    #[test]
+    fn enqueue_steer_unknown_mission_is_an_error() {
+        let tmp = TempDir::new().unwrap();
+        let err = enqueue_steer(tmp.path(), Some("m-nope"), ControlCommand::Pause)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("m-nope"), "error names the unknown mission");
+    }
+
+    #[tokio::test]
+    async fn steer_denies_an_unlisted_user_and_enqueues_nothing() {
+        // A non-empty allowlist gates pause/resume exactly like config: an
+        // unlisted user is refused and NO control command is enqueued. Passing
+        // response_url = None keeps reply_ephemeral a no-op (no network).
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-gated", "goal");
+        let cfg = SlackConfig {
+            bot_token: "xoxb".into(),
+            app_token: "xapp".into(),
+            channel: "C1".into(),
+            notify: NotifyFlags::default(),
+            allow_users: vec!["U-allowed".into()],
+            dashboard_url: None,
+        };
+        let client = SlackClient::new(&cfg).unwrap();
+        steer(
+            &cfg,
+            &client,
+            tmp.path(),
+            Some("m-gated"),
+            Some("U-outsider"),
+            None,
+            ControlCommand::Pause,
+            "paused",
+        )
+        .await;
+        assert!(
+            kranz_engine::control::drain(&MissionPaths::new(tmp.path(), "m-gated"))
+                .unwrap()
+                .is_empty(),
+            "an unlisted user's pause enqueues nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn steer_allows_a_listed_user_and_enqueues_the_command() {
+        // The gate's positive half: a listed user's pause is enqueued.
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-ok", "goal");
+        let cfg = SlackConfig {
+            bot_token: "xoxb".into(),
+            app_token: "xapp".into(),
+            channel: "C1".into(),
+            notify: NotifyFlags::default(),
+            allow_users: vec!["U-allowed".into()],
+            dashboard_url: None,
+        };
+        let client = SlackClient::new(&cfg).unwrap();
+        steer(
+            &cfg,
+            &client,
+            tmp.path(),
+            Some("m-ok"),
+            Some("U-allowed"),
+            None,
+            ControlCommand::Resume,
+            "resumed",
+        )
+        .await;
+        let drained = kranz_engine::control::drain(&MissionPaths::new(tmp.path(), "m-ok")).unwrap();
+        assert_eq!(drained.len(), 1, "listed user's resume is enqueued");
+        assert!(matches!(drained[0].1, ControlCommand::Resume), "got {:?}", drained[0].1);
+    }
+
+    #[test]
+    fn pause_resume_work_are_noops_in_apply_action() {
+        // These reply over the network in dispatch_action; apply_action must not
+        // double-handle them (no control file, no side effects).
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-1", "goal");
+        for action in [
+            Action::Pause { mission_id: Some("m-1".into()), user_id: None, response_url: None },
+            Action::Resume { mission_id: Some("m-1".into()), user_id: None, response_url: None },
+            Action::Work { response_url: None },
+        ] {
+            apply_action(tmp.path(), &action).unwrap();
+        }
+        assert!(
+            kranz_engine::control::drain(&MissionPaths::new(tmp.path(), "m-1")).unwrap().is_empty(),
+            "apply_action is inert for pause/resume/work"
+        );
+    }
+
+    // --- /kranz work (report-only queue read) ------------------------------
+
+    #[test]
+    fn build_work_reply_reports_empty_queue_and_points_at_the_dispatcher() {
+        let tmp = TempDir::new().unwrap();
+        let blocks = build_work_reply(tmp.path());
+        let text = serde_json::to_string(&blocks).unwrap();
+        assert!(text.to_lowercase().contains("queue is empty"));
+        assert!(text.contains("kranz work"), "points at the dispatcher");
+        assert!(text.to_lowercase().contains("no mission is running"));
+    }
+
+    #[test]
+    fn build_work_reply_lists_queued_entries() {
+        let tmp = TempDir::new().unwrap();
+        queue::enqueue(
+            tmp.path(),
+            queue::QueueEntry {
+                mission_id: "m-q1".into(),
+                ticket_slug: None,
+                priority: 1,
+                seq: 0,
+            },
+        )
+        .unwrap();
+        queue::enqueue(
+            tmp.path(),
+            queue::QueueEntry {
+                mission_id: "m-q2".into(),
+                ticket_slug: None,
+                priority: 2,
+                seq: 0,
+            },
+        )
+        .unwrap();
+        let blocks = build_work_reply(tmp.path());
+        let text = serde_json::to_string(&blocks).unwrap();
+        assert!(text.contains("m-q1") && text.contains("m-q2"), "both queued missions listed");
+        assert!(text.contains("2 waiting"), "queue depth reported");
+        // is_repo_busy is None here (no live lock), so it reports no running mission.
+        assert!(text.to_lowercase().contains("no mission is running"));
     }
 
     #[test]
