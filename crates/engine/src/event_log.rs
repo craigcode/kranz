@@ -79,6 +79,23 @@ pub struct EventLog {
     buffer: Vec<BufferedLine>,
 }
 
+/// Write buffered lines to `sink` from the front, removing each line from
+/// `buffer` only after it is successfully written. On the first write error
+/// the failing line and everything after it stay in `buffer`, in original
+/// order, so a later retry can pick up exactly where this call left off —
+/// `Vec::drain` cannot do this since its guard discards not-yet-yielded
+/// items if the iteration is cut short by `?`.
+fn drain_lines<W: std::io::Write>(
+    sink: &mut W,
+    buffer: &mut Vec<BufferedLine>,
+) -> std::io::Result<()> {
+    while !buffer.is_empty() {
+        sink.write_all(buffer[0].line.as_bytes())?;
+        buffer.remove(0);
+    }
+    Ok(())
+}
+
 impl EventLog {
     /// Acquire the single-writer lock for a mission and open its event log.
     ///
@@ -254,9 +271,7 @@ impl EventLog {
     }
 
     fn drain_buffer(&mut self) -> Result<()> {
-        for buffered in self.buffer.drain(..) {
-            self.file.write_all(buffered.line.as_bytes())?;
-        }
+        drain_lines(&mut self.file, &mut self.buffer)?;
         Ok(())
     }
 
@@ -343,7 +358,11 @@ impl EventLog {
 impl Drop for EventLog {
     fn drop(&mut self) {
         if let Err(e) = self.flush() {
-            tracing::warn!(error = %e, "failed to flush event buffer on drop");
+            tracing::warn!(
+                error = %e,
+                retained = self.buffer.len(),
+                "failed to flush event buffer on drop; buffered deltas retained for a future drain"
+            );
         }
         if let Err(e) = std::fs::remove_file(&self.lock_path) {
             if e.kind() != ErrorKind::NotFound {
@@ -821,5 +840,65 @@ mod tests {
 
         let info = LockInfo { token: Some(format!("{own}-not")), ..info };
         assert_eq!(probe_liveness(&info), LockLiveness::Dead);
+    }
+
+    /// A writer that succeeds for the first `fail_at` writes and then always
+    /// errors, recording every line it actually wrote.
+    struct FlakyWriter {
+        fail_at: usize,
+        writes: Vec<String>,
+    }
+
+    impl std::io::Write for FlakyWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.writes.len() >= self.fail_at {
+                return Err(std::io::Error::other("simulated write failure"));
+            }
+            self.writes.push(String::from_utf8_lossy(buf).into_owned());
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn buffered(n: usize) -> Vec<BufferedLine> {
+        (0..n)
+            .map(|i| BufferedLine { buffered_at: Instant::now(), line: format!("line-{i}\n") })
+            .collect()
+    }
+
+    #[test]
+    fn drain_retains_unwritten_deltas_on_write_failure() {
+        let k = 3;
+        let n = 7;
+        let mut writer = FlakyWriter { fail_at: k, writes: Vec::new() };
+        let mut buffer = buffered(n);
+
+        let result = drain_lines(&mut writer, &mut buffer);
+
+        assert!(result.is_err(), "drain must surface the write error");
+        assert_eq!(
+            writer.writes,
+            (0..k).map(|i| format!("line-{i}\n")).collect::<Vec<_>>(),
+            "exactly the first k lines must have been written, in order"
+        );
+        assert_eq!(
+            buffer.iter().map(|b| b.line.clone()).collect::<Vec<_>>(),
+            (k..n).map(|i| format!("line-{i}\n")).collect::<Vec<_>>(),
+            "the remaining lines, including the one that failed, must stay buffered in order"
+        );
+
+        // A subsequent drain with a working writer must recover the retained
+        // lines successfully — nothing is permanently lost.
+        let mut retry_writer = FlakyWriter { fail_at: usize::MAX, writes: Vec::new() };
+        let retry_result = drain_lines(&mut retry_writer, &mut buffer);
+        assert!(retry_result.is_ok());
+        assert!(buffer.is_empty());
+        assert_eq!(
+            retry_writer.writes,
+            (k..n).map(|i| format!("line-{i}\n")).collect::<Vec<_>>()
+        );
     }
 }
