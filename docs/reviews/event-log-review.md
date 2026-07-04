@@ -6,7 +6,12 @@ with `crates/engine/src/events.rs` (`Event`, `EventKind::is_stream_delta`),
 `crates/engine/src/error.rs` (`EngineError::LogCorruption` /
 `EngineError::LockHeld`), and `crates/engine/src/paths.rs` (`MissionPaths`) for
 context. This is a read-only review — no source, test, or config file was
-changed.
+changed. This document has been through an independent adversarial
+verification pass: every finding below was re-derived from the source
+(reading the code before re-reading the prior claim) and checked against its
+own stated trigger; none were refuted. See the per-finding **Verification**
+notes and the [Rejected during verification](#rejected-during-verification)
+section.
 
 The module's core design is sound: lifecycle events are fsynced per append,
 stream deltas are buffered and reconciled with file order on the next
@@ -105,6 +110,17 @@ written (`self.buffer.drain(..written_count)`), leaving the remainder to be
 retried by the next `drain_buffer` call. Callers (especially `Drop`) should
 also log *how many* lines were lost/retained, not just that flushing failed.
 
+**Verification:** Re-derived from `Vec::drain`'s documented contract rather
+than taking the claim on faith: `drain(..)` sets `self.buffer`'s length to 0
+immediately and yields items lazily from the guard's internal range; if that
+guard is dropped before full consumption (here, via the `?` on `write_all`
+at event_log.rs:258 returning early), every not-yet-yielded item is dropped
+with it — never written, never restored to `self.buffer`. Confirmed the `?`
+is the only exit from the loop body and that all three call sites
+(event_log.rs:238, 251, 345) are reachable with a non-empty buffer and no
+path to recover the lost suffix. The trigger, mechanism, and line references
+hold exactly as stated; this finding survives unchanged.
+
 ## F2 — Throttle-based drain has no independent time source (Medium)
 
 **Location:** event_log.rs:231-236 (throttle check inside `append`), header contract at event_log.rs:5-9.
@@ -168,6 +184,15 @@ time-based flush path (e.g. have the caller that owns the event loop poll
 `flush()`.) — a prose-only suggestion, no code should change as part of
 this review.
 
+**Verification:** Read the whole module for any timer, background thread, or
+scheduled callback that could drain the buffer independently of a caller
+invoking `append`/`flush`/drop — found none; `Instant::now()` /
+`.elapsed()` (event_log.rs:232, 234) are only ever evaluated synchronously
+inside `append`. The header and doc-comment wording cited
+(event_log.rs:6-8, 219-220) matches the source verbatim, and the throttle
+check at event_log.rs:231-236 is confirmed to run only on the next
+`append()` call, never on a wall-clock schedule. Finding survives unchanged.
+
 ## F3 — Mission-id guard only checks the first log line (Low)
 
 **Location:** event_log.rs:144-153 (mission_id check in `acquire`), interacts with event_log.rs:317-325 (per-line seq validation, which has no matching per-line mission_id check) and `Event::mission_id` in events.rs.
@@ -224,6 +249,16 @@ turning a mismatch anywhere in the file into the same
 `EngineError::LogCorruption` used for seq discontinuities, rather than only
 checking line 1 from `acquire`.
 
+**Verification:** Confirmed `parse_log` (event_log.rs:281-332) validates
+only `seq` continuity per line (event_log.rs:317-325) with no `mission_id`
+comparison anywhere in the loop, and that `acquire`'s own check
+(event_log.rs:144-153) reads only `parsed.events.first()`, which is `None`
+(and thus skipped) for an empty-events log. Both gaps are real as stated.
+Severity is appropriately Low: the single-writer discipline (one `EventLog`
+per `mission_id` ever appends to a given path) makes the trigger reachable
+only via an already-anomalous precondition, not ordinary operation. Finding
+survives unchanged.
+
 ## F4 — "Dead" liveness verdict is unreachable on non-unix builds (Low)
 
 **Location:** event_log.rs:640-643 (`probe_liveness`, `#[cfg(not(unix))]` branch), event_log.rs:26-30 (LockForce table), event_log.rs:731-734 (`process_identity_token` non-unix stub).
@@ -275,6 +310,17 @@ platforms, only the token-reuse screen for a reused *own* pid can produce
 Dead, so recovery from a foreign crashed holder always requires an explicit
 force tier.
 
+**Verification:** Confirmed the `#[cfg(not(unix))]` arm of `probe_liveness`
+(event_log.rs:640-643) is an unconditional `Unknown` with no path to `Dead`,
+and that the only other route to `Dead` is `alive_or_reused`
+(event_log.rs:657-678), which requires `process_identity_token` to return
+`Some` — the non-unix stub (event_log.rs:731-734) always returns `None`, so
+that route is closed too. Cross-checked the LockForce table text
+(event_log.rs:26-30) against this and confirmed the "regardless of tier"
+wording carries no platform caveat there, only in `probe_liveness`'s own doc
+comment (event_log.rs:617). Not a correctness bug — `Unknown` is handled
+conservatively everywhere it's consumed. Finding survives unchanged.
+
 ## F5 — macOS liveness probe depends on a `ps` subprocess (Low)
 
 **Location:** event_log.rs:710-727 (`process_identity_token`, macOS).
@@ -309,6 +355,14 @@ matters in practice, a native `libc`/`sysctl` (`KERN_PROC_PID` / `p_starttime`
 via `sysctl`) route would avoid the subprocess, at the cost of `unsafe`
 FFI. Documenting the current tradeoff (simplicity over a syscall) is
 sufficient if the maintainers consider it acceptable.
+
+**Verification:** Confirmed `process_identity_token` on macOS
+(event_log.rs:710-727) spawns `std::process::Command::new("ps")` with no
+timeout, and that both failure modes (`!out.status.success()`, empty
+stdout) map to `None` (event_log.rs:718-726), which `alive_or_reused`
+(event_log.rs:661-663) treats as `Alive` — never `Dead`. So the failure mode
+is confirmed safe (perf/robustness only, no correctness exposure). Finding
+survives unchanged.
 
 ## Soundness notes
 
@@ -404,6 +458,22 @@ Invariants examined and found upheld:
   tolerates a *present-but-empty* third line as `None` too
   (event_log.rs:608); worth a one-clause mention since it's easy to miss
   when reading `LockInfo` in isolation.
+
+## Rejected during verification
+
+None. All five findings (F1-F5) and every soundness note were independently
+re-derived against the code — reading `event_log.rs`, `events.rs`,
+`error.rs`, and `paths.rs` fresh before re-reading the prior claims — and
+each finding's stated trigger sequence was traced through the actual control
+flow rather than accepted on the strength of its prose. No finding was
+refuted, no line reference was found out of range or misattributed, and no
+severity was found clearly mis-scaled. The principal surfaces enumerated for
+this pass (append/fsync asymmetry & delta-loss window, torn-tail repair, seq
+validation, lock-steal concurrency & the `StealGuard` unlink race, pid-reuse
+token screen) are each covered, either by a surviving finding (F1, F2, F3)
+or by a soundness note recording why no bug was found (torn-tail repair, seq
+continuity, `StealGuard` unlink-race closure, pid-reuse screening) — no
+additional Critical or High issue was discovered among them.
 
 ## Verification
 
