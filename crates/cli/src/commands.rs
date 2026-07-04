@@ -1022,17 +1022,24 @@ async fn cmd_serve(
     token: Option<String>,
     slack: bool,
 ) -> Result<i32> {
+    // One hosted-engine registry for BOTH clients: the axum handlers below and
+    // (when --slack) the bridge. Handing the bridge its own MissionHost would
+    // mean two engines contending for one mission's single-writer lock.
+    let host = Arc::new(kranz_server::MissionHost::new(repo.clone()));
+
     // Opt-in Slack bridge, spawned alongside the server and stopped when the
     // process exits. serve_slack is a no-op (logs) when Slack is unconfigured,
     // so `--slack` is safe to pass unconditionally.
     if slack {
         let repo_slack = repo.clone();
+        let bridge_host: kranz_slack::SharedHost =
+            Arc::new(crate::host_bridge::HostedPlanning(host.clone()));
         tokio::spawn(async move {
             // No graceful-shutdown wiring for the CLI's long-lived server:
             // this future never resolves, so the bridge runs until the
             // process is killed (same lifetime as the server below).
             let never = std::future::pending::<()>();
-            if let Err(e) = kranz_slack::serve_slack(&repo_slack, never).await {
+            if let Err(e) = kranz_slack::serve_slack(&repo_slack, Some(bridge_host), never).await {
                 tracing::error!(error = %e, "slack bridge exited with an error");
             }
         });
@@ -1075,7 +1082,7 @@ async fn cmd_serve(
         });
     }
 
-    match kranz_server::serve_with_static(repo, port, static_assets, Some(token)).await {
+    match kranz_server::serve_with_shared_host(host, port, static_assets, Some(token)).await {
         Ok(()) => Ok(0),
         Err(e) => Err(anyhow!("server failed: {e}")),
     }

@@ -24,6 +24,7 @@ pub mod cli;
 pub mod commands;
 pub mod config_cmd;
 pub mod exec;
+pub mod host_bridge;
 pub mod output;
 pub mod planning_tui;
 pub mod tail;

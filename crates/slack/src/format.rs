@@ -340,19 +340,31 @@ pub fn build_new_mission_ack(a: &NewMissionAck) -> Vec<Value> {
         header(&format!("Planning {} — new mission", a.mission_id)),
         section(&format!("*Goal*\n{}", clip(a.goal.trim()))),
     ];
+    let footer = format!(
+        "Reply in this thread to answer — each reply is a planning turn. \
+         When you're ready, run `/kranz plan {}` from the channel \
+         (Slack doesn't deliver slash commands typed inside a thread).",
+        a.mission_id
+    );
     if let Some(reply) = a.opening_reply.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
         blocks.push(section(&format!("*Orchestrator*\n{}", clip(reply))));
-        blocks.push(context(
-            "Reply in this thread to answer — each reply is a planning turn. \
-             When you're ready, run `/kranz plan` to see the plan.",
-        ));
-    } else {
-        blocks.push(context(
-            "Reply in this thread to plan (each reply is a planning turn). \
-             When you're ready, run `/kranz plan` to see the plan.",
-        ));
     }
+    blocks.push(context(&footer));
     blocks
+}
+
+/// A planning-conversation reply, posted threaded: the orchestrator's prose
+/// plus the standing "how to continue" context line. Used for both a planning
+/// turn's reply and a NotReady `/kranz plan` outcome (which is the same thing:
+/// the orchestrator talking back instead of emitting a plan).
+pub fn build_planning_reply(mission_id: &str, reply: &str) -> Vec<Value> {
+    vec![
+        section(&format!("*Orchestrator*\n{}", clip(reply.trim()))),
+        context(&format!(
+            "Reply in this thread to continue planning · `/kranz plan {mission_id}` \
+             from the channel when you're ready to review the plan."
+        )),
+    ]
 }
 
 /// Status summary: a header carrying the mission id + status pill, then the

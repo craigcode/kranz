@@ -114,7 +114,10 @@ impl MissionHost {
 
     /// `POST /api/missions`: layered config + optional request patch →
     /// validate → create the mission → hold its engine in the registry.
-    pub(crate) async fn create(
+    /// Public: the Slack bridge drives the same lifecycle through this host
+    /// (wired by `kranz serve --slack`), so these five operations are the
+    /// shared client surface, not axum-private plumbing.
+    pub async fn create(
         &self,
         goal: &str,
         config_patch: Option<&Value>,
@@ -146,8 +149,8 @@ impl MissionHost {
     /// `POST /api/missions/:id/planning/turn`: one conversational turn. A
     /// captured seed reply (fresh session / re-seed) is prepended — it
     /// happened first in the conversation.
-    pub(crate) async fn planning_turn(&self, id: &str, text: &str) -> Result<String, ApiError> {
-        let cell = self.planning_cell(id)?;
+    pub async fn planning_turn(&self, id: &str, text: &str) -> Result<String, ApiError> {
+        let cell = self.planning_cell_or_attach(id).await?;
         let mut engine = try_lock(&cell)?;
         let reply = engine.planning_turn(text).await?;
         Ok(prepend_seed(engine.take_seed_reply(), reply))
@@ -156,8 +159,8 @@ impl MissionHost {
     /// `POST /api/missions/:id/planning/request-plan`: demand the plan.
     /// Ready → plan + cost estimate; NotReady → the orchestrator's prose
     /// (back to the conversation).
-    pub(crate) async fn request_plan(&self, id: &str) -> Result<Value, ApiError> {
-        let cell = self.planning_cell(id)?;
+    pub async fn request_plan(&self, id: &str) -> Result<Value, ApiError> {
+        let cell = self.planning_cell_or_attach(id).await?;
         let mut engine = try_lock(&cell)?;
         let request = engine.request_plan().await?;
         let seed = engine.take_seed_reply();
@@ -183,8 +186,8 @@ impl MissionHost {
 
     /// `POST /api/missions/:id/approve`: commit plan.json/plan.md/index.md on
     /// the mission branch exactly like the CLI. Returns the mission branch.
-    pub(crate) async fn approve(&self, id: &str, plan: Plan) -> Result<String, ApiError> {
-        let cell = self.planning_cell(id)?;
+    pub async fn approve(&self, id: &str, plan: Plan) -> Result<String, ApiError> {
+        let cell = self.planning_cell_or_attach(id).await?;
         let mut engine = try_lock(&cell)?;
         engine.approve_plan(plan)?;
         Ok(engine.state().mission.mission_branch.clone())
@@ -194,7 +197,7 @@ impl MissionHost {
     /// background `engine.run()` task — or, for a mission not in the registry
     /// (blocked earlier, server restarted, or CLI-created), resume it from
     /// the event log and run that.
-    pub(crate) async fn start(&self, id: &str) -> Result<(), ApiError> {
+    pub async fn start(&self, id: &str) -> Result<(), ApiError> {
         // Try to consume a hosted planning-phase engine.
         let taken: Option<Box<MissionEngine>> = {
             let mut map = self.missions.lock().expect("missions registry lock");
@@ -305,6 +308,55 @@ impl MissionHost {
             ))),
             None => Err(self.not_hosted(id)),
         }
+    }
+
+    /// [`planning_cell`], attaching an un-hosted in-planning mission from disk
+    /// first when needed. This is what lets a mission whose engine was released
+    /// (CLI-created, bridge seed turn, server restart) continue planning through
+    /// this host: resume it under the single-writer lock, adopt it into the
+    /// registry, and hand back its cell. A mission held live elsewhere surfaces
+    /// as the engine's `LockHeld` (409) — unless the holder is this registry
+    /// itself racing us, in which case the second lookup finds the winner.
+    async fn planning_cell_or_attach(&self, id: &str) -> Result<EngineCell, ApiError> {
+        let miss = match self.planning_cell(id) {
+            Ok(cell) => return Ok(cell),
+            Err(miss) => miss,
+        };
+        // Only "exists on disk but not hosted" is attachable; Running entries
+        // and unknown missions keep their original error.
+        if !MissionPaths::new(&self.repo_root, id).events_file().is_file()
+            || self.missions.lock().expect("missions registry lock").contains_key(id)
+        {
+            return Err(miss);
+        }
+        let cfg = config::load(&self.repo_root)?;
+        let backend = self.backend(cfg.claude_binary.as_deref()).await?;
+        let engine = match MissionEngine::resume(backend, self.repo_root.clone(), id, LockForce::No)
+        {
+            Ok(engine) => Box::new(engine),
+            // LockHeld can mean a concurrent request won the attach race and
+            // the winner's engine now sits in the registry: prefer that cell.
+            Err(EngineError::LockHeld(holder)) => {
+                return self.planning_cell(id).map_err(|_| {
+                    ApiError::from(EngineError::LockHeld(holder))
+                })
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if engine.state().mission.status != MissionStatus::Planning {
+            // Dropping the engine releases the just-taken lock.
+            return Err(ApiError::conflict(format!(
+                "mission '{id}' is not in planning (status {:?}) — planning turns only \
+                 apply before a plan is approved",
+                engine.state().mission.status
+            )));
+        }
+        let cell = new_cell(engine);
+        let mut map = self.missions.lock().expect("missions registry lock");
+        // We hold the mission's file lock, so nobody else can have inserted a
+        // LIVE engine meanwhile; insert unconditionally.
+        map.insert(id.to_string(), HostedMission::Planning(Arc::clone(&cell)));
+        Ok(cell)
     }
 
     /// A mission that exists on disk but has no engine in this registry:

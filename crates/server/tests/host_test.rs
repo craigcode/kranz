@@ -498,16 +498,23 @@ async fn second_start_and_planning_turns_conflict_while_running() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn planning_endpoints_on_non_hosted_or_unknown_missions() {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().to_path_buf();
-    // A mission that exists on disk but whose engine lives elsewhere (CLI).
+async fn planning_endpoints_attach_non_hosted_missions_and_404_unknown() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    // A mission that exists on disk but whose engine was released (a CLI
+    // planning session that exited, a bridge seed turn, a server restart).
+    // The host ADOPTS it on demand — the Slack planning-conversation path —
+    // instead of refusing with "not hosted".
     seed_mission_log(&root, "m-cli");
-    let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
-    let host = kranz_server::MissionHost::with_backend(root, backend);
+    let orch =
+        MockScript::streaming(vec![mock_init("orch-attach"), mock_result_text("attach-hi")])
+            .responding(vec![turn("resumed and listening")]);
+    let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::with_scripts(vec![orch]));
+    let host = kranz_server::MissionHost::with_backend(root.clone(), backend);
     let app = kranz_server::router_with_host(host, None, Some(TOKEN.to_string()));
 
-    // Not hosted here → 409 naming what to do.
     let (status, body) = post_json(
         &app,
         "/api/missions/m-cli/planning/turn",
@@ -515,12 +522,28 @@ async fn planning_endpoints_on_non_hosted_or_unknown_missions() {
         json!({ "text": "hi" }),
     )
     .await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    assert!(body["error"].as_str().unwrap().contains("not hosted"), "{body}");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["reply"], "attach-hi\n\nresumed and listening");
 
-    let (status, _) =
-        post_json(&app, "/api/missions/m-cli/planning/request-plan", Some(TOKEN), json!({})).await;
-    assert_eq!(status, StatusCode::CONFLICT);
+    // An on-disk mission PAST planning is refused with its status named
+    // (attach must never hand a planning cell to an approved/running mission).
+    seed_mission_log(&root, "m-done");
+    {
+        let paths = MissionPaths::new(&root, "m-done");
+        let mut log =
+            EventLog::acquire(&paths, "m-done", Duration::ZERO, LockForce::No).unwrap();
+        let plan: kranz_engine::types::Plan = serde_json::from_value(plan_json()).unwrap();
+        log.append(EventKind::PlanApproved { plan }).unwrap();
+    }
+    let (status, body) = post_json(
+        &app,
+        "/api/missions/m-done/planning/turn",
+        Some(TOKEN),
+        json!({ "text": "hi" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("not in planning"), "{body}");
 
     // Unknown mission → plain 404.
     let (status, body) = post_json(

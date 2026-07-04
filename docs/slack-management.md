@@ -75,9 +75,37 @@ Slack; forensics one tap away in the browser.
 
 ## Build slices (ship incrementally)
 
-- **Slice 1 — lifecycle** (DONE): `/kranz new` → thread planning → request-plan
-  block → approve/start buttons. The core "create a mission from Slack" loop.
-  Reuses MissionHost + the existing plan-render + the built approve/queue paths.
+- **Slice 1 — lifecycle** (DONE, create-only at first): `/kranz new` + status;
+  request-plan and thread-planning were honest stubs until slice 5, and the
+  approve paths only queued (see the slice 5 note on the bug that exposed).
+- **Slice 5 — hosted planning conversation** (DONE, 2026-07-04): the bridge is
+  now a client of the SAME `MissionHost` registry the web UI uses (`kranz
+  serve --slack` passes an adapter — `kranz_slack::PlanningHost`, implemented
+  in the CLI's `host_bridge` — so `kranz_slack` still never depends on
+  `kranz_server`). This lit up, found by the first live end-to-end test:
+  - **Thread replies on a PLANNING mission run a planning turn** (acked
+    in-thread first; allowlist-gated — it spends). Previously they were
+    silently enqueued to a control inbox nothing drained until run time.
+    Running-mission replies stay control-inbox guidance, unchanged.
+  - **`/kranz plan <id>` works**: immediate ephemeral ack, then the plan-review
+    block (goal, milestones, calibrated estimate, **Approve & start** /
+    **Approve & queue**) posts to the mission thread; NotReady posts the
+    orchestrator's prose. The reviewed plan parks in an in-memory
+    `PendingPlans` cache for the buttons (a serve restart forfeits it —
+    re-run `/kranz plan`).
+  - **Approve commits the plan** (`MissionHost::approve` →
+    `engine.approve_plan`, same plan.json/plan.md/index.md commit as the CLI)
+    before queueing or starting. The first cut only inserted a queue entry, so
+    `kranz work` later refused the un-approved mission — a silent dead end.
+  - **`MissionHost` lazily attaches** an on-disk in-planning mission into its
+    registry (planning_turn/request_plan/approve), so missions created by the
+    CLI or by a pre-slice-5 bridge keep working after their engine was
+    released. Trade-off: once attached, serve holds the mission's
+    single-writer lock, so a concurrent `kranz plan --mission` in a terminal
+    sees LockHeld until serve releases it.
+  - Slash commands typed INSIDE a thread are rejected by Slack itself
+    (platform rule); the thread footers now say so and name the id to use
+    from the channel.
 - **Slice 2 — control & status** (DONE): `/kranz status` (slice 1) plus
   `/kranz config`, deep-link buttons, and the spend allowlist (which now also
   gates the approve *button*, not just `/kranz approve`).

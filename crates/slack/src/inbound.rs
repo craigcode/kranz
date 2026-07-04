@@ -29,7 +29,7 @@
 //!   [`Action::Help`] (the command list).
 //! - anything else → [`Action::Ignore`].
 
-use crate::format::APPROVE_ACTION_ID;
+use crate::format::{APPROVE_ACTION_ID, START_ACTION_ID};
 use serde_json::Value;
 
 /// The routed intent of an inbound envelope. `envelope_id` (when the envelope
@@ -42,8 +42,16 @@ pub enum Action {
     /// `response_url` delivers a not-authorized ephemeral, mirroring the
     /// `/kranz approve` slash twin.
     Approve { mission_id: String, user_id: Option<String>, response_url: Option<String> },
-    /// A threaded reply on `mission_id`'s thread → orchestrator guidance.
-    Guidance { mission_id: String, text: String },
+    /// Approve-and-START button pressed for `mission_id` (the primary button
+    /// on a plan-review message). Spend-gated exactly like [`Action::Approve`];
+    /// on authorization the bridge commits the pending plan and starts
+    /// execution through the hosted registry instead of queueing.
+    ApproveStart { mission_id: String, user_id: Option<String>, response_url: Option<String> },
+    /// A threaded reply on `mission_id`'s thread. On a RUNNING mission it
+    /// becomes orchestrator guidance (a control-inbox message); on a PLANNING
+    /// mission the bridge runs a hosted planning turn — a spend action, so
+    /// `user_id` (the message author) rides along for the allowlist gate.
+    Guidance { mission_id: String, text: String, user_id: Option<String> },
     /// `/kranz ticket <title>` → scaffold a new ticket file.
     NewTicket { title: String, channel: String, thread_ts: Option<String> },
     /// `/kranz new <goal>` → create a mission and seed planning (M2.9 slice 1).
@@ -152,8 +160,9 @@ fn payload(envelope: &Value) -> &Value {
     envelope.get("payload").unwrap_or(&Value::Null)
 }
 
-/// `interactive` → an approve button click, else ignore. We only act on
-/// `block_actions` whose action id is our approve button; every other
+/// `interactive` → an approve / approve-and-start button click, else ignore.
+/// We only act on `block_actions` whose action id is one of ours
+/// ([`APPROVE_ACTION_ID`] → queue, [`START_ACTION_ID`] → start); every other
 /// interaction (menus, other buttons) is ignored.
 fn route_interactive(payload: &Value) -> Action {
     if payload.get("type").and_then(Value::as_str) != Some("block_actions") {
@@ -163,27 +172,31 @@ fn route_interactive(payload: &Value) -> Action {
         return Action::Ignore;
     };
     for action in actions {
-        if action.get("action_id").and_then(Value::as_str) == Some(APPROVE_ACTION_ID) {
-            // The mission id rides in the button `value`.
-            if let Some(mission_id) = action.get("value").and_then(Value::as_str) {
-                let mission_id = mission_id.trim();
-                if !mission_id.is_empty() {
-                    // Capture the clicker + response_url so the bridge can gate
-                    // the button on the spend allowlist (block_actions carries
-                    // `user.id` and `response_url`, same as a slash command).
-                    let user_id = payload
-                        .get("user")
-                        .and_then(|u| u.get("id"))
-                        .and_then(Value::as_str)
-                        .map(str::to_string);
-                    let response_url =
-                        payload.get("response_url").and_then(Value::as_str).map(str::to_string);
-                    return Action::Approve {
-                        mission_id: mission_id.to_string(),
-                        user_id,
-                        response_url,
-                    };
-                }
+        let start = match action.get("action_id").and_then(Value::as_str) {
+            Some(id) if id == APPROVE_ACTION_ID => false,
+            Some(id) if id == START_ACTION_ID => true,
+            _ => continue,
+        };
+        // The mission id rides in the button `value`.
+        if let Some(mission_id) = action.get("value").and_then(Value::as_str) {
+            let mission_id = mission_id.trim();
+            if !mission_id.is_empty() {
+                // Capture the clicker + response_url so the bridge can gate
+                // the button on the spend allowlist (block_actions carries
+                // `user.id` and `response_url`, same as a slash command).
+                let user_id = payload
+                    .get("user")
+                    .and_then(|u| u.get("id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let response_url =
+                    payload.get("response_url").and_then(Value::as_str).map(str::to_string);
+                let mission_id = mission_id.to_string();
+                return if start {
+                    Action::ApproveStart { mission_id, user_id, response_url }
+                } else {
+                    Action::Approve { mission_id, user_id, response_url }
+                };
             }
         }
     }
@@ -237,7 +250,10 @@ fn route_event(payload: &Value, lookup: &impl ThreadLookup) -> Action {
     if text.is_empty() {
         return Action::Ignore;
     }
-    Action::Guidance { mission_id, text: text.to_string() }
+    // The author: gate fuel for the planning-turn path (a plain `user` string
+    // on message events, unlike the `user.id` object interactive payloads use).
+    let user_id = event.get("user").and_then(Value::as_str).map(str::to_string);
+    Action::Guidance { mission_id, text: text.to_string(), user_id }
 }
 
 /// `slash_commands` → the `/kranz` subcommand router. Recognized subcommands:
@@ -532,6 +548,31 @@ mod tests {
     }
 
     #[test]
+    fn block_actions_start_button_routes_to_approve_start() {
+        let env = json!({
+            "type": "interactive",
+            "envelope_id": "env-9",
+            "payload": {
+                "type": "block_actions",
+                "user": { "id": "Uclicker" },
+                "response_url": "https://hooks.slack/s",
+                "actions": [
+                    { "action_id": START_ACTION_ID, "value": "m-42", "type": "button" }
+                ]
+            }
+        });
+        let routed = route(&env, &lookup_none());
+        assert_eq!(
+            routed.action,
+            Action::ApproveStart {
+                mission_id: "m-42".into(),
+                user_id: Some("Uclicker".into()),
+                response_url: Some("https://hooks.slack/s".into()),
+            }
+        );
+    }
+
+    #[test]
     fn block_actions_other_button_is_ignored() {
         let env = json!({
             "type": "interactive",
@@ -565,7 +606,8 @@ mod tests {
             routed.action,
             Action::Guidance {
                 mission_id: "m-7".into(),
-                text: "use the token bucket, cap at 100/min".into()
+                text: "use the token bucket, cap at 100/min".into(),
+                user_id: Some("U123".into())
             }
         );
     }

@@ -60,6 +60,7 @@ fn thread_message_fixture_routes_to_guidance() {
         Action::Guidance {
             mission_id: "m-7".into(),
             text: "use a token bucket, cap requests at 100 per minute per token".into(),
+            user_id: Some("U0263M3QW".into()),
         }
     );
 }

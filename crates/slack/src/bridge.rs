@@ -21,6 +21,7 @@
 
 use crate::client::SlackClient;
 use crate::config::{NotifyFlags, SlackConfig};
+use crate::host::{PlanOutcome, SharedHost};
 use crate::inbound::{route, Action, ThreadLookup};
 use crate::outbound::{classify, NotifyClass, Outbound};
 use crate::threads::ThreadMap;
@@ -29,7 +30,7 @@ use futures_util::{SinkExt, StreamExt};
 use kranz_engine::event_log::EventLog;
 use kranz_engine::paths::MissionPaths;
 use kranz_engine::reducer;
-use kranz_engine::types::{ControlCommand, MissionState, MissionStatus};
+use kranz_engine::types::{ControlCommand, MissionState, MissionStatus, Plan};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -82,6 +83,27 @@ impl SharedThreads {
 impl ThreadLookup for SharedThreads {
     fn mission_for_thread(&self, thread_ts: &str) -> Option<String> {
         self.inner.lock().unwrap().mission_for_thread(thread_ts).map(str::to_string)
+    }
+}
+
+/// Plans returned by `/kranz plan`, held for the approve buttons — a Block Kit
+/// button `value` can't carry a whole plan, so the bridge keeps the reviewed
+/// plan in memory keyed by mission id and the button click consumes it.
+///
+/// Deliberately NOT persisted: a serve restart between review and approve
+/// forfeits the pending plan, and the approve reply says to run `/kranz plan`
+/// again — honest and cheap to recover, unlike silently approving a plan that
+/// was never re-reviewed against a possibly-changed conversation.
+#[derive(Clone, Default)]
+pub struct PendingPlans(Arc<Mutex<HashMap<String, Plan>>>);
+
+impl PendingPlans {
+    fn put(&self, mission_id: &str, plan: Plan) {
+        self.0.lock().unwrap().insert(mission_id.to_string(), plan);
+    }
+
+    fn take(&self, mission_id: &str) -> Option<Plan> {
+        self.0.lock().unwrap().remove(mission_id)
     }
 }
 
@@ -244,8 +266,12 @@ pub async fn run_socket(
     client: SlackClient,
     repo_root: PathBuf,
     threads: SharedThreads,
+    host: Option<SharedHost>,
     shutdown: impl std::future::Future<Output = ()>,
 ) {
+    // Reviewed-plan cache for the approve buttons, shared across reconnects
+    // (a websocket rotation must not forfeit a plan awaiting approval).
+    let pending = PendingPlans::default();
     // A Notify fired once when shutdown resolves; the per-connection loop selects
     // on it so a mid-connection shutdown is prompt.
     let stop = Arc::new(Notify::new());
@@ -260,7 +286,7 @@ pub async fn run_socket(
                 tracing::info!("slack inbound loop shutting down");
                 return;
             }
-            result = connect_once(&cfg, &client, &repo_root, &threads, &stop) => {
+            result = connect_once(&cfg, &client, &repo_root, &threads, &host, &pending, &stop) => {
                 match result {
                     // Clean close requested by shutdown: exit.
                     Ok(true) => return,
@@ -307,6 +333,8 @@ async fn connect_once(
     client: &SlackClient,
     repo_root: &Path,
     threads: &SharedThreads,
+    host: &Option<SharedHost>,
+    pending: &PendingPlans,
     stop: &Arc<Notify>,
 ) -> Result<bool> {
     let url = client.open_connection().await.context("opening Socket Mode connection")?;
@@ -348,17 +376,31 @@ async fn connect_once(
                                 continue;
                             }
                         }
-                        // Slow (claude-spawning) actions run on a spawned task so
-                        // the read loop keeps answering pings; fast local actions
-                        // run inline.
+                        // Slow (claude-spawning or engine-touching) actions run
+                        // on a spawned task so the read loop keeps answering
+                        // pings; fast local actions run inline.
                         if is_slow_action(&routed.action) {
-                            let (cfg, client, repo, threads) =
-                                (cfg.clone(), client.clone(), repo_root.to_path_buf(), threads.clone());
+                            let (cfg, client, repo, threads, host, pending) = (
+                                cfg.clone(),
+                                client.clone(),
+                                repo_root.to_path_buf(),
+                                threads.clone(),
+                                host.clone(),
+                                pending.clone(),
+                            );
                             tokio::spawn(async move {
-                                dispatch_action(&cfg, &client, &repo, &threads, &routed.action).await;
+                                dispatch_action(
+                                    &cfg, &client, &repo, &threads, host.as_ref(), &pending,
+                                    &routed.action,
+                                )
+                                .await;
                             });
                         } else {
-                            dispatch_action(cfg, client, repo_root, threads, &routed.action).await;
+                            dispatch_action(
+                                cfg, client, repo_root, threads, host.as_ref(), pending,
+                                &routed.action,
+                            )
+                            .await;
                         }
                     }
                     // Respond to ping with pong so Slack keeps the socket alive.
@@ -389,10 +431,22 @@ fn parse_envelope(text: &str, threads: &SharedThreads) -> Option<crate::inbound:
     }
 }
 
-/// Actions that spawn a claude session (a multi-second turn) and so must run
-/// off the socket read loop, after the ack.
+/// Actions that may spawn a claude session (a multi-minute turn) or touch a
+/// live engine (approve commits files under the engine mutex) and so must run
+/// off the socket read loop, after the ack. Guidance is here because a reply
+/// on a PLANNING mission's thread runs a hosted planning turn; on a running
+/// mission it degrades to a fast control-inbox write, and spawning for that is
+/// harmless.
 fn is_slow_action(action: &Action) -> bool {
-    matches!(action, Action::NewMission { .. } | Action::RequestPlan { .. })
+    matches!(
+        action,
+        Action::NewMission { .. }
+            | Action::RequestPlan { .. }
+            | Action::Guidance { .. }
+            | Action::Approve { .. }
+            | Action::ApproveStart { .. }
+            | Action::ApproveMission { .. }
+    )
 }
 
 /// A bounded set of recently-seen envelope ids (FIFO eviction). Human-driven
@@ -452,7 +506,16 @@ async fn handle_envelope(
         }
     };
     let routed = route(&envelope, threads);
-    dispatch_action(cfg, client, repo_root, threads, &routed.action).await;
+    dispatch_action(
+        cfg,
+        client,
+        repo_root,
+        threads,
+        None,
+        &PendingPlans::default(),
+        &routed.action,
+    )
+    .await;
     // Ack whatever carried an envelope_id, even Ignore, so Slack stops retrying.
     routed.envelope_id.map(|id| json!({ "envelope_id": id }).to_string())
 }
@@ -496,22 +559,29 @@ fn not_authorized_blocks() -> Vec<Value> {
 /// the button/thread actions (approve button, guidance, ticket) are pure local
 /// filesystem writes and go through [`apply_action`].
 ///
-/// ## What is WIRED vs. STUBBED in this slice (M2.9 slice 1)
-/// - **Status** — fully wired: folds the mission's event log and posts a status
-///   block. Read-only, so no allowlist gate. Unit-tested end-to-end.
-/// - **ApproveMission** (`/kranz approve <id>`) — fully wired: allowlist-gated,
-///   then the same queue-insert as the approve button ([`approve_mission`]).
-/// - **NewMission** (`/kranz new <goal>`) — allowlist-gated, then create +
-///   one seeding planning turn via [`new_mission`], which builds the real
-///   backend (`ClaudeBackend::discover`) and spawns `claude`. That spawn is why
-///   it is guarded and never exercised in tests; the parse/gate/render around
-///   it are fully tested. Subsequent multi-turn planning is a follow-up.
-/// - **RequestPlan** (`/kranz plan <id>`) — allowlist-gated, but demanding the
-///   plan needs the *same* live `MissionEngine` that ran planning held across
-///   async turns (the M2.5 host's `MissionHost` registry). That registry is in
-///   `kranz_server`, which this crate must not touch in this slice, so
-///   request-plan replies with an ephemeral pointing at `kranz plan <id>` /
-///   the web UI. Documented handoff, not silently dropped.
+/// ## The hosted lifecycle (M2.9 planning-conversation slice)
+/// With a [`SharedHost`] wired in (`kranz serve --slack` passes an adapter
+/// over the SAME `MissionHost` registry the web UI uses), the full lifecycle
+/// runs from Slack:
+/// - **Status** — folds the mission's event log and posts a status block.
+///   Read-only, so no allowlist gate. Unit-tested end-to-end.
+/// - **NewMission** (`/kranz new <goal>`) — allowlist-gated; creates THROUGH
+///   the host so the planning engine stays live across turns.
+/// - **Guidance** on a PLANNING mission's thread — allowlist-gated hosted
+///   planning turn, acked in-thread first (the turn takes minutes); on a
+///   running mission it stays the control-inbox guidance write.
+/// - **RequestPlan** (`/kranz plan <id>`) — allowlist-gated; immediate
+///   ephemeral ack, then `host.request_plan`. Ready → a plan-review block
+///   (goal, milestones, estimate, approve buttons) posted to the mission
+///   thread, the plan parked in [`PendingPlans`] for the buttons. NotReady →
+///   the orchestrator's prose posted threaded.
+/// - **Approve / ApproveStart / ApproveMission** — allowlist-gated
+///   [`approve_flow`]: commit the pending plan through the host, then queue
+///   (`Approve`/slash) or start execution through the host (`ApproveStart`).
+///   State-aware without a pending plan (see [`approve_flow`]).
+///
+/// Without a host every engine-needing surface degrades to an honest
+/// ephemeral refusal pointing at the CLI ([`no_host_blocks`]).
 ///
 /// ## M2.9 slices 2 & 3 additions
 /// - **Config** (`/kranz config [<id>] <role> <model> [effort]`) — spend-adjacent,
@@ -536,22 +606,19 @@ fn not_authorized_blocks() -> Vec<Value> {
 ///   (`queue::list` + `is_repo_busy`, [`build_work_reply`]) and points at the
 ///   `kranz work` CLI / dispatcher for actually draining it. Read-only, no gate.
 ///
-/// ## Known limitation (ack budget, docs must-have #3)
-/// This handler runs inline in the socket read loop (see [`handle_envelope`] /
-/// `connect_once`), so the `NewMission` seeding `planning_turn` — a real
-/// `claude` turn — blocks the ack past Slack's 3 s budget, and Slack will
-/// redeliver. For this slice that is an accepted rough edge (the seed turn is
-/// idempotent-ish: a redelivery creates a *second* mission thread, which is
-/// noise, not corruption). The follow-up that lands `RequestPlan` also moves
-/// these spend actions off the read path (ack first, then do the work on a
-/// spawned task, deduped by envelope id) to satisfy the fast-ack + idempotency
-/// must-haves. The read-only actions (status/help) and the pure-local
-/// approve/queue all finish well inside the budget today.
+/// ## Ack budget (docs must-have #3)
+/// `connect_once` acks every envelope FIRST and runs the slow actions
+/// ([`is_slow_action`]: claude-spawning or engine-touching) on spawned tasks,
+/// deduped by envelope id ([`SeenEnvelopes`]) so a Slack redelivery can't
+/// double-create or double-approve. Only pure-local actions run inline on the
+/// read loop.
 async fn dispatch_action(
     cfg: &SlackConfig,
     client: &SlackClient,
     repo_root: &Path,
     threads: &SharedThreads,
+    host: Option<&SharedHost>,
+    pending: &PendingPlans,
     action: &Action,
 ) {
     match action {
@@ -580,7 +647,7 @@ async fn dispatch_action(
                 reply_ephemeral(cfg, client, response_url.as_deref(), &not_authorized_blocks()).await;
                 return;
             }
-            match new_mission(cfg, client, repo_root, threads, goal, channel).await {
+            match new_mission(cfg, client, repo_root, threads, host, goal, channel).await {
                 Ok(blocks) => reply_ephemeral(cfg, client, response_url.as_deref(), &blocks).await,
                 Err(e) => {
                     tracing::warn!(error = %e, "failed to create mission from Slack");
@@ -600,48 +667,80 @@ async fn dispatch_action(
                 reply_ephemeral(cfg, client, response_url.as_deref(), &not_authorized_blocks()).await;
                 return;
             }
-            // Documented handoff (see dispatch_action docs): request-plan needs
-            // the live planning engine held across turns (the M2.5 host), which
-            // lives in kranz_server — out of scope for this slice.
+            let Some(host) = host else {
+                reply_ephemeral(cfg, client, response_url.as_deref(), &no_host_blocks(mission_id))
+                    .await;
+                return;
+            };
+            // Ack IMMEDIATELY: the request-plan turn takes minutes, and a
+            // silently-working command is exactly the confusion this surface
+            // is meant to avoid.
             reply_ephemeral(
                 cfg,
                 client,
                 response_url.as_deref(),
                 &error_blocks(&format!(
-                    "Requesting a plan over Slack needs the hosted planning engine \
-                     (coming in a follow-up). For now: `kranz plan --mission {mission_id}`, \
-                     or the web UI via `kranz serve --open`."
+                    ":hourglass_flowing_sand: Requesting the plan for `{mission_id}` — the \
+                     orchestrator turn usually takes a minute or two; the plan will post \
+                     in the mission thread."
                 )),
             )
             .await;
+            match host.request_plan(mission_id).await {
+                Ok(PlanOutcome::Ready { plan, estimate }) => {
+                    let review = crate::format::build_plan_review(&crate::format::PlanReview {
+                        mission_id: mission_id.clone(),
+                        goal: plan.goal.clone(),
+                        milestone_titles:
+                            plan.milestones.iter().map(|m| m.title.clone()).collect(),
+                        assertion_count: plan.validation_contract.len(),
+                        estimate,
+                    });
+                    // Cache BEFORE posting: once the buttons are visible they
+                    // must find the plan.
+                    pending.put(mission_id, plan);
+                    if let Err(e) =
+                        post_to_mission_thread(cfg, client, threads, mission_id, review).await
+                    {
+                        tracing::warn!(mission = %mission_id, error = %e, "failed to post plan review");
+                        reply_ephemeral(
+                            cfg,
+                            client,
+                            response_url.as_deref(),
+                            &error_blocks(&format!(
+                                "The plan is ready but posting it failed: {e}. \
+                                 Run `/kranz plan {mission_id}` again."
+                            )),
+                        )
+                        .await;
+                    }
+                }
+                Ok(PlanOutcome::NotReady(prose)) => {
+                    let blocks = crate::format::build_planning_reply(mission_id, &prose);
+                    if let Err(e) =
+                        post_to_mission_thread(cfg, client, threads, mission_id, blocks).await
+                    {
+                        tracing::warn!(mission = %mission_id, error = %e, "failed to post not-ready reply");
+                    }
+                }
+                Err(e) => {
+                    reply_ephemeral(
+                        cfg,
+                        client,
+                        response_url.as_deref(),
+                        &error_blocks(&format!("Couldn't request the plan: {e}")),
+                    )
+                    .await;
+                }
+            }
         }
 
         Action::ApproveMission { mission_id, user_id, response_url } => {
-            if !cfg.is_authorized(user_id.as_deref()) {
-                reply_ephemeral(cfg, client, response_url.as_deref(), &not_authorized_blocks()).await;
-                return;
-            }
-            match approve_mission(repo_root, mission_id) {
-                Ok(()) => {
-                    reply_ephemeral(
-                        cfg,
-                        client,
-                        response_url.as_deref(),
-                        &error_blocks(&format!(":white_check_mark: Queued `{mission_id}`.")),
-                    )
-                    .await
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to approve mission from Slack");
-                    reply_ephemeral(
-                        cfg,
-                        client,
-                        response_url.as_deref(),
-                        &error_blocks(&format!("Couldn't queue `{mission_id}`: {e}")),
-                    )
-                    .await
-                }
-            }
+            approve_flow(
+                cfg, client, repo_root, threads, host, pending, mission_id,
+                user_id.as_deref(), response_url.as_deref(), false,
+            )
+            .await;
         }
 
         // Per-role config change. SPEND-ADJACENT (it re-shapes future turns'
@@ -715,33 +814,281 @@ async fn dispatch_action(
             }
         }
 
-        // The approve BUTTON is the spend twin of `/kranz approve` and must be
-        // gated identically — otherwise an unlisted user clicking it queues a
-        // paid mission, bypassing the allowlist that the slash command enforces.
+        // The approve BUTTONS are the spend twins of `/kranz approve` and must
+        // be gated identically — otherwise an unlisted user clicking one queues
+        // (or starts) a paid mission, bypassing the allowlist that the slash
+        // command enforces.
         Action::Approve { mission_id, user_id, response_url } => {
-            if !cfg.is_authorized(user_id.as_deref()) {
-                reply_ephemeral(cfg, client, response_url.as_deref(), &not_authorized_blocks()).await;
-                return;
-            }
-            match approve_mission(repo_root, mission_id) {
-                Ok(()) => {
-                    reply_ephemeral(
-                        cfg,
-                        client,
-                        response_url.as_deref(),
-                        &error_blocks(&format!(":white_check_mark: Queued `{mission_id}`.")),
+            approve_flow(
+                cfg, client, repo_root, threads, host, pending, mission_id,
+                user_id.as_deref(), response_url.as_deref(), false,
+            )
+            .await;
+        }
+        Action::ApproveStart { mission_id, user_id, response_url } => {
+            approve_flow(
+                cfg, client, repo_root, threads, host, pending, mission_id,
+                user_id.as_deref(), response_url.as_deref(), true,
+            )
+            .await;
+        }
+
+        // A threaded reply: on a PLANNING mission this is a hosted planning
+        // turn (spend → allowlist-gated, acked in-thread because a message
+        // event has no response_url); on anything else it stays the running-
+        // mission guidance write it has always been.
+        Action::Guidance { mission_id, text, user_id } => {
+            match mission_status(repo_root, mission_id) {
+                Ok(MissionStatus::Planning) => {
+                    let Some(host) = host else {
+                        post_thread_note(cfg, client, threads, mission_id, &format!(
+                            "This mission is still in planning, and this bridge has no hosted \
+                             engine (it was started without `kranz serve`). Continue with \
+                             `kranz plan --mission {mission_id}` in a terminal."
+                        ))
+                        .await;
+                        return;
+                    };
+                    if !cfg.is_authorized(user_id.as_deref()) {
+                        post_thread_note(cfg, client, threads, mission_id,
+                            "Planning turns spend money and are limited to the \
+                             `slack.allowUsers` allowlist — ask an admin to add you.",
+                        )
+                        .await;
+                        return;
+                    }
+                    post_thread_note(cfg, client, threads, mission_id,
+                        ":hourglass_flowing_sand: Planning turn running — the orchestrator's \
+                         reply lands here, usually within a couple of minutes.",
                     )
-                    .await
+                    .await;
+                    match host.planning_turn(mission_id, text).await {
+                        Ok(reply) => {
+                            let blocks = crate::format::build_planning_reply(mission_id, &reply);
+                            if let Err(e) =
+                                post_to_mission_thread(cfg, client, threads, mission_id, blocks)
+                                    .await
+                            {
+                                tracing::warn!(mission = %mission_id, error = %e, "failed to post planning reply");
+                            }
+                        }
+                        Err(e) => {
+                            post_thread_note(cfg, client, threads, mission_id, &format!(
+                                "Planning turn failed: {e}"
+                            ))
+                            .await;
+                        }
+                    }
                 }
-                Err(e) => tracing::warn!(error = %e, "failed to approve mission from Slack button"),
+                // Running / paused / blocked (and, unchanged from before,
+                // terminal): the control-inbox guidance write.
+                Ok(_) => {
+                    if let Err(e) = guidance(repo_root, mission_id, text) {
+                        tracing::warn!(error = %e, "failed to enqueue Slack guidance");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(mission = %mission_id, error = %e, "failed to read mission status for thread reply");
+                }
             }
         }
 
-        // Thread guidance / ticket scaffolding: pure local writes, no reply.
+        // Ticket scaffolding: a pure local write, no reply.
         action => {
             if let Err(e) = apply_action(repo_root, action) {
                 tracing::warn!(error = %e, "failed to apply inbound Slack action");
             }
+        }
+    }
+}
+
+/// Shared approve path for the slash command and both buttons.
+///
+/// With a reviewed plan pending (from `/kranz plan`): commit it through the
+/// hosted engine — THE step the first cut of this bridge skipped, which left
+/// missions queued-but-unapproved that `kranz work` then refused — and either
+/// start execution through the host (`start == true`) or insert into the
+/// per-repo queue. Without a pending plan: honest, state-aware handling (a
+/// planning mission needs `/kranz plan` first; an approved-but-idle one can
+/// still be queued/started).
+#[allow(clippy::too_many_arguments)]
+async fn approve_flow(
+    cfg: &SlackConfig,
+    client: &SlackClient,
+    repo_root: &Path,
+    threads: &SharedThreads,
+    host: Option<&SharedHost>,
+    pending: &PendingPlans,
+    mission_id: &str,
+    user_id: Option<&str>,
+    response_url: Option<&str>,
+    start: bool,
+) {
+    if !cfg.is_authorized(user_id) {
+        reply_ephemeral(cfg, client, response_url, &not_authorized_blocks()).await;
+        return;
+    }
+
+    if let Some(plan) = pending.take(mission_id) {
+        let Some(host) = host else {
+            pending.put(mission_id, plan);
+            reply_ephemeral(cfg, client, response_url, &no_host_blocks(mission_id)).await;
+            return;
+        };
+        let branch = match host.approve(mission_id, plan.clone()).await {
+            Ok(branch) => branch,
+            Err(e) => {
+                // A transient failure (e.g. a turn in flight) must not forfeit
+                // the reviewed plan — put it back for the retry click.
+                pending.put(mission_id, plan);
+                reply_ephemeral(
+                    cfg,
+                    client,
+                    response_url,
+                    &error_blocks(&format!("Couldn't approve `{mission_id}`: {e}")),
+                )
+                .await;
+                return;
+            }
+        };
+        if start {
+            match host.start(mission_id).await {
+                Ok(()) => {
+                    post_thread_note(cfg, client, threads, mission_id, &format!(
+                        ":rocket: Plan approved and execution started (branch `{branch}`) — \
+                         progress posts in this thread; deep inspection in the web UI."
+                    ))
+                    .await;
+                }
+                Err(e) => {
+                    reply_ephemeral(
+                        cfg,
+                        client,
+                        response_url,
+                        &error_blocks(&format!(
+                            "Approved `{mission_id}` (branch `{branch}`) but starting failed: \
+                             {e}. Queue it with `/kranz approve {mission_id}` or run \
+                             `kranz work`."
+                        )),
+                    )
+                    .await;
+                }
+            }
+        } else {
+            match approve_mission(repo_root, mission_id) {
+                Ok(()) => {
+                    post_thread_note(cfg, client, threads, mission_id, &format!(
+                        ":white_check_mark: Plan approved and queued (branch `{branch}`) — \
+                         the `kranz work` dispatcher runs it next."
+                    ))
+                    .await;
+                }
+                Err(e) => {
+                    reply_ephemeral(
+                        cfg,
+                        client,
+                        response_url,
+                        &error_blocks(&format!(
+                            "Approved `{mission_id}` (branch `{branch}`) but queueing failed: {e}"
+                        )),
+                    )
+                    .await;
+                }
+            }
+        }
+        return;
+    }
+
+    // No pending plan. Route by actual mission state instead of blindly
+    // queueing (the old behavior, which dead-ended at run time on unapproved
+    // missions).
+    match mission_status(repo_root, mission_id) {
+        Ok(MissionStatus::Planning) => {
+            reply_ephemeral(
+                cfg,
+                client,
+                response_url,
+                &error_blocks(&format!(
+                    "No reviewed plan is pending for `{mission_id}` — run \
+                     `/kranz plan {mission_id}` first, then approve from the plan message."
+                )),
+            )
+            .await;
+        }
+        Ok(
+            status @ (MissionStatus::Complete | MissionStatus::Failed | MissionStatus::Abandoned),
+        ) => {
+            reply_ephemeral(
+                cfg,
+                client,
+                response_url,
+                &error_blocks(&format!(
+                    "Mission `{mission_id}` is {status:?} — nothing to approve or queue."
+                )),
+            )
+            .await;
+        }
+        // Approved earlier (plan committed, no live run) or paused/blocked:
+        // starting/queueing is legitimate.
+        Ok(_) => {
+            if start {
+                let Some(host) = host else {
+                    reply_ephemeral(cfg, client, response_url, &no_host_blocks(mission_id)).await;
+                    return;
+                };
+                match host.start(mission_id).await {
+                    Ok(()) => {
+                        post_thread_note(cfg, client, threads, mission_id, &format!(
+                            ":rocket: Execution started for `{mission_id}` — progress posts \
+                             in this thread."
+                        ))
+                        .await;
+                    }
+                    Err(e) => {
+                        reply_ephemeral(
+                            cfg,
+                            client,
+                            response_url,
+                            &error_blocks(&format!("Couldn't start `{mission_id}`: {e}")),
+                        )
+                        .await;
+                    }
+                }
+            } else {
+                match approve_mission(repo_root, mission_id) {
+                    Ok(()) => {
+                        reply_ephemeral(
+                            cfg,
+                            client,
+                            response_url,
+                            &error_blocks(&format!(
+                                ":white_check_mark: Queued `{mission_id}` — the `kranz work` \
+                                 dispatcher runs it next."
+                            )),
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to queue mission from Slack");
+                        reply_ephemeral(
+                            cfg,
+                            client,
+                            response_url,
+                            &error_blocks(&format!("Couldn't queue `{mission_id}`: {e}")),
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            reply_ephemeral(
+                cfg,
+                client,
+                response_url,
+                &error_blocks(&format!("Couldn't read `{mission_id}`: {e}")),
+            )
+            .await;
         }
     }
 }
@@ -752,6 +1099,63 @@ fn error_blocks(msg: &str) -> Vec<Value> {
     vec![json!({ "type": "section", "text": { "type": "mrkdwn", "text": msg } })]
 }
 
+/// The honest refusal for hosted-engine operations when the bridge was started
+/// without a host (tests, or embedding `serve_slack` outside `kranz serve`).
+fn no_host_blocks(mission_id: &str) -> Vec<Value> {
+    error_blocks(&format!(
+        "This bridge has no hosted planning engine (it was started without \
+         `kranz serve`). Use `kranz plan --mission {mission_id}` in a terminal, \
+         or the web UI via `kranz serve --open`."
+    ))
+}
+
+/// A mission's current status, folded read-only from its event log.
+fn mission_status(repo_root: &Path, mission_id: &str) -> Result<MissionStatus> {
+    let paths = MissionPaths::new(repo_root, mission_id);
+    let events_path = paths.events_file();
+    if !events_path.is_file() {
+        anyhow::bail!("unknown mission `{mission_id}`");
+    }
+    let events = EventLog::read_events(&events_path)?;
+    let state = reducer::fold(&events)?;
+    Ok(state.mission.status)
+}
+
+/// Post blocks to a mission's Slack thread (instance-labeled), creating the
+/// thread root in the configured channel — and recording the mapping — when
+/// the mission has no thread yet (e.g. it was created via the CLI or web UI).
+async fn post_to_mission_thread(
+    cfg: &SlackConfig,
+    client: &SlackClient,
+    threads: &SharedThreads,
+    mission_id: &str,
+    blocks: Vec<Value>,
+) -> Result<()> {
+    let blocks = crate::format::label_blocks(blocks, cfg.instance_name.as_deref());
+    let thread_ts = threads.thread_ts(mission_id);
+    let posted_ts = client.post_message(&cfg.channel, &blocks, thread_ts.as_deref()).await?;
+    if thread_ts.is_none() {
+        threads.set(mission_id, &posted_ts);
+    }
+    Ok(())
+}
+
+/// [`post_to_mission_thread`] for a one-line note (acks, refusals, errors on
+/// the thread-reply path, which has no `response_url` to reply ephemerally
+/// to). Best-effort: a failed post is logged, never fatal.
+async fn post_thread_note(
+    cfg: &SlackConfig,
+    client: &SlackClient,
+    threads: &SharedThreads,
+    mission_id: &str,
+    msg: &str,
+) {
+    if let Err(e) = post_to_mission_thread(cfg, client, threads, mission_id, error_blocks(msg)).await
+    {
+        tracing::warn!(mission = %mission_id, error = %e, "failed to post thread note");
+    }
+}
+
 /// Apply a routed inbound action to the local mission machinery. The actions
 /// that reply over the slash `response_url` (Help, Status, NewMission,
 /// RequestPlan, ApproveMission) are handled in [`dispatch_action`] because they
@@ -759,13 +1163,14 @@ fn error_blocks(msg: &str) -> Vec<Value> {
 fn apply_action(repo_root: &Path, action: &Action) -> Result<()> {
     match action {
         Action::Approve { mission_id, .. } => approve_mission(repo_root, mission_id),
-        Action::Guidance { mission_id, text } => guidance(repo_root, mission_id, text),
+        Action::Guidance { mission_id, text, .. } => guidance(repo_root, mission_id, text),
         Action::NewTicket { title, .. } => scaffold_ticket(repo_root, title),
         Action::Help { .. }
         | Action::Status { .. }
         | Action::NewMission { .. }
         | Action::RequestPlan { .. }
         | Action::ApproveMission { .. }
+        | Action::ApproveStart { .. }
         | Action::Config { .. }
         | Action::Pause { .. }
         | Action::Resume { .. }
@@ -1103,27 +1508,47 @@ async fn new_mission(
     client: &SlackClient,
     repo_root: &Path,
     threads: &SharedThreads,
+    host: Option<&SharedHost>,
     goal: &str,
     channel: &str,
 ) -> Result<Vec<Value>> {
-    use kranz_engine::backend_claude::ClaudeBackend;
-    use kranz_engine::config;
-    use kranz_engine::orchestrator::MissionEngine;
-    use std::sync::Arc;
+    // Hosted path (`kranz serve --slack`): create THROUGH the registry so the
+    // planning engine stays live across turns — this is what makes replying in
+    // the thread (a follow-up planning turn) work. The engine-dropping direct
+    // path below survives only for a host-less bridge.
+    let (mission_id, opening) = match host {
+        Some(host) => {
+            let mission_id = host.create(goal).await.context("creating mission")?;
+            let reply = host
+                .planning_turn(&mission_id, goal)
+                .await
+                .context("seeding planning turn")?;
+            (mission_id, reply)
+        }
+        None => {
+            use kranz_engine::backend_claude::ClaudeBackend;
+            use kranz_engine::config;
+            use kranz_engine::orchestrator::MissionEngine;
+            use std::sync::Arc;
 
-    let cfg_engine = config::load(repo_root).context("loading mission config")?;
-    let backend = ClaudeBackend::discover(cfg_engine.claude_binary.as_deref())
-        .context("discovering claude backend")?;
-    let mut engine =
-        MissionEngine::create(Arc::new(backend), repo_root.to_path_buf(), goal, cfg_engine)
+            let cfg_engine = config::load(repo_root).context("loading mission config")?;
+            let backend = ClaudeBackend::discover(cfg_engine.claude_binary.as_deref())
+                .context("discovering claude backend")?;
+            let mut engine = MissionEngine::create(
+                Arc::new(backend),
+                repo_root.to_path_buf(),
+                goal,
+                cfg_engine,
+            )
             .context("creating mission")?;
-    let mission_id = engine.mission_id().to_string();
-
-    // One seeding planning turn: give the orchestrator the goal so its opening
-    // scoping questions come back to post in-thread. A captured seed reply
-    // (fresh session) happened first in the conversation, so prepend it.
-    let reply = engine.planning_turn(goal).await.context("seeding planning turn")?;
-    let opening = prepend_seed(engine.take_seed_reply(), reply);
+            let mission_id = engine.mission_id().to_string();
+            // One seeding planning turn: the orchestrator's opening scoping
+            // questions come back to post in-thread. A captured seed reply
+            // (fresh session) happened first, so prepend it.
+            let reply = engine.planning_turn(goal).await.context("seeding planning turn")?;
+            (mission_id, prepend_seed(engine.take_seed_reply(), reply))
+        }
+    };
     let opening = opening.trim();
     let opening_reply = (!opening.is_empty()).then(|| opening.to_string());
 
@@ -1237,7 +1662,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         apply_action(
             tmp.path(),
-            &Action::Guidance { mission_id: "m-1".into(), text: "use a token bucket".into() },
+            &Action::Guidance {
+                mission_id: "m-1".into(),
+                text: "use a token bucket".into(),
+                user_id: None,
+            },
         )
         .unwrap();
         let paths = MissionPaths::new(tmp.path(), "m-1");
@@ -1305,6 +1734,74 @@ mod tests {
     /// Seed a mission's `events.jsonl` with a single `mission.created` event,
     /// built from public engine types so it folds exactly like a real log —
     /// no git, no backend. Returns the mission id.
+    #[test]
+    fn pending_plans_take_consumes_and_put_restores() {
+        use kranz_engine::types::{Plan, PlanFeature, PlanMilestone};
+        let plan = Plan {
+            goal: "g".into(),
+            validation_contract: vec![],
+            milestones: vec![PlanMilestone {
+                title: "M1".into(),
+                features: vec![PlanFeature {
+                    title: "F1".into(),
+                    spec: "s".into(),
+                    validation_criteria: vec!["c".into()],
+                }],
+            }],
+        };
+        let pending = PendingPlans::default();
+        assert!(pending.take("m-1").is_none(), "empty cache has nothing");
+        pending.put("m-1", plan.clone());
+        let taken = pending.take("m-1").expect("cached plan comes back");
+        assert_eq!(taken.goal, "g");
+        // take() consumed it — a second click must not find a stale plan…
+        assert!(pending.take("m-1").is_none());
+        // …but a failed approve puts it back for the retry.
+        pending.put("m-1", taken);
+        assert!(pending.take("m-1").is_some());
+    }
+
+    #[test]
+    fn mission_status_folds_planning_and_post_approval() {
+        use kranz_engine::events::{Event, EventKind};
+        use kranz_engine::types::{Plan, PlanFeature, PlanMilestone};
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-p", "still planning");
+        assert_eq!(mission_status(tmp.path(), "m-p").unwrap(), MissionStatus::Planning);
+
+        // Append a PlanApproved: the reducer folds it to Running (approved,
+        // executable) — the state the approve_flow no-pending path may queue.
+        seed_mission(tmp.path(), "m-a", "approved");
+        let paths = MissionPaths::new(tmp.path(), "m-a");
+        let event = Event {
+            seq: 2,
+            ts: chrono::Utc::now(),
+            mission_id: "m-a".to_string(),
+            kind: EventKind::PlanApproved {
+                plan: Plan {
+                    goal: "approved".into(),
+                    validation_contract: vec![],
+                    milestones: vec![PlanMilestone {
+                        title: "M1".into(),
+                        features: vec![PlanFeature {
+                            title: "F1".into(),
+                            spec: "s".into(),
+                            validation_criteria: vec!["c".into()],
+                        }],
+                    }],
+                },
+            },
+        };
+        let line = serde_json::to_string(&event).unwrap();
+        let mut existing = std::fs::read_to_string(paths.events_file()).unwrap();
+        existing.push_str(&line);
+        existing.push('\n');
+        std::fs::write(paths.events_file(), existing).unwrap();
+        assert_eq!(mission_status(tmp.path(), "m-a").unwrap(), MissionStatus::Running);
+
+        assert!(mission_status(tmp.path(), "m-nope").is_err(), "unknown mission is an error");
+    }
+
     fn seed_mission(repo_root: &Path, mission_id: &str, goal: &str) {
         use kranz_engine::events::{Event, EventKind};
         use kranz_engine::types::MissionConfig;
@@ -1858,16 +2355,25 @@ mod tests {
             user_id: None,
             response_url: None,
         }));
-        // Fast local/one-call actions stay inline.
-        assert!(!is_slow_action(&Action::Approve {
+        // Engine-touching actions moved off the read loop with the hosted
+        // registry: approvals commit files under the engine mutex, and a
+        // thread reply on a planning mission runs a full planning turn.
+        assert!(is_slow_action(&Action::Approve {
             mission_id: "m-1".into(),
             user_id: None,
             response_url: None,
         }));
-        assert!(!is_slow_action(&Action::Guidance {
+        assert!(is_slow_action(&Action::ApproveStart {
+            mission_id: "m-1".into(),
+            user_id: None,
+            response_url: None,
+        }));
+        assert!(is_slow_action(&Action::Guidance {
             mission_id: "m-1".into(),
             text: "hi".into(),
+            user_id: None,
         }));
+        // Fast local/one-call actions stay inline.
         assert!(!is_slow_action(&Action::Status { mission_id: None, response_url: None }));
         assert!(!is_slow_action(&Action::Ignore));
     }

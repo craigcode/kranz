@@ -18,6 +18,7 @@ mod host;
 mod rest;
 mod ws;
 
+pub use error::ApiError;
 pub use host::MissionHost;
 
 use axum::body::Body;
@@ -62,7 +63,10 @@ pub enum DashboardStatic {
 /// data is re-read from disk per request) plus the hosted-engine registry.
 pub struct ServerState {
     pub repo_root: PathBuf,
-    pub host: MissionHost,
+    /// Shared (`Arc`) so `kranz serve --slack` can hand the SAME registry to
+    /// the Slack bridge: web and Slack are two clients of one set of live
+    /// engines, never two engines fighting over one mission lock.
+    pub host: Arc<MissionHost>,
 }
 
 /// Build the full router (public so tests can drive it with
@@ -100,6 +104,16 @@ pub fn router_with_token(
 /// mutation token.
 pub fn router_with_host(
     host: MissionHost,
+    static_assets: Option<DashboardStatic>,
+    token: Option<String>,
+) -> Router {
+    router_with_shared_host(Arc::new(host), static_assets, token)
+}
+
+/// [`router_with_host`] over an already-shared registry — the `kranz serve
+/// --slack` path, where the Slack bridge holds a clone of the same host.
+pub fn router_with_shared_host(
+    host: Arc<MissionHost>,
     static_assets: Option<DashboardStatic>,
     token: Option<String>,
 ) -> Router {
@@ -303,7 +317,18 @@ pub async fn serve_with_static(
     static_assets: Option<DashboardStatic>,
     token: Option<String>,
 ) -> anyhow::Result<()> {
-    let app = router_with_token(repo_root, static_assets, token);
+    serve_with_shared_host(Arc::new(MissionHost::new(repo_root)), port, static_assets, token).await
+}
+
+/// [`serve_with_static`] over an already-shared registry (see
+/// [`router_with_shared_host`]).
+pub async fn serve_with_shared_host(
+    host: Arc<MissionHost>,
+    port: u16,
+    static_assets: Option<DashboardStatic>,
+    token: Option<String>,
+) -> anyhow::Result<()> {
+    let app = router_with_shared_host(host, static_assets, token);
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local_addr = listener.local_addr()?;

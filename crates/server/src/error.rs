@@ -10,7 +10,7 @@ use serde_json::json;
 use std::io::ErrorKind;
 
 #[derive(Debug)]
-pub(crate) struct ApiError {
+pub struct ApiError {
     pub status: StatusCode,
     pub message: String,
 }
