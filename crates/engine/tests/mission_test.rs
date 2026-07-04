@@ -21,7 +21,7 @@
 use kranz_engine::backend::{AgentBackend, PromptMode, SessionExit};
 use kranz_engine::backend_mock::{mock_init, mock_result_text, mock_text, MockBackend, MockScript};
 use kranz_engine::control;
-use kranz_engine::event_log::EventLog;
+use kranz_engine::event_log::{EventLog, LockForce};
 use kranz_engine::events::{Event, EventKind};
 use kranz_engine::git_ops::GitRepo;
 use kranz_engine::orchestrator::{synthesize_conflict_resolution, MissionEngine, PlanRequest};
@@ -1018,7 +1018,7 @@ async fn kill_and_resume_completes_on_single_log() {
     ]));
     let backend2_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend2) as Arc<dyn AgentBackend>;
     let mut engine =
-        MissionEngine::resume(backend2_dyn, &root, &mission_id, false).expect("resume mission");
+        MissionEngine::resume(backend2_dyn, &root, &mission_id, LockForce::No).expect("resume mission");
 
     let status = timeout(TEST_TIMEOUT, engine.run()).await.expect("run must not hang").unwrap();
     assert_eq!(status, MissionStatus::Complete);
@@ -1258,7 +1258,7 @@ async fn seed_reply_is_captured_once_for_fresh_and_resumed_sessions() {
     .responding(vec![vec![mock_text("continuing"), mock_result_text("continuing")]])]));
     let backend2_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend2) as Arc<dyn AgentBackend>;
     let mut engine =
-        MissionEngine::resume(backend2_dyn, &root, &mission_id, false).expect("resume mission");
+        MissionEngine::resume(backend2_dyn, &root, &mission_id, LockForce::No).expect("resume mission");
 
     let reply = timeout(TEST_TIMEOUT, engine.planning_turn("go on"))
         .await
@@ -1367,7 +1367,7 @@ async fn plan_approval_writes_plan_branch_and_commit() {
     // (Recreate an engine handle just to probe the state machine guard —
     // resume() re-acquires the lock the drop released.)
     let backend_dyn: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
-    let mut engine = MissionEngine::resume(backend_dyn, &root, &mission_id, false).unwrap();
+    let mut engine = MissionEngine::resume(backend_dyn, &root, &mission_id, LockForce::No).unwrap();
     let err = engine.approve_plan(simple_plan(1, vec![])).unwrap_err();
     assert!(err.to_string().contains("Planning"), "got: {err}");
 }
@@ -1440,7 +1440,7 @@ async fn abandon_planning_mission_sets_abandoned_status() {
     let before = read_log(&paths);
     assert_eq!(reducer::fold(&before).unwrap().mission.status, MissionStatus::Planning);
 
-    kranz_engine::orchestrator::abandon_mission(&root, &mission_id, "no longer needed", false)
+    kranz_engine::orchestrator::abandon_mission(&root, &mission_id, "no longer needed", LockForce::No)
         .expect("abandon a planning mission");
 
     // Exactly one new event, of the right kind, carrying the reason.
@@ -1475,11 +1475,11 @@ async fn running_an_abandoned_mission_is_rejected() {
     let paths = engine.paths().clone();
     drop(engine);
 
-    kranz_engine::orchestrator::abandon_mission(&root, &mission_id, "stop", false)
+    kranz_engine::orchestrator::abandon_mission(&root, &mission_id, "stop", LockForce::No)
         .expect("abandon");
 
     let backend2: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
-    let mut resumed = MissionEngine::resume(backend2, &root, &mission_id, false).expect("resume");
+    let mut resumed = MissionEngine::resume(backend2, &root, &mission_id, LockForce::No).expect("resume");
     let err = resumed.run().await.expect_err("running a terminal mission must be rejected");
     assert!(
         matches!(err, kranz_engine::error::EngineError::InvalidState(_)),
@@ -1508,11 +1508,11 @@ async fn abandon_already_terminal_mission_errors() {
     drop(engine);
 
     // First abandon succeeds and makes the mission terminal.
-    kranz_engine::orchestrator::abandon_mission(&root, &mission_id, "first", false).unwrap();
+    kranz_engine::orchestrator::abandon_mission(&root, &mission_id, "first", LockForce::No).unwrap();
     let after_first = read_log(&paths);
 
     // A second abandon is rejected: the mission is already terminal.
-    let err = kranz_engine::orchestrator::abandon_mission(&root, &mission_id, "again", false)
+    let err = kranz_engine::orchestrator::abandon_mission(&root, &mission_id, "again", LockForce::No)
         .expect_err("abandoning a terminal mission must error");
     assert!(
         err.to_string().contains("already terminal"),
@@ -1538,7 +1538,7 @@ async fn abandon_fails_while_engine_holds_lock() {
     let engine = make_engine(&backend, &root, test_cfg());
     let mission_id = engine.mission_id().to_string();
 
-    let err = kranz_engine::orchestrator::abandon_mission(&root, &mission_id, "x", false)
+    let err = kranz_engine::orchestrator::abandon_mission(&root, &mission_id, "x", LockForce::No)
         .expect_err("abandon must fail while the lock is held");
     assert!(
         matches!(err, kranz_engine::error::EngineError::LockHeld(_)),
@@ -2179,7 +2179,7 @@ async fn crash_mid_parallel_batch_resumes_cleanly() {
     ]));
     let backend2_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend2) as Arc<dyn AgentBackend>;
     let mut engine =
-        MissionEngine::resume(backend2_dyn, &root, &mission_id, false).expect("resume mission");
+        MissionEngine::resume(backend2_dyn, &root, &mission_id, LockForce::No).expect("resume mission");
 
     let status = timeout(TEST_TIMEOUT, engine.run()).await.expect("run must not hang").unwrap();
     assert_eq!(status, MissionStatus::Complete);
@@ -2233,7 +2233,7 @@ async fn resume_does_not_sweep_worktrees_while_lock_is_live() {
 
     // Engine 2 (no --force-lock) must refuse at the lock, BEFORE any sweep.
     let backend2: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
-    let err = match MissionEngine::resume(backend2, &root, &mission_id, false) {
+    let err = match MissionEngine::resume(backend2, &root, &mission_id, LockForce::No) {
         Ok(_) => panic!("resume must fail while a live engine holds the lock"),
         Err(e) => e,
     };

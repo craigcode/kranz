@@ -117,6 +117,36 @@ fn parses_run_with_global_flags() {
     assert_eq!(cli.mission.as_deref(), Some("m-2"));
 }
 
+/// The two lock flags route to the engine's three-tier [`LockForce`]:
+/// nothing → No, --force-lock → IfNotLive, --dangerously-steal-live-lock →
+/// EvenIfLive (implies force; passing both keeps the strongest).
+#[test]
+fn lock_flags_route_to_lock_force_tiers() {
+    use kranz_engine::event_log::LockForce;
+
+    let cli = Cli::try_parse_from(["kranz", "run"]).unwrap();
+    assert_eq!(cli.lock_force(), LockForce::No);
+
+    let cli = Cli::try_parse_from(["kranz", "run", "--force-lock"]).unwrap();
+    assert_eq!(cli.lock_force(), LockForce::IfNotLive);
+
+    let cli = Cli::try_parse_from(["kranz", "run", "--dangerously-steal-live-lock"]).unwrap();
+    assert_eq!(cli.lock_force(), LockForce::EvenIfLive);
+
+    // Both at once is legal; the stronger tier wins.
+    let cli = Cli::try_parse_from([
+        "kranz",
+        "--force-lock",
+        "--dangerously-steal-live-lock",
+        "abandon",
+        "m-1",
+    ])
+    .unwrap();
+    assert!(cli.force_lock);
+    assert!(cli.dangerously_steal_live_lock);
+    assert_eq!(cli.lock_force(), LockForce::EvenIfLive);
+}
+
 #[test]
 fn parses_status() {
     let cli = Cli::try_parse_from(["kranz", "status"]).unwrap();

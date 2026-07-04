@@ -6,7 +6,7 @@ use kranz_engine::backend_mock::{
     mock_denied, mock_init, mock_result_text, mock_text, mock_tool_use, MockBackend, MockScript,
 };
 use kranz_engine::control::{self, ControlWatcher};
-use kranz_engine::event_log::EventLog;
+use kranz_engine::event_log::{EventLog, LockForce};
 use kranz_engine::events::{Event, EventKind};
 use kranz_engine::paths::MissionPaths;
 use kranz_engine::permissions::{self, PermissionProfile};
@@ -41,7 +41,7 @@ fn paths(dir: &std::path::Path) -> MissionPaths {
 /// Acquire the log (throttle 0 → deltas flush immediately) and seed it with
 /// mission.created, as every real mission log starts.
 fn seeded_log(p: &MissionPaths) -> EventLog {
-    let mut log = EventLog::acquire(p, MISSION, Duration::from_millis(0), false).unwrap();
+    let mut log = EventLog::acquire(p, MISSION, Duration::from_millis(0), LockForce::No).unwrap();
     log.append(EventKind::MissionCreated {
         goal: "test the runner".to_string(),
         base_branch: "main".to_string(),

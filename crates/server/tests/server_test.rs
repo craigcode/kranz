@@ -8,7 +8,7 @@ use axum::http::{header, Request, StatusCode};
 use futures::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use kranz_engine::control;
-use kranz_engine::event_log::EventLog;
+use kranz_engine::event_log::{EventLog, LockForce};
 use kranz_engine::events::EventKind;
 use kranz_engine::paths::MissionPaths;
 use kranz_engine::types::{
@@ -56,7 +56,7 @@ fn sample_plan() -> Plan {
 /// Seed a 7-event mission (seq 1..=7) and release the writer lock.
 fn seed_mission(repo_root: &Path) -> MissionPaths {
     let paths = MissionPaths::new(repo_root, MISSION_ID);
-    let mut log = EventLog::acquire(&paths, MISSION_ID, Duration::ZERO, false).unwrap();
+    let mut log = EventLog::acquire(&paths, MISSION_ID, Duration::ZERO, LockForce::No).unwrap();
     log.append(EventKind::MissionCreated {
         goal: "Ship the demo".into(),
         base_branch: "main".into(),
@@ -607,7 +607,7 @@ async fn ws_snapshot_tail_state_ping_and_since_replay() {
 
     // Append two more events from the test (re-acquire the writer lock).
     {
-        let mut log = EventLog::acquire(&paths, MISSION_ID, Duration::ZERO, false).unwrap();
+        let mut log = EventLog::acquire(&paths, MISSION_ID, Duration::ZERO, LockForce::No).unwrap();
         log.append(EventKind::WorkerMessage {
             run_id: "run-1".into(),
             tag: "text".into(),

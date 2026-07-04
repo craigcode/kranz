@@ -2,7 +2,7 @@
 
 use chrono::Utc;
 use kranz_engine::error::EngineError;
-use kranz_engine::event_log::EventLog;
+use kranz_engine::event_log::{EventLog, LockForce};
 use kranz_engine::events::{Event, EventKind};
 use kranz_engine::paths::MissionPaths;
 use std::io::Write;
@@ -48,6 +48,42 @@ fn raw_event(seq: u64, kind: EventKind) -> String {
     .unwrap()
 }
 
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// A real, live child process (`sleep 300`) whose pid can be planted in a
+/// lock file. Killed and reaped on drop so no test leaks a sleeper.
+#[cfg(unix)]
+struct LiveHolder(std::process::Child);
+
+#[cfg(unix)]
+impl LiveHolder {
+    fn spawn() -> Self {
+        LiveHolder(
+            std::process::Command::new("sleep")
+                .arg("300")
+                .spawn()
+                .expect("spawn sleep child"),
+        )
+    }
+
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for LiveHolder {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Locking
 // ---------------------------------------------------------------------------
@@ -56,14 +92,26 @@ fn raw_event(seq: u64, kind: EventKind) -> String {
 fn acquire_creates_dirs_and_lock() {
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
-    let log = EventLog::acquire(&p, MISSION, NEVER, false).unwrap();
+    let before = now_epoch_secs();
+    let log = EventLog::acquire(&p, MISSION, NEVER, LockForce::No).unwrap();
 
     assert!(p.mission_dir().is_dir());
     assert!(p.runs_dir().is_dir());
     assert!(p.control_dir().is_dir());
     assert!(p.lock_file().is_file());
-    let pid = std::fs::read_to_string(p.lock_file()).unwrap();
-    assert_eq!(pid, std::process::id().to_string());
+    // Two-line lock format: pid, then acquire time (unix epoch secs).
+    let contents = std::fs::read_to_string(p.lock_file()).unwrap();
+    let mut lines = contents.lines();
+    assert_eq!(lines.next().unwrap(), std::process::id().to_string());
+    let acquired: u64 = lines
+        .next()
+        .expect("second lock line: acquire epoch secs")
+        .parse()
+        .expect("acquire time must be an integer");
+    assert!(
+        acquired >= before && acquired <= now_epoch_secs(),
+        "acquire time {acquired} outside [{before}, now]"
+    );
     assert_eq!(log.last_seq(), 0);
 }
 
@@ -71,9 +119,9 @@ fn acquire_creates_dirs_and_lock() {
 fn second_acquire_fails_with_lock_held_naming_pid() {
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
-    let _held = EventLog::acquire(&p, MISSION, NEVER, false).unwrap();
+    let _held = EventLog::acquire(&p, MISSION, NEVER, LockForce::No).unwrap();
 
-    let err = EventLog::acquire(&p, MISSION, NEVER, false).unwrap_err();
+    let err = EventLog::acquire(&p, MISSION, NEVER, LockForce::No).unwrap_err();
     match err {
         EngineError::LockHeld(msg) => {
             assert!(
@@ -85,13 +133,24 @@ fn second_acquire_fails_with_lock_held_naming_pid() {
     }
 }
 
+/// The holder here is OUR OWN (live) pid, so only the strongest tier may
+/// steal: `IfNotLive` (the old --force-lock) must now refuse a live holder.
 #[test]
-fn force_steals_lock() {
+fn even_if_live_steals_lock_from_live_holder_if_not_live_refuses() {
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
-    let first = EventLog::acquire(&p, MISSION, NEVER, false).unwrap();
+    let first = EventLog::acquire(&p, MISSION, NEVER, LockForce::No).unwrap();
 
-    let mut stolen = EventLog::acquire(&p, MISSION, NEVER, true).unwrap();
+    let err = EventLog::acquire(&p, MISSION, NEVER, LockForce::IfNotLive).unwrap_err();
+    match err {
+        EngineError::LockHeld(msg) => assert!(
+            msg.contains("dangerously-steal-live-lock"),
+            "live-holder refusal must point at the stronger flag: {msg}"
+        ),
+        other => panic!("expected LockHeld, got {other:?}"),
+    }
+
+    let mut stolen = EventLog::acquire(&p, MISSION, NEVER, LockForce::EvenIfLive).unwrap();
     stolen.append(lifecycle("after steal")).unwrap();
     drop(first);
     drop(stolen);
@@ -104,12 +163,12 @@ fn force_steals_lock() {
 fn drop_removes_lock_file() {
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
-    let log = EventLog::acquire(&p, MISSION, NEVER, false).unwrap();
+    let log = EventLog::acquire(&p, MISSION, NEVER, LockForce::No).unwrap();
     assert!(p.lock_file().exists());
     drop(log);
     assert!(!p.lock_file().exists());
     // Reacquire works after release.
-    let _again = EventLog::acquire(&p, MISSION, NEVER, false).unwrap();
+    let _again = EventLog::acquire(&p, MISSION, NEVER, LockForce::No).unwrap();
 }
 
 #[test]
@@ -117,14 +176,14 @@ fn failed_acquire_releases_lock() {
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
     {
-        let mut log = EventLog::acquire(&p, MISSION, NEVER, false).unwrap();
+        let mut log = EventLog::acquire(&p, MISSION, NEVER, LockForce::No).unwrap();
         log.append(lifecycle("hello")).unwrap();
     }
     // Wrong mission id: acquire must fail AND must not leave the lock behind.
-    let err = EventLog::acquire(&p, "m-other", NEVER, false).unwrap_err();
+    let err = EventLog::acquire(&p, "m-other", NEVER, LockForce::No).unwrap_err();
     assert!(matches!(err, EngineError::InvalidState(_)), "got {err:?}");
     assert!(!p.lock_file().exists());
-    let _ok = EventLog::acquire(&p, MISSION, NEVER, false).unwrap();
+    let _ok = EventLog::acquire(&p, MISSION, NEVER, LockForce::No).unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -135,7 +194,7 @@ fn failed_acquire_releases_lock() {
 fn append_assigns_contiguous_seq_and_round_trips() {
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
-    let mut log = EventLog::acquire(&p, MISSION, NEVER, false).unwrap();
+    let mut log = EventLog::acquire(&p, MISSION, NEVER, LockForce::No).unwrap();
 
     let e1 = log.append(lifecycle("one")).unwrap();
     let e2 = log.append(lifecycle("two")).unwrap();
@@ -165,7 +224,7 @@ fn append_assigns_contiguous_seq_and_round_trips() {
 fn lifecycle_events_are_durable_immediately() {
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
-    let mut log = EventLog::acquire(&p, MISSION, NEVER, false).unwrap();
+    let mut log = EventLog::acquire(&p, MISSION, NEVER, LockForce::No).unwrap();
 
     log.append(lifecycle("durable")).unwrap();
     // No flush(), no drop: a lifecycle append is already on disk (fsynced).
@@ -178,7 +237,7 @@ fn lifecycle_events_are_durable_immediately() {
 fn deltas_buffer_and_lifecycle_drains_in_order() {
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
-    let mut log = EventLog::acquire(&p, MISSION, NEVER, false).unwrap();
+    let mut log = EventLog::acquire(&p, MISSION, NEVER, LockForce::No).unwrap();
 
     log.append(lifecycle("L1")).unwrap();
     log.append(delta("d1")).unwrap();
@@ -209,7 +268,7 @@ fn deltas_buffer_and_lifecycle_drains_in_order() {
 fn throttle_flushes_buffer_by_age() {
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
-    let mut log = EventLog::acquire(&p, MISSION, Duration::from_millis(30), false).unwrap();
+    let mut log = EventLog::acquire(&p, MISSION, Duration::from_millis(30), LockForce::No).unwrap();
 
     log.append(delta("d1")).unwrap();
     assert_eq!(
@@ -229,7 +288,7 @@ fn throttle_flushes_buffer_by_age() {
 fn explicit_flush_drains_buffer() {
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
-    let mut log = EventLog::acquire(&p, MISSION, NEVER, false).unwrap();
+    let mut log = EventLog::acquire(&p, MISSION, NEVER, LockForce::No).unwrap();
 
     log.append(delta("d1")).unwrap();
     assert_eq!(EventLog::read_events(&p.events_file()).unwrap().len(), 0);
@@ -242,7 +301,7 @@ fn drop_flushes_buffered_deltas() {
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
     {
-        let mut log = EventLog::acquire(&p, MISSION, NEVER, false).unwrap();
+        let mut log = EventLog::acquire(&p, MISSION, NEVER, LockForce::No).unwrap();
         log.append(delta("d1")).unwrap();
         log.append(delta("d2")).unwrap();
     } // dropped without flush()
@@ -257,11 +316,11 @@ fn reacquire_resumes_seq_from_existing_log() {
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
     {
-        let mut log = EventLog::acquire(&p, MISSION, NEVER, false).unwrap();
+        let mut log = EventLog::acquire(&p, MISSION, NEVER, LockForce::No).unwrap();
         log.append(lifecycle("one")).unwrap();
         log.append(lifecycle("two")).unwrap();
     }
-    let mut log = EventLog::acquire(&p, MISSION, NEVER, false).unwrap();
+    let mut log = EventLog::acquire(&p, MISSION, NEVER, LockForce::No).unwrap();
     assert_eq!(log.last_seq(), 2);
     let e = log.append(lifecycle("three")).unwrap();
     assert_eq!(e.seq, 3);
@@ -363,14 +422,14 @@ fn reacquire_truncates_torn_final_line_without_newline() {
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
     {
-        let mut log = EventLog::acquire(&p, MISSION, NEVER, false).unwrap();
+        let mut log = EventLog::acquire(&p, MISSION, NEVER, LockForce::No).unwrap();
         log.append(lifecycle("one")).unwrap();
         log.append(lifecycle("two")).unwrap();
     }
     // Crash mid-append: a partial line with no trailing newline.
     append_raw_bytes(&p.events_file(), br#"{"seq":3,"ts":"2026-01-01T00:0"#);
 
-    let mut log = EventLog::acquire(&p, MISSION, NEVER, false).unwrap();
+    let mut log = EventLog::acquire(&p, MISSION, NEVER, LockForce::No).unwrap();
     assert_eq!(log.last_seq(), 2, "torn line must not count toward seq");
     log.append(lifecycle("three")).unwrap();
     log.append(lifecycle("four")).unwrap();
@@ -387,14 +446,14 @@ fn reacquire_truncates_torn_final_line_with_newline() {
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
     {
-        let mut log = EventLog::acquire(&p, MISSION, NEVER, false).unwrap();
+        let mut log = EventLog::acquire(&p, MISSION, NEVER, LockForce::No).unwrap();
         log.append(lifecycle("one")).unwrap();
         log.append(lifecycle("two")).unwrap();
     }
     // Garbage final line that did get its newline out before the crash.
     append_raw_bytes(&p.events_file(), b"{\"seq\":3,\"ts\":\"2026-01-01T00:0\n");
 
-    let mut log = EventLog::acquire(&p, MISSION, NEVER, false).unwrap();
+    let mut log = EventLog::acquire(&p, MISSION, NEVER, LockForce::No).unwrap();
     assert_eq!(log.last_seq(), 2);
     log.append(lifecycle("three")).unwrap();
     log.append(lifecycle("four")).unwrap();
@@ -417,7 +476,7 @@ fn reacquire_repairs_valid_final_line_missing_its_newline() {
     write!(f, "{}", raw_event(2, lifecycle("b"))).unwrap(); // no '\n'
     drop(f);
 
-    let mut log = EventLog::acquire(&p, MISSION, NEVER, false).unwrap();
+    let mut log = EventLog::acquire(&p, MISSION, NEVER, LockForce::No).unwrap();
     assert_eq!(log.last_seq(), 2, "unterminated valid line must survive");
     log.append(lifecycle("c")).unwrap();
     drop(log);
@@ -433,7 +492,7 @@ fn reacquire_truncates_log_that_is_only_a_torn_line() {
     std::fs::create_dir_all(p.events_file().parent().unwrap()).unwrap();
     std::fs::write(p.events_file(), b"{\"seq\":1,\"ts").unwrap();
 
-    let mut log = EventLog::acquire(&p, MISSION, NEVER, false).unwrap();
+    let mut log = EventLog::acquire(&p, MISSION, NEVER, LockForce::No).unwrap();
     assert_eq!(log.last_seq(), 0);
     log.append(lifecycle("first")).unwrap();
     drop(log);
@@ -451,7 +510,7 @@ fn torn_final_line_splitting_multibyte_char_is_dropped_on_read() {
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
     {
-        let mut log = EventLog::acquire(&p, MISSION, NEVER, false).unwrap();
+        let mut log = EventLog::acquire(&p, MISSION, NEVER, LockForce::No).unwrap();
         log.append(lifecycle("one")).unwrap();
     }
     // Tear mid multi-byte character: 0xE2 is the first byte of a 3-byte UTF-8
@@ -469,12 +528,12 @@ fn reacquire_truncates_torn_line_splitting_multibyte_char() {
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
     {
-        let mut log = EventLog::acquire(&p, MISSION, NEVER, false).unwrap();
+        let mut log = EventLog::acquire(&p, MISSION, NEVER, LockForce::No).unwrap();
         log.append(lifecycle("one")).unwrap();
     }
     append_raw_bytes(&p.events_file(), b"{\"seq\":2,\"ts\":\"2026\xE2");
 
-    let mut log = EventLog::acquire(&p, MISSION, NEVER, false).unwrap();
+    let mut log = EventLog::acquire(&p, MISSION, NEVER, LockForce::No).unwrap();
     assert_eq!(log.last_seq(), 1);
     log.append(lifecycle("two")).unwrap();
     drop(log);
@@ -488,7 +547,7 @@ fn read_events_after_returns_suffix() {
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
     {
-        let mut log = EventLog::acquire(&p, MISSION, NEVER, false).unwrap();
+        let mut log = EventLog::acquire(&p, MISSION, NEVER, LockForce::No).unwrap();
         for i in 1..=5 {
             log.append(lifecycle(&format!("e{i}"))).unwrap();
         }
@@ -502,28 +561,178 @@ fn read_events_after_returns_suffix() {
     assert!(none.is_empty());
 }
 
-/// A lock whose recorded holder is provably dead is stale: acquire succeeds
-/// without force. A lock held by a live pid (our own) still refuses.
+/// A lock whose recorded holder is provably dead is stale: EVERY tier steals
+/// it, force flags not required. (Legacy one-line pid-only lock format —
+/// compat is exercised at the same time.)
 #[cfg(unix)]
 #[test]
-fn stale_lock_from_dead_holder_is_stolen_without_force() {
+fn dead_holder_lock_is_stolen_at_every_tier() {
     let tmp = tempfile::tempdir().unwrap();
     let paths = MissionPaths::new(tmp.path(), "m-lock");
     std::fs::create_dir_all(paths.mission_dir()).unwrap();
 
-    // i32::MAX exceeds every real pid space: kill(_, 0) -> ESRCH -> dead.
-    std::fs::write(paths.lock_file(), i32::MAX.to_string()).unwrap();
-    let log = EventLog::acquire(&paths, "m-lock", Duration::from_millis(50), false)
-        .expect("dead holder means stale lock; acquire must steal it");
+    for force in [LockForce::No, LockForce::IfNotLive, LockForce::EvenIfLive] {
+        // i32::MAX exceeds every real pid space: kill(_, 0) -> ESRCH -> dead.
+        std::fs::write(paths.lock_file(), i32::MAX.to_string()).unwrap();
+        let log = EventLog::acquire(&paths, "m-lock", Duration::from_millis(50), force)
+            .unwrap_or_else(|e| panic!("dead holder must be stolen at tier {force:?}: {e}"));
+        drop(log); // releases the lock for the next tier's fixture
+    }
+}
+
+/// A lock held by a provably ALIVE process (a real spawned child): `No` and
+/// `IfNotLive` refuse — with tier-specific guidance — and only
+/// `EvenIfLive` steals.
+#[cfg(unix)]
+#[test]
+fn alive_holder_lock_needs_the_dangerous_tier() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = MissionPaths::new(tmp.path(), "m-lock");
+    std::fs::create_dir_all(paths.mission_dir()).unwrap();
+
+    let holder = LiveHolder::spawn();
+    // Legacy one-line format: liveness still probes, reuse screen is skipped.
+    std::fs::write(paths.lock_file(), holder.pid().to_string()).unwrap();
+
+    let err =
+        EventLog::acquire(&paths, "m-lock", Duration::from_millis(50), LockForce::No).unwrap_err();
+    match err {
+        EngineError::LockHeld(msg) => assert!(
+            msg.contains("--force-lock") && msg.contains(&holder.pid().to_string()),
+            "no-force refusal keeps today's message shape: {msg}"
+        ),
+        other => panic!("expected LockHeld, got {other:?}"),
+    }
+
+    let err = EventLog::acquire(&paths, "m-lock", Duration::from_millis(50), LockForce::IfNotLive)
+        .unwrap_err();
+    match err {
+        EngineError::LockHeld(msg) => {
+            assert!(msg.contains("ALIVE"), "must say the holder is alive: {msg}");
+            assert!(
+                msg.contains(&format!("ps -p {}", holder.pid())),
+                "must suggest identifying the holder: {msg}"
+            );
+            assert!(
+                msg.contains("--dangerously-steal-live-lock"),
+                "must name the stronger flag: {msg}"
+            );
+        }
+        other => panic!("expected LockHeld, got {other:?}"),
+    }
+
+    let log = EventLog::acquire(&paths, "m-lock", Duration::from_millis(50), LockForce::EvenIfLive)
+        .expect("EvenIfLive must steal even from a live holder");
     drop(log);
+    drop(holder);
+}
 
-    // Our own (live) pid is honored: LockHeld without force.
-    std::fs::write(paths.lock_file(), std::process::id().to_string()).unwrap();
-    let err = EventLog::acquire(&paths, "m-lock", Duration::from_millis(50), false).unwrap_err();
-    assert!(matches!(err, kranz_engine::error::EngineError::LockHeld(_)));
+/// Indeterminate liveness (garbage pid in the lock file): `No` refuses with
+/// today's message; both force tiers steal — --force-lock keeps its
+/// historical meaning where liveness cannot be probed.
+#[test]
+fn unknown_holder_lock_yields_to_any_force_tier() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = MissionPaths::new(tmp.path(), "m-lock");
+    std::fs::create_dir_all(paths.mission_dir()).unwrap();
 
-    // Unparseable holder stays conservative too.
     std::fs::write(paths.lock_file(), "not-a-pid").unwrap();
-    let err = EventLog::acquire(&paths, "m-lock", Duration::from_millis(50), false).unwrap_err();
-    assert!(matches!(err, kranz_engine::error::EngineError::LockHeld(_)));
+    let err =
+        EventLog::acquire(&paths, "m-lock", Duration::from_millis(50), LockForce::No).unwrap_err();
+    match err {
+        EngineError::LockHeld(msg) => assert!(
+            msg.contains("--force-lock"),
+            "unknown-holder refusal mentions --force-lock: {msg}"
+        ),
+        other => panic!("expected LockHeld, got {other:?}"),
+    }
+
+    for force in [LockForce::IfNotLive, LockForce::EvenIfLive] {
+        std::fs::write(paths.lock_file(), "not-a-pid").unwrap();
+        let log = EventLog::acquire(&paths, "m-lock", Duration::from_millis(50), force)
+            .unwrap_or_else(|e| panic!("unknown holder must yield to {force:?}: {e}"));
+        drop(log);
+    }
+
+    // Non-positive pids are equally unprobeable: Unknown, not Dead.
+    std::fs::write(paths.lock_file(), "-7").unwrap();
+    let err =
+        EventLog::acquire(&paths, "m-lock", Duration::from_millis(50), LockForce::No).unwrap_err();
+    assert!(matches!(err, EngineError::LockHeld(_)));
+}
+
+/// PID-REUSE DETECTION: a holder pid that is alive but whose process started
+/// AFTER the lock's recorded acquire time cannot be the engine that wrote the
+/// lock — the pid was recycled, the writer is dead, and ALL tiers steal.
+/// Start-time probing is implemented on linux (/proc) and macOS (ps etime).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn reused_pid_lock_is_stale_at_every_tier() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = MissionPaths::new(tmp.path(), "m-lock");
+    std::fs::create_dir_all(paths.mission_dir()).unwrap();
+
+    let holder = LiveHolder::spawn();
+    for force in [LockForce::No, LockForce::IfNotLive, LockForce::EvenIfLive] {
+        // Lock "acquired" an hour before the child started: provable reuse.
+        std::fs::write(
+            paths.lock_file(),
+            format!("{}\n{}\n", holder.pid(), now_epoch_secs() - 3600),
+        )
+        .unwrap();
+        let log = EventLog::acquire(&paths, "m-lock", Duration::from_millis(50), force)
+            .unwrap_or_else(|e| panic!("reused pid means dead writer; {force:?} must steal: {e}"));
+        drop(log);
+    }
+    drop(holder);
+}
+
+/// The inverse guard: an acquire time at/after the holder's start (here:
+/// stamped in the future) proves nothing — the holder counts as plain ALIVE
+/// and `IfNotLive` keeps refusing. A reuse probe must never demote a live
+/// holder on ambiguous timestamps.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn holder_older_than_lock_stays_alive_and_refuses_force_lock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = MissionPaths::new(tmp.path(), "m-lock");
+    std::fs::create_dir_all(paths.mission_dir()).unwrap();
+
+    let holder = LiveHolder::spawn();
+    // Acquired "in the future": start < acquired + slack, so NOT a reuse.
+    std::fs::write(
+        paths.lock_file(),
+        format!("{}\n{}\n", holder.pid(), now_epoch_secs() + 60),
+    )
+    .unwrap();
+
+    let err =
+        EventLog::acquire(&paths, "m-lock", Duration::from_millis(50), LockForce::No).unwrap_err();
+    assert!(matches!(err, EngineError::LockHeld(_)));
+    let err = EventLog::acquire(&paths, "m-lock", Duration::from_millis(50), LockForce::IfNotLive)
+        .unwrap_err();
+    match err {
+        EngineError::LockHeld(msg) => {
+            assert!(msg.contains("ALIVE"), "alive holder refusal: {msg}")
+        }
+        other => panic!("expected LockHeld, got {other:?}"),
+    }
+    drop(holder);
+}
+
+/// A two-line lock whose second line is garbage degrades to the legacy
+/// behavior: acquire time unknown, alive holder is plain Alive.
+#[cfg(unix)]
+#[test]
+fn garbage_acquire_time_degrades_to_plain_liveness() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = MissionPaths::new(tmp.path(), "m-lock");
+    std::fs::create_dir_all(paths.mission_dir()).unwrap();
+
+    let holder = LiveHolder::spawn();
+    std::fs::write(paths.lock_file(), format!("{}\nnot-a-time\n", holder.pid())).unwrap();
+    let err = EventLog::acquire(&paths, "m-lock", Duration::from_millis(50), LockForce::IfNotLive)
+        .unwrap_err();
+    assert!(matches!(err, EngineError::LockHeld(_)), "got {err:?}");
+    drop(holder);
 }

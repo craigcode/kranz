@@ -1,6 +1,7 @@
 //! clap derive surface of the `kranz` binary (plan §5 Phase 1-2).
 
 use clap::{Parser, Subcommand};
+use kranz_engine::event_log::LockForce;
 use std::path::PathBuf;
 
 /// Long help for `kranz msg` (plan §4.5): the queue/interrupt semantics must
@@ -27,9 +28,18 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "ID")]
     pub mission: Option<String>,
 
-    /// Steal a stale engine lock left behind by a crashed engine process
+    /// Steal the engine lock unless its holder is provably ALIVE (a lock
+    /// whose holder is provably dead is stolen automatically, without this
+    /// flag; a live holder additionally needs --dangerously-steal-live-lock)
     #[arg(long, global = true)]
     pub force_lock: bool,
+
+    /// DANGEROUS: steal the engine lock even from a provably LIVE holder
+    /// (implies --force-lock). Only for a holder you have verified — e.g. via
+    /// `ps -p <pid>` — to be a zombie or foreign process: stealing from a
+    /// running kranz engine lets two engines corrupt one event log.
+    #[arg(long, global = true, hide_short_help = true)]
+    pub dangerously_steal_live_lock: bool,
 
     /// DANGEROUS: bypass all permission gating for every agent session
     /// (bypassPermissions). Loud, never the default.
@@ -38,6 +48,21 @@ pub struct Cli {
 
     #[command(subcommand)]
     pub command: Command,
+}
+
+impl Cli {
+    /// Map the two lock flags onto the engine's [`LockForce`] tier. Passing
+    /// both is fine — the strongest wins (--dangerously-steal-live-lock
+    /// implies --force-lock).
+    pub fn lock_force(&self) -> LockForce {
+        if self.dangerously_steal_live_lock {
+            LockForce::EvenIfLive
+        } else if self.force_lock {
+            LockForce::IfNotLive
+        } else {
+            LockForce::No
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -88,7 +113,9 @@ pub enum Command {
     /// Appends `mission.abandoned` to the event log and stops here — git
     /// branches, tags, and the deliverable are left untouched. A mission that
     /// is already terminal (Complete/Failed/Abandoned) is rejected. If a live
-    /// engine still holds the mission lock, stop it first or pass --force-lock.
+    /// engine still holds the mission lock, stop it first; --force-lock
+    /// steals only a lock whose holder is not provably alive, and
+    /// --dangerously-steal-live-lock steals even a live one.
     Abandon {
         /// The mission id (defaults to the global --mission / auto-selection)
         id: Option<String>,

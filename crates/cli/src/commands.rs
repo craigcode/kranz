@@ -16,7 +16,7 @@ use kranz_engine::backend_claude::ClaudeBackend;
 use kranz_engine::config;
 use kranz_engine::control;
 use kranz_engine::cost;
-use kranz_engine::event_log::EventLog;
+use kranz_engine::event_log::{EventLog, LockForce};
 use kranz_engine::orchestrator::{self, MissionEngine, PlanRequest};
 use kranz_engine::paths::MissionPaths;
 use kranz_engine::reducer;
@@ -30,6 +30,7 @@ use std::time::{Duration, SystemTime};
 /// Parse-level entry point: resolve the repo, print the danger banner when
 /// requested, dispatch the subcommand, and return the process exit code.
 pub async fn run_cli(cli: Cli) -> Result<i32> {
+    let lock_force = cli.lock_force();
     let repo = match cli.repo {
         Some(repo) => repo,
         None => std::env::current_dir().context("cannot determine the current directory")?,
@@ -41,13 +42,13 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
     match cli.command {
         Command::Plan { goal } => {
             let cfg = load_config(&repo, cli.dangerously_allow_all)?;
-            cmd_plan(repo, goal, cfg, cli.mission.as_deref(), cli.force_lock)
+            cmd_plan(repo, goal, cfg, cli.mission.as_deref(), lock_force)
                 .await
                 .map_err(augment_limit_hint)
         }
         Command::Run => {
             let mission = select_mission(&repo, cli.mission.as_deref())?;
-            cmd_run(repo, mission, cli.force_lock, cli.dangerously_allow_all)
+            cmd_run(repo, mission, lock_force, cli.dangerously_allow_all)
                 .await
                 .map_err(augment_limit_hint)
         }
@@ -97,7 +98,7 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             // back to the usual auto-selection.
             let mission = select_mission(&repo, id.as_deref().or(cli.mission.as_deref()))?;
             let reason = reason.as_deref().unwrap_or("abandoned by operator");
-            cmd_abandon(&repo, &mission, reason, cli.force_lock)?;
+            cmd_abandon(&repo, &mission, reason, lock_force)?;
             println!("mission {mission} ABANDONED ({reason})");
             Ok(0)
         }
@@ -392,7 +393,7 @@ async fn cmd_plan(
     goal: Option<String>,
     cfg: MissionConfig,
     explicit_mission: Option<&str>,
-    force_lock: bool,
+    force_lock: LockForce,
 ) -> Result<i32> {
     let backend = build_backend(&cfg)?;
     let (mut engine, intro) = match goal {
@@ -602,7 +603,7 @@ async fn start_run_after_plan(repo: PathBuf, mission_id: String) -> Result<i32> 
         "starting mission {mission_id} — live event feed follows \
          (Ctrl-C safe; resume with 'kranz run')"
     );
-    run_mission_loop(repo, mission_id, false, true).await
+    run_mission_loop(repo, mission_id, LockForce::No, true).await
 }
 
 /// Print an orchestrator reply, each line under a dim `orchestrator>` prefix.
@@ -626,7 +627,7 @@ fn print_orchestrator_reply(text: &str, tty: bool) {
 async fn cmd_run(
     repo: PathBuf,
     mission: String,
-    force_lock: bool,
+    force_lock: LockForce,
     dangerously_allow_all: bool,
 ) -> Result<i32> {
     // The mission's own config lives in the event log; the flag opts in via
@@ -649,7 +650,7 @@ async fn cmd_run(
 pub(crate) async fn run_mission_loop(
     repo: PathBuf,
     mission: String,
-    force_lock: bool,
+    force_lock: LockForce,
     // Interactive callers (`kranz run`) prompt for guidance on a blocked
     // milestone; the batch dispatcher (`kranz work`) passes false so a blocked
     // mission returns exit 2 immediately instead of hanging on stdin forever.
@@ -797,16 +798,23 @@ pub fn cmd_missions(repo: &Path) -> Result<String> {
 // ---------------------------------------------------------------------------
 
 /// Retire a mission via the engine's abandon path. Maps the engine's
-/// `LockHeld` error to an actionable hint (stop the running mission or pass
-/// --force-lock) since that is the common operator mistake.
-pub fn cmd_abandon(repo: &Path, mission_id: &str, reason: &str, force_lock: bool) -> Result<()> {
+/// `LockHeld` error to an actionable hint (stop the running mission, or pick
+/// the right lock-steal tier) since that is the common operator mistake.
+pub fn cmd_abandon(
+    repo: &Path,
+    mission_id: &str,
+    reason: &str,
+    force_lock: LockForce,
+) -> Result<()> {
     require_mission(repo, mission_id)?;
     orchestrator::abandon_mission(repo, mission_id, reason, force_lock).map_err(|e| {
         if matches!(e, kranz_engine::error::EngineError::LockHeld(_)) {
             anyhow!(
-                "cannot abandon mission '{mission_id}' — a running engine still holds its \
-                 lock. Stop the running `kranz run` first, or pass --force-lock if you are \
-                 sure the process is gone.\n  (underlying: {e})"
+                "cannot abandon mission '{mission_id}' — an engine still holds its lock. \
+                 Stop the running `kranz run` first. If the holder is a crashed leftover, \
+                 pass --force-lock (steals unless the holder is provably alive); a provably \
+                 LIVE holder that you have verified to be a zombie or foreign process \
+                 additionally requires --dangerously-steal-live-lock.\n  (underlying: {e})"
             )
         } else {
             anyhow::Error::new(e).context(format!("abandoning mission '{mission_id}'"))
