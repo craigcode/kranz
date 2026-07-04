@@ -23,7 +23,7 @@ use crate::types::TokenUsage;
 use serde_json::json;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use tokio::sync::Notify;
+use tokio::sync::{watch, Notify};
 
 // ---------------------------------------------------------------------------
 // Script
@@ -44,6 +44,15 @@ pub struct MockScript {
     pub streaming: bool,
     /// Session id override; defaults to `spec.session_id`.
     pub session_id: Option<String>,
+    /// Rendezvous: withhold this script's FINAL scripted event (for a
+    /// single-shot run, its `Result`) until at least this many sessions have
+    /// been started backend-wide. Makes wall-clock-overlap tests
+    /// deterministic: a held session provably cannot finish before its peers
+    /// start, so peak-concurrency assertions are exact — and if the engine
+    /// ever dispatches sequentially, the rendezvous deadlocks into the
+    /// test's timeout instead of flaky-passing. Meaningful for single-shot
+    /// scripts (streaming sessions end via `abort`, not a final event).
+    pub hold_result_until_started: Option<usize>,
 }
 
 impl Default for MockScript {
@@ -54,6 +63,7 @@ impl Default for MockScript {
             exit: SessionExit::Completed,
             streaming: false,
             session_id: None,
+            hold_result_until_started: None,
         }
     }
 }
@@ -110,6 +120,13 @@ impl MockScript {
     /// (defaults to `spec.session_id`).
     pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
         self.session_id = Some(session_id.into());
+        self
+    }
+
+    /// Rendezvous (see [`MockScript::hold_result_until_started`]): withhold
+    /// the final scripted event until `n` sessions have started.
+    pub fn rendezvous(mut self, n: usize) -> Self {
+        self.hold_result_until_started = Some(n);
         self
     }
 }
@@ -263,13 +280,26 @@ pub fn mock_result_json(value: &serde_json::Value) -> AgentEvent {
 /// Scripted [`AgentBackend`]: `start()` pops scripts FIFO and records every
 /// spec it saw. Injected user messages are recorded per session, aligned with
 /// start order.
-#[derive(Default)]
 pub struct MockBackend {
     scripts: Mutex<VecDeque<MockScript>>,
     started_specs: Mutex<Vec<SessionSpec>>,
     /// Shared with sessions: `injected[i]` are the messages injected into the
     /// i-th started session.
     injected: Arc<Mutex<Vec<Vec<String>>>>,
+    /// Count of sessions started, observable by parked rendezvous sessions
+    /// (see [`MockScript::hold_result_until_started`]).
+    started_count: watch::Sender<usize>,
+}
+
+impl Default for MockBackend {
+    fn default() -> Self {
+        MockBackend {
+            scripts: Mutex::new(VecDeque::new()),
+            started_specs: Mutex::new(Vec::new()),
+            injected: Arc::new(Mutex::new(Vec::new())),
+            started_count: watch::channel(0).0,
+        }
+    }
 }
 
 impl MockBackend {
@@ -317,6 +347,7 @@ impl AgentBackend for MockBackend {
         let session_id =
             script.session_id.clone().unwrap_or_else(|| spec.session_id.clone());
         self.started_specs.lock().expect("mock specs lock").push(spec.clone());
+        self.started_count.send_modify(|count| *count += 1);
 
         Ok(Box::new(MockSession {
             spec,
@@ -329,6 +360,8 @@ impl AgentBackend for MockBackend {
             notify: Notify::new(),
             injected: Arc::clone(&self.injected),
             slot,
+            hold_result_until_started: script.hold_result_until_started,
+            started_count: self.started_count.subscribe(),
         }))
     }
 }
@@ -355,6 +388,11 @@ pub struct MockSession {
     notify: Notify,
     injected: Arc<Mutex<Vec<Vec<String>>>>,
     slot: usize,
+    /// Rendezvous (see [`MockScript::hold_result_until_started`]): while
+    /// `Some(n)` and only the final event remains, `next_event` parks until
+    /// `started_count` reaches `n`, then clears itself.
+    hold_result_until_started: Option<usize>,
+    started_count: watch::Receiver<usize>,
 }
 
 #[async_trait::async_trait]
@@ -372,6 +410,22 @@ impl AgentSession for MockSession {
                 // Closed (aborted or already finished). Abort drops any
                 // still-pending events, matching process-kill semantics.
                 return Ok(None);
+            }
+            // Rendezvous: the FINAL scripted event is withheld until enough
+            // sessions have started (deterministic wall-clock overlap).
+            if let Some(n) = self.hold_result_until_started {
+                if self.pending.len() == 1 {
+                    while *self.started_count.borrow() < n {
+                        if self.started_count.changed().await.is_err() {
+                            return Err(EngineError::Backend(format!(
+                                "mock: rendezvous({n}) abandoned — backend dropped with only \
+                                 {} session(s) started",
+                                *self.started_count.borrow()
+                            )));
+                        }
+                    }
+                    self.hold_result_until_started = None;
+                }
             }
             if let Some(event) = self.pending.pop_front() {
                 return Ok(Some(event));

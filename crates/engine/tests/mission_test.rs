@@ -2028,10 +2028,18 @@ async fn parallel_batch_runs_both_features_and_leaks_no_worktrees() {
 }
 
 /// Wall-clock overlap (roadmap M3 "done when"): the two worker SESSIONS run at
-/// the same time, not one-at-a-time. Proven WITHOUT touching the mock backend:
-/// the engine's own peak-concurrency tracker records how many worker sessions
-/// were live simultaneously and surfaces it in the batch summary decision. With
-/// max_parallel_workers=2 and two independent features, the peak is 2.
+/// the same time, not one-at-a-time. The engine's own peak-concurrency tracker
+/// records how many worker sessions were live simultaneously and surfaces it
+/// in the batch summary decision; with max_parallel_workers=2 and two
+/// independent features, the peak is 2.
+///
+/// The overlap is DETERMINISTIC, not scheduler-dependent: each worker script
+/// carries a rendezvous — its Result is withheld until 3 sessions have
+/// started (orchestrator + both workers) — so neither worker can finish
+/// before the other starts, on any runner load. (Without the rendezvous this
+/// test flaked on slow CI runners: both workers ran back-to-back and the peak
+/// read 1. With it, a sequential-dispatch regression deadlocks into the
+/// timeout below instead of flaky-passing.)
 ///
 /// The single-writer invariant still holds around that overlap: the resulting
 /// events.jsonl has CONTIGUOUS seq (read_events refuses gaps), both workers'
@@ -2044,15 +2052,16 @@ async fn parallel_batch_sessions_overlap_in_wall_clock() {
     let (_dir, root) = init_repo();
 
     // Same script shape as the leak test: orchestrator first (parallel plan +
-    // two judgements), then the two feature workers.
+    // two judgements), then the two feature workers, rendezvoused so both must
+    // be live at once.
     let backend = Arc::new(MockBackend::with_scripts(vec![
         orch_script(vec![
             parallel_plan(&["f-1-1", "f-1-2"]),
             judgement("complete", ""),
             judgement("complete", ""),
         ]),
-        worker_pass(),
-        worker_pass(),
+        worker_pass().rendezvous(3),
+        worker_pass().rendezvous(3),
     ]));
 
     let cfg = MissionConfig { max_parallel_workers: 2, ..test_cfg() };
