@@ -48,11 +48,35 @@ Denied tool results are tagged `denied` on `worker.message` events.
 ## Cross-process control
 
 Single writer rule (§4.3): only the engine process appends `events.jsonl`
-(exclusive `events.jsonl.lock` with pid). CLI (`kranz msg/pause/resume`) and the
+(exclusive `events.jsonl.lock`, two lines: holder pid + acquire time as unix
+epoch seconds; the legacy one-line pid-only format still parses). CLI
+(`kranz msg/pause/resume`) and the
 server enqueue `ControlCommand` JSON files into
 `.kranz/missions/<id>/control/<millis>-<rand>.json`; the engine drains the inbox
 between worker runs (and a watcher aborts the active run on `--interrupt`).
 Dashboard/CLI observe by reading `events.jsonl` + `state.json` (read-only tail).
+
+Lock stealing is tiered by the holder's probed liveness (`kill(pid, 0)` on
+unix; unprobeable elsewhere). A holder that is provably DEAD — ESRCH, or an
+alive pid whose process START time postdates the lock's acquire time by more
+than 2s (pid reuse: the writer is dead, the pid was recycled; start time via
+`/proc/<pid>/stat` on linux, `ps -o etime=` on macOS) — is stale and stolen
+automatically, no flag needed. Otherwise:
+
+| holder liveness                     | (no flag) | `--force-lock` | `--dangerously-steal-live-lock` |
+|-------------------------------------|-----------|----------------|---------------------------------|
+| dead / pid reused                   | steal     | steal          | steal                           |
+| unknown (unparseable pid, non-unix) | refuse    | steal          | steal                           |
+| provably ALIVE                      | refuse    | refuse         | steal (loud warning)            |
+
+`--force-lock` therefore can no longer rip the lock from a running engine —
+the failure mode where an operator decides a long parallel batch is "stuck"
+and corrupts it with a second engine. Stealing from a provably live holder
+requires `--dangerously-steal-live-lock` (implies `--force-lock`), reserved
+for holders verified — e.g. via `ps -p <pid>` — to be zombies or foreign
+processes. The probe must never report a false "dead": anything uncertain
+reads as unknown or alive, because a false dead lets two engines write one
+log.
 
 ## Orchestrator loop specifics (§4.5)
 

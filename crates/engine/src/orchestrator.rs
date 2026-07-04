@@ -42,7 +42,7 @@ use crate::control;
 use crate::cost;
 use crate::digest;
 use crate::error::{EngineError, Result};
-use crate::event_log::EventLog;
+use crate::event_log::{EventLog, LockForce};
 use crate::events::{Event, EventKind};
 use crate::git_ops::GitRepo;
 use crate::paths::MissionPaths;
@@ -286,11 +286,14 @@ impl MissionEngine {
         let paths = MissionPaths::new(&repo_root, &mission_id);
         write_kranz_gitignore(&paths)?;
 
+        // A brand-new mission id can never have a legitimate lock holder, so
+        // never force: a collision here is a bug worth surfacing, not one to
+        // steal through.
         let mut log = EventLog::acquire(
             &paths,
             &mission_id,
             Duration::from_millis(cfg.event_stream_throttle_ms),
-            false,
+            LockForce::No,
         )?;
 
         let base_branch = repo.current_branch()?;
@@ -322,14 +325,15 @@ impl MissionEngine {
     /// Resume an existing mission from its event log (§4.3 kill-safety).
     ///
     /// Rebuilds state by folding the log, re-acquires the single-writer lock
-    /// (`force_lock` steals a stale one), and remembers the sdk session id of
-    /// the most recent orchestrator session for `--resume`. No agent session
-    /// is started here — sessions are lazy.
+    /// (`force` selects the [`LockForce`] steal tier; a provably dead holder
+    /// is always stolen), and remembers the sdk session id of the most recent
+    /// orchestrator session for `--resume`. No agent session is started here
+    /// — sessions are lazy.
     pub fn resume(
         backend: Arc<dyn AgentBackend>,
         repo_root: impl Into<PathBuf>,
         mission_id: &str,
-        force_lock: bool,
+        force: LockForce,
     ) -> Result<Self> {
         let repo_root = canonical_root(repo_root.into());
         let repo = GitRepo::open(&repo_root)?;
@@ -354,7 +358,7 @@ impl MissionEngine {
             &paths,
             mission_id,
             Duration::from_millis(state.config.event_stream_throttle_ms),
-            force_lock,
+            force,
         )?;
 
         // Reap per-feature worktrees/branches orphaned by a crash mid parallel
@@ -3676,7 +3680,9 @@ fn write_kranz_gitignore(paths: &MissionPaths) -> Result<()> {
 ///
 /// Acquires the single-writer lock via [`EventLog::acquire`], so a live engine
 /// holding it surfaces as [`EngineError::LockHeld`] (the CLI then tells the
-/// operator to stop the running mission or pass `--force-lock`). A mission that
+/// operator to stop the running mission; `--force-lock` steals only a lock
+/// whose holder is not provably alive, `--dangerously-steal-live-lock` steals
+/// even a live one). A mission that
 /// is already terminal (Complete/Failed/Abandoned) is rejected with
 /// [`EngineError::InvalidState`] — abandoning is only meaningful for live work.
 /// On success one `mission.abandoned` event is appended, the state snapshot is
@@ -3689,7 +3695,7 @@ pub fn abandon_mission(
     repo_root: impl Into<PathBuf>,
     mission_id: &str,
     reason: &str,
-    force_lock: bool,
+    force: LockForce,
 ) -> Result<()> {
     let repo_root = canonical_root(repo_root.into());
     let paths = MissionPaths::new(&repo_root, mission_id);
@@ -3710,7 +3716,7 @@ pub fn abandon_mission(
         &paths,
         mission_id,
         Duration::from_millis(state.config.event_stream_throttle_ms),
-        force_lock,
+        force,
     )?;
     let event = log.append(EventKind::MissionAbandoned { reason: reason.to_string() })?;
     // Fold the one new event on top of the state we already have and snapshot,
@@ -3788,7 +3794,9 @@ pub fn mission_lock_is_live(paths: &MissionPaths) -> bool {
         // unreadable one is treated as live (conservative).
         return lock.exists();
     };
-    let Ok(pid) = contents.trim().parse::<i32>() else {
+    // First line is the pid; a second line (acquire time, for the event-log
+    // module's pid-reuse detection) is ignored here.
+    let Ok(pid) = contents.lines().next().unwrap_or("").trim().parse::<i32>() else {
         return true; // present but unparseable ⇒ conservatively live
     };
     if pid <= 0 {

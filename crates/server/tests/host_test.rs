@@ -18,7 +18,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use kranz_engine::backend::AgentBackend;
 use kranz_engine::backend_mock::{mock_init, mock_result_text, mock_text, MockBackend, MockScript};
-use kranz_engine::event_log::EventLog;
+use kranz_engine::event_log::{EventLog, LockForce};
 use kranz_engine::events::EventKind;
 use kranz_engine::paths::MissionPaths;
 use kranz_engine::types::MissionConfig;
@@ -213,7 +213,7 @@ async fn wait_for_status(app: &axum::Router, id: &str, status: &str) {
 /// Seed a minimal readable mission log (no git needed).
 fn seed_mission_log(repo_root: &Path, id: &str) {
     let paths = MissionPaths::new(repo_root, id);
-    let mut log = EventLog::acquire(&paths, id, Duration::ZERO, false).unwrap();
+    let mut log = EventLog::acquire(&paths, id, Duration::ZERO, LockForce::No).unwrap();
     log.append(EventKind::MissionCreated {
         goal: "observe".into(),
         base_branch: "main".into(),

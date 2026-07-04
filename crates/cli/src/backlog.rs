@@ -633,7 +633,13 @@ pub async fn cmd_work(repo: PathBuf, once: bool) -> Result<i32> {
 /// exit code (0 complete / 2 blocked / 1 failed). Extracted so `cmd_work` maps
 /// it to a ticket state.
 async fn drive_mission(repo: PathBuf, mission_id: &str) -> Result<i32> {
-    run_mission_loop(repo, mission_id.to_string(), false, false).await
+    run_mission_loop(
+        repo,
+        mission_id.to_string(),
+        kranz_engine::event_log::LockForce::No,
+        false,
+    )
+    .await
 }
 
 /// Map a `run_mission_loop` exit code to the ticket's terminal state (0 → Done,

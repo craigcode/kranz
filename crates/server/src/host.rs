@@ -36,6 +36,7 @@ use kranz_engine::backend_claude::ClaudeBackend;
 use kranz_engine::config;
 use kranz_engine::cost::{self, CostEstimate};
 use kranz_engine::error::EngineError;
+use kranz_engine::event_log::LockForce;
 use kranz_engine::orchestrator::{MissionEngine, PlanRequest};
 use kranz_engine::paths::MissionPaths;
 use kranz_engine::types::{MissionStatus, Plan};
@@ -246,8 +247,12 @@ impl MissionHost {
                 }
                 let cfg = config::load(&self.repo_root)?;
                 let backend = self.backend(cfg.claude_binary.as_deref()).await?;
-                let engine =
-                    Box::new(MissionEngine::resume(backend, self.repo_root.clone(), id, false)?);
+                let engine = Box::new(MissionEngine::resume(
+                    backend,
+                    self.repo_root.clone(),
+                    id,
+                    LockForce::No,
+                )?);
                 match engine.state().mission.status {
                     MissionStatus::Planning => {
                         return Err(ApiError::conflict(format!(
