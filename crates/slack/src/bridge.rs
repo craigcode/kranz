@@ -647,6 +647,19 @@ async fn dispatch_action(
                 reply_ephemeral(cfg, client, response_url.as_deref(), &not_authorized_blocks()).await;
                 return;
             }
+            // Ack IMMEDIATELY: create + the seeding planning turn take minutes,
+            // and a silently-working command reads as a dead one.
+            reply_ephemeral(
+                cfg,
+                client,
+                response_url.as_deref(),
+                &error_blocks(
+                    ":hourglass_flowing_sand: Creating the mission — the seeding planning \
+                     turn usually takes a minute or two; the planning thread will appear \
+                     in the channel.",
+                ),
+            )
+            .await;
             match new_mission(cfg, client, repo_root, threads, host, goal, channel).await {
                 Ok(blocks) => reply_ephemeral(cfg, client, response_url.as_deref(), &blocks).await,
                 Err(e) => {
