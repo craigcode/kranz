@@ -81,6 +81,10 @@ impl SlackClient {
     ) -> Result<()> {
         let payload = serde_json::json!({
             "response_type": if ephemeral { "ephemeral" } else { "in_channel" },
+            // Explicit: a block_actions response_url must never silently
+            // clobber the source message — replacement goes through
+            // `replace_original` below, deliberately.
+            "replace_original": false,
             "blocks": blocks,
         });
         self.http
@@ -91,6 +95,27 @@ impl SlackClient {
             .context("slash response_url request failed")?
             .error_for_status()
             .context("slash response_url returned an error status")?;
+        Ok(())
+    }
+
+    /// Rewrite the interactive message a button click came from (block_actions
+    /// `response_url` with `replace_original: true`). Used to retire consumed
+    /// approve buttons: the plan-review card becomes an outcome card, so a
+    /// second tap has nothing to tap.
+    pub async fn replace_original(&self, response_url: &str, blocks: &[Value]) -> Result<()> {
+        let payload = serde_json::json!({
+            "replace_original": true,
+            "response_type": "in_channel",
+            "blocks": blocks,
+        });
+        self.http
+            .post(response_url)
+            .json(&payload)
+            .send()
+            .await
+            .context("replace_original request failed")?
+            .error_for_status()
+            .context("replace_original returned an error status")?;
         Ok(())
     }
 

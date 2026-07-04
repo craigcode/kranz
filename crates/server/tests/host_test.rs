@@ -207,6 +207,43 @@ async fn wait_for_status(app: &axum::Router, id: &str, status: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// Release: an attached engine frees the single-writer lock
+// ---------------------------------------------------------------------------
+
+/// The approve-and-queue path depends on `release`: an attached engine holds
+/// the mission's single-writer lock, and without releasing it the external
+/// `kranz work` dispatcher the queue points at is refused with `LockHeld`.
+#[tokio::test]
+async fn release_frees_the_mission_lock_for_external_runners() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    seed_mission_log(&root, "m-rel");
+    let orch = MockScript::streaming(vec![mock_init("orch-rel"), mock_result_text("hello")])
+        .responding(vec![turn("still planning")]);
+    let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::with_scripts(vec![orch]));
+    let host = kranz_server::MissionHost::with_backend(root.clone(), backend);
+
+    // Attach via a planning turn: the host now holds the lock…
+    host.planning_turn("m-rel", "hi").await.expect("planning turn attaches");
+    let paths = MissionPaths::new(&root, "m-rel");
+    assert!(
+        EventLog::acquire(&paths, "m-rel", Duration::ZERO, LockForce::No).is_err(),
+        "while attached, an external acquire must be LockHeld-refused"
+    );
+
+    // …and release frees it for an external runner.
+    assert!(host.release("m-rel").expect("release"), "idle engine releases cleanly");
+    let log = EventLog::acquire(&paths, "m-rel", Duration::ZERO, LockForce::No);
+    assert!(log.is_ok(), "after release, an external acquire succeeds");
+    drop(log);
+
+    // Unknown / never-hosted missions are trivially free.
+    assert!(host.release("m-unknown").expect("release unknown"));
+}
+
+// ---------------------------------------------------------------------------
 // Mutation token (protocol "Authority: mutation token")
 // ---------------------------------------------------------------------------
 

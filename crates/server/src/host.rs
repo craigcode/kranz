@@ -293,6 +293,41 @@ impl MissionHost {
         Ok(())
     }
 
+    /// Release a hosted idle engine: drop it from the registry (flushing its
+    /// log and freeing the single-writer lock) so an EXTERNAL runner — the
+    /// `kranz work` dispatcher, a terminal `kranz plan/run` — can take the
+    /// mission over. The approve-and-QUEUE path needs this: without it the
+    /// approved engine would sit attached here holding the lock, and the very
+    /// dispatcher the queue points at would be refused with `LockHeld`.
+    ///
+    /// Returns `true` when the mission is now free of THIS host (released, or
+    /// was never hosted), `false` when it is actively running here (never
+    /// interrupted). A turn in flight is an error, mirroring the other
+    /// planning operations.
+    pub fn release(&self, id: &str) -> Result<bool, ApiError> {
+        let mut map = self.missions.lock().expect("missions registry lock");
+        match map.remove(id) {
+            None => Ok(true),
+            Some(HostedMission::Running(handle)) => {
+                let finished = handle.is_finished();
+                if !finished {
+                    map.insert(id.to_string(), HostedMission::Running(handle));
+                }
+                Ok(finished)
+            }
+            Some(HostedMission::Planning(cell)) => match Arc::try_unwrap(cell) {
+                Ok(mutex) => {
+                    drop(mutex.into_inner()); // flushes the log, frees the lock
+                    Ok(true)
+                }
+                Err(cell) => {
+                    map.insert(id.to_string(), HostedMission::Planning(cell));
+                    Err(turn_in_flight())
+                }
+            },
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Registry plumbing
     // -----------------------------------------------------------------------
