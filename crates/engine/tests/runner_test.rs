@@ -11,7 +11,8 @@ use kranz_engine::events::{Event, EventKind};
 use kranz_engine::paths::MissionPaths;
 use kranz_engine::permissions::{self, PermissionProfile};
 use kranz_engine::runner::{
-    parse_validator_report, parse_worker_report, run_session, run_validator, run_worker, RunMeta,
+    parse_validator_report, parse_worker_report, run_session, run_validator, run_worker,
+    run_worker_in_buffered, RunMeta,
 };
 use kranz_engine::types::{
     Assertion, AssertionCheck, ControlCommand, Feature, FeatureOrigin, FeatureStatus, Milestone,
@@ -921,4 +922,79 @@ fn validator_command_patterns_cover_natural_variations() {
         &["python3 -m pytest test_x.py -v".to_string()],
     );
     assert!(profile.allowed_tools.iter().any(|p| p == "Bash(python3 -m*)"));
+}
+
+// ---------------------------------------------------------------------------
+// run_worker_in_buffered (roadmap M3 wall-clock overlap)
+// ---------------------------------------------------------------------------
+
+/// The buffered worker path touches NO event log and returns the exact same
+/// event KINDS the live path would have appended, in append order — the
+/// building block the engine replays serially after a concurrent batch, so
+/// events.jsonl stays single-writer. The per-run transcript is still written
+/// live (transcripts are per-run files, not the single-writer log), and the
+/// RunOutcome matches the live path.
+#[tokio::test]
+async fn run_worker_in_buffered_collects_kinds_without_touching_the_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    let log = seeded_log(&p);
+    let cfg = MissionConfig::default();
+
+    // A worker run with a tool-use so we get a worker.message delta in the
+    // buffer as well as spawned/completed.
+    let script = MockScript {
+        events: vec![
+            mock_init("mock-session"),
+            mock_tool_use("Bash", "cargo build"),
+            mock_text(&worker_report_json().to_string()),
+            mock_result_text(&worker_report_json().to_string()),
+        ],
+        ..Default::default()
+    };
+    let backend = MockBackend::with_scripts(vec![script]);
+
+    let cwd = p.repo_root.clone();
+    let (buffered, outcome) = run_worker_in_buffered(
+        &backend,
+        &p,
+        &cfg,
+        &feature(),
+        "ship the auth system",
+        "Auth",
+        None,
+        &cwd,
+    )
+    .await
+    .unwrap();
+
+    // The RunOutcome is exactly what the live path yields.
+    assert_eq!(outcome.result, RunResult::Pass);
+    assert!(outcome.report.is_some());
+
+    // The log was NOT touched: only mission.created is on disk (no spawned/
+    // message/completed appended). The single-writer invariant is preserved by
+    // construction — the buffered path never held the log.
+    drop(log);
+    let events = read_log(&p);
+    assert_eq!(event_types(&events), vec!["mission.created"], "buffered run appends nothing");
+
+    // The buffer holds spawned first, at least one message, completed last —
+    // the same kinds, same order, the live path would have appended.
+    assert!(
+        matches!(buffered.first(), Some(EventKind::WorkerSpawned { role: Role::Worker, .. })),
+        "first buffered kind is worker.spawned: {buffered:?}"
+    );
+    assert!(
+        matches!(buffered.last(), Some(EventKind::WorkerCompleted { result: RunResult::Pass, .. })),
+        "last buffered kind is a passing worker.completed: {buffered:?}"
+    );
+    assert!(
+        buffered.iter().any(|k| matches!(k, EventKind::WorkerMessage { tag, .. } if tag == "tool-use")),
+        "a tool-use worker.message is buffered: {buffered:?}"
+    );
+
+    // The transcript file WAS written live (per-run file, not the log).
+    let transcript = std::fs::read_to_string(p.transcript_file(&outcome.run_id)).unwrap();
+    assert_eq!(transcript.lines().count(), 4, "init + tool-use + text + result");
 }

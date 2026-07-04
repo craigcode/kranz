@@ -12,6 +12,24 @@
 //!
 //! Cancellation: callers may pass an `Arc<tokio::sync::Notify>`; when it
 //! fires, the session is aborted and the run finishes as `Partial`/`Aborted`.
+//!
+//! ## Buffered runs (roadmap M3 — wall-clock overlap)
+//!
+//! The default path writes each event to the shared single-writer
+//! [`EventLog`] as the stream arrives ([`LogTarget::Live`]). That is
+//! incompatible with running N worker sessions concurrently: two live sessions
+//! would race the one `&mut EventLog`. So a run may instead target an
+//! in-memory buffer ([`LogTarget::Buffer`]): every [`EventKind`] the run would
+//! have appended (`worker.spawned`, throttled `worker.message` deltas,
+//! `worker.completed`) is collected in order into a `Vec` and returned
+//! alongside the [`RunOutcome`], and NOTHING touches the EventLog. The engine
+//! then replays those buffered kinds through its own single-writer `emit`
+//! serially, in a deterministic order, AFTER the concurrent sessions finish —
+//! so the single-writer / monotonic-seq invariant is preserved while the
+//! claude sessions themselves overlapped in wall-clock (see
+//! [`run_worker_in_buffered`]). Per-run transcripts (`runs/<id>.jsonl`) are
+//! separate files, not the single-writer log, so they are written live in both
+//! modes.
 
 use crate::backend::{AgentBackend, AgentEvent, PromptMode, SessionExit, SessionSpec};
 use crate::error::{EngineError, Result};
@@ -35,18 +53,52 @@ use tokio::sync::Notify;
 const MESSAGE_CONTENT_MAX: usize = 2000;
 
 // ---------------------------------------------------------------------------
+// Log target: live single-writer append vs. in-memory buffer
+// ---------------------------------------------------------------------------
+
+/// Where the event KINDS a run produces are sent.
+///
+/// [`Live`](LogTarget::Live) appends each kind to the shared single-writer
+/// [`EventLog`] immediately — the sequential path, byte-for-byte as before.
+/// [`Buffer`](LogTarget::Buffer) collects them in order into a `Vec` and
+/// touches no log, so a run can execute concurrently with others; the engine
+/// later replays the buffer through its own single-writer `emit`
+/// (roadmap M3 wall-clock overlap). Transcripts are files, not the log, and
+/// are written live regardless of the target.
+pub enum LogTarget<'a> {
+    /// Append straight to the single-writer log (default sequential path).
+    Live(&'a mut EventLog),
+    /// Collect kinds in append order; the engine emits them later, serially.
+    Buffer(Vec<EventKind>),
+}
+
+impl LogTarget<'_> {
+    /// Record one event kind: append it live, or push it onto the buffer.
+    /// Order is preserved either way (the buffer is drained in push order).
+    fn record(&mut self, kind: EventKind) -> Result<()> {
+        match self {
+            LogTarget::Live(log) => {
+                log.append(kind)?;
+            }
+            LogTarget::Buffer(buf) => buf.push(kind),
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Sink: transcript + event-log fan-out for one run's stream
 // ---------------------------------------------------------------------------
 
 /// Where a run's event stream lands: every event's raw JSON goes to the
-/// transcript (one line each, scrubbed); selected events are appended to the
-/// event log as `worker.message` deltas (scrubbed + truncated).
-pub struct RunSink<'a> {
-    pub log: &'a mut EventLog,
+/// transcript (one line each, scrubbed); selected events are recorded to the
+/// [`LogTarget`] as `worker.message` deltas (scrubbed + truncated).
+pub struct RunSink<'a, 'l> {
+    pub log: &'a mut LogTarget<'l>,
     pub transcript: &'a mut (dyn std::io::Write + Send),
 }
 
-impl RunSink<'_> {
+impl RunSink<'_, '_> {
     /// Process one event. Returns `true` when the event was a denied tool
     /// result (a guardrail hit, §4.7).
     ///
@@ -80,7 +132,7 @@ impl RunSink<'_> {
             _ => return Ok(false),
         };
 
-        self.log.append(EventKind::WorkerMessage {
+        self.log.record(EventKind::WorkerMessage {
             run_id: run_id.to_string(),
             tag: tag.to_string(),
             content: scrub::scrub_and_truncate(&content, MESSAGE_CONTENT_MAX),
@@ -150,10 +202,37 @@ enum Step {
 /// worker or validator is `Partial`, plan §4.6).
 ///
 /// `cancel`: when the notify fires the session is aborted (`exit: Aborted`).
+///
+/// This is the [`LogTarget::Live`] convenience form: the caller passes the
+/// shared single-writer log and every event kind is appended to it as it
+/// arrives. [`run_session_to`] is the same logic over an arbitrary
+/// [`LogTarget`], used by the buffered concurrent path (roadmap M3).
 pub async fn run_session(
     backend: &dyn AgentBackend,
     spec: SessionSpec,
     log: &mut EventLog,
+    paths: &MissionPaths,
+    run_meta: RunMeta,
+    cancel: Option<Arc<Notify>>,
+) -> Result<RunOutcome> {
+    let mut target = LogTarget::Live(log);
+    run_session_to(backend, spec, &mut target, paths, run_meta, cancel).await
+}
+
+/// [`run_session`] over an explicit [`LogTarget`].
+///
+/// With [`LogTarget::Live`] this is byte-for-byte the sequential behaviour
+/// (every kind appended to the log immediately). With [`LogTarget::Buffer`]
+/// the exact same kinds — `worker.spawned`, throttled `worker.message` deltas,
+/// `worker.completed` — are collected in append order into the buffer instead,
+/// and NO log is touched, so the session can run concurrently with others; the
+/// engine replays the buffer through its own single-writer `emit` afterwards
+/// (preserving monotonic seq). The transcript file is written live in both
+/// modes (it is not the single-writer log).
+pub async fn run_session_to(
+    backend: &dyn AgentBackend,
+    spec: SessionSpec,
+    log: &mut LogTarget<'_>,
     paths: &MissionPaths,
     run_meta: RunMeta,
     cancel: Option<Arc<Notify>>,
@@ -165,7 +244,7 @@ pub async fn run_session(
     // The sdk session id recorded for --resume bookkeeping: the resumed id
     // when resuming, else the engine-chosen fresh id.
     let sdk_session_id = spec.resume.clone().unwrap_or_else(|| spec.session_id.clone());
-    log.append(EventKind::WorkerSpawned {
+    log.record(EventKind::WorkerSpawned {
         run_id: run_meta.run_id.clone(),
         role: run_meta.role,
         feature_id: run_meta.feature_id.clone(),
@@ -273,7 +352,7 @@ pub async fn run_session(
         }
     };
 
-    log.append(EventKind::WorkerCompleted {
+    log.record(EventKind::WorkerCompleted {
         run_id: run_meta.run_id.clone(),
         result,
         tokens: usage.clone(),
@@ -450,6 +529,63 @@ pub async fn run_worker_in(
     cancel: Option<Arc<Notify>>,
     session_cwd: &std::path::Path,
 ) -> Result<RunOutcome> {
+    let (spec, run_meta) =
+        build_worker_spec(cfg, feature, plan_goal, milestone_title, extra_guidance, session_cwd);
+    let mut target = LogTarget::Live(log);
+    run_session_to(backend, spec, &mut target, paths, run_meta, cancel).await
+}
+
+/// [`run_worker_in`] that BUFFERS its event kinds instead of appending them to
+/// the shared log (roadmap M3 wall-clock overlap).
+///
+/// Returns the `worker.spawned` / `worker.message` / `worker.completed` kinds
+/// this run produced, in append order, alongside the [`RunOutcome`]. It takes
+/// NO `&mut EventLog`, so N of these can run concurrently (each in its own
+/// worktree) via `tokio::join!`/`JoinSet` without racing the single writer.
+/// The engine replays the returned kinds through its own single-writer `emit`
+/// serially afterwards, in a deterministic order, preserving monotonic seq.
+///
+/// The per-run transcript is still written live under `paths` — transcripts
+/// are per-run files, not the single-writer log, so concurrent writers to
+/// distinct `runs/<id>.jsonl` files never conflict.
+///
+/// No `cancel`: the buffered concurrent path does not wire interrupts (matching
+/// the parallel subset's live path). Interrupts remain a sequential-path
+/// feature.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_worker_in_buffered(
+    backend: &dyn AgentBackend,
+    paths: &MissionPaths,
+    cfg: &MissionConfig,
+    feature: &Feature,
+    plan_goal: &str,
+    milestone_title: &str,
+    extra_guidance: Option<&str>,
+    session_cwd: &std::path::Path,
+) -> Result<(Vec<EventKind>, RunOutcome)> {
+    let (spec, run_meta) =
+        build_worker_spec(cfg, feature, plan_goal, milestone_title, extra_guidance, session_cwd);
+    let mut target = LogTarget::Buffer(Vec::new());
+    let outcome = run_session_to(backend, spec, &mut target, paths, run_meta, None).await?;
+    let buffered = match target {
+        LogTarget::Buffer(buf) => buf,
+        LogTarget::Live(_) => unreachable!("buffered target constructed above"),
+    };
+    Ok((buffered, outcome))
+}
+
+/// Build the worker [`SessionSpec`] + [`RunMeta`] shared by the live and
+/// buffered worker paths. Identical spec construction guarantees a buffered
+/// run and a live run are byte-for-byte the same session, differing only in
+/// where their event kinds land.
+fn build_worker_spec(
+    cfg: &MissionConfig,
+    feature: &Feature,
+    plan_goal: &str,
+    milestone_title: &str,
+    extra_guidance: Option<&str>,
+    session_cwd: &std::path::Path,
+) -> (SessionSpec, RunMeta) {
     let role = Role::Worker;
     let role_cfg = cfg.role(role);
 
@@ -513,7 +649,7 @@ pub async fn run_worker_in(
         model: role_cfg.model.clone(),
         prompt_hash: prompts::hash(role),
     };
-    run_session(backend, spec, log, paths, run_meta, cancel).await
+    (spec, run_meta)
 }
 
 /// Run one validator session for a milestone (plan §4.4/§4.6).
