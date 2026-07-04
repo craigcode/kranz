@@ -97,7 +97,7 @@ Done when: a mission goes goal → planning → approve → start → complete e
 in Slack; `/kranz` fully operates the backlog; unauthorized users cannot spend;
 transcripts are one tap from the thread.
 
-## M3 — Parallel workers ◑ (built: worktree isolation, ordered merge, conflict-resolver, true wall-clock overlap via buffered single-writer; remaining: the instrumented proof bar below)
+## M3 — Parallel workers ✅ (done-when met 2026-07-04: live A/B measured 1.92× faster at lower cost with a self-healed merge conflict — docs/m3-measurement.md; corruption soak 20/20 — scripts/soak.sh. `--sequential` stays the default pending more live runs)
 
 The marquee deferred capability. Correctness groundwork exists (single-writer
 log, engine-serialized appends); the work is orchestration.
