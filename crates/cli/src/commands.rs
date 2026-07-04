@@ -124,6 +124,9 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             token,
             slack,
         } => cmd_serve(repo, port, open, dashboard, token, slack).await,
+        Command::Config { command } => {
+            crate::config_cmd::cmd_config(&repo, command, cli.mission.as_deref())
+        }
     }
 }
 

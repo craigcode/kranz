@@ -235,6 +235,20 @@ pub enum Command {
         #[arg(long)]
         slack: bool,
     },
+
+    /// Inspect and edit kranz configuration (files + mid-mission changes).
+    ///
+    /// Config resolves from three layers, later winning: compiled-in defaults
+    /// <- ~/.kranz/config.json (--global) <- <repo>/.kranz/config.json (the
+    /// default target). `show` prints the effective merge; `set`/`unset` edit
+    /// one layer file (validated before writing, other keys preserved);
+    /// `role` is the MID-MISSION path — it enqueues a config-change control
+    /// command on a running mission (the CLI twin of Slack's /kranz config),
+    /// while file edits only shape future missions.
+    Config {
+        #[command(subcommand)]
+        command: crate::config_cmd::ConfigCommand,
+    },
 }
 
 /// Subcommands under `kranz ticket` — the backlog surface.

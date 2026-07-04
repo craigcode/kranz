@@ -780,43 +780,13 @@ fn build_status_reply(repo_root: &Path, mission_id: Option<&str>) -> Result<Vec<
 /// listed by [`MissionPaths::list_missions`]; "most recent" is the one whose
 /// event log was modified last (creation writes `mission.created`), which is a
 /// good-enough "the mission you just made" heuristic for a bare `/kranz status`.
-/// Fold one mission's status (None if its log is unreadable/absent).
-fn mission_status(repo_root: &Path, id: &str) -> Option<MissionStatus> {
-    let paths = MissionPaths::new(repo_root, id);
-    let events = EventLog::read_events(&paths.events_file()).ok()?;
-    Some(reducer::fold(&events).ok()?.mission.status)
-}
-
-/// Resolve the target of a spend-reshaping `/kranz config`: an ACTIVE
-/// (non-terminal) mission, chosen unambiguously.
-/// - explicit id: must exist and be active (terminal → error, so the user is
-///   not told a config landed on a mission that will never apply it).
-/// - no id: exactly one active mission → use it; none → error; several → error
-///   asking for an explicit id (never silently guess).
+/// Resolve the target of a spend-reshaping `/kranz config` (also pause/resume):
+/// an ACTIVE (non-terminal) mission, chosen unambiguously. Thin delegation to
+/// the engine's [`kranz_engine::control::resolve_active_mission`], which the
+/// CLI's `kranz config role` shares — both surfaces refuse the same hazardous
+/// targets (unknown, terminal, or ambiguous without an explicit id).
 fn resolve_active_config_target(repo_root: &Path, explicit: Option<&str>) -> Result<String> {
-    let is_terminal = kranz_engine::orchestrator::is_terminal_status;
-    if let Some(id) = explicit {
-        match mission_status(repo_root, id) {
-            None => Err(anyhow::anyhow!("unknown mission `{id}`")),
-            Some(s) if is_terminal(s) => Err(anyhow::anyhow!(
-                "mission `{id}` is {s:?}; config changes apply only to active missions"
-            )),
-            Some(_) => Ok(id.to_string()),
-        }
-    } else {
-        let active: Vec<String> = MissionPaths::list_missions(repo_root)
-            .into_iter()
-            .filter(|id| mission_status(repo_root, id).is_some_and(|s| !is_terminal(s)))
-            .collect();
-        match active.len() {
-            0 => Err(anyhow::anyhow!("no active mission — create one with `/kranz new <goal>`")),
-            1 => Ok(active.into_iter().next().expect("len == 1")),
-            _ => Err(anyhow::anyhow!(
-                "several active missions ({}); name one: `/kranz config <id> <role> <model>`",
-                active.join(", ")
-            )),
-        }
-    }
+    Ok(kranz_engine::control::resolve_active_mission(repo_root, explicit)?)
 }
 
 fn most_recent_mission(repo_root: &Path) -> Option<String> {
@@ -883,8 +853,8 @@ fn approve_mission(repo_root: &Path, mission_id: &str) -> Result<()> {
 /// `/kranz config [<id>] <role> <model> [effort]` → enqueue a `config-change`
 /// control command on the target mission's inbox. `role` is the canonical
 /// friendly name from the router; the camelCase engine patch is built by
-/// [`crate::inbound::config_patch`]. When `mission_id` is `None`, the
-/// most-recently-created mission is targeted (like `/kranz status`). Returns the
+/// [`crate::inbound::config_patch`]. When `mission_id` is `None`, the repo's
+/// single active mission is targeted (several active → refusal). Returns the
 /// mission id the change was applied to (for the reply).
 fn config_change(
     repo_root: &Path,

@@ -109,6 +109,12 @@ kranz work --once                 # runs it (per-repo serialized)
 
 # Web lifecycle:
 kranz serve --open                # + new-mission / plan / approve / start in-browser
+
+# Config (layers: defaults <- ~/.kranz/config.json <- <repo>/.kranz/config.json):
+kranz config show                 # effective merge; --global/--project = one layer
+kranz config set worker.model opus       # edit one key (validated before writing)
+kranz config unset worker.model          # remove one key (siblings preserved)
+kranz config role worker opus xhigh      # MID-MISSION: control-inbox config change
 ```
 
 ## Suggested next (from the roadmap)

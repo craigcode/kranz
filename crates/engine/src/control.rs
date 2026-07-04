@@ -11,9 +11,9 @@
 //! [`ControlWatcher`] polls [`peek_interrupt`] so an `interrupt` message can
 //! abort the active run.
 
-use crate::error::Result;
+use crate::error::{EngineError, Result};
 use crate::paths::MissionPaths;
-use crate::types::ControlCommand;
+use crate::types::{ControlCommand, MissionStatus};
 use chrono::Utc;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -101,6 +101,51 @@ pub fn peek_interrupt(paths: &MissionPaths) -> Result<bool> {
     Ok(false)
 }
 
+/// Fold one mission's status; `None` when its log is unreadable or absent.
+fn mission_status(repo_root: &Path, id: &str) -> Option<MissionStatus> {
+    let paths = MissionPaths::new(repo_root, id);
+    let events = crate::event_log::EventLog::read_events(&paths.events_file()).ok()?;
+    Some(crate::reducer::fold(&events).ok()?.mission.status)
+}
+
+/// Resolve the target mission for a mid-mission control command (config
+/// change, pause, resume): an ACTIVE (non-terminal) mission, chosen
+/// unambiguously. Shared by the Slack bridge (`/kranz config|pause|resume`)
+/// and the CLI (`kranz config role`), so both surfaces refuse the same
+/// hazardous targets:
+///
+/// - explicit id: must exist and be active. A terminal mission's control
+///   inbox is never drained (run() refuses terminal missions), so enqueuing
+///   there would be a silent no-op reported as success — reject it instead.
+/// - no id: exactly one active mission → use it; none → error; several →
+///   error listing the candidates and asking for an explicit id (an
+///   mtime-based guess could hijack the wrong running mission).
+pub fn resolve_active_mission(repo_root: &Path, explicit: Option<&str>) -> Result<String> {
+    let is_terminal = crate::orchestrator::is_terminal_status;
+    if let Some(id) = explicit {
+        match mission_status(repo_root, id) {
+            None => Err(EngineError::Other(format!("unknown mission `{id}`"))),
+            Some(s) if is_terminal(s) => Err(EngineError::Other(format!(
+                "mission `{id}` is {s:?}; this change applies only to active missions"
+            ))),
+            Some(_) => Ok(id.to_string()),
+        }
+    } else {
+        let active: Vec<String> = MissionPaths::list_missions(repo_root)
+            .into_iter()
+            .filter(|id| mission_status(repo_root, id).is_some_and(|s| !is_terminal(s)))
+            .collect();
+        match active.len() {
+            0 => Err(EngineError::Other("no active mission — create one first".into())),
+            1 => Ok(active.into_iter().next().expect("len == 1")),
+            _ => Err(EngineError::Other(format!(
+                "several active missions ({}); name one explicitly",
+                active.join(", ")
+            ))),
+        }
+    }
+}
+
 /// Queued `.json` command files in filename (== chronological) order.
 /// A missing control dir is an empty queue, not an error.
 fn queued_files(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -171,5 +216,92 @@ impl ControlWatcher {
             }
             tokio::time::sleep(poll).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::{Event, EventKind};
+    use crate::types::MissionConfig;
+    use tempfile::TempDir;
+
+    /// Seed a mission's `events.jsonl` with a `mission.created` event (and
+    /// optionally a `mission.completed`) so it folds like a real log.
+    fn seed_mission(repo_root: &Path, mission_id: &str, completed: bool) {
+        let paths = MissionPaths::new(repo_root, mission_id);
+        std::fs::create_dir_all(paths.mission_dir()).unwrap();
+        let mut lines = String::new();
+        let created = Event {
+            seq: 1,
+            ts: Utc::now(),
+            mission_id: mission_id.to_string(),
+            kind: EventKind::MissionCreated {
+                goal: "goal".into(),
+                base_branch: "main".into(),
+                mission_branch: format!("kranz/mission-{mission_id}"),
+                config: MissionConfig::default(),
+            },
+        };
+        lines.push_str(&serde_json::to_string(&created).unwrap());
+        lines.push('\n');
+        if completed {
+            let done = Event {
+                seq: 2,
+                ts: Utc::now(),
+                mission_id: mission_id.to_string(),
+                kind: EventKind::MissionCompleted {},
+            };
+            lines.push_str(&serde_json::to_string(&done).unwrap());
+            lines.push('\n');
+        }
+        std::fs::write(paths.events_file(), lines).unwrap();
+    }
+
+    #[test]
+    fn resolve_explicit_active_mission_is_accepted() {
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-a", false);
+        assert_eq!(resolve_active_mission(tmp.path(), Some("m-a")).unwrap(), "m-a");
+    }
+
+    #[test]
+    fn resolve_unknown_mission_is_an_error() {
+        let tmp = TempDir::new().unwrap();
+        let err = resolve_active_mission(tmp.path(), Some("m-nope")).unwrap_err().to_string();
+        assert!(err.contains("m-nope"), "error names the unknown mission: {err}");
+    }
+
+    #[test]
+    fn resolve_terminal_mission_is_an_error() {
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-done", true);
+        let err = resolve_active_mission(tmp.path(), Some("m-done")).unwrap_err().to_string();
+        assert!(err.contains("active missions"), "honest error, not false success: {err}");
+    }
+
+    #[test]
+    fn resolve_bare_uses_the_single_active_mission() {
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-only", false);
+        // A terminal sibling does not make the bare form ambiguous.
+        seed_mission(tmp.path(), "m-done", true);
+        assert_eq!(resolve_active_mission(tmp.path(), None).unwrap(), "m-only");
+    }
+
+    #[test]
+    fn resolve_bare_with_no_active_mission_is_an_error() {
+        let tmp = TempDir::new().unwrap();
+        assert!(resolve_active_mission(tmp.path(), None).is_err());
+    }
+
+    #[test]
+    fn resolve_bare_with_several_active_missions_refuses_and_lists_them() {
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-a", false);
+        seed_mission(tmp.path(), "m-b", false);
+        let err = resolve_active_mission(tmp.path(), None).unwrap_err().to_string();
+        assert!(err.contains("several active missions"), "{err}");
+        assert!(err.contains("m-a") && err.contains("m-b"), "candidates listed: {err}");
     }
 }
