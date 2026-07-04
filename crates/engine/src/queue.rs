@@ -9,8 +9,8 @@
 //! Per-repo serialization is mandatory: missions share the working tree, so at
 //! most one may run at a time in a repo. [`is_repo_busy`] detects the currently
 //! RUNNING mission by finding any live `events.jsonl.lock` (a lock held by a
-//! process that is still alive), re-implementing a small pid-liveness check
-//! here rather than depending on the event-log module.
+//! process that is still alive), delegating to the event-log module's
+//! canonical liveness probe.
 
 use crate::error::Result;
 use serde::{Deserialize, Serialize};
@@ -185,37 +185,19 @@ pub fn is_repo_busy(repo_root: &Path) -> Option<String> {
     None
 }
 
-/// True when a lock file records a pid that is still alive.
+/// True when a lock file records a holder that is still alive.
 ///
-/// Local re-implementation of the liveness probe (the engine's event-log module
-/// owns the canonical one, but the queue must not depend on it). On unix,
-/// `kill(pid, 0)` returning 0 or `EPERM` means the process exists. On non-unix
-/// platforms liveness is not probeable, so an existing lock is treated as busy
-/// conservatively — a false "busy" only delays a queued mission; a false
-/// "free" could run two missions on one working tree.
+/// Delegates to the event-log module's canonical probe
+/// ([`crate::event_log::lock_holder_is_alive`]) — ONE source of truth for
+/// lock-file format and liveness semantics, so the queue can never diverge
+/// from what `EventLog::acquire` itself would decide. (A divergent local
+/// parser once read the entire file as a single integer, so any multi-line
+/// lock was "unparseable ⇒ busy" — a SIGKILL'd engine livelocked `kranz
+/// work` forever.) Genuinely unparseable-but-present locks still read as
+/// busy, conservatively: a false "busy" only delays a queued mission, while
+/// a false "free" could run two missions on one working tree.
 fn lock_pid_is_alive(lock_path: &Path) -> bool {
-    let Ok(contents) = std::fs::read_to_string(lock_path) else {
-        // Unreadable lock that nonetheless exists: assume busy.
-        return true;
-    };
-    let Ok(pid) = contents.trim().parse::<i32>() else {
-        // A present-but-unparseable lock is treated as busy (conservative).
-        return true;
-    };
-    if pid <= 0 {
-        return true;
-    }
-    #[cfg(unix)]
-    {
-        // kill(pid, 0): 0 = alive; EPERM = alive but not ours; ESRCH = dead.
-        let rc = unsafe { libc::kill(pid, 0) };
-        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        true
-    }
+    crate::event_log::lock_holder_is_alive(lock_path)
 }
 
 /// Atomic write via a sibling temp file + rename.

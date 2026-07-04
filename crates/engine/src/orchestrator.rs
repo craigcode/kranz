@@ -3778,40 +3778,17 @@ pub fn cleanable_class(status: MissionStatus, has_plan: bool) -> CleanClass {
     }
 }
 
-/// True when a mission's lock file records a pid that is still alive (a running
-/// engine). A local re-implementation of the liveness probe — the event-log
-/// module owns the canonical one, but the hygiene helpers must not reach into
-/// its internals. On unix `kill(pid, 0)` returning 0 or `EPERM` means the
-/// process exists; a present-but-unreadable/unparseable lock is treated as
-/// live (conservative — a false "alive" only spares a directory from cleaning,
-/// while a false "dead" could delete a mission out from under a running
-/// engine). Non-unix platforms cannot probe, so an existing lock reads as live.
+/// True when a mission's lock file records a holder that is still alive (a
+/// running engine). Delegates to the event-log module's canonical probe
+/// ([`crate::event_log::lock_holder_is_alive`]) — ONE source of truth for
+/// lock-file format and liveness semantics. A missing lock is not live; a
+/// present-but-unreadable/unparseable one is treated as live (conservative —
+/// a false "alive" only spares a directory from cleaning, while a false
+/// "dead" could delete a mission out from under a running engine); a
+/// provably-dead holder (ESRCH, or a token-proven pid reuse) is not live.
+/// Non-unix platforms cannot probe, so an existing lock reads as live.
 pub fn mission_lock_is_live(paths: &MissionPaths) -> bool {
-    let lock = paths.lock_file();
-    let Ok(contents) = std::fs::read_to_string(&lock) else {
-        // read_to_string errors both when the lock is missing and when it
-        // exists but can't be read. A missing lock is not live; a present-but-
-        // unreadable one is treated as live (conservative).
-        return lock.exists();
-    };
-    // First line is the pid; a second line (acquire time, for the event-log
-    // module's pid-reuse detection) is ignored here.
-    let Ok(pid) = contents.lines().next().unwrap_or("").trim().parse::<i32>() else {
-        return true; // present but unparseable ⇒ conservatively live
-    };
-    if pid <= 0 {
-        return true;
-    }
-    #[cfg(unix)]
-    {
-        let rc = unsafe { libc::kill(pid, 0) };
-        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        true
-    }
+    crate::event_log::lock_holder_is_alive(&paths.lock_file())
 }
 
 /// Pre-flight a `config.changed` patch: the merged result must deserialize

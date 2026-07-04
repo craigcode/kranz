@@ -379,3 +379,48 @@ fn is_repo_busy_ignores_a_dead_lock() {
         "a lock held by a dead pid must not count as busy (unix)"
     );
 }
+
+/// FINDING B REGRESSION: `is_repo_busy` must understand the CURRENT
+/// multi-line lock format that `EventLog::acquire` actually writes. A
+/// divergent local parser once parsed the ENTIRE file as one integer, so any
+/// multi-line lock read as "unparseable ⇒ busy" — after a SIGKILL'd engine
+/// (dead pid, multi-line lock) `kranz work` reported the repo busy forever.
+#[cfg(unix)]
+#[test]
+fn is_repo_busy_ignores_a_dead_multiline_lock() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let dead_dir = root.join(".kranz").join("missions").join("dead-mission");
+    fs::create_dir_all(&dead_dir).unwrap();
+    // The full three-line format: pid, acquire epoch secs, identity token.
+    fs::write(
+        dead_dir.join("events.jsonl.lock"),
+        format!("{}\n{}\nsome-boot-id:12345\n", i32::MAX, 1_700_000_000u64),
+    )
+    .unwrap();
+    assert_eq!(
+        queue::is_repo_busy(root),
+        None,
+        "a multi-line lock with a dead holder must not count as busy"
+    );
+}
+
+/// The inverse guard for the shared parser: a multi-line lock held by a LIVE
+/// pid (ours) still counts as busy on every platform.
+#[test]
+fn is_repo_busy_detects_a_live_multiline_lock() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let live_dir = root.join(".kranz").join("missions").join("live-mission");
+    fs::create_dir_all(&live_dir).unwrap();
+    fs::write(
+        live_dir.join("events.jsonl.lock"),
+        format!("{}\n{}\n", std::process::id(), 1_700_000_000u64),
+    )
+    .unwrap();
+    assert_eq!(
+        queue::is_repo_busy(root).as_deref(),
+        Some("live-mission"),
+        "a multi-line lock held by a live pid identifies the running mission"
+    );
+}

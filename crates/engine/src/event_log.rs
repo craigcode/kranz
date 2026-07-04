@@ -93,11 +93,14 @@ impl EventLog {
     /// the line itself is intact) before the append handle opens, so new
     /// events never glue onto a partial line.
     ///
-    /// The lock file records two lines — `<pid>` and the acquire time as unix
-    /// epoch seconds — so a later acquire can detect pid reuse (a holder
-    /// process that STARTED after the lock was acquired cannot be the engine
-    /// that wrote it). The legacy one-line pid-only format is still accepted;
-    /// it just forgoes reuse detection.
+    /// The lock file records up to three lines — `<pid>`, the acquire time as
+    /// unix epoch seconds (diagnostics only), and the holder's own process
+    /// identity token — so a later acquire can detect pid reuse: a holder
+    /// whose CURRENT token differs from the recorded one is not the process
+    /// that wrote the lock. Tokens are compared for raw equality (see
+    /// [`process_identity_token`]) — never via clock arithmetic, which
+    /// wall-clock steps would poison. The legacy one- and two-line formats
+    /// are still accepted; they just forgo reuse detection.
     pub fn acquire(
         paths: &MissionPaths,
         mission_id: &str,
@@ -112,72 +115,7 @@ impl EventLog {
         let mut lock_file = match OpenOptions::new().write(true).create_new(true).open(&lock_path)
         {
             Ok(f) => f,
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                let info = read_lock_info(&lock_path);
-                match (probe_liveness(&info), force) {
-                    // A provably-dead holder is stale (e.g. the engine was
-                    // Ctrl-C'd — SIGINT skips destructors — or its pid was
-                    // provably reused): steal it at every tier without
-                    // demanding --force-lock.
-                    (LockLiveness::Dead, _) => {
-                        tracing::warn!(
-                            lock = %lock_path.display(),
-                            holder = %info.holder,
-                            "stale engine lock (holder is dead); taking over"
-                        );
-                    }
-                    // Not provably dead and no force: refuse. Same message
-                    // whether the holder is alive or indeterminate — without
-                    // force the distinction changes nothing for the operator.
-                    (LockLiveness::Unknown | LockLiveness::Alive, LockForce::No) => {
-                        return Err(EngineError::LockHeld(format!(
-                            "lock file {} exists (held by pid {}); if that process \
-                             is truly gone, re-run with --force-lock",
-                            lock_path.display(),
-                            info.holder
-                        )));
-                    }
-                    // Indeterminate liveness (unparseable pid, non-unix
-                    // platform): --force-lock keeps its historical meaning
-                    // and steals.
-                    (LockLiveness::Unknown, LockForce::IfNotLive | LockForce::EvenIfLive) => {
-                        tracing::warn!(
-                            lock = %lock_path.display(),
-                            holder = %info.holder,
-                            "forced takeover of a lock whose holder's liveness \
-                             cannot be determined"
-                        );
-                    }
-                    // A provably ALIVE holder survives --force-lock: this is
-                    // exactly how an operator who believes a long run is
-                    // "stuck" would otherwise corrupt it.
-                    (LockLiveness::Alive, LockForce::IfNotLive) => {
-                        return Err(EngineError::LockHeld(format!(
-                            "lock file {} is held by pid {}, and that process is \
-                             ALIVE — refusing --force-lock. Identify it with \
-                             `ps -p {}`; pass --dangerously-steal-live-lock ONLY \
-                             if you are certain it is a zombie or foreign process \
-                             and not a running kranz engine (two engines on one \
-                             mission corrupt its event log)",
-                            lock_path.display(),
-                            info.holder,
-                            info.holder
-                        )));
-                    }
-                    (LockLiveness::Alive, LockForce::EvenIfLive) => {
-                        tracing::warn!(
-                            lock = %lock_path.display(),
-                            holder = %info.holder,
-                            "DANGEROUS: stealing the mission lock from a LIVE \
-                             process at operator request \
-                             (--dangerously-steal-live-lock); if that process is \
-                             a kranz engine, two engines now write one event log"
-                        );
-                    }
-                }
-                std::fs::remove_file(&lock_path)?;
-                OpenOptions::new().write(true).create_new(true).open(&lock_path)?
-            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => steal_lock(&lock_path, force)?,
             Err(e) => return Err(e.into()),
         };
 
@@ -188,8 +126,16 @@ impl EventLog {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            lock_file
-                .write_all(format!("{}\n{}\n", std::process::id(), acquired_secs).as_bytes())?;
+            // Line 1: pid. Line 2: acquire time (diagnostics only — reuse
+            // detection is the token's job). Line 3: our own identity token,
+            // where this platform can produce one; a probe that finds it
+            // missing degrades to plain pid liveness, never to Dead.
+            let mut lock_contents = format!("{}\n{}\n", std::process::id(), acquired_secs);
+            if let Some(token) = process_identity_token(std::process::id() as i32) {
+                lock_contents.push_str(&token);
+                lock_contents.push('\n');
+            }
+            lock_file.write_all(lock_contents.as_bytes())?;
             lock_file.flush()?;
 
             let events_path = paths.events_file();
@@ -411,6 +357,208 @@ impl Drop for EventLog {
     }
 }
 
+/// Contended-path acquire: decide whether the existing lock at `lock_path`
+/// may be stolen under `force` and, if so, atomically replace it with a fresh
+/// lock file owned by this process.
+///
+/// unix: the whole probe→remove→create sequence is serialized under an
+/// exclusive `flock` on a sibling guard file (`<lock>.steal`). Unserialized,
+/// two concurrent acquires can both judge the same stale holder Dead; the
+/// slower one's `remove_file` then deletes the FASTER one's freshly created
+/// lock and both end up holding. After winning the flock the lock is
+/// re-attempted and re-probed from scratch — it may have been released, or
+/// stolen and rewritten, while we waited.
+///
+/// non-unix: no guard, and that is acceptable — liveness is never probed
+/// there (every verdict is Unknown, see [`probe_liveness`]), so the Dead
+/// auto-steal path cannot trigger; steals happen only under explicit operator
+/// force flags, which are deliberate one-off actions rather than the
+/// concurrent-by-accident crash-recovery restarts the guard defends against.
+fn steal_lock(lock_path: &Path, force: LockForce) -> Result<File> {
+    #[cfg(unix)]
+    let _guard = StealGuard::acquire(lock_path)?;
+
+    loop {
+        // The lock may have been RELEASED while we waited for the guard:
+        // retry the clean create before probing anything.
+        match OpenOptions::new().write(true).create_new(true).open(lock_path) {
+            Ok(f) => return Ok(f),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
+
+        authorize_steal(lock_path, force)?;
+
+        // Guarded steals never interleave here, but a rival acquire's FIRST
+        // (unguarded) create attempt can still slip into the remove→create
+        // window and win the freed slot. If it does, loop back and judge
+        // THAT holder like any other — never surface the raw io collision.
+        match std::fs::remove_file(lock_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        }
+        match OpenOptions::new().write(true).create_new(true).open(lock_path) {
+            Ok(f) => return Ok(f),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// Probe the CURRENT holder recorded at `lock_path` and decide, against the
+/// [`LockForce`] matrix, whether stealing is permitted: `Ok(())` authorizes
+/// the steal, `Err(LockHeld)` refuses with operator guidance.
+fn authorize_steal(lock_path: &Path, force: LockForce) -> Result<()> {
+    let info = read_lock_info(lock_path);
+    match (probe_liveness(&info), force) {
+        // A provably-dead holder is stale (e.g. the engine was Ctrl-C'd —
+        // SIGINT skips destructors — or its pid was provably reused): steal
+        // it at every tier without demanding --force-lock.
+        (LockLiveness::Dead, _) => {
+            tracing::warn!(
+                lock = %lock_path.display(),
+                holder = %info.holder,
+                "stale engine lock (holder is dead); taking over"
+            );
+            Ok(())
+        }
+        // Not provably dead and no force: refuse. Same message whether the
+        // holder is alive or indeterminate — without force the distinction
+        // changes nothing for the operator.
+        (LockLiveness::Unknown | LockLiveness::Alive, LockForce::No) => {
+            Err(EngineError::LockHeld(format!(
+                "lock file {} exists (held by pid {}); if that process \
+                 is truly gone, re-run with --force-lock",
+                lock_path.display(),
+                info.holder
+            )))
+        }
+        // Indeterminate liveness (unparseable pid, non-unix platform):
+        // --force-lock keeps its historical meaning and steals.
+        (LockLiveness::Unknown, LockForce::IfNotLive | LockForce::EvenIfLive) => {
+            tracing::warn!(
+                lock = %lock_path.display(),
+                holder = %info.holder,
+                "forced takeover of a lock whose holder's liveness \
+                 cannot be determined"
+            );
+            Ok(())
+        }
+        // A provably ALIVE holder survives --force-lock: this is exactly how
+        // an operator who believes a long run is "stuck" would otherwise
+        // corrupt it.
+        (LockLiveness::Alive, LockForce::IfNotLive) => Err(EngineError::LockHeld(format!(
+            "lock file {} is held by pid {}, and that process is \
+             ALIVE — refusing --force-lock. Identify it with \
+             `ps -p {}`; pass --dangerously-steal-live-lock ONLY \
+             if you are certain it is a zombie or foreign process \
+             and not a running kranz engine (two engines on one \
+             mission corrupt its event log)",
+            lock_path.display(),
+            info.holder,
+            info.holder
+        ))),
+        (LockLiveness::Alive, LockForce::EvenIfLive) => {
+            tracing::warn!(
+                lock = %lock_path.display(),
+                holder = %info.holder,
+                "DANGEROUS: stealing the mission lock from a LIVE \
+                 process at operator request \
+                 (--dangerously-steal-live-lock); if that process is \
+                 a kranz engine, two engines now write one event log"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// RAII serialization of the lock-steal sequence (unix): an exclusive
+/// `flock` on a sibling guard file (`<lock>.steal`).
+///
+/// The guard file is best-effort removed on drop, so acquisition must defend
+/// against the unlink race: a waiter can win the flock on an inode that was
+/// unlinked (and possibly recreated) while it slept, which would serialize
+/// nothing. After each flock win the held fd's identity is compared to
+/// whatever the path names NOW; a mismatch retries on the fresh file.
+///
+/// `flock` contends across separate fds within one process too, so the guard
+/// serializes racing threads exactly like racing processes.
+#[cfg(unix)]
+struct StealGuard {
+    /// Held only for the flock; dropping (closing) it releases the lock.
+    _file: File,
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+impl StealGuard {
+    fn acquire(lock_path: &Path) -> Result<StealGuard> {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::io::AsRawFd;
+        let mut name = lock_path.file_name().unwrap_or_default().to_os_string();
+        name.push(".steal");
+        let path = lock_path.with_file_name(name);
+        loop {
+            // Contents are irrelevant (the file exists only to be flock'd),
+            // but be explicit that nothing is truncated.
+            let file =
+                OpenOptions::new().write(true).create(true).truncate(false).open(&path)?;
+            loop {
+                if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                    break;
+                }
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::EINTR) {
+                    return Err(err.into());
+                }
+            }
+            let held = file.metadata()?;
+            match std::fs::metadata(&path) {
+                Ok(m) if m.dev() == held.dev() && m.ino() == held.ino() => {
+                    return Ok(StealGuard { _file: file, path });
+                }
+                // The guard file was unlinked (and possibly recreated) while
+                // we waited: this flock guards a dead inode and serializes
+                // nothing. Retry on whatever the path names now.
+                _ => continue,
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for StealGuard {
+    fn drop(&mut self) {
+        // Best-effort cleanup; the identity re-check in acquire() keeps this
+        // safe against waiters still blocked on the removed inode.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Whether the holder recorded in the lock file at `lock_path` is still
+/// alive — the ONE liveness query shared by every subsystem that asks "is
+/// this mission's engine running?" (the event-log acquire path itself, queue
+/// busy checks, hygiene sweeps), so no caller can diverge from the canonical
+/// lock-file format.
+///
+/// Missing lock file → `false` (nothing holds it). A provably-dead holder
+/// (ESRCH, or a token-proven pid reuse) → `false`. Everything else — alive
+/// holder, unparseable/garbage lock file, unprobeable platform — → `true`:
+/// conservative, because a false "alive" merely delays a queued mission or
+/// spares a directory from cleaning, while a false "dead" runs two engines
+/// on one working tree.
+pub fn lock_holder_is_alive(lock_path: &Path) -> bool {
+    if !lock_path.exists() {
+        return false;
+    }
+    let info = read_lock_info(lock_path);
+    match probe_liveness(&info) {
+        LockLiveness::Dead => false,
+        LockLiveness::Alive | LockLiveness::Unknown => true,
+    }
+}
+
 /// Liveness verdict for the process recorded in a lock file.
 ///
 /// INVARIANT: anything uncertain must NEVER report `Dead` — a false `Dead`
@@ -437,15 +585,19 @@ struct LockInfo {
     holder: String,
     /// The holder pid, when the first line parses as a positive i32.
     pid: Option<i32>,
-    /// Unix epoch seconds at acquire time (second line). `None` for the
-    /// legacy one-line pid-only format — reuse detection is then impossible
-    /// and an alive pid is simply Alive, exactly as before the format grew
-    /// the timestamp.
+    /// Unix epoch seconds at acquire time (second line): diagnostics only.
+    /// `None` for the legacy one-line pid-only format.
     acquired_secs: Option<u64>,
+    /// Process identity token the holder recorded for ITSELF at acquire
+    /// (third line, see [`process_identity_token`]). `None` for the older
+    /// one-/two-line formats and on platforms that cannot produce one —
+    /// reuse detection is then impossible and an alive pid is simply Alive.
+    token: Option<String>,
 }
 
-/// Best-effort parse of a lock file: `<pid>\n<acquired_unix_epoch_secs>`,
-/// tolerating the legacy one-line pid-only format and arbitrary garbage.
+/// Best-effort parse of a lock file:
+/// `<pid>\n<acquired_unix_epoch_secs>\n<identity_token>`, tolerating the
+/// legacy one- and two-line formats and arbitrary garbage.
 fn read_lock_info(lock_path: &Path) -> LockInfo {
     let contents = std::fs::read_to_string(lock_path).unwrap_or_default();
     let mut lines = contents.lines();
@@ -453,7 +605,8 @@ fn read_lock_info(lock_path: &Path) -> LockInfo {
     let holder = if first.is_empty() { "unknown".to_string() } else { first.to_string() };
     let pid = first.parse::<i32>().ok().filter(|p| *p > 0);
     let acquired_secs = lines.next().and_then(|l| l.trim().parse::<u64>().ok());
-    LockInfo { holder, pid, acquired_secs }
+    let token = lines.next().map(str::trim).filter(|t| !t.is_empty()).map(String::from);
+    LockInfo { holder, pid, acquired_secs, token }
 }
 
 /// Probe the liveness of a lock file's recorded holder.
@@ -490,104 +643,94 @@ fn probe_liveness(info: &LockInfo) -> LockLiveness {
     }
 }
 
-/// Screen an Alive pid for reuse: if the holder process STARTED after the
-/// lock was acquired (+2s clock/rounding slack), the pid was recycled — the
-/// process that wrote the lock is dead, so the verdict is `Dead`. Any
-/// inability to determine the start time (legacy lock format, unsupported
-/// platform, probe error) keeps the verdict `Alive` — a probe failure must
-/// never demote Alive to Dead.
+/// Screen an Alive pid for reuse by comparing process identity tokens: the
+/// token the holder recorded for ITSELF at acquire (lock line 3) against the
+/// token of whatever occupies that pid NOW. Tokens are compared for raw
+/// equality — no clocks, no slack — so wall-clock steps (NTP corrections,
+/// manual resets) can never misclassify a live holder as Dead the way the
+/// old start-time-vs-acquire-time arithmetic could. Different tokens prove
+/// the pid was recycled within this boot, or the machine rebooted; the
+/// process that wrote the lock is dead either way, so the verdict is `Dead`.
+/// Any inability to obtain a token (legacy one-/two-line lock file,
+/// unsupported platform, probe error) keeps the verdict `Alive` — uncertainty
+/// must never demote Alive to Dead.
 fn alive_or_reused(pid: i32, info: &LockInfo) -> LockLiveness {
-    let Some(acquired) = info.acquired_secs else {
+    let Some(recorded) = info.token.as_deref() else {
         return LockLiveness::Alive;
     };
-    let Some(started) = process_start_epoch_secs(pid) else {
+    let Some(current) = process_identity_token(pid) else {
         return LockLiveness::Alive;
     };
-    if started > acquired + 2 {
+    if current == recorded {
+        LockLiveness::Alive
+    } else {
         tracing::warn!(
             pid,
-            lock_acquired_epoch_secs = acquired,
-            holder_started_epoch_secs = started,
-            "lock holder pid was REUSED: the process started after the lock \
-             was acquired, so the engine that wrote the lock is dead"
+            recorded_token = recorded,
+            current_token = %current,
+            lock_acquired_epoch_secs = ?info.acquired_secs,
+            "lock holder pid was REUSED: the process now at this pid is not \
+             the one that recorded the lock, so the engine that wrote the \
+             lock is dead"
         );
         LockLiveness::Dead
-    } else {
-        LockLiveness::Alive
     }
 }
 
-/// Unix-epoch start time (seconds) of process `pid`, or `None` when it
-/// cannot be determined on this platform. Callers treat `None` as "still
-/// alive" — never as dead.
+/// Platform-opaque identity token for process `pid`, or `None` when this
+/// platform cannot produce one. Two readings of a LIVE process's token are
+/// byte-identical because both derive from the same immutable kernel state
+/// (boot + spawn identity), never from wall-clock arithmetic — so tokens are
+/// compared for raw equality only.
+///
+/// linux: `"<boot_id>:<starttime_ticks>"`. `/proc/sys/kernel/random/boot_id`
+/// is fixed per boot; `/proc/<pid>/stat` field 22 (starttime) is a
+/// CLOCK_MONOTONIC-based tick count fixed for the life of the process. comm
+/// (field 2) is parenthesized and may itself contain spaces or ')', so
+/// fields 3.. are indexed from after the LAST ')'.
 #[cfg(target_os = "linux")]
-fn process_start_epoch_secs(pid: i32) -> Option<u64> {
-    // /proc/<pid>/stat field 22 is starttime, in clock ticks since boot.
-    // comm (field 2) is parenthesized and may itself contain spaces or ')',
-    // so index from the LAST ')' — fields 3.. follow it.
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let rest = stat.get(stat.rfind(')')? + 1..)?;
-    let start_ticks: u64 = rest.split_whitespace().nth(19)?.parse().ok()?;
-    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    if hz <= 0 {
+fn process_identity_token(pid: i32) -> Option<String> {
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let boot_id = boot_id.trim();
+    if boot_id.is_empty() {
         return None;
     }
-    // Boot time (unix epoch secs) from /proc/stat's btime line.
-    let btime: u64 = std::fs::read_to_string("/proc/stat")
-        .ok()?
-        .lines()
-        .find_map(|l| l.strip_prefix("btime "))?
-        .trim()
-        .parse()
-        .ok()?;
-    Some(btime + start_ticks / hz as u64)
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = stat.get(stat.rfind(')')? + 1..)?;
+    let start_ticks = rest.split_whitespace().nth(19)?;
+    start_ticks.parse::<u64>().ok()?; // reject garbage rather than record it
+    Some(format!("{boot_id}:{start_ticks}"))
 }
 
-/// macOS: `ps -p <pid> -o etime=` prints the elapsed time since the process
-/// started in the fixed, locale-independent `[[dd-]hh:]mm:ss` format;
-/// start = now − elapsed. Second-granular, which the +2s reuse slack absorbs.
+/// macOS: `ps -p <pid> -o lstart=` prints an absolute spawn timestamp
+/// rendered from the kernel's stored `p_starttime`. Locale and timezone are
+/// pinned so the acquire-time and probe-time renderings of the SAME stored
+/// value are byte-identical; the strings are compared for equality, never
+/// parsed back into clock arithmetic.
 #[cfg(target_os = "macos")]
-fn process_start_epoch_secs(pid: i32) -> Option<u64> {
+fn process_identity_token(pid: i32) -> Option<String> {
     let out = std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "etime="])
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
+        .args(["-p", &pid.to_string(), "-o", "lstart="])
         .output()
         .ok()?;
     if !out.status.success() {
         return None;
     }
-    let elapsed = parse_etime(String::from_utf8_lossy(&out.stdout).trim())?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-    Some(now.saturating_sub(elapsed))
-}
-
-/// Everywhere else (windows, exotic unix): start time is not determinable,
-/// so pid reuse cannot be proven and an alive holder stays Alive.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn process_start_epoch_secs(_pid: i32) -> Option<u64> {
-    None
-}
-
-/// Parse `ps`'s ELAPSED (`etime`) format `[[dd-]hh:]mm:ss` into seconds.
-#[cfg(any(target_os = "macos", test))]
-fn parse_etime(s: &str) -> Option<u64> {
-    let (days, rest) = match s.split_once('-') {
-        Some((d, rest)) => (d.parse::<u64>().ok()?, rest),
-        None => (0u64, s),
-    };
-    let mut parts = rest.split(':').rev();
-    let secs: u64 = parts.next()?.parse().ok()?;
-    let mins: u64 = parts.next()?.parse().ok()?;
-    let hours: u64 = match parts.next() {
-        Some(h) => h.parse().ok()?,
-        None => 0,
-    };
-    if parts.next().is_some() {
-        return None;
+    let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token)
     }
-    Some(((days * 24 + hours) * 60 + mins) * 60 + secs)
+}
+
+/// Everywhere else (windows, exotic unix): no identity token, so pid reuse
+/// cannot be proven and an alive holder stays Alive.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_identity_token(_pid: i32) -> Option<String> {
+    None
 }
 
 #[cfg(test)]
@@ -595,32 +738,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn etime_parses_all_shapes() {
-        assert_eq!(parse_etime("00:03"), Some(3));
-        assert_eq!(parse_etime("12:34"), Some(12 * 60 + 34));
-        assert_eq!(parse_etime("01:02:03"), Some(3600 + 2 * 60 + 3));
-        assert_eq!(parse_etime("2-01:02:03"), Some(2 * 86400 + 3600 + 2 * 60 + 3));
-        assert_eq!(parse_etime(""), None);
-        assert_eq!(parse_etime("garbage"), None);
-        assert_eq!(parse_etime("1:2:3:4"), None);
-    }
-
-    #[test]
-    fn lock_info_parses_both_formats() {
+    fn lock_info_parses_all_formats() {
         let dir = tempfile::tempdir().unwrap();
         let lock = dir.path().join("l");
 
-        std::fs::write(&lock, "1234\n1700000000\n").unwrap();
+        // Current three-line format: pid, acquire time, identity token.
+        std::fs::write(&lock, "1234\n1700000000\nabcd-boot-id:5678\n").unwrap();
         let info = read_lock_info(&lock);
         assert_eq!(info.holder, "1234");
         assert_eq!(info.pid, Some(1234));
         assert_eq!(info.acquired_secs, Some(1_700_000_000));
+        assert_eq!(info.token.as_deref(), Some("abcd-boot-id:5678"));
 
-        // Legacy one-line format: pid known, acquire time unknown.
+        // Two-line format: token unknown, reuse screen impossible.
+        std::fs::write(&lock, "1234\n1700000000\n").unwrap();
+        let info = read_lock_info(&lock);
+        assert_eq!(info.pid, Some(1234));
+        assert_eq!(info.acquired_secs, Some(1_700_000_000));
+        assert_eq!(info.token, None);
+
+        // An EMPTY third line (a platform with no token) is the same as none.
+        std::fs::write(&lock, "1234\n1700000000\n\n").unwrap();
+        assert_eq!(read_lock_info(&lock).token, None);
+
+        // Legacy one-line format: pid known, everything else unknown.
         std::fs::write(&lock, "1234").unwrap();
         let info = read_lock_info(&lock);
         assert_eq!(info.pid, Some(1234));
         assert_eq!(info.acquired_secs, None);
+        assert_eq!(info.token, None);
 
         // Garbage: nothing parseable, holder preserved for the message.
         std::fs::write(&lock, "not-a-pid\nnot-a-time").unwrap();
@@ -628,9 +774,52 @@ mod tests {
         assert_eq!(info.holder, "not-a-pid");
         assert_eq!(info.pid, None);
         assert_eq!(info.acquired_secs, None);
+        assert_eq!(info.token, None);
 
         // Non-positive pids are never probeable.
         std::fs::write(&lock, "-4\n1700000000").unwrap();
         assert_eq!(read_lock_info(&lock).pid, None);
+    }
+
+    /// Two readings of a live process's identity token must be byte-identical
+    /// — the entire reuse screen rests on this. (The old design reconstructed
+    /// a wall-clock start time on every probe, which clock steps shifted.)
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn identity_token_is_stable_for_a_live_process() {
+        let pid = std::process::id() as i32;
+        let a = process_identity_token(pid).expect("own token must be obtainable");
+        let b = process_identity_token(pid).expect("own token must be obtainable");
+        assert_eq!(a, b, "token readings of the same live process must match");
+        assert!(!a.is_empty() && !a.contains('\n'), "token must be a single non-empty line: {a:?}");
+    }
+
+    /// A pid that provably has no process yields no token (dead pids have no
+    /// /proc entry on linux and no ps row on macOS) — never a fabricated one.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn identity_token_of_a_dead_pid_is_none() {
+        assert_eq!(process_identity_token(i32::MAX), None);
+    }
+
+    /// Token mismatch on a lock that records OUR pid: the recorder was a
+    /// different process whose pid the OS recycled onto us — provably Dead.
+    /// Matching token: an ordinary double acquire — Alive.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn own_pid_reuse_is_decided_by_token_equality() {
+        let pid = std::process::id() as i32;
+        let own = process_identity_token(pid).expect("own token must be obtainable");
+
+        let info = LockInfo {
+            holder: pid.to_string(),
+            pid: Some(pid),
+            acquired_secs: Some(0),
+            token: Some(own.clone()),
+        };
+        assert_eq!(probe_liveness(&info), LockLiveness::Alive);
+
+        let info = LockInfo { token: Some(format!("{own}-not")), ..info };
+        assert_eq!(probe_liveness(&info), LockLiveness::Dead);
     }
 }
