@@ -4,9 +4,10 @@
 //! (`events.jsonl.lock`) rather than POSIX advisory locks so Windows stays
 //! first-class. Lifecycle events are flushed + fsynced per append; stream
 //! deltas (`worker.message`) are buffered in memory and drained by age
-//! (throttle), by the next lifecycle append, by explicit [`EventLog::flush`],
-//! or on drop. Losing buffered deltas on a crash is recoverable; losing a
-//! lifecycle event is not, hence the asymmetry.
+//! (throttle) — checked on the next append, or on demand via
+//! [`EventLog::flush_if_due`] — by the next lifecycle append, by explicit
+//! [`EventLog::flush`], or on drop. Losing buffered deltas on a crash is
+//! recoverable; losing a lifecycle event is not, hence the asymmetry.
 
 use crate::error::{EngineError, Result};
 use crate::events::{Event, EventKind};
@@ -234,7 +235,8 @@ impl EventLog {
     /// Durability: lifecycle events drain any buffered deltas first (file
     /// order == append order), then write + flush + fsync. Stream deltas are
     /// buffered and drained once the oldest buffered delta exceeds the
-    /// throttle age.
+    /// throttle age — checked here on each append, or on demand (without
+    /// waiting for another append) via [`EventLog::flush_if_due`].
     pub fn append(&mut self, kind: EventKind) -> Result<Event> {
         let event = Event {
             seq: self.next_seq,
@@ -268,6 +270,29 @@ impl EventLog {
         self.drain_buffer()?;
         self.file.flush()?;
         Ok(())
+    }
+
+    /// Elapsed time since the OLDEST buffered delta, or `None` when the
+    /// buffer is empty.
+    pub fn buffer_age(&self) -> Option<Duration> {
+        self.buffer.first().map(|b| b.buffered_at.elapsed())
+    }
+
+    /// Drain the buffer to the file, WITHOUT waiting for another [`append`]
+    /// call, if it is non-empty and has aged past `throttle`. Gives idle
+    /// missions (waiting on an approval gate, worker stopped) a wall-clock-
+    /// driven flush instead of leaving deltas buffered indefinitely.
+    ///
+    /// [`append`]: EventLog::append
+    pub fn flush_if_due(&mut self) -> Result<bool> {
+        match self.buffer_age() {
+            Some(age) if age >= self.throttle => {
+                self.drain_buffer()?;
+                self.file.flush()?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     fn drain_buffer(&mut self) -> Result<()> {

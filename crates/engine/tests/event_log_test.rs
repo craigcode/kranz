@@ -317,6 +317,47 @@ fn throttle_flushes_buffer_by_age() {
 }
 
 #[test]
+fn flush_if_due_drains_idle_buffer_by_age() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    let mut log = EventLog::acquire(&p, MISSION, Duration::from_millis(30), LockForce::No).unwrap();
+
+    log.append(delta("d1")).unwrap();
+    assert_eq!(
+        EventLog::read_events(&p.events_file()).unwrap().len(),
+        0,
+        "young delta stays buffered"
+    );
+
+    std::thread::sleep(Duration::from_millis(60));
+    // No intervening append/flush/drop: an idle mission still ages out.
+    let due = log.flush_if_due().unwrap();
+    assert!(due, "flush_if_due must report that it drained the buffer");
+    assert_eq!(EventLog::read_events(&p.events_file()).unwrap().len(), 1);
+}
+
+#[test]
+fn buffer_age_reports_oldest_and_none_when_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    let mut log = EventLog::acquire(&p, MISSION, NEVER, LockForce::No).unwrap();
+
+    assert_eq!(log.buffer_age(), None, "fresh log has no buffered deltas");
+
+    log.append(delta("d1")).unwrap();
+    assert!(log.buffer_age().is_some(), "buffer_age must report the oldest delta's age");
+
+    // Throttle is NEVER (1 hour): the buffer is far too young to flush.
+    let due = log.flush_if_due().unwrap();
+    assert!(!due, "flush_if_due must not drain a buffer younger than the throttle");
+    assert_eq!(
+        EventLog::read_events(&p.events_file()).unwrap().len(),
+        0,
+        "delta must remain buffered"
+    );
+}
+
+#[test]
 fn explicit_flush_drains_buffer() {
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
