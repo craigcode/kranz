@@ -75,12 +75,73 @@ Slack; forensics one tap away in the browser.
 
 ## Build slices (ship incrementally)
 
-- **Slice 1 — lifecycle**: `/kranz new` modal → thread planning → request-plan
+- **Slice 1 — lifecycle** (DONE): `/kranz new` → thread planning → request-plan
   block → approve/start buttons. The core "create a mission from Slack" loop.
   Reuses MissionHost + the existing plan-render + the built approve/queue paths.
-- **Slice 2 — control & status**: `/kranz status|pause|resume|config`, deep-link
-  buttons, spend allowlist.
-- **Slice 3 — App Home**: the dashboard tab (missions + queue + tickets).
+- **Slice 2 — control & status** (DONE): `/kranz status` (slice 1) plus
+  `/kranz config`, deep-link buttons, and the spend allowlist (which now also
+  gates the approve *button*, not just `/kranz approve`). `pause`/`resume` remain
+  a follow-up (they need the hosted-engine registry, same as `request_plan`).
+- **Slice 3 — App Home** (DONE): the dashboard tab (missions + queue + tickets),
+  published on `app_home_opened`.
+
+## Slice 2 & 3 implementation notes
+
+### `/kranz config [<id>] <role> <model> [effort]`
+
+Per-role model/effort change, mid-mission. **Spend-adjacent** (it re-shapes what
+future turns spend), so it is gated on the `slack.allowUsers` allowlist exactly
+like `/kranz new`; unlisted users get the same ephemeral "not authorized" reply.
+
+- **Roles**: `orchestrator` · `worker` · `scrutiny` · `functional`. The two
+  validator roles use the short forms; they map to the engine's config keys
+  `validatorScrutiny` / `validatorFunctional`. `effort` (optional) is one of
+  `low` · `medium` · `high` · `xhigh` · `max`.
+- **Mission targeting** (chosen convention): the id is **optional** and
+  disambiguated positionally. If the first argument is a known role, there is no
+  id and the change applies to the **most-recent mission** (the same "the mission
+  you just made" heuristic `/kranz status` uses). Otherwise the first argument is
+  the mission id: `/kranz config m-42 worker sonnet high`. A bad role/effort or
+  wrong arity falls through to `/kranz help` (a typo is discoverable, never a
+  silent surprising action). An unknown mission id is a plain ephemeral error.
+- **Wiring**: on authorization, the bridge enqueues
+  `ControlCommand::ConfigChange { patch }` onto the target mission's control
+  inbox, where `patch` is the camelCase engine patch, e.g.
+  `{"worker":{"model":"sonnet","reasoningEffort":"high"}}`. The role→key mapping
+  and patch shape are a pure, table-tested function (`inbound::config_patch`).
+
+### Deep-link buttons (`slack.dashboardUrl`)
+
+Optional config field `slack.dashboardUrl` (from `~/.kranz/config.json` or
+`KRANZ_SLACK_DASHBOARD_URL`, env winning). When **set**, every mission
+notification (plan-ready, blocked, complete) and every App Home mission row
+carries an **"Open in dashboard"** link pointing at
+`<dashboardUrl>#/m/<mission_id>`. When **unset**, no button is added — no
+behavior change from before. The link is a Block Kit *link button* (`url`, no
+`action_id` handler needed), so it opens the browser directly with no inbound
+routing.
+
+### App Home tab
+
+On an `app_home_opened` event the bridge folds the repo **read-only**
+(`EventLog::read_events` + `reducer::fold` per mission for status; `queue::list`;
+`Ticket::list` + `Ticket::read_state`) and publishes a Block Kit **home** view
+via `views.publish` (`SlackClient::publish_home_view`, bot token). The view lists
+active (non-terminal) missions with a status pill, the execution queue, and open
+(not Done/Failed) tickets.
+
+**Manifest / scope prerequisite (must re-apply the manifest / reinstall):**
+enabling the Home tab is a manifest change, so an existing install will NOT show
+the tab until the app is updated. `docs/slack-app-manifest.yaml` now sets
+`features.app_home.home_tab_enabled: true` and adds `app_home_opened` to the
+subscribed `bot_events`. Re-paste the manifest (api.slack.com/apps → your app →
+"App Manifest") and **reinstall the app to the workspace** so the new event
+subscription + Home tab take effect. `views.publish` itself needs **no OAuth
+scope beyond the existing `chat:write`** — it is authorized by the bot token and
+the only prerequisite is the Home tab being enabled — so reinstalling does not
+re-prompt for broader permissions. If a workspace hasn't reinstalled, Slack
+returns `{"ok":false,"error":…}` from `views.publish`; the bridge logs it and
+carries on (a missing Home tab never wedges the socket loop).
 
 ## Done when
 

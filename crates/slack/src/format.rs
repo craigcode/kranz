@@ -113,9 +113,49 @@ pub struct PlanReview {
 /// per-text-object Block Kit limit.
 const MAX_FIELD: usize = 2500;
 
+/// The deep-link URL for a mission's dashboard view: `<dashboard_url>#/m/<id>`.
+/// A single `/` between the base and the fragment is collapsed so a base with or
+/// without a trailing slash both yield exactly one (`…:4600#/m/x` regardless of
+/// whether the base ended in `/`). Pure; unit-tested.
+pub fn dashboard_deep_link(dashboard_url: &str, mission_id: &str) -> String {
+    let base = dashboard_url.trim_end_matches('/');
+    format!("{base}/#/m/{mission_id}")
+}
+
+/// A Block Kit `actions` block carrying a single "Open in dashboard" link
+/// button that deep-links to `<dashboard_url>#/m/<mission_id>`, or `None` when
+/// `dashboard_url` is `None`/blank (no button, no behavior change). A link
+/// button (has a `url`, no interaction handler) opens the browser directly, so
+/// it needs no inbound routing. Pure; unit-tested.
+pub fn dashboard_button(dashboard_url: Option<&str>, mission_id: &str) -> Option<Value> {
+    let url = dashboard_url.map(str::trim).filter(|u| !u.is_empty())?;
+    Some(json!({
+        "type": "actions",
+        "elements": [
+            {
+                "type": "button",
+                "text": { "type": "plain_text", "text": "Open in dashboard" },
+                "url": dashboard_deep_link(url, mission_id),
+                "action_id": "kranz_open_dashboard",
+            }
+        ]
+    }))
+}
+
+/// Append a dashboard deep-link `actions` block to `blocks` when a dashboard URL
+/// is configured; a no-op otherwise. Kept private and shared by the three
+/// mission-notification builders so the link shape is identical everywhere.
+fn push_dashboard_button(blocks: &mut Vec<Value>, dashboard_url: Option<&str>, mission_id: &str) {
+    if let Some(button) = dashboard_button(dashboard_url, mission_id) {
+        blocks.push(button);
+    }
+}
+
 /// Plan-ready message: header + goal + milestone list + assertion count, then an
 /// actions block with an [`APPROVE_ACTION_ID`] button carrying the mission id.
-pub fn build_plan_ready(p: &PlanReady) -> Vec<Value> {
+/// When `dashboard_url` is set, an "Open in dashboard" deep-link button is
+/// appended (see [`dashboard_button`]); when `None`, nothing extra is added.
+pub fn build_plan_ready(p: &PlanReady, dashboard_url: Option<&str>) -> Vec<Value> {
     let mut milestones = String::new();
     for title in &p.milestone_titles {
         milestones.push_str("• ");
@@ -126,7 +166,7 @@ pub fn build_plan_ready(p: &PlanReady) -> Vec<Value> {
         milestones.push_str("_(no milestones listed)_");
     }
 
-    vec![
+    let mut blocks = vec![
         header(&format!("Plan ready for review — {}", p.mission_id)),
         section(&format!("*Goal*\n{}", clip(&p.goal))),
         section(&format!("*Milestones*\n{}", clip(milestones.trim_end()))),
@@ -148,7 +188,9 @@ pub fn build_plan_ready(p: &PlanReady) -> Vec<Value> {
                 }
             ]
         }),
-    ]
+    ];
+    push_dashboard_button(&mut blocks, dashboard_url, &p.mission_id);
+    blocks
 }
 
 /// Needs-context message: the orchestrator's questions, threaded, with a nudge
@@ -175,9 +217,10 @@ pub fn build_needs_context(n: &NeedsContext) -> Vec<Value> {
 }
 
 /// Blocked-milestone message: reason + an explicit "reply in this thread to
-/// unblock" instruction (a threaded reply becomes `kranz msg` guidance).
-pub fn build_blocked(b: &Blocked) -> Vec<Value> {
-    vec![
+/// unblock" instruction (a threaded reply becomes `kranz msg` guidance). When
+/// `dashboard_url` is set, an "Open in dashboard" deep-link button is appended.
+pub fn build_blocked(b: &Blocked, dashboard_url: Option<&str>) -> Vec<Value> {
+    let mut blocks = vec![
         header(&format!("Milestone blocked — {}", b.mission_id)),
         section(&format!(
             "Milestone `{}` is blocked:\n>{}",
@@ -185,11 +228,14 @@ pub fn build_blocked(b: &Blocked) -> Vec<Value> {
             clip(b.reason.trim()).replace('\n', "\n>")
         )),
         context("Reply in this thread to unblock (your reply becomes orchestrator guidance)."),
-    ]
+    ];
+    push_dashboard_button(&mut blocks, dashboard_url, &b.mission_id);
+    blocks
 }
 
-/// Completion message: outcome header + summary + branch + optional cost.
-pub fn build_complete(c: &Complete) -> Vec<Value> {
+/// Completion message: outcome header + summary + branch + optional cost. When
+/// `dashboard_url` is set, an "Open in dashboard" deep-link button is appended.
+pub fn build_complete(c: &Complete, dashboard_url: Option<&str>) -> Vec<Value> {
     let (emoji, verb) = match c.outcome {
         Outcome::Completed => (":white_check_mark:", "completed"),
         Outcome::Failed => (":x:", "failed"),
@@ -200,11 +246,13 @@ pub fn build_complete(c: &Complete) -> Vec<Value> {
     }
     meta.push_str(&format!(" · mission `{}`", c.mission_id));
 
-    vec![
+    let mut blocks = vec![
         header(&format!("{emoji} Mission {verb} — {}", c.mission_id)),
         section(&clip(c.summary.trim())),
         context(&meta),
-    ]
+    ];
+    push_dashboard_button(&mut blocks, dashboard_url, &c.mission_id);
+    blocks
 }
 
 /// New-mission ack (M2.9 slice 1): confirms the mission id + goal and, when the
@@ -303,6 +351,8 @@ pub fn build_help() -> Vec<Value> {
              • `/kranz new <goal>` — create a mission and open its planning thread\n\
              • `/kranz plan <id>` — request the plan for review\n\
              • `/kranz approve <id>` — approve the plan and queue the mission\n\
+             • `/kranz config [<id>] <role> <model> [effort]` — change a role's model/effort \
+             (roles: orchestrator·worker·scrutiny·functional; effort: low·medium·high·xhigh·max)\n\
              • `/kranz status [<id>]` — show a mission's status\n\
              • `/kranz ticket <title>` — file a new backlog ticket\n\
              • `/kranz help` — show this message",
@@ -315,11 +365,120 @@ pub fn build_help() -> Vec<Value> {
              (unblocks a blocked milestone, steers a running one)",
         ),
         context(
-            "Money-spending actions (`new` · `plan` · `approve`) are gated by the \
+            "Money-spending actions (`new` · `plan` · `approve` · `config`) are gated by the \
              `slack.allowUsers` allowlist. Deep forensic inspection (full transcripts, \
              the four-pane live view) lives in the web UI via `kranz serve --open`.",
         ),
     ]
+}
+
+// -- App Home tab -----------------------------------------------------------
+
+/// One active mission row for the App Home dashboard: id + a status word for the
+/// pill. Folded read-only from the mission's event log by the bridge.
+#[derive(Debug, Clone)]
+pub struct HomeMission {
+    pub mission_id: String,
+    /// Short status word (e.g. `Running`, `Planning`) — the reducer's status.
+    pub status: String,
+}
+
+/// One queued mission row: id + priority (lower = sooner).
+#[derive(Debug, Clone)]
+pub struct HomeQueueItem {
+    pub mission_id: String,
+    pub priority: u8,
+}
+
+/// One open ticket row: slug + title + pipeline state word.
+#[derive(Debug, Clone)]
+pub struct HomeTicket {
+    pub slug: String,
+    pub title: String,
+    /// Pipeline state word (e.g. `New`, `Drafting`, `NeedsContext`).
+    pub state: String,
+}
+
+/// Build the Block Kit **home** view object (the payload for `views.publish`):
+/// active missions (id + status pill), the queue, and open tickets — a
+/// lightweight Mission Control inside Slack. Pure `data -> Value`; the bridge
+/// folds the inputs read-only from the repo and publishes the result.
+///
+/// The returned value is a full view object (`{"type":"home","blocks":[…]}`),
+/// ready to hand to [`crate::client::SlackClient::publish_home_view`]. When
+/// `dashboard_url` is set, each mission row carries an "Open" deep-link to the
+/// web UI; when `None`, the rows render without links.
+pub fn build_home_view(
+    missions: &[HomeMission],
+    queue: &[HomeQueueItem],
+    tickets: &[HomeTicket],
+    dashboard_url: Option<&str>,
+) -> Value {
+    let mut blocks = vec![header(":satellite_antenna: Kranz — Mission Control")];
+
+    // -- Active missions --
+    blocks.push(section("*Active missions*"));
+    if missions.is_empty() {
+        blocks.push(context("_No active missions. Create one with_ `/kranz new <goal>`."));
+    } else {
+        for m in missions {
+            let line = format!("`{}` · *{}*", m.mission_id, m.status);
+            match dashboard_url.map(str::trim).filter(|u| !u.is_empty()) {
+                Some(url) => blocks.push(section_with_link(
+                    &line,
+                    "Open",
+                    &dashboard_deep_link(url, &m.mission_id),
+                    &format!("kranz_home_open_{}", m.mission_id),
+                )),
+                None => blocks.push(section(&line)),
+            }
+        }
+    }
+
+    blocks.push(json!({ "type": "divider" }));
+
+    // -- Queue --
+    blocks.push(section("*Queue*"));
+    if queue.is_empty() {
+        blocks.push(context("_The execution queue is empty._"));
+    } else {
+        let mut body = String::new();
+        for (i, q) in queue.iter().enumerate() {
+            body.push_str(&format!("{}. `{}` · priority {}\n", i + 1, q.mission_id, q.priority));
+        }
+        blocks.push(section(&clip(body.trim_end())));
+    }
+
+    blocks.push(json!({ "type": "divider" }));
+
+    // -- Open tickets --
+    blocks.push(section("*Open tickets*"));
+    if tickets.is_empty() {
+        blocks.push(context("_No open tickets. File one with_ `/kranz ticket <title>`."));
+    } else {
+        let mut body = String::new();
+        for t in tickets {
+            body.push_str(&format!("• `{}` — {} · _{}_\n", t.slug, t.title.trim(), t.state));
+        }
+        blocks.push(section(&clip(body.trim_end())));
+    }
+
+    json!({ "type": "home", "blocks": blocks })
+}
+
+/// A `section` block with a trailing link-button `accessory` (a URL button, so
+/// it opens the browser directly and needs no inbound routing).
+fn section_with_link(mrkdwn: &str, label: &str, url: &str, action_id: &str) -> Value {
+    json!({
+        "type": "section",
+        "text": { "type": "mrkdwn", "text": mrkdwn },
+        "accessory": {
+            "type": "button",
+            "text": { "type": "plain_text", "text": label },
+            "url": url,
+            "action_id": action_id,
+        }
+    })
 }
 
 // -- block primitives -------------------------------------------------------
@@ -403,7 +562,7 @@ mod tests {
             goal: "Rate-limit the notes API".into(),
             milestone_titles: vec!["Token bucket".into(), "429 responses".into()],
             assertion_count: 3,
-        });
+        }, None);
         let text = all_text(&blocks);
         assert!(text.contains("m-42"), "mission id present");
         assert!(text.contains("Rate-limit the notes API"), "goal present");
@@ -424,7 +583,7 @@ mod tests {
             goal: "g".into(),
             milestone_titles: vec![],
             assertion_count: 1,
-        });
+        }, None);
         assert!(all_text(&blocks).contains("1 validation assertion "));
     }
 
@@ -450,7 +609,7 @@ mod tests {
             mission_id: "m-7".into(),
             milestone_id: "ms-2".into(),
             reason: "fix-cycle cap exceeded after 2 rounds".into(),
-        });
+        }, None);
         let text = all_text(&blocks);
         assert!(text.contains("m-7"), "mission id present");
         assert!(text.contains("ms-2"), "milestone id present");
@@ -466,7 +625,7 @@ mod tests {
             summary: "Added rate limiting; all tests pass.".into(),
             branch: "kranz/mission-m-9".into(),
             cost_usd: Some(4.2),
-        });
+        }, None);
         let text = all_text(&blocks);
         assert!(text.contains("m-9"), "mission id present");
         assert!(text.contains("completed"), "outcome verb present");
@@ -483,7 +642,7 @@ mod tests {
             summary: "worker exhausted respawns".into(),
             branch: "kranz/mission-m-9".into(),
             cost_usd: None,
-        });
+        }, None);
         let text = all_text(&blocks);
         assert!(text.contains("failed"), "failure verb present");
         assert!(text.contains("worker exhausted respawns"));
@@ -497,7 +656,7 @@ mod tests {
             mission_id: "m".into(),
             milestone_id: "ms".into(),
             reason: long,
-        });
+        }, None);
         let text = all_text(&blocks);
         assert!(text.contains('…'), "clipped fields end with an ellipsis");
         // The clipped field itself must stay under the cap; the assembled
@@ -627,5 +786,167 @@ mod tests {
         let text = all_text(&blocks);
         assert!(text.contains("1 validation assertion "), "singular assertion");
         assert!(text.contains("no milestones listed"));
+    }
+
+    // -- deep-link buttons --------------------------------------------------
+
+    #[test]
+    fn dashboard_deep_link_shape_with_and_without_trailing_slash() {
+        assert_eq!(
+            dashboard_deep_link("http://127.0.0.1:4600", "m-42"),
+            "http://127.0.0.1:4600/#/m/m-42"
+        );
+        // A trailing slash on the base is collapsed to exactly one.
+        assert_eq!(
+            dashboard_deep_link("http://127.0.0.1:4600/", "m-42"),
+            "http://127.0.0.1:4600/#/m/m-42"
+        );
+    }
+
+    /// Extract every `url` field found on any button element in the blocks.
+    fn all_button_urls(blocks: &[Value]) -> Vec<String> {
+        let mut out = Vec::new();
+        for b in blocks {
+            if b["type"] == "actions" {
+                if let Some(elems) = b["elements"].as_array() {
+                    for e in elems {
+                        if let Some(url) = e["url"].as_str() {
+                            out.push(url.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn dashboard_button_present_only_when_url_set() {
+        // None → no button.
+        assert!(dashboard_button(None, "m-1").is_none());
+        // Blank → treated as unset.
+        assert!(dashboard_button(Some("   "), "m-1").is_none());
+        // Set → a link button whose url is the deep link.
+        let btn = dashboard_button(Some("http://127.0.0.1:4600"), "m-1").expect("button");
+        let elem = &btn["elements"][0];
+        assert_eq!(elem["url"], "http://127.0.0.1:4600/#/m/m-1");
+        assert_eq!(elem["action_id"], "kranz_open_dashboard");
+        assert!(elem.get("value").is_none(), "link buttons carry a url, not a value");
+    }
+
+    #[test]
+    fn plan_ready_adds_dashboard_button_only_when_url_set() {
+        let p = PlanReady {
+            mission_id: "m-42".into(),
+            goal: "g".into(),
+            milestone_titles: vec![],
+            assertion_count: 1,
+        };
+        // Unset → no link button (only the approve button, which has no url).
+        let blocks = build_plan_ready(&p, None);
+        assert!(all_button_urls(&blocks).is_empty(), "no deep link when unset");
+        // Set → exactly one deep-link url, correctly shaped.
+        let blocks = build_plan_ready(&p, Some("http://127.0.0.1:4600"));
+        assert_eq!(all_button_urls(&blocks), vec!["http://127.0.0.1:4600/#/m/m-42".to_string()]);
+    }
+
+    #[test]
+    fn blocked_and_complete_carry_dashboard_link_when_set() {
+        let blocked = build_blocked(
+            &Blocked { mission_id: "m-7".into(), milestone_id: "ms-1".into(), reason: "x".into() },
+            Some("http://dash/"),
+        );
+        assert_eq!(all_button_urls(&blocked), vec!["http://dash/#/m/m-7".to_string()]);
+
+        let complete = build_complete(
+            &Complete {
+                mission_id: "m-9".into(),
+                outcome: Outcome::Completed,
+                summary: "done".into(),
+                branch: "b".into(),
+                cost_usd: None,
+            },
+            Some("http://dash"),
+        );
+        assert_eq!(all_button_urls(&complete), vec!["http://dash/#/m/m-9".to_string()]);
+        // And absent when unset.
+        let complete_no = build_complete(
+            &Complete {
+                mission_id: "m-9".into(),
+                outcome: Outcome::Completed,
+                summary: "done".into(),
+                branch: "b".into(),
+                cost_usd: None,
+            },
+            None,
+        );
+        assert!(all_button_urls(&complete_no).is_empty());
+    }
+
+    // -- App Home view ------------------------------------------------------
+
+    #[test]
+    fn home_view_lists_missions_queue_and_tickets() {
+        let view = build_home_view(
+            &[
+                HomeMission { mission_id: "m-1".into(), status: "Running".into() },
+                HomeMission { mission_id: "m-2".into(), status: "Planning".into() },
+            ],
+            &[HomeQueueItem { mission_id: "m-3".into(), priority: 2 }],
+            &[HomeTicket {
+                slug: "rate-limit".into(),
+                title: "Rate-limit the notes API".into(),
+                state: "New".into(),
+            }],
+            None,
+        );
+        assert_eq!(view["type"], "home", "a home view object");
+        let blocks = view["blocks"].as_array().expect("home blocks");
+        let text = all_text(blocks);
+        // Missions with their status pills.
+        assert!(text.contains("m-1") && text.contains("Running"));
+        assert!(text.contains("m-2") && text.contains("Planning"));
+        // Queue entry.
+        assert!(text.contains("m-3") && text.contains("priority 2"));
+        // Ticket slug + title + state.
+        assert!(text.contains("rate-limit"));
+        assert!(text.contains("Rate-limit the notes API"));
+        assert!(text.contains("New"));
+        // The whole view must serialize (it's the views.publish body).
+        assert!(serde_json::to_string(&view).is_ok());
+    }
+
+    #[test]
+    fn home_view_empty_state_is_friendly_and_valid() {
+        let view = build_home_view(&[], &[], &[], None);
+        let blocks = view["blocks"].as_array().expect("home blocks");
+        let text = all_text(blocks);
+        assert!(text.to_lowercase().contains("no active missions"));
+        assert!(text.to_lowercase().contains("queue is empty"));
+        assert!(text.to_lowercase().contains("no open tickets"));
+        // Every block still has a recognized type.
+        for b in blocks {
+            let ty = b["type"].as_str().expect("block type");
+            assert!(
+                ["header", "section", "context", "divider", "actions"].contains(&ty),
+                "unexpected home block type {ty}"
+            );
+        }
+    }
+
+    #[test]
+    fn home_view_mission_rows_deep_link_when_dashboard_url_set() {
+        let view = build_home_view(
+            &[HomeMission { mission_id: "m-1".into(), status: "Running".into() }],
+            &[],
+            &[],
+            Some("http://127.0.0.1:4600"),
+        );
+        let blocks = view["blocks"].as_array().expect("home blocks");
+        // A mission section carries an accessory link button to the deep link.
+        let has_link = blocks.iter().any(|b| {
+            b["accessory"]["url"] == "http://127.0.0.1:4600/#/m/m-1"
+        });
+        assert!(has_link, "mission row deep-links to the dashboard when configured");
     }
 }

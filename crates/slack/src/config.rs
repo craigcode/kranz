@@ -57,6 +57,12 @@ pub struct SlackConfig {
     /// Empty = solo default: allow anyone (the plumbing exists regardless so
     /// a workspace can lock spend down by listing its operators).
     pub allow_users: Vec<String>,
+    /// Base URL of the web dashboard (e.g. `http://127.0.0.1:4600/`). When set,
+    /// mission notifications carry an "Open in dashboard" deep link pointing at
+    /// `<dashboard_url>#/m/<mission_id>`; when `None`, no link is added (no
+    /// behavior change). Resolved from `slack.dashboardUrl` in the config file
+    /// or `KRANZ_SLACK_DASHBOARD_URL`, env winning.
+    pub dashboard_url: Option<String>,
 }
 
 impl SlackConfig {
@@ -94,6 +100,9 @@ struct SlackFileConfig {
     /// Optional spend allowlist (`allowUsers: ["Uxxxx"]`). Absent = empty.
     #[serde(default)]
     allow_users: Vec<String>,
+    /// Optional web-dashboard base URL (`dashboardUrl`) for deep-link buttons.
+    #[serde(default)]
+    dashboard_url: Option<String>,
 }
 
 /// Top-level shape we deserialize `~/.kranz/config.json` into — only the
@@ -130,6 +139,7 @@ struct EnvVars {
     bot_token: Option<String>,
     app_token: Option<String>,
     channel: Option<String>,
+    dashboard_url: Option<String>,
 }
 
 impl EnvVars {
@@ -138,6 +148,7 @@ impl EnvVars {
             bot_token: non_empty_env("KRANZ_SLACK_BOT_TOKEN"),
             app_token: non_empty_env("KRANZ_SLACK_APP_TOKEN"),
             channel: non_empty_env("KRANZ_SLACK_CHANNEL"),
+            dashboard_url: non_empty_env("KRANZ_SLACK_DASHBOARD_URL"),
         }
     }
 }
@@ -173,6 +184,9 @@ fn resolve(file: SlackFileConfig, env: EnvVars) -> Option<SlackConfig> {
     let bot_token = env.bot_token.or(file.bot_token).map(trim).filter(|s| non_blank(s));
     let app_token = env.app_token.or(file.app_token).map(trim).filter(|s| non_blank(s));
     let channel = env.channel.or(file.channel).map(trim).filter(|s| non_blank(s));
+    // Optional: env wins over file, blanks drop to None. Never gates enablement.
+    let dashboard_url =
+        env.dashboard_url.or(file.dashboard_url).map(trim).filter(|s| non_blank(s));
 
     match (bot_token, app_token, channel) {
         (Some(bot_token), Some(app_token), Some(channel)) => Some(SlackConfig {
@@ -188,6 +202,7 @@ fn resolve(file: SlackFileConfig, env: EnvVars) -> Option<SlackConfig> {
                 .map(|u| u.trim().to_string())
                 .filter(|u| !u.is_empty())
                 .collect(),
+            dashboard_url,
         }),
         _ => None,
     }
@@ -213,6 +228,7 @@ mod tests {
                 bot_token: Some("xoxb-1".into()),
                 app_token: Some("xapp-1".into()),
                 channel: Some("C1".into()),
+                ..EnvVars::default()
             },
         )
         .expect("full env triple resolves");
@@ -300,6 +316,7 @@ mod tests {
             channel: Some("C1".into()),
             notify: None,
             allow_users: vec![" U123 ".into(), "".into(), "  ".into(), "U456".into()],
+            ..SlackFileConfig::default()
         };
         let cfg = resolve(file, EnvVars::default()).expect("Some");
         // Blank entries dropped; surviving ids trimmed.
@@ -315,12 +332,62 @@ mod tests {
                 channel: Some("C1".into()),
                 notify: None,
                 allow_users: vec![],
+                ..SlackFileConfig::default()
             },
             EnvVars::default(),
         )
         .unwrap();
         assert!(cfg.is_authorized(Some("U999")), "solo default: anyone allowed");
         assert!(cfg.is_authorized(None), "even a missing user id is allowed with no list");
+    }
+
+    #[test]
+    fn dashboard_url_resolves_from_file_and_defaults_to_none() {
+        // Absent everywhere → None (no behavior change).
+        let cfg = resolve(
+            SlackFileConfig {
+                bot_token: Some("xoxb".into()),
+                app_token: Some("xapp".into()),
+                channel: Some("C1".into()),
+                notify: None,
+                ..SlackFileConfig::default()
+            },
+            EnvVars::default(),
+        )
+        .unwrap();
+        assert_eq!(cfg.dashboard_url, None);
+
+        // Present in the file → resolved and trimmed.
+        let cfg = resolve(
+            SlackFileConfig {
+                bot_token: Some("xoxb".into()),
+                app_token: Some("xapp".into()),
+                channel: Some("C1".into()),
+                notify: None,
+                dashboard_url: Some("  http://127.0.0.1:4600/  ".into()),
+                ..SlackFileConfig::default()
+            },
+            EnvVars::default(),
+        )
+        .unwrap();
+        assert_eq!(cfg.dashboard_url.as_deref(), Some("http://127.0.0.1:4600/"));
+    }
+
+    #[test]
+    fn dashboard_url_env_wins_over_file() {
+        let cfg = resolve(
+            SlackFileConfig {
+                bot_token: Some("xoxb".into()),
+                app_token: Some("xapp".into()),
+                channel: Some("C1".into()),
+                notify: None,
+                dashboard_url: Some("http://file/".into()),
+                ..SlackFileConfig::default()
+            },
+            EnvVars { dashboard_url: Some("http://env/".into()), ..EnvVars::default() },
+        )
+        .unwrap();
+        assert_eq!(cfg.dashboard_url.as_deref(), Some("http://env/"));
     }
 
     #[test]
@@ -332,6 +399,7 @@ mod tests {
                 channel: Some("C1".into()),
                 notify: None,
                 allow_users: vec!["U123".into()],
+                ..SlackFileConfig::default()
             },
             EnvVars::default(),
         )

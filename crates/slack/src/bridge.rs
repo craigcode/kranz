@@ -214,10 +214,11 @@ async fn post_outbound(
     mission_id: &str,
     outbound: &Outbound,
 ) -> Result<()> {
+    let dash = cfg.dashboard_url.as_deref();
     let blocks = match outbound {
-        Outbound::PlanReady(p) => crate::format::build_plan_ready(p),
-        Outbound::Blocked(b) => crate::format::build_blocked(b),
-        Outbound::Complete(c) => crate::format::build_complete(c),
+        Outbound::PlanReady(p) => crate::format::build_plan_ready(p, dash),
+        Outbound::Blocked(b) => crate::format::build_blocked(b, dash),
+        Outbound::Complete(c) => crate::format::build_complete(c, dash),
     };
     let thread_ts = threads.thread_ts(mission_id);
     let posted_ts = client.post_message(&cfg.channel, &blocks, thread_ts.as_deref()).await?;
@@ -499,6 +500,15 @@ fn not_authorized_blocks() -> Vec<Value> {
 ///   request-plan replies with an ephemeral pointing at `kranz plan <id>` /
 ///   the web UI. Documented handoff, not silently dropped.
 ///
+/// ## M2.9 slices 2 & 3 additions
+/// - **Config** (`/kranz config [<id>] <role> <model> [effort]`) — spend-adjacent,
+///   so allowlist-gated like `new`; on authorization enqueues a
+///   `config-change` control command with the camelCase patch ([`config_change`]).
+///   A pure local write, so it stays inline (fast ack).
+/// - **AppHome** (`app_home_opened`) — read-only: folds the repo and publishes
+///   the Home view via `views.publish` ([`build_home_view`]). One Web API call,
+///   no allowlist gate; a publish failure is logged, never surfaced.
+///
 /// ## Known limitation (ack budget, docs must-have #3)
 /// This handler runs inline in the socket read loop (see [`handle_envelope`] /
 /// `connect_once`), so the `NewMission` seeding `planning_turn` — a real
@@ -602,6 +612,50 @@ async fn dispatch_action(
             }
         }
 
+        // Per-role config change. SPEND-ADJACENT (it re-shapes future turns'
+        // spend), so it is gated on the allowlist exactly like `/kranz new`.
+        Action::Config { mission_id, role, model, effort, user_id, response_url } => {
+            if !cfg.is_authorized(user_id.as_deref()) {
+                reply_ephemeral(client, response_url.as_deref(), &not_authorized_blocks()).await;
+                return;
+            }
+            match config_change(repo_root, mission_id.as_deref(), role, model, effort.as_deref()) {
+                Ok(applied_to) => {
+                    let effort_note = effort
+                        .as_deref()
+                        .map(|e| format!(", effort `{e}`"))
+                        .unwrap_or_default();
+                    reply_ephemeral(
+                        client,
+                        response_url.as_deref(),
+                        &error_blocks(&format!(
+                            ":gear: Set `{role}` model `{model}`{effort_note} on `{applied_to}`."
+                        )),
+                    )
+                    .await
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to apply config change from Slack");
+                    reply_ephemeral(
+                        client,
+                        response_url.as_deref(),
+                        &error_blocks(&format!("Couldn't change config: {e}")),
+                    )
+                    .await
+                }
+            }
+        }
+
+        // App Home tab: fold the repo read-only and publish this user's home
+        // view. Read-only (no allowlist gate); a publish failure is logged, not
+        // surfaced (there's no response_url — the user just opened a tab).
+        Action::AppHome { user_id } => {
+            let view = build_home_view(repo_root, cfg.dashboard_url.as_deref());
+            if let Err(e) = client.publish_home_view(user_id, &view).await {
+                tracing::warn!(user = %user_id, error = %e, "failed to publish App Home view");
+            }
+        }
+
         // The approve BUTTON is the spend twin of `/kranz approve` and must be
         // gated identically — otherwise an unlisted user clicking it queues a
         // paid mission, bypassing the allowlist that the slash command enforces.
@@ -652,6 +706,8 @@ fn apply_action(repo_root: &Path, action: &Action) -> Result<()> {
         | Action::NewMission { .. }
         | Action::RequestPlan { .. }
         | Action::ApproveMission { .. }
+        | Action::Config { .. }
+        | Action::AppHome { .. }
         | Action::Ignore => Ok(()),
     }
 }
@@ -744,6 +800,99 @@ fn approve_mission(repo_root: &Path, mission_id: &str) -> Result<()> {
     queue::enqueue(repo_root, entry).context("enqueue approved mission")?;
     tracing::info!(mission = %mission_id, "approved+queued from Slack");
     Ok(())
+}
+
+/// `/kranz config [<id>] <role> <model> [effort]` → enqueue a `config-change`
+/// control command on the target mission's inbox. `role` is the canonical
+/// friendly name from the router; the camelCase engine patch is built by
+/// [`crate::inbound::config_patch`]. When `mission_id` is `None`, the
+/// most-recently-created mission is targeted (like `/kranz status`). Returns the
+/// mission id the change was applied to (for the reply).
+fn config_change(
+    repo_root: &Path,
+    mission_id: Option<&str>,
+    role: &str,
+    model: &str,
+    effort: Option<&str>,
+) -> Result<String> {
+    let mission_id = match mission_id {
+        Some(id) => id.to_string(),
+        None => most_recent_mission(repo_root).ok_or_else(|| {
+            anyhow::anyhow!("no missions yet — create one with `/kranz new <goal>`")
+        })?,
+    };
+    let paths = MissionPaths::new(repo_root, &mission_id);
+    // Only enqueue against a mission that actually exists, so a typo'd id fails
+    // loudly rather than dropping a control file into a phantom inbox.
+    if !paths.events_file().is_file() {
+        return Err(anyhow::anyhow!("unknown mission `{mission_id}`"));
+    }
+    let patch = crate::inbound::config_patch(role, model, effort)
+        .ok_or_else(|| anyhow::anyhow!("unknown role `{role}`"))?;
+    kranz_engine::control::enqueue(&paths, &ControlCommand::ConfigChange { patch })
+        .context("enqueue config change")?;
+    tracing::info!(mission = %mission_id, role, model, "config change enqueued from Slack");
+    Ok(mission_id)
+}
+
+/// Fold the repo read-only into an App Home view: active (non-terminal)
+/// missions with their status, the execution queue, and open (not-done) tickets.
+/// Pure rendering lives in [`crate::format::build_home_view`]; this is the
+/// read-only fold that feeds it.
+fn build_home_view(repo_root: &Path, dashboard_url: Option<&str>) -> Value {
+    use crate::format::{HomeMission, HomeQueueItem, HomeTicket};
+
+    // Active missions: fold each log, keep the non-terminal ones.
+    let mut missions = Vec::new();
+    for id in MissionPaths::list_missions(repo_root) {
+        let events_path = MissionPaths::new(repo_root, &id).events_file();
+        if !events_path.is_file() {
+            continue;
+        }
+        let state = match EventLog::read_events(&events_path).and_then(|e| reducer::fold(&e)) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(mission = %id, error = %e, "skipping mission in home view (fold failed)");
+                continue;
+            }
+        };
+        if is_terminal(state.mission.status) {
+            continue;
+        }
+        missions.push(HomeMission { mission_id: id, status: status_word(state.mission.status) });
+    }
+
+    let queue = kranz_engine::queue::list(repo_root)
+        .into_iter()
+        .map(|e| HomeQueueItem { mission_id: e.mission_id, priority: e.priority })
+        .collect::<Vec<_>>();
+
+    // Open tickets: everything not in a terminal (Done/Failed) pipeline state.
+    let tickets = kranz_engine::ticket::Ticket::list(repo_root)
+        .into_iter()
+        .filter_map(|t| {
+            let state = kranz_engine::ticket::Ticket::read_state(repo_root, &t.slug);
+            if ticket_is_open(state) {
+                Some(HomeTicket { slug: t.slug, title: t.title, state: format!("{state:?}") })
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    crate::format::build_home_view(&missions, &queue, &tickets, dashboard_url)
+}
+
+/// Whether a mission status is terminal (excluded from the active-missions list).
+fn is_terminal(status: MissionStatus) -> bool {
+    matches!(status, MissionStatus::Complete | MissionStatus::Failed | MissionStatus::Abandoned)
+}
+
+/// Whether a ticket is still "open" (surfaced in App Home) — anything not in a
+/// terminal pipeline state.
+fn ticket_is_open(state: kranz_engine::ticket::TicketState) -> bool {
+    use kranz_engine::ticket::TicketState;
+    !matches!(state, TicketState::Done | TicketState::Failed)
 }
 
 /// Threaded reply → orchestrator guidance via the mission's control inbox.
@@ -1003,6 +1152,40 @@ mod tests {
         std::fs::write(paths.events_file(), format!("{line}\n")).unwrap();
     }
 
+    /// Seed a mission that folds to [`MissionStatus::Complete`] — a `created`
+    /// event followed by a `mission.completed` — so App Home's terminal-filter
+    /// is exercised without a backend.
+    fn seed_completed_mission(repo_root: &Path, mission_id: &str) {
+        use kranz_engine::events::{Event, EventKind};
+        use kranz_engine::types::MissionConfig;
+        seed_mission(repo_root, mission_id, "goal");
+        let paths = MissionPaths::new(repo_root, mission_id);
+        let created = {
+            let e = Event {
+                seq: 1,
+                ts: chrono::Utc::now(),
+                mission_id: mission_id.to_string(),
+                kind: EventKind::MissionCreated {
+                    goal: "goal".into(),
+                    base_branch: "main".into(),
+                    mission_branch: format!("kranz/mission-{mission_id}"),
+                    config: MissionConfig::default(),
+                },
+            };
+            serde_json::to_string(&e).unwrap()
+        };
+        let completed = {
+            let e = Event {
+                seq: 2,
+                ts: chrono::Utc::now(),
+                mission_id: mission_id.to_string(),
+                kind: EventKind::MissionCompleted {},
+            };
+            serde_json::to_string(&e).unwrap()
+        };
+        std::fs::write(paths.events_file(), format!("{created}\n{completed}\n")).unwrap();
+    }
+
     #[test]
     fn build_status_reply_folds_the_log() {
         let tmp = TempDir::new().unwrap();
@@ -1050,6 +1233,157 @@ mod tests {
         assert_eq!(status_word(MissionStatus::Complete), "Complete");
     }
 
+    #[test]
+    fn config_change_enqueues_camelcase_patch_on_the_mission() {
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-cfg", "goal");
+        // scrutiny → validatorScrutiny, with effort → reasoningEffort.
+        let applied =
+            config_change(tmp.path(), Some("m-cfg"), "scrutiny", "opus", Some("high")).unwrap();
+        assert_eq!(applied, "m-cfg");
+        let paths = MissionPaths::new(tmp.path(), "m-cfg");
+        let drained = kranz_engine::control::drain(&paths).unwrap();
+        assert_eq!(drained.len(), 1);
+        match &drained[0].1 {
+            ControlCommand::ConfigChange { patch } => {
+                assert_eq!(
+                    *patch,
+                    json!({ "validatorScrutiny": { "model": "opus", "reasoningEffort": "high" } })
+                );
+            }
+            other => panic!("expected ConfigChange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_change_without_id_targets_most_recent_and_omits_effort() {
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-only", "goal");
+        let applied = config_change(tmp.path(), None, "worker", "sonnet", None).unwrap();
+        assert_eq!(applied, "m-only");
+        let drained =
+            kranz_engine::control::drain(&MissionPaths::new(tmp.path(), "m-only")).unwrap();
+        match &drained[0].1 {
+            ControlCommand::ConfigChange { patch } => {
+                assert_eq!(*patch, json!({ "worker": { "model": "sonnet" } }));
+            }
+            other => panic!("expected ConfigChange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_change_unknown_mission_is_error() {
+        let tmp = TempDir::new().unwrap();
+        let err = config_change(tmp.path(), Some("m-nope"), "worker", "sonnet", None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("m-nope"), "error names the unknown mission");
+    }
+
+    #[test]
+    fn config_action_is_a_noop_in_apply_action() {
+        // Config replies over the network in dispatch_action; apply_action must
+        // not double-handle it (no control file, no mission dir).
+        let tmp = TempDir::new().unwrap();
+        apply_action(
+            tmp.path(),
+            &Action::Config {
+                mission_id: Some("m-1".into()),
+                role: "worker".into(),
+                model: "sonnet".into(),
+                effort: None,
+                user_id: None,
+                response_url: None,
+            },
+        )
+        .unwrap();
+        // Nothing was enqueued (apply_action is inert for Config).
+        assert!(!MissionPaths::new(tmp.path(), "m-1").control_dir().exists());
+    }
+
+    #[test]
+    fn build_home_view_folds_missions_queue_and_tickets() {
+        let tmp = TempDir::new().unwrap();
+        // Two missions (both Planning → both active), one queued, one ticket.
+        seed_mission(tmp.path(), "m-a", "goal a");
+        seed_mission(tmp.path(), "m-b", "goal b");
+        queue::enqueue(
+            tmp.path(),
+            queue::QueueEntry {
+                mission_id: "m-b".into(),
+                ticket_slug: None,
+                priority: 2,
+                seq: 0,
+            },
+        )
+        .unwrap();
+        kranz_engine::ticket::Ticket::write_state(
+            tmp.path(),
+            "rate-limit",
+            kranz_engine::ticket::TicketState::New,
+            None,
+        )
+        .unwrap();
+        // A ticket .md is needed for Ticket::list to surface it.
+        let tdir = kranz_engine::ticket::Ticket::tickets_dir(tmp.path());
+        std::fs::write(
+            tdir.join("rate-limit.md"),
+            "---\ntitle: Rate-limit the notes API\n---\n\n## Goal\nx\n",
+        )
+        .unwrap();
+
+        let view = build_home_view(tmp.path(), Some("http://127.0.0.1:4600"));
+        let s = serde_json::to_string(&view).unwrap();
+        assert_eq!(view["type"], "home");
+        assert!(s.contains("m-a") && s.contains("m-b"), "active missions present");
+        assert!(s.contains("Planning"), "status pill present");
+        assert!(s.contains("Rate-limit the notes API"), "open ticket title present");
+        assert!(s.contains("m/m-a"), "deep link present when dashboard configured");
+    }
+
+    #[test]
+    fn build_home_view_excludes_terminal_missions_and_done_tickets() {
+        let tmp = TempDir::new().unwrap();
+        // A mission driven to Complete via mission.completed.
+        seed_completed_mission(tmp.path(), "m-done");
+        // A ticket in the Done terminal state.
+        let tdir = kranz_engine::ticket::Ticket::tickets_dir(tmp.path());
+        std::fs::create_dir_all(&tdir).unwrap();
+        std::fs::write(tdir.join("finished.md"), "---\ntitle: Finished\n---\n\n## Goal\nx\n").unwrap();
+        kranz_engine::ticket::Ticket::write_state(
+            tmp.path(),
+            "finished",
+            kranz_engine::ticket::TicketState::Done,
+            None,
+        )
+        .unwrap();
+
+        let view = build_home_view(tmp.path(), None);
+        let blocks = view["blocks"].as_array().unwrap();
+        let text = {
+            let mut out = String::new();
+            for b in blocks {
+                if let Some(t) = b.pointer("/text/text").and_then(Value::as_str) {
+                    out.push_str(t);
+                    out.push('\n');
+                }
+                if let Some(elems) = b["elements"].as_array() {
+                    for e in elems {
+                        if let Some(t) = e["text"].as_str() {
+                            out.push_str(t);
+                            out.push('\n');
+                        }
+                    }
+                }
+            }
+            out
+        };
+        assert!(!text.contains("m-done"), "terminal mission excluded from active list");
+        assert!(!text.contains("Finished"), "done ticket excluded from open tickets");
+        assert!(text.to_lowercase().contains("no active missions"));
+        assert!(text.to_lowercase().contains("no open tickets"));
+    }
+
     #[tokio::test]
     async fn handle_envelope_acks_with_envelope_id() {
         let tmp = TempDir::new().unwrap();
@@ -1060,6 +1394,7 @@ mod tests {
             channel: "C1".into(),
             notify: NotifyFlags::default(),
             allow_users: vec![],
+            dashboard_url: None,
         };
         let client = SlackClient::new(&cfg).unwrap();
         let frame = json!({
@@ -1087,6 +1422,7 @@ mod tests {
             channel: "C1".into(),
             notify: NotifyFlags::default(),
             allow_users: vec![],
+            dashboard_url: None,
         };
         let client = SlackClient::new(&cfg).unwrap();
         let hello = json!({ "type": "hello" }).to_string();

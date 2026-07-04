@@ -1,0 +1,20 @@
+{
+  "type": "events_api",
+  "envelope_id": "c8f2013a-609e-1b87-f292-4f307e819203",
+  "accepts_response_payload": false,
+  "payload": {
+    "token": "verification-token-redacted",
+    "team_id": "T024BE7LD",
+    "api_app_id": "A0123456789",
+    "event": {
+      "type": "app_home_opened",
+      "user": "U0263M3QW",
+      "channel": "D0LAN2Q65",
+      "tab": "home",
+      "event_ts": "1700000123.000200"
+    },
+    "type": "event_callback",
+    "event_id": "Ev0PV52K21",
+    "event_time": 1700000123
+  }
+}

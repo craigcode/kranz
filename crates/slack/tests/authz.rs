@@ -13,6 +13,7 @@ fn cfg(allow_users: Vec<&str>) -> SlackConfig {
         channel: "C1".into(),
         notify: NotifyFlags::default(),
         allow_users: allow_users.into_iter().map(String::from).collect(),
+        dashboard_url: None,
     }
 }
 

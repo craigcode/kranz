@@ -3,8 +3,9 @@
 //! the mission id / reason / branch / questions a reader needs.
 
 use kranz_slack::format::{
-    build_blocked, build_complete, build_help, build_needs_context, build_new_mission_ack,
-    build_plan_ready, build_plan_review, build_status, Blocked, Complete, NeedsContext,
+    build_blocked, build_complete, build_help, build_home_view, build_needs_context,
+    build_new_mission_ack, build_plan_ready, build_plan_review, build_status, dashboard_button,
+    dashboard_deep_link, Blocked, Complete, HomeMission, HomeQueueItem, HomeTicket, NeedsContext,
     NewMissionAck, Outcome, PlanReady, PlanReview, StatusSummary, APPROVE_ACTION_ID,
     START_ACTION_ID,
 };
@@ -47,12 +48,15 @@ fn all_text(blocks: &[Value]) -> String {
 
 #[test]
 fn plan_ready_block_kit() {
-    let blocks = build_plan_ready(&PlanReady {
-        mission_id: "m-42".into(),
-        goal: "Rate-limit the notes API".into(),
-        milestone_titles: vec!["Token bucket".into(), "429 responses".into()],
-        assertion_count: 2,
-    });
+    let blocks = build_plan_ready(
+        &PlanReady {
+            mission_id: "m-42".into(),
+            goal: "Rate-limit the notes API".into(),
+            milestone_titles: vec!["Token bucket".into(), "429 responses".into()],
+            assertion_count: 2,
+        },
+        None,
+    );
     assert_valid_blocks(&blocks);
     let text = all_text(&blocks);
     assert!(text.contains("m-42"));
@@ -85,11 +89,14 @@ fn needs_context_block_kit() {
 
 #[test]
 fn blocked_block_kit() {
-    let blocks = build_blocked(&Blocked {
-        mission_id: "m-7".into(),
-        milestone_id: "ms-2".into(),
-        reason: "fix-cycle cap exceeded after 2 rounds".into(),
-    });
+    let blocks = build_blocked(
+        &Blocked {
+            mission_id: "m-7".into(),
+            milestone_id: "ms-2".into(),
+            reason: "fix-cycle cap exceeded after 2 rounds".into(),
+        },
+        None,
+    );
     assert_valid_blocks(&blocks);
     let text = all_text(&blocks);
     assert!(text.contains("m-7"));
@@ -100,13 +107,16 @@ fn blocked_block_kit() {
 
 #[test]
 fn complete_block_kit() {
-    let blocks = build_complete(&Complete {
-        mission_id: "m-9".into(),
-        outcome: Outcome::Completed,
-        summary: "Added rate limiting; all tests pass.".into(),
-        branch: "kranz/mission-m-9".into(),
-        cost_usd: Some(4.2),
-    });
+    let blocks = build_complete(
+        &Complete {
+            mission_id: "m-9".into(),
+            outcome: Outcome::Completed,
+            summary: "Added rate limiting; all tests pass.".into(),
+            branch: "kranz/mission-m-9".into(),
+            cost_usd: Some(4.2),
+        },
+        None,
+    );
     assert_valid_blocks(&blocks);
     let text = all_text(&blocks);
     assert!(text.contains("m-9"));
@@ -118,13 +128,16 @@ fn complete_block_kit() {
 
 #[test]
 fn failed_block_kit_reads_failed() {
-    let blocks = build_complete(&Complete {
-        mission_id: "m-9".into(),
-        outcome: Outcome::Failed,
-        summary: "worker exhausted respawns".into(),
-        branch: "kranz/mission-m-9".into(),
-        cost_usd: None,
-    });
+    let blocks = build_complete(
+        &Complete {
+            mission_id: "m-9".into(),
+            outcome: Outcome::Failed,
+            summary: "worker exhausted respawns".into(),
+            branch: "kranz/mission-m-9".into(),
+            cost_usd: None,
+        },
+        None,
+    );
     assert_valid_blocks(&blocks);
     let text = all_text(&blocks);
     assert!(text.contains("failed"));
@@ -209,4 +222,93 @@ fn plan_review_block_kit_has_start_and_queue_buttons() {
     assert_eq!(queue["value"], "m-42");
     // The whole thing must serialize (it goes straight into a postMessage body).
     assert!(serde_json::to_string(&blocks).is_ok());
+}
+
+// --- M2.9 slices 2 & 3: deep-link buttons + App Home -----------------------
+
+/// The `url` of every link button across all `actions` blocks.
+fn actions_button_urls(blocks: &[Value]) -> Vec<String> {
+    let mut out = Vec::new();
+    for b in blocks {
+        if b["type"] == "actions" {
+            if let Some(elems) = b["elements"].as_array() {
+                for e in elems {
+                    if let Some(url) = e["url"].as_str() {
+                        out.push(url.to_string());
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn deep_link_shape_and_button_presence() {
+    // The deep link is <dashboardUrl>#/m/<id>, one slash regardless of the base.
+    assert_eq!(dashboard_deep_link("http://h:4600", "m-1"), "http://h:4600/#/m/m-1");
+    assert_eq!(dashboard_deep_link("http://h:4600/", "m-1"), "http://h:4600/#/m/m-1");
+
+    // No button when unset/blank; a link button when set.
+    assert!(dashboard_button(None, "m-1").is_none());
+    assert!(dashboard_button(Some("  "), "m-1").is_none());
+    let btn = dashboard_button(Some("http://h:4600"), "m-1").expect("button");
+    assert_eq!(btn["elements"][0]["url"], "http://h:4600/#/m/m-1");
+}
+
+#[test]
+fn plan_ready_deep_link_present_only_when_url_set() {
+    let p = PlanReady {
+        mission_id: "m-42".into(),
+        goal: "g".into(),
+        milestone_titles: vec![],
+        assertion_count: 1,
+    };
+    assert!(actions_button_urls(&build_plan_ready(&p, None)).is_empty());
+    assert_eq!(
+        actions_button_urls(&build_plan_ready(&p, Some("http://h:4600"))),
+        vec!["http://h:4600/#/m/m-42".to_string()]
+    );
+}
+
+#[test]
+fn home_view_is_valid_block_kit_with_missions_queue_and_tickets() {
+    let view = build_home_view(
+        &[HomeMission { mission_id: "m-1".into(), status: "Running".into() }],
+        &[HomeQueueItem { mission_id: "m-2".into(), priority: 3 }],
+        &[HomeTicket {
+            slug: "rate-limit".into(),
+            title: "Rate-limit the notes API".into(),
+            state: "New".into(),
+        }],
+        Some("http://h:4600"),
+    );
+    assert_eq!(view["type"], "home", "views.publish expects a home view");
+    let blocks = view["blocks"].as_array().expect("home blocks");
+    assert_valid_blocks(blocks);
+    let text = all_text(blocks);
+    assert!(text.contains("m-1") && text.contains("Running"), "mission + status pill");
+    assert!(text.contains("m-2") && text.contains("priority 3"), "queue row");
+    assert!(text.contains("rate-limit") && text.contains("Rate-limit the notes API"), "ticket");
+    // Mission row deep-links to the dashboard when configured.
+    let has_link = blocks.iter().any(|b| b["accessory"]["url"] == "http://h:4600/#/m/m-1");
+    assert!(has_link, "mission row carries a dashboard deep link");
+    assert!(serde_json::to_string(&view).is_ok(), "the view must serialize");
+}
+
+#[test]
+fn home_view_empty_state_renders_and_validates() {
+    let view = build_home_view(&[], &[], &[], None);
+    let blocks = view["blocks"].as_array().expect("home blocks");
+    assert_valid_blocks(blocks);
+    let text = all_text(blocks).to_lowercase();
+    assert!(text.contains("no active missions"));
+    assert!(text.contains("queue is empty"));
+    assert!(text.contains("no open tickets"));
+}
+
+#[test]
+fn help_lists_the_config_command() {
+    let text = serde_json::to_string(&build_help()).unwrap();
+    assert!(text.contains("/kranz config"), "help lists the config command");
 }

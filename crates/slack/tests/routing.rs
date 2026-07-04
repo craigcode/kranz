@@ -180,3 +180,36 @@ fn slash_status_and_plan_route_at_the_boundary() {
         }
     );
 }
+
+// --- M2.9 slices 2 & 3: config + App Home ----------------------------------
+
+#[test]
+fn slash_command_config_fixture_routes_to_config() {
+    let routed = route(&fixture("slash_command_config.json"), &no_lookup());
+    assert_eq!(
+        routed.envelope_id.as_deref(),
+        Some("b7e1f028-5f9d-0a76-e181-3e2f6d708192")
+    );
+    // First arg is a role → no explicit id (applies to the most-recent mission).
+    assert_eq!(
+        routed.action,
+        Action::Config {
+            mission_id: None,
+            role: "worker".into(),
+            model: "sonnet".into(),
+            effort: Some("high".into()),
+            user_id: Some("U0263M3QW".into()),
+            response_url: Some("https://hooks.slack.com/commands/T024BE7LD/1234/configurl".into()),
+        }
+    );
+}
+
+#[test]
+fn app_home_opened_fixture_routes_to_app_home() {
+    let routed = route(&fixture("app_home_opened.json"), &no_lookup());
+    assert_eq!(
+        routed.envelope_id.as_deref(),
+        Some("c8f2013a-609e-1b87-f292-4f307e819203")
+    );
+    assert_eq!(routed.action, Action::AppHome { user_id: "U0263M3QW".into() });
+}

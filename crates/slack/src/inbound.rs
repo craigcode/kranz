@@ -66,6 +66,25 @@ pub enum Action {
     /// `/kranz approve <id>` → approve the plan and queue the mission. The
     /// slash-command twin of the [`Action::Approve`] button; spend-gated.
     ApproveMission { mission_id: String, user_id: Option<String>, response_url: Option<String> },
+    /// `/kranz config [<id>] <role> <model> [effort]` → change a role's model
+    /// (and optionally reasoning effort) mid-mission via a `config-change`
+    /// control command. SPEND-ADJACENT (it re-shapes what future turns spend),
+    /// so it is gated on the allowlist exactly like `/kranz new`. `mission_id`
+    /// absent = the most-recent mission (like `/kranz status`). `role` /
+    /// `effort` are the already-validated canonical spellings (see
+    /// [`parse_role`] / [`parse_effort`]); a bad role or effort never reaches
+    /// here — routing falls through to [`Action::Help`] instead.
+    Config {
+        mission_id: Option<String>,
+        role: String,
+        model: String,
+        effort: Option<String>,
+        user_id: Option<String>,
+        response_url: Option<String>,
+    },
+    /// `app_home_opened` events_api envelope → publish this user's App Home tab
+    /// (active missions + queue + open tickets). Read-only, so not spend-gated.
+    AppHome { user_id: String },
     /// `/kranz help`, bare `/kranz`, or an unrecognized subcommand → reply with
     /// the command list. `response_url` (from the slash payload) is where the
     /// ephemeral help is posted.
@@ -169,6 +188,15 @@ fn route_event(payload: &Value, lookup: &impl ThreadLookup) -> Action {
     let Some(event) = payload.get("event") else {
         return Action::Ignore;
     };
+    // App Home opened → publish this user's dashboard tab. It carries the
+    // opening user's id in `event.user` and no thread; handle it before the
+    // message path (a home-open is not a message).
+    if event.get("type").and_then(Value::as_str) == Some("app_home_opened") {
+        return match event.get("user").and_then(Value::as_str).map(str::trim) {
+            Some(user) if !user.is_empty() => Action::AppHome { user_id: user.to_string() },
+            _ => Action::Ignore,
+        };
+    }
     if event.get("type").and_then(Value::as_str) != Some("message") {
         return Action::Ignore;
     }
@@ -272,7 +300,111 @@ fn route_slash(payload: &Value) -> Action {
         // `approve` with no id → help.
     }
 
+    // `config [<id>] <role> <model> [effort]` → per-role model/effort change
+    // (spend-adjacent, gated in the bridge). A bad role/effort or too few args
+    // falls through to help so a typo is discoverable rather than silent.
+    if let Some(rest) = strip_ci_prefix(text, "config") {
+        if let Some(cfg) = parse_config_args(rest, user_id.clone(), response_url.clone()) {
+            return cfg;
+        }
+        // Malformed config → help.
+    }
+
     Action::Help { response_url }
+}
+
+/// Canonical role names accepted by `/kranz config` (the friendly spellings) and
+/// their [`crate::types`]-side camelCase config keys are mapped in
+/// [`config_patch`]. `scrutiny` / `functional` are the short forms of the two
+/// validator roles.
+const ROLES: [&str; 4] = ["orchestrator", "worker", "scrutiny", "functional"];
+
+/// Reasoning-effort values accepted by `/kranz config` (mirrors the engine's
+/// `claude --effort` set).
+const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+/// Parse a role token (case-insensitively) to its canonical spelling, or `None`
+/// if it is not one of the four roles.
+fn parse_role(token: &str) -> Option<&'static str> {
+    ROLES.iter().copied().find(|r| r.eq_ignore_ascii_case(token))
+}
+
+/// Parse an effort token (case-insensitively) to its canonical spelling, or
+/// `None` if it is not a valid effort.
+fn parse_effort(token: &str) -> Option<&'static str> {
+    EFFORTS.iter().copied().find(|e| e.eq_ignore_ascii_case(token))
+}
+
+/// Parse the arguments after `config` into an [`Action::Config`], or `None`
+/// when the shape is wrong (which routes to help). Accepts two shapes,
+/// disambiguated by whether the FIRST token is a known role:
+/// - `<role> <model> [effort]`         → applies to the most-recent mission
+/// - `<id> <role> <model> [effort]`    → applies to `<id>`
+///
+/// `model` is any non-empty token (model aliases/ids are open-ended, so we
+/// don't validate them). `effort`, when present, must be a valid effort.
+fn parse_config_args(
+    rest: &str,
+    user_id: Option<String>,
+    response_url: Option<String>,
+) -> Option<Action> {
+    let tokens: Vec<&str> = rest.split_whitespace().collect();
+    if tokens.is_empty() {
+        return None;
+    }
+
+    // If the first token is a role, there's no explicit mission id; otherwise the
+    // first token is the mission id and the role starts at index 1.
+    let (mission_id, role_idx) = if parse_role(tokens[0]).is_some() {
+        (None, 0)
+    } else {
+        (Some(tokens[0].to_string()), 1)
+    };
+
+    let role = parse_role(tokens.get(role_idx)?)?.to_string();
+    let model = tokens.get(role_idx + 1).map(|s| s.trim()).filter(|s| !s.is_empty())?;
+    // At most one trailing effort token; extra tokens make it ambiguous → help.
+    let effort = match tokens.get(role_idx + 2) {
+        Some(tok) => Some(parse_effort(tok)?.to_string()),
+        None => None,
+    };
+    if tokens.len() > role_idx + 3 {
+        return None;
+    }
+
+    Some(Action::Config {
+        mission_id,
+        role,
+        model: model.to_string(),
+        effort,
+        user_id,
+        response_url,
+    })
+}
+
+/// Build the camelCase `config-change` patch for a canonical `role` (as parsed
+/// by [`parse_role`]) with the given `model` and optional `effort`. Returns
+/// `None` for an unknown role (defensive — routing only ever passes a canonical
+/// one). The mapping is the load-bearing bit: the friendly `/kranz config` role
+/// names map to the engine's `MissionConfig` keys —
+/// `scrutiny → validatorScrutiny`, `functional → validatorFunctional`, the
+/// other two unchanged — and `effort → reasoningEffort`.
+pub fn config_patch(role: &str, model: &str, effort: Option<&str>) -> Option<Value> {
+    let key = match role {
+        "orchestrator" => "orchestrator",
+        "worker" => "worker",
+        "scrutiny" => "validatorScrutiny",
+        "functional" => "validatorFunctional",
+        _ => return None,
+    };
+    let mut role_obj = serde_json::Map::new();
+    role_obj.insert("model".to_string(), Value::String(model.to_string()));
+    if let Some(effort) = effort {
+        role_obj.insert("reasoningEffort".to_string(), Value::String(effort.to_string()));
+    }
+    let mut patch = serde_json::Map::new();
+    patch.insert(key.to_string(), Value::Object(role_obj));
+    Some(Value::Object(patch))
 }
 
 /// Strip a leading case-insensitive word `prefix` from `text`, requiring a word
@@ -639,6 +771,139 @@ mod tests {
                 "text={text:?} should route to help"
             );
         }
+    }
+
+    // --- /kranz config -----------------------------------------------------
+
+    /// Build a `/kranz config <text>` slash envelope.
+    fn config_env(text: &str) -> Value {
+        json!({
+            "type": "slash_commands",
+            "envelope_id": "env-cfg",
+            "payload": {
+                "command": "/kranz",
+                "text": format!("config {text}"),
+                "user_id": "Ucfg",
+                "response_url": "https://hooks.slack/c"
+            }
+        })
+    }
+
+    #[test]
+    fn slash_config_role_model_routes_to_config_most_recent() {
+        // No id → applies to the most-recent mission (mission_id None).
+        assert_eq!(
+            route(&config_env("worker sonnet"), &lookup_none()).action,
+            Action::Config {
+                mission_id: None,
+                role: "worker".into(),
+                model: "sonnet".into(),
+                effort: None,
+                user_id: Some("Ucfg".into()),
+                response_url: Some("https://hooks.slack/c".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn slash_config_role_model_effort_routes_to_config() {
+        assert_eq!(
+            route(&config_env("ORCHESTRATOR opus XHIGH"), &lookup_none()).action,
+            Action::Config {
+                mission_id: None,
+                role: "orchestrator".into(),
+                model: "opus".into(),
+                effort: Some("xhigh".into()),
+                user_id: Some("Ucfg".into()),
+                response_url: Some("https://hooks.slack/c".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn slash_config_with_explicit_id_routes_to_config() {
+        // First token is not a role → it's the mission id.
+        assert_eq!(
+            route(&config_env("m-42 scrutiny opus high"), &lookup_none()).action,
+            Action::Config {
+                mission_id: Some("m-42".into()),
+                role: "scrutiny".into(),
+                model: "opus".into(),
+                effort: Some("high".into()),
+                user_id: Some("Ucfg".into()),
+                response_url: Some("https://hooks.slack/c".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn slash_config_bad_role_or_effort_or_arity_falls_through_to_help() {
+        for text in [
+            "",                        // no args
+            "worker",                  // no model
+            "notarole sonnet",         // bad role, and "sonnet" isn't a role either
+            "worker sonnet turbo",     // bad effort
+            "worker sonnet high extra", // too many tokens
+            "m-42 worker",             // id + role but no model
+        ] {
+            assert_eq!(
+                route(&config_env(text), &lookup_none()).action,
+                Action::Help { response_url: Some("https://hooks.slack/c".into()) },
+                "config {text:?} should fall through to help"
+            );
+        }
+    }
+
+    #[test]
+    fn config_patch_maps_roles_to_camelcase_keys() {
+        // Table of (friendly role, expected top-level camelCase key).
+        let cases = [
+            ("orchestrator", "orchestrator"),
+            ("worker", "worker"),
+            ("scrutiny", "validatorScrutiny"),
+            ("functional", "validatorFunctional"),
+        ];
+        for (role, key) in cases {
+            let patch = config_patch(role, "sonnet", Some("high")).expect("known role");
+            assert_eq!(
+                patch,
+                json!({ key: { "model": "sonnet", "reasoningEffort": "high" } }),
+                "role {role} maps to {key} with reasoningEffort"
+            );
+        }
+    }
+
+    #[test]
+    fn config_patch_omits_effort_when_absent_and_none_for_unknown_role() {
+        assert_eq!(
+            config_patch("worker", "sonnet", None).unwrap(),
+            json!({ "worker": { "model": "sonnet" } }),
+            "no effort → only model in the patch"
+        );
+        assert!(config_patch("nope", "sonnet", None).is_none(), "unknown role → None");
+    }
+
+    // --- app_home_opened ---------------------------------------------------
+
+    #[test]
+    fn app_home_opened_routes_to_app_home() {
+        let env = json!({
+            "type": "events_api",
+            "envelope_id": "env-home",
+            "payload": { "event": { "type": "app_home_opened", "user": "Uhome", "tab": "home" } }
+        });
+        let routed = route(&env, &lookup_none());
+        assert_eq!(routed.envelope_id.as_deref(), Some("env-home"));
+        assert_eq!(routed.action, Action::AppHome { user_id: "Uhome".into() });
+    }
+
+    #[test]
+    fn app_home_opened_without_user_is_ignored() {
+        let env = json!({
+            "type": "events_api",
+            "payload": { "event": { "type": "app_home_opened", "tab": "home" } }
+        });
+        assert_eq!(route(&env, &lookup_none()).action, Action::Ignore);
     }
 
     #[test]

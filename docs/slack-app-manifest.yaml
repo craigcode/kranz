@@ -9,15 +9,27 @@ features:
   bot_user:
     display_name: kranz
     always_online: true
+  # App Home tab: a dashboard of active missions + queue + open tickets,
+  # published via views.publish when a user opens the Home tab (see the
+  # app_home_opened bot event below). Enabling this requires re-applying this
+  # manifest / reinstalling the app — see docs/slack-management.md.
+  app_home:
+    home_tab_enabled: true
+    messages_tab_enabled: false
+    messages_tab_read_only_enabled: false
   slash_commands:
     - command: /kranz
       description: Kranz mission commands — try /kranz help
-      usage_hint: help | ticket <title>
+      usage_hint: help | new <goal> | status [id] | config <role> <model> [effort] | ticket <title>
       should_escape: false
 oauth_config:
   scopes:
     bot:
-      # post mission updates + button/thread replies
+      # post mission updates + button/thread replies. Also authorizes
+      # views.publish for the App Home tab — publishing a Home view needs NO
+      # scope beyond chat:write; the only prerequisite is app_home.home_tab_enabled
+      # above (already set). No new scope means re-installing does not re-prompt
+      # for broader permissions.
       - chat:write
       # the /kranz slash command
       - commands
@@ -28,6 +40,8 @@ settings:
     bot_events:
       # deliver messages in public channels the bot is in (thread replies)
       - message.channels
+      # a user opened the App Home tab → publish their dashboard view
+      - app_home_opened
   interactivity:
     is_enabled: true # the approve button (block_actions over the socket)
   socket_mode_enabled: true # outbound websocket — no public URL needed

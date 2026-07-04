@@ -17,6 +17,7 @@ use serde_json::Value;
 
 const POST_MESSAGE_URL: &str = "https://slack.com/api/chat.postMessage";
 const CONNECTIONS_OPEN_URL: &str = "https://slack.com/api/apps.connections.open";
+const VIEWS_PUBLISH_URL: &str = "https://slack.com/api/views.publish";
 
 /// Authenticated Slack Web API client. Holds the bot + app tokens and a reused
 /// `reqwest::Client` (connection pooling).
@@ -126,6 +127,37 @@ impl SlackClient {
             .and_then(Value::as_str)
             .map(str::to_string)
             .ok_or_else(|| anyhow!("chat.postMessage: response missing `ts`"))
+    }
+
+    /// `views.publish` with the bot token → set `user_id`'s App Home tab to
+    /// `view` (a Block Kit home view object, e.g. from
+    /// [`crate::format::build_home_view`]).
+    ///
+    /// SCOPE NOTE: `views.publish` is authorized by the bot token and needs no
+    /// scope beyond the existing `chat:write` family — the only prerequisite is
+    /// that the app has the **App Home tab enabled** (manifest
+    /// `features.app_home.home_tab_enabled: true`) and is subscribed to
+    /// `app_home_opened`. Both are added in docs/slack-app-manifest.yaml;
+    /// enabling them requires re-applying the manifest / reinstalling the app
+    /// (see docs/slack-management.md). If a workspace hasn't re-installed, Slack
+    /// returns `{"ok":false,"error":"…"}` here, which [`check_ok`] surfaces —
+    /// the bridge logs it and carries on (a missing Home tab never wedges the
+    /// socket loop).
+    pub async fn publish_home_view(&self, user_id: &str, view: &Value) -> Result<()> {
+        let payload = serde_json::json!({ "user_id": user_id, "view": view });
+        let resp = self
+            .http
+            .post(VIEWS_PUBLISH_URL)
+            .bearer_auth(&self.bot_token)
+            .json(&payload)
+            .send()
+            .await
+            .context("views.publish request failed")?;
+        let body: Value = resp
+            .json()
+            .await
+            .context("views.publish: response was not JSON")?;
+        check_ok(&body, "views.publish")
     }
 }
 
