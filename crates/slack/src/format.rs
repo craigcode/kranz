@@ -23,6 +23,14 @@ pub const APPROVE_ACTION_ID: &str = "kranz_approve";
 /// button `value` carries the mission id, same as approve.
 pub const START_ACTION_ID: &str = "kranz_start";
 
+/// `callback_id` of the new-mission modal ([`build_new_mission_modal`]); its
+/// `view_submission` routes to [`crate::inbound::Action::NewMission`].
+pub const NEW_MISSION_CALLBACK_ID: &str = "kranz_new_mission";
+/// block_id / action_id of the modal's goal input, used to dig the goal out
+/// of `view.state.values` on submission.
+pub const NEW_MISSION_GOAL_BLOCK: &str = "goal";
+pub const NEW_MISSION_GOAL_ACTION: &str = "goal_text";
+
 /// A mission whose plan is ready for review. The `value` carried by the approve
 /// button is the mission id, so a click round-trips back to the right mission.
 #[derive(Debug, Clone)]
@@ -353,6 +361,47 @@ pub fn build_new_mission_ack(a: &NewMissionAck) -> Vec<Value> {
     blocks
 }
 
+/// The new-mission modal: a real MULTILINE goal field — the escape hatch from
+/// Slack's one-line slash-command ceiling. The invoking channel rides in
+/// `private_metadata` (a `view_submission` doesn't carry the channel), so the
+/// planning thread lands where the command was issued. Pure; unit-tested.
+pub fn build_new_mission_modal(channel: &str) -> Value {
+    json!({
+        "type": "modal",
+        "callback_id": NEW_MISSION_CALLBACK_ID,
+        "private_metadata": channel,
+        "title": { "type": "plain_text", "text": "New mission" },
+        "submit": { "type": "plain_text", "text": "Create" },
+        "close": { "type": "plain_text", "text": "Cancel" },
+        "blocks": [
+            {
+                "type": "input",
+                "block_id": NEW_MISSION_GOAL_BLOCK,
+                "label": { "type": "plain_text", "text": "Mission goal" },
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": NEW_MISSION_GOAL_ACTION,
+                    "multiline": true,
+                    "placeholder": {
+                        "type": "plain_text",
+                        "text": "What should this mission accomplish? Constraints, file paths, \
+                                 and acceptance criteria all help the planner."
+                    }
+                }
+            },
+            {
+                "type": "context",
+                "elements": [{
+                    "type": "mrkdwn",
+                    "text": "Creating spends an orchestrator planning turn. The planning \
+                             thread opens in this channel — reply there to keep shaping \
+                             the plan."
+                }]
+            }
+        ]
+    })
+}
+
 /// A planning-conversation reply, posted threaded: the orchestrator's prose
 /// plus the standing "how to continue" context line. Used for both a planning
 /// turn's reply and a NotReady `/kranz plan` outcome (which is the same thing:
@@ -436,7 +485,8 @@ pub fn build_help() -> Vec<Value> {
         header(":sparkles: Kranz — Slack commands"),
         section(
             "*Slash commands*\n\
-             • `/kranz new <goal>` — create a mission and open its planning thread\n\
+             • `/kranz new <goal>` — create a mission and open its planning thread \
+             (bare `/kranz new` opens a form with a full multiline goal field)\n\
              • `/kranz plan <id>` — request the plan for review\n\
              • `/kranz approve <id>` — approve the plan and queue the mission\n\
              • `/kranz config [<id>] <role> <model> [effort]` — change a role's model/effort \
@@ -840,6 +890,24 @@ mod tests {
         assert!(text.contains("Running"), "status pill present");
         assert!(text.contains("2/3 milestones complete"), "summary body present");
         assert!(text.contains("cost $1.20"));
+    }
+
+    #[test]
+    fn new_mission_modal_carries_channel_and_multiline_goal_input() {
+        let view = build_new_mission_modal("C0BF6SAJLJ0");
+        assert_eq!(view["type"], "modal");
+        assert_eq!(view["callback_id"], NEW_MISSION_CALLBACK_ID);
+        // The invoking channel rides in private_metadata: a view_submission
+        // carries no channel, and the planning thread must land where the
+        // command was issued.
+        assert_eq!(view["private_metadata"], "C0BF6SAJLJ0");
+        let input = &view["blocks"][0];
+        assert_eq!(input["block_id"], NEW_MISSION_GOAL_BLOCK);
+        assert_eq!(input["element"]["action_id"], NEW_MISSION_GOAL_ACTION);
+        assert_eq!(
+            input["element"]["multiline"], true,
+            "the whole point: a multiline goal field"
+        );
     }
 
     #[test]

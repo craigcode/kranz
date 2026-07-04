@@ -540,6 +540,29 @@ async fn reply_ephemeral(
     }
 }
 
+/// User-only reply for actions that know their channel: over the
+/// `response_url` when there is one (slash commands, buttons), else
+/// `chat.postEphemeral` (the modal path — a `view_submission` carries no
+/// response_url). Best-effort, instance-labeled either way.
+async fn user_reply(
+    cfg: &SlackConfig,
+    client: &SlackClient,
+    response_url: Option<&str>,
+    channel: &str,
+    user_id: Option<&str>,
+    blocks: &[Value],
+) {
+    if response_url.is_some() {
+        reply_ephemeral(cfg, client, response_url, blocks).await;
+        return;
+    }
+    let Some(user) = user_id else { return };
+    let blocks = crate::format::label_blocks(blocks.to_vec(), cfg.instance_name.as_deref());
+    if let Err(e) = client.post_ephemeral(channel, user, &blocks).await {
+        tracing::warn!(error = %e, "failed to post ephemeral Slack reply (postEphemeral)");
+    }
+}
+
 /// A one-line ephemeral "not authorized" reply for a spend-gated action from an
 /// unlisted user (docs/slack-management.md must-have #1).
 fn not_authorized_blocks() -> Vec<Value> {
@@ -644,15 +667,14 @@ async fn dispatch_action(
 
         Action::NewMission { goal, user_id, response_url, channel } => {
             if !cfg.is_authorized(user_id.as_deref()) {
-                reply_ephemeral(cfg, client, response_url.as_deref(), &not_authorized_blocks()).await;
+                user_reply(cfg, client, response_url.as_deref(), channel, user_id.as_deref(),
+                    &not_authorized_blocks()).await;
                 return;
             }
             // Ack IMMEDIATELY: create + the seeding planning turn take minutes,
             // and a silently-working command reads as a dead one.
-            reply_ephemeral(
-                cfg,
-                client,
-                response_url.as_deref(),
+            user_reply(
+                cfg, client, response_url.as_deref(), channel, user_id.as_deref(),
                 &error_blocks(
                     ":hourglass_flowing_sand: Creating the mission — the seeding planning \
                      turn usually takes a minute or two; the planning thread will appear \
@@ -661,17 +683,42 @@ async fn dispatch_action(
             )
             .await;
             match new_mission(cfg, client, repo_root, threads, host, goal, channel).await {
-                Ok(blocks) => reply_ephemeral(cfg, client, response_url.as_deref(), &blocks).await,
+                Ok(blocks) => {
+                    user_reply(cfg, client, response_url.as_deref(), channel,
+                        user_id.as_deref(), &blocks).await;
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "failed to create mission from Slack");
-                    reply_ephemeral(
-                        cfg,
-                        client,
-                        response_url.as_deref(),
+                    user_reply(
+                        cfg, client, response_url.as_deref(), channel, user_id.as_deref(),
                         &error_blocks(&format!("Couldn't create the mission: {e}")),
                     )
                     .await;
                 }
+            }
+        }
+
+        // Bare `/kranz new`: open the multiline goal modal. MUST run inline —
+        // the trigger_id expires ~3 s after the slash — and it's one Web API
+        // call, well inside the ack budget.
+        Action::NewMissionModal { trigger_id, user_id, response_url, channel } => {
+            if !cfg.is_authorized(user_id.as_deref()) {
+                reply_ephemeral(cfg, client, response_url.as_deref(), &not_authorized_blocks()).await;
+                return;
+            }
+            let view = crate::format::build_new_mission_modal(channel);
+            if let Err(e) = client.open_view(trigger_id, &view).await {
+                tracing::warn!(error = %e, "failed to open new-mission modal");
+                reply_ephemeral(
+                    cfg,
+                    client,
+                    response_url.as_deref(),
+                    &error_blocks(&format!(
+                        "Couldn't open the new-mission form: {e}. One-line fallback: \
+                         `/kranz new <goal>`."
+                    )),
+                )
+                .await;
             }
         }
 
@@ -1289,6 +1336,7 @@ fn apply_action(repo_root: &Path, action: &Action) -> Result<()> {
         Action::Help { .. }
         | Action::Status { .. }
         | Action::NewMission { .. }
+        | Action::NewMissionModal { .. }
         | Action::RequestPlan { .. }
         | Action::ApproveMission { .. }
         | Action::ApproveStart { .. }

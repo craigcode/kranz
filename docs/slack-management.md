@@ -106,6 +106,17 @@ Slack; forensics one tap away in the browser.
   - Slash commands typed INSIDE a thread are rejected by Slack itself
     (platform rule); the thread footers now say so and name the id to use
     from the channel.
+- **Slice 5b — new-mission modal** (DONE, 2026-07-04): slash commands are also
+  SINGLE-LINE (a pasted multiline goal never dispatches — Slack sends it as a
+  plain message the bridge ignores), so bare `/kranz new` now opens a modal
+  with a real multiline goal field (`views.open` on the slash `trigger_id`,
+  which expires ~3 s — opened inline, never from a spawned task). The
+  invoking channel rides in the view's `private_metadata`; the
+  `view_submission` routes into the SAME `Action::NewMission` path as the
+  one-line form, spend-gated identically. Modal-path replies (acks, errors)
+  go out via `chat.postEphemeral` — a `view_submission` has no
+  `response_url`. The `/kranz config` modal from the original design remains
+  unbuilt.
 - **Slice 2 — control & status** (DONE): `/kranz status` (slice 1) plus
   `/kranz config`, deep-link buttons, and the spend allowlist (which now also
   gates the approve *button*, not just `/kranz approve`).

@@ -29,7 +29,10 @@
 //!   [`Action::Help`] (the command list).
 //! - anything else → [`Action::Ignore`].
 
-use crate::format::{APPROVE_ACTION_ID, START_ACTION_ID};
+use crate::format::{
+    APPROVE_ACTION_ID, NEW_MISSION_CALLBACK_ID, NEW_MISSION_GOAL_ACTION, NEW_MISSION_GOAL_BLOCK,
+    START_ACTION_ID,
+};
 use serde_json::Value;
 
 /// The routed intent of an inbound envelope. `envelope_id` (when the envelope
@@ -54,13 +57,26 @@ pub enum Action {
     Guidance { mission_id: String, text: String, user_id: Option<String> },
     /// `/kranz ticket <title>` → scaffold a new ticket file.
     NewTicket { title: String, channel: String, thread_ts: Option<String> },
-    /// `/kranz new <goal>` → create a mission and seed planning (M2.9 slice 1).
-    /// A money-spending action: gated by the spend allowlist. `user_id` is the
-    /// invoking Slack user (for the gate); `response_url` is where an
-    /// ack / not-authorized ephemeral is posted; `channel` roots the mission
-    /// thread.
+    /// `/kranz new <goal>` (or a new-mission modal submission) → create a
+    /// mission and seed planning. A money-spending action: gated by the spend
+    /// allowlist. `user_id` is the invoking Slack user (for the gate);
+    /// `response_url` is where an ack / not-authorized ephemeral is posted
+    /// (absent on the modal path — a `view_submission` has none, so the
+    /// bridge falls back to `chat.postEphemeral`); `channel` roots the
+    /// mission thread.
     NewMission {
         goal: String,
+        user_id: Option<String>,
+        response_url: Option<String>,
+        channel: String,
+    },
+    /// Bare `/kranz new` → open the multiline new-mission modal (Slack slash
+    /// commands are single-line, so long goals need this). Free to open —
+    /// the SUBMISSION is the spend gate — but gated anyway so an unlisted
+    /// user learns early. `trigger_id` expires ~3 s after the slash, so the
+    /// bridge opens the view inline, never on a spawned task.
+    NewMissionModal {
+        trigger_id: String,
         user_id: Option<String>,
         response_url: Option<String>,
         channel: String,
@@ -160,11 +176,15 @@ fn payload(envelope: &Value) -> &Value {
     envelope.get("payload").unwrap_or(&Value::Null)
 }
 
-/// `interactive` → an approve / approve-and-start button click, else ignore.
-/// We only act on `block_actions` whose action id is one of ours
-/// ([`APPROVE_ACTION_ID`] → queue, [`START_ACTION_ID`] → start); every other
-/// interaction (menus, other buttons) is ignored.
+/// `interactive` → an approve / approve-and-start button click or a
+/// new-mission modal submission, else ignore. We only act on `block_actions`
+/// whose action id is one of ours ([`APPROVE_ACTION_ID`] → queue,
+/// [`START_ACTION_ID`] → start) and on `view_submission`s carrying our
+/// [`NEW_MISSION_CALLBACK_ID`]; every other interaction is ignored.
 fn route_interactive(payload: &Value) -> Action {
+    if payload.get("type").and_then(Value::as_str) == Some("view_submission") {
+        return route_view_submission(payload);
+    }
     if payload.get("type").and_then(Value::as_str) != Some("block_actions") {
         return Action::Ignore;
     }
@@ -201,6 +221,46 @@ fn route_interactive(payload: &Value) -> Action {
         }
     }
     Action::Ignore
+}
+
+/// A modal `view_submission` → [`Action::NewMission`] when it is our
+/// new-mission modal. The goal comes from `view.state.values`, the channel
+/// from `private_metadata` (stashed at open — submissions carry no channel),
+/// the user from `payload.user.id` (the spend gate). The plain envelope ack
+/// closes the modal; there is no `response_url`, so replies go out as
+/// `chat.postEphemeral`.
+fn route_view_submission(payload: &Value) -> Action {
+    let Some(view) = payload.get("view") else {
+        return Action::Ignore;
+    };
+    if view.get("callback_id").and_then(Value::as_str) != Some(NEW_MISSION_CALLBACK_ID) {
+        return Action::Ignore;
+    }
+    let goal = view
+        .pointer(&format!(
+            "/state/values/{NEW_MISSION_GOAL_BLOCK}/{NEW_MISSION_GOAL_ACTION}/value"
+        ))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let channel =
+        view.get("private_metadata").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    if goal.is_empty() || channel.is_empty() {
+        // Slack enforces the required input; an empty goal or a lost channel
+        // means a malformed submission — nothing sane to create.
+        return Action::Ignore;
+    }
+    let user_id = payload
+        .get("user")
+        .and_then(|u| u.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Action::NewMission {
+        goal: goal.to_string(),
+        user_id,
+        response_url: None,
+        channel,
+    }
 }
 
 /// `events_api` → a threaded human message on a known mission thread becomes
@@ -292,6 +352,9 @@ fn route_slash(payload: &Value) -> Action {
     }
 
     // `new <goal>` → create + seed a mission (spend-gated in the bridge).
+    // Bare `new` → the multiline goal modal (slash commands are single-line;
+    // a pasted multiline goal never even dispatches, so the modal is the
+    // long-form path).
     if let Some(rest) = strip_ci_prefix(text, "new") {
         let goal = rest.trim();
         if !goal.is_empty() {
@@ -302,7 +365,17 @@ fn route_slash(payload: &Value) -> Action {
                 channel,
             };
         }
-        // `new` with no goal → help.
+        if let Some(trigger_id) =
+            payload.get("trigger_id").and_then(Value::as_str).filter(|t| !t.is_empty())
+        {
+            return Action::NewMissionModal {
+                trigger_id: trigger_id.to_string(),
+                user_id,
+                response_url,
+                channel,
+            };
+        }
+        // `new` with no goal AND no trigger_id (shouldn't happen) → help.
     }
 
     // `status [<id>]` → folded status summary; the optional id selects a
@@ -768,7 +841,29 @@ mod tests {
     }
 
     #[test]
-    fn slash_new_without_goal_falls_through_to_help() {
+    fn slash_new_without_goal_opens_the_modal() {
+        // Slash commands are single-line, so bare `new` is the doorway to the
+        // multiline form; the trigger_id is what views.open needs.
+        let env = json!({
+            "type": "slash_commands",
+            "payload": { "command": "/kranz", "text": "new   ",
+                         "trigger_id": "13345224609.738474920.8088930838d88f008e0",
+                         "user_id": "U777", "channel_id": "C123",
+                         "response_url": "https://hooks.slack/x" }
+        });
+        assert_eq!(
+            route(&env, &lookup_none()).action,
+            Action::NewMissionModal {
+                trigger_id: "13345224609.738474920.8088930838d88f008e0".into(),
+                user_id: Some("U777".into()),
+                response_url: Some("https://hooks.slack/x".into()),
+                channel: "C123".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn slash_new_without_goal_or_trigger_falls_through_to_help() {
         let env = json!({
             "type": "slash_commands",
             "payload": { "command": "/kranz", "text": "new   ",
@@ -778,6 +873,56 @@ mod tests {
             route(&env, &lookup_none()).action,
             Action::Help { response_url: Some("https://hooks.slack/x".into()) }
         );
+    }
+
+    #[test]
+    fn new_mission_modal_submission_routes_to_new_mission() {
+        let env = json!({
+            "type": "interactive",
+            "envelope_id": "env-modal",
+            "payload": {
+                "type": "view_submission",
+                "user": { "id": "U777" },
+                "view": {
+                    "callback_id": NEW_MISSION_CALLBACK_ID,
+                    "private_metadata": "C123",
+                    "state": { "values": {
+                        NEW_MISSION_GOAL_BLOCK: {
+                            NEW_MISSION_GOAL_ACTION: {
+                                "type": "plain_text_input",
+                                "value": "  Fix F1 and F2 from the review.\nAdd regression tests.  "
+                            }
+                        }
+                    }}
+                }
+            }
+        });
+        let routed = route(&env, &lookup_none());
+        assert_eq!(routed.envelope_id.as_deref(), Some("env-modal"));
+        assert_eq!(
+            routed.action,
+            Action::NewMission {
+                goal: "Fix F1 and F2 from the review.\nAdd regression tests.".into(),
+                user_id: Some("U777".into()),
+                response_url: None,
+                channel: "C123".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn foreign_view_submission_is_ignored() {
+        let env = json!({
+            "type": "interactive",
+            "envelope_id": "env-other",
+            "payload": {
+                "type": "view_submission",
+                "user": { "id": "U777" },
+                "view": { "callback_id": "someone_elses_modal", "private_metadata": "C123",
+                          "state": { "values": {} } }
+            }
+        });
+        assert_eq!(route(&env, &lookup_none()).action, Action::Ignore);
     }
 
     #[test]

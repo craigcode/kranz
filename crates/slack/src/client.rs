@@ -154,6 +154,46 @@ impl SlackClient {
             .ok_or_else(|| anyhow!("chat.postMessage: response missing `ts`"))
     }
 
+    /// `views.open` with the bot token: open a modal for the interaction that
+    /// produced `trigger_id`. Slack expires trigger ids after ~3 s, so this is
+    /// called inline on the dispatch path, never from a spawned slow task.
+    pub async fn open_view(&self, trigger_id: &str, view: &Value) -> Result<()> {
+        let payload = serde_json::json!({ "trigger_id": trigger_id, "view": view });
+        let resp = self
+            .http
+            .post("https://slack.com/api/views.open")
+            .bearer_auth(&self.bot_token)
+            .json(&payload)
+            .send()
+            .await
+            .context("views.open request failed")?;
+        let body: Value = resp.json().await.context("views.open: response was not JSON")?;
+        check_ok(&body, "views.open")
+    }
+
+    /// `chat.postEphemeral` with the bot token: a user-only message in a
+    /// channel. The modal path needs this — a `view_submission` has no
+    /// `response_url` to reply over.
+    pub async fn post_ephemeral(
+        &self,
+        channel: &str,
+        user: &str,
+        blocks: &[Value],
+    ) -> Result<()> {
+        let payload = serde_json::json!({ "channel": channel, "user": user, "blocks": blocks });
+        let resp = self
+            .http
+            .post("https://slack.com/api/chat.postEphemeral")
+            .bearer_auth(&self.bot_token)
+            .json(&payload)
+            .send()
+            .await
+            .context("chat.postEphemeral request failed")?;
+        let body: Value =
+            resp.json().await.context("chat.postEphemeral: response was not JSON")?;
+        check_ok(&body, "chat.postEphemeral")
+    }
+
     /// `views.publish` with the bot token → set `user_id`'s App Home tab to
     /// `view` (a Block Kit home view object, e.g. from
     /// [`crate::format::build_home_view`]).
