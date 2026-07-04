@@ -1371,11 +1371,17 @@ impl MissionEngine {
     // * A cleanup GUARD removes every per-feature worktree and its branch at
     //   the end of the batch — success or failure, panic or early return — so
     //   no worktree is ever leaked.
-    // * The event log stays single-writer: emits are funnelled through the
-    //   engine one at a time. Worker sessions are driven one-at-a-time through
-    //   the single log (the simplest correct approach the design blesses); the
-    //   wall-clock overlap the roadmap's "done when" measures is explicitly
-    //   deferred until it can be instrumented, which is the roadmap's own bar.
+    // * The event log stays single-writer AND the N worker claude sessions
+    //   OVERLAP in wall-clock (roadmap M3 "done when"). The batch runs in three
+    //   phases (see run_parallel_batch_inner): Phase A emits feature.started +
+    //   forks worktrees serially; Phase B runs all N worker sessions CONCURRENTLY
+    //   via a JoinSet, each BUFFERING its event kinds (run_worker_in_buffered)
+    //   and touching no log; Phase C replays each worker's buffered kinds through
+    //   the engine's single-writer emit, then judges + merges, serially, in the
+    //   declared order. Only the engine ever appends (Phases A/C are &mut self,
+    //   one at a time; Phase B appends nothing), so seq stays monotonic and
+    //   contiguous while the sessions themselves ran at the same time. The peak
+    //   wall-clock overlap is recorded in the batch summary decision.
 
     /// Try to run a parallel batch for milestone `mi`. Returns `Ok(true)` when
     /// a batch ran (the loop should re-evaluate) and `Ok(false)` when there was
@@ -1542,6 +1548,32 @@ impl MissionEngine {
 
     /// Fallible body of [`Self::run_parallel_batch`] (the caller's cleanup guard
     /// runs regardless of how this returns).
+    ///
+    /// WALL-CLOCK OVERLAP, SINGLE-WRITER PRESERVED (roadmap M3). The batch runs
+    /// in three phases so the N worker *claude sessions* overlap in wall-clock
+    /// while the events.jsonl single-writer / monotonic-seq invariant still
+    /// holds:
+    ///
+    ///   Phase A (serial, engine-owned writer): emit `feature.started` for each
+    ///     Pending feature and create its worktree off the milestone-start sha.
+    ///   Phase B (CONCURRENT, no log/engine access): run every feature's worker
+    ///     session at once via a `JoinSet`, each BUFFERING its event kinds
+    ///     (`run_worker_in_buffered`) rather than touching the shared log. Only
+    ///     the claude sessions and per-run transcript files (distinct files) are
+    ///     live here; nothing appends to events.jsonl.
+    ///   Phase C (serial, engine-owned writer, in declared merge order): replay
+    ///     each worker's buffered kinds through the engine's single-writer
+    ///     `emit`, then judge + commit + merge exactly as the sequential-merge
+    ///     code did — so appends stay serialized and seq stays contiguous.
+    ///
+    /// Because only the engine appends (Phases A and C are `&mut self`, one at a
+    /// time; Phase B appends nothing), invariant (a) SINGLE WRITER holds. A
+    /// crash during Phase B loses only buffered-but-unwritten worker events —
+    /// acceptable: the whole batch re-runs on resume and its worktree branches
+    /// are swept by `resume()`. A crash during Phase C leaves a log the resume
+    /// path recovers from (any half-emitted feature is re-forked, its stale
+    /// worktree/branch swept). This is gated behind `max_parallel_workers > 1`;
+    /// the sequential path never reaches here.
     async fn run_parallel_batch_inner(
         &mut self,
         mi: usize,
@@ -1549,22 +1581,101 @@ impl MissionEngine {
         mission_branch: &str,
         workspaces: &[ParallelWorkspace],
     ) -> Result<()> {
-        // (1) Create every worktree off the milestone-start sha, then run each
-        // feature's worker in its worktree, judging + committing its work there.
-        // Worker sessions are driven one at a time through the single-writer
-        // log (emits funnelled through the engine); the parallelism that
-        // matters for correctness is the per-worktree filesystem isolation and
-        // the ordered merge below.
         let milestone_id = self.state.mission.milestones[mi].id.clone();
         let mut merged_ok: usize = 0;
         let mut conflicts: usize = 0;
         let mut resolutions: usize = 0;
-        let mut worker_ok: Vec<bool> = Vec::with_capacity(workspaces.len());
 
+        // --- Phase A (serial, single-writer): feature.started + worktrees ----
+        // Emit feature.started through the engine's own writer and fork every
+        // worktree off the milestone-start sha, up front, in workspace order.
+        // Doing this before any session runs keeps the ONLY log appends in this
+        // phase engine-serial, and gives the cleanup guard every path even if a
+        // later phase fails.
         for ws in workspaces {
-            // Fresh worktree on a new per-feature branch off start_sha.
+            let (mwi, fwi) = self.locate_feature(&ws.feature_id)?;
+            if self.state.mission.milestones[mwi].features[fwi].status == FeatureStatus::Pending {
+                self.emit(EventKind::FeatureStarted { feature_id: ws.feature_id.clone() })?;
+            }
             self.repo.add_worktree(&ws.path, &ws.branch, start_sha)?;
-            let ok = self.run_worker_in_worktree(ws, start_sha).await?;
+        }
+
+        // --- Phase B (CONCURRENT, no log access): run every worker session ---
+        // Snapshot each worker's inputs, then run all sessions at once. Each
+        // buffers its kinds and returns them with its RunOutcome; NONE touches
+        // the shared log. A shared peak-concurrency tracker records how many
+        // sessions were live simultaneously so the batch summary can prove the
+        // overlap (and tests can assert it).
+        let goal = self.state.mission.goal.clone();
+        let milestone_title = self.state.mission.milestones[mi].title.clone();
+        let cfg = self.state.config.clone();
+        let tracker = ConcurrencyTracker::new();
+
+        let mut set: tokio::task::JoinSet<(usize, BufferedRunResult)> =
+            tokio::task::JoinSet::new();
+        for (idx, ws) in workspaces.iter().enumerate() {
+            let (mwi, fwi) = self.locate_feature(&ws.feature_id)?;
+            let feature = self.state.mission.milestones[mwi].features[fwi].clone();
+            let backend = Arc::clone(&self.backend);
+            let paths = self.paths.clone();
+            let cfg = cfg.clone();
+            let goal = goal.clone();
+            let milestone_title = milestone_title.clone();
+            let ws_path = ws.path.clone();
+            let guard = tracker.clone();
+            set.spawn(async move {
+                let _live = guard.enter(); // count this session as live
+                let result = runner::run_worker_in_buffered(
+                    backend.as_ref(),
+                    &paths,
+                    &cfg,
+                    &feature,
+                    &goal,
+                    &milestone_title,
+                    None,
+                    &ws_path,
+                )
+                .await;
+                (idx, result)
+            });
+        }
+
+        // Collect results, keyed by workspace index so Phase C can process them
+        // in the DECLARED merge order regardless of completion order.
+        let mut buffered: Vec<Option<(Vec<EventKind>, runner::RunOutcome)>> =
+            (0..workspaces.len()).map(|_| None).collect();
+        let mut join_err: Option<EngineError> = None;
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok((idx, Ok(result))) => buffered[idx] = Some(result),
+                Ok((_, Err(e))) => join_err = join_err.or(Some(e)),
+                Err(e) => {
+                    join_err = join_err.or(Some(EngineError::Backend(format!(
+                        "parallel worker task panicked: {e}"
+                    ))));
+                }
+            }
+        }
+        // A session error/panic aborts the batch AFTER every task has been
+        // joined (the JoinSet is drained above, so no worker is left running).
+        // The caller's cleanup guard still sweeps every worktree/branch, and a
+        // re-run of the batch on resume retries cleanly.
+        if let Some(e) = join_err {
+            return Err(e);
+        }
+        let peak = tracker.peak();
+
+        // --- Phase C (serial, single-writer, DECLARED merge order) -----------
+        // Replay each worker's buffered kinds through the engine's own writer,
+        // then judge + commit + merge exactly as the sequential-merge code did.
+        let mut worker_ok: Vec<bool> = Vec::with_capacity(workspaces.len());
+        for (idx, ws) in workspaces.iter().enumerate() {
+            let (events, outcome) = buffered[idx]
+                .take()
+                .expect("every non-errored workspace has a buffered result");
+            let ok = self
+                .append_and_judge_worktree(ws, start_sha, events, &outcome)
+                .await?;
             worker_ok.push(ok);
         }
 
@@ -1667,13 +1778,16 @@ impl MissionEngine {
         }
 
         // (3) One summarizing orchestrator.decision for the batch (existing
-        // event vocabulary only). Names the conflict→resolution outcome so it
-        // appears in the replayed history and digest.
+        // event vocabulary only). Names the conflict→resolution outcome AND the
+        // peak wall-clock overlap (how many worker sessions ran at once) so both
+        // appear in the replayed history/digest — and so tests can assert the
+        // sessions actually overlapped without touching the mock backend.
         self.emit_decision(
             &format!(
-                "parallel: {} workers, merged {} branches, {} conflicts -> {} resolution \
-                 features ({milestone_id})",
+                "parallel: {} workers (peak {} concurrent), merged {} branches, {} conflicts \
+                 -> {} resolution features ({milestone_id})",
                 workspaces.len(),
+                peak,
                 merged_ok,
                 conflicts,
                 resolutions
@@ -1683,54 +1797,42 @@ impl MissionEngine {
         Ok(())
     }
 
-    /// Run one feature's worker inside its git worktree (roadmap M3): emit
-    /// `feature.started`, run the worker with cwd = the worktree, judge the
-    /// result, and — on a keep verdict — commit any worker output on the
-    /// per-feature branch so the later merge carries it. Returns `true` when
-    /// the feature's work is ready to merge, `false` when it should be failed.
+    /// Phase C for one feature (roadmap M3): append the worker's BUFFERED event
+    /// kinds through the engine's single-writer `emit`, checkpoint-commit its
+    /// worktree, and judge the run. Returns `true` when the work is ready to
+    /// merge, `false` when it should be failed.
+    ///
+    /// `buffered` is exactly the `worker.spawned` / `worker.message` /
+    /// `worker.completed` kinds `run_worker_in_buffered` collected while the
+    /// session ran concurrently in Phase B — replaying them here, serially,
+    /// through `emit` is what keeps events.jsonl single-writer with contiguous
+    /// seq even though the sessions overlapped. `feature.started` was already
+    /// emitted in Phase A.
     ///
     /// Deliberately does NOT respawn: the parallel batch is best-effort per the
     /// honest subset. A non-complete judgement fails the feature (its branch is
     /// discarded by the cleanup guard); the sequential path — with its full
     /// respawn/dirty-tree machinery — remains the way a feature gets retried.
-    async fn run_worker_in_worktree(
+    async fn append_and_judge_worktree(
         &mut self,
         ws: &ParallelWorkspace,
         start_sha: &str,
+        buffered: Vec<EventKind>,
+        outcome: &runner::RunOutcome,
     ) -> Result<bool> {
-        let mi_fi = self.locate_feature(&ws.feature_id)?;
-        if self.state.mission.milestones[mi_fi.0].features[mi_fi.1].status
-            == FeatureStatus::Pending
-        {
-            self.emit(EventKind::FeatureStarted { feature_id: ws.feature_id.clone() })?;
+        // Replay the buffered run kinds through the engine's own single writer,
+        // in the order the session produced them. `emit` folds each into state
+        // (worker.spawned → the run is registered on the feature, etc.), so no
+        // separate catch_up is needed — but flush any throttled deltas so a
+        // later log read sees them.
+        for kind in buffered {
+            self.emit(kind)?;
         }
-
-        let feature = self.state.mission.milestones[mi_fi.0].features[mi_fi.1].clone();
-        let goal = self.state.mission.goal.clone();
-        let milestone_title = self.state.mission.milestones[mi_fi.0].title.clone();
-        let cfg = self.state.config.clone();
+        self.log.flush()?;
 
         // A GitRepo rooted at the worktree, for its own dirty-tree/commit ops.
         let wt_repo = GitRepo::open(&ws.path)?;
         wt_repo.ensure_identity()?;
-
-        let backend = Arc::clone(&self.backend);
-        let outcome = runner::run_worker_in(
-            backend.as_ref(),
-            &mut self.log,
-            &self.paths,
-            &cfg,
-            &feature,
-            &goal,
-            &milestone_title,
-            None,
-            None, // no interrupt wiring in the parallel subset
-            &ws.path,
-        )
-        .await;
-        let caught = self.catch_up();
-        let outcome = outcome?;
-        caught?;
 
         // Commit any worker output on the per-feature branch (in the worktree)
         // so the merge carries it. The worker session's own commits (if any)
@@ -2680,6 +2782,54 @@ struct ParallelWorkspace {
     branch: String,
     /// Absolute worktree directory the branch is checked out in.
     path: PathBuf,
+}
+
+/// Result of one buffered parallel worker session (roadmap M3): the event
+/// kinds it collected (to be replayed by the engine's single writer) plus its
+/// [`runner::RunOutcome`], or the error that aborted the session.
+type BufferedRunResult = Result<(Vec<EventKind>, runner::RunOutcome)>;
+
+/// Tracks how many parallel worker sessions were live at once (roadmap M3),
+/// so the batch can prove real wall-clock overlap. Cheap and lock-free: each
+/// session bumps the live count on entry and records the running peak, then
+/// decrements on exit. Cloning shares the same counters (an `Arc` inside).
+#[derive(Clone)]
+struct ConcurrencyTracker {
+    live: Arc<std::sync::atomic::AtomicUsize>,
+    peak: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// RAII guard: a live session while held; decrements the live count on drop.
+struct ConcurrencyGuard {
+    live: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ConcurrencyTracker {
+    fn new() -> Self {
+        ConcurrencyTracker {
+            live: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            peak: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    /// Mark a session live for the returned guard's lifetime, updating the peak.
+    fn enter(&self) -> ConcurrencyGuard {
+        use std::sync::atomic::Ordering;
+        let now = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
+        ConcurrencyGuard { live: Arc::clone(&self.live) }
+    }
+
+    /// The greatest number of sessions ever live simultaneously.
+    fn peak(&self) -> usize {
+        self.peak.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for ConcurrencyGuard {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Infix marking a conflict-RESOLUTION fix-feature id (`<ms>-conflict-<n>`).

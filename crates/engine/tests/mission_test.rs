@@ -2027,6 +2027,183 @@ async fn parallel_batch_runs_both_features_and_leaks_no_worktrees() {
     }
 }
 
+/// Wall-clock overlap (roadmap M3 "done when"): the two worker SESSIONS run at
+/// the same time, not one-at-a-time. Proven WITHOUT touching the mock backend:
+/// the engine's own peak-concurrency tracker records how many worker sessions
+/// were live simultaneously and surfaces it in the batch summary decision. With
+/// max_parallel_workers=2 and two independent features, the peak is 2.
+///
+/// The single-writer invariant still holds around that overlap: the resulting
+/// events.jsonl has CONTIGUOUS seq (read_events refuses gaps), both workers'
+/// worker.spawned + worker.completed present, and it folds cleanly to Complete.
+#[tokio::test(flavor = "multi_thread")]
+async fn parallel_batch_sessions_overlap_in_wall_clock() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    // Same script shape as the leak test: orchestrator first (parallel plan +
+    // two judgements), then the two feature workers.
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        orch_script(vec![
+            parallel_plan(&["f-1-1", "f-1-2"]),
+            judgement("complete", ""),
+            judgement("complete", ""),
+        ]),
+        worker_pass(),
+        worker_pass(),
+    ]));
+
+    let cfg = MissionConfig { max_parallel_workers: 2, ..test_cfg() };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(2, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run()).await.expect("run must not hang").unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+
+    // The batch summary decision records a peak overlap of 2 concurrent worker
+    // sessions — the sessions provably ran at the same time.
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::OrchestratorDecision { summary, .. }
+                if summary.starts_with("parallel:") && summary.contains("peak 2 concurrent")
+        )),
+        "the batch summary must record peak 2 concurrent sessions: {:?}",
+        events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::OrchestratorDecision { summary, .. } => Some(summary.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    );
+
+    // Single-writer invariant around the overlap: contiguous seq, both workers
+    // spawned + completed, clean fold to Complete.
+    assert_eq!(events.first().unwrap().seq, 1);
+    assert_eq!(events.last().unwrap().seq, events.len() as u64, "contiguous seq");
+    let worker_spawns = events
+        .iter()
+        .filter(|e| matches!(&e.kind, EventKind::WorkerSpawned { role: Role::Worker, .. }))
+        .count();
+    let worker_completes = events
+        .iter()
+        .filter(|e| matches!(&e.kind, EventKind::WorkerCompleted { .. }))
+        .count();
+    assert_eq!(worker_spawns, 2, "both worker sessions spawned");
+    // 2 workers + orchestrator turns each emit worker.completed; at least the
+    // two feature workers must be present.
+    assert!(worker_completes >= 2, "both worker sessions completed: {worker_completes}");
+    let state = reducer::fold(&events).unwrap();
+    assert_eq!(state.mission.status, MissionStatus::Complete);
+}
+
+/// Crash-safety (roadmap M3 invariant c): a crash DURING a parallel batch —
+/// before the engine has appended the concurrent workers' buffered events —
+/// leaves a log the resume path recovers from, and re-running the batch
+/// completes the mission on ONE contiguous events.jsonl.
+///
+/// The "crash" is simulated in-process: the batch fans out two workers, but the
+/// backend has only ONE worker script queued, so the second concurrent session
+/// fails to start. run_parallel_batch_inner drains the JoinSet and returns the
+/// error; run() propagates it. Both features already have feature.started on the
+/// log (Phase A), so they resume as Active respawn candidates — no buffered
+/// worker event of the successful task ever reached the log (accepted loss).
+/// The cleanup guard + resume() sweep the per-feature worktrees/branches, and a
+/// fresh engine finishes both features sequentially.
+#[tokio::test(flavor = "multi_thread")]
+async fn crash_mid_parallel_batch_resumes_cleanly() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    // --- Phase 1: the crash ---------------------------------------------
+    // Orchestrator marks both features independent, then the batch fans out
+    // two concurrent workers — but only ONE worker script is queued, so the
+    // other session's start errors and the batch aborts.
+    let backend1 = Arc::new(MockBackend::with_scripts(vec![
+        orch_script(vec![parallel_plan(&["f-1-1", "f-1-2"])]),
+        worker_pass(), // only ONE worker script for a TWO-worker batch
+    ]));
+
+    let cfg = MissionConfig { max_parallel_workers: 2, ..test_cfg() };
+    let mut engine = make_engine(&backend1, &root, cfg);
+    engine.approve_plan(simple_plan(2, vec![])).unwrap();
+    let mission_id = engine.mission_id().to_string();
+    let paths = engine.paths().clone();
+
+    let err = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .expect_err("a starved concurrent worker aborts the batch (simulated crash)");
+    eprintln!("phase 1 crashed as scripted: {err}");
+    drop(engine); // releases the lock, flushes buffered deltas
+
+    // The log is intact and contiguous despite the crash: it folds cleanly,
+    // both features are Active (Phase A emitted feature.started; no worker
+    // events landed), and the milestone is still in-flight.
+    let phase1 = read_log(&paths);
+    assert_eq!(phase1.first().unwrap().seq, 1);
+    assert_eq!(phase1.last().unwrap().seq, phase1.len() as u64, "contiguous seq after crash");
+    let state1 = reducer::fold(&phase1).expect("crashed log still folds cleanly");
+    for f in &state1.mission.milestones[0].features {
+        assert_eq!(f.status, FeatureStatus::Active, "features left Active by the crash");
+        assert!(f.worker_runs.is_empty(), "no worker run recorded before the crash");
+    }
+    // No WORKER session's buffered events reached the log (the successful
+    // task's buffer was dropped — accepted loss). Orchestrator runs still
+    // complete their turns; only feature-worker spawns/completions are the
+    // buffered-and-lost ones.
+    assert!(
+        !phase1
+            .iter()
+            .any(|e| matches!(&e.kind, EventKind::WorkerSpawned { role: Role::Worker, .. })),
+        "no buffered worker session survived the crash"
+    );
+
+    // --- Phase 2: resume and finish -------------------------------------
+    // resume() sweeps the orphaned per-feature worktrees/branches. Both
+    // features are Active respawn candidates → the SEQUENTIAL path finishes
+    // them (each: worker → judgement). Validators skipped, empty contract.
+    let backend2 = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(), // f-1-1 rerun (sequential)
+        orch_script(vec![judgement("complete", ""), judgement("complete", "")]),
+        worker_pass(), // f-1-2 rerun (sequential)
+    ]));
+    let backend2_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend2) as Arc<dyn AgentBackend>;
+    let mut engine =
+        MissionEngine::resume(backend2_dyn, &root, &mission_id, false).expect("resume mission");
+
+    let status = timeout(TEST_TIMEOUT, engine.run()).await.expect("run must not hang").unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+    drop(engine);
+
+    // ONE events.jsonl spanning both lifetimes: contiguous seq, clean Complete
+    // fold, both features complete.
+    let events = read_log(&paths);
+    assert_eq!(events.first().unwrap().seq, 1);
+    assert_eq!(events.last().unwrap().seq, events.len() as u64, "one contiguous log");
+    let state = reducer::fold(&events).unwrap();
+    assert_eq!(state.mission.status, MissionStatus::Complete);
+    assert!(state.mission.milestones[0]
+        .features
+        .iter()
+        .all(|f| f.status == FeatureStatus::Complete));
+
+    // No leaked worktrees after recovery.
+    let repo = GitRepo::open(&root).unwrap();
+    assert_eq!(repo.list_worktrees().unwrap().len(), 1, "no leaked worktrees: recovered clean");
+    assert!(!repo.branch_exists(&format!("kranz/wt/{mission_id}/f-1-1")).unwrap_or(false));
+    assert!(!repo.branch_exists(&format!("kranz/wt/{mission_id}/f-1-2")).unwrap_or(false));
+}
+
 /// Sequential invariance: the SAME 1-milestone / 2-feature mission run with
 /// max_parallel_workers=1 behaves exactly as it does today — no parallelization
 /// decision turn, no worktree branches, and the features run one at a time via
