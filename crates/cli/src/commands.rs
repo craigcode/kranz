@@ -602,7 +602,7 @@ async fn start_run_after_plan(repo: PathBuf, mission_id: String) -> Result<i32> 
         "starting mission {mission_id} — live event feed follows \
          (Ctrl-C safe; resume with 'kranz run')"
     );
-    run_mission_loop(repo, mission_id, false).await
+    run_mission_loop(repo, mission_id, false, true).await
 }
 
 /// Print an orchestrator reply, each line under a dim `orchestrator>` prefix.
@@ -640,7 +640,7 @@ async fn cmd_run(
             },
         )?;
     }
-    run_mission_loop(repo, mission, force_lock).await
+    run_mission_loop(repo, mission, force_lock, true).await
 }
 
 /// Resume the mission, tail its events live, drive the loop to a terminal
@@ -650,6 +650,10 @@ pub(crate) async fn run_mission_loop(
     repo: PathBuf,
     mission: String,
     force_lock: bool,
+    // Interactive callers (`kranz run`) prompt for guidance on a blocked
+    // milestone; the batch dispatcher (`kranz work`) passes false so a blocked
+    // mission returns exit 2 immediately instead of hanging on stdin forever.
+    interactive: bool,
 ) -> Result<i32> {
     let cfg = load_config(&repo, false)?;
     let backend = build_backend(&cfg)?;
@@ -691,8 +695,12 @@ pub(crate) async fn run_mission_loop(
                      ==========================================================="
                 );
                 // Interactive recovery: ask for guidance right here instead of
-                // demanding the kranz msg / kranz run two-step.
-                if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+                // demanding the kranz msg / kranz run two-step. The batch
+                // dispatcher (interactive=false) skips this so it never hangs.
+                if interactive
+                    && std::io::stdin().is_terminal()
+                    && std::io::stdout().is_terminal()
+                {
                     print!(
                         "guidance for the orchestrator (what to do about the block; \
                          empty line or Ctrl-D exits)\nguidance> "
@@ -896,7 +904,17 @@ fn cmd_clean(repo: &Path, yes: bool, all: bool) -> Result<i32> {
 pub fn remove_missions(repo: &Path, entries: &[CleanEntry], verbose: bool) -> Vec<String> {
     let mut removed = Vec::new();
     for e in entries {
-        let dir = MissionPaths::new(repo, &e.id).mission_dir();
+        let paths = MissionPaths::new(repo, &e.id);
+        // Re-check liveness immediately before deleting: a Planning-husk can go
+        // live during the confirmation prompt (kranz plan writes the lock file
+        // before its session runs), and deleting a mission dir out from under a
+        // running engine would corrupt it. This closes the unbounded
+        // human-prompt window (a sub-ms race remains but is bounded).
+        if orchestrator::mission_lock_is_live(&paths) {
+            eprintln!("kranz: skipping {} — became live since listing", e.id);
+            continue;
+        }
+        let dir = paths.mission_dir();
         match std::fs::remove_dir_all(&dir) {
             Ok(()) => {
                 if verbose {

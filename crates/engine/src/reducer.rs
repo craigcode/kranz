@@ -184,6 +184,16 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
 
         EventKind::FixFeatureCreated { milestone_id, feature } => {
             let ms = milestone_mut(state, milestone_id)?;
+            // Reject a colliding feature id loudly rather than silently
+            // shadowing (mirrors the worker.spawned duplicate guard). A second
+            // re-plan of the same milestone could otherwise mint a duplicate
+            // `<ms>-replan-N` id.
+            if ms.features.iter().any(|f| f.id == feature.id) {
+                return Err(EngineError::InvalidState(format!(
+                    "duplicate fixfeature.created for feature '{}'",
+                    feature.id
+                )));
+            }
             // One fix-cycle increment per validation round: the first
             // fixfeature after milestone.validating flips the milestone back
             // to Active; later fixfeatures in the same round arrive while

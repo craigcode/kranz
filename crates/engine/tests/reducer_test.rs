@@ -975,3 +975,31 @@ fn validation_finding_accepts_reserved_engine_run_id() {
     let events = vec![ev(1, created()), ev(2, EventKind::PlanApproved { plan: plan() }), ev(3, finding("r-77"))];
     assert!(matches!(fold(&events), Err(EngineError::InvalidState(_))));
 }
+
+/// A colliding fixfeature id (e.g. a second re-plan minting the same
+/// `<ms>-replan-N`) is rejected loudly rather than silently shadowing.
+#[test]
+fn fixfeature_created_rejects_a_duplicate_feature_id() {
+    let mut state = fold(&[ev(1, created()), ev(2, EventKind::PlanApproved { plan: plan() })])
+        .expect("fold base");
+    let ms = state.mission.milestones[0].id.clone();
+
+    // First fixfeature with id "dup" — accepted.
+    apply(
+        &mut state,
+        &ev(3, EventKind::FixFeatureCreated { milestone_id: ms.clone(), feature: fix_feature("dup") }),
+    )
+    .expect("first fixfeature accepted");
+
+    // Second fixfeature reusing the same id — must error, not shadow.
+    let err = apply(
+        &mut state,
+        &ev(4, EventKind::FixFeatureCreated { milestone_id: ms.clone(), feature: fix_feature("dup") }),
+    )
+    .expect_err("duplicate feature id must be rejected");
+    assert!(matches!(err, EngineError::InvalidState(_)), "expected InvalidState, got {err:?}");
+
+    // Only one feature with that id landed.
+    let count = state.mission.milestones[0].features.iter().filter(|f| f.id == "dup").count();
+    assert_eq!(count, 1, "no silent duplicate");
+}

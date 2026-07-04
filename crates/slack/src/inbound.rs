@@ -37,8 +37,11 @@ use serde_json::Value;
 /// otherwise-ignored envelope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    /// Approve-and-queue button pressed for `mission_id`.
-    Approve { mission_id: String },
+    /// Approve-and-queue button pressed for `mission_id`. A money-spending
+    /// action: `user_id` (the clicker) is gated by the spend allowlist and
+    /// `response_url` delivers a not-authorized ephemeral, mirroring the
+    /// `/kranz approve` slash twin.
+    Approve { mission_id: String, user_id: Option<String>, response_url: Option<String> },
     /// A threaded reply on `mission_id`'s thread → orchestrator guidance.
     Guidance { mission_id: String, text: String },
     /// `/kranz ticket <title>` → scaffold a new ticket file.
@@ -131,7 +134,21 @@ fn route_interactive(payload: &Value) -> Action {
             if let Some(mission_id) = action.get("value").and_then(Value::as_str) {
                 let mission_id = mission_id.trim();
                 if !mission_id.is_empty() {
-                    return Action::Approve { mission_id: mission_id.to_string() };
+                    // Capture the clicker + response_url so the bridge can gate
+                    // the button on the spend allowlist (block_actions carries
+                    // `user.id` and `response_url`, same as a slash command).
+                    let user_id = payload
+                        .get("user")
+                        .and_then(|u| u.get("id"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    let response_url =
+                        payload.get("response_url").and_then(Value::as_str).map(str::to_string);
+                    return Action::Approve {
+                        mission_id: mission_id.to_string(),
+                        user_id,
+                        response_url,
+                    };
                 }
             }
         }
@@ -298,6 +315,8 @@ mod tests {
             "envelope_id": "env-1",
             "payload": {
                 "type": "block_actions",
+                "user": { "id": "Uclicker" },
+                "response_url": "https://hooks.slack/b",
                 "actions": [
                     { "action_id": APPROVE_ACTION_ID, "value": "m-42", "type": "button" }
                 ]
@@ -305,7 +324,16 @@ mod tests {
         });
         let routed = route(&env, &lookup_none());
         assert_eq!(routed.envelope_id.as_deref(), Some("env-1"));
-        assert_eq!(routed.action, Action::Approve { mission_id: "m-42".into() });
+        // The clicker identity + response_url are captured so the bridge can
+        // gate the button on the spend allowlist.
+        assert_eq!(
+            routed.action,
+            Action::Approve {
+                mission_id: "m-42".into(),
+                user_id: Some("Uclicker".into()),
+                response_url: Some("https://hooks.slack/b".into()),
+            }
+        );
     }
 
     #[test]

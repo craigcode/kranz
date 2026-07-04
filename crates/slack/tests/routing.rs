@@ -35,7 +35,17 @@ fn block_actions_approve_fixture_routes_to_approve() {
         routed.envelope_id.as_deref(),
         Some("b1e5a7c2-9f3d-4a10-8c2b-7e6f0d1a2b3c")
     );
-    assert_eq!(routed.action, Action::Approve { mission_id: "m-42".into() });
+    // The clicker's user id and response_url must be captured so the bridge
+    // can gate the button on the spend allowlist (regression: without user_id
+    // the button bypassed the allowlist entirely).
+    assert_eq!(
+        routed.action,
+        Action::Approve {
+            mission_id: "m-42".into(),
+            user_id: Some("U0263M3QW".into()),
+            response_url: Some("https://hooks.slack.com/actions/T024BE7LD/1234/abcd".into()),
+        }
+    );
 }
 
 #[test]

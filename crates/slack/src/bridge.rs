@@ -311,6 +311,11 @@ async fn connect_once(
         .context("dialing Socket Mode websocket")?;
     tracing::info!("slack Socket Mode connected");
     let (mut write, mut read) = ws_stream.split();
+    // Bounded dedup of processed envelope ids: Slack redelivers an envelope if
+    // the ack is late, which for a claude-spawning action (NewMission) would
+    // otherwise create a DUPLICATE mission. Seen ids are re-acked but not
+    // re-dispatched. Bounded so a long-lived connection can't grow it forever.
+    let mut seen = SeenEnvelopes::default();
 
     loop {
         tokio::select! {
@@ -321,10 +326,35 @@ async fn connect_once(
             msg = read.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        if let Some(reply) = handle_envelope(cfg, client, repo_root, threads, &text).await {
-                            if write.send(Message::Text(reply)).await.is_err() {
+                        let Some(routed) = parse_envelope(&text, threads) else { continue };
+                        // Ack FIRST (within Slack's 3 s budget), before any slow
+                        // work — otherwise a claude turn would delay the ack and
+                        // block ping handling on this same read loop.
+                        if let Some(id) = &routed.envelope_id {
+                            if write
+                                .send(Message::Text(json!({ "envelope_id": id }).to_string()))
+                                .await
+                                .is_err()
+                            {
                                 return Ok(false);
                             }
+                            // Redelivery of an already-processed envelope: acked
+                            // above, but do not run the side effect again.
+                            if !seen.insert(id) {
+                                continue;
+                            }
+                        }
+                        // Slow (claude-spawning) actions run on a spawned task so
+                        // the read loop keeps answering pings; fast local actions
+                        // run inline.
+                        if is_slow_action(&routed.action) {
+                            let (cfg, client, repo, threads) =
+                                (cfg.clone(), client.clone(), repo_root.to_path_buf(), threads.clone());
+                            tokio::spawn(async move {
+                                dispatch_action(&cfg, &client, &repo, &threads, &routed.action).await;
+                            });
+                        } else {
+                            dispatch_action(cfg, client, repo_root, threads, &routed.action).await;
                         }
                     }
                     // Respond to ping with pong so Slack keeps the socket alive.
@@ -342,6 +372,51 @@ async fn connect_once(
     }
 }
 
+/// Parse a Socket Mode text frame into a routed action, resolving thread →
+/// mission via the shared map (needed so a thread reply routes to Guidance).
+/// `None` on an unparseable frame.
+fn parse_envelope(text: &str, threads: &SharedThreads) -> Option<crate::inbound::Routed> {
+    match serde_json::from_str::<Value>(text) {
+        Ok(envelope) => Some(route(&envelope, threads)),
+        Err(e) => {
+            tracing::warn!(error = %e, "unparseable Socket Mode frame; ignoring");
+            None
+        }
+    }
+}
+
+/// Actions that spawn a claude session (a multi-second turn) and so must run
+/// off the socket read loop, after the ack.
+fn is_slow_action(action: &Action) -> bool {
+    matches!(action, Action::NewMission { .. } | Action::RequestPlan { .. })
+}
+
+/// A bounded set of recently-seen envelope ids (FIFO eviction). Human-driven
+/// volume is low; the cap only guards against unbounded growth over a
+/// long-lived connection.
+#[derive(Default)]
+struct SeenEnvelopes {
+    set: std::collections::HashSet<String>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl SeenEnvelopes {
+    const CAP: usize = 512;
+    /// Record `id`; returns true if it was NOT seen before.
+    fn insert(&mut self, id: &str) -> bool {
+        if !self.set.insert(id.to_string()) {
+            return false;
+        }
+        self.order.push_back(id.to_string());
+        if self.order.len() > Self::CAP {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+        true
+    }
+}
+
 /// Parse one text frame as a Socket Mode envelope, route it, apply the action,
 /// and return the ack frame to send (the `{"envelope_id":…}` Slack requires
 /// within 3 s). Returns `None` when the frame carries no envelope id (e.g.
@@ -353,6 +428,11 @@ async fn connect_once(
 /// ack budget. A failed action is logged but still acked — retrying the same
 /// envelope wouldn't fix a local write error, and leaving it un-acked would make
 /// Slack redeliver it indefinitely.
+///
+/// Test-only: production goes through [`connect_once`], which acks first and
+/// dispatches slow (claude-spawning) actions off the read loop. This inline
+/// variant keeps the existing ack + side-effect tests concise.
+#[cfg(test)]
 async fn handle_envelope(
     cfg: &SlackConfig,
     client: &SlackClient,
@@ -522,7 +602,28 @@ async fn dispatch_action(
             }
         }
 
-        // Button/thread actions: pure local writes, no network reply.
+        // The approve BUTTON is the spend twin of `/kranz approve` and must be
+        // gated identically — otherwise an unlisted user clicking it queues a
+        // paid mission, bypassing the allowlist that the slash command enforces.
+        Action::Approve { mission_id, user_id, response_url } => {
+            if !cfg.is_authorized(user_id.as_deref()) {
+                reply_ephemeral(client, response_url.as_deref(), &not_authorized_blocks()).await;
+                return;
+            }
+            match approve_mission(repo_root, mission_id) {
+                Ok(()) => {
+                    reply_ephemeral(
+                        client,
+                        response_url.as_deref(),
+                        &error_blocks(&format!(":white_check_mark: Queued `{mission_id}`.")),
+                    )
+                    .await
+                }
+                Err(e) => tracing::warn!(error = %e, "failed to approve mission from Slack button"),
+            }
+        }
+
+        // Thread guidance / ticket scaffolding: pure local writes, no reply.
         action => {
             if let Err(e) = apply_action(repo_root, action) {
                 tracing::warn!(error = %e, "failed to apply inbound Slack action");
@@ -543,7 +644,7 @@ fn error_blocks(msg: &str) -> Vec<Value> {
 /// need the async client; they are no-ops here for exhaustiveness.
 fn apply_action(repo_root: &Path, action: &Action) -> Result<()> {
     match action {
-        Action::Approve { mission_id } => approve_mission(repo_root, mission_id),
+        Action::Approve { mission_id, .. } => approve_mission(repo_root, mission_id),
         Action::Guidance { mission_id, text } => guidance(repo_root, mission_id, text),
         Action::NewTicket { title, .. } => scaffold_ticket(repo_root, title),
         Action::Help { .. }
@@ -805,7 +906,7 @@ mod tests {
     #[test]
     fn approve_action_enqueues_mission() {
         let tmp = TempDir::new().unwrap();
-        apply_action(tmp.path(), &Action::Approve { mission_id: "m-1".into() }).unwrap();
+        apply_action(tmp.path(), &Action::Approve { mission_id: "m-1".into(), user_id: None, response_url: None }).unwrap();
         assert!(queue::contains(tmp.path(), "m-1"));
     }
 
@@ -990,5 +1091,47 @@ mod tests {
         let client = SlackClient::new(&cfg).unwrap();
         let hello = json!({ "type": "hello" }).to_string();
         assert!(handle_envelope(&cfg, &client, tmp.path(), &threads, &hello).await.is_none());
+    }
+
+    #[test]
+    fn slow_actions_are_the_claude_spawning_ones() {
+        // NewMission / RequestPlan spawn a turn → must run off the read loop.
+        assert!(is_slow_action(&Action::NewMission {
+            goal: "g".into(),
+            user_id: None,
+            response_url: None,
+            channel: "C1".into(),
+        }));
+        assert!(is_slow_action(&Action::RequestPlan {
+            mission_id: "m-1".into(),
+            user_id: None,
+            response_url: None,
+        }));
+        // Fast local/one-call actions stay inline.
+        assert!(!is_slow_action(&Action::Approve {
+            mission_id: "m-1".into(),
+            user_id: None,
+            response_url: None,
+        }));
+        assert!(!is_slow_action(&Action::Guidance {
+            mission_id: "m-1".into(),
+            text: "hi".into(),
+        }));
+        assert!(!is_slow_action(&Action::Status { mission_id: None, response_url: None }));
+        assert!(!is_slow_action(&Action::Ignore));
+    }
+
+    #[test]
+    fn seen_envelopes_dedups_and_bounds() {
+        let mut seen = SeenEnvelopes::default();
+        assert!(seen.insert("env-a"), "first sighting is new");
+        assert!(!seen.insert("env-a"), "redelivery is not new");
+        assert!(seen.insert("env-b"));
+        // Overflow the cap; the oldest id is evicted and can be re-seen.
+        for i in 0..SeenEnvelopes::CAP {
+            seen.insert(&format!("fill-{i}"));
+        }
+        assert!(seen.insert("env-a"), "evicted id counts as new again");
+        assert!(seen.set.len() <= SeenEnvelopes::CAP + 1);
     }
 }

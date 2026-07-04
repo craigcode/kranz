@@ -1460,6 +1460,39 @@ async fn abandon_planning_mission_sets_abandoned_status() {
     assert_eq!(snapshot.last_seq, after.last().unwrap().seq);
 }
 
+/// An abandoned mission must never be resumed and run — abandon exists to stop
+/// spend, and the abandon event (being the newest log write) would otherwise be
+/// auto-selected by `kranz run`. run() must reject it with no worker spawned.
+#[tokio::test(flavor = "multi_thread")]
+async fn running_an_abandoned_mission_is_rejected() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let backend = Arc::new(MockBackend::new());
+    let engine = make_engine(&backend, &root, test_cfg());
+    let mission_id = engine.mission_id().to_string();
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    kranz_engine::orchestrator::abandon_mission(&root, &mission_id, "stop", false)
+        .expect("abandon");
+
+    let backend2: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+    let mut resumed = MissionEngine::resume(backend2, &root, &mission_id, false).expect("resume");
+    let err = resumed.run().await.expect_err("running a terminal mission must be rejected");
+    assert!(
+        matches!(err, kranz_engine::error::EngineError::InvalidState(_)),
+        "expected InvalidState, got {err:?}"
+    );
+    // No worker.spawned appended by the rejected run.
+    let events = read_log(&paths);
+    assert!(
+        !events.iter().any(|e| matches!(e.kind, EventKind::WorkerSpawned { .. })),
+        "a rejected run must not spawn workers"
+    );
+}
+
 /// Abandoning an already-terminal mission errors without touching the log.
 #[tokio::test(flavor = "multi_thread")]
 async fn abandon_already_terminal_mission_errors() {
@@ -1696,7 +1729,9 @@ async fn request_and_approve_revised_plan_drops_and_adds_features() {
     assert_eq!(by_id("f-1-1").unwrap().status, FeatureStatus::Pending, "kept feature untouched");
     assert_eq!(by_id("f-1-2").unwrap().status, FeatureStatus::Skipped, "dropped feature skipped");
     assert_eq!(by_id("f-1-3").unwrap().status, FeatureStatus::Skipped, "dropped feature skipped");
-    let added = by_id("ms-1-replan-1").expect("added feature exists with re-plan id");
+    // Re-plan ids carry a cycle discriminator (`-replan-<cycle>-<n>`) so a
+    // second re-plan of the same milestone can't collide.
+    let added = by_id("ms-1-replan-1-1").expect("added feature exists with re-plan id");
     assert_eq!(added.origin, FeatureOrigin::Fix, "added feature is fix-origin");
     assert_eq!(added.status, FeatureStatus::Pending);
     assert_eq!(added.title, "extra feature");

@@ -341,6 +341,32 @@ impl MissionEngine {
         let events = EventLog::read_events(&paths.events_file())?;
         let state = reducer::fold(&events)?;
 
+        // Reap per-feature worktrees/branches orphaned by a crash mid parallel
+        // batch (M3). Resume is only reached after the engine process died, so
+        // no batch is in-flight — any `kranz/wt/<mission>/*` worktree or branch
+        // is a leak. Removing them here stops accumulation AND lets a re-forked
+        // Pending feature run cleanly (the branch no longer "already exists").
+        // Best-effort and idempotent: remove_worktree/delete_branch_force
+        // tolerate absence; branch deletion runs after prune (git refuses to
+        // -D a branch checked out in a still-registered worktree).
+        for milestone in &state.mission.milestones {
+            for feature in &milestone.features {
+                let path = parallel_worktree_path(mission_id, &feature.id);
+                if path.exists() {
+                    let _ = repo.remove_worktree(&path);
+                }
+            }
+        }
+        let _ = repo.prune_worktrees();
+        for milestone in &state.mission.milestones {
+            for feature in &milestone.features {
+                let branch = format!("kranz/wt/{mission_id}/{}", feature.id);
+                if repo.branch_exists(&branch).unwrap_or(false) {
+                    let _ = repo.delete_branch_force(&branch);
+                }
+            }
+        }
+
         // The most recent orchestrator session's sdk id (events are in seq
         // order, so the last matching worker.spawned wins).
         let orch_session_id = events.iter().rev().find_map(|e| match &e.kind {
@@ -836,6 +862,19 @@ impl MissionEngine {
 
         // (5) Record the revision, then apply the expressible subset.
         let target_id = target.id.clone();
+        // Next re-plan cycle = 1 + the highest existing `<id>-replan-<c>-*`
+        // cycle on this milestone, so repeated re-plans never mint colliding
+        // ids (two re-plans without an intervening validation round would share
+        // fix_cycles). The reducer also rejects duplicates as a backstop.
+        let replan_prefix = format!("{target_id}-replan-");
+        let replan_cycle = target
+            .features
+            .iter()
+            .filter_map(|f| f.id.strip_prefix(&replan_prefix))
+            .filter_map(|rest| rest.split('-').next())
+            .filter_map(|c| c.parse::<u32>().ok())
+            .max()
+            .map_or(1, |m| m + 1);
         self.emit_decision(
             &format!(
                 "re-plan for {target_id}: {} feature(s) dropped, {} added",
@@ -862,7 +901,7 @@ impl MissionEngine {
         // validation fix ids (which are ms-<id>-fix-<cycle>-<n>).
         for (i, pf) in to_add.into_iter().enumerate() {
             let feature = Feature {
-                id: format!("{target_id}-replan-{}", i + 1),
+                id: format!("{target_id}-replan-{replan_cycle}-{}", i + 1),
                 title: scrub::scrub(&pf.title),
                 spec: scrub::scrub(&pf.spec),
                 validation_criteria: pf.validation_criteria.iter().map(|c| scrub::scrub(c)).collect(),
@@ -893,6 +932,16 @@ impl MissionEngine {
             return Err(EngineError::InvalidState(
                 "cannot run a mission whose plan is not approved".to_string(),
             ));
+        }
+        // A terminal mission (Complete/Failed/Abandoned) must never spawn
+        // workers again — abandon exists precisely to STOP spend. Without this
+        // gate, `kranz run` (or auto-selection, since the abandon event is the
+        // newest log write) would resurrect a killed mission and pay for it.
+        if is_terminal_status(self.state.mission.status) {
+            return Err(EngineError::InvalidState(format!(
+                "mission is already terminal ({:?}); nothing to run",
+                self.state.mission.status
+            )));
         }
 
         // Environment preflight (roadmap M2): surface obvious missing
