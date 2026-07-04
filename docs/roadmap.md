@@ -110,6 +110,11 @@ log, engine-serialized appends); the work is orchestration.
 - `--sequential` remains the default until instrumentation (wall-clock and
   token cost per mission, recorded in report.md) proves parallel wins on real
   workloads — the plan's own bar.
+- Soak harness (`scripts/soak.sh`, default 20 iterations) covers the
+  corruption half of the done-when: repeated parallel missions cycling
+  clean / crash+resume / real-merge-conflict variants, with contiguous-seq,
+  fold, snapshot, worktree and branch invariants asserted after every run.
+  The wall-clock/cost half still requires live missions.
 
 Done when: a 2-milestone mission with independent features completes in
 materially less wall-clock than sequential at comparable cost, with zero
