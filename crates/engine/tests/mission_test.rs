@@ -24,7 +24,7 @@ use kranz_engine::control;
 use kranz_engine::event_log::EventLog;
 use kranz_engine::events::{Event, EventKind};
 use kranz_engine::git_ops::GitRepo;
-use kranz_engine::orchestrator::{MissionEngine, PlanRequest};
+use kranz_engine::orchestrator::{synthesize_conflict_resolution, MissionEngine, PlanRequest};
 use kranz_engine::paths::MissionPaths;
 use kranz_engine::reducer;
 use kranz_engine::types::*;
@@ -2081,4 +2081,123 @@ async fn max_parallel_one_is_the_unchanged_sequential_path() {
     // No worktree branches were ever created; a single primary worktree.
     let repo = GitRepo::open(&root).unwrap();
     assert_eq!(repo.list_worktrees().unwrap().len(), 1, "no extra worktrees in sequential mode");
+}
+
+// ---------------------------------------------------------------------------
+// 12b. Parallel-merge CONFLICT → resolution fix-feature (roadmap M3)
+// ---------------------------------------------------------------------------
+//
+// The mock backend never touches the repo (workers make no commits — see
+// worker_pass), so two per-feature worktree branches off the same start sha
+// can never produce a REAL merge conflict end-to-end. Per the task, the
+// conflict→resolution logic is therefore verified at the unit level against
+// the pure `synthesize_conflict_resolution` helper the batch calls: given a
+// MergeOutcome::Conflict's file list and the failed feature, it produces the
+// resolution Feature with the right id/origin/spec, and the infinite-chain
+// guard refuses to spawn a resolution-of-a-resolution.
+
+/// A Plan-origin, Pending feature fixture with the given id.
+fn plan_feature(id: &str, title: &str, spec: &str) -> Feature {
+    Feature {
+        id: id.to_string(),
+        title: title.to_string(),
+        spec: spec.to_string(),
+        validation_criteria: vec![format!("{title} works")],
+        origin: FeatureOrigin::Plan,
+        status: FeatureStatus::Pending,
+        worker_runs: Vec::new(),
+        commits: Vec::new(),
+        respawns: 0,
+    }
+}
+
+/// A parallel-merge conflict on the SECOND feature synthesizes a resolution
+/// fix-feature: id `<ms>-conflict-1`, origin Fix, status Pending, and a spec
+/// that names the conflicting files, the original feature's spec, and the note
+/// that earlier features already merged.
+#[test]
+fn conflict_synthesizes_resolution_fix_feature() {
+    // Milestone ms-1 with two independent plan features; the first merged
+    // cleanly, the second (f-1-2) conflicted.
+    let f_1_1 = plan_feature("f-1-1", "feature one", "build part one");
+    let f_1_2 = plan_feature("f-1-2", "feature two", "build the widget in src/widget.rs");
+    let existing = vec![f_1_1, f_1_2.clone()];
+    let conflict_files = vec!["src/widget.rs".to_string(), "src/lib.rs".to_string()];
+
+    let resolution = synthesize_conflict_resolution("ms-1", &f_1_2, &conflict_files, &existing)
+        .expect("a Plan-origin conflict must synthesize a resolution feature");
+
+    // Id shape `<ms>-conflict-<n>`; n=1 (no existing -conflict- features).
+    assert_eq!(resolution.id, "ms-1-conflict-1", "namespaced conflict-resolution id");
+    // Origin Fix + Pending → the sequential loop (first_incomplete + next_feature)
+    // picks it up on the next iteration, straight on the mission branch.
+    assert_eq!(resolution.origin, FeatureOrigin::Fix, "resolution is a fix feature");
+    assert_eq!(resolution.status, FeatureStatus::Pending, "resolution starts Pending");
+    assert!(resolution.worker_runs.is_empty(), "fresh feature, no runs yet");
+    assert_eq!(resolution.respawns, 0);
+
+    // The spec carries the original title, the original spec, the conflicting
+    // file list, and the earlier-features-merged note.
+    let spec = &resolution.spec;
+    assert!(spec.contains("build the widget in src/widget.rs"), "original spec text: {spec}");
+    assert!(spec.contains("src/widget.rs"), "conflicting file listed: {spec}");
+    assert!(spec.contains("src/lib.rs"), "second conflicting file listed: {spec}");
+    assert!(
+        spec.contains("already contains") || spec.contains("merged first"),
+        "notes earlier features already merged: {spec}"
+    );
+    assert!(resolution.title.contains("feature two"), "title references original: {}", resolution.title);
+    // Original feature's validation criteria carried over.
+    assert_eq!(resolution.validation_criteria, f_1_2.validation_criteria);
+}
+
+/// The `-conflict-<n>` suffix increments off the count of existing conflict
+/// features on the milestone, so two conflicts in one batch never collide
+/// (mirrors the replan-id fix).
+#[test]
+fn second_conflict_gets_a_fresh_namespaced_id() {
+    let f_1_2 = plan_feature("f-1-2", "feature two", "spec two");
+    let f_1_3 = plan_feature("f-1-3", "feature three", "spec three");
+    // After the first conflict fired, ms-1-conflict-1 already exists on the
+    // milestone; the second conflict must derive n=2.
+    let mut resolution_1 = plan_feature("ms-1-conflict-1", "Resolve merge conflict: feature two", "…");
+    resolution_1.origin = FeatureOrigin::Fix;
+    let existing = vec![f_1_2, f_1_3.clone(), resolution_1];
+
+    let resolution =
+        synthesize_conflict_resolution("ms-1", &f_1_3, &["src/x.rs".to_string()], &existing)
+            .expect("second conflict synthesizes a resolution");
+    assert_eq!(resolution.id, "ms-1-conflict-2", "second conflict is -conflict-2, no collision");
+}
+
+/// Infinite-chain guard: a feature whose id already contains `-conflict-`
+/// (a resolution feature) must NOT spawn a resolution-of-a-resolution. The
+/// helper returns None, so the milestone proceeds to validation/loop-guard as
+/// today rather than looping conflict→resolution forever.
+#[test]
+fn resolution_feature_does_not_spawn_another_resolution() {
+    let mut resolution = plan_feature("ms-1-conflict-1", "Resolve merge conflict: feature two", "spec");
+    resolution.origin = FeatureOrigin::Fix;
+    let existing = vec![resolution.clone()];
+
+    let again =
+        synthesize_conflict_resolution("ms-1", &resolution, &["src/x.rs".to_string()], &existing);
+    assert!(again.is_none(), "a -conflict- feature must not spawn another resolution");
+}
+
+/// A conflict where git named no specific files still produces a usable
+/// resolution spec (the file list falls back to a clear placeholder rather
+/// than an empty string).
+#[test]
+fn conflict_with_no_named_files_still_synthesizes() {
+    let f = plan_feature("f-1-1", "feature one", "the original work");
+    let resolution = synthesize_conflict_resolution("ms-2", &f, &[], std::slice::from_ref(&f))
+        .expect("empty file list still synthesizes");
+    assert_eq!(resolution.id, "ms-2-conflict-1");
+    assert!(resolution.spec.contains("the original work"), "original spec preserved");
+    assert!(
+        resolution.spec.contains("no specific files"),
+        "empty conflict list gets a placeholder: {}",
+        resolution.spec
+    );
 }

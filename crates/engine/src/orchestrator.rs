@@ -1555,8 +1555,10 @@ impl MissionEngine {
         // log (emits funnelled through the engine); the parallelism that
         // matters for correctness is the per-worktree filesystem isolation and
         // the ordered merge below.
+        let milestone_id = self.state.mission.milestones[mi].id.clone();
         let mut merged_ok: usize = 0;
         let mut conflicts: usize = 0;
+        let mut resolutions: usize = 0;
         let mut worker_ok: Vec<bool> = Vec::with_capacity(workspaces.len());
 
         for ws in workspaces {
@@ -1568,8 +1570,9 @@ impl MissionEngine {
 
         // (2) Merge the per-feature branches into the mission branch in the
         // declared order. Clean → keep the feature's commits + feature.completed;
-        // conflict (aborted, clean tree) → feature.failed; a worker that failed
-        // in its worktree → feature.failed without attempting a merge.
+        // conflict (aborted, clean tree) → feature.failed PLUS a resolution
+        // fix-feature (below); a worker that failed in its worktree →
+        // feature.failed without attempting a merge.
         for (ws, ok) in workspaces.iter().zip(&worker_ok) {
             let feature_id = ws.feature_id.clone();
             if !ok {
@@ -1593,32 +1596,87 @@ impl MissionEngine {
                 }
                 crate::git_ops::MergeOutcome::Conflict { files } => {
                     conflicts += 1;
-                    let files = if files.is_empty() {
+                    // Fail the conflicting feature (its worktree branch is
+                    // discarded by the cleanup guard) …
+                    let files_note = if files.is_empty() {
                         String::new()
                     } else {
                         format!(" (conflicting files: {})", files.join(", "))
                     };
+                    // Snapshot the original before feature.failed flips its
+                    // status — the resolution spec quotes its title/spec.
+                    let original =
+                        self.state.mission.milestones[self.locate_feature(&feature_id)?.0]
+                            .features
+                            .iter()
+                            .find(|f| f.id == feature_id)
+                            .cloned();
                     self.emit(EventKind::FeatureFailed {
-                        feature_id,
+                        feature_id: feature_id.clone(),
                         reason: format!(
                             "parallel merge of {} into {mission_branch} conflicted and was \
-                             aborted{files}; re-run this feature sequentially",
+                             aborted{files_note}; a resolution feature re-does this work on \
+                             the merged branch",
                             ws.branch
                         ),
                     })?;
+                    // … and ALSO synthesize a conflict-resolution fix-feature
+                    // on the SAME (still-Active) milestone so the milestone can
+                    // be RESOLVED rather than merely losing the feature. It runs
+                    // SEQUENTIALLY on the next loop iteration (first_incomplete
+                    // picks up the Active milestone; next_feature the new
+                    // Pending fix feature) — no worktree, straight on the
+                    // mission branch, so it cannot conflict again. The
+                    // infinite-chain guard (synthesize_conflict_resolution
+                    // returns None for a `-conflict-` id) means a resolution
+                    // that ITSELF conflicts would not spawn another; in this
+                    // Plan-origin batch that never arises, so the emit always
+                    // fires here.
+                    if let Some(original) = original {
+                        let existing = &self.state.mission.milestones
+                            [self.locate_feature(&feature_id)?.0]
+                            .features;
+                        if let Some(resolution) = synthesize_conflict_resolution(
+                            &milestone_id,
+                            &original,
+                            &files,
+                            existing,
+                        ) {
+                            // Belt and braces: the strings are model-derived
+                            // (the original feature's title/spec) and land
+                            // verbatim in a fixfeature.created event.
+                            let feature = Feature {
+                                title: scrub::scrub(&resolution.title),
+                                spec: scrub::scrub(&resolution.spec),
+                                validation_criteria: resolution
+                                    .validation_criteria
+                                    .iter()
+                                    .map(|c| scrub::scrub(c))
+                                    .collect(),
+                                ..resolution
+                            };
+                            self.emit(EventKind::FixFeatureCreated {
+                                milestone_id: milestone_id.clone(),
+                                feature,
+                            })?;
+                            resolutions += 1;
+                        }
+                    }
                 }
             }
         }
 
         // (3) One summarizing orchestrator.decision for the batch (existing
-        // event vocabulary only).
-        let milestone_id = self.state.mission.milestones[mi].id.clone();
+        // event vocabulary only). Names the conflict→resolution outcome so it
+        // appears in the replayed history and digest.
         self.emit_decision(
             &format!(
-                "parallel: {} workers, merged {} branches, {} conflicts ({milestone_id})",
+                "parallel: {} workers, merged {} branches, {} conflicts -> {} resolution \
+                 features ({milestone_id})",
                 workspaces.len(),
                 merged_ok,
-                conflicts
+                conflicts,
+                resolutions
             ),
             None,
         )?;
@@ -2622,6 +2680,78 @@ struct ParallelWorkspace {
     branch: String,
     /// Absolute worktree directory the branch is checked out in.
     path: PathBuf,
+}
+
+/// Infix marking a conflict-RESOLUTION fix-feature id (`<ms>-conflict-<n>`).
+/// A feature whose id already contains this must never spawn ANOTHER
+/// resolution — the guard against an infinite conflict→resolution chain.
+const CONFLICT_INFIX: &str = "-conflict-";
+
+/// Synthesize the conflict-RESOLUTION fix-feature for a parallel-merge
+/// conflict (roadmap M3). When a per-feature branch fails to merge, its own
+/// commits are discarded (the branch is thrown away by the cleanup guard) and
+/// the feature is FAILED — but the work still needs doing on top of the
+/// now-merged mission branch. This builds the resolution feature that redoes
+/// it: a Fix-origin, Pending feature the sequential loop picks up on the next
+/// iteration (no worktree, straight on the mission branch, so it cannot
+/// conflict again).
+///
+/// - Id shape `<milestone_id>-conflict-<n>`, where `n` is 1 + the count of
+///   features on the milestone whose id already contains [`CONFLICT_INFIX`]
+///   (namespaced so repeated conflicts in one batch never collide, mirroring
+///   the replan-id fix).
+/// - Spec carries the ORIGINAL feature's title and spec, the conflicting file
+///   list, and a note that earlier features in this milestone already merged
+///   (so the worker redoes the work COMPATIBLY on the current branch).
+///
+/// Returns `None` — the infinite-chain guard — when `original.id` already
+/// contains [`CONFLICT_INFIX`]: a resolution feature that itself conflicts
+/// must NOT spawn a resolution-of-a-resolution. (In practice only Plan-origin
+/// `f-<m>-<n>` features enter a parallel batch, so the guard is belt-and-
+/// braces; it is enforced here so the property holds wherever this is called.)
+///
+/// Pure and deterministic; the caller scrubs at the emit boundary as usual.
+pub fn synthesize_conflict_resolution(
+    milestone_id: &str,
+    original: &Feature,
+    conflict_files: &[String],
+    existing_features: &[Feature],
+) -> Option<Feature> {
+    if original.id.contains(CONFLICT_INFIX) {
+        return None;
+    }
+    let n = existing_features
+        .iter()
+        .filter(|f| f.id.contains(CONFLICT_INFIX))
+        .count()
+        + 1;
+    let files = if conflict_files.is_empty() {
+        "(git named no specific files)".to_string()
+    } else {
+        conflict_files.join(", ")
+    };
+    let spec = format!(
+        "Re-implement the feature \"{title}\" ON TOP OF the current mission branch, which \
+         already contains the other features from this milestone that merged first. The \
+         original attempt ran in an isolated worktree and its branch FAILED to merge back \
+         (conflicting files: {files}); those commits were discarded. Redo the work \
+         compatibly with what is now on the branch — read the current state of the \
+         conflicting files first, then apply the change so it no longer conflicts.\n\n\
+         ORIGINAL FEATURE SPEC:\n{spec}",
+        title = original.title.trim(),
+        spec = original.spec.trim(),
+    );
+    Some(Feature {
+        id: format!("{milestone_id}{CONFLICT_INFIX}{n}"),
+        title: format!("Resolve merge conflict: {}", original.title.trim()),
+        spec,
+        validation_criteria: original.validation_criteria.clone(),
+        origin: FeatureOrigin::Fix,
+        status: FeatureStatus::Pending,
+        worker_runs: Vec::new(),
+        commits: Vec::new(),
+        respawns: 0,
+    })
 }
 
 /// Absolute worktree directory for one feature of one mission (roadmap M3).
