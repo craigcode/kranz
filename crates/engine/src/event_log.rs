@@ -4,9 +4,10 @@
 //! (`events.jsonl.lock`) rather than POSIX advisory locks so Windows stays
 //! first-class. Lifecycle events are flushed + fsynced per append; stream
 //! deltas (`worker.message`) are buffered in memory and drained by age
-//! (throttle), by the next lifecycle append, by explicit [`EventLog::flush`],
-//! or on drop. Losing buffered deltas on a crash is recoverable; losing a
-//! lifecycle event is not, hence the asymmetry.
+//! (throttle) — checked on the next append, or on demand via
+//! [`EventLog::flush_if_due`] — by the next lifecycle append, by explicit
+//! [`EventLog::flush`], or on drop. Losing buffered deltas on a crash is
+//! recoverable; losing a lifecycle event is not, hence the asymmetry.
 
 use crate::error::{EngineError, Result};
 use crate::events::{Event, EventKind};
@@ -77,6 +78,23 @@ pub struct EventLog {
     next_seq: u64,
     throttle: Duration,
     buffer: Vec<BufferedLine>,
+}
+
+/// Write buffered lines to `sink` from the front, removing each line from
+/// `buffer` only after it is successfully written. On the first write error
+/// the failing line and everything after it stay in `buffer`, in original
+/// order, so a later retry can pick up exactly where this call left off —
+/// `Vec::drain` cannot do this since its guard discards not-yet-yielded
+/// items if the iteration is cut short by `?`.
+fn drain_lines<W: std::io::Write>(
+    sink: &mut W,
+    buffer: &mut Vec<BufferedLine>,
+) -> std::io::Result<()> {
+    while !buffer.is_empty() {
+        sink.write_all(buffer[0].line.as_bytes())?;
+        buffer.remove(0);
+    }
+    Ok(())
 }
 
 impl EventLog {
@@ -217,7 +235,8 @@ impl EventLog {
     /// Durability: lifecycle events drain any buffered deltas first (file
     /// order == append order), then write + flush + fsync. Stream deltas are
     /// buffered and drained once the oldest buffered delta exceeds the
-    /// throttle age.
+    /// throttle age — checked here on each append, or on demand (without
+    /// waiting for another append) via [`EventLog::flush_if_due`].
     pub fn append(&mut self, kind: EventKind) -> Result<Event> {
         let event = Event {
             seq: self.next_seq,
@@ -253,10 +272,31 @@ impl EventLog {
         Ok(())
     }
 
-    fn drain_buffer(&mut self) -> Result<()> {
-        for buffered in self.buffer.drain(..) {
-            self.file.write_all(buffered.line.as_bytes())?;
+    /// Elapsed time since the OLDEST buffered delta, or `None` when the
+    /// buffer is empty.
+    pub fn buffer_age(&self) -> Option<Duration> {
+        self.buffer.first().map(|b| b.buffered_at.elapsed())
+    }
+
+    /// Drain the buffer to the file, WITHOUT waiting for another [`append`]
+    /// call, if it is non-empty and has aged past `throttle`. Gives idle
+    /// missions (waiting on an approval gate, worker stopped) a wall-clock-
+    /// driven flush instead of leaving deltas buffered indefinitely.
+    ///
+    /// [`append`]: EventLog::append
+    pub fn flush_if_due(&mut self) -> Result<bool> {
+        match self.buffer_age() {
+            Some(age) if age >= self.throttle => {
+                self.drain_buffer()?;
+                self.file.flush()?;
+                Ok(true)
+            }
+            _ => Ok(false),
         }
+    }
+
+    fn drain_buffer(&mut self) -> Result<()> {
+        drain_lines(&mut self.file, &mut self.buffer)?;
         Ok(())
     }
 
@@ -343,7 +383,11 @@ impl EventLog {
 impl Drop for EventLog {
     fn drop(&mut self) {
         if let Err(e) = self.flush() {
-            tracing::warn!(error = %e, "failed to flush event buffer on drop");
+            tracing::warn!(
+                error = %e,
+                retained = self.buffer.len(),
+                "failed to flush event buffer on drop; buffered deltas retained for a future drain"
+            );
         }
         if let Err(e) = std::fs::remove_file(&self.lock_path) {
             if e.kind() != ErrorKind::NotFound {
@@ -821,5 +865,65 @@ mod tests {
 
         let info = LockInfo { token: Some(format!("{own}-not")), ..info };
         assert_eq!(probe_liveness(&info), LockLiveness::Dead);
+    }
+
+    /// A writer that succeeds for the first `fail_at` writes and then always
+    /// errors, recording every line it actually wrote.
+    struct FlakyWriter {
+        fail_at: usize,
+        writes: Vec<String>,
+    }
+
+    impl std::io::Write for FlakyWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.writes.len() >= self.fail_at {
+                return Err(std::io::Error::other("simulated write failure"));
+            }
+            self.writes.push(String::from_utf8_lossy(buf).into_owned());
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn buffered(n: usize) -> Vec<BufferedLine> {
+        (0..n)
+            .map(|i| BufferedLine { buffered_at: Instant::now(), line: format!("line-{i}\n") })
+            .collect()
+    }
+
+    #[test]
+    fn drain_retains_unwritten_deltas_on_write_failure() {
+        let k = 3;
+        let n = 7;
+        let mut writer = FlakyWriter { fail_at: k, writes: Vec::new() };
+        let mut buffer = buffered(n);
+
+        let result = drain_lines(&mut writer, &mut buffer);
+
+        assert!(result.is_err(), "drain must surface the write error");
+        assert_eq!(
+            writer.writes,
+            (0..k).map(|i| format!("line-{i}\n")).collect::<Vec<_>>(),
+            "exactly the first k lines must have been written, in order"
+        );
+        assert_eq!(
+            buffer.iter().map(|b| b.line.clone()).collect::<Vec<_>>(),
+            (k..n).map(|i| format!("line-{i}\n")).collect::<Vec<_>>(),
+            "the remaining lines, including the one that failed, must stay buffered in order"
+        );
+
+        // A subsequent drain with a working writer must recover the retained
+        // lines successfully — nothing is permanently lost.
+        let mut retry_writer = FlakyWriter { fail_at: usize::MAX, writes: Vec::new() };
+        let retry_result = drain_lines(&mut retry_writer, &mut buffer);
+        assert!(retry_result.is_ok());
+        assert!(buffer.is_empty());
+        assert_eq!(
+            retry_writer.writes,
+            (k..n).map(|i| format!("line-{i}\n")).collect::<Vec<_>>()
+        );
     }
 }
