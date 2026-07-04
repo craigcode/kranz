@@ -381,14 +381,14 @@ fn route_slash(payload: &Value) -> Action {
     // `status [<id>]` → folded status summary; the optional id selects a
     // mission, otherwise the bridge picks the most recent one.
     if let Some(rest) = strip_ci_prefix(text, "status") {
-        let id = rest.trim();
+        let id = clean_id(rest);
         let mission_id = (!id.is_empty()).then(|| id.to_string());
         return Action::Status { mission_id, response_url };
     }
 
     // `plan <id>` → demand the plan (spend-gated: runs an orchestrator turn).
     if let Some(rest) = strip_ci_prefix(text, "plan") {
-        let id = rest.trim();
+        let id = clean_id(rest);
         if !id.is_empty() {
             return Action::RequestPlan { mission_id: id.to_string(), user_id, response_url };
         }
@@ -398,7 +398,7 @@ fn route_slash(payload: &Value) -> Action {
     // `approve <id>` → approve + queue (spend-gated). The slash twin of the
     // approve button.
     if let Some(rest) = strip_ci_prefix(text, "approve") {
-        let id = rest.trim();
+        let id = clean_id(rest);
         if !id.is_empty() {
             return Action::ApproveMission { mission_id: id.to_string(), user_id, response_url };
         }
@@ -491,7 +491,7 @@ fn parse_config_args(
     let (mission_id, role_idx) = if parse_role(tokens[0]).is_some() {
         (None, 0)
     } else {
-        (Some(tokens[0].to_string()), 1)
+        (Some(clean_id(tokens[0]).to_string()), 1)
     };
 
     let role = parse_role(tokens.get(role_idx)?)?.to_string();
@@ -528,10 +528,19 @@ fn parse_optional_id(rest: &str) -> Option<Option<String>> {
     let mut tokens = rest.split_whitespace();
     match (tokens.next(), tokens.next()) {
         (None, _) => Some(None),
-        (Some(id), None) => Some(Some(id.to_string())),
+        (Some(id), None) => Some(Some(clean_id(id).to_string())),
         // A second token means the input isn't a clean `pause`/`resume [<id>]`.
         (Some(_), Some(_)) => None,
     }
+}
+
+/// Strip the wrapper characters a Slack copy-paste smuggles in around an id:
+/// copying a rendered code span yields the text WITH its backticks (observed
+/// live: `/kranz plan `m-c9c915`` → "unknown mission"), and quotes/angle
+/// brackets arrive from other clients. Interior characters are never touched;
+/// goals are never cleaned (only id tokens).
+fn clean_id(raw: &str) -> &str {
+    raw.trim().trim_matches(|c| matches!(c, '`' | '\'' | '"' | '<' | '>'))
 }
 
 /// Build the camelCase `config-change` patch for a canonical `role` (as parsed
@@ -923,6 +932,39 @@ mod tests {
             }
         });
         assert_eq!(route(&env, &lookup_none()).action, Action::Ignore);
+    }
+
+    #[test]
+    fn pasted_backticked_ids_are_cleaned() {
+        // Observed live: Slack's copy of a rendered code span keeps the
+        // backticks, so `/kranz plan `m-c9c915`` reached the router with a
+        // literal-backtick id and failed as "unknown mission".
+        let env = json!({
+            "type": "slash_commands",
+            "payload": { "command": "/kranz", "text": "plan `m-c9c915`",
+                         "user_id": "U777", "response_url": "https://hooks.slack/p" }
+        });
+        assert_eq!(
+            route(&env, &lookup_none()).action,
+            Action::RequestPlan {
+                mission_id: "m-c9c915".into(),
+                user_id: Some("U777".into()),
+                response_url: Some("https://hooks.slack/p".into()),
+            }
+        );
+        let env = json!({
+            "type": "slash_commands",
+            "payload": { "command": "/kranz", "text": "approve \"m-42\"",
+                         "user_id": "U777", "response_url": "https://hooks.slack/a" }
+        });
+        assert_eq!(
+            route(&env, &lookup_none()).action,
+            Action::ApproveMission {
+                mission_id: "m-42".into(),
+                user_id: Some("U777".into()),
+                response_url: Some("https://hooks.slack/a".into()),
+            }
+        );
     }
 
     #[test]
