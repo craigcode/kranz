@@ -2204,6 +2204,58 @@ async fn crash_mid_parallel_batch_resumes_cleanly() {
     assert!(!repo.branch_exists(&format!("kranz/wt/{mission_id}/f-1-2")).unwrap_or(false));
 }
 
+/// The resume() worktree/branch sweep is destructive (`worktree remove
+/// --force`, `branch -D`) and must therefore only run once the single-writer
+/// lock is held. A second `kranz run` racing a LIVE engine mid parallel batch
+/// must fail LockHeld WITHOUT touching the live batch's worktrees/branches
+/// (cycle-3 review finding).
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_does_not_sweep_worktrees_while_lock_is_live() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let backend = Arc::new(MockBackend::new());
+    // Engine 1 stays ALIVE holding the single-writer lock, mid "batch".
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+    let mission_id = engine.mission_id().to_string();
+
+    // Simulate the live batch's per-feature worktree + branch (what Phase A
+    // creates before the concurrent workers run). Same layout as
+    // parallel_worktree_path: temp dir, kranz-wt-<mission>-<feature>.
+    let repo = GitRepo::open(&root).unwrap();
+    let branch = format!("kranz/wt/{mission_id}/f-1-1");
+    let wt_path = std::env::temp_dir().join(format!("kranz-wt-{mission_id}-f-1-1"));
+    let head = repo.head_sha().unwrap();
+    repo.add_worktree(&wt_path, &branch, &head).unwrap();
+
+    // Engine 2 (no --force-lock) must refuse at the lock, BEFORE any sweep.
+    let backend2: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+    let err = match MissionEngine::resume(backend2, &root, &mission_id, false) {
+        Ok(_) => panic!("resume must fail while a live engine holds the lock"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, kranz_engine::error::EngineError::LockHeld(_)),
+        "expected LockHeld, got: {err}"
+    );
+
+    // The live batch's worktree and branch are untouched.
+    assert!(wt_path.exists(), "live worktree must not be swept by a lock-refused resume");
+    assert!(
+        repo.branch_exists(&branch).unwrap_or(false),
+        "live branch must not be -D'd by a lock-refused resume"
+    );
+
+    // Cleanup.
+    let _ = repo.remove_worktree(&wt_path);
+    let _ = repo.prune_worktrees();
+    let _ = repo.delete_branch_force(&branch);
+    drop(engine);
+}
+
 /// Sequential invariance: the SAME 1-milestone / 2-feature mission run with
 /// max_parallel_workers=1 behaves exactly as it does today — no parallelization
 /// decision turn, no worktree branches, and the features run one at a time via

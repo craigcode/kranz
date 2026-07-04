@@ -341,11 +341,31 @@ impl MissionEngine {
         let events = EventLog::read_events(&paths.events_file())?;
         let state = reducer::fold(&events)?;
 
+        // The most recent orchestrator session's sdk id (events are in seq
+        // order, so the last matching worker.spawned wins).
+        let orch_session_id = events.iter().rev().find_map(|e| match &e.kind {
+            EventKind::WorkerSpawned { role: Role::Orchestrator, sdk_session_id, .. } => {
+                Some(sdk_session_id.clone())
+            }
+            _ => None,
+        });
+
+        let log = EventLog::acquire(
+            &paths,
+            mission_id,
+            Duration::from_millis(state.config.event_stream_throttle_ms),
+            force_lock,
+        )?;
+
         // Reap per-feature worktrees/branches orphaned by a crash mid parallel
-        // batch (M3). Resume is only reached after the engine process died, so
-        // no batch is in-flight — any `kranz/wt/<mission>/*` worktree or branch
-        // is a leak. Removing them here stops accumulation AND lets a re-forked
-        // Pending feature run cleanly (the branch no longer "already exists").
+        // batch (M3). Any `kranz/wt/<mission>/*` worktree or branch exists only
+        // while a lock-holding engine is mid-batch, so with the lock now held
+        // these are leaks from a dead engine. Removing them stops accumulation
+        // AND lets a re-forked Pending feature run cleanly (the branch no
+        // longer "already exists"). MUST run after EventLog::acquire: the
+        // sweep is destructive (`worktree remove --force`, `branch -D`), and
+        // running it lock-free would let a second `kranz run` rip live
+        // worktrees out from under a running engine before failing LockHeld.
         // Best-effort and idempotent: remove_worktree/delete_branch_force
         // tolerate absence; branch deletion runs after prune (git refuses to
         // -D a branch checked out in a still-registered worktree).
@@ -366,22 +386,6 @@ impl MissionEngine {
                 }
             }
         }
-
-        // The most recent orchestrator session's sdk id (events are in seq
-        // order, so the last matching worker.spawned wins).
-        let orch_session_id = events.iter().rev().find_map(|e| match &e.kind {
-            EventKind::WorkerSpawned { role: Role::Orchestrator, sdk_session_id, .. } => {
-                Some(sdk_session_id.clone())
-            }
-            _ => None,
-        });
-
-        let log = EventLog::acquire(
-            &paths,
-            mission_id,
-            Duration::from_millis(state.config.event_stream_throttle_ms),
-            force_lock,
-        )?;
         reducer::write_snapshot(&state, &paths.state_file())?;
 
         Ok(MissionEngine {
