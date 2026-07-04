@@ -978,8 +978,11 @@ impl MissionEngine {
             match self.state.mission.status {
                 MissionStatus::Complete => return Ok(MissionStatus::Complete),
                 MissionStatus::Failed => return Ok(MissionStatus::Failed),
-                // (b) paused: idle-drain until resumed.
+                // (b) paused: idle-drain until resumed. The mission may sit
+                // here indefinitely, so age-flush any buffered deltas each
+                // tick rather than waiting for the next lifecycle event.
                 MissionStatus::Paused => {
+                    self.log.flush_if_due()?;
                     tokio::time::sleep(PAUSE_POLL).await;
                     continue;
                 }
@@ -4131,5 +4134,91 @@ mod tests {
         for key in value.as_object().unwrap().keys() {
             assert!(props.contains_key(key), "schema missing top-level key {key}");
         }
+    }
+
+    /// F2: while `run()` idles in the `MissionStatus::Paused` poll branch, a
+    /// buffered stream delta must age out to disk on its own — no further
+    /// lifecycle event, no resume — proving the loop actually calls
+    /// `EventLog::flush_if_due` on its `PAUSE_POLL` tick rather than only on
+    /// the next `append`/`flush`/drop.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paused_idle_loop_age_flushes_buffered_delta() {
+        let ok = std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !ok {
+            eprintln!("skipping test: git is not on PATH");
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .expect("spawn git");
+            assert!(out.status.success(), "git {args:?} failed: {:?}", out);
+        };
+        if !std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(dir.path())
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            run(&["init"]);
+            run(&["symbolic-ref", "HEAD", "refs/heads/main"]);
+        }
+        run(&["config", "user.name", "test"]);
+        run(&["config", "user.email", "test@example.com"]);
+        std::fs::write(dir.path().join("README.md"), "seed\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-m", "seed"]);
+        let root = std::fs::canonicalize(dir.path()).expect("canonicalize repo root");
+
+        let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
+        let cfg = MissionConfig { event_stream_throttle_ms: 10, ..MissionConfig::default() };
+        let mut engine = MissionEngine::create(backend, &root, "goal", cfg).expect("create engine");
+
+        // Force the idle-Paused branch and buffer a stream delta directly
+        // (bypassing any lifecycle path that would flush it immediately).
+        engine.state.mission.status = MissionStatus::Paused;
+        engine
+            .log
+            .append(EventKind::WorkerMessage {
+                run_id: "test-run".to_string(),
+                tag: "text".to_string(),
+                content: "buffered delta".to_string(),
+            })
+            .expect("buffer a stream delta");
+
+        let paths = engine.paths.clone();
+        let before = EventLog::read_events(&paths.events_file()).expect("read events.jsonl");
+        assert!(
+            !before.iter().any(|e| matches!(&e.kind, EventKind::WorkerMessage { .. })),
+            "delta must still be buffered, not yet on disk"
+        );
+
+        let handle = tokio::spawn(async move {
+            let _ = tokio::time::timeout(Duration::from_secs(5), engine.run()).await;
+        });
+
+        // PAUSE_POLL is 300ms and the throttle above is 10ms, so a couple of
+        // idle ticks are more than enough for flush_if_due to drain it.
+        // Checked BEFORE aborting the task: EventLog's Drop also flushes, so
+        // reading only after abort would pass even without the fix under test.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let after = EventLog::read_events(&paths.events_file()).expect("read events.jsonl");
+        handle.abort();
+
+        assert!(
+            after.iter().any(
+                |e| matches!(&e.kind, EventKind::WorkerMessage { content, .. } if content == "buffered delta")
+            ),
+            "idle Paused loop must age-flush the buffered delta to disk without a lifecycle event"
+        );
     }
 }
