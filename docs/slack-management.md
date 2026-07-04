@@ -194,6 +194,87 @@ external `kranz work` CLI: `kranz work` drains the whole queue, `kranz work
 dispatcher watches — it polls the queue on its own timer — so report-only is the
 correct and safe surface here.)
 
+## Running multiple instances
+
+Kranz is per-machine: two Macs today, a cloud host later, each running its own
+`kranz serve --slack`. The supported topology is **one Slack app per
+instance**. Clone the app for every machine; never point two bridges at the
+same app's tokens.
+
+### Why one app per instance
+
+- **Socket Mode load-balances, it does not broadcast.** All open Socket Mode
+  connections of a *single* app form one pool, and Slack delivers each inbound
+  envelope (slash command, button click, thread reply) to **one** connection in
+  that pool, round-robin-ish. Two Kranz instances sharing one app therefore
+  each receive a random ~half of the commands: `/kranz approve m-42` lands on
+  the studio Mac or the laptop by coin flip, and only one of them has mission
+  `m-42`. There is **no channel-based filtering** — an instance cannot say
+  "only give me envelopes from #kranz-studio" — so this cannot be routed around
+  at the app layer. One app per instance means one connection pool per
+  instance, and every envelope reaches the machine that owns the app.
+- **Outbound is fine either way** — `chat.postMessage` goes wherever the poster
+  says — it is *inbound* routing that forces the split.
+
+### Setting it up per machine
+
+1. **Clone the app** from [docs/slack-app-manifest.yaml](slack-app-manifest.yaml)
+   (api.slack.com/apps → "Create New App" → "From an app manifest"), once per
+   machine. **Name it per machine** — `Kranz (studio)`, `Kranz (laptop)`,
+   `Kranz (cloud)` — so the workspace's app list and message author lines stay
+   legible.
+2. **Give each app a distinct slash-command name** — `/kranz-studio`,
+   `/kranz-laptop`, … — in the manifest's `slash_commands` block. Slash-command
+   names are workspace-global and **duplicates are last-install-wins**: if two
+   apps both register `/kranz`, the most recently (re)installed app silently
+   captures ALL `/kranz` invocations and the other app never sees any. A
+   distinct name per app is required, not cosmetic.
+3. **Per-machine `~/.kranz/config.json`**: each machine's `slack` block holds
+   *its own app's* `botToken` / `appToken` (tokens are per-app), plus an
+   `instanceName` naming the machine:
+
+   ```json
+   {
+     "slack": {
+       "botToken": "xoxb-…the studio app's bot token…",
+       "appToken": "xapp-…the studio app's app token…",
+       "channel": "C0123ABC",
+       "instanceName": "studio"
+     }
+   }
+   ```
+
+   `instanceName` (or the `KRANZ_SLACK_INSTANCE` env var, env winning) makes
+   the instance visibly distinct: every message the bridge posts —
+   notifications, `/kranz help`, ephemeral approve/config/pause confirmations,
+   the App Home header — carries a leading `[studio]` label, so you can always
+   tell which machine is talking (and which one just answered your command).
+   Unset, nothing is labeled — single-instance behavior is unchanged. The name
+   is treated as plain text (mrkdwn-escaped), never interpreted.
+4. **Channels: separate recommended, optional.** One channel per instance
+   (`#kranz-studio`, `#kranz-laptop`) keeps feeds untangled and is the
+   recommended default. A shared channel also works — inbound routing is
+   per-app regardless of channel, and the `[instanceName]` label keeps the
+   shared feed readable. Just remember which app's slash command drives which
+   machine.
+
+### Cloud shapes (see [docs/deploy.md](deploy.md))
+
+- **Ephemeral `kranz exec` containers are outbound-only.** A CI-shaped
+  one-mission container runs no bridge, opens no Socket Mode connection, and
+  registers no commands — it (at most) posts progress. No app cloning needed:
+  posting into a shared channel with a run-id tag is safe, because the
+  misrouting hazard above is inbound-only.
+- **A persistent cloud `serve --slack` is a full instance** and follows the
+  same rule: its own cloned app, its own tokens — injected as `KRANZ_SLACK_*`
+  env vars from the platform's secret store rather than a config file — and
+  `KRANZ_SLACK_INSTANCE=cloud` so its messages are labeled.
+- **Simplest consolidated topology:** make the cloud host the **only**
+  Slack-connected instance. One app, one `/kranz` command, one always-on
+  bridge; the Macs run missions locally without `--slack` (or drive the cloud
+  host's queue). You give up per-machine Slack control but keep a single
+  uncloned app and zero routing ambiguity.
+
 ## Done when
 
 A mission goes goal → planning conversation → reviewed plan → approve → start →

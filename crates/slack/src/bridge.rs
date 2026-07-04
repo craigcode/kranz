@@ -220,6 +220,9 @@ async fn post_outbound(
         Outbound::Blocked(b) => crate::format::build_blocked(b, dash),
         Outbound::Complete(c) => crate::format::build_complete(c, dash),
     };
+    // Multi-instance labeling: with `instanceName` configured the message gets
+    // a `[name]` prefix; unset → the blocks pass through unchanged.
+    let blocks = crate::format::label_blocks(blocks, cfg.instance_name.as_deref());
     let thread_ts = threads.thread_ts(mission_id);
     let posted_ts = client.post_message(&cfg.channel, &blocks, thread_ts.as_deref()).await?;
     // First post for this mission establishes the thread root.
@@ -456,9 +459,19 @@ async fn handle_envelope(
 
 /// Ephemeral reply to the slash `response_url`, best-effort (a failed reply
 /// must never wedge the ack). No-op when the action carried no `response_url`.
-async fn reply_ephemeral(client: &SlackClient, response_url: Option<&str>, blocks: &[Value]) {
+/// Labels the reply with the configured instance name
+/// ([`crate::format::label_blocks`]) so a user driving several Kranz instances
+/// can tell WHICH one answered; with no `instanceName` configured the blocks
+/// pass through unchanged.
+async fn reply_ephemeral(
+    cfg: &SlackConfig,
+    client: &SlackClient,
+    response_url: Option<&str>,
+    blocks: &[Value],
+) {
     if let Some(url) = response_url {
-        if let Err(e) = client.post_response(url, blocks, true).await {
+        let blocks = crate::format::label_blocks(blocks.to_vec(), cfg.instance_name.as_deref());
+        if let Err(e) = client.post_response(url, &blocks, true).await {
             tracing::warn!(error = %e, "failed to post ephemeral Slack reply");
         }
     }
@@ -543,15 +556,16 @@ async fn dispatch_action(
 ) {
     match action {
         Action::Help { response_url } => {
-            reply_ephemeral(client, response_url.as_deref(), &crate::format::build_help()).await;
+            reply_ephemeral(cfg, client, response_url.as_deref(), &crate::format::build_help()).await;
         }
 
         Action::Status { mission_id, response_url } => {
             match build_status_reply(repo_root, mission_id.as_deref()) {
-                Ok(blocks) => reply_ephemeral(client, response_url.as_deref(), &blocks).await,
+                Ok(blocks) => reply_ephemeral(cfg, client, response_url.as_deref(), &blocks).await,
                 Err(e) => {
                     tracing::warn!(error = %e, "failed to build Slack status reply");
                     reply_ephemeral(
+                        cfg,
                         client,
                         response_url.as_deref(),
                         &error_blocks(&format!("Couldn't read that mission: {e}")),
@@ -563,14 +577,15 @@ async fn dispatch_action(
 
         Action::NewMission { goal, user_id, response_url, channel } => {
             if !cfg.is_authorized(user_id.as_deref()) {
-                reply_ephemeral(client, response_url.as_deref(), &not_authorized_blocks()).await;
+                reply_ephemeral(cfg, client, response_url.as_deref(), &not_authorized_blocks()).await;
                 return;
             }
-            match new_mission(client, repo_root, threads, goal, channel).await {
-                Ok(blocks) => reply_ephemeral(client, response_url.as_deref(), &blocks).await,
+            match new_mission(cfg, client, repo_root, threads, goal, channel).await {
+                Ok(blocks) => reply_ephemeral(cfg, client, response_url.as_deref(), &blocks).await,
                 Err(e) => {
                     tracing::warn!(error = %e, "failed to create mission from Slack");
                     reply_ephemeral(
+                        cfg,
                         client,
                         response_url.as_deref(),
                         &error_blocks(&format!("Couldn't create the mission: {e}")),
@@ -582,13 +597,14 @@ async fn dispatch_action(
 
         Action::RequestPlan { mission_id, user_id, response_url } => {
             if !cfg.is_authorized(user_id.as_deref()) {
-                reply_ephemeral(client, response_url.as_deref(), &not_authorized_blocks()).await;
+                reply_ephemeral(cfg, client, response_url.as_deref(), &not_authorized_blocks()).await;
                 return;
             }
             // Documented handoff (see dispatch_action docs): request-plan needs
             // the live planning engine held across turns (the M2.5 host), which
             // lives in kranz_server — out of scope for this slice.
             reply_ephemeral(
+                cfg,
                 client,
                 response_url.as_deref(),
                 &error_blocks(&format!(
@@ -602,12 +618,13 @@ async fn dispatch_action(
 
         Action::ApproveMission { mission_id, user_id, response_url } => {
             if !cfg.is_authorized(user_id.as_deref()) {
-                reply_ephemeral(client, response_url.as_deref(), &not_authorized_blocks()).await;
+                reply_ephemeral(cfg, client, response_url.as_deref(), &not_authorized_blocks()).await;
                 return;
             }
             match approve_mission(repo_root, mission_id) {
                 Ok(()) => {
                     reply_ephemeral(
+                        cfg,
                         client,
                         response_url.as_deref(),
                         &error_blocks(&format!(":white_check_mark: Queued `{mission_id}`.")),
@@ -617,6 +634,7 @@ async fn dispatch_action(
                 Err(e) => {
                     tracing::warn!(error = %e, "failed to approve mission from Slack");
                     reply_ephemeral(
+                        cfg,
                         client,
                         response_url.as_deref(),
                         &error_blocks(&format!("Couldn't queue `{mission_id}`: {e}")),
@@ -630,7 +648,7 @@ async fn dispatch_action(
         // spend), so it is gated on the allowlist exactly like `/kranz new`.
         Action::Config { mission_id, role, model, effort, user_id, response_url } => {
             if !cfg.is_authorized(user_id.as_deref()) {
-                reply_ephemeral(client, response_url.as_deref(), &not_authorized_blocks()).await;
+                reply_ephemeral(cfg, client, response_url.as_deref(), &not_authorized_blocks()).await;
                 return;
             }
             match config_change(repo_root, mission_id.as_deref(), role, model, effort.as_deref()) {
@@ -640,6 +658,7 @@ async fn dispatch_action(
                         .map(|e| format!(", effort `{e}`"))
                         .unwrap_or_default();
                     reply_ephemeral(
+                        cfg,
                         client,
                         response_url.as_deref(),
                         &error_blocks(&format!(
@@ -651,6 +670,7 @@ async fn dispatch_action(
                 Err(e) => {
                     tracing::warn!(error = %e, "failed to apply config change from Slack");
                     reply_ephemeral(
+                        cfg,
                         client,
                         response_url.as_deref(),
                         &error_blocks(&format!("Couldn't change config: {e}")),
@@ -679,14 +699,17 @@ async fn dispatch_action(
         // queue on the socket loop (that would spawn `claude`); it reads the
         // queue state and points at the `kranz work` dispatcher.
         Action::Work { response_url } => {
-            reply_ephemeral(client, response_url.as_deref(), &build_work_reply(repo_root)).await;
+            reply_ephemeral(cfg, client, response_url.as_deref(), &build_work_reply(repo_root)).await;
         }
 
         // App Home tab: fold the repo read-only and publish this user's home
         // view. Read-only (no allowlist gate); a publish failure is logged, not
         // surfaced (there's no response_url — the user just opened a tab).
         Action::AppHome { user_id } => {
-            let view = build_home_view(repo_root, cfg.dashboard_url.as_deref());
+            let view = crate::format::label_home_view(
+                build_home_view(repo_root, cfg.dashboard_url.as_deref()),
+                cfg.instance_name.as_deref(),
+            );
             if let Err(e) = client.publish_home_view(user_id, &view).await {
                 tracing::warn!(user = %user_id, error = %e, "failed to publish App Home view");
             }
@@ -697,12 +720,13 @@ async fn dispatch_action(
         // paid mission, bypassing the allowlist that the slash command enforces.
         Action::Approve { mission_id, user_id, response_url } => {
             if !cfg.is_authorized(user_id.as_deref()) {
-                reply_ephemeral(client, response_url.as_deref(), &not_authorized_blocks()).await;
+                reply_ephemeral(cfg, client, response_url.as_deref(), &not_authorized_blocks()).await;
                 return;
             }
             match approve_mission(repo_root, mission_id) {
                 Ok(()) => {
                     reply_ephemeral(
+                        cfg,
                         client,
                         response_url.as_deref(),
                         &error_blocks(&format!(":white_check_mark: Queued `{mission_id}`.")),
@@ -899,12 +923,13 @@ async fn steer(
     verb: &str,
 ) {
     if !cfg.is_authorized(user_id) {
-        reply_ephemeral(client, response_url, &not_authorized_blocks()).await;
+        reply_ephemeral(cfg, client, response_url, &not_authorized_blocks()).await;
         return;
     }
     match enqueue_steer(repo_root, mission_id, cmd) {
         Ok(applied_to) => {
             reply_ephemeral(
+                cfg,
                 client,
                 response_url,
                 &error_blocks(&format!(
@@ -916,6 +941,7 @@ async fn steer(
         Err(e) => {
             tracing::warn!(error = %e, "failed to enqueue steering command from Slack");
             reply_ephemeral(
+                cfg,
                 client,
                 response_url,
                 &error_blocks(&format!("Couldn't {verb} that mission: {e}")),
@@ -1068,8 +1094,12 @@ fn guidance(repo_root: &Path, mission_id: &str, text: &str) -> Result<()> {
 ///    it will build on).
 ///
 /// Returns the ack blocks the caller sends ephemerally to the invoker; the
-/// public thread root is posted here.
+/// public thread root is posted here. The public post is instance-labeled
+/// directly; the RETURNED blocks are unlabeled because the caller routes them
+/// through [`reply_ephemeral`], which applies the label (labeling here too
+/// would double-prefix).
 async fn new_mission(
+    cfg: &SlackConfig,
     client: &SlackClient,
     repo_root: &Path,
     threads: &SharedThreads,
@@ -1103,10 +1133,12 @@ async fn new_mission(
         opening_reply,
     });
 
-    // Post the planning thread root publicly, then record the mapping so
-    // in-thread replies route back to this mission.
+    // Post the planning thread root publicly (instance-labeled), then record
+    // the mapping so in-thread replies route back to this mission.
+    let labeled =
+        crate::format::label_blocks(blocks.clone(), cfg.instance_name.as_deref());
     let posted_ts = client
-        .post_message(channel, &blocks, None)
+        .post_message(channel, &labeled, None)
         .await
         .context("posting new-mission thread root")?;
     threads.set(&mission_id, &posted_ts);
@@ -1546,6 +1578,7 @@ mod tests {
             notify: NotifyFlags::default(),
             allow_users: vec!["U-allowed".into()],
             dashboard_url: None,
+            instance_name: None,
         };
         let client = SlackClient::new(&cfg).unwrap();
         steer(
@@ -1579,6 +1612,7 @@ mod tests {
             notify: NotifyFlags::default(),
             allow_users: vec!["U-allowed".into()],
             dashboard_url: None,
+            instance_name: None,
         };
         let client = SlackClient::new(&cfg).unwrap();
         steer(
@@ -1774,6 +1808,7 @@ mod tests {
             notify: NotifyFlags::default(),
             allow_users: vec![],
             dashboard_url: None,
+            instance_name: None,
         };
         let client = SlackClient::new(&cfg).unwrap();
         let frame = json!({
@@ -1802,6 +1837,7 @@ mod tests {
             notify: NotifyFlags::default(),
             allow_users: vec![],
             dashboard_url: None,
+            instance_name: None,
         };
         let client = SlackClient::new(&cfg).unwrap();
         let hello = json!({ "type": "hello" }).to_string();
