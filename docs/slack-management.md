@@ -105,16 +105,23 @@ like `/kranz new`; unlisted users get the same ephemeral "not authorized" reply.
   `low` · `medium` · `high` · `xhigh` · `max`.
 - **Mission targeting** (chosen convention): the id is **optional** and
   disambiguated positionally. If the first argument is a known role, there is no
-  id and the change applies to the **most-recent mission** (the same "the mission
-  you just made" heuristic `/kranz status` uses). Otherwise the first argument is
-  the mission id: `/kranz config m-42 worker sonnet high`. A bad role/effort or
-  wrong arity falls through to `/kranz help` (a typo is discoverable, never a
-  silent surprising action). An unknown mission id is a plain ephemeral error.
+  id and the change applies to the repo's **single active mission** — with
+  several active it refuses and asks for an explicit id, and a terminal target
+  is rejected (its control inbox is never drained, so the change would be a
+  silent no-op). Otherwise the first argument is the mission id:
+  `/kranz config m-42 worker sonnet high`. A bad role/effort or wrong arity
+  falls through to `/kranz help` (a typo is discoverable, never a silent
+  surprising action). An unknown mission id is a plain ephemeral error.
 - **Wiring**: on authorization, the bridge enqueues
   `ControlCommand::ConfigChange { patch }` onto the target mission's control
   inbox, where `patch` is the camelCase engine patch, e.g.
   `{"worker":{"model":"sonnet","reasoningEffort":"high"}}`. The role→key mapping
   and patch shape are a pure, table-tested function (`inbound::config_patch`).
+- **CLI twin**: `kranz config role <role> <model> [effort] [--mission <id>]`
+  enqueues the identical patch through the same machinery; target resolution
+  (active missions only, refuse ambiguous/terminal) is shared via
+  `kranz_engine::control::resolve_active_mission`, so both surfaces refuse the
+  same hazardous targets.
 
 ### Deep-link buttons (`slack.dashboardUrl`)
 

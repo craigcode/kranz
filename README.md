@@ -47,6 +47,9 @@ kranz status                      # terminal tree + tokens/cost
 kranz msg "swap feature 4 for X"  # queued between worker runs
 kranz msg --interrupt "stop"      # aborts the current worker first
 kranz pause | kranz resume
+kranz config show                 # effective merged config (+ the layer files)
+kranz config set worker.model opus       # edit .kranz/config.json (validated)
+kranz config role worker opus xhigh      # MID-MISSION: applies at next worker spawn
 kranz serve --open                # Mission Control dashboard (browser)
 ```
 
@@ -133,7 +136,11 @@ assert the implementation, unwired criteria, broken seams between features.
 
 Config: `.kranz/config.json` (project) over `~/.kranz/config.json` (global) —
 per-role models/effort/budgets, fix-cycle caps, deny patterns. Defaults use
-model aliases (`opus`, `sonnet`) so they track the latest releases.
+model aliases (`opus`, `sonnet`) so they track the latest releases. Inspect and
+edit the layers with `kranz config show|set|unset` (`--global` targets the home
+file; edits are validated before writing and only shape *future* missions);
+`kranz config role <role> <model> [effort]` is the mid-mission path — it queues
+a config-change on the running mission, like Slack's `/kranz config`.
 
 ## Development
 
