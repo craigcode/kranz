@@ -1,9 +1,10 @@
 # Kranz handoff
 
 State as of 2026-07-03. Everything below is built, merged to `main`, and
-verified as far as this dev host (macOS) allows: **360 workspace tests green,
-`clippy -D warnings` clean, dashboard tsc+build clean, Windows kill code
-cross-compile-verified against the real `windows` 0.58 API**. Two live
+**CI-green on all three jobs — `rust (ubuntu-latest)`, `rust (windows-latest)`,
+and `dashboard`** (github.com/craigcode/kranz). 445 workspace tests, `clippy
+-D warnings` clean. The Windows Job-Object process-tree kill is now
+**runtime-validated on windows-latest**, not just cross-compiled. Two live
 acceptance missions completed end-to-end (opus and Fable orchestrators).
 
 ## Shipped
@@ -12,31 +13,56 @@ acceptance missions completed end-to-end (opus and Fable orchestrators).
   dashboard + Tauri, hardened by live missions + adversarial review.
 - **M1** — `report.md` at completion, estimate calibration from actuals,
   §5 acceptance proven twice.
+- **M2** — `kranz abandon` / `kranz clean` (mission hygiene), environment
+  preflight, and mid-mission re-planning (tested safe subset).
 - **M2.5** — full mission lifecycle from the web UI (create/plan/approve/
   start) behind a per-serve mutation token.
 - **M2.75** — mission backlog (`kranz ticket`/`draft`/`queue`/`work`) +
-  Slack Socket Mode bridge (`kranz serve --slack`).
-- **M4** — Windows process-tree kill (Job Objects), release workflow,
-  Homebrew formula, Tauri bundle config, [releasing runbook](releasing.md).
+  Slack Socket Mode bridge (`kranz serve --slack`), incl. `/kranz help`.
+- **M2.9 Slice 1** — Slack lifecycle commands (`/kranz new/status/plan/
+  approve`) + spend allowlist.
+- **M3** — parallel workers, worktree-isolated, flag-gated behind
+  `maxParallelWorkers > 1`; the sequential path is byte-identical.
+- **M4** — Windows process-tree kill (Job Objects, **CI-validated**), release
+  workflow, Homebrew formula, Tauri bundle config, [runbook](releasing.md).
+- **M5** — `kranz exec -f mission.md` (headless CI missions) + hardened
+  credential `scrub` (entropy heuristic, vendor patterns, allowlist).
+- **M6** — scoped `kranz/*` push primitive, Dockerfile, [deploy runbook](deploy.md),
+  and `kranz exec --push <remote>` (the cloud handoff).
 
-## Three gates only you can close
+Deferred by choice (in the roadmap): OTEL export (heavy dep tree), computer-use
+QA, skill capture, and Slack control slices 2–3 (App Home, config modals).
+Two engine contract-change requests are logged for a fuller M3 (a
+`feature.conflict` event; a shared/interior-mutable event log for true
+concurrent worker overlap).
 
-Each is a one-time setup step; everything up to it is done and tested.
+## Gates you can close
 
-### 1. Git remote → CI + Windows validation (M4)
+Two of the original three are now closed: the **GitHub remote** is live
+(github.com/craigcode/kranz, CI green on all platforms) and **Slack** is
+configured and verified (the bridge posts to `#kranz`). What remains:
 
-The Windows Job-Object kill compiles and type-checks against the real API here
-but has **never run on Windows**. The CI matrix
-([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) already targets
-ubuntu + windows; it just needs a remote to run against.
+### 1. First public release (crates.io / Homebrew)
 
-```sh
-# create a repo (gh, or the web UI), then:
-git remote add origin https://github.com/<OWNER>/kranz.git
-git push -u origin main
-```
+Prepared but not published. Follow [docs/releasing.md](releasing.md): bump the
+version, tag `vX.Y.Z`, push the tag → `release.yml` builds and attaches
+per-platform binaries; then update the Homebrew `sha256` and `cargo publish` in
+order (engine → server, slack → cli). The `OWNER` placeholders can be replaced
+with `craigcode` now that the repo exists.
 
-Then: watch the Actions tab. Windows-latest runs the full suite including the
+### 2. Cloud deploy (M6, when you want it)
+
+The pieces exist ([Dockerfile](../Dockerfile), scoped push, `kranz exec --push`,
+[deploy runbook](deploy.md)) but no live deploy has run. A Railway/Fly/VPS host
+running `kranz serve --slack` with a `.kranz` volume + the mutation token over
+TLS is the persistent-host shape; a container-per-mission running `kranz exec -f
+… --push` is the ephemeral CI shape.
+
+### (historical) Git remote → CI + Windows validation — DONE
+
+The Windows Job-Object kill is now runtime-validated on windows-latest CI. The
+matrix ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) runs the full
+suite on ubuntu + windows on every push. Windows-latest runs the
 `#[cfg(windows)]` process-tree-kill regression test — that's the real
 validation. Fix whatever windows-latest surfaces (likely none; it's clean on
 `x86_64-pc-windows-gnu` locally). Replace the `OWNER` placeholder in
