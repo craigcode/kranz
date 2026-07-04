@@ -741,6 +741,45 @@ fn build_status_reply(repo_root: &Path, mission_id: Option<&str>) -> Result<Vec<
 /// listed by [`MissionPaths::list_missions`]; "most recent" is the one whose
 /// event log was modified last (creation writes `mission.created`), which is a
 /// good-enough "the mission you just made" heuristic for a bare `/kranz status`.
+/// Fold one mission's status (None if its log is unreadable/absent).
+fn mission_status(repo_root: &Path, id: &str) -> Option<MissionStatus> {
+    let paths = MissionPaths::new(repo_root, id);
+    let events = EventLog::read_events(&paths.events_file()).ok()?;
+    Some(reducer::fold(&events).ok()?.mission.status)
+}
+
+/// Resolve the target of a spend-reshaping `/kranz config`: an ACTIVE
+/// (non-terminal) mission, chosen unambiguously.
+/// - explicit id: must exist and be active (terminal → error, so the user is
+///   not told a config landed on a mission that will never apply it).
+/// - no id: exactly one active mission → use it; none → error; several → error
+///   asking for an explicit id (never silently guess).
+fn resolve_active_config_target(repo_root: &Path, explicit: Option<&str>) -> Result<String> {
+    let is_terminal = kranz_engine::orchestrator::is_terminal_status;
+    if let Some(id) = explicit {
+        match mission_status(repo_root, id) {
+            None => Err(anyhow::anyhow!("unknown mission `{id}`")),
+            Some(s) if is_terminal(s) => Err(anyhow::anyhow!(
+                "mission `{id}` is {s:?}; config changes apply only to active missions"
+            )),
+            Some(_) => Ok(id.to_string()),
+        }
+    } else {
+        let active: Vec<String> = MissionPaths::list_missions(repo_root)
+            .into_iter()
+            .filter(|id| mission_status(repo_root, id).is_some_and(|s| !is_terminal(s)))
+            .collect();
+        match active.len() {
+            0 => Err(anyhow::anyhow!("no active mission — create one with `/kranz new <goal>`")),
+            1 => Ok(active.into_iter().next().expect("len == 1")),
+            _ => Err(anyhow::anyhow!(
+                "several active missions ({}); name one: `/kranz config <id> <role> <model>`",
+                active.join(", ")
+            )),
+        }
+    }
+}
+
 fn most_recent_mission(repo_root: &Path) -> Option<String> {
     MissionPaths::list_missions(repo_root)
         .into_iter()
@@ -815,18 +854,17 @@ fn config_change(
     model: &str,
     effort: Option<&str>,
 ) -> Result<String> {
-    let mission_id = match mission_id {
-        Some(id) => id.to_string(),
-        None => most_recent_mission(repo_root).ok_or_else(|| {
-            anyhow::anyhow!("no missions yet — create one with `/kranz new <goal>`")
-        })?,
-    };
+    // Resolve to an ACTIVE (non-terminal) mission by identity, not filesystem
+    // mtime. Two hazards the mtime `most_recent_mission` heuristic (fine for a
+    // read-only status guess) causes for a spend-reshaping config change:
+    //  - a running mission's log mtime keeps advancing, so a bare
+    //    `/kranz config` after `/kranz new` would hijack the RUNNING mission;
+    //  - a terminal mission's control inbox is never drained (run() refuses
+    //    terminal missions), so enqueuing there is a silent no-op reported as
+    //    success. So: reject terminal targets, and require an explicit id when
+    //    more than one mission is active.
+    let mission_id = resolve_active_config_target(repo_root, mission_id)?;
     let paths = MissionPaths::new(repo_root, &mission_id);
-    // Only enqueue against a mission that actually exists, so a typo'd id fails
-    // loudly rather than dropping a control file into a phantom inbox.
-    if !paths.events_file().is_file() {
-        return Err(anyhow::anyhow!("unknown mission `{mission_id}`"));
-    }
     let patch = crate::inbound::config_patch(role, model, effort)
         .ok_or_else(|| anyhow::anyhow!("unknown role `{role}`"))?;
     kranz_engine::control::enqueue(&paths, &ControlCommand::ConfigChange { patch })
@@ -1278,6 +1316,42 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("m-nope"), "error names the unknown mission");
+    }
+
+    #[test]
+    fn config_change_refuses_a_bare_command_when_several_missions_are_active() {
+        // Two active (Planning) missions: a bare `/kranz config` must NOT guess
+        // (an mtime race would otherwise hijack a running mission) — it errors
+        // and asks for an explicit id, and enqueues nothing.
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-a", "goal a");
+        seed_mission(tmp.path(), "m-b", "goal b");
+        let err = config_change(tmp.path(), None, "worker", "opus", None).unwrap_err().to_string();
+        assert!(err.contains("several active missions"), "asks for an explicit id: {err}");
+        for id in ["m-a", "m-b"] {
+            assert!(
+                kranz_engine::control::drain(&MissionPaths::new(tmp.path(), id)).unwrap().is_empty(),
+                "nothing enqueued on {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_change_refuses_a_terminal_mission_and_enqueues_nothing() {
+        // A completed mission's control inbox is never drained, so a config
+        // change there would be a silent no-op reported as success. Reject it.
+        let tmp = TempDir::new().unwrap();
+        seed_completed_mission(tmp.path(), "m-done");
+        let err = config_change(tmp.path(), Some("m-done"), "worker", "opus", None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("active missions"), "honest error, not false success: {err}");
+        assert!(
+            kranz_engine::control::drain(&MissionPaths::new(tmp.path(), "m-done"))
+                .unwrap()
+                .is_empty(),
+            "no control file leaked into a terminal mission"
+        );
     }
 
     #[test]
