@@ -120,7 +120,7 @@ Done when: a 2-milestone mission with independent features completes in
 materially less wall-clock than sequential at comparable cost, with zero
 event-log corruption across 20 repeated runs.
 
-## M4 — Windows first-class + distribution ◑ (CI green on ubuntu+windows incl. kill/resume; remaining: tagged release + package distribution)
+## M4 — Windows first-class + distribution ◑ (CI green on ubuntu+windows incl. kill/resume; v0.1.0 tagged 2026-07-04 with linux/macos/windows binaries attached; remaining: crates.io + Homebrew, gated on the repo going public)
 
 The code is path-safe and lock-file based per §9, but never proven on Windows,
 and the project has no distribution story.
