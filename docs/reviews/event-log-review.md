@@ -5,8 +5,12 @@ log that is the mission's single source of truth. Reviewed in full, together
 with `crates/engine/src/events.rs` (`Event`, `EventKind::is_stream_delta`),
 `crates/engine/src/error.rs` (`EngineError::LogCorruption` /
 `EngineError::LockHeld`), and `crates/engine/src/paths.rs` (`MissionPaths`) for
-context. This is a read-only review — no source, test, or config file was
-changed. This document has been through an independent adversarial
+context. This is a read-only review — this review's own commits (b51cf7d,
+cbb4afb) touch only this document, verifiable with `git show --stat
+<commit>`; no source, test, or config file is changed by them. (This mission
+currently shares a branch/worktree with unrelated concurrent development, so
+an unqualified `git diff --name-only main` also lists sibling commits' files
+— those are not part of this review.) This document has been through an independent adversarial
 verification pass: every finding below was re-derived from the source
 (reading the code before re-reading the prior claim) and checked against its
 own stated trigger; none were refuted. See the per-finding **Verification**
@@ -477,6 +481,11 @@ additional Critical or High issue was discovered among them.
 
 ## Verification
 
-No source file was modified; the only file created or edited by this review
-is `docs/reviews/event-log-review.md`. `git diff --name-only main` output is
-quoted verbatim in the worker report.
+This review's own commits (b51cf7d, cbb4afb) modify no source, test, or
+config file; the only file they create or edit is
+`docs/reviews/event-log-review.md`, verifiable with `git show --stat
+<commit>` for each. This mission currently shares a branch/worktree with
+unrelated concurrent development (e.g. Slack approve-button and Web UI
+mission-management work), so an unqualified `git diff --name-only main` on
+this branch also lists those sibling commits' files — those files are not
+part of, and were not touched by, this review.
