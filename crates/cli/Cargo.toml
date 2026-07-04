@@ -1,5 +1,9 @@
 [package]
-name = "kranz-cli"
+# Published as `kranz` so `cargo install kranz` works (the binary below is
+# also `kranz`). The LIBRARY target keeps the historical `kranz_cli` name so
+# `use kranz_cli::…` in main.rs and the integration tests is undisturbed —
+# same package/bin/lib naming split as ripgrep (package `ripgrep`, bin `rg`).
+name = "kranz"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,6 +12,10 @@ readme.workspace = true
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
+
+[lib]
+name = "kranz_cli"
+path = "src/lib.rs"
 
 [[bin]]
 name = "kranz"

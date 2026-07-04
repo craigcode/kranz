@@ -129,7 +129,7 @@ and the project has no distribution story.
   fix what Windows breaks. Process-tree kill via Job Objects (the documented
   unix-process-group gap).
 - The §4.3 kill/resume acceptance test on Windows (`taskkill /F`).
-- Packaging: versioned releases, `cargo install kranz-cli` from crates.io
+- Packaging: versioned releases, `cargo install kranz` from crates.io
   and/or Homebrew tap; Tauri app bundles (`.dmg`/`.msi`).
 
 Done when: CI is green on both platforms including the kill/resume test, and

@@ -36,7 +36,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build kranz (release)
-        run: cargo build --release --locked -p kranz-cli --bin kranz
+        run: cargo build --release --locked -p kranz --bin kranz
 
       # Rename the produced binary to a per-OS/arch asset name and stage it.
       # macos-latest runners are Apple Silicon (aarch64); the linux/windows

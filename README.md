@@ -80,7 +80,7 @@ and drop it on your `PATH`.
 **Once published (planned).**
 
 ```sh
-cargo install kranz-cli            # from crates.io
+cargo install kranz            # from crates.io
 
 brew tap craigcode/kranz               # Homebrew (from-source formula)
 brew install kranz

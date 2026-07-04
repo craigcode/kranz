@@ -29,7 +29,7 @@ root `Cargo.toml` once and every crate follows (they all use
 - `packaging/homebrew/kranz.rb` — `version` and the `v#{version}` in `url`
   (updated again in step 4 once the tag exists and its sha256 is known).
 
-Run `cargo update -p kranz-engine -p kranz-server -p kranz-slack -p kranz-cli`
+Run `cargo update -p kranz-engine -p kranz-server -p kranz-slack -p kranz`
 (or `cargo check --workspace`) so `Cargo.lock` records the new version, and
 commit the bump.
 
@@ -44,7 +44,7 @@ git push origin vX.Y.Z  # this push is what fires the release build
 Pushing the tag triggers `.github/workflows/release.yml`:
 
 - Matrix build on `ubuntu-latest`, `macos-latest`, `windows-latest`.
-- Each job runs `cargo build --release --locked -p kranz-cli --bin kranz`,
+- Each job runs `cargo build --release --locked -p kranz --bin kranz`,
   renames the binary to `kranz-<os>-<arch>` (`.exe` on Windows), and attaches
   it to the release for the tag via `softprops/action-gh-release`.
 - `release.yml` only *builds*; `ci.yml` already gates PRs and pushes to `main`
@@ -78,7 +78,7 @@ homebrew-core PR. Verify locally with `brew install --build-from-source
 
 ## 5. Publish to crates.io (optional, once public)
 
-`kranz-cli` and `kranz-server`/`kranz-slack` depend on sibling crates by
+`kranz` (the CLI package) and `kranz-server`/`kranz-slack` depend on sibling crates by
 **path** (e.g. `kranz-engine = { version = "0.1.0", path = "crates/engine" }`).
 crates.io ignores the `path` and resolves each dependency by its `version`, but
 that only works if the dependency is already published at that version — so the
@@ -88,7 +88,7 @@ order matters. The dependency DAG is:
 engine  (no intra-workspace deps)
   ├── server  (deps: engine)
   ├── slack   (deps: engine)
-  └── cli     (deps: engine, server)
+  └── cli     (deps: engine, server, slack)
 ```
 
 Publish bottom-up, waiting for each crate to be live on crates.io (index
@@ -98,7 +98,7 @@ propagation) before the crate that depends on it:
 cargo publish -p kranz-engine     # 1. base crate, no siblings
 cargo publish -p kranz-server     # 2. depends on engine
 cargo publish -p kranz-slack      # 2. depends on engine (independent of server)
-cargo publish -p kranz-cli        # 3. depends on engine + server
+cargo publish -p kranz            # 3. the CLI — depends on engine + server + slack
 ```
 
 Notes:
