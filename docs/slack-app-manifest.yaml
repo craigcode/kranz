@@ -2,6 +2,15 @@
 # "Create New App" → "From an app manifest" → pick your workspace → paste.
 # This encodes every scope, event, slash command, and Socket Mode setting the
 # bridge needs, so there are no checkboxes to hunt for afterwards.
+#
+# NAMING — running more than one Kranz instance? Clone this app ONCE PER
+# INSTANCE (Socket Mode load-balances inbound envelopes across a single app's
+# connections, so two instances sharing one app randomly misroute commands).
+# For each clone: give it a per-machine display name (e.g. "Kranz (studio)")
+# AND a distinct slash-command name below (e.g. /kranz-studio) — slash-command
+# names are workspace-global and duplicates are last-install-wins. Then set
+# slack.instanceName in that machine's ~/.kranz/config.json so its messages
+# are labeled. See docs/slack-management.md "Running multiple instances".
 display_information:
   name: Kranz
   description: Mission notifications and control for Kranz.
@@ -18,6 +27,8 @@ features:
     messages_tab_enabled: false
     messages_tab_read_only_enabled: false
   slash_commands:
+    # Multi-instance: rename per clone (/kranz-studio, /kranz-laptop, …) —
+    # same-name commands across apps collide, most-recently-installed wins.
     - command: /kranz
       description: Kranz mission commands — try /kranz help
       usage_hint: help | new <goal> | status [id] | config <role> <model> [effort] | ticket <title>

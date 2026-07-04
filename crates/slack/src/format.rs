@@ -113,6 +113,82 @@ pub struct PlanReview {
 /// per-text-object Block Kit limit.
 const MAX_FIELD: usize = 2500;
 
+/// Block Kit `header` text objects are plain_text capped at 150 chars.
+const MAX_HEADER: usize = 150;
+
+/// Escape Slack mrkdwn control characters in user-supplied text so it renders
+/// as literal text (Slack parses `<…>` as links/mentions and `&` as an entity
+/// start in mrkdwn fields). Per Slack's escaping rules only `&`, `<`, `>` need
+/// escaping; `&` goes first so already-escaped output isn't double-escaped.
+/// plain_text fields (e.g. header blocks) render verbatim and must NOT be
+/// escaped (the entities would show literally).
+pub fn escape_mrkdwn(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+// -- instance labels ----------------------------------------------------------
+
+/// Label a message with the configured instance name: a leading `[name] `
+/// prefix on the message's first text (the header when there is one, the first
+/// section otherwise). ONE mechanism for every surface — notifications, help,
+/// ephemerals, App Home — so a multi-instance workspace (one Slack app per
+/// instance, docs/slack-management.md "Running multiple instances") always
+/// reads the same way. `None`/blank name → the blocks are returned UNCHANGED
+/// (byte-identical single-instance behavior).
+///
+/// The name is user-supplied config, treated strictly as text: in a plain_text
+/// header it is inserted verbatim (plain_text never parses markup) and the
+/// header is re-clipped to Block Kit's 150-char cap; in an mrkdwn text it is
+/// [`escape_mrkdwn`]-escaped so `<&>` can't smuggle links/mentions/entities.
+/// No block is ever added or removed for a message that has a leading text, so
+/// existing block-count expectations hold.
+pub fn label_blocks(mut blocks: Vec<Value>, instance_name: Option<&str>) -> Vec<Value> {
+    let Some(name) = instance_name.map(str::trim).filter(|n| !n.is_empty()) else {
+        return blocks;
+    };
+    let prefixed = match blocks.first_mut() {
+        Some(first) => prefix_first_text(first, name),
+        None => return blocks, // nothing to label
+    };
+    if !prefixed {
+        // Defensive fallback: a message whose first block carries no direct
+        // text (none of ours today) gets a leading context line instead.
+        blocks.insert(0, context(&format!("[{}]", escape_mrkdwn(name))));
+    }
+    blocks
+}
+
+/// Prefix `[name] ` onto a block's `/text/text`, escaping for mrkdwn and
+/// re-clipping headers to their 150-char cap. Returns false when the block has
+/// no direct text field (e.g. an `actions` or `context` block).
+fn prefix_first_text(block: &mut Value, name: &str) -> bool {
+    let is_plain_header = block["type"] == "header";
+    let Some(text) = block.pointer_mut("/text/text") else {
+        return false;
+    };
+    let Some(old) = text.as_str() else {
+        return false;
+    };
+    *text = if is_plain_header {
+        Value::String(clip_to(&format!("[{name}] {old}"), MAX_HEADER))
+    } else {
+        Value::String(format!("[{}] {old}", escape_mrkdwn(name)))
+    };
+    true
+}
+
+/// [`label_blocks`] for an App Home **view** object
+/// (`{"type":"home","blocks":[…]}`): labels the view's blocks in place with the
+/// same mechanism, so the Home header reads `[name] … Kranz — Mission Control`.
+/// `None`/blank name → the view is returned unchanged.
+pub fn label_home_view(mut view: Value, instance_name: Option<&str>) -> Value {
+    if let Some(blocks) = view.get_mut("blocks").and_then(Value::as_array_mut) {
+        let labeled = label_blocks(std::mem::take(blocks), instance_name);
+        *blocks = labeled;
+    }
+    view
+}
+
 /// The deep-link URL for a mission's dashboard view: `<dashboard_url>#/m/<id>`.
 /// A single `/` between the base and the fragment is collapsed so a base with or
 /// without a trailing slash both yield exactly one (`…:4600#/m/x` regardless of
@@ -489,7 +565,7 @@ fn section_with_link(mrkdwn: &str, label: &str, url: &str, action_id: &str) -> V
 
 fn header(text: &str) -> Value {
     // header blocks only accept plain_text and cap at 150 chars.
-    json!({ "type": "header", "text": { "type": "plain_text", "text": clip_to(text, 150) } })
+    json!({ "type": "header", "text": { "type": "plain_text", "text": clip_to(text, MAX_HEADER) } })
 }
 
 fn section(mrkdwn: &str) -> Value {
@@ -935,6 +1011,183 @@ mod tests {
                 ["header", "section", "context", "divider", "actions"].contains(&ty),
                 "unexpected home block type {ty}"
             );
+        }
+    }
+
+    // -- instance labels ------------------------------------------------------
+
+    #[test]
+    fn escape_mrkdwn_escapes_amp_lt_gt_and_nothing_else() {
+        assert_eq!(escape_mrkdwn("<&>"), "&lt;&amp;&gt;");
+        assert_eq!(escape_mrkdwn("a & b <c> d"), "a &amp; b &lt;c&gt; d");
+        // `&` is escaped first, so entities aren't double-escaped into &amp;lt;.
+        assert_eq!(escape_mrkdwn("&lt;"), "&amp;lt;");
+        assert_eq!(escape_mrkdwn("plain studio-2"), "plain studio-2");
+    }
+
+    #[test]
+    fn label_blocks_none_is_byte_identical_for_every_builder() {
+        // BACKCOMPAT: with no instance name, labeling must be a perfect no-op
+        // on every message shape the bridge posts.
+        let shapes: Vec<Vec<Value>> = vec![
+            build_plan_ready(
+                &PlanReady {
+                    mission_id: "m-1".into(),
+                    goal: "g".into(),
+                    milestone_titles: vec!["a".into()],
+                    assertion_count: 1,
+                },
+                Some("http://dash"),
+            ),
+            build_blocked(
+                &Blocked { mission_id: "m-1".into(), milestone_id: "ms".into(), reason: "r".into() },
+                None,
+            ),
+            build_complete(
+                &Complete {
+                    mission_id: "m-1".into(),
+                    outcome: Outcome::Completed,
+                    summary: "s".into(),
+                    branch: "b".into(),
+                    cost_usd: Some(1.0),
+                },
+                None,
+            ),
+            build_help(),
+            build_needs_context(&NeedsContext { ticket_slug: "t".into(), questions: vec![] }),
+            build_status(&StatusSummary {
+                mission_id: "m-1".into(),
+                status: "Running".into(),
+                summary: "s".into(),
+            }),
+            // The single-section ephemeral shape (confirmations / errors).
+            vec![json!({ "type": "section", "text": { "type": "mrkdwn", "text": "Queued `m-1`." } })],
+        ];
+        for blocks in shapes {
+            assert_eq!(label_blocks(blocks.clone(), None), blocks, "None must not touch blocks");
+            // A blank name is treated as unset, not rendered as `[] `.
+            assert_eq!(label_blocks(blocks.clone(), Some("   ")), blocks);
+        }
+        // Same for the home view object.
+        let view = build_home_view(&[], &[], &[], None);
+        assert_eq!(label_home_view(view.clone(), None), view);
+    }
+
+    #[test]
+    fn label_blocks_prefixes_the_header_and_adds_no_blocks() {
+        let p = PlanReady {
+            mission_id: "m-42".into(),
+            goal: "g".into(),
+            milestone_titles: vec![],
+            assertion_count: 1,
+        };
+        let unlabeled = build_plan_ready(&p, None);
+        let labeled = label_blocks(unlabeled.clone(), Some("studio"));
+        // Block count unchanged — the label rides on the existing header.
+        assert_eq!(labeled.len(), unlabeled.len(), "labeling never adds blocks");
+        let head = labeled[0].pointer("/text/text").and_then(Value::as_str).unwrap();
+        assert!(head.starts_with("[studio] "), "leading prefix on the header: {head}");
+        assert!(head.contains("Plan ready for review — m-42"), "original header text intact");
+        // Only the first block was touched.
+        assert_eq!(labeled[1..], unlabeled[1..]);
+    }
+
+    #[test]
+    fn label_blocks_labels_every_notification_help_and_ephemeral_shape() {
+        let blocked = label_blocks(
+            build_blocked(
+                &Blocked { mission_id: "m-7".into(), milestone_id: "ms".into(), reason: "r".into() },
+                None,
+            ),
+            Some("laptop"),
+        );
+        assert!(all_text(&blocked).contains("[laptop] "), "blocked labeled");
+
+        let complete = label_blocks(
+            build_complete(
+                &Complete {
+                    mission_id: "m-9".into(),
+                    outcome: Outcome::Failed,
+                    summary: "s".into(),
+                    branch: "b".into(),
+                    cost_usd: None,
+                },
+                None,
+            ),
+            Some("laptop"),
+        );
+        assert!(all_text(&complete).contains("[laptop] "), "complete labeled");
+
+        // `/kranz help` states the instance name in its header.
+        let help = label_blocks(build_help(), Some("laptop"));
+        let head = help[0].pointer("/text/text").and_then(Value::as_str).unwrap();
+        assert!(head.starts_with("[laptop] "), "help header states the instance: {head}");
+
+        // A single-section ephemeral (approve/config/pause confirmations)
+        // carries the label in its mrkdwn text.
+        let eph = label_blocks(
+            vec![json!({ "type": "section",
+                         "text": { "type": "mrkdwn", "text": ":gear: Set `worker` on `m-1`." } })],
+            Some("laptop"),
+        );
+        assert_eq!(eph.len(), 1, "still a single block");
+        let text = eph[0].pointer("/text/text").and_then(Value::as_str).unwrap();
+        assert!(text.starts_with("[laptop] :gear:"), "confirmation labeled: {text}");
+    }
+
+    #[test]
+    fn label_blocks_escapes_a_hostile_name_in_mrkdwn_and_keeps_headers_plain() {
+        // mrkdwn surface (an ephemeral section): `<&>` must be entity-escaped
+        // so it can't smuggle a link/mention or break rendering.
+        let eph = label_blocks(
+            vec![json!({ "type": "section", "text": { "type": "mrkdwn", "text": "ok" } })],
+            Some("<&>"),
+        );
+        let text = eph[0].pointer("/text/text").and_then(Value::as_str).unwrap();
+        assert_eq!(text, "[&lt;&amp;&gt;] ok", "hostile name escaped in mrkdwn");
+
+        // plain_text surface (a header): rendered verbatim — plain_text never
+        // parses markup, and escaping would display the entities literally.
+        let labeled = label_blocks(
+            build_status(&StatusSummary {
+                mission_id: "m-1".into(),
+                status: "Running".into(),
+                summary: "s".into(),
+            }),
+            Some("<&>"),
+        );
+        let head = labeled[0].pointer("/text/text").and_then(Value::as_str).unwrap();
+        assert!(head.starts_with("[<&>] "), "plain_text header keeps the raw name: {head}");
+    }
+
+    #[test]
+    fn label_blocks_reclips_a_labeled_header_to_the_150_char_cap() {
+        // A near-cap header plus a prefix must stay within Block Kit's limit.
+        let long_goal_header = vec![header(&"x".repeat(400))];
+        let labeled = label_blocks(long_goal_header, Some("studio"));
+        let head = labeled[0].pointer("/text/text").and_then(Value::as_str).unwrap();
+        assert!(head.chars().count() <= 150, "header cap holds: {}", head.chars().count());
+        assert!(head.starts_with("[studio] "), "prefix survives the re-clip");
+    }
+
+    #[test]
+    fn label_home_view_prefixes_the_home_header() {
+        let view = build_home_view(
+            &[HomeMission { mission_id: "m-1".into(), status: "Running".into() }],
+            &[],
+            &[],
+            None,
+        );
+        let labeled = label_home_view(view.clone(), Some("cloud"));
+        assert_eq!(labeled["type"], "home", "still a home view object");
+        let blocks = labeled["blocks"].as_array().unwrap();
+        assert_eq!(blocks.len(), view["blocks"].as_array().unwrap().len(), "no blocks added");
+        let head = blocks[0].pointer("/text/text").and_then(Value::as_str).unwrap();
+        assert!(head.starts_with("[cloud] "), "home header shows the instance: {head}");
+        // Every block still has a recognized type (the empty-state test's bar).
+        for b in blocks {
+            let ty = b["type"].as_str().expect("block type");
+            assert!(["header", "section", "context", "divider", "actions"].contains(&ty));
         }
     }
 

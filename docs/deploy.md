@@ -60,7 +60,8 @@ into the image** (see the TODO block in the [`Dockerfile`](../Dockerfile)).
 | --- | --- | --- |
 | `ANTHROPIC_API_KEY` | secret | Cloud auth for the `claude` CLI. Replaces local OAuth — the container has no browser to log in with. |
 | `KRANZ_CLAUDE_BIN` | path | Where the `claude` CLI lives, if not on `PATH`. Kranz shells out to it for every agent turn. |
-| `KRANZ_SLACK_BOT_TOKEN` / `KRANZ_SLACK_APP_TOKEN` / `KRANZ_SLACK_CHANNEL` | secrets | Only for a persistent host running `--slack` (§D). Same tokens as the local bridge (see [docs/handoff.md](handoff.md) gate 2). |
+| `KRANZ_SLACK_BOT_TOKEN` / `KRANZ_SLACK_APP_TOKEN` / `KRANZ_SLACK_CHANNEL` | secrets | Only for a persistent host running `--slack` (§D). The cloud host is its **own Kranz instance and needs its own Slack app** — clone the app and use *that clone's* tokens, never a Mac's (see [docs/slack-management.md](slack-management.md) "Running multiple instances"). |
+| `KRANZ_SLACK_INSTANCE` | plain (e.g. `cloud`) | Optional instance label for a `--slack` host: every message the cloud bridge posts gets a leading `[cloud]` tag so it is distinguishable from your other Kranz instances. |
 | a deploy key scoped to `kranz/*` | SSH key / GitHub App | Lets the container push the mission branch and **nothing else**. See §3 and §5. |
 
 The `claude` CLI and the mission's target toolchain (cargo / node / go / …) are
@@ -120,10 +121,22 @@ Goal: a browser-driven `kranz serve` on rented compute. Concretely:
    docker run \
      -e ANTHROPIC_API_KEY \
      -e KRANZ_SLACK_BOT_TOKEN -e KRANZ_SLACK_APP_TOKEN -e KRANZ_SLACK_CHANNEL \
+     -e KRANZ_SLACK_INSTANCE=cloud \
      -v kranz-data:/work \
      kranz-image \
      serve --port 4560 --token "$KRANZ_MUTATION_TOKEN" --slack
    ```
+
+   A `--slack` cloud host is a full Kranz instance on the Slack side: give it
+   **its own cloned Slack app** (its own tokens, its own slash-command name)
+   and a `KRANZ_SLACK_INSTANCE` label — one app per instance is the supported
+   topology, because Socket Mode load-balances inbound envelopes across a
+   single app's connections. The ephemeral shape (§1.A) is exempt: it runs no
+   bridge, so it is outbound-only and posting into a shared channel with a
+   run-id tag is safe. The simplest consolidated topology is to make the cloud
+   host the **only** Slack-connected instance. Details:
+   [docs/slack-management.md](slack-management.md) "Running multiple
+   instances".
 
 4. **Terminate TLS in front of it.** `kranz serve` binds **`127.0.0.1` only**
    (`crates/server/src/lib.rs`) — it never listens on a public interface. So a

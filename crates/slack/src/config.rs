@@ -10,7 +10,8 @@
 //!
 //! 1. the `slack` object in `~/.kranz/config.json` (never the repo — tokens are
 //!    secrets and must not be committed).
-//! 2. `KRANZ_SLACK_BOT_TOKEN` / `KRANZ_SLACK_APP_TOKEN` / `KRANZ_SLACK_CHANNEL`.
+//! 2. `KRANZ_SLACK_BOT_TOKEN` / `KRANZ_SLACK_APP_TOKEN` / `KRANZ_SLACK_CHANNEL`
+//!    (plus the optional `KRANZ_SLACK_DASHBOARD_URL` / `KRANZ_SLACK_INSTANCE`).
 //!
 //! The bridge is opt-in: [`SlackConfig::from_config`] returns `Ok(None)` when
 //! neither source supplies a full triple, and `serve_slack` then no-ops.
@@ -63,6 +64,16 @@ pub struct SlackConfig {
     /// behavior change). Resolved from `slack.dashboardUrl` in the config file
     /// or `KRANZ_SLACK_DASHBOARD_URL`, env winning.
     pub dashboard_url: Option<String>,
+    /// Human-readable name of THIS Kranz instance (e.g. `studio`, `laptop`,
+    /// `cloud`). When several instances post into Slack (one Slack app per
+    /// instance — see docs/slack-management.md "Running multiple instances"),
+    /// the name is rendered as a `[name]` prefix on every message the bridge
+    /// posts so a human can tell which machine is talking. When `None`, no
+    /// label is added anywhere (no behavior change). Resolved from
+    /// `slack.instanceName` in the config file or `KRANZ_SLACK_INSTANCE`, env
+    /// winning. User-supplied text: rendered via mrkdwn escaping (see
+    /// [`crate::format::escape_mrkdwn`]), never interpreted.
+    pub instance_name: Option<String>,
 }
 
 impl SlackConfig {
@@ -103,6 +114,9 @@ struct SlackFileConfig {
     /// Optional web-dashboard base URL (`dashboardUrl`) for deep-link buttons.
     #[serde(default)]
     dashboard_url: Option<String>,
+    /// Optional instance label (`instanceName`) shown on every posted message.
+    #[serde(default)]
+    instance_name: Option<String>,
 }
 
 /// Top-level shape we deserialize `~/.kranz/config.json` into — only the
@@ -140,6 +154,7 @@ struct EnvVars {
     app_token: Option<String>,
     channel: Option<String>,
     dashboard_url: Option<String>,
+    instance_name: Option<String>,
 }
 
 impl EnvVars {
@@ -149,6 +164,7 @@ impl EnvVars {
             app_token: non_empty_env("KRANZ_SLACK_APP_TOKEN"),
             channel: non_empty_env("KRANZ_SLACK_CHANNEL"),
             dashboard_url: non_empty_env("KRANZ_SLACK_DASHBOARD_URL"),
+            instance_name: non_empty_env("KRANZ_SLACK_INSTANCE"),
         }
     }
 }
@@ -187,6 +203,9 @@ fn resolve(file: SlackFileConfig, env: EnvVars) -> Option<SlackConfig> {
     // Optional: env wins over file, blanks drop to None. Never gates enablement.
     let dashboard_url =
         env.dashboard_url.or(file.dashboard_url).map(trim).filter(|s| non_blank(s));
+    // Optional instance label, same precedence. Never gates enablement.
+    let instance_name =
+        env.instance_name.or(file.instance_name).map(trim).filter(|s| non_blank(s));
 
     match (bot_token, app_token, channel) {
         (Some(bot_token), Some(app_token), Some(channel)) => Some(SlackConfig {
@@ -203,6 +222,7 @@ fn resolve(file: SlackFileConfig, env: EnvVars) -> Option<SlackConfig> {
                 .filter(|u| !u.is_empty())
                 .collect(),
             dashboard_url,
+            instance_name,
         }),
         _ => None,
     }
@@ -388,6 +408,111 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.dashboard_url.as_deref(), Some("http://env/"));
+    }
+
+    #[test]
+    fn instance_name_absent_everywhere_is_none_and_config_matches_pre_field_shape() {
+        // BACKCOMPAT: with no `instanceName` in the file and no
+        // KRANZ_SLACK_INSTANCE in the env, the resolved config is exactly what
+        // it was before the field existed — every other field identical and
+        // `instance_name == None` (which renders zero labels anywhere).
+        let cfg = resolve(
+            SlackFileConfig {
+                bot_token: Some("xoxb".into()),
+                app_token: Some("xapp".into()),
+                channel: Some("C1".into()),
+                ..SlackFileConfig::default()
+            },
+            EnvVars::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg,
+            SlackConfig {
+                bot_token: "xoxb".into(),
+                app_token: "xapp".into(),
+                channel: "C1".into(),
+                notify: NotifyFlags::default(),
+                allow_users: vec![],
+                dashboard_url: None,
+                instance_name: None,
+            }
+        );
+    }
+
+    #[test]
+    fn instance_name_parses_from_file_json_camel_case() {
+        // The on-disk key is camelCase `instanceName`, like every other field.
+        let root: RootConfig = serde_json::from_str(
+            r#"{ "slack": { "botToken": "xoxb", "appToken": "xapp",
+                 "channel": "C1", "instanceName": "  studio  " } }"#,
+        )
+        .unwrap();
+        let cfg = resolve(root.slack.unwrap(), EnvVars::default()).unwrap();
+        assert_eq!(cfg.instance_name.as_deref(), Some("studio"), "resolved and trimmed");
+
+        // And a file WITHOUT the key still parses (older configs keep working).
+        let root: RootConfig = serde_json::from_str(
+            r#"{ "slack": { "botToken": "xoxb", "appToken": "xapp", "channel": "C1" } }"#,
+        )
+        .unwrap();
+        let cfg = resolve(root.slack.unwrap(), EnvVars::default()).unwrap();
+        assert_eq!(cfg.instance_name, None);
+    }
+
+    #[test]
+    fn instance_name_env_wins_over_file_and_blank_is_none() {
+        let file = SlackFileConfig {
+            bot_token: Some("xoxb".into()),
+            app_token: Some("xapp".into()),
+            channel: Some("C1".into()),
+            instance_name: Some("file-name".into()),
+            ..SlackFileConfig::default()
+        };
+        // Env wins over the file, same as every other override.
+        let cfg = resolve(
+            file.clone(),
+            EnvVars { instance_name: Some("env-name".into()), ..EnvVars::default() },
+        )
+        .unwrap();
+        assert_eq!(cfg.instance_name.as_deref(), Some("env-name"));
+
+        // No env → the file value is used.
+        let cfg = resolve(file, EnvVars::default()).unwrap();
+        assert_eq!(cfg.instance_name.as_deref(), Some("file-name"));
+
+        // A blank value (file or env) drops to None — no empty "[] " labels.
+        let cfg = resolve(
+            SlackFileConfig {
+                bot_token: Some("xoxb".into()),
+                app_token: Some("xapp".into()),
+                channel: Some("C1".into()),
+                instance_name: Some("   ".into()),
+                ..SlackFileConfig::default()
+            },
+            EnvVars::default(),
+        )
+        .unwrap();
+        assert_eq!(cfg.instance_name, None);
+    }
+
+    #[test]
+    fn instance_name_env_var_is_read_from_the_process_environment() {
+        // The wiring test for the KRANZ_SLACK_INSTANCE name itself. Serial
+        // hazard is nil: no other test in this crate touches the process env.
+        // The host machine might legitimately have the var set, so save and
+        // restore it around the probe.
+        let saved = std::env::var("KRANZ_SLACK_INSTANCE").ok();
+        std::env::set_var("KRANZ_SLACK_INSTANCE", " laptop ");
+        let set_read = EnvVars::from_process().instance_name;
+        std::env::remove_var("KRANZ_SLACK_INSTANCE");
+        let absent_read = EnvVars::from_process().instance_name;
+        if let Some(v) = saved {
+            std::env::set_var("KRANZ_SLACK_INSTANCE", v);
+        }
+        assert_eq!(set_read.as_deref(), Some("laptop"), "read and trimmed");
+        // Absent env var → absent field, the backcompat default.
+        assert_eq!(absent_read, None);
     }
 
     #[test]
