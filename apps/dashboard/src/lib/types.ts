@@ -13,7 +13,8 @@ export type MissionStatus =
   | 'blocked'
   | 'validating'
   | 'complete'
-  | 'failed';
+  | 'failed'
+  | 'abandoned';
 
 export type MilestoneStatus =
   | 'pending'

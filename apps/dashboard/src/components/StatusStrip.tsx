@@ -1,6 +1,8 @@
 // Full-width status strip: color-coded status pill, pause/resume controls,
-// blocked reason (impossible to miss), and a thin feature-progress bar.
+// a confirm-gated abandon, blocked reason (impossible to miss), and a thin
+// feature-progress bar.
 
+import { useEffect, useState } from 'react';
 import { useKranzStore } from '../lib/store';
 import type { MissionStatus } from '../lib/types';
 
@@ -12,7 +14,18 @@ const STATUS_LABEL: Record<MissionStatus, string> = {
   validating: 'Validating',
   complete: 'Complete',
   failed: 'Failed',
+  abandoned: 'Abandoned',
 };
+
+/** Statuses whose detail view offers abandon (running included — that's the
+ *  confirm-gated stop; terminal missions have nothing left to abandon). */
+const ABANDONABLE: ReadonlySet<MissionStatus> = new Set([
+  'planning',
+  'running',
+  'paused',
+  'blocked',
+  'validating',
+]);
 
 export function StatusStrip() {
   const state = useKranzStore((s) => s.state);
@@ -20,6 +33,15 @@ export function StatusStrip() {
   const sendControl = useKranzStore((s) => s.sendControl);
   const selectedRun = useKranzStore((s) => s.selectedRun);
   const selectRun = useKranzStore((s) => s.selectRun);
+  const abandonMission = useKranzStore((s) => s.abandonMission);
+  const [armedAbandon, setArmedAbandon] = useState(false);
+
+  // An armed abandon disarms itself: a stray click must not lie in wait.
+  useEffect(() => {
+    if (!armedAbandon) return;
+    const t = window.setTimeout(() => setArmedAbandon(false), 5000);
+    return () => window.clearTimeout(t);
+  }, [armedAbandon]);
 
   if (!state) return <div className="status-strip status-planning" />;
 
@@ -83,6 +105,29 @@ export function StatusStrip() {
           ⏸ pause
         </button>
       )}
+
+      {ABANDONABLE.has(status) &&
+        (armedAbandon ? (
+          <button
+            type="button"
+            className="strip-btn strip-btn-danger"
+            title={
+              status === 'running' || status === 'validating'
+                ? 'stops the run, kills its agent sessions, and records the abandonment'
+                : 'records the abandonment in the event log; the directory stays'
+            }
+            onClick={() => {
+              setArmedAbandon(false);
+              void abandonMission(state.mission.id);
+            }}
+          >
+            confirm abandon
+          </button>
+        ) : (
+          <button type="button" className="strip-btn" onClick={() => setArmedAbandon(true)}>
+            abandon
+          </button>
+        ))}
 
       {status === 'blocked' && (
         <span className="strip-reason">

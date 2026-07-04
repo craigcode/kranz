@@ -207,6 +207,105 @@ async fn wait_for_status(app: &axum::Router, id: &str, status: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// Abandon / delete (web twins of `kranz abandon` / `kranz clean`)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn abandon_then_delete_lifecycle_over_rest() {
+    isolate_git_env();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    // A planning husk (no plan.json): abandonable, then Stale → deletable.
+    seed_mission_log(&root, "m-husk");
+    let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+    let host = kranz_server::MissionHost::with_backend(root.clone(), backend);
+    let app = kranz_server::router_with_host(host, None, Some(TOKEN.to_string()));
+
+    // Abandon: 200, reason recorded, state folds terminal.
+    let (status, body) = post_json(
+        &app,
+        "/api/missions/m-husk/abandon",
+        Some(TOKEN),
+        json!({ "reason": "duplicate from live test" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["abandoned"], true);
+    let (_, state) = get_json(&app, "/api/missions/m-husk/state").await;
+    assert_eq!(state["mission"]["status"], "abandoned");
+
+    // Abandoning again: terminal → 409, not a server error.
+    let (status, body) =
+        post_json(&app, "/api/missions/m-husk/abandon", Some(TOKEN), json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+    // Delete: Abandoned is Stale → removed without any opt-in.
+    let (status, body) =
+        post_json(&app, "/api/missions/m-husk/delete", Some(TOKEN), json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["deleted"], true);
+    assert!(
+        !MissionPaths::new(&root, "m-husk").mission_dir().exists(),
+        "mission directory removed"
+    );
+
+    // Gone means gone: both endpoints 404 now.
+    let (status, _) =
+        post_json(&app, "/api/missions/m-husk/abandon", Some(TOKEN), json!({})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) =
+        post_json(&app, "/api/missions/m-husk/delete", Some(TOKEN), json!({})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn delete_guards_live_and_complete_missions() {
+    isolate_git_env();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+    let host = kranz_server::MissionHost::with_backend(root.clone(), backend);
+    let app = kranz_server::router_with_host(host, None, Some(TOKEN.to_string()));
+
+    // Approved (Running-status, plan committed) = live work → never deleted.
+    seed_mission_log(&root, "m-live");
+    {
+        let paths = MissionPaths::new(&root, "m-live");
+        let mut log =
+            EventLog::acquire(&paths, "m-live", Duration::ZERO, LockForce::No).unwrap();
+        let plan: kranz_engine::types::Plan = serde_json::from_value(plan_json()).unwrap();
+        log.append(EventKind::PlanApproved { plan }).unwrap();
+    }
+    let (status, body) =
+        post_json(&app, "/api/missions/m-live/delete", Some(TOKEN), json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+    // Complete: kept by default (calibration corpus), deleted only with all.
+    seed_mission_log(&root, "m-done");
+    {
+        let paths = MissionPaths::new(&root, "m-done");
+        let mut log =
+            EventLog::acquire(&paths, "m-done", Duration::ZERO, LockForce::No).unwrap();
+        let plan: kranz_engine::types::Plan = serde_json::from_value(plan_json()).unwrap();
+        log.append(EventKind::PlanApproved { plan }).unwrap();
+        log.append(EventKind::MissionCompleted {}).unwrap();
+    }
+    let (status, body) =
+        post_json(&app, "/api/missions/m-done/delete", Some(TOKEN), json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("calibration"), "{body}");
+    let (status, body) = post_json(
+        &app,
+        "/api/missions/m-done/delete",
+        Some(TOKEN),
+        json!({ "all": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!MissionPaths::new(&root, "m-done").mission_dir().exists());
+}
+
+// ---------------------------------------------------------------------------
 // Release: an attached engine frees the single-writer lock
 // ---------------------------------------------------------------------------
 

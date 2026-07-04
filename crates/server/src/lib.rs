@@ -139,6 +139,8 @@ pub fn router_with_shared_host(
         )
         .route("/api/missions/{id}/approve", post(host::approve_mission))
         .route("/api/missions/{id}/start", post(host::start_mission))
+        .route("/api/missions/{id}/abandon", post(host::abandon_mission_route))
+        .route("/api/missions/{id}/delete", post(host::delete_mission_route))
         .route("/api/missions/{id}/ws", get(ws::ws_handler))
         .with_state(state);
 

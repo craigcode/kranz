@@ -282,6 +282,13 @@ button {
   background: var(--border);
 }
 
+.pill-abandoned {
+  color: var(--dim);
+  background: var(--border);
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+}
+
 @keyframes pulse {
   0%,
   100% {
@@ -1237,6 +1244,46 @@ button {
 
 .picker-row:hover {
   background: var(--bg);
+}
+
+/* A list row plus its management action: the row keeps the click-to-open
+   area, the action sits beside it (never nested — buttons can't nest). */
+.picker-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.picker-item .picker-row {
+  flex: 1;
+  min-width: 0;
+}
+
+.picker-action {
+  flex: none;
+  white-space: nowrap;
+}
+
+.picker-action-danger {
+  color: #fff;
+  background: var(--red);
+  border-color: var(--red);
+}
+
+.picker-closed {
+  margin: 10px 6px 2px;
+}
+
+.picker-closed > summary {
+  cursor: pointer;
+  font-size: 12px;
+  padding: 2px 8px;
+}
+
+.strip-btn-danger {
+  color: #fff;
+  background: var(--red);
+  border-color: var(--red);
 }
 
 .picker-id {

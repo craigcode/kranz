@@ -93,6 +93,11 @@ interface KranzStore {
   disconnect: () => void;
   selectRun: (runId: string | null) => void;
   sendControl: (command: ControlCommand) => Promise<void>;
+  /** Web twin of `kranz abandon`: terminal-refusing, event-recorded. */
+  abandonMission: (id: string) => Promise<void>;
+  /** Web twin of `kranz clean` for ONE mission; `all` opts in to deleting a
+   *  Complete mission (kept by default — they feed cost calibration). */
+  deleteMission: (id: string, all: boolean) => Promise<void>;
 
   /** Enter send in the planning composer: runs a turn, or queues it while one
    *  is in flight (typing is safe — sends when the current turn finishes). */
@@ -257,6 +262,24 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
       } catch (err) {
         set({ missionsError: err instanceof Error ? err.message : String(err) });
       }
+    },
+
+    abandonMission: async (id: string) => {
+      try {
+        await api.abandonMission(id);
+      } catch (err) {
+        set({ missionsError: err instanceof Error ? err.message : String(err) });
+      }
+      await get().loadMissions();
+    },
+
+    deleteMission: async (id: string, all: boolean) => {
+      try {
+        await api.deleteMission(id, all);
+      } catch (err) {
+        set({ missionsError: err instanceof Error ? err.message : String(err) });
+      }
+      await get().loadMissions();
     },
 
     connectMission: (id: string) => {
