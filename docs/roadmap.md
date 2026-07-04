@@ -83,7 +83,7 @@ plan → Slack approve → queued run → blocked-to-unblocked entirely in a
 thread; underspecified tickets bounce back with the orchestrator's actual
 questions; per-repo serialization holds).
 
-## M2.9 — Slack as a full control surface
+## M2.9 — Slack as a full control surface ◑ (shipped in slices: new/plan/approve, config, pause/resume/work, App Home, deep links; full goal→complete lifecycle in Slack pending live validation)
 
 Extend the Slack bridge from notifications+light-steering to FULL management:
 create, plan (thread conversation), review, approve, start, steer, configure,
@@ -97,7 +97,7 @@ Done when: a mission goes goal → planning → approve → start → complete e
 in Slack; `/kranz` fully operates the backlog; unauthorized users cannot spend;
 transcripts are one tap from the thread.
 
-## M3 — Parallel workers ◑ (worktree-isolated, flag-gated; conflict-resolver + true overlap deferred)
+## M3 — Parallel workers ◑ (built: worktree isolation, ordered merge, conflict-resolver, true wall-clock overlap via buffered single-writer; remaining: the instrumented proof bar below)
 
 The marquee deferred capability. Correctness groundwork exists (single-writer
 log, engine-serialized appends); the work is orchestration.
@@ -115,7 +115,7 @@ Done when: a 2-milestone mission with independent features completes in
 materially less wall-clock than sequential at comparable cost, with zero
 event-log corruption across 20 repeated runs.
 
-## M4 — Windows first-class + distribution ◑ (built; user-gated on git remote)
+## M4 — Windows first-class + distribution ◑ (CI green on ubuntu+windows incl. kill/resume; remaining: tagged release + package distribution)
 
 The code is path-safe and lock-file based per §9, but never proven on Windows,
 and the project has no distribution story.
