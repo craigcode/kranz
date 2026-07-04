@@ -63,19 +63,25 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             Ok(0)
         }
         Command::Pause => {
-            let mission = select_mission(&repo, cli.mission.as_deref())?;
+            let mission = select_control_mission(&repo, cli.mission.as_deref())?;
             cmd_pause(&repo, &mission)?;
             println!("pause queued for mission {mission} (takes effect between worker runs)");
+            if let Some(hint) = control_queue_hint(&repo, &mission) {
+                println!("{hint}");
+            }
             Ok(0)
         }
         Command::Resume => {
-            let mission = select_mission(&repo, cli.mission.as_deref())?;
+            let mission = select_control_mission(&repo, cli.mission.as_deref())?;
             cmd_resume(&repo, &mission)?;
             println!("resume queued for mission {mission} (takes effect between worker runs)");
+            if let Some(hint) = control_queue_hint(&repo, &mission) {
+                println!("{hint}");
+            }
             Ok(0)
         }
         Command::Msg { text, interrupt } => {
-            let mission = select_mission(&repo, cli.mission.as_deref())?;
+            let mission = select_control_mission(&repo, cli.mission.as_deref())?;
             cmd_msg(&repo, &mission, &text, interrupt)?;
             if interrupt {
                 println!(
@@ -86,6 +92,9 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
                 println!(
                     "message queued for mission {mission}; it is processed between worker runs"
                 );
+            }
+            if let Some(hint) = control_queue_hint(&repo, &mission) {
+                println!("{hint}");
             }
             Ok(0)
         }
@@ -209,6 +218,47 @@ pub fn select_mission(repo: &Path, explicit: Option<&str>) -> Result<String> {
             Ok(best.expect("non-empty list").1)
         }
     }
+}
+
+/// Resolve the mission a control-inbox WRITE (`kranz pause|resume|msg`)
+/// targets. A terminal mission's inbox is never drained (the engine refuses
+/// to run terminal missions), so enqueuing there would print success for a
+/// silent no-op — the same lie `kranz config role` already refuses via the
+/// shared engine resolver:
+///
+/// - explicit `--mission` id: routed through
+///   [`control::resolve_active_mission`] — it must exist and be non-terminal
+///   (the resolver's error names the actual status);
+/// - no id: keeps [`select_mission`]'s newest-by-mtime defaulting UX, but
+///   refuses a terminal pick instead of "succeeding" into a dead inbox.
+pub fn select_control_mission(repo: &Path, explicit: Option<&str>) -> Result<String> {
+    if explicit.is_some() {
+        return Ok(control::resolve_active_mission(repo, explicit)?);
+    }
+    let mission = select_mission(repo, None)?;
+    let status = load_state(repo, &mission)?.mission.status;
+    if orchestrator::is_terminal_status(status) {
+        bail!(
+            "mission {mission} is {status:?}; control commands apply only to active \
+             missions (a terminal mission's inbox is never drained — see \
+             `kranz missions`)"
+        );
+    }
+    Ok(mission)
+}
+
+/// The honest post-enqueue note for `pause`/`resume`/`msg`: when no live
+/// engine holds the mission lock, the command just sits in the inbox — say
+/// so instead of implying it takes effect now. `None` while the mission is
+/// actually running (a live lock holder will drain the inbox shortly).
+pub fn control_queue_hint(repo: &Path, mission_id: &str) -> Option<String> {
+    let paths = MissionPaths::new(repo, mission_id);
+    (!orchestrator::mission_lock_is_live(&paths)).then(|| {
+        format!(
+            "note: mission {mission_id} is not currently running — the command is \
+             queued and applies when the mission next runs"
+        )
+    })
 }
 
 /// Pick the mission to resume planning: the explicit `--mission` (validated

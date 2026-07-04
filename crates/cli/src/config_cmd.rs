@@ -7,16 +7,26 @@
 //! Four verbs:
 //! - `show` — the effective merged config (or one layer with
 //!   `--global`/`--project`).
-//! - `set <path> <value>` — set ONE dotted key in a layer file. The edit
-//!   happens on the raw JSON tree (never a `MissionConfig` round-trip), so
-//!   every other key — including keys kranz doesn't know about — survives
-//!   untouched. The candidate merge is validated BEFORE anything is written;
-//!   an invalid value leaves the file byte-identical.
+//! - `set <path> <value>` — set ONE dotted key in a layer file. The dotted
+//!   path is checked against the config SCHEMA first (a typo'd key would
+//!   deep-merge, validate green — unknown keys are ignored on deserialize —
+//!   and be a silent no-op). The edit then happens on the raw JSON tree
+//!   (never a `MissionConfig` round-trip), so every other key already IN the
+//!   file — including keys kranz doesn't know about — survives untouched.
+//!   The candidate merge is validated BEFORE anything is written; an invalid
+//!   value leaves the file byte-identical. A `--global` write is validated
+//!   TWICE: standalone (defaults + candidate global — what every OTHER repo
+//!   sees) and merged with this repo's project layer; either failure refuses
+//!   the write, so a project override can never mask a global value that
+//!   would poison other repos.
 //! - `unset <path>` — remove one dotted key from a layer file, pruning parent
 //!   objects the removal left empty. Removing the last key leaves an empty
-//!   `{}` file (the file is never deleted). Unset is NOT validity-gated:
-//!   removal converges toward the defaults, and gating it could deadlock
-//!   (an invalid key in one layer would block its own removal).
+//!   `{}` file (the file is never deleted). The dotted path gets the same
+//!   schema check as `set` (a typo'd key should say "unknown key", not "not
+//!   set"). Unset is NOT validity-gated: removal converges toward the
+//!   defaults, and gating it could deadlock (an invalid VALUE in one layer
+//!   would block its own removal). The schema-path gate cannot deadlock: an
+//!   unknown key never affects validation in the first place.
 //! - `role <role> <model> [effort]` — the MID-MISSION path: enqueue a
 //!   `config-change` control command on a running mission (the CLI twin of
 //!   Slack's `/kranz config`). File edits only shape FUTURE missions; `role`
@@ -233,9 +243,13 @@ pub fn render_layer_file(path: &Path) -> Result<(String, bool)> {
 // ---------------------------------------------------------------------------
 
 /// Set `dotted` to `raw` (JSON-parsed, string fallback) in the chosen layer
-/// file. The merged result of ALL layers is validated BEFORE writing; on any
-/// failure the file is left byte-identical. Returns the file written.
+/// file. The dotted path must exist in the config schema (a typo'd key would
+/// otherwise merge, validate green, and be a silent no-op). The candidate
+/// state is validated BEFORE writing — for `--global` both standalone and
+/// merged with this repo's project layer; on any failure the file is left
+/// byte-identical. Returns the file written.
 pub fn set_key(layers: &Layers, global: bool, dotted: &str, raw: &str) -> Result<PathBuf> {
+    check_schema_path(dotted)?;
     let target = layers.target(global)?.to_path_buf();
     let mut tree = read_layer(&target)?;
     set_dotted(&mut tree, dotted, parse_value(raw))?;
@@ -246,10 +260,12 @@ pub fn set_key(layers: &Layers, global: bool, dotted: &str, raw: &str) -> Result
 }
 
 /// Remove `dotted` from the chosen layer file, pruning parents the removal
-/// left empty. A key that is not set is an error (and nothing is written).
-/// Removing the last key leaves `{}` — the file is never deleted. Returns the
-/// file written.
+/// left empty. The dotted path gets the same schema check as `set` — a typo'd
+/// key errors as "unknown key", not "not set". A schema-valid key that is not
+/// set is an error too (and nothing is written). Removing the last key leaves
+/// `{}` — the file is never deleted. Returns the file written.
 pub fn unset_key(layers: &Layers, global: bool, dotted: &str) -> Result<PathBuf> {
+    check_schema_path(dotted)?;
     let target = layers.target(global)?.to_path_buf();
     let mut tree = read_layer(&target)?;
     if !remove_dotted(&mut tree, dotted) {
@@ -284,13 +300,40 @@ fn read_layer(path: &Path) -> Result<serde_json::Map<String, Value>> {
 }
 
 /// Pretty-print the tree back to the layer file (creating parent dirs).
+///
+/// ATOMIC: written to a sibling tmp file (same directory, so the rename never
+/// crosses a filesystem), flushed + synced, then renamed over the target —
+/// the same pattern as `reducer::write_snapshot` / `control::enqueue`. A
+/// concurrent `config::load` (serve create, the `kranz work` dispatcher, the
+/// Slack bridge) therefore only ever sees the old bytes or the new bytes,
+/// never a torn/empty file, and a crash mid-write cannot lose the config.
+/// An existing target's permissions are carried over to the replacement.
 fn write_layer(path: &Path, tree: &serde_json::Map<String, Value>) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("config path {} has no file name", path.display()))?;
+    let tmp = path.with_file_name(format!("{}.tmp", file_name.to_string_lossy()));
     let text = format!("{}\n", serde_json::to_string_pretty(&Value::Object(tree.clone()))?);
-    std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
+    {
+        use std::io::Write as _;
+        let mut file = std::fs::File::create(&tmp)
+            .with_context(|| format!("creating {}", tmp.display()))?;
+        file.write_all(text.as_bytes())
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        file.sync_data()
+            .with_context(|| format!("syncing {}", tmp.display()))?;
+    }
+    // Keep the operator's permissions (e.g. a chmod 600 config) across the
+    // replacement; best-effort — the rename below is the load-bearing part.
+    if let Ok(meta) = std::fs::metadata(path) {
+        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+    }
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("renaming {} over {}", tmp.display(), path.display()))?;
     Ok(())
 }
 
@@ -342,27 +385,139 @@ fn remove_dotted(root: &mut serde_json::Map<String, Value>, dotted: &str) -> boo
     recurse(root, &segs)
 }
 
-/// Validate the WOULD-BE state: deep-merge defaults <- every layer, with the
-/// target layer's on-disk content replaced by `candidate`, then deserialize
-/// and run `config::validate` — exactly the load path the engine takes. An
-/// error here means `set` writes nothing.
+/// Validate the WOULD-BE state; an error here means `set` writes nothing.
+///
+/// A PROJECT write is validated as this repo's full merge (defaults <- global
+/// <- candidate project) — exactly the load path the engine takes here.
+///
+/// A GLOBAL write is validated TWICE:
+/// 1. standalone (defaults <- candidate global) — what every OTHER repo,
+///    without this repo's project overrides, would load. Skipping this let a
+///    project override mask an invalid global value: the write "succeeded"
+///    here and poisoned every repo lacking the override.
+/// 2. merged with this repo's project layer, like any other write.
+///
+/// Either failure refuses the write, with the failing combination named.
 fn validate_candidate(
     layers: &Layers,
     target: &Path,
     candidate: &serde_json::Map<String, Value>,
 ) -> Result<()> {
+    if layers.global.as_deref() == Some(target) {
+        validate_merged(&[target.to_path_buf()], target, candidate).context(
+            "the global config would be invalid on its own (defaults + global): every \
+             repo without this repo's project overrides would fail to load it",
+        )?;
+    }
+    validate_merged(&layers.merge_order(), target, candidate).context(
+        "the merged config for this repo (defaults + global + project) would be invalid",
+    )?;
+    Ok(())
+}
+
+/// Deep-merge defaults <- the given layers (the target layer's on-disk
+/// content replaced by `candidate`), then deserialize and run
+/// `config::validate` — exactly the load path the engine takes.
+fn validate_merged(
+    layer_paths: &[PathBuf],
+    target: &Path,
+    candidate: &serde_json::Map<String, Value>,
+) -> Result<()> {
     let mut merged = serde_json::to_value(MissionConfig::default())?;
-    for path in layers.merge_order() {
-        let layer = if path == target {
+    for path in layer_paths {
+        let layer = if path.as_path() == target {
             Value::Object(candidate.clone())
         } else {
-            Value::Object(read_layer(&path)?)
+            Value::Object(read_layer(path)?)
         };
         config::deep_merge(&mut merged, &layer);
     }
     let cfg: MissionConfig = serde_json::from_value(merged)
         .map_err(|e| anyhow!("merged configuration does not deserialize: {e}"))?;
     config::validate(&cfg)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Schema-path validation (a typo'd key must never be a silent no-op)
+// ---------------------------------------------------------------------------
+
+/// The config schema as a JSON tree: a FULLY-POPULATED `MissionConfig`
+/// serialized out. A dotted path is legal iff every segment (the final one
+/// too) exists in this tree — unknown keys are ignored on deserialization,
+/// so without this gate `set worker.mdoel` merges, validates green, prints
+/// success, and changes nothing.
+///
+/// Full population is load-bearing: `default()` leaves the
+/// `skip_serializing_if` options out of its serialization (`claudeBinary`,
+/// `orchestrator.maxTurns`, `maxBudgetUsd`, …) and those are LEGAL keys that
+/// must not be false-rejected — so every `Option` is forced to `Some` first.
+fn schema_tree() -> Value {
+    let mut cfg = MissionConfig {
+        claude_binary: Some(String::new()),
+        ..MissionConfig::default()
+    };
+    for role in [
+        &mut cfg.orchestrator,
+        &mut cfg.worker,
+        &mut cfg.validator_scrutiny,
+        &mut cfg.validator_functional,
+    ] {
+        role.max_turns = Some(0);
+        role.max_budget_usd = Some(0.0);
+    }
+    serde_json::to_value(cfg).expect("MissionConfig always serializes")
+}
+
+/// Refuse a dotted path that does not exist in the config schema.
+///
+/// - An unknown segment names the unknown part and lists the valid keys at
+///   that level (so `max_parallel_workers` points at `maxParallelWorkers`).
+/// - Array-valued keys (`denyPatterns`, `allowValidatorCommands`) are
+///   settable only as a whole: a path THROUGH one (`denyPatterns.0`) is a
+///   clean error, not an attempted merge.
+/// - A path through a scalar (`worker.model.x`) is a clean error too.
+fn check_schema_path(dotted: &str) -> Result<()> {
+    let segments: Vec<&str> = dotted.split('.').collect();
+    if segments.iter().any(|s| s.is_empty()) {
+        bail!("invalid config path {dotted:?} (empty segment)");
+    }
+    let schema = schema_tree();
+    let mut cur = &schema;
+    let mut walked: Vec<&str> = Vec::with_capacity(segments.len());
+    for seg in segments {
+        match cur {
+            Value::Object(map) => match map.get(seg) {
+                Some(next) => {
+                    walked.push(seg);
+                    cur = next;
+                }
+                None => {
+                    let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
+                    keys.sort_unstable();
+                    let level = if walked.is_empty() {
+                        "the top level".to_string()
+                    } else {
+                        format!("`{}`", walked.join("."))
+                    };
+                    bail!(
+                        "unknown config key `{seg}` at {level}; valid keys here: {}",
+                        keys.join(", ")
+                    );
+                }
+            },
+            Value::Array(_) => bail!(
+                "config path `{dotted}`: `{walked}` is an array and can only be set as a \
+                 whole (e.g. `kranz config set {walked} '[\"…\"]'`); its elements are not \
+                 individually addressable",
+                walked = walked.join(".")
+            ),
+            _ => bail!(
+                "config path `{dotted}`: `{}` is a plain value; nothing nests beneath it",
+                walked.join(".")
+            ),
+        }
+    }
     Ok(())
 }
 
@@ -664,6 +819,180 @@ mod tests {
             &json!({ "worker": { "reasoningEffort": "warp" } }),
         );
         set_key(&layers, false, "skipScrutiny", "true").unwrap();
+    }
+
+    // --- set --global (finding C: both standalone and merged must hold) ----------
+
+    #[test]
+    fn set_global_invalid_value_masked_by_a_project_override_is_refused() {
+        // This repo's project layer masks the bad value, so a merged-only
+        // validation passes — and the write would poison every OTHER repo
+        // that lacks the override. The global layer must also validate
+        // standalone (defaults + candidate global).
+        let tmp = TempDir::new().unwrap();
+        let layers = temp_layers(&tmp);
+        write_json(&layers.project, &json!({ "worker": { "reasoningEffort": "high" } }));
+
+        let err = format!(
+            "{:#}",
+            set_key(&layers, true, "worker.reasoningEffort", "warp").unwrap_err()
+        );
+        assert!(err.contains("on its own"), "standalone gate named: {err}");
+        assert!(
+            !layers.global.as_deref().unwrap().exists(),
+            "global file never materialized"
+        );
+
+        // The valid twin passes both gates and lands in the global file.
+        set_key(&layers, true, "worker.reasoningEffort", "low").unwrap();
+        assert_eq!(
+            read_json(layers.global.as_deref().unwrap()),
+            json!({ "worker": { "reasoningEffort": "low" } })
+        );
+    }
+
+    #[test]
+    fn set_global_names_the_merged_gate_when_this_repo_is_what_breaks() {
+        // The candidate global is fine standalone, but this repo's project
+        // layer is broken: the refusal must blame the merged combination.
+        let tmp = TempDir::new().unwrap();
+        let layers = temp_layers(&tmp);
+        write_json(&layers.project, &json!({ "worker": { "reasoningEffort": "warp" } }));
+
+        let err =
+            format!("{:#}", set_key(&layers, true, "skipScrutiny", "true").unwrap_err());
+        assert!(err.contains("this repo"), "merged gate named: {err}");
+        assert!(!err.contains("on its own"), "standalone gate passed: {err}");
+        assert!(!layers.global.as_deref().unwrap().exists());
+    }
+
+    // --- write_layer atomicity (finding D) ----------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn set_replaces_the_file_via_rename_and_preserves_permissions() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let tmp = TempDir::new().unwrap();
+        let layers = temp_layers(&tmp);
+        write_json(&layers.project, &json!({ "worker": { "model": "opus" } }));
+        std::fs::set_permissions(&layers.project, std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        let before_ino = std::fs::metadata(&layers.project).unwrap().ino();
+
+        set_key(&layers, false, "worker.model", "sonnet").unwrap();
+
+        let meta = std::fs::metadata(&layers.project).unwrap();
+        assert_ne!(
+            meta.ino(),
+            before_ino,
+            "the file must be REPLACED by rename, never truncated in place — a \
+             concurrent config::load (serve create, kranz work, slack bridge) must \
+             never observe a torn/empty file"
+        );
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600, "permissions carried over");
+        assert_eq!(read_json(&layers.project), json!({ "worker": { "model": "sonnet" } }));
+
+        // No tmp litter left beside the target.
+        let leftovers: Vec<String> = std::fs::read_dir(layers.project.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "tmp litter: {leftovers:?}");
+    }
+
+    // --- schema path check (finding E: typos must never be silent no-ops) --------
+
+    #[test]
+    fn set_typo_key_is_refused_naming_the_unknown_part_and_that_levels_keys() {
+        let tmp = TempDir::new().unwrap();
+        let layers = temp_layers(&tmp);
+
+        // Nested typo: names the segment, the level, and its valid keys.
+        let err = format!("{:#}", set_key(&layers, false, "worker.mdoel", "opus").unwrap_err());
+        assert!(err.contains("`mdoel`"), "unknown part named: {err}");
+        assert!(err.contains("`worker`"), "level named: {err}");
+        assert!(
+            err.contains("model") && err.contains("reasoningEffort"),
+            "valid keys at that level listed: {err}"
+        );
+
+        // Top-level snake_case typo: the camelCase twin is in the listing.
+        let err =
+            format!("{:#}", set_key(&layers, false, "max_parallel_workers", "4").unwrap_err());
+        assert!(err.contains("`max_parallel_workers`"), "{err}");
+        assert!(err.contains("top level"), "{err}");
+        assert!(err.contains("maxParallelWorkers"), "camelCase twin listed: {err}");
+
+        // Wrong case is an unknown key, not a match.
+        assert!(set_key(&layers, false, "Worker.model", "opus").is_err());
+        assert!(set_key(&layers, false, "worker.Model", "opus").is_err());
+
+        assert!(!layers.project.exists(), "no typo'd set ever materialized the file");
+    }
+
+    #[test]
+    fn set_accepts_optional_keys_that_default_serialization_omits() {
+        // claudeBinary and orchestrator.maxTurns are None in default() and so
+        // absent from a default() serialization — they are legal keys and
+        // must not be false-rejected by the schema gate.
+        let tmp = TempDir::new().unwrap();
+        let layers = temp_layers(&tmp);
+
+        set_key(&layers, false, "claudeBinary", "/usr/local/bin/claude").unwrap();
+        set_key(&layers, false, "orchestrator.maxTurns", "33").unwrap();
+        set_key(&layers, false, "orchestrator.maxBudgetUsd", "12.5").unwrap();
+        assert_eq!(
+            read_json(&layers.project),
+            json!({
+                "claudeBinary": "/usr/local/bin/claude",
+                "orchestrator": { "maxTurns": 33, "maxBudgetUsd": 12.5 }
+            })
+        );
+    }
+
+    #[test]
+    fn set_array_keys_work_as_a_whole_but_paths_through_them_are_refused() {
+        let tmp = TempDir::new().unwrap();
+        let layers = temp_layers(&tmp);
+
+        set_key(&layers, false, "denyPatterns", r#"["rm -rf"]"#).unwrap();
+        assert_eq!(read_json(&layers.project), json!({ "denyPatterns": ["rm -rf"] }));
+
+        let err = format!("{:#}", set_key(&layers, false, "denyPatterns.0", "x").unwrap_err());
+        assert!(err.contains("array") && err.contains("as a whole"), "{err}");
+        let err = format!(
+            "{:#}",
+            set_key(&layers, false, "allowValidatorCommands.2.cmd", "x").unwrap_err()
+        );
+        assert!(err.contains("array"), "deep paths through arrays refused too: {err}");
+    }
+
+    #[test]
+    fn set_paths_through_scalars_are_refused_cleanly() {
+        let tmp = TempDir::new().unwrap();
+        let layers = temp_layers(&tmp);
+
+        let err = format!("{:#}", set_key(&layers, false, "worker.model.x", "y").unwrap_err());
+        assert!(
+            err.contains("worker.model") && err.contains("plain value"),
+            "clean error, no object-over-scalar clobber: {err}"
+        );
+        assert!(!layers.project.exists());
+    }
+
+    #[test]
+    fn unset_typo_key_gets_the_same_schema_error_not_a_not_set_one() {
+        let tmp = TempDir::new().unwrap();
+        let layers = temp_layers(&tmp);
+        write_json(&layers.project, &json!({ "worker": { "model": "opus" } }));
+        let before = std::fs::read(&layers.project).unwrap();
+
+        let err = format!("{:#}", unset_key(&layers, false, "worker.mdoel").unwrap_err());
+        assert!(err.contains("unknown config key"), "schema error, not 'not set': {err}");
+        assert!(err.contains("`mdoel`"), "{err}");
+        assert_eq!(std::fs::read(&layers.project).unwrap(), before, "file untouched");
     }
 
     // --- unset ------------------------------------------------------------------

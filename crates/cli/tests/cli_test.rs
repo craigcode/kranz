@@ -434,6 +434,80 @@ fn msg_rejects_unknown_mission() {
 }
 
 // ---------------------------------------------------------------------------
+// Control-command targeting (pause/resume/msg refuse terminal missions —
+// their inbox is never drained, so "success" there would be a silent no-op)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn control_targeting_refuses_an_explicit_terminal_mission_naming_its_status() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+    write_events(
+        repo,
+        "m-done",
+        vec![created_kind("goal", "m-done"), EventKind::MissionCompleted {}],
+    );
+
+    let err = commands::select_control_mission(repo, Some("m-done"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("Complete"), "the actual status is named: {err}");
+
+    // Unknown explicit ids stay errors.
+    let err = commands::select_control_mission(repo, Some("m-nope")).unwrap_err().to_string();
+    assert!(err.contains("m-nope"), "{err}");
+}
+
+#[test]
+fn control_targeting_bare_refuses_a_terminal_pick() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+    write_events(
+        repo,
+        "m-done",
+        vec![created_kind("goal", "m-done"), EventKind::MissionCompleted {}],
+    );
+
+    let err = commands::select_control_mission(repo, None).unwrap_err().to_string();
+    assert!(err.contains("Complete"), "status named: {err}");
+    assert!(err.contains("active"), "{err}");
+}
+
+#[test]
+fn control_targeting_bare_keeps_the_newest_by_mtime_defaulting_for_active_missions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+    let old_events = write_events(repo, "m-old", vec![created_kind("old", "m-old")]);
+    write_events(repo, "m-new", vec![created_kind("new", "m-new")]);
+    let file = fs::OpenOptions::new().write(true).open(&old_events).unwrap();
+    file.set_times(
+        fs::FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(3600)),
+    )
+    .unwrap();
+
+    // Same UX as select_mission for active picks…
+    assert_eq!(commands::select_control_mission(repo, None).unwrap(), "m-new");
+    // …and an explicit ACTIVE id passes through the shared resolver.
+    assert_eq!(commands::select_control_mission(repo, Some("m-old")).unwrap(), "m-old");
+}
+
+#[test]
+fn control_queue_hint_appears_only_when_no_engine_is_running() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+    write_events(repo, "m-1", vec![created_kind("goal", "m-1")]);
+
+    // No lock holder: the command would just sit in the inbox — say so.
+    let hint = commands::control_queue_hint(repo, "m-1").expect("no live engine, so a hint");
+    assert!(hint.contains("next runs"), "{hint}");
+
+    // A live lock (our own pid) means an engine will drain the inbox: no hint.
+    let paths = kranz_engine::paths::MissionPaths::new(repo, "m-1");
+    fs::write(paths.lock_file(), format!("{}\n", std::process::id())).unwrap();
+    assert_eq!(commands::control_queue_hint(repo, "m-1"), None);
+}
+
+// ---------------------------------------------------------------------------
 // Mission auto-selection
 // ---------------------------------------------------------------------------
 
