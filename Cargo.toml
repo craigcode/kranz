@@ -8,10 +8,9 @@ edition = "2021"
 license = "MIT"
 description = "Local mission-control harness for Claude Code."
 readme = "README.md"
-# OWNER is a placeholder — replace with the real GitHub org/user before the
-# first `cargo publish` (see docs/releasing.md). release.yml and the Homebrew
-# formula reference the same OWNER/kranz slug.
-repository = "https://github.com/OWNER/kranz"
+# release.yml and the Homebrew formula reference this same craigcode/kranz
+# slug (see docs/releasing.md).
+repository = "https://github.com/craigcode/kranz"
 keywords = ["claude", "agent", "orchestration", "mission-control", "ai"]
 categories = ["development-tools", "command-line-utilities"]
 

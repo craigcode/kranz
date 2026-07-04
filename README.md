@@ -82,13 +82,12 @@ and drop it on your `PATH`.
 ```sh
 cargo install kranz-cli            # from crates.io
 
-brew tap OWNER/kranz               # Homebrew (from-source formula)
+brew tap craigcode/kranz               # Homebrew (from-source formula)
 brew install kranz
 ```
 
 The crates.io and Homebrew paths are not live yet — they wait on the first
-public release. `OWNER` is the GitHub org/user that owns the repo; the
-maintainer fills it in at release time (see [docs/releasing.md](docs/releasing.md)).
+public release (see [docs/releasing.md](docs/releasing.md)).
 
 ## The four roles
 
