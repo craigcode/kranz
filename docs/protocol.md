@@ -36,11 +36,15 @@ started — the event log is the source of truth).
 | `POST /api/missions/:id/planning/request-plan` | → `200 {"ready":true, "plan":{...}, "estimate":{...CostEstimate}}` or `200 {"ready":false, "reply":"<orchestrator prose>"}` (NotReady returns to conversation) |
 | `POST /api/missions/:id/approve` | body `{"plan":{...}}` (the plan previously returned) → commits plan.json/plan.md/index.md exactly like the CLI → `200 {"branch":"kranz/mission-…"}` |
 | `POST /api/missions/:id/start` | spawns `engine.run()` as a background task → `202 {"running":true}`. Re-invocable when the mission is Blocked (after queueing guidance via control) or after a server restart (`resume` semantics). `409` while already running |
+| `POST /api/missions/:id/abandon` | optional body `{"reason":"..."}` → the engine's canonical abandon (terminal-refusing, `mission.abandoned` recorded) → `200 {"abandoned":true}`. A mission hosted here is taken out of the registry first (an idle engine is dropped; a running task is aborted and awaited). A lock held by a foreign process → `409` — the web never force-steals |
+| `POST /api/missions/:id/delete` | optional body `{"all":true}` → removes a TERMINAL mission's directory, mirroring `kranz clean`: Failed/Abandoned (and planning husks) delete by default; Complete needs `"all":true` (completed missions feed the cost-calibration corpus); live missions and live locks → `409`. POST (not the DELETE verb) so the mutation-token gate applies by construction → `200 {"deleted":true}` |
 
 Hosted-engine rules: planning endpoints serialize per mission (one turn at a
-time); `start` consumes the hosted engine into the run task; when the run
-ends (Complete/Blocked/Failed) the registry entry is dropped and the lock
-released — the mission is then observable/resumable from anywhere.
+time) and lazily ATTACH an on-disk in-planning mission into the registry
+(resume under the single-writer lock); `start` consumes the hosted engine
+into the run task; when the run ends (Complete/Blocked/Failed) the registry
+entry is dropped and the lock released — the mission is then
+observable/resumable from anywhere.
 
 ## Authority: mutation token
 

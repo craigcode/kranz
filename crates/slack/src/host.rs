@@ -60,6 +60,12 @@ pub trait PlanningHost: Send + Sync + 'static {
 
     /// Start execution: the host consumes the engine into a background run.
     fn start<'a>(&'a self, id: &'a str) -> BoxFuture<'a, anyhow::Result<()>>;
+
+    /// Release a hosted idle engine (freeing the mission lock) so an external
+    /// runner — the `kranz work` dispatcher — can take the mission over.
+    /// `true` = the mission is now free of this host (released or never
+    /// hosted); `false` = it is actively running here and was left alone.
+    fn release<'a>(&'a self, id: &'a str) -> BoxFuture<'a, anyhow::Result<bool>>;
 }
 
 /// How the bridge holds the host: shared, optional (a bridge without a host —

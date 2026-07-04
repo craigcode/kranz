@@ -148,6 +148,21 @@ export const api = {
     return postJson(`/api/missions/${encodeURIComponent(id)}/planning/request-plan`, {});
   },
 
+  // --- mission hygiene (web twins of `kranz abandon` / `kranz clean`) ------
+
+  abandonMission(id: string, reason?: string): Promise<{ abandoned: boolean }> {
+    return postJson(
+      `/api/missions/${encodeURIComponent(id)}/abandon`,
+      reason !== undefined ? { reason } : {},
+    );
+  },
+
+  /** `all` opts in to deleting a Complete mission (they feed cost calibration
+   *  and are kept by default — same contract as `kranz clean --all`). */
+  deleteMission(id: string, all: boolean): Promise<{ deleted: boolean }> {
+    return postJson(`/api/missions/${encodeURIComponent(id)}/delete`, { all });
+  },
+
   approvePlan(id: string, plan: Plan): Promise<{ branch: string }> {
     return postJson(`/api/missions/${encodeURIComponent(id)}/approve`, { plan });
   },

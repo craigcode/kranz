@@ -647,6 +647,19 @@ async fn dispatch_action(
                 reply_ephemeral(cfg, client, response_url.as_deref(), &not_authorized_blocks()).await;
                 return;
             }
+            // Ack IMMEDIATELY: create + the seeding planning turn take minutes,
+            // and a silently-working command reads as a dead one.
+            reply_ephemeral(
+                cfg,
+                client,
+                response_url.as_deref(),
+                &error_blocks(
+                    ":hourglass_flowing_sand: Creating the mission — the seeding planning \
+                     turn usually takes a minute or two; the planning thread will appear \
+                     in the channel.",
+                ),
+            )
+            .await;
             match new_mission(cfg, client, repo_root, threads, host, goal, channel).await {
                 Ok(blocks) => reply_ephemeral(cfg, client, response_url.as_deref(), &blocks).await,
                 Err(e) => {
@@ -738,7 +751,7 @@ async fn dispatch_action(
         Action::ApproveMission { mission_id, user_id, response_url } => {
             approve_flow(
                 cfg, client, repo_root, threads, host, pending, mission_id,
-                user_id.as_deref(), response_url.as_deref(), false,
+                user_id.as_deref(), response_url.as_deref(), false, false,
             )
             .await;
         }
@@ -821,14 +834,14 @@ async fn dispatch_action(
         Action::Approve { mission_id, user_id, response_url } => {
             approve_flow(
                 cfg, client, repo_root, threads, host, pending, mission_id,
-                user_id.as_deref(), response_url.as_deref(), false,
+                user_id.as_deref(), response_url.as_deref(), false, true,
             )
             .await;
         }
         Action::ApproveStart { mission_id, user_id, response_url } => {
             approve_flow(
                 cfg, client, repo_root, threads, host, pending, mission_id,
-                user_id.as_deref(), response_url.as_deref(), true,
+                user_id.as_deref(), response_url.as_deref(), true, true,
             )
             .await;
         }
@@ -923,6 +936,7 @@ async fn approve_flow(
     user_id: Option<&str>,
     response_url: Option<&str>,
     start: bool,
+    button: bool,
 ) {
     if !cfg.is_authorized(user_id) {
         reply_ephemeral(cfg, client, response_url, &not_authorized_blocks()).await;
@@ -951,6 +965,13 @@ async fn approve_flow(
                 return;
             }
         };
+        // Retire the plan card FIRST: from a button, rewrite the source
+        // message into an outcome card so the second tap the old card invited
+        // has nothing left to tap. Best-effort — the state change stands
+        // regardless.
+        if button {
+            retire_plan_card(client, response_url, mission_id, Some(&branch), start).await;
+        }
         if start {
             match host.start(mission_id).await {
                 Ok(()) => {
@@ -975,6 +996,17 @@ async fn approve_flow(
                 }
             }
         } else {
+            // Free the just-approved engine BEFORE queueing: approve left it
+            // attached in the host's registry holding the mission lock, and
+            // the `kranz work` dispatcher this queue entry points at would be
+            // refused with LockHeld while it stays there. Best-effort: on a
+            // failed release the entry still queues, and the dispatcher's own
+            // LockHeld refusal stays the honest backstop.
+            match host.release(mission_id).await {
+                Ok(true) => {}
+                Ok(false) => tracing::warn!(mission = %mission_id, "release after approve found mission running"),
+                Err(e) => tracing::warn!(mission = %mission_id, error = %e, "release after approve failed"),
+            }
             match approve_mission(repo_root, mission_id) {
                 Ok(()) => {
                     post_thread_note(cfg, client, threads, mission_id, &format!(
@@ -1029,15 +1061,26 @@ async fn approve_flow(
             .await;
         }
         // Approved earlier (plan committed, no live run) or paused/blocked:
-        // starting/queueing is legitimate.
+        // starting/queueing is legitimate — EXCEPT when the mission is
+        // actually executing right now. Status alone can't tell (approval
+        // folds to Running before any run loop exists), so ask the host to
+        // release its idle engine and treat an unreleasable / live-locked
+        // mission as executing. This is the guard against a stale second
+        // approve tap queueing a mission that is already underway.
         Ok(_) => {
             if start {
                 let Some(host) = host else {
                     reply_ephemeral(cfg, client, response_url, &no_host_blocks(mission_id)).await;
                     return;
                 };
+                // host.start disambiguates on its own: it consumes an idle
+                // hosted engine, resumes an unhosted one, and refuses a live
+                // run with an honest conflict message.
                 match host.start(mission_id).await {
                     Ok(()) => {
+                        if button {
+                            retire_plan_card(client, response_url, mission_id, None, true).await;
+                        }
                         post_thread_note(cfg, client, threads, mission_id, &format!(
                             ":rocket: Execution started for `{mission_id}` — progress posts \
                              in this thread."
@@ -1055,8 +1098,44 @@ async fn approve_flow(
                     }
                 }
             } else {
+                if let Some(host) = host {
+                    match host.release(mission_id).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            reply_ephemeral(cfg, client, response_url, &error_blocks(&format!(
+                                "`{mission_id}` is already executing — steer it by replying \
+                                 in its thread; nothing was queued."
+                            )))
+                            .await;
+                            return;
+                        }
+                        Err(e) => {
+                            reply_ephemeral(
+                                cfg,
+                                client,
+                                response_url,
+                                &error_blocks(&format!("Couldn't queue `{mission_id}`: {e}")),
+                            )
+                            .await;
+                            return;
+                        }
+                    }
+                }
+                // Host-free (or released): a LIVE lock holder now means an
+                // external process is running the mission.
+                if kranz_engine::queue::is_repo_busy(repo_root).as_deref() == Some(mission_id) {
+                    reply_ephemeral(cfg, client, response_url, &error_blocks(&format!(
+                        "`{mission_id}` is already executing — steer it by replying in its \
+                         thread; nothing was queued."
+                    )))
+                    .await;
+                    return;
+                }
                 match approve_mission(repo_root, mission_id) {
                     Ok(()) => {
+                        if button {
+                            retire_plan_card(client, response_url, mission_id, None, false).await;
+                        }
                         reply_ephemeral(
                             cfg,
                             client,
@@ -1138,6 +1217,48 @@ async fn post_to_mission_thread(
         threads.set(mission_id, &posted_ts);
     }
     Ok(())
+}
+
+/// The outcome card a consumed plan-review message is rewritten into: what
+/// happened, to which mission, on which branch — and, pointedly, NO buttons.
+/// Pure; unit-tested.
+fn approved_card(mission_id: &str, branch: Option<&str>, started: bool) -> Vec<Value> {
+    let (emoji, verb) = if started {
+        (":rocket:", "approved & started")
+    } else {
+        (":white_check_mark:", "approved & queued")
+    };
+    let mut headline = format!("{emoji} *Plan {verb} — `{mission_id}`*");
+    if let Some(branch) = branch {
+        headline.push_str(&format!("\nbranch `{branch}`"));
+    }
+    let followup = if started {
+        "Progress posts in the mission thread · deep inspection in the web UI."
+    } else {
+        "The `kranz work` dispatcher runs it next."
+    };
+    vec![
+        json!({ "type": "section", "text": { "type": "mrkdwn", "text": headline } }),
+        json!({ "type": "context", "elements": [{ "type": "mrkdwn", "text": followup }] }),
+    ]
+}
+
+/// Rewrite the plan-review message a button click came from into an
+/// [`approved_card`] (via `replace_original`), retiring its buttons.
+/// Best-effort: the approval/start already happened; a failed rewrite only
+/// leaves stale buttons, which the state-aware refusals now absorb anyway.
+async fn retire_plan_card(
+    client: &SlackClient,
+    response_url: Option<&str>,
+    mission_id: &str,
+    branch: Option<&str>,
+    started: bool,
+) {
+    let Some(url) = response_url else { return };
+    if let Err(e) = client.replace_original(url, &approved_card(mission_id, branch, started)).await
+    {
+        tracing::warn!(mission = %mission_id, error = %e, "failed to retire plan card");
+    }
 }
 
 /// [`post_to_mission_thread`] for a one-line note (acks, refusals, errors on
@@ -1734,6 +1855,22 @@ mod tests {
     /// Seed a mission's `events.jsonl` with a single `mission.created` event,
     /// built from public engine types so it folds exactly like a real log —
     /// no git, no backend. Returns the mission id.
+    #[test]
+    fn approved_card_carries_outcome_and_no_buttons() {
+        let started = approved_card("m-9", Some("kranz/mission-m-9"), true);
+        let text = serde_json::to_string(&started).unwrap();
+        assert!(text.contains("approved &amp; started") || text.contains("approved & started"));
+        assert!(text.contains("kranz/mission-m-9"));
+        assert!(!text.contains("\"button\""), "outcome card must retire the buttons");
+
+        let queued = approved_card("m-9", None, false);
+        let text = serde_json::to_string(&queued).unwrap();
+        assert!(text.contains("approved & queued"));
+        assert!(text.contains("kranz work"), "queue outcome points at the dispatcher");
+        assert!(!text.contains("branch"), "no branch line when branch is unknown");
+        assert!(!text.contains("\"button\""));
+    }
+
     #[test]
     fn pending_plans_take_consumes_and_put_restores() {
         use kranz_engine::types::{Plan, PlanFeature, PlanMilestone};

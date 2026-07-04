@@ -50,6 +50,10 @@ impl PlanningHost for HostedPlanning {
     fn start<'a>(&'a self, id: &'a str) -> BoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async move { self.0.start(id).await.map_err(plain) })
     }
+
+    fn release<'a>(&'a self, id: &'a str) -> BoxFuture<'a, anyhow::Result<bool>> {
+        Box::pin(async move { self.0.release(id).map_err(plain) })
+    }
 }
 
 /// The host's errors already carry user-presentable messages (409 "a turn is

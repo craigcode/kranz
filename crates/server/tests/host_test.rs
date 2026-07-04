@@ -207,6 +207,142 @@ async fn wait_for_status(app: &axum::Router, id: &str, status: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// Abandon / delete (web twins of `kranz abandon` / `kranz clean`)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn abandon_then_delete_lifecycle_over_rest() {
+    isolate_git_env();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    // A planning husk (no plan.json): abandonable, then Stale → deletable.
+    seed_mission_log(&root, "m-husk");
+    let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+    let host = kranz_server::MissionHost::with_backend(root.clone(), backend);
+    let app = kranz_server::router_with_host(host, None, Some(TOKEN.to_string()));
+
+    // Abandon: 200, reason recorded, state folds terminal.
+    let (status, body) = post_json(
+        &app,
+        "/api/missions/m-husk/abandon",
+        Some(TOKEN),
+        json!({ "reason": "duplicate from live test" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["abandoned"], true);
+    let (_, state) = get_json(&app, "/api/missions/m-husk/state").await;
+    assert_eq!(state["mission"]["status"], "abandoned");
+
+    // Abandoning again: terminal → 409, not a server error.
+    let (status, body) =
+        post_json(&app, "/api/missions/m-husk/abandon", Some(TOKEN), json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+    // Delete: Abandoned is Stale → removed without any opt-in.
+    let (status, body) =
+        post_json(&app, "/api/missions/m-husk/delete", Some(TOKEN), json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["deleted"], true);
+    assert!(
+        !MissionPaths::new(&root, "m-husk").mission_dir().exists(),
+        "mission directory removed"
+    );
+
+    // Gone means gone: both endpoints 404 now.
+    let (status, _) =
+        post_json(&app, "/api/missions/m-husk/abandon", Some(TOKEN), json!({})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) =
+        post_json(&app, "/api/missions/m-husk/delete", Some(TOKEN), json!({})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn delete_guards_live_and_complete_missions() {
+    isolate_git_env();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+    let host = kranz_server::MissionHost::with_backend(root.clone(), backend);
+    let app = kranz_server::router_with_host(host, None, Some(TOKEN.to_string()));
+
+    // Approved (Running-status, plan committed) = live work → never deleted.
+    seed_mission_log(&root, "m-live");
+    {
+        let paths = MissionPaths::new(&root, "m-live");
+        let mut log =
+            EventLog::acquire(&paths, "m-live", Duration::ZERO, LockForce::No).unwrap();
+        let plan: kranz_engine::types::Plan = serde_json::from_value(plan_json()).unwrap();
+        log.append(EventKind::PlanApproved { plan }).unwrap();
+    }
+    let (status, body) =
+        post_json(&app, "/api/missions/m-live/delete", Some(TOKEN), json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+    // Complete: kept by default (calibration corpus), deleted only with all.
+    seed_mission_log(&root, "m-done");
+    {
+        let paths = MissionPaths::new(&root, "m-done");
+        let mut log =
+            EventLog::acquire(&paths, "m-done", Duration::ZERO, LockForce::No).unwrap();
+        let plan: kranz_engine::types::Plan = serde_json::from_value(plan_json()).unwrap();
+        log.append(EventKind::PlanApproved { plan }).unwrap();
+        log.append(EventKind::MissionCompleted {}).unwrap();
+    }
+    let (status, body) =
+        post_json(&app, "/api/missions/m-done/delete", Some(TOKEN), json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("calibration"), "{body}");
+    let (status, body) = post_json(
+        &app,
+        "/api/missions/m-done/delete",
+        Some(TOKEN),
+        json!({ "all": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!MissionPaths::new(&root, "m-done").mission_dir().exists());
+}
+
+// ---------------------------------------------------------------------------
+// Release: an attached engine frees the single-writer lock
+// ---------------------------------------------------------------------------
+
+/// The approve-and-queue path depends on `release`: an attached engine holds
+/// the mission's single-writer lock, and without releasing it the external
+/// `kranz work` dispatcher the queue points at is refused with `LockHeld`.
+#[tokio::test]
+async fn release_frees_the_mission_lock_for_external_runners() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    seed_mission_log(&root, "m-rel");
+    let orch = MockScript::streaming(vec![mock_init("orch-rel"), mock_result_text("hello")])
+        .responding(vec![turn("still planning")]);
+    let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::with_scripts(vec![orch]));
+    let host = kranz_server::MissionHost::with_backend(root.clone(), backend);
+
+    // Attach via a planning turn: the host now holds the lock…
+    host.planning_turn("m-rel", "hi").await.expect("planning turn attaches");
+    let paths = MissionPaths::new(&root, "m-rel");
+    assert!(
+        EventLog::acquire(&paths, "m-rel", Duration::ZERO, LockForce::No).is_err(),
+        "while attached, an external acquire must be LockHeld-refused"
+    );
+
+    // …and release frees it for an external runner.
+    assert!(host.release("m-rel").expect("release"), "idle engine releases cleanly");
+    let log = EventLog::acquire(&paths, "m-rel", Duration::ZERO, LockForce::No);
+    assert!(log.is_ok(), "after release, an external acquire succeeds");
+    drop(log);
+
+    // Unknown / never-hosted missions are trivially free.
+    assert!(host.release("m-unknown").expect("release unknown"));
+}
+
+// ---------------------------------------------------------------------------
 // Mutation token (protocol "Authority: mutation token")
 // ---------------------------------------------------------------------------
 

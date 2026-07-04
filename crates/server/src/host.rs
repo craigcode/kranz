@@ -36,7 +36,7 @@ use kranz_engine::backend_claude::ClaudeBackend;
 use kranz_engine::config;
 use kranz_engine::cost::{self, CostEstimate};
 use kranz_engine::error::EngineError;
-use kranz_engine::event_log::LockForce;
+use kranz_engine::event_log::{EventLog, LockForce};
 use kranz_engine::orchestrator::{MissionEngine, PlanRequest};
 use kranz_engine::paths::MissionPaths;
 use kranz_engine::types::{MissionStatus, Plan};
@@ -293,6 +293,133 @@ impl MissionHost {
         Ok(())
     }
 
+    /// Release a hosted idle engine: drop it from the registry (flushing its
+    /// log and freeing the single-writer lock) so an EXTERNAL runner — the
+    /// `kranz work` dispatcher, a terminal `kranz plan/run` — can take the
+    /// mission over. The approve-and-QUEUE path needs this: without it the
+    /// approved engine would sit attached here holding the lock, and the very
+    /// dispatcher the queue points at would be refused with `LockHeld`.
+    ///
+    /// Returns `true` when the mission is now free of THIS host (released, or
+    /// was never hosted), `false` when it is actively running here (never
+    /// interrupted). A turn in flight is an error, mirroring the other
+    /// planning operations.
+    pub fn release(&self, id: &str) -> Result<bool, ApiError> {
+        let mut map = self.missions.lock().expect("missions registry lock");
+        match map.remove(id) {
+            None => Ok(true),
+            Some(HostedMission::Running(handle)) => {
+                let finished = handle.is_finished();
+                if !finished {
+                    map.insert(id.to_string(), HostedMission::Running(handle));
+                }
+                Ok(finished)
+            }
+            Some(HostedMission::Planning(cell)) => match Arc::try_unwrap(cell) {
+                Ok(mutex) => {
+                    drop(mutex.into_inner()); // flushes the log, frees the lock
+                    Ok(true)
+                }
+                Err(cell) => {
+                    map.insert(id.to_string(), HostedMission::Planning(cell));
+                    Err(turn_in_flight())
+                }
+            },
+        }
+    }
+
+    /// `POST /api/missions/:id/abandon`: retire a mission through the
+    /// engine's canonical abandon path (terminal-refusing, event-recorded).
+    /// A mission hosted HERE is taken out of the registry first — an idle
+    /// planning engine is dropped (freeing the lock), a running task is
+    /// aborted and awaited (the engine's Drop flushes the log and kills its
+    /// agent children) — so the abandon event lands on a quiet log. A lock
+    /// held by a FOREIGN process (a terminal `kranz plan/run`) surfaces as
+    /// the engine's LockHeld → 409; the web never force-steals.
+    pub async fn abandon(&self, id: &str, reason: &str) -> Result<(), ApiError> {
+        let taken = self.missions.lock().expect("missions registry lock").remove(id);
+        match taken {
+            None => {}
+            Some(HostedMission::Planning(cell)) => match Arc::try_unwrap(cell) {
+                Ok(mutex) => drop(mutex.into_inner()),
+                Err(cell) => {
+                    self.missions
+                        .lock()
+                        .expect("missions registry lock")
+                        .insert(id.to_string(), HostedMission::Planning(cell));
+                    return Err(turn_in_flight());
+                }
+            },
+            Some(HostedMission::Running(handle)) => {
+                if !handle.is_finished() {
+                    handle.abort();
+                }
+                // Cancelled or finished either way: await settles the task so
+                // the engine is dropped (log flushed, lock freed) before we
+                // append the abandon event.
+                let _ = handle.await;
+            }
+        }
+        kranz_engine::orchestrator::abandon_mission(
+            self.repo_root.clone(),
+            id,
+            reason,
+            LockForce::No,
+        )
+        .map_err(ApiError::from)?;
+        Ok(())
+    }
+
+    /// `POST /api/missions/:id/delete`: remove a TERMINAL mission's directory,
+    /// mirroring `kranz clean` exactly — [`cleanable_class`] decides, `all`
+    /// opts in to deleting Complete missions (which otherwise stay: they feed
+    /// the cost-calibration corpus), and a live lock is re-checked immediately
+    /// before removal so nothing is ever deleted under a running engine.
+    /// Only the mission directory goes; branches, tags, and missions/index.md
+    /// are never touched (same contract as the CLI).
+    pub fn clean(&self, id: &str, all: bool) -> Result<(), ApiError> {
+        use kranz_engine::orchestrator::{cleanable_class, mission_lock_is_live, CleanClass};
+        if self.missions.lock().expect("missions registry lock").contains_key(id) {
+            return Err(ApiError::conflict(format!(
+                "mission '{id}' is hosted by this server (attached or running) — abandon it \
+                 first, or let its run finish"
+            )));
+        }
+        let paths = MissionPaths::new(&self.repo_root, id);
+        if !paths.events_file().is_file() {
+            return Err(ApiError::not_found(format!("unknown mission '{id}'")));
+        }
+        let events = EventLog::read_events(&paths.events_file())?;
+        let state = kranz_engine::reducer::fold(&events).map_err(ApiError::from)?;
+        let has_plan = paths.plan_file().is_file();
+        match cleanable_class(state.mission.status, has_plan) {
+            CleanClass::Keep => {
+                return Err(ApiError::conflict(format!(
+                    "mission '{id}' is live ({:?}) — abandon it before deleting",
+                    state.mission.status
+                )))
+            }
+            CleanClass::CompleteKeepByDefault if !all => {
+                return Err(ApiError::conflict(format!(
+                    "mission '{id}' is Complete; completed missions feed the cost-calibration \
+                     corpus — pass \"all\": true to delete it anyway"
+                )))
+            }
+            CleanClass::Stale | CleanClass::CompleteKeepByDefault => {}
+        }
+        // Same last-instant liveness re-check as the CLI's remove_missions: a
+        // husk can go live between the fold and the removal.
+        if mission_lock_is_live(&paths) {
+            return Err(ApiError::conflict(format!(
+                "mission '{id}' became live — nothing was deleted"
+            )));
+        }
+        kranz_engine::queue::remove(&self.repo_root, id);
+        std::fs::remove_dir_all(paths.mission_dir())
+            .map_err(|e| ApiError::internal(format!("removing mission '{id}': {e}")))?;
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Registry plumbing
     // -----------------------------------------------------------------------
@@ -504,6 +631,41 @@ pub(crate) async fn approve_mission(
         .map_err(|e| ApiError::bad_request(format!("'plan' is not a valid Plan: {e}")))?;
     let branch = server.host.approve(&id, plan).await?;
     Ok(Json(json!({ "branch": branch })))
+}
+
+/// `POST /api/missions/:id/abandon` — optional body `{"reason":"..."}` →
+/// `200 {"abandoned": true}`. See [`MissionHost::abandon`].
+pub(crate) async fn abandon_mission_route(
+    State(server): State<Arc<ServerState>>,
+    UrlPath(id): UrlPath<String>,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let id = valid_id(&server, &id)?;
+    let value = parse_body(&body)?;
+    let reason = value
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .unwrap_or("abandoned by operator");
+    server.host.abandon(&id, reason).await?;
+    Ok(Json(json!({ "abandoned": true })))
+}
+
+/// `POST /api/missions/:id/delete` — optional body `{"all": true}` (opt in to
+/// deleting a Complete mission) → `200 {"deleted": true}`. See
+/// [`MissionHost::clean`]. POST (not the DELETE verb) so the mutation-token
+/// gate — which covers `POST /api/...` — applies by construction.
+pub(crate) async fn delete_mission_route(
+    State(server): State<Arc<ServerState>>,
+    UrlPath(id): UrlPath<String>,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let id = valid_id(&server, &id)?;
+    let value = parse_body(&body)?;
+    let all = value.get("all").and_then(Value::as_bool).unwrap_or(false);
+    server.host.clean(&id, all)?;
+    Ok(Json(json!({ "deleted": true })))
 }
 
 /// `POST /api/missions/:id/start` → `202 {"running":true}`.
