@@ -406,14 +406,25 @@ pub fn build_new_mission_modal(channel: &str) -> Value {
 /// plus the standing "how to continue" context line. Used for both a planning
 /// turn's reply and a NotReady `/kranz plan` outcome (which is the same thing:
 /// the orchestrator talking back instead of emitting a plan).
-pub fn build_planning_reply(mission_id: &str, reply: &str) -> Vec<Value> {
-    vec![
-        section(&format!("*Orchestrator*\n{}", clip(reply.trim()))),
-        context(&format!(
-            "Reply in this thread to continue planning · `/kranz plan {mission_id}` \
-             from the channel when you're ready to review the plan."
-        )),
-    ]
+///
+/// `plan_spotted` inserts an explicit next-step callout: the orchestrator
+/// chatted out what looks like a complete plan, which users reasonably read
+/// as approvable — it isn't (conversation can't approve; only the formal
+/// request-plan validates, prices, and arms the approve buttons).
+pub fn build_planning_reply(mission_id: &str, reply: &str, plan_spotted: bool) -> Vec<Value> {
+    let mut blocks = vec![section(&format!("*Orchestrator*\n{}", clip(reply.trim())))];
+    if plan_spotted {
+        blocks.push(section(&format!(
+            ":bulb: That looks like a complete plan — but a plan in chat can't be \
+             approved. Run `/kranz plan {mission_id}` from the channel to validate \
+             and price it; the approve buttons arrive with that message."
+        )));
+    }
+    blocks.push(context(&format!(
+        "Reply in this thread to continue planning · `/kranz plan {mission_id}` \
+         from the channel when you're ready to review the plan."
+    )));
+    blocks
 }
 
 /// Status summary: a header carrying the mission id + status pill, then the

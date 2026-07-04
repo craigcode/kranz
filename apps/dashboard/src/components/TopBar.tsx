@@ -1,8 +1,24 @@
-// Top bar: mission path + goal | TIME | PROGRESS | USAGE | connection dot.
+// Top bar: home | mission path + goal | TIME | PROGRESS | USAGE | connection.
 
 import { useKranzStore } from '../lib/store';
 import { fmtCost, fmtElapsed, fmtTokens, pausedMs } from '../lib/format';
 import { useNow } from '../lib/useNow';
+
+// KRANZ wordmark as the way back to the mission list from any mission view.
+function HomeButton() {
+  return (
+    <button
+      type="button"
+      className="topbar-home mono"
+      title="all missions"
+      onClick={() => {
+        window.location.hash = '#/';
+      }}
+    >
+      KRANZ
+    </button>
+  );
+}
 
 export function TopBar() {
   const state = useKranzStore((s) => s.state);
@@ -13,6 +29,7 @@ export function TopBar() {
   if (!state) {
     return (
       <header className="topbar">
+        <HomeButton />
         <div className="topbar-mission">
           <span className="dim">Connecting to mission…</span>
         </div>
@@ -29,6 +46,7 @@ export function TopBar() {
 
   return (
     <header className="topbar">
+      <HomeButton />
       <div className="topbar-mission" title={`${mission.missionBranch} — ${mission.goal}`}>
         <span className="mono topbar-path">{mission.missionBranch}</span>
         <span className="topbar-goal">{mission.goal}</span>

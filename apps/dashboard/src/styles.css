@@ -127,6 +127,23 @@ button {
   border-bottom: 1px solid var(--border);
 }
 
+/* The KRANZ wordmark doubles as the way home (mission list). */
+.topbar-home {
+  flex: none;
+  border: 0;
+  background: none;
+  padding: 2px 4px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  color: var(--accent);
+}
+
+.topbar-home:hover {
+  text-decoration: underline;
+}
+
 .topbar-mission {
   flex: 1;
   min-width: 0;

@@ -776,7 +776,8 @@ async fn dispatch_action(
                     }
                 }
                 Ok(PlanOutcome::NotReady(prose)) => {
-                    let blocks = crate::format::build_planning_reply(mission_id, &prose);
+                    // NotReady by definition: never claim a plan was spotted.
+                    let blocks = crate::format::build_planning_reply(mission_id, &prose, false);
                     if let Err(e) =
                         post_to_mission_thread(cfg, client, threads, mission_id, blocks).await
                     {
@@ -924,7 +925,11 @@ async fn dispatch_action(
                     .await;
                     match host.planning_turn(mission_id, text).await {
                         Ok(reply) => {
-                            let blocks = crate::format::build_planning_reply(mission_id, &reply);
+                            let blocks = crate::format::build_planning_reply(
+                                mission_id,
+                                &reply,
+                                looks_like_plan_json(&reply),
+                            );
                             if let Err(e) =
                                 post_to_mission_thread(cfg, client, threads, mission_id, blocks)
                                     .await
@@ -1233,6 +1238,15 @@ fn no_host_blocks(mission_id: &str) -> Vec<Value> {
          `kranz serve`). Use `kranz plan --mission {mission_id}` in a terminal, \
          or the web UI via `kranz serve --open`."
     ))
+}
+
+/// Heuristic: does a planning reply contain what looks like a COMPLETE plan
+/// JSON (the orchestrator chatted the plan out instead of waiting for the
+/// formal request-plan)? Matches the plan schema's two distinctive top-level
+/// keys — prose mentioning them both in quotes-and-colon form doesn't happen
+/// in practice, and a false positive only adds a harmless hint line.
+fn looks_like_plan_json(reply: &str) -> bool {
+    reply.contains("\"validationContract\"") && reply.contains("\"milestones\"")
 }
 
 /// A mission's current status, folded read-only from its event log.
@@ -1944,6 +1958,18 @@ mod tests {
         // …but a failed approve puts it back for the retry.
         pending.put("m-1", taken);
         assert!(pending.take("m-1").is_some());
+    }
+
+    #[test]
+    fn plan_json_heuristic_spots_chatted_plans_not_prose() {
+        // Observed live (m-c9c915): the orchestrator chatted the full plan
+        // JSON into the thread and said "approve this" — users need the
+        // "run /kranz plan" nudge exactly then.
+        assert!(looks_like_plan_json(
+            r#"Here it is: {"goal":"x","validationContract":[],"milestones":[]}"#
+        ));
+        assert!(!looks_like_plan_json("I'll draft milestones around the validation contract."));
+        assert!(!looks_like_plan_json(r#"the "milestones" key alone is not a plan"#));
     }
 
     #[test]

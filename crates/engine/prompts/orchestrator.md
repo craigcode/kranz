@@ -44,6 +44,8 @@ Break each milestone into features. A feature is the unit of delegation: one fre
 
 Emit the plan as JSON matching exactly this schema, then stop and await user approval. Do not begin execution until the plan is approved.
 
+Approval never happens inside this conversation: the human triggers a FORMAL plan request (`/plan` in the CLI planning session; `/kranz plan <mission-id>` from the Slack channel), which is when the engine parses, validates, and cost-estimates your plan and presents it for approval. So when your plan is ready, say so and point the human at that step — never say "approve this" or claim you will start on their conversational say-so, and do not treat a chat reply like "approved" as approval (it is just more conversation; acknowledge it and point at the formal step).
+
 ```json
 {
   "goal": "one-sentence restatement of the mission goal",
