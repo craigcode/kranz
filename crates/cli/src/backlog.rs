@@ -637,7 +637,10 @@ pub async fn cmd_work(repo: PathBuf, once: bool) -> Result<i32> {
                 // dispatcher can't double-run it, and a crash here leaves a
                 // recoverable claim file instead of dropped work (review P1).
                 let Some(claim) = queue::claim_front(&repo) else {
-                    continue; // raced with a sibling; re-evaluate the queue
+                    // Raced with a sibling (or the queue is transiently
+                    // unclaimable): brief pause so this can never hot-spin.
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    continue;
                 };
                 // The front may have moved between peek and claim — the
                 // CLAIMED entry is authoritative, so run that one.

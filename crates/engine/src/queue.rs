@@ -71,6 +71,13 @@ const LOCK_STALE: Duration = Duration::from_secs(10);
 
 struct MutationLock {
     path: PathBuf,
+    /// Written into the lock file at acquire; Drop deletes the file only if
+    /// it still holds OUR token, so a holder whose lock was stale-stolen
+    /// cannot delete the stealer's lock and cascade-break mutual exclusion.
+    /// (The read-then-remove in Drop is itself a tiny TOCTOU window —
+    /// microseconds against a 10s staleness horizon — accepted for an
+    /// advisory lock on a low-contention queue.)
+    token: String,
 }
 
 impl MutationLock {
@@ -78,12 +85,21 @@ impl MutationLock {
         let path = queue_dir(repo_root).join(".mutate.lock");
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
+            let token = format!(
+                "{}.{}",
+                std::process::id(),
+                LOCK_TOKEN_SEQ.fetch_add(1, Ordering::Relaxed)
+            );
             match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&path)
             {
-                Ok(_) => return Ok(MutationLock { path }),
+                Ok(mut f) => {
+                    use std::io::Write as _;
+                    let _ = f.write_all(token.as_bytes());
+                    return Ok(MutationLock { path, token });
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     let stale = std::fs::metadata(&path)
                         .and_then(|m| m.modified())
@@ -110,9 +126,18 @@ impl MutationLock {
 
 impl Drop for MutationLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        let ours = std::fs::read_to_string(&self.path)
+            .map(|c| c == self.token)
+            .unwrap_or(false);
+        if ours {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
+
+/// Uniquifies lock tokens within one process (pid alone is shared by all
+/// tasks in the process).
+static LOCK_TOKEN_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Reserve the next sequence number: read the counter file, increment, write
 /// it back. Falls back to `max(existing entry seq) + 1` if the counter file is
@@ -247,7 +272,9 @@ pub struct Claim {
 /// Atomically claim the front entry, if any. A lost rename race (a sibling
 /// claimed first) retries with the next front.
 pub fn claim_front(repo_root: &Path) -> Option<Claim> {
-    loop {
+    // Bounded: a lost race retries, but a PERSISTENT rename failure
+    // (read-only fs, permissions) must not spin forever.
+    for _ in 0..16 {
         let entry = peek(repo_root)?;
         let original = queue_dir(repo_root).join(entry.file_name());
         let claimed = queue_dir(repo_root).join(format!(
@@ -270,6 +297,8 @@ pub fn claim_front(repo_root: &Path) -> Option<Claim> {
             }
         }
     }
+    tracing::warn!("claim_front: 16 consecutive claim failures; treating queue as unclaimable");
+    None
 }
 
 /// The mission ran to a terminal state (any outcome): retire the claim.
@@ -305,15 +334,19 @@ pub fn recover_dead_claims(repo_root: &Path) -> usize {
         let Some((entry_name, pid_str)) = name.split_once(".claimed.") else {
             continue;
         };
+        let aged_out = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > Duration::from_secs(3600));
         let dead = match pid_str.parse::<i32>() {
+            // Pid liveness where we can probe it — with the age fallback as a
+            // pid-REUSE backstop (a recycled pid reads alive forever, which
+            // would strand the claim).
             #[cfg(unix)]
-            Ok(pid) => unsafe { libc::kill(pid, 0) != 0 },
+            Ok(pid) => (unsafe { libc::kill(pid, 0) != 0 }) || aged_out,
             #[cfg(not(unix))]
-            Ok(_) => std::fs::metadata(&path)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.elapsed().ok())
-                .is_some_and(|age| age > Duration::from_secs(3600)),
+            Ok(_) => aged_out,
             Err(_) => true,
         };
         if dead && std::fs::rename(&path, dir.join(entry_name)).is_ok() {
