@@ -395,13 +395,16 @@ pub async fn cmd_draft(
     }
 
     let mission_branch = engine.state().mission.mission_branch.clone();
-    // Drop the engine (flush + release the mission lock) before touching the
-    // checkout / running anything.
-    drop(engine);
-    restore_draft_checkout(&repo, original_branch.as_deref(), &mission_branch);
-
+    // The checkout only ever moves in the Approve path (`approve_plan` checks
+    // out the mission branch to commit plan.md); NeedsContext never touches
+    // it, so — matching pre-hoist `cmd_draft` — only restore when a plan was
+    // produced. Drop the engine (flush + release the mission lock) first.
     if let Some(plan) = &drive.plan {
         println!("{}", output::render_plan(plan));
+        drop(engine);
+        restore_draft_checkout(&repo, original_branch.as_deref(), &mission_branch);
+    } else {
+        drop(engine);
     }
 
     match drive.outcome {
