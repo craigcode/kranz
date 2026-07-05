@@ -9,3 +9,4 @@ Approved plans, newest last.
 - 2026-07-05 · [m-2bc647](m-2bc647/plan.md) — Enforce a scrutiny floor in `kranz exec` and close two long-parked gaps (SessionSpec `tools` plumbing; a documented find… [truncated] · [report](m-2bc647/report.md)
 - 2026-07-05 · [m-502576](m-502576/plan.md) — Turn cross-mission learning into a designed loop: on completion the orchestrator captures at most one reusable lesson in… [truncated] · [report](m-502576/report.md)
 - 2026-07-05 · [m-8b7db0](m-8b7db0/plan.md) — Add an opt-in `kranz otel --endpoint <otlp>` sidecar that tails mission event logs and exports OpenTelemetry spans (miss… [truncated] · [report](m-8b7db0/report.md)
+- 2026-07-05 · [m-45624a](m-45624a/plan.md) — Enable a 'live QA mode' for the functional validator: when a mission config lists browser/computer-use tooling for valid… [truncated]
