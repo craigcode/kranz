@@ -134,6 +134,10 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             token,
             slack,
         } => cmd_serve(repo, host, port, open, dashboard, token, slack).await,
+        Command::Release { url, token } => {
+            let mission = select_mission(&repo, cli.mission.as_deref())?;
+            cmd_release(&mission, &url, token).await
+        }
         Command::Config { command } => {
             crate::config_cmd::cmd_config(&repo, command, cli.mission.as_deref())
         }
@@ -1279,10 +1283,99 @@ fn open_browser(url: &str) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// release
+// ---------------------------------------------------------------------------
+
+/// `kranz release [--url <u>] [--token <t>]`: POST to a running `kranz
+/// serve`'s release endpoint to free the mission's single-writer lock. The
+/// CLI runs in a different process and cannot reach serve's in-memory
+/// registry directly, so this always goes over HTTP — never the event log.
+async fn cmd_release(mission_id: &str, url: &str, token: Option<String>) -> Result<i32> {
+    let token = token
+        .or_else(|| std::env::var("KRANZ_TOKEN").ok())
+        .ok_or_else(|| {
+            anyhow!(
+                "no mutation token available — pass --token or set $KRANZ_TOKEN \
+                 (the token `kranz serve` prints on startup)"
+            )
+        })?;
+
+    let base = url.trim_end_matches('/');
+    let endpoint = format!("{base}/api/missions/{mission_id}/release");
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(&endpoint)
+        .header("x-kranz-token", token)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .map_err(|e| {
+            if e.is_connect() {
+                anyhow!("no kranz serve reachable at {url} — is it running?")
+            } else {
+                anyhow::Error::new(e).context(format!("releasing mission '{mission_id}'"))
+            }
+        })?;
+
+    match response.status() {
+        reqwest::StatusCode::OK => {
+            let body: serde_json::Value = response.json().await.unwrap_or_default();
+            let released =
+                body.get("released").and_then(serde_json::Value::as_bool).unwrap_or(false);
+            if released {
+                println!("mission {mission_id} released — the lock is now free");
+            } else {
+                println!("mission {mission_id} was already free (no lock held)");
+            }
+            Ok(0)
+        }
+        reqwest::StatusCode::CONFLICT => {
+            eprintln!(
+                "kranz: mission {mission_id} has a turn in flight — try again shortly"
+            );
+            Ok(1)
+        }
+        reqwest::StatusCode::NOT_FOUND => {
+            eprintln!("kranz: unknown mission '{mission_id}' at {url}");
+            Ok(1)
+        }
+        reqwest::StatusCode::UNAUTHORIZED => {
+            eprintln!(
+                "kranz: the token was missing or invalid — check --token / $KRANZ_TOKEN \
+                 against the token `kranz serve` printed on startup"
+            );
+            Ok(1)
+        }
+        other => {
+            let body = response.text().await.unwrap_or_default();
+            eprintln!("kranz: release failed ({other}): {body}");
+            Ok(1)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+
+    /// With no --token and no $KRANZ_TOKEN, `cmd_release` fails fast with an
+    /// actionable error instead of attempting the HTTP call.
+    #[tokio::test]
+    async fn release_without_a_token_errors_clearly() {
+        // SAFETY: single-threaded w.r.t. this var — no other test reads/writes
+        // KRANZ_TOKEN, and #[tokio::test] runs this test body to completion
+        // before any assertion on the env var elsewhere could interleave.
+        unsafe {
+            std::env::remove_var("KRANZ_TOKEN");
+        }
+        let err = cmd_release("m-1", "http://127.0.0.1:4560", None).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("--token"), "{msg}");
+        assert!(msg.contains("KRANZ_TOKEN"), "{msg}");
+    }
 
     fn dashboard_at(path: PathBuf) -> PathBuf {
         fs::create_dir_all(&path).unwrap();

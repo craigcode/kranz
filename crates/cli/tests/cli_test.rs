@@ -217,6 +217,40 @@ fn parses_serve() {
     }
 }
 
+#[test]
+fn parses_release() {
+    let cli = Cli::try_parse_from(["kranz", "release"]).unwrap();
+    match cli.command {
+        Command::Release { ref url, ref token } => {
+            assert_eq!(url, "http://127.0.0.1:4560");
+            assert!(token.is_none());
+        }
+        other => panic!("expected Release, got {other:?}"),
+    }
+
+    // The global --mission is unaffected by (and available to) release.
+    let cli = Cli::try_parse_from(["kranz", "--mission", "m-7", "release"]).unwrap();
+    assert_eq!(cli.mission.as_deref(), Some("m-7"));
+    assert!(matches!(cli.command, Command::Release { .. }));
+
+    let cli = Cli::try_parse_from([
+        "kranz",
+        "release",
+        "--url",
+        "http://127.0.0.1:5001",
+        "--token",
+        "sesame",
+    ])
+    .unwrap();
+    match cli.command {
+        Command::Release { url, token } => {
+            assert_eq!(url, "http://127.0.0.1:5001");
+            assert_eq!(token.as_deref(), Some("sesame"));
+        }
+        other => panic!("expected Release, got {other:?}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // msg --help documents the queue/interrupt semantics (plan §4.5)
 // ---------------------------------------------------------------------------

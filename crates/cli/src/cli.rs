@@ -243,6 +243,22 @@ pub enum Command {
         slack: bool,
     },
 
+    /// Free the mission's single-writer lock held by a running `kranz serve`.
+    ///
+    /// POSTs to a running serve's `/api/missions/:id/release` endpoint (the
+    /// CLI runs in a different process and cannot reach serve's in-memory
+    /// registry directly). The mission id comes from the global --mission /
+    /// auto-selection, same as `kranz abandon`.
+    Release {
+        /// Base URL of the running `kranz serve` instance
+        #[arg(long, default_value = "http://127.0.0.1:4560")]
+        url: String,
+
+        /// Mutation token printed by `kranz serve` (falls back to $KRANZ_TOKEN)
+        #[arg(long, value_name = "TOKEN")]
+        token: Option<String>,
+    },
+
     /// Inspect and edit kranz configuration (files + mid-mission changes).
     ///
     /// Config resolves from three layers, later winning: compiled-in defaults
