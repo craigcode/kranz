@@ -723,7 +723,16 @@ fn missions_lists_ids_status_and_goal() {
     assert!(listing.contains("PLANNING"), "in: {listing}");
     assert!(listing.contains("goal a"), "in: {listing}");
     assert!(listing.contains("m-b"), "in: {listing}");
-    assert!(listing.contains("RUNNING"), "in: {listing}");
+    assert!(listing.contains("APPROVED"), "in: {listing}");
+
+    let m_b_line = listing
+        .lines()
+        .find(|line| line.contains("m-b"))
+        .unwrap_or_else(|| panic!("no m-b line in: {listing}"));
+    assert!(
+        !m_b_line.contains("RUNNING"),
+        "m-b line should not be RUNNING: {m_b_line}"
+    );
 }
 
 // ---------------------------------------------------------------------------
