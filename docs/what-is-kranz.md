@@ -168,4 +168,5 @@ of them hold mission state; kill any of them and the missions don't notice.
 - `docs/protocol.md` — the REST/SSE surface
 - `docs/backlog-and-slack.md` — tickets, the queue, and the Slack bridge
 - `docs/gascity.md` — running kranz missions from Gas City beads
+- `docs/gascity-citizenship.md` — the Gas City citizenship plan of record
 - `docs/otel.md` — exporting missions as OpenTelemetry traces

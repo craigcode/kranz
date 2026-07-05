@@ -3,7 +3,8 @@
 Status: spike complete; **parked as documented optionality**, not wired into
 daily flow. The pack lives in [packaging/gascity/](../packaging/gascity/).
 Target: Gas City only (`gc` 1.3.2) — the gastown-era surface (agents.json,
-`gt prime`, tmux detection) is deliberately not used.
+`gt prime`, tmux detection) is deliberately not used. Plan of record:
+[gascity-citizenship.md](gascity-citizenship.md).
 
 ## What was proven live
 
