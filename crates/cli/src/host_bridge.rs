@@ -48,8 +48,8 @@ impl PlanningHost for HostedPlanning {
         })
     }
 
-    fn approve<'a>(&'a self, id: &'a str, plan: Plan) -> BoxFuture<'a, anyhow::Result<String>> {
-        Box::pin(async move { self.0.approve(id, plan).await.map_err(plain) })
+    fn approve_pending<'a>(&'a self, id: &'a str) -> BoxFuture<'a, anyhow::Result<Option<String>>> {
+        Box::pin(async move { self.0.try_approve_pending(id).await.map_err(plain) })
     }
 
     fn start<'a>(&'a self, id: &'a str) -> BoxFuture<'a, anyhow::Result<()>> {

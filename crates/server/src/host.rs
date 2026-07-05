@@ -515,11 +515,12 @@ impl MissionHost {
         }
     }
 
-    /// Approve the PARKED plan (from the last Ready `request_plan`) — the
-    /// one-cache approve every surface shares. Consumes the pending plan on
-    /// success; a failed approve puts it back so a retry can fire. 409 when
-    /// nothing is pending.
-    pub async fn approve_pending(&self, id: &str) -> Result<String, ApiError> {
+    /// Approve the PARKED plan if one exists: `Ok(Some(branch))` committed,
+    /// `Ok(None)` nothing pending — for callers with their own no-plan
+    /// fallback (the Slack bridge's state-aware routing). Consumes the
+    /// pending plan on success; a failed approve puts it back so a retry can
+    /// fire.
+    pub async fn try_approve_pending(&self, id: &str) -> Result<Option<String>, ApiError> {
         let Some(plan) = ({
             let map = self.missions.lock().expect("missions registry lock");
             match map.get(id) {
@@ -529,18 +530,26 @@ impl MissionHost {
                 _ => None,
             }
         }) else {
-            return Err(ApiError::conflict(format!(
-                "mission '{id}' has no reviewed plan pending — request the plan first \
-                 (POST /api/missions/{id}/planning/request-plan, /kranz plan, or the UI)"
-            )));
+            return Ok(None);
         };
         match self.approve(id, plan.clone()).await {
-            Ok(branch) => Ok(branch),
+            Ok(branch) => Ok(Some(branch)),
             Err(e) => {
                 self.set_pending_plan(id, Some(plan));
                 Err(e)
             }
         }
+    }
+
+    /// [`Self::try_approve_pending`] with nothing-pending as a 409 — the
+    /// REST shape (`POST /api/missions/:id/approve-pending`).
+    pub async fn approve_pending(&self, id: &str) -> Result<String, ApiError> {
+        self.try_approve_pending(id).await?.ok_or_else(|| {
+            ApiError::conflict(format!(
+                "mission '{id}' has no reviewed plan pending — request the plan first \
+                 (POST /api/missions/{id}/planning/request-plan, /kranz plan, or the UI)"
+            ))
+        })
     }
 
     // -----------------------------------------------------------------------

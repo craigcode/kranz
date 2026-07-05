@@ -30,7 +30,7 @@ use futures_util::{SinkExt, StreamExt};
 use kranz_engine::event_log::EventLog;
 use kranz_engine::paths::MissionPaths;
 use kranz_engine::reducer;
-use kranz_engine::types::{ControlCommand, MissionState, MissionStatus, Plan};
+use kranz_engine::types::{ControlCommand, MissionState, MissionStatus};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -91,27 +91,6 @@ impl ThreadLookup for SharedThreads {
             .unwrap()
             .mission_for_thread(thread_ts)
             .map(str::to_string)
-    }
-}
-
-/// Plans returned by `/kranz plan`, held for the approve buttons — a Block Kit
-/// button `value` can't carry a whole plan, so the bridge keeps the reviewed
-/// plan in memory keyed by mission id and the button click consumes it.
-///
-/// Deliberately NOT persisted: a serve restart between review and approve
-/// forfeits the pending plan, and the approve reply says to run `/kranz plan`
-/// again — honest and cheap to recover, unlike silently approving a plan that
-/// was never re-reviewed against a possibly-changed conversation.
-#[derive(Clone, Default)]
-pub struct PendingPlans(Arc<Mutex<HashMap<String, Plan>>>);
-
-impl PendingPlans {
-    fn put(&self, mission_id: &str, plan: Plan) {
-        self.0.lock().unwrap().insert(mission_id.to_string(), plan);
-    }
-
-    fn take(&self, mission_id: &str) -> Option<Plan> {
-        self.0.lock().unwrap().remove(mission_id)
     }
 }
 
@@ -279,9 +258,6 @@ pub async fn run_socket(
     host: Option<SharedHost>,
     shutdown: impl std::future::Future<Output = ()>,
 ) {
-    // Reviewed-plan cache for the approve buttons, shared across reconnects
-    // (a websocket rotation must not forfeit a plan awaiting approval).
-    let pending = PendingPlans::default();
     // A Notify fired once when shutdown resolves; the per-connection loop selects
     // on it so a mid-connection shutdown is prompt.
     let stop = Arc::new(Notify::new());
@@ -296,7 +272,7 @@ pub async fn run_socket(
                 tracing::info!("slack inbound loop shutting down");
                 return;
             }
-            result = connect_once(&cfg, &client, &repo_root, &threads, &host, &pending, &stop) => {
+            result = connect_once(&cfg, &client, &repo_root, &threads, &host, &stop) => {
                 match result {
                     // Clean close requested by shutdown: exit.
                     Ok(true) => return,
@@ -344,7 +320,6 @@ async fn connect_once(
     repo_root: &Path,
     threads: &SharedThreads,
     host: &Option<SharedHost>,
-    pending: &PendingPlans,
     stop: &Arc<Notify>,
 ) -> Result<bool> {
     let url = client
@@ -393,24 +368,23 @@ async fn connect_once(
                         // on a spawned task so the read loop keeps answering
                         // pings; fast local actions run inline.
                         if is_slow_action(&routed.action) {
-                            let (cfg, client, repo, threads, host, pending) = (
+                            let (cfg, client, repo, threads, host) = (
                                 cfg.clone(),
                                 client.clone(),
                                 repo_root.to_path_buf(),
                                 threads.clone(),
                                 host.clone(),
-                                pending.clone(),
                             );
                             tokio::spawn(async move {
                                 dispatch_action(
-                                    &cfg, &client, &repo, &threads, host.as_ref(), &pending,
+                                    &cfg, &client, &repo, &threads, host.as_ref(),
                                     &routed.action,
                                 )
                                 .await;
                             });
                         } else {
                             dispatch_action(
-                                cfg, client, repo_root, threads, host.as_ref(), pending,
+                                cfg, client, repo_root, threads, host.as_ref(),
                                 &routed.action,
                             )
                             .await;
@@ -519,16 +493,7 @@ async fn handle_envelope(
         }
     };
     let routed = route(&envelope, threads);
-    dispatch_action(
-        cfg,
-        client,
-        repo_root,
-        threads,
-        None,
-        &PendingPlans::default(),
-        &routed.action,
-    )
-    .await;
+    dispatch_action(cfg, client, repo_root, threads, None, &routed.action).await;
     // Ack whatever carried an envelope_id, even Ignore, so Slack stops retrying.
     routed
         .envelope_id
@@ -611,7 +576,7 @@ fn not_authorized_blocks() -> Vec<Value> {
 /// - **RequestPlan** (`/kranz plan <id>`) — allowlist-gated; immediate
 ///   ephemeral ack, then `host.request_plan`. Ready → a plan-review block
 ///   (goal, milestones, estimate, approve buttons) posted to the mission
-///   thread, the plan parked in [`PendingPlans`] for the buttons. NotReady →
+///   thread; the HOST parked the reviewed plan (one cache, every surface). NotReady →
 ///   the orchestrator's prose posted threaded.
 /// - **Approve / ApproveStart / ApproveMission** — allowlist-gated
 ///   [`approve_flow`]: commit the pending plan through the host, then queue
@@ -656,7 +621,6 @@ async fn dispatch_action(
     repo_root: &Path,
     threads: &SharedThreads,
     host: Option<&SharedHost>,
-    pending: &PendingPlans,
     action: &Action,
 ) {
     match action {
@@ -864,9 +828,9 @@ async fn dispatch_action(
                         assertion_count: plan.validation_contract.len(),
                         estimate,
                     });
-                    // Cache BEFORE posting: once the buttons are visible they
-                    // must find the plan.
-                    pending.put(mission_id, plan);
+                    // No caching here: the host parked the reviewed plan
+                    // when request_plan returned Ready, so the buttons (and
+                    // any other surface's approve) consume it host-side.
                     if let Err(e) =
                         post_to_mission_thread(cfg, client, threads, mission_id, review).await
                     {
@@ -915,7 +879,6 @@ async fn dispatch_action(
                 repo_root,
                 threads,
                 host,
-                pending,
                 mission_id,
                 user_id.as_deref(),
                 response_url.as_deref(),
@@ -1069,7 +1032,6 @@ async fn dispatch_action(
                 repo_root,
                 threads,
                 host,
-                pending,
                 mission_id,
                 user_id.as_deref(),
                 response_url.as_deref(),
@@ -1089,7 +1051,6 @@ async fn dispatch_action(
                 repo_root,
                 threads,
                 host,
-                pending,
                 mission_id,
                 user_id.as_deref(),
                 response_url.as_deref(),
@@ -1196,13 +1157,16 @@ async fn dispatch_action(
 
 /// Shared approve path for the slash command and both buttons.
 ///
-/// With a reviewed plan pending (from `/kranz plan`): commit it through the
-/// hosted engine — THE step the first cut of this bridge skipped, which left
-/// missions queued-but-unapproved that `kranz work` then refused — and either
-/// start execution through the host (`start == true`) or insert into the
-/// per-repo queue. Without a pending plan: honest, state-aware handling (a
-/// planning mission needs `/kranz plan` first; an approved-but-idle one can
-/// still be queued/started).
+/// The reviewed plan is parked HOST-SIDE by a Ready `request_plan` — one
+/// cache shared by every surface (Slack buttons, web, glasses ring), so an
+/// approve from any of them consumes the same plan. With a parked plan:
+/// commit it through the hosted engine — THE step the first cut of this
+/// bridge skipped, which left missions queued-but-unapproved that
+/// `kranz work` then refused — and either start execution through the host
+/// (`start == true`) or insert into the per-repo queue. Without one
+/// (never requested, or forfeited by a serve restart / idle release):
+/// honest, state-aware handling (a planning mission needs `/kranz plan`
+/// first; an approved-but-idle one can still be queued/started).
 #[allow(clippy::too_many_arguments)]
 async fn approve_flow(
     cfg: &SlackConfig,
@@ -1210,7 +1174,6 @@ async fn approve_flow(
     repo_root: &Path,
     threads: &SharedThreads,
     host: Option<&SharedHost>,
-    pending: &PendingPlans,
     mission_id: &str,
     user_id: Option<&str>,
     response_url: Option<&str>,
@@ -1222,18 +1185,15 @@ async fn approve_flow(
         return;
     }
 
-    if let Some(plan) = pending.take(mission_id) {
-        let Some(host) = host else {
-            pending.put(mission_id, plan);
-            reply_ephemeral(cfg, client, response_url, &no_host_blocks(mission_id)).await;
-            return;
-        };
-        let branch = match host.approve(mission_id, plan.clone()).await {
-            Ok(branch) => branch,
+    // `approve_pending` consumes the host-parked plan. `None` = no host, or
+    // nothing parked — fall through to the state-aware routing below. On a
+    // transient failure (e.g. a turn in flight) the host re-parked the plan,
+    // so the retry click finds it again.
+    let approved = match host {
+        None => None,
+        Some(host) => match host.approve_pending(mission_id).await {
+            Ok(branch) => branch.map(|branch| (branch, host)),
             Err(e) => {
-                // A transient failure (e.g. a turn in flight) must not forfeit
-                // the reviewed plan — put it back for the retry click.
-                pending.put(mission_id, plan);
                 reply_ephemeral(
                     cfg,
                     client,
@@ -1243,7 +1203,9 @@ async fn approve_flow(
                 .await;
                 return;
             }
-        };
+        },
+    };
+    if let Some((branch, host)) = approved {
         // Retire the plan card FIRST: from a button, rewrite the source
         // message into an outcome card so the second tap the old card invited
         // has nothing left to tap. Best-effort — the state change stands
@@ -1326,7 +1288,7 @@ async fn approve_flow(
         return;
     }
 
-    // No pending plan. Route by actual mission state instead of blindly
+    // No parked plan (or no host). Route by actual mission state instead of blindly
     // queueing (the old behavior, which dead-ended at run time on unapproved
     // missions).
     match mission_status(repo_root, mission_id) {
@@ -2251,33 +2213,6 @@ mod tests {
             "no branch line when branch is unknown"
         );
         assert!(!text.contains("\"button\""));
-    }
-
-    #[test]
-    fn pending_plans_take_consumes_and_put_restores() {
-        use kranz_engine::types::{Plan, PlanFeature, PlanMilestone};
-        let plan = Plan {
-            goal: "g".into(),
-            validation_contract: vec![],
-            milestones: vec![PlanMilestone {
-                title: "M1".into(),
-                features: vec![PlanFeature {
-                    title: "F1".into(),
-                    spec: "s".into(),
-                    validation_criteria: vec!["c".into()],
-                }],
-            }],
-        };
-        let pending = PendingPlans::default();
-        assert!(pending.take("m-1").is_none(), "empty cache has nothing");
-        pending.put("m-1", plan.clone());
-        let taken = pending.take("m-1").expect("cached plan comes back");
-        assert_eq!(taken.goal, "g");
-        // take() consumed it — a second click must not find a stale plan…
-        assert!(pending.take("m-1").is_none());
-        // …but a failed approve puts it back for the retry.
-        pending.put("m-1", taken);
-        assert!(pending.take("m-1").is_some());
     }
 
     #[test]

@@ -54,9 +54,14 @@ pub trait PlanningHost: Send + Sync + 'static {
     /// Demand the plan (one orchestrator turn).
     fn request_plan<'a>(&'a self, id: &'a str) -> BoxFuture<'a, anyhow::Result<PlanOutcome>>;
 
-    /// Commit an approved plan (plan.json/plan.md/index.md on the mission
-    /// branch); returns the mission branch name.
-    fn approve<'a>(&'a self, id: &'a str, plan: Plan) -> BoxFuture<'a, anyhow::Result<String>>;
+    /// Approve the plan PARKED by the last Ready [`Self::request_plan`] —
+    /// the ONE pending-plan cache every surface (Slack, web, glasses ring)
+    /// shares, held by the host, never the bridge. `Ok(Some(branch))` =
+    /// committed (plan.json/plan.md/index.md on the mission branch);
+    /// `Ok(None)` = nothing parked (never requested, or forfeited by a serve
+    /// restart / idle release — re-run `/kranz plan`). A failed approve
+    /// re-parks the plan so a retry can fire.
+    fn approve_pending<'a>(&'a self, id: &'a str) -> BoxFuture<'a, anyhow::Result<Option<String>>>;
 
     /// Start execution: the host consumes the engine into a background run.
     fn start<'a>(&'a self, id: &'a str) -> BoxFuture<'a, anyhow::Result<()>>;

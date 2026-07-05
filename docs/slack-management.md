@@ -90,10 +90,12 @@ Slack; forensics one tap away in the browser.
   - **`/kranz plan <id>` works**: immediate ephemeral ack, then the plan-review
     block (goal, milestones, calibrated estimate, **Approve & start** /
     **Approve & queue**) posts to the mission thread; NotReady posts the
-    orchestrator's prose. The reviewed plan parks in an in-memory
-    `PendingPlans` cache for the buttons (a serve restart forfeits it —
-    re-run `/kranz plan`).
-  - **Approve commits the plan** (`MissionHost::approve` →
+    orchestrator's prose. The reviewed plan parks HOST-SIDE in the
+    `MissionHost` registry's `pending_plan` slot — ONE cache shared by every
+    surface (Slack buttons, web, glasses ring), so any surface's approve
+    consumes the same plan. In-memory: a serve restart or idle release
+    forfeits it — re-run `/kranz plan`.
+  - **Approve commits the plan** (`MissionHost::try_approve_pending` →
     `engine.approve_plan`, same plan.json/plan.md/index.md commit as the CLI)
     before queueing or starting. The first cut only inserted a queue entry, so
     `kranz work` later refused the un-approved mission — a silent dead end.
