@@ -165,17 +165,17 @@ async fn ready_plan_parks_in_review_with_mission_recorded() {
     let mut engine = MissionEngine::create(backend, root.clone(), &goal, test_cfg()).unwrap();
     let mission_id = engine.mission_id().to_string();
 
-    let outcome = drive_draft(&mut engine, &root, &ticket, false)
+    let drive = drive_draft(&mut engine, &root, &ticket, false)
         .await
         .unwrap();
 
-    match outcome {
+    match &drive.outcome {
         DraftOutcome::ParkedForReview {
             mission_id: out_id,
             mission_branch,
         } => {
-            assert_eq!(out_id, mission_id);
-            assert_eq!(mission_branch, format!("kranz/mission-{mission_id}"));
+            assert_eq!(out_id, &mission_id);
+            assert_eq!(mission_branch, &format!("kranz/mission-{mission_id}"));
         }
         other => panic!("expected ParkedForReview, got {other:?}"),
     }
@@ -185,6 +185,12 @@ async fn ready_plan_parks_in_review_with_mission_recorded() {
         Some(mission_id.as_str())
     );
     assert!(!queue::contains(&root, &mission_id));
+
+    // The seed reply and approved plan must be surfaced, not dropped, so the
+    // CLI (and any surface) can reproduce the pre-hoist stdout.
+    assert_eq!(drive.seed_reply.as_deref(), Some("ready"));
+    let plan = drive.plan.expect("Approve path must surface the plan");
+    assert_eq!(plan.goal, goal);
 }
 
 // ---------------------------------------------------------------------------
@@ -208,16 +214,17 @@ async fn ready_plan_with_then_enqueue_queues_the_mission() {
     let mut engine = MissionEngine::create(backend, root.clone(), &goal, test_cfg()).unwrap();
     let mission_id = engine.mission_id().to_string();
 
-    let outcome = drive_draft(&mut engine, &root, &ticket, true)
+    let drive = drive_draft(&mut engine, &root, &ticket, true)
         .await
         .unwrap();
 
-    match outcome {
-        DraftOutcome::Enqueued { mission_id: out_id } => assert_eq!(out_id, mission_id),
+    match &drive.outcome {
+        DraftOutcome::Enqueued { mission_id: out_id } => assert_eq!(out_id, &mission_id),
         other => panic!("expected Enqueued, got {other:?}"),
     }
     assert_eq!(Ticket::read_state(&root, "rl2"), TicketState::Queued);
     assert!(queue::contains(&root, &mission_id));
+    assert!(drive.plan.is_some());
 }
 
 // ---------------------------------------------------------------------------
@@ -244,19 +251,19 @@ async fn not_ready_reply_appends_needs_context_and_flips_state() {
     let mut engine = MissionEngine::create(backend, root.clone(), &goal, test_cfg()).unwrap();
     let mission_id = engine.mission_id().to_string();
 
-    let outcome = drive_draft(&mut engine, &root, &ticket, false)
+    let drive = drive_draft(&mut engine, &root, &ticket, false)
         .await
         .unwrap();
 
-    match outcome {
+    match &drive.outcome {
         DraftOutcome::NeedsContext {
             mission_id: out_id,
             questions,
         } => {
-            assert_eq!(out_id, mission_id);
+            assert_eq!(out_id, &mission_id);
             assert_eq!(
                 questions,
-                vec![
+                &vec![
                     "which auth backend?".to_string(),
                     "is postgres available?".to_string(),
                 ]
@@ -265,6 +272,10 @@ async fn not_ready_reply_appends_needs_context_and_flips_state() {
         other => panic!("expected NeedsContext, got {other:?}"),
     }
     assert_eq!(Ticket::read_state(&root, "rl3"), TicketState::NeedsContext);
+    assert!(
+        drive.plan.is_none(),
+        "NeedsContext path must not surface a plan"
+    );
 
     let path = Ticket::tickets_dir(&root).join("rl3.md");
     let body = std::fs::read_to_string(&path).unwrap();

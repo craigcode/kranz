@@ -383,10 +383,16 @@ pub async fn cmd_draft(
         engine.mission_id()
     );
 
-    let outcome = drive_draft(&mut engine, &repo, &ticket, yes)
+    let drive = drive_draft(&mut engine, &repo, &ticket, yes)
         .await
         .map_err(|e| crate::commands::augment_limit_hint(e.into()))
         .with_context(|| format!("drafting ticket '{slug}'"))?;
+
+    // Surface any captured seed reply (session start) for visibility, same as
+    // pre-hoist `cmd_draft`.
+    if let Some(seed) = &drive.seed_reply {
+        println!("orchestrator: {}", output::one_line(seed, 200));
+    }
 
     let mission_branch = engine.state().mission.mission_branch.clone();
     // Drop the engine (flush + release the mission lock) before touching the
@@ -394,7 +400,11 @@ pub async fn cmd_draft(
     drop(engine);
     restore_draft_checkout(&repo, original_branch.as_deref(), &mission_branch);
 
-    match outcome {
+    if let Some(plan) = &drive.plan {
+        println!("{}", output::render_plan(plan));
+    }
+
+    match drive.outcome {
         DraftOutcome::NeedsContext {
             mission_id: _,
             questions,

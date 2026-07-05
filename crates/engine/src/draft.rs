@@ -13,6 +13,7 @@ use crate::error::Result;
 use crate::orchestrator::{MissionEngine, PlanRequest};
 use crate::queue::{self, QueueEntry};
 use crate::ticket::{Ticket, TicketState};
+use crate::types::Plan;
 use std::path::Path;
 
 // ---------------------------------------------------------------------------
@@ -118,6 +119,21 @@ pub enum DraftOutcome {
     },
 }
 
+/// [`drive_draft`]'s return: the terminal [`DraftOutcome`] plus the display
+/// payload a caller needs to reproduce the pre-hoist CLI output exactly —
+/// the seed reply (from the session-start turn) and, on the Approve path,
+/// the approved [`Plan`]. The core itself never prints either; it only
+/// avoids dropping them.
+#[derive(Debug, Clone)]
+pub struct DraftDrive {
+    pub outcome: DraftOutcome,
+    /// The orchestrator's session-start reply, captured before `request_plan`.
+    pub seed_reply: Option<String>,
+    /// The approved plan, cloned before it was moved into `approve_plan`.
+    /// `None` on the `NeedsContext` path.
+    pub plan: Option<Plan>,
+}
+
 /// Drive `ticket` through one non-interactive draft turn against an
 /// already-constructed `engine` (holding its backend): seed the orchestrator
 /// with the whole ticket, demand the plan, and resolve via [`draft_decision`].
@@ -131,7 +147,7 @@ pub async fn drive_draft(
     repo: &Path,
     ticket: &Ticket,
     then_enqueue: bool,
-) -> Result<DraftOutcome> {
+) -> Result<DraftDrive> {
     let slug = ticket.slug.as_str();
     Ticket::write_state(repo, slug, TicketState::Drafting, None)?;
 
@@ -143,9 +159,9 @@ pub async fn drive_draft(
         Ticket::write_state(repo, slug, TicketState::New, None)?;
         return Err(e);
     }
-    // Drain the seed reply (session-start turn); the caller may still want
-    // it for display, but the core itself never prints.
-    let _ = engine.take_seed_reply();
+    // Capture the seed reply (session-start turn) so the caller can display
+    // it exactly as pre-hoist `cmd_draft` did; the core itself never prints.
+    let seed_reply = engine.take_seed_reply();
 
     let request = match engine.request_plan().await {
         Ok(r) => r,
@@ -158,9 +174,13 @@ pub async fn drive_draft(
     match draft_decision(&request, then_enqueue) {
         DraftDecision::NeedsContext { questions } => {
             Ticket::append_needs_context(repo, slug, &questions)?;
-            Ok(DraftOutcome::NeedsContext {
-                mission_id,
-                questions,
+            Ok(DraftDrive {
+                outcome: DraftOutcome::NeedsContext {
+                    mission_id,
+                    questions,
+                },
+                seed_reply,
+                plan: None,
             })
         }
         DraftDecision::Approve {
@@ -170,6 +190,7 @@ pub async fn drive_draft(
             let PlanRequest::Ready(plan) = request else {
                 unreachable!("Approve decision implies a Ready plan");
             };
+            let approved_plan = plan.clone();
             engine.approve_plan(plan)?;
             let mission_branch = engine.state().mission.mission_branch.clone();
 
@@ -184,12 +205,20 @@ pub async fn drive_draft(
                     },
                 )?;
                 Ticket::write_state(repo, slug, next_state, None)?;
-                Ok(DraftOutcome::Enqueued { mission_id })
+                Ok(DraftDrive {
+                    outcome: DraftOutcome::Enqueued { mission_id },
+                    seed_reply,
+                    plan: Some(approved_plan),
+                })
             } else {
                 Ticket::write_state(repo, slug, next_state, None)?;
-                Ok(DraftOutcome::ParkedForReview {
-                    mission_id,
-                    mission_branch,
+                Ok(DraftDrive {
+                    outcome: DraftOutcome::ParkedForReview {
+                        mission_id,
+                        mission_branch,
+                    },
+                    seed_reply,
+                    plan: Some(approved_plan),
                 })
             }
         }
