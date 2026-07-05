@@ -37,6 +37,11 @@ tracing-subscriber.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 reqwest.workspace = true
+sha2.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+axum.workspace = true

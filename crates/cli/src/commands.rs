@@ -149,6 +149,9 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
         Command::Config { command } => {
             crate::config_cmd::cmd_config(&repo, command, cli.mission.as_deref())
         }
+        Command::Otel { endpoint, from_start } => {
+            crate::otel::run_otel(repo, cli.mission.clone(), endpoint, from_start).await
+        }
     }
 }
 

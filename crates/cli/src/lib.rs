@@ -11,6 +11,7 @@
 //! - [`config_cmd`] — `kranz config show|set|unset|role` (layered files +
 //!   mid-mission role changes)
 //! - [`exec`] — `kranz exec -f mission.md`, fully headless missions for CI
+//! - [`otel`] — event-log-to-span mapping for the `kranz otel` sidecar
 //! - [`output`] — pure rendering (status tree, plan review, cost estimate)
 //! - [`tail`] — the live event printer used by `kranz run`
 //! - [`planning_tui`] — the full-screen interactive planning UI
@@ -25,6 +26,7 @@ pub mod commands;
 pub mod config_cmd;
 pub mod exec;
 pub mod host_bridge;
+pub mod otel;
 pub mod output;
 pub mod planning_tui;
 pub mod tail;
