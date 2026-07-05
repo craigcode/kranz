@@ -33,6 +33,17 @@ not register a city.
 
 ### Component inventory (pack v2)
 
+- **`packaging/gascity/pack.toml`** — the pack manifest (name "kranz", schema
+  2); the file `gc lint` validates and the unit a future `gc pack` remote
+  source would fetch.
+
+- **`packaging/gascity/orders/kranz-dispatch.toml`** — the order config that
+  wires `bin/kranz-dispatch` into the city (see below). `trigger =
+  "cooldown"` with `interval = "5m"` runs `exec = "kranz-dispatch"` on that
+  cadence; it sets no env itself, deferring routing knobs
+  (`KRANZ_RIG_DIR`/`KRANZ_SPOOL`/`KRANZ_ALLOW_UNVALIDATED`) to the city's own
+  environment.
+
 - **`packaging/gascity/bin/kranz-dispatch`** — the fast-path dispatch order,
   run under `gc order run` on a cooldown. Since `gc order exec` enforces a
   context deadline (docs/gascity.md lesson 1), this script does no mission
@@ -398,8 +409,10 @@ is exactly that minimal config today: a `long_running` agent with no
 `prompt_template` and no LLM cast, because `kranz exec` already carries its
 own orchestrator/worker/validator prompting internally — there is no CLI
 coding agent on the City side for `gc prime` to prime. So `gc prime
-kranz-worker` today would fall back to (or, under `--strict`, refuse to
-run without) a default worker prompt that nothing consumes. Whether kranz
+kranz-worker` today would emit only a default/empty worker prompt that
+nothing consumes; `--strict` tolerates the intentionally-absent
+`prompt_template` and errors only on unknown agent names or unreadable
+templates. Whether kranz
 should ever grow a City-visible, primeable LLM session — for interactive
 triage of a blocked mission, say — is exactly the question flagged as D1 in
 the `gc agent` subsection above, and constraint 5 (no named sessions, kept
