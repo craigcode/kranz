@@ -45,8 +45,8 @@ not register a city.
   environment.
 
 - **`packaging/gascity/bin/kranz-dispatch`** — the fast-path dispatch order,
-  run under `gc order run` on a cooldown. Since `gc order exec` enforces a
-  context deadline (docs/gascity.md lesson 1), this script does no mission
+  run under `gc order run` on a cooldown. Since `gc order run` enforces an
+  exec context deadline (docs/gascity.md lesson 1), this script does no mission
   work itself: it drains READY beads carrying the `kranz` label
   (`gc bd ready --label kranz --json`), and for each one:
   1. Resolves a target rig checkout — `KRANZ_RIG_DIR` wins when set
@@ -140,7 +140,7 @@ work stays on kranz's own rails.
 Each of docs/gascity.md's six numbered lessons, distilled into a standing
 constraint this plan must respect:
 
-1. **Orders dispatch and return.** `gc order exec` enforces a context
+1. **Orders dispatch and return.** `gc order run` enforces an exec context
    deadline; it killed a mid-mission dispatcher live. No City order may host
    a multi-minute mission. Dispatch-side code claims work and hands it to a
    supervised long-running process (or enqueues into kranz's own queue) —
@@ -411,8 +411,8 @@ own orchestrator/worker/validator prompting internally — there is no CLI
 coding agent on the City side for `gc prime` to prime. So `gc prime
 kranz-worker` today would emit only a default/empty worker prompt that
 nothing consumes; `--strict` tolerates the intentionally-absent
-`prompt_template` and errors only on unknown agent names or unreadable
-templates. Whether kranz
+`prompt_template` and errors on a missing or unloadable city config, a
+missing or unknown agent name, or an unreadable `prompt_template`. Whether kranz
 should ever grow a City-visible, primeable LLM session — for interactive
 triage of a blocked mission, say — is exactly the question flagged as D1 in
 the `gc agent` subsection above, and constraint 5 (no named sessions, kept
