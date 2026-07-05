@@ -1112,11 +1112,6 @@ async fn cmd_serve(
     let url = format!("http://{display_host}:{port}/");
     let token = token.unwrap_or_else(kranz_server::generate_token);
 
-    // Filesystem read access to .kranz/serve.token confers mutation
-    // authority — the same trust boundary as the .kranz/ directory itself,
-    // so this file must never be written world- or group-readable.
-    let token_file = write_serve_token(&repo, &token).ok();
-
     println!("kranz server on {url}");
     println!("mutation token: {token}");
     match &dashboard_assets {
@@ -1150,14 +1145,45 @@ async fn cmd_serve(
         });
     }
 
-    let result = kranz_server::serve_with_shared_host(host, bind, port, static_assets, Some(token)).await;
-    if token_file.is_some() {
-        remove_serve_token(&repo);
-    }
+    let shutdown = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::error!(error = %e, "failed to install ctrl-c handler");
+        }
+    };
+    let result = serve_with_token_cleanup(&repo, host, bind, port, static_assets, token, shutdown).await;
     match result {
         Ok(()) => Ok(0),
         Err(e) => Err(anyhow!("server failed: {e}")),
     }
+}
+
+/// Owns the write→serve→remove sequence for `.kranz/serve.token` so the
+/// removal-on-shutdown behaviour is exercised by tests instead of just
+/// asserted by a helper the tests bypass. Removes the token file on both the
+/// `Ok` and `Err` serve paths — a server that fails to bind must not leave a
+/// stale mutation token behind.
+async fn serve_with_token_cleanup(
+    repo: &Path,
+    host: Arc<kranz_server::MissionHost>,
+    bind: std::net::IpAddr,
+    port: u16,
+    static_assets: Option<kranz_server::DashboardStatic>,
+    token: String,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
+    // Filesystem read access to .kranz/serve.token confers mutation
+    // authority — the same trust boundary as the .kranz/ directory itself,
+    // so this file must never be written world- or group-readable.
+    let token_file = write_serve_token(repo, &token).ok();
+
+    let result =
+        kranz_server::serve_with_shutdown(host, bind, port, static_assets, Some(token), shutdown).await;
+
+    if token_file.is_some() {
+        remove_serve_token(repo);
+    }
+
+    result
 }
 
 /// Write the per-serve mutation token to `<repo>/.kranz/serve.token` so
@@ -1573,22 +1599,20 @@ mod tests {
     async fn serve_token_file_is_removed_after_graceful_shutdown() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().to_path_buf();
-        write_serve_token(&repo, "tok").unwrap();
         let path = repo.join(".kranz").join("serve.token");
-        assert!(path.exists());
 
         let host = std::sync::Arc::new(kranz_server::MissionHost::new(repo.clone()));
-        kranz_server::serve_with_shutdown(
+        serve_with_token_cleanup(
+            &repo,
             host,
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             0,
             None,
-            None,
+            "tok".to_string(),
             std::future::ready(()),
         )
         .await
         .unwrap();
-        remove_serve_token(&repo);
 
         assert!(!path.exists());
     }
