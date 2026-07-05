@@ -2544,6 +2544,7 @@ impl MissionEngine {
             permission_mode: None,
             allowed_tools: Vec::new(),
             disallowed_tools: Vec::new(),
+            tools: cfg.role(Role::Orchestrator).tools.clone(),
             settings_json: None,
             json_schema: None,
             max_budget_usd: role_cfg.max_budget_usd,

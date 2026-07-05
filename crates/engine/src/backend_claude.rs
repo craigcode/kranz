@@ -321,6 +321,10 @@ pub fn build_args(spec: &SessionSpec) -> Vec<String> {
         args.push("--disallowedTools".into());
         args.extend(spec.disallowed_tools.iter().cloned());
     }
+    if !spec.tools.is_empty() {
+        args.push("--tools".into());
+        args.extend(spec.tools.iter().cloned());
+    }
     if let Some(settings) = &spec.settings_json {
         args.push("--settings".into());
         args.push(settings.to_string()); // compact JSON

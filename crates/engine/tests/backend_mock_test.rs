@@ -7,6 +7,11 @@ use kranz_engine::backend_mock::{
     mock_denied, mock_init, mock_result_text, mock_text, mock_tool_use, MockBackend, MockScript,
 };
 use kranz_engine::error::EngineError;
+use kranz_engine::event_log::{EventLog, LockForce};
+use kranz_engine::paths::MissionPaths;
+use kranz_engine::runner::run_worker;
+use kranz_engine::types::{Feature, FeatureOrigin, FeatureStatus, MissionConfig};
+use serde_json::json;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -26,6 +31,7 @@ fn spec(session_id: &str, prompt: PromptMode) -> SessionSpec {
         permission_mode: Some("acceptEdits".to_string()),
         allowed_tools: vec!["Bash(cargo test*)".to_string()],
         disallowed_tools: vec!["Bash(git push*)".to_string()],
+        tools: vec![],
         settings_json: None,
         json_schema: None,
         max_budget_usd: Some(1.0),
@@ -318,4 +324,51 @@ async fn injected_messages_align_with_start_order() {
         }
     }
     assert_eq!(texts, vec!["one", "r1", "r2"]);
+}
+
+fn worker_report_json() -> serde_json::Value {
+    json!({
+        "result": "pass",
+        "summary": "built the login endpoint",
+        "filesTouched": ["src/login.rs"],
+        "testsAdded": ["login_works"],
+        "testEvidence": "test login_works ... ok",
+        "dependenciesAdded": [],
+        "knownGaps": [],
+        "commits": ["abc123 [f-1] add login"]
+    })
+}
+
+fn feature() -> Feature {
+    Feature {
+        id: "f-1".to_string(),
+        title: "Add login".to_string(),
+        spec: "Build the login endpoint".to_string(),
+        validation_criteria: vec!["users can log in".to_string()],
+        origin: FeatureOrigin::Plan,
+        status: FeatureStatus::Pending,
+        worker_runs: vec![],
+        commits: vec![],
+        respawns: 0,
+    }
+}
+
+#[tokio::test]
+async fn worker_session_carries_configured_tools_onto_the_spec() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = MissionPaths::new(dir.path(), "m-test");
+    let mut log = EventLog::acquire(&p, "m-test", Duration::from_millis(0), LockForce::No).unwrap();
+
+    let mut cfg = MissionConfig::default();
+    cfg.worker.tools = vec!["Bash".to_string(), "Read".to_string()];
+
+    let backend =
+        MockBackend::with_scripts(vec![MockScript::single_shot_json(&worker_report_json())]);
+    run_worker(&backend, &mut log, &p, &cfg, &feature(), "ship auth", "Auth", None, None, None)
+        .await
+        .unwrap();
+
+    let specs = backend.started_specs();
+    assert_eq!(specs.len(), 1);
+    assert_eq!(specs[0].tools, cfg.worker.tools);
 }
