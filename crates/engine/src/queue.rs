@@ -266,9 +266,7 @@ pub fn claim_front(repo_root: &Path) -> Option<Claim> {
             Err(_) => {
                 // Raced: the front changed under us. Re-peek; a missing queue
                 // means nothing left to claim.
-                if peek(repo_root).is_none() {
-                    return None;
-                }
+                peek(repo_root)?;
             }
         }
     }

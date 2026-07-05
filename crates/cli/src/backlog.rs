@@ -630,7 +630,7 @@ pub async fn cmd_work(repo: PathBuf, once: bool) -> Result<i32> {
                 continue;
             }
             WorkAction::Run {
-                mission_id,
+                mission_id: _,
                 ticket_slug,
             } => {
                 // Claim the entry ATOMICALLY (rename, not remove): a peer
@@ -639,10 +639,8 @@ pub async fn cmd_work(repo: PathBuf, once: bool) -> Result<i32> {
                 let Some(claim) = queue::claim_front(&repo) else {
                     continue; // raced with a sibling; re-evaluate the queue
                 };
-                if claim.entry.mission_id != mission_id {
-                    // The front moved between peek and claim; run what we
-                    // actually claimed.
-                }
+                // The front may have moved between peek and claim — the
+                // CLAIMED entry is authoritative, so run that one.
                 let mission_id = claim.entry.mission_id.clone();
                 if let Some(slug) = &ticket_slug {
                     Ticket::write_state(&repo, slug, TicketState::Running, None)?;
