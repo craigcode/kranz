@@ -136,3 +136,8 @@ log.
    future mission's planning seed gets a byte-capped (2048 bytes) rendering
    of the index, newest-first, at most 10 entries, with the 3 newest inlined
    in full text.
+8. **`MissionStatus::Approved` added** — an approved-but-not-yet-run mission
+   otherwise had no accurate status to report and misreported as Running.
+   The reducer now folds `plan.approved` to `Approved`; the first
+   `milestone.started` or `worker.spawned` event folds the status onward to
+   `Running`.

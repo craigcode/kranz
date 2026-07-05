@@ -45,6 +45,8 @@ emits — no new engine capabilities are required.
 - Blocked milestones must be impossible to miss (plan §4.5): the status strip
   turns red with the reason and a jump-to-unblock affordance — Factory's
   paused strip generalizes to `paused | blocked | validating | complete | failed`.
+  `approved` is a distinct pre-run state — an approved mission with no
+  milestone/worker activity yet — shown separately from `running`.
 
 ## Style notes from the screenshot
 

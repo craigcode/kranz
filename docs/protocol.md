@@ -11,7 +11,7 @@ the engine's serde shapes.
 
 | Method/Path | Response |
 |---|---|
-| `GET /api/missions` | `[{ "id", "status", "goal", "createdAt" }]` (folds each log; tolerate corrupt ones with `"status":"failed"` + `"error"`) |
+| `GET /api/missions` | `[{ "id", "status", "goal", "createdAt" }]` (folds each log; tolerate corrupt ones with `"status":"failed"` + `"error"`; `status` now also includes `"approved"` for an approved mission with no run activity yet — additive, backward-compatible) |
 | `GET /api/missions/:id/state` | full `MissionState` JSON (fold of events.jsonl; NOT the state.json cache) |
 | `GET /api/missions/:id/events?since=<seq>` | `[Event]` with `seq > since` (omit `since` → all) |
 | `GET /api/missions/:id/plan` | contents of plan.json (404 if not approved yet) |
