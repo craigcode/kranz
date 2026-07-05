@@ -55,7 +55,15 @@ enum HostedMission {
     /// In planning (or approved, awaiting start): the live engine, holding
     /// the mission lock and the orchestrator conversation, plus when it was
     /// last touched by a planning turn (for the idle sweeper).
-    Planning { cell: EngineCell, last_use: Arc<Mutex<Instant>> },
+    Planning {
+        cell: EngineCell,
+        last_use: Arc<Mutex<Instant>>,
+        /// The last plan `request_plan` returned Ready, awaiting approval —
+        /// ONE cache for every surface's approve affordance (Slack buttons,
+        /// web, glasses ring). Consumed by [`MissionHost::approve_pending`];
+        /// volatile by design (a restart forfeits it — re-request the plan).
+        pending_plan: Arc<Mutex<Option<Plan>>>,
+    },
     /// `engine.run()` owns the engine inside this background task; the task
     /// removes this entry when the run ends.
     Running(tokio::task::JoinHandle<()>),
@@ -179,6 +187,9 @@ impl MissionHost {
                 let calibration = cost::calibrate(&self.repo_root);
                 let estimate =
                     cost::estimate(&plan, &engine.state().config, &calibration.params);
+                // Park the reviewed plan so ANY surface's approve affordance
+                // (Slack buttons, web, glasses ring) can commit it later.
+                self.set_pending_plan(id, Some(plan.clone()));
                 Ok(json!({
                     "ready": true,
                     "plan": plan,
@@ -225,11 +236,11 @@ impl MissionHost {
                         )));
                     }
                 }
-                Some(HostedMission::Planning { cell, last_use }) => match Arc::try_unwrap(cell) {
+                Some(HostedMission::Planning { cell, last_use, pending_plan }) => match Arc::try_unwrap(cell) {
                     Err(cell) => {
                         // A handler holds a clone: a turn is (or is about to
                         // be) in flight. Put the entry back untouched.
-                        map.insert(id.to_string(), HostedMission::Planning { cell, last_use });
+                        map.insert(id.to_string(), HostedMission::Planning { cell, last_use, pending_plan });
                         return Err(turn_in_flight());
                     }
                     Ok(mutex) => {
@@ -357,7 +368,39 @@ impl MissionHost {
         }));
     }
 
-    /// `POST /api/missions/:id/abandon`: retire a mission through the
+    /// `GET /api/missions/:id/pending-plan` → `200 {"pending":true,"plan":{…}}`
+/// or `200 {"pending":false}`. The parked plan from the last Ready
+/// request-plan — what the approve affordances (buttons, ring) will commit.
+pub(crate) async fn pending_plan_route(
+    State(server): State<Arc<ServerState>>,
+    UrlPath(id): UrlPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let id = valid_id(&server, &id)?;
+    Ok(Json(match server.host.pending_plan(&id) {
+        Some(plan) => json!({ "pending": true, "plan": plan }),
+        None => json!({ "pending": false }),
+    }))
+}
+
+/// `POST /api/missions/:id/approve-pending` — optional body
+/// `{"start": true}` → approve the parked plan (409 when none), then
+/// optionally start. `200 {"branch": …, "started": bool}`.
+pub(crate) async fn approve_pending_route(
+    State(server): State<Arc<ServerState>>,
+    UrlPath(id): UrlPath<String>,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let id = valid_id(&server, &id)?;
+    let value = parse_body(&body)?;
+    let start = value.get("start").and_then(Value::as_bool).unwrap_or(false);
+    let branch = server.host.approve_pending(&id).await?;
+    if start {
+        server.host.start(&id).await?;
+    }
+    Ok(Json(json!({ "branch": branch, "started": start })))
+}
+
+/// `POST /api/missions/:id/abandon`: retire a mission through the
     /// engine's canonical abandon path (terminal-refusing, event-recorded).
     /// A mission hosted HERE is taken out of the registry first — an idle
     /// planning engine is dropped (freeing the lock), a running task is
@@ -369,13 +412,13 @@ impl MissionHost {
         let taken = self.missions.lock().expect("missions registry lock").remove(id);
         match taken {
             None => {}
-            Some(HostedMission::Planning { cell, last_use }) => match Arc::try_unwrap(cell) {
+            Some(HostedMission::Planning { cell, last_use, pending_plan }) => match Arc::try_unwrap(cell) {
                 Ok(mutex) => drop(mutex.into_inner()),
                 Err(cell) => {
                     self.missions
                         .lock()
                         .expect("missions registry lock")
-                        .insert(id.to_string(), HostedMission::Planning { cell, last_use });
+                        .insert(id.to_string(), HostedMission::Planning { cell, last_use, pending_plan });
                     return Err(turn_in_flight());
                 }
             },
@@ -449,6 +492,53 @@ impl MissionHost {
         Ok(())
     }
 
+    /// The reviewed plan awaiting approval, if any (clone). `GET
+    /// /api/missions/:id/pending-plan` and the glasses PLAN page read this.
+    pub fn pending_plan(&self, id: &str) -> Option<Plan> {
+        let map = self.missions.lock().expect("missions registry lock");
+        match map.get(id) {
+            Some(HostedMission::Planning { pending_plan, .. }) => {
+                pending_plan.lock().expect("pending plan lock").clone()
+            }
+            _ => None,
+        }
+    }
+
+    fn set_pending_plan(&self, id: &str, plan: Option<Plan>) {
+        let map = self.missions.lock().expect("missions registry lock");
+        if let Some(HostedMission::Planning { pending_plan, .. }) = map.get(id) {
+            *pending_plan.lock().expect("pending plan lock") = plan;
+        }
+    }
+
+    /// Approve the PARKED plan (from the last Ready `request_plan`) — the
+    /// one-cache approve every surface shares. Consumes the pending plan on
+    /// success; a failed approve puts it back so a retry can fire. 409 when
+    /// nothing is pending.
+    pub async fn approve_pending(&self, id: &str) -> Result<String, ApiError> {
+        let Some(plan) = ({
+            let map = self.missions.lock().expect("missions registry lock");
+            match map.get(id) {
+                Some(HostedMission::Planning { pending_plan, .. }) => {
+                    pending_plan.lock().expect("pending plan lock").take()
+                }
+                _ => None,
+            }
+        }) else {
+            return Err(ApiError::conflict(format!(
+                "mission '{id}' has no reviewed plan pending — request the plan first \
+                 (POST /api/missions/{id}/planning/request-plan, /kranz plan, or the UI)"
+            )));
+        };
+        match self.approve(id, plan.clone()).await {
+            Ok(branch) => Ok(branch),
+            Err(e) => {
+                self.set_pending_plan(id, Some(plan));
+                Err(e)
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Registry plumbing
     // -----------------------------------------------------------------------
@@ -458,7 +548,7 @@ impl MissionHost {
     fn planning_cell(&self, id: &str) -> Result<EngineCell, ApiError> {
         let map = self.missions.lock().expect("missions registry lock");
         match map.get(id) {
-            Some(HostedMission::Planning { cell, last_use }) => {
+            Some(HostedMission::Planning { cell, last_use, .. }) => {
                 *last_use.lock().expect("last-use lock") = Instant::now();
                 Ok(Arc::clone(cell))
             }
@@ -565,7 +655,11 @@ fn new_cell(engine: Box<MissionEngine>) -> EngineCell {
 
 /// A fresh `Planning` entry, last-used now.
 fn new_planning(cell: EngineCell) -> HostedMission {
-    HostedMission::Planning { cell, last_use: Arc::new(Mutex::new(Instant::now())) }
+    HostedMission::Planning {
+        cell,
+        last_use: Arc::new(Mutex::new(Instant::now())),
+        pending_plan: Arc::new(Mutex::new(None)),
+    }
 }
 
 /// Shared by [`MissionHost::release`] and the sweeper: drop an idle planning
@@ -582,13 +676,13 @@ fn release_from(missions: &Mutex<HashMap<String, HostedMission>>, id: &str) -> R
             }
             Ok(finished)
         }
-        Some(HostedMission::Planning { cell, last_use }) => match Arc::try_unwrap(cell) {
+        Some(HostedMission::Planning { cell, last_use, pending_plan }) => match Arc::try_unwrap(cell) {
             Ok(mutex) => {
                 drop(mutex.into_inner()); // flushes the log, frees the lock
                 Ok(true)
             }
             Err(cell) => {
-                map.insert(id.to_string(), HostedMission::Planning { cell, last_use });
+                map.insert(id.to_string(), HostedMission::Planning { cell, last_use, pending_plan });
                 Err(turn_in_flight())
             }
         },
@@ -718,6 +812,38 @@ pub(crate) async fn approve_mission(
         .map_err(|e| ApiError::bad_request(format!("'plan' is not a valid Plan: {e}")))?;
     let branch = server.host.approve(&id, plan).await?;
     Ok(Json(json!({ "branch": branch })))
+}
+
+/// `GET /api/missions/:id/pending-plan` → `200 {"pending":true,"plan":{…}}`
+/// or `200 {"pending":false}`. The parked plan from the last Ready
+/// request-plan — what the approve affordances (buttons, ring) will commit.
+pub(crate) async fn pending_plan_route(
+    State(server): State<Arc<ServerState>>,
+    UrlPath(id): UrlPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let id = valid_id(&server, &id)?;
+    Ok(Json(match server.host.pending_plan(&id) {
+        Some(plan) => json!({ "pending": true, "plan": plan }),
+        None => json!({ "pending": false }),
+    }))
+}
+
+/// `POST /api/missions/:id/approve-pending` — optional body
+/// `{"start": true}` → approve the parked plan (409 when none), then
+/// optionally start. `200 {"branch": …, "started": bool}`.
+pub(crate) async fn approve_pending_route(
+    State(server): State<Arc<ServerState>>,
+    UrlPath(id): UrlPath<String>,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let id = valid_id(&server, &id)?;
+    let value = parse_body(&body)?;
+    let start = value.get("start").and_then(Value::as_bool).unwrap_or(false);
+    let branch = server.host.approve_pending(&id).await?;
+    if start {
+        server.host.start(&id).await?;
+    }
+    Ok(Json(json!({ "branch": branch, "started": start })))
 }
 
 /// `POST /api/missions/:id/abandon` — optional body `{"reason":"..."}` →
