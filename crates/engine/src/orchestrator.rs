@@ -45,6 +45,7 @@ use crate::error::{EngineError, Result};
 use crate::event_log::{EventLog, LockForce};
 use crate::events::{Event, EventKind};
 use crate::git_ops::GitRepo;
+use crate::lessons;
 use crate::paths::MissionPaths;
 use crate::permissions;
 use crate::prompts;
@@ -2543,16 +2544,18 @@ impl MissionEngine {
                 Some(prev),
             )
         } else if planning {
-            (
-                format!(
-                    "MISSION GOAL:\n{}\n\nYou are in the planning phase. Interrogate the \
-                     goal and the repository (read-only), ask the user sharp questions if \
-                     anything material is ambiguous, then propose the validation contract, \
-                     milestones and features. Do not emit the plan JSON until asked.",
-                    self.state.mission.goal
-                ),
-                None,
-            )
+            let mut seed = format!(
+                "MISSION GOAL:\n{}\n\nYou are in the planning phase. Interrogate the \
+                 goal and the repository (read-only), ask the user sharp questions if \
+                 anything material is ambiguous, then propose the validation contract, \
+                 milestones and features. Do not emit the plan JSON until asked.",
+                self.state.mission.goal
+            );
+            if let Some(index) = lessons::render_lessons_index(&self.paths.repo_root) {
+                seed.push_str("\n\n");
+                seed.push_str(&index);
+            }
+            (seed, None)
         } else {
             (digest::render_reseed(&self.state, &self.plan_json()?), None)
         };
@@ -2568,14 +2571,19 @@ impl MissionEngine {
                 // During planning there is no plan to re-seed from: restart
                 // the planning conversation from the goal instead.
                 let seed = if planning {
-                    format!(
+                    let mut seed = format!(
                         "MISSION GOAL:\n{}\n\nYou are in the planning phase; a previous \
                          planning conversation was lost. Re-establish context from the \
                          repository (read-only), then continue shaping the validation \
                          contract, milestones and features with the user. Do not emit \
                          the plan JSON until asked.",
                         self.state.mission.goal
-                    )
+                    );
+                    if let Some(index) = lessons::render_lessons_index(&self.paths.repo_root) {
+                        seed.push_str("\n\n");
+                        seed.push_str(&index);
+                    }
+                    seed
                 } else {
                     digest::render_reseed(&self.state, &self.plan_json()?)
                 };
@@ -4479,5 +4487,113 @@ mod tests {
     fn lessons_normalize_body_keeps_short_first_line_as_is() {
         let text = "Short imperative note.\n\nMore context below.";
         assert_eq!(normalize_lesson_body(text), text);
+    }
+
+    // -----------------------------------------------------------------------
+    // Lessons index injection into planning seeds
+    // -----------------------------------------------------------------------
+
+    fn seed_lesson_for_index(root: &std::path::Path, id: &str, first_line: &str) {
+        let lessons_dir = root.join(".kranz").join("lessons");
+        std::fs::create_dir_all(&lessons_dir).unwrap();
+        std::fs::write(lessons_dir.join(format!("{id}.md")), format!("{first_line}\n")).unwrap();
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(lessons_dir.join("index.md"))
+            .unwrap();
+        f.write_all(format!("- {id}.md · {first_line}\n").as_bytes()).unwrap();
+    }
+
+    fn streaming_seed(spec: &SessionSpec) -> &str {
+        match &spec.prompt {
+            PromptMode::Streaming(seed) => seed.as_str(),
+            other => panic!("expected a streaming prompt, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn planning_seed_injects_lessons_index() {
+        let Some((_dir, root)) = lessons_test_repo() else { return };
+        seed_lesson_for_index(&root, "m01", "Always check the plan for a base_branch override.");
+
+        let mock =
+            Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![lesson_orch_script("ready")]));
+        let backend: Arc<dyn AgentBackend> = mock.clone();
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+        assert_eq!(engine.state.mission.status, MissionStatus::Planning);
+
+        engine.ensure_orchestrator().await.expect("ensure orchestrator");
+
+        let specs = mock.started_specs();
+        assert_eq!(specs.len(), 1);
+        let seed = streaming_seed(&specs[0]);
+        assert!(seed.contains("m01.md"));
+        assert!(seed.contains("Always check the plan for a base_branch override."));
+        assert!(seed.contains("## Lessons from past missions in this repo"));
+    }
+
+    #[tokio::test]
+    async fn planning_seed_unchanged_without_lessons() {
+        let Some((_dir, root)) = lessons_test_repo() else { return };
+
+        let mock =
+            Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![lesson_orch_script("ready")]));
+        let backend: Arc<dyn AgentBackend> = mock.clone();
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+        assert_eq!(engine.state.mission.status, MissionStatus::Planning);
+
+        engine.ensure_orchestrator().await.expect("ensure orchestrator");
+
+        let specs = mock.started_specs();
+        assert_eq!(specs.len(), 1);
+        let seed = streaming_seed(&specs[0]);
+        assert!(!seed.contains("Lessons from past missions"));
+    }
+
+    #[tokio::test]
+    async fn resume_ack_seed_never_carries_lessons_index() {
+        let Some((_dir, root)) = lessons_test_repo() else { return };
+        seed_lesson_for_index(&root, "m01", "Always check the plan for a base_branch override.");
+
+        let mock =
+            Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![lesson_orch_script("ready")]));
+        let backend: Arc<dyn AgentBackend> = mock.clone();
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+        // Simulate a known previous sdk session so ensure_orchestrator takes
+        // the resume-ack path instead of a fresh planning seed.
+        engine.orch_session_id = Some("prev-session".to_string());
+
+        engine.ensure_orchestrator().await.expect("ensure orchestrator");
+
+        let specs = mock.started_specs();
+        assert_eq!(specs.len(), 1);
+        let seed = streaming_seed(&specs[0]);
+        assert!(seed.contains("The engine resumed this orchestrator session"));
+        assert!(!seed.contains("Lessons from past missions"));
+    }
+
+    #[tokio::test]
+    async fn non_planning_reseed_never_carries_lessons_index() {
+        let Some((_dir, root)) = lessons_test_repo() else { return };
+        seed_lesson_for_index(&root, "m01", "Always check the plan for a base_branch override.");
+
+        let mock =
+            Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![lesson_orch_script("ready")]));
+        let backend: Arc<dyn AgentBackend> = mock.clone();
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+        engine.state.mission.status = MissionStatus::Running;
+
+        engine.ensure_orchestrator().await.expect("ensure orchestrator");
+
+        let specs = mock.started_specs();
+        assert_eq!(specs.len(), 1);
+        let seed = streaming_seed(&specs[0]);
+        assert!(!seed.contains("Lessons from past missions"));
     }
 }
