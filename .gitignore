@@ -13,3 +13,4 @@ dist/
 .kranz/missions/*/state.json
 .kranz/missions/*/runs/
 .kranz/missions/*/control/
+/notes.txt

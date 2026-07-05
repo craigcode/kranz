@@ -4033,7 +4033,10 @@ fn write_kranz_gitignore(paths: &MissionPaths) -> Result<()> {
              missions/*/state.json\n\
              missions/*/state.json.tmp\n\
              missions/*/control/\n\
-             missions/*/runs/\n",
+             missions/*/runs/\n\
+             slack-threads.json\n\
+             queue/\n\
+             tickets/*.status\n",
         )?;
     }
     Ok(())
