@@ -377,6 +377,55 @@ async fn sweep_idle_releases_an_attached_mission_and_frees_its_lock() {
 // crates/server/src/host.rs's own `#[cfg(test)]` module instead.
 
 // ---------------------------------------------------------------------------
+// Release: web twin of `MissionHost::release`, over REST
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn release_route_frees_the_lock_over_rest() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    seed_mission_log(&root, "m-rel-rest");
+    let orch = MockScript::streaming(vec![mock_init("orch-rel-rest"), mock_result_text("hello")])
+        .responding(vec![turn("still planning")]);
+    let backend = Arc::new(MockBackend::with_scripts(vec![orch]));
+    let app = hosted_app(&root, backend);
+
+    // Attach via a planning turn over REST: the host now holds the lock…
+    let (status, body) =
+        post_json(&app, "/api/missions/m-rel-rest/planning/turn", Some(TOKEN), json!({ "text": "hi" }))
+            .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let paths = MissionPaths::new(&root, "m-rel-rest");
+    assert!(
+        EventLog::acquire(&paths, "m-rel-rest", Duration::ZERO, LockForce::No).is_err(),
+        "while attached, an external acquire must be LockHeld-refused"
+    );
+
+    let (status, body) =
+        post_json(&app, "/api/missions/m-rel-rest/release", Some(TOKEN), json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["released"], true);
+
+    let log = EventLog::acquire(&paths, "m-rel-rest", Duration::ZERO, LockForce::No);
+    assert!(log.is_ok(), "after release, an external acquire succeeds");
+}
+
+#[tokio::test]
+async fn release_route_is_404_for_an_unknown_mission() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let backend = Arc::new(MockBackend::new());
+    let app = hosted_app(&root, backend);
+
+    let (status, _) =
+        post_json(&app, "/api/missions/m-does-not-exist/release", Some(TOKEN), json!({})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
 // Mutation token (protocol "Authority: mutation token")
 // ---------------------------------------------------------------------------
 
@@ -420,6 +469,7 @@ async fn mutation_token_gates_every_post_and_no_get() {
         "/api/missions/m-01/planning/request-plan",
         "/api/missions/m-01/approve",
         "/api/missions/m-01/start",
+        "/api/missions/m-01/release",
     ] {
         let (status, _) = post_json(&app, uri, None, json!({})).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri} must require the token");

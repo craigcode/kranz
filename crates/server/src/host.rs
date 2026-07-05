@@ -739,6 +739,24 @@ pub(crate) async fn abandon_mission_route(
     Ok(Json(json!({ "abandoned": true })))
 }
 
+/// `POST /api/missions/:id/release` — no body → `200 {"released": bool}`. See
+/// [`MissionHost::release`]. A mission absent from disk is 404; a not-hosted
+/// but on-disk mission is an idempotent 200 (already free). POST (not a
+/// dedicated verb) so the mutation-token gate applies by construction.
+pub(crate) async fn release_mission_route(
+    State(server): State<Arc<ServerState>>,
+    UrlPath(id): UrlPath<String>,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let id = valid_id(&server, &id)?;
+    let _ = parse_body(&body)?;
+    if !MissionPaths::new(server.host.repo_root(), &id).events_file().is_file() {
+        return Err(ApiError::not_found(format!("mission '{id}' not found")));
+    }
+    let released = server.host.release(&id)?;
+    Ok(Json(json!({ "released": released })))
+}
+
 /// `POST /api/missions/:id/delete` — optional body `{"all": true}` (opt in to
 /// deleting a Complete mission) → `200 {"deleted": true}`. See
 /// [`MissionHost::clean`]. POST (not the DELETE verb) so the mutation-token
@@ -903,6 +921,37 @@ mod tests {
         let released = host.sweep_idle(std::time::Duration::ZERO);
         assert!(!released.contains(&id), "{released:?}");
         assert!(host.planning_cell(&id).is_ok(), "mission must remain hosted");
+    }
+
+    #[tokio::test]
+    async fn release_route_is_409_mid_turn() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let Some((_dir, root)) = init_repo() else { return };
+        let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+        let host = MissionHost::with_backend(root, backend);
+        let id = host.create("ship it", None).await.expect("create mission");
+
+        // Hold the per-mission engine mutex exactly like an in-flight turn.
+        let cell = host.planning_cell(&id).expect("hosted planning cell");
+        let _guard = cell.try_lock().expect("uncontended lock");
+
+        let app = crate::router_with_host(host, None, Some("tok".to_string()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/missions/{id}/release"))
+                    .header("content-type", "application/json")
+                    .header("x-kranz-token", "tok")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]
