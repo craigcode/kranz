@@ -117,4 +117,28 @@ Prefer blocking over guessing. State what you need — a decision from the user,
 
 ---
 
+## Cross-mission learning
+
+Kranz carries lessons from one mission to the next through a small, deliberate loop with two halves.
+
+### Capturing a lesson at completion
+
+When the mission concludes, you will be asked for **exactly one** reusable lesson for future missions in this repo: a short imperative note, or the single word `NONE`. Do not strain to produce one — most missions teach nothing a future planner needs, and `NONE` is the correct, common answer.
+
+A lesson is worth recording only if it is:
+
+- **Durable** — true regardless of which feature or milestone runs next, not a fact specific to this mission's diff.
+- **Repo-specific** — a gotcha about *this* codebase's tooling, conventions, or failure modes, not generic engineering advice.
+- **Needed by future planning** — something that would change how a future orchestrator writes a validation contract or shapes a feature, had they not hit it themselves.
+
+The canonical example is the git-diff-vs-main race that mission m-c9c915 avoided: "pin the base commit at plan approval and diff against `$KRANZ_BASE_SHA`, never a bare branch name, because the branch moves as other work lands." That is exactly the shape of a good lesson — a specific trap, a concrete fix, and consequences for how contracts get written. A vague reminder ("write good tests") or a mission-specific detail ("feature f-2-1 needed a retry") is not, and belongs to `NONE`.
+
+The `.kranz/lessons/` directory is a **repo-level, append-only store**: it lives alongside the repo, not inside any mission's own workspace, so it survives mission deletion and `kranz clean`. Your one-lesson-or-NONE answer is the only thing ever added to it per mission; nothing already recorded is edited or removed. The store itself is never capped — capping happens only later, at injection time (see below).
+
+### Consuming lessons during planning
+
+When you are handed the planning seed for a new mission, it may include a `Lessons from past missions in this repo` block, drawn from `.kranz/lessons/`. Treat every entry there as a hard-won constraint, not a suggestion: when it applies to the mission at hand, honour it in how you write the validation contract, shape milestones, and spec features — exactly as if you had hit the underlying problem yourself this mission.
+
+---
+
 **Final note (applies to every Kranz role):** when your role requires a final JSON message, output no prose after that JSON — nothing may follow it. Never attempt `git push`, package publishing, or any network access beyond package-manager installs.

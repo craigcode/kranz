@@ -117,3 +117,13 @@ log.
    validator session as the `KRANZ_BASE_SHA` env var. The role prompts
    reference it so contracts diff against a pinned commit instead of a
    moving branch name.
+7. **Repo-level cross-mission lessons** (not in the plan document) — a
+   deliberate learning loop closes the gap between missions. `.kranz/lessons/`
+   is a repo-level, append-only store (an `index.md` manifest plus one file
+   per lesson) that survives mission deletion and `kranz clean`. At mission
+   completion the orchestrator is asked for at most one reusable lesson —
+   a short imperative note or `NONE` — which is appended and committed
+   alongside the final report. Capping only happens at injection time: a
+   future mission's planning seed gets a byte-capped (2048 bytes) rendering
+   of the index, newest-first, at most 10 entries, with the 3 newest inlined
+   in full text.

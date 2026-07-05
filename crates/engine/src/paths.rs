@@ -63,6 +63,17 @@ impl MissionPaths {
         self.mission_dir().join("runs")
     }
 
+    /// Repo-level (not per-mission) directory of captured cross-mission
+    /// lessons; deliberately survives `kranz clean` and mission deletion.
+    pub fn lessons_dir(&self) -> PathBuf {
+        self.kranz_dir().join("lessons")
+    }
+
+    /// Append-only manifest of captured lessons in capture order.
+    pub fn lessons_index(&self) -> PathBuf {
+        self.lessons_dir().join("index.md")
+    }
+
     pub fn transcript_file(&self, run_id: &str) -> PathBuf {
         self.runs_dir().join(format!("{run_id}.jsonl"))
     }
@@ -99,4 +110,16 @@ pub fn project_config(repo_root: &Path) -> PathBuf {
 pub fn global_config() -> Option<PathBuf> {
     std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
         .map(|h| PathBuf::from(h).join(".kranz").join("config.json"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lessons_paths_are_repo_level_not_per_mission() {
+        let paths = MissionPaths::new("/repo", "m-abc123");
+        assert_eq!(paths.lessons_dir(), PathBuf::from("/repo/.kranz/lessons"));
+        assert_eq!(paths.lessons_index(), PathBuf::from("/repo/.kranz/lessons/index.md"));
+    }
 }
