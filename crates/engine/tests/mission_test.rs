@@ -1372,6 +1372,51 @@ async fn plan_approval_writes_plan_branch_and_commit() {
     assert!(err.to_string().contains("Planning"), "got: {err}");
 }
 
+/// approve_plan resolves the base branch's tip and records it as
+/// `state.mission.base_sha` (and the emitted `plan.approved` event's
+/// `baseSha`) — pinned at approval time, not re-resolved later.
+#[test]
+fn approval_records_base_branch_sha() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    // Base branch tip BEFORE approval, recorded independently of the code
+    // under test via a raw git rev-parse.
+    let base_tip_before = raw_git(&root, &["rev-parse", "main"]).trim().to_string();
+
+    let backend = Arc::new(MockBackend::new());
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let state = engine.state();
+    assert_eq!(
+        state.mission.base_sha.as_deref(),
+        Some(base_tip_before.as_str()),
+        "folded state.mission.base_sha must equal the base branch tip recorded before approval"
+    );
+
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    let approved = events
+        .iter()
+        .find(|e| e.kind.type_name() == "plan.approved")
+        .expect("plan.approved event must be on the log");
+    match &approved.kind {
+        EventKind::PlanApproved { base_sha, .. } => {
+            assert_eq!(base_sha.as_deref(), Some(base_tip_before.as_str()));
+        }
+        other => panic!("expected PlanApproved, got: {other:?}"),
+    }
+
+    // Base branch itself never moved — approve_plan commits onto the mission
+    // branch only, so the recorded sha is still the base tip.
+    let base_tip_after = raw_git(&root, &["rev-parse", "main"]).trim().to_string();
+    assert_eq!(base_tip_after, base_tip_before, "base branch must not move");
+}
+
 /// The missions catalog upserts by mission id: appends new entries newest
 /// last, replaces on re-approval, never duplicates.
 #[test]

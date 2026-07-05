@@ -630,6 +630,11 @@ impl MissionEngine {
             self.repo.create_branch(&branch, Some(&base))?;
         }
         self.repo.checkout(&branch)?;
+        // Committing plan files onto the mission branch below does not move
+        // the base branch ref, so resolving it anywhere in approve_plan pins
+        // the base tip as of approval (plan §f-1-2: never re-resolve later —
+        // that would reintroduce the moving-base-branch race this fixes).
+        let base_sha = self.repo.rev_parse(&base)?;
 
         let plan_file = self.paths.plan_file();
         if let Some(parent) = plan_file.parent() {
@@ -655,7 +660,7 @@ impl MissionEngine {
             &format!("[kranz] approved plan for {}", self.state.mission.id),
         )?;
 
-        self.emit(EventKind::PlanApproved { plan, base_sha: None })?;
+        self.emit(EventKind::PlanApproved { plan, base_sha: Some(base_sha) })?;
         Ok(())
     }
 
