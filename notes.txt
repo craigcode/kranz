@@ -4,3 +4,10 @@ cd ~/Data/kranz && kranz serve --slack
 in slack example:
 
 /kranz new Fix findings F1 and F2 from docs/reviews/event-log-review.md in crates/engine/src/event_log.rs — F1: drain() must not discard acknowledged buffered deltas on a mid-loop write failure; F2: idle missions must age-flush buffered deltas. Add regression tests proving both failure modes; keep all existing tests green.
+
+
+
+kranz ticket approve fix-status-approved-vs-executing    
+kranz ticket approve fix-dashboard-start-affordance     
+kranz ticket approve fix-mutation-token-file          
+kranz work
