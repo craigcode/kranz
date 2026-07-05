@@ -431,3 +431,28 @@ fn is_repo_busy_detects_a_live_multiline_lock() {
         "a multi-line lock held by a live pid identifies the running mission"
     );
 }
+
+// --- review P3: slugs are file stems, never paths ---------------------------
+
+#[test]
+fn traversal_slugs_are_rejected_before_any_filesystem_touch() {
+    let tmp = tempfile::tempdir().unwrap();
+    for bad in ["../evil", "a/b", "a\\b", "..", ".hidden", "", "x/../../y"] {
+        assert!(!Ticket::valid_slug(bad), "must reject {bad:?}");
+        assert!(Ticket::ensure_valid_slug(bad).is_err());
+        assert!(
+            Ticket::write_state(tmp.path(), bad, TicketState::New, None).is_err(),
+            "write_state must refuse {bad:?}"
+        );
+        // read_state is total: invalid slugs read as New without touching disk.
+        assert_eq!(Ticket::read_state(tmp.path(), bad), TicketState::New);
+    }
+    assert!(!tmp.path().join("..").join("evil.status").exists());
+}
+
+#[test]
+fn ordinary_slugs_still_work() {
+    for good in ["rate-limit", "fix_f1", "a1", "v0.1.0-notes"] {
+        assert!(Ticket::valid_slug(good), "must accept {good:?}");
+    }
+}

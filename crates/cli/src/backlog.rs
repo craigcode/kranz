@@ -54,6 +54,7 @@ pub fn ticket_template(title: &str, goal: Option<&str>) -> String {
 /// Scaffold `.kranz/tickets/<slug>.md` from the template. Refuses (error) if a
 /// ticket with that slug already exists. Returns the written path.
 pub fn cmd_ticket_new(repo: &Path, slug: &str, title: &str, goal: Option<&str>) -> Result<PathBuf> {
+    Ticket::ensure_valid_slug(slug)?;
     let dir = Ticket::tickets_dir(repo);
     let path = dir.join(format!("{slug}.md"));
     if path.exists() {

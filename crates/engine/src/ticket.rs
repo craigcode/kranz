@@ -93,6 +93,29 @@ impl Ticket {
         repo_root.join(".kranz").join("tickets")
     }
 
+    /// A slug is a bare file stem, never a path: reject separators, `..`,
+    /// leading dots, and empties BEFORE any join — a slug like `../x` must
+    /// not escape `.kranz/tickets/` (review P3).
+    pub fn valid_slug(slug: &str) -> bool {
+        !slug.is_empty()
+            && slug.len() <= 128
+            && !slug.starts_with('.')
+            && !slug.contains("..")
+            && slug.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    }
+
+    /// [`valid_slug`](Self::valid_slug) as an error for write/scaffold paths.
+    pub fn ensure_valid_slug(slug: &str) -> Result<()> {
+        if Self::valid_slug(slug) {
+            Ok(())
+        } else {
+            Err(EngineError::Config(format!(
+                "invalid ticket slug '{slug}': use letters, digits, '-', '_' \
+                 (no path separators, no leading dot, no '..')"
+            )))
+        }
+    }
+
     /// Parse ticket markdown. `slug` is supplied by the caller (usually the
     /// file stem). Malformed frontmatter is an [`EngineError::Config`].
     pub fn parse(slug: &str, markdown: &str) -> Result<Ticket> {
@@ -248,8 +271,11 @@ impl Ticket {
     }
 
     /// Read the pipeline state; a missing or unreadable status file is
-    /// [`TicketState::New`].
+    /// [`TicketState::New`]. An invalid slug never touches the filesystem.
     pub fn read_state(repo_root: &Path, slug: &str) -> TicketState {
+        if !Self::valid_slug(slug) {
+            return TicketState::New;
+        }
         let path = Self::status_path(repo_root, slug);
         match std::fs::read_to_string(&path) {
             Ok(text) => match serde_json::from_str::<StatusFile>(&text) {
@@ -271,6 +297,7 @@ impl Ticket {
         state: TicketState,
         note: Option<String>,
     ) -> Result<()> {
+        Self::ensure_valid_slug(slug)?;
         let dir = Self::tickets_dir(repo_root);
         std::fs::create_dir_all(&dir)?;
         let sf = StatusFile { state, note };
@@ -283,6 +310,7 @@ impl Ticket {
     /// `.md` under a `## Needs context (from orchestrator)` heading, and set
     /// the state to [`TicketState::NeedsContext`].
     pub fn append_needs_context(repo_root: &Path, slug: &str, questions: &[String]) -> Result<()> {
+        Self::ensure_valid_slug(slug)?;
         let md = Self::md_path(repo_root, slug);
         let mut text = std::fs::read_to_string(&md)?;
         if !text.ends_with('\n') {
