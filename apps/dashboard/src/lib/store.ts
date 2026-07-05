@@ -87,6 +87,13 @@ interface KranzStore {
   /** Last seq seen over the wire (frames or seeded events). */
   lastSeq: number | null;
   planning: PlanningSlice;
+  /** True while POST start is in flight for the mission page's Start action
+   *  (StatusStrip). Distinct from planning.starting — that's PlanReview's
+   *  consent-#2 start; this is starting an already-approved-idle mission. */
+  startingRun: boolean;
+  /** Host's rejection message for the mission-page Start action (e.g. a 409
+   *  double-start conflict), or null. */
+  startRunError: string | null;
 
   loadMissions: () => Promise<void>;
   connectMission: (id: string) => void;
@@ -111,6 +118,10 @@ interface KranzStore {
   startMission: () => void;
   /** Back to conversation from the review panel (either step). */
   planningBack: () => void;
+  /** Mission-page Start action (StatusStrip): POST start for an
+   *  approved-idle mission. Surfaces the host's conflict message on a race
+   *  (e.g. a 409 double-start) rather than enforcing refusal client-side. */
+  startRun: () => Promise<void>;
 }
 
 let socket: MissionSocket | null = null;
@@ -253,6 +264,8 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
     selectedRun: null,
     lastSeq: null,
     planning: PLANNING_RESET,
+    startingRun: false,
+    startRunError: null,
 
     loadMissions: async () => {
       set({ missionsError: null });
@@ -295,6 +308,8 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
         selectedRun: null,
         lastSeq: null,
         planning: PLANNING_RESET,
+        startingRun: false,
+        startRunError: null,
       });
 
       // Seed the event log over REST so history predating the WS snapshot
@@ -370,6 +385,8 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
         selectedRun: null,
         lastSeq: null,
         planning: PLANNING_RESET,
+        startingRun: false,
+        startRunError: null,
       });
     },
 
@@ -461,5 +478,19 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
     },
 
     planningBack: () => patchPlanning({ review: null, approvedBranch: null, error: null }),
+
+    startRun: async () => {
+      const id = get().missionId;
+      if (id === null) return;
+      set({ startingRun: true, startRunError: null });
+      try {
+        await api.startMission(id);
+        if (get().missionId === id) set({ startingRun: false });
+      } catch (err) {
+        if (get().missionId === id) {
+          set({ startingRun: false, startRunError: err instanceof Error ? err.message : String(err) });
+        }
+      }
+    },
   };
 });

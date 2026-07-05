@@ -4,6 +4,7 @@
 
 import { useEffect, useState } from 'react';
 import { useKranzStore } from '../lib/store';
+import { isApprovedIdle } from '../lib/startAffordance';
 import type { MissionStatus } from '../lib/types';
 
 const STATUS_LABEL: Record<MissionStatus, string> = {
@@ -36,6 +37,9 @@ export function StatusStrip() {
   const selectedRun = useKranzStore((s) => s.selectedRun);
   const selectRun = useKranzStore((s) => s.selectRun);
   const abandonMission = useKranzStore((s) => s.abandonMission);
+  const startingRun = useKranzStore((s) => s.startingRun);
+  const startRunError = useKranzStore((s) => s.startRunError);
+  const startRun = useKranzStore((s) => s.startRun);
   const [armedAbandon, setArmedAbandon] = useState(false);
 
   // An armed abandon disarms itself: a stray click must not lie in wait.
@@ -47,6 +51,7 @@ export function StatusStrip() {
 
   if (!state) return <div className="status-strip status-planning" />;
 
+  const approvedIdle = isApprovedIdle(state);
   const status = state.mission.status;
   const features = state.mission.milestones.flatMap((m) => m.features);
   const done = features.filter((f) => f.status === 'complete').length;
@@ -98,14 +103,25 @@ export function StatusStrip() {
           ▶ resume
         </button>
       )}
-      {status === 'running' && (
+      {approvedIdle ? (
         <button
           type="button"
           className="strip-btn"
-          onClick={() => void sendControl({ kind: 'pause' }).catch(() => {})}
+          disabled={startingRun}
+          onClick={() => void startRun()}
         >
-          ⏸ pause
+          {startingRun ? 'Starting…' : 'Start'}
         </button>
+      ) : (
+        status === 'running' && (
+          <button
+            type="button"
+            className="strip-btn"
+            onClick={() => void sendControl({ kind: 'pause' }).catch(() => {})}
+          >
+            ⏸ pause
+          </button>
+        )
       )}
 
       {ABANDONABLE.has(status) &&
@@ -139,6 +155,11 @@ export function StatusStrip() {
       )}
       {status === 'failed' && failedReason?.type === 'mission.failed' && (
         <span className="strip-reason">{failedReason.payload.reason}</span>
+      )}
+      {startRunError !== null && (
+        <span className="strip-reason" role="alert">
+          {startRunError}
+        </span>
       )}
 
       <div
