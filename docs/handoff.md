@@ -117,6 +117,31 @@ kranz config unset worker.model          # remove one key (siblings preserved)
 kranz config role worker opus xhigh      # MID-MISSION: control-inbox config change
 ```
 
+## Closed finding: piped line-mode readline (not applicable)
+
+`kranz plan`'s line-mode REPL (`cmd_plan` in `crates/cli/src/commands.rs`,
+~lines 517-624, reading via `StdinLines`) was long-parked as "no readline in
+piped line mode." Investigated and closed as not-applicable, with no
+zero-dependency improvement warranted:
+
+- **Both stdin and stdout TTY** — the full-screen `planning_tui` (crossterm
+  raw mode) already owns the interaction and provides complete interactive
+  editing: arrow keys, history, word-nav, Ctrl-U/A/E. Line-mode never runs in
+  this case.
+- **Piped stdin** — lines are delivered up-front by the OS/pipe; there is no
+  live keystroke stream to attach editing to, so there is fundamentally
+  nothing to add. This path must also never discard lines (scripts depend on
+  it), so any change here is out of bounds.
+- **Real-TTY stdin, piped stdout** — the OS's cooked-mode terminal line
+  discipline already supplies basic editing (backspace, Ctrl-U kill-line,
+  Ctrl-W word-erase) for free, before the process ever sees the line.
+
+Richer editing beyond cooked-mode defaults would require raw-mode input
+handling, which is what the TUI already is — duplicating it in line-mode
+would mean re-implementing the TUI without a terminal to draw it in. No
+crate-free enhancement clears that bar, so this item is closed with no
+functional change.
+
 ## Suggested next (from the roadmap)
 
 - **M2** — mission hygiene (`kranz clean`/`abandon`), mid-mission re-planning,
