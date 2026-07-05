@@ -22,6 +22,7 @@ pub mod config;
 pub mod cost;
 pub mod event_log;
 pub mod git_ops;
+pub mod lessons;
 pub mod prompts;
 pub mod queue;
 pub mod reducer;
