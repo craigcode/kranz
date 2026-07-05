@@ -2200,11 +2200,7 @@ impl MissionEngine {
         }
 
         if findings.is_empty() {
-            // Completion report (roadmap M1): written + committed just before
-            // mission.completed so a completed mission always carries its
-            // report. Best-effort — see write_mission_report.
-            self.write_mission_report();
-            self.emit(EventKind::MissionCompleted {})?;
+            self.complete_mission().await?;
             return Ok(Some(MissionStatus::Complete));
         }
 
@@ -2228,8 +2224,7 @@ impl MissionEngine {
                 self.emit_waive_decision(&waived)?;
                 // Report AFTER the waive decision (so the gate waiver is in
                 // the replayed history) and BEFORE mission.completed.
-                self.write_mission_report();
-                self.emit(EventKind::MissionCompleted {})?;
+                self.complete_mission().await?;
                 Ok(Some(MissionStatus::Complete))
             }
             FindingsConversion::Fix { specs, summary, text } => {
@@ -2334,15 +2329,40 @@ impl MissionEngine {
     // Completion report (roadmap M1)
     // -----------------------------------------------------------------------
 
+    /// Complete the mission: capture at most one cross-mission lesson, note
+    /// whether one was captured (or NONE) on the event feed, then write and
+    /// commit the completion report — with the lesson files (if any) folded
+    /// into the SAME report commit — and finally emit `mission.completed`.
+    ///
+    /// Both callers (findings-empty and all-waived at the final gate) must
+    /// go through this single path so the capture turn runs exactly once,
+    /// only at completion. Every step here is best-effort: a capture or
+    /// commit failure must never prevent `mission.completed` from being
+    /// emitted for a mission that already passed its final gate.
+    async fn complete_mission(&mut self) -> Result<()> {
+        let lesson_paths = self.capture_lesson().await;
+        match &lesson_paths {
+            Some(paths) => self.emit_decision(
+                &format!("cross-mission lesson captured ({} file(s))", paths.len()),
+                None,
+            )?,
+            None => self.emit_decision("no cross-mission lesson captured", None)?,
+        }
+        self.write_mission_report(lesson_paths);
+        self.emit(EventKind::MissionCompleted {})?;
+        Ok(())
+    }
+
     /// Write, commit, and index the mission completion report.
     ///
     /// Best-effort BY DESIGN: the report is derived data, regenerable from
     /// the event log at any time, so a render/write/git failure here must
     /// never strand a mission that just passed its final gate — every error
     /// is downgraded to a warning and the caller proceeds to emit
-    /// `mission.completed` regardless.
-    fn write_mission_report(&mut self) {
-        if let Err(e) = self.try_write_mission_report() {
+    /// `mission.completed` regardless. `extra_paths` (e.g. a captured lesson
+    /// + its index) are folded into the same report commit when present.
+    fn write_mission_report(&mut self, extra_paths: Option<Vec<PathBuf>>) {
+        if let Err(e) = self.try_write_mission_report(extra_paths) {
             tracing::warn!(error = %e, "mission report failed; completing the mission without it");
         }
     }
@@ -2350,8 +2370,9 @@ impl MissionEngine {
     /// Fallible body of [`Self::write_mission_report`]: render `report.md`
     /// from the (flushed) event log, write it beside plan.md, add a report
     /// link to this mission's line in `missions/index.md`, and commit both
-    /// in one `[kranz] mission report for <id>` commit.
-    fn try_write_mission_report(&mut self) -> Result<()> {
+    /// (plus any `extra_paths`) in one `[kranz] mission report for <id>`
+    /// commit.
+    fn try_write_mission_report(&mut self, extra_paths: Option<Vec<PathBuf>>) -> Result<()> {
         // Flush buffered stream deltas so the replayed history is complete.
         self.log.flush()?;
         let events = EventLog::read_events(&self.paths.events_file())?;
@@ -2386,6 +2407,8 @@ impl MissionEngine {
         if index_changed {
             commit.push(index.as_path());
         }
+        let extra_paths = extra_paths.unwrap_or_default();
+        commit.extend(extra_paths.iter().map(PathBuf::as_path));
         self.repo.commit_paths(
             &commit,
             &format!("[kranz] mission report for {}", self.state.mission.id),

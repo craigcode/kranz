@@ -203,6 +203,12 @@ fn fix_features(n: usize) -> String {
     json!({ "fixFeatures": features, "summary": format!("{n} fix feature(s)") }).to_string()
 }
 
+/// Capture-turn reply (§ cross-mission lesson capture): nothing worth
+/// carrying forward, so the completion path's capture turn writes nothing.
+fn no_lesson() -> String {
+    "NONE".to_string()
+}
+
 /// Conversion-turn reply that waives the one finding instead of fixing it.
 fn waive_reply(subject: &str, reason: &str) -> String {
     json!({
@@ -298,6 +304,7 @@ async fn happy_path_completes_mission_with_tag_and_contract_gate() {
             judgement("complete", ""),
             judgement("complete", ""),
             verdicts_pass(&["a-2"]),
+            no_lesson(),
         ]),
         worker_pass(),
         validator_with(json!([])),
@@ -427,6 +434,7 @@ async fn validation_round_creates_fix_feature_then_completes() {
             judgement("complete", ""),
             fix_features(1),
             judgement("complete", ""),
+            no_lesson(),
         ]),
         validator_with(finding),
         worker_pass(),
@@ -557,6 +565,7 @@ async fn waive_completes_milestone() {
         orch_script(vec![
             judgement("complete", ""),
             waive_reply("part 1 works", "docstring nitpick"),
+            no_lesson(),
         ]),
         validator_with(finding),
     ]));
@@ -654,6 +663,7 @@ async fn waive_at_cap_completes_instead_of_blocking() {
             fix_features(1),
             judgement("complete", ""),
             waive_reply("helper docs", "cosmetic; outside the contract"),
+            no_lesson(),
         ]),
         validator_with(major),
         worker_pass(),
@@ -708,6 +718,7 @@ async fn waive_at_final_gate_completes_mission() {
         orch_script(vec![
             judgement("complete", ""),
             waive_reply("a-1", "command not runnable in this environment"),
+            "Always check that build commands are portable across shells.".to_string(),
         ]),
     ]));
 
@@ -717,6 +728,7 @@ async fn waive_at_final_gate_completes_mission() {
     let status = timeout(TEST_TIMEOUT, engine.run()).await.expect("run must not hang").unwrap();
     assert_eq!(status, MissionStatus::Complete);
 
+    let mission_id = engine.mission_id().to_string();
     let paths = engine.paths().clone();
     drop(engine);
     let events = read_log(&paths);
@@ -731,6 +743,31 @@ async fn waive_at_final_gate_completes_mission() {
         EventKind::OrchestratorDecision { summary, .. }
             if summary.starts_with("waived 1 finding(s)") && summary.contains("a-1")
     )));
+
+    // The waive branch also runs the capture turn — exactly once — and its
+    // outcome is noted on the event feed.
+    let capture_decisions: Vec<&String> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::OrchestratorDecision { summary, .. }
+                if summary.contains("lesson captured") || summary.contains("no cross-mission lesson") =>
+            {
+                Some(summary)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(capture_decisions.len(), 1, "capture turn runs exactly once: {events:?}");
+
+    // The captured lesson file + index landed in the SAME report commit as
+    // report.md (not a separate commit).
+    let subject = raw_git(&root, &["log", "-1", "--format=%s"]);
+    assert_eq!(subject.trim(), format!("[kranz] mission report for {mission_id}"));
+    let files = raw_git(&root, &["show", "--name-only", "--format=", "HEAD"]);
+    let files: Vec<&str> = files.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert!(files.contains(&format!(".kranz/lessons/{mission_id}.md").as_str()), "{files:?}");
+    assert!(files.contains(&".kranz/lessons/index.md"), "{files:?}");
+    assert!(files.iter().any(|f| f.ends_with("report.md")), "{files:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -755,6 +792,7 @@ async fn respawn_bounded_fails_feature_then_mission_continues() {
             judgement("respawn", "add the missing test double"),
             judgement("respawn", "try harder"), // denied: budget exhausted
             judgement("complete", ""),          // f-1-2
+            no_lesson(),
         ]),
         worker_fail(), // f-1-1 attempt 2 (the one allowed respawn)
         worker_pass(), // f-1-2
@@ -811,6 +849,7 @@ async fn pause_resume_and_user_message_flow() {
         orch_script(vec![
             "Acknowledged — I'll fold the request into the remaining feature.".to_string(),
             judgement("complete", ""),
+            no_lesson(),
         ]),
         worker_pass(),
     ]));
@@ -913,7 +952,7 @@ async fn orchestrator_decision_detail_is_scrubbed() {
     // seed, then the leaky judgement.
     let backend = Arc::new(MockBackend::with_scripts(vec![
         worker_pass(),
-        orch_script(vec![leaky_judgement]),
+        orch_script(vec![leaky_judgement, no_lesson()]),
     ]));
 
     let mut engine = make_engine(&backend, &root, test_cfg());
@@ -1013,7 +1052,7 @@ async fn kill_and_resume_completes_on_single_log() {
     // both features complete. Validators skipped, contract empty → complete.
     let backend2 = Arc::new(MockBackend::with_scripts(vec![
         worker_pass(), // f-1-1 rerun
-        orch_script(vec![judgement("complete", ""), judgement("complete", "")]),
+        orch_script(vec![judgement("complete", ""), judgement("complete", ""), no_lesson()]),
         worker_pass(), // f-1-2
     ]));
     let backend2_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend2) as Arc<dyn AgentBackend>;
@@ -1075,7 +1114,7 @@ async fn force_reseed_reseeds_with_digest_and_plan() {
             plan_json,
         ]),
         worker_pass(),
-        orch_script(vec![judgement("complete", ""), judgement("complete", "")]),
+        orch_script(vec![judgement("complete", ""), judgement("complete", ""), no_lesson()]),
         worker_pass(),
     ]));
 
@@ -1430,7 +1469,7 @@ async fn base_sha_reaches_worker_and_validator_env() {
 
     let backend = Arc::new(MockBackend::with_scripts(vec![
         worker_pass(),
-        orch_script(vec![judgement("complete", ""), verdicts_pass(&["a-2"])]),
+        orch_script(vec![judgement("complete", ""), verdicts_pass(&["a-2"]), no_lesson()]),
         validator_with(json!([])),
     ]));
 
@@ -1720,6 +1759,7 @@ async fn run_emits_preflight_decision_when_issues_exist() {
         orch_script(vec![
             judgement("complete", ""),
             waive_reply("a-1", "command program unavailable in this environment"),
+            no_lesson(),
         ]),
     ]));
 
@@ -2276,7 +2316,7 @@ async fn crash_mid_parallel_batch_resumes_cleanly() {
     // them (each: worker → judgement). Validators skipped, empty contract.
     let backend2 = Arc::new(MockBackend::with_scripts(vec![
         worker_pass(), // f-1-1 rerun (sequential)
-        orch_script(vec![judgement("complete", ""), judgement("complete", "")]),
+        orch_script(vec![judgement("complete", ""), judgement("complete", ""), no_lesson()]),
         worker_pass(), // f-1-2 rerun (sequential)
     ]));
     let backend2_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend2) as Arc<dyn AgentBackend>;
@@ -2374,7 +2414,7 @@ async fn max_parallel_one_is_the_unchanged_sequential_path() {
     // pre-M3 happy path shape.)
     let backend = Arc::new(MockBackend::with_scripts(vec![
         worker_pass(),
-        orch_script(vec![judgement("complete", ""), judgement("complete", "")]),
+        orch_script(vec![judgement("complete", ""), judgement("complete", ""), no_lesson()]),
         worker_pass(),
     ]));
 
