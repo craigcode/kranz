@@ -182,12 +182,12 @@ pub fn map_mission(events: &[Event]) -> Vec<MissionSpan> {
                         open_milestones
                             .get(mid)
                             .map(|m| span_id(&mission_id, m.open_seq))
-                            .unwrap_or_else(|| root_span_id(&mission_id, created_seq))
+                            .or_else(|| root_span_id(&mission_id, created_seq))
                     } else if let Some(fid) = &open.feature_id {
                         milestone_id_from_feature_id(fid)
                             .and_then(|mid| open_milestones.get(&mid))
                             .map(|m| span_id(&mission_id, m.open_seq))
-                            .unwrap_or_else(|| root_span_id(&mission_id, created_seq))
+                            .or_else(|| root_span_id(&mission_id, created_seq))
                     } else {
                         root_span_id(&mission_id, created_seq)
                     };
@@ -222,7 +222,7 @@ pub fn map_mission(events: &[Event]) -> Vec<MissionSpan> {
                     spans.push(MissionSpan {
                         trace_id: trace_id(&mission_id),
                         span_id: span_id(&mission_id, open.open_seq),
-                        parent_span_id: Some(parent),
+                        parent_span_id: parent,
                         name: format!("{} {}", role_str(open.role), run_id),
                         start: open.start,
                         end: event.ts,
@@ -313,10 +313,14 @@ pub fn map_mission(events: &[Event]) -> Vec<MissionSpan> {
     spans
 }
 
-fn root_span_id(mission_id: &str, created_seq: Option<u64>) -> [u8; 8] {
-    // Only called once mission.created has definitely been observed (a run
-    // or milestone cannot open before the mission does).
-    span_id(mission_id, created_seq.expect("mission.created precedes all other events"))
+/// The root span id, if `mission.created` is among the events this fold saw.
+///
+/// A live tail may start mid-mission and observe a milestone or run's full
+/// open/close pair without ever having seen `mission.created` (it happened
+/// before the tail began) — such a span still gets exported, just parentless
+/// rather than panicking.
+fn root_span_id(mission_id: &str, created_seq: Option<u64>) -> Option<[u8; 8]> {
+    created_seq.map(|seq| span_id(mission_id, seq))
 }
 
 fn role_str(role: kranz_engine::types::Role) -> &'static str {
@@ -357,7 +361,7 @@ fn finished_milestone_span(
     MissionSpan {
         trace_id: trace_id(mission_id),
         span_id: span_id(mission_id, open.open_seq),
-        parent_span_id: Some(root_span_id(mission_id, created_seq)),
+        parent_span_id: root_span_id(mission_id, created_seq),
         name: format!("milestone {milestone_id}: {}", open.title),
         start: open.start,
         end,

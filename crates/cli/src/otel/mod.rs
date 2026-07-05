@@ -6,6 +6,8 @@
 
 pub mod emit;
 pub mod map;
+pub mod run;
 
 pub use emit::{build_exporter, export_spans, kranz_resource, to_span_data};
 pub use map::{map_mission, span_id, trace_id, AttrValue, MissionSpan, SpanStatus};
+pub use run::run_otel;

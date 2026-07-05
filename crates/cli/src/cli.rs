@@ -267,6 +267,25 @@ pub enum Command {
         token: Option<String>,
     },
 
+    /// Tail mission event logs and export OpenTelemetry spans over OTLP HTTP.
+    ///
+    /// Entirely read-side: polls each in-scope mission's events.jsonl (like
+    /// `kranz run`'s tail and the Slack bridge), folds spans from the event
+    /// timestamps, and exports one span per closed run/milestone/mission.
+    /// Runs until Ctrl-C. Honors the global --repo/--mission.
+    Otel {
+        /// OTLP HTTP traces endpoint, e.g. http://localhost:4318/v1/traces
+        #[arg(long, value_name = "URL")]
+        endpoint: String,
+
+        /// Replay each mission's full log (spans built from event
+        /// timestamps) before following live. Without this, each mission's
+        /// cursor is seeded at its current head — only spans whose opening
+        /// AND closing events arrive during the tail are exported.
+        #[arg(long)]
+        from_start: bool,
+    },
+
     /// Inspect and edit kranz configuration (files + mid-mission changes).
     ///
     /// Config resolves from three layers, later winning: compiled-in defaults
