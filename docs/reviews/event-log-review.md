@@ -338,6 +338,20 @@ wording carries no platform caveat there, only in `probe_liveness`'s own doc
 comment (event_log.rs:617). Not a correctness bug — `Unknown` is handled
 conservatively everywhere it's consumed. Finding survives unchanged.
 
+**Remediated (F4):** The `LockForce` table's intro now states that
+automatic Dead detection is unix-only (`kill(pid, 0)` ESRCH plus the own-pid
+token-reuse screen), and that non-unix recovery from a foreign crashed
+holder always requires an explicit force tier (`--force-lock` /
+`--dangerously-steal-live-lock`). `probe_liveness`'s `#[cfg(not(unix))]` arm
+now emits a `tracing::debug!` noting that liveness cannot be proven on this
+platform and Dead is unreachable there, before returning `Unknown` exactly
+as before — no steal behavior changed on any platform. The non-unix verdict
+itself is factored into `non_unix_liveness_fallback`, compiled on every
+platform, so the cross-platform test `non_unix_liveness_fallback_is_never_dead`
+in `event_log.rs`'s test module can pin that it returns `Unknown` and never
+`Dead` even though CI cannot execute the `#[cfg(not(unix))]` arm directly
+(feature f-2-1).
+
 ## F5 — macOS liveness probe depends on a `ps` subprocess (Low)
 
 **Location:** event_log.rs:710-727 (`process_identity_token`, macOS).

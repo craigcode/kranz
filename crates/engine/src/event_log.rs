@@ -22,7 +22,12 @@ use std::time::{Duration, Instant};
 ///
 /// A holder that is provably DEAD is always stolen (a stale lock from a
 /// crashed engine), regardless of tier. The tiers only govern holders that
-/// are alive or of indeterminate liveness:
+/// are alive or of indeterminate liveness. Automatic Dead detection is
+/// unix-only (`kill(pid, 0)` returning `ESRCH`, plus the own-pid
+/// token-reuse screen on any platform): on non-unix targets only the
+/// own-pid token-reuse screen can ever yield Dead, so recovering the lock
+/// from a foreign crashed holder there always requires an explicit force
+/// tier (`--force-lock` / `--dangerously-steal-live-lock`).
 ///
 /// | holder liveness | `No`       | `IfNotLive` | `EvenIfLive` |
 /// |-----------------|------------|-------------|--------------|
@@ -694,8 +699,27 @@ fn probe_liveness(info: &LockInfo) -> LockLiveness {
     }
     #[cfg(not(unix))]
     {
-        LockLiveness::Unknown
+        // No non-unix equivalent of `kill(pid, 0)` is wired up here, and
+        // `process_identity_token`'s non-unix stub always returns `None`, so
+        // `alive_or_reused` can never reach `Dead` for a foreign pid on this
+        // platform. Liveness is therefore unprovable for a foreign holder:
+        // report Unknown rather than guessing, and never Dead.
+        tracing::debug!(
+            pid,
+            "liveness cannot be proven for a foreign pid on this platform; \
+             reporting Unknown (Dead is unreachable here)"
+        );
+        non_unix_liveness_fallback()
     }
+}
+
+/// The verdict `probe_liveness` reports for a foreign pid on non-unix
+/// targets, where liveness cannot be proven. Factored out (and compiled on
+/// every platform) so a cross-platform test can pin that it is `Unknown` and
+/// never `Dead` — uncertainty must never demote to Dead.
+#[cfg_attr(unix, allow(dead_code))]
+fn non_unix_liveness_fallback() -> LockLiveness {
+    LockLiveness::Unknown
 }
 
 /// Screen an Alive pid for reuse by comparing process identity tokens: the
@@ -791,6 +815,17 @@ fn process_identity_token(_pid: i32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // `probe_liveness`'s non-unix arm (the actual code path this pins) only
+    // compiles under `#[cfg(not(unix))]`, and our CI runs macOS/Linux, so it
+    // cannot be exercised directly here. `non_unix_liveness_fallback` is
+    // factored out and compiled on ALL platforms so this cross-platform test
+    // can still pin its invariant: uncertainty must never demote to Dead.
+    #[test]
+    fn non_unix_liveness_fallback_is_never_dead() {
+        assert_eq!(non_unix_liveness_fallback(), LockLiveness::Unknown);
+        assert_ne!(non_unix_liveness_fallback(), LockLiveness::Dead);
+    }
 
     #[test]
     fn lock_info_parses_all_formats() {
