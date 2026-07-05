@@ -407,12 +407,35 @@ mod tests {
         let t1 = trace_id("m-01");
         let t2 = trace_id("m-01");
         assert_eq!(t1, t2, "trace_id must be idempotent for the same mission_id");
-        assert_eq!(t1.len(), 16);
+
+        // Pin the exact derivation: first 16 bytes of sha256(mission_id),
+        // computed independently of `trace_id` via sha2 directly.
+        let expected_trace: [u8; 16] = {
+            let digest = Sha256::digest(b"m-01");
+            digest[..16].try_into().unwrap()
+        };
+        assert_eq!(t1, expected_trace);
+
+        // And against a hardcoded hex vector (`printf 'm-01' | shasum -a
+        // 256` => 71677172fe9630d25271b72337b5caa4...), so the test also
+        // guards against the hash algorithm itself changing.
+        let expected_trace_hex: [u8; 16] = [
+            0x71, 0x67, 0x71, 0x72, 0xfe, 0x96, 0x30, 0xd2, 0x52, 0x71, 0xb7, 0x23, 0x37, 0xb5,
+            0xca, 0xa4,
+        ];
+        assert_eq!(t1, expected_trace_hex);
 
         let s1 = span_id("m-01", 42);
         let s2 = span_id("m-01", 42);
         assert_eq!(s1, s2, "span_id must be idempotent for the same (mission_id, seq)");
-        assert_eq!(s1.len(), 8);
+
+        // Pin span_id to first 8 bytes of sha256("{mission_id}:{seq}"),
+        // independently computed via sha2 directly.
+        let expected_span: [u8; 8] = {
+            let digest = Sha256::digest(b"m-01:42");
+            digest[..8].try_into().unwrap()
+        };
+        assert_eq!(s1, expected_span);
 
         let t_other = trace_id("m-02");
         assert_ne!(t1, t_other, "distinct missions must get distinct trace ids");
