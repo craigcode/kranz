@@ -8,6 +8,7 @@
 
 export type MissionStatus =
   | 'planning'
+  | 'approved'
   | 'running'
   | 'paused'
   | 'blocked'

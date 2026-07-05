@@ -299,6 +299,11 @@ button {
   background: var(--border);
 }
 
+.pill-approved {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
 .pill-abandoned {
   color: var(--dim);
   background: var(--border);

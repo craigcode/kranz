@@ -8,6 +8,7 @@ import type { MissionStatus } from '../lib/types';
 
 const STATUS_LABEL: Record<MissionStatus, string> = {
   planning: 'Planning',
+  approved: 'Approved',
   running: 'Running',
   paused: 'Paused',
   blocked: 'Blocked',
@@ -21,6 +22,7 @@ const STATUS_LABEL: Record<MissionStatus, string> = {
  *  confirm-gated stop; terminal missions have nothing left to abandon). */
 const ABANDONABLE: ReadonlySet<MissionStatus> = new Set([
   'planning',
+  'approved',
   'running',
   'paused',
   'blocked',
