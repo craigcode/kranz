@@ -128,11 +128,12 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
         Command::Work { once } => backlog::cmd_work(repo, once).await.map_err(augment_limit_hint),
         Command::Serve {
             port,
+            host,
             open,
             dashboard,
             token,
             slack,
-        } => cmd_serve(repo, port, open, dashboard, token, slack).await,
+        } => cmd_serve(repo, host, port, open, dashboard, token, slack).await,
         Command::Config { command } => {
             crate::config_cmd::cmd_config(&repo, command, cli.mission.as_deref())
         }
@@ -1016,12 +1017,23 @@ fn confirm_clean() -> Result<bool> {
 /// a `#token=<t>` fragment the dashboard stores.
 async fn cmd_serve(
     repo: PathBuf,
+    host: String,
     port: u16,
     open: bool,
     dashboard: Option<PathBuf>,
     token: Option<String>,
     slack: bool,
 ) -> Result<i32> {
+    let bind: std::net::IpAddr = host
+        .parse()
+        .map_err(|e| anyhow!("--host '{host}' is not an IP address: {e}"))?;
+    if !bind.is_loopback() {
+        eprintln!(
+            "WARNING: binding {bind} — the API is reachable beyond this machine. \
+             POSTs require the mutation token; GETs (mission states, transcripts) \
+             do NOT. Use only on a network you trust (LAN/tailnet)."
+        );
+    }
     // One hosted-engine registry for BOTH clients: the axum handlers below and
     // (when --slack) the bridge. Handing the bridge its own MissionHost would
     // mean two engines contending for one mission's single-writer lock.
@@ -1046,7 +1058,8 @@ async fn cmd_serve(
     }
 
     let dashboard_assets = resolve_dashboard_assets(&repo, dashboard);
-    let url = format!("http://127.0.0.1:{port}/");
+    let display_host = if bind.is_loopback() { "127.0.0.1".to_string() } else { bind.to_string() };
+    let url = format!("http://{display_host}:{port}/");
     let token = token.unwrap_or_else(kranz_server::generate_token);
 
     println!("kranz server on {url}");
@@ -1082,7 +1095,7 @@ async fn cmd_serve(
         });
     }
 
-    match kranz_server::serve_with_shared_host(host, port, static_assets, Some(token)).await {
+    match kranz_server::serve_with_shared_host(host, bind, port, static_assets, Some(token)).await {
         Ok(()) => Ok(0),
         Err(e) => Err(anyhow!("server failed: {e}")),
     }
