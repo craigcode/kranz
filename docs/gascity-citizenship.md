@@ -595,11 +595,370 @@ nudge, session).
 
 ## Staged roadmap
 
-*Populated by a later feature.*
+Each stage names the assessment verdicts it lands (never a rejected one),
+sizes work as kranz missions (history prices a single-feature brief at
+roughly $30–50), and separates autonomously stub-verifiable verification from
+anything requiring a human — the latter flagged on its own **Human-gated:**
+line. Every stage carries a **Trigger:** line naming the condition under
+which the stage is worth doing; several stages conclude that the trigger has
+not fired and the stage is not worth doing yet. This is an assessment, not
+advocacy, matching docs/gascity.md's reality-check ethos.
+
+### Stage 0 — today: pack v2 parked, stub-verified
+
+Scope: the current committed state. No adopted mechanism beyond what
+docs/gascity.md already proved live (happy path, escalation plumbing, field
+mapping) plus the exit-code contract documented in Current state. Nothing
+from the Citizenship assessment is landed yet — `gc order`'s cooldown→event
+move, `gc events` emission, `gc agent` registration, `gc status`/`gc
+dashboard` visibility, and `gc skill` documentation are all still pending
+(Stages 2–3 below).
+
+Work items: none — this stage is the already-committed baseline
+(`packaging/gascity/`, docs/gascity.md, this document's Current state and
+Constraints sections). Recorded here only so the roadmap has a zero point to
+measure forward from.
+
+Verification: `gc lint packaging/gascity` (adopt, read-only) passes today,
+per Current state — this is the one live, non-mutating check available
+without a registered city. Everything else about this stage's correctness is
+stub-level (docs/gascity.md's stubbed exit-2 run, the happy-path bead cited
+there) — no live-supervisor check exists yet, which is exactly the gap
+Stage 1 closes.
+
+**Trigger:** none needed — this is the present state, not a proposal.
+
+### Stage 1 — live-city validation of the existing pack
+
+Scope: validate the Stage 0 pack (dispatch → spool → worker → run-bead →
+exit-code mapping, and the `agent.toml` registration wiring) against an
+actual `gc` supervisor for the first time. Lands no new mechanism from the
+assessment — it closes the "never validated against a live supervisor" gap
+that the `gc hook`, `gc agent`, and `gc pack` verdicts all name as their
+defer/adopt precondition. This is entirely human-run; no kranz code changes.
+
+Work items: none sized as a kranz mission — this stage is a human validation
+session, not development work. If the session surfaces a real bug (e.g. the
+lock-file trap misfiring, or the bd dialect assumptions being wrong against a
+live city), *that* fix becomes a normal kranz mission (~$30–50) filed
+afterward, scoped to the specific defect found.
+
+**Human-gated:** the entire stage. `gc init`/`gc register`/`gc order run`
+are state-mutating (constraint: kranz code paths never run them; a human
+runs them by hand, once, in a disposable city). Concretely, a human would:
+
+1. Set up (disposable city, isolated from any real one):
+   `gc init --city /tmp/kranz-citizenship-test` (or the equivalent
+   city-scoping flag `gc init --help` documents at the time), confirming
+   first that this spawns a live, billed mayor session per constraint 5 —
+   budget for that cost before running it.
+2. `gc pack fetch` or hand-copy `packaging/gascity/` into the test city's
+   pack search path, then `gc register` the pack; `gc agent add
+   kranz-worker` (or hand-author the `agent.toml` stanza) to land the
+   registration the `gc agent` verdict scoped as adopt.
+3. Start `kranz-city-worker` under the test city's supervision (per the
+   pack's intended wiring) and `gc bd create … --label kranz` a smoke bead,
+   the same shape docs/gascity.md's happy path used.
+4. Observe: `gc status`/`gc dashboard` show the worker; the bead reaches
+   `bd close` on exit 0 (or the matching state for injected 1/2/3 exits);
+   `gc lint packaging/gascity` still passes.
+5. Teardown, in order, every time — this is the step docs/gascity.md lesson
+   5 says is easy to skip: `gc stop` (or the city-scoped equivalent) to
+   unregister the test city, then verify no orphaned tmux server remains
+   (`tmux -L <test-city-name> ls` should error "no server running"); if it
+   doesn't, manually kill it (`tmux -L <test-city-name> kill-server`) — do
+   not leave a paid mayor session or orphaned tmux socket running past the
+   test.
+
+**Trigger:** a live `gc` city becomes available to test against (this
+machine currently has none registered — see Current state) *and* someone is
+willing to spend the setup/teardown time plus the live mayor-session cost
+constraint 5 implies. Not worth doing to satisfy curiosity alone — do it
+when Stage 2 or 3's work is about to be built and needs a live target to
+validate against, not before.
+
+### Stage 2 — event-driven dispatch and mail-based escalation (already-adopted mail, not backflow)
+
+Scope: lands the `gc order` verdict (adopt) — move
+`orders/kranz-dispatch.toml`'s trigger from `cooldown`/`interval = "5m"` to
+`event`, matching `bead.created`/`bead.ready`-shaped events for the `kranz`
+label, per the trigger kinds the assessment cites from `gc order --help`.
+Confirms (does not newly land) the already-adopted outbound `gc mail send
+human --notify` escalation path already wired in `kranz-run-bead`. Does
+**not** land inbound mail-based guidance backflow — the assessment rejects
+that (`gc mail` verdict: the inbound half would duplicate kranz's own
+guidance rails) and D3 below holds that line.
+
+Work items (kranz missions, ~$30–50 each):
+- Change `orders/kranz-dispatch.toml`'s trigger block from cooldown to
+  event, matching the `kranz` label; no change to `kranz-dispatch`'s body
+  (constraint 1 — the order still just claims and spools within the exec
+  deadline).
+- Add a regression check (stub-level, no live city) that the changed
+  `pack.toml`/`orders/kranz-dispatch.toml` still passes `gc lint
+  packaging/gascity`.
+
+Verification: `gc lint packaging/gascity` (adopt, read-only, run today)
+covers the config's validity autonomously.
+
+**Human-gated:** confirming the event trigger actually fires dispatch faster
+than the old cooldown requires a live city — re-run the Stage 1 smoke-bead
+flow against the event-triggered config in a disposable test city and
+observe latency, not just correctness.
+
+**Trigger:** Stage 1 has run at least once (so there's a validated baseline
+to compare cooldown-vs-event behavior against) — otherwise this is a config
+change with no way to confirm it does what it claims beyond `gc lint`.
+
+### Stage 3 — City-visible progress and health
+
+Scope: lands four adopt verdicts together, since they share the same
+registration prerequisite: `gc agent` (register `kranz-worker` in
+city.toml), `gc status`/`gc dashboard` (free once registered), and `gc
+events` (emit `kranz.mission.{started,blocked,complete}` from
+`kranz-run-bead` alongside its existing bd mutations, per the exit-code
+contract extension the assessment specifies). Explicitly does **not** land
+`gc doctor` (deferred — no documented pack-contributed health-check
+extension point) as a second telemetry path: kranz already exports OTEL
+(docs/otel.md, `kranz otel` — an opt-in sidecar tailing mission events to an
+OTLP collector). Registering `kranz-worker` for `gc status`/`gc dashboard`
+visibility is agent-liveness reporting, a different altitude than mission
+telemetry, so it doesn't compete with OTEL; but a future pack-contributed
+`gc doctor` check *would* be a second health-signal path alongside `kranz
+otel`, which is exactly why `gc doctor` stays deferred here rather than
+folded into this stage.
+
+Work items (kranz missions, ~$30–50 each):
+- Author the `agents/kranz-worker/agent.toml` registration stanza (already
+  drafted per Current state — confirm it matches whatever `gc agent add`
+  scaffolds, or hand-author to match).
+- Add `gc event emit kranz.mission.started/blocked/complete` calls to
+  `kranz-run-bead` at the three points its exit-code mapping already
+  branches (0/2/3|1), per the `gc events` verdict.
+- Unit/stub coverage for the emit calls firing at the right branch (mock
+  `gc` binary, assert the right subcommand + event name per exit code).
+
+Verification: the emit-call wiring and its exit-code branching is
+stub-verifiable exactly like the existing bd-mutation tests (mock `gc`,
+assert arguments) — no live city needed for correctness of *what* gets
+called.
+
+**Human-gated:** confirming the events actually land in a live `gc events
+--follow` stream and that `gc status`/`gc dashboard` show the registered
+agent requires the Stage 1 disposable-city setup/teardown procedure again
+(same tmux-reaping care applies if a fresh test city is spun up rather than
+reusing one still live from Stage 1/2).
+
+**Trigger:** Stage 1 has validated agent registration works as documented
+against a live supervisor (the `gc agent`/`gc status`/`gc dashboard` verdicts
+all name this as their shared precondition) — building the emit/registration
+code is stub-safe today, but calling this stage "done" needs that live
+confirmation.
+
+### Stage 4 — distribution: a lint-clean published pack
+
+Scope: lands the `gc pack` verdict's trigger condition by attempting it —
+publish `packaging/gascity/` via `gc pack registry`/`gc pack release` so
+other operators' cities can `gc pack fetch` it, per the assessment's named
+distribution future. Presupposes Stages 1 and 3 are done: the assessment is
+explicit that publishing an unvalidated pack "would export that gap beyond
+this machine." Also revisits `gc hook` (currently deferred) once a published
+pack implies other operators' cities, since `gc hook`'s defer condition is
+the same live-supervisor validation this stage's precondition already
+requires.
+
+Work items (kranz missions, ~$30–50 each):
+- Write the pack's publish-facing metadata (registry description, versioning
+  policy for `pack.toml`'s schema field) — documentation-shaped, no runtime
+  change.
+- Re-run `gc lint packaging/gascity` as a pre-publish gate (already adopt,
+  already passing) and wire it into CI per the `gc lint` verdict's stated
+  recommendation, so pack drift is caught the same commit it's introduced.
+- Evaluate collapsing `kranz-dispatch` + `kranz-city-worker` into a single
+  `gc hook`-driven claim (the simplification the `gc hook` verdict names),
+  now that a live supervisor is available to validate `work_query` semantics
+  against.
+
+Verification: CI-wired `gc lint` is autonomously verifiable (it already
+passes, per Current state) and stays that way on every change under
+`packaging/gascity/`.
+
+**Human-gated:** the actual `gc pack registry`/`gc pack release` publish
+step is networked and state-mutating — this plan's invariants keep
+publishing out of any autonomous mission or worker; a human runs it,
+deliberately, once the pack is validated (Stage 1) and City-visible
+(Stage 3).
+
+**Trigger:** a second operator or city actually wants to consume the kranz
+pack as a rig type. Nothing today creates that demand — this machine has one
+operator and no other city to fetch from. Not worth doing until that demand
+is concrete; publishing a pack nobody fetches only exports Stage-0/1 risk for
+no benefit.
+
+### Stage 5 — fleets and cross-machine execution (speculative)
+
+Scope: the two remaining named futures from the spike verdict —
+heterogeneous fleets (lands `gc sling` and re-evaluates `gc mcp`, both
+currently deferred pending exactly this) and cross-machine execution (no
+specific mechanism verdict names this as its direct trigger; it would mean
+City k8s runtimes behind kranz's `AgentBackend` seam, which does not exist
+today). Does not land any mechanism the assessment rejected — `gc handoff`,
+`gc nudge`, and `gc session` stay rejected regardless of fleet size, since
+they require a named interactive session constraint 5 rules out
+independent of how many agents share the router.
+
+Work items: none sized — this stage is explicitly speculative. If a
+heterogeneous fleet is actually assembled, the first real work item would be
+scoping `kranz-worker` as a `gc sling` target (a normal ~$30–50 kranz
+mission at that point), not before.
+
+Verification: not applicable — there is nothing to verify until the
+precondition below is real.
+
+**Human-gated:** by construction, since standing up a second agent type
+under one City router and/or a k8s cross-machine runtime is itself a human
+infrastructure decision, not something a kranz mission would do
+autonomously.
+
+**Trigger:** a heterogeneous fleet (kranz plus at least one other agent
+type, e.g. codex/gemini) is actually assembled under one City router, for
+`gc sling`/`gc mcp`; a City k8s cross-machine runtime is actually offered
+behind an `AgentBackend` implementation, for cross-machine execution.
+Neither condition holds today, and this document does not predict when
+either would. Not until the trigger fires.
 
 ## Design decisions
 
-*Populated by a later feature.*
+### D1 — the opacity boundary
+
+Options: (a) hold the one-opaque-agent stance — no resident LLM session
+City-side, `kranz-worker` stays a `long_running` agent with no
+`[[named_session]]`, City's richer machinery (formulas, convoys, sessions,
+handoff, nudge) stays bypassed; (b) open kranz internals to City by
+declaring a City-visible, primeable LLM session for `kranz-worker` (unlocks
+`gc prime`, and would let `gc handoff`/`gc nudge`/`gc session` apply).
+
+**Recommendation:** (a), hold the opacity boundary. Constraint 5 exists
+specifically because `gc init`'s mayor and its restart/tmux lifecycle are a
+real, observed operational cost (docs/gascity.md lesson 5: orphaned tmux
+servers, observed twice) — adding a second named session multiplies that
+surface for a benefit the assessment can't currently name (no mechanism
+verdict needed `gc prime`/`gc handoff`/`gc nudge`/`gc session` badly enough
+to accept reject on all four). This forecloses interactive, City-native
+triage of a blocked kranz mission (no `gc session`/`gc handoff` for it) —
+that steering stays on kranz's own web/Slack/CLI surfaces, per D3. Revisit
+only if a concrete need for City-side interactive triage of kranz missions
+specifically (not generic City agents) is identified — none is, today.
+
+### D2 — the dispatch model
+
+Options: (a) stay on cooldown-polling (`orders/kranz-dispatch.toml`,
+`trigger = "cooldown"`, `interval = "5m"`, the Stage 0 baseline); (b) move to
+event-driven order dispatch (`trigger = "event"` matching
+`bead.created`/`bead.ready` for the `kranz` label, the `gc order` verdict's
+adopt recommendation, landed in Stage 2); (c) native `gc hook` routing
+(`kranz-worker` calls `gc hook kranz-worker --claim` directly, collapsing
+dispatch and worker into one process, the `gc hook` verdict's deferred
+simplification).
+
+**Recommendation:** (b) now, with (c) as the Stage 4 re-evaluation. Event
+dispatch is a pure config change within the already-adopted `gc order`
+mechanism — no new invariant surface, still respects constraint 1 (order
+claims and returns within the exec deadline) — so it's strictly better than
+cooldown-polling with no live-validation prerequisite beyond `gc lint`. (c)
+is real but requires validating `work_query`/agent-registration semantics
+against a live supervisor first (the `gc hook` verdict's stated defer
+reason), which this machine cannot do until Stage 1 runs. This forecloses,
+for now, collapsing the two-script split into one — that stays two
+processes (dispatch order + supervised worker) until Stage 1/4 validate the
+simpler alternative.
+
+### D3 — guidance backflow
+
+Options: (a) City mail feeding kranz's guidance inbox for blocked missions —
+build an inbound path where `gc mail inbox`/`reply` responses steer a
+blocked mission's fix cycle; (b) keep steering exclusively on kranz-native
+surfaces (web dashboard, Slack thread, CLI), with outbound `gc mail send
+human --notify` staying a pointer to those surfaces, not a channel itself.
+
+**Recommendation:** (b), per the `gc mail` verdict (reject on the inbound
+half) and docs/gascity.md's explicit statement that a blocked mission is
+steered "from kranz's own surfaces." Building (a) creates two sources of
+truth for one steering decision — a human could reply via mail *or* via
+Slack/web/CLI, and now the mission needs a merge policy between them that
+doesn't exist and isn't scoped anywhere. This forecloses City mail as a
+guidance channel entirely, not just today: the reject verdict isn't
+trigger-gated (unlike defers elsewhere in this plan) because the duplication
+problem doesn't resolve with more validation or a bigger fleet — it's
+structural. The outbound escalation notification (already adopted, Stage 0)
+is unaffected.
+
+### D4 — supervision and health
+
+Options: (a) keep `kranz-city-worker` under the supervisor's health patrol
+as a registered `long_running` agent (current pack design, extended by
+Stage 3's `gc agent`/`gc status`/`gc dashboard` adoption); (b) make `kranz
+serve` itself the supervised City service, with a lock-probe health check
+replacing or supplementing the worker-lock-file liveness signal.
+
+**Recommendation:** (a). The pack's entire `kranz-city-worker` design
+already exists to be the supervised long-running process constraint 1
+requires (replacing the spike's unsupervised `nohup` runner, docs/gascity.md
+lesson 1) — it takes the single-instance lock, drains serially, and is
+exactly the shape `gc agent`'s adopt verdict registers. Making `kranz serve`
+itself the City-supervised unit would mean the always-on kranz web/API
+server becomes City-coupled, which contradicts the standing invariant that
+"kranz remains fully usable standalone" and the Gas City pack stays optional
+integration surface, never a dependency of core kranz behavior. This
+forecloses folding kranz's own service lifecycle into City's supervisor —
+`kranz serve` keeps running (or not) independent of whether any city has
+`kranz-worker` registered at all.
+
+### D5 — the private spool vs kranz-native queue
+
+Options: (a) keep the current private spool directory (`KRANZ_SPOOL`,
+`.env` entries written by `kranz-dispatch` and drained serially by
+`kranz-city-worker`) as the production path; (b) build the long-lived
+`kranz work` dispatcher docs/gascity.md deviation 1 names as the production
+path, replacing the private spool with kranz's own native queue mechanism.
+
+**Recommendation:** (b) is the better long-term target, but (a) is what's
+committed today and nothing in this assessment forces an immediate swap —
+this decision is a flag for Stage 2+ work, not a stage in itself. The
+spool-file mechanism is a private, kranz-specific re-implementation of
+routed-work claiming that the `gc hook` verdict already identifies as
+collapsible once `work_query` semantics are validated (Stage 4). Building
+`kranz work` as kranz's own native queue is orthogonal to that City-side
+collapse: it would replace the *dispatch-order-writes-spool-file* half with
+a kranz-owned mechanism, independent of whether the worker later claims via
+`gc hook` or drains a `kranz work` queue directly. This forecloses treating
+the current `.env`-file spool as a permanent design — it is understood, per
+docs/gascity.md, as the spike-era stand-in, and `kranz work` should absorb
+its function whenever kranz-side queue work is next scoped (not scheduled by
+this document).
+
+### D6 — verification strategy for city-coupled behavior
+
+Options: (a) design a disposable test-city fixture — scripted `gc init`/`gc
+register`/teardown against an isolated city directory, reused across Stage
+1/2/3/4 validation runs; (b) stay stub-only (mock `gc` binary/CLI calls in
+unit tests, as `kranz-run-bead`'s bd-mutation tests already do) and never
+automate live-city checks.
+
+**Recommendation:** (b) for anything a kranz mission or CI job runs, with
+(a) specified as a **human-run** procedure (Stage 1) rather than an
+automated fixture. Constraint 5's costs are real and per-invocation (a live,
+billed mayor session; a tmux server that must be manually reaped on
+teardown) — scripting (a) as something CI or a mission could invoke
+unattended would mean an autonomous process potentially spawning billed
+sessions and leaving orphaned tmux servers with nobody watching to reap
+them, which is exactly the failure mode docs/gascity.md lesson 5 already
+observed under a human's attention. This forecloses ever fully automating
+live-city verification: the disposable-city procedure stays a documented,
+human-run checklist (Stage 1) permanently, not a fixture kranz's own test
+suite or CI grows to own. Stub-level mocking (mock `gc`, assert
+argument-shape) remains the ceiling for what kranz's own automated tests
+verify about City integration.
 
 ## Ticket-ready briefs
 
