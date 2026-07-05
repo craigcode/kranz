@@ -296,7 +296,7 @@ type, not a resident mayor" — specifically to avoid adding kranz to the
 named-session surface that `gc init`'s mayor and its restart/tmux lifecycle
 occupy. Adopting handoff would mean declaring kranz-worker as a
 controller-restartable named session, which is the surface constraint 5
-exists to keep kranz out of. Reject: violates invariant 5 (no named
+exists to keep kranz out of. Reject: violates constraint 5 (no named
 sessions).
 
 ### gc nudge — reject
@@ -309,7 +309,7 @@ delivery until. `kranz-city-worker` has no such boundary: it is a headless
 serial drain loop with a fixed poll sleep, not a named/interactive session
 gc's controller tracks for wakefulness. Using nudge for it would require
 the same named-session declaration handoff would, which constraint 5
-rules out. Reject: violates invariant 5 (no named sessions) — there is no
+rules out. Reject: violates constraint 5 (no named sessions) — there is no
 session for a nudge to target.
 
 ### gc events — adopt
@@ -435,7 +435,7 @@ channel. Declaring a `gc session` for kranz-worker would mean giving it
 exactly the `[[named_session]]` block constraint 5 and the pack's own
 `agent.toml` comment ("no resident mayor") deliberately omit, adding kranz
 to the same controller-restart/tmux-lifecycle surface `gc init`'s mayor
-occupies. Reject: violates invariant 5 (no named sessions) and duplicates
+occupies. Reject: violates constraint 5 (no named sessions) and duplicates
 kranz's own interactive surfaces — the same capability-neutral overlap the
 spike verdict already priced in.
 
@@ -652,10 +652,12 @@ runs them by hand, once, in a disposable city). Concretely, a human would:
    city-scoping flag `gc init --help` documents at the time), confirming
    first that this spawns a live, billed mayor session per constraint 5 —
    budget for that cost before running it.
-2. `gc pack fetch` or hand-copy `packaging/gascity/` into the test city's
-   pack search path, then `gc register` the pack; `gc agent add
-   kranz-worker` (or hand-author the `agent.toml` stanza) to land the
-   registration the `gc agent` verdict scoped as adopt.
+2. Make the pack visible to the test city (hand-copy `packaging/gascity/`
+   into its pack search path, or wire it via `gc import` per
+   `gc import --help` at the time), then `gc register` the test city with
+   the machine-wide supervisor; `gc agent add kranz-worker` (or hand-author
+   the `agent.toml` stanza) to land the registration the `gc agent` verdict
+   scoped as adopt.
 3. Start `kranz-city-worker` under the test city's supervision (per the
    pack's intended wiring) and `gc bd create … --label kranz` a smoke bead,
    the same shape docs/gascity.md's happy path used.
@@ -965,9 +967,16 @@ verify about City integration.
 These briefs paste directly into kranz's own backlog (`kranz ticket`) or into
 a Gas City bead via the pack's own field mapping (`title → Goal`, `description
 → Context`, `acceptance_criteria → Acceptance hints`, per the exit-code
-contract section above). Each one is scoped to the earliest **not**
-**Human-gated:** work item its roadmap stage names, so a fresh worker with no
-memory of this document's discussion can pick it up and run it headlessly.
+contract section above). Briefs 1 and 3 are each scoped to the earliest
+**not** **Human-gated:** work item their roadmap stage (Stage 2 and Stage 3
+respectively) names. Brief 2 is different: design decision D5 deliberately
+leaves the kranz-native queue unscheduled — "a flag for Stage 2+ work, not a
+stage in itself" and "not scheduled by this document" — so no Stage 0-5 work
+item names it. Brief 2 is instead the ready-made scoping D5 defers to
+"whenever kranz-side queue work is next scoped"; filing it *is* that scoping
+decision, left to the operator rather than scheduled by this document. Either
+way, a fresh worker with no memory of this document's discussion can pick any
+brief up and run it headlessly.
 
 #### Brief 1: Switch kranz-dispatch's order trigger from cooldown to event
 
