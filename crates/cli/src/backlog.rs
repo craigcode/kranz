@@ -16,12 +16,18 @@
 use crate::commands::{build_backend, load_config, run_mission_loop};
 use crate::output;
 use anyhow::{anyhow, bail, Context, Result};
+use kranz_engine::draft::{drive_draft, DraftOutcome};
 use kranz_engine::git_ops::GitRepo;
-use kranz_engine::orchestrator::{MissionEngine, PlanRequest};
+use kranz_engine::orchestrator::MissionEngine;
 use kranz_engine::queue::{self, QueueEntry};
 use kranz_engine::ticket::{Ticket, TicketState};
 use kranz_engine::types::MissionStatus;
 use std::path::{Path, PathBuf};
+
+// Relocated into kranz-engine (roadmap f-1-1): the pure draft decision helpers
+// live in `kranz_engine::draft` now so any surface can reuse the sequencing
+// core. Re-exported here so existing CLI callers/tests keep working.
+pub use kranz_engine::draft::{draft_decision, split_questions, DraftDecision};
 
 // ---------------------------------------------------------------------------
 // ticket new — scaffold
@@ -247,85 +253,6 @@ pub fn render_queue(entries: &[QueueEntry], busy_with: Option<&str>) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// draft — pure decision helper
-// ---------------------------------------------------------------------------
-
-/// What a `draft` turn resolved to, given the [`PlanRequest`] and whether
-/// `--yes` (auto-approve+enqueue) was passed. Separating the decision from the
-/// I/O keeps the state-machine unit-testable without a backend.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DraftDecision {
-    /// Plan ready: `approve_plan` (commits plan.md) then set this state.
-    /// `Queued` when `--yes` also enqueues; otherwise `Review` (parked).
-    Approve {
-        then_enqueue: bool,
-        next_state: TicketState,
-    },
-    /// Orchestrator wants answers first: append its questions to the ticket
-    /// and set `NeedsContext`. Short-circuits before any approval.
-    NeedsContext { questions: Vec<String> },
-}
-
-/// Map a completed plan request + the `--yes` flag to the next action. Pure:
-/// the caller performs the git/state side effects the decision names.
-pub fn draft_decision(request: &PlanRequest, yes: bool) -> DraftDecision {
-    match request {
-        PlanRequest::Ready(_) => DraftDecision::Approve {
-            then_enqueue: yes,
-            next_state: if yes {
-                TicketState::Queued
-            } else {
-                TicketState::Review
-            },
-        },
-        PlanRequest::NotReady(text) => DraftDecision::NeedsContext {
-            questions: split_questions(text),
-        },
-    }
-}
-
-/// Split the orchestrator's "not ready" prose into individual questions: each
-/// non-empty line, with any leading bullet/number marker stripped. A reply
-/// with no line breaks becomes a single one-item list.
-pub fn split_questions(text: &str) -> Vec<String> {
-    let items: Vec<String> = text
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .map(|l| strip_bullet(l).to_string())
-        .filter(|l| !l.is_empty())
-        .collect();
-    if items.is_empty() {
-        // Preserve *something* so the ticket records the orchestrator spoke.
-        vec![text.trim().to_string()]
-            .into_iter()
-            .filter(|s| !s.is_empty())
-            .collect()
-    } else {
-        items
-    }
-}
-
-/// Strip a single leading `-`/`*`/`+` bullet or `N.`/`N)` number marker.
-fn strip_bullet(line: &str) -> &str {
-    for marker in ["- ", "* ", "+ "] {
-        if let Some(rest) = line.strip_prefix(marker) {
-            return rest.trim_start();
-        }
-    }
-    // Numbered: leading digits then `.`/`)` then a space.
-    let bytes = line.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i > 0 && i < bytes.len() && (bytes[i] == b'.' || bytes[i] == b')') {
-        return line[i + 1..].trim_start();
-    }
-    line
-}
-
-// ---------------------------------------------------------------------------
 // work dispatcher — pure decision helper
 // ---------------------------------------------------------------------------
 
@@ -445,43 +372,33 @@ pub async fn cmd_draft(
     let cfg = config_for_ticket(load_config(&repo, dangerously_allow_all)?, &ticket);
     let backend = build_backend(&cfg)?;
 
-    Ticket::write_state(&repo, slug, TicketState::Drafting, None)?;
-
-    let goal = ticket.mission_goal();
     // Remember where the operator was: parking the plan checks out the
     // mission branch, and the draft must put the checkout back afterward.
     let original_branch = GitRepo::open(&repo)
         .ok()
         .and_then(|g| g.current_branch().ok());
-    let mut engine = MissionEngine::create(backend, repo.clone(), &goal, cfg)?;
-    let mission_id = engine.mission_id().to_string();
-    Ticket::record_mission(&repo, slug, &mission_id)?;
-    println!("drafting ticket '{slug}' as mission {mission_id}");
+    let mut engine = MissionEngine::create(backend, repo.clone(), &ticket.mission_goal(), cfg)?;
+    println!(
+        "drafting ticket '{slug}' as mission {}",
+        engine.mission_id()
+    );
 
-    // Seed the orchestrator with the whole ticket, then demand the plan. One
-    // planning turn gives it the full context before request_plan.
-    if let Err(e) = engine.planning_turn(&goal).await {
-        Ticket::write_state(&repo, slug, TicketState::New, None)?;
-        return Err(crate::commands::augment_limit_hint(e.into()))
-            .with_context(|| format!("seeding the orchestrator for ticket '{slug}'"));
-    }
-    // Surface any captured seed reply (session start) for visibility.
-    if let Some(seed) = engine.take_seed_reply() {
-        println!("orchestrator: {}", output::one_line(&seed, 200));
-    }
+    let outcome = drive_draft(&mut engine, &repo, &ticket, yes)
+        .await
+        .map_err(|e| crate::commands::augment_limit_hint(e.into()))
+        .with_context(|| format!("drafting ticket '{slug}'"))?;
 
-    let request = match engine.request_plan().await {
-        Ok(r) => r,
-        Err(e) => {
-            Ticket::write_state(&repo, slug, TicketState::New, None)?;
-            return Err(crate::commands::augment_limit_hint(e.into()))
-                .with_context(|| format!("requesting the plan for ticket '{slug}'"));
-        }
-    };
+    let mission_branch = engine.state().mission.mission_branch.clone();
+    // Drop the engine (flush + release the mission lock) before touching the
+    // checkout / running anything.
+    drop(engine);
+    restore_draft_checkout(&repo, original_branch.as_deref(), &mission_branch);
 
-    match draft_decision(&request, yes) {
-        DraftDecision::NeedsContext { questions } => {
-            Ticket::append_needs_context(&repo, slug, &questions)?;
+    match outcome {
+        DraftOutcome::NeedsContext {
+            mission_id: _,
+            questions,
+        } => {
             println!("ticket '{slug}' needs context — the orchestrator asked:");
             for q in &questions {
                 println!("  - {q}");
@@ -492,50 +409,25 @@ pub async fn cmd_draft(
                     .join(format!("{slug}.md"))
                     .display()
             );
-            Ok(0)
         }
-        DraftDecision::Approve {
-            then_enqueue,
-            next_state,
+        DraftOutcome::Enqueued { mission_id } => {
+            println!(
+                "plan committed on {mission_branch}; mission {mission_id} approved and QUEUED. \
+                 Run it with `kranz work`."
+            );
+        }
+        DraftOutcome::ParkedForReview {
+            mission_id,
+            mission_branch: _,
         } => {
-            let PlanRequest::Ready(plan) = request else {
-                unreachable!("Approve decision implies a Ready plan");
-            };
-            println!("{}", output::render_plan(&plan));
-            engine.approve_plan(plan)?;
-            let branch = engine.state().mission.mission_branch.clone();
-            let priority = ticket.priority;
-            // Drop the engine (flush + release the mission lock) before touching
-            // the queue / running anything.
-            drop(engine);
-            restore_draft_checkout(&repo, original_branch.as_deref(), &branch);
-
-            if then_enqueue {
-                queue::enqueue(
-                    &repo,
-                    QueueEntry {
-                        mission_id: mission_id.clone(),
-                        ticket_slug: Some(slug.to_string()),
-                        priority,
-                        seq: 0, // assigned by enqueue
-                    },
-                )?;
-                Ticket::write_state(&repo, slug, next_state, None)?;
-                println!(
-                    "plan committed on {branch}; mission {mission_id} approved and QUEUED. \
-                     Run it with `kranz work`."
-                );
-            } else {
-                Ticket::write_state(&repo, slug, next_state, None)?;
-                println!(
-                    "plan committed on {branch} for review; mission {mission_id} parked. \
-                     Review it, then run `kranz ticket approve {slug}` to queue it \
-                     (or `kranz plan --mission {mission_id}` to reshape)."
-                );
-            }
-            Ok(0)
+            println!(
+                "plan committed on {mission_branch} for review; mission {mission_id} parked. \
+                 Review it, then run `kranz ticket approve {slug}` to queue it \
+                 (or `kranz plan --mission {mission_id}` to reshape)."
+            );
         }
     }
+    Ok(0)
 }
 
 /// `kranz ticket approve <slug> [--mission <id>]`: enqueue the parked (Review)
