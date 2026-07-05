@@ -1150,7 +1150,8 @@ async fn cmd_serve(
             tracing::error!(error = %e, "failed to install ctrl-c handler");
         }
     };
-    let result = serve_with_token_cleanup(&repo, host, bind, port, static_assets, token, shutdown).await;
+    let result =
+        serve_with_token_cleanup(&repo, host, bind, port, static_assets, token, shutdown).await;
     match result {
         Ok(()) => Ok(0),
         Err(e) => Err(anyhow!("server failed: {e}")),
@@ -1177,7 +1178,8 @@ async fn serve_with_token_cleanup(
     let token_file = write_serve_token(repo, &token).ok();
 
     let result =
-        kranz_server::serve_with_shutdown(host, bind, port, static_assets, Some(token), shutdown).await;
+        kranz_server::serve_with_shutdown(host, bind, port, static_assets, Some(token), shutdown)
+            .await;
 
     if token_file.is_some() {
         remove_serve_token(repo);
@@ -1405,11 +1407,12 @@ fn open_browser(url: &str) {
 /// Resolve the mutation token for `kranz release`, in precedence order:
 /// `--token` flag > `$KRANZ_TOKEN` > `<repo>/.kranz/serve.token`.
 fn resolve_release_token(repo: &Path, flag: Option<String>) -> Option<String> {
-    flag.or_else(|| std::env::var("KRANZ_TOKEN").ok()).or_else(|| {
-        std::fs::read_to_string(repo.join(".kranz").join("serve.token"))
-            .ok()
-            .map(|s| s.trim_end().to_string())
-    })
+    flag.or_else(|| std::env::var("KRANZ_TOKEN").ok())
+        .or_else(|| {
+            std::fs::read_to_string(repo.join(".kranz").join("serve.token"))
+                .ok()
+                .map(|s| s.trim_end().to_string())
+        })
 }
 
 async fn cmd_release(

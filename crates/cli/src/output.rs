@@ -220,7 +220,9 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use kranz_engine::events::{Event, EventKind};
     use kranz_engine::reducer::fold;
-    use kranz_engine::types::{Assertion, AssertionCheck, MissionConfig, Plan, PlanFeature, PlanMilestone};
+    use kranz_engine::types::{
+        Assertion, AssertionCheck, MissionConfig, Plan, PlanFeature, PlanMilestone,
+    };
 
     #[test]
     fn approved_status_label_is_uppercase() {

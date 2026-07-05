@@ -2395,7 +2395,10 @@ mod tests {
     #[test]
     fn approved_status_word_reads_approved_not_running() {
         assert_eq!(status_word(MissionStatus::Approved), "Approved");
-        assert_ne!(status_word(MissionStatus::Approved), status_word(MissionStatus::Running));
+        assert_ne!(
+            status_word(MissionStatus::Approved),
+            status_word(MissionStatus::Running)
+        );
     }
 
     #[test]
