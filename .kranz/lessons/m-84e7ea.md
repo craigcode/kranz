@@ -1,0 +1,5 @@
+A single lesson is worth carrying forward — it cost a full fix cycle and would change how a future planner writes any lifecycle/cleanup ass…
+
+A single lesson is worth carrying forward — it cost a full fix cycle and would change how a future planner writes any lifecycle/cleanup assertion in this repo.
+
+When a contract assertion says a resource is *removed/released/cleaned up on shutdown or exit* (as a2 did for `.kranz/serve.token`), spec the feature so the test drives the **production cleanup wiring end-to-end** — factor the whole write→serve→remove sequence into one helper the test invokes — rather than letting the test perform the side effect itself. A test that calls the removal directly (instead of exercising `cmd_serve`'s wiring) passes vacuously: deleting the real cleanup line leaves it green. The milestone validator catches this and it costs a fix cycle. State the "test must red-fail if the production cleanup is deleted" requirement in the feature's validationCriteria up front.
