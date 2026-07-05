@@ -96,7 +96,7 @@ impl EventRenderer {
             EventKind::MissionCreated { goal, .. } => {
                 ("mission".to_string(), ansi::YELLOW, format!("created: {goal}"))
             }
-            EventKind::PlanApproved { plan } => {
+            EventKind::PlanApproved { plan, .. } => {
                 let features: usize = plan.milestones.iter().map(|m| m.features.len()).sum();
                 (
                     "mission".to_string(),

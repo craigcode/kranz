@@ -1372,6 +1372,99 @@ async fn plan_approval_writes_plan_branch_and_commit() {
     assert!(err.to_string().contains("Planning"), "got: {err}");
 }
 
+/// approve_plan resolves the base branch's tip and records it as
+/// `state.mission.base_sha` (and the emitted `plan.approved` event's
+/// `baseSha`) — pinned at approval time, not re-resolved later.
+#[test]
+fn approval_records_base_branch_sha() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    // Base branch tip BEFORE approval, recorded independently of the code
+    // under test via a raw git rev-parse.
+    let base_tip_before = raw_git(&root, &["rev-parse", "main"]).trim().to_string();
+
+    let backend = Arc::new(MockBackend::new());
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let state = engine.state();
+    assert_eq!(
+        state.mission.base_sha.as_deref(),
+        Some(base_tip_before.as_str()),
+        "folded state.mission.base_sha must equal the base branch tip recorded before approval"
+    );
+
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    let approved = events
+        .iter()
+        .find(|e| e.kind.type_name() == "plan.approved")
+        .expect("plan.approved event must be on the log");
+    match &approved.kind {
+        EventKind::PlanApproved { base_sha, .. } => {
+            assert_eq!(base_sha.as_deref(), Some(base_tip_before.as_str()));
+        }
+        other => panic!("expected PlanApproved, got: {other:?}"),
+    }
+
+    // Base branch itself never moved — approve_plan commits onto the mission
+    // branch only, so the recorded sha is still the base tip.
+    let base_tip_after = raw_git(&root, &["rev-parse", "main"]).trim().to_string();
+    assert_eq!(base_tip_after, base_tip_before, "base branch must not move");
+}
+
+/// The base sha recorded at plan approval reaches both the worker session's
+/// and the validator session's env as `KRANZ_BASE_SHA`, so contracts never
+/// diff against the moving base branch.
+#[tokio::test(flavor = "multi_thread")]
+async fn base_sha_reaches_worker_and_validator_env() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let base_tip_before = raw_git(&root, &["rev-parse", "main"]).trim().to_string();
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![judgement("complete", ""), verdicts_pass(&["a-2"])]),
+        validator_with(json!([])),
+    ]));
+
+    let contract = vec![assertion("a-2", "error messages are actionable", None)];
+    let cfg = MissionConfig { skip_scrutiny: false, ..test_cfg() };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, contract)).unwrap();
+    assert_eq!(engine.state().mission.base_sha.as_deref(), Some(base_tip_before.as_str()));
+
+    let status = timeout(TEST_TIMEOUT, engine.run()).await.expect("run must not hang").unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+
+    let specs = backend.started_specs();
+    let worker_spec = specs
+        .iter()
+        .find(|s| matches!(s.prompt, PromptMode::SingleShot(ref t) if t.contains("Implement feature")))
+        .expect("a worker spec was started");
+    assert_eq!(
+        worker_spec.env.get("KRANZ_BASE_SHA").map(String::as_str),
+        Some(base_tip_before.as_str()),
+        "worker env carries the recorded base sha"
+    );
+
+    let validator_spec = specs
+        .iter()
+        .find(|s| matches!(s.prompt, PromptMode::SingleShot(ref t) if t.contains("Validate milestone")))
+        .expect("a validator spec was started");
+    assert_eq!(
+        validator_spec.env.get("KRANZ_BASE_SHA").map(String::as_str),
+        Some(base_tip_before.as_str()),
+        "validator env carries the recorded base sha"
+    );
+}
+
 /// The missions catalog upserts by mission id: appends new entries newest
 /// last, replaces on re-approval, never duplicates.
 #[test]

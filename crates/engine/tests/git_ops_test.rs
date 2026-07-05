@@ -138,6 +138,33 @@ fn current_branch_reports_main() {
 }
 
 #[test]
+fn rev_parse_matches_head_sha_for_current_branch() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo, first) = seeded_repo();
+    assert_eq!(repo.rev_parse("main").unwrap(), first);
+    assert_eq!(repo.rev_parse("main").unwrap(), repo.head_sha().unwrap());
+}
+
+#[test]
+fn rev_parse_rejects_flag_shaped_ref_without_invoking_git() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo, _first) = seeded_repo();
+    let err = repo
+        .rev_parse("-somethingflagshaped")
+        .expect_err("flag-shaped ref must be refused");
+    match err {
+        EngineError::Git(msg) => {
+            assert!(msg.contains("refusing"), "expected refusal message, got: {msg}");
+        }
+        other => panic!("expected EngineError::Git, got: {other:?}"),
+    }
+}
+
+#[test]
 fn branch_create_checkout_roundtrip() {
     if !setup() {
         return;

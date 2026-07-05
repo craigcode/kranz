@@ -109,3 +109,11 @@ log.
    sharing reducer code (plan assumed one TS codebase). The Rust reducer stays
    the single source of truth; the UI is a pure view.
 5. **Worker turn budget enforced by the engine** (CLI dropped `--max-turns`).
+6. **Pinned-base validation contract** — after the m-660ffc incident, where a
+   contract's `git diff main` assertion raced a concurrent commit landing on
+   the base branch mid-mission, the base branch's commit SHA is now captured
+   at plan approval, recorded on the `plan.approved` event (optional field,
+   additive for backward compatibility), and exposed to every worker and
+   validator session as the `KRANZ_BASE_SHA` env var. The role prompts
+   reference it so contracts diff against a pinned commit instead of a
+   moving branch name.

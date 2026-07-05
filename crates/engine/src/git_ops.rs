@@ -77,6 +77,21 @@ impl GitRepo {
         Ok(self.run(&["rev-parse", "--abbrev-ref", "HEAD"])?.trim().to_string())
     }
 
+    /// Sha of an arbitrary ref (`git rev-parse <refname>`).
+    ///
+    /// Rejects a flag-shaped `refname` (leading `-`) with an
+    /// [`EngineError::Git`] before invoking git, mirroring the guard on
+    /// [`GitRepo::add_worktree`]/[`GitRepo::merge_no_ff`]/
+    /// [`GitRepo::push_mission_branch`].
+    pub fn rev_parse(&self, refname: &str) -> Result<String> {
+        if refname.starts_with('-') {
+            return Err(EngineError::Git(format!(
+                "refusing rev-parse of flag-shaped ref {refname:?}"
+            )));
+        }
+        Ok(self.run(&["rev-parse", refname])?.trim().to_string())
+    }
+
     /// Whether a local branch of this name exists.
     pub fn branch_exists(&self, name: &str) -> Result<bool> {
         let git_ref = format!("refs/heads/{name}");

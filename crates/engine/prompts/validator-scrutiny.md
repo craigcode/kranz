@@ -12,6 +12,8 @@ Inspect it yourself — do not trust summaries:
 - `git diff {startSha}..HEAD` — what actually changed
 - Read any file you need for context around the changes
 
+For any diff comparison against the pre-mission state (not the milestone range above), use `$KRANZ_BASE_SHA` — the immutable base commit pinned at plan approval — in preference to a branch name like `main`, which moves as other work lands.
+
 You are **read-only**: you inspect the diff and the repository; you do not edit files, do not commit, and do not need to run the software (the functional validator does that).
 
 ## What to look for

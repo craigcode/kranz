@@ -741,6 +741,7 @@ async fn run_worker_builds_spec_and_uses_report_result() {
         "Auth",
         Some("mind the rate limiter"),
         None,
+        None,
     )
     .await
     .unwrap();
@@ -752,6 +753,7 @@ async fn run_worker_builds_spec_and_uses_report_result() {
     assert_eq!(specs.len(), 1);
     let spec = &specs[0];
     assert_eq!(spec.cwd, p.repo_root);
+    assert!(!spec.env.contains_key("KRANZ_BASE_SHA"), "no base sha means no env var");
     assert_eq!(spec.model, cfg.worker.model);
     assert_eq!(spec.effort, cfg.worker.reasoning_effort);
     assert_eq!(spec.max_turns, cfg.worker.max_turns);
@@ -818,6 +820,7 @@ async fn run_validator_builds_spec_permissions_and_parses_report() {
         &contract,
         "abc123",
         None,
+        None,
     )
     .await
     .unwrap();
@@ -829,6 +832,7 @@ async fn run_validator_builds_spec_permissions_and_parses_report() {
 
     let specs = backend.started_specs();
     let spec = &specs[0];
+    assert!(!spec.env.contains_key("KRANZ_BASE_SHA"), "no base sha means no env var");
     assert_eq!(spec.model, cfg.validator_scrutiny.model);
     assert_eq!(spec.permission_mode.as_deref(), Some("default"));
     assert!(spec.allowed_tools.iter().any(|a| a == "Bash(cargo test --all*)"));
@@ -878,6 +882,7 @@ async fn run_validator_rejects_non_validator_roles() {
         &milestone(),
         &[],
         "abc123",
+        None,
         None,
     )
     .await
@@ -964,6 +969,7 @@ async fn run_worker_in_buffered_collects_kinds_without_touching_the_log() {
         "Auth",
         None,
         &cwd,
+        None,
     )
     .await
     .unwrap();

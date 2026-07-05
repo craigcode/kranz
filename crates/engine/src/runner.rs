@@ -491,6 +491,7 @@ pub async fn run_worker(
     milestone_title: &str,
     extra_guidance: Option<&str>,
     cancel: Option<Arc<Notify>>,
+    base_sha: Option<&str>,
 ) -> Result<RunOutcome> {
     let cwd = paths.repo_root.clone();
     run_worker_in(
@@ -504,6 +505,7 @@ pub async fn run_worker(
         extra_guidance,
         cancel,
         &cwd,
+        base_sha,
     )
     .await
 }
@@ -528,9 +530,17 @@ pub async fn run_worker_in(
     extra_guidance: Option<&str>,
     cancel: Option<Arc<Notify>>,
     session_cwd: &std::path::Path,
+    base_sha: Option<&str>,
 ) -> Result<RunOutcome> {
-    let (spec, run_meta) =
-        build_worker_spec(cfg, feature, plan_goal, milestone_title, extra_guidance, session_cwd);
+    let (spec, run_meta) = build_worker_spec(
+        cfg,
+        feature,
+        plan_goal,
+        milestone_title,
+        extra_guidance,
+        session_cwd,
+        base_sha,
+    );
     let mut target = LogTarget::Live(log);
     run_session_to(backend, spec, &mut target, paths, run_meta, cancel).await
 }
@@ -562,9 +572,17 @@ pub async fn run_worker_in_buffered(
     milestone_title: &str,
     extra_guidance: Option<&str>,
     session_cwd: &std::path::Path,
+    base_sha: Option<&str>,
 ) -> Result<(Vec<EventKind>, RunOutcome)> {
-    let (spec, run_meta) =
-        build_worker_spec(cfg, feature, plan_goal, milestone_title, extra_guidance, session_cwd);
+    let (spec, run_meta) = build_worker_spec(
+        cfg,
+        feature,
+        plan_goal,
+        milestone_title,
+        extra_guidance,
+        session_cwd,
+        base_sha,
+    );
     let mut target = LogTarget::Buffer(Vec::new());
     let outcome = run_session_to(backend, spec, &mut target, paths, run_meta, None).await?;
     let buffered = match target {
@@ -578,6 +596,7 @@ pub async fn run_worker_in_buffered(
 /// buffered worker paths. Identical spec construction guarantees a buffered
 /// run and a live run are byte-for-byte the same session, differing only in
 /// where their event kinds land.
+#[allow(clippy::too_many_arguments)]
 fn build_worker_spec(
     cfg: &MissionConfig,
     feature: &Feature,
@@ -585,6 +604,7 @@ fn build_worker_spec(
     milestone_title: &str,
     extra_guidance: Option<&str>,
     session_cwd: &std::path::Path,
+    base_sha: Option<&str>,
 ) -> (SessionSpec, RunMeta) {
     let role = Role::Worker;
     let role_cfg = cfg.role(role);
@@ -639,6 +659,9 @@ fn build_worker_spec(
         max_turns: role_cfg.max_turns,
         env: HashMap::new(),
     };
+    if let Some(sha) = base_sha.filter(|s| !s.is_empty()) {
+        spec.env.insert("KRANZ_BASE_SHA".to_string(), sha.to_string());
+    }
     permissions::apply(permissions::for_role(role, cfg, &[]), &mut spec);
 
     let run_meta = RunMeta {
@@ -668,6 +691,7 @@ pub async fn run_validator(
     contract: &[Assertion],
     start_sha: &str,
     cancel: Option<Arc<Notify>>,
+    base_sha: Option<&str>,
 ) -> Result<RunOutcome> {
     if !matches!(kind, Role::ValidatorScrutiny | Role::ValidatorFunctional) {
         return Err(EngineError::InvalidState(format!(
@@ -745,6 +769,9 @@ pub async fn run_validator(
         max_turns: role_cfg.max_turns,
         env: HashMap::new(),
     };
+    if let Some(sha) = base_sha.filter(|s| !s.is_empty()) {
+        spec.env.insert("KRANZ_BASE_SHA".to_string(), sha.to_string());
+    }
     permissions::apply(permissions::for_role(kind, cfg, &contract_commands), &mut spec);
 
     let run_meta = RunMeta {

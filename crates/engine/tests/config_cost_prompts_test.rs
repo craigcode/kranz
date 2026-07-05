@@ -370,7 +370,7 @@ fn fix_feature(id: &str) -> Feature {
 fn mission_a_events() -> Vec<EventKind> {
     vec![
         created("m-a"),
-        EventKind::PlanApproved { plan: plan_with(&[2]) },
+        EventKind::PlanApproved { plan: plan_with(&[2]), base_sha: None },
         EventKind::MilestoneStarted { milestone_id: "ms-1".into(), start_sha: "aaa".into() },
         EventKind::FeatureStarted { feature_id: "f-1-1".into() },
         spawned("w-1", Role::Worker, Some("f-1-1"), None),
@@ -426,7 +426,7 @@ fn mission_a_events() -> Vec<EventKind> {
 fn mission_b_events() -> Vec<EventKind> {
     vec![
         created("m-b"),
-        EventKind::PlanApproved { plan: plan_with(&[1]) },
+        EventKind::PlanApproved { plan: plan_with(&[1]), base_sha: None },
         EventKind::MilestoneStarted { milestone_id: "ms-1".into(), start_sha: "bbb".into() },
         EventKind::FeatureStarted { feature_id: "f-1-1".into() },
         spawned("w-1", Role::Worker, Some("f-1-1"), None),
@@ -454,7 +454,7 @@ fn calibrate_averages_actuals_across_completed_missions() {
     write_events(
         repo,
         "m-running",
-        vec![created("m-running"), EventKind::PlanApproved { plan: plan_with(&[1]) }],
+        vec![created("m-running"), EventKind::PlanApproved { plan: plan_with(&[1]), base_sha: None }],
     );
     // ...an unreadable log (corruption mid-file)...
     let bad = repo.join(".kranz").join("missions").join("m-bad");
@@ -506,7 +506,7 @@ fn calibrate_clamps_zero_costs_to_floor() {
         "m-zero",
         vec![
             created("m-zero"),
-            EventKind::PlanApproved { plan: plan_with(&[1]) },
+            EventKind::PlanApproved { plan: plan_with(&[1]), base_sha: None },
             EventKind::MilestoneStarted { milestone_id: "ms-1".into(), start_sha: "ccc".into() },
             EventKind::FeatureStarted { feature_id: "f-1-1".into() },
             spawned("w-1", Role::Worker, Some("f-1-1"), None),

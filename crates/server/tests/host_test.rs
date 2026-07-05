@@ -274,7 +274,7 @@ async fn delete_guards_live_and_complete_missions() {
         let mut log =
             EventLog::acquire(&paths, "m-live", Duration::ZERO, LockForce::No).unwrap();
         let plan: kranz_engine::types::Plan = serde_json::from_value(plan_json()).unwrap();
-        log.append(EventKind::PlanApproved { plan }).unwrap();
+        log.append(EventKind::PlanApproved { plan, base_sha: None }).unwrap();
     }
     let (status, body) =
         post_json(&app, "/api/missions/m-live/delete", Some(TOKEN), json!({})).await;
@@ -287,7 +287,7 @@ async fn delete_guards_live_and_complete_missions() {
         let mut log =
             EventLog::acquire(&paths, "m-done", Duration::ZERO, LockForce::No).unwrap();
         let plan: kranz_engine::types::Plan = serde_json::from_value(plan_json()).unwrap();
-        log.append(EventKind::PlanApproved { plan }).unwrap();
+        log.append(EventKind::PlanApproved { plan, base_sha: None }).unwrap();
         log.append(EventKind::MissionCompleted {}).unwrap();
     }
     let (status, body) =
@@ -669,7 +669,7 @@ async fn planning_endpoints_attach_non_hosted_missions_and_404_unknown() {
         let mut log =
             EventLog::acquire(&paths, "m-done", Duration::ZERO, LockForce::No).unwrap();
         let plan: kranz_engine::types::Plan = serde_json::from_value(plan_json()).unwrap();
-        log.append(EventKind::PlanApproved { plan }).unwrap();
+        log.append(EventKind::PlanApproved { plan, base_sha: None }).unwrap();
     }
     let (status, body) = post_json(
         &app,

@@ -50,3 +50,23 @@ pub fn render(template: &str, vars: &HashMap<&str, String>) -> String {
     })
     .into_owned()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_prompts_mention_base_sha() {
+        for role in [
+            Role::Orchestrator,
+            Role::Worker,
+            Role::ValidatorScrutiny,
+            Role::ValidatorFunctional,
+        ] {
+            assert!(
+                text(role).contains("KRANZ_BASE_SHA"),
+                "{role:?} prompt does not mention KRANZ_BASE_SHA"
+            );
+        }
+    }
+}

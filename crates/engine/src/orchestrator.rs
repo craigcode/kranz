@@ -630,6 +630,11 @@ impl MissionEngine {
             self.repo.create_branch(&branch, Some(&base))?;
         }
         self.repo.checkout(&branch)?;
+        // Committing plan files onto the mission branch below does not move
+        // the base branch ref, so resolving it anywhere in approve_plan pins
+        // the base tip as of approval (plan §f-1-2: never re-resolve later —
+        // that would reintroduce the moving-base-branch race this fixes).
+        let base_sha = self.repo.rev_parse(&base)?;
 
         let plan_file = self.paths.plan_file();
         if let Some(parent) = plan_file.parent() {
@@ -655,7 +660,7 @@ impl MissionEngine {
             &format!("[kranz] approved plan for {}", self.state.mission.id),
         )?;
 
-        self.emit(EventKind::PlanApproved { plan })?;
+        self.emit(EventKind::PlanApproved { plan, base_sha: Some(base_sha) })?;
         Ok(())
     }
 
@@ -1194,6 +1199,7 @@ impl MissionEngine {
             let goal = self.state.mission.goal.clone();
             let milestone_title = self.state.mission.milestones[mi].title.clone();
             let cfg = self.state.config.clone();
+            let base_sha = self.state.mission.base_sha.clone();
             let pre_run_sha = self.repo.head_sha()?;
 
             // Interrupt wiring: a control watcher polls the inbox and fires
@@ -1216,6 +1222,7 @@ impl MissionEngine {
                 &milestone_title,
                 guidance.as_deref(),
                 Some(cancel),
+                base_sha.as_deref(),
             )
             .await;
             watcher.abort();
@@ -1620,6 +1627,7 @@ impl MissionEngine {
         let goal = self.state.mission.goal.clone();
         let milestone_title = self.state.mission.milestones[mi].title.clone();
         let cfg = self.state.config.clone();
+        let base_sha = self.state.mission.base_sha.clone();
         let tracker = ConcurrencyTracker::new();
 
         let mut set: tokio::task::JoinSet<(usize, BufferedRunResult)> =
@@ -1634,6 +1642,7 @@ impl MissionEngine {
             let milestone_title = milestone_title.clone();
             let ws_path = ws.path.clone();
             let guard = tracker.clone();
+            let base_sha = base_sha.clone();
             set.spawn(async move {
                 let _live = guard.enter(); // count this session as live
                 let result = runner::run_worker_in_buffered(
@@ -1645,6 +1654,7 @@ impl MissionEngine {
                     &milestone_title,
                     None,
                     &ws_path,
+                    base_sha.as_deref(),
                 )
                 .await;
                 (idx, result)
@@ -1923,6 +1933,7 @@ impl MissionEngine {
             let milestone = self.state.mission.milestones[mi].clone();
             let contract = self.state.mission.validation_contract.clone();
             let cfg = self.state.config.clone();
+            let base_sha = self.state.mission.base_sha.clone();
             let backend = Arc::clone(&self.backend);
             let outcome = runner::run_validator(
                 backend.as_ref(),
@@ -1934,6 +1945,7 @@ impl MissionEngine {
                 &contract,
                 &start_sha,
                 None,
+                base_sha.as_deref(),
             )
             .await;
             let caught = self.catch_up();
