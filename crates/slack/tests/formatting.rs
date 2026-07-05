@@ -64,12 +64,14 @@ fn plan_ready_block_kit() {
     assert!(text.contains("Token bucket") && text.contains("429 responses"));
     assert!(text.contains("2 validation assertions"));
 
-    // The approve button carries the mission id under the shared action id, and
-    // must be serializable (it goes straight into a chat.postMessage body).
-    let actions = blocks.iter().find(|b| b["type"] == "actions").expect("actions block");
-    let button = &actions["elements"][0];
-    assert_eq!(button["action_id"], APPROVE_ACTION_ID);
-    assert_eq!(button["value"], "m-42");
+    // Post-approval announcement: NO actions block (a live approve button
+    // after approval invited stale second approvals — seen on m-c9c915) and
+    // still serializable (it goes straight into a chat.postMessage body).
+    assert!(
+        blocks.iter().all(|b| b["type"] != "actions"),
+        "no buttons on the plan-approved announcement"
+    );
+    assert!(text.contains("Plan approved"));
     assert!(serde_json::to_string(&blocks).is_ok());
 }
 
