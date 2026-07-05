@@ -81,7 +81,7 @@ rather than being dropped or panicking.
 | `kranz.mission.id` | root | Mission id |
 | `kranz.mission.goal` | root | Mission goal string |
 | `kranz.mission.status` | root | `complete` \| `failed` \| `abandoned` |
-| `kranz.milestone.id` | milestone, run | Milestone id (`ms-<n>`) |
+| `kranz.milestone.id` | milestone, run (only when the run was spawned with an explicit milestone_id — e.g. validator runs) | Milestone id (`ms-<n>`) |
 | `kranz.milestone.title` | milestone | Milestone title |
 | `kranz.milestone.status` | milestone | `complete` \| `blocked` |
 | `kranz.milestone.fix_cycles` | milestone | Count of fix-feature cycles entered while validating |
