@@ -85,6 +85,10 @@ struct StatusFile {
     state: TicketState,
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<String>,
+    /// The mission `kranz draft` created for this ticket — the durable
+    /// ticket→mission link `kranz ticket approve <slug>` resolves by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mission_id: Option<String>,
 }
 
 impl Ticket {
@@ -302,10 +306,53 @@ impl Ticket {
         Self::ensure_valid_slug(slug)?;
         let dir = Self::tickets_dir(repo_root);
         std::fs::create_dir_all(&dir)?;
-        let sf = StatusFile { state, note };
+        // Preserve an existing mission link: state flips (Review→Queued→Done)
+        // must never erase which mission the draft created.
+        let mission_id = Self::read_status_file(repo_root, slug).and_then(|sf| sf.mission_id);
+        let sf = StatusFile {
+            state,
+            note,
+            mission_id,
+        };
         let json = serde_json::to_string_pretty(&sf)?;
         atomic_write(&Self::status_path(repo_root, slug), json.as_bytes())?;
         Ok(())
+    }
+
+    fn read_status_file(repo_root: &Path, slug: &str) -> Option<StatusFile> {
+        if !Self::valid_slug(slug) {
+            return None;
+        }
+        let text = std::fs::read_to_string(Self::status_path(repo_root, slug)).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
+    /// Durably link the ticket to the mission `kranz draft` created for it.
+    /// `kranz ticket approve <slug>` resolves through this link — goal-text
+    /// matching breaks the moment `plan.approved` rewrites the mission goal
+    /// to the orchestrator's refined phrasing (observed live on the first
+    /// drafted batch).
+    pub fn record_mission(repo_root: &Path, slug: &str, mission_id: &str) -> Result<()> {
+        Self::ensure_valid_slug(slug)?;
+        let dir = Self::tickets_dir(repo_root);
+        std::fs::create_dir_all(&dir)?;
+        let (state, note) = match Self::read_status_file(repo_root, slug) {
+            Some(sf) => (sf.state, sf.note),
+            None => (TicketState::Drafting, None),
+        };
+        let sf = StatusFile {
+            state,
+            note,
+            mission_id: Some(mission_id.to_string()),
+        };
+        let json = serde_json::to_string_pretty(&sf)?;
+        atomic_write(&Self::status_path(repo_root, slug), json.as_bytes())?;
+        Ok(())
+    }
+
+    /// The mission recorded by [`Self::record_mission`], if any.
+    pub fn mission_for(repo_root: &Path, slug: &str) -> Option<String> {
+        Self::read_status_file(repo_root, slug).and_then(|sf| sf.mission_id)
     }
 
     /// Append the orchestrator's verbatim clarifying questions to the ticket

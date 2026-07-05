@@ -286,6 +286,18 @@ impl MissionEngine {
         let repo_root = canonical_root(repo_root.into());
         let repo = GitRepo::open(&repo_root)?;
         repo.ensure_identity()?;
+        // The current branch becomes this mission's base. Basing one mission
+        // on another's branch inherits unmerged work and records a poisoned
+        // base (observed live: sequential drafts stacked three mission
+        // branches on each other) — loud refusal beats silent stacking.
+        let base_branch = repo.current_branch()?;
+        if base_branch.starts_with("kranz/mission-") {
+            return Err(EngineError::InvalidState(format!(
+                "refusing to create a mission while '{base_branch}' is checked out — \
+                 another mission's branch would become this mission's base; \
+                 check out the intended base (e.g. main) first"
+            )));
+        }
 
         let mission_id = format!("m-{}", &uuid::Uuid::new_v4().simple().to_string()[..6]);
         let paths = MissionPaths::new(&repo_root, &mission_id);
@@ -301,7 +313,6 @@ impl MissionEngine {
             LockForce::No,
         )?;
 
-        let base_branch = repo.current_branch()?;
         let mission_branch = format!("kranz/mission-{mission_id}");
         let created = log.append(EventKind::MissionCreated {
             goal: goal.to_string(),
@@ -971,6 +982,12 @@ impl MissionEngine {
     /// (returned so the user can intervene), or the process is killed (safe:
     /// the log is the source of truth). Paused missions loop in place,
     /// draining the control inbox, until a Resume arrives.
+    /// NOTE on checkout lifetime: run() leaves the checkout on the MISSION
+    /// branch at terminal states deliberately — report.md/plan.md are
+    /// committed there, and yanking the checkout back to base would make the
+    /// mission's own artifacts vanish from the working tree at the exact
+    /// moment the operator reads them. The dispatcher (`kranz work`) and
+    /// `kranz draft` restore the operator's checkout at THEIR boundaries.
     pub async fn run(&mut self) -> Result<MissionStatus> {
         if self.state.mission.status == MissionStatus::Planning {
             return Err(EngineError::InvalidState(
@@ -986,6 +1003,30 @@ impl MissionEngine {
                 "mission is already terminal ({:?}); nothing to run",
                 self.state.mission.status
             )));
+        }
+
+        // Branch isolation: workers commit on the mission branch, never on
+        // whatever branch the operator (or a previous mission/draft) left
+        // checked out. Approval created and checked out the branch, but
+        // nothing re-asserted it at run time — the first live `kranz work`
+        // train committed three missions straight to main.
+        let mission_branch = self.state.mission.mission_branch.clone();
+        if self.repo.current_branch()? != mission_branch {
+            if !self.repo.branch_exists(&mission_branch)? {
+                // A deleted branch is recreated at the pinned approval base.
+                let from = self
+                    .state
+                    .mission
+                    .base_sha
+                    .clone()
+                    .unwrap_or_else(|| self.state.mission.base_branch.clone());
+                self.repo.create_branch(&mission_branch, Some(&from))?;
+            }
+            self.repo.checkout(&mission_branch)?;
+            self.emit_decision(
+                &format!("run: re-asserted mission branch {mission_branch} (checkout had drifted)"),
+                None,
+            )?;
         }
 
         // Environment preflight (roadmap M2): surface obvious missing

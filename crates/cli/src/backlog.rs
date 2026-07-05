@@ -16,6 +16,7 @@
 use crate::commands::{build_backend, load_config, run_mission_loop};
 use crate::output;
 use anyhow::{anyhow, bail, Context, Result};
+use kranz_engine::git_ops::GitRepo;
 use kranz_engine::orchestrator::{MissionEngine, PlanRequest};
 use kranz_engine::queue::{self, QueueEntry};
 use kranz_engine::ticket::{Ticket, TicketState};
@@ -447,8 +448,14 @@ pub async fn cmd_draft(
     Ticket::write_state(&repo, slug, TicketState::Drafting, None)?;
 
     let goal = ticket.mission_goal();
+    // Remember where the operator was: parking the plan checks out the
+    // mission branch, and the draft must put the checkout back afterward.
+    let original_branch = GitRepo::open(&repo)
+        .ok()
+        .and_then(|g| g.current_branch().ok());
     let mut engine = MissionEngine::create(backend, repo.clone(), &goal, cfg)?;
     let mission_id = engine.mission_id().to_string();
+    Ticket::record_mission(&repo, slug, &mission_id)?;
     println!("drafting ticket '{slug}' as mission {mission_id}");
 
     // Seed the orchestrator with the whole ticket, then demand the plan. One
@@ -501,6 +508,7 @@ pub async fn cmd_draft(
             // Drop the engine (flush + release the mission lock) before touching
             // the queue / running anything.
             drop(engine);
+            restore_draft_checkout(&repo, original_branch.as_deref(), &branch);
 
             if then_enqueue {
                 queue::enqueue(
@@ -550,12 +558,14 @@ pub fn cmd_ticket_approve(repo: &Path, slug: &str, explicit_mission: Option<&str
     }
     let mission_id = match explicit_mission {
         Some(id) => id.to_string(),
-        None => find_mission_for_ticket(repo, &ticket).ok_or_else(|| {
-            anyhow!(
-                "could not find the drafted mission for ticket '{slug}' automatically — \
+        None => Ticket::mission_for(repo, slug)
+            .or_else(|| find_mission_for_ticket(repo, &ticket))
+            .ok_or_else(|| {
+                anyhow!(
+                    "could not find the drafted mission for ticket '{slug}' automatically — \
                  pass it with `kranz ticket approve {slug} --mission <id>` (see `kranz missions`)"
-            )
-        })?,
+                )
+            })?,
     };
     let entry = queue::enqueue(
         repo,
@@ -576,6 +586,60 @@ pub fn cmd_ticket_approve(repo: &Path, slug: &str, explicit_mission: Option<&str
 
 /// Find the mission `draft` created for a ticket: the newest-by-event-log
 /// mission whose recorded goal equals the ticket's folded mission goal.
+/// Dispatcher-exit twin of [`restore_draft_checkout`]: put the checkout back
+/// where the operator started `kranz work`. Skipped when the operator was
+/// already on a mission branch (restoring TO one would recreate the very
+/// stranding this exists to end).
+fn restore_work_checkout(repo: &Path, original: Option<&str>) {
+    let Some(original) = original else { return };
+    if original.starts_with("kranz/mission-") {
+        return;
+    }
+    let Ok(git) = GitRepo::open(repo) else { return };
+    if git.current_branch().ok().as_deref() == Some(original) {
+        return;
+    }
+    match git.is_clean_tracked() {
+        Ok(true) => match git.checkout(original) {
+            Ok(()) => println!("checkout restored to {original}"),
+            Err(e) => eprintln!("warning: could not restore checkout to {original}: {e}"),
+        },
+        Ok(false) => {
+            eprintln!("warning: checkout left in place: tracked files have uncommitted changes")
+        }
+        Err(e) => {
+            eprintln!("warning: could not probe the working tree ({e}); checkout left in place")
+        }
+    }
+}
+
+/// Put the checkout back where the operator had it before `kranz draft`
+/// parked the plan. Untracked files ride along; TRACKED modifications abort
+/// the restore — never carry uncommitted operator edits across a branch
+/// switch silently.
+fn restore_draft_checkout(repo: &Path, original: Option<&str>, mission_branch: &str) {
+    let Some(original) = original else { return };
+    if original == mission_branch {
+        return;
+    }
+    let Ok(git) = GitRepo::open(repo) else { return };
+    match git.is_clean_tracked() {
+        Ok(true) => match git.checkout(original) {
+            Ok(()) => println!("checkout restored to {original}"),
+            Err(e) => eprintln!("warning: could not restore checkout to {original}: {e}"),
+        },
+        Ok(false) => eprintln!(
+            "warning: leaving checkout on {mission_branch}: tracked files have \
+             uncommitted changes"
+        ),
+        Err(e) => eprintln!(
+            "warning: could not probe the working tree ({e}); checkout left on {mission_branch}"
+        ),
+    }
+}
+
+/// Legacy fallback when no recorded link exists (missions drafted before the
+/// sidecar carried `missionId`): newest mission whose goal matches.
 fn find_mission_for_ticket(repo: &Path, ticket: &Ticket) -> Option<String> {
     use kranz_engine::paths::MissionPaths;
     let goal = ticket.mission_goal();
@@ -602,6 +666,12 @@ fn find_mission_for_ticket(repo: &Path, ticket: &Ticket) -> Option<String> {
 /// mission at a time; `--once` processes exactly one front entry (or exits if
 /// the repo is busy). Per-repo serialization is enforced by `is_repo_busy`.
 pub async fn cmd_work(repo: PathBuf, once: bool) -> Result<i32> {
+    // Remember the operator's checkout: each mission's run() asserts its own
+    // branch, so when the dispatcher exits it puts the checkout back where
+    // the operator started (tracked-dirty trees abort the restore).
+    let dispatch_branch = GitRepo::open(&repo)
+        .ok()
+        .and_then(|g| g.current_branch().ok());
     // Claims abandoned by a crashed dispatcher come back first (review P1).
     let recovered = queue::recover_dead_claims(&repo);
     if recovered > 0 {
@@ -616,6 +686,7 @@ pub async fn cmd_work(repo: PathBuf, once: bool) -> Result<i32> {
         match next_work_action(front.as_ref(), busy.as_deref()) {
             WorkAction::Empty => {
                 println!("queue empty — nothing to do.");
+                restore_work_checkout(&repo, dispatch_branch.as_deref());
                 return Ok(0);
             }
             WorkAction::Busy { mission_id } => {
@@ -682,6 +753,7 @@ pub async fn cmd_work(repo: PathBuf, once: bool) -> Result<i32> {
                 }
 
                 if once {
+                    restore_work_checkout(&repo, dispatch_branch.as_deref());
                     return Ok(0);
                 }
                 // Loop: re-check the queue for the next mission.

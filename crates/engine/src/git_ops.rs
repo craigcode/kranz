@@ -125,6 +125,17 @@ impl GitRepo {
         Ok(self.run(&["status", "--porcelain"])?.trim().is_empty())
     }
 
+    /// Like [`Self::is_clean`] but ignoring untracked files: `true` when no
+    /// TRACKED file is modified, staged, or deleted. Untracked files never
+    /// block a branch switch (git carries them across), so restore-checkout
+    /// paths use this rather than full cleanliness.
+    pub fn is_clean_tracked(&self) -> Result<bool> {
+        Ok(self
+            .run(&["status", "--porcelain", "--untracked-files=no"])?
+            .trim()
+            .is_empty())
+    }
+
     /// `git add -A` then `git commit -m <message>`; returns the new head sha.
     ///
     /// A no-change commit attempt exits non-zero, so it surfaces as an

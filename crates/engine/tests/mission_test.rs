@@ -3202,3 +3202,85 @@ fn conflict_with_no_named_files_still_synthesizes() {
         resolution.spec
     );
 }
+
+// ---------------------------------------------------------------------------
+// Branch isolation + checkout restore (fix-work-branch-isolation,
+// fix-checkout-restore-on-completion)
+// ---------------------------------------------------------------------------
+
+/// The exact live failure from the first `kranz work` train: approval put the
+/// checkout on the mission branch, the operator (or another draft) moved it
+/// back to main, and run() then committed every worker commit straight to
+/// main. run() must re-assert the mission branch — and, once terminal,
+/// restore the base checkout.
+#[tokio::test]
+async fn run_reasserts_mission_branch_and_restores_base() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![judgement("complete", ""), "NONE".to_string()]),
+    ]));
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine
+        .approve_plan(simple_plan(
+            1,
+            vec![assertion("a-1", "the build command succeeds", Some("cd ."))],
+        ))
+        .unwrap();
+
+    // Simulate the drift: operator back on main after approval.
+    raw_git(&root, &["checkout", "main"]);
+    let main_before = raw_git(&root, &["rev-parse", "main"]);
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+    let branch = engine.state().mission.mission_branch.clone();
+    drop(engine);
+
+    // Worker commits landed on the mission branch; main never moved.
+    assert_eq!(
+        main_before,
+        raw_git(&root, &["rev-parse", "main"]),
+        "main must not receive mission commits"
+    );
+    let ahead: u32 = raw_git(&root, &["rev-list", "--count", &format!("main..{branch}")])
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(ahead > 0, "the mission branch must carry the work");
+
+    // run() deliberately leaves the mission branch checked out: report.md
+    // and plan.md live there, and the operator reads them at completion.
+    // (The dispatcher and draft restore checkouts at THEIR boundaries.)
+    assert_eq!(
+        raw_git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+        branch,
+        "completed run keeps its artifacts visible on the mission branch"
+    );
+}
+
+/// Creating a mission while another mission's branch is checked out records a
+/// poisoned base (observed live: three drafts stacked). create() refuses.
+#[tokio::test]
+async fn create_refuses_another_missions_branch_as_base() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    raw_git(&root, &["checkout", "-b", "kranz/mission-m-fake01"]);
+    let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::with_scripts(vec![]));
+    let Err(err) = MissionEngine::create(backend, &root, GOAL, test_cfg()) else {
+        panic!("create must refuse a kranz/mission-* base branch");
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("another mission's branch"),
+        "refusal must explain the stacking hazard, got: {msg}"
+    );
+}

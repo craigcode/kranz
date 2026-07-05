@@ -872,11 +872,24 @@ pub fn cmd_missions(repo: &Path) -> Result<String> {
     if ids.is_empty() {
         return Ok("no missions\n".to_string());
     }
+    // Reverse map mission→ticket from the ticket sidecars (the durable link
+    // kranz draft records), so drafted missions are recognizable at a glance.
+    let ticket_of: std::collections::HashMap<String, String> =
+        kranz_engine::ticket::Ticket::list(repo)
+            .into_iter()
+            .filter_map(|t| {
+                kranz_engine::ticket::Ticket::mission_for(repo, &t.slug).map(|m| (m, t.slug))
+            })
+            .collect();
     let mut out = String::new();
     for id in ids {
+        let ticket = ticket_of
+            .get(&id)
+            .map(|s| format!("  [ticket: {s}]"))
+            .unwrap_or_default();
         match load_state(repo, &id) {
             Ok(state) => out.push_str(&format!(
-                "{id}  {:<10}  {}\n",
+                "{id}  {:<10}  {}{ticket}\n",
                 output::mission_status_label(state.mission.status),
                 state.mission.goal
             )),

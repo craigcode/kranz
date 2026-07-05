@@ -564,3 +564,39 @@ fn claim_lifecycle_finish_release_and_dead_recovery() {
     );
     queue::finish_claim(claim);
 }
+
+// ---------------------------------------------------------------------------
+// Ticket→mission link (fix-ticket-mission-linkage)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn mission_link_records_and_survives_state_flips() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+
+    // No sidecar yet: no link.
+    assert_eq!(Ticket::mission_for(root, "my-fix"), None);
+
+    Ticket::record_mission(root, "my-fix", "m-abc123").unwrap();
+    assert_eq!(
+        Ticket::mission_for(root, "my-fix").as_deref(),
+        Some("m-abc123")
+    );
+    // record_mission with no prior sidecar lands in Drafting.
+    assert_eq!(Ticket::read_state(root, "my-fix"), TicketState::Drafting);
+
+    // Every later state flip must PRESERVE the link — approve resolves
+    // through it after the draft parked (Review) and queued (Queued).
+    for state in [TicketState::Review, TicketState::Queued, TicketState::Done] {
+        Ticket::write_state(root, "my-fix", state, None).unwrap();
+        assert_eq!(
+            Ticket::mission_for(root, "my-fix").as_deref(),
+            Some("m-abc123"),
+            "state flip to {state:?} must not erase the mission link"
+        );
+    }
+
+    // Traversal-shaped slugs never read or write.
+    assert_eq!(Ticket::mission_for(root, "../evil"), None);
+    assert!(Ticket::record_mission(root, "../evil", "m-x").is_err());
+}
