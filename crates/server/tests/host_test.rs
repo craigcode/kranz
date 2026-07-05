@@ -593,6 +593,9 @@ async fn hosted_lifecycle_reaches_complete_without_a_terminal() {
             turn("really, tell me about platforms first"),
             turn(&plan_json().to_string()),
             turn(&judgement.to_string()),
+            // Mission-5 era: completion runs a lesson-capture turn; NONE
+            // records nothing and lets the mission close.
+            turn("NONE"),
         ]);
     // Session-start order: the orchestrator starts during planning, the
     // worker at run time.
