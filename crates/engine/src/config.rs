@@ -144,3 +144,39 @@ pub fn validate(cfg: &MissionConfig) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_planning_idle_release_minutes_is_30() {
+        assert_eq!(MissionConfig::default().planning_idle_release_minutes, 30);
+    }
+
+    #[test]
+    fn default_serializes_camel_case_planning_idle_release_minutes() {
+        let value = serde_json::to_value(MissionConfig::default()).unwrap();
+        assert_eq!(value["planningIdleReleaseMinutes"], 30);
+    }
+
+    #[test]
+    fn layer_overrides_planning_idle_release_minutes() {
+        let dir = tempfile::tempdir().unwrap();
+        let layer_path = dir.path().join("config.json");
+        std::fs::write(&layer_path, r#"{"planningIdleReleaseMinutes": 5}"#).unwrap();
+
+        let cfg = load_layers(&[layer_path]).unwrap();
+        assert_eq!(cfg.planning_idle_release_minutes, 5);
+    }
+
+    #[test]
+    fn absent_key_in_layer_keeps_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let layer_path = dir.path().join("config.json");
+        std::fs::write(&layer_path, r#"{"maxRespawns": 3}"#).unwrap();
+
+        let cfg = load_layers(&[layer_path]).unwrap();
+        assert_eq!(cfg.planning_idle_release_minutes, 30);
+    }
+}

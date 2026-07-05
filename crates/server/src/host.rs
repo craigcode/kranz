@@ -44,6 +44,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// The engine cell of a planning-phase mission: turns lock it, `start`
 /// consumes it.
@@ -52,8 +53,9 @@ type EngineCell = Arc<tokio::sync::Mutex<Box<MissionEngine>>>;
 /// One mission hosted by this server process.
 enum HostedMission {
     /// In planning (or approved, awaiting start): the live engine, holding
-    /// the mission lock and the orchestrator conversation.
-    Planning(EngineCell),
+    /// the mission lock and the orchestrator conversation, plus when it was
+    /// last touched by a planning turn (for the idle sweeper).
+    Planning { cell: EngineCell, last_use: Arc<Mutex<Instant>> },
     /// `engine.run()` owns the engine inside this background task; the task
     /// removes this entry when the run ends.
     Running(tokio::task::JoinHandle<()>),
@@ -68,6 +70,9 @@ pub struct MissionHost {
     backend: tokio::sync::OnceCell<Arc<dyn AgentBackend>>,
     /// Shared with each run task so it can remove its own entry on exit.
     missions: Arc<Mutex<HashMap<String, HostedMission>>>,
+    /// The lazily-spawned idle-release background task, started at most once
+    /// (see [`MissionHost::ensure_sweeper_started`]).
+    sweeper: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl MissionHost {
@@ -77,6 +82,7 @@ impl MissionHost {
             repo_root,
             backend: tokio::sync::OnceCell::new(),
             missions: Arc::new(Mutex::new(HashMap::new())),
+            sweeper: Mutex::new(None),
         }
     }
 
@@ -87,6 +93,7 @@ impl MissionHost {
             repo_root,
             backend: tokio::sync::OnceCell::new_with(Some(backend)),
             missions: Arc::new(Mutex::new(HashMap::new())),
+            sweeper: Mutex::new(None),
         }
     }
 
@@ -142,7 +149,8 @@ impl MissionHost {
         self.missions
             .lock()
             .expect("missions registry lock")
-            .insert(id.clone(), HostedMission::Planning(new_cell(Box::new(engine))));
+            .insert(id.clone(), new_planning(new_cell(Box::new(engine))));
+        self.ensure_sweeper_started();
         Ok(id)
     }
 
@@ -217,17 +225,17 @@ impl MissionHost {
                         )));
                     }
                 }
-                Some(HostedMission::Planning(cell)) => match Arc::try_unwrap(cell) {
+                Some(HostedMission::Planning { cell, last_use }) => match Arc::try_unwrap(cell) {
                     Err(cell) => {
                         // A handler holds a clone: a turn is (or is about to
                         // be) in flight. Put the entry back untouched.
-                        map.insert(id.to_string(), HostedMission::Planning(cell));
+                        map.insert(id.to_string(), HostedMission::Planning { cell, last_use });
                         return Err(turn_in_flight());
                     }
                     Ok(mutex) => {
                         let engine = mutex.into_inner();
                         if engine.state().mission.status == MissionStatus::Planning {
-                            map.insert(id.to_string(), HostedMission::Planning(new_cell(engine)));
+                            map.insert(id.to_string(), new_planning(new_cell(engine)));
                             return Err(ApiError::conflict(format!(
                                 "mission '{id}' has no approved plan yet — approve one via \
                                  POST /api/missions/{id}/approve first"
@@ -305,27 +313,48 @@ impl MissionHost {
     /// interrupted). A turn in flight is an error, mirroring the other
     /// planning operations.
     pub fn release(&self, id: &str) -> Result<bool, ApiError> {
-        let mut map = self.missions.lock().expect("missions registry lock");
-        match map.remove(id) {
-            None => Ok(true),
-            Some(HostedMission::Running(handle)) => {
-                let finished = handle.is_finished();
-                if !finished {
-                    map.insert(id.to_string(), HostedMission::Running(handle));
-                }
-                Ok(finished)
-            }
-            Some(HostedMission::Planning(cell)) => match Arc::try_unwrap(cell) {
-                Ok(mutex) => {
-                    drop(mutex.into_inner()); // flushes the log, frees the lock
-                    Ok(true)
-                }
-                Err(cell) => {
-                    map.insert(id.to_string(), HostedMission::Planning(cell));
-                    Err(turn_in_flight())
-                }
-            },
+        release_from(&self.missions, id)
+    }
+
+    /// Release every `Planning` entry idle for at least `threshold` (a mission
+    /// touched more recently than that is left alone). A mid-turn cell can
+    /// never actually be released — [`release`](Self::release) refuses it via
+    /// `turn_in_flight`, which this treats as "not idle yet" rather than an
+    /// error. Returns the ids this call actually released.
+    pub fn sweep_idle(&self, threshold: Duration) -> Vec<String> {
+        sweep_idle_from(&self.missions, threshold)
+    }
+
+    /// Spawn the idle-release sweeper at most once, the first time a mission
+    /// is hosted. It loops for the lifetime of the host: sleep, read the
+    /// configured window, sweep. `planningIdleReleaseMinutes == 0` means
+    /// "never release" — checked fresh each tick so a live config edit takes
+    /// effect without a restart.
+    fn ensure_sweeper_started(&self) {
+        let mut guard = self.sweeper.lock().expect("sweeper lock");
+        if guard.is_some() {
+            return;
         }
+        let repo_root = self.repo_root.clone();
+        let missions = Arc::clone(&self.missions);
+        *guard = Some(tokio::spawn(async move {
+            const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+            loop {
+                tokio::time::sleep(SWEEP_INTERVAL).await;
+                let minutes = match config::load(&repo_root) {
+                    Ok(cfg) => cfg.planning_idle_release_minutes,
+                    Err(_) => continue,
+                };
+                if minutes == 0 {
+                    continue;
+                }
+                let threshold = Duration::from_secs(minutes * 60);
+                let released = sweep_idle_from(&missions, threshold);
+                for id in released {
+                    tracing::info!(mission = %id, "released idle planning engine");
+                }
+            }
+        }));
     }
 
     /// `POST /api/missions/:id/abandon`: retire a mission through the
@@ -340,13 +369,13 @@ impl MissionHost {
         let taken = self.missions.lock().expect("missions registry lock").remove(id);
         match taken {
             None => {}
-            Some(HostedMission::Planning(cell)) => match Arc::try_unwrap(cell) {
+            Some(HostedMission::Planning { cell, last_use }) => match Arc::try_unwrap(cell) {
                 Ok(mutex) => drop(mutex.into_inner()),
                 Err(cell) => {
                     self.missions
                         .lock()
                         .expect("missions registry lock")
-                        .insert(id.to_string(), HostedMission::Planning(cell));
+                        .insert(id.to_string(), HostedMission::Planning { cell, last_use });
                     return Err(turn_in_flight());
                 }
             },
@@ -429,7 +458,10 @@ impl MissionHost {
     fn planning_cell(&self, id: &str) -> Result<EngineCell, ApiError> {
         let map = self.missions.lock().expect("missions registry lock");
         match map.get(id) {
-            Some(HostedMission::Planning(cell)) => Ok(Arc::clone(cell)),
+            Some(HostedMission::Planning { cell, last_use }) => {
+                *last_use.lock().expect("last-use lock") = Instant::now();
+                Ok(Arc::clone(cell))
+            }
             Some(HostedMission::Running(_)) => Err(ApiError::conflict(format!(
                 "mission '{id}' is running — steer it via POST /api/missions/{id}/control"
             ))),
@@ -482,7 +514,9 @@ impl MissionHost {
         let mut map = self.missions.lock().expect("missions registry lock");
         // We hold the mission's file lock, so nobody else can have inserted a
         // LIVE engine meanwhile; insert unconditionally.
-        map.insert(id.to_string(), HostedMission::Planning(Arc::clone(&cell)));
+        map.insert(id.to_string(), new_planning(Arc::clone(&cell)));
+        drop(map);
+        self.ensure_sweeper_started();
         Ok(cell)
     }
 
@@ -527,6 +561,59 @@ async fn run_to_end(
 
 fn new_cell(engine: Box<MissionEngine>) -> EngineCell {
     Arc::new(tokio::sync::Mutex::new(engine))
+}
+
+/// A fresh `Planning` entry, last-used now.
+fn new_planning(cell: EngineCell) -> HostedMission {
+    HostedMission::Planning { cell, last_use: Arc::new(Mutex::new(Instant::now())) }
+}
+
+/// Shared by [`MissionHost::release`] and the sweeper: drop an idle planning
+/// engine from the registry (flushing its log and freeing the single-writer
+/// lock), refuse a mid-turn one, and leave running/absent entries be.
+fn release_from(missions: &Mutex<HashMap<String, HostedMission>>, id: &str) -> Result<bool, ApiError> {
+    let mut map = missions.lock().expect("missions registry lock");
+    match map.remove(id) {
+        None => Ok(true),
+        Some(HostedMission::Running(handle)) => {
+            let finished = handle.is_finished();
+            if !finished {
+                map.insert(id.to_string(), HostedMission::Running(handle));
+            }
+            Ok(finished)
+        }
+        Some(HostedMission::Planning { cell, last_use }) => match Arc::try_unwrap(cell) {
+            Ok(mutex) => {
+                drop(mutex.into_inner()); // flushes the log, frees the lock
+                Ok(true)
+            }
+            Err(cell) => {
+                map.insert(id.to_string(), HostedMission::Planning { cell, last_use });
+                Err(turn_in_flight())
+            }
+        },
+    }
+}
+
+/// Collect ids of `Planning` entries idle for at least `threshold`, release
+/// each via [`release_from`], and return the ids actually freed. A mid-turn
+/// cell (its `try_unwrap` fails inside `release_from`) is skipped, not an
+/// error — it simply isn't idle yet from the sweeper's point of view.
+/// `Running` entries are never candidates.
+fn sweep_idle_from(missions: &Mutex<HashMap<String, HostedMission>>, threshold: Duration) -> Vec<String> {
+    let idle_ids: Vec<String> = {
+        let map = missions.lock().expect("missions registry lock");
+        map.iter()
+            .filter_map(|(id, mission)| match mission {
+                HostedMission::Planning { last_use, .. } => {
+                    let elapsed = last_use.lock().expect("last-use lock").elapsed();
+                    (elapsed >= threshold).then(|| id.clone())
+                }
+                HostedMission::Running(_) => None,
+            })
+            .collect()
+    };
+    idle_ids.into_iter().filter(|id| matches!(release_from(missions, id), Ok(true))).collect()
 }
 
 /// Planning endpoints never queue behind each other: contended = 409.
@@ -650,6 +737,24 @@ pub(crate) async fn abandon_mission_route(
         .unwrap_or("abandoned by operator");
     server.host.abandon(&id, reason).await?;
     Ok(Json(json!({ "abandoned": true })))
+}
+
+/// `POST /api/missions/:id/release` — no body → `200 {"released": bool}`. See
+/// [`MissionHost::release`]. A mission absent from disk is 404; a not-hosted
+/// but on-disk mission is an idempotent 200 (already free). POST (not a
+/// dedicated verb) so the mutation-token gate applies by construction.
+pub(crate) async fn release_mission_route(
+    State(server): State<Arc<ServerState>>,
+    UrlPath(id): UrlPath<String>,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let id = valid_id(&server, &id)?;
+    let _ = parse_body(&body)?;
+    if !MissionPaths::new(server.host.repo_root(), &id).events_file().is_file() {
+        return Err(ApiError::not_found(format!("mission '{id}' not found")));
+    }
+    let released = server.host.release(&id)?;
+    Ok(Json(json!({ "released": released })))
 }
 
 /// `POST /api/missions/:id/delete` — optional body `{"all": true}` (opt in to
@@ -800,6 +905,53 @@ mod tests {
         assert!(err.message.contains("no approved plan"), "{}", err.message);
         // The engine went back into the registry: planning can continue.
         assert!(host.planning_cell(&id).is_ok());
+    }
+
+    #[tokio::test]
+    async fn sweep_idle_leaves_a_mid_turn_mission_hosted() {
+        let Some((_dir, root)) = init_repo() else { return };
+        let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+        let host = MissionHost::with_backend(root, backend);
+        let id = host.create("ship it", None).await.expect("create mission");
+
+        // Hold the per-mission engine mutex exactly like an in-flight turn.
+        let cell = host.planning_cell(&id).expect("hosted planning cell");
+        let _guard = cell.try_lock().expect("uncontended lock");
+
+        let released = host.sweep_idle(std::time::Duration::ZERO);
+        assert!(!released.contains(&id), "{released:?}");
+        assert!(host.planning_cell(&id).is_ok(), "mission must remain hosted");
+    }
+
+    #[tokio::test]
+    async fn release_route_is_409_mid_turn() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let Some((_dir, root)) = init_repo() else { return };
+        let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+        let host = MissionHost::with_backend(root, backend);
+        let id = host.create("ship it", None).await.expect("create mission");
+
+        // Hold the per-mission engine mutex exactly like an in-flight turn.
+        let cell = host.planning_cell(&id).expect("hosted planning cell");
+        let _guard = cell.try_lock().expect("uncontended lock");
+
+        let app = crate::router_with_host(host, None, Some("tok".to_string()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/missions/{id}/release"))
+                    .header("content-type", "application/json")
+                    .header("x-kranz-token", "tok")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]

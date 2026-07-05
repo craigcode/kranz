@@ -970,6 +970,7 @@ dependencies = [
  "kranz-server",
  "kranz-slack",
  "ratatui",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",

@@ -102,7 +102,12 @@ Slack; forensics one tap away in the browser.
     CLI or by a pre-slice-5 bridge keep working after their engine was
     released. Trade-off: once attached, serve holds the mission's
     single-writer lock, so a concurrent `kranz plan --mission` in a terminal
-    sees LockHeld until serve releases it.
+    sees LockHeld until serve releases it. **closed by idle-release**: an
+    idle attached planning engine is now auto-released after
+    `planningIdleReleaseMinutes` (default 30; `0` disables the sweep), and
+    `kranz release [--mission <id>]` (`POST /api/missions/:id/release`) frees
+    it on demand, so a terminal `kranz plan`/`kranz work` is no longer
+    stranded behind serve.
   - Slash commands typed INSIDE a thread are rejected by Slack itself
     (platform rule); the thread footers now say so and name the id to use
     from the channel.
