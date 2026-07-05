@@ -342,6 +342,40 @@ async fn release_frees_the_mission_lock_for_external_runners() {
     assert!(host.release("m-unknown").expect("release unknown"));
 }
 
+/// `sweep_idle(Duration::ZERO)` treats every attached planning engine as idle
+/// and releases it — the same lock-freeing effect as `release`, but driven by
+/// the idle sweeper instead of an explicit call.
+#[tokio::test]
+async fn sweep_idle_releases_an_attached_mission_and_frees_its_lock() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    seed_mission_log(&root, "m-sweep");
+    let orch = MockScript::streaming(vec![mock_init("orch-sweep"), mock_result_text("hello")])
+        .responding(vec![turn("still planning")]);
+    let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::with_scripts(vec![orch]));
+    let host = kranz_server::MissionHost::with_backend(root.clone(), backend);
+
+    host.planning_turn("m-sweep", "hi").await.expect("planning turn attaches");
+    let paths = MissionPaths::new(&root, "m-sweep");
+    assert!(
+        EventLog::acquire(&paths, "m-sweep", Duration::ZERO, LockForce::No).is_err(),
+        "while attached, an external acquire must be LockHeld-refused"
+    );
+
+    let released = host.sweep_idle(Duration::ZERO);
+    assert!(released.contains(&"m-sweep".to_string()), "{released:?}");
+
+    let log = EventLog::acquire(&paths, "m-sweep", Duration::ZERO, LockForce::No);
+    assert!(log.is_ok(), "after the sweep, an external acquire succeeds");
+}
+
+// The mid-turn-survives-sweep_idle case needs the private `planning_cell`
+// accessor (to hold the cell mutex exactly like an in-flight turn) — it lives
+// alongside `contended_planning_mutex_is_409_for_turns_and_start` in
+// crates/server/src/host.rs's own `#[cfg(test)]` module instead.
+
 // ---------------------------------------------------------------------------
 // Mutation token (protocol "Authority: mutation token")
 // ---------------------------------------------------------------------------
