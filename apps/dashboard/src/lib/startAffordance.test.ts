@@ -64,20 +64,25 @@ function makeState(status: MissionStatus, runs: Record<string, WorkerRun>): Miss
 }
 
 describe('isApprovedIdle', () => {
-  it('is true when running with zero runs', () => {
-    expect(isApprovedIdle(makeState('running', {}))).toBe(true);
+  it('is true when approved with zero runs', () => {
+    expect(isApprovedIdle(makeState('approved', {}))).toBe(true);
   });
 
-  it('is false when running with one or more runs', () => {
-    expect(isApprovedIdle(makeState('running', { r1: makeWorkerRun('r1') }))).toBe(false);
+  it('is true when approved regardless of run activity', () => {
+    expect(isApprovedIdle(makeState('approved', { r1: makeWorkerRun('r1') }))).toBe(true);
     expect(
       isApprovedIdle(
-        makeState('running', { r1: makeWorkerRun('r1'), r2: makeWorkerRun('r2') }),
+        makeState('approved', { r1: makeWorkerRun('r1'), r2: makeWorkerRun('r2') }),
       ),
-    ).toBe(false);
+    ).toBe(true);
   });
 
-  const nonRunningStatuses: MissionStatus[] = [
+  it('is false when running, with or without runs', () => {
+    expect(isApprovedIdle(makeState('running', {}))).toBe(false);
+    expect(isApprovedIdle(makeState('running', { r1: makeWorkerRun('r1') }))).toBe(false);
+  });
+
+  const otherStatuses: MissionStatus[] = [
     'planning',
     'paused',
     'blocked',
@@ -87,7 +92,7 @@ describe('isApprovedIdle', () => {
     'abandoned',
   ];
 
-  for (const status of nonRunningStatuses) {
+  for (const status of otherStatuses) {
     it(`is false for status ${status} with zero runs`, () => {
       expect(isApprovedIdle(makeState(status, {}))).toBe(false);
     });
