@@ -902,6 +902,7 @@ async fn second_start_and_planning_turns_conflict_while_running() {
     )
     .await;
     assert_eq!(status, StatusCode::ACCEPTED);
+    wait_for_status(&app, &id, "running").await;
     let (status, state) = get_json(&app, &format!("/api/missions/{id}/state")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(state["mission"]["status"], "running");
