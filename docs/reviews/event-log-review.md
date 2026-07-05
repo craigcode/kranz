@@ -263,6 +263,19 @@ per `mission_id` ever appends to a given path) makes the trigger reachable
 only via an already-anomalous precondition, not ordinary operation. Finding
 survives unchanged.
 
+**Remediated (F3):** `parse_log`'s single existing per-line walk now also
+asserts every event's `mission_id` matches the first successfully parsed
+event's `mission_id`, returning `EngineError::LogCorruption` (naming the
+path, line number, expected, and found mission_id) on a mismatch anywhere in
+the file — closing gap (2) for all `parse_log` callers (`acquire`,
+`read_events`, `read_events_after`). `acquire`'s own first-event-vs-expected
+check is unchanged (`EngineError::InvalidState`). Gap (1), the empty
+pre-existing log, is unchanged behavior (adopted as fresh, no error) and is
+now pinned by a dedicated test. See `acquire_rejects_foreign_mission_id_in_later_event`,
+`parse_log_rejects_mixed_mission_ids`, and
+`acquire_adopts_empty_preexisting_log_as_fresh` in `event_log.rs`'s test
+module (feature f-1-1).
+
 ## F4 — "Dead" liveness verdict is unreachable on non-unix builds (Low)
 
 **Location:** event_log.rs:640-643 (`probe_liveness`, `#[cfg(not(unix))]` branch), event_log.rs:26-30 (LockForce table), event_log.rs:731-734 (`process_identity_token` non-unix stub).

@@ -363,6 +363,17 @@ impl EventLog {
                     event.seq
                 )));
             }
+            if let Some(first_mission_id) = events.first().map(|e: &Event| &e.mission_id) {
+                if event.mission_id != *first_mission_id {
+                    return Err(EngineError::LogCorruption(format!(
+                        "mission_id mismatch at {}:{}: expected '{}' (from first event), found '{}'",
+                        path.display(),
+                        line_no,
+                        first_mission_id,
+                        event.mission_id
+                    )));
+                }
+            }
             events.push(event);
             offset += step;
             valid_len = offset;
@@ -925,5 +936,86 @@ mod tests {
             retry_writer.writes,
             (k..n).map(|i| format!("line-{i}\n")).collect::<Vec<_>>()
         );
+    }
+
+    /// Build a raw JSONL line for a `mission.paused` event with the given
+    /// `seq`/`mission_id` — enough to exercise seq continuity and mission-id
+    /// consistency without pulling in the full Event field set.
+    fn event_line(seq: u64, mission_id: &str) -> String {
+        let event = Event {
+            seq,
+            ts: Utc::now(),
+            mission_id: mission_id.to_string(),
+            kind: EventKind::MissionPaused {},
+        };
+        let mut line = serde_json::to_string(&event).unwrap();
+        line.push('\n');
+        line
+    }
+
+    #[test]
+    fn acquire_rejects_foreign_mission_id_in_later_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = MissionPaths::new(dir.path(), "m-a");
+        std::fs::create_dir_all(paths.mission_dir()).unwrap();
+        let events_path = paths.events_file();
+
+        // Only defect: seq 2's mission_id differs from seq 1's.
+        std::fs::write(
+            &events_path,
+            format!("{}{}", event_line(1, "m-a"), event_line(2, "m-b")),
+        )
+        .unwrap();
+
+        let err = EventLog::acquire(&paths, "m-a", Duration::from_secs(1), LockForce::No)
+            .expect_err("mixed mission_id log must be rejected");
+        assert!(
+            matches!(err, EngineError::LogCorruption(_)),
+            "expected LogCorruption, got {err:?}"
+        );
+
+        // Control: identical seqs, single consistent mission_id, acquires cleanly.
+        let dir2 = tempfile::tempdir().unwrap();
+        let paths2 = MissionPaths::new(dir2.path(), "m-a");
+        std::fs::create_dir_all(paths2.mission_dir()).unwrap();
+        std::fs::write(
+            paths2.events_file(),
+            format!("{}{}", event_line(1, "m-a"), event_line(2, "m-a")),
+        )
+        .unwrap();
+        let log = EventLog::acquire(&paths2, "m-a", Duration::from_secs(1), LockForce::No)
+            .expect("consistent-mission log must acquire cleanly");
+        assert_eq!(log.last_seq(), 2);
+    }
+
+    #[test]
+    fn parse_log_rejects_mixed_mission_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        std::fs::write(&path, format!("{}{}", event_line(1, "m-a"), event_line(2, "m-b")))
+            .unwrap();
+
+        let err = EventLog::read_events(&path).expect_err("mixed mission_id must be rejected");
+        assert!(
+            matches!(err, EngineError::LogCorruption(_)),
+            "expected LogCorruption, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn acquire_adopts_empty_preexisting_log_as_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = MissionPaths::new(dir.path(), "m-a");
+        std::fs::create_dir_all(paths.mission_dir()).unwrap();
+        std::fs::write(paths.events_file(), "").unwrap();
+
+        let log = EventLog::acquire(&paths, "m-a", Duration::from_secs(1), LockForce::No)
+            .expect("empty pre-existing log must be adopted as fresh");
+        assert_eq!(log.last_seq(), 0);
+        let appended = {
+            let mut log = log;
+            log.append(EventKind::MissionPaused {}).unwrap()
+        };
+        assert_eq!(appended.seq, 1);
     }
 }
