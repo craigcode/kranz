@@ -368,39 +368,7 @@ impl MissionHost {
         }));
     }
 
-    /// `GET /api/missions/:id/pending-plan` → `200 {"pending":true,"plan":{…}}`
-/// or `200 {"pending":false}`. The parked plan from the last Ready
-/// request-plan — what the approve affordances (buttons, ring) will commit.
-pub(crate) async fn pending_plan_route(
-    State(server): State<Arc<ServerState>>,
-    UrlPath(id): UrlPath<String>,
-) -> Result<Json<Value>, ApiError> {
-    let id = valid_id(&server, &id)?;
-    Ok(Json(match server.host.pending_plan(&id) {
-        Some(plan) => json!({ "pending": true, "plan": plan }),
-        None => json!({ "pending": false }),
-    }))
-}
-
-/// `POST /api/missions/:id/approve-pending` — optional body
-/// `{"start": true}` → approve the parked plan (409 when none), then
-/// optionally start. `200 {"branch": …, "started": bool}`.
-pub(crate) async fn approve_pending_route(
-    State(server): State<Arc<ServerState>>,
-    UrlPath(id): UrlPath<String>,
-    body: Bytes,
-) -> Result<Json<Value>, ApiError> {
-    let id = valid_id(&server, &id)?;
-    let value = parse_body(&body)?;
-    let start = value.get("start").and_then(Value::as_bool).unwrap_or(false);
-    let branch = server.host.approve_pending(&id).await?;
-    if start {
-        server.host.start(&id).await?;
-    }
-    Ok(Json(json!({ "branch": branch, "started": start })))
-}
-
-/// `POST /api/missions/:id/abandon`: retire a mission through the
+    /// `POST /api/missions/:id/abandon`: retire a mission through the
     /// engine's canonical abandon path (terminal-refusing, event-recorded).
     /// A mission hosted HERE is taken out of the registry first — an idle
     /// planning engine is dropped (freeing the lock), a running task is
