@@ -962,4 +962,104 @@ verify about City integration.
 
 ## Ticket-ready briefs
 
-*Populated by a later feature.*
+These briefs paste directly into kranz's own backlog (`kranz ticket`) or into
+a Gas City bead via the pack's own field mapping (`title → Goal`, `description
+→ Context`, `acceptance_criteria → Acceptance hints`, per the exit-code
+contract section above). Each one is scoped to the earliest **not**
+**Human-gated:** work item its roadmap stage names, so a fresh worker with no
+memory of this document's discussion can pick it up and run it headlessly.
+
+#### Brief 1: Switch kranz-dispatch's order trigger from cooldown to event
+
+**Goal:** Change `packaging/gascity/orders/kranz-dispatch.toml`'s trigger
+from `cooldown`/`interval = "5m"` to an `event` trigger matching
+`bead.created`/`bead.ready`-shaped events for the `kranz` label, so dispatch
+fires the moment a labelled bead is ready instead of waiting out a fixed
+sleep.
+
+**Context:** This lands the `gc order` verdict (adopt) and design decision
+D2, Stage 2 of docs/gascity-citizenship.md's staged roadmap. Read-only `gc`
+use only — inspect the exact trigger-kind config keys via `gc order --help`
+(and `gc <cmd> --json-schema` if it documents the order schema); never run
+any state-mutating `gc` command (no `gc order run`, `gc register`, etc.) and
+no network access. Do not change `packaging/gascity/bin/kranz-dispatch`'s
+body — constraint 1 (docs/gascity-citizenship.md's Constraints and
+invariants) requires the order to still only claim-and-spool within the
+exec context deadline; this brief is a config-only change to the TOML
+trigger block. Do not touch `packaging/gascity/bin/kranz-city-worker` or
+`packaging/gascity/bin/kranz-run-bead`. No new dependencies.
+
+**Acceptance:** `packaging/gascity/orders/kranz-dispatch.toml` has an
+`event` trigger (not `cooldown`) scoped to the `kranz` label, using only
+trigger-kind keys documented by a live `gc order --help`/`--json-schema`
+run captured in the ticket's own report; `gc lint packaging/gascity`
+exits 0 with its `ok` line; `git diff` against the prior commit touches only
+`packaging/gascity/orders/kranz-dispatch.toml` (and, if a regression test is
+added, a test file alongside it — no changes to `kranz-dispatch`'s body,
+`kranz-city-worker`, or `kranz-run-bead`).
+
+#### Brief 2: Build a kranz-native queue to replace the pack's private spool
+
+**Goal:** Implement a `kranz work` queue dispatcher inside kranz itself —
+enqueue, dequeue-oldest-first, and single-consumer drain semantics
+equivalent to the pack's current `.env`-file spool directory — as a
+kranz-owned mechanism, without yet wiring the pack to use it.
+
+**Context:** This lands design decision D5's recommended direction
+(docs/gascity-citizenship.md), flagged there as work to scope "whenever
+kranz-side queue work is next scoped" following Stage 2. The target
+behavior to match is the private spool described in this repo's Current
+state section: `kranz-dispatch` writes one `.env` entry per claimed bead
+into `KRANZ_SPOOL`; `kranz-city-worker` drains strictly serially, oldest
+entry first, one at a time, under a single-instance lock. This brief is
+kranz-internal only — it must not modify anything under
+`packaging/gascity/` (that pack keeps using its existing spool until a
+later, separate brief swaps it over); it needs no `gc` interaction at all,
+read-only or otherwise, and no network access. No new dependencies unless
+the crate already vendors an equivalent; if one is truly required, name it
+explicitly in the ticket.
+
+**Acceptance:** A new `kranz work` command (or equivalent library entry
+point, whichever fits the existing crate's command conventions) provides
+enqueue, oldest-first dequeue, and serial single-consumer drain; a new
+automated test suite covers oldest-first ordering, empty-queue behavior,
+and that a second concurrent drain attempt does not double-process an
+entry. Running that suite's own runner command piped through
+`grep -qE 'result: ok\. [1-9][0-9]* passed'` (never a bare test-name
+filter, which exits 0 on zero matches) confirms at least one test passed;
+the existing `packaging/gascity/` spool mechanism and its scripts are
+untouched by this brief's diff.
+
+#### Brief 3: Emit `kranz.mission.*` events from kranz-run-bead's exit-code mapping
+
+**Goal:** Extend `packaging/gascity/bin/kranz-run-bead` to call
+`gc event emit kranz.mission.started`, `kranz.mission.blocked`, or
+`kranz.mission.complete` (with the report line) at the same points its
+existing exit-code mapping already branches on 0/2/1/3, alongside its
+current `bd update`/`bd close`/`bd comment` calls.
+
+**Context:** This lands the `gc events` verdict (adopt) and Stage 3 of
+docs/gascity-citizenship.md's staged roadmap. It is a small, explicit
+extension to the documented exit-code contract in this repo's Current
+state section (the table mapping exit 0/1/2/3 to bead effects) — do not
+invent any other bd or gc mutation beyond the three named
+`kranz.mission.*` events, and do not add a `started` emission anywhere
+except where the worker first picks up a spool entry, matching the
+existing bd dialect rules (constraint 4: `bd close` takes `--reason`,
+`bd comment` takes text positionally, neither takes `-m`). No changes to
+`packaging/gascity/bin/kranz-dispatch` or `agents/kranz-worker/agent.toml`.
+Verification is stub-only: mock the `gc`/`bd` binaries on `PATH` the same
+way this repo's existing bd-mutation coverage does; this brief does not
+require, and must not attempt, a live registered city (no `gc init`, `gc
+register`, or any other state-mutating `gc` command). No new dependencies.
+
+**Acceptance:** A stub/mock-`gc` test suite proves: on exit 0,
+`kranz.mission.complete` is emitted after the `bd close` call; on exit 2,
+`kranz.mission.blocked` is emitted alongside the existing `bd
+update`/`comment`/`gc mail send human --notify` calls; on worker pickup of
+a spool entry (before the mission runs), `kranz.mission.started` is
+emitted; on exit 1 or 3, no `kranz.mission.complete` event is emitted. If
+the suite is a cargo test, its invocation is piped through
+`grep -qE 'result: ok\. [1-9][0-9]* passed'` (never a bare `cargo test
+<name>` filter, which exits 0 on zero matches); `gc lint
+packaging/gascity` still passes after the change.
