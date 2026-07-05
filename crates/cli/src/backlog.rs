@@ -602,6 +602,14 @@ fn find_mission_for_ticket(repo: &Path, ticket: &Ticket) -> Option<String> {
 /// mission at a time; `--once` processes exactly one front entry (or exits if
 /// the repo is busy). Per-repo serialization is enforced by `is_repo_busy`.
 pub async fn cmd_work(repo: PathBuf, once: bool) -> Result<i32> {
+    // Claims abandoned by a crashed dispatcher come back first (review P1).
+    let recovered = queue::recover_dead_claims(&repo);
+    if recovered > 0 {
+        println!(
+            "recovered {recovered} claimed queue entr{} from dead dispatchers",
+            if recovered == 1 { "y" } else { "ies" }
+        );
+    }
     loop {
         let front = queue::peek(&repo);
         let busy = queue::is_repo_busy(&repo);
@@ -625,15 +633,36 @@ pub async fn cmd_work(repo: PathBuf, once: bool) -> Result<i32> {
                 mission_id,
                 ticket_slug,
             } => {
-                // Claim the entry: remove it so a peer dispatcher won't re-run
-                // it, then mark its ticket Running.
-                queue::remove(&repo, &mission_id);
+                // Claim the entry ATOMICALLY (rename, not remove): a peer
+                // dispatcher can't double-run it, and a crash here leaves a
+                // recoverable claim file instead of dropped work (review P1).
+                let Some(claim) = queue::claim_front(&repo) else {
+                    continue; // raced with a sibling; re-evaluate the queue
+                };
+                if claim.entry.mission_id != mission_id {
+                    // The front moved between peek and claim; run what we
+                    // actually claimed.
+                }
+                let mission_id = claim.entry.mission_id.clone();
                 if let Some(slug) = &ticket_slug {
                     Ticket::write_state(&repo, slug, TicketState::Running, None)?;
                 }
                 println!("running mission {mission_id} from the queue");
 
                 let status = drive_mission(repo.clone(), &mission_id).await;
+
+                // Terminal outcome (any) retires the claim. A mission we
+                // could not RUN (lock held, config, spawn failure): for a
+                // ticket-born entry the ticket is marked Failed below and the
+                // claim retires with it (matching pre-claim semantics, no
+                // re-run loop); a bare entry is RELEASED so the work isn't
+                // lost, and the `status?` below stops this dispatcher rather
+                // than hot-looping on the same failing entry.
+                match &status {
+                    Ok(_) => queue::finish_claim(claim),
+                    Err(_) if ticket_slug.is_some() => queue::finish_claim(claim),
+                    Err(_) => queue::release_claim(claim),
+                }
 
                 if let Some(slug) = &ticket_slug {
                     let (next, ok) = match &status {

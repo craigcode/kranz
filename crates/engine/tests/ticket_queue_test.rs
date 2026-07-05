@@ -456,3 +456,111 @@ fn ordinary_slugs_still_work() {
         assert!(Ticket::valid_slug(good), "must accept {good:?}");
     }
 }
+
+// --- review P1: queue concurrency + crash-safe claims -----------------------
+
+#[test]
+fn concurrent_enqueues_get_unique_seqs_and_all_land() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let mut handles = Vec::new();
+    for t in 0..8 {
+        let root = root.clone();
+        handles.push(std::thread::spawn(move || {
+            for i in 0..8 {
+                queue::enqueue(
+                    &root,
+                    QueueEntry {
+                        mission_id: format!("m-{t}-{i}"),
+                        ticket_slug: None,
+                        priority: 2,
+                        seq: 0,
+                    },
+                )
+                .expect("enqueue under contention");
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    let entries = queue::list(&root);
+    assert_eq!(entries.len(), 64, "every concurrent enqueue landed");
+    let mut seqs: Vec<u64> = entries.iter().map(|e| e.seq).collect();
+    seqs.sort_unstable();
+    seqs.dedup();
+    assert_eq!(
+        seqs.len(),
+        64,
+        "no duplicate sequence numbers under contention"
+    );
+}
+
+#[test]
+fn claim_lifecycle_finish_release_and_dead_recovery() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    for id in ["m-a", "m-b"] {
+        queue::enqueue(
+            root,
+            QueueEntry {
+                mission_id: id.into(),
+                ticket_slug: None,
+                priority: 2,
+                seq: 0,
+            },
+        )
+        .unwrap();
+    }
+
+    // Claim removes the entry from the visible queue without deleting it.
+    let claim = queue::claim_front(root).expect("front claimable");
+    assert_eq!(claim.entry.mission_id, "m-a");
+    assert_eq!(
+        queue::list(root).len(),
+        1,
+        "claimed entry hidden from the queue"
+    );
+
+    // Release puts it back at its original position.
+    queue::release_claim(claim);
+    assert_eq!(queue::list(root).len(), 2, "released entry restored");
+    assert_eq!(
+        queue::peek(root).unwrap().mission_id,
+        "m-a",
+        "order preserved"
+    );
+
+    // Finish retires it for good.
+    let claim = queue::claim_front(root).unwrap();
+    queue::finish_claim(claim);
+    assert_eq!(queue::list(root).len(), 1);
+    assert_eq!(queue::peek(root).unwrap().mission_id, "m-b");
+
+    // A claim held by a DEAD pid is recovered; one held by THIS live process
+    // is left alone.
+    let claim = queue::claim_front(root).unwrap();
+    let claimed_dir = queue::queue_dir(root);
+    let live_name = std::fs::read_dir(&claimed_dir)
+        .unwrap()
+        .flatten()
+        .map(|f| f.file_name().to_string_lossy().to_string())
+        .find(|n| n.contains(".claimed."))
+        .expect("live claim file present");
+    // Forge a dead-pid claim beside it.
+    let dead_name = live_name.replace(
+        &format!(".claimed.{}", std::process::id()),
+        ".claimed.999999999",
+    );
+    std::fs::copy(claimed_dir.join(&live_name), claimed_dir.join(&dead_name)).unwrap();
+    let recovered = queue::recover_dead_claims(root);
+    assert_eq!(
+        recovered, 1,
+        "dead-pid claim recovered, live claim untouched"
+    );
+    assert!(
+        claimed_dir.join(&live_name).exists(),
+        "live claim survives recovery"
+    );
+    queue::finish_claim(claim);
+}

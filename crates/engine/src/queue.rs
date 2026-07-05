@@ -15,6 +15,9 @@
 use crate::error::Result;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::Duration;
 
 /// Width of the zero-padded sequence field in a queue filename. u64 max is 20
 /// digits, so this keeps lexicographic order == numeric order for any seq.
@@ -54,6 +57,63 @@ fn seq_file(repo_root: &Path) -> PathBuf {
     queue_dir(repo_root).join(".seq")
 }
 
+/// Same-process serialization of queue mutations (Slack spawns concurrent
+/// approval tasks in one process — review P1).
+static LOCAL_MUTATION_LOCK: Mutex<()> = Mutex::new(());
+
+/// Cross-process advisory lock: `.mutate.lock` created with `create_new`
+/// (exclusive). Held across the read-seq/write-seq/write-entry critical
+/// section so `kranz serve` and `kranz work` cannot interleave. A lock file
+/// older than [`LOCK_STALE`] is treated as a crash leftover and stolen —
+/// contention here is rare and short, so staleness is unambiguous at that
+/// age. Dropped = deleted.
+const LOCK_STALE: Duration = Duration::from_secs(10);
+
+struct MutationLock {
+    path: PathBuf,
+}
+
+impl MutationLock {
+    fn acquire(repo_root: &Path) -> Result<MutationLock> {
+        let path = queue_dir(repo_root).join(".mutate.lock");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Ok(MutationLock { path }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age > LOCK_STALE);
+                    if stale {
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    if std::time::Instant::now() > deadline {
+                        return Err(crate::error::EngineError::Io(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!("queue mutation lock busy: {}", path.display()),
+                        )));
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+}
+
+impl Drop for MutationLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// Reserve the next sequence number: read the counter file, increment, write
 /// it back. Falls back to `max(existing entry seq) + 1` if the counter file is
 /// missing or corrupt, so a wiped counter can never hand out a duplicate that
@@ -82,6 +142,13 @@ fn next_seq(repo_root: &Path) -> Result<u64> {
 pub fn enqueue(repo_root: &Path, entry: QueueEntry) -> Result<QueueEntry> {
     let dir = queue_dir(repo_root);
     std::fs::create_dir_all(&dir)?;
+
+    // Serialize the dedupe-check + seq-reserve + entry-write critical section
+    // against same-process tasks AND sibling processes (review P1).
+    let _local = LOCAL_MUTATION_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _cross = MutationLock::acquire(repo_root)?;
 
     if contains(repo_root, &entry.mission_id) {
         // Already queued: return the existing entry unchanged.
@@ -161,6 +228,103 @@ pub fn contains(repo_root: &Path, mission_id: &str) -> bool {
     list(repo_root).iter().any(|e| e.mission_id == mission_id)
 }
 
+// ---------------------------------------------------------------------------
+// Claims: crash-safe hand-off from queue to dispatcher (review P1)
+// ---------------------------------------------------------------------------
+
+/// A claimed queue entry: the entry file was atomically RENAMED to
+/// `<name>.json.claimed.<pid>`, so no sibling dispatcher can double-run it,
+/// and a crash before completion leaves a recoverable file instead of
+/// dropped work. Call [`finish_claim`] when the mission reached a terminal
+/// state (any outcome), or [`release_claim`] to put the entry back.
+#[derive(Debug)]
+pub struct Claim {
+    pub entry: QueueEntry,
+    claimed_path: PathBuf,
+    original_path: PathBuf,
+}
+
+/// Atomically claim the front entry, if any. A lost rename race (a sibling
+/// claimed first) retries with the next front.
+pub fn claim_front(repo_root: &Path) -> Option<Claim> {
+    loop {
+        let entry = peek(repo_root)?;
+        let original = queue_dir(repo_root).join(entry.file_name());
+        let claimed = queue_dir(repo_root).join(format!(
+            "{}.claimed.{}",
+            entry.file_name(),
+            std::process::id()
+        ));
+        match std::fs::rename(&original, &claimed) {
+            Ok(()) => {
+                return Some(Claim {
+                    entry,
+                    claimed_path: claimed,
+                    original_path: original,
+                })
+            }
+            Err(_) => {
+                // Raced: the front changed under us. Re-peek; a missing queue
+                // means nothing left to claim.
+                if peek(repo_root).is_none() {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+/// The mission ran to a terminal state (any outcome): retire the claim.
+pub fn finish_claim(claim: Claim) {
+    let _ = std::fs::remove_file(&claim.claimed_path);
+}
+
+/// The mission could NOT be run (start failure, lock held, config error):
+/// put the entry back so the work is not lost.
+pub fn release_claim(claim: Claim) {
+    if std::fs::rename(&claim.claimed_path, &claim.original_path).is_err() {
+        tracing::warn!(
+            path = %claim.claimed_path.display(),
+            "failed to release queue claim; entry remains claimed on disk"
+        );
+    }
+}
+
+/// Recover claims left by dead dispatchers: `*.claimed.<pid>` whose pid is
+/// provably dead (unix) — or, where liveness can't be probed, whose file is
+/// over an hour old — is renamed back to its entry name.
+pub fn recover_dead_claims(repo_root: &Path) -> usize {
+    let dir = queue_dir(repo_root);
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return 0;
+    };
+    let mut recovered = 0;
+    for f in rd.flatten() {
+        let path = f.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some((entry_name, pid_str)) = name.split_once(".claimed.") else {
+            continue;
+        };
+        let dead = match pid_str.parse::<i32>() {
+            #[cfg(unix)]
+            Ok(pid) => unsafe { libc::kill(pid, 0) != 0 },
+            #[cfg(not(unix))]
+            Ok(_) => std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > Duration::from_secs(3600)),
+            Err(_) => true,
+        };
+        if dead && std::fs::rename(&path, dir.join(entry_name)).is_ok() {
+            recovered += 1;
+        }
+    }
+    recovered
+}
+
 /// The mission id currently RUNNING in this repo, if any: detected by any
 /// `.kranz/missions/*/events.jsonl.lock` whose recorded pid is still alive.
 /// This enforces one-mission-at-a-time-per-repo.
@@ -205,7 +369,14 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir)?;
     let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("entry");
-    let tmp = dir.join(format!(".{file_name}.{}.tmp", std::process::id()));
+    // Pid + process-wide counter: concurrent tasks in ONE process must not
+    // share a temp file (review P1 — Slack spawns parallel approvals).
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let tmp = dir.join(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     std::fs::write(&tmp, bytes)?;
     match std::fs::rename(&tmp, path) {
         Ok(()) => Ok(()),

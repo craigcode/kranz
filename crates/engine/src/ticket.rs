@@ -101,7 +101,9 @@ impl Ticket {
             && slug.len() <= 128
             && !slug.starts_with('.')
             && !slug.contains("..")
-            && slug.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            && slug
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
     }
 
     /// [`valid_slug`](Self::valid_slug) as an error for write/scaffold paths.
