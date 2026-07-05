@@ -37,6 +37,7 @@ tracing-subscriber.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 reqwest.workspace = true
+rustls.workspace = true
 sha2.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true

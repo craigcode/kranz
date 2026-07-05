@@ -8,6 +8,14 @@ use std::process::ExitCode;
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // The dep graph enables BOTH rustls crypto backends (aws-lc-rs via
+    // reqwest, ring via the OTLP client), so rustls cannot auto-select and
+    // panics at the first TLS connection (found live: the Slack bridge's
+    // socket open killed a tokio worker). Pick one, process-wide, first.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("install rustls ring CryptoProvider before any TLS use");
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
