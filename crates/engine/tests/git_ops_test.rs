@@ -20,8 +20,10 @@ static ENV_ISOLATION: Once = Once::new();
 /// are written exactly once for the whole test process.
 fn isolate_git_env() {
     ENV_ISOLATION.call_once(|| {
-        let missing = std::env::temp_dir()
-            .join(format!("kranz-git-ops-test-no-config-{}", std::process::id()));
+        let missing = std::env::temp_dir().join(format!(
+            "kranz-git-ops-test-no-config-{}",
+            std::process::id()
+        ));
         std::env::set_var("GIT_CONFIG_GLOBAL", &missing);
         std::env::set_var("GIT_CONFIG_SYSTEM", &missing);
         // Stop git from discovering a repository above the temp dir (some CI
@@ -98,7 +100,9 @@ fn write(dir: &TempDir, name: &str, content: &str) {
 fn seeded_repo() -> (TempDir, GitRepo, String) {
     let (dir, repo) = init_repo_with_identity();
     write(&dir, "README.md", "hello\n");
-    let sha = repo.add_all_and_commit("initial commit").expect("seed commit");
+    let sha = repo
+        .add_all_and_commit("initial commit")
+        .expect("seed commit");
     (dir, repo, sha)
 }
 
@@ -109,7 +113,10 @@ fn open_fails_on_non_repo_dir() {
     }
     let dir = tempfile::tempdir().unwrap();
     let err = GitRepo::open(dir.path()).expect_err("open must fail on a plain directory");
-    assert!(matches!(err, EngineError::Git(_)), "expected EngineError::Git, got: {err:?}");
+    assert!(
+        matches!(err, EngineError::Git(_)),
+        "expected EngineError::Git, got: {err:?}"
+    );
 }
 
 #[test]
@@ -119,13 +126,20 @@ fn head_sha_and_add_all_and_commit_advance_history() {
     }
     let (dir, repo, first) = seeded_repo();
     assert!(first.len() >= 40, "unexpected sha: {first}");
-    assert!(first.chars().all(|c| c.is_ascii_hexdigit()), "unexpected sha: {first}");
+    assert!(
+        first.chars().all(|c| c.is_ascii_hexdigit()),
+        "unexpected sha: {first}"
+    );
     assert_eq!(repo.head_sha().unwrap(), first);
 
     write(&dir, "a.txt", "one\n");
     let second = repo.add_all_and_commit("add a").unwrap();
     assert_ne!(first, second);
-    assert_eq!(repo.head_sha().unwrap(), second, "returned sha must be the new head");
+    assert_eq!(
+        repo.head_sha().unwrap(),
+        second,
+        "returned sha must be the new head"
+    );
 }
 
 #[test]
@@ -158,7 +172,10 @@ fn rev_parse_rejects_flag_shaped_ref_without_invoking_git() {
         .expect_err("flag-shaped ref must be refused");
     match err {
         EngineError::Git(msg) => {
-            assert!(msg.contains("refusing"), "expected refusal message, got: {msg}");
+            assert!(
+                msg.contains("refusing"),
+                "expected refusal message, got: {msg}"
+            );
         }
         other => panic!("expected EngineError::Git, got: {other:?}"),
     }
@@ -211,8 +228,13 @@ fn checkout_of_missing_branch_errors() {
         return;
     }
     let (_dir, repo, _) = seeded_repo();
-    let err = repo.checkout("does-not-exist").expect_err("checkout must fail");
-    assert!(matches!(err, EngineError::Git(_)), "expected EngineError::Git, got: {err:?}");
+    let err = repo
+        .checkout("does-not-exist")
+        .expect_err("checkout must fail");
+    assert!(
+        matches!(err, EngineError::Git(_)),
+        "expected EngineError::Git, got: {err:?}"
+    );
 }
 
 #[test]
@@ -224,7 +246,10 @@ fn is_clean_counts_untracked_files() {
     assert!(repo.is_clean().unwrap(), "fresh commit leaves a clean tree");
 
     write(&dir, "untracked.txt", "x\n");
-    assert!(!repo.is_clean().unwrap(), "an untracked file must make the tree dirty");
+    assert!(
+        !repo.is_clean().unwrap(),
+        "an untracked file must make the tree dirty"
+    );
 
     repo.add_all_and_commit("track it").unwrap();
     assert!(repo.is_clean().unwrap());
@@ -236,10 +261,15 @@ fn no_change_commit_is_a_clear_git_error() {
         return;
     }
     let (_dir, repo, _) = seeded_repo();
-    let err = repo.add_all_and_commit("nothing here").expect_err("no-change commit must fail");
+    let err = repo
+        .add_all_and_commit("nothing here")
+        .expect_err("no-change commit must fail");
     match err {
         EngineError::Git(msg) => {
-            assert!(msg.to_lowercase().contains("commit"), "error lacks commit context: {msg}");
+            assert!(
+                msg.to_lowercase().contains("commit"),
+                "error lacks commit context: {msg}"
+            );
         }
         other => panic!("expected EngineError::Git, got: {other:?}"),
     }
@@ -260,10 +290,15 @@ fn commit_paths_commits_only_named_paths() {
 
     let stat = repo.diff_stat(&base, &sha).unwrap();
     assert!(stat.contains("a.txt"), "diff stat missing a.txt: {stat}");
-    assert!(!stat.contains("b.txt"), "diff stat must not include b.txt: {stat}");
+    assert!(
+        !stat.contains("b.txt"),
+        "diff stat must not include b.txt: {stat}"
+    );
 
     // Empty path list is rejected up front.
-    let err = repo.commit_paths(&[], "nothing").expect_err("empty path list must fail");
+    let err = repo
+        .commit_paths(&[], "nothing")
+        .expect_err("empty path list must fail");
     assert!(matches!(err, EngineError::Git(_)));
 }
 
@@ -281,13 +316,22 @@ fn commits_between_is_oldest_first() {
     ] {
         write(&dir, file, subject);
         let sha = repo.add_all_and_commit(subject).unwrap();
-        expected.push(CommitInfo { sha, subject: subject.to_string() });
+        expected.push(CommitInfo {
+            sha,
+            subject: subject.to_string(),
+        });
     }
 
     let listed = repo.commits_between(&base, "HEAD").unwrap();
-    assert_eq!(listed, expected, "must list oldest first with matching shas/subjects");
+    assert_eq!(
+        listed, expected,
+        "must list oldest first with matching shas/subjects"
+    );
 
-    assert!(repo.commits_between("HEAD", "HEAD").unwrap().is_empty(), "empty range");
+    assert!(
+        repo.commits_between("HEAD", "HEAD").unwrap().is_empty(),
+        "empty range"
+    );
 }
 
 #[test]
@@ -317,11 +361,20 @@ fn tag_creates_annotated_tag() {
     repo.tag("kranz/m1", "milestone 1 complete").unwrap();
 
     let tags = raw_git(dir.path(), &["tag", "--list"]);
-    assert!(tags.lines().any(|l| l.trim() == "kranz/m1"), "tag missing from: {tags}");
+    assert!(
+        tags.lines().any(|l| l.trim() == "kranz/m1"),
+        "tag missing from: {tags}"
+    );
 
     // Annotated tags are real tag objects (lightweight ones point at commits).
-    let objtype =
-        raw_git(dir.path(), &["for-each-ref", "refs/tags/kranz/m1", "--format=%(objecttype)"]);
+    let objtype = raw_git(
+        dir.path(),
+        &[
+            "for-each-ref",
+            "refs/tags/kranz/m1",
+            "--format=%(objecttype)",
+        ],
+    );
     assert_eq!(objtype.trim(), "tag");
 }
 
@@ -338,19 +391,32 @@ fn ensure_identity_sets_local_identity_when_missing() {
         .current_dir(dir.path())
         .output()
         .unwrap();
-    assert!(!probe.status.success(), "test precondition failed: user.name is already set");
+    assert!(
+        !probe.status.success(),
+        "test precondition failed: user.name is already set"
+    );
 
     repo.ensure_identity().unwrap();
-    assert_eq!(raw_git(dir.path(), &["config", "--get", "user.name"]).trim(), "kranz");
-    assert_eq!(raw_git(dir.path(), &["config", "--get", "user.email"]).trim(), "kranz@localhost");
+    assert_eq!(
+        raw_git(dir.path(), &["config", "--get", "user.name"]).trim(),
+        "kranz"
+    );
+    assert_eq!(
+        raw_git(dir.path(), &["config", "--get", "user.email"]).trim(),
+        "kranz@localhost"
+    );
 
     // And committing actually works now.
     write(&dir, "f.txt", "x\n");
-    repo.add_all_and_commit("first commit with kranz identity").unwrap();
+    repo.add_all_and_commit("first commit with kranz identity")
+        .unwrap();
 
     // Idempotent: calling again neither errors nor changes anything.
     repo.ensure_identity().unwrap();
-    assert_eq!(raw_git(dir.path(), &["config", "--get", "user.name"]).trim(), "kranz");
+    assert_eq!(
+        raw_git(dir.path(), &["config", "--get", "user.name"]).trim(),
+        "kranz"
+    );
 }
 
 #[test]
@@ -361,12 +427,29 @@ fn has_remote_reports_presence() {
     let (dir, repo, _) = seeded_repo();
 
     // No remotes configured on a fresh repo.
-    assert!(!repo.has_remote("origin").unwrap(), "fresh repo has no origin");
+    assert!(
+        !repo.has_remote("origin").unwrap(),
+        "fresh repo has no origin"
+    );
 
     // Add a fake remote (URL is never contacted — has_remote only reads config).
-    raw_git(dir.path(), &["remote", "add", "origin", "https://example.invalid/repo.git"]);
-    assert!(repo.has_remote("origin").unwrap(), "origin must be visible after remote add");
-    assert!(!repo.has_remote("upstream").unwrap(), "unadded remote must report absent");
+    raw_git(
+        dir.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/repo.git",
+        ],
+    );
+    assert!(
+        repo.has_remote("origin").unwrap(),
+        "origin must be visible after remote add"
+    );
+    assert!(
+        !repo.has_remote("upstream").unwrap(),
+        "unadded remote must report absent"
+    );
 }
 
 #[test]
@@ -390,7 +473,10 @@ fn push_mission_branch_rejects_non_kranz_ref_without_network() {
                     msg.contains("refusing to push"),
                     "guard message expected for {bad:?}, got: {msg}"
                 );
-                assert!(msg.contains(bad), "message should name the rejected ref {bad:?}: {msg}");
+                assert!(
+                    msg.contains(bad),
+                    "message should name the rejected ref {bad:?}: {msg}"
+                );
             }
             other => panic!("expected EngineError::Git for {bad:?}, got: {other:?}"),
         }
@@ -406,7 +492,11 @@ fn push_mission_branch_rejects_refspec_and_flag_smuggling() {
 
     // Even a kranz/* prefix must not carry a refspec, a flag, or whitespace
     // that could push a second ref or force. Refused before git runs.
-    for bad in ["kranz/mission-1:main", "kranz/mission-1 --force", "kranz/ mission"] {
+    for bad in [
+        "kranz/mission-1:main",
+        "kranz/mission-1 --force",
+        "kranz/ mission",
+    ] {
         let err = repo
             .push_mission_branch("origin", bad)
             .expect_err("malformed kranz ref must be refused");
@@ -435,7 +525,12 @@ fn push_mission_branch_attempts_push_and_surfaces_git_error() {
     let bogus = dir.path().join("no-such-remote-repo");
     raw_git(
         dir.path(),
-        &["remote", "add", "origin", &format!("file://{}", bogus.display())],
+        &[
+            "remote",
+            "add",
+            "origin",
+            &format!("file://{}", bogus.display()),
+        ],
     );
     repo.create_branch("kranz/mission-1", None).unwrap();
 
@@ -449,7 +544,10 @@ fn push_mission_branch_attempts_push_and_surfaces_git_error() {
                 !msg.contains("refusing to push"),
                 "kranz/* ref must pass the guard and reach git: {msg}"
             );
-            assert!(msg.contains("push"), "error should carry the push command context: {msg}");
+            assert!(
+                msg.contains("push"),
+                "error should carry the push command context: {msg}"
+            );
         }
         other => panic!("expected EngineError::Git, got: {other:?}"),
     }
@@ -465,7 +563,10 @@ fn ensure_identity_keeps_existing_identity() {
     raw_git(dir.path(), &["config", "user.email", "alice@example.com"]);
 
     repo.ensure_identity().unwrap();
-    assert_eq!(raw_git(dir.path(), &["config", "--get", "user.name"]).trim(), "Alice");
+    assert_eq!(
+        raw_git(dir.path(), &["config", "--get", "user.name"]).trim(),
+        "Alice"
+    );
     assert_eq!(
         raw_git(dir.path(), &["config", "--get", "user.email"]).trim(),
         "alice@example.com"
@@ -502,7 +603,9 @@ fn add_worktree_new_branch_then_clean_merge_back() {
     let listed = repo.list_worktrees().unwrap();
     let wt_canon = std::fs::canonicalize(&wt).unwrap();
     assert!(
-        listed.iter().any(|p| std::fs::canonicalize(p).map(|c| c == wt_canon).unwrap_or(false)),
+        listed.iter().any(|p| std::fs::canonicalize(p)
+            .map(|c| c == wt_canon)
+            .unwrap_or(false)),
         "worktree not in list: {listed:?}"
     );
     // The new branch exists and is checked out in the worktree at the seed sha.
@@ -512,7 +615,9 @@ fn add_worktree_new_branch_then_clean_merge_back() {
     // Commit work IN the worktree (a GitRepo rooted there).
     let wt_repo = GitRepo::open(&wt).unwrap();
     std::fs::write(wt.join("feature.txt"), "worktree work\n").unwrap();
-    let on_branch = wt_repo.add_all_and_commit("feature work in worktree").unwrap();
+    let on_branch = wt_repo
+        .add_all_and_commit("feature work in worktree")
+        .unwrap();
     assert_ne!(on_branch, seed);
     // The primary tree (still on main) has not moved.
     assert_eq!(repo.head_sha().unwrap(), seed, "primary branch untouched");
@@ -526,7 +631,9 @@ fn add_worktree_new_branch_then_clean_merge_back() {
     assert_ne!(repo.head_sha().unwrap(), seed, "main advanced by the merge");
     let merged = repo.commits_between(&seed, "HEAD").unwrap();
     assert!(
-        merged.iter().any(|c| c.subject.contains("feature work in worktree")),
+        merged
+            .iter()
+            .any(|c| c.subject.contains("feature work in worktree")),
         "the worktree commit is now on main: {merged:?}"
     );
 
@@ -535,11 +642,14 @@ fn add_worktree_new_branch_then_clean_merge_back() {
     repo.prune_worktrees().unwrap();
     let after = repo.list_worktrees().unwrap();
     assert!(
-        !after.iter().any(|p| std::fs::canonicalize(p).map(|c| c == wt_canon).unwrap_or(false)),
+        !after.iter().any(|p| std::fs::canonicalize(p)
+            .map(|c| c == wt_canon)
+            .unwrap_or(false)),
         "worktree still listed after remove: {after:?}"
     );
     // remove is idempotent: a second remove of a gone worktree is Ok.
-    repo.remove_worktree(&wt).expect("second remove tolerates absence");
+    repo.remove_worktree(&wt)
+        .expect("second remove tolerates absence");
 }
 
 /// Two branches that change the SAME file differently: the first merges clean,
@@ -571,7 +681,10 @@ fn conflicting_merge_reports_conflict_and_leaves_tree_clean() {
     b_repo.add_all_and_commit("B edits shared").unwrap();
 
     // First merge (A) is clean.
-    assert_eq!(repo.merge_no_ff("kranz/wt/m/a").unwrap(), MergeOutcome::Clean);
+    assert_eq!(
+        repo.merge_no_ff("kranz/wt/m/a").unwrap(),
+        MergeOutcome::Clean
+    );
     assert!(repo.is_clean().unwrap());
 
     // Second merge (B) conflicts on shared.txt; merge_no_ff aborts it.
@@ -596,9 +709,15 @@ fn conflicting_merge_reports_conflict_and_leaves_tree_clean() {
         .current_dir(dir.path())
         .output()
         .unwrap();
-    assert!(!merge_head.status.success(), "no merge should be in progress after abort");
+    assert!(
+        !merge_head.status.success(),
+        "no merge should be in progress after abort"
+    );
     // A's change survived; B's was rolled back.
-    assert_eq!(std::fs::read_to_string(dir.path().join("shared.txt")).unwrap(), "A's version\n");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("shared.txt")).unwrap(),
+        "A's version\n"
+    );
 
     // Cleanup.
     repo.remove_worktree(&wt_a).unwrap();
@@ -623,7 +742,11 @@ fn merge_no_ff_of_up_to_date_branch_is_clean() {
     let outcome = repo.merge_no_ff("kranz/wt/m/noop").unwrap();
     assert_eq!(outcome, MergeOutcome::Clean, "an up-to-date merge is clean");
     assert!(repo.is_clean().unwrap());
-    assert_eq!(repo.head_sha().unwrap(), seed, "HEAD unchanged by a no-op merge");
+    assert_eq!(
+        repo.head_sha().unwrap(),
+        seed,
+        "HEAD unchanged by a no-op merge"
+    );
 
     repo.remove_worktree(&wt).unwrap();
     repo.prune_worktrees().unwrap();
@@ -641,7 +764,13 @@ fn add_worktree_rejects_flag_shaped_arguments() {
     let err = repo
         .add_worktree(&wt, "--force", &seed)
         .expect_err("flag-shaped branch must be refused");
-    assert!(matches!(err, EngineError::Git(_)), "expected EngineError::Git, got: {err:?}");
+    assert!(
+        matches!(err, EngineError::Git(_)),
+        "expected EngineError::Git, got: {err:?}"
+    );
     // No worktree was created.
-    assert!(!wt.exists(), "no worktree dir should exist after a refused add");
+    assert!(
+        !wt.exists(),
+        "no worktree dir should exist after a refused add"
+    );
 }

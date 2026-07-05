@@ -74,7 +74,10 @@ impl GitRepo {
 
     /// Name of the currently checked-out branch (`"HEAD"` when detached).
     pub fn current_branch(&self) -> Result<String> {
-        Ok(self.run(&["rev-parse", "--abbrev-ref", "HEAD"])?.trim().to_string())
+        Ok(self
+            .run(&["rev-parse", "--abbrev-ref", "HEAD"])?
+            .trim()
+            .to_string())
     }
 
     /// Sha of an arbitrary ref (`git rev-parse <refname>`).
@@ -147,7 +150,8 @@ impl GitRepo {
         add.extend(path_args.clone());
         self.run_os(&add)?;
 
-        let mut commit: Vec<OsString> = vec!["commit".into(), "-m".into(), message.into(), "--".into()];
+        let mut commit: Vec<OsString> =
+            vec!["commit".into(), "-m".into(), message.into(), "--".into()];
         commit.extend(path_args);
         self.run_os(&commit)?;
 
@@ -167,7 +171,10 @@ impl GitRepo {
                 continue;
             }
             let (sha, subject) = line.split_once('\t').unwrap_or((line, ""));
-            commits.push(CommitInfo { sha: sha.to_string(), subject: subject.to_string() });
+            commits.push(CommitInfo {
+                sha: sha.to_string(),
+                subject: subject.to_string(),
+            });
         }
         Ok(commits)
     }
@@ -283,7 +290,11 @@ impl GitRepo {
                 "refusing to merge flag-shaped ref {branch:?}"
             )));
         }
-        if self.probe(&["merge", "--no-ff", "--no-edit", branch])?.status.success() {
+        if self
+            .probe(&["merge", "--no-ff", "--no-edit", branch])?
+            .status
+            .success()
+        {
             return Ok(MergeOutcome::Clean);
         }
         // A conflicting merge leaves the tree mid-merge; collect the unmerged
@@ -490,7 +501,10 @@ impl GitRepo {
 
 /// Human-readable rendering of an argument vector for error context.
 fn render_args(args: &[OsString]) -> String {
-    args.iter().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>().join(" ")
+    args.iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Best error detail available: stderr, falling back to stdout (git prints

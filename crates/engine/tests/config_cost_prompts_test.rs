@@ -71,7 +71,10 @@ fn layered_load_partial_files_override_only_their_keys() {
     let default = MissionConfig::default();
     assert_eq!(cfg.worker.max_turns, default.worker.max_turns);
     assert_eq!(cfg.orchestrator, default.orchestrator);
-    assert_eq!(cfg.max_fix_cycles_per_milestone, default.max_fix_cycles_per_milestone);
+    assert_eq!(
+        cfg.max_fix_cycles_per_milestone,
+        default.max_fix_cycles_per_milestone
+    );
     assert!(!cfg.skip_scrutiny);
 }
 
@@ -139,7 +142,10 @@ fn max_parallel_workers_bounds() {
     // are rejected.
     for n in 1..=8 {
         let cfg = cfg_with(|c| c.max_parallel_workers = n);
-        assert!(config::validate(&cfg).is_ok(), "maxParallelWorkers={n} must validate");
+        assert!(
+            config::validate(&cfg).is_ok(),
+            "maxParallelWorkers={n} must validate"
+        );
     }
     for bad in [0, 9] {
         let cfg = cfg_with(|c| c.max_parallel_workers = bad);
@@ -325,7 +331,12 @@ fn created(mission_id: &str) -> EventKind {
     }
 }
 
-fn spawned(run_id: &str, role: Role, feature_id: Option<&str>, milestone_id: Option<&str>) -> EventKind {
+fn spawned(
+    run_id: &str,
+    role: Role,
+    feature_id: Option<&str>,
+    milestone_id: Option<&str>,
+) -> EventKind {
     EventKind::WorkerSpawned {
         run_id: run_id.to_string(),
         role,
@@ -370,13 +381,26 @@ fn fix_feature(id: &str) -> Feature {
 fn mission_a_events() -> Vec<EventKind> {
     vec![
         created("m-a"),
-        EventKind::PlanApproved { plan: plan_with(&[2]), base_sha: None },
-        EventKind::MilestoneStarted { milestone_id: "ms-1".into(), start_sha: "aaa".into() },
-        EventKind::FeatureStarted { feature_id: "f-1-1".into() },
+        EventKind::PlanApproved {
+            plan: plan_with(&[2]),
+            base_sha: None,
+        },
+        EventKind::MilestoneStarted {
+            milestone_id: "ms-1".into(),
+            start_sha: "aaa".into(),
+        },
+        EventKind::FeatureStarted {
+            feature_id: "f-1-1".into(),
+        },
         spawned("w-1", Role::Worker, Some("f-1-1"), None),
         completed("w-1", Some(1.0), TokenUsage::default()),
-        EventKind::FeatureCompleted { feature_id: "f-1-1".into(), commits: vec![] },
-        EventKind::FeatureStarted { feature_id: "f-1-2".into() },
+        EventKind::FeatureCompleted {
+            feature_id: "f-1-1".into(),
+            commits: vec![],
+        },
+        EventKind::FeatureStarted {
+            feature_id: "f-1-2".into(),
+        },
         spawned("w-2", Role::Worker, Some("f-1-2"), None),
         completed("w-2", Some(2.0), TokenUsage::default()),
         // Respawn on f-1-2 (2nd run on the same feature)...
@@ -386,10 +410,20 @@ fn mission_a_events() -> Vec<EventKind> {
         completed(
             "w-3",
             None,
-            TokenUsage { input: 1_000_000, output: 0, cache_read: 0, cache_write: 0 },
+            TokenUsage {
+                input: 1_000_000,
+                output: 0,
+                cache_read: 0,
+                cache_write: 0,
+            },
         ),
-        EventKind::FeatureCompleted { feature_id: "f-1-2".into(), commits: vec![] },
-        EventKind::MilestoneValidating { milestone_id: "ms-1".into() },
+        EventKind::FeatureCompleted {
+            feature_id: "f-1-2".into(),
+            commits: vec![],
+        },
+        EventKind::MilestoneValidating {
+            milestone_id: "ms-1".into(),
+        },
         spawned("v-1", Role::ValidatorScrutiny, None, Some("ms-1")),
         completed("v-1", Some(0.6), TokenUsage::default()),
         EventKind::ValidationFinding {
@@ -407,14 +441,24 @@ fn mission_a_events() -> Vec<EventKind> {
             milestone_id: "ms-1".into(),
             feature: fix_feature("f-fix-1"),
         },
-        EventKind::FeatureStarted { feature_id: "f-fix-1".into() },
+        EventKind::FeatureStarted {
+            feature_id: "f-fix-1".into(),
+        },
         spawned("w-4", Role::Worker, Some("f-fix-1"), None),
         completed("w-4", Some(2.0), TokenUsage::default()),
-        EventKind::FeatureCompleted { feature_id: "f-fix-1".into(), commits: vec![] },
-        EventKind::MilestoneValidating { milestone_id: "ms-1".into() },
+        EventKind::FeatureCompleted {
+            feature_id: "f-fix-1".into(),
+            commits: vec![],
+        },
+        EventKind::MilestoneValidating {
+            milestone_id: "ms-1".into(),
+        },
         spawned("v-2", Role::ValidatorFunctional, None, Some("ms-1")),
         completed("v-2", Some(1.0), TokenUsage::default()),
-        EventKind::MilestoneCompleted { milestone_id: "ms-1".into(), tag: None },
+        EventKind::MilestoneCompleted {
+            milestone_id: "ms-1".into(),
+            tag: None,
+        },
         spawned("o-1", Role::Orchestrator, None, None),
         completed("o-1", Some(0.9), TokenUsage::default()),
         EventKind::MissionCompleted {},
@@ -426,16 +470,32 @@ fn mission_a_events() -> Vec<EventKind> {
 fn mission_b_events() -> Vec<EventKind> {
     vec![
         created("m-b"),
-        EventKind::PlanApproved { plan: plan_with(&[1]), base_sha: None },
-        EventKind::MilestoneStarted { milestone_id: "ms-1".into(), start_sha: "bbb".into() },
-        EventKind::FeatureStarted { feature_id: "f-1-1".into() },
+        EventKind::PlanApproved {
+            plan: plan_with(&[1]),
+            base_sha: None,
+        },
+        EventKind::MilestoneStarted {
+            milestone_id: "ms-1".into(),
+            start_sha: "bbb".into(),
+        },
+        EventKind::FeatureStarted {
+            feature_id: "f-1-1".into(),
+        },
         spawned("w-1", Role::Worker, Some("f-1-1"), None),
         completed("w-1", Some(1.0), TokenUsage::default()),
-        EventKind::FeatureCompleted { feature_id: "f-1-1".into(), commits: vec![] },
-        EventKind::MilestoneValidating { milestone_id: "ms-1".into() },
+        EventKind::FeatureCompleted {
+            feature_id: "f-1-1".into(),
+            commits: vec![],
+        },
+        EventKind::MilestoneValidating {
+            milestone_id: "ms-1".into(),
+        },
         spawned("v-1", Role::ValidatorScrutiny, None, Some("ms-1")),
         completed("v-1", Some(0.4), TokenUsage::default()),
-        EventKind::MilestoneCompleted { milestone_id: "ms-1".into(), tag: None },
+        EventKind::MilestoneCompleted {
+            milestone_id: "ms-1".into(),
+            tag: None,
+        },
         spawned("o-1", Role::Orchestrator, None, None),
         completed("o-1", Some(0.5), TokenUsage::default()),
         EventKind::MissionCompleted {},
@@ -454,7 +514,13 @@ fn calibrate_averages_actuals_across_completed_missions() {
     write_events(
         repo,
         "m-running",
-        vec![created("m-running"), EventKind::PlanApproved { plan: plan_with(&[1]), base_sha: None }],
+        vec![
+            created("m-running"),
+            EventKind::PlanApproved {
+                plan: plan_with(&[1]),
+                base_sha: None,
+            },
+        ],
     );
     // ...an unreadable log (corruption mid-file)...
     let bad = repo.join(".kranz").join("missions").join("m-bad");
@@ -506,13 +572,27 @@ fn calibrate_clamps_zero_costs_to_floor() {
         "m-zero",
         vec![
             created("m-zero"),
-            EventKind::PlanApproved { plan: plan_with(&[1]), base_sha: None },
-            EventKind::MilestoneStarted { milestone_id: "ms-1".into(), start_sha: "ccc".into() },
-            EventKind::FeatureStarted { feature_id: "f-1-1".into() },
+            EventKind::PlanApproved {
+                plan: plan_with(&[1]),
+                base_sha: None,
+            },
+            EventKind::MilestoneStarted {
+                milestone_id: "ms-1".into(),
+                start_sha: "ccc".into(),
+            },
+            EventKind::FeatureStarted {
+                feature_id: "f-1-1".into(),
+            },
             spawned("w-1", Role::Worker, Some("f-1-1"), None),
             completed("w-1", Some(0.0), TokenUsage::default()),
-            EventKind::FeatureCompleted { feature_id: "f-1-1".into(), commits: vec![] },
-            EventKind::MilestoneCompleted { milestone_id: "ms-1".into(), tag: None },
+            EventKind::FeatureCompleted {
+                feature_id: "f-1-1".into(),
+                commits: vec![],
+            },
+            EventKind::MilestoneCompleted {
+                milestone_id: "ms-1".into(),
+                tag: None,
+            },
             EventKind::MissionCompleted {},
         ],
     );
@@ -579,12 +659,17 @@ fn prompt_hashes_are_12_hex_chars_and_distinct() {
     for h in &hashes {
         assert_eq!(h.len(), 12, "hash {h:?} is not 12 chars");
         assert!(
-            h.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            h.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
             "hash {h:?} is not lowercase hex"
         );
     }
     let unique: std::collections::HashSet<&String> = hashes.iter().collect();
-    assert_eq!(unique.len(), ALL_ROLES.len(), "role hashes must differ: {hashes:?}");
+    assert_eq!(
+        unique.len(),
+        ALL_ROLES.len(),
+        "role hashes must differ: {hashes:?}"
+    );
 }
 
 #[test]

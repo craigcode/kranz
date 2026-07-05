@@ -143,7 +143,9 @@ const MAX_HEADER: usize = 150;
 /// plain_text fields (e.g. header blocks) render verbatim and must NOT be
 /// escaped (the entities would show literally).
 pub fn escape_mrkdwn(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 // -- instance labels ----------------------------------------------------------
@@ -357,7 +359,12 @@ pub fn build_new_mission_ack(a: &NewMissionAck) -> Vec<Value> {
          (Slack doesn't deliver slash commands typed inside a thread).",
         a.mission_id
     );
-    if let Some(reply) = a.opening_reply.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+    if let Some(reply) = a
+        .opening_reply
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+    {
         blocks.push(section(&format!("*Orchestrator*\n{}", clip(reply))));
     }
     blocks.push(context(&footer));
@@ -528,7 +535,12 @@ pub fn build_plan_review(p: &PlanReview) -> Vec<Value> {
         plural(p.assertion_count),
         p.mission_id
     );
-    if let Some(est) = p.estimate.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
+    if let Some(est) = p
+        .estimate
+        .as_deref()
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+    {
         meta.push_str(&format!(" · {est}"));
     }
     blocks.push(context(&meta));
@@ -637,7 +649,9 @@ pub fn build_home_view(
     // -- Active missions --
     blocks.push(section("*Active missions*"));
     if missions.is_empty() {
-        blocks.push(context("_No active missions. Create one with_ `/kranz new <goal>`."));
+        blocks.push(context(
+            "_No active missions. Create one with_ `/kranz new <goal>`.",
+        ));
     } else {
         for m in missions {
             let line = format!("`{}` · *{}*", m.mission_id, m.status);
@@ -662,7 +676,12 @@ pub fn build_home_view(
     } else {
         let mut body = String::new();
         for (i, q) in queue.iter().enumerate() {
-            body.push_str(&format!("{}. `{}` · priority {}\n", i + 1, q.mission_id, q.priority));
+            body.push_str(&format!(
+                "{}. `{}` · priority {}\n",
+                i + 1,
+                q.mission_id,
+                q.priority
+            ));
         }
         blocks.push(section(&clip(body.trim_end())));
     }
@@ -672,11 +691,18 @@ pub fn build_home_view(
     // -- Open tickets --
     blocks.push(section("*Open tickets*"));
     if tickets.is_empty() {
-        blocks.push(context("_No open tickets. File one with_ `/kranz ticket <title>`."));
+        blocks.push(context(
+            "_No open tickets. File one with_ `/kranz ticket <title>`.",
+        ));
     } else {
         let mut body = String::new();
         for t in tickets {
-            body.push_str(&format!("• `{}` — {} · _{}_\n", t.slug, t.title.trim(), t.state));
+            body.push_str(&format!(
+                "• `{}` — {} · _{}_\n",
+                t.slug,
+                t.title.trim(),
+                t.state
+            ));
         }
         blocks.push(section(&clip(body.trim_end())));
     }
@@ -775,33 +801,48 @@ mod tests {
 
     #[test]
     fn plan_approved_announcement_has_facts_and_no_button() {
-        let blocks = build_plan_ready(&PlanReady {
-            mission_id: "m-42".into(),
-            goal: "Rate-limit the notes API".into(),
-            milestone_titles: vec!["Token bucket".into(), "429 responses".into()],
-            assertion_count: 3,
-        }, None);
+        let blocks = build_plan_ready(
+            &PlanReady {
+                mission_id: "m-42".into(),
+                goal: "Rate-limit the notes API".into(),
+                milestone_titles: vec!["Token bucket".into(), "429 responses".into()],
+                assertion_count: 3,
+            },
+            None,
+        );
         let text = all_text(&blocks);
         assert!(text.contains("m-42"), "mission id present");
         assert!(text.contains("Rate-limit the notes API"), "goal present");
         assert!(text.contains("Token bucket"), "milestone 1 present");
         assert!(text.contains("429 responses"), "milestone 2 present");
-        assert!(text.contains("3 validation assertions"), "assertion count present");
-        assert!(text.contains("Plan approved"), "announces the approval, not a review ask");
+        assert!(
+            text.contains("3 validation assertions"),
+            "assertion count present"
+        );
+        assert!(
+            text.contains("Plan approved"),
+            "announces the approval, not a review ask"
+        );
 
         // Approval already happened — the announcement must carry NO approve
         // button (a live one invited stale second approvals; seen on m-c9c915).
-        assert!(find_button(&blocks).is_none(), "no button on a post-approval announcement");
+        assert!(
+            find_button(&blocks).is_none(),
+            "no button on a post-approval announcement"
+        );
     }
 
     #[test]
     fn plan_ready_single_assertion_is_singular() {
-        let blocks = build_plan_ready(&PlanReady {
-            mission_id: "m-1".into(),
-            goal: "g".into(),
-            milestone_titles: vec![],
-            assertion_count: 1,
-        }, None);
+        let blocks = build_plan_ready(
+            &PlanReady {
+                mission_id: "m-1".into(),
+                goal: "g".into(),
+                milestone_titles: vec![],
+                assertion_count: 1,
+            },
+            None,
+        );
         assert!(all_text(&blocks).contains("1 validation assertion "));
     }
 
@@ -823,27 +864,35 @@ mod tests {
 
     #[test]
     fn blocked_carries_reason_and_unblock_hint() {
-        let blocks = build_blocked(&Blocked {
-            mission_id: "m-7".into(),
-            milestone_id: "ms-2".into(),
-            reason: "fix-cycle cap exceeded after 2 rounds".into(),
-        }, None);
+        let blocks = build_blocked(
+            &Blocked {
+                mission_id: "m-7".into(),
+                milestone_id: "ms-2".into(),
+                reason: "fix-cycle cap exceeded after 2 rounds".into(),
+            },
+            None,
+        );
         let text = all_text(&blocks);
         assert!(text.contains("m-7"), "mission id present");
         assert!(text.contains("ms-2"), "milestone id present");
         assert!(text.contains("fix-cycle cap exceeded"), "reason present");
-        assert!(text.to_lowercase().contains("reply in this thread to unblock"));
+        assert!(text
+            .to_lowercase()
+            .contains("reply in this thread to unblock"));
     }
 
     #[test]
     fn complete_shows_branch_summary_and_cost() {
-        let blocks = build_complete(&Complete {
-            mission_id: "m-9".into(),
-            outcome: Outcome::Completed,
-            summary: "Added rate limiting; all tests pass.".into(),
-            branch: "kranz/mission-m-9".into(),
-            cost_usd: Some(4.2),
-        }, None);
+        let blocks = build_complete(
+            &Complete {
+                mission_id: "m-9".into(),
+                outcome: Outcome::Completed,
+                summary: "Added rate limiting; all tests pass.".into(),
+                branch: "kranz/mission-m-9".into(),
+                cost_usd: Some(4.2),
+            },
+            None,
+        );
         let text = all_text(&blocks);
         assert!(text.contains("m-9"), "mission id present");
         assert!(text.contains("completed"), "outcome verb present");
@@ -854,13 +903,16 @@ mod tests {
 
     #[test]
     fn failed_mission_reads_failed_and_omits_cost_when_absent() {
-        let blocks = build_complete(&Complete {
-            mission_id: "m-9".into(),
-            outcome: Outcome::Failed,
-            summary: "worker exhausted respawns".into(),
-            branch: "kranz/mission-m-9".into(),
-            cost_usd: None,
-        }, None);
+        let blocks = build_complete(
+            &Complete {
+                mission_id: "m-9".into(),
+                outcome: Outcome::Failed,
+                summary: "worker exhausted respawns".into(),
+                branch: "kranz/mission-m-9".into(),
+                cost_usd: None,
+            },
+            None,
+        );
         let text = all_text(&blocks);
         assert!(text.contains("failed"), "failure verb present");
         assert!(text.contains("worker exhausted respawns"));
@@ -870,11 +922,14 @@ mod tests {
     #[test]
     fn long_fields_are_clipped_with_ellipsis() {
         let long = "x".repeat(5000);
-        let blocks = build_blocked(&Blocked {
-            mission_id: "m".into(),
-            milestone_id: "ms".into(),
-            reason: long,
-        }, None);
+        let blocks = build_blocked(
+            &Blocked {
+                mission_id: "m".into(),
+                milestone_id: "ms".into(),
+                reason: long,
+            },
+            None,
+        );
         let text = all_text(&blocks);
         assert!(text.contains('…'), "clipped fields end with an ellipsis");
         // The clipped field itself must stay under the cap; the assembled
@@ -935,7 +990,10 @@ mod tests {
         let text = all_text(&blocks);
         assert!(text.contains("m-42"), "mission id present");
         assert!(text.contains("Rate-limit the notes API"), "goal present");
-        assert!(text.contains("What is the test command?"), "opening reply present");
+        assert!(
+            text.contains("What is the test command?"),
+            "opening reply present"
+        );
         assert!(text.to_lowercase().contains("reply in this thread"));
         assert!(text.contains("/kranz plan"), "nudges toward request-plan");
     }
@@ -964,7 +1022,10 @@ mod tests {
         let text = all_text(&blocks);
         assert!(text.contains("m-7"), "mission id present");
         assert!(text.contains("Running"), "status pill present");
-        assert!(text.contains("2/3 milestones complete"), "summary body present");
+        assert!(
+            text.contains("2/3 milestones complete"),
+            "summary body present"
+        );
         assert!(text.contains("cost $1.20"));
     }
 
@@ -999,13 +1060,22 @@ mod tests {
         assert!(text.contains("m-42"), "mission id present");
         assert!(text.contains("Rate-limit the notes API"), "goal present");
         assert!(text.contains("Token bucket") && text.contains("429 responses"));
-        assert!(text.contains("3 validation assertions"), "assertion count present");
+        assert!(
+            text.contains("3 validation assertions"),
+            "assertion count present"
+        );
         assert!(text.contains("~$4.50 · ~12 min"), "estimate rendered");
 
         let buttons = all_buttons(&blocks);
         assert_eq!(buttons.len(), 2, "approve & start plus approve & queue");
-        let start = buttons.iter().find(|b| b["action_id"] == START_ACTION_ID).expect("start btn");
-        let queue = buttons.iter().find(|b| b["action_id"] == APPROVE_ACTION_ID).expect("queue btn");
+        let start = buttons
+            .iter()
+            .find(|b| b["action_id"] == START_ACTION_ID)
+            .expect("start btn");
+        let queue = buttons
+            .iter()
+            .find(|b| b["action_id"] == APPROVE_ACTION_ID)
+            .expect("queue btn");
         assert_eq!(start["value"], "m-42");
         assert_eq!(queue["value"], "m-42");
     }
@@ -1020,7 +1090,10 @@ mod tests {
             estimate: None,
         });
         let text = all_text(&blocks);
-        assert!(text.contains("1 validation assertion "), "singular assertion");
+        assert!(
+            text.contains("1 validation assertion "),
+            "singular assertion"
+        );
         assert!(text.contains("no milestones listed"));
     }
 
@@ -1067,7 +1140,10 @@ mod tests {
         let elem = &btn["elements"][0];
         assert_eq!(elem["url"], "http://127.0.0.1:4600/#/m/m-1");
         assert_eq!(elem["action_id"], "kranz_open_dashboard");
-        assert!(elem.get("value").is_none(), "link buttons carry a url, not a value");
+        assert!(
+            elem.get("value").is_none(),
+            "link buttons carry a url, not a value"
+        );
     }
 
     #[test]
@@ -1080,19 +1156,32 @@ mod tests {
         };
         // Unset → no link button (only the approve button, which has no url).
         let blocks = build_plan_ready(&p, None);
-        assert!(all_button_urls(&blocks).is_empty(), "no deep link when unset");
+        assert!(
+            all_button_urls(&blocks).is_empty(),
+            "no deep link when unset"
+        );
         // Set → exactly one deep-link url, correctly shaped.
         let blocks = build_plan_ready(&p, Some("http://127.0.0.1:4600"));
-        assert_eq!(all_button_urls(&blocks), vec!["http://127.0.0.1:4600/#/m/m-42".to_string()]);
+        assert_eq!(
+            all_button_urls(&blocks),
+            vec!["http://127.0.0.1:4600/#/m/m-42".to_string()]
+        );
     }
 
     #[test]
     fn blocked_and_complete_carry_dashboard_link_when_set() {
         let blocked = build_blocked(
-            &Blocked { mission_id: "m-7".into(), milestone_id: "ms-1".into(), reason: "x".into() },
+            &Blocked {
+                mission_id: "m-7".into(),
+                milestone_id: "ms-1".into(),
+                reason: "x".into(),
+            },
             Some("http://dash/"),
         );
-        assert_eq!(all_button_urls(&blocked), vec!["http://dash/#/m/m-7".to_string()]);
+        assert_eq!(
+            all_button_urls(&blocked),
+            vec!["http://dash/#/m/m-7".to_string()]
+        );
 
         let complete = build_complete(
             &Complete {
@@ -1104,7 +1193,10 @@ mod tests {
             },
             Some("http://dash"),
         );
-        assert_eq!(all_button_urls(&complete), vec!["http://dash/#/m/m-9".to_string()]);
+        assert_eq!(
+            all_button_urls(&complete),
+            vec!["http://dash/#/m/m-9".to_string()]
+        );
         // And absent when unset.
         let complete_no = build_complete(
             &Complete {
@@ -1125,10 +1217,19 @@ mod tests {
     fn home_view_lists_missions_queue_and_tickets() {
         let view = build_home_view(
             &[
-                HomeMission { mission_id: "m-1".into(), status: "Running".into() },
-                HomeMission { mission_id: "m-2".into(), status: "Planning".into() },
+                HomeMission {
+                    mission_id: "m-1".into(),
+                    status: "Running".into(),
+                },
+                HomeMission {
+                    mission_id: "m-2".into(),
+                    status: "Planning".into(),
+                },
             ],
-            &[HomeQueueItem { mission_id: "m-3".into(), priority: 2 }],
+            &[HomeQueueItem {
+                mission_id: "m-3".into(),
+                priority: 2,
+            }],
             &[HomeTicket {
                 slug: "rate-limit".into(),
                 title: "Rate-limit the notes API".into(),
@@ -1196,7 +1297,11 @@ mod tests {
                 Some("http://dash"),
             ),
             build_blocked(
-                &Blocked { mission_id: "m-1".into(), milestone_id: "ms".into(), reason: "r".into() },
+                &Blocked {
+                    mission_id: "m-1".into(),
+                    milestone_id: "ms".into(),
+                    reason: "r".into(),
+                },
                 None,
             ),
             build_complete(
@@ -1210,17 +1315,26 @@ mod tests {
                 None,
             ),
             build_help(),
-            build_needs_context(&NeedsContext { ticket_slug: "t".into(), questions: vec![] }),
+            build_needs_context(&NeedsContext {
+                ticket_slug: "t".into(),
+                questions: vec![],
+            }),
             build_status(&StatusSummary {
                 mission_id: "m-1".into(),
                 status: "Running".into(),
                 summary: "s".into(),
             }),
             // The single-section ephemeral shape (confirmations / errors).
-            vec![json!({ "type": "section", "text": { "type": "mrkdwn", "text": "Queued `m-1`." } })],
+            vec![
+                json!({ "type": "section", "text": { "type": "mrkdwn", "text": "Queued `m-1`." } }),
+            ],
         ];
         for blocks in shapes {
-            assert_eq!(label_blocks(blocks.clone(), None), blocks, "None must not touch blocks");
+            assert_eq!(
+                label_blocks(blocks.clone(), None),
+                blocks,
+                "None must not touch blocks"
+            );
             // A blank name is treated as unset, not rendered as `[] `.
             assert_eq!(label_blocks(blocks.clone(), Some("   ")), blocks);
         }
@@ -1241,9 +1355,18 @@ mod tests {
         let labeled = label_blocks(unlabeled.clone(), Some("studio"));
         // Block count unchanged — the label rides on the existing header.
         assert_eq!(labeled.len(), unlabeled.len(), "labeling never adds blocks");
-        let head = labeled[0].pointer("/text/text").and_then(Value::as_str).unwrap();
-        assert!(head.starts_with("[studio] "), "leading prefix on the header: {head}");
-        assert!(head.contains("Plan approved — m-42"), "original header text intact");
+        let head = labeled[0]
+            .pointer("/text/text")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(
+            head.starts_with("[studio] "),
+            "leading prefix on the header: {head}"
+        );
+        assert!(
+            head.contains("Plan approved — m-42"),
+            "original header text intact"
+        );
         // Only the first block was touched.
         assert_eq!(labeled[1..], unlabeled[1..]);
     }
@@ -1252,7 +1375,11 @@ mod tests {
     fn label_blocks_labels_every_notification_help_and_ephemeral_shape() {
         let blocked = label_blocks(
             build_blocked(
-                &Blocked { mission_id: "m-7".into(), milestone_id: "ms".into(), reason: "r".into() },
+                &Blocked {
+                    mission_id: "m-7".into(),
+                    milestone_id: "ms".into(),
+                    reason: "r".into(),
+                },
                 None,
             ),
             Some("laptop"),
@@ -1272,12 +1399,21 @@ mod tests {
             ),
             Some("laptop"),
         );
-        assert!(all_text(&complete).contains("[laptop] "), "complete labeled");
+        assert!(
+            all_text(&complete).contains("[laptop] "),
+            "complete labeled"
+        );
 
         // `/kranz help` states the instance name in its header.
         let help = label_blocks(build_help(), Some("laptop"));
-        let head = help[0].pointer("/text/text").and_then(Value::as_str).unwrap();
-        assert!(head.starts_with("[laptop] "), "help header states the instance: {head}");
+        let head = help[0]
+            .pointer("/text/text")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(
+            head.starts_with("[laptop] "),
+            "help header states the instance: {head}"
+        );
 
         // A single-section ephemeral (approve/config/pause confirmations)
         // carries the label in its mrkdwn text.
@@ -1287,8 +1423,14 @@ mod tests {
             Some("laptop"),
         );
         assert_eq!(eph.len(), 1, "still a single block");
-        let text = eph[0].pointer("/text/text").and_then(Value::as_str).unwrap();
-        assert!(text.starts_with("[laptop] :gear:"), "confirmation labeled: {text}");
+        let text = eph[0]
+            .pointer("/text/text")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(
+            text.starts_with("[laptop] :gear:"),
+            "confirmation labeled: {text}"
+        );
     }
 
     #[test]
@@ -1299,7 +1441,10 @@ mod tests {
             vec![json!({ "type": "section", "text": { "type": "mrkdwn", "text": "ok" } })],
             Some("<&>"),
         );
-        let text = eph[0].pointer("/text/text").and_then(Value::as_str).unwrap();
+        let text = eph[0]
+            .pointer("/text/text")
+            .and_then(Value::as_str)
+            .unwrap();
         assert_eq!(text, "[&lt;&amp;&gt;] ok", "hostile name escaped in mrkdwn");
 
         // plain_text surface (a header): rendered verbatim — plain_text never
@@ -1312,8 +1457,14 @@ mod tests {
             }),
             Some("<&>"),
         );
-        let head = labeled[0].pointer("/text/text").and_then(Value::as_str).unwrap();
-        assert!(head.starts_with("[<&>] "), "plain_text header keeps the raw name: {head}");
+        let head = labeled[0]
+            .pointer("/text/text")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(
+            head.starts_with("[<&>] "),
+            "plain_text header keeps the raw name: {head}"
+        );
     }
 
     #[test]
@@ -1321,15 +1472,25 @@ mod tests {
         // A near-cap header plus a prefix must stay within Block Kit's limit.
         let long_goal_header = vec![header(&"x".repeat(400))];
         let labeled = label_blocks(long_goal_header, Some("studio"));
-        let head = labeled[0].pointer("/text/text").and_then(Value::as_str).unwrap();
-        assert!(head.chars().count() <= 150, "header cap holds: {}", head.chars().count());
+        let head = labeled[0]
+            .pointer("/text/text")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(
+            head.chars().count() <= 150,
+            "header cap holds: {}",
+            head.chars().count()
+        );
         assert!(head.starts_with("[studio] "), "prefix survives the re-clip");
     }
 
     #[test]
     fn label_home_view_prefixes_the_home_header() {
         let view = build_home_view(
-            &[HomeMission { mission_id: "m-1".into(), status: "Running".into() }],
+            &[HomeMission {
+                mission_id: "m-1".into(),
+                status: "Running".into(),
+            }],
             &[],
             &[],
             None,
@@ -1337,9 +1498,19 @@ mod tests {
         let labeled = label_home_view(view.clone(), Some("cloud"));
         assert_eq!(labeled["type"], "home", "still a home view object");
         let blocks = labeled["blocks"].as_array().unwrap();
-        assert_eq!(blocks.len(), view["blocks"].as_array().unwrap().len(), "no blocks added");
-        let head = blocks[0].pointer("/text/text").and_then(Value::as_str).unwrap();
-        assert!(head.starts_with("[cloud] "), "home header shows the instance: {head}");
+        assert_eq!(
+            blocks.len(),
+            view["blocks"].as_array().unwrap().len(),
+            "no blocks added"
+        );
+        let head = blocks[0]
+            .pointer("/text/text")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(
+            head.starts_with("[cloud] "),
+            "home header shows the instance: {head}"
+        );
         // Every block still has a recognized type (the empty-state test's bar).
         for b in blocks {
             let ty = b["type"].as_str().expect("block type");
@@ -1350,16 +1521,22 @@ mod tests {
     #[test]
     fn home_view_mission_rows_deep_link_when_dashboard_url_set() {
         let view = build_home_view(
-            &[HomeMission { mission_id: "m-1".into(), status: "Running".into() }],
+            &[HomeMission {
+                mission_id: "m-1".into(),
+                status: "Running".into(),
+            }],
             &[],
             &[],
             Some("http://127.0.0.1:4600"),
         );
         let blocks = view["blocks"].as_array().expect("home blocks");
         // A mission section carries an accessory link button to the deep link.
-        let has_link = blocks.iter().any(|b| {
-            b["accessory"]["url"] == "http://127.0.0.1:4600/#/m/m-1"
-        });
-        assert!(has_link, "mission row deep-links to the dashboard when configured");
+        let has_link = blocks
+            .iter()
+            .any(|b| b["accessory"]["url"] == "http://127.0.0.1:4600/#/m/m-1");
+        assert!(
+            has_link,
+            "mission row deep-links to the dashboard when configured"
+        );
     }
 }

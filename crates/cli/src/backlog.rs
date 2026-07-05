@@ -53,19 +53,13 @@ pub fn ticket_template(title: &str, goal: Option<&str>) -> String {
 
 /// Scaffold `.kranz/tickets/<slug>.md` from the template. Refuses (error) if a
 /// ticket with that slug already exists. Returns the written path.
-pub fn cmd_ticket_new(
-    repo: &Path,
-    slug: &str,
-    title: &str,
-    goal: Option<&str>,
-) -> Result<PathBuf> {
+pub fn cmd_ticket_new(repo: &Path, slug: &str, title: &str, goal: Option<&str>) -> Result<PathBuf> {
     let dir = Ticket::tickets_dir(repo);
     let path = dir.join(format!("{slug}.md"));
     if path.exists() {
         bail!("ticket '{slug}' already exists at {}", path.display());
     }
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("creating {}", dir.display()))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let body = ticket_template(title, goal);
     // Fail loudly if the template ever stops parsing (guards future edits).
     Ticket::parse(slug, &body)
@@ -136,7 +130,11 @@ pub fn render_ticket_list(rows: &[TicketRow<'_>]) -> String {
 /// "needs context" block appended to the ticket body.
 pub fn render_ticket_show(ticket: &Ticket, state: TicketState) -> String {
     let mut out = String::new();
-    out.push_str(&format!("ticket {} [{}]\n", ticket.slug, ticket_state_label(state)));
+    out.push_str(&format!(
+        "ticket {} [{}]\n",
+        ticket.slug,
+        ticket_state_label(state)
+    ));
     out.push_str(&format!("  title:    {}\n", ticket.title));
     out.push_str(&format!("  priority: {}\n", ticket.priority));
     out.push_str(&format!("  schedule: {:?}\n", ticket.schedule));
@@ -230,7 +228,10 @@ pub fn render_queue(entries: &[QueueEntry], busy_with: Option<&str>) -> String {
         out.push_str("queue empty\n");
         return out;
     }
-    out.push_str(&format!("{:<3}  {:<3}  {:<14}  {}\n", "#", "PRI", "MISSION", "TICKET"));
+    out.push_str(&format!(
+        "{:<3}  {:<3}  {:<14}  {}\n",
+        "#", "PRI", "MISSION", "TICKET"
+    ));
     for (i, entry) in entries.iter().enumerate() {
         out.push_str(&format!(
             "{:<3}  {:<3}  {:<14}  {}\n",
@@ -254,7 +255,10 @@ pub fn render_queue(entries: &[QueueEntry], busy_with: Option<&str>) -> String {
 pub enum DraftDecision {
     /// Plan ready: `approve_plan` (commits plan.md) then set this state.
     /// `Queued` when `--yes` also enqueues; otherwise `Review` (parked).
-    Approve { then_enqueue: bool, next_state: TicketState },
+    Approve {
+        then_enqueue: bool,
+        next_state: TicketState,
+    },
     /// Orchestrator wants answers first: append its questions to the ticket
     /// and set `NeedsContext`. Short-circuits before any approval.
     NeedsContext { questions: Vec<String> },
@@ -266,7 +270,11 @@ pub fn draft_decision(request: &PlanRequest, yes: bool) -> DraftDecision {
     match request {
         PlanRequest::Ready(_) => DraftDecision::Approve {
             then_enqueue: yes,
-            next_state: if yes { TicketState::Queued } else { TicketState::Review },
+            next_state: if yes {
+                TicketState::Queued
+            } else {
+                TicketState::Review
+            },
         },
         PlanRequest::NotReady(text) => DraftDecision::NeedsContext {
             questions: split_questions(text),
@@ -327,7 +335,10 @@ pub enum WorkAction {
     /// The repo is busy running `mission_id`: wait (default) or exit (`--once`).
     Busy { mission_id: String },
     /// Free to run the front mission.
-    Run { mission_id: String, ticket_slug: Option<String> },
+    Run {
+        mission_id: String,
+        ticket_slug: Option<String>,
+    },
 }
 
 /// Decide the dispatcher's next step from the queue front + busy state.
@@ -364,7 +375,10 @@ pub fn cmd_ticket_list(repo: &Path) -> String {
     let tickets = Ticket::list(repo);
     let rows: Vec<TicketRow<'_>> = tickets
         .iter()
-        .map(|t| TicketRow { ticket: t, state: Ticket::read_state(repo, &t.slug) })
+        .map(|t| TicketRow {
+            ticket: t,
+            state: Ticket::read_state(repo, &t.slug),
+        })
         .collect();
     render_ticket_list(&rows)
 }
@@ -398,7 +412,10 @@ fn load_ticket(repo: &Path, slug: &str) -> Result<Ticket> {
 
 /// Apply a ticket's per-ticket budget override to the orchestrator role, so
 /// draft spend is bounded by the ticket's `maxBudgetUsd` when it sets one.
-fn config_for_ticket(mut cfg: kranz_engine::types::MissionConfig, ticket: &Ticket) -> kranz_engine::types::MissionConfig {
+fn config_for_ticket(
+    mut cfg: kranz_engine::types::MissionConfig,
+    ticket: &Ticket,
+) -> kranz_engine::types::MissionConfig {
     if let Some(budget) = ticket.max_budget_usd {
         cfg.orchestrator.max_budget_usd = Some(budget);
     }
@@ -416,7 +433,12 @@ fn config_for_ticket(mut cfg: kranz_engine::types::MissionConfig, ticket: &Ticke
 ///
 /// Only the orchestrator runs (no workers); spend is bounded by the
 /// orchestrator budget cap (per-ticket override applied).
-pub async fn cmd_draft(repo: PathBuf, slug: &str, yes: bool, dangerously_allow_all: bool) -> Result<i32> {
+pub async fn cmd_draft(
+    repo: PathBuf,
+    slug: &str,
+    yes: bool,
+    dangerously_allow_all: bool,
+) -> Result<i32> {
     let ticket = load_ticket(&repo, slug)?;
     let cfg = config_for_ticket(load_config(&repo, dangerously_allow_all)?, &ticket);
     let backend = build_backend(&cfg)?;
@@ -458,11 +480,16 @@ pub async fn cmd_draft(repo: PathBuf, slug: &str, yes: bool, dangerously_allow_a
             }
             println!(
                 "answer them in {} then run `kranz draft {slug}` again.",
-                Ticket::tickets_dir(&repo).join(format!("{slug}.md")).display()
+                Ticket::tickets_dir(&repo)
+                    .join(format!("{slug}.md"))
+                    .display()
             );
             Ok(0)
         }
-        DraftDecision::Approve { then_enqueue, next_state } => {
+        DraftDecision::Approve {
+            then_enqueue,
+            next_state,
+        } => {
             let PlanRequest::Ready(plan) = request else {
                 unreachable!("Approve decision implies a Ready plan");
             };
@@ -593,7 +620,10 @@ pub async fn cmd_work(repo: PathBuf, once: bool) -> Result<i32> {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 continue;
             }
-            WorkAction::Run { mission_id, ticket_slug } => {
+            WorkAction::Run {
+                mission_id,
+                ticket_slug,
+            } => {
                 // Claim the entry: remove it so a peer dispatcher won't re-run
                 // it, then mark its ticket Running.
                 queue::remove(&repo, &mission_id);

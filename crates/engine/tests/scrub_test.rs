@@ -52,7 +52,10 @@ fn aws_access_key_id_redacted() {
 fn aws_secret_access_key_redacted_key_name_kept() {
     let out = scrub("aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
     assert!(!out.contains("wJalrXUtnFEMI"), "{out}");
-    assert!(out.contains("aws_secret_access_key"), "key name must survive: {out}");
+    assert!(
+        out.contains("aws_secret_access_key"),
+        "key name must survive: {out}"
+    );
     assert!(out.contains(MARKER));
 }
 
@@ -81,7 +84,10 @@ fn jwt_redacted() {
 fn bearer_header_redacted_scheme_kept() {
     let out = scrub("Authorization: Bearer abcdef1234567890abcdef\nnext line");
     assert!(!out.contains("abcdef1234567890abcdef"), "{out}");
-    assert!(out.contains("Bearer [REDACTED]"), "scheme word must survive: {out}");
+    assert!(
+        out.contains("Bearer [REDACTED]"),
+        "scheme word must survive: {out}"
+    );
     assert!(out.contains("Authorization"));
     assert!(out.ends_with("next line"));
 }
@@ -89,17 +95,36 @@ fn bearer_header_redacted_scheme_kept() {
 #[test]
 fn generic_assignments_keep_key_name() {
     let cases = [
-        (r#"api_key = "abcd1234efgh5678""#, "api_key", "abcd1234efgh5678"),
+        (
+            r#"api_key = "abcd1234efgh5678""#,
+            "api_key",
+            "abcd1234efgh5678",
+        ),
         ("password: hunter2hunter2", "password", "hunter2hunter2"),
-        ("export MY_TOKEN=deadbeefcafe1234", "MY_TOKEN=", "deadbeefcafe1234"),
+        (
+            "export MY_TOKEN=deadbeefcafe1234",
+            "MY_TOKEN=",
+            "deadbeefcafe1234",
+        ),
         ("secret: velvetunderground", "secret", "velvetunderground"),
-        ("passwd=correcthorsebattery", "passwd", "correcthorsebattery"),
-        ("credential: aVeryLongValue123", "credential", "aVeryLongValue123"),
+        (
+            "passwd=correcthorsebattery",
+            "passwd",
+            "correcthorsebattery",
+        ),
+        (
+            "credential: aVeryLongValue123",
+            "credential",
+            "aVeryLongValue123",
+        ),
     ];
     for (input, key, value) in cases {
         let out = scrub(input);
         assert!(out.contains(key), "key name lost in {input:?} -> {out:?}");
-        assert!(!out.contains(value), "secret survived in {input:?} -> {out:?}");
+        assert!(
+            !out.contains(value),
+            "secret survived in {input:?} -> {out:?}"
+        );
         assert!(out.contains(MARKER), "no marker in {input:?} -> {out:?}");
     }
 }
@@ -159,12 +184,14 @@ fn google_api_key_redacted() {
 
 #[test]
 fn gcp_service_account_private_key_json_redacted() {
-    let input =
-        r#"{"type":"service_account","private_key":"-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBg\n-----END PRIVATE KEY-----\n","client_email":"x@y.iam"}"#;
+    let input = r#"{"type":"service_account","private_key":"-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBg\n-----END PRIVATE KEY-----\n","client_email":"x@y.iam"}"#;
     let out = scrub(input);
     assert!(!out.contains("MIIEvQIBADANBg"), "PEM body survived: {out}");
     assert!(!out.contains("BEGIN PRIVATE KEY"), "{out}");
-    assert!(out.contains("private_key"), "field name must survive: {out}");
+    assert!(
+        out.contains("private_key"),
+        "field name must survive: {out}"
+    );
     assert!(out.contains(MARKER));
     // Non-secret sibling fields are untouched.
     assert!(out.contains("service_account"), "{out}");
@@ -207,7 +234,10 @@ fn openai_project_key_redacted() {
 fn basic_auth_header_redacted_scheme_kept() {
     let out = scrub("Authorization: Basic dXNlcm5hbWU6cGFzc3dvcmQxMjM=\nnext line");
     assert!(!out.contains("dXNlcm5hbWU6cGFzc3dvcmQxMjM="), "{out}");
-    assert!(out.contains("Basic [REDACTED]"), "scheme word must survive: {out}");
+    assert!(
+        out.contains("Basic [REDACTED]"),
+        "scheme word must survive: {out}"
+    );
     assert!(out.contains("Authorization"));
     assert!(out.ends_with("next line"));
 }
@@ -217,7 +247,10 @@ fn connection_string_password_redacted_user_host_kept() {
     let out = scrub("postgres://appuser:s3cr3tP@ssw0rd@db.internal:5432/prod");
     assert!(!out.contains("s3cr3tP"), "password survived: {out}");
     assert!(out.contains("appuser"), "user must survive: {out}");
-    assert!(out.contains("db.internal:5432/prod"), "host must survive: {out}");
+    assert!(
+        out.contains("db.internal:5432/prod"),
+        "host must survive: {out}"
+    );
     assert!(out.contains("postgres://appuser:[REDACTED]@"), "{out}");
 }
 
@@ -231,7 +264,10 @@ fn entropy_rule_redacts_bare_high_entropy_value_in_key_context() {
     // rule), so this exercises the entropy heuristic specifically: a 40-char
     // base64 blob with no recognizable vendor prefix.
     let out = scrub("access_token = aB3xQ9zK7mP2wR5tY8uV1nJ4kL6dF0sGhWqZ7xC");
-    assert!(!out.contains("aB3xQ9zK7mP2wR5tY8uV1nJ4kL6dF0sGhWqZ7xC"), "{out}");
+    assert!(
+        !out.contains("aB3xQ9zK7mP2wR5tY8uV1nJ4kL6dF0sGhWqZ7xC"),
+        "{out}"
+    );
     assert!(out.contains("access_token"), "key name must survive: {out}");
     assert!(out.contains(MARKER));
 }
@@ -243,7 +279,10 @@ fn entropy_rule_declines_low_entropy_value() {
     // not clear the 4.0 bits/char bar.
     let text = "auth = abababababababababababababababab";
     let out = scrub(text);
-    assert!(out.contains("abababababababababababababababab"), "low-entropy redacted: {out}");
+    assert!(
+        out.contains("abababababababababababababababab"),
+        "low-entropy redacted: {out}"
+    );
     assert!(!out.contains(MARKER), "{out}");
 }
 
@@ -268,7 +307,10 @@ fn entropy_rule_leaves_uuid_in_key_context() {
     // Even assigned to a token-ish name, a canonical UUID is allowlisted.
     let text = "session_token: 550e8400-e29b-41d4-a716-446655440000";
     let out = scrub(text);
-    assert!(out.contains("550e8400-e29b-41d4-a716-446655440000"), "UUID redacted: {out}");
+    assert!(
+        out.contains("550e8400-e29b-41d4-a716-446655440000"),
+        "UUID redacted: {out}"
+    );
     assert!(!out.contains(MARKER), "{out}");
 }
 
@@ -287,7 +329,11 @@ fn entropy_rule_leaves_placeholder_in_key_context() {
 #[test]
 fn truncate_noop_when_short_enough() {
     let s = "héllo".repeat(4); // 20 chars, 24 bytes
-    assert_eq!(truncate_chars(&s, 20), s, "exactly max chars must not truncate");
+    assert_eq!(
+        truncate_chars(&s, 20),
+        s,
+        "exactly max chars must not truncate"
+    );
     assert_eq!(truncate_chars(&s, 100), s);
     assert_eq!(truncate_chars("", 0), "");
 }
@@ -312,7 +358,10 @@ fn scrub_and_truncate_scrubs_before_cutting() {
     // 40-char key body: raw text is long, scrubbed text is 19 chars.
     let input = format!("key sk-ant-{} tail", "a".repeat(40));
     let out = scrub_and_truncate(&input, 18);
-    assert!(out.contains(MARKER), "secret must be scrubbed before the cut: {out}");
+    assert!(
+        out.contains(MARKER),
+        "secret must be scrubbed before the cut: {out}"
+    );
     assert!(!out.contains("sk-ant-"), "{out}");
     assert!(out.ends_with(TRUNCATED), "{out}");
 }

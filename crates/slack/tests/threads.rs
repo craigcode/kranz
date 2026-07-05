@@ -20,7 +20,10 @@ fn save_then_load_round_trips() {
     let reloaded = ThreadMap::load(repo).unwrap();
     assert_eq!(reloaded, map);
     assert_eq!(reloaded.thread_ts("m-01"), Some("1700000000.000100"));
-    assert_eq!(reloaded.mission_for_thread("1700000500.000700"), Some("m-02"));
+    assert_eq!(
+        reloaded.mission_for_thread("1700000500.000700"),
+        Some("m-02")
+    );
     assert!(reloaded.contains("m-02"));
     assert!(!reloaded.contains("m-99"));
 }
@@ -55,5 +58,8 @@ fn overwrite_persists_new_root() {
     reloaded.set("m-01", "ts-new");
     reloaded.save(repo).unwrap();
 
-    assert_eq!(ThreadMap::load(repo).unwrap().thread_ts("m-01"), Some("ts-new"));
+    assert_eq!(
+        ThreadMap::load(repo).unwrap().thread_ts("m-01"),
+        Some("ts-new")
+    );
 }

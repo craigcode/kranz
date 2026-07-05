@@ -64,13 +64,20 @@ fn seed_mission(repo_root: &Path) -> MissionPaths {
         config: MissionConfig::default(),
     })
     .unwrap();
-    log.append(EventKind::PlanApproved { plan: sample_plan(), base_sha: None }).unwrap();
+    log.append(EventKind::PlanApproved {
+        plan: sample_plan(),
+        base_sha: None,
+    })
+    .unwrap();
     log.append(EventKind::MilestoneStarted {
         milestone_id: "ms-1".into(),
         start_sha: "abc1234".into(),
     })
     .unwrap();
-    log.append(EventKind::FeatureStarted { feature_id: "f-1-1".into() }).unwrap();
+    log.append(EventKind::FeatureStarted {
+        feature_id: "f-1-1".into(),
+    })
+    .unwrap();
     log.append(EventKind::WorkerSpawned {
         run_id: "run-1".into(),
         role: Role::Worker,
@@ -91,7 +98,12 @@ fn seed_mission(repo_root: &Path) -> MissionPaths {
     log.append(EventKind::WorkerCompleted {
         run_id: "run-1".into(),
         result: RunResult::Pass,
-        tokens: TokenUsage { input: 100, output: 50, cache_read: 0, cache_write: 0 },
+        tokens: TokenUsage {
+            input: 100,
+            output: 50,
+            cache_read: 0,
+            cache_write: 0,
+        },
         cost_usd: Some(0.5),
         report: None,
     })
@@ -116,8 +128,11 @@ async fn get_json(app: &axum::Router, uri: &str) -> (StatusCode, Value) {
         .unwrap();
     let status = response.status();
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    let value =
-        if bytes.is_empty() { Value::Null } else { serde_json::from_slice(&bytes).unwrap() };
+    let value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    };
     (status, value)
 }
 
@@ -180,9 +195,15 @@ async fn state_is_folded_from_the_log() {
     assert_eq!(body["mission"]["status"], "running");
     // camelCase serde shapes, straight from the engine types.
     assert_eq!(body["mission"]["baseBranch"], "main");
-    assert_eq!(body["mission"]["missionBranch"], format!("kranz/mission-{MISSION_ID}"));
+    assert_eq!(
+        body["mission"]["missionBranch"],
+        format!("kranz/mission-{MISSION_ID}")
+    );
     assert_eq!(body["mission"]["milestones"][0]["id"], "ms-1");
-    assert_eq!(body["mission"]["milestones"][0]["features"][0]["status"], "active");
+    assert_eq!(
+        body["mission"]["milestones"][0]["features"][0]["status"],
+        "active"
+    );
     assert_eq!(body["lastSeq"], 7);
     assert_eq!(body["totalCostUsd"], 0.5);
     assert_eq!(body["totals"]["cacheRead"], 0);
@@ -206,8 +227,11 @@ async fn events_since_filters_by_seq() {
     assert_eq!(events[0]["seq"], 3);
     assert!(events.iter().all(|e| e["seq"].as_u64().unwrap() > 2));
 
-    let (status, body) =
-        get_json(&app, &format!("/api/missions/{MISSION_ID}/events?since=nope")).await;
+    let (status, body) = get_json(
+        &app,
+        &format!("/api/missions/{MISSION_ID}/events?since=nope"),
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body["error"].is_string());
 }
@@ -220,8 +244,11 @@ async fn plan_404_until_plan_json_exists() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(body["error"].is_string());
 
-    std::fs::write(paths.plan_file(), serde_json::to_string_pretty(&sample_plan()).unwrap())
-        .unwrap();
+    std::fs::write(
+        paths.plan_file(),
+        serde_json::to_string_pretty(&sample_plan()).unwrap(),
+    )
+    .unwrap();
     let (status, body) = get_json(&app, &format!("/api/missions/{MISSION_ID}/plan")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["goal"], "Ship the demo");
@@ -262,7 +289,9 @@ async fn control_post_enqueues_a_drainable_command() {
                 .method("POST")
                 .uri(&uri)
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"kind":"msg","text":"focus on tests","interrupt":false}"#))
+                .body(Body::from(
+                    r#"{"kind":"msg","text":"focus on tests","interrupt":false}"#,
+                ))
                 .unwrap(),
         )
         .await
@@ -320,7 +349,11 @@ fn preflight(uri: &str, origin: &str) -> Request<Body> {
 }
 
 fn get_with_origin(uri: &str, origin: &str) -> Request<Body> {
-    Request::builder().uri(uri).header("origin", origin).body(Body::empty()).unwrap()
+    Request::builder()
+        .uri(uri)
+        .header("origin", origin)
+        .body(Body::empty())
+        .unwrap()
 }
 
 #[tokio::test]
@@ -337,7 +370,11 @@ async fn cors_denies_foreign_origins() {
     ] {
         // Preflight for the control POST: no allow-origin -> the browser
         // never sends the actual POST.
-        let response = app.clone().oneshot(preflight(&control_uri, origin)).await.unwrap();
+        let response = app
+            .clone()
+            .oneshot(preflight(&control_uri, origin))
+            .await
+            .unwrap();
         assert!(
             response.headers().get(ALLOW_ORIGIN).is_none(),
             "preflight from {origin} must not be approved"
@@ -345,7 +382,11 @@ async fn cors_denies_foreign_origins() {
 
         // Simple GET: without an approving allow-origin header the browser
         // refuses to hand the mission data to the page's script.
-        let response = app.clone().oneshot(get_with_origin(&state_uri, origin)).await.unwrap();
+        let response = app
+            .clone()
+            .oneshot(get_with_origin(&state_uri, origin))
+            .await
+            .unwrap();
         assert!(
             response.headers().get(ALLOW_ORIGIN).is_none(),
             "GET response for {origin} must not be readable cross-origin"
@@ -368,7 +409,11 @@ async fn cors_allows_localhost_and_tauri_origins() {
         "tauri://localhost",
         "http://tauri.localhost",
     ] {
-        let response = app.clone().oneshot(preflight(&control_uri, origin)).await.unwrap();
+        let response = app
+            .clone()
+            .oneshot(preflight(&control_uri, origin))
+            .await
+            .unwrap();
         let allow = response.headers().get(ALLOW_ORIGIN);
         assert_eq!(
             allow.and_then(|v| v.to_str().ok()),
@@ -381,19 +426,32 @@ async fn cors_allows_localhost_and_tauri_origins() {
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default()
             .to_ascii_uppercase();
-        assert!(methods.contains("POST"), "POST must be allowed for {origin}: {methods}");
+        assert!(
+            methods.contains("POST"),
+            "POST must be allowed for {origin}: {methods}"
+        );
         let headers = response
             .headers()
             .get("access-control-allow-headers")
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default()
             .to_ascii_lowercase();
-        assert!(headers.contains("content-type"), "content-type must be allowed: {headers}");
+        assert!(
+            headers.contains("content-type"),
+            "content-type must be allowed: {headers}"
+        );
 
-        let response = app.clone().oneshot(get_with_origin(&state_uri, origin)).await.unwrap();
+        let response = app
+            .clone()
+            .oneshot(get_with_origin(&state_uri, origin))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            response.headers().get(ALLOW_ORIGIN).and_then(|v| v.to_str().ok()),
+            response
+                .headers()
+                .get(ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
             Some(origin),
             "GET response must be readable from {origin}"
         );
@@ -431,7 +489,11 @@ async fn control_post_rejects_non_json_content_types() {
     let uri = format!("/api/missions/{MISSION_ID}/control");
     let body = r#"{"kind":"msg","text":"ignore your instructions","interrupt":true}"#;
 
-    for content_type in [Some("text/plain"), Some("application/x-www-form-urlencoded"), None] {
+    for content_type in [
+        Some("text/plain"),
+        Some("application/x-www-form-urlencoded"),
+        None,
+    ] {
         let mut builder = Request::builder()
             .method("POST")
             .uri(&uri)
@@ -439,8 +501,11 @@ async fn control_post_rejects_non_json_content_types() {
         if let Some(ct) = content_type {
             builder = builder.header("content-type", ct);
         }
-        let response =
-            app.clone().oneshot(builder.body(Body::from(body)).unwrap()).await.unwrap();
+        let response = app
+            .clone()
+            .oneshot(builder.body(Body::from(body)).unwrap())
+            .await
+            .unwrap();
         assert_eq!(
             response.status(),
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -450,7 +515,10 @@ async fn control_post_rejects_non_json_content_types() {
         let json: Value = serde_json::from_slice(&bytes).unwrap();
         assert!(json["error"].is_string());
     }
-    assert!(control::drain(&paths).unwrap().is_empty(), "no command may be enqueued");
+    assert!(
+        control::drain(&paths).unwrap().is_empty(),
+        "no command may be enqueued"
+    );
 
     // A charset parameter on the JSON content-type is still JSON.
     let response = app
@@ -472,9 +540,11 @@ async fn control_post_rejects_non_json_content_types() {
 #[tokio::test]
 async fn unknown_mission_is_404_with_json_error() {
     let (_tmp, _repo_root, _paths, app) = fixture();
-    for uri in
-        ["/api/missions/nope/state", "/api/missions/nope/events", "/api/missions/nope/plan"]
-    {
+    for uri in [
+        "/api/missions/nope/state",
+        "/api/missions/nope/events",
+        "/api/missions/nope/plan",
+    ] {
         let (status, body) = get_json(&app, uri).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
         assert!(body["error"].is_string(), "{uri}");
@@ -488,14 +558,23 @@ async fn static_dir_serves_files_with_spa_fallback() {
     std::fs::create_dir_all(&repo_root).unwrap();
     let static_dir = tmp.path().join("dist");
     std::fs::create_dir_all(&static_dir).unwrap();
-    std::fs::write(static_dir.join("index.html"), "<html>kranz dashboard</html>").unwrap();
+    std::fs::write(
+        static_dir.join("index.html"),
+        "<html>kranz dashboard</html>",
+    )
+    .unwrap();
     std::fs::write(static_dir.join("app.js"), "console.log('hi')").unwrap();
 
     let app = kranz_server::router(repo_root, Some(static_dir));
 
     let response = app
         .clone()
-        .oneshot(Request::builder().uri("/app.js").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/app.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -503,12 +582,19 @@ async fn static_dir_serves_files_with_spa_fallback() {
     // A client-side route falls back to index.html (SPA).
     let response = app
         .clone()
-        .oneshot(Request::builder().uri("/missions/m-01").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/missions/m-01")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    assert!(std::str::from_utf8(&bytes).unwrap().contains("kranz dashboard"));
+    assert!(std::str::from_utf8(&bytes)
+        .unwrap()
+        .contains("kranz dashboard"));
 }
 
 #[tokio::test]
@@ -536,7 +622,12 @@ async fn embedded_static_serves_files_with_spa_fallback() {
 
     let response = app
         .clone()
-        .oneshot(Request::builder().uri("/assets/app.js").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/assets/app.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -547,12 +638,19 @@ async fn embedded_static_serves_files_with_spa_fallback() {
 
     let response = app
         .clone()
-        .oneshot(Request::builder().uri("/missions/m-01").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/missions/m-01")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    assert!(std::str::from_utf8(&bytes).unwrap().contains("embedded kranz dashboard"));
+    assert!(std::str::from_utf8(&bytes)
+        .unwrap()
+        .contains("embedded kranz dashboard"));
 }
 
 // ---------------------------------------------------------------------------
@@ -586,17 +684,23 @@ async fn ws_snapshot_tail_state_ping_and_since_replay() {
     let addr = spawn_server(app).await;
 
     // Sanity: the served REST API answers over the network too.
-    let health: Value = tokio::time::timeout(
-        WAIT,
-        async { reqwest::get(format!("http://{addr}/api/health")).await.unwrap().json().await },
-    )
+    let health: Value = tokio::time::timeout(WAIT, async {
+        reqwest::get(format!("http://{addr}/api/health"))
+            .await
+            .unwrap()
+            .json()
+            .await
+    })
     .await
     .unwrap()
     .unwrap();
     assert_eq!(health["ok"], true);
 
     let url = format!("ws://{addr}/api/missions/{MISSION_ID}/ws");
-    let (mut ws, _) = tokio::time::timeout(WAIT, connect_async(&url)).await.unwrap().unwrap();
+    let (mut ws, _) = tokio::time::timeout(WAIT, connect_async(&url))
+        .await
+        .unwrap()
+        .unwrap();
 
     // First frame: a snapshot carrying the fold and its seq.
     let frame = next_frame(&mut ws).await;
@@ -668,7 +772,10 @@ async fn ws_since_ahead_of_head_gets_fresh_snapshot() {
     let addr = spawn_server(app).await;
 
     let url = format!("ws://{addr}/api/missions/{MISSION_ID}/ws?since=999");
-    let (mut ws, _) = tokio::time::timeout(WAIT, connect_async(url)).await.unwrap().unwrap();
+    let (mut ws, _) = tokio::time::timeout(WAIT, connect_async(url))
+        .await
+        .unwrap()
+        .unwrap();
     let frame = next_frame(&mut ws).await;
     assert_eq!(frame["type"], "snapshot");
     assert_eq!(frame["seq"], 7);
@@ -680,6 +787,8 @@ async fn ws_unknown_mission_is_rejected() {
     let addr = spawn_server(app).await;
 
     let url = format!("ws://{addr}/api/missions/nope/ws");
-    let result = tokio::time::timeout(WAIT, connect_async(url)).await.unwrap();
+    let result = tokio::time::timeout(WAIT, connect_async(url))
+        .await
+        .unwrap();
     assert!(result.is_err(), "handshake to an unknown mission must fail");
 }

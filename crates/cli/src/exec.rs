@@ -82,8 +82,7 @@ pub fn scrutiny_gate(skip_scrutiny: bool, allow_unvalidated: bool) -> Result<(),
 /// Pure over `(slug, markdown)` so the parse path is unit-tested without touching
 /// the filesystem; [`read_mission_file`] is the thin I/O wrapper exec calls.
 pub fn parse_mission_markdown(slug: &str, markdown: &str) -> Result<Ticket> {
-    Ticket::parse(slug, markdown)
-        .with_context(|| format!("parsing mission plan file '{slug}'"))
+    Ticket::parse(slug, markdown).with_context(|| format!("parsing mission plan file '{slug}'"))
 }
 
 /// Read + parse a plan file from disk. The slug is the file stem; a path with
@@ -120,8 +119,8 @@ pub async fn cmd_exec(
     let ticket = read_mission_file(&file)?;
     let cfg = load_config(&repo, dangerously_allow_all)?;
 
-    let allow_unvalidated = allow_unvalidated
-        || std::env::var("KRANZ_ALLOW_UNVALIDATED").ok().as_deref() == Some("1");
+    let allow_unvalidated =
+        allow_unvalidated || std::env::var("KRANZ_ALLOW_UNVALIDATED").ok().as_deref() == Some("1");
     if let Err(msg) = scrutiny_gate(cfg.skip_scrutiny, allow_unvalidated) {
         eprintln!("{msg}");
         return Ok(1);
@@ -132,7 +131,10 @@ pub async fn cmd_exec(
     let goal = ticket.mission_goal();
     let mut engine = MissionEngine::create(backend, repo.clone(), &goal, cfg)?;
     let mission_id = engine.mission_id().to_string();
-    eprintln!("kranz exec: mission {mission_id} created from {}", file.display());
+    eprintln!(
+        "kranz exec: mission {mission_id} created from {}",
+        file.display()
+    );
 
     // Seed the orchestrator with the whole ticket, then demand the plan — the
     // same single-turn seed the non-interactive draft path uses.

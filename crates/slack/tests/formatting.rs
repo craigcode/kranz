@@ -104,7 +104,9 @@ fn blocked_block_kit() {
     assert!(text.contains("m-7"));
     assert!(text.contains("ms-2"));
     assert!(text.contains("fix-cycle cap exceeded"));
-    assert!(text.to_lowercase().contains("reply in this thread to unblock"));
+    assert!(text
+        .to_lowercase()
+        .contains("reply in this thread to unblock"));
 }
 
 #[test]
@@ -151,10 +153,19 @@ fn help_lists_the_commands() {
     let blocks = build_help();
     assert_valid_blocks(&blocks);
     let text = serde_json::to_string(&blocks).unwrap();
-    assert!(text.contains("/kranz ticket"), "help lists the ticket command");
+    assert!(
+        text.contains("/kranz ticket"),
+        "help lists the ticket command"
+    );
     assert!(text.contains("/kranz help"), "help lists itself");
-    assert!(text.to_lowercase().contains("approve"), "help mentions the approve button");
-    assert!(text.to_lowercase().contains("guidance"), "help mentions thread-reply guidance");
+    assert!(
+        text.to_lowercase().contains("approve"),
+        "help mentions the approve button"
+    );
+    assert!(
+        text.to_lowercase().contains("guidance"),
+        "help mentions thread-reply guidance"
+    );
     // M2.9 slice 1 lifecycle commands are now listed.
     assert!(text.contains("/kranz new"), "help lists new");
     assert!(text.contains("/kranz plan"), "help lists plan");
@@ -172,8 +183,14 @@ fn new_mission_ack_block_kit() {
     assert_valid_blocks(&blocks);
     let text = all_text(&blocks);
     assert!(text.contains("m-42"), "ack carries the mission id");
-    assert!(text.contains("Rate-limit the notes API"), "ack carries the goal");
-    assert!(text.contains("Which endpoints are in scope?"), "opening questions surfaced");
+    assert!(
+        text.contains("Rate-limit the notes API"),
+        "ack carries the goal"
+    );
+    assert!(
+        text.contains("Which endpoints are in scope?"),
+        "opening questions surfaced"
+    );
     assert!(text.to_lowercase().contains("reply in this thread"));
 }
 
@@ -188,7 +205,10 @@ fn status_block_kit() {
     let text = all_text(&blocks);
     assert!(text.contains("m-7"), "status carries the mission id");
     assert!(text.contains("Running"), "status pill present");
-    assert!(text.contains("2/3 milestones complete"), "summary body present");
+    assert!(
+        text.contains("2/3 milestones complete"),
+        "summary body present"
+    );
 }
 
 #[test]
@@ -209,7 +229,10 @@ fn plan_review_block_kit_has_start_and_queue_buttons() {
     assert!(text.contains("~$3.10 · ~9 min"), "estimate rendered");
 
     // Two buttons, both carrying the mission id under their distinct action ids.
-    let actions = blocks.iter().find(|b| b["type"] == "actions").expect("actions block");
+    let actions = blocks
+        .iter()
+        .find(|b| b["type"] == "actions")
+        .expect("actions block");
     let elements = actions["elements"].as_array().expect("button elements");
     assert_eq!(elements.len(), 2, "approve & start plus approve & queue");
     let start = elements
@@ -248,8 +271,14 @@ fn actions_button_urls(blocks: &[Value]) -> Vec<String> {
 #[test]
 fn deep_link_shape_and_button_presence() {
     // The deep link is <dashboardUrl>#/m/<id>, one slash regardless of the base.
-    assert_eq!(dashboard_deep_link("http://h:4600", "m-1"), "http://h:4600/#/m/m-1");
-    assert_eq!(dashboard_deep_link("http://h:4600/", "m-1"), "http://h:4600/#/m/m-1");
+    assert_eq!(
+        dashboard_deep_link("http://h:4600", "m-1"),
+        "http://h:4600/#/m/m-1"
+    );
+    assert_eq!(
+        dashboard_deep_link("http://h:4600/", "m-1"),
+        "http://h:4600/#/m/m-1"
+    );
 
     // No button when unset/blank; a link button when set.
     assert!(dashboard_button(None, "m-1").is_none());
@@ -276,8 +305,14 @@ fn plan_ready_deep_link_present_only_when_url_set() {
 #[test]
 fn home_view_is_valid_block_kit_with_missions_queue_and_tickets() {
     let view = build_home_view(
-        &[HomeMission { mission_id: "m-1".into(), status: "Running".into() }],
-        &[HomeQueueItem { mission_id: "m-2".into(), priority: 3 }],
+        &[HomeMission {
+            mission_id: "m-1".into(),
+            status: "Running".into(),
+        }],
+        &[HomeQueueItem {
+            mission_id: "m-2".into(),
+            priority: 3,
+        }],
         &[HomeTicket {
             slug: "rate-limit".into(),
             title: "Rate-limit the notes API".into(),
@@ -289,13 +324,27 @@ fn home_view_is_valid_block_kit_with_missions_queue_and_tickets() {
     let blocks = view["blocks"].as_array().expect("home blocks");
     assert_valid_blocks(blocks);
     let text = all_text(blocks);
-    assert!(text.contains("m-1") && text.contains("Running"), "mission + status pill");
-    assert!(text.contains("m-2") && text.contains("priority 3"), "queue row");
-    assert!(text.contains("rate-limit") && text.contains("Rate-limit the notes API"), "ticket");
+    assert!(
+        text.contains("m-1") && text.contains("Running"),
+        "mission + status pill"
+    );
+    assert!(
+        text.contains("m-2") && text.contains("priority 3"),
+        "queue row"
+    );
+    assert!(
+        text.contains("rate-limit") && text.contains("Rate-limit the notes API"),
+        "ticket"
+    );
     // Mission row deep-links to the dashboard when configured.
-    let has_link = blocks.iter().any(|b| b["accessory"]["url"] == "http://h:4600/#/m/m-1");
+    let has_link = blocks
+        .iter()
+        .any(|b| b["accessory"]["url"] == "http://h:4600/#/m/m-1");
     assert!(has_link, "mission row carries a dashboard deep link");
-    assert!(serde_json::to_string(&view).is_ok(), "the view must serialize");
+    assert!(
+        serde_json::to_string(&view).is_ok(),
+        "the view must serialize"
+    );
 }
 
 #[test]
@@ -312,7 +361,10 @@ fn home_view_empty_state_renders_and_validates() {
 #[test]
 fn help_lists_the_config_command() {
     let text = serde_json::to_string(&build_help()).unwrap();
-    assert!(text.contains("/kranz config"), "help lists the config command");
+    assert!(
+        text.contains("/kranz config"),
+        "help lists the config command"
+    );
 }
 
 #[test]

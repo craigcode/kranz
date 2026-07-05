@@ -135,7 +135,10 @@ impl EventLog {
         std::fs::create_dir_all(paths.control_dir())?;
 
         let lock_path = paths.lock_file();
-        let mut lock_file = match OpenOptions::new().write(true).create_new(true).open(&lock_path)
+        let mut lock_file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
         {
             Ok(f) => f,
             Err(e) if e.kind() == ErrorKind::AlreadyExists => steal_lock(&lock_path, force)?,
@@ -197,7 +200,10 @@ impl EventLog {
                 0
             };
 
-            let file = OpenOptions::new().append(true).create(true).open(&events_path)?;
+            let file = OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&events_path)?;
             Ok(EventLog {
                 mission_id: mission_id.to_string(),
                 events_path,
@@ -253,7 +259,10 @@ impl EventLog {
         line.push('\n');
 
         if event.kind.is_stream_delta() {
-            self.buffer.push(BufferedLine { buffered_at: Instant::now(), line });
+            self.buffer.push(BufferedLine {
+                buffered_at: Instant::now(),
+                line,
+            });
             let oldest = self.buffer.first().expect("just pushed").buffered_at;
             if oldest.elapsed() >= self.throttle {
                 self.drain_buffer()?;
@@ -384,7 +393,11 @@ impl EventLog {
             valid_len = offset;
             terminated = step > line_end;
         }
-        Ok(ParsedLog { events, valid_len: valid_len as u64, terminated })
+        Ok(ParsedLog {
+            events,
+            valid_len: valid_len as u64,
+            terminated,
+        })
     }
 
     /// Read events with `seq > after_seq` (WS reconnect / tailing). The whole
@@ -441,7 +454,11 @@ fn steal_lock(lock_path: &Path, force: LockForce) -> Result<File> {
     loop {
         // The lock may have been RELEASED while we waited for the guard:
         // retry the clean create before probing anything.
-        match OpenOptions::new().write(true).create_new(true).open(lock_path) {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(lock_path)
+        {
             Ok(f) => return Ok(f),
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e.into()),
@@ -458,7 +475,11 @@ fn steal_lock(lock_path: &Path, force: LockForce) -> Result<File> {
             Err(e) if e.kind() == ErrorKind::NotFound => continue,
             Err(e) => return Err(e.into()),
         }
-        match OpenOptions::new().write(true).create_new(true).open(lock_path) {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(lock_path)
+        {
             Ok(f) => return Ok(f),
             Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e.into()),
@@ -562,8 +583,11 @@ impl StealGuard {
         loop {
             // Contents are irrelevant (the file exists only to be flock'd),
             // but be explicit that nothing is truncated.
-            let file =
-                OpenOptions::new().write(true).create(true).truncate(false).open(&path)?;
+            let file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)?;
             loop {
                 if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
                     break;
@@ -662,11 +686,24 @@ fn read_lock_info(lock_path: &Path) -> LockInfo {
     let contents = std::fs::read_to_string(lock_path).unwrap_or_default();
     let mut lines = contents.lines();
     let first = lines.next().unwrap_or("").trim();
-    let holder = if first.is_empty() { "unknown".to_string() } else { first.to_string() };
+    let holder = if first.is_empty() {
+        "unknown".to_string()
+    } else {
+        first.to_string()
+    };
     let pid = first.parse::<i32>().ok().filter(|p| *p > 0);
     let acquired_secs = lines.next().and_then(|l| l.trim().parse::<u64>().ok());
-    let token = lines.next().map(str::trim).filter(|t| !t.is_empty()).map(String::from);
-    LockInfo { holder, pid, acquired_secs, token }
+    let token = lines
+        .next()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(String::from);
+    LockInfo {
+        holder,
+        pid,
+        acquired_secs,
+        token,
+    }
 }
 
 /// Probe the liveness of a lock file's recorded holder.
@@ -825,8 +862,9 @@ fn ps_identity_token(pid: i32) -> Option<String> {
 /// tests in this file concurrently spawning `ps` for a DIFFERENT pid.
 /// Test-only: it exists purely to observe the seam.
 #[cfg(all(test, target_os = "macos"))]
-static PS_SPAWN_COUNTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<i32, usize>>> =
-    std::sync::OnceLock::new();
+static PS_SPAWN_COUNTS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<i32, usize>>,
+> = std::sync::OnceLock::new();
 
 /// How long a cached macOS identity token may be served before a fresh `ps`
 /// spawn is required. This window only needs to be long enough to collapse
@@ -847,7 +885,8 @@ const IDENTITY_TOKEN_CACHE_TTL: Duration = Duration::from_millis(50);
 /// pid can never return another pid's token. Guarded by a `Mutex` for safe
 /// concurrent access.
 #[cfg(target_os = "macos")]
-type IdentityTokenCache = std::sync::Mutex<std::collections::HashMap<i32, (Option<String>, Instant)>>;
+type IdentityTokenCache =
+    std::sync::Mutex<std::collections::HashMap<i32, (Option<String>, Instant)>>;
 
 #[cfg(target_os = "macos")]
 static IDENTITY_TOKEN_CACHE: std::sync::OnceLock<IdentityTokenCache> = std::sync::OnceLock::new();
@@ -858,7 +897,8 @@ static IDENTITY_TOKEN_CACHE: std::sync::OnceLock<IdentityTokenCache> = std::sync
 /// `recorded == current` on every call, using whatever token this returns.
 #[cfg(target_os = "macos")]
 fn process_identity_token(pid: i32) -> Option<String> {
-    let cache = IDENTITY_TOKEN_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let cache = IDENTITY_TOKEN_CACHE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let now = Instant::now();
     if let Some((token, captured)) = cache.lock().unwrap().get(&pid) {
         if now.duration_since(*captured) < IDENTITY_TOKEN_CACHE_TTL {
@@ -946,7 +986,10 @@ mod tests {
         let a = process_identity_token(pid).expect("own token must be obtainable");
         let b = process_identity_token(pid).expect("own token must be obtainable");
         assert_eq!(a, b, "token readings of the same live process must match");
-        assert!(!a.is_empty() && !a.contains('\n'), "token must be a single non-empty line: {a:?}");
+        assert!(
+            !a.is_empty() && !a.contains('\n'),
+            "token must be a single non-empty line: {a:?}"
+        );
     }
 
     /// A pid that provably has no process yields no token (dead pids have no
@@ -974,7 +1017,10 @@ mod tests {
         };
         assert_eq!(probe_liveness(&info), LockLiveness::Alive);
 
-        let info = LockInfo { token: Some(format!("{own}-not")), ..info };
+        let info = LockInfo {
+            token: Some(format!("{own}-not")),
+            ..info
+        };
         assert_eq!(probe_liveness(&info), LockLiveness::Dead);
     }
 
@@ -1004,7 +1050,11 @@ mod tests {
         let b = process_identity_token(pid).expect("own token must be obtainable");
 
         let after = count_for_pid(pid);
-        assert_eq!(after - before, 1, "second call within the cache window must not spawn ps again");
+        assert_eq!(
+            after - before,
+            1,
+            "second call within the cache window must not spawn ps again"
+        );
         assert_eq!(a, b, "cached token must match the freshly spawned one");
     }
 
@@ -1054,7 +1104,10 @@ mod tests {
 
     fn buffered(n: usize) -> Vec<BufferedLine> {
         (0..n)
-            .map(|i| BufferedLine { buffered_at: Instant::now(), line: format!("line-{i}\n") })
+            .map(|i| BufferedLine {
+                buffered_at: Instant::now(),
+                line: format!("line-{i}\n"),
+            })
             .collect()
     }
 
@@ -1062,7 +1115,10 @@ mod tests {
     fn drain_retains_unwritten_deltas_on_write_failure() {
         let k = 3;
         let n = 7;
-        let mut writer = FlakyWriter { fail_at: k, writes: Vec::new() };
+        let mut writer = FlakyWriter {
+            fail_at: k,
+            writes: Vec::new(),
+        };
         let mut buffer = buffered(n);
 
         let result = drain_lines(&mut writer, &mut buffer);
@@ -1081,7 +1137,10 @@ mod tests {
 
         // A subsequent drain with a working writer must recover the retained
         // lines successfully — nothing is permanently lost.
-        let mut retry_writer = FlakyWriter { fail_at: usize::MAX, writes: Vec::new() };
+        let mut retry_writer = FlakyWriter {
+            fail_at: usize::MAX,
+            writes: Vec::new(),
+        };
         let retry_result = drain_lines(&mut retry_writer, &mut buffer);
         assert!(retry_result.is_ok());
         assert!(buffer.is_empty());
@@ -1145,8 +1204,11 @@ mod tests {
     fn parse_log_rejects_mixed_mission_ids() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.jsonl");
-        std::fs::write(&path, format!("{}{}", event_line(1, "m-a"), event_line(2, "m-b")))
-            .unwrap();
+        std::fs::write(
+            &path,
+            format!("{}{}", event_line(1, "m-a"), event_line(2, "m-b")),
+        )
+        .unwrap();
 
         let err = EventLog::read_events(&path).expect_err("mixed mission_id must be rejected");
         assert!(

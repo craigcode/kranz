@@ -161,7 +161,9 @@ impl Ticket {
         let slug = path
             .file_stem()
             .and_then(|s| s.to_str())
-            .ok_or_else(|| EngineError::Config(format!("ticket path has no file stem: {}", path.display())))?
+            .ok_or_else(|| {
+                EngineError::Config(format!("ticket path has no file stem: {}", path.display()))
+            })?
             .to_string();
         let text = std::fs::read_to_string(path)?;
         Ticket::parse(&slug, &text)
@@ -187,7 +189,11 @@ impl Ticket {
                 }
             }
         }
-        out.sort_by(|a, b| a.priority.cmp(&b.priority).then_with(|| a.slug.cmp(&b.slug)));
+        out.sort_by(|a, b| {
+            a.priority
+                .cmp(&b.priority)
+                .then_with(|| a.slug.cmp(&b.slug))
+        });
         out
     }
 

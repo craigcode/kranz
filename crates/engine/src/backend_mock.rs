@@ -101,7 +101,11 @@ impl MockScript {
     /// injected user messages. Chain [`responding`](Self::responding) to
     /// script the per-message batches.
     pub fn streaming(initial: Vec<AgentEvent>) -> Self {
-        MockScript { events: initial, streaming: true, ..Default::default() }
+        MockScript {
+            events: initial,
+            streaming: true,
+            ..Default::default()
+        }
     }
 
     /// Script the batches released by successive `send_user_message` calls.
@@ -137,7 +141,12 @@ impl MockScript {
 
 /// The token usage attached to every mock result event.
 fn mock_usage() -> TokenUsage {
-    TokenUsage { input: 1000, output: 200, cache_read: 0, cache_write: 0 }
+    TokenUsage {
+        input: 1000,
+        output: 200,
+        cache_read: 0,
+        cache_write: 0,
+    }
 }
 
 /// System init event (first message of every session).
@@ -246,7 +255,12 @@ pub fn mock_result_text(text: &str) -> AgentEvent {
 /// abort scripting).
 pub fn mock_result_error(text: &str) -> AgentEvent {
     match mock_result_text(text) {
-        AgentEvent::Result { usage, cost_usd, num_turns, .. } => AgentEvent::Result {
+        AgentEvent::Result {
+            usage,
+            cost_usd,
+            num_turns,
+            ..
+        } => AgentEvent::Result {
             text: text.to_string(),
             is_error: true,
             usage,
@@ -277,7 +291,13 @@ pub fn mock_result_error(text: &str) -> AgentEvent {
 pub fn mock_result_json(value: &serde_json::Value) -> AgentEvent {
     let text = value.to_string();
     match mock_result_text(&text) {
-        AgentEvent::Result { is_error, usage, cost_usd, num_turns, .. } => AgentEvent::Result {
+        AgentEvent::Result {
+            is_error,
+            usage,
+            cost_usd,
+            num_turns,
+            ..
+        } => AgentEvent::Result {
             text,
             is_error,
             usage,
@@ -340,12 +360,18 @@ impl MockBackend {
 
     /// Backend pre-loaded with scripts (consumed FIFO by `start()`).
     pub fn with_scripts(scripts: Vec<MockScript>) -> Self {
-        MockBackend { scripts: Mutex::new(scripts.into()), ..Default::default() }
+        MockBackend {
+            scripts: Mutex::new(scripts.into()),
+            ..Default::default()
+        }
     }
 
     /// Queue another script at the back.
     pub fn push_script(&self, script: MockScript) {
-        self.scripts.lock().expect("mock scripts lock").push_back(script);
+        self.scripts
+            .lock()
+            .expect("mock scripts lock")
+            .push_back(script);
     }
 
     /// Clones of every spec passed to `start()`, in start order.
@@ -375,9 +401,14 @@ impl AgentBackend for MockBackend {
             injected.len() - 1
         };
 
-        let session_id =
-            script.session_id.clone().unwrap_or_else(|| spec.session_id.clone());
-        self.started_specs.lock().expect("mock specs lock").push(spec.clone());
+        let session_id = script
+            .session_id
+            .clone()
+            .unwrap_or_else(|| spec.session_id.clone());
+        self.started_specs
+            .lock()
+            .expect("mock specs lock")
+            .push(spec.clone());
         self.started_count.send_modify(|count| *count += 1);
 
         Ok(Box::new(MockSession {

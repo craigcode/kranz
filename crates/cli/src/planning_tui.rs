@@ -45,8 +45,8 @@ use crate::output::{self, one_line};
 use crate::tail::EventRenderer;
 use anyhow::{Context, Result};
 use crossterm::event::{
-    self as ct_event, DisableMouseCapture, EnableMouseCapture, KeyCode, KeyEventKind,
-    KeyModifiers, MouseEventKind,
+    self as ct_event, DisableMouseCapture, EnableMouseCapture, KeyCode, KeyEventKind, KeyModifiers,
+    MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -348,7 +348,10 @@ pub struct ScrollState {
 
 impl Default for ScrollState {
     fn default() -> Self {
-        ScrollState { follow: true, top: 0 }
+        ScrollState {
+            follow: true,
+            top: 0,
+        }
     }
 }
 
@@ -459,17 +462,14 @@ pub enum BusyKind {
 pub const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 /// Idle status line.
-pub const IDLE_STATUS: &str =
-    "● ready — type a message; /plan to request the plan; /quit to exit";
+pub const IDLE_STATUS: &str = "● ready — type a message; /plan to request the plan; /quit to exit";
 
 /// Approval-mode bar (replaces the status line).
-pub const APPROVAL_BAR: &str =
-    "approve this plan? [y] approve & commit   [n] back to conversation";
+pub const APPROVAL_BAR: &str = "approve this plan? [y] approve & commit   [n] back to conversation";
 
 /// Post-approval bar: the plan is committed; starting execution (spend) is
 /// its own explicit consent step.
-pub const POST_APPROVAL_BAR: &str =
-    "plan committed — start execution now? [y] run   [n] exit";
+pub const POST_APPROVAL_BAR: &str = "plan committed — start execution now? [y] run   [n] exit";
 
 /// Detached-scroll marker shown on the transcript's bottom row.
 pub const DETACHED_MARKER: &str = "▼ new output below — End to follow";
@@ -578,7 +578,10 @@ fn entry_lines(entry: &TranscriptEntry, width: usize, out: &mut Vec<Line<'static
                     " ".repeat(prefix.len())
                 };
                 out.push(Line::from(vec![
-                    Span::styled(lead, Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        lead,
+                        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled(line, Style::new().add_modifier(Modifier::BOLD)),
                 ]));
             }
@@ -592,14 +595,13 @@ fn entry_lines(entry: &TranscriptEntry, width: usize, out: &mut Vec<Line<'static
                 } else {
                     " ".repeat(prefix.len())
                 };
-                out.push(Line::from(vec![
-                    Span::styled(lead, dim),
-                    Span::raw(line),
-                ]));
+                out.push(Line::from(vec![Span::styled(lead, dim), Span::raw(line)]));
             }
         }
         TranscriptEntry::Activity(text) => {
-            for (i, line) in wrap_text(text, width.saturating_sub(2).max(1)).into_iter().enumerate()
+            for (i, line) in wrap_text(text, width.saturating_sub(2).max(1))
+                .into_iter()
+                .enumerate()
             {
                 let lead = if i == 0 { "" } else { "  " };
                 out.push(Line::from(Span::styled(format!("{lead}{line}"), dim)));
@@ -686,7 +688,10 @@ enum Phase {
         fut: TurnFut,
     },
     /// Plan rendered; waiting for a single y/n key.
-    Approval { engine: Box<MissionEngine>, plan: Plan },
+    Approval {
+        engine: Box<MissionEngine>,
+        plan: Plan,
+    },
     /// Plan committed; waiting for the single-key run-now/exit choice. The
     /// engine is never used again but must stay alive until teardown (it
     /// flushes buffered events and releases the mission lock on drop).
@@ -827,7 +832,13 @@ impl InputThread {
                 }
             }
         });
-        (InputThread { stop, handle: Some(handle) }, rx)
+        (
+            InputThread {
+                stop,
+                handle: Some(handle),
+            },
+            rx,
+        )
     }
 
     /// Stop the thread and wait for it (≤ [`INPUT_POLL`]) so it can never
@@ -883,7 +894,8 @@ pub async fn run(engine: MissionEngine, intro: String) -> Result<PlanningOutcome
     let mission_id = engine.mission_id().to_string();
     let title = format!(
         "KRANZ PLANNING — {} — {}",
-        mission_id, engine.state().mission.goal
+        mission_id,
+        engine.state().mission.goal
     );
     let events_path = engine.paths().events_file();
     let last_seq = engine.state().last_seq;
@@ -1073,9 +1085,7 @@ impl TuiRun {
                     self.app.editor.delete();
                 }
             }
-            (KeyCode::Char('a'), m) if m.contains(KeyModifiers::CONTROL) => {
-                self.app.editor.home()
-            }
+            (KeyCode::Char('a'), m) if m.contains(KeyModifiers::CONTROL) => self.app.editor.home(),
             (KeyCode::Char('e'), m) if m.contains(KeyModifiers::CONTROL) => self.app.editor.end(),
             (KeyCode::Char('u'), m) if m.contains(KeyModifiers::CONTROL) => {
                 self.app.editor.clear_line()
@@ -1123,21 +1133,27 @@ impl TuiRun {
                 )));
             }
             SubmitDisposition::Queued(text) => {
-                self.app
-                    .push(TranscriptEntry::User { text: text.clone(), queued: true });
+                self.app.push(TranscriptEntry::User {
+                    text: text.clone(),
+                    queued: true,
+                });
                 self.app.queue.push(text);
             }
             SubmitDisposition::RequestPlan => {
-                self.app
-                    .push(TranscriptEntry::User { text: line, queued: false });
+                self.app.push(TranscriptEntry::User {
+                    text: line,
+                    queued: false,
+                });
                 self.phase = match std::mem::replace(&mut self.phase, Phase::Transitioning) {
                     Phase::Idle(engine) => start_plan_request(engine),
                     other => other,
                 };
             }
             SubmitDisposition::Turn(text) => {
-                self.app
-                    .push(TranscriptEntry::User { text: text.clone(), queued: false });
+                self.app.push(TranscriptEntry::User {
+                    text: text.clone(),
+                    queued: false,
+                });
                 self.phase = match std::mem::replace(&mut self.phase, Phase::Transitioning) {
                     Phase::Idle(engine) => start_turn(engine, text),
                     other => other,
@@ -1161,8 +1177,9 @@ impl TuiRun {
             }
             TurnOutput::Reply(Err(e)) => {
                 let message = format!("{:#}", augment_limit_hint(e.into()));
-                self.app
-                    .push(TranscriptEntry::Error(format!("orchestrator turn failed: {message}")));
+                self.app.push(TranscriptEntry::Error(format!(
+                    "orchestrator turn failed: {message}"
+                )));
                 self.app.error = Some(format!("orchestrator turn failed: {message}"));
                 self.phase = Phase::Idle(engine);
             }
@@ -1170,28 +1187,31 @@ impl TuiRun {
                 // Conversational, not an error: show what the orchestrator
                 // said and return to idle — no approval mode, no red.
                 self.app.push(TranscriptEntry::Orch(text));
-                self.app.push(TranscriptEntry::Notice(PLAN_NOT_READY_NOTICE.to_string()));
+                self.app
+                    .push(TranscriptEntry::Notice(PLAN_NOT_READY_NOTICE.to_string()));
                 self.phase = Phase::Idle(engine);
             }
             TurnOutput::Plan(Ok(PlanRequest::Ready(plan))) => {
-                self.app
-                    .push(TranscriptEntry::Block(output::render_plan(&plan).trim_end().to_string()));
+                self.app.push(TranscriptEntry::Block(
+                    output::render_plan(&plan).trim_end().to_string(),
+                ));
                 // Estimate with params calibrated from this repo's completed
                 // missions (built-in defaults when there are none yet).
                 let calibration = cost::calibrate(&engine.paths().repo_root);
-                let estimate =
-                    cost::estimate(&plan, &engine.state().config, &calibration.params);
-                self.app.push(TranscriptEntry::Block(output::render_cost_estimate(
-                    &estimate,
-                    calibration.missions_used,
-                )));
+                let estimate = cost::estimate(&plan, &engine.state().config, &calibration.params);
+                self.app
+                    .push(TranscriptEntry::Block(output::render_cost_estimate(
+                        &estimate,
+                        calibration.missions_used,
+                    )));
                 self.phase = Phase::Approval { engine, plan };
                 return; // queued messages wait for the approval decision
             }
             TurnOutput::Plan(Err(e)) => {
                 let message = format!("{:#}", augment_limit_hint(e.into()));
-                self.app
-                    .push(TranscriptEntry::Error(format!("plan request failed: {message}")));
+                self.app.push(TranscriptEntry::Error(format!(
+                    "plan request failed: {message}"
+                )));
                 self.app.error = Some(format!("plan request failed: {message}"));
                 self.phase = Phase::Idle(engine);
             }
@@ -1220,8 +1240,9 @@ impl TuiRun {
                                 self.app.push(TranscriptEntry::Error(format!(
                                     "plan approval failed: {e}"
                                 )));
-                                self.app
-                                    .push(TranscriptEntry::Notice("back to the conversation.".into()));
+                                self.app.push(TranscriptEntry::Notice(
+                                    "back to the conversation.".into(),
+                                ));
                                 Phase::Idle(engine)
                             }
                         }
@@ -1233,8 +1254,9 @@ impl TuiRun {
                 }
             }
             ApprovalKey::Reject => {
-                self.app
-                    .push(TranscriptEntry::Notice("not approved — back to the conversation.".into()));
+                self.app.push(TranscriptEntry::Notice(
+                    "not approved — back to the conversation.".into(),
+                ));
                 self.phase = match std::mem::replace(&mut self.phase, Phase::Transitioning) {
                     Phase::Approval { engine, .. } => Phase::Idle(engine),
                     other => other,
@@ -1320,8 +1342,11 @@ fn draw_ui(frame: &mut Frame, app: &App, view: &PhaseView, title: &str) -> (u16,
 fn draw_title(frame: &mut Frame, area: Rect, title: &str) {
     let text = one_line(title, area.width as usize);
     frame.render_widget(
-        Paragraph::new(Span::styled(text, Style::new().add_modifier(Modifier::BOLD)))
-            .style(Style::new().bg(Color::DarkGray).fg(Color::White)),
+        Paragraph::new(Span::styled(
+            text,
+            Style::new().add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::new().bg(Color::DarkGray).fg(Color::White)),
         area,
     );
 }
@@ -1375,7 +1400,10 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App, view: &PhaseView) {
         )),
         PhaseView::Idle => match &app.error {
             Some(error) => Paragraph::new(Span::styled(
-                format!("✖ {}", one_line(error, (area.width as usize).saturating_sub(2))),
+                format!(
+                    "✖ {}",
+                    one_line(error, (area.width as usize).saturating_sub(2))
+                ),
                 Style::new().fg(Color::Red),
             )),
             None => Paragraph::new(Span::styled(IDLE_STATUS, Style::new().fg(Color::Green))),
@@ -1399,7 +1427,11 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App, view: &PhaseView) {
     let window = (area.width as usize).saturating_sub(prompt.len()).max(1);
     let chars: Vec<char> = app.editor.text().chars().collect();
     let cursor = app.editor.cursor();
-    let start = if cursor >= window { cursor + 1 - window } else { 0 };
+    let start = if cursor >= window {
+        cursor + 1 - window
+    } else {
+        0
+    };
     let end = (start + window).min(chars.len());
     let visible: String = chars[start.min(chars.len())..end].iter().collect();
     frame.render_widget(

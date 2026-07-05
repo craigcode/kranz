@@ -63,7 +63,9 @@ fn parses_ticket_list() {
     let cli = Cli::try_parse_from(["kranz", "ticket", "list"]).unwrap();
     assert!(matches!(
         cli.command,
-        Command::Ticket { command: TicketCommand::List }
+        Command::Ticket {
+            command: TicketCommand::List
+        }
     ));
 }
 
@@ -71,7 +73,9 @@ fn parses_ticket_list() {
 fn parses_ticket_show() {
     let cli = Cli::try_parse_from(["kranz", "ticket", "show", "my-slug"]).unwrap();
     match cli.command {
-        Command::Ticket { command: TicketCommand::Show { slug } } => assert_eq!(slug, "my-slug"),
+        Command::Ticket {
+            command: TicketCommand::Show { slug },
+        } => assert_eq!(slug, "my-slug"),
         other => panic!("unexpected: {other:?}"),
     }
 }
@@ -79,7 +83,13 @@ fn parses_ticket_show() {
 #[test]
 fn parses_ticket_new_with_title_and_goal() {
     let cli = Cli::try_parse_from([
-        "kranz", "ticket", "new", "rate-limit", "--title", "Rate limit the API", "--goal",
+        "kranz",
+        "ticket",
+        "new",
+        "rate-limit",
+        "--title",
+        "Rate limit the API",
+        "--goal",
         "cap requests per token",
     ])
     .unwrap();
@@ -103,8 +113,15 @@ fn ticket_new_requires_title() {
 
 #[test]
 fn parses_ticket_approve_with_mission() {
-    let cli =
-        Cli::try_parse_from(["kranz", "ticket", "approve", "slug", "--mission", "m-abc123"]).unwrap();
+    let cli = Cli::try_parse_from([
+        "kranz",
+        "ticket",
+        "approve",
+        "slug",
+        "--mission",
+        "m-abc123",
+    ])
+    .unwrap();
     match cli.command {
         Command::Ticket {
             command: TicketCommand::Approve { slug, mission },
@@ -220,7 +237,10 @@ fn render_ticket_list_from_tempdir() {
     let tickets = Ticket::list(repo);
     let rows: Vec<TicketRow<'_>> = tickets
         .iter()
-        .map(|t| TicketRow { ticket: t, state: Ticket::read_state(repo, &t.slug) })
+        .map(|t| TicketRow {
+            ticket: t,
+            state: Ticket::read_state(repo, &t.slug),
+        })
         .collect();
     let out = render_ticket_list(&rows);
 
@@ -289,7 +309,9 @@ fn render_queue_lists_positions_and_busy() {
     assert!(out.contains("ticket-a"));
     assert!(out.contains("m-bbb"));
     // No slug renders as `-`.
-    assert!(out.lines().any(|l| l.contains("m-bbb") && l.trim_end().ends_with('-')));
+    assert!(out
+        .lines()
+        .any(|l| l.contains("m-bbb") && l.trim_end().ends_with('-')));
 }
 
 // ---------------------------------------------------------------------------
@@ -301,7 +323,10 @@ fn draft_ready_without_yes_parks_for_review() {
     let req = PlanRequest::Ready(sample_plan());
     assert_eq!(
         draft_decision(&req, false),
-        DraftDecision::Approve { then_enqueue: false, next_state: TicketState::Review }
+        DraftDecision::Approve {
+            then_enqueue: false,
+            next_state: TicketState::Review
+        }
     );
 }
 
@@ -310,7 +335,10 @@ fn draft_ready_with_yes_enqueues() {
     let req = PlanRequest::Ready(sample_plan());
     assert_eq!(
         draft_decision(&req, true),
-        DraftDecision::Approve { then_enqueue: true, next_state: TicketState::Queued }
+        DraftDecision::Approve {
+            then_enqueue: true,
+            next_state: TicketState::Queued
+        }
     );
 }
 
@@ -348,9 +376,18 @@ fn draft_not_ready_single_line_becomes_one_question() {
 
 #[test]
 fn ticket_state_for_mission_maps_terminal_status() {
-    assert_eq!(ticket_state_for_mission(MissionStatus::Complete), TicketState::Done);
-    assert_eq!(ticket_state_for_mission(MissionStatus::Blocked), TicketState::Failed);
-    assert_eq!(ticket_state_for_mission(MissionStatus::Failed), TicketState::Failed);
+    assert_eq!(
+        ticket_state_for_mission(MissionStatus::Complete),
+        TicketState::Done
+    );
+    assert_eq!(
+        ticket_state_for_mission(MissionStatus::Blocked),
+        TicketState::Failed
+    );
+    assert_eq!(
+        ticket_state_for_mission(MissionStatus::Failed),
+        TicketState::Failed
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -369,7 +406,9 @@ fn work_action_busy_waits() {
     let front = entry("m-front", Some("t"), 1, 0);
     assert_eq!(
         next_work_action(Some(&front), Some("m-running")),
-        WorkAction::Busy { mission_id: "m-running".to_string() }
+        WorkAction::Busy {
+            mission_id: "m-running".to_string()
+        }
     );
 }
 

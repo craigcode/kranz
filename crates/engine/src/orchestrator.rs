@@ -174,7 +174,11 @@ enum FindingsConversion {
     /// Convert into fix features. Unparseable answers and answers that
     /// neither fix nor waive land here with specs synthesized 1:1 from the
     /// findings — the conservative default.
-    Fix { specs: Vec<FixFeatureSpec>, summary: String, text: String },
+    Fix {
+        specs: Vec<FixFeatureSpec>,
+        summary: String,
+        text: String,
+    },
     /// Every finding waived, each with a one-line justification.
     Waive { waived: Vec<WaivedFinding> },
 }
@@ -349,9 +353,11 @@ impl MissionEngine {
         // The most recent orchestrator session's sdk id (events are in seq
         // order, so the last matching worker.spawned wins).
         let orch_session_id = events.iter().rev().find_map(|e| match &e.kind {
-            EventKind::WorkerSpawned { role: Role::Orchestrator, sdk_session_id, .. } => {
-                Some(sdk_session_id.clone())
-            }
+            EventKind::WorkerSpawned {
+                role: Role::Orchestrator,
+                sdk_session_id,
+                ..
+            } => Some(sdk_session_id.clone()),
             _ => None,
         });
 
@@ -471,10 +477,7 @@ impl MissionEngine {
         if !is_git_repo(self.paths.repo_root.as_path()) {
             issues.push(PreflightIssue {
                 severity: "error",
-                message: format!(
-                    "{} is not a git repository",
-                    self.paths.repo_root.display()
-                ),
+                message: format!("{} is not a git repository", self.paths.repo_root.display()),
             });
         }
         if !kranz_dir_is_writable(&self.paths) {
@@ -491,8 +494,12 @@ impl MissionEngine {
             if assertion.check != AssertionCheck::Command {
                 continue;
             }
-            let Some(command) = assertion.command.as_deref() else { continue };
-            let Some(program) = leading_program(command) else { continue };
+            let Some(command) = assertion.command.as_deref() else {
+                continue;
+            };
+            let Some(program) = leading_program(command) else {
+                continue;
+            };
             if !probed.insert(program.clone()) {
                 continue; // already reported/checked this program
             }
@@ -598,7 +605,11 @@ impl MissionEngine {
             // Prefer the retry's text (the model's latest word); fall back to
             // the first turn's when the retry came back empty. Both are
             // already scrubbed by pump_turn.
-            None => Ok(PlanRequest::NotReady(if retry.trim().is_empty() { text } else { retry })),
+            None => Ok(PlanRequest::NotReady(if retry.trim().is_empty() {
+                text
+            } else {
+                retry
+            })),
         }
     }
 
@@ -613,7 +624,9 @@ impl MissionEngine {
             )));
         }
         if plan.milestones.is_empty() {
-            return Err(EngineError::InvalidState("plan has no milestones".to_string()));
+            return Err(EngineError::InvalidState(
+                "plan has no milestones".to_string(),
+            ));
         }
         if let Some(empty) = plan.milestones.iter().find(|m| m.features.is_empty()) {
             return Err(EngineError::InvalidState(format!(
@@ -661,7 +674,10 @@ impl MissionEngine {
             &format!("[kranz] approved plan for {}", self.state.mission.id),
         )?;
 
-        self.emit(EventKind::PlanApproved { plan, base_sha: Some(base_sha) })?;
+        self.emit(EventKind::PlanApproved {
+            plan,
+            base_sha: Some(base_sha),
+        })?;
         Ok(())
     }
 
@@ -736,7 +752,11 @@ impl MissionEngine {
         let retry = self.orch_turn(JSON_RETRY_MSG).await?;
         match runner::parse_report::<Plan>(&retry) {
             Some(plan) => Ok(PlanRequest::Ready(plan)),
-            None => Ok(PlanRequest::NotReady(if retry.trim().is_empty() { text } else { retry })),
+            None => Ok(PlanRequest::NotReady(if retry.trim().is_empty() {
+                text
+            } else {
+                retry
+            })),
         }
     }
 
@@ -835,10 +855,16 @@ impl MissionEngine {
         // Titles are compared trimmed/case-insensitively so trivial editorial
         // differences do not spuriously drop or duplicate a feature.
         let target = &self.state.mission.milestones[target_mi];
-        let revised_titles: Vec<String> =
-            revised_target.features.iter().map(|f| norm_title(&f.title)).collect();
-        let current_titles: Vec<String> =
-            target.features.iter().map(|f| norm_title(&f.title)).collect();
+        let revised_titles: Vec<String> = revised_target
+            .features
+            .iter()
+            .map(|f| norm_title(&f.title))
+            .collect();
+        let current_titles: Vec<String> = target
+            .features
+            .iter()
+            .map(|f| norm_title(&f.title))
+            .collect();
 
         let to_skip: Vec<String> = target
             .features
@@ -918,7 +944,11 @@ impl MissionEngine {
                 id: format!("{target_id}-replan-{replan_cycle}-{}", i + 1),
                 title: scrub::scrub(&pf.title),
                 spec: scrub::scrub(&pf.spec),
-                validation_criteria: pf.validation_criteria.iter().map(|c| scrub::scrub(c)).collect(),
+                validation_criteria: pf
+                    .validation_criteria
+                    .iter()
+                    .map(|c| scrub::scrub(c))
+                    .collect(),
                 origin: FeatureOrigin::Fix,
                 status: FeatureStatus::Pending,
                 worker_runs: Vec::new(),
@@ -1021,7 +1051,10 @@ impl MissionEngine {
             if self.state.mission.milestones[mi].status == MilestoneStatus::Pending {
                 let start_sha = self.repo.head_sha()?;
                 let milestone_id = self.state.mission.milestones[mi].id.clone();
-                self.emit(EventKind::MilestoneStarted { milestone_id, start_sha })?;
+                self.emit(EventKind::MilestoneStarted {
+                    milestone_id,
+                    start_sha,
+                })?;
             }
 
             // Parallel-within-milestone (roadmap M3), STRICTLY gated: only when
@@ -1034,9 +1067,7 @@ impl MissionEngine {
             // With max_parallel_workers == 1 this guard short-circuits before
             // any parallel code runs, so the sequential behaviour below is
             // exactly what it was pre-M3.
-            if self.state.config.max_parallel_workers > 1
-                && self.try_parallel_batch(mi).await?
-            {
+            if self.state.config.max_parallel_workers > 1 && self.try_parallel_batch(mi).await? {
                 continue;
             }
 
@@ -1137,9 +1168,15 @@ impl MissionEngine {
         // Conservative default (documented): stay blocked.
         let (action, note) = match decision {
             Some(d) => (d.action.trim().to_ascii_lowercase(), d.note),
-            None => ("stay-blocked".to_string(), "unparseable unblock decision".to_string()),
+            None => (
+                "stay-blocked".to_string(),
+                "unparseable unblock decision".to_string(),
+            ),
         };
-        self.emit_decision(&format!("unblock decision for {milestone_id}: {action}"), Some(text))?;
+        self.emit_decision(
+            &format!("unblock decision for {milestone_id}: {action}"),
+            Some(text),
+        )?;
 
         match action.as_str() {
             "unblock-raise-cap" | "unblock-skip-findings" => {
@@ -1161,9 +1198,7 @@ impl MissionEngine {
                 let to_skip: Vec<String> = self.state.mission.milestones[mi]
                     .features
                     .iter()
-                    .filter(|f| {
-                        matches!(f.status, FeatureStatus::Pending | FeatureStatus::Active)
-                    })
+                    .filter(|f| matches!(f.status, FeatureStatus::Pending | FeatureStatus::Active))
                     .map(|f| f.id.clone())
                     .collect();
                 for feature_id in to_skip {
@@ -1172,7 +1207,10 @@ impl MissionEngine {
                         reason: "milestone skipped".to_string(),
                     })?;
                 }
-                self.emit(EventKind::MilestoneCompleted { milestone_id, tag: None })?;
+                self.emit(EventKind::MilestoneCompleted {
+                    milestone_id,
+                    tag: None,
+                })?;
                 Ok(None)
             }
             _ => Ok(Some(MissionStatus::Blocked)),
@@ -1247,18 +1285,27 @@ impl MissionEngine {
                 .iter()
                 .map(|c| format!("{} {}", c.sha, c.subject))
                 .collect();
-            let diff_stat = self.repo.diff_stat(&pre_run_sha, "HEAD").unwrap_or_default();
+            let diff_stat = self
+                .repo
+                .diff_stat(&pre_run_sha, "HEAD")
+                .unwrap_or_default();
 
             match self
                 .judge_worker_run(&feature.id, outcome.report.as_ref(), &commits, &diff_stat)
                 .await?
             {
                 JudgementOutcome::Complete => {
-                    self.emit(EventKind::FeatureCompleted { feature_id: feature.id, commits })?;
+                    self.emit(EventKind::FeatureCompleted {
+                        feature_id: feature.id,
+                        commits,
+                    })?;
                     return Ok(());
                 }
                 JudgementOutcome::Failed(reason) => {
-                    self.emit(EventKind::FeatureFailed { feature_id: feature.id, reason })?;
+                    self.emit(EventKind::FeatureFailed {
+                        feature_id: feature.id,
+                        reason,
+                    })?;
                     return Ok(());
                 }
                 JudgementOutcome::Respawn(new_guidance) => {
@@ -1291,17 +1338,28 @@ impl MissionEngine {
         // preserved on the mission branch for inspection either way.
         let (action, note) = match decision {
             Some(d) => (d.action.trim().to_ascii_lowercase(), d.note),
-            None => ("commit-as-is".to_string(), "unparseable dirty-tree decision".to_string()),
+            None => (
+                "commit-as-is".to_string(),
+                "unparseable dirty-tree decision".to_string(),
+            ),
         };
-        self.emit_decision(&format!("dirty tree after {feature_id}: {action}"), Some(text))?;
+        self.emit_decision(
+            &format!("dirty tree after {feature_id}: {action}"),
+            Some(text),
+        )?;
         if action == "fail-feature" {
             self.emit(EventKind::FeatureFailed {
                 feature_id: feature_id.to_string(),
-                reason: if note.is_empty() { "dirty tree; orchestrator failed the feature".into() } else { note },
+                reason: if note.is_empty() {
+                    "dirty tree; orchestrator failed the feature".into()
+                } else {
+                    note
+                },
             })?;
             return Ok(false);
         }
-        self.repo.add_all_and_commit(&format!("[{feature_id}] checkpoint (engine commit)"))?;
+        self.repo
+            .add_all_and_commit(&format!("[{feature_id}] checkpoint (engine commit)"))?;
         Ok(true)
     }
 
@@ -1323,7 +1381,11 @@ impl MissionEngine {
         let commits_text = if commits.is_empty() {
             "(none)".to_string()
         } else {
-            commits.iter().map(|c| format!("- {c}")).collect::<Vec<_>>().join("\n")
+            commits
+                .iter()
+                .map(|c| format!("- {c}"))
+                .collect::<Vec<_>>()
+                .join("\n")
         };
         let message = format!(
             "A worker run for feature {feature_id} just finished. Judge it.\n\n\
@@ -1338,7 +1400,11 @@ impl MissionEngine {
         let (verdict, guidance, summary) = match decision {
             Some(d) => {
                 let verdict = d.decision.trim().to_ascii_lowercase();
-                let summary = if d.summary.is_empty() { verdict.clone() } else { d.summary };
+                let summary = if d.summary.is_empty() {
+                    verdict.clone()
+                } else {
+                    d.summary
+                };
                 (verdict, d.guidance, summary)
             }
             None => (
@@ -1351,13 +1417,20 @@ impl MissionEngine {
                 "judgement unparseable; conservative default (respawn/fail)".to_string(),
             ),
         };
-        self.emit_decision(&format!("judgement for {feature_id}: {summary}"), Some(text))?;
+        self.emit_decision(
+            &format!("judgement for {feature_id}: {summary}"),
+            Some(text),
+        )?;
 
         Ok(match verdict.as_str() {
             "complete" => JudgementOutcome::Complete,
             "failed" | "fail" => JudgementOutcome::Failed(summary),
             // "respawn" and anything unrecognized take the conservative path.
-            _ => JudgementOutcome::Respawn(if guidance.is_empty() { summary } else { guidance }),
+            _ => JudgementOutcome::Respawn(if guidance.is_empty() {
+                summary
+            } else {
+                guidance
+            }),
         })
     }
 
@@ -1435,7 +1508,12 @@ impl MissionEngine {
         // Map the chosen ids back to feature indices, in the declared merge
         // order, keeping only known candidate ids and capping at N. Fewer than
         // two after all filtering → not worth a batch, fall through.
-        let index_of = |id: &str| candidates.iter().find(|(cid, _)| cid == id).map(|(_, fi)| *fi);
+        let index_of = |id: &str| {
+            candidates
+                .iter()
+                .find(|(cid, _)| cid == id)
+                .map(|(_, fi)| *fi)
+        };
         let mut chosen: Vec<(String, usize)> = Vec::new();
         for id in &batch {
             if chosen.len() >= cap {
@@ -1524,11 +1602,14 @@ impl MissionEngine {
     /// `chosen` is `(feature_id, feature_index)` in merge order.
     async fn run_parallel_batch(&mut self, mi: usize, chosen: &[(String, usize)]) -> Result<()> {
         let milestone_id = self.state.mission.milestones[mi].id.clone();
-        let start_sha = self.state.mission.milestones[mi].start_sha.clone().ok_or_else(|| {
-            EngineError::InvalidState(format!(
-                "milestone {milestone_id} started a parallel batch without a start sha"
-            ))
-        })?;
+        let start_sha = self.state.mission.milestones[mi]
+            .start_sha
+            .clone()
+            .ok_or_else(|| {
+                EngineError::InvalidState(format!(
+                    "milestone {milestone_id} started a parallel batch without a start sha"
+                ))
+            })?;
         let mission_branch = self.state.mission.mission_branch.clone();
 
         // Per-feature worktree layout, built up front so the cleanup guard sees
@@ -1545,7 +1626,9 @@ impl MissionEngine {
         // The whole batch is wrapped so we can ALWAYS clean up worktrees, even
         // on an error return. `batch_result` carries the fallible body's error
         // to re-raise after cleanup.
-        let batch_result = self.run_parallel_batch_inner(mi, &start_sha, &mission_branch, &workspaces).await;
+        let batch_result = self
+            .run_parallel_batch_inner(mi, &start_sha, &mission_branch, &workspaces)
+            .await;
 
         // Cleanup guard: remove every worktree + branch we created. Best-effort
         // and idempotent (remove_worktree/delete_branch_force tolerate absence);
@@ -1614,7 +1697,9 @@ impl MissionEngine {
         for ws in workspaces {
             let (mwi, fwi) = self.locate_feature(&ws.feature_id)?;
             if self.state.mission.milestones[mwi].features[fwi].status == FeatureStatus::Pending {
-                self.emit(EventKind::FeatureStarted { feature_id: ws.feature_id.clone() })?;
+                self.emit(EventKind::FeatureStarted {
+                    feature_id: ws.feature_id.clone(),
+                })?;
             }
             self.repo.add_worktree(&ws.path, &ws.branch, start_sha)?;
         }
@@ -1631,8 +1716,7 @@ impl MissionEngine {
         let base_sha = self.state.mission.base_sha.clone();
         let tracker = ConcurrencyTracker::new();
 
-        let mut set: tokio::task::JoinSet<(usize, BufferedRunResult)> =
-            tokio::task::JoinSet::new();
+        let mut set: tokio::task::JoinSet<(usize, BufferedRunResult)> = tokio::task::JoinSet::new();
         for (idx, ws) in workspaces.iter().enumerate() {
             let (mwi, fwi) = self.locate_feature(&ws.feature_id)?;
             let feature = self.state.mission.milestones[mwi].features[fwi].clone();
@@ -1724,7 +1808,10 @@ impl MissionEngine {
                         .iter()
                         .map(|c| format!("{} {}", c.sha, c.subject))
                         .collect();
-                    self.emit(EventKind::FeatureCompleted { feature_id, commits })?;
+                    self.emit(EventKind::FeatureCompleted {
+                        feature_id,
+                        commits,
+                    })?;
                     merged_ok += 1;
                 }
                 crate::git_ops::MergeOutcome::Conflict { files } => {
@@ -1738,12 +1825,12 @@ impl MissionEngine {
                     };
                     // Snapshot the original before feature.failed flips its
                     // status — the resolution spec quotes its title/spec.
-                    let original =
-                        self.state.mission.milestones[self.locate_feature(&feature_id)?.0]
-                            .features
-                            .iter()
-                            .find(|f| f.id == feature_id)
-                            .cloned();
+                    let original = self.state.mission.milestones
+                        [self.locate_feature(&feature_id)?.0]
+                        .features
+                        .iter()
+                        .find(|f| f.id == feature_id)
+                        .cloned();
                     self.emit(EventKind::FeatureFailed {
                         feature_id: feature_id.clone(),
                         reason: format!(
@@ -1878,7 +1965,12 @@ impl MissionEngine {
             .collect();
         let diff_stat = wt_repo.diff_stat(start_sha, "HEAD").unwrap_or_default();
         match self
-            .judge_worker_run(&ws.feature_id, outcome.report.as_ref(), &commits, &diff_stat)
+            .judge_worker_run(
+                &ws.feature_id,
+                outcome.report.as_ref(),
+                &commits,
+                &diff_stat,
+            )
             .await?
         {
             JudgementOutcome::Complete => Ok(true),
@@ -1910,7 +2002,9 @@ impl MissionEngine {
     /// it; no findings — or all findings waived — means a tag + completion.
     async fn validation_round(&mut self, mi: usize) -> Result<()> {
         let milestone_id = self.state.mission.milestones[mi].id.clone();
-        self.emit(EventKind::MilestoneValidating { milestone_id: milestone_id.clone() })?;
+        self.emit(EventKind::MilestoneValidating {
+            milestone_id: milestone_id.clone(),
+        })?;
 
         let start_sha = self.state.mission.milestones[mi]
             .start_sha
@@ -1984,7 +2078,11 @@ impl MissionEngine {
                 let tag = self.tag_milestone(&milestone_id);
                 self.emit(EventKind::MilestoneCompleted { milestone_id, tag })?;
             }
-            FindingsConversion::Fix { specs, summary, text } => {
+            FindingsConversion::Fix {
+                specs,
+                summary,
+                text,
+            } => {
                 if self.fix_cycle_exhausted(mi) {
                     self.emit_decision(
                         &format!(
@@ -2079,13 +2177,20 @@ impl MissionEngine {
                         "Address this validation finding.\nEvidence: {}\nSuggested fix: {}",
                         f.evidence, f.suggested_fix
                     ),
-                    validation_criteria: vec![format!("finding '{}' no longer reproduces", f.subject)],
+                    validation_criteria: vec![format!(
+                        "finding '{}' no longer reproduces",
+                        f.subject
+                    )],
                 })
                 .collect()
         } else {
             specs
         };
-        Ok(FindingsConversion::Fix { specs, summary, text })
+        Ok(FindingsConversion::Fix {
+            specs,
+            summary,
+            text,
+        })
     }
 
     /// Emit the all-waived `orchestrator.decision`: summary names the waived
@@ -2093,8 +2198,11 @@ impl MissionEngine {
     /// credential-scrubbed by [`Self::emit_decision`] — waiver reasons are
     /// model-authored text.
     fn emit_waive_decision(&mut self, waived: &[WaivedFinding]) -> Result<()> {
-        let subjects =
-            waived.iter().map(|w| w.subject.as_str()).collect::<Vec<_>>().join(", ");
+        let subjects = waived
+            .iter()
+            .map(|w| w.subject.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
         let reasons = waived
             .iter()
             .map(|w| format!("- {}: {}", w.subject, w.reason))
@@ -2118,7 +2226,10 @@ impl MissionEngine {
     ) -> Result<()> {
         let milestone_id = self.state.mission.milestones[mi].id.clone();
         self.emit_decision(
-            &format!("{} fix feature(s) for {milestone_id}: {summary}", specs.len()),
+            &format!(
+                "{} fix feature(s) for {milestone_id}: {summary}",
+                specs.len()
+            ),
             Some(text),
         )?;
 
@@ -2170,7 +2281,10 @@ impl MissionEngine {
         let mut findings: Vec<Finding> = Vec::new();
 
         // command assertions — engine-run (design.md: the hard gate).
-        for assertion in contract.iter().filter(|a| a.check == AssertionCheck::Command) {
+        for assertion in contract
+            .iter()
+            .filter(|a| a.check == AssertionCheck::Command)
+        {
             let Some(command) = assertion.command.as_deref() else {
                 findings.push(Finding {
                     subject: assertion.id.clone(),
@@ -2228,7 +2342,11 @@ impl MissionEngine {
                 self.complete_mission().await?;
                 Ok(Some(MissionStatus::Complete))
             }
-            FindingsConversion::Fix { specs, summary, text } => {
+            FindingsConversion::Fix {
+                specs,
+                summary,
+                text,
+            } => {
                 if self.fix_cycle_exhausted(li) {
                     self.emit_decision(
                         &format!(
@@ -2378,8 +2496,7 @@ impl MissionEngine {
         self.log.flush()?;
         let events = EventLog::read_events(&self.paths.events_file())?;
         let plan: Plan = serde_json::from_str(&self.plan_json()?)?;
-        let estimate =
-            cost::estimate(&plan, &self.state.config, &cost::EstimateParams::default());
+        let estimate = cost::estimate(&plan, &self.state.config, &cost::EstimateParams::default());
         let report = render_mission_report(&self.state, &events, &plan, &estimate);
 
         let report_file = self.paths.mission_dir().join("report.md");
@@ -2469,7 +2586,10 @@ impl MissionEngine {
         let line = format!("- {mission_id}.md · {summary}\n");
         {
             use std::io::Write as _;
-            let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&index)?;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&index)?;
             file.write_all(line.as_bytes())?;
         }
 
@@ -2641,7 +2761,10 @@ impl MissionEngine {
             max_turns: role_cfg.max_turns,
             env: HashMap::new(),
         };
-        permissions::apply(permissions::for_role(Role::Orchestrator, &cfg, &[]), &mut spec);
+        permissions::apply(
+            permissions::for_role(Role::Orchestrator, &cfg, &[]),
+            &mut spec,
+        );
 
         let session = self.backend.start(spec).await?;
 
@@ -2750,14 +2873,24 @@ impl MissionEngine {
             self.mirror_orch_event(&run_id, &event)?;
             match event {
                 AgentEvent::Text { text, .. } => texts.push(text),
-                AgentEvent::Result { text, is_error, usage, cost_usd, .. } => {
+                AgentEvent::Result {
+                    text,
+                    is_error,
+                    usage,
+                    cost_usd,
+                    ..
+                } => {
                     // Per-turn accounting: streaming sessions emit one Result
                     // per injected turn (design.md), so each becomes one
                     // worker.completed carrying that turn's usage — totals
                     // accumulate in the reducer.
                     self.emit(EventKind::WorkerCompleted {
                         run_id: run_id.clone(),
-                        result: if is_error { RunResult::Fail } else { RunResult::Pass },
+                        result: if is_error {
+                            RunResult::Fail
+                        } else {
+                            RunResult::Pass
+                        },
                         tokens: usage,
                         cost_usd,
                         report: None,
@@ -2768,7 +2901,11 @@ impl MissionEngine {
                             scrub::scrub(&text)
                         )));
                     }
-                    let turn_text = if text.trim().is_empty() { texts.join("\n") } else { text };
+                    let turn_text = if text.trim().is_empty() {
+                        texts.join("\n")
+                    } else {
+                        text
+                    };
                     return Ok(scrub::scrub(&turn_text));
                 }
                 _ => {}
@@ -2793,10 +2930,13 @@ impl MissionEngine {
         }
         let (tag, content) = match event {
             AgentEvent::Text { text, .. } => ("text", text.clone()),
-            AgentEvent::ToolUse { tool, summary, .. } => {
-                ("tool-use", format!("{tool}: {summary}"))
-            }
-            AgentEvent::ToolResult { tool, denied, summary, .. } => {
+            AgentEvent::ToolUse { tool, summary, .. } => ("tool-use", format!("{tool}: {summary}")),
+            AgentEvent::ToolResult {
+                tool,
+                denied,
+                summary,
+                ..
+            } => {
                 let content = match tool {
                     Some(tool) => format!("{tool}: {summary}"),
                     None => summary.clone(),
@@ -2931,7 +3071,9 @@ impl ConcurrencyTracker {
         use std::sync::atomic::Ordering;
         let now = self.live.fetch_add(1, Ordering::SeqCst) + 1;
         self.peak.fetch_max(now, Ordering::SeqCst);
-        ConcurrencyGuard { live: Arc::clone(&self.live) }
+        ConcurrencyGuard {
+            live: Arc::clone(&self.live),
+        }
     }
 
     /// The greatest number of sessions ever live simultaneously.
@@ -3027,7 +3169,13 @@ fn parallel_worktree_path(mission_id: &str, feature_id: &str) -> PathBuf {
     // but replace anything unexpected defensively.
     let safe: String = feature_id
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     std::env::temp_dir().join(format!("kranz-wt-{mission_id}-{safe}"))
 }
@@ -3070,7 +3218,11 @@ pub fn upsert_mission_index(
 
     let mut out = String::new();
     let mut replaced = false;
-    let body = if existing.trim().is_empty() { HEADER } else { existing };
+    let body = if existing.trim().is_empty() {
+        HEADER
+    } else {
+        existing
+    };
     for l in body.lines() {
         if l.contains(&marker) {
             out.push_str(&line);
@@ -3103,7 +3255,10 @@ pub fn render_plan_markdown(plan: &Plan, mission: &Mission) -> String {
     );
 
     let _ = writeln!(md, "## Validation contract\n");
-    let _ = writeln!(md, "Defined before any feature; gates mission completion.\n");
+    let _ = writeln!(
+        md,
+        "Defined before any feature; gates mission completion.\n"
+    );
     for a in &plan.validation_contract {
         match (&a.check, &a.command) {
             (AssertionCheck::Command, Some(cmd)) => {
@@ -3190,13 +3345,19 @@ pub fn render_revised_plan_markdown(
     if dropped_feature_ids.is_empty() {
         let _ = writeln!(md, "- Dropped features: none");
     } else {
-        let _ = writeln!(md, "- Dropped (skipped) features: {}", dropped_feature_ids.join(", "));
+        let _ = writeln!(
+            md,
+            "- Dropped (skipped) features: {}",
+            dropped_feature_ids.join(", ")
+        );
     }
     if added_features.is_empty() {
         let _ = writeln!(md, "- Added features: none");
     } else {
-        let titles: Vec<String> =
-            added_features.iter().map(|f| f.title.trim().to_string()).collect();
+        let titles: Vec<String> = added_features
+            .iter()
+            .map(|f| f.title.trim().to_string())
+            .collect();
         let _ = writeln!(md, "- Added features: {}", titles.join(", "));
     }
     let _ = writeln!(md);
@@ -3277,8 +3438,10 @@ pub fn render_mission_report(
         .or_else(|| events.last().map(|e| e.ts))
         .unwrap_or(mission.created_at);
     let paused = paused_time(events, completed_ts);
-    let elapsed =
-        std::cmp::max(completed_ts - mission.created_at - paused, chrono::Duration::zero());
+    let elapsed = std::cmp::max(
+        completed_ts - mission.created_at - paused,
+        chrono::Duration::zero(),
+    );
     let _ = write!(md, "**Elapsed:** {}", format_duration(elapsed));
     if paused > chrono::Duration::zero() {
         let _ = write!(md, " ({} paused)", format_duration(paused));
@@ -3314,7 +3477,11 @@ pub fn render_mission_report(
                 "- {} **{}**{} — {} run{}",
                 feature_icon(f.status),
                 f.title,
-                if f.origin == FeatureOrigin::Fix { " *(fix)*" } else { "" },
+                if f.origin == FeatureOrigin::Fix {
+                    " *(fix)*"
+                } else {
+                    ""
+                },
                 runs,
                 if runs == 1 { "" } else { "s" },
             );
@@ -3367,17 +3534,31 @@ pub fn render_mission_report(
             continue;
         }
         for (run_id, finding) in &round.findings {
-            let gate =
-                if *run_id == crate::reducer::ENGINE_RUN_ID { " *(final gate)*" } else { "" };
+            let gate = if *run_id == crate::reducer::ENGINE_RUN_ID {
+                " *(final gate)*"
+            } else {
+                ""
+            };
             let evidence = scrub::truncate_chars(
-                &finding.evidence.split_whitespace().collect::<Vec<_>>().join(" "),
+                &finding
+                    .evidence
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" "),
                 200,
             );
-            let _ =
-                writeln!(md, "- [{}] {}{gate} — {evidence}", finding.severity, finding.subject);
+            let _ = writeln!(
+                md,
+                "- [{}] {}{gate} — {evidence}",
+                finding.severity, finding.subject
+            );
         }
         if round.fix_features > 0 {
-            let _ = writeln!(md, "\nDisposition: {} fix feature(s) created.", round.fix_features);
+            let _ = writeln!(
+                md,
+                "\nDisposition: {} fix feature(s) created.",
+                round.fix_features
+            );
         }
         if !round.waived.is_empty() {
             let _ = writeln!(md, "\nDisposition: waived.");
@@ -3459,16 +3640,26 @@ fn collect_validation_rounds(events: &[Event]) -> Vec<ValidationRound<'_>> {
                 rounds.push(round(Some(milestone_id)));
             }
             EventKind::MissionValidating {} => rounds.push(round(None)),
-            EventKind::ValidationFinding { milestone_id, run_id, finding } => {
+            EventKind::ValidationFinding {
+                milestone_id,
+                run_id,
+                finding,
+            } => {
                 // Engine-attributed findings belong to a gate round; the
                 // second gate pass runs without a fresh mission.validating
                 // (the status is already Validating), so open one on demand.
                 let gate = run_id == crate::reducer::ENGINE_RUN_ID;
-                let fits = rounds.last().is_some_and(|r| !gate || r.milestone_id.is_none());
+                let fits = rounds
+                    .last()
+                    .is_some_and(|r| !gate || r.milestone_id.is_none());
                 if !fits {
                     rounds.push(round(if gate { None } else { Some(milestone_id) }));
                 }
-                rounds.last_mut().expect("pushed above").findings.push((run_id, finding));
+                rounds
+                    .last_mut()
+                    .expect("pushed above")
+                    .findings
+                    .push((run_id, finding));
             }
             EventKind::FixFeatureCreated { .. } => {
                 if let Some(r) = rounds.iter_mut().rev().find(|r| !r.findings.is_empty()) {
@@ -3598,7 +3789,10 @@ fn assign_assertion_ids(contract: &mut [Assertion]) {
 
 /// First non-empty line of a text (decision summaries).
 fn first_nonempty_line(text: &str) -> &str {
-    text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("")
+    text.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
 }
 
 /// Whether a lesson-turn reply is the single word NONE (case-insensitive,
@@ -3677,7 +3871,9 @@ fn is_env_assignment(token: &str) -> bool {
     match token.split_once('=') {
         Some((name, _)) if !name.is_empty() => {
             let mut chars = name.chars();
-            chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            chars
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
                 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         }
         _ => false,
@@ -3699,8 +3895,9 @@ fn is_env_assignment(token: &str) -> bool {
 /// PATH dir counts), and `.exe`/`.bat`/`.cmd` variants are also accepted.
 fn program_resolves(program: &str) -> bool {
     // Shell builtins with no backing binary — never a missing prerequisite.
-    const BUILTINS: &[&str] =
-        &["cd", ":", "true", "false", "echo", "test", "[", "set", "export", "unset"];
+    const BUILTINS: &[&str] = &[
+        "cd", ":", "true", "false", "echo", "test", "[", "set", "export", "unset",
+    ];
     if BUILTINS.contains(&program) {
         return true;
     }
@@ -3735,7 +3932,9 @@ fn program_resolves(program: &str) -> bool {
 /// Whether `path` is a regular file that is executable (unix: any execute bit;
 /// other platforms: mere existence as a file).
 fn path_is_executable(path: &std::path::Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else { return false };
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
     if !meta.is_file() {
         return false;
     }
@@ -3851,7 +4050,9 @@ pub fn abandon_mission(
         Duration::from_millis(state.config.event_stream_throttle_ms),
         force,
     )?;
-    let event = log.append(EventKind::MissionAbandoned { reason: reason.to_string() })?;
+    let event = log.append(EventKind::MissionAbandoned {
+        reason: reason.to_string(),
+    })?;
     // Fold the one new event on top of the state we already have and snapshot,
     // so state.json matches the log without a full re-fold.
     let mut state = state;
@@ -4042,7 +4243,10 @@ async fn run_shell_command_with_timeout(
                 combined.push_str("\n--- stderr ---\n");
                 combined.push_str(stderr.trim_end());
             }
-            (output.status.success(), tail_chars(combined.trim_end(), COMMAND_OUTPUT_TAIL))
+            (
+                output.status.success(),
+                tail_chars(combined.trim_end(), COMMAND_OUTPUT_TAIL),
+            )
         }
     }
 }
@@ -4130,7 +4334,12 @@ mod tests {
 
     #[test]
     fn assign_assertion_ids_fills_missing_and_dedupes() {
-        let mut contract = vec![assertion(""), assertion("x"), assertion("x"), assertion("a-2")];
+        let mut contract = vec![
+            assertion(""),
+            assertion("x"),
+            assertion("x"),
+            assertion("a-2"),
+        ];
         assign_assertion_ids(&mut contract);
         let ids: Vec<&str> = contract.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids[0], "a-1", "missing id gets a-1");
@@ -4167,7 +4376,11 @@ mod tests {
             fix_cycles: 0,
             start_sha: None,
         };
-        assert_eq!(next_feature(&ms), Some(3), "Active (crashed) before Pending");
+        assert_eq!(
+            next_feature(&ms),
+            Some(3),
+            "Active (crashed) before Pending"
+        );
         let mut done = ms.clone();
         done.features[3].status = FeatureStatus::Complete;
         done.features[4].status = FeatureStatus::Complete;
@@ -4262,7 +4475,10 @@ mod tests {
         let schema = plan_schema();
         let props = schema["properties"].as_object().unwrap();
         for key in value.as_object().unwrap().keys() {
-            assert!(props.contains_key(key), "schema missing top-level key {key}");
+            assert!(
+                props.contains_key(key),
+                "schema missing top-level key {key}"
+            );
         }
     }
 
@@ -4310,7 +4526,10 @@ mod tests {
         let root = std::fs::canonicalize(dir.path()).expect("canonicalize repo root");
 
         let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
-        let cfg = MissionConfig { event_stream_throttle_ms: 10, ..MissionConfig::default() };
+        let cfg = MissionConfig {
+            event_stream_throttle_ms: 10,
+            ..MissionConfig::default()
+        };
         let mut engine = MissionEngine::create(backend, &root, "goal", cfg).expect("create engine");
 
         // Force the idle-Paused branch and buffer a stream delta directly
@@ -4328,7 +4547,9 @@ mod tests {
         let paths = engine.paths.clone();
         let before = EventLog::read_events(&paths.events_file()).expect("read events.jsonl");
         assert!(
-            !before.iter().any(|e| matches!(&e.kind, EventKind::WorkerMessage { .. })),
+            !before
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::WorkerMessage { .. })),
             "delta must still be buffered, not yet on disk"
         );
 
@@ -4408,12 +4629,15 @@ mod tests {
 
     #[tokio::test]
     async fn lessons_capture_writes_file_and_index() {
-        let Some((_dir, root)) = lessons_test_repo() else { return };
-        let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::with_scripts(
-            vec![lesson_orch_script(
-                "Always check the plan for a base_branch override before assuming main.",
-            )],
-        ));
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> =
+            Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+                lesson_orch_script(
+                    "Always check the plan for a base_branch override before assuming main.",
+                ),
+            ]));
         let mut engine =
             MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
         let mission_id = engine.state.mission.id.clone();
@@ -4432,36 +4656,50 @@ mod tests {
         let index = engine.paths.lessons_index();
         assert!(written.contains(&index));
         let index_text = std::fs::read_to_string(&index).expect("index exists");
-        assert_eq!(index_text.lines().count(), 1, "one manifest line per capture");
+        assert_eq!(
+            index_text.lines().count(),
+            1,
+            "one manifest line per capture"
+        );
         assert!(index_text.contains(&format!("{mission_id}.md")));
         assert!(index_text.contains("Always check the plan for a base_branch override"));
     }
 
     #[tokio::test]
     async fn lessons_capture_none_reply_writes_nothing() {
-        let Some((_dir, root)) = lessons_test_repo() else { return };
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
         let backend: Arc<dyn AgentBackend> =
-            Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![lesson_orch_script(
-                "  none.  ",
-            )]));
+            Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+                lesson_orch_script("  none.  "),
+            ]));
         let mut engine =
             MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
 
         let written = engine.capture_lesson().await;
         assert!(written.is_none(), "NONE reply must write nothing");
-        assert!(!engine.paths.lessons_dir().exists(), "lessons dir must not be created");
+        assert!(
+            !engine.paths.lessons_dir().exists(),
+            "lessons dir must not be created"
+        );
     }
 
     #[tokio::test]
     async fn lessons_capture_turn_error_returns_none() {
-        let Some((_dir, root)) = lessons_test_repo() else { return };
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
         // No scripts queued: the orchestrator turn fails immediately.
         let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
         let mut engine =
             MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
 
         let written = engine.capture_lesson().await;
-        assert!(written.is_none(), "a failed turn must downgrade to None, not panic");
+        assert!(
+            written.is_none(),
+            "a failed turn must downgrade to None, not panic"
+        );
         assert!(!engine.paths.lessons_dir().exists());
     }
 
@@ -4496,14 +4734,19 @@ mod tests {
     fn seed_lesson_for_index(root: &std::path::Path, id: &str, first_line: &str) {
         let lessons_dir = root.join(".kranz").join("lessons");
         std::fs::create_dir_all(&lessons_dir).unwrap();
-        std::fs::write(lessons_dir.join(format!("{id}.md")), format!("{first_line}\n")).unwrap();
+        std::fs::write(
+            lessons_dir.join(format!("{id}.md")),
+            format!("{first_line}\n"),
+        )
+        .unwrap();
         use std::io::Write as _;
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(lessons_dir.join("index.md"))
             .unwrap();
-        f.write_all(format!("- {id}.md · {first_line}\n").as_bytes()).unwrap();
+        f.write_all(format!("- {id}.md · {first_line}\n").as_bytes())
+            .unwrap();
     }
 
     fn streaming_seed(spec: &SessionSpec) -> &str {
@@ -4515,17 +4758,27 @@ mod tests {
 
     #[tokio::test]
     async fn planning_seed_injects_lessons_index() {
-        let Some((_dir, root)) = lessons_test_repo() else { return };
-        seed_lesson_for_index(&root, "m01", "Always check the plan for a base_branch override.");
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        seed_lesson_for_index(
+            &root,
+            "m01",
+            "Always check the plan for a base_branch override.",
+        );
 
-        let mock =
-            Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![lesson_orch_script("ready")]));
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            lesson_orch_script("ready"),
+        ]));
         let backend: Arc<dyn AgentBackend> = mock.clone();
         let mut engine =
             MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
         assert_eq!(engine.state.mission.status, MissionStatus::Planning);
 
-        engine.ensure_orchestrator().await.expect("ensure orchestrator");
+        engine
+            .ensure_orchestrator()
+            .await
+            .expect("ensure orchestrator");
 
         let specs = mock.started_specs();
         assert_eq!(specs.len(), 1);
@@ -4537,16 +4790,22 @@ mod tests {
 
     #[tokio::test]
     async fn planning_seed_unchanged_without_lessons() {
-        let Some((_dir, root)) = lessons_test_repo() else { return };
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
 
-        let mock =
-            Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![lesson_orch_script("ready")]));
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            lesson_orch_script("ready"),
+        ]));
         let backend: Arc<dyn AgentBackend> = mock.clone();
         let mut engine =
             MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
         assert_eq!(engine.state.mission.status, MissionStatus::Planning);
 
-        engine.ensure_orchestrator().await.expect("ensure orchestrator");
+        engine
+            .ensure_orchestrator()
+            .await
+            .expect("ensure orchestrator");
 
         let specs = mock.started_specs();
         assert_eq!(specs.len(), 1);
@@ -4556,11 +4815,18 @@ mod tests {
 
     #[tokio::test]
     async fn resume_ack_seed_never_carries_lessons_index() {
-        let Some((_dir, root)) = lessons_test_repo() else { return };
-        seed_lesson_for_index(&root, "m01", "Always check the plan for a base_branch override.");
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        seed_lesson_for_index(
+            &root,
+            "m01",
+            "Always check the plan for a base_branch override.",
+        );
 
-        let mock =
-            Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![lesson_orch_script("ready")]));
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            lesson_orch_script("ready"),
+        ]));
         let backend: Arc<dyn AgentBackend> = mock.clone();
         let mut engine =
             MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
@@ -4568,7 +4834,10 @@ mod tests {
         // the resume-ack path instead of a fresh planning seed.
         engine.orch_session_id = Some("prev-session".to_string());
 
-        engine.ensure_orchestrator().await.expect("ensure orchestrator");
+        engine
+            .ensure_orchestrator()
+            .await
+            .expect("ensure orchestrator");
 
         let specs = mock.started_specs();
         assert_eq!(specs.len(), 1);
@@ -4579,17 +4848,27 @@ mod tests {
 
     #[tokio::test]
     async fn non_planning_reseed_never_carries_lessons_index() {
-        let Some((_dir, root)) = lessons_test_repo() else { return };
-        seed_lesson_for_index(&root, "m01", "Always check the plan for a base_branch override.");
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        seed_lesson_for_index(
+            &root,
+            "m01",
+            "Always check the plan for a base_branch override.",
+        );
 
-        let mock =
-            Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![lesson_orch_script("ready")]));
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            lesson_orch_script("ready"),
+        ]));
         let backend: Arc<dyn AgentBackend> = mock.clone();
         let mut engine =
             MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
         engine.state.mission.status = MissionStatus::Running;
 
-        engine.ensure_orchestrator().await.expect("ensure orchestrator");
+        engine
+            .ensure_orchestrator()
+            .await
+            .expect("ensure orchestrator");
 
         let specs = mock.started_specs();
         assert_eq!(specs.len(), 1);

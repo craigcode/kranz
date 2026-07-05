@@ -46,19 +46,35 @@ pub enum Action {
     /// action: `user_id` (the clicker) is gated by the spend allowlist and
     /// `response_url` delivers a not-authorized ephemeral, mirroring the
     /// `/kranz approve` slash twin.
-    Approve { mission_id: String, user_id: Option<String>, response_url: Option<String> },
+    Approve {
+        mission_id: String,
+        user_id: Option<String>,
+        response_url: Option<String>,
+    },
     /// Approve-and-START button pressed for `mission_id` (the primary button
     /// on a plan-review message). Spend-gated exactly like [`Action::Approve`];
     /// on authorization the bridge commits the pending plan and starts
     /// execution through the hosted registry instead of queueing.
-    ApproveStart { mission_id: String, user_id: Option<String>, response_url: Option<String> },
+    ApproveStart {
+        mission_id: String,
+        user_id: Option<String>,
+        response_url: Option<String>,
+    },
     /// A threaded reply on `mission_id`'s thread. On a RUNNING mission it
     /// becomes orchestrator guidance (a control-inbox message); on a PLANNING
     /// mission the bridge runs a hosted planning turn — a spend action, so
     /// `user_id` (the message author) rides along for the allowlist gate.
-    Guidance { mission_id: String, text: String, user_id: Option<String> },
+    Guidance {
+        mission_id: String,
+        text: String,
+        user_id: Option<String>,
+    },
     /// `/kranz ticket <title>` → scaffold a new ticket file.
-    NewTicket { title: String, channel: String, thread_ts: Option<String> },
+    NewTicket {
+        title: String,
+        channel: String,
+        thread_ts: Option<String>,
+    },
     /// `/kranz new <goal>` (or a new-mission modal submission) → create a
     /// mission and seed planning. A money-spending action: gated by the spend
     /// allowlist. `user_id` is the invoking Slack user (for the gate);
@@ -85,13 +101,24 @@ pub enum Action {
     },
     /// `/kranz status [<id>]` → post a folded status summary. `mission_id`
     /// absent = "the most recent mission". Read-only, so not spend-gated.
-    Status { mission_id: Option<String>, response_url: Option<String> },
+    Status {
+        mission_id: Option<String>,
+        response_url: Option<String>,
+    },
     /// `/kranz plan <id>` → demand the plan for a mission (request-plan turn).
     /// A money-spending action (it runs an orchestrator turn): spend-gated.
-    RequestPlan { mission_id: String, user_id: Option<String>, response_url: Option<String> },
+    RequestPlan {
+        mission_id: String,
+        user_id: Option<String>,
+        response_url: Option<String>,
+    },
     /// `/kranz approve <id>` → approve the plan and queue the mission. The
     /// slash-command twin of the [`Action::Approve`] button; spend-gated.
-    ApproveMission { mission_id: String, user_id: Option<String>, response_url: Option<String> },
+    ApproveMission {
+        mission_id: String,
+        user_id: Option<String>,
+        response_url: Option<String>,
+    },
     /// `/kranz config [<id>] <role> <model> [effort]` → change a role's model
     /// (and optionally reasoning effort) mid-mission via a `config-change`
     /// control command. SPEND-ADJACENT (it re-shapes what future turns spend),
@@ -126,10 +153,18 @@ pub enum Action {
     /// gated on the allowlist exactly like `config`. `mission_id` absent = the
     /// single active mission (resolved via `resolve_active_config_target`, which
     /// refuses when ambiguous/terminal).
-    Pause { mission_id: Option<String>, user_id: Option<String>, response_url: Option<String> },
+    Pause {
+        mission_id: Option<String>,
+        user_id: Option<String>,
+        response_url: Option<String>,
+    },
     /// `/kranz resume [<id>]` → enqueue a `Resume` control command on the target
     /// mission. The twin of [`Action::Pause`]; same gating and targeting.
-    Resume { mission_id: Option<String>, user_id: Option<String>, response_url: Option<String> },
+    Resume {
+        mission_id: Option<String>,
+        user_id: Option<String>,
+        response_url: Option<String>,
+    },
     /// `/kranz work` → report the queue state (entries + whether the repo is
     /// busy) as an ephemeral, and point at the `kranz work` dispatcher for
     /// actually draining it. REPORT-ONLY: the bridge must never spawn a mission
@@ -175,7 +210,10 @@ where
 /// Route a raw Socket Mode envelope to an [`Action`], resolving message threads
 /// via `lookup`. Pure: no I/O, no clock.
 pub fn route(envelope: &Value, lookup: &impl ThreadLookup) -> Routed {
-    let envelope_id = envelope.get("envelope_id").and_then(Value::as_str).map(str::to_string);
+    let envelope_id = envelope
+        .get("envelope_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let action = match envelope.get("type").and_then(Value::as_str) {
         Some("interactive") => route_interactive(payload(envelope)),
         Some("events_api") => route_event(payload(envelope), lookup),
@@ -184,7 +222,10 @@ pub fn route(envelope: &Value, lookup: &impl ThreadLookup) -> Routed {
         // either, so nothing gets acked spuriously).
         _ => Action::Ignore,
     };
-    Routed { action, envelope_id }
+    Routed {
+        action,
+        envelope_id,
+    }
 }
 
 fn payload(envelope: &Value) -> &Value {
@@ -224,13 +265,23 @@ fn route_interactive(payload: &Value) -> Action {
                     .and_then(|u| u.get("id"))
                     .and_then(Value::as_str)
                     .map(str::to_string);
-                let response_url =
-                    payload.get("response_url").and_then(Value::as_str).map(str::to_string);
+                let response_url = payload
+                    .get("response_url")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 let mission_id = mission_id.to_string();
                 return if start {
-                    Action::ApproveStart { mission_id, user_id, response_url }
+                    Action::ApproveStart {
+                        mission_id,
+                        user_id,
+                        response_url,
+                    }
                 } else {
-                    Action::Approve { mission_id, user_id, response_url }
+                    Action::Approve {
+                        mission_id,
+                        user_id,
+                        response_url,
+                    }
                 };
             }
         }
@@ -260,8 +311,12 @@ fn route_view_submission(payload: &Value) -> Action {
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim();
-    let channel =
-        view.get("private_metadata").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let channel = view
+        .get("private_metadata")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
     if goal.is_empty() || channel.is_empty() {
         // Slack enforces the required input; an empty goal or a lost channel
         // means a malformed submission — nothing sane to create.
@@ -288,14 +343,18 @@ fn route_config_submission(payload: &Value, view: &Value) -> Action {
     let val = |block: &str, action: &str| -> Option<String> {
         view.pointer(&format!("/state/values/{block}/{action}/value"))
             .or_else(|| {
-                view.pointer(&format!("/state/values/{block}/{action}/selected_option/value"))
+                view.pointer(&format!(
+                    "/state/values/{block}/{action}/selected_option/value"
+                ))
             })
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     };
-    let Some(role) = val(CONFIG_ROLE_BLOCK, CONFIG_ROLE_ACTION).and_then(|r| parse_role(&r).map(str::to_string)) else {
+    let Some(role) =
+        val(CONFIG_ROLE_BLOCK, CONFIG_ROLE_ACTION).and_then(|r| parse_role(&r).map(str::to_string))
+    else {
         return Action::Ignore;
     };
     let Some(model) = val(CONFIG_MODEL_BLOCK, CONFIG_MODEL_ACTION) else {
@@ -316,7 +375,15 @@ fn route_config_submission(payload: &Value, view: &Value) -> Action {
         .map(str::trim)
         .filter(|c| !c.is_empty())
         .map(str::to_string);
-    Action::Config { mission_id, role, model, effort, user_id, response_url: None, channel }
+    Action::Config {
+        mission_id,
+        role,
+        model,
+        effort,
+        user_id,
+        response_url: None,
+        channel,
+    }
 }
 
 /// `events_api` → a threaded human message on a known mission thread becomes
@@ -337,7 +404,9 @@ fn route_event(payload: &Value, lookup: &impl ThreadLookup) -> Action {
     // message path (a home-open is not a message).
     if event.get("type").and_then(Value::as_str) == Some("app_home_opened") {
         return match event.get("user").and_then(Value::as_str).map(str::trim) {
-            Some(user) if !user.is_empty() => Action::AppHome { user_id: user.to_string() },
+            Some(user) if !user.is_empty() => Action::AppHome {
+                user_id: user.to_string(),
+            },
             _ => Action::Ignore,
         };
     }
@@ -362,14 +431,25 @@ fn route_event(payload: &Value, lookup: &impl ThreadLookup) -> Action {
     let Some(mission_id) = lookup.mission_for_thread(thread_ts) else {
         return Action::Ignore;
     };
-    let text = event.get("text").and_then(Value::as_str).unwrap_or("").trim();
+    let text = event
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
     if text.is_empty() {
         return Action::Ignore;
     }
     // The author: gate fuel for the planning-turn path (a plain `user` string
     // on message events, unlike the `user.id` object interactive payloads use).
-    let user_id = event.get("user").and_then(Value::as_str).map(str::to_string);
-    Action::Guidance { mission_id, text: text.to_string(), user_id }
+    let user_id = event
+        .get("user")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Action::Guidance {
+        mission_id,
+        text: text.to_string(),
+        user_id,
+    }
 }
 
 /// `slash_commands` → the `/kranz` subcommand router. Recognized subcommands:
@@ -389,11 +469,24 @@ fn route_slash(payload: &Value) -> Action {
     if payload.get("command").and_then(Value::as_str) != Some("/kranz") {
         return Action::Ignore;
     }
-    let text = payload.get("text").and_then(Value::as_str).unwrap_or("").trim();
-    let response_url = payload.get("response_url").and_then(Value::as_str).map(str::to_string);
-    let user_id = payload.get("user_id").and_then(Value::as_str).map(str::to_string);
-    let channel =
-        payload.get("channel_id").and_then(Value::as_str).unwrap_or("").to_string();
+    let text = payload
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let response_url = payload
+        .get("response_url")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let user_id = payload
+        .get("user_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let channel = payload
+        .get("channel_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
 
     // `ticket <title>` scaffolds a ticket; the thread is captured so the
     // scaffolder can seed from it and reply in place.
@@ -401,8 +494,15 @@ fn route_slash(payload: &Value) -> Action {
         let title = rest.trim();
         if !title.is_empty() {
             // Slash commands can be invoked from a thread; `thread_ts` is present then.
-            let thread_ts = payload.get("thread_ts").and_then(Value::as_str).map(str::to_string);
-            return Action::NewTicket { title: title.to_string(), channel, thread_ts };
+            let thread_ts = payload
+                .get("thread_ts")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            return Action::NewTicket {
+                title: title.to_string(),
+                channel,
+                thread_ts,
+            };
         }
         // `ticket` with no title → fall through to help.
     }
@@ -421,8 +521,10 @@ fn route_slash(payload: &Value) -> Action {
                 channel,
             };
         }
-        if let Some(trigger_id) =
-            payload.get("trigger_id").and_then(Value::as_str).filter(|t| !t.is_empty())
+        if let Some(trigger_id) = payload
+            .get("trigger_id")
+            .and_then(Value::as_str)
+            .filter(|t| !t.is_empty())
         {
             return Action::NewMissionModal {
                 trigger_id: trigger_id.to_string(),
@@ -439,14 +541,21 @@ fn route_slash(payload: &Value) -> Action {
     if let Some(rest) = strip_ci_prefix(text, "status") {
         let id = clean_id(rest);
         let mission_id = (!id.is_empty()).then(|| id.to_string());
-        return Action::Status { mission_id, response_url };
+        return Action::Status {
+            mission_id,
+            response_url,
+        };
     }
 
     // `plan <id>` → demand the plan (spend-gated: runs an orchestrator turn).
     if let Some(rest) = strip_ci_prefix(text, "plan") {
         let id = clean_id(rest);
         if !id.is_empty() {
-            return Action::RequestPlan { mission_id: id.to_string(), user_id, response_url };
+            return Action::RequestPlan {
+                mission_id: id.to_string(),
+                user_id,
+                response_url,
+            };
         }
         // `plan` with no id → help.
     }
@@ -456,7 +565,11 @@ fn route_slash(payload: &Value) -> Action {
     if let Some(rest) = strip_ci_prefix(text, "approve") {
         let id = clean_id(rest);
         if !id.is_empty() {
-            return Action::ApproveMission { mission_id: id.to_string(), user_id, response_url };
+            return Action::ApproveMission {
+                mission_id: id.to_string(),
+                user_id,
+                response_url,
+            };
         }
         // `approve` with no id → help.
     }
@@ -467,8 +580,10 @@ fn route_slash(payload: &Value) -> Action {
     if let Some(rest) = strip_ci_prefix(text, "config") {
         if rest.trim().is_empty() {
             // Bare `config` → the modal (pickers beat positional args).
-            if let Some(trigger_id) =
-                payload.get("trigger_id").and_then(Value::as_str).filter(|t| !t.is_empty())
+            if let Some(trigger_id) = payload
+                .get("trigger_id")
+                .and_then(Value::as_str)
+                .filter(|t| !t.is_empty())
             {
                 return Action::ConfigModal {
                     trigger_id: trigger_id.to_string(),
@@ -478,7 +593,12 @@ fn route_slash(payload: &Value) -> Action {
                 };
             }
         }
-        if let Some(cfg) = parse_config_args(rest, user_id.clone(), response_url.clone(), Some(channel.clone()).filter(|c| !c.is_empty())) {
+        if let Some(cfg) = parse_config_args(
+            rest,
+            user_id.clone(),
+            response_url.clone(),
+            Some(channel.clone()).filter(|c| !c.is_empty()),
+        ) {
             return cfg;
         }
         // Malformed config → help.
@@ -491,13 +611,21 @@ fn route_slash(payload: &Value) -> Action {
     // trailing token is a typo → help.
     if let Some(rest) = strip_ci_prefix(text, "pause") {
         if let Some(mission_id) = parse_optional_id(rest) {
-            return Action::Pause { mission_id, user_id, response_url };
+            return Action::Pause {
+                mission_id,
+                user_id,
+                response_url,
+            };
         }
         // Too many tokens → help.
     }
     if let Some(rest) = strip_ci_prefix(text, "resume") {
         if let Some(mission_id) = parse_optional_id(rest) {
-            return Action::Resume { mission_id, user_id, response_url };
+            return Action::Resume {
+                mission_id,
+                user_id,
+                response_url,
+            };
         }
         // Too many tokens → help.
     }
@@ -528,13 +656,19 @@ const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 /// Parse a role token (case-insensitively) to its canonical spelling, or `None`
 /// if it is not one of the four roles.
 fn parse_role(token: &str) -> Option<&'static str> {
-    ROLES.iter().copied().find(|r| r.eq_ignore_ascii_case(token))
+    ROLES
+        .iter()
+        .copied()
+        .find(|r| r.eq_ignore_ascii_case(token))
 }
 
 /// Parse an effort token (case-insensitively) to its canonical spelling, or
 /// `None` if it is not a valid effort.
 fn parse_effort(token: &str) -> Option<&'static str> {
-    EFFORTS.iter().copied().find(|e| e.eq_ignore_ascii_case(token))
+    EFFORTS
+        .iter()
+        .copied()
+        .find(|e| e.eq_ignore_ascii_case(token))
 }
 
 /// Parse the arguments after `config` into an [`Action::Config`], or `None`
@@ -565,7 +699,10 @@ fn parse_config_args(
     };
 
     let role = parse_role(tokens.get(role_idx)?)?.to_string();
-    let model = tokens.get(role_idx + 1).map(|s| s.trim()).filter(|s| !s.is_empty())?;
+    let model = tokens
+        .get(role_idx + 1)
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())?;
     // At most one trailing effort token; extra tokens make it ambiguous → help.
     let effort = match tokens.get(role_idx + 2) {
         Some(tok) => Some(parse_effort(tok)?.to_string()),
@@ -611,7 +748,8 @@ fn parse_optional_id(rest: &str) -> Option<Option<String>> {
 /// brackets arrive from other clients. Interior characters are never touched;
 /// goals are never cleaned (only id tokens).
 fn clean_id(raw: &str) -> &str {
-    raw.trim().trim_matches(|c| matches!(c, '`' | '\'' | '"' | '<' | '>'))
+    raw.trim()
+        .trim_matches(|c| matches!(c, '`' | '\'' | '"' | '<' | '>'))
 }
 
 /// Build the camelCase `config-change` patch for a canonical `role` (as parsed
@@ -632,7 +770,10 @@ pub fn config_patch(role: &str, model: &str, effort: Option<&str>) -> Option<Val
     let mut role_obj = serde_json::Map::new();
     role_obj.insert("model".to_string(), Value::String(model.to_string()));
     if let Some(effort) = effort {
-        role_obj.insert("reasoningEffort".to_string(), Value::String(effort.to_string()));
+        role_obj.insert(
+            "reasoningEffort".to_string(),
+            Value::String(effort.to_string()),
+        );
     }
     let mut patch = serde_json::Map::new();
     patch.insert(key.to_string(), Value::Object(role_obj));
@@ -781,7 +922,10 @@ mod tests {
                 }
             }
         });
-        assert_eq!(route(&env, &lookup_one("1700000000.000100", "m-7")).action, Action::Ignore);
+        assert_eq!(
+            route(&env, &lookup_one("1700000000.000100", "m-7")).action,
+            Action::Ignore
+        );
     }
 
     #[test]
@@ -796,7 +940,10 @@ mod tests {
                 "thread_ts": "1700000000.000100"
             }}
         });
-        assert_eq!(route(&env, &lookup_one("1700000000.000100", "m-7")).action, Action::Ignore);
+        assert_eq!(
+            route(&env, &lookup_one("1700000000.000100", "m-7")).action,
+            Action::Ignore
+        );
     }
 
     #[test]
@@ -810,7 +957,10 @@ mod tests {
                 "thread_ts": "9999999999.000000"
             }}
         });
-        assert_eq!(route(&env, &lookup_one("1700000000.000100", "m-7")).action, Action::Ignore);
+        assert_eq!(
+            route(&env, &lookup_one("1700000000.000100", "m-7")).action,
+            Action::Ignore
+        );
     }
 
     #[test]
@@ -825,7 +975,10 @@ mod tests {
                 "thread_ts": "1700000000.000100"
             }}
         });
-        assert_eq!(route(&env, &lookup_one("1700000000.000100", "m-7")).action, Action::Ignore);
+        assert_eq!(
+            route(&env, &lookup_one("1700000000.000100", "m-7")).action,
+            Action::Ignore
+        );
     }
 
     #[test]
@@ -890,7 +1043,9 @@ mod tests {
         });
         assert_eq!(
             route(&env, &lookup_none()).action,
-            Action::Help { response_url: Some("https://hooks.slack/x".into()) }
+            Action::Help {
+                response_url: Some("https://hooks.slack/x".into())
+            }
         );
     }
 
@@ -951,7 +1106,9 @@ mod tests {
         });
         assert_eq!(
             route(&env, &lookup_none()).action,
-            Action::Help { response_url: Some("https://hooks.slack/x".into()) }
+            Action::Help {
+                response_url: Some("https://hooks.slack/x".into())
+            }
         );
     }
 
@@ -1062,7 +1219,13 @@ mod tests {
             }
         });
         match route(&env, &lookup_none()).action {
-            Action::Config { mission_id, effort, role, model, .. } => {
+            Action::Config {
+                mission_id,
+                effort,
+                role,
+                model,
+                ..
+            } => {
                 assert_eq!(mission_id, None, "blank id -> single-active resolution");
                 assert_eq!(effort, None);
                 assert_eq!(role, "orchestrator");
@@ -1145,7 +1308,10 @@ mod tests {
         });
         assert_eq!(
             route(&env, &lookup_none()).action,
-            Action::Status { mission_id: None, response_url: Some("https://hooks.slack/s".into()) }
+            Action::Status {
+                mission_id: None,
+                response_url: Some("https://hooks.slack/s".into())
+            }
         );
     }
 
@@ -1193,7 +1359,9 @@ mod tests {
             });
             assert_eq!(
                 route(&env, &lookup_none()).action,
-                Action::Help { response_url: Some("https://hooks.slack/h".into()) },
+                Action::Help {
+                    response_url: Some("https://hooks.slack/h".into())
+                },
                 "text={text:?} with no id should route to help"
             );
         }
@@ -1209,10 +1377,16 @@ mod tests {
                              "response_url": "https://hooks.slack/r" }
             });
             let routed = route(&env, &lookup_none());
-            assert_eq!(routed.envelope_id.as_deref(), Some("env-h"), "text={text:?}");
+            assert_eq!(
+                routed.envelope_id.as_deref(),
+                Some("env-h"),
+                "text={text:?}"
+            );
             assert_eq!(
                 routed.action,
-                Action::Help { response_url: Some("https://hooks.slack/r".into()) },
+                Action::Help {
+                    response_url: Some("https://hooks.slack/r".into())
+                },
                 "text={text:?} should route to help"
             );
         }
@@ -1287,16 +1461,18 @@ mod tests {
     #[test]
     fn slash_config_bad_role_or_effort_or_arity_falls_through_to_help() {
         for text in [
-            "",                        // no args
-            "worker",                  // no model
-            "notarole sonnet",         // bad role, and "sonnet" isn't a role either
-            "worker sonnet turbo",     // bad effort
+            "",                         // no args
+            "worker",                   // no model
+            "notarole sonnet",          // bad role, and "sonnet" isn't a role either
+            "worker sonnet turbo",      // bad effort
             "worker sonnet high extra", // too many tokens
-            "m-42 worker",             // id + role but no model
+            "m-42 worker",              // id + role but no model
         ] {
             assert_eq!(
                 route(&config_env(text), &lookup_none()).action,
-                Action::Help { response_url: Some("https://hooks.slack/c".into()) },
+                Action::Help {
+                    response_url: Some("https://hooks.slack/c".into())
+                },
                 "config {text:?} should fall through to help"
             );
         }
@@ -1328,7 +1504,10 @@ mod tests {
             json!({ "worker": { "model": "sonnet" } }),
             "no effort → only model in the patch"
         );
-        assert!(config_patch("nope", "sonnet", None).is_none(), "unknown role → None");
+        assert!(
+            config_patch("nope", "sonnet", None).is_none(),
+            "unknown role → None"
+        );
     }
 
     // --- /kranz pause | resume | work --------------------------------------
@@ -1397,12 +1576,16 @@ mod tests {
     fn slash_work_routes_to_work() {
         assert_eq!(
             route(&steer_env("work"), &lookup_none()).action,
-            Action::Work { response_url: Some("https://hooks.slack/steer".into()) }
+            Action::Work {
+                response_url: Some("https://hooks.slack/steer".into())
+            }
         );
         // Trailing whitespace is still a bare `work`.
         assert_eq!(
             route(&steer_env("WORK   "), &lookup_none()).action,
-            Action::Work { response_url: Some("https://hooks.slack/steer".into()) }
+            Action::Work {
+                response_url: Some("https://hooks.slack/steer".into())
+            }
         );
     }
 
@@ -1412,7 +1595,9 @@ mod tests {
         for text in ["pause m-1 extra", "resume a b", "work now", "work m-1"] {
             assert_eq!(
                 route(&steer_env(text), &lookup_none()).action,
-                Action::Help { response_url: Some("https://hooks.slack/steer".into()) },
+                Action::Help {
+                    response_url: Some("https://hooks.slack/steer".into())
+                },
                 "text={text:?} should route to help"
             );
         }
@@ -1429,7 +1614,12 @@ mod tests {
         });
         let routed = route(&env, &lookup_none());
         assert_eq!(routed.envelope_id.as_deref(), Some("env-home"));
-        assert_eq!(routed.action, Action::AppHome { user_id: "Uhome".into() });
+        assert_eq!(
+            routed.action,
+            Action::AppHome {
+                user_id: "Uhome".into()
+            }
+        );
     }
 
     #[test]

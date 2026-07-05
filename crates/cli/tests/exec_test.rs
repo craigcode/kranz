@@ -20,7 +20,12 @@ use kranz_engine::types::MissionStatus;
 fn parses_exec_with_short_file_flag() {
     let cli = Cli::try_parse_from(["kranz", "exec", "-f", "mission.md"]).unwrap();
     match cli.command {
-        Command::Exec { file, yes, max_cycles, .. } => {
+        Command::Exec {
+            file,
+            yes,
+            max_cycles,
+            ..
+        } => {
             assert_eq!(file.to_str(), Some("mission.md"));
             assert!(!yes);
             assert_eq!(max_cycles, None);
@@ -42,7 +47,12 @@ fn parses_exec_with_long_file_flag_and_all_options() {
     ])
     .unwrap();
     match cli.command {
-        Command::Exec { file, yes, max_cycles, .. } => {
+        Command::Exec {
+            file,
+            yes,
+            max_cycles,
+            ..
+        } => {
             assert_eq!(file.to_str(), Some("plans/ci.md"));
             assert!(yes);
             assert_eq!(max_cycles, Some(5));
@@ -69,7 +79,10 @@ fn exec_honors_global_repo_and_danger_flags() {
         "mission.md",
     ])
     .unwrap();
-    assert_eq!(cli.repo.as_deref(), Some(std::path::Path::new("/tmp/target")));
+    assert_eq!(
+        cli.repo.as_deref(),
+        Some(std::path::Path::new("/tmp/target"))
+    );
     assert!(cli.dangerously_allow_all);
     assert!(matches!(cli.command, Command::Exec { .. }));
 }
@@ -85,7 +98,9 @@ fn exec_rejects_non_numeric_max_cycles() {
 fn allow_unvalidated_defaults_to_false() {
     let cli = Cli::try_parse_from(["kranz", "exec", "-f", "mission.md"]).unwrap();
     match cli.command {
-        Command::Exec { allow_unvalidated, .. } => assert!(!allow_unvalidated),
+        Command::Exec {
+            allow_unvalidated, ..
+        } => assert!(!allow_unvalidated),
         other => panic!("unexpected: {other:?}"),
     }
 }
@@ -95,7 +110,9 @@ fn parses_exec_with_allow_unvalidated_flag() {
     let cli =
         Cli::try_parse_from(["kranz", "exec", "-f", "mission.md", "--allow-unvalidated"]).unwrap();
     match cli.command {
-        Command::Exec { allow_unvalidated, .. } => assert!(allow_unvalidated),
+        Command::Exec {
+            allow_unvalidated, ..
+        } => assert!(allow_unvalidated),
         other => panic!("unexpected: {other:?}"),
     }
 }
@@ -152,9 +169,7 @@ fn parses_ticket_shaped_markdown_and_extracts_goal() {
     assert_eq!(ticket.slug, "rate-limit");
     assert_eq!(ticket.title, "Rate-limit the public API");
     assert_eq!(ticket.priority, 1);
-    assert!(ticket
-        .goal
-        .contains("Cap requests per API token"));
+    assert!(ticket.goal.contains("Cap requests per API token"));
     assert_eq!(ticket.scoping_answers.len(), 2);
     assert_eq!(ticket.acceptance_hints.len(), 2);
 }

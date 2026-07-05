@@ -111,7 +111,10 @@ impl MissionHost {
     }
 
     /// The backend, constructing [`ClaudeBackend`] on first use.
-    async fn backend(&self, claude_binary: Option<&str>) -> Result<Arc<dyn AgentBackend>, ApiError> {
+    async fn backend(
+        &self,
+        claude_binary: Option<&str>,
+    ) -> Result<Arc<dyn AgentBackend>, ApiError> {
         let configured = claude_binary.map(str::to_string);
         self.backend
             .get_or_try_init(|| async move {
@@ -185,8 +188,7 @@ impl MissionHost {
                 // Estimate with params calibrated from this repo's completed
                 // missions (built-in defaults when there are none yet).
                 let calibration = cost::calibrate(&self.repo_root);
-                let estimate =
-                    cost::estimate(&plan, &engine.state().config, &calibration.params);
+                let estimate = cost::estimate(&plan, &engine.state().config, &calibration.params);
                 // Park the reviewed plan so ANY surface's approve affordance
                 // (Slack buttons, web, glasses ring) can commit it later.
                 self.set_pending_plan(id, Some(plan.clone()));
@@ -236,11 +238,22 @@ impl MissionHost {
                         )));
                     }
                 }
-                Some(HostedMission::Planning { cell, last_use, pending_plan }) => match Arc::try_unwrap(cell) {
+                Some(HostedMission::Planning {
+                    cell,
+                    last_use,
+                    pending_plan,
+                }) => match Arc::try_unwrap(cell) {
                     Err(cell) => {
                         // A handler holds a clone: a turn is (or is about to
                         // be) in flight. Put the entry back untouched.
-                        map.insert(id.to_string(), HostedMission::Planning { cell, last_use, pending_plan });
+                        map.insert(
+                            id.to_string(),
+                            HostedMission::Planning {
+                                cell,
+                                last_use,
+                                pending_plan,
+                            },
+                        );
                         return Err(turn_in_flight());
                     }
                     Ok(mutex) => {
@@ -264,7 +277,10 @@ impl MissionHost {
                 // Re-invocable path: resume from the log. A live engine
                 // elsewhere (CLI, or a hosted run racing this request) holds
                 // the single-writer lock → EngineError::LockHeld → 409.
-                if !MissionPaths::new(&self.repo_root, id).events_file().is_file() {
+                if !MissionPaths::new(&self.repo_root, id)
+                    .events_file()
+                    .is_file()
+                {
                     return Err(ApiError::not_found(format!("unknown mission '{id}'")));
                 }
                 let cfg = config::load(&self.repo_root)?;
@@ -377,16 +393,31 @@ impl MissionHost {
     /// held by a FOREIGN process (a terminal `kranz plan/run`) surfaces as
     /// the engine's LockHeld → 409; the web never force-steals.
     pub async fn abandon(&self, id: &str, reason: &str) -> Result<(), ApiError> {
-        let taken = self.missions.lock().expect("missions registry lock").remove(id);
+        let taken = self
+            .missions
+            .lock()
+            .expect("missions registry lock")
+            .remove(id);
         match taken {
             None => {}
-            Some(HostedMission::Planning { cell, last_use, pending_plan }) => match Arc::try_unwrap(cell) {
+            Some(HostedMission::Planning {
+                cell,
+                last_use,
+                pending_plan,
+            }) => match Arc::try_unwrap(cell) {
                 Ok(mutex) => drop(mutex.into_inner()),
                 Err(cell) => {
                     self.missions
                         .lock()
                         .expect("missions registry lock")
-                        .insert(id.to_string(), HostedMission::Planning { cell, last_use, pending_plan });
+                        .insert(
+                            id.to_string(),
+                            HostedMission::Planning {
+                                cell,
+                                last_use,
+                                pending_plan,
+                            },
+                        );
                     return Err(turn_in_flight());
                 }
             },
@@ -419,7 +450,12 @@ impl MissionHost {
     /// are never touched (same contract as the CLI).
     pub fn clean(&self, id: &str, all: bool) -> Result<(), ApiError> {
         use kranz_engine::orchestrator::{cleanable_class, mission_lock_is_live, CleanClass};
-        if self.missions.lock().expect("missions registry lock").contains_key(id) {
+        if self
+            .missions
+            .lock()
+            .expect("missions registry lock")
+            .contains_key(id)
+        {
             return Err(ApiError::conflict(format!(
                 "mission '{id}' is hosted by this server (attached or running) — abandon it \
                  first, or let its run finish"
@@ -541,8 +577,14 @@ impl MissionHost {
         };
         // Only "exists on disk but not hosted" is attachable; Running entries
         // and unknown missions keep their original error.
-        if !MissionPaths::new(&self.repo_root, id).events_file().is_file()
-            || self.missions.lock().expect("missions registry lock").contains_key(id)
+        if !MissionPaths::new(&self.repo_root, id)
+            .events_file()
+            .is_file()
+            || self
+                .missions
+                .lock()
+                .expect("missions registry lock")
+                .contains_key(id)
         {
             return Err(miss);
         }
@@ -554,9 +596,9 @@ impl MissionHost {
             // LockHeld can mean a concurrent request won the attach race and
             // the winner's engine now sits in the registry: prefer that cell.
             Err(EngineError::LockHeld(holder)) => {
-                return self.planning_cell(id).map_err(|_| {
-                    ApiError::from(EngineError::LockHeld(holder))
-                })
+                return self
+                    .planning_cell(id)
+                    .map_err(|_| ApiError::from(EngineError::LockHeld(holder)))
             }
             Err(e) => return Err(e.into()),
         };
@@ -614,7 +656,10 @@ async fn run_to_end(
         }
     }
     drop(engine);
-    missions.lock().expect("missions registry lock").remove(&mission_id);
+    missions
+        .lock()
+        .expect("missions registry lock")
+        .remove(&mission_id);
 }
 
 fn new_cell(engine: Box<MissionEngine>) -> EngineCell {
@@ -633,7 +678,10 @@ fn new_planning(cell: EngineCell) -> HostedMission {
 /// Shared by [`MissionHost::release`] and the sweeper: drop an idle planning
 /// engine from the registry (flushing its log and freeing the single-writer
 /// lock), refuse a mid-turn one, and leave running/absent entries be.
-fn release_from(missions: &Mutex<HashMap<String, HostedMission>>, id: &str) -> Result<bool, ApiError> {
+fn release_from(
+    missions: &Mutex<HashMap<String, HostedMission>>,
+    id: &str,
+) -> Result<bool, ApiError> {
     let mut map = missions.lock().expect("missions registry lock");
     match map.remove(id) {
         None => Ok(true),
@@ -644,13 +692,24 @@ fn release_from(missions: &Mutex<HashMap<String, HostedMission>>, id: &str) -> R
             }
             Ok(finished)
         }
-        Some(HostedMission::Planning { cell, last_use, pending_plan }) => match Arc::try_unwrap(cell) {
+        Some(HostedMission::Planning {
+            cell,
+            last_use,
+            pending_plan,
+        }) => match Arc::try_unwrap(cell) {
             Ok(mutex) => {
                 drop(mutex.into_inner()); // flushes the log, frees the lock
                 Ok(true)
             }
             Err(cell) => {
-                map.insert(id.to_string(), HostedMission::Planning { cell, last_use, pending_plan });
+                map.insert(
+                    id.to_string(),
+                    HostedMission::Planning {
+                        cell,
+                        last_use,
+                        pending_plan,
+                    },
+                );
                 Err(turn_in_flight())
             }
         },
@@ -662,7 +721,10 @@ fn release_from(missions: &Mutex<HashMap<String, HostedMission>>, id: &str) -> R
 /// cell (its `try_unwrap` fails inside `release_from`) is skipped, not an
 /// error — it simply isn't idle yet from the sweeper's point of view.
 /// `Running` entries are never candidates.
-fn sweep_idle_from(missions: &Mutex<HashMap<String, HostedMission>>, threshold: Duration) -> Vec<String> {
+fn sweep_idle_from(
+    missions: &Mutex<HashMap<String, HostedMission>>,
+    threshold: Duration,
+) -> Vec<String> {
     let idle_ids: Vec<String> = {
         let map = missions.lock().expect("missions registry lock");
         map.iter()
@@ -675,11 +737,16 @@ fn sweep_idle_from(missions: &Mutex<HashMap<String, HostedMission>>, threshold: 
             })
             .collect()
     };
-    idle_ids.into_iter().filter(|id| matches!(release_from(missions, id), Ok(true))).collect()
+    idle_ids
+        .into_iter()
+        .filter(|id| matches!(release_from(missions, id), Ok(true)))
+        .collect()
 }
 
 /// Planning endpoints never queue behind each other: contended = 409.
-fn try_lock(cell: &EngineCell) -> Result<tokio::sync::MutexGuard<'_, Box<MissionEngine>>, ApiError> {
+fn try_lock(
+    cell: &EngineCell,
+) -> Result<tokio::sync::MutexGuard<'_, Box<MissionEngine>>, ApiError> {
     cell.try_lock().map_err(|_| turn_in_flight())
 }
 
@@ -844,7 +911,10 @@ pub(crate) async fn release_mission_route(
 ) -> Result<Json<Value>, ApiError> {
     let id = valid_id(&server, &id)?;
     let _ = parse_body(&body)?;
-    if !MissionPaths::new(server.host.repo_root(), &id).events_file().is_file() {
+    if !MissionPaths::new(server.host.repo_root(), &id)
+        .events_file()
+        .is_file()
+    {
         return Err(ApiError::not_found(format!("mission '{id}' not found")));
     }
     let released = server.host.release(&id)?;
@@ -887,7 +957,8 @@ fn parse_body(body: &Bytes) -> Result<Value, ApiError> {
     if body.is_empty() {
         return Ok(json!({}));
     }
-    serde_json::from_slice(body).map_err(|e| ApiError::bad_request(format!("invalid JSON body: {e}")))
+    serde_json::from_slice(body)
+        .map_err(|e| ApiError::bad_request(format!("invalid JSON body: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -919,16 +990,24 @@ mod tests {
             if let Ok(ceiling) = std::fs::canonicalize(std::env::temp_dir()) {
                 std::env::set_var("GIT_CEILING_DIRECTORIES", ceiling);
             }
-            let home = std::env::temp_dir()
-                .join(format!("kranz-host-test-home-{}", std::process::id()));
+            let home =
+                std::env::temp_dir().join(format!("kranz-host-test-home-{}", std::process::id()));
             let _ = std::fs::create_dir_all(&home);
             std::env::set_var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }, &home);
         });
     }
 
     fn git(dir: &std::path::Path, args: &[&str]) {
-        let out = Command::new("git").args(args).current_dir(dir).output().expect("spawn git");
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// Throwaway repo with one commit; `None` (skip) when git is missing.
@@ -964,7 +1043,9 @@ mod tests {
 
     #[tokio::test]
     async fn contended_planning_mutex_is_409_for_turns_and_start() {
-        let Some((_dir, root)) = init_repo() else { return };
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
         let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
         let host = MissionHost::with_backend(root, backend);
         let id = host.create("ship it", None).await.expect("create mission");
@@ -973,28 +1054,42 @@ mod tests {
         let cell = host.planning_cell(&id).expect("hosted planning cell");
         let _guard = cell.try_lock().expect("uncontended lock");
 
-        let err = host.planning_turn(&id, "hello").await.expect_err("turn must 409");
+        let err = host
+            .planning_turn(&id, "hello")
+            .await
+            .expect_err("turn must 409");
         assert_eq!(err.status, StatusCode::CONFLICT);
         assert!(err.message.contains("turn is in flight"), "{}", err.message);
 
-        let err = host.request_plan(&id).await.expect_err("request-plan must 409");
+        let err = host
+            .request_plan(&id)
+            .await
+            .expect_err("request-plan must 409");
         assert_eq!(err.status, StatusCode::CONFLICT);
 
         // `start` also refuses while a turn holds the engine (the Arc clone
         // keeps try_unwrap failing) — and the entry survives the attempt.
         let err = host.start(&id).await.expect_err("start must 409");
         assert_eq!(err.status, StatusCode::CONFLICT);
-        assert!(host.planning_cell(&id).is_ok(), "registry entry must survive");
+        assert!(
+            host.planning_cell(&id).is_ok(),
+            "registry entry must survive"
+        );
     }
 
     #[tokio::test]
     async fn start_without_an_approved_plan_is_409() {
-        let Some((_dir, root)) = init_repo() else { return };
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
         let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
         let host = MissionHost::with_backend(root, backend);
         let id = host.create("ship it", None).await.expect("create mission");
 
-        let err = host.start(&id).await.expect_err("start must 409 in planning");
+        let err = host
+            .start(&id)
+            .await
+            .expect_err("start must 409 in planning");
         assert_eq!(err.status, StatusCode::CONFLICT);
         assert!(err.message.contains("no approved plan"), "{}", err.message);
         // The engine went back into the registry: planning can continue.
@@ -1003,7 +1098,9 @@ mod tests {
 
     #[tokio::test]
     async fn sweep_idle_leaves_a_mid_turn_mission_hosted() {
-        let Some((_dir, root)) = init_repo() else { return };
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
         let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
         let host = MissionHost::with_backend(root, backend);
         let id = host.create("ship it", None).await.expect("create mission");
@@ -1014,7 +1111,10 @@ mod tests {
 
         let released = host.sweep_idle(std::time::Duration::ZERO);
         assert!(!released.contains(&id), "{released:?}");
-        assert!(host.planning_cell(&id).is_ok(), "mission must remain hosted");
+        assert!(
+            host.planning_cell(&id).is_ok(),
+            "mission must remain hosted"
+        );
     }
 
     #[tokio::test]
@@ -1023,7 +1123,9 @@ mod tests {
         use axum::http::Request;
         use tower::ServiceExt;
 
-        let Some((_dir, root)) = init_repo() else { return };
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
         let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
         let host = MissionHost::with_backend(root, backend);
         let id = host.create("ship it", None).await.expect("create mission");
@@ -1050,7 +1152,9 @@ mod tests {
 
     #[tokio::test]
     async fn create_rejects_an_invalid_config_patch() {
-        let Some((_dir, root)) = init_repo() else { return };
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
         let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
         let host = MissionHost::with_backend(root, backend);
 
@@ -1058,7 +1162,10 @@ mod tests {
         // create must be rejected as a bad request. (2..=8 is now valid — it
         // opts into parallel workers — so an out-of-range value is used here.)
         let patch = json!({ "maxParallelWorkers": 9 });
-        let err = host.create("ship it", Some(&patch)).await.expect_err("must reject");
+        let err = host
+            .create("ship it", Some(&patch))
+            .await
+            .expect_err("must reject");
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 }

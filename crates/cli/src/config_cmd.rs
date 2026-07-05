@@ -151,7 +151,11 @@ pub fn cmd_config(repo: &Path, command: ConfigCommand, mission: Option<&str>) ->
             }
             Ok(0)
         }
-        ConfigCommand::Set { path, value, global } => {
+        ConfigCommand::Set {
+            path,
+            value,
+            global,
+        } => {
             let file = set_key(&layers, global, &path, &value)?;
             println!("set {path} in {}", file.display());
             Ok(0)
@@ -161,7 +165,11 @@ pub fn cmd_config(repo: &Path, command: ConfigCommand, mission: Option<&str>) ->
             println!("removed {path} from {}", file.display());
             Ok(0)
         }
-        ConfigCommand::Role { role, model, effort } => {
+        ConfigCommand::Role {
+            role,
+            model,
+            effort,
+        } => {
             let role = parse_role(&role)?;
             let effort = effort.as_deref().map(parse_effort).transpose()?;
             let applied_to = role_change(repo, mission, role, &model, effort)?;
@@ -191,7 +199,10 @@ pub struct Layers {
 impl Layers {
     /// The real layer paths for `repo` (global from the home directory).
     pub fn resolve(repo: &Path) -> Self {
-        Layers { global: paths::global_config(), project: paths::project_config(repo) }
+        Layers {
+            global: paths::global_config(),
+            project: paths::project_config(repo),
+        }
     }
 
     /// Layer paths in merge order: global first, project last (later wins) —
@@ -291,7 +302,10 @@ fn read_layer(path: &Path) -> Result<serde_json::Map<String, Value>> {
                 .with_context(|| format!("invalid JSON in {}", path.display()))?;
             match v {
                 Value::Object(map) => Ok(map),
-                _ => bail!("{} must contain a JSON object at the top level", path.display()),
+                _ => bail!(
+                    "{} must contain a JSON object at the top level",
+                    path.display()
+                ),
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(serde_json::Map::new()),
@@ -317,11 +331,14 @@ fn write_layer(path: &Path, tree: &serde_json::Map<String, Value>) -> Result<()>
         .file_name()
         .ok_or_else(|| anyhow!("config path {} has no file name", path.display()))?;
     let tmp = path.with_file_name(format!("{}.tmp", file_name.to_string_lossy()));
-    let text = format!("{}\n", serde_json::to_string_pretty(&Value::Object(tree.clone()))?);
+    let text = format!(
+        "{}\n",
+        serde_json::to_string_pretty(&Value::Object(tree.clone()))?
+    );
     {
         use std::io::Write as _;
-        let mut file = std::fs::File::create(&tmp)
-            .with_context(|| format!("creating {}", tmp.display()))?;
+        let mut file =
+            std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
         file.write_all(text.as_bytes())
             .with_context(|| format!("writing {}", tmp.display()))?;
         file.sync_data()
@@ -528,16 +545,30 @@ fn check_schema_path(dotted: &str) -> Result<()> {
 /// Parse a role token (case-insensitively) to its canonical spelling — the
 /// same names (and aliases) Slack's `/kranz config` accepts.
 fn parse_role(token: &str) -> Result<&'static str> {
-    ROLES.iter().copied().find(|r| r.eq_ignore_ascii_case(token)).ok_or_else(|| {
-        anyhow!("unknown role {token:?}; expected one of {}", ROLES.join("|"))
-    })
+    ROLES
+        .iter()
+        .copied()
+        .find(|r| r.eq_ignore_ascii_case(token))
+        .ok_or_else(|| {
+            anyhow!(
+                "unknown role {token:?}; expected one of {}",
+                ROLES.join("|")
+            )
+        })
 }
 
 /// Parse an effort token (case-insensitively) to its canonical spelling.
 fn parse_effort(token: &str) -> Result<&'static str> {
-    EFFORTS.iter().copied().find(|e| e.eq_ignore_ascii_case(token)).ok_or_else(|| {
-        anyhow!("invalid effort {token:?}; expected one of {}", EFFORTS.join("|"))
-    })
+    EFFORTS
+        .iter()
+        .copied()
+        .find(|e| e.eq_ignore_ascii_case(token))
+        .ok_or_else(|| {
+            anyhow!(
+                "invalid effort {token:?}; expected one of {}",
+                EFFORTS.join("|")
+            )
+        })
 }
 
 /// Resolve the target ACTIVE mission (shared engine resolver — the same policy
@@ -639,7 +670,9 @@ mod tests {
         use crate::cli::{Cli, Command};
 
         let cli = Cli::try_parse_from(["kranz", "config", "show"]).unwrap();
-        let Command::Config { command: ConfigCommand::Show { global, project } } = cli.command
+        let Command::Config {
+            command: ConfigCommand::Show { global, project },
+        } = cli.command
         else {
             panic!("expected config show");
         };
@@ -648,11 +681,21 @@ mod tests {
         let cli =
             Cli::try_parse_from(["kranz", "config", "set", "worker.model", "opus", "--global"])
                 .unwrap();
-        let Command::Config { command: ConfigCommand::Set { path, value, global } } = cli.command
+        let Command::Config {
+            command:
+                ConfigCommand::Set {
+                    path,
+                    value,
+                    global,
+                },
+        } = cli.command
         else {
             panic!("expected config set");
         };
-        assert_eq!((path.as_str(), value.as_str(), global), ("worker.model", "opus", true));
+        assert_eq!(
+            (path.as_str(), value.as_str(), global),
+            ("worker.model", "opus", true)
+        );
 
         let cli = Cli::try_parse_from(["kranz", "config", "unset", "worker.model"]).unwrap();
         assert!(matches!(
@@ -663,11 +706,25 @@ mod tests {
 
         // `role` targets a mission via the GLOBAL --mission flag.
         let cli = Cli::try_parse_from([
-            "kranz", "config", "role", "worker", "opus", "high", "--mission", "m-1",
+            "kranz",
+            "config",
+            "role",
+            "worker",
+            "opus",
+            "high",
+            "--mission",
+            "m-1",
         ])
         .unwrap();
         assert_eq!(cli.mission.as_deref(), Some("m-1"));
-        let Command::Config { command: ConfigCommand::Role { role, model, effort } } = cli.command
+        let Command::Config {
+            command:
+                ConfigCommand::Role {
+                    role,
+                    model,
+                    effort,
+                },
+        } = cli.command
         else {
             panic!("expected config role");
         };
@@ -686,11 +743,17 @@ mod tests {
     fn show_effective_reflects_a_project_override() {
         let tmp = TempDir::new().unwrap();
         let layers = temp_layers(&tmp);
-        write_json(&layers.project, &json!({ "worker": { "model": "my-custom-model" } }));
+        write_json(
+            &layers.project,
+            &json!({ "worker": { "model": "my-custom-model" } }),
+        );
 
         let rendered = render_effective(&layers.merge_order()).unwrap();
         let effective: Value = serde_json::from_str(&rendered).unwrap();
-        assert_eq!(effective["worker"]["model"], "my-custom-model", "override applied");
+        assert_eq!(
+            effective["worker"]["model"], "my-custom-model",
+            "override applied"
+        );
         // Untouched keys come from the compiled-in defaults.
         assert_eq!(effective["orchestrator"]["model"], "opus");
         assert_eq!(effective["worker"]["reasoningEffort"], "medium");
@@ -759,14 +822,21 @@ mod tests {
     fn set_invalid_effort_writes_nothing_and_leaves_the_file_byte_identical() {
         let tmp = TempDir::new().unwrap();
         let layers = temp_layers(&tmp);
-        write_json(&layers.project, &json!({ "worker": { "model": "opus" }, "keep": 1 }));
+        write_json(
+            &layers.project,
+            &json!({ "worker": { "model": "opus" }, "keep": 1 }),
+        );
         let before = std::fs::read(&layers.project).unwrap();
 
         let err = set_key(&layers, false, "worker.reasoningEffort", "turbo")
             .unwrap_err()
             .to_string();
         assert!(err.contains("refusing to write"), "{err}");
-        assert_eq!(std::fs::read(&layers.project).unwrap(), before, "file byte-identical");
+        assert_eq!(
+            std::fs::read(&layers.project).unwrap(),
+            before,
+            "file byte-identical"
+        );
     }
 
     #[test]
@@ -781,7 +851,10 @@ mod tests {
 
         // The valid twin lands.
         set_key(&layers, false, "maxParallelWorkers", "4").unwrap();
-        assert_eq!(read_json(&layers.project), json!({ "maxParallelWorkers": 4 }));
+        assert_eq!(
+            read_json(&layers.project),
+            json!({ "maxParallelWorkers": 4 })
+        );
     }
 
     #[test]
@@ -794,10 +867,16 @@ mod tests {
             read_json(layers.global.as_deref().unwrap()),
             json!({ "worker": { "model": "sonnet" } })
         );
-        assert!(!layers.project.exists(), "project layer untouched by --global");
+        assert!(
+            !layers.project.exists(),
+            "project layer untouched by --global"
+        );
 
         // No resolvable home directory → --global is an honest error.
-        let no_home = Layers { global: None, project: layers.project.clone() };
+        let no_home = Layers {
+            global: None,
+            project: layers.project.clone(),
+        };
         assert!(set_key(&no_home, true, "worker.model", "opus").is_err());
     }
 
@@ -808,11 +887,17 @@ mod tests {
         // set in the GLOBAL layer is masked by the project override → allowed.
         let tmp = TempDir::new().unwrap();
         let layers = temp_layers(&tmp);
-        write_json(&layers.project, &json!({ "worker": { "reasoningEffort": "warp" } }));
+        write_json(
+            &layers.project,
+            &json!({ "worker": { "reasoningEffort": "warp" } }),
+        );
 
         assert!(set_key(&layers, false, "skipScrutiny", "true").is_err());
 
-        write_json(&layers.project, &json!({ "worker": { "reasoningEffort": "high" } }));
+        write_json(
+            &layers.project,
+            &json!({ "worker": { "reasoningEffort": "high" } }),
+        );
         // Global carries a bad effort, but the project layer wins the merge.
         write_json(
             layers.global.as_deref().unwrap(),
@@ -831,7 +916,10 @@ mod tests {
         // standalone (defaults + candidate global).
         let tmp = TempDir::new().unwrap();
         let layers = temp_layers(&tmp);
-        write_json(&layers.project, &json!({ "worker": { "reasoningEffort": "high" } }));
+        write_json(
+            &layers.project,
+            &json!({ "worker": { "reasoningEffort": "high" } }),
+        );
 
         let err = format!(
             "{:#}",
@@ -857,10 +945,15 @@ mod tests {
         // layer is broken: the refusal must blame the merged combination.
         let tmp = TempDir::new().unwrap();
         let layers = temp_layers(&tmp);
-        write_json(&layers.project, &json!({ "worker": { "reasoningEffort": "warp" } }));
+        write_json(
+            &layers.project,
+            &json!({ "worker": { "reasoningEffort": "warp" } }),
+        );
 
-        let err =
-            format!("{:#}", set_key(&layers, true, "skipScrutiny", "true").unwrap_err());
+        let err = format!(
+            "{:#}",
+            set_key(&layers, true, "skipScrutiny", "true").unwrap_err()
+        );
         assert!(err.contains("this repo"), "merged gate named: {err}");
         assert!(!err.contains("on its own"), "standalone gate passed: {err}");
         assert!(!layers.global.as_deref().unwrap().exists());
@@ -875,8 +968,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let layers = temp_layers(&tmp);
         write_json(&layers.project, &json!({ "worker": { "model": "opus" } }));
-        std::fs::set_permissions(&layers.project, std::fs::Permissions::from_mode(0o600))
-            .unwrap();
+        std::fs::set_permissions(&layers.project, std::fs::Permissions::from_mode(0o600)).unwrap();
         let before_ino = std::fs::metadata(&layers.project).unwrap().ino();
 
         set_key(&layers, false, "worker.model", "sonnet").unwrap();
@@ -889,8 +981,15 @@ mod tests {
              concurrent config::load (serve create, kranz work, slack bridge) must \
              never observe a torn/empty file"
         );
-        assert_eq!(meta.permissions().mode() & 0o777, 0o600, "permissions carried over");
-        assert_eq!(read_json(&layers.project), json!({ "worker": { "model": "sonnet" } }));
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o600,
+            "permissions carried over"
+        );
+        assert_eq!(
+            read_json(&layers.project),
+            json!({ "worker": { "model": "sonnet" } })
+        );
 
         // No tmp litter left beside the target.
         let leftovers: Vec<String> = std::fs::read_dir(layers.project.parent().unwrap())
@@ -910,7 +1009,10 @@ mod tests {
         let layers = temp_layers(&tmp);
 
         // Nested typo: names the segment, the level, and its valid keys.
-        let err = format!("{:#}", set_key(&layers, false, "worker.mdoel", "opus").unwrap_err());
+        let err = format!(
+            "{:#}",
+            set_key(&layers, false, "worker.mdoel", "opus").unwrap_err()
+        );
         assert!(err.contains("`mdoel`"), "unknown part named: {err}");
         assert!(err.contains("`worker`"), "level named: {err}");
         assert!(
@@ -919,17 +1021,25 @@ mod tests {
         );
 
         // Top-level snake_case typo: the camelCase twin is in the listing.
-        let err =
-            format!("{:#}", set_key(&layers, false, "max_parallel_workers", "4").unwrap_err());
+        let err = format!(
+            "{:#}",
+            set_key(&layers, false, "max_parallel_workers", "4").unwrap_err()
+        );
         assert!(err.contains("`max_parallel_workers`"), "{err}");
         assert!(err.contains("top level"), "{err}");
-        assert!(err.contains("maxParallelWorkers"), "camelCase twin listed: {err}");
+        assert!(
+            err.contains("maxParallelWorkers"),
+            "camelCase twin listed: {err}"
+        );
 
         // Wrong case is an unknown key, not a match.
         assert!(set_key(&layers, false, "Worker.model", "opus").is_err());
         assert!(set_key(&layers, false, "worker.Model", "opus").is_err());
 
-        assert!(!layers.project.exists(), "no typo'd set ever materialized the file");
+        assert!(
+            !layers.project.exists(),
+            "no typo'd set ever materialized the file"
+        );
     }
 
     #[test]
@@ -958,15 +1068,24 @@ mod tests {
         let layers = temp_layers(&tmp);
 
         set_key(&layers, false, "denyPatterns", r#"["rm -rf"]"#).unwrap();
-        assert_eq!(read_json(&layers.project), json!({ "denyPatterns": ["rm -rf"] }));
+        assert_eq!(
+            read_json(&layers.project),
+            json!({ "denyPatterns": ["rm -rf"] })
+        );
 
-        let err = format!("{:#}", set_key(&layers, false, "denyPatterns.0", "x").unwrap_err());
+        let err = format!(
+            "{:#}",
+            set_key(&layers, false, "denyPatterns.0", "x").unwrap_err()
+        );
         assert!(err.contains("array") && err.contains("as a whole"), "{err}");
         let err = format!(
             "{:#}",
             set_key(&layers, false, "allowValidatorCommands.2.cmd", "x").unwrap_err()
         );
-        assert!(err.contains("array"), "deep paths through arrays refused too: {err}");
+        assert!(
+            err.contains("array"),
+            "deep paths through arrays refused too: {err}"
+        );
     }
 
     #[test]
@@ -974,7 +1093,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let layers = temp_layers(&tmp);
 
-        let err = format!("{:#}", set_key(&layers, false, "worker.model.x", "y").unwrap_err());
+        let err = format!(
+            "{:#}",
+            set_key(&layers, false, "worker.model.x", "y").unwrap_err()
+        );
         assert!(
             err.contains("worker.model") && err.contains("plain value"),
             "clean error, no object-over-scalar clobber: {err}"
@@ -989,10 +1111,20 @@ mod tests {
         write_json(&layers.project, &json!({ "worker": { "model": "opus" } }));
         let before = std::fs::read(&layers.project).unwrap();
 
-        let err = format!("{:#}", unset_key(&layers, false, "worker.mdoel").unwrap_err());
-        assert!(err.contains("unknown config key"), "schema error, not 'not set': {err}");
+        let err = format!(
+            "{:#}",
+            unset_key(&layers, false, "worker.mdoel").unwrap_err()
+        );
+        assert!(
+            err.contains("unknown config key"),
+            "schema error, not 'not set': {err}"
+        );
         assert!(err.contains("`mdoel`"), "{err}");
-        assert_eq!(std::fs::read(&layers.project).unwrap(), before, "file untouched");
+        assert_eq!(
+            std::fs::read(&layers.project).unwrap(),
+            before,
+            "file untouched"
+        );
     }
 
     // --- unset ------------------------------------------------------------------
@@ -1044,7 +1176,9 @@ mod tests {
         write_json(&layers.project, &json!({ "skipScrutiny": true }));
         let before = std::fs::read(&layers.project).unwrap();
 
-        let err = unset_key(&layers, false, "worker.model").unwrap_err().to_string();
+        let err = unset_key(&layers, false, "worker.model")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("worker.model"), "{err}");
         assert_eq!(std::fs::read(&layers.project).unwrap(), before);
     }
@@ -1056,8 +1190,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         seed_mission(tmp.path(), "m-cfg", false);
 
-        let applied = role_change(tmp.path(), Some("m-cfg"), "scrutiny", "opus", Some("high"))
-            .unwrap();
+        let applied =
+            role_change(tmp.path(), Some("m-cfg"), "scrutiny", "opus", Some("high")).unwrap();
         assert_eq!(applied, "m-cfg");
 
         let cmds = drained(tmp.path(), "m-cfg");
@@ -1100,10 +1234,15 @@ mod tests {
         seed_mission(tmp.path(), "m-a", false);
         seed_mission(tmp.path(), "m-b", false);
 
-        let err = role_change(tmp.path(), None, "worker", "opus", None).unwrap_err().to_string();
+        let err = role_change(tmp.path(), None, "worker", "opus", None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("several active missions"), "{err}");
         for id in ["m-a", "m-b"] {
-            assert!(drained(tmp.path(), id).is_empty(), "nothing enqueued on {id}");
+            assert!(
+                drained(tmp.path(), id).is_empty(),
+                "nothing enqueued on {id}"
+            );
         }
     }
 
@@ -1115,8 +1254,14 @@ mod tests {
         let err = role_change(tmp.path(), Some("m-done"), "worker", "opus", None)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("active missions"), "honest error, not false success: {err}");
-        assert!(drained(tmp.path(), "m-done").is_empty(), "no control file leaked");
+        assert!(
+            err.contains("active missions"),
+            "honest error, not false success: {err}"
+        );
+        assert!(
+            drained(tmp.path(), "m-done").is_empty(),
+            "no control file leaked"
+        );
     }
 
     #[test]

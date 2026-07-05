@@ -173,6 +173,9 @@ fn read_file_or_404(
     match std::fs::read_to_string(path) {
         Ok(content) => Ok(content),
         Err(e) if e.kind() == ErrorKind::NotFound => Err(ApiError::not_found(not_found_msg())),
-        Err(e) => Err(ApiError::internal(format!("failed to read {}: {e}", path.display()))),
+        Err(e) => Err(ApiError::internal(format!(
+            "failed to read {}: {e}",
+            path.display()
+        ))),
     }
 }

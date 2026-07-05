@@ -117,7 +117,10 @@ pub fn router_with_shared_host(
     static_assets: Option<DashboardStatic>,
     token: Option<String>,
 ) -> Router {
-    let state = Arc::new(ServerState { repo_root: host.repo_root().clone(), host });
+    let state = Arc::new(ServerState {
+        repo_root: host.repo_root().clone(),
+        host,
+    });
     let app = Router::new()
         .route("/api/health", get(rest::health))
         .route(
@@ -132,21 +135,36 @@ pub fn router_with_shared_host(
             get(rest::run_transcript),
         )
         .route("/api/missions/{id}/control", post(rest::post_control))
-        .route("/api/missions/{id}/planning/turn", post(host::planning_turn))
+        .route(
+            "/api/missions/{id}/planning/turn",
+            post(host::planning_turn),
+        )
         .route(
             "/api/missions/{id}/planning/request-plan",
             post(host::request_plan),
         )
         .route("/api/missions/{id}/approve", post(host::approve_mission))
         .route("/api/missions/{id}/start", post(host::start_mission))
-        .route("/api/missions/{id}/pending-plan", get(host::pending_plan_route))
+        .route(
+            "/api/missions/{id}/pending-plan",
+            get(host::pending_plan_route),
+        )
         .route(
             "/api/missions/{id}/approve-pending",
             post(host::approve_pending_route),
         )
-        .route("/api/missions/{id}/abandon", post(host::abandon_mission_route))
-        .route("/api/missions/{id}/release", post(host::release_mission_route))
-        .route("/api/missions/{id}/delete", post(host::delete_mission_route))
+        .route(
+            "/api/missions/{id}/abandon",
+            post(host::abandon_mission_route),
+        )
+        .route(
+            "/api/missions/{id}/release",
+            post(host::release_mission_route),
+        )
+        .route(
+            "/api/missions/{id}/delete",
+            post(host::delete_mission_route),
+        )
         .route("/api/missions/{id}/ws", get(ws::ws_handler))
         .with_state(state);
 
@@ -164,9 +182,12 @@ pub fn router_with_shared_host(
     // Layer order (outermost last): the CORS layer wraps the JSON gate wraps
     // the token gate, so even rejections carry CORS headers for approved
     // origins and a non-JSON POST is rejected before the token is examined.
-    app.layer(middleware::from_fn_with_state(token, require_mutation_token))
-        .layer(middleware::from_fn(require_json_api_posts))
-        .layer(cors_layer())
+    app.layer(middleware::from_fn_with_state(
+        token,
+        require_mutation_token,
+    ))
+    .layer(middleware::from_fn(require_json_api_posts))
+    .layer(cors_layer())
 }
 
 fn embedded_static_response(uri: Uri, files: &'static [EmbeddedFile]) -> Response {

@@ -5,10 +5,9 @@
 
 use crossterm::event::KeyCode;
 use kranz_cli::planning_tui::{
-    approval_key, busy_status_line, classify_submission, post_approval_key, wrap_text,
-    ApprovalKey, BusyKind, InputEditor, PendingQueue, PlanningOutcome, ScrollState,
-    SubmitDisposition, APPROVAL_BAR, IDLE_STATUS, PLAN_NOT_READY_NOTICE, POST_APPROVAL_BAR,
-    SPINNER_FRAMES,
+    approval_key, busy_status_line, classify_submission, post_approval_key, wrap_text, ApprovalKey,
+    BusyKind, InputEditor, PendingQueue, PlanningOutcome, ScrollState, SubmitDisposition,
+    APPROVAL_BAR, IDLE_STATUS, PLAN_NOT_READY_NOTICE, POST_APPROVAL_BAR, SPINNER_FRAMES,
 };
 
 // ---------------------------------------------------------------------------
@@ -206,7 +205,10 @@ fn classify_routes_by_business() {
         classify_submission("build it", false),
         SubmitDisposition::Turn("build it".into())
     );
-    assert_eq!(classify_submission("/plan", false), SubmitDisposition::RequestPlan);
+    assert_eq!(
+        classify_submission("/plan", false),
+        SubmitDisposition::RequestPlan
+    );
 
     // Busy: both queue instead — never discarded, never answering a prompt.
     assert_eq!(
@@ -228,7 +230,10 @@ fn classify_routes_by_business() {
         SubmitDisposition::Unknown("/frobnicate".into())
     );
     // Leading/trailing whitespace is trimmed before routing.
-    assert_eq!(classify_submission("  /quit  ", true), SubmitDisposition::Quit);
+    assert_eq!(
+        classify_submission("  /quit  ", true),
+        SubmitDisposition::Quit
+    );
 }
 
 #[test]
@@ -341,10 +346,22 @@ fn approval_mode_filters_keys() {
 #[test]
 fn post_approval_mode_filters_keys() {
     // y starts the run, n exits with the plan committed.
-    assert_eq!(post_approval_key(KeyCode::Char('y')), Some(PlanningOutcome::ApprovedRun));
-    assert_eq!(post_approval_key(KeyCode::Char('Y')), Some(PlanningOutcome::ApprovedRun));
-    assert_eq!(post_approval_key(KeyCode::Char('n')), Some(PlanningOutcome::ApprovedExit));
-    assert_eq!(post_approval_key(KeyCode::Char('N')), Some(PlanningOutcome::ApprovedExit));
+    assert_eq!(
+        post_approval_key(KeyCode::Char('y')),
+        Some(PlanningOutcome::ApprovedRun)
+    );
+    assert_eq!(
+        post_approval_key(KeyCode::Char('Y')),
+        Some(PlanningOutcome::ApprovedRun)
+    );
+    assert_eq!(
+        post_approval_key(KeyCode::Char('n')),
+        Some(PlanningOutcome::ApprovedExit)
+    );
+    assert_eq!(
+        post_approval_key(KeyCode::Char('N')),
+        Some(PlanningOutcome::ApprovedExit)
+    );
 
     // Everything else is ignored — starting execution spend must be an
     // explicit keypress; Enter/type-ahead must never trigger it.
@@ -374,10 +391,16 @@ fn busy_status_shows_spinner_elapsed_and_queue_depth() {
     assert!(line.starts_with(SPINNER_FRAMES[1]), "{line}");
     assert!(line.contains("requesting plan…"), "{line}");
     assert!(line.contains("3s"), "{line}");
-    assert!(line.contains("2 messages queued, send in order when this turn finishes"), "{line}");
+    assert!(
+        line.contains("2 messages queued, send in order when this turn finishes"),
+        "{line}"
+    );
 
     let line = busy_status_line(BusyKind::Turn, 5, 0, 1);
-    assert!(line.contains("1 message queued, sends when this turn finishes"), "{line}");
+    assert!(
+        line.contains("1 message queued, sends when this turn finishes"),
+        "{line}"
+    );
 }
 
 #[test]

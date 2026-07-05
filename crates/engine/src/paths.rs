@@ -24,7 +24,10 @@ pub struct MissionPaths {
 
 impl MissionPaths {
     pub fn new(repo_root: impl Into<PathBuf>, mission_id: impl Into<String>) -> Self {
-        Self { repo_root: repo_root.into(), mission_id: mission_id.into() }
+        Self {
+            repo_root: repo_root.into(),
+            mission_id: mission_id.into(),
+        }
     }
 
     pub fn kranz_dir(&self) -> PathBuf {
@@ -120,6 +123,9 @@ mod tests {
     fn lessons_paths_are_repo_level_not_per_mission() {
         let paths = MissionPaths::new("/repo", "m-abc123");
         assert_eq!(paths.lessons_dir(), PathBuf::from("/repo/.kranz/lessons"));
-        assert_eq!(paths.lessons_index(), PathBuf::from("/repo/.kranz/lessons/index.md"));
+        assert_eq!(
+            paths.lessons_index(),
+            PathBuf::from("/repo/.kranz/lessons/index.md")
+        );
     }
 }

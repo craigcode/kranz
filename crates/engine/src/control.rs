@@ -36,7 +36,11 @@ pub fn enqueue(paths: &MissionPaths, cmd: &ControlCommand) -> Result<PathBuf> {
 
     let millis = Utc::now().timestamp_millis().max(0) as u64;
     let rand = uuid::Uuid::new_v4().simple().to_string();
-    let name = format!("{millis:0width$}-{}.json", &rand[..RAND_LEN], width = MILLIS_WIDTH);
+    let name = format!(
+        "{millis:0width$}-{}.json",
+        &rand[..RAND_LEN],
+        width = MILLIS_WIDTH
+    );
 
     let final_path = dir.join(&name);
     let tmp_path = dir.join(format!("{name}.tmp"));
@@ -91,9 +95,12 @@ pub fn drain(paths: &MissionPaths) -> Result<Vec<(PathBuf, ControlCommand)>> {
 /// message itself.
 pub fn peek_interrupt(paths: &MissionPaths) -> Result<bool> {
     for path in queued_files(&paths.control_dir())? {
-        let Ok(content) = std::fs::read_to_string(&path) else { continue };
-        if let Ok(ControlCommand::Msg { interrupt: true, .. }) =
-            serde_json::from_str::<ControlCommand>(&content)
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Ok(ControlCommand::Msg {
+            interrupt: true, ..
+        }) = serde_json::from_str::<ControlCommand>(&content)
         {
             return Ok(true);
         }
@@ -136,7 +143,9 @@ pub fn resolve_active_mission(repo_root: &Path, explicit: Option<&str>) -> Resul
             .filter(|id| mission_status(repo_root, id).is_some_and(|s| !is_terminal(s)))
             .collect();
         match active.len() {
-            0 => Err(EngineError::Other("no active mission — create one first".into())),
+            0 => Err(EngineError::Other(
+                "no active mission — create one first".into(),
+            )),
             1 => Ok(active.into_iter().next().expect("len == 1")),
             _ => Err(EngineError::Other(format!(
                 "several active missions ({}); name one explicitly",
@@ -169,7 +178,10 @@ fn queued_files(dir: &Path) -> Result<Vec<PathBuf>> {
 /// Rename an unparseable command file to `<name>.bad` so it stops blocking
 /// the queue but stays on disk for diagnosis.
 fn quarantine(path: &Path, err: &serde_json::Error) {
-    let file_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let bad = path.with_file_name(format!("{file_name}.bad"));
     tracing::warn!(
         path = %path.display(),
@@ -262,22 +274,35 @@ mod tests {
     fn resolve_explicit_active_mission_is_accepted() {
         let tmp = TempDir::new().unwrap();
         seed_mission(tmp.path(), "m-a", false);
-        assert_eq!(resolve_active_mission(tmp.path(), Some("m-a")).unwrap(), "m-a");
+        assert_eq!(
+            resolve_active_mission(tmp.path(), Some("m-a")).unwrap(),
+            "m-a"
+        );
     }
 
     #[test]
     fn resolve_unknown_mission_is_an_error() {
         let tmp = TempDir::new().unwrap();
-        let err = resolve_active_mission(tmp.path(), Some("m-nope")).unwrap_err().to_string();
-        assert!(err.contains("m-nope"), "error names the unknown mission: {err}");
+        let err = resolve_active_mission(tmp.path(), Some("m-nope"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("m-nope"),
+            "error names the unknown mission: {err}"
+        );
     }
 
     #[test]
     fn resolve_terminal_mission_is_an_error() {
         let tmp = TempDir::new().unwrap();
         seed_mission(tmp.path(), "m-done", true);
-        let err = resolve_active_mission(tmp.path(), Some("m-done")).unwrap_err().to_string();
-        assert!(err.contains("active missions"), "honest error, not false success: {err}");
+        let err = resolve_active_mission(tmp.path(), Some("m-done"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("active missions"),
+            "honest error, not false success: {err}"
+        );
     }
 
     #[test]
@@ -300,8 +325,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         seed_mission(tmp.path(), "m-a", false);
         seed_mission(tmp.path(), "m-b", false);
-        let err = resolve_active_mission(tmp.path(), None).unwrap_err().to_string();
+        let err = resolve_active_mission(tmp.path(), None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("several active missions"), "{err}");
-        assert!(err.contains("m-a") && err.contains("m-b"), "candidates listed: {err}");
+        assert!(
+            err.contains("m-a") && err.contains("m-b"),
+            "candidates listed: {err}"
+        );
     }
 }

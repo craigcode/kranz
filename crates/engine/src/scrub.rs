@@ -207,7 +207,15 @@ fn is_allowlisted(value: &str) -> bool {
 
     // Placeholder / dummy substrings.
     const PLACEHOLDERS: &[&str] = &[
-        "xxxx", "replace", "example", "changeme", "your", "dummy", "placeholder", "todo", "none",
+        "xxxx",
+        "replace",
+        "example",
+        "changeme",
+        "your",
+        "dummy",
+        "placeholder",
+        "todo",
+        "none",
         "redacted",
     ];
     if PLACEHOLDERS.iter().any(|p| lower.contains(p)) {

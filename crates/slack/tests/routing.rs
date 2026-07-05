@@ -10,8 +10,8 @@ use serde_json::{json, Value};
 
 fn fixture(name: &str) -> Value {
     let path = concat_fixture(name);
-    let text = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read fixture {path}: {e}"));
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read fixture {path}: {e}"));
     serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse fixture {path}: {e}"))
 }
 
@@ -250,7 +250,9 @@ fn slash_pause_and_resume_route_with_optional_id() {
 fn slash_work_routes_to_work() {
     assert_eq!(
         route(&steer_env("work"), &no_lookup()).action,
-        Action::Work { response_url: Some("https://hooks.slack/steer".into()) }
+        Action::Work {
+            response_url: Some("https://hooks.slack/steer".into())
+        }
     );
 }
 
@@ -260,7 +262,9 @@ fn slash_pause_resume_work_bad_input_routes_to_help() {
     for text in ["pause a b", "resume x y", "work drain", "work m-1"] {
         assert_eq!(
             route(&steer_env(text), &no_lookup()).action,
-            Action::Help { response_url: Some("https://hooks.slack/steer".into()) },
+            Action::Help {
+                response_url: Some("https://hooks.slack/steer".into())
+            },
             "text={text:?} should route to help"
         );
     }
@@ -273,5 +277,10 @@ fn app_home_opened_fixture_routes_to_app_home() {
         routed.envelope_id.as_deref(),
         Some("c8f2013a-609e-1b87-f292-4f307e819203")
     );
-    assert_eq!(routed.action, Action::AppHome { user_id: "U0263M3QW".into() });
+    assert_eq!(
+        routed.action,
+        Action::AppHome {
+            user_id: "U0263M3QW".into()
+        }
+    );
 }

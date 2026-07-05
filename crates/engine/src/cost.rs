@@ -40,15 +40,30 @@ impl Pricing {
 pub fn pricing_for_model(model: &str) -> Pricing {
     let m = model.to_ascii_lowercase();
     if m.contains("fable") {
-        Pricing { input_per_mtok: 10.0, output_per_mtok: 50.0 }
+        Pricing {
+            input_per_mtok: 10.0,
+            output_per_mtok: 50.0,
+        }
     } else if m.contains("opus") {
-        Pricing { input_per_mtok: 5.0, output_per_mtok: 25.0 }
+        Pricing {
+            input_per_mtok: 5.0,
+            output_per_mtok: 25.0,
+        }
     } else if m.contains("sonnet") {
-        Pricing { input_per_mtok: 3.0, output_per_mtok: 15.0 }
+        Pricing {
+            input_per_mtok: 3.0,
+            output_per_mtok: 15.0,
+        }
     } else if m.contains("haiku") {
-        Pricing { input_per_mtok: 1.0, output_per_mtok: 5.0 }
+        Pricing {
+            input_per_mtok: 1.0,
+            output_per_mtok: 5.0,
+        }
     } else {
-        Pricing { input_per_mtok: 5.0, output_per_mtok: 25.0 }
+        Pricing {
+            input_per_mtok: 5.0,
+            output_per_mtok: 25.0,
+        }
     }
 }
 
@@ -192,7 +207,10 @@ pub fn calibrate(repo_root: &Path) -> Calibration {
     }
 
     if per_mission.is_empty() {
-        return Calibration { params: EstimateParams::default(), missions_used: 0 };
+        return Calibration {
+            params: EstimateParams::default(),
+            missions_used: 0,
+        };
     }
 
     let n = per_mission.len() as f64;
@@ -206,7 +224,10 @@ pub fn calibrate(repo_root: &Path) -> Calibration {
         orchestrator_overhead_usd_per_feature: mean(|p| p.orchestrator_overhead_usd_per_feature)
             .max(0.01),
     };
-    Calibration { params, missions_used: per_mission.len() }
+    Calibration {
+        params,
+        missions_used: per_mission.len(),
+    }
 }
 
 /// One completed mission's actuals, expressed in [`EstimateParams`] terms so
@@ -220,8 +241,10 @@ pub fn calibrate(repo_root: &Path) -> Calibration {
 /// - orchestrator overhead per feature: total orchestrator run cost / total
 ///   features.
 fn mission_actuals(state: &MissionState) -> EstimateParams {
-    let run_cost =
-        |run: &WorkerRun| run.cost_usd.unwrap_or_else(|| usage_cost_usd(&run.tokens, &run.model));
+    let run_cost = |run: &WorkerRun| {
+        run.cost_usd
+            .unwrap_or_else(|| usage_cost_usd(&run.tokens, &run.model))
+    };
     let mean_run_cost = |roles: &[Role]| -> f64 {
         let costs: Vec<f64> = state
             .runs
@@ -229,17 +252,35 @@ fn mission_actuals(state: &MissionState) -> EstimateParams {
             .filter(|r| roles.contains(&r.role))
             .map(run_cost)
             .collect();
-        if costs.is_empty() { 0.0 } else { costs.iter().sum::<f64>() / costs.len() as f64 }
+        if costs.is_empty() {
+            0.0
+        } else {
+            costs.iter().sum::<f64>() / costs.len() as f64
+        }
     };
 
-    let features = || state.mission.milestones.iter().flat_map(|m| m.features.iter());
+    let features = || {
+        state
+            .mission
+            .milestones
+            .iter()
+            .flat_map(|m| m.features.iter())
+    };
     let total_features = features().count() as f64;
-    let planned_features = features().filter(|f| f.origin == FeatureOrigin::Plan).count() as f64;
-    let fix_features = features().filter(|f| f.origin == FeatureOrigin::Fix).count() as f64;
+    let planned_features = features()
+        .filter(|f| f.origin == FeatureOrigin::Plan)
+        .count() as f64;
+    let fix_features = features()
+        .filter(|f| f.origin == FeatureOrigin::Fix)
+        .count() as f64;
     let total_respawns = features().map(|f| f.respawns as f64).sum::<f64>();
     let milestones = state.mission.milestones.len() as f64;
-    let total_fix_cycles =
-        state.mission.milestones.iter().map(|m| m.fix_cycles as f64).sum::<f64>();
+    let total_fix_cycles = state
+        .mission
+        .milestones
+        .iter()
+        .map(|m| m.fix_cycles as f64)
+        .sum::<f64>();
 
     let orchestrator_total = state
         .runs
@@ -255,10 +296,7 @@ fn mission_actuals(state: &MissionState) -> EstimateParams {
         fix_cycles_per_milestone: safe_div(total_fix_cycles, milestones),
         fix_features_per_cycle: fix_features / total_fix_cycles.max(1.0),
         avg_worker_run_usd: mean_run_cost(&[Role::Worker]),
-        avg_validator_run_usd: mean_run_cost(&[
-            Role::ValidatorScrutiny,
-            Role::ValidatorFunctional,
-        ]),
+        avg_validator_run_usd: mean_run_cost(&[Role::ValidatorScrutiny, Role::ValidatorFunctional]),
         orchestrator_overhead_usd_per_feature: safe_div(orchestrator_total, total_features),
     }
 }

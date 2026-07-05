@@ -255,7 +255,11 @@ mod tests {
     use crate::types::Plan;
 
     fn sample_plan() -> Plan {
-        Plan { goal: "g".into(), validation_contract: vec![], milestones: vec![] }
+        Plan {
+            goal: "g".into(),
+            validation_contract: vec![],
+            milestones: vec![],
+        }
     }
 
     #[test]
@@ -277,7 +281,10 @@ mod tests {
 
         // None is omitted from the wire (byte-identical to pre-baseSha logs)
         // and round-trips back to None.
-        let without_sha = EventKind::PlanApproved { plan: sample_plan(), base_sha: None };
+        let without_sha = EventKind::PlanApproved {
+            plan: sample_plan(),
+            base_sha: None,
+        };
         let json = serde_json::to_value(&without_sha).unwrap();
         assert!(
             !json["payload"].as_object().unwrap().contains_key("baseSha"),

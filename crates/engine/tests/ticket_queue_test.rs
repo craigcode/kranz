@@ -283,7 +283,10 @@ fn enqueue_orders_by_priority_then_insertion() {
     queue::enqueue(root, entry("m-mid", 2)).unwrap();
     queue::enqueue(root, entry("m-high-b", 1)).unwrap();
 
-    let ids: Vec<String> = queue::list(root).into_iter().map(|e| e.mission_id).collect();
+    let ids: Vec<String> = queue::list(root)
+        .into_iter()
+        .map(|e| e.mission_id)
+        .collect();
     assert_eq!(ids, vec!["m-high-a", "m-high-b", "m-mid", "m-low"]);
 
     // Seq is a global monotonic counter reflecting insertion order across all
@@ -353,7 +356,11 @@ fn is_repo_busy_detects_a_live_lock() {
     // platform.
     let live_dir = missions.join("live-mission");
     fs::create_dir_all(&live_dir).unwrap();
-    fs::write(live_dir.join("events.jsonl.lock"), std::process::id().to_string()).unwrap();
+    fs::write(
+        live_dir.join("events.jsonl.lock"),
+        std::process::id().to_string(),
+    )
+    .unwrap();
     assert_eq!(
         queue::is_repo_busy(root).as_deref(),
         Some("live-mission"),

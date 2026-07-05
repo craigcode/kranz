@@ -13,7 +13,11 @@ use kranz_slack::SlackConfig;
 use tempfile::TempDir;
 
 /// The env vars this suite manipulates.
-const HOME_KEYS: &[&str] = if cfg!(windows) { &["USERPROFILE"] } else { &["HOME"] };
+const HOME_KEYS: &[&str] = if cfg!(windows) {
+    &["USERPROFILE"]
+} else {
+    &["HOME"]
+};
 const SLACK_KEYS: &[&str] = &[
     "KRANZ_SLACK_BOT_TOKEN",
     "KRANZ_SLACK_APP_TOKEN",
@@ -24,7 +28,9 @@ const SLACK_KEYS: &[&str] = &[
 
 /// Snapshot the current values of the given keys so they can be restored.
 fn snapshot(keys: &[&str]) -> Vec<(String, Option<String>)> {
-    keys.iter().map(|k| (k.to_string(), std::env::var(k).ok())).collect()
+    keys.iter()
+        .map(|k| (k.to_string(), std::env::var(k).ok()))
+        .collect()
 }
 
 fn restore(saved: &[(String, Option<String>)]) {
@@ -90,7 +96,9 @@ fn from_config_scenarios() {
             std::env::set_var("KRANZ_SLACK_CHANNEL", "C-ENV");
             std::env::set_var("KRANZ_SLACK_INSTANCE", "studio-env");
 
-            let cfg = SlackConfig::from_config(repo_root).unwrap().expect("env triple → Some");
+            let cfg = SlackConfig::from_config(repo_root)
+                .unwrap()
+                .expect("env triple → Some");
             assert_eq!(cfg.bot_token, "xoxb-from-env");
             assert_eq!(cfg.app_token, "xapp-from-env");
             assert_eq!(cfg.channel, "C-ENV");
@@ -122,7 +130,9 @@ fn from_config_scenarios() {
                 }"#,
             );
 
-            let cfg = SlackConfig::from_config(repo_root).unwrap().expect("file triple → Some");
+            let cfg = SlackConfig::from_config(repo_root)
+                .unwrap()
+                .expect("file triple → Some");
             assert_eq!(cfg.bot_token, "xoxb-from-file");
             assert_eq!(cfg.app_token, "xapp-from-file");
             assert_eq!(cfg.channel, "C-FILE");
@@ -151,7 +161,11 @@ fn from_config_scenarios() {
             let cfg = SlackConfig::from_config(repo_root).unwrap().expect("Some");
             assert_eq!(cfg.bot_token, "xoxb-file", "token from file");
             assert_eq!(cfg.channel, "C-ENV-WINS", "channel from env");
-            assert_eq!(cfg.instance_name.as_deref(), Some("laptop-env"), "instance from env");
+            assert_eq!(
+                cfg.instance_name.as_deref(),
+                Some("laptop-env"),
+                "instance from env"
+            );
         }
 
         // --- 5. Partial (missing channel) → None ------------------------

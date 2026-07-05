@@ -80,8 +80,14 @@ const GIT_INSPECT: &[&str] = &[
 ];
 
 /// Deny list for the read-only roles (orchestrator, validators).
-const READ_ONLY_DENY: &[&str] =
-    &["Write", "Edit", "NotebookEdit", "WebFetch", "WebSearch", "Bash(git push*)"];
+const READ_ONLY_DENY: &[&str] = &[
+    "Write",
+    "Edit",
+    "NotebookEdit",
+    "WebFetch",
+    "WebSearch",
+    "Bash(git push*)",
+];
 
 /// The CLI `--tools` restriction for read-only roles (design.md table).
 const INSPECT_TOOLS: &[&str] = &["Bash", "Read", "Glob", "Grep"];
@@ -111,7 +117,11 @@ pub struct PermissionProfile {
 ///
 /// `cfg.dangerously_allow_all` short-circuits every role to
 /// `bypassPermissions` with empty lists (loud escape hatch, never default).
-pub fn for_role(role: Role, cfg: &MissionConfig, validator_commands: &[String]) -> PermissionProfile {
+pub fn for_role(
+    role: Role,
+    cfg: &MissionConfig,
+    validator_commands: &[String],
+) -> PermissionProfile {
     if cfg.dangerously_allow_all {
         return PermissionProfile {
             permission_mode: Some("bypassPermissions".to_string()),
@@ -150,8 +160,9 @@ pub fn for_role(role: Role, cfg: &MissionConfig, validator_commands: &[String]) 
         Role::ValidatorScrutiny | Role::ValidatorFunctional => {
             let mut allowed = to_strings(&["Read", "Glob", "Grep"]);
             allowed.extend(to_strings(GIT_INSPECT));
-            for command in
-                validator_commands.iter().chain(cfg.allow_validator_commands.iter())
+            for command in validator_commands
+                .iter()
+                .chain(cfg.allow_validator_commands.iter())
             {
                 allowed.extend(command_allow_patterns(command));
             }

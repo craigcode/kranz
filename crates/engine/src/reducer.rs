@@ -18,9 +18,9 @@ pub const ENGINE_RUN_ID: &str = "engine";
 /// Fold a contiguous event slice into a state. The first event MUST be
 /// `mission.created`.
 pub fn fold(events: &[Event]) -> Result<MissionState> {
-    let first = events.first().ok_or_else(|| {
-        EngineError::InvalidState("cannot fold an empty event log".to_string())
-    })?;
+    let first = events
+        .first()
+        .ok_or_else(|| EngineError::InvalidState("cannot fold an empty event log".to_string()))?;
     let mut state = initial_state(first)?;
     for event in &events[1..] {
         apply(&mut state, event)?;
@@ -82,7 +82,10 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             state.mission.status = MissionStatus::Running;
         }
 
-        EventKind::MilestoneStarted { milestone_id, start_sha } => {
+        EventKind::MilestoneStarted {
+            milestone_id,
+            start_sha,
+        } => {
             let ms = milestone_mut(state, milestone_id)?;
             ms.status = MilestoneStatus::Active;
             ms.start_sha = Some(start_sha.clone());
@@ -143,7 +146,13 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             run_mut(state, run_id)?; // stream delta: existence check only
         }
 
-        EventKind::WorkerCompleted { run_id, result, tokens, cost_usd, report } => {
+        EventKind::WorkerCompleted {
+            run_id,
+            result,
+            tokens,
+            cost_usd,
+            report,
+        } => {
             let run = run_mut(state, run_id)?;
             run.result = Some(*result);
             run.tokens = tokens.clone();
@@ -154,7 +163,10 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             state.total_cost_usd += cost_usd.unwrap_or(0.0);
         }
 
-        EventKind::FeatureCompleted { feature_id, commits } => {
+        EventKind::FeatureCompleted {
+            feature_id,
+            commits,
+        } => {
             let feature = feature_mut(state, feature_id)?;
             feature.status = FeatureStatus::Complete;
             feature.commits.extend(commits.iter().cloned());
@@ -172,7 +184,11 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             milestone_mut(state, milestone_id)?.status = MilestoneStatus::Validating;
         }
 
-        EventKind::ValidationFinding { milestone_id, run_id, .. } => {
+        EventKind::ValidationFinding {
+            milestone_id,
+            run_id,
+            ..
+        } => {
             // No structural change; validate references as a corruption guard.
             // run_id "engine" is reserved for findings the engine itself
             // produces (final contract gate command failures) — no session
@@ -183,7 +199,10 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             }
         }
 
-        EventKind::FixFeatureCreated { milestone_id, feature } => {
+        EventKind::FixFeatureCreated {
+            milestone_id,
+            feature,
+        } => {
             let ms = milestone_mut(state, milestone_id)?;
             // Reject a colliding feature id loudly rather than silently
             // shadowing (mirrors the worker.spawned duplicate guard). A second
@@ -274,7 +293,12 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
 const MAX_RECENT_DECISIONS: usize = 10;
 
 fn initial_state(event: &Event) -> Result<MissionState> {
-    let EventKind::MissionCreated { goal, base_branch, mission_branch, config } = &event.kind
+    let EventKind::MissionCreated {
+        goal,
+        base_branch,
+        mission_branch,
+        config,
+    } = &event.kind
     else {
         return Err(EngineError::InvalidState(format!(
             "first event must be mission.created, found '{}'",
@@ -304,9 +328,14 @@ fn initial_state(event: &Event) -> Result<MissionState> {
 }
 
 fn milestone_mut<'a>(state: &'a mut MissionState, id: &str) -> Result<&'a mut Milestone> {
-    state.mission.milestones.iter_mut().find(|m| m.id == id).ok_or_else(|| {
-        EngineError::InvalidState(format!("event references unknown milestone '{id}'"))
-    })
+    state
+        .mission
+        .milestones
+        .iter_mut()
+        .find(|m| m.id == id)
+        .ok_or_else(|| {
+            EngineError::InvalidState(format!("event references unknown milestone '{id}'"))
+        })
 }
 
 fn feature_mut<'a>(state: &'a mut MissionState, id: &str) -> Result<&'a mut Feature> {
@@ -322,9 +351,10 @@ fn feature_mut<'a>(state: &'a mut MissionState, id: &str) -> Result<&'a mut Feat
 }
 
 fn run_mut<'a>(state: &'a mut MissionState, id: &str) -> Result<&'a mut WorkerRun> {
-    state.runs.get_mut(id).ok_or_else(|| {
-        EngineError::InvalidState(format!("event references unknown run '{id}'"))
-    })
+    state
+        .runs
+        .get_mut(id)
+        .ok_or_else(|| EngineError::InvalidState(format!("event references unknown run '{id}'")))
 }
 
 /// Recursive JSON merge: objects merge key-by-key, anything else in the patch
@@ -352,10 +382,7 @@ fn deep_merge(base: &mut serde_json::Value, patch: &serde_json::Value) {
 /// rename over `path` so readers never observe a half-written snapshot.
 pub fn write_snapshot(state: &MissionState, path: &Path) -> Result<()> {
     let file_name = path.file_name().ok_or_else(|| {
-        EngineError::InvalidState(format!(
-            "snapshot path {} has no file name",
-            path.display()
-        ))
+        EngineError::InvalidState(format!("snapshot path {} has no file name", path.display()))
     })?;
     let tmp = path.with_file_name(format!("{}.tmp", file_name.to_string_lossy()));
 

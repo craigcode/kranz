@@ -80,7 +80,10 @@ pub enum AgentEvent {
         raw: serde_json::Value,
     },
     /// Assistant text output.
-    Text { text: String, raw: serde_json::Value },
+    Text {
+        text: String,
+        raw: serde_json::Value,
+    },
     /// Assistant requested a tool.
     ToolUse {
         tool: String,

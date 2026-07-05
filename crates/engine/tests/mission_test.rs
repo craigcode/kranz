@@ -51,8 +51,10 @@ static ENV_ISOLATION: Once = Once::new();
 /// never leak into the throwaway repos.
 fn isolate_git_env() {
     ENV_ISOLATION.call_once(|| {
-        let missing = std::env::temp_dir()
-            .join(format!("kranz-mission-test-no-config-{}", std::process::id()));
+        let missing = std::env::temp_dir().join(format!(
+            "kranz-mission-test-no-config-{}",
+            std::process::id()
+        ));
         std::env::set_var("GIT_CONFIG_GLOBAL", &missing);
         std::env::set_var("GIT_CONFIG_SYSTEM", &missing);
         if let Ok(ceiling) = std::fs::canonicalize(std::env::temp_dir()) {
@@ -62,7 +64,11 @@ fn isolate_git_env() {
 }
 
 fn git_available() -> bool {
-    Command::new("git").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+    Command::new("git")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// Returns false (after a skip note) when git is missing.
@@ -78,7 +84,11 @@ fn setup() -> bool {
 
 /// Run git directly (test plumbing, independent of the code under test).
 fn raw_git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git").args(args).current_dir(dir).output().expect("spawn git");
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("spawn git");
     assert!(
         out.status.success(),
         "git {args:?} failed: {}",
@@ -119,7 +129,11 @@ const GOAL: &str = "ship the demo feature";
 /// Baseline test config: both validators off (individual tests re-enable the
 /// functional validator where the scenario needs a validation round).
 fn test_cfg() -> MissionConfig {
-    MissionConfig { skip_scrutiny: true, skip_functional: true, ..MissionConfig::default() }
+    MissionConfig {
+        skip_scrutiny: true,
+        skip_functional: true,
+        ..MissionConfig::default()
+    }
 }
 
 fn make_engine(backend: &Arc<MockBackend>, root: &Path, cfg: MissionConfig) -> MissionEngine {
@@ -312,11 +326,17 @@ async fn happy_path_completes_mission_with_tag_and_contract_gate() {
         validator_with(json!([])),
     ]));
 
-    let cfg = MissionConfig { skip_functional: false, ..test_cfg() };
+    let cfg = MissionConfig {
+        skip_functional: false,
+        ..test_cfg()
+    };
     let mut engine = make_engine(&backend, &root, cfg);
     engine.approve_plan(simple_plan(2, contract)).unwrap();
 
-    let status = timeout(TEST_TIMEOUT, engine.run()).await.expect("run must not hang").unwrap();
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
     assert_eq!(status, MissionStatus::Complete);
 
     let mission_id = engine.mission_id().to_string();
@@ -348,7 +368,10 @@ async fn happy_path_completes_mission_with_tag_and_contract_gate() {
     // The milestone tag exists in git and is recorded on the event.
     let tag_name = format!("kranz/{mission_id}/ms-1");
     let tags = raw_git(&root, &["tag", "-l"]);
-    assert!(tags.contains(&tag_name), "tag {tag_name} missing from: {tags}");
+    assert!(
+        tags.contains(&tag_name),
+        "tag {tag_name} missing from: {tags}"
+    );
     assert!(events.iter().any(|e| matches!(
         &e.kind,
         EventKind::MilestoneCompleted { tag: Some(t), .. } if *t == tag_name
@@ -373,19 +396,31 @@ async fn happy_path_completes_mission_with_tag_and_contract_gate() {
     // branch BEFORE mission.completed was emitted (it is HEAD — nothing
     // commits after it).
     let report = std::fs::read_to_string(
-        root.join(".kranz").join("missions").join(&mission_id).join("report.md"),
+        root.join(".kranz")
+            .join("missions")
+            .join(&mission_id)
+            .join("report.md"),
     )
     .expect("report.md written at completion");
-    assert!(report.starts_with(&format!("# Mission report — {mission_id}")), "{report}");
+    assert!(
+        report.starts_with(&format!("# Mission report — {mission_id}")),
+        "{report}"
+    );
     assert!(report.contains("## What shipped"), "{report}");
     assert!(report.contains("feature 1"), "{report}");
     assert!(report.contains("## Validation history"), "{report}");
     assert!(report.contains("actual vs"), "{report}");
     assert!(report.contains("## Contract outcomes"), "{report}");
-    assert!(report.contains("**[a-2]**"), "both assertions listed: {report}");
+    assert!(
+        report.contains("**[a-2]**"),
+        "both assertions listed: {report}"
+    );
 
     let subject = raw_git(&root, &["log", "-1", "--format=%s"]);
-    assert_eq!(subject.trim(), format!("[kranz] mission report for {mission_id}"));
+    assert_eq!(
+        subject.trim(),
+        format!("[kranz] mission report for {mission_id}")
+    );
     let files = raw_git(&root, &["show", "--name-only", "--format=", "HEAD"]);
     let mut files: Vec<&str> = files.lines().filter(|l| !l.trim().is_empty()).collect();
     files.sort_unstable();
@@ -401,13 +436,18 @@ async fn happy_path_completes_mission_with_tag_and_contract_gate() {
          as report.md (not a separate commit)"
     );
     let lesson = std::fs::read_to_string(
-        root.join(".kranz").join("lessons").join(format!("{mission_id}.md")),
+        root.join(".kranz")
+            .join("lessons")
+            .join(format!("{mission_id}.md")),
     )
     .expect("lesson file written");
     assert!(lesson.contains("regression test"), "{lesson}");
     let lessons_index =
         std::fs::read_to_string(root.join(".kranz").join("lessons").join("index.md")).unwrap();
-    assert!(lessons_index.contains(&format!("{mission_id}.md")), "{lessons_index}");
+    assert!(
+        lessons_index.contains(&format!("{mission_id}.md")),
+        "{lessons_index}"
+    );
 
     // The mission's index line kept its format and gained the report link.
     let index =
@@ -416,8 +456,14 @@ async fn happy_path_completes_mission_with_tag_and_contract_gate() {
         .lines()
         .find(|l| l.contains(&format!("[{mission_id}](")))
         .expect("mission line in index.md");
-    assert!(line.contains(&format!("({mission_id}/plan.md)")), "plan link kept: {line}");
-    assert!(line.contains(&format!("[report]({mission_id}/report.md)")), "report link: {line}");
+    assert!(
+        line.contains(&format!("({mission_id}/plan.md)")),
+        "plan link kept: {line}"
+    );
+    assert!(
+        line.contains(&format!("[report]({mission_id}/report.md)")),
+        "report link: {line}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -454,11 +500,17 @@ async fn validation_round_creates_fix_feature_then_completes() {
         validator_with(json!([])),
     ]));
 
-    let cfg = MissionConfig { skip_functional: false, ..test_cfg() };
+    let cfg = MissionConfig {
+        skip_functional: false,
+        ..test_cfg()
+    };
     let mut engine = make_engine(&backend, &root, cfg);
     engine.approve_plan(simple_plan(1, vec![])).unwrap();
 
-    let status = timeout(TEST_TIMEOUT, engine.run()).await.expect("run must not hang").unwrap();
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
     assert_eq!(status, MissionStatus::Complete);
 
     // One fix cycle consumed; the fix feature exists with origin Fix and the
@@ -478,10 +530,19 @@ async fn validation_round_creates_fix_feature_then_completes() {
     drop(engine);
     let events = read_log(&paths);
     let types = event_types(&events);
-    assert!(types.contains(&"validation.finding"), "finding event: {types:?}");
-    assert!(types.contains(&"fixfeature.created"), "fixfeature event: {types:?}");
+    assert!(
+        types.contains(&"validation.finding"),
+        "finding event: {types:?}"
+    );
+    assert!(
+        types.contains(&"fixfeature.created"),
+        "fixfeature event: {types:?}"
+    );
     assert_eq!(
-        types.iter().filter(|t| **t == "milestone.validating").count(),
+        types
+            .iter()
+            .filter(|t| **t == "milestone.validating")
+            .count(),
         2,
         "two validation rounds: {types:?}"
     );
@@ -530,10 +591,16 @@ async fn loop_guard_blocks_milestone_after_max_fix_cycles() {
     let mut engine = make_engine(&backend, &root, cfg);
     engine.approve_plan(simple_plan(1, vec![])).unwrap();
 
-    let status = timeout(TEST_TIMEOUT, engine.run()).await.expect("run must not hang").unwrap();
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
     assert_eq!(status, MissionStatus::Blocked);
     assert_eq!(engine.state().mission.status, MissionStatus::Blocked);
-    assert_eq!(engine.state().mission.milestones[0].status, MilestoneStatus::Blocked);
+    assert_eq!(
+        engine.state().mission.milestones[0].status,
+        MilestoneStatus::Blocked
+    );
     assert_eq!(engine.state().mission.milestones[0].fix_cycles, 1);
 
     let paths = engine.paths().clone();
@@ -546,7 +613,10 @@ async fn loop_guard_blocks_milestone_after_max_fix_cycles() {
     // Round 2's conversion turn wanted fixes but the cap was spent: nothing
     // beyond round 1's single fix feature was ever created.
     assert_eq!(
-        event_types(&events).iter().filter(|t| **t == "fixfeature.created").count(),
+        event_types(&events)
+            .iter()
+            .filter(|t| **t == "fixfeature.created")
+            .count(),
         1,
         "only round 1 created a fix feature"
     );
@@ -583,11 +653,17 @@ async fn waive_completes_milestone() {
         validator_with(finding),
     ]));
 
-    let cfg = MissionConfig { skip_functional: false, ..test_cfg() };
+    let cfg = MissionConfig {
+        skip_functional: false,
+        ..test_cfg()
+    };
     let mut engine = make_engine(&backend, &root, cfg);
     engine.approve_plan(simple_plan(1, vec![])).unwrap();
 
-    let status = timeout(TEST_TIMEOUT, engine.run()).await.expect("run must not hang").unwrap();
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
     assert_eq!(status, MissionStatus::Complete);
 
     // No fix cycle consumed, no fix feature materialized.
@@ -601,43 +677,75 @@ async fn waive_completes_milestone() {
     drop(engine);
     let events = read_log(&paths);
     let types = event_types(&events);
-    assert!(types.contains(&"validation.finding"), "finding still surfaced: {types:?}");
-    assert!(!types.contains(&"fixfeature.created"), "no fix feature: {types:?}");
+    assert!(
+        types.contains(&"validation.finding"),
+        "finding still surfaced: {types:?}"
+    );
+    assert!(
+        !types.contains(&"fixfeature.created"),
+        "no fix feature: {types:?}"
+    );
     assert_eq!(
-        types.iter().filter(|t| **t == "milestone.validating").count(),
+        types
+            .iter()
+            .filter(|t| **t == "milestone.validating")
+            .count(),
         1,
         "exactly one validation round: {types:?}"
     );
-    assert!(types.contains(&"mission.completed"), "mission completed: {types:?}");
+    assert!(
+        types.contains(&"mission.completed"),
+        "mission completed: {types:?}"
+    );
 
     // The waiver is on the log as an orchestrator decision: summary names
     // the subject, detail carries the one-line justification.
     let (summary, detail) = events
         .iter()
         .find_map(|e| match &e.kind {
-            EventKind::OrchestratorDecision { summary, detail: Some(detail) }
-                if summary.starts_with("waived") =>
-            {
-                Some((summary.clone(), detail.clone()))
-            }
+            EventKind::OrchestratorDecision {
+                summary,
+                detail: Some(detail),
+            } if summary.starts_with("waived") => Some((summary.clone(), detail.clone())),
             _ => None,
         })
         .expect("a waive orchestrator.decision exists");
-    assert!(summary.contains("waived 1 finding(s)"), "summary: {summary}");
-    assert!(summary.contains("part 1 works"), "summary names the subject: {summary}");
-    assert!(detail.contains("docstring nitpick"), "detail carries the reason: {detail}");
+    assert!(
+        summary.contains("waived 1 finding(s)"),
+        "summary: {summary}"
+    );
+    assert!(
+        summary.contains("part 1 works"),
+        "summary names the subject: {summary}"
+    );
+    assert!(
+        detail.contains("docstring nitpick"),
+        "detail carries the reason: {detail}"
+    );
 
     // The completion report replays the round: the waived finding is listed
     // with its severity/subject/evidence and the waiver's justification.
     let report = std::fs::read_to_string(
-        root.join(".kranz").join("missions").join(&mission_id).join("report.md"),
+        root.join(".kranz")
+            .join("missions")
+            .join(&mission_id)
+            .join("report.md"),
     )
     .expect("report.md written at completion");
     assert!(report.contains("## Validation history"), "{report}");
-    assert!(report.contains("[minor] part 1 works"), "finding listed: {report}");
-    assert!(report.contains("docstring omits the error case"), "evidence listed: {report}");
+    assert!(
+        report.contains("[minor] part 1 works"),
+        "finding listed: {report}"
+    );
+    assert!(
+        report.contains("docstring omits the error case"),
+        "evidence listed: {report}"
+    );
     assert!(report.contains("Disposition: waived."), "{report}");
-    assert!(report.contains("part 1 works: docstring nitpick"), "waiver reason: {report}");
+    assert!(
+        report.contains("part 1 works: docstring nitpick"),
+        "waiver reason: {report}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -691,7 +799,10 @@ async fn waive_at_cap_completes_instead_of_blocking() {
     let mut engine = make_engine(&backend, &root, cfg);
     engine.approve_plan(simple_plan(1, vec![])).unwrap();
 
-    let status = timeout(TEST_TIMEOUT, engine.run()).await.expect("run must not hang").unwrap();
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
     assert_eq!(status, MissionStatus::Complete);
     let ms = &engine.state().mission.milestones[0];
     assert_eq!(ms.status, MilestoneStatus::Complete);
@@ -701,8 +812,14 @@ async fn waive_at_cap_completes_instead_of_blocking() {
     drop(engine);
     let events = read_log(&paths);
     let types = event_types(&events);
-    assert!(!types.contains(&"milestone.blocked"), "must not block: {types:?}");
-    assert!(types.contains(&"mission.completed"), "mission completed: {types:?}");
+    assert!(
+        !types.contains(&"milestone.blocked"),
+        "must not block: {types:?}"
+    );
+    assert!(
+        types.contains(&"mission.completed"),
+        "mission completed: {types:?}"
+    );
     assert!(events.iter().any(|e| matches!(
         &e.kind,
         EventKind::OrchestratorDecision { summary, .. }
@@ -723,7 +840,11 @@ async fn waive_at_final_gate_completes_mission() {
 
     // One command assertion that fails portably (`cd` into a missing dir
     // errors under both `sh -c` and `cmd /C`) → one final-gate finding.
-    let contract = vec![assertion("a-1", "the build succeeds", Some("cd kranz-no-such-dir"))];
+    let contract = vec![assertion(
+        "a-1",
+        "the build succeeds",
+        Some("cd kranz-no-such-dir"),
+    )];
 
     // Orchestrator turns: seed, judgement f-1-1, gate conversion (waive).
     let backend = Arc::new(MockBackend::with_scripts(vec![
@@ -738,7 +859,10 @@ async fn waive_at_final_gate_completes_mission() {
     let mut engine = make_engine(&backend, &root, test_cfg());
     engine.approve_plan(simple_plan(1, contract)).unwrap();
 
-    let status = timeout(TEST_TIMEOUT, engine.run()).await.expect("run must not hang").unwrap();
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
     assert_eq!(status, MissionStatus::Complete);
 
     let mission_id = engine.mission_id().to_string();
@@ -746,10 +870,22 @@ async fn waive_at_final_gate_completes_mission() {
     drop(engine);
     let events = read_log(&paths);
     let types = event_types(&events);
-    assert!(types.contains(&"validation.finding"), "gate finding surfaced: {types:?}");
-    assert!(!types.contains(&"fixfeature.created"), "no fix feature: {types:?}");
-    assert!(!types.contains(&"milestone.blocked"), "must not block: {types:?}");
-    assert!(types.contains(&"mission.completed"), "mission completed: {types:?}");
+    assert!(
+        types.contains(&"validation.finding"),
+        "gate finding surfaced: {types:?}"
+    );
+    assert!(
+        !types.contains(&"fixfeature.created"),
+        "no fix feature: {types:?}"
+    );
+    assert!(
+        !types.contains(&"milestone.blocked"),
+        "must not block: {types:?}"
+    );
+    assert!(
+        types.contains(&"mission.completed"),
+        "mission completed: {types:?}"
+    );
     assert!(seq_of(&events, "mission.validating") < seq_of(&events, "mission.completed"));
     assert!(events.iter().any(|e| matches!(
         &e.kind,
@@ -763,22 +899,33 @@ async fn waive_at_final_gate_completes_mission() {
         .iter()
         .filter_map(|e| match &e.kind {
             EventKind::OrchestratorDecision { summary, .. }
-                if summary.contains("lesson captured") || summary.contains("no cross-mission lesson") =>
+                if summary.contains("lesson captured")
+                    || summary.contains("no cross-mission lesson") =>
             {
                 Some(summary)
             }
             _ => None,
         })
         .collect();
-    assert_eq!(capture_decisions.len(), 1, "capture turn runs exactly once: {events:?}");
+    assert_eq!(
+        capture_decisions.len(),
+        1,
+        "capture turn runs exactly once: {events:?}"
+    );
 
     // The captured lesson file + index landed in the SAME report commit as
     // report.md (not a separate commit).
     let subject = raw_git(&root, &["log", "-1", "--format=%s"]);
-    assert_eq!(subject.trim(), format!("[kranz] mission report for {mission_id}"));
+    assert_eq!(
+        subject.trim(),
+        format!("[kranz] mission report for {mission_id}")
+    );
     let files = raw_git(&root, &["show", "--name-only", "--format=", "HEAD"]);
     let files: Vec<&str> = files.lines().filter(|l| !l.trim().is_empty()).collect();
-    assert!(files.contains(&format!(".kranz/lessons/{mission_id}.md").as_str()), "{files:?}");
+    assert!(
+        files.contains(&format!(".kranz/lessons/{mission_id}.md").as_str()),
+        "{files:?}"
+    );
     assert!(files.contains(&".kranz/lessons/index.md"), "{files:?}");
     assert!(files.iter().any(|f| f.ends_with("report.md")), "{files:?}");
 }
@@ -805,7 +952,10 @@ async fn capture_turn_error_still_completes_mission() {
         worker_pass(),
         MockScript::streaming(vec![mock_init("orch-session"), mock_result_text("ready")])
             .responding(vec![
-                vec![mock_text(&judgement("complete", "")), mock_result_text(&judgement("complete", ""))],
+                vec![
+                    mock_text(&judgement("complete", "")),
+                    mock_result_text(&judgement("complete", "")),
+                ],
                 vec![mock_text("boom"), mock_result_error("boom")],
             ]),
     ]));
@@ -813,15 +963,25 @@ async fn capture_turn_error_still_completes_mission() {
     let mut engine = make_engine(&backend, &root, test_cfg());
     engine.approve_plan(simple_plan(1, vec![])).unwrap();
 
-    let status = timeout(TEST_TIMEOUT, engine.run()).await.expect("run must not hang").unwrap();
-    assert_eq!(status, MissionStatus::Complete, "completion must proceed despite the capture-turn error");
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(
+        status,
+        MissionStatus::Complete,
+        "completion must proceed despite the capture-turn error"
+    );
 
     let mission_id = engine.mission_id().to_string();
     let paths = engine.paths().clone();
     drop(engine);
     let events = read_log(&paths);
     let types = event_types(&events);
-    assert!(types.contains(&"mission.completed"), "mission completed: {types:?}");
+    assert!(
+        types.contains(&"mission.completed"),
+        "mission completed: {types:?}"
+    );
 
     // No lesson was captured, and completion says so on the event feed.
     assert!(events.iter().any(|e| matches!(
@@ -829,13 +989,20 @@ async fn capture_turn_error_still_completes_mission() {
         EventKind::OrchestratorDecision { summary, .. } if summary == "no cross-mission lesson captured"
     )));
     assert!(
-        !root.join(".kranz").join("lessons").join(format!("{mission_id}.md")).exists(),
+        !root
+            .join(".kranz")
+            .join("lessons")
+            .join(format!("{mission_id}.md"))
+            .exists(),
         "no lesson file written when the capture turn errors"
     );
 
     // The report commit still lands, just without any lesson files.
     let subject = raw_git(&root, &["log", "-1", "--format=%s"]);
-    assert_eq!(subject.trim(), format!("[kranz] mission report for {mission_id}"));
+    assert_eq!(
+        subject.trim(),
+        format!("[kranz] mission report for {mission_id}")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -866,11 +1033,17 @@ async fn respawn_bounded_fails_feature_then_mission_continues() {
         worker_pass(), // f-1-2
     ]));
 
-    let cfg = MissionConfig { max_respawns: 1, ..test_cfg() };
+    let cfg = MissionConfig {
+        max_respawns: 1,
+        ..test_cfg()
+    };
     let mut engine = make_engine(&backend, &root, cfg);
     engine.approve_plan(simple_plan(2, vec![])).unwrap();
 
-    let status = timeout(TEST_TIMEOUT, engine.run()).await.expect("run must not hang").unwrap();
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
     assert_eq!(status, MissionStatus::Complete);
 
     let ms = &engine.state().mission.milestones[0];
@@ -884,7 +1057,10 @@ async fn respawn_bounded_fails_feature_then_mission_continues() {
     // start order: worker, orch, worker(respawn), worker(f-1-2)
     match &specs[2].prompt {
         PromptMode::SingleShot(task) => {
-            assert!(task.contains("add the missing test double"), "guidance passed: {task}")
+            assert!(
+                task.contains("add the missing test double"),
+                "guidance passed: {task}"
+            )
         }
         other => panic!("respawned worker must be single-shot, got {other:?}"),
     }
@@ -938,7 +1114,11 @@ async fn pause_resume_and_user_message_flow() {
     // lockstep by emit) must show Paused.
     tokio::time::sleep(Duration::from_millis(900)).await;
     let snapshot = reducer::read_snapshot(&paths.state_file()).expect("state.json snapshot");
-    assert_eq!(snapshot.mission.status, MissionStatus::Paused, "engine paused while waiting");
+    assert_eq!(
+        snapshot.mission.status,
+        MissionStatus::Paused,
+        "engine paused while waiting"
+    );
 
     // Queue the user message WHILE PAUSED: a paused engine only drains its
     // inbox, so the message provably sits in pending_user_messages until the
@@ -948,13 +1128,19 @@ async fn pause_resume_and_user_message_flow() {
     // Resume alone and start a worker before ever seeing the message.
     control::enqueue(
         &paths,
-        &ControlCommand::Msg { text: "swap feature".to_string(), interrupt: false },
+        &ControlCommand::Msg {
+            text: "swap feature".to_string(),
+            interrupt: false,
+        },
     )
     .unwrap();
     tokio::time::sleep(Duration::from_millis(700)).await; // a drain tick passes
     control::enqueue(&paths, &ControlCommand::Resume).unwrap();
 
-    let (engine, result) = timeout(TEST_TIMEOUT, handle).await.expect("run must not hang").unwrap();
+    let (engine, result) = timeout(TEST_TIMEOUT, handle)
+        .await
+        .expect("run must not hang")
+        .unwrap();
     assert_eq!(result.unwrap(), MissionStatus::Complete);
     let mission_id = engine.mission_id().to_string();
     drop(engine);
@@ -962,7 +1148,10 @@ async fn pause_resume_and_user_message_flow() {
     // The completion report folds the paused span out of the elapsed time
     // and says so (mission.paused → mission.resumed is > 1s in this test).
     let report = std::fs::read_to_string(
-        root.join(".kranz").join("missions").join(&mission_id).join("report.md"),
+        root.join(".kranz")
+            .join("missions")
+            .join(&mission_id)
+            .join("report.md"),
     )
     .expect("report.md written at completion");
     assert!(report.contains("paused)"), "paused time surfaced: {report}");
@@ -977,9 +1166,18 @@ async fn pause_resume_and_user_message_flow() {
         .map(|e| e.seq)
         .find(|s| *s > user_msg)
         .expect("an orchestrator.decision follows the user message");
-    assert!(paused < user_msg, "paused {paused} before user.message {user_msg}");
-    assert!(user_msg < resumed, "user.message {user_msg} queued while paused, before resumed {resumed}");
-    assert!(resumed < decision, "resumed {resumed} before the consult decision {decision}");
+    assert!(
+        paused < user_msg,
+        "paused {paused} before user.message {user_msg}"
+    );
+    assert!(
+        user_msg < resumed,
+        "user.message {user_msg} queued while paused, before resumed {resumed}"
+    );
+    assert!(
+        resumed < decision,
+        "resumed {resumed} before the consult decision {decision}"
+    );
     assert!(events.iter().any(|e| matches!(
         &e.kind,
         EventKind::UserMessage { text, interrupt: false } if text == "swap feature"
@@ -988,9 +1186,16 @@ async fn pause_resume_and_user_message_flow() {
     // Delete-after-apply: every applied control file was removed once its
     // event hit the log — the normal path leaves an empty inbox.
     let leftover: Vec<String> = std::fs::read_dir(paths.control_dir())
-        .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
         .unwrap_or_default();
-    assert!(leftover.is_empty(), "control inbox must be empty after apply: {leftover:?}");
+    assert!(
+        leftover.is_empty(),
+        "control inbox must be empty after apply: {leftover:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1026,7 +1231,10 @@ async fn orchestrator_decision_detail_is_scrubbed() {
     let mut engine = make_engine(&backend, &root, test_cfg());
     engine.approve_plan(simple_plan(1, vec![])).unwrap();
 
-    let status = timeout(TEST_TIMEOUT, engine.run()).await.expect("run must not hang").unwrap();
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
     assert_eq!(status, MissionStatus::Complete);
 
     let paths = engine.paths().clone();
@@ -1041,11 +1249,10 @@ async fn orchestrator_decision_detail_is_scrubbed() {
     let (summary, detail) = events
         .iter()
         .find_map(|e| match &e.kind {
-            EventKind::OrchestratorDecision { summary, detail: Some(detail) }
-                if summary.starts_with("judgement for") =>
-            {
-                Some((summary.clone(), detail.clone()))
-            }
+            EventKind::OrchestratorDecision {
+                summary,
+                detail: Some(detail),
+            } if summary.starts_with("judgement for") => Some((summary.clone(), detail.clone())),
             _ => None,
         })
         .expect("a judgement orchestrator.decision with detail exists");
@@ -1101,9 +1308,11 @@ async fn kill_and_resume_completes_on_single_log() {
     let phase1_orch_sdk_id = phase1_events
         .iter()
         .find_map(|e| match &e.kind {
-            EventKind::WorkerSpawned { role: Role::Orchestrator, sdk_session_id, .. } => {
-                Some(sdk_session_id.clone())
-            }
+            EventKind::WorkerSpawned {
+                role: Role::Orchestrator,
+                sdk_session_id,
+                ..
+            } => Some(sdk_session_id.clone()),
             _ => None,
         })
         .expect("phase 1 spawned an orchestrator run");
@@ -1120,14 +1329,21 @@ async fn kill_and_resume_completes_on_single_log() {
     // both features complete. Validators skipped, contract empty → complete.
     let backend2 = Arc::new(MockBackend::with_scripts(vec![
         worker_pass(), // f-1-1 rerun
-        orch_script(vec![judgement("complete", ""), judgement("complete", ""), no_lesson()]),
+        orch_script(vec![
+            judgement("complete", ""),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
         worker_pass(), // f-1-2
     ]));
     let backend2_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend2) as Arc<dyn AgentBackend>;
-    let mut engine =
-        MissionEngine::resume(backend2_dyn, &root, &mission_id, LockForce::No).expect("resume mission");
+    let mut engine = MissionEngine::resume(backend2_dyn, &root, &mission_id, LockForce::No)
+        .expect("resume mission");
 
-    let status = timeout(TEST_TIMEOUT, engine.run()).await.expect("run must not hang").unwrap();
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
     assert_eq!(status, MissionStatus::Complete);
     drop(engine);
 
@@ -1137,7 +1353,10 @@ async fn kill_and_resume_completes_on_single_log() {
         .iter()
         .find(|s| matches!(s.prompt, PromptMode::Streaming(_)))
         .expect("phase 2 started a streaming orchestrator session");
-    assert_eq!(orch_spec.resume.as_deref(), Some(phase1_orch_sdk_id.as_str()));
+    assert_eq!(
+        orch_spec.resume.as_deref(),
+        Some(phase1_orch_sdk_id.as_str())
+    );
 
     // ONE events.jsonl spanning both engine lifetimes: contiguous seq
     // (read_events refuses gaps) and a final fold of Complete.
@@ -1182,17 +1401,24 @@ async fn force_reseed_reseeds_with_digest_and_plan() {
             plan_json,
         ]),
         worker_pass(),
-        orch_script(vec![judgement("complete", ""), judgement("complete", ""), no_lesson()]),
+        orch_script(vec![
+            judgement("complete", ""),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
         worker_pass(),
     ]));
 
     let mut engine = make_engine(&backend, &root, test_cfg());
 
     // Planning phase drives orchestrator session #1.
-    let reply = timeout(TEST_TIMEOUT, engine.planning_turn("plan two features please"))
-        .await
-        .expect("planning turn must not hang")
-        .unwrap();
+    let reply = timeout(
+        TEST_TIMEOUT,
+        engine.planning_turn("plan two features please"),
+    )
+    .await
+    .expect("planning turn must not hang")
+    .unwrap();
     assert!(reply.contains("no open questions"));
     let plan = match timeout(TEST_TIMEOUT, engine.request_plan())
         .await
@@ -1209,21 +1435,38 @@ async fn force_reseed_reseeds_with_digest_and_plan() {
     // must take the fresh re-seed path. Behaviour must not visibly change.
     engine.force_reseed();
 
-    let status = timeout(TEST_TIMEOUT, engine.run()).await.expect("run must not hang").unwrap();
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
     assert_eq!(status, MissionStatus::Complete);
 
     // The second streaming session was seeded (initial prompt) with the
     // re-seed context: digest header + the approved plan.json.
     let specs = backend.started_specs();
-    let streaming: Vec<_> =
-        specs.iter().filter(|s| matches!(s.prompt, PromptMode::Streaming(_))).collect();
+    let streaming: Vec<_> = specs
+        .iter()
+        .filter(|s| matches!(s.prompt, PromptMode::Streaming(_)))
+        .collect();
     assert_eq!(streaming.len(), 2, "exactly two orchestrator sessions");
-    assert!(streaming[1].resume.is_none(), "re-seed is a fresh session, not a resume");
+    assert!(
+        streaming[1].resume.is_none(),
+        "re-seed is a fresh session, not a resume"
+    );
     match &streaming[1].prompt {
         PromptMode::Streaming(seed) => {
-            assert!(seed.starts_with("MISSION m-"), "digest header first: {seed}");
-            assert!(seed.contains("APPROVED PLAN (plan.json):"), "plan.json embedded: {seed}");
-            assert!(seed.contains("build part 1"), "plan content present: {seed}");
+            assert!(
+                seed.starts_with("MISSION m-"),
+                "digest header first: {seed}"
+            );
+            assert!(
+                seed.contains("APPROVED PLAN (plan.json):"),
+                "plan.json embedded: {seed}"
+            );
+            assert!(
+                seed.contains("build part 1"),
+                "plan content present: {seed}"
+            );
         }
         other => panic!("orchestrator must be streaming, got {other:?}"),
     }
@@ -1332,11 +1575,13 @@ async fn seed_reply_is_captured_once_for_fresh_and_resumed_sessions() {
     // --- Fresh session: the planning seed's reply ends in questions -------
     let seed_text = "Two questions before I plan: which auth flows are in scope, and is the \
                      dashboard part of this mission?";
-    let backend = Arc::new(MockBackend::with_scripts(vec![MockScript::streaming(vec![
-        mock_init("orch-session"),
-        mock_text(seed_text),
-        mock_result_text(seed_text),
-    ])
+    let backend = Arc::new(MockBackend::with_scripts(vec![MockScript::streaming(
+        vec![
+            mock_init("orch-session"),
+            mock_text(seed_text),
+            mock_result_text(seed_text),
+        ],
+    )
     .responding(vec![vec![mock_text("noted"), mock_result_text("noted")]])]));
 
     let mut engine = make_engine(&backend, &root, test_cfg());
@@ -1350,22 +1595,31 @@ async fn seed_reply_is_captured_once_for_fresh_and_resumed_sessions() {
         Some(seed_text),
         "the seed turn's reply is captured, not discarded"
     );
-    assert_eq!(engine.take_seed_reply(), None, "the seed reply is taken exactly once");
+    assert_eq!(
+        engine.take_seed_reply(),
+        None,
+        "the seed reply is taken exactly once"
+    );
 
     let mission_id = engine.mission_id().to_string();
     drop(engine); // releases the lock; the sdk session id is on the log
 
     // --- Resume path: the resume-ack seed reply is captured too -----------
     let ack_text = "Acknowledged — resuming the planning conversation.";
-    let backend2 = Arc::new(MockBackend::with_scripts(vec![MockScript::streaming(vec![
-        mock_init("orch-session"),
-        mock_text(ack_text),
-        mock_result_text(ack_text),
-    ])
-    .responding(vec![vec![mock_text("continuing"), mock_result_text("continuing")]])]));
+    let backend2 = Arc::new(MockBackend::with_scripts(vec![MockScript::streaming(
+        vec![
+            mock_init("orch-session"),
+            mock_text(ack_text),
+            mock_result_text(ack_text),
+        ],
+    )
+    .responding(vec![vec![
+        mock_text("continuing"),
+        mock_result_text("continuing"),
+    ]])]));
     let backend2_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend2) as Arc<dyn AgentBackend>;
-    let mut engine =
-        MissionEngine::resume(backend2_dyn, &root, &mission_id, LockForce::No).expect("resume mission");
+    let mut engine = MissionEngine::resume(backend2_dyn, &root, &mission_id, LockForce::No)
+        .expect("resume mission");
 
     let reply = timeout(TEST_TIMEOUT, engine.planning_turn("go on"))
         .await
@@ -1385,7 +1639,10 @@ async fn seed_reply_is_captured_once_for_fresh_and_resumed_sessions() {
         .iter()
         .find(|s| matches!(s.prompt, PromptMode::Streaming(_)))
         .expect("the resumed engine started a streaming orchestrator session");
-    assert!(orch_spec.resume.is_some(), "resume-ack path expected (--resume set)");
+    assert!(
+        orch_spec.resume.is_some(),
+        "resume-ack path expected (--resume set)"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1404,10 +1661,13 @@ async fn plan_approval_writes_plan_branch_and_commit() {
 
     // Contract ids are missing/duplicated on purpose: approval must assign
     // unique-ish ids (a-1..).
-    let mut plan = simple_plan(1, vec![
-        assertion("", "tests pass", Some("cargo test")),
-        assertion("", "docs updated", None),
-    ]);
+    let mut plan = simple_plan(
+        1,
+        vec![
+            assertion("", "tests pass", Some("cargo test")),
+            assertion("", "docs updated", None),
+        ],
+    );
     plan.milestones[0].title = "Milestone One".to_string();
     engine.approve_plan(plan).unwrap();
 
@@ -1415,7 +1675,11 @@ async fn plan_approval_writes_plan_branch_and_commit() {
     let paths = engine.paths().clone();
     let plan_text = std::fs::read_to_string(paths.plan_file()).expect("plan.json written");
     let written: Plan = serde_json::from_str(&plan_text).expect("plan.json parses");
-    let ids: Vec<&str> = written.validation_contract.iter().map(|a| a.id.as_str()).collect();
+    let ids: Vec<&str> = written
+        .validation_contract
+        .iter()
+        .map(|a| a.id.as_str())
+        .collect();
     assert_eq!(ids, vec!["a-1", "a-2"]);
 
     // Mission branch created from main and checked out; the approval commit
@@ -1423,7 +1687,10 @@ async fn plan_approval_writes_plan_branch_and_commit() {
     let branch = raw_git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]);
     assert_eq!(branch.trim(), format!("kranz/mission-{mission_id}"));
     let subject = raw_git(&root, &["log", "-1", "--format=%s"]);
-    assert_eq!(subject.trim(), format!("[kranz] approved plan for {mission_id}"));
+    assert_eq!(
+        subject.trim(),
+        format!("[kranz] approved plan for {mission_id}")
+    );
     let files = raw_git(&root, &["show", "--name-only", "--format=", "HEAD"]);
     let mut files: Vec<&str> = files.lines().filter(|l| !l.trim().is_empty()).collect();
     files.sort_unstable();
@@ -1444,10 +1711,16 @@ async fn plan_approval_writes_plan_branch_and_commit() {
         "{index}"
     );
     let md = std::fs::read_to_string(
-        root.join(".kranz").join("missions").join(&mission_id).join("plan.md"),
+        root.join(".kranz")
+            .join("missions")
+            .join(&mission_id)
+            .join("plan.md"),
     )
     .expect("plan.md written");
-    assert!(md.starts_with(&format!("# Mission plan — {mission_id}")), "{md}");
+    assert!(
+        md.starts_with(&format!("# Mission plan — {mission_id}")),
+        "{md}"
+    );
     assert!(md.contains("## Validation contract"), "{md}");
     assert!(md.contains("**[a-1]**"), "{md}");
     assert!(md.contains("## Milestone 1 —"), "{md}");
@@ -1537,17 +1810,30 @@ async fn base_sha_reaches_worker_and_validator_env() {
 
     let backend = Arc::new(MockBackend::with_scripts(vec![
         worker_pass(),
-        orch_script(vec![judgement("complete", ""), verdicts_pass(&["a-2"]), no_lesson()]),
+        orch_script(vec![
+            judgement("complete", ""),
+            verdicts_pass(&["a-2"]),
+            no_lesson(),
+        ]),
         validator_with(json!([])),
     ]));
 
     let contract = vec![assertion("a-2", "error messages are actionable", None)];
-    let cfg = MissionConfig { skip_scrutiny: false, ..test_cfg() };
+    let cfg = MissionConfig {
+        skip_scrutiny: false,
+        ..test_cfg()
+    };
     let mut engine = make_engine(&backend, &root, cfg);
     engine.approve_plan(simple_plan(1, contract)).unwrap();
-    assert_eq!(engine.state().mission.base_sha.as_deref(), Some(base_tip_before.as_str()));
+    assert_eq!(
+        engine.state().mission.base_sha.as_deref(),
+        Some(base_tip_before.as_str())
+    );
 
-    let status = timeout(TEST_TIMEOUT, engine.run()).await.expect("run must not hang").unwrap();
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
     assert_eq!(status, MissionStatus::Complete);
 
     let specs = backend.started_specs();
@@ -1582,15 +1868,28 @@ fn mission_index_upserts_by_id() {
 
     let one = upsert_mission_index("", "m-aaa", "first goal", d1);
     assert!(one.starts_with("# Kranz missions"), "{one}");
-    assert!(one.contains("- 2026-07-02 · [m-aaa](m-aaa/plan.md) — first goal"), "{one}");
+    assert!(
+        one.contains("- 2026-07-02 · [m-aaa](m-aaa/plan.md) — first goal"),
+        "{one}"
+    );
 
     let two = upsert_mission_index(&one, "m-bbb", "second goal\nwith newline", d2);
     assert!(two.contains("[m-aaa]("), "{two}");
-    assert!(two.contains("- 2026-07-03 · [m-bbb](m-bbb/plan.md) — second goal with newline"), "{two}");
-    assert!(two.find("[m-aaa](").unwrap() < two.find("[m-bbb](").unwrap(), "newest last");
+    assert!(
+        two.contains("- 2026-07-03 · [m-bbb](m-bbb/plan.md) — second goal with newline"),
+        "{two}"
+    );
+    assert!(
+        two.find("[m-aaa](").unwrap() < two.find("[m-bbb](").unwrap(),
+        "newest last"
+    );
 
     let re = upsert_mission_index(&two, "m-aaa", "first goal, re-planned", d2);
-    assert_eq!(re.matches("[m-aaa](").count(), 1, "no duplicate on re-approval: {re}");
+    assert_eq!(
+        re.matches("[m-aaa](").count(),
+        1,
+        "no duplicate on re-approval: {re}"
+    );
     assert!(re.contains("first goal, re-planned"), "{re}");
 }
 
@@ -1608,7 +1907,10 @@ fn mission_index_report_link_appends_once() {
         marked.contains("- 2026-07-03 · [m-aaa](m-aaa/plan.md) — goal · [report](m-aaa/report.md)"),
         "{marked}"
     );
-    assert!(!marked.contains("[report](m-bbb/report.md)"), "only the named mission: {marked}");
+    assert!(
+        !marked.contains("[report](m-bbb/report.md)"),
+        "only the named mission: {marked}"
+    );
 
     let again = mark_mission_index_report(&marked, "m-aaa");
     assert_eq!(again, marked, "idempotent");
@@ -1638,23 +1940,38 @@ async fn abandon_planning_mission_sets_abandoned_status() {
     drop(engine);
 
     let before = read_log(&paths);
-    assert_eq!(reducer::fold(&before).unwrap().mission.status, MissionStatus::Planning);
+    assert_eq!(
+        reducer::fold(&before).unwrap().mission.status,
+        MissionStatus::Planning
+    );
 
-    kranz_engine::orchestrator::abandon_mission(&root, &mission_id, "no longer needed", LockForce::No)
-        .expect("abandon a planning mission");
+    kranz_engine::orchestrator::abandon_mission(
+        &root,
+        &mission_id,
+        "no longer needed",
+        LockForce::No,
+    )
+    .expect("abandon a planning mission");
 
     // Exactly one new event, of the right kind, carrying the reason.
     let after = read_log(&paths);
     assert_eq!(after.len(), before.len() + 1, "one event appended");
     assert_eq!(after.first().unwrap().seq, 1);
-    assert_eq!(after.last().unwrap().seq, after.len() as u64, "contiguous seq");
+    assert_eq!(
+        after.last().unwrap().seq,
+        after.len() as u64,
+        "contiguous seq"
+    );
     assert!(matches!(
         &after.last().unwrap().kind,
         EventKind::MissionAbandoned { reason } if reason == "no longer needed"
     ));
 
     // The reducer folds to Abandoned, and the on-disk snapshot matches.
-    assert_eq!(reducer::fold(&after).unwrap().mission.status, MissionStatus::Abandoned);
+    assert_eq!(
+        reducer::fold(&after).unwrap().mission.status,
+        MissionStatus::Abandoned
+    );
     let snapshot = reducer::read_snapshot(&paths.state_file()).expect("state.json");
     assert_eq!(snapshot.mission.status, MissionStatus::Abandoned);
     assert_eq!(snapshot.last_seq, after.last().unwrap().seq);
@@ -1679,8 +1996,12 @@ async fn running_an_abandoned_mission_is_rejected() {
         .expect("abandon");
 
     let backend2: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
-    let mut resumed = MissionEngine::resume(backend2, &root, &mission_id, LockForce::No).expect("resume");
-    let err = resumed.run().await.expect_err("running a terminal mission must be rejected");
+    let mut resumed =
+        MissionEngine::resume(backend2, &root, &mission_id, LockForce::No).expect("resume");
+    let err = resumed
+        .run()
+        .await
+        .expect_err("running a terminal mission must be rejected");
     assert!(
         matches!(err, kranz_engine::error::EngineError::InvalidState(_)),
         "expected InvalidState, got {err:?}"
@@ -1688,7 +2009,9 @@ async fn running_an_abandoned_mission_is_rejected() {
     // No worker.spawned appended by the rejected run.
     let events = read_log(&paths);
     assert!(
-        !events.iter().any(|e| matches!(e.kind, EventKind::WorkerSpawned { .. })),
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::WorkerSpawned { .. })),
         "a rejected run must not spawn workers"
     );
 }
@@ -1708,12 +2031,14 @@ async fn abandon_already_terminal_mission_errors() {
     drop(engine);
 
     // First abandon succeeds and makes the mission terminal.
-    kranz_engine::orchestrator::abandon_mission(&root, &mission_id, "first", LockForce::No).unwrap();
+    kranz_engine::orchestrator::abandon_mission(&root, &mission_id, "first", LockForce::No)
+        .unwrap();
     let after_first = read_log(&paths);
 
     // A second abandon is rejected: the mission is already terminal.
-    let err = kranz_engine::orchestrator::abandon_mission(&root, &mission_id, "again", LockForce::No)
-        .expect_err("abandoning a terminal mission must error");
+    let err =
+        kranz_engine::orchestrator::abandon_mission(&root, &mission_id, "again", LockForce::No)
+            .expect_err("abandoning a terminal mission must error");
     assert!(
         err.to_string().contains("already terminal"),
         "error should name the terminal state: {err}"
@@ -1721,7 +2046,11 @@ async fn abandon_already_terminal_mission_errors() {
 
     // The rejected call appended nothing.
     let after_second = read_log(&paths);
-    assert_eq!(after_second.len(), after_first.len(), "no event appended on the rejected abandon");
+    assert_eq!(
+        after_second.len(),
+        after_first.len(),
+        "no event appended on the rejected abandon"
+    );
 }
 
 /// A live engine holding the mission lock makes abandon fail with LockHeld
@@ -1776,7 +2105,10 @@ async fn preflight_flags_missing_program_and_ignores_present_ones() {
         .iter()
         .find(|i| i.message.contains("definitely-not-a-real-program-xyz"))
         .expect("the missing program is flagged");
-    assert_eq!(warn.severity, "warn", "a missing program is a warning, not an error");
+    assert_eq!(
+        warn.severity, "warn",
+        "a missing program is a warning, not an error"
+    );
     // No spurious hard-error issues: this IS a git repo with a writable .kranz.
     assert!(
         !issues.iter().any(|i| i.severity == "error"),
@@ -1834,7 +2166,10 @@ async fn run_emits_preflight_decision_when_issues_exist() {
     let mut engine = make_engine(&backend, &root, test_cfg());
     engine.approve_plan(simple_plan(1, contract)).unwrap();
 
-    let status = timeout(TEST_TIMEOUT, engine.run()).await.expect("run must not hang").unwrap();
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
     assert_eq!(status, MissionStatus::Complete);
 
     let paths = engine.paths().clone();
@@ -1845,13 +2180,19 @@ async fn run_emits_preflight_decision_when_issues_exist() {
     let preflight_seqs: Vec<u64> = events
         .iter()
         .filter_map(|e| match &e.kind {
-            EventKind::OrchestratorDecision { summary, .. } if summary.starts_with("preflight:") => {
+            EventKind::OrchestratorDecision { summary, .. }
+                if summary.starts_with("preflight:") =>
+            {
                 Some(e.seq)
             }
             _ => None,
         })
         .collect();
-    assert_eq!(preflight_seqs.len(), 1, "exactly one preflight decision: {preflight_seqs:?}");
+    assert_eq!(
+        preflight_seqs.len(),
+        1,
+        "exactly one preflight decision: {preflight_seqs:?}"
+    );
     let preflight_seq = preflight_seqs[0];
     let first_spawn = seq_of(&events, "worker.spawned");
     assert!(
@@ -1901,7 +2242,9 @@ async fn request_and_approve_revised_plan_drops_and_adds_features() {
 
     // One streaming orchestrator session; the single turn is the revised-plan
     // demand → the revised plan JSON.
-    let backend = Arc::new(MockBackend::with_scripts(vec![orch_script(vec![revised_json])]));
+    let backend = Arc::new(MockBackend::with_scripts(vec![orch_script(vec![
+        revised_json,
+    ])]));
 
     let mut engine = make_engine(&backend, &root, test_cfg());
     // Approve a 3-feature plan: mission goes Running, milestone ms-1 Pending
@@ -1921,33 +2264,60 @@ async fn request_and_approve_revised_plan_drops_and_adds_features() {
     assert_eq!(plan.milestones[0].features.len(), 2);
 
     // Apply it.
-    engine.approve_revised_plan(plan).expect("apply the revised plan");
+    engine
+        .approve_revised_plan(plan)
+        .expect("apply the revised plan");
 
     // f-1-2 and f-1-3 are dropped (skipped); f-1-1 untouched; one fix-origin
     // feature added to ms-1 with the re-plan id shape.
     let ms = &engine.state().mission.milestones[0];
     let by_id = |id: &str| ms.features.iter().find(|f| f.id == id).cloned();
-    assert_eq!(by_id("f-1-1").unwrap().status, FeatureStatus::Pending, "kept feature untouched");
-    assert_eq!(by_id("f-1-2").unwrap().status, FeatureStatus::Skipped, "dropped feature skipped");
-    assert_eq!(by_id("f-1-3").unwrap().status, FeatureStatus::Skipped, "dropped feature skipped");
+    assert_eq!(
+        by_id("f-1-1").unwrap().status,
+        FeatureStatus::Pending,
+        "kept feature untouched"
+    );
+    assert_eq!(
+        by_id("f-1-2").unwrap().status,
+        FeatureStatus::Skipped,
+        "dropped feature skipped"
+    );
+    assert_eq!(
+        by_id("f-1-3").unwrap().status,
+        FeatureStatus::Skipped,
+        "dropped feature skipped"
+    );
     // Re-plan ids carry a cycle discriminator (`-replan-<cycle>-<n>`) so a
     // second re-plan of the same milestone can't collide.
     let added = by_id("ms-1-replan-1-1").expect("added feature exists with re-plan id");
-    assert_eq!(added.origin, FeatureOrigin::Fix, "added feature is fix-origin");
+    assert_eq!(
+        added.origin,
+        FeatureOrigin::Fix,
+        "added feature is fix-origin"
+    );
     assert_eq!(added.status, FeatureStatus::Pending);
     assert_eq!(added.title, "extra feature");
 
     // revised-plan.md was written + committed on the mission branch.
     let mission_id = engine.mission_id().to_string();
     let md = std::fs::read_to_string(
-        root.join(".kranz").join("missions").join(&mission_id).join("revised-plan.md"),
+        root.join(".kranz")
+            .join("missions")
+            .join(&mission_id)
+            .join("revised-plan.md"),
     )
     .expect("revised-plan.md written");
-    assert!(md.starts_with(&format!("# Revised mission plan — {mission_id}")), "{md}");
+    assert!(
+        md.starts_with(&format!("# Revised mission plan — {mission_id}")),
+        "{md}"
+    );
     assert!(md.contains("## Re-plan changes applied"), "{md}");
     assert!(md.contains("extra feature"), "{md}");
     let subject = raw_git(&root, &["log", "-1", "--format=%s"]);
-    assert_eq!(subject.trim(), format!("[kranz] revised plan for {mission_id}"));
+    assert_eq!(
+        subject.trim(),
+        format!("[kranz] revised plan for {mission_id}")
+    );
 
     // The log carries the re-plan decision, two feature.skipped, one
     // fixfeature.created.
@@ -1961,21 +2331,30 @@ async fn request_and_approve_revised_plan_drops_and_adds_features() {
     assert_eq!(
         events
             .iter()
-            .filter(|e| matches!(&e.kind, EventKind::FeatureSkipped { reason, .. }
-                if reason.contains("re-plan")))
+            .filter(
+                |e| matches!(&e.kind, EventKind::FeatureSkipped { reason, .. }
+                if reason.contains("re-plan"))
+            )
             .count(),
         2,
         "both dropped features skipped by the re-plan"
     );
     assert_eq!(
-        event_types(&events).iter().filter(|t| **t == "fixfeature.created").count(),
+        event_types(&events)
+            .iter()
+            .filter(|t| **t == "fixfeature.created")
+            .count(),
         1,
         "exactly one feature added by the re-plan"
     );
 
     // The revised mission still folds cleanly (contiguous log, no corruption).
     let state = reducer::fold(&events).unwrap();
-    assert_eq!(state.mission.milestones[0].features.len(), 4, "3 planned + 1 added");
+    assert_eq!(
+        state.mission.milestones[0].features.len(),
+        4,
+        "3 planned + 1 added"
+    );
 }
 
 /// approve_revised_plan rejects a revision that drops (or reorders away) an
@@ -2006,15 +2385,15 @@ async fn approve_revised_plan_rejects_dropping_a_completed_milestone() {
         orch_script(vec![
             judgement("complete", ""), // M1 f-1-1
             judgement("complete", ""), // M2 f-2-1
-            fix_features(1),            // M2 round 1 conversion → one fix
+            fix_features(1),           // M2 round 1 conversion → one fix
             judgement("complete", ""), // M2 fix worker
-            fix_features(1),            // M2 round 2 conversion at the cap → wants another
+            fix_features(1),           // M2 round 2 conversion at the cap → wants another
         ]),
-        validator_with(json!([])),       // M1 validation: clean → M1 completes
-        worker_pass(),                    // M2 f-2-1
-        validator_with(finding.clone()),  // M2 round 1: finding (fix cycle 1)
-        worker_pass(),                    // M2 fix worker
-        validator_with(finding),          // M2 round 2: finding again → blocked
+        validator_with(json!([])), // M1 validation: clean → M1 completes
+        worker_pass(),             // M2 f-2-1
+        validator_with(finding.clone()), // M2 round 1: finding (fix cycle 1)
+        worker_pass(),             // M2 fix worker
+        validator_with(finding),   // M2 round 2: finding again → blocked
     ]));
 
     let cfg = MissionConfig {
@@ -2048,8 +2427,15 @@ async fn approve_revised_plan_rejects_dropping_a_completed_milestone() {
     };
     engine.approve_plan(plan).unwrap();
 
-    let status = timeout(TEST_TIMEOUT, engine.run()).await.expect("run must not hang").unwrap();
-    assert_eq!(status, MissionStatus::Blocked, "M2 blocked at the fix-cycle cap");
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(
+        status,
+        MissionStatus::Blocked,
+        "M2 blocked at the fix-cycle cap"
+    );
     assert_eq!(
         engine.state().mission.milestones[0].status,
         MilestoneStatus::Complete,
@@ -2077,7 +2463,10 @@ async fn approve_revised_plan_rejects_dropping_a_completed_milestone() {
         matches!(err, kranz_engine::error::EngineError::InvalidState(_)),
         "expected InvalidState, got: {err}"
     );
-    assert!(err.to_string().contains("M1"), "error names the dropped completed milestone: {err}");
+    assert!(
+        err.to_string().contains("M1"),
+        "error names the dropped completed milestone: {err}"
+    );
 
     // A revised plan that ALTERS the completed M1's features is also rejected.
     let alters_completed = Plan {
@@ -2105,7 +2494,10 @@ async fn approve_revised_plan_rejects_dropping_a_completed_milestone() {
     let err = engine
         .approve_revised_plan(alters_completed)
         .expect_err("altering a completed milestone's features must be rejected");
-    assert!(err.to_string().contains("alters"), "error explains the alteration: {err}");
+    assert!(
+        err.to_string().contains("alters"),
+        "error explains the alteration: {err}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2143,18 +2535,32 @@ async fn parallel_batch_runs_both_features_and_leaks_no_worktrees() {
         worker_pass(),
     ]));
 
-    let cfg = MissionConfig { max_parallel_workers: 2, ..test_cfg() };
+    let cfg = MissionConfig {
+        max_parallel_workers: 2,
+        ..test_cfg()
+    };
     let mut engine = make_engine(&backend, &root, cfg);
     engine.approve_plan(simple_plan(2, vec![])).unwrap();
     let mission_id = engine.mission_id().to_string();
 
-    let status = timeout(TEST_TIMEOUT, engine.run()).await.expect("run must not hang").unwrap();
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
     assert_eq!(status, MissionStatus::Complete);
 
     // Both plan features completed.
     let ms = &engine.state().mission.milestones[0];
-    assert_eq!(ms.features[0].status, FeatureStatus::Complete, "f-1-1 complete");
-    assert_eq!(ms.features[1].status, FeatureStatus::Complete, "f-1-2 complete");
+    assert_eq!(
+        ms.features[0].status,
+        FeatureStatus::Complete,
+        "f-1-1 complete"
+    );
+    assert_eq!(
+        ms.features[1].status,
+        FeatureStatus::Complete,
+        "f-1-2 complete"
+    );
 
     let paths = engine.paths().clone();
     drop(engine);
@@ -2163,7 +2569,15 @@ async fn parallel_batch_runs_both_features_and_leaks_no_worktrees() {
     let events = read_log(&paths);
     let worker_spawns = events
         .iter()
-        .filter(|e| matches!(&e.kind, EventKind::WorkerSpawned { role: Role::Worker, .. }))
+        .filter(|e| {
+            matches!(
+                &e.kind,
+                EventKind::WorkerSpawned {
+                    role: Role::Worker,
+                    ..
+                }
+            )
+        })
         .count();
     assert_eq!(worker_spawns, 2, "both features ran a worker");
 
@@ -2174,8 +2588,14 @@ async fn parallel_batch_runs_both_features_and_leaks_no_worktrees() {
         2,
         "both features completed: {types:?}"
     );
-    assert!(types.contains(&"milestone.completed"), "milestone completed: {types:?}");
-    assert!(types.contains(&"mission.completed"), "mission completed: {types:?}");
+    assert!(
+        types.contains(&"milestone.completed"),
+        "milestone completed: {types:?}"
+    );
+    assert!(
+        types.contains(&"mission.completed"),
+        "mission completed: {types:?}"
+    );
 
     // The parallel batch summary decision is on the log (existing event vocab).
     assert!(
@@ -2190,7 +2610,9 @@ async fn parallel_batch_runs_both_features_and_leaks_no_worktrees() {
     let plan_seq = events
         .iter()
         .find_map(|e| match &e.kind {
-            EventKind::OrchestratorDecision { summary, .. } if summary.starts_with("parallel plan for") => {
+            EventKind::OrchestratorDecision { summary, .. }
+                if summary.starts_with("parallel plan for") =>
+            {
                 Some(e.seq)
             }
             _ => None,
@@ -2198,23 +2620,42 @@ async fn parallel_batch_runs_both_features_and_leaks_no_worktrees() {
         .expect("parallel plan decision exists");
     let first_worker_spawn = events
         .iter()
-        .find(|e| matches!(&e.kind, EventKind::WorkerSpawned { role: Role::Worker, .. }))
+        .find(|e| {
+            matches!(
+                &e.kind,
+                EventKind::WorkerSpawned {
+                    role: Role::Worker,
+                    ..
+                }
+            )
+        })
         .expect("a worker spawned")
         .seq;
-    assert!(plan_seq < first_worker_spawn, "parallel plan precedes the first worker");
+    assert!(
+        plan_seq < first_worker_spawn,
+        "parallel plan precedes the first worker"
+    );
 
     // NO leaked worktrees: git worktree list is back to a single (primary)
     // working tree. The per-feature worktree dirs are gone from disk too.
     let repo = GitRepo::open(&root).unwrap();
     let worktrees = repo.list_worktrees().unwrap();
-    assert_eq!(worktrees.len(), 1, "only the primary worktree remains: {worktrees:?}");
+    assert_eq!(
+        worktrees.len(),
+        1,
+        "only the primary worktree remains: {worktrees:?}"
+    );
     // The per-feature branches were cleaned up as well.
     assert!(
-        !repo.branch_exists(&format!("kranz/wt/{mission_id}/f-1-1")).unwrap_or(false),
+        !repo
+            .branch_exists(&format!("kranz/wt/{mission_id}/f-1-1"))
+            .unwrap_or(false),
         "per-feature worktree branch must be deleted"
     );
     assert!(
-        !repo.branch_exists(&format!("kranz/wt/{mission_id}/f-1-2")).unwrap_or(false),
+        !repo
+            .branch_exists(&format!("kranz/wt/{mission_id}/f-1-2"))
+            .unwrap_or(false),
         "per-feature worktree branch must be deleted"
     );
     // No worktree dir for THIS mission leaked into the temp dir.
@@ -2267,11 +2708,17 @@ async fn parallel_batch_sessions_overlap_in_wall_clock() {
         worker_pass().rendezvous(3),
     ]));
 
-    let cfg = MissionConfig { max_parallel_workers: 2, ..test_cfg() };
+    let cfg = MissionConfig {
+        max_parallel_workers: 2,
+        ..test_cfg()
+    };
     let mut engine = make_engine(&backend, &root, cfg);
     engine.approve_plan(simple_plan(2, vec![])).unwrap();
 
-    let status = timeout(TEST_TIMEOUT, engine.run()).await.expect("run must not hang").unwrap();
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
     assert_eq!(status, MissionStatus::Complete);
 
     let paths = engine.paths().clone();
@@ -2299,10 +2746,22 @@ async fn parallel_batch_sessions_overlap_in_wall_clock() {
     // Single-writer invariant around the overlap: contiguous seq, both workers
     // spawned + completed, clean fold to Complete.
     assert_eq!(events.first().unwrap().seq, 1);
-    assert_eq!(events.last().unwrap().seq, events.len() as u64, "contiguous seq");
+    assert_eq!(
+        events.last().unwrap().seq,
+        events.len() as u64,
+        "contiguous seq"
+    );
     let worker_spawns = events
         .iter()
-        .filter(|e| matches!(&e.kind, EventKind::WorkerSpawned { role: Role::Worker, .. }))
+        .filter(|e| {
+            matches!(
+                &e.kind,
+                EventKind::WorkerSpawned {
+                    role: Role::Worker,
+                    ..
+                }
+            )
+        })
         .count();
     let worker_completes = events
         .iter()
@@ -2311,7 +2770,10 @@ async fn parallel_batch_sessions_overlap_in_wall_clock() {
     assert_eq!(worker_spawns, 2, "both worker sessions spawned");
     // 2 workers + orchestrator turns each emit worker.completed; at least the
     // two feature workers must be present.
-    assert!(worker_completes >= 2, "both worker sessions completed: {worker_completes}");
+    assert!(
+        worker_completes >= 2,
+        "both worker sessions completed: {worker_completes}"
+    );
     let state = reducer::fold(&events).unwrap();
     assert_eq!(state.mission.status, MissionStatus::Complete);
 }
@@ -2345,7 +2807,10 @@ async fn crash_mid_parallel_batch_resumes_cleanly() {
         worker_pass(), // only ONE worker script for a TWO-worker batch
     ]));
 
-    let cfg = MissionConfig { max_parallel_workers: 2, ..test_cfg() };
+    let cfg = MissionConfig {
+        max_parallel_workers: 2,
+        ..test_cfg()
+    };
     let mut engine = make_engine(&backend1, &root, cfg);
     engine.approve_plan(simple_plan(2, vec![])).unwrap();
     let mission_id = engine.mission_id().to_string();
@@ -2363,20 +2828,35 @@ async fn crash_mid_parallel_batch_resumes_cleanly() {
     // events landed), and the milestone is still in-flight.
     let phase1 = read_log(&paths);
     assert_eq!(phase1.first().unwrap().seq, 1);
-    assert_eq!(phase1.last().unwrap().seq, phase1.len() as u64, "contiguous seq after crash");
+    assert_eq!(
+        phase1.last().unwrap().seq,
+        phase1.len() as u64,
+        "contiguous seq after crash"
+    );
     let state1 = reducer::fold(&phase1).expect("crashed log still folds cleanly");
     for f in &state1.mission.milestones[0].features {
-        assert_eq!(f.status, FeatureStatus::Active, "features left Active by the crash");
-        assert!(f.worker_runs.is_empty(), "no worker run recorded before the crash");
+        assert_eq!(
+            f.status,
+            FeatureStatus::Active,
+            "features left Active by the crash"
+        );
+        assert!(
+            f.worker_runs.is_empty(),
+            "no worker run recorded before the crash"
+        );
     }
     // No WORKER session's buffered events reached the log (the successful
     // task's buffer was dropped — accepted loss). Orchestrator runs still
     // complete their turns; only feature-worker spawns/completions are the
     // buffered-and-lost ones.
     assert!(
-        !phase1
-            .iter()
-            .any(|e| matches!(&e.kind, EventKind::WorkerSpawned { role: Role::Worker, .. })),
+        !phase1.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::WorkerSpawned {
+                role: Role::Worker,
+                ..
+            }
+        )),
         "no buffered worker session survived the crash"
     );
 
@@ -2386,14 +2866,21 @@ async fn crash_mid_parallel_batch_resumes_cleanly() {
     // them (each: worker → judgement). Validators skipped, empty contract.
     let backend2 = Arc::new(MockBackend::with_scripts(vec![
         worker_pass(), // f-1-1 rerun (sequential)
-        orch_script(vec![judgement("complete", ""), judgement("complete", ""), no_lesson()]),
+        orch_script(vec![
+            judgement("complete", ""),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
         worker_pass(), // f-1-2 rerun (sequential)
     ]));
     let backend2_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend2) as Arc<dyn AgentBackend>;
-    let mut engine =
-        MissionEngine::resume(backend2_dyn, &root, &mission_id, LockForce::No).expect("resume mission");
+    let mut engine = MissionEngine::resume(backend2_dyn, &root, &mission_id, LockForce::No)
+        .expect("resume mission");
 
-    let status = timeout(TEST_TIMEOUT, engine.run()).await.expect("run must not hang").unwrap();
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
     assert_eq!(status, MissionStatus::Complete);
     drop(engine);
 
@@ -2401,7 +2888,11 @@ async fn crash_mid_parallel_batch_resumes_cleanly() {
     // fold, both features complete.
     let events = read_log(&paths);
     assert_eq!(events.first().unwrap().seq, 1);
-    assert_eq!(events.last().unwrap().seq, events.len() as u64, "one contiguous log");
+    assert_eq!(
+        events.last().unwrap().seq,
+        events.len() as u64,
+        "one contiguous log"
+    );
     let state = reducer::fold(&events).unwrap();
     assert_eq!(state.mission.status, MissionStatus::Complete);
     assert!(state.mission.milestones[0]
@@ -2411,9 +2902,17 @@ async fn crash_mid_parallel_batch_resumes_cleanly() {
 
     // No leaked worktrees after recovery.
     let repo = GitRepo::open(&root).unwrap();
-    assert_eq!(repo.list_worktrees().unwrap().len(), 1, "no leaked worktrees: recovered clean");
-    assert!(!repo.branch_exists(&format!("kranz/wt/{mission_id}/f-1-1")).unwrap_or(false));
-    assert!(!repo.branch_exists(&format!("kranz/wt/{mission_id}/f-1-2")).unwrap_or(false));
+    assert_eq!(
+        repo.list_worktrees().unwrap().len(),
+        1,
+        "no leaked worktrees: recovered clean"
+    );
+    assert!(!repo
+        .branch_exists(&format!("kranz/wt/{mission_id}/f-1-1"))
+        .unwrap_or(false));
+    assert!(!repo
+        .branch_exists(&format!("kranz/wt/{mission_id}/f-1-2"))
+        .unwrap_or(false));
 }
 
 /// The resume() worktree/branch sweep is destructive (`worktree remove
@@ -2455,7 +2954,10 @@ async fn resume_does_not_sweep_worktrees_while_lock_is_live() {
     );
 
     // The live batch's worktree and branch are untouched.
-    assert!(wt_path.exists(), "live worktree must not be swept by a lock-refused resume");
+    assert!(
+        wt_path.exists(),
+        "live worktree must not be swept by a lock-refused resume"
+    );
     assert!(
         repo.branch_exists(&branch).unwrap_or(false),
         "live branch must not be -D'd by a lock-refused resume"
@@ -2484,15 +2986,25 @@ async fn max_parallel_one_is_the_unchanged_sequential_path() {
     // pre-M3 happy path shape.)
     let backend = Arc::new(MockBackend::with_scripts(vec![
         worker_pass(),
-        orch_script(vec![judgement("complete", ""), judgement("complete", ""), no_lesson()]),
+        orch_script(vec![
+            judgement("complete", ""),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
         worker_pass(),
     ]));
 
-    let cfg = MissionConfig { max_parallel_workers: 1, ..test_cfg() };
+    let cfg = MissionConfig {
+        max_parallel_workers: 1,
+        ..test_cfg()
+    };
     let mut engine = make_engine(&backend, &root, cfg);
     engine.approve_plan(simple_plan(2, vec![])).unwrap();
 
-    let status = timeout(TEST_TIMEOUT, engine.run()).await.expect("run must not hang").unwrap();
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
     assert_eq!(status, MissionStatus::Complete);
 
     let paths = engine.paths().clone();
@@ -2521,7 +3033,11 @@ async fn max_parallel_one_is_the_unchanged_sequential_path() {
 
     // No worktree branches were ever created; a single primary worktree.
     let repo = GitRepo::open(&root).unwrap();
-    assert_eq!(repo.list_worktrees().unwrap().len(), 1, "no extra worktrees in sequential mode");
+    assert_eq!(
+        repo.list_worktrees().unwrap().len(),
+        1,
+        "no extra worktrees in sequential mode"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2569,25 +3085,52 @@ fn conflict_synthesizes_resolution_fix_feature() {
         .expect("a Plan-origin conflict must synthesize a resolution feature");
 
     // Id shape `<ms>-conflict-<n>`; n=1 (no existing -conflict- features).
-    assert_eq!(resolution.id, "ms-1-conflict-1", "namespaced conflict-resolution id");
+    assert_eq!(
+        resolution.id, "ms-1-conflict-1",
+        "namespaced conflict-resolution id"
+    );
     // Origin Fix + Pending → the sequential loop (first_incomplete + next_feature)
     // picks it up on the next iteration, straight on the mission branch.
-    assert_eq!(resolution.origin, FeatureOrigin::Fix, "resolution is a fix feature");
-    assert_eq!(resolution.status, FeatureStatus::Pending, "resolution starts Pending");
-    assert!(resolution.worker_runs.is_empty(), "fresh feature, no runs yet");
+    assert_eq!(
+        resolution.origin,
+        FeatureOrigin::Fix,
+        "resolution is a fix feature"
+    );
+    assert_eq!(
+        resolution.status,
+        FeatureStatus::Pending,
+        "resolution starts Pending"
+    );
+    assert!(
+        resolution.worker_runs.is_empty(),
+        "fresh feature, no runs yet"
+    );
     assert_eq!(resolution.respawns, 0);
 
     // The spec carries the original title, the original spec, the conflicting
     // file list, and the earlier-features-merged note.
     let spec = &resolution.spec;
-    assert!(spec.contains("build the widget in src/widget.rs"), "original spec text: {spec}");
-    assert!(spec.contains("src/widget.rs"), "conflicting file listed: {spec}");
-    assert!(spec.contains("src/lib.rs"), "second conflicting file listed: {spec}");
+    assert!(
+        spec.contains("build the widget in src/widget.rs"),
+        "original spec text: {spec}"
+    );
+    assert!(
+        spec.contains("src/widget.rs"),
+        "conflicting file listed: {spec}"
+    );
+    assert!(
+        spec.contains("src/lib.rs"),
+        "second conflicting file listed: {spec}"
+    );
     assert!(
         spec.contains("already contains") || spec.contains("merged first"),
         "notes earlier features already merged: {spec}"
     );
-    assert!(resolution.title.contains("feature two"), "title references original: {}", resolution.title);
+    assert!(
+        resolution.title.contains("feature two"),
+        "title references original: {}",
+        resolution.title
+    );
     // Original feature's validation criteria carried over.
     assert_eq!(resolution.validation_criteria, f_1_2.validation_criteria);
 }
@@ -2601,14 +3144,21 @@ fn second_conflict_gets_a_fresh_namespaced_id() {
     let f_1_3 = plan_feature("f-1-3", "feature three", "spec three");
     // After the first conflict fired, ms-1-conflict-1 already exists on the
     // milestone; the second conflict must derive n=2.
-    let mut resolution_1 = plan_feature("ms-1-conflict-1", "Resolve merge conflict: feature two", "…");
+    let mut resolution_1 = plan_feature(
+        "ms-1-conflict-1",
+        "Resolve merge conflict: feature two",
+        "…",
+    );
     resolution_1.origin = FeatureOrigin::Fix;
     let existing = vec![f_1_2, f_1_3.clone(), resolution_1];
 
     let resolution =
         synthesize_conflict_resolution("ms-1", &f_1_3, &["src/x.rs".to_string()], &existing)
             .expect("second conflict synthesizes a resolution");
-    assert_eq!(resolution.id, "ms-1-conflict-2", "second conflict is -conflict-2, no collision");
+    assert_eq!(
+        resolution.id, "ms-1-conflict-2",
+        "second conflict is -conflict-2, no collision"
+    );
 }
 
 /// Infinite-chain guard: a feature whose id already contains `-conflict-`
@@ -2617,13 +3167,20 @@ fn second_conflict_gets_a_fresh_namespaced_id() {
 /// today rather than looping conflict→resolution forever.
 #[test]
 fn resolution_feature_does_not_spawn_another_resolution() {
-    let mut resolution = plan_feature("ms-1-conflict-1", "Resolve merge conflict: feature two", "spec");
+    let mut resolution = plan_feature(
+        "ms-1-conflict-1",
+        "Resolve merge conflict: feature two",
+        "spec",
+    );
     resolution.origin = FeatureOrigin::Fix;
     let existing = vec![resolution.clone()];
 
     let again =
         synthesize_conflict_resolution("ms-1", &resolution, &["src/x.rs".to_string()], &existing);
-    assert!(again.is_none(), "a -conflict- feature must not spawn another resolution");
+    assert!(
+        again.is_none(),
+        "a -conflict- feature must not spawn another resolution"
+    );
 }
 
 /// A conflict where git named no specific files still produces a usable
@@ -2635,7 +3192,10 @@ fn conflict_with_no_named_files_still_synthesizes() {
     let resolution = synthesize_conflict_resolution("ms-2", &f, &[], std::slice::from_ref(&f))
         .expect("empty file list still synthesizes");
     assert_eq!(resolution.id, "ms-2-conflict-1");
-    assert!(resolution.spec.contains("the original work"), "original spec preserved");
+    assert!(
+        resolution.spec.contains("the original work"),
+        "original spec preserved"
+    );
     assert!(
         resolution.spec.contains("no specific files"),
         "empty conflict list gets a placeholder: {}",

@@ -30,14 +30,19 @@ impl PlanningHost for HostedPlanning {
         Box::pin(async move {
             let value = self.0.request_plan(id).await.map_err(plain)?;
             if value.get("ready").and_then(Value::as_bool) == Some(true) {
-                let plan: Plan = serde_json::from_value(
-                    value.get("plan").cloned().unwrap_or(Value::Null),
-                )
-                .map_err(|e| anyhow::anyhow!("host returned an unparseable plan: {e}"))?;
-                Ok(PlanOutcome::Ready { plan, estimate: estimate_line(&value) })
+                let plan: Plan =
+                    serde_json::from_value(value.get("plan").cloned().unwrap_or(Value::Null))
+                        .map_err(|e| anyhow::anyhow!("host returned an unparseable plan: {e}"))?;
+                Ok(PlanOutcome::Ready {
+                    plan,
+                    estimate: estimate_line(&value),
+                })
             } else {
-                let reply =
-                    value.get("reply").and_then(Value::as_str).unwrap_or_default().to_string();
+                let reply = value
+                    .get("reply")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
                 Ok(PlanOutcome::NotReady(reply))
             }
         })
@@ -71,7 +76,9 @@ fn estimate_line(value: &Value) -> Option<String> {
     let low = est.get("lowUsd").and_then(Value::as_f64)?;
     let expected = est.get("expectedUsd").and_then(Value::as_f64)?;
     let high = est.get("highUsd").and_then(Value::as_f64)?;
-    Some(format!("estimated ${low:.2}–${high:.2} (expected ~${expected:.2})"))
+    Some(format!(
+        "estimated ${low:.2}–${high:.2} (expected ~${expected:.2})"
+    ))
 }
 
 #[cfg(test)]

@@ -71,7 +71,11 @@ fn isolate_git_env() {
 }
 
 fn git_available() -> bool {
-    Command::new("git").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+    Command::new("git")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// Returns false (after a skip note) when git is missing.
@@ -86,7 +90,11 @@ fn setup() -> bool {
 }
 
 fn raw_git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git").args(args).current_dir(dir).output().expect("spawn git");
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("spawn git");
     assert!(
         out.status.success(),
         "git {args:?} failed: {}",
@@ -119,7 +127,11 @@ fn init_repo() -> (TempDir, PathBuf) {
 const GOAL: &str = "ship the demo feature";
 
 fn test_cfg() -> MissionConfig {
-    MissionConfig { skip_scrutiny: true, skip_functional: true, ..MissionConfig::default() }
+    MissionConfig {
+        skip_scrutiny: true,
+        skip_functional: true,
+        ..MissionConfig::default()
+    }
 }
 
 fn make_engine(backend: Arc<dyn AgentBackend>, root: &Path, cfg: MissionConfig) -> MissionEngine {
@@ -235,7 +247,12 @@ impl SoakCtx {
             .map(|s| {
                 let lines: Vec<&str> = s.lines().collect();
                 let start = lines.len().saturating_sub(12);
-                format!("(last {} of {} events)\n{}", lines.len() - start, lines.len(), lines[start..].join("\n"))
+                format!(
+                    "(last {} of {} events)\n{}",
+                    lines.len() - start,
+                    lines.len(),
+                    lines[start..].join("\n")
+                )
             })
             .unwrap_or_else(|e| format!("<events.jsonl unreadable: {e}>"));
         panic!(
@@ -265,7 +282,10 @@ fn json_diff(a: &serde_json::Value, b: &serde_json::Value, path: &str) -> Option
     use serde_json::Value;
     match (a, b) {
         (Value::Number(x), Value::Number(y)) => {
-            let (x, y) = (x.as_f64().unwrap_or(f64::NAN), y.as_f64().unwrap_or(f64::NAN));
+            let (x, y) = (
+                x.as_f64().unwrap_or(f64::NAN),
+                y.as_f64().unwrap_or(f64::NAN),
+            );
             if (x - y).abs() > 1e-9 {
                 Some(format!("{path}: {x} != {y}"))
             } else {
@@ -274,7 +294,11 @@ fn json_diff(a: &serde_json::Value, b: &serde_json::Value, path: &str) -> Option
         }
         (Value::Array(xs), Value::Array(ys)) => {
             if xs.len() != ys.len() {
-                return Some(format!("{path}: array lengths {} != {}", xs.len(), ys.len()));
+                return Some(format!(
+                    "{path}: array lengths {} != {}",
+                    xs.len(),
+                    ys.len()
+                ));
             }
             xs.iter()
                 .zip(ys)
@@ -292,8 +316,10 @@ fn json_diff(a: &serde_json::Value, b: &serde_json::Value, path: &str) -> Option
                     (x, y) => {
                         return Some(format!(
                             "{path}.{key}: {} != {}",
-                            x.map(|v| v.to_string()).unwrap_or_else(|| "<absent>".into()),
-                            y.map(|v| v.to_string()).unwrap_or_else(|| "<absent>".into())
+                            x.map(|v| v.to_string())
+                                .unwrap_or_else(|| "<absent>".into()),
+                            y.map(|v| v.to_string())
+                                .unwrap_or_else(|| "<absent>".into())
                         ))
                     }
                 }
@@ -325,7 +351,11 @@ fn assert_invariants(ctx: &SoakCtx, root: &Path, mission_id: &str, allowed_faile
     for (i, event) in events.iter().enumerate() {
         ctx.ensure(
             event.seq == (i + 1) as u64,
-            format!("seq gap: position {i} carries seq {} (want {})", event.seq, i + 1),
+            format!(
+                "seq gap: position {i} carries seq {} (want {})",
+                event.seq,
+                i + 1
+            ),
         );
     }
 
@@ -368,7 +398,9 @@ fn assert_invariants(ctx: &SoakCtx, root: &Path, mission_id: &str, allowed_faile
     let snapshot_json = serde_json::to_value(&snapshot).expect("serialize snapshot");
     let fold_json = serde_json::to_value(&state).expect("serialize fold");
     if let Some(diff) = json_diff(&snapshot_json, &fold_json, "$") {
-        ctx.fail(format!("state.json snapshot diverges from a fresh fold at {diff}"));
+        ctx.fail(format!(
+            "state.json snapshot diverges from a fresh fold at {diff}"
+        ));
     }
 
     // 6. Exactly the main worktree remains — no per-feature worktree leaked.
@@ -385,7 +417,10 @@ fn assert_invariants(ctx: &SoakCtx, root: &Path, mission_id: &str, allowed_faile
     }
     // No per-feature worktree dir for THIS mission left in the temp dir.
     let leak_prefix = format!("kranz-wt-{mission_id}-");
-    for entry in std::fs::read_dir(std::env::temp_dir()).expect("read temp dir").flatten() {
+    for entry in std::fs::read_dir(std::env::temp_dir())
+        .expect("read temp dir")
+        .flatten()
+    {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         ctx.ensure(
@@ -445,11 +480,18 @@ async fn run_clean_iteration(iter: usize) {
         worker_pass(),
     ]));
 
-    let cfg = MissionConfig { max_parallel_workers: 2, ..test_cfg() };
+    let cfg = MissionConfig {
+        max_parallel_workers: 2,
+        ..test_cfg()
+    };
     let mut engine = make_engine(backend, &root, cfg);
     engine.approve_plan(soak_plan(2, 2)).expect("approve plan");
     let mission_id = engine.mission_id().to_string();
-    let ctx = SoakCtx { iter, variant: "CLEAN", paths: engine.paths().clone() };
+    let ctx = SoakCtx {
+        iter,
+        variant: "CLEAN",
+        paths: engine.paths().clone(),
+    };
 
     let status = run_to_status(&ctx, &mut engine).await;
     ctx.ensure(
@@ -477,11 +519,18 @@ async fn run_crash_resume_iteration(iter: usize) {
         worker_pass(), // only ONE worker script for a TWO-worker batch
     ]));
 
-    let cfg = MissionConfig { max_parallel_workers: 2, ..test_cfg() };
+    let cfg = MissionConfig {
+        max_parallel_workers: 2,
+        ..test_cfg()
+    };
     let mut engine = make_engine(backend1, &root, cfg.clone());
     engine.approve_plan(soak_plan(1, 2)).expect("approve plan");
     let mission_id = engine.mission_id().to_string();
-    let ctx = SoakCtx { iter, variant: "CRASH+RESUME", paths: engine.paths().clone() };
+    let ctx = SoakCtx {
+        iter,
+        variant: "CRASH+RESUME",
+        paths: engine.paths().clone(),
+    };
 
     match timeout(TEST_TIMEOUT, engine.run()).await {
         Err(_) => ctx.fail("crash phase hung instead of erroring"),
@@ -549,11 +598,18 @@ async fn run_conflict_iteration(iter: usize) {
     ]);
     let backend: Arc<dyn AgentBackend> = Arc::new(ConflictBackend { inner });
 
-    let cfg = MissionConfig { max_parallel_workers: 2, ..test_cfg() };
+    let cfg = MissionConfig {
+        max_parallel_workers: 2,
+        ..test_cfg()
+    };
     let mut engine = make_engine(backend, &root, cfg);
     engine.approve_plan(soak_plan(1, 2)).expect("approve plan");
     let mission_id = engine.mission_id().to_string();
-    let ctx = SoakCtx { iter, variant: "CONFLICT", paths: engine.paths().clone() };
+    let ctx = SoakCtx {
+        iter,
+        variant: "CONFLICT",
+        paths: engine.paths().clone(),
+    };
 
     let status = run_to_status(&ctx, &mut engine).await;
     ctx.ensure(
@@ -575,10 +631,12 @@ async fn run_conflict_iteration(iter: usize) {
         "no feature.failed(f-1-2) with a conflicted-merge reason — the merge conflict never happened",
     );
     ctx.ensure(
-        events.iter().any(|e| matches!(
-            &e.kind,
-            EventKind::FixFeatureCreated { feature, .. } if feature.id == "ms-1-conflict-1"
-        )),
+        events.iter().any(|e| {
+            matches!(
+                &e.kind,
+                EventKind::FixFeatureCreated { feature, .. } if feature.id == "ms-1-conflict-1"
+            )
+        }),
         "no fixfeature.created for ms-1-conflict-1 — the resolution feature was never synthesized",
     );
 

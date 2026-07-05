@@ -62,10 +62,22 @@ pub fn span_id(mission_id: &str, open_seq: u64) -> [u8; 8] {
 
 fn tokens_attrs(tokens: &TokenUsage) -> [(String, AttrValue); 4] {
     [
-        ("kranz.tokens.input".to_string(), AttrValue::I64(tokens.input as i64)),
-        ("kranz.tokens.output".to_string(), AttrValue::I64(tokens.output as i64)),
-        ("kranz.tokens.cache_read".to_string(), AttrValue::I64(tokens.cache_read as i64)),
-        ("kranz.tokens.cache_write".to_string(), AttrValue::I64(tokens.cache_write as i64)),
+        (
+            "kranz.tokens.input".to_string(),
+            AttrValue::I64(tokens.input as i64),
+        ),
+        (
+            "kranz.tokens.output".to_string(),
+            AttrValue::I64(tokens.output as i64),
+        ),
+        (
+            "kranz.tokens.cache_read".to_string(),
+            AttrValue::I64(tokens.cache_read as i64),
+        ),
+        (
+            "kranz.tokens.cache_write".to_string(),
+            AttrValue::I64(tokens.cache_write as i64),
+        ),
     ]
 }
 
@@ -128,8 +140,10 @@ pub fn map_mission(events: &[Event]) -> Vec<MissionSpan> {
             }
 
             EventKind::MilestoneStarted { milestone_id, .. } => {
-                let title =
-                    milestone_titles.get(milestone_id).cloned().unwrap_or_else(|| milestone_id.clone());
+                let title = milestone_titles
+                    .get(milestone_id)
+                    .cloned()
+                    .unwrap_or_else(|| milestone_id.clone());
                 open_milestones.insert(
                     milestone_id.clone(),
                     OpenMilestone {
@@ -157,7 +171,14 @@ pub fn map_mission(events: &[Event]) -> Vec<MissionSpan> {
                 }
             }
 
-            EventKind::WorkerSpawned { run_id, role, feature_id, milestone_id, model, .. } => {
+            EventKind::WorkerSpawned {
+                run_id,
+                role,
+                feature_id,
+                milestone_id,
+                model,
+                ..
+            } => {
                 open_runs.insert(
                     run_id.clone(),
                     OpenRun {
@@ -171,7 +192,13 @@ pub fn map_mission(events: &[Event]) -> Vec<MissionSpan> {
                 );
             }
 
-            EventKind::WorkerCompleted { run_id, result, tokens, cost_usd, .. } => {
+            EventKind::WorkerCompleted {
+                run_id,
+                result,
+                tokens,
+                cost_usd,
+                ..
+            } => {
                 total_tokens.add(tokens);
                 if let Some(c) = cost_usd {
                     total_cost += c;
@@ -203,20 +230,38 @@ pub fn map_mission(events: &[Event]) -> Vec<MissionSpan> {
                     };
 
                     let mut attrs = vec![
-                        ("kranz.run.id".to_string(), AttrValue::String(run_id.clone())),
-                        ("kranz.role".to_string(), AttrValue::String(role_str(open.role).to_string())),
-                        ("kranz.model".to_string(), AttrValue::String(open.model.clone())),
-                        ("kranz.run.result".to_string(), AttrValue::String(result_str.to_string())),
+                        (
+                            "kranz.run.id".to_string(),
+                            AttrValue::String(run_id.clone()),
+                        ),
+                        (
+                            "kranz.role".to_string(),
+                            AttrValue::String(role_str(open.role).to_string()),
+                        ),
+                        (
+                            "kranz.model".to_string(),
+                            AttrValue::String(open.model.clone()),
+                        ),
+                        (
+                            "kranz.run.result".to_string(),
+                            AttrValue::String(result_str.to_string()),
+                        ),
                     ];
                     if let Some(c) = cost_usd {
                         attrs.push(("kranz.cost.usd".to_string(), AttrValue::F64(*c)));
                     }
                     attrs.extend(tokens_attrs(tokens));
                     if let Some(fid) = &open.feature_id {
-                        attrs.push(("kranz.feature.id".to_string(), AttrValue::String(fid.clone())));
+                        attrs.push((
+                            "kranz.feature.id".to_string(),
+                            AttrValue::String(fid.clone()),
+                        ));
                     }
                     if let Some(mid) = &open.milestone_id {
-                        attrs.push(("kranz.milestone.id".to_string(), AttrValue::String(mid.clone())));
+                        attrs.push((
+                            "kranz.milestone.id".to_string(),
+                            AttrValue::String(mid.clone()),
+                        ));
                     }
 
                     spans.push(MissionSpan {
@@ -245,7 +290,10 @@ pub fn map_mission(events: &[Event]) -> Vec<MissionSpan> {
                 }
             }
 
-            EventKind::MilestoneBlocked { milestone_id, reason } => {
+            EventKind::MilestoneBlocked {
+                milestone_id,
+                reason,
+            } => {
                 if let Some(open) = open_milestones.remove(milestone_id) {
                     spans.push(finished_milestone_span(
                         &mission_id,
@@ -349,13 +397,26 @@ fn finished_milestone_span(
     created_seq: Option<u64>,
 ) -> MissionSpan {
     let attrs = vec![
-        ("kranz.milestone.id".to_string(), AttrValue::String(milestone_id.to_string())),
-        ("kranz.milestone.title".to_string(), AttrValue::String(open.title.clone())),
+        (
+            "kranz.milestone.id".to_string(),
+            AttrValue::String(milestone_id.to_string()),
+        ),
+        (
+            "kranz.milestone.title".to_string(),
+            AttrValue::String(open.title.clone()),
+        ),
         (
             "kranz.milestone.status".to_string(),
-            AttrValue::String(if status == SpanStatus::Ok { "complete".to_string() } else { "blocked".to_string() }),
+            AttrValue::String(if status == SpanStatus::Ok {
+                "complete".to_string()
+            } else {
+                "blocked".to_string()
+            }),
         ),
-        ("kranz.milestone.fix_cycles".to_string(), AttrValue::I64(open.fix_cycles as i64)),
+        (
+            "kranz.milestone.fix_cycles".to_string(),
+            AttrValue::I64(open.fix_cycles as i64),
+        ),
     ];
 
     MissionSpan {
@@ -383,9 +444,18 @@ fn finished_root_span(
     cost: f64,
 ) -> MissionSpan {
     let mut attrs = vec![
-        ("kranz.mission.id".to_string(), AttrValue::String(mission_id.to_string())),
-        ("kranz.mission.goal".to_string(), AttrValue::String(goal.to_string())),
-        ("kranz.mission.status".to_string(), AttrValue::String(status_str.to_string())),
+        (
+            "kranz.mission.id".to_string(),
+            AttrValue::String(mission_id.to_string()),
+        ),
+        (
+            "kranz.mission.goal".to_string(),
+            AttrValue::String(goal.to_string()),
+        ),
+        (
+            "kranz.mission.status".to_string(),
+            AttrValue::String(status_str.to_string()),
+        ),
         ("kranz.cost.usd".to_string(), AttrValue::F64(cost)),
     ];
     attrs.extend(tokens_attrs(tokens));
@@ -410,7 +480,10 @@ mod tests {
     fn ids_are_deterministic_and_idempotent() {
         let t1 = trace_id("m-01");
         let t2 = trace_id("m-01");
-        assert_eq!(t1, t2, "trace_id must be idempotent for the same mission_id");
+        assert_eq!(
+            t1, t2,
+            "trace_id must be idempotent for the same mission_id"
+        );
 
         // Pin the exact derivation: first 16 bytes of sha256(mission_id),
         // computed independently of `trace_id` via sha2 directly.
@@ -431,7 +504,10 @@ mod tests {
 
         let s1 = span_id("m-01", 42);
         let s2 = span_id("m-01", 42);
-        assert_eq!(s1, s2, "span_id must be idempotent for the same (mission_id, seq)");
+        assert_eq!(
+            s1, s2,
+            "span_id must be idempotent for the same (mission_id, seq)"
+        );
 
         // Pin span_id to first 8 bytes of sha256("{mission_id}:{seq}"),
         // independently computed via sha2 directly.
@@ -448,18 +524,26 @@ mod tests {
         assert_ne!(s1, s_other_seq, "distinct seqs must get distinct span ids");
 
         let s_other_mission = span_id("m-02", 42);
-        assert_ne!(s1, s_other_mission, "distinct missions must get distinct span ids even with the same seq");
+        assert_ne!(
+            s1, s_other_mission,
+            "distinct missions must get distinct span ids even with the same seq"
+        );
     }
 
-    use kranz_engine::types::{MissionConfig, Role, RunResult, TokenUsage};
     use chrono::TimeZone;
+    use kranz_engine::types::{MissionConfig, Role, RunResult, TokenUsage};
 
     fn ts(secs: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(1_700_000_000 + secs, 0).unwrap()
     }
 
     fn ev(seq: u64, secs: i64, kind: EventKind) -> Event {
-        Event { seq, ts: ts(secs), mission_id: "m-01".to_string(), kind }
+        Event {
+            seq,
+            ts: ts(secs),
+            mission_id: "m-01".to_string(),
+            kind,
+        }
     }
 
     fn created(seq: u64, secs: i64) -> Event {
@@ -500,11 +584,24 @@ mod tests {
         )
     }
 
-    fn completed(seq: u64, secs: i64, run_id: &str, result: RunResult, tokens: TokenUsage, cost_usd: Option<f64>) -> Event {
+    fn completed(
+        seq: u64,
+        secs: i64,
+        run_id: &str,
+        result: RunResult,
+        tokens: TokenUsage,
+        cost_usd: Option<f64>,
+    ) -> Event {
         ev(
             seq,
             secs,
-            EventKind::WorkerCompleted { run_id: run_id.to_string(), result, tokens, cost_usd, report: None },
+            EventKind::WorkerCompleted {
+                run_id: run_id.to_string(),
+                result,
+                tokens,
+                cost_usd,
+                report: None,
+            },
         )
     }
 
@@ -512,16 +609,31 @@ mod tests {
         ev(
             seq,
             secs,
-            EventKind::MilestoneStarted { milestone_id: milestone_id.to_string(), start_sha: "abc123".to_string() },
+            EventKind::MilestoneStarted {
+                milestone_id: milestone_id.to_string(),
+                start_sha: "abc123".to_string(),
+            },
         )
     }
 
     fn milestone_completed(seq: u64, secs: i64, milestone_id: &str) -> Event {
-        ev(seq, secs, EventKind::MilestoneCompleted { milestone_id: milestone_id.to_string(), tag: None })
+        ev(
+            seq,
+            secs,
+            EventKind::MilestoneCompleted {
+                milestone_id: milestone_id.to_string(),
+                tag: None,
+            },
+        )
     }
 
     fn sample_tokens() -> TokenUsage {
-        TokenUsage { input: 100, output: 50, cache_read: 10, cache_write: 5 }
+        TokenUsage {
+            input: 100,
+            output: 50,
+            cache_read: 10,
+            cache_write: 5,
+        }
     }
 
     #[test]
@@ -536,8 +648,15 @@ mod tests {
         ];
 
         let spans = map_mission(&events);
-        let roots: Vec<_> = spans.iter().filter(|s| s.parent_span_id.is_none()).collect();
-        assert_eq!(roots.len(), 1, "expected exactly one root span, got: {spans:#?}");
+        let roots: Vec<_> = spans
+            .iter()
+            .filter(|s| s.parent_span_id.is_none())
+            .collect();
+        assert_eq!(
+            roots.len(),
+            1,
+            "expected exactly one root span, got: {spans:#?}"
+        );
 
         let root = roots[0];
         assert_eq!(root.trace_id, trace_id("m-01"));
@@ -550,7 +669,10 @@ mod tests {
     fn mission_without_terminal_event_emits_no_root() {
         let events = vec![created(1, 0), milestone_started(2, 10, "ms-1")];
         let spans = map_mission(&events);
-        assert!(spans.iter().all(|s| s.parent_span_id.is_some()), "no root span should be emitted for a still-running mission");
+        assert!(
+            spans.iter().all(|s| s.parent_span_id.is_some()),
+            "no root span should be emitted for a still-running mission"
+        );
     }
 
     #[test]
@@ -562,34 +684,65 @@ mod tests {
         ];
 
         let spans = map_mission(&events);
-        let run_span = spans.iter().find(|s| s.name.contains("run-1")).expect("run span expected");
+        let run_span = spans
+            .iter()
+            .find(|s| s.name.contains("run-1"))
+            .expect("run span expected");
 
         assert_eq!(
-            run_span.attributes.iter().find(|(k, _)| k == "kranz.cost.usd").map(|(_, v)| v.clone()),
+            run_span
+                .attributes
+                .iter()
+                .find(|(k, _)| k == "kranz.cost.usd")
+                .map(|(_, v)| v.clone()),
             Some(AttrValue::F64(1.25))
         );
         assert_eq!(
-            run_span.attributes.iter().find(|(k, _)| k == "kranz.tokens.input").map(|(_, v)| v.clone()),
+            run_span
+                .attributes
+                .iter()
+                .find(|(k, _)| k == "kranz.tokens.input")
+                .map(|(_, v)| v.clone()),
             Some(AttrValue::I64(100))
         );
         assert_eq!(
-            run_span.attributes.iter().find(|(k, _)| k == "kranz.tokens.output").map(|(_, v)| v.clone()),
+            run_span
+                .attributes
+                .iter()
+                .find(|(k, _)| k == "kranz.tokens.output")
+                .map(|(_, v)| v.clone()),
             Some(AttrValue::I64(50))
         );
         assert_eq!(
-            run_span.attributes.iter().find(|(k, _)| k == "kranz.tokens.cache_read").map(|(_, v)| v.clone()),
+            run_span
+                .attributes
+                .iter()
+                .find(|(k, _)| k == "kranz.tokens.cache_read")
+                .map(|(_, v)| v.clone()),
             Some(AttrValue::I64(10))
         );
         assert_eq!(
-            run_span.attributes.iter().find(|(k, _)| k == "kranz.tokens.cache_write").map(|(_, v)| v.clone()),
+            run_span
+                .attributes
+                .iter()
+                .find(|(k, _)| k == "kranz.tokens.cache_write")
+                .map(|(_, v)| v.clone()),
             Some(AttrValue::I64(5))
         );
         assert_eq!(
-            run_span.attributes.iter().find(|(k, _)| k == "kranz.role").map(|(_, v)| v.clone()),
+            run_span
+                .attributes
+                .iter()
+                .find(|(k, _)| k == "kranz.role")
+                .map(|(_, v)| v.clone()),
             Some(AttrValue::String("worker".to_string()))
         );
         assert_eq!(
-            run_span.attributes.iter().find(|(k, _)| k == "kranz.model").map(|(_, v)| v.clone()),
+            run_span
+                .attributes
+                .iter()
+                .find(|(k, _)| k == "kranz.model")
+                .map(|(_, v)| v.clone()),
             Some(AttrValue::String("sonnet".to_string()))
         );
     }
@@ -609,34 +762,84 @@ mod tests {
             ];
             let spans = map_mission(&events);
             let run_span = spans.iter().find(|s| s.name.contains("run-1")).unwrap();
-            assert_eq!(run_span.status, expected, "result {result:?} should map to {expected:?}");
+            assert_eq!(
+                run_span.status, expected,
+                "result {result:?} should map to {expected:?}"
+            );
         }
 
         // Mission statuses.
         let complete = vec![created(1, 0), ev(2, 10, EventKind::MissionCompleted {})];
-        let root = map_mission(&complete).into_iter().find(|s| s.parent_span_id.is_none()).unwrap();
+        let root = map_mission(&complete)
+            .into_iter()
+            .find(|s| s.parent_span_id.is_none())
+            .unwrap();
         assert_eq!(root.status, SpanStatus::Ok);
 
-        let failed = vec![created(1, 0), ev(2, 10, EventKind::MissionFailed { reason: "boom".to_string() })];
-        let root = map_mission(&failed).into_iter().find(|s| s.parent_span_id.is_none()).unwrap();
+        let failed = vec![
+            created(1, 0),
+            ev(
+                2,
+                10,
+                EventKind::MissionFailed {
+                    reason: "boom".to_string(),
+                },
+            ),
+        ];
+        let root = map_mission(&failed)
+            .into_iter()
+            .find(|s| s.parent_span_id.is_none())
+            .unwrap();
         assert_eq!(root.status, SpanStatus::Error("boom".to_string()));
 
-        let abandoned = vec![created(1, 0), ev(2, 10, EventKind::MissionAbandoned { reason: "retired".to_string() })];
-        let root = map_mission(&abandoned).into_iter().find(|s| s.parent_span_id.is_none()).unwrap();
+        let abandoned = vec![
+            created(1, 0),
+            ev(
+                2,
+                10,
+                EventKind::MissionAbandoned {
+                    reason: "retired".to_string(),
+                },
+            ),
+        ];
+        let root = map_mission(&abandoned)
+            .into_iter()
+            .find(|s| s.parent_span_id.is_none())
+            .unwrap();
         assert_eq!(root.status, SpanStatus::Error("retired".to_string()));
 
         // Milestone statuses.
-        let ms_complete = vec![created(1, 0), milestone_started(2, 10, "ms-1"), milestone_completed(3, 20, "ms-1")];
-        let ms_span = map_mission(&ms_complete).into_iter().find(|s| s.name.contains("ms-1")).unwrap();
+        let ms_complete = vec![
+            created(1, 0),
+            milestone_started(2, 10, "ms-1"),
+            milestone_completed(3, 20, "ms-1"),
+        ];
+        let ms_span = map_mission(&ms_complete)
+            .into_iter()
+            .find(|s| s.name.contains("ms-1"))
+            .unwrap();
         assert_eq!(ms_span.status, SpanStatus::Ok);
 
         let ms_blocked = vec![
             created(1, 0),
             milestone_started(2, 10, "ms-1"),
-            ev(3, 20, EventKind::MilestoneBlocked { milestone_id: "ms-1".to_string(), reason: "too many fix cycles".to_string() }),
+            ev(
+                3,
+                20,
+                EventKind::MilestoneBlocked {
+                    milestone_id: "ms-1".to_string(),
+                    reason: "too many fix cycles".to_string(),
+                },
+            ),
         ];
-        let ms_span = map_mission(&ms_blocked).into_iter().find(|s| s.name.contains("ms-1")).unwrap();
-        assert_eq!(ms_span.status, SpanStatus::Error("too many fix cycles".to_string()));
+        let ms_span = map_mission(&ms_blocked)
+            .into_iter()
+            .find(|s| s.name.contains("ms-1"))
+            .unwrap();
+        assert_eq!(
+            ms_span.status,
+            SpanStatus::Error("too many fix cycles".to_string())
+        );
     }
 
     #[test]
@@ -648,11 +851,27 @@ mod tests {
             completed(3, 6, "orch-1", RunResult::Pass, sample_tokens(), None),
             // milestone ms-1, and a milestone-scoped validator run.
             milestone_started(4, 10, "ms-1"),
-            spawned(5, 15, "val-1", Role::ValidatorFunctional, None, Some("ms-1"), "sonnet"),
+            spawned(
+                5,
+                15,
+                "val-1",
+                Role::ValidatorFunctional,
+                None,
+                Some("ms-1"),
+                "sonnet",
+            ),
             completed(6, 16, "val-1", RunResult::Pass, sample_tokens(), None),
             // milestone ms-2, and a worker run parented via featureId f-2-1.
             milestone_started(7, 20, "ms-2"),
-            spawned(8, 25, "run-2-1", Role::Worker, Some("f-2-1"), None, "sonnet"),
+            spawned(
+                8,
+                25,
+                "run-2-1",
+                Role::Worker,
+                Some("f-2-1"),
+                None,
+                "sonnet",
+            ),
             completed(9, 26, "run-2-1", RunResult::Pass, sample_tokens(), None),
             milestone_completed(10, 30, "ms-1"),
             milestone_completed(11, 31, "ms-2"),
@@ -660,18 +879,56 @@ mod tests {
         ];
 
         let spans = map_mission(&events);
-        let root = spans.iter().find(|s| s.parent_span_id.is_none()).expect("root span");
-        let ms1 = spans.iter().find(|s| s.name.contains("ms-1")).expect("ms-1 span");
-        let ms2 = spans.iter().find(|s| s.name.contains("ms-2")).expect("ms-2 span");
-        let orch = spans.iter().find(|s| s.name.contains("orch-1")).expect("orch span");
-        let val = spans.iter().find(|s| s.name.contains("val-1")).expect("val span");
-        let run2 = spans.iter().find(|s| s.name.contains("run-2-1")).expect("run-2-1 span");
+        let root = spans
+            .iter()
+            .find(|s| s.parent_span_id.is_none())
+            .expect("root span");
+        let ms1 = spans
+            .iter()
+            .find(|s| s.name.contains("ms-1"))
+            .expect("ms-1 span");
+        let ms2 = spans
+            .iter()
+            .find(|s| s.name.contains("ms-2"))
+            .expect("ms-2 span");
+        let orch = spans
+            .iter()
+            .find(|s| s.name.contains("orch-1"))
+            .expect("orch span");
+        let val = spans
+            .iter()
+            .find(|s| s.name.contains("val-1"))
+            .expect("val span");
+        let run2 = spans
+            .iter()
+            .find(|s| s.name.contains("run-2-1"))
+            .expect("run-2-1 span");
 
-        assert_eq!(orch.parent_span_id, Some(root.span_id), "orchestrator run parents to root");
-        assert_eq!(ms1.parent_span_id, Some(root.span_id), "milestone parents to root");
-        assert_eq!(ms2.parent_span_id, Some(root.span_id), "milestone parents to root");
-        assert_eq!(val.parent_span_id, Some(ms1.span_id), "validator run with milestoneId parents to that milestone");
-        assert_eq!(run2.parent_span_id, Some(ms2.span_id), "run with featureId f-2-1 parents to ms-2");
+        assert_eq!(
+            orch.parent_span_id,
+            Some(root.span_id),
+            "orchestrator run parents to root"
+        );
+        assert_eq!(
+            ms1.parent_span_id,
+            Some(root.span_id),
+            "milestone parents to root"
+        );
+        assert_eq!(
+            ms2.parent_span_id,
+            Some(root.span_id),
+            "milestone parents to root"
+        );
+        assert_eq!(
+            val.parent_span_id,
+            Some(ms1.span_id),
+            "validator run with milestoneId parents to that milestone"
+        );
+        assert_eq!(
+            run2.parent_span_id,
+            Some(ms2.span_id),
+            "run with featureId f-2-1 parents to ms-2"
+        );
     }
 
     #[test]
@@ -679,8 +936,23 @@ mod tests {
         let events = vec![
             created(1, 1000),
             milestone_started(2, 1010, "ms-1"),
-            spawned(3, 1020, "run-1", Role::Worker, Some("f-1-1"), None, "sonnet"),
-            completed(4, 1030, "run-1", RunResult::Pass, sample_tokens(), Some(0.1)),
+            spawned(
+                3,
+                1020,
+                "run-1",
+                Role::Worker,
+                Some("f-1-1"),
+                None,
+                "sonnet",
+            ),
+            completed(
+                4,
+                1030,
+                "run-1",
+                RunResult::Pass,
+                sample_tokens(),
+                Some(0.1),
+            ),
             milestone_completed(5, 1040, "ms-1"),
             ev(6, 1050, EventKind::MissionCompleted {}),
         ];

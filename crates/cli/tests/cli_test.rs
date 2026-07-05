@@ -21,7 +21,12 @@ use std::time::{Duration, SystemTime};
 // ---------------------------------------------------------------------------
 
 fn event(seq: u64, mission_id: &str, kind: EventKind) -> Event {
-    Event { seq, ts: Utc::now(), mission_id: mission_id.to_string(), kind }
+    Event {
+        seq,
+        ts: Utc::now(),
+        mission_id: mission_id.to_string(),
+        kind,
+    }
 }
 
 fn created_kind(goal: &str, mission_id: &str) -> EventKind {
@@ -157,8 +162,14 @@ fn parses_status() {
 
 #[test]
 fn parses_pause_and_resume() {
-    assert!(matches!(Cli::try_parse_from(["kranz", "pause"]).unwrap().command, Command::Pause));
-    assert!(matches!(Cli::try_parse_from(["kranz", "resume"]).unwrap().command, Command::Resume));
+    assert!(matches!(
+        Cli::try_parse_from(["kranz", "pause"]).unwrap().command,
+        Command::Pause
+    ));
+    assert!(matches!(
+        Cli::try_parse_from(["kranz", "resume"]).unwrap().command,
+        Command::Resume
+    ));
 }
 
 #[test]
@@ -193,7 +204,14 @@ fn parses_missions() {
 fn parses_serve() {
     let cli = Cli::try_parse_from(["kranz", "serve"]).unwrap();
     match cli.command {
-        Command::Serve { port, ref host, open, ref dashboard, ref token, slack } => {
+        Command::Serve {
+            port,
+            ref host,
+            open,
+            ref dashboard,
+            ref token,
+            slack,
+        } => {
             assert_eq!(port, 4560);
             assert_eq!(host, "127.0.0.1", "default bind stays loopback");
             assert!(!open && !slack);
@@ -202,7 +220,14 @@ fn parses_serve() {
         other => panic!("expected Serve, got {other:?}"),
     }
     let cli = Cli::try_parse_from(["kranz", "serve", "--port", "5001", "--open"]).unwrap();
-    assert!(matches!(cli.command, Command::Serve { port: 5001, open: true, .. }));
+    assert!(matches!(
+        cli.command,
+        Command::Serve {
+            port: 5001,
+            open: true,
+            ..
+        }
+    ));
     // --host widens the bind (glasses/LAN clients).
     let cli = Cli::try_parse_from(["kranz", "serve", "--host", "0.0.0.0"]).unwrap();
     match cli.command {
@@ -287,12 +312,17 @@ fn status_renders_tree_icons_totals_messages_and_decisions() {
         "m-test",
         vec![
             created_kind("ship it", "m-test"),
-            EventKind::PlanApproved { plan: sample_plan(), base_sha: None },
+            EventKind::PlanApproved {
+                plan: sample_plan(),
+                base_sha: None,
+            },
             EventKind::MilestoneStarted {
                 milestone_id: "ms-1".to_string(),
                 start_sha: "abc123".to_string(),
             },
-            EventKind::FeatureStarted { feature_id: "f-1-1".to_string() },
+            EventKind::FeatureStarted {
+                feature_id: "f-1-1".to_string(),
+            },
             EventKind::WorkerSpawned {
                 run_id: "w-1".to_string(),
                 role: Role::Worker,
@@ -306,7 +336,12 @@ fn status_renders_tree_icons_totals_messages_and_decisions() {
             EventKind::WorkerCompleted {
                 run_id: "w-1".to_string(),
                 result: RunResult::Pass,
-                tokens: TokenUsage { input: 1000, output: 200, cache_read: 50, cache_write: 25 },
+                tokens: TokenUsage {
+                    input: 1000,
+                    output: 200,
+                    cache_read: 50,
+                    cache_write: 25,
+                },
                 cost_usd: Some(0.5),
                 report: None,
             },
@@ -318,17 +353,29 @@ fn status_renders_tree_icons_totals_messages_and_decisions() {
                 summary: "looks good".to_string(),
                 detail: None,
             },
-            EventKind::UserMessage { text: "hurry up".to_string(), interrupt: false },
+            EventKind::UserMessage {
+                text: "hurry up".to_string(),
+                interrupt: false,
+            },
         ],
     );
 
     let state = commands::load_state(repo, "m-test").unwrap();
     let rendered = output::render_status(&state);
 
-    assert!(rendered.contains("mission m-test  RUNNING  ship it"), "headline in:\n{rendered}");
-    assert!(rendered.contains("branch  kranz/mission-m-test (base main)"), "branch in:\n{rendered}");
+    assert!(
+        rendered.contains("mission m-test  RUNNING  ship it"),
+        "headline in:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("branch  kranz/mission-m-test (base main)"),
+        "branch in:\n{rendered}"
+    );
     // Milestone active ◐ with fixCycles; features complete ● and pending ○.
-    assert!(rendered.contains("[◐] ms-1 Milestone One (fixCycles 0)"), "milestone in:\n{rendered}");
+    assert!(
+        rendered.contains("[◐] ms-1 Milestone One (fixCycles 0)"),
+        "milestone in:\n{rendered}"
+    );
     assert!(
         rendered.contains("[●] f-1-1 Feature One (runs 1, respawns 0)"),
         "feature one in:\n{rendered}"
@@ -341,9 +388,18 @@ fn status_renders_tree_icons_totals_messages_and_decisions() {
         rendered.contains("totals: tokens 1000 in / 200 out, cache 50 r / 25 w, cost $0.50"),
         "totals in:\n{rendered}"
     );
-    assert!(rendered.contains("pending user messages:"), "pending header in:\n{rendered}");
-    assert!(rendered.contains("  - hurry up"), "pending message in:\n{rendered}");
-    assert!(rendered.contains("  - looks good"), "decision in:\n{rendered}");
+    assert!(
+        rendered.contains("pending user messages:"),
+        "pending header in:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("  - hurry up"),
+        "pending message in:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("  - looks good"),
+        "decision in:\n{rendered}"
+    );
 }
 
 #[test]
@@ -356,7 +412,10 @@ fn status_icons_cover_terminal_states() {
         "m-icons",
         vec![
             created_kind("icon check", "m-icons"),
-            EventKind::PlanApproved { plan: sample_plan(), base_sha: None },
+            EventKind::PlanApproved {
+                plan: sample_plan(),
+                base_sha: None,
+            },
             EventKind::MilestoneStarted {
                 milestone_id: "ms-1".to_string(),
                 start_sha: "abc".to_string(),
@@ -377,10 +436,22 @@ fn status_icons_cover_terminal_states() {
     );
     let state = commands::load_state(repo, "m-icons").unwrap();
     let rendered = output::render_status(&state);
-    assert!(rendered.contains("mission m-icons  BLOCKED"), "in:\n{rendered}");
-    assert!(rendered.contains("[✖] ms-1"), "blocked milestone in:\n{rendered}");
-    assert!(rendered.contains("[✗] f-1-1"), "failed feature in:\n{rendered}");
-    assert!(rendered.contains("[⊘] f-1-2"), "skipped feature in:\n{rendered}");
+    assert!(
+        rendered.contains("mission m-icons  BLOCKED"),
+        "in:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("[✖] ms-1"),
+        "blocked milestone in:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("[✗] f-1-1"),
+        "failed feature in:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("[⊘] f-1-2"),
+        "skipped feature in:\n{rendered}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -399,8 +470,14 @@ fn cost_estimate_renders_range_and_calibration_provenance() {
 
     // Calibrated from completed missions: says how many.
     let rendered = output::render_cost_estimate(&estimate, 2);
-    assert!(rendered.contains("estimated $9.18-$45.88"), "range in: {rendered}");
-    assert!(rendered.contains("expected ~$18.35"), "expected in: {rendered}");
+    assert!(
+        rendered.contains("estimated $9.18-$45.88"),
+        "range in: {rendered}"
+    );
+    assert!(
+        rendered.contains("expected ~$18.35"),
+        "expected in: {rendered}"
+    );
     assert!(
         rendered.contains("based on 2 completed mission(s)"),
         "provenance in: {rendered}"
@@ -423,7 +500,11 @@ fn cost_estimate_renders_range_and_calibration_provenance() {
 // ---------------------------------------------------------------------------
 
 fn queued_json_files(repo: &Path, mission_id: &str) -> Vec<PathBuf> {
-    let control = repo.join(".kranz").join("missions").join(mission_id).join("control");
+    let control = repo
+        .join(".kranz")
+        .join("missions")
+        .join(mission_id)
+        .join("control");
     let mut files: Vec<PathBuf> = fs::read_dir(control)
         .unwrap()
         .flatten()
@@ -490,16 +571,24 @@ fn control_targeting_refuses_an_explicit_terminal_mission_naming_its_status() {
     write_events(
         repo,
         "m-done",
-        vec![created_kind("goal", "m-done"), EventKind::MissionCompleted {}],
+        vec![
+            created_kind("goal", "m-done"),
+            EventKind::MissionCompleted {},
+        ],
     );
 
     let err = commands::select_control_mission(repo, Some("m-done"))
         .unwrap_err()
         .to_string();
-    assert!(err.contains("Complete"), "the actual status is named: {err}");
+    assert!(
+        err.contains("Complete"),
+        "the actual status is named: {err}"
+    );
 
     // Unknown explicit ids stay errors.
-    let err = commands::select_control_mission(repo, Some("m-nope")).unwrap_err().to_string();
+    let err = commands::select_control_mission(repo, Some("m-nope"))
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("m-nope"), "{err}");
 }
 
@@ -510,10 +599,15 @@ fn control_targeting_bare_refuses_a_terminal_pick() {
     write_events(
         repo,
         "m-done",
-        vec![created_kind("goal", "m-done"), EventKind::MissionCompleted {}],
+        vec![
+            created_kind("goal", "m-done"),
+            EventKind::MissionCompleted {},
+        ],
     );
 
-    let err = commands::select_control_mission(repo, None).unwrap_err().to_string();
+    let err = commands::select_control_mission(repo, None)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("Complete"), "status named: {err}");
     assert!(err.contains("active"), "{err}");
 }
@@ -524,16 +618,25 @@ fn control_targeting_bare_keeps_the_newest_by_mtime_defaulting_for_active_missio
     let repo = tmp.path();
     let old_events = write_events(repo, "m-old", vec![created_kind("old", "m-old")]);
     write_events(repo, "m-new", vec![created_kind("new", "m-new")]);
-    let file = fs::OpenOptions::new().write(true).open(&old_events).unwrap();
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(&old_events)
+        .unwrap();
     file.set_times(
         fs::FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(3600)),
     )
     .unwrap();
 
     // Same UX as select_mission for active picks…
-    assert_eq!(commands::select_control_mission(repo, None).unwrap(), "m-new");
+    assert_eq!(
+        commands::select_control_mission(repo, None).unwrap(),
+        "m-new"
+    );
     // …and an explicit ACTIVE id passes through the shared resolver.
-    assert_eq!(commands::select_control_mission(repo, Some("m-old")).unwrap(), "m-old");
+    assert_eq!(
+        commands::select_control_mission(repo, Some("m-old")).unwrap(),
+        "m-old"
+    );
 }
 
 #[test]
@@ -575,7 +678,10 @@ fn mission_selection_picks_newest_events_log() {
 
     // Push m-old's events.jsonl an hour into the past so mtimes differ
     // regardless of filesystem timestamp granularity.
-    let file = fs::OpenOptions::new().write(true).open(&old_events).unwrap();
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(&old_events)
+        .unwrap();
     file.set_times(
         fs::FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(3600)),
     )
@@ -583,7 +689,10 @@ fn mission_selection_picks_newest_events_log() {
 
     assert_eq!(commands::select_mission(repo, None).unwrap(), "m-new");
     // --mission overrides auto-selection.
-    assert_eq!(commands::select_mission(repo, Some("m-old")).unwrap(), "m-old");
+    assert_eq!(
+        commands::select_mission(repo, Some("m-old")).unwrap(),
+        "m-old"
+    );
     // ... but a bogus explicit id is an error.
     assert!(commands::select_mission(repo, Some("m-missing")).is_err());
 }
@@ -600,7 +709,13 @@ fn missions_lists_ids_status_and_goal() {
     write_events(
         repo,
         "m-b",
-        vec![created_kind("goal b", "m-b"), EventKind::PlanApproved { plan: sample_plan(), base_sha: None }],
+        vec![
+            created_kind("goal b", "m-b"),
+            EventKind::PlanApproved {
+                plan: sample_plan(),
+                base_sha: None,
+            },
+        ],
     );
 
     let listing = commands::cmd_missions(repo).unwrap();
@@ -644,7 +759,10 @@ fn renderer_tags_worker_lines_and_truncates() {
             content: "Bash: cargo test".to_string(),
         },
     );
-    assert_eq!(renderer.render(&tool_use), "[worker f-1-2] tool-use: Bash: cargo test");
+    assert_eq!(
+        renderer.render(&tool_use),
+        "[worker f-1-2] tool-use: Bash: cargo test"
+    );
 
     let denied = event(
         3,
@@ -660,15 +778,23 @@ fn renderer_tags_worker_lines_and_truncates() {
     let decision = event(
         4,
         "m-1",
-        EventKind::OrchestratorDecision { summary: "carry on".to_string(), detail: None },
+        EventKind::OrchestratorDecision {
+            summary: "carry on".to_string(),
+            detail: None,
+        },
     );
     assert_eq!(renderer.render(&decision), "[orch] decision: carry on");
 
     let paused = event(5, "m-1", EventKind::MissionPaused {});
     assert_eq!(renderer.render(&paused), "[mission] paused");
 
-    let validating =
-        event(6, "m-1", EventKind::MilestoneValidating { milestone_id: "ms-1".to_string() });
+    let validating = event(
+        6,
+        "m-1",
+        EventKind::MilestoneValidating {
+            milestone_id: "ms-1".to_string(),
+        },
+    );
     assert_eq!(renderer.render(&validating), "[milestone ms-1] validating");
 
     // Long, multi-line content collapses to one line capped at 160 chars.
@@ -683,7 +809,11 @@ fn renderer_tags_worker_lines_and_truncates() {
     );
     let line = renderer.render(&long);
     assert!(!line.contains('\n'));
-    assert!(line.chars().count() <= 160, "len {} in: {line}", line.chars().count());
+    assert!(
+        line.chars().count() <= 160,
+        "len {} in: {line}",
+        line.chars().count()
+    );
     assert!(line.ends_with('…'));
 }
 
@@ -701,16 +831,30 @@ fn select_planning_mission_prefers_newest_planning_only() {
         "m-run",
         vec![
             created_kind("running goal", "m-run"),
-            EventKind::PlanApproved { plan: sample_plan(), base_sha: None },
+            EventKind::PlanApproved {
+                plan: sample_plan(),
+                base_sha: None,
+            },
         ],
     );
     let newest = write_events(repo, "m-new", vec![created_kind("new goal", "m-new")]);
     let future = SystemTime::now() + Duration::from_secs(60);
     let times = fs::FileTimes::new().set_modified(future);
-    fs::File::options().append(true).open(&newest).unwrap().set_times(times).unwrap();
+    fs::File::options()
+        .append(true)
+        .open(&newest)
+        .unwrap()
+        .set_times(times)
+        .unwrap();
 
-    assert_eq!(commands::select_planning_mission(repo, None).unwrap(), "m-new");
-    assert_eq!(commands::select_planning_mission(repo, Some("m-old")).unwrap(), "m-old");
+    assert_eq!(
+        commands::select_planning_mission(repo, None).unwrap(),
+        "m-new"
+    );
+    assert_eq!(
+        commands::select_planning_mission(repo, Some("m-old")).unwrap(),
+        "m-old"
+    );
 
     // With only non-planning missions, there is nothing to resume.
     let tmp2 = tempfile::tempdir().unwrap();
@@ -719,11 +863,16 @@ fn select_planning_mission_prefers_newest_planning_only() {
         "m-run",
         vec![
             created_kind("g", "m-run"),
-            EventKind::PlanApproved { plan: sample_plan(), base_sha: None },
+            EventKind::PlanApproved {
+                plan: sample_plan(),
+                base_sha: None,
+            },
         ],
     );
     let err = commands::select_planning_mission(tmp2.path(), None).unwrap_err();
-    assert!(err.to_string().contains("no mission is currently in planning"));
+    assert!(err
+        .to_string()
+        .contains("no mission is currently in planning"));
 }
 
 // ---------------------------------------------------------------------------
@@ -760,7 +909,10 @@ fn limit_errors_gain_resume_hint() {
     );
     let msg = format!("{:#}", commands::augment_limit_hint(limit));
     assert!(msg.contains("usage window, not a Kranz failure"), "{msg}");
-    assert!(msg.contains("`kranz plan` (no goal) resumes planning"), "{msg}");
+    assert!(
+        msg.contains("`kranz plan` (no goal) resumes planning"),
+        "{msg}"
+    );
 
     let other = anyhow::anyhow!("git operation failed: nothing to commit");
     let msg = format!("{:#}", commands::augment_limit_hint(other));
@@ -775,11 +927,17 @@ fn limit_errors_gain_resume_hint() {
 fn parses_abandon() {
     // Bare abandon: id via the global --mission, default reason.
     let cli = Cli::try_parse_from(["kranz", "abandon"]).unwrap();
-    assert!(matches!(cli.command, Command::Abandon { id: None, reason: None }));
+    assert!(matches!(
+        cli.command,
+        Command::Abandon {
+            id: None,
+            reason: None
+        }
+    ));
 
     // Positional id + explicit reason.
-    let cli = Cli::try_parse_from(["kranz", "abandon", "m-42", "--reason", "cut from scope"])
-        .unwrap();
+    let cli =
+        Cli::try_parse_from(["kranz", "abandon", "m-42", "--reason", "cut from scope"]).unwrap();
     match cli.command {
         Command::Abandon { id, reason } => {
             assert_eq!(id.as_deref(), Some("m-42"));
@@ -797,13 +955,31 @@ fn parses_abandon() {
 #[test]
 fn parses_clean() {
     let cli = Cli::try_parse_from(["kranz", "clean"]).unwrap();
-    assert!(matches!(cli.command, Command::Clean { yes: false, all: false }));
+    assert!(matches!(
+        cli.command,
+        Command::Clean {
+            yes: false,
+            all: false
+        }
+    ));
 
     let cli = Cli::try_parse_from(["kranz", "clean", "--yes", "--all"]).unwrap();
-    assert!(matches!(cli.command, Command::Clean { yes: true, all: true }));
+    assert!(matches!(
+        cli.command,
+        Command::Clean {
+            yes: true,
+            all: true
+        }
+    ));
 
     let cli = Cli::try_parse_from(["kranz", "clean", "--yes"]).unwrap();
-    assert!(matches!(cli.command, Command::Clean { yes: true, all: false }));
+    assert!(matches!(
+        cli.command,
+        Command::Clean {
+            yes: true,
+            all: false
+        }
+    ));
 }
 
 /// The pure status→class classifier (in the engine) selects exactly the right
@@ -813,15 +989,30 @@ fn cleanable_class_selects_the_right_missions() {
     use kranz_engine::orchestrator::{cleanable_class, CleanClass};
 
     // Terminal-not-complete is always stale.
-    assert_eq!(cleanable_class(MissionStatus::Failed, true), CleanClass::Stale);
-    assert_eq!(cleanable_class(MissionStatus::Abandoned, false), CleanClass::Stale);
+    assert_eq!(
+        cleanable_class(MissionStatus::Failed, true),
+        CleanClass::Stale
+    );
+    assert_eq!(
+        cleanable_class(MissionStatus::Abandoned, false),
+        CleanClass::Stale
+    );
 
     // Planning: a husk (no plan) is stale; with a plan it is live work.
-    assert_eq!(cleanable_class(MissionStatus::Planning, false), CleanClass::Stale);
-    assert_eq!(cleanable_class(MissionStatus::Planning, true), CleanClass::Keep);
+    assert_eq!(
+        cleanable_class(MissionStatus::Planning, false),
+        CleanClass::Stale
+    );
+    assert_eq!(
+        cleanable_class(MissionStatus::Planning, true),
+        CleanClass::Keep
+    );
 
     // Complete is kept by default, removed only with --all.
-    assert_eq!(cleanable_class(MissionStatus::Complete, true), CleanClass::CompleteKeepByDefault);
+    assert_eq!(
+        cleanable_class(MissionStatus::Complete, true),
+        CleanClass::CompleteKeepByDefault
+    );
     assert!(!cleanable_class(MissionStatus::Complete, true).is_cleaned(false));
     assert!(cleanable_class(MissionStatus::Complete, true).is_cleaned(true));
 
@@ -832,8 +1023,15 @@ fn cleanable_class_selects_the_right_missions() {
         MissionStatus::Blocked,
         MissionStatus::Validating,
     ] {
-        assert_eq!(cleanable_class(status, true), CleanClass::Keep, "{status:?}");
-        assert!(!cleanable_class(status, false).is_cleaned(true), "{status:?} with --all");
+        assert_eq!(
+            cleanable_class(status, true),
+            CleanClass::Keep,
+            "{status:?}"
+        );
+        assert!(
+            !cleanable_class(status, false).is_cleaned(true),
+            "{status:?} with --all"
+        );
     }
 }
 
@@ -841,7 +1039,11 @@ fn cleanable_class_selects_the_right_missions() {
 fn write_plan_json(repo: &Path, mission_id: &str) {
     let dir = repo.join(".kranz").join("missions").join(mission_id);
     fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join("plan.json"), serde_json::to_string(&sample_plan()).unwrap()).unwrap();
+    fs::write(
+        dir.join("plan.json"),
+        serde_json::to_string(&sample_plan()).unwrap(),
+    )
+    .unwrap();
 }
 
 /// Write a lock file recording `pid` for a mission (a live current-process pid
@@ -864,13 +1066,19 @@ fn select_cleanable_over_mixed_missions() {
     write_events(
         repo,
         "m-failed",
-        vec![created_kind("g", "m-failed"), EventKind::MissionFailed { reason: "x".into() }],
+        vec![
+            created_kind("g", "m-failed"),
+            EventKind::MissionFailed { reason: "x".into() },
+        ],
     );
     // Abandoned: terminal → stale.
     write_events(
         repo,
         "m-abandoned",
-        vec![created_kind("g", "m-abandoned"), EventKind::MissionAbandoned { reason: "x".into() }],
+        vec![
+            created_kind("g", "m-abandoned"),
+            EventKind::MissionAbandoned { reason: "x".into() },
+        ],
     );
     // Planning husk: still Planning, NO plan.json → stale.
     write_events(repo, "m-husk", vec![created_kind("g", "m-husk")]);
@@ -881,13 +1089,19 @@ fn select_cleanable_over_mixed_missions() {
     write_events(
         repo,
         "m-complete",
-        vec![created_kind("g", "m-complete"), EventKind::MissionCompleted {}],
+        vec![
+            created_kind("g", "m-complete"),
+            EventKind::MissionCompleted {},
+        ],
     );
     // Failed but its lock is held by THIS live process → never cleaned.
     write_events(
         repo,
         "m-running",
-        vec![created_kind("g", "m-running"), EventKind::MissionFailed { reason: "x".into() }],
+        vec![
+            created_kind("g", "m-running"),
+            EventKind::MissionFailed { reason: "x".into() },
+        ],
     );
     write_lock(repo, "m-running", std::process::id());
 
@@ -899,18 +1113,36 @@ fn select_cleanable_over_mixed_missions() {
     assert!(ids.contains(&"m-failed".to_string()), "{ids:?}");
     assert!(ids.contains(&"m-abandoned".to_string()), "{ids:?}");
     assert!(ids.contains(&"m-husk".to_string()), "{ids:?}");
-    assert!(!ids.contains(&"m-planned".to_string()), "planning-with-plan kept: {ids:?}");
-    assert!(!ids.contains(&"m-complete".to_string()), "complete kept by default: {ids:?}");
-    assert!(!ids.contains(&"m-running".to_string()), "live-locked never cleaned: {ids:?}");
+    assert!(
+        !ids.contains(&"m-planned".to_string()),
+        "planning-with-plan kept: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"m-complete".to_string()),
+        "complete kept by default: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"m-running".to_string()),
+        "live-locked never cleaned: {ids:?}"
+    );
 
     // --all additionally includes the Complete mission (still never running).
     let ids_all: Vec<String> = commands::select_cleanable(repo, true)
         .into_iter()
         .map(|e| e.id)
         .collect();
-    assert!(ids_all.contains(&"m-complete".to_string()), "--all includes complete: {ids_all:?}");
-    assert!(!ids_all.contains(&"m-running".to_string()), "live-locked still safe: {ids_all:?}");
-    assert!(!ids_all.contains(&"m-planned".to_string()), "planning-with-plan still kept: {ids_all:?}");
+    assert!(
+        ids_all.contains(&"m-complete".to_string()),
+        "--all includes complete: {ids_all:?}"
+    );
+    assert!(
+        !ids_all.contains(&"m-running".to_string()),
+        "live-locked still safe: {ids_all:?}"
+    );
+    assert!(
+        !ids_all.contains(&"m-planned".to_string()),
+        "planning-with-plan still kept: {ids_all:?}"
+    );
 }
 
 /// The removal path deletes exactly the selected mission directories and leaves
@@ -923,7 +1155,10 @@ fn remove_missions_deletes_selected_and_keeps_index_and_others() {
     write_events(
         repo,
         "m-failed",
-        vec![created_kind("g", "m-failed"), EventKind::MissionFailed { reason: "x".into() }],
+        vec![
+            created_kind("g", "m-failed"),
+            EventKind::MissionFailed { reason: "x".into() },
+        ],
     );
     write_events(repo, "m-planned", vec![created_kind("g", "m-planned")]);
     write_plan_json(repo, "m-planned");
@@ -934,11 +1169,24 @@ fn remove_missions_deletes_selected_and_keeps_index_and_others() {
 
     let entries = commands::select_cleanable(repo, false);
     let removed = commands::remove_missions(repo, &entries, false);
-    assert_eq!(removed, vec!["m-failed".to_string()], "only the failed mission removed");
+    assert_eq!(
+        removed,
+        vec!["m-failed".to_string()],
+        "only the failed mission removed"
+    );
 
-    assert!(!missions_dir.join("m-failed").exists(), "failed mission dir gone");
-    assert!(missions_dir.join("m-planned").exists(), "planning-with-plan mission kept");
-    assert!(missions_dir.join("index.md").is_file(), "missions index.md untouched");
+    assert!(
+        !missions_dir.join("m-failed").exists(),
+        "failed mission dir gone"
+    );
+    assert!(
+        missions_dir.join("m-planned").exists(),
+        "planning-with-plan mission kept"
+    );
+    assert!(
+        missions_dir.join("index.md").is_file(),
+        "missions index.md untouched"
+    );
     // Nothing else lingering: exactly the kept mission dir + the index remain.
     let mut remaining: Vec<String> = fs::read_dir(&missions_dir)
         .unwrap()
@@ -946,5 +1194,8 @@ fn remove_missions_deletes_selected_and_keeps_index_and_others() {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
     remaining.sort();
-    assert_eq!(remaining, vec!["index.md".to_string(), "m-planned".to_string()]);
+    assert_eq!(
+        remaining,
+        vec!["index.md".to_string(), "m-planned".to_string()]
+    );
 }

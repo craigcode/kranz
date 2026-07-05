@@ -113,27 +113,35 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
         }
         Command::Clean { yes, all } => cmd_clean(&repo, yes, all),
         Command::Ticket { command } => dispatch_ticket(&repo, command, cli.mission.as_deref()),
-        Command::Draft { slug, yes } => backlog::cmd_draft(repo, &slug, yes, cli.dangerously_allow_all)
-            .await
-            .map_err(augment_limit_hint),
-        Command::Exec { file, yes, max_cycles, push, allow_unvalidated } => {
-            crate::exec::cmd_exec(
-                repo,
-                file,
-                yes,
-                max_cycles,
-                push,
-                cli.dangerously_allow_all,
-                allow_unvalidated,
-            )
-            .await
-            .map_err(augment_limit_hint)
+        Command::Draft { slug, yes } => {
+            backlog::cmd_draft(repo, &slug, yes, cli.dangerously_allow_all)
+                .await
+                .map_err(augment_limit_hint)
         }
+        Command::Exec {
+            file,
+            yes,
+            max_cycles,
+            push,
+            allow_unvalidated,
+        } => crate::exec::cmd_exec(
+            repo,
+            file,
+            yes,
+            max_cycles,
+            push,
+            cli.dangerously_allow_all,
+            allow_unvalidated,
+        )
+        .await
+        .map_err(augment_limit_hint),
         Command::Queue => {
             print!("{}", backlog::cmd_queue(&repo));
             Ok(0)
         }
-        Command::Work { once } => backlog::cmd_work(repo, once).await.map_err(augment_limit_hint),
+        Command::Work { once } => backlog::cmd_work(repo, once)
+            .await
+            .map_err(augment_limit_hint),
         Command::Serve {
             port,
             host,
@@ -149,9 +157,10 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
         Command::Config { command } => {
             crate::config_cmd::cmd_config(&repo, command, cli.mission.as_deref())
         }
-        Command::Otel { endpoint, from_start } => {
-            crate::otel::run_otel(repo, cli.mission.clone(), endpoint, from_start).await
-        }
+        Command::Otel {
+            endpoint,
+            from_start,
+        } => crate::otel::run_otel(repo, cli.mission.clone(), endpoint, from_start).await,
     }
 }
 
@@ -173,7 +182,10 @@ fn dispatch_ticket(repo: &Path, command: TicketCommand, mission: Option<&str>) -
             println!("created ticket '{slug}' at {}", path.display());
             Ok(0)
         }
-        TicketCommand::Approve { slug, mission: explicit } => {
+        TicketCommand::Approve {
+            slug,
+            mission: explicit,
+        } => {
             // A `ticket approve --mission` wins over the global `--mission`.
             backlog::cmd_ticket_approve(repo, &slug, explicit.as_deref().or(mission))
         }
@@ -315,9 +327,14 @@ pub fn select_planning_mission(repo: &Path, explicit: Option<&str>) -> Result<St
 /// backend error reads like a Kranz failure otherwise.
 pub fn augment_limit_hint(e: anyhow::Error) -> anyhow::Error {
     let msg = format!("{e:#}").to_ascii_lowercase();
-    if ["session limit", "usage limit", "rate limit", "hit your limit"]
-        .iter()
-        .any(|s| msg.contains(s))
+    if [
+        "session limit",
+        "usage limit",
+        "rate limit",
+        "hit your limit",
+    ]
+    .iter()
+    .any(|s| msg.contains(s))
     {
         e.context(
             "this is your Claude subscription's usage window, not a Kranz failure. \
@@ -441,7 +458,11 @@ impl StdinLines {
         }
         let n = self.drain();
         if n > 0 {
-            let (dim, reset) = if tty { (ansi::DIM, ansi::RESET) } else { ("", "") };
+            let (dim, reset) = if tty {
+                (ansi::DIM, ansi::RESET)
+            } else {
+                ("", "")
+            };
             eprintln!(
                 "{dim}(ignored {n} line(s) typed while the orchestrator was working — \
                  the prompt below wants fresh input){reset}"
@@ -560,7 +581,10 @@ async fn cmd_plan(
                         continue;
                     }
                     Err(e) => {
-                        eprintln!("kranz: plan request failed: {:#}", augment_limit_hint(e.into()));
+                        eprintln!(
+                            "kranz: plan request failed: {:#}",
+                            augment_limit_hint(e.into())
+                        );
                         continue;
                     }
                 };
@@ -568,8 +592,7 @@ async fn cmd_plan(
                 // Estimate with params calibrated from this repo's completed
                 // missions (built-in defaults when there are none yet).
                 let calibration = cost::calibrate(&repo);
-                let estimate =
-                    cost::estimate(&plan, &engine.state().config, &calibration.params);
+                let estimate = cost::estimate(&plan, &engine.state().config, &calibration.params);
                 println!(
                     "{}",
                     output::render_cost_estimate(&estimate, calibration.missions_used)
@@ -767,9 +790,7 @@ pub(crate) async fn run_mission_loop(
                 // Interactive recovery: ask for guidance right here instead of
                 // demanding the kranz msg / kranz run two-step. The batch
                 // dispatcher (interactive=false) skips this so it never hangs.
-                if interactive
-                    && std::io::stdin().is_terminal()
-                    && std::io::stdout().is_terminal()
+                if interactive && std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
                 {
                     print!(
                         "guidance for the orchestrator (what to do about the block; \
@@ -782,7 +803,10 @@ pub(crate) async fn run_mission_loop(
                         if !text.is_empty() {
                             control::enqueue(
                                 &paths,
-                                &ControlCommand::Msg { text, interrupt: false },
+                                &ControlCommand::Msg {
+                                    text,
+                                    interrupt: false,
+                                },
                             )?;
                             println!("guidance queued — resuming the mission…");
                             continue;
@@ -957,7 +981,11 @@ fn cmd_clean(repo: &Path, yes: bool, all: bool) -> Result<i32> {
         "\n{} mission director{} above would be removed.{}",
         entries.len(),
         if entries.len() == 1 { "y" } else { "ies" },
-        if all { "" } else { " (Complete missions are kept; pass --all to include them.)" }
+        if all {
+            ""
+        } else {
+            " (Complete missions are kept; pass --all to include them.)"
+        }
     );
 
     if !yes && !confirm_clean()? {
@@ -1016,7 +1044,10 @@ fn confirm_clean() -> Result<bool> {
     if n == 0 {
         return Ok(false); // EOF
     }
-    Ok(matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+    Ok(matches!(
+        line.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1073,7 +1104,11 @@ async fn cmd_serve(
     }
 
     let dashboard_assets = resolve_dashboard_assets(&repo, dashboard);
-    let display_host = if bind.is_loopback() { "127.0.0.1".to_string() } else { bind.to_string() };
+    let display_host = if bind.is_loopback() {
+        "127.0.0.1".to_string()
+    } else {
+        bind.to_string()
+    };
     let url = format!("http://{display_host}:{port}/");
     let token = token.unwrap_or_else(kranz_server::generate_token);
 
@@ -1333,8 +1368,10 @@ async fn cmd_release(mission_id: &str, url: &str, token: Option<String>) -> Resu
     match response.status() {
         reqwest::StatusCode::OK => {
             let body: serde_json::Value = response.json().await.unwrap_or_default();
-            let released =
-                body.get("released").and_then(serde_json::Value::as_bool).unwrap_or(false);
+            let released = body
+                .get("released")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
             if released {
                 println!("mission {mission_id} released — the lock is now free");
             } else {
@@ -1343,9 +1380,7 @@ async fn cmd_release(mission_id: &str, url: &str, token: Option<String>) -> Resu
             Ok(0)
         }
         reqwest::StatusCode::CONFLICT => {
-            eprintln!(
-                "kranz: mission {mission_id} has a turn in flight — try again shortly"
-            );
+            eprintln!("kranz: mission {mission_id} has a turn in flight — try again shortly");
             Ok(1)
         }
         reqwest::StatusCode::NOT_FOUND => {
@@ -1382,7 +1417,9 @@ mod tests {
         unsafe {
             std::env::remove_var("KRANZ_TOKEN");
         }
-        let err = cmd_release("m-1", "http://127.0.0.1:4560", None).await.unwrap_err();
+        let err = cmd_release("m-1", "http://127.0.0.1:4560", None)
+            .await
+            .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("--token"), "{msg}");
         assert!(msg.contains("KRANZ_TOKEN"), "{msg}");

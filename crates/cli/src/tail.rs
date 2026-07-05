@@ -42,7 +42,11 @@ pub struct EventRenderer {
 
 impl EventRenderer {
     pub fn new(color: bool) -> Self {
-        EventRenderer { color, runs: HashMap::new(), suppress_text: false }
+        EventRenderer {
+            color,
+            runs: HashMap::new(),
+            suppress_text: false,
+        }
     }
 
     /// Renderer for the planning REPL (see `suppress_text`).
@@ -81,10 +85,14 @@ impl EventRenderer {
                     },
                     ansi::GREEN,
                 ),
-                Role::ValidatorScrutiny => (scoped("validator-scrutiny", &tag.milestone_id), ansi::MAGENTA),
-                Role::ValidatorFunctional => {
-                    (scoped("validator-functional", &tag.milestone_id), ansi::MAGENTA)
-                }
+                Role::ValidatorScrutiny => (
+                    scoped("validator-scrutiny", &tag.milestone_id),
+                    ansi::MAGENTA,
+                ),
+                Role::ValidatorFunctional => (
+                    scoped("validator-functional", &tag.milestone_id),
+                    ansi::MAGENTA,
+                ),
             },
             None => ("worker".to_string(), ansi::GREEN),
         }
@@ -93,9 +101,11 @@ impl EventRenderer {
     /// One event → one human line (role-tagged, truncated to [`LINE_MAX`]).
     pub fn render(&mut self, event: &Event) -> String {
         let (tag, color, body) = match &event.kind {
-            EventKind::MissionCreated { goal, .. } => {
-                ("mission".to_string(), ansi::YELLOW, format!("created: {goal}"))
-            }
+            EventKind::MissionCreated { goal, .. } => (
+                "mission".to_string(),
+                ansi::YELLOW,
+                format!("created: {goal}"),
+            ),
             EventKind::PlanApproved { plan, .. } => {
                 let features: usize = plan.milestones.iter().map(|m| m.features.len()).sum();
                 (
@@ -107,13 +117,24 @@ impl EventRenderer {
                     ),
                 )
             }
-            EventKind::MilestoneStarted { milestone_id, .. } => {
-                (format!("milestone {milestone_id}"), ansi::YELLOW, "started".to_string())
-            }
-            EventKind::FeatureStarted { feature_id } => {
-                (format!("feature {feature_id}"), ansi::BLUE, "started".to_string())
-            }
-            EventKind::WorkerSpawned { run_id, role, feature_id, milestone_id, model, .. } => {
+            EventKind::MilestoneStarted { milestone_id, .. } => (
+                format!("milestone {milestone_id}"),
+                ansi::YELLOW,
+                "started".to_string(),
+            ),
+            EventKind::FeatureStarted { feature_id } => (
+                format!("feature {feature_id}"),
+                ansi::BLUE,
+                "started".to_string(),
+            ),
+            EventKind::WorkerSpawned {
+                run_id,
+                role,
+                feature_id,
+                milestone_id,
+                model,
+                ..
+            } => {
                 self.runs.insert(
                     run_id.clone(),
                     RunTag {
@@ -125,7 +146,11 @@ impl EventRenderer {
                 let (tag, color) = self.run_tag(run_id);
                 (tag, color, format!("spawned ({model})"))
             }
-            EventKind::WorkerMessage { run_id, tag: kind, content } => {
+            EventKind::WorkerMessage {
+                run_id,
+                tag: kind,
+                content,
+            } => {
                 if self.suppress_text && kind == "text" {
                     return String::new();
                 }
@@ -140,72 +165,133 @@ impl EventRenderer {
                 };
                 (tag, color, body)
             }
-            EventKind::WorkerCompleted { run_id, result, cost_usd, .. } => {
+            EventKind::WorkerCompleted {
+                run_id,
+                result,
+                cost_usd,
+                ..
+            } => {
                 let (tag, color) = self.run_tag(run_id);
                 let cost = cost_usd.map(|c| format!(" (${c:.2})")).unwrap_or_default();
-                (tag, color, format!("completed: {}{cost}", result_label(*result)))
+                (
+                    tag,
+                    color,
+                    format!("completed: {}{cost}", result_label(*result)),
+                )
             }
-            EventKind::FeatureCompleted { feature_id, commits } => (
+            EventKind::FeatureCompleted {
+                feature_id,
+                commits,
+            } => (
                 format!("feature {feature_id}"),
                 ansi::BLUE,
                 format!("complete ({} commit(s))", commits.len()),
             ),
-            EventKind::FeatureFailed { feature_id, reason } => {
-                (format!("feature {feature_id}"), ansi::RED, format!("FAILED: {reason}"))
-            }
-            EventKind::FeatureSkipped { feature_id, reason } => {
-                (format!("feature {feature_id}"), ansi::BLUE, format!("skipped: {reason}"))
-            }
-            EventKind::MilestoneValidating { milestone_id } => {
-                (format!("milestone {milestone_id}"), ansi::YELLOW, "validating".to_string())
-            }
-            EventKind::ValidationFinding { milestone_id, finding, .. } => (
+            EventKind::FeatureFailed { feature_id, reason } => (
+                format!("feature {feature_id}"),
+                ansi::RED,
+                format!("FAILED: {reason}"),
+            ),
+            EventKind::FeatureSkipped { feature_id, reason } => (
+                format!("feature {feature_id}"),
+                ansi::BLUE,
+                format!("skipped: {reason}"),
+            ),
+            EventKind::MilestoneValidating { milestone_id } => (
                 format!("milestone {milestone_id}"),
                 ansi::YELLOW,
-                format!("finding [{}] {}: {}", finding.severity, finding.subject, finding.evidence),
+                "validating".to_string(),
             ),
-            EventKind::FixFeatureCreated { milestone_id, feature } => (
+            EventKind::ValidationFinding {
+                milestone_id,
+                finding,
+                ..
+            } => (
+                format!("milestone {milestone_id}"),
+                ansi::YELLOW,
+                format!(
+                    "finding [{}] {}: {}",
+                    finding.severity, finding.subject, finding.evidence
+                ),
+            ),
+            EventKind::FixFeatureCreated {
+                milestone_id,
+                feature,
+            } => (
                 format!("milestone {milestone_id}"),
                 ansi::YELLOW,
                 format!("fix feature {}: {}", feature.id, feature.title),
             ),
-            EventKind::MilestoneBlocked { milestone_id, reason } => {
-                (format!("milestone {milestone_id}"), ansi::RED, format!("BLOCKED: {reason}"))
-            }
-            EventKind::MilestoneUnblocked { milestone_id, reason } => {
-                (format!("milestone {milestone_id}"), ansi::YELLOW, format!("unblocked: {reason}"))
-            }
+            EventKind::MilestoneBlocked {
+                milestone_id,
+                reason,
+            } => (
+                format!("milestone {milestone_id}"),
+                ansi::RED,
+                format!("BLOCKED: {reason}"),
+            ),
+            EventKind::MilestoneUnblocked {
+                milestone_id,
+                reason,
+            } => (
+                format!("milestone {milestone_id}"),
+                ansi::YELLOW,
+                format!("unblocked: {reason}"),
+            ),
             EventKind::MilestoneCompleted { milestone_id, tag } => {
-                let tag_note = tag.as_deref().map(|t| format!(" (tag {t})")).unwrap_or_default();
-                (format!("milestone {milestone_id}"), ansi::YELLOW, format!("complete{tag_note}"))
+                let tag_note = tag
+                    .as_deref()
+                    .map(|t| format!(" (tag {t})"))
+                    .unwrap_or_default();
+                (
+                    format!("milestone {milestone_id}"),
+                    ansi::YELLOW,
+                    format!("complete{tag_note}"),
+                )
             }
-            EventKind::MissionValidating {} => {
-                ("mission".to_string(), ansi::YELLOW, "final contract gate".to_string())
+            EventKind::MissionValidating {} => (
+                "mission".to_string(),
+                ansi::YELLOW,
+                "final contract gate".to_string(),
+            ),
+            EventKind::MissionPaused {} => {
+                ("mission".to_string(), ansi::YELLOW, "paused".to_string())
             }
-            EventKind::MissionPaused {} => ("mission".to_string(), ansi::YELLOW, "paused".to_string()),
             EventKind::MissionResumed {} => {
                 ("mission".to_string(), ansi::YELLOW, "resumed".to_string())
             }
             EventKind::UserMessage { text, interrupt } => (
                 "user".to_string(),
                 ansi::MAGENTA,
-                if *interrupt { format!("(interrupt) {text}") } else { text.clone() },
+                if *interrupt {
+                    format!("(interrupt) {text}")
+                } else {
+                    text.clone()
+                },
             ),
-            EventKind::OrchestratorDecision { summary, .. } => {
-                ("orch".to_string(), ansi::CYAN, format!("decision: {summary}"))
-            }
-            EventKind::ConfigChanged { .. } => {
-                ("mission".to_string(), ansi::YELLOW, "config changed".to_string())
-            }
+            EventKind::OrchestratorDecision { summary, .. } => (
+                "orch".to_string(),
+                ansi::CYAN,
+                format!("decision: {summary}"),
+            ),
+            EventKind::ConfigChanged { .. } => (
+                "mission".to_string(),
+                ansi::YELLOW,
+                "config changed".to_string(),
+            ),
             EventKind::MissionCompleted {} => {
                 ("mission".to_string(), ansi::GREEN, "COMPLETE".to_string())
             }
-            EventKind::MissionFailed { reason } => {
-                ("mission".to_string(), ansi::RED, format!("FAILED: {reason}"))
-            }
-            EventKind::MissionAbandoned { reason } => {
-                ("mission".to_string(), ansi::DIM, format!("ABANDONED: {reason}"))
-            }
+            EventKind::MissionFailed { reason } => (
+                "mission".to_string(),
+                ansi::RED,
+                format!("FAILED: {reason}"),
+            ),
+            EventKind::MissionAbandoned { reason } => (
+                "mission".to_string(),
+                ansi::DIM,
+                format!("ABANDONED: {reason}"),
+            ),
         };
 
         // Budget: "[tag] body" must fit LINE_MAX visible chars.

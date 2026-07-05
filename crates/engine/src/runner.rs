@@ -122,12 +122,21 @@ impl RunSink<'_, '_> {
             AgentEvent::ToolUse { tool, summary, .. } => {
                 ("tool-use", format!("{tool}: {summary}"), false)
             }
-            AgentEvent::ToolResult { tool, denied, summary, .. } => {
+            AgentEvent::ToolResult {
+                tool,
+                denied,
+                summary,
+                ..
+            } => {
                 let content = match tool {
                     Some(tool) => format!("{tool}: {summary}"),
                     None => summary.clone(),
                 };
-                (if *denied { "denied" } else { "tool-result" }, content, *denied)
+                (
+                    if *denied { "denied" } else { "tool-result" },
+                    content,
+                    *denied,
+                )
             }
             _ => return Ok(false),
         };
@@ -243,7 +252,10 @@ pub async fn run_session_to(
 
     // The sdk session id recorded for --resume bookkeeping: the resumed id
     // when resuming, else the engine-chosen fresh id.
-    let sdk_session_id = spec.resume.clone().unwrap_or_else(|| spec.session_id.clone());
+    let sdk_session_id = spec
+        .resume
+        .clone()
+        .unwrap_or_else(|| spec.session_id.clone());
     log.record(EventKind::WorkerSpawned {
         run_id: run_meta.run_id.clone(),
         role: run_meta.role,
@@ -266,7 +278,10 @@ pub async fn run_session_to(
     let mut cancelled = false;
 
     {
-        let mut sink = RunSink { log, transcript: &mut transcript };
+        let mut sink = RunSink {
+            log,
+            transcript: &mut transcript,
+        };
         loop {
             let step = match &cancel {
                 Some(notify) if !cancelled => tokio::select! {
@@ -340,7 +355,10 @@ pub async fn run_session_to(
         RunResult::Partial
     } else {
         match run_meta.role {
-            Role::Worker => report.as_ref().map(|r| r.result).unwrap_or(RunResult::Partial),
+            Role::Worker => report
+                .as_ref()
+                .map(|r| r.result)
+                .unwrap_or(RunResult::Partial),
             Role::ValidatorScrutiny | Role::ValidatorFunctional => {
                 if validator_report.is_some() {
                     RunResult::Pass
@@ -610,8 +628,10 @@ fn build_worker_spec(
     let role_cfg = cfg.role(role);
 
     let criteria = bullet_list(&feature.validation_criteria);
-    let turn_budget =
-        role_cfg.max_turns.map(|n| n.to_string()).unwrap_or_else(|| "unlimited".to_string());
+    let turn_budget = role_cfg
+        .max_turns
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "unlimited".to_string());
     let guidance = extra_guidance.unwrap_or("").trim().to_string();
 
     let mut vars: HashMap<&str, String> = HashMap::new();
@@ -661,7 +681,8 @@ fn build_worker_spec(
         env: HashMap::new(),
     };
     if let Some(sha) = base_sha.filter(|s| !s.is_empty()) {
-        spec.env.insert("KRANZ_BASE_SHA".to_string(), sha.to_string());
+        spec.env
+            .insert("KRANZ_BASE_SHA".to_string(), sha.to_string());
     }
     permissions::apply(permissions::for_role(role, cfg, &[]), &mut spec);
 
@@ -725,7 +746,11 @@ pub async fn run_validator(
     let criteria_items: Vec<String> = milestone
         .features
         .iter()
-        .flat_map(|f| f.validation_criteria.iter().map(|c| format!("[{}] {}", f.id, c)))
+        .flat_map(|f| {
+            f.validation_criteria
+                .iter()
+                .map(|c| format!("[{}] {}", f.id, c))
+        })
         .collect();
     let criteria = bullet_list(&criteria_items);
 
@@ -772,9 +797,13 @@ pub async fn run_validator(
         env: HashMap::new(),
     };
     if let Some(sha) = base_sha.filter(|s| !s.is_empty()) {
-        spec.env.insert("KRANZ_BASE_SHA".to_string(), sha.to_string());
+        spec.env
+            .insert("KRANZ_BASE_SHA".to_string(), sha.to_string());
     }
-    permissions::apply(permissions::for_role(kind, cfg, &contract_commands), &mut spec);
+    permissions::apply(
+        permissions::for_role(kind, cfg, &contract_commands),
+        &mut spec,
+    );
 
     let run_meta = RunMeta {
         run_id: uuid::Uuid::new_v4().to_string(),
@@ -792,5 +821,9 @@ fn bullet_list(items: &[String]) -> String {
     if items.is_empty() {
         return "- (none)".to_string();
     }
-    items.iter().map(|item| format!("- {item}")).collect::<Vec<_>>().join("\n")
+    items
+        .iter()
+        .map(|item| format!("- {item}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }

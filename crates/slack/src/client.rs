@@ -167,19 +167,17 @@ impl SlackClient {
             .send()
             .await
             .context("views.open request failed")?;
-        let body: Value = resp.json().await.context("views.open: response was not JSON")?;
+        let body: Value = resp
+            .json()
+            .await
+            .context("views.open: response was not JSON")?;
         check_ok(&body, "views.open")
     }
 
     /// `chat.postEphemeral` with the bot token: a user-only message in a
     /// channel. The modal path needs this — a `view_submission` has no
     /// `response_url` to reply over.
-    pub async fn post_ephemeral(
-        &self,
-        channel: &str,
-        user: &str,
-        blocks: &[Value],
-    ) -> Result<()> {
+    pub async fn post_ephemeral(&self, channel: &str, user: &str, blocks: &[Value]) -> Result<()> {
         let payload = serde_json::json!({ "channel": channel, "user": user, "blocks": blocks });
         let resp = self
             .http
@@ -189,8 +187,10 @@ impl SlackClient {
             .send()
             .await
             .context("chat.postEphemeral request failed")?;
-        let body: Value =
-            resp.json().await.context("chat.postEphemeral: response was not JSON")?;
+        let body: Value = resp
+            .json()
+            .await
+            .context("chat.postEphemeral: response was not JSON")?;
         check_ok(&body, "chat.postEphemeral")
     }
 
@@ -231,7 +231,10 @@ fn check_ok(body: &Value, method: &str) -> Result<()> {
     if body.get("ok").and_then(Value::as_bool) == Some(true) {
         return Ok(());
     }
-    let err = body.get("error").and_then(Value::as_str).unwrap_or("unknown_error");
+    let err = body
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown_error");
     Err(anyhow!("{method} failed: {err}"))
 }
 
@@ -247,9 +250,12 @@ mod tests {
 
     #[test]
     fn check_ok_surfaces_error_string() {
-        let err = check_ok(&json!({ "ok": false, "error": "channel_not_found" }), "chat.postMessage")
-            .unwrap_err()
-            .to_string();
+        let err = check_ok(
+            &json!({ "ok": false, "error": "channel_not_found" }),
+            "chat.postMessage",
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("channel_not_found"));
         assert!(err.contains("chat.postMessage"));
     }

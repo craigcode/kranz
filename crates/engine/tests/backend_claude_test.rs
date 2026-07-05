@@ -63,9 +63,7 @@ fn index_of(args: &[String], needle: &str) -> usize {
         .unwrap_or_else(|| panic!("{needle} not found in {args:?}"))
 }
 
-async fn next_event(
-    session: &mut Box<dyn AgentSession>,
-) -> Option<AgentEvent> {
+async fn next_event(session: &mut Box<dyn AgentSession>) -> Option<AgentEvent> {
     tokio::time::timeout(Duration::from_secs(30), session.next_event())
         .await
         .expect("next_event timed out")
@@ -96,7 +94,9 @@ fn fixture_parses_into_expected_events() {
     let inits: Vec<(&String, &String)> = events
         .iter()
         .filter_map(|e| match e {
-            AgentEvent::Init { session_id, model, .. } => Some((session_id, model)),
+            AgentEvent::Init {
+                session_id, model, ..
+            } => Some((session_id, model)),
             _ => None,
         })
         .collect();
@@ -121,7 +121,14 @@ fn fixture_parses_into_expected_events() {
         .filter(|e| matches!(e, AgentEvent::Result { .. }))
         .collect();
     assert_eq!(results.len(), 1, "expected exactly one Result event");
-    let AgentEvent::Result { text, is_error, usage, cost_usd, num_turns, raw } = results[0]
+    let AgentEvent::Result {
+        text,
+        is_error,
+        usage,
+        cost_usd,
+        num_turns,
+        raw,
+    } = results[0]
     else {
         unreachable!()
     };
@@ -153,7 +160,10 @@ fn fixture_parses_into_expected_events() {
     assert!(other_raw_tags.contains(&"rate_limit_event/-".to_string()));
     assert!(other_raw_tags.contains(&"system/thinking_tokens".to_string()));
     assert!(other_raw_tags.contains(&"system/post_turn_summary".to_string()));
-    assert!(other_raw_tags.contains(&"assistant/-".to_string()), "thinking block -> Other");
+    assert!(
+        other_raw_tags.contains(&"assistant/-".to_string()),
+        "thinking block -> Other"
+    );
 
     // Nothing dropped: 1 init + 1 text + 1 result + 6 other.
     assert_eq!(events.len(), 9);
@@ -262,7 +272,13 @@ fn tool_result_denied_heuristic() {
         "Permission denied: Bash(git push) requires approval",
         true,
     ));
-    let AgentEvent::ToolResult { tool, denied, summary, .. } = &events[0] else {
+    let AgentEvent::ToolResult {
+        tool,
+        denied,
+        summary,
+        ..
+    } = &events[0]
+    else {
         panic!("expected ToolResult, got {:?}", events[0]);
     };
     assert!(denied);
@@ -277,7 +293,10 @@ fn tool_result_denied_heuristic() {
     assert!(!denied);
 
     // Hook blocks are denials even without is_error.
-    let events = parse_stream_line(&tool_result_line("operation blocked by PreToolUse hook", false));
+    let events = parse_stream_line(&tool_result_line(
+        "operation blocked by PreToolUse hook",
+        false,
+    ));
     let AgentEvent::ToolResult { denied, .. } = &events[0] else {
         panic!("expected ToolResult");
     };
@@ -286,7 +305,10 @@ fn tool_result_denied_heuristic() {
     // Successful results are not denials; summary keeps first 200 chars.
     let long = "y".repeat(450);
     let events = parse_stream_line(&tool_result_line(&long, false));
-    let AgentEvent::ToolResult { denied, summary, .. } = &events[0] else {
+    let AgentEvent::ToolResult {
+        denied, summary, ..
+    } = &events[0]
+    else {
         panic!("expected ToolResult");
     };
     assert!(!denied);
@@ -314,7 +336,10 @@ fn tool_result_content_array_form_is_flattened() {
     .to_string();
     let events = parse_stream_line(&line);
     assert_eq!(events.len(), 1);
-    let AgentEvent::ToolResult { denied, summary, .. } = &events[0] else {
+    let AgentEvent::ToolResult {
+        denied, summary, ..
+    } = &events[0]
+    else {
         panic!("expected ToolResult, got {:?}", events[0]);
     };
     assert!(denied);
@@ -331,7 +356,10 @@ fn build_args_single_shot_puts_prompt_last() {
     spec.append_system_prompt = Some("you are a worker".to_string());
     let args = build_args(&spec);
 
-    assert_eq!(&args[..4], &["-p", "--output-format", "stream-json", "--verbose"]);
+    assert_eq!(
+        &args[..4],
+        &["-p", "--output-format", "stream-json", "--verbose"]
+    );
     assert_eq!(args[index_of(&args, "--model") + 1], "sonnet");
     assert_eq!(args[index_of(&args, "--effort") + 1], "medium");
     assert_eq!(
@@ -342,7 +370,11 @@ fn build_args_single_shot_puts_prompt_last() {
         args[index_of(&args, "--session-id") + 1],
         "11111111-2222-3333-4444-555555555555"
     );
-    assert_eq!(args.last().unwrap(), "Reply with exactly: OK", "prompt must be last");
+    assert_eq!(
+        args.last().unwrap(),
+        "Reply with exactly: OK",
+        "prompt must be last"
+    );
     assert!(!args.contains(&"--resume".to_string()));
     assert!(!args.contains(&"--input-format".to_string()));
     // Omitted options add no flags.
@@ -384,12 +416,18 @@ fn build_args_resume_replaces_session_id() {
 fn build_args_each_tool_pattern_is_its_own_arg() {
     let mut spec = base_spec(PromptMode::SingleShot("go".to_string()));
     spec.permission_mode = Some("acceptEdits".to_string());
-    spec.allowed_tools =
-        vec!["Bash(cargo test*)".to_string(), "Read".to_string(), "Glob".to_string()];
+    spec.allowed_tools = vec![
+        "Bash(cargo test*)".to_string(),
+        "Read".to_string(),
+        "Glob".to_string(),
+    ];
     spec.disallowed_tools = vec!["Bash(git push*)".to_string(), "WebFetch".to_string()];
     let args = build_args(&spec);
 
-    assert_eq!(args[index_of(&args, "--permission-mode") + 1], "acceptEdits");
+    assert_eq!(
+        args[index_of(&args, "--permission-mode") + 1],
+        "acceptEdits"
+    );
 
     let a = index_of(&args, "--allowedTools");
     assert_eq!(args[a + 1], "Bash(cargo test*)");
@@ -413,7 +451,10 @@ fn build_args_emits_tools_flag_only_when_configured() {
 
     let empty_spec = base_spec(PromptMode::SingleShot("go".to_string()));
     let empty_args = build_args(&empty_spec);
-    assert!(!empty_args.iter().any(|a| a == "--tools"), "no --tools token when spec.tools is empty");
+    assert!(
+        !empty_args.iter().any(|a| a == "--tools"),
+        "no --tools token when spec.tools is empty"
+    );
 }
 
 #[test]
@@ -438,7 +479,11 @@ fn build_args_settings_schema_and_budget_are_compact() {
 fn user_message_line_is_one_json_line_in_wire_format() {
     let line = user_message_line("hello\nworld");
     assert!(line.ends_with('\n'));
-    assert_eq!(line.trim_end().lines().count(), 1, "must be a single JSONL line");
+    assert_eq!(
+        line.trim_end().lines().count(),
+        1,
+        "must be a single JSONL line"
+    );
     let value: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
     assert_eq!(value["type"], "user");
     assert_eq!(value["message"]["role"], "user");
@@ -455,7 +500,9 @@ fn write_script(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let path = dir.join(name);
     std::fs::write(&path, body).expect("write script");
-    let mut perms = std::fs::metadata(&path).expect("script metadata").permissions();
+    let mut perms = std::fs::metadata(&path)
+        .expect("script metadata")
+        .permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&path, perms).expect("chmod script");
     path
@@ -465,7 +512,11 @@ fn write_script(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
 #[test]
 fn discover_accepts_configured_script_that_reports_a_version() {
     let dir = tempfile::tempdir().unwrap();
-    let script = write_script(dir.path(), "fake-claude", "#!/bin/sh\necho '9.9.9 (fake)'\n");
+    let script = write_script(
+        dir.path(),
+        "fake-claude",
+        "#!/bin/sh\necho '9.9.9 (fake)'\n",
+    );
     let found = discover_claude_binary(Some(script.to_str().unwrap()))
         .expect("configured script must be accepted");
     assert_eq!(found, script);
@@ -484,8 +535,14 @@ fn discover_with_nonexistent_configured_path_falls_through_or_lists_attempts() {
         Ok(found) => assert_ne!(found, PathBuf::from(bogus)),
         // Nothing else found: the error must list what was tried.
         Err(EngineError::Config(msg)) => {
-            assert!(msg.contains(bogus), "error must list the configured attempt: {msg}");
-            assert!(msg.contains("claude"), "error should mention other candidates: {msg}");
+            assert!(
+                msg.contains(bogus),
+                "error must list the configured attempt: {msg}"
+            );
+            assert!(
+                msg.contains("claude"),
+                "error should mention other candidates: {msg}"
+            );
         }
         Err(other) => panic!("expected Config error, got {other:?}"),
     }
@@ -538,7 +595,10 @@ mod fake_cli {
         std::fs::write(&stream_path, stream_lines.join("\n") + "\n").unwrap();
         let script = write_script(dir.path(), "fake-claude.sh", script_body);
         let mut env = HashMap::new();
-        env.insert("KRANZ_FAKE_STREAM".to_string(), stream_path.display().to_string());
+        env.insert(
+            "KRANZ_FAKE_STREAM".to_string(),
+            stream_path.display().to_string(),
+        );
         (ClaudeBackend::new(script), env)
     }
 
@@ -570,9 +630,15 @@ mod fake_cli {
                 _ => None,
             })
             .collect();
-        assert_eq!(texts, vec!["one", "one continued", "two"], "budget-2 keeps 2 turns");
+        assert_eq!(
+            texts,
+            vec!["one", "one continued", "two"],
+            "budget-2 keeps 2 turns"
+        );
         assert!(
-            !events.iter().any(|e| matches!(e, AgentEvent::Result { .. })),
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Result { .. })),
             "nothing after the over-budget message may be emitted"
         );
         assert_eq!(session.exit_status(), Some(SessionExit::Aborted));
@@ -598,13 +664,21 @@ mod fake_cli {
         let events = drain(&mut session).await;
 
         assert_eq!(events.len(), 9);
-        assert_eq!(session.session_id(), FIXTURE_SESSION_ID, "init overrides spec id");
+        assert_eq!(
+            session.session_id(),
+            FIXTURE_SESSION_ID,
+            "init overrides spec id"
+        );
         assert!(events
             .iter()
             .any(|e| matches!(e, AgentEvent::Text { text, .. } if text == "OK")));
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::Result { is_error: false, .. })));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Result {
+                is_error: false,
+                ..
+            }
+        )));
         assert_eq!(session.exit_status(), Some(SessionExit::Completed));
     }
 
@@ -626,7 +700,10 @@ mod fake_cli {
 
         match session.exit_status() {
             Some(SessionExit::Failed(msg)) => {
-                assert!(msg.contains('3'), "message should carry the exit code: {msg}");
+                assert!(
+                    msg.contains('3'),
+                    "message should carry the exit code: {msg}"
+                );
                 assert!(
                     msg.contains("boom: something went wrong"),
                     "message should carry the stderr tail: {msg}"
@@ -675,16 +752,28 @@ mod fake_cli {
             events.push(next_event(&mut session).await.expect("scripted event"));
         }
         assert!(matches!(events[0], AgentEvent::Init { .. }));
-        assert!(matches!(events[2], AgentEvent::Result { is_error: false, .. }));
+        assert!(matches!(
+            events[2],
+            AgentEvent::Result {
+                is_error: false,
+                ..
+            }
+        ));
 
         // Injection is allowed on streaming sessions.
-        session.send_user_message("next turn").await.expect("streaming send works");
+        session
+            .send_user_message("next turn")
+            .await
+            .expect("streaming send works");
 
         // Abort a still-running process: Aborted (success result seen, but
         // the process had not exited on its own).
         session.abort().await.unwrap();
         assert_eq!(session.exit_status(), Some(SessionExit::Aborted));
-        assert!(next_event(&mut session).await.is_none(), "stream closed after abort");
+        assert!(
+            next_event(&mut session).await.is_none(),
+            "stream closed after abort"
+        );
 
         // Once closed, sends must error.
         let err = session.send_user_message("too late").await.unwrap_err();
@@ -727,7 +816,10 @@ mod fake_cli {
         let tool_pid =
             i32::try_from(raw["pid"].as_i64().expect("pid field")).expect("pid fits i32");
         assert!(tool_pid > 0, "pid was {tool_pid}");
-        assert!(process_alive(tool_pid), "tool child must be alive before abort");
+        assert!(
+            process_alive(tool_pid),
+            "tool child must be alive before abort"
+        );
 
         // Bounded: abort joins the stderr capture task, which only finishes
         // when every pipe holder is dead — a surviving tool subprocess would
@@ -737,7 +829,10 @@ mod fake_cli {
             .expect("abort hung: a tool subprocess survived and held the pipes")
             .unwrap();
         assert_eq!(session.exit_status(), Some(SessionExit::Aborted));
-        assert!(next_event(&mut session).await.is_none(), "stream closed after abort");
+        assert!(
+            next_event(&mut session).await.is_none(),
+            "stream closed after abort"
+        );
 
         // The tool subprocess must die with the CLI. Bounded wait: SIGKILL
         // delivery and init reaping the reparented orphan are asynchronous.
@@ -832,7 +927,10 @@ mod win_process_tree {
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         let _init = next_event(&mut session).await.expect("init event");
         while !pidfile.exists() {
-            assert!(std::time::Instant::now() < deadline, "pidfile never appeared");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pidfile never appeared"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         // Extract the digit run (robust to any BOM/whitespace the shell adds).
@@ -922,13 +1020,19 @@ async fn real_single_shot() {
         events.push(event);
     }
 
-    let saw_text = events.iter().any(
-        |e| matches!(e, AgentEvent::Text { text, .. } if text.contains("KRANZ_OK")),
-    );
+    let saw_text = events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::Text { text, .. } if text.contains("KRANZ_OK")));
     let saw_result = events.iter().any(|e| {
         matches!(e, AgentEvent::Result { text, is_error: false, .. } if text.contains("KRANZ_OK"))
     });
-    assert!(saw_text, "expected a Text event containing KRANZ_OK: {events:?}");
-    assert!(saw_result, "expected a successful Result containing KRANZ_OK");
+    assert!(
+        saw_text,
+        "expected a Text event containing KRANZ_OK: {events:?}"
+    );
+    assert!(
+        saw_result,
+        "expected a successful Result containing KRANZ_OK"
+    );
     assert_eq!(session.exit_status(), Some(SessionExit::Completed));
 }

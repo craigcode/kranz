@@ -46,22 +46,30 @@ static ENV_ISOLATION: Once = Once::new();
 /// read the developer's real ~/.kranz/config.json into the test missions.
 fn isolate_git_env() {
     ENV_ISOLATION.call_once(|| {
-        let missing = std::env::temp_dir()
-            .join(format!("kranz-server-host-test-no-config-{}", std::process::id()));
+        let missing = std::env::temp_dir().join(format!(
+            "kranz-server-host-test-no-config-{}",
+            std::process::id()
+        ));
         std::env::set_var("GIT_CONFIG_GLOBAL", &missing);
         std::env::set_var("GIT_CONFIG_SYSTEM", &missing);
         if let Ok(ceiling) = std::fs::canonicalize(std::env::temp_dir()) {
             std::env::set_var("GIT_CEILING_DIRECTORIES", ceiling);
         }
-        let home = std::env::temp_dir()
-            .join(format!("kranz-server-host-test-home-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!(
+            "kranz-server-host-test-home-{}",
+            std::process::id()
+        ));
         let _ = std::fs::create_dir_all(&home);
         std::env::set_var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }, &home);
     });
 }
 
 fn git_available() -> bool {
-    Command::new("git").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+    Command::new("git")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// Returns false (after a skip note) when git is missing.
@@ -76,7 +84,11 @@ fn setup() -> bool {
 }
 
 fn raw_git(dir: &Path, args: &[&str]) {
-    let out = Command::new("git").args(args).current_dir(dir).output().expect("spawn git");
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("spawn git");
     assert!(
         out.status.success(),
         "git {args:?} failed: {}",
@@ -158,8 +170,11 @@ async fn get_json(app: &axum::Router, uri: &str) -> (StatusCode, Value) {
         .unwrap();
     let status = response.status();
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    let value =
-        if bytes.is_empty() { Value::Null } else { serde_json::from_slice(&bytes).unwrap() };
+    let value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    };
     (status, value)
 }
 
@@ -183,8 +198,11 @@ async fn post_json(
         .unwrap();
     let status = response.status();
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    let value =
-        if bytes.is_empty() { Value::Null } else { serde_json::from_slice(&bytes).unwrap() };
+    let value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    };
     (status, value)
 }
 
@@ -221,8 +239,13 @@ async fn pending_plan_parks_on_ready_and_approve_pending_commits() {
     let backend = Arc::new(MockBackend::with_scripts(vec![orch]));
     let app = hosted_app(&root, backend);
 
-    let (status, body) =
-        post_json(&app, "/api/missions", Some(TOKEN), json!({ "goal": "park a plan" })).await;
+    let (status, body) = post_json(
+        &app,
+        "/api/missions",
+        Some(TOKEN),
+        json!({ "goal": "park a plan" }),
+    )
+    .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     let id = body["id"].as_str().unwrap().to_string();
 
@@ -231,9 +254,13 @@ async fn pending_plan_parks_on_ready_and_approve_pending_commits() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["pending"], false);
     // Approving with nothing parked is an honest 409.
-    let (status, _) =
-        post_json(&app, &format!("/api/missions/{id}/approve-pending"), Some(TOKEN), json!({}))
-            .await;
+    let (status, _) = post_json(
+        &app,
+        &format!("/api/missions/{id}/approve-pending"),
+        Some(TOKEN),
+        json!({}),
+    )
+    .await;
     assert_eq!(status, StatusCode::CONFLICT);
 
     // One conversational turn, then a Ready request-plan parks the plan.
@@ -271,15 +298,22 @@ async fn pending_plan_parks_on_ready_and_approve_pending_commits() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["branch"], format!("kranz/mission-{id}"));
     assert_eq!(body["started"], false);
-    assert!(MissionPaths::new(&root, &id).plan_file().is_file(), "plan.json committed");
+    assert!(
+        MissionPaths::new(&root, &id).plan_file().is_file(),
+        "plan.json committed"
+    );
 
     // …consumes the parked plan, and a second approve is a clean 409.
     let (status, body) = get_json(&app, &format!("/api/missions/{id}/pending-plan")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["pending"], false, "{body}");
-    let (status, _) =
-        post_json(&app, &format!("/api/missions/{id}/approve-pending"), Some(TOKEN), json!({}))
-            .await;
+    let (status, _) = post_json(
+        &app,
+        &format!("/api/missions/{id}/approve-pending"),
+        Some(TOKEN),
+        json!({}),
+    )
+    .await;
     assert_eq!(status, StatusCode::CONFLICT);
 }
 
@@ -327,11 +361,9 @@ async fn abandon_then_delete_lifecycle_over_rest() {
     );
 
     // Gone means gone: both endpoints 404 now.
-    let (status, _) =
-        post_json(&app, "/api/missions/m-husk/abandon", Some(TOKEN), json!({})).await;
+    let (status, _) = post_json(&app, "/api/missions/m-husk/abandon", Some(TOKEN), json!({})).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    let (status, _) =
-        post_json(&app, "/api/missions/m-husk/delete", Some(TOKEN), json!({})).await;
+    let (status, _) = post_json(&app, "/api/missions/m-husk/delete", Some(TOKEN), json!({})).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
@@ -348,10 +380,13 @@ async fn delete_guards_live_and_complete_missions() {
     seed_mission_log(&root, "m-live");
     {
         let paths = MissionPaths::new(&root, "m-live");
-        let mut log =
-            EventLog::acquire(&paths, "m-live", Duration::ZERO, LockForce::No).unwrap();
+        let mut log = EventLog::acquire(&paths, "m-live", Duration::ZERO, LockForce::No).unwrap();
         let plan: kranz_engine::types::Plan = serde_json::from_value(plan_json()).unwrap();
-        log.append(EventKind::PlanApproved { plan, base_sha: None }).unwrap();
+        log.append(EventKind::PlanApproved {
+            plan,
+            base_sha: None,
+        })
+        .unwrap();
     }
     let (status, body) =
         post_json(&app, "/api/missions/m-live/delete", Some(TOKEN), json!({})).await;
@@ -361,16 +396,22 @@ async fn delete_guards_live_and_complete_missions() {
     seed_mission_log(&root, "m-done");
     {
         let paths = MissionPaths::new(&root, "m-done");
-        let mut log =
-            EventLog::acquire(&paths, "m-done", Duration::ZERO, LockForce::No).unwrap();
+        let mut log = EventLog::acquire(&paths, "m-done", Duration::ZERO, LockForce::No).unwrap();
         let plan: kranz_engine::types::Plan = serde_json::from_value(plan_json()).unwrap();
-        log.append(EventKind::PlanApproved { plan, base_sha: None }).unwrap();
+        log.append(EventKind::PlanApproved {
+            plan,
+            base_sha: None,
+        })
+        .unwrap();
         log.append(EventKind::MissionCompleted {}).unwrap();
     }
     let (status, body) =
         post_json(&app, "/api/missions/m-done/delete", Some(TOKEN), json!({})).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(body["error"].as_str().unwrap().contains("calibration"), "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("calibration"),
+        "{body}"
+    );
     let (status, body) = post_json(
         &app,
         "/api/missions/m-done/delete",
@@ -402,7 +443,9 @@ async fn release_frees_the_mission_lock_for_external_runners() {
     let host = kranz_server::MissionHost::with_backend(root.clone(), backend);
 
     // Attach via a planning turn: the host now holds the lock…
-    host.planning_turn("m-rel", "hi").await.expect("planning turn attaches");
+    host.planning_turn("m-rel", "hi")
+        .await
+        .expect("planning turn attaches");
     let paths = MissionPaths::new(&root, "m-rel");
     assert!(
         EventLog::acquire(&paths, "m-rel", Duration::ZERO, LockForce::No).is_err(),
@@ -410,7 +453,10 @@ async fn release_frees_the_mission_lock_for_external_runners() {
     );
 
     // …and release frees it for an external runner.
-    assert!(host.release("m-rel").expect("release"), "idle engine releases cleanly");
+    assert!(
+        host.release("m-rel").expect("release"),
+        "idle engine releases cleanly"
+    );
     let log = EventLog::acquire(&paths, "m-rel", Duration::ZERO, LockForce::No);
     assert!(log.is_ok(), "after release, an external acquire succeeds");
     drop(log);
@@ -434,7 +480,9 @@ async fn sweep_idle_releases_an_attached_mission_and_frees_its_lock() {
     let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::with_scripts(vec![orch]));
     let host = kranz_server::MissionHost::with_backend(root.clone(), backend);
 
-    host.planning_turn("m-sweep", "hi").await.expect("planning turn attaches");
+    host.planning_turn("m-sweep", "hi")
+        .await
+        .expect("planning turn attaches");
     let paths = MissionPaths::new(&root, "m-sweep");
     assert!(
         EventLog::acquire(&paths, "m-sweep", Duration::ZERO, LockForce::No).is_err(),
@@ -470,9 +518,13 @@ async fn release_route_frees_the_lock_over_rest() {
     let app = hosted_app(&root, backend);
 
     // Attach via a planning turn over REST: the host now holds the lock…
-    let (status, body) =
-        post_json(&app, "/api/missions/m-rel-rest/planning/turn", Some(TOKEN), json!({ "text": "hi" }))
-            .await;
+    let (status, body) = post_json(
+        &app,
+        "/api/missions/m-rel-rest/planning/turn",
+        Some(TOKEN),
+        json!({ "text": "hi" }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
     let paths = MissionPaths::new(&root, "m-rel-rest");
@@ -481,8 +533,13 @@ async fn release_route_frees_the_lock_over_rest() {
         "while attached, an external acquire must be LockHeld-refused"
     );
 
-    let (status, body) =
-        post_json(&app, "/api/missions/m-rel-rest/release", Some(TOKEN), json!({})).await;
+    let (status, body) = post_json(
+        &app,
+        "/api/missions/m-rel-rest/release",
+        Some(TOKEN),
+        json!({}),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["released"], true);
 
@@ -497,8 +554,13 @@ async fn release_route_is_404_for_an_unknown_mission() {
     let backend = Arc::new(MockBackend::new());
     let app = hosted_app(&root, backend);
 
-    let (status, _) =
-        post_json(&app, "/api/missions/m-does-not-exist/release", Some(TOKEN), json!({})).await;
+    let (status, _) = post_json(
+        &app,
+        "/api/missions/m-does-not-exist/release",
+        Some(TOKEN),
+        json!({}),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
@@ -549,7 +611,11 @@ async fn mutation_token_gates_every_post_and_no_get() {
         "/api/missions/m-01/release",
     ] {
         let (status, _) = post_json(&app, uri, None, json!({})).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri} must require the token");
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{uri} must require the token"
+        );
     }
 
     // Correct token → the control command is accepted.
@@ -621,7 +687,10 @@ async fn hosted_lifecycle_reaches_complete_without_a_terminal() {
     let (status, state) = get_json(&app, &format!("/api/missions/{id}/state")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(state["mission"]["status"], "planning");
-    assert_eq!(state["config"]["skipScrutiny"], true, "config patch applied");
+    assert_eq!(
+        state["config"]["skipScrutiny"], true,
+        "config patch applied"
+    );
 
     // Planning turn: the seed turn's reply is prepended, blank-line separated.
     let (status, body) = post_json(
@@ -658,10 +727,18 @@ async fn hosted_lifecycle_reaches_complete_without_a_terminal() {
     let plan = body["plan"].clone();
 
     // Start before approval is refused with advice.
-    let (status, body) =
-        post_json(&app, &format!("/api/missions/{id}/start"), Some(TOKEN), json!({})).await;
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/missions/{id}/start"),
+        Some(TOKEN),
+        json!({}),
+    )
+    .await;
     assert_eq!(status, StatusCode::CONFLICT);
-    assert!(body["error"].as_str().unwrap().contains("approve"), "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("approve"),
+        "{body}"
+    );
 
     // Approve: branch + the same plan.json/plan.md/index.md commit as the CLI.
     let (status, body) = post_json(
@@ -675,9 +752,15 @@ async fn hosted_lifecycle_reaches_complete_without_a_terminal() {
     assert_eq!(body["branch"], format!("kranz/mission-{id}"));
     let paths = MissionPaths::new(&root, &id);
     assert!(paths.plan_file().is_file(), "plan.json committed");
-    assert!(paths.mission_dir().join("plan.md").is_file(), "plan.md committed");
+    assert!(
+        paths.mission_dir().join("plan.md").is_file(),
+        "plan.md committed"
+    );
     let index = std::fs::read_to_string(paths.missions_dir().join("index.md")).unwrap();
-    assert!(index.contains(&id), "missions catalog lists the mission: {index}");
+    assert!(
+        index.contains(&id),
+        "missions catalog lists the mission: {index}"
+    );
 
     // Approving again is a lifecycle conflict, not a server error.
     let (status, _) = post_json(
@@ -691,8 +774,13 @@ async fn hosted_lifecycle_reaches_complete_without_a_terminal() {
 
     // Start: 202, then the background engine.run() drives the mission to
     // COMPLETE (worker → judgement → milestone tag → empty final gate).
-    let (status, body) =
-        post_json(&app, &format!("/api/missions/{id}/start"), Some(TOKEN), json!({})).await;
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/missions/{id}/start"),
+        Some(TOKEN),
+        json!({}),
+    )
+    .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     assert_eq!(body["running"], true);
 
@@ -703,8 +791,13 @@ async fn hosted_lifecycle_reaches_complete_without_a_terminal() {
     // terminal state as a conflict (nothing left to run).
     let deadline = tokio::time::Instant::now() + RUN_TIMEOUT;
     loop {
-        let (status, body) =
-            post_json(&app, &format!("/api/missions/{id}/start"), Some(TOKEN), json!({})).await;
+        let (status, body) = post_json(
+            &app,
+            &format!("/api/missions/{id}/start"),
+            Some(TOKEN),
+            json!({}),
+        )
+        .await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
         let error = body["error"].as_str().unwrap_or_default().to_string();
         if error.contains("complete") {
@@ -743,8 +836,13 @@ async fn second_start_and_planning_turns_conflict_while_running() {
     let backend = Arc::new(MockBackend::with_scripts(vec![worker_pass(), orch]));
     let app = hosted_app(&root, backend);
 
-    let (status, body) =
-        post_json(&app, "/api/missions", Some(TOKEN), json!({ "goal": "ship the demo" })).await;
+    let (status, body) = post_json(
+        &app,
+        "/api/missions",
+        Some(TOKEN),
+        json!({ "goal": "ship the demo" }),
+    )
+    .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     let id = body["id"].as_str().unwrap().to_string();
 
@@ -758,15 +856,28 @@ async fn second_start_and_planning_turns_conflict_while_running() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    let (status, _) =
-        post_json(&app, &format!("/api/missions/{id}/start"), Some(TOKEN), json!({})).await;
+    let (status, _) = post_json(
+        &app,
+        &format!("/api/missions/{id}/start"),
+        Some(TOKEN),
+        json!({}),
+    )
+    .await;
     assert_eq!(status, StatusCode::ACCEPTED);
 
     // Second start while the run task is live → 409 "already running".
-    let (status, body) =
-        post_json(&app, &format!("/api/missions/{id}/start"), Some(TOKEN), json!({})).await;
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/missions/{id}/start"),
+        Some(TOKEN),
+        json!({}),
+    )
+    .await;
     assert_eq!(status, StatusCode::CONFLICT);
-    assert!(body["error"].as_str().unwrap().contains("already running"), "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("already running"),
+        "{body}"
+    );
 
     // Planning endpoints on a running mission point at the control inbox.
     let (status, body) = post_json(
@@ -777,7 +888,10 @@ async fn second_start_and_planning_turns_conflict_while_running() {
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
-    assert!(body["error"].as_str().unwrap().contains("control"), "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("control"),
+        "{body}"
+    );
 
     // Steering stays available (and tokenless GETs still observe).
     let (status, _) = post_json(
@@ -808,9 +922,11 @@ async fn planning_endpoints_attach_non_hosted_missions_and_404_unknown() {
     // The host ADOPTS it on demand — the Slack planning-conversation path —
     // instead of refusing with "not hosted".
     seed_mission_log(&root, "m-cli");
-    let orch =
-        MockScript::streaming(vec![mock_init("orch-attach"), mock_result_text("attach-hi")])
-            .responding(vec![turn("resumed and listening")]);
+    let orch = MockScript::streaming(vec![
+        mock_init("orch-attach"),
+        mock_result_text("attach-hi"),
+    ])
+    .responding(vec![turn("resumed and listening")]);
     let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::with_scripts(vec![orch]));
     let host = kranz_server::MissionHost::with_backend(root.clone(), backend);
     let app = kranz_server::router_with_host(host, None, Some(TOKEN.to_string()));
@@ -830,10 +946,13 @@ async fn planning_endpoints_attach_non_hosted_missions_and_404_unknown() {
     seed_mission_log(&root, "m-done");
     {
         let paths = MissionPaths::new(&root, "m-done");
-        let mut log =
-            EventLog::acquire(&paths, "m-done", Duration::ZERO, LockForce::No).unwrap();
+        let mut log = EventLog::acquire(&paths, "m-done", Duration::ZERO, LockForce::No).unwrap();
         let plan: kranz_engine::types::Plan = serde_json::from_value(plan_json()).unwrap();
-        log.append(EventKind::PlanApproved { plan, base_sha: None }).unwrap();
+        log.append(EventKind::PlanApproved {
+            plan,
+            base_sha: None,
+        })
+        .unwrap();
     }
     let (status, body) = post_json(
         &app,
@@ -843,7 +962,10 @@ async fn planning_endpoints_attach_non_hosted_missions_and_404_unknown() {
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(body["error"].as_str().unwrap().contains("not in planning"), "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("not in planning"),
+        "{body}"
+    );
 
     // Unknown mission → plain 404.
     let (status, body) = post_json(
@@ -854,8 +976,7 @@ async fn planning_endpoints_attach_non_hosted_missions_and_404_unknown() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-    let (status, _) =
-        post_json(&app, "/api/missions/m-nope/start", Some(TOKEN), json!({})).await;
+    let (status, _) = post_json(&app, "/api/missions/m-nope/start", Some(TOKEN), json!({})).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
     // Bad request bodies are 400s, not 500s.

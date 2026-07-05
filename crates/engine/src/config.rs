@@ -52,7 +52,10 @@ pub fn load_layers(layers: &[PathBuf]) -> Result<MissionConfig> {
         };
 
         let patch: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
-            EngineError::Config(format!("invalid JSON in config file {}: {e}", path.display()))
+            EngineError::Config(format!(
+                "invalid JSON in config file {}: {e}",
+                path.display()
+            ))
         })?;
 
         if !patch.is_object() {
@@ -65,9 +68,8 @@ pub fn load_layers(layers: &[PathBuf]) -> Result<MissionConfig> {
         deep_merge(&mut merged, &patch);
     }
 
-    serde_json::from_value(merged).map_err(|e| {
-        EngineError::Config(format!("merged configuration does not deserialize: {e}"))
-    })
+    serde_json::from_value(merged)
+        .map_err(|e| EngineError::Config(format!("merged configuration does not deserialize: {e}")))
 }
 
 /// Recursively merge `patch` into `base`: objects merge key-wise, everything

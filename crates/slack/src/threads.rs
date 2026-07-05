@@ -66,7 +66,11 @@ impl ThreadMap {
 
     /// Record the thread root for a mission. Returns the previous value if the
     /// mission was already threaded (a re-post overwriting the old root).
-    pub fn set(&mut self, mission_id: impl Into<String>, thread_ts: impl Into<String>) -> Option<String> {
+    pub fn set(
+        &mut self,
+        mission_id: impl Into<String>,
+        thread_ts: impl Into<String>,
+    ) -> Option<String> {
         self.by_mission.insert(mission_id.into(), thread_ts.into())
     }
 
@@ -81,7 +85,10 @@ impl ThreadMap {
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir)?;
-    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("slack-threads.json");
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("slack-threads.json");
     let tmp = dir.join(format!(".{file_name}.{}.tmp", std::process::id()));
     std::fs::write(&tmp, bytes)?;
     match std::fs::rename(&tmp, path) {

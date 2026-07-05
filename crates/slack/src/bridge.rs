@@ -65,7 +65,11 @@ impl SharedThreads {
     }
 
     fn thread_ts(&self, mission_id: &str) -> Option<String> {
-        self.inner.lock().unwrap().thread_ts(mission_id).map(str::to_string)
+        self.inner
+            .lock()
+            .unwrap()
+            .thread_ts(mission_id)
+            .map(str::to_string)
     }
 
     /// Record a mission's thread root and persist. A persistence error is
@@ -82,7 +86,11 @@ impl SharedThreads {
 
 impl ThreadLookup for SharedThreads {
     fn mission_for_thread(&self, thread_ts: &str) -> Option<String> {
-        self.inner.lock().unwrap().mission_for_thread(thread_ts).map(str::to_string)
+        self.inner
+            .lock()
+            .unwrap()
+            .mission_for_thread(thread_ts)
+            .map(str::to_string)
     }
 }
 
@@ -246,7 +254,9 @@ async fn post_outbound(
     // a `[name]` prefix; unset → the blocks pass through unchanged.
     let blocks = crate::format::label_blocks(blocks, cfg.instance_name.as_deref());
     let thread_ts = threads.thread_ts(mission_id);
-    let posted_ts = client.post_message(&cfg.channel, &blocks, thread_ts.as_deref()).await?;
+    let posted_ts = client
+        .post_message(&cfg.channel, &blocks, thread_ts.as_deref())
+        .await?;
     // First post for this mission establishes the thread root.
     if thread_ts.is_none() {
         threads.set(mission_id, &posted_ts);
@@ -337,7 +347,10 @@ async fn connect_once(
     pending: &PendingPlans,
     stop: &Arc<Notify>,
 ) -> Result<bool> {
-    let url = client.open_connection().await.context("opening Socket Mode connection")?;
+    let url = client
+        .open_connection()
+        .await
+        .context("opening Socket Mode connection")?;
     let (ws_stream, _resp) = tokio_tungstenite::connect_async(&url)
         .await
         .context("dialing Socket Mode websocket")?;
@@ -517,7 +530,9 @@ async fn handle_envelope(
     )
     .await;
     // Ack whatever carried an envelope_id, even Ignore, so Slack stops retrying.
-    routed.envelope_id.map(|id| json!({ "envelope_id": id }).to_string())
+    routed
+        .envelope_id
+        .map(|id| json!({ "envelope_id": id }).to_string())
 }
 
 /// Ephemeral reply to the slash `response_url`, best-effort (a failed reply
@@ -646,35 +661,58 @@ async fn dispatch_action(
 ) {
     match action {
         Action::Help { response_url } => {
-            reply_ephemeral(cfg, client, response_url.as_deref(), &crate::format::build_help()).await;
+            reply_ephemeral(
+                cfg,
+                client,
+                response_url.as_deref(),
+                &crate::format::build_help(),
+            )
+            .await;
         }
 
-        Action::Status { mission_id, response_url } => {
-            match build_status_reply(repo_root, mission_id.as_deref()) {
-                Ok(blocks) => reply_ephemeral(cfg, client, response_url.as_deref(), &blocks).await,
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to build Slack status reply");
-                    reply_ephemeral(
-                        cfg,
-                        client,
-                        response_url.as_deref(),
-                        &error_blocks(&format!("Couldn't read that mission: {e}")),
-                    )
-                    .await;
-                }
+        Action::Status {
+            mission_id,
+            response_url,
+        } => match build_status_reply(repo_root, mission_id.as_deref()) {
+            Ok(blocks) => reply_ephemeral(cfg, client, response_url.as_deref(), &blocks).await,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to build Slack status reply");
+                reply_ephemeral(
+                    cfg,
+                    client,
+                    response_url.as_deref(),
+                    &error_blocks(&format!("Couldn't read that mission: {e}")),
+                )
+                .await;
             }
-        }
+        },
 
-        Action::NewMission { goal, user_id, response_url, channel } => {
+        Action::NewMission {
+            goal,
+            user_id,
+            response_url,
+            channel,
+        } => {
             if !cfg.is_authorized(user_id.as_deref()) {
-                user_reply(cfg, client, response_url.as_deref(), channel, user_id.as_deref(),
-                    &not_authorized_blocks()).await;
+                user_reply(
+                    cfg,
+                    client,
+                    response_url.as_deref(),
+                    channel,
+                    user_id.as_deref(),
+                    &not_authorized_blocks(),
+                )
+                .await;
                 return;
             }
             // Ack IMMEDIATELY: create + the seeding planning turn take minutes,
             // and a silently-working command reads as a dead one.
             user_reply(
-                cfg, client, response_url.as_deref(), channel, user_id.as_deref(),
+                cfg,
+                client,
+                response_url.as_deref(),
+                channel,
+                user_id.as_deref(),
                 &error_blocks(
                     ":hourglass_flowing_sand: Creating the mission — the seeding planning \
                      turn usually takes a minute or two; the planning thread will appear \
@@ -684,13 +722,24 @@ async fn dispatch_action(
             .await;
             match new_mission(cfg, client, repo_root, threads, host, goal, channel).await {
                 Ok(blocks) => {
-                    user_reply(cfg, client, response_url.as_deref(), channel,
-                        user_id.as_deref(), &blocks).await;
+                    user_reply(
+                        cfg,
+                        client,
+                        response_url.as_deref(),
+                        channel,
+                        user_id.as_deref(),
+                        &blocks,
+                    )
+                    .await;
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "failed to create mission from Slack");
                     user_reply(
-                        cfg, client, response_url.as_deref(), channel, user_id.as_deref(),
+                        cfg,
+                        client,
+                        response_url.as_deref(),
+                        channel,
+                        user_id.as_deref(),
                         &error_blocks(&format!("Couldn't create the mission: {e}")),
                     )
                     .await;
@@ -700,9 +749,20 @@ async fn dispatch_action(
 
         // Bare `/kranz config`: open the role/model/effort picker modal.
         // Inline for the same trigger_id-expiry reason as the goal modal.
-        Action::ConfigModal { trigger_id, user_id, response_url, channel } => {
+        Action::ConfigModal {
+            trigger_id,
+            user_id,
+            response_url,
+            channel,
+        } => {
             if !cfg.is_authorized(user_id.as_deref()) {
-                reply_ephemeral(cfg, client, response_url.as_deref(), &not_authorized_blocks()).await;
+                reply_ephemeral(
+                    cfg,
+                    client,
+                    response_url.as_deref(),
+                    &not_authorized_blocks(),
+                )
+                .await;
                 return;
             }
             let view = crate::format::build_config_modal(channel);
@@ -724,9 +784,20 @@ async fn dispatch_action(
         // Bare `/kranz new`: open the multiline goal modal. MUST run inline —
         // the trigger_id expires ~3 s after the slash — and it's one Web API
         // call, well inside the ack budget.
-        Action::NewMissionModal { trigger_id, user_id, response_url, channel } => {
+        Action::NewMissionModal {
+            trigger_id,
+            user_id,
+            response_url,
+            channel,
+        } => {
             if !cfg.is_authorized(user_id.as_deref()) {
-                reply_ephemeral(cfg, client, response_url.as_deref(), &not_authorized_blocks()).await;
+                reply_ephemeral(
+                    cfg,
+                    client,
+                    response_url.as_deref(),
+                    &not_authorized_blocks(),
+                )
+                .await;
                 return;
             }
             let view = crate::format::build_new_mission_modal(channel);
@@ -745,14 +816,29 @@ async fn dispatch_action(
             }
         }
 
-        Action::RequestPlan { mission_id, user_id, response_url } => {
+        Action::RequestPlan {
+            mission_id,
+            user_id,
+            response_url,
+        } => {
             if !cfg.is_authorized(user_id.as_deref()) {
-                reply_ephemeral(cfg, client, response_url.as_deref(), &not_authorized_blocks()).await;
+                reply_ephemeral(
+                    cfg,
+                    client,
+                    response_url.as_deref(),
+                    &not_authorized_blocks(),
+                )
+                .await;
                 return;
             }
             let Some(host) = host else {
-                reply_ephemeral(cfg, client, response_url.as_deref(), &no_host_blocks(mission_id))
-                    .await;
+                reply_ephemeral(
+                    cfg,
+                    client,
+                    response_url.as_deref(),
+                    &no_host_blocks(mission_id),
+                )
+                .await;
                 return;
             };
             // Ack IMMEDIATELY: the request-plan turn takes minutes, and a
@@ -774,8 +860,7 @@ async fn dispatch_action(
                     let review = crate::format::build_plan_review(&crate::format::PlanReview {
                         mission_id: mission_id.clone(),
                         goal: plan.goal.clone(),
-                        milestone_titles:
-                            plan.milestones.iter().map(|m| m.title.clone()).collect(),
+                        milestone_titles: plan.milestones.iter().map(|m| m.title.clone()).collect(),
                         assertion_count: plan.validation_contract.len(),
                         estimate,
                     });
@@ -819,30 +904,68 @@ async fn dispatch_action(
             }
         }
 
-        Action::ApproveMission { mission_id, user_id, response_url } => {
+        Action::ApproveMission {
+            mission_id,
+            user_id,
+            response_url,
+        } => {
             approve_flow(
-                cfg, client, repo_root, threads, host, pending, mission_id,
-                user_id.as_deref(), response_url.as_deref(), false, false,
+                cfg,
+                client,
+                repo_root,
+                threads,
+                host,
+                pending,
+                mission_id,
+                user_id.as_deref(),
+                response_url.as_deref(),
+                false,
+                false,
             )
             .await;
         }
 
         // Per-role config change. SPEND-ADJACENT (it re-shapes future turns'
         // spend), so it is gated on the allowlist exactly like `/kranz new`.
-        Action::Config { mission_id, role, model, effort, user_id, response_url, channel } => {
+        Action::Config {
+            mission_id,
+            role,
+            model,
+            effort,
+            user_id,
+            response_url,
+            channel,
+        } => {
             if !cfg.is_authorized(user_id.as_deref()) {
-                user_reply(cfg, client, response_url.as_deref(), channel.as_deref().unwrap_or(&cfg.channel), user_id.as_deref(), &not_authorized_blocks()).await;
+                user_reply(
+                    cfg,
+                    client,
+                    response_url.as_deref(),
+                    channel.as_deref().unwrap_or(&cfg.channel),
+                    user_id.as_deref(),
+                    &not_authorized_blocks(),
+                )
+                .await;
                 return;
             }
-            match config_change(repo_root, mission_id.as_deref(), role, model, effort.as_deref()) {
+            match config_change(
+                repo_root,
+                mission_id.as_deref(),
+                role,
+                model,
+                effort.as_deref(),
+            ) {
                 Ok(applied_to) => {
                     let effort_note = effort
                         .as_deref()
                         .map(|e| format!(", effort `{e}`"))
                         .unwrap_or_default();
                     user_reply(
-                        cfg, client, response_url.as_deref(),
-                        channel.as_deref().unwrap_or(&cfg.channel), user_id.as_deref(),
+                        cfg,
+                        client,
+                        response_url.as_deref(),
+                        channel.as_deref().unwrap_or(&cfg.channel),
+                        user_id.as_deref(),
                         &error_blocks(&format!(
                             ":gear: Set `{role}` model `{model}`{effort_note} on `{applied_to}`."
                         )),
@@ -852,8 +975,11 @@ async fn dispatch_action(
                 Err(e) => {
                     tracing::warn!(error = %e, "failed to apply config change from Slack");
                     user_reply(
-                        cfg, client, response_url.as_deref(),
-                        channel.as_deref().unwrap_or(&cfg.channel), user_id.as_deref(),
+                        cfg,
+                        client,
+                        response_url.as_deref(),
+                        channel.as_deref().unwrap_or(&cfg.channel),
+                        user_id.as_deref(),
                         &error_blocks(&format!("Couldn't change config: {e}")),
                     )
                     .await
@@ -867,20 +993,52 @@ async fn dispatch_action(
         // mission (resolved via the same active-mission resolver config uses, so
         // a terminal/ambiguous target is an honest error that enqueues NOTHING).
         // A pure local write, so it stays inline (fast ack).
-        Action::Pause { mission_id, user_id, response_url } => {
-            steer(cfg, client, repo_root, mission_id.as_deref(), user_id.as_deref(),
-                  response_url.as_deref(), ControlCommand::Pause, "paused").await;
+        Action::Pause {
+            mission_id,
+            user_id,
+            response_url,
+        } => {
+            steer(
+                cfg,
+                client,
+                repo_root,
+                mission_id.as_deref(),
+                user_id.as_deref(),
+                response_url.as_deref(),
+                ControlCommand::Pause,
+                "paused",
+            )
+            .await;
         }
-        Action::Resume { mission_id, user_id, response_url } => {
-            steer(cfg, client, repo_root, mission_id.as_deref(), user_id.as_deref(),
-                  response_url.as_deref(), ControlCommand::Resume, "resumed").await;
+        Action::Resume {
+            mission_id,
+            user_id,
+            response_url,
+        } => {
+            steer(
+                cfg,
+                client,
+                repo_root,
+                mission_id.as_deref(),
+                user_id.as_deref(),
+                response_url.as_deref(),
+                ControlCommand::Resume,
+                "resumed",
+            )
+            .await;
         }
 
         // Queue report. READ-ONLY and REPORT-ONLY: the bridge never drains the
         // queue on the socket loop (that would spawn `claude`); it reads the
         // queue state and points at the `kranz work` dispatcher.
         Action::Work { response_url } => {
-            reply_ephemeral(cfg, client, response_url.as_deref(), &build_work_reply(repo_root)).await;
+            reply_ephemeral(
+                cfg,
+                client,
+                response_url.as_deref(),
+                &build_work_reply(repo_root),
+            )
+            .await;
         }
 
         // App Home tab: fold the repo read-only and publish this user's home
@@ -900,17 +1058,43 @@ async fn dispatch_action(
         // be gated identically — otherwise an unlisted user clicking one queues
         // (or starts) a paid mission, bypassing the allowlist that the slash
         // command enforces.
-        Action::Approve { mission_id, user_id, response_url } => {
+        Action::Approve {
+            mission_id,
+            user_id,
+            response_url,
+        } => {
             approve_flow(
-                cfg, client, repo_root, threads, host, pending, mission_id,
-                user_id.as_deref(), response_url.as_deref(), false, true,
+                cfg,
+                client,
+                repo_root,
+                threads,
+                host,
+                pending,
+                mission_id,
+                user_id.as_deref(),
+                response_url.as_deref(),
+                false,
+                true,
             )
             .await;
         }
-        Action::ApproveStart { mission_id, user_id, response_url } => {
+        Action::ApproveStart {
+            mission_id,
+            user_id,
+            response_url,
+        } => {
             approve_flow(
-                cfg, client, repo_root, threads, host, pending, mission_id,
-                user_id.as_deref(), response_url.as_deref(), true, true,
+                cfg,
+                client,
+                repo_root,
+                threads,
+                host,
+                pending,
+                mission_id,
+                user_id.as_deref(),
+                response_url.as_deref(),
+                true,
+                true,
             )
             .await;
         }
@@ -919,27 +1103,45 @@ async fn dispatch_action(
         // turn (spend → allowlist-gated, acked in-thread because a message
         // event has no response_url); on anything else it stays the running-
         // mission guidance write it has always been.
-        Action::Guidance { mission_id, text, user_id } => {
+        Action::Guidance {
+            mission_id,
+            text,
+            user_id,
+        } => {
             match mission_status(repo_root, mission_id) {
                 Ok(MissionStatus::Planning) => {
                     let Some(host) = host else {
-                        post_thread_note(cfg, client, threads, mission_id, &format!(
-                            "This mission is still in planning, and this bridge has no hosted \
+                        post_thread_note(
+                            cfg,
+                            client,
+                            threads,
+                            mission_id,
+                            &format!(
+                                "This mission is still in planning, and this bridge has no hosted \
                              engine (it was started without `kranz serve`). Continue with \
                              `kranz plan --mission {mission_id}` in a terminal."
-                        ))
+                            ),
+                        )
                         .await;
                         return;
                     };
                     if !cfg.is_authorized(user_id.as_deref()) {
-                        post_thread_note(cfg, client, threads, mission_id,
+                        post_thread_note(
+                            cfg,
+                            client,
+                            threads,
+                            mission_id,
                             "Planning turns spend money and are limited to the \
                              `slack.allowUsers` allowlist — ask an admin to add you.",
                         )
                         .await;
                         return;
                     }
-                    post_thread_note(cfg, client, threads, mission_id,
+                    post_thread_note(
+                        cfg,
+                        client,
+                        threads,
+                        mission_id,
                         ":hourglass_flowing_sand: Planning turn running — the orchestrator's \
                          reply lands here, usually within a couple of minutes.",
                     )
@@ -959,9 +1161,13 @@ async fn dispatch_action(
                             }
                         }
                         Err(e) => {
-                            post_thread_note(cfg, client, threads, mission_id, &format!(
-                                "Planning turn failed: {e}"
-                            ))
+                            post_thread_note(
+                                cfg,
+                                client,
+                                threads,
+                                mission_id,
+                                &format!("Planning turn failed: {e}"),
+                            )
                             .await;
                         }
                     }
@@ -1048,10 +1254,16 @@ async fn approve_flow(
         if start {
             match host.start(mission_id).await {
                 Ok(()) => {
-                    post_thread_note(cfg, client, threads, mission_id, &format!(
-                        ":rocket: Plan approved and execution started (branch `{branch}`) — \
+                    post_thread_note(
+                        cfg,
+                        client,
+                        threads,
+                        mission_id,
+                        &format!(
+                            ":rocket: Plan approved and execution started (branch `{branch}`) — \
                          progress posts in this thread; deep inspection in the web UI."
-                    ))
+                        ),
+                    )
                     .await;
                 }
                 Err(e) => {
@@ -1077,15 +1289,25 @@ async fn approve_flow(
             // LockHeld refusal stays the honest backstop.
             match host.release(mission_id).await {
                 Ok(true) => {}
-                Ok(false) => tracing::warn!(mission = %mission_id, "release after approve found mission running"),
-                Err(e) => tracing::warn!(mission = %mission_id, error = %e, "release after approve failed"),
+                Ok(false) => {
+                    tracing::warn!(mission = %mission_id, "release after approve found mission running")
+                }
+                Err(e) => {
+                    tracing::warn!(mission = %mission_id, error = %e, "release after approve failed")
+                }
             }
             match approve_mission(repo_root, mission_id) {
                 Ok(()) => {
-                    post_thread_note(cfg, client, threads, mission_id, &format!(
-                        ":white_check_mark: Plan approved and queued (branch `{branch}`) — \
+                    post_thread_note(
+                        cfg,
+                        client,
+                        threads,
+                        mission_id,
+                        &format!(
+                            ":white_check_mark: Plan approved and queued (branch `{branch}`) — \
                          the `kranz work` dispatcher runs it next."
-                    ))
+                        ),
+                    )
                     .await;
                 }
                 Err(e) => {
@@ -1154,10 +1376,16 @@ async fn approve_flow(
                         if button {
                             retire_plan_card(client, response_url, mission_id, None, true).await;
                         }
-                        post_thread_note(cfg, client, threads, mission_id, &format!(
-                            ":rocket: Execution started for `{mission_id}` — progress posts \
+                        post_thread_note(
+                            cfg,
+                            client,
+                            threads,
+                            mission_id,
+                            &format!(
+                                ":rocket: Execution started for `{mission_id}` — progress posts \
                              in this thread."
-                        ))
+                            ),
+                        )
                         .await;
                     }
                     Err(e) => {
@@ -1175,10 +1403,15 @@ async fn approve_flow(
                     match host.release(mission_id).await {
                         Ok(true) => {}
                         Ok(false) => {
-                            reply_ephemeral(cfg, client, response_url, &error_blocks(&format!(
-                                "`{mission_id}` is already executing — steer it by replying \
+                            reply_ephemeral(
+                                cfg,
+                                client,
+                                response_url,
+                                &error_blocks(&format!(
+                                    "`{mission_id}` is already executing — steer it by replying \
                                  in its thread; nothing was queued."
-                            )))
+                                )),
+                            )
                             .await;
                             return;
                         }
@@ -1197,10 +1430,15 @@ async fn approve_flow(
                 // Host-free (or released): a LIVE lock holder now means an
                 // external process is running the mission.
                 if kranz_engine::queue::is_repo_busy(repo_root).as_deref() == Some(mission_id) {
-                    reply_ephemeral(cfg, client, response_url, &error_blocks(&format!(
-                        "`{mission_id}` is already executing — steer it by replying in its \
+                    reply_ephemeral(
+                        cfg,
+                        client,
+                        response_url,
+                        &error_blocks(&format!(
+                            "`{mission_id}` is already executing — steer it by replying in its \
                          thread; nothing was queued."
-                    )))
+                        )),
+                    )
                     .await;
                     return;
                 }
@@ -1294,7 +1532,9 @@ async fn post_to_mission_thread(
 ) -> Result<()> {
     let blocks = crate::format::label_blocks(blocks, cfg.instance_name.as_deref());
     let thread_ts = threads.thread_ts(mission_id);
-    let posted_ts = client.post_message(&cfg.channel, &blocks, thread_ts.as_deref()).await?;
+    let posted_ts = client
+        .post_message(&cfg.channel, &blocks, thread_ts.as_deref())
+        .await?;
     if thread_ts.is_none() {
         threads.set(mission_id, &posted_ts);
     }
@@ -1337,7 +1577,9 @@ async fn retire_plan_card(
     started: bool,
 ) {
     let Some(url) = response_url else { return };
-    if let Err(e) = client.replace_original(url, &approved_card(mission_id, branch, started)).await
+    if let Err(e) = client
+        .replace_original(url, &approved_card(mission_id, branch, started))
+        .await
     {
         tracing::warn!(mission = %mission_id, error = %e, "failed to retire plan card");
     }
@@ -1353,7 +1595,8 @@ async fn post_thread_note(
     mission_id: &str,
     msg: &str,
 ) {
-    if let Err(e) = post_to_mission_thread(cfg, client, threads, mission_id, error_blocks(msg)).await
+    if let Err(e) =
+        post_to_mission_thread(cfg, client, threads, mission_id, error_blocks(msg)).await
     {
         tracing::warn!(mission = %mission_id, error = %e, "failed to post thread note");
     }
@@ -1366,7 +1609,9 @@ async fn post_thread_note(
 fn apply_action(repo_root: &Path, action: &Action) -> Result<()> {
     match action {
         Action::Approve { mission_id, .. } => approve_mission(repo_root, mission_id),
-        Action::Guidance { mission_id, text, .. } => guidance(repo_root, mission_id, text),
+        Action::Guidance {
+            mission_id, text, ..
+        } => guidance(repo_root, mission_id, text),
         Action::NewTicket { title, .. } => scaffold_ticket(repo_root, title),
         Action::Help { .. }
         | Action::Status { .. }
@@ -1392,8 +1637,9 @@ fn apply_action(repo_root: &Path, action: &Action) -> Result<()> {
 fn build_status_reply(repo_root: &Path, mission_id: Option<&str>) -> Result<Vec<Value>> {
     let mission_id = match mission_id {
         Some(id) => id.to_string(),
-        None => most_recent_mission(repo_root)
-            .ok_or_else(|| anyhow::anyhow!("no missions yet — create one with `/kranz new <goal>`"))?,
+        None => most_recent_mission(repo_root).ok_or_else(|| {
+            anyhow::anyhow!("no missions yet — create one with `/kranz new <goal>`")
+        })?,
     };
     let paths = MissionPaths::new(repo_root, &mission_id);
     let events_path = paths.events_file();
@@ -1420,7 +1666,9 @@ fn build_status_reply(repo_root: &Path, mission_id: Option<&str>) -> Result<Vec<
 /// CLI's `kranz config role` shares — both surfaces refuse the same hazardous
 /// targets (unknown, terminal, or ambiguous without an explicit id).
 fn resolve_active_config_target(repo_root: &Path, explicit: Option<&str>) -> Result<String> {
-    Ok(kranz_engine::control::resolve_active_mission(repo_root, explicit)?)
+    Ok(kranz_engine::control::resolve_active_mission(
+        repo_root, explicit,
+    )?)
 }
 
 fn most_recent_mission(repo_root: &Path) -> Option<String> {
@@ -1457,7 +1705,10 @@ fn render_status_body(state: &MissionState) -> String {
         body.push_str(goal);
         body.push_str("\n\n");
     }
-    body.push_str(&format!("{done}/{total} milestone{} complete", if total == 1 { "" } else { "s" }));
+    body.push_str(&format!(
+        "{done}/{total} milestone{} complete",
+        if total == 1 { "" } else { "s" }
+    ));
     if state.total_cost_usd > 0.0 {
         body.push_str(&format!(" · cost ${:.2}", state.total_cost_usd));
     }
@@ -1601,7 +1852,12 @@ fn build_work_reply(repo_root: &Path) -> Vec<Value> {
     } else {
         body.push_str(&format!("*Queue* ({} waiting)\n", queue.len()));
         for (i, e) in queue.iter().enumerate() {
-            body.push_str(&format!("{}. `{}` · priority {}\n", i + 1, e.mission_id, e.priority));
+            body.push_str(&format!(
+                "{}. `{}` · priority {}\n",
+                i + 1,
+                e.mission_id,
+                e.priority
+            ));
         }
     }
     body.push_str(
@@ -1636,12 +1892,18 @@ fn build_home_view(repo_root: &Path, dashboard_url: Option<&str>) -> Value {
         if is_terminal(state.mission.status) {
             continue;
         }
-        missions.push(HomeMission { mission_id: id, status: status_word(state.mission.status) });
+        missions.push(HomeMission {
+            mission_id: id,
+            status: status_word(state.mission.status),
+        });
     }
 
     let queue = kranz_engine::queue::list(repo_root)
         .into_iter()
-        .map(|e| HomeQueueItem { mission_id: e.mission_id, priority: e.priority })
+        .map(|e| HomeQueueItem {
+            mission_id: e.mission_id,
+            priority: e.priority,
+        })
         .collect::<Vec<_>>();
 
     // Open tickets: everything not in a terminal (Done/Failed) pipeline state.
@@ -1650,7 +1912,11 @@ fn build_home_view(repo_root: &Path, dashboard_url: Option<&str>) -> Value {
         .filter_map(|t| {
             let state = kranz_engine::ticket::Ticket::read_state(repo_root, &t.slug);
             if ticket_is_open(state) {
-                Some(HomeTicket { slug: t.slug, title: t.title, state: format!("{state:?}") })
+                Some(HomeTicket {
+                    slug: t.slug,
+                    title: t.title,
+                    state: format!("{state:?}"),
+                })
             } else {
                 None
             }
@@ -1662,7 +1928,10 @@ fn build_home_view(repo_root: &Path, dashboard_url: Option<&str>) -> Value {
 
 /// Whether a mission status is terminal (excluded from the active-missions list).
 fn is_terminal(status: MissionStatus) -> bool {
-    matches!(status, MissionStatus::Complete | MissionStatus::Failed | MissionStatus::Abandoned)
+    matches!(
+        status,
+        MissionStatus::Complete | MissionStatus::Failed | MissionStatus::Abandoned
+    )
 }
 
 /// Whether a ticket is still "open" (surfaced in App Home) — anything not in a
@@ -1677,7 +1946,10 @@ fn guidance(repo_root: &Path, mission_id: &str, text: &str) -> Result<()> {
     let paths = MissionPaths::new(repo_root, mission_id);
     kranz_engine::control::enqueue(
         &paths,
-        &ControlCommand::Msg { text: text.to_string(), interrupt: false },
+        &ControlCommand::Msg {
+            text: text.to_string(),
+            interrupt: false,
+        },
     )
     .context("enqueue guidance message")?;
     tracing::info!(mission = %mission_id, "guidance enqueued from Slack thread");
@@ -1739,18 +2011,17 @@ async fn new_mission(
             let cfg_engine = config::load(repo_root).context("loading mission config")?;
             let backend = ClaudeBackend::discover(cfg_engine.claude_binary.as_deref())
                 .context("discovering claude backend")?;
-            let mut engine = MissionEngine::create(
-                Arc::new(backend),
-                repo_root.to_path_buf(),
-                goal,
-                cfg_engine,
-            )
-            .context("creating mission")?;
+            let mut engine =
+                MissionEngine::create(Arc::new(backend), repo_root.to_path_buf(), goal, cfg_engine)
+                    .context("creating mission")?;
             let mission_id = engine.mission_id().to_string();
             // One seeding planning turn: the orchestrator's opening scoping
             // questions come back to post in-thread. A captured seed reply
             // (fresh session) happened first, so prepend it.
-            let reply = engine.planning_turn(goal).await.context("seeding planning turn")?;
+            let reply = engine
+                .planning_turn(goal)
+                .await
+                .context("seeding planning turn")?;
             (mission_id, prepend_seed(engine.take_seed_reply(), reply))
         }
     };
@@ -1765,8 +2036,7 @@ async fn new_mission(
 
     // Post the planning thread root publicly (instance-labeled), then record
     // the mapping so in-thread replies route back to this mission.
-    let labeled =
-        crate::format::label_blocks(blocks.clone(), cfg.instance_name.as_deref());
+    let labeled = crate::format::label_blocks(blocks.clone(), cfg.instance_name.as_deref());
     let posted_ts = client
         .post_message(channel, &labeled, None)
         .await
@@ -1842,7 +2112,12 @@ mod tests {
 
     #[test]
     fn class_enabled_respects_flags() {
-        let flags = NotifyFlags { plan_ready: false, blocked: true, complete: true, needs_context: true };
+        let flags = NotifyFlags {
+            plan_ready: false,
+            blocked: true,
+            complete: true,
+            needs_context: true,
+        };
         assert!(!class_enabled(&flags, NotifyClass::PlanReady));
         assert!(class_enabled(&flags, NotifyClass::Blocked));
         assert!(class_enabled(&flags, NotifyClass::Complete));
@@ -1850,7 +2125,10 @@ mod tests {
 
     #[test]
     fn slugify_examples() {
-        assert_eq!(slugify("Rate-limit the notes API"), "rate-limit-the-notes-api");
+        assert_eq!(
+            slugify("Rate-limit the notes API"),
+            "rate-limit-the-notes-api"
+        );
         assert_eq!(slugify("  Fix   the  thing!! "), "fix-the-thing");
         assert_eq!(slugify("***"), "ticket");
     }
@@ -1858,7 +2136,15 @@ mod tests {
     #[test]
     fn approve_action_enqueues_mission() {
         let tmp = TempDir::new().unwrap();
-        apply_action(tmp.path(), &Action::Approve { mission_id: "m-1".into(), user_id: None, response_url: None }).unwrap();
+        apply_action(
+            tmp.path(),
+            &Action::Approve {
+                mission_id: "m-1".into(),
+                user_id: None,
+                response_url: None,
+            },
+        )
+        .unwrap();
         assert!(queue::contains(tmp.path(), "m-1"));
     }
 
@@ -1920,7 +2206,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         apply_action(
             tmp.path(),
-            &Action::Status { mission_id: None, response_url: None },
+            &Action::Status {
+                mission_id: None,
+                response_url: None,
+            },
         )
         .unwrap();
         apply_action(
@@ -1945,13 +2234,22 @@ mod tests {
         let text = serde_json::to_string(&started).unwrap();
         assert!(text.contains("approved &amp; started") || text.contains("approved & started"));
         assert!(text.contains("kranz/mission-m-9"));
-        assert!(!text.contains("\"button\""), "outcome card must retire the buttons");
+        assert!(
+            !text.contains("\"button\""),
+            "outcome card must retire the buttons"
+        );
 
         let queued = approved_card("m-9", None, false);
         let text = serde_json::to_string(&queued).unwrap();
         assert!(text.contains("approved & queued"));
-        assert!(text.contains("kranz work"), "queue outcome points at the dispatcher");
-        assert!(!text.contains("branch"), "no branch line when branch is unknown");
+        assert!(
+            text.contains("kranz work"),
+            "queue outcome points at the dispatcher"
+        );
+        assert!(
+            !text.contains("branch"),
+            "no branch line when branch is unknown"
+        );
         assert!(!text.contains("\"button\""));
     }
 
@@ -1990,8 +2288,12 @@ mod tests {
         assert!(looks_like_plan_json(
             r#"Here it is: {"goal":"x","validationContract":[],"milestones":[]}"#
         ));
-        assert!(!looks_like_plan_json("I'll draft milestones around the validation contract."));
-        assert!(!looks_like_plan_json(r#"the "milestones" key alone is not a plan"#));
+        assert!(!looks_like_plan_json(
+            "I'll draft milestones around the validation contract."
+        ));
+        assert!(!looks_like_plan_json(
+            r#"the "milestones" key alone is not a plan"#
+        ));
     }
 
     #[test]
@@ -2000,7 +2302,10 @@ mod tests {
         use kranz_engine::types::{Plan, PlanFeature, PlanMilestone};
         let tmp = TempDir::new().unwrap();
         seed_mission(tmp.path(), "m-p", "still planning");
-        assert_eq!(mission_status(tmp.path(), "m-p").unwrap(), MissionStatus::Planning);
+        assert_eq!(
+            mission_status(tmp.path(), "m-p").unwrap(),
+            MissionStatus::Planning
+        );
 
         // Append a PlanApproved: the reducer folds it to Running (approved,
         // executable) — the state the approve_flow no-pending path may queue.
@@ -2031,9 +2336,15 @@ mod tests {
         existing.push_str(&line);
         existing.push('\n');
         std::fs::write(paths.events_file(), existing).unwrap();
-        assert_eq!(mission_status(tmp.path(), "m-a").unwrap(), MissionStatus::Running);
+        assert_eq!(
+            mission_status(tmp.path(), "m-a").unwrap(),
+            MissionStatus::Running
+        );
 
-        assert!(mission_status(tmp.path(), "m-nope").is_err(), "unknown mission is an error");
+        assert!(
+            mission_status(tmp.path(), "m-nope").is_err(),
+            "unknown mission is an error"
+        );
     }
 
     fn seed_mission(repo_root: &Path, mission_id: &str, goal: &str) {
@@ -2097,15 +2408,23 @@ mod tests {
         let blocks = build_status_reply(tmp.path(), Some("m-abc")).unwrap();
         let text = serde_json::to_string(&blocks).unwrap();
         assert!(text.contains("m-abc"), "status carries the mission id");
-        assert!(text.contains("Rate-limit the notes API"), "status carries the goal");
+        assert!(
+            text.contains("Rate-limit the notes API"),
+            "status carries the goal"
+        );
         // A freshly-created mission is in Planning.
-        assert!(text.contains("Planning"), "status pill reflects the folded state");
+        assert!(
+            text.contains("Planning"),
+            "status pill reflects the folded state"
+        );
     }
 
     #[test]
     fn build_status_reply_unknown_mission_is_error() {
         let tmp = TempDir::new().unwrap();
-        let err = build_status_reply(tmp.path(), Some("m-nope")).unwrap_err().to_string();
+        let err = build_status_reply(tmp.path(), Some("m-nope"))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("m-nope"), "error names the unknown mission");
     }
 
@@ -2192,11 +2511,18 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         seed_mission(tmp.path(), "m-a", "goal a");
         seed_mission(tmp.path(), "m-b", "goal b");
-        let err = config_change(tmp.path(), None, "worker", "opus", None).unwrap_err().to_string();
-        assert!(err.contains("several active missions"), "asks for an explicit id: {err}");
+        let err = config_change(tmp.path(), None, "worker", "opus", None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("several active missions"),
+            "asks for an explicit id: {err}"
+        );
         for id in ["m-a", "m-b"] {
             assert!(
-                kranz_engine::control::drain(&MissionPaths::new(tmp.path(), id)).unwrap().is_empty(),
+                kranz_engine::control::drain(&MissionPaths::new(tmp.path(), id))
+                    .unwrap()
+                    .is_empty(),
                 "nothing enqueued on {id}"
             );
         }
@@ -2211,7 +2537,10 @@ mod tests {
         let err = config_change(tmp.path(), Some("m-done"), "worker", "opus", None)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("active missions"), "honest error, not false success: {err}");
+        assert!(
+            err.contains("active missions"),
+            "honest error, not false success: {err}"
+        );
         assert!(
             kranz_engine::control::drain(&MissionPaths::new(tmp.path(), "m-done"))
                 .unwrap()
@@ -2227,10 +2556,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         seed_mission(tmp.path(), "m-steer", "goal");
         // Explicit id, active mission → one Pause on that mission.
-        let applied =
-            enqueue_steer(tmp.path(), Some("m-steer"), ControlCommand::Pause).unwrap();
+        let applied = enqueue_steer(tmp.path(), Some("m-steer"), ControlCommand::Pause).unwrap();
         assert_eq!(applied, "m-steer");
-        let drained = kranz_engine::control::drain(&MissionPaths::new(tmp.path(), "m-steer")).unwrap();
+        let drained =
+            kranz_engine::control::drain(&MissionPaths::new(tmp.path(), "m-steer")).unwrap();
         assert_eq!(drained.len(), 1, "exactly one control command enqueued");
         assert!(
             matches!(drained[0].1, ControlCommand::Pause),
@@ -2246,9 +2575,14 @@ mod tests {
         // No id, exactly one active mission → resolved to it; one Resume enqueued.
         let applied = enqueue_steer(tmp.path(), None, ControlCommand::Resume).unwrap();
         assert_eq!(applied, "m-only");
-        let drained = kranz_engine::control::drain(&MissionPaths::new(tmp.path(), "m-only")).unwrap();
+        let drained =
+            kranz_engine::control::drain(&MissionPaths::new(tmp.path(), "m-only")).unwrap();
         assert_eq!(drained.len(), 1);
-        assert!(matches!(drained[0].1, ControlCommand::Resume), "got {:?}", drained[0].1);
+        assert!(
+            matches!(drained[0].1, ControlCommand::Resume),
+            "got {:?}",
+            drained[0].1
+        );
     }
 
     #[test]
@@ -2258,11 +2592,18 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         seed_mission(tmp.path(), "m-a", "goal a");
         seed_mission(tmp.path(), "m-b", "goal b");
-        let err = enqueue_steer(tmp.path(), None, ControlCommand::Pause).unwrap_err().to_string();
-        assert!(err.contains("several active missions"), "asks for an explicit id: {err}");
+        let err = enqueue_steer(tmp.path(), None, ControlCommand::Pause)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("several active missions"),
+            "asks for an explicit id: {err}"
+        );
         for id in ["m-a", "m-b"] {
             assert!(
-                kranz_engine::control::drain(&MissionPaths::new(tmp.path(), id)).unwrap().is_empty(),
+                kranz_engine::control::drain(&MissionPaths::new(tmp.path(), id))
+                    .unwrap()
+                    .is_empty(),
                 "nothing enqueued on {id}"
             );
         }
@@ -2277,7 +2618,10 @@ mod tests {
         let err = enqueue_steer(tmp.path(), Some("m-done"), ControlCommand::Resume)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("active missions"), "honest error, not false success: {err}");
+        assert!(
+            err.contains("active missions"),
+            "honest error, not false success: {err}"
+        );
         assert!(
             kranz_engine::control::drain(&MissionPaths::new(tmp.path(), "m-done"))
                 .unwrap()
@@ -2359,7 +2703,11 @@ mod tests {
         .await;
         let drained = kranz_engine::control::drain(&MissionPaths::new(tmp.path(), "m-ok")).unwrap();
         assert_eq!(drained.len(), 1, "listed user's resume is enqueued");
-        assert!(matches!(drained[0].1, ControlCommand::Resume), "got {:?}", drained[0].1);
+        assert!(
+            matches!(drained[0].1, ControlCommand::Resume),
+            "got {:?}",
+            drained[0].1
+        );
     }
 
     #[test]
@@ -2369,14 +2717,24 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         seed_mission(tmp.path(), "m-1", "goal");
         for action in [
-            Action::Pause { mission_id: Some("m-1".into()), user_id: None, response_url: None },
-            Action::Resume { mission_id: Some("m-1".into()), user_id: None, response_url: None },
+            Action::Pause {
+                mission_id: Some("m-1".into()),
+                user_id: None,
+                response_url: None,
+            },
+            Action::Resume {
+                mission_id: Some("m-1".into()),
+                user_id: None,
+                response_url: None,
+            },
             Action::Work { response_url: None },
         ] {
             apply_action(tmp.path(), &action).unwrap();
         }
         assert!(
-            kranz_engine::control::drain(&MissionPaths::new(tmp.path(), "m-1")).unwrap().is_empty(),
+            kranz_engine::control::drain(&MissionPaths::new(tmp.path(), "m-1"))
+                .unwrap()
+                .is_empty(),
             "apply_action is inert for pause/resume/work"
         );
     }
@@ -2418,7 +2776,10 @@ mod tests {
         .unwrap();
         let blocks = build_work_reply(tmp.path());
         let text = serde_json::to_string(&blocks).unwrap();
-        assert!(text.contains("m-q1") && text.contains("m-q2"), "both queued missions listed");
+        assert!(
+            text.contains("m-q1") && text.contains("m-q2"),
+            "both queued missions listed"
+        );
         assert!(text.contains("2 waiting"), "queue depth reported");
         // is_repo_busy is None here (no live lock), so it reports no running mission.
         assert!(text.to_lowercase().contains("no mission is running"));
@@ -2480,10 +2841,19 @@ mod tests {
         let view = build_home_view(tmp.path(), Some("http://127.0.0.1:4600"));
         let s = serde_json::to_string(&view).unwrap();
         assert_eq!(view["type"], "home");
-        assert!(s.contains("m-a") && s.contains("m-b"), "active missions present");
+        assert!(
+            s.contains("m-a") && s.contains("m-b"),
+            "active missions present"
+        );
         assert!(s.contains("Planning"), "status pill present");
-        assert!(s.contains("Rate-limit the notes API"), "open ticket title present");
-        assert!(s.contains("m/m-a"), "deep link present when dashboard configured");
+        assert!(
+            s.contains("Rate-limit the notes API"),
+            "open ticket title present"
+        );
+        assert!(
+            s.contains("m/m-a"),
+            "deep link present when dashboard configured"
+        );
     }
 
     #[test]
@@ -2494,7 +2864,11 @@ mod tests {
         // A ticket in the Done terminal state.
         let tdir = kranz_engine::ticket::Ticket::tickets_dir(tmp.path());
         std::fs::create_dir_all(&tdir).unwrap();
-        std::fs::write(tdir.join("finished.md"), "---\ntitle: Finished\n---\n\n## Goal\nx\n").unwrap();
+        std::fs::write(
+            tdir.join("finished.md"),
+            "---\ntitle: Finished\n---\n\n## Goal\nx\n",
+        )
+        .unwrap();
         kranz_engine::ticket::Ticket::write_state(
             tmp.path(),
             "finished",
@@ -2523,8 +2897,14 @@ mod tests {
             }
             out
         };
-        assert!(!text.contains("m-done"), "terminal mission excluded from active list");
-        assert!(!text.contains("Finished"), "done ticket excluded from open tickets");
+        assert!(
+            !text.contains("m-done"),
+            "terminal mission excluded from active list"
+        );
+        assert!(
+            !text.contains("Finished"),
+            "done ticket excluded from open tickets"
+        );
         assert!(text.to_lowercase().contains("no active missions"));
         assert!(text.to_lowercase().contains("no open tickets"));
     }
@@ -2549,7 +2929,9 @@ mod tests {
             "payload": { "command": "/kranz", "text": "ticket Fix it", "channel_id": "C1" }
         })
         .to_string();
-        let ack = handle_envelope(&cfg, &client, tmp.path(), &threads, &frame).await.unwrap();
+        let ack = handle_envelope(&cfg, &client, tmp.path(), &threads, &frame)
+            .await
+            .unwrap();
         let parsed: Value = serde_json::from_str(&ack).unwrap();
         assert_eq!(parsed["envelope_id"], "env-xyz");
         // And the side effect happened.
@@ -2573,7 +2955,9 @@ mod tests {
         };
         let client = SlackClient::new(&cfg).unwrap();
         let hello = json!({ "type": "hello" }).to_string();
-        assert!(handle_envelope(&cfg, &client, tmp.path(), &threads, &hello).await.is_none());
+        assert!(handle_envelope(&cfg, &client, tmp.path(), &threads, &hello)
+            .await
+            .is_none());
     }
 
     #[test]
@@ -2609,7 +2993,10 @@ mod tests {
             user_id: None,
         }));
         // Fast local/one-call actions stay inline.
-        assert!(!is_slow_action(&Action::Status { mission_id: None, response_url: None }));
+        assert!(!is_slow_action(&Action::Status {
+            mission_id: None,
+            response_url: None
+        }));
         assert!(!is_slow_action(&Action::Ignore));
     }
 

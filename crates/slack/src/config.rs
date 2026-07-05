@@ -38,7 +38,12 @@ pub struct NotifyFlags {
 
 impl Default for NotifyFlags {
     fn default() -> Self {
-        NotifyFlags { plan_ready: true, needs_context: true, blocked: true, complete: true }
+        NotifyFlags {
+            plan_ready: true,
+            needs_context: true,
+            blocked: true,
+            complete: true,
+        }
     }
 }
 
@@ -171,7 +176,10 @@ impl EnvVars {
 
 /// Read an env var, mapping absent-or-blank to `None`.
 fn non_empty_env(key: &str) -> Option<String> {
-    std::env::var(key).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// Load and parse the `slack` object from the global config file. A missing
@@ -184,9 +192,7 @@ fn load_file_config() -> Result<SlackFileConfig> {
     };
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(SlackFileConfig::default())
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(SlackFileConfig::default()),
         Err(e) => return Err(anyhow!("cannot read {}: {e}", path.display())),
     };
     let root: RootConfig = serde_json::from_str(&text)
@@ -197,15 +203,33 @@ fn load_file_config() -> Result<SlackFileConfig> {
 /// Pure resolution of file + env into an optional config. Split out so the
 /// precedence and "all three required" logic is unit-testable without any I/O.
 fn resolve(file: SlackFileConfig, env: EnvVars) -> Option<SlackConfig> {
-    let bot_token = env.bot_token.or(file.bot_token).map(trim).filter(|s| non_blank(s));
-    let app_token = env.app_token.or(file.app_token).map(trim).filter(|s| non_blank(s));
-    let channel = env.channel.or(file.channel).map(trim).filter(|s| non_blank(s));
+    let bot_token = env
+        .bot_token
+        .or(file.bot_token)
+        .map(trim)
+        .filter(|s| non_blank(s));
+    let app_token = env
+        .app_token
+        .or(file.app_token)
+        .map(trim)
+        .filter(|s| non_blank(s));
+    let channel = env
+        .channel
+        .or(file.channel)
+        .map(trim)
+        .filter(|s| non_blank(s));
     // Optional: env wins over file, blanks drop to None. Never gates enablement.
-    let dashboard_url =
-        env.dashboard_url.or(file.dashboard_url).map(trim).filter(|s| non_blank(s));
+    let dashboard_url = env
+        .dashboard_url
+        .or(file.dashboard_url)
+        .map(trim)
+        .filter(|s| non_blank(s));
     // Optional instance label, same precedence. Never gates enablement.
-    let instance_name =
-        env.instance_name.or(file.instance_name).map(trim).filter(|s| non_blank(s));
+    let instance_name = env
+        .instance_name
+        .or(file.instance_name)
+        .map(trim)
+        .filter(|s| non_blank(s));
 
     match (bot_token, app_token, channel) {
         (Some(bot_token), Some(app_token), Some(channel)) => Some(SlackConfig {
@@ -264,7 +288,10 @@ mod tests {
             bot_token: Some("xoxb-file".into()),
             app_token: Some("xapp-file".into()),
             channel: Some("Cfile".into()),
-            notify: Some(NotifyFlags { plan_ready: false, ..NotifyFlags::default() }),
+            notify: Some(NotifyFlags {
+                plan_ready: false,
+                ..NotifyFlags::default()
+            }),
             ..SlackFileConfig::default()
         };
         let cfg = resolve(file, EnvVars::default()).expect("full file triple resolves");
@@ -284,7 +311,10 @@ mod tests {
         };
         let cfg = resolve(
             file,
-            EnvVars { channel: Some("Cenv".into()), ..EnvVars::default() },
+            EnvVars {
+                channel: Some("Cenv".into()),
+                ..EnvVars::default()
+            },
         )
         .expect("env channel fills, file supplies tokens");
         assert_eq!(cfg.bot_token, "xoxb-file");
@@ -340,7 +370,10 @@ mod tests {
         };
         let cfg = resolve(file, EnvVars::default()).expect("Some");
         // Blank entries dropped; surviving ids trimmed.
-        assert_eq!(cfg.allow_users, vec!["U123".to_string(), "U456".to_string()]);
+        assert_eq!(
+            cfg.allow_users,
+            vec!["U123".to_string(), "U456".to_string()]
+        );
     }
 
     #[test]
@@ -357,8 +390,14 @@ mod tests {
             EnvVars::default(),
         )
         .unwrap();
-        assert!(cfg.is_authorized(Some("U999")), "solo default: anyone allowed");
-        assert!(cfg.is_authorized(None), "even a missing user id is allowed with no list");
+        assert!(
+            cfg.is_authorized(Some("U999")),
+            "solo default: anyone allowed"
+        );
+        assert!(
+            cfg.is_authorized(None),
+            "even a missing user id is allowed with no list"
+        );
     }
 
     #[test]
@@ -404,7 +443,10 @@ mod tests {
                 dashboard_url: Some("http://file/".into()),
                 ..SlackFileConfig::default()
             },
-            EnvVars { dashboard_url: Some("http://env/".into()), ..EnvVars::default() },
+            EnvVars {
+                dashboard_url: Some("http://env/".into()),
+                ..EnvVars::default()
+            },
         )
         .unwrap();
         assert_eq!(cfg.dashboard_url.as_deref(), Some("http://env/"));
@@ -449,7 +491,11 @@ mod tests {
         )
         .unwrap();
         let cfg = resolve(root.slack.unwrap(), EnvVars::default()).unwrap();
-        assert_eq!(cfg.instance_name.as_deref(), Some("studio"), "resolved and trimmed");
+        assert_eq!(
+            cfg.instance_name.as_deref(),
+            Some("studio"),
+            "resolved and trimmed"
+        );
 
         // And a file WITHOUT the key still parses (older configs keep working).
         let root: RootConfig = serde_json::from_str(
@@ -472,7 +518,10 @@ mod tests {
         // Env wins over the file, same as every other override.
         let cfg = resolve(
             file.clone(),
-            EnvVars { instance_name: Some("env-name".into()), ..EnvVars::default() },
+            EnvVars {
+                instance_name: Some("env-name".into()),
+                ..EnvVars::default()
+            },
         )
         .unwrap();
         assert_eq!(cfg.instance_name.as_deref(), Some("env-name"));
@@ -530,9 +579,18 @@ mod tests {
         )
         .unwrap();
         assert!(cfg.is_authorized(Some("U123")), "listed user authorized");
-        assert!(cfg.is_authorized(Some(" U123 ")), "surrounding whitespace tolerated");
+        assert!(
+            cfg.is_authorized(Some(" U123 ")),
+            "surrounding whitespace tolerated"
+        );
         assert!(!cfg.is_authorized(Some("U999")), "unlisted user denied");
-        assert!(!cfg.is_authorized(None), "missing user id denied when a list is set");
-        assert!(!cfg.is_authorized(Some("   ")), "blank user id denied when a list is set");
+        assert!(
+            !cfg.is_authorized(None),
+            "missing user id denied when a list is set"
+        );
+        assert!(
+            !cfg.is_authorized(Some("   ")),
+            "blank user id denied when a list is set"
+        );
     }
 }

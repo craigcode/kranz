@@ -152,8 +152,8 @@ fn event_types(events: &[Event]) -> Vec<&'static str> {
 fn worker_profile_denies_push_publish_network_and_config_extras() {
     let cfg = MissionConfig {
         deny_patterns: vec![
-            "rm -rf /*".to_string(),   // bare command → wrapped
-            "Bash(dd*)".to_string(),   // already a tool rule (has parens)
+            "rm -rf /*".to_string(),    // bare command → wrapped
+            "Bash(dd*)".to_string(),    // already a tool rule (has parens)
             "NotebookEdit".to_string(), // known tool name → kept verbatim
         ],
         ..MissionConfig::default()
@@ -223,8 +223,18 @@ fn orchestrator_profile_is_read_only() {
         );
     }
     // No write access anywhere in the allow list.
-    assert!(!profile.allowed_tools.iter().any(|a| a == "Write" || a == "Edit"));
-    for expected in ["Write", "Edit", "NotebookEdit", "WebFetch", "WebSearch", "Bash(git push*)"] {
+    assert!(!profile
+        .allowed_tools
+        .iter()
+        .any(|a| a == "Write" || a == "Edit"));
+    for expected in [
+        "Write",
+        "Edit",
+        "NotebookEdit",
+        "WebFetch",
+        "WebSearch",
+        "Bash(git push*)",
+    ] {
         assert!(
             profile.disallowed_tools.iter().any(|d| d == expected),
             "orchestrator deny list missing {expected:?}"
@@ -252,7 +262,11 @@ fn bash_rule_covers(rule: &str, command: &str) -> bool {
 #[test]
 fn read_only_git_allows_cover_listing_but_not_ref_mutation() {
     let cfg = MissionConfig::default();
-    for role in [Role::Orchestrator, Role::ValidatorScrutiny, Role::ValidatorFunctional] {
+    for role in [
+        Role::Orchestrator,
+        Role::ValidatorScrutiny,
+        Role::ValidatorFunctional,
+    ] {
         let profile = permissions::for_role(role, &cfg, &[]);
 
         for mutating in [
@@ -268,7 +282,10 @@ fn read_only_git_allows_cover_listing_but_not_ref_mutation() {
             "git tag -a v3 -m msg",
         ] {
             assert!(
-                !profile.allowed_tools.iter().any(|a| bash_rule_covers(a, mutating)),
+                !profile
+                    .allowed_tools
+                    .iter()
+                    .any(|a| bash_rule_covers(a, mutating)),
                 "{role:?} allow list covers mutating command {mutating:?}: {:?}",
                 profile.allowed_tools
             );
@@ -289,7 +306,10 @@ fn read_only_git_allows_cover_listing_but_not_ref_mutation() {
             "git tag --contains abc123",
         ] {
             assert!(
-                profile.allowed_tools.iter().any(|a| bash_rule_covers(a, listing)),
+                profile
+                    .allowed_tools
+                    .iter()
+                    .any(|a| bash_rule_covers(a, listing)),
                 "{role:?} allow list does not cover read-only command {listing:?}: {:?}",
                 profile.allowed_tools
             );
@@ -320,8 +340,14 @@ fn validator_profile_allows_contract_commands_as_bash_patterns() {
                 profile.allowed_tools
             );
         }
-        for expected in ["Write", "Edit", "NotebookEdit", "WebFetch", "WebSearch", "Bash(git push*)"]
-        {
+        for expected in [
+            "Write",
+            "Edit",
+            "NotebookEdit",
+            "WebFetch",
+            "WebSearch",
+            "Bash(git push*)",
+        ] {
             assert!(
                 profile.disallowed_tools.iter().any(|d| d == expected),
                 "{role:?} deny list missing {expected:?}"
@@ -332,12 +358,21 @@ fn validator_profile_allows_contract_commands_as_bash_patterns() {
 
 #[test]
 fn dangerously_allow_all_bypasses_every_role() {
-    let cfg = MissionConfig { dangerously_allow_all: true, ..MissionConfig::default() };
-    for role in
-        [Role::Worker, Role::Orchestrator, Role::ValidatorScrutiny, Role::ValidatorFunctional]
-    {
+    let cfg = MissionConfig {
+        dangerously_allow_all: true,
+        ..MissionConfig::default()
+    };
+    for role in [
+        Role::Worker,
+        Role::Orchestrator,
+        Role::ValidatorScrutiny,
+        Role::ValidatorFunctional,
+    ] {
         let profile = permissions::for_role(role, &cfg, &["cargo test".to_string()]);
-        assert_eq!(profile.permission_mode.as_deref(), Some("bypassPermissions"));
+        assert_eq!(
+            profile.permission_mode.as_deref(),
+            Some("bypassPermissions")
+        );
         assert!(profile.allowed_tools.is_empty());
         assert!(profile.disallowed_tools.is_empty());
     }
@@ -372,8 +407,9 @@ async fn run_session_happy_path_pass_report_events_and_transcript() {
     let backend =
         MockBackend::with_scripts(vec![MockScript::single_shot_json(&worker_report_json())]);
     let spec = session_spec(PromptMode::SingleShot("build it".to_string()));
-    let outcome =
-        run_session(&backend, spec, &mut log, &p, worker_meta("run-1"), None).await.unwrap();
+    let outcome = run_session(&backend, spec, &mut log, &p, worker_meta("run-1"), None)
+        .await
+        .unwrap();
 
     assert_eq!(outcome.run_id, "run-1");
     assert_eq!(outcome.result, RunResult::Pass);
@@ -382,7 +418,12 @@ async fn run_session_happy_path_pass_report_events_and_transcript() {
     // Usage/cost from the mock's standard result event.
     assert_eq!(
         outcome.usage,
-        TokenUsage { input: 1000, output: 200, cache_read: 0, cache_write: 0 }
+        TokenUsage {
+            input: 1000,
+            output: 200,
+            cache_read: 0,
+            cache_write: 0
+        }
     );
     assert_eq!(outcome.cost_usd, Some(0.01));
     let report = outcome.report.expect("worker report should parse");
@@ -403,7 +444,13 @@ async fn run_session_happy_path_pass_report_events_and_transcript() {
     );
 
     match &events[1].kind {
-        EventKind::WorkerSpawned { run_id, role, sdk_session_id, transcript_path, .. } => {
+        EventKind::WorkerSpawned {
+            run_id,
+            role,
+            sdk_session_id,
+            transcript_path,
+            ..
+        } => {
             assert_eq!(run_id, "run-1");
             assert_eq!(*role, Role::Worker);
             assert_eq!(sdk_session_id, "11111111-1111-4111-8111-111111111111");
@@ -412,12 +459,23 @@ async fn run_session_happy_path_pass_report_events_and_transcript() {
         other => panic!("expected worker.spawned, got {other:?}"),
     }
     match &events.last().unwrap().kind {
-        EventKind::WorkerCompleted { run_id, result, tokens, cost_usd, report } => {
+        EventKind::WorkerCompleted {
+            run_id,
+            result,
+            tokens,
+            cost_usd,
+            report,
+        } => {
             assert_eq!(run_id, "run-1");
             assert_eq!(*result, RunResult::Pass);
             assert_eq!(
                 *tokens,
-                TokenUsage { input: 1000, output: 200, cache_read: 0, cache_write: 0 }
+                TokenUsage {
+                    input: 1000,
+                    output: 200,
+                    cache_read: 0,
+                    cache_write: 0
+                }
             );
             assert_eq!(*cost_usd, Some(0.01));
             assert!(report.is_some());
@@ -452,8 +510,9 @@ async fn run_session_tags_denied_tool_results() {
     };
     let backend = MockBackend::with_scripts(vec![script]);
     let spec = session_spec(PromptMode::SingleShot("try to push".to_string()));
-    let outcome =
-        run_session(&backend, spec, &mut log, &p, worker_meta("run-d"), None).await.unwrap();
+    let outcome = run_session(&backend, spec, &mut log, &p, worker_meta("run-d"), None)
+        .await
+        .unwrap();
 
     assert_eq!(outcome.denied_count, 1);
 
@@ -463,9 +522,15 @@ async fn run_session_tags_denied_tool_results() {
         .iter()
         .filter(|e| matches!(&e.kind, EventKind::WorkerMessage { tag, .. } if tag == "denied"))
         .collect();
-    assert_eq!(denied.len(), 1, "exactly one denied worker.message: {events:?}");
+    assert_eq!(
+        denied.len(),
+        1,
+        "exactly one denied worker.message: {events:?}"
+    );
     match &denied[0].kind {
-        EventKind::WorkerMessage { run_id, content, .. } => {
+        EventKind::WorkerMessage {
+            run_id, content, ..
+        } => {
             assert_eq!(run_id, "run-d");
             assert!(content.contains("git push"), "denied content: {content}");
         }
@@ -484,11 +549,11 @@ async fn run_session_without_parseable_report_is_partial() {
     let p = paths(dir.path());
     let mut log = seeded_log(&p);
 
-    let backend =
-        MockBackend::with_scripts(vec![MockScript::single_shot("no json here at all")]);
+    let backend = MockBackend::with_scripts(vec![MockScript::single_shot("no json here at all")]);
     let spec = session_spec(PromptMode::SingleShot("build it".to_string()));
-    let outcome =
-        run_session(&backend, spec, &mut log, &p, worker_meta("run-g"), None).await.unwrap();
+    let outcome = run_session(&backend, spec, &mut log, &p, worker_meta("run-g"), None)
+        .await
+        .unwrap();
 
     assert_eq!(outcome.exit, SessionExit::Completed);
     assert!(outcome.report.is_none());
@@ -504,8 +569,9 @@ async fn run_session_report_downgrades_provisional_pass() {
     let report = json!({ "result": "partial", "summary": "ran out of budget" });
     let backend = MockBackend::with_scripts(vec![MockScript::single_shot_json(&report)]);
     let spec = session_spec(PromptMode::SingleShot("build it".to_string()));
-    let outcome =
-        run_session(&backend, spec, &mut log, &p, worker_meta("run-p"), None).await.unwrap();
+    let outcome = run_session(&backend, spec, &mut log, &p, worker_meta("run-p"), None)
+        .await
+        .unwrap();
 
     assert_eq!(outcome.exit, SessionExit::Completed);
     assert_eq!(outcome.result, RunResult::Partial);
@@ -520,8 +586,7 @@ async fn run_session_cancellation_aborts_and_reports_partial() {
 
     // Streaming session that never ends on its own: after the initial events
     // it parks waiting for injected messages that never come.
-    let script =
-        MockScript::streaming(vec![mock_init("mock-session"), mock_text("working...")]);
+    let script = MockScript::streaming(vec![mock_init("mock-session"), mock_text("working...")]);
     let backend = MockBackend::with_scripts(vec![script]);
     let spec = session_spec(PromptMode::Streaming("keep working".to_string()));
 
@@ -532,7 +597,14 @@ async fn run_session_cancellation_aborts_and_reports_partial() {
 
     let outcome = timeout(
         HANG_PROOF,
-        run_session(&backend, spec, &mut log, &p, worker_meta("run-c"), Some(cancel)),
+        run_session(
+            &backend,
+            spec,
+            &mut log,
+            &p,
+            worker_meta("run-c"),
+            Some(cancel),
+        ),
     )
     .await
     .expect("cancelled run must not hang")
@@ -560,7 +632,14 @@ async fn interrupt_fired_before_first_poll_still_aborts_the_run() {
     let p = paths(dir.path());
     let mut log = seeded_log(&p);
 
-    control::enqueue(&p, &ControlCommand::Msg { text: "stop".into(), interrupt: true }).unwrap();
+    control::enqueue(
+        &p,
+        &ControlCommand::Msg {
+            text: "stop".into(),
+            interrupt: true,
+        },
+    )
+    .unwrap();
     let cancel = Arc::new(Notify::new());
     // Run the watcher to completion first: it fires and returns while nobody
     // is registered on the notify.
@@ -576,14 +655,20 @@ async fn interrupt_fired_before_first_poll_still_aborts_the_run() {
     .expect("watcher must fire and return");
 
     // Never-ending streaming session: only the stored permit can end it.
-    let script =
-        MockScript::streaming(vec![mock_init("mock-session"), mock_text("working...")]);
+    let script = MockScript::streaming(vec![mock_init("mock-session"), mock_text("working...")]);
     let backend = MockBackend::with_scripts(vec![script]);
     let spec = session_spec(PromptMode::Streaming("keep working".to_string()));
 
     let outcome = timeout(
         HANG_PROOF,
-        run_session(&backend, spec, &mut log, &p, worker_meta("run-pre"), Some(cancel)),
+        run_session(
+            &backend,
+            spec,
+            &mut log,
+            &p,
+            worker_meta("run-pre"),
+            Some(cancel),
+        ),
     )
     .await
     .expect("a pre-fired interrupt must abort the run, not hang")
@@ -610,7 +695,9 @@ async fn run_session_scrubs_credentials_from_log_and_transcript() {
     };
     let backend = MockBackend::with_scripts(vec![script]);
     let spec = session_spec(PromptMode::SingleShot("scan".to_string()));
-    run_session(&backend, spec, &mut log, &p, worker_meta("run-s"), None).await.unwrap();
+    run_session(&backend, spec, &mut log, &p, worker_meta("run-s"), None)
+        .await
+        .unwrap();
 
     drop(log);
     let raw_log = std::fs::read_to_string(p.events_file()).unwrap();
@@ -623,7 +710,10 @@ async fn run_session_scrubs_credentials_from_log_and_transcript() {
             _ => None,
         })
         .expect("a text worker.message should exist");
-    assert!(text_content.contains("[REDACTED]"), "content: {text_content}");
+    assert!(
+        text_content.contains("[REDACTED]"),
+        "content: {text_content}"
+    );
     assert!(!text_content.contains(token));
 
     let transcript = std::fs::read_to_string(p.transcript_file("run-s")).unwrap();
@@ -649,21 +739,29 @@ async fn run_session_scrubs_worker_report_structured_fields() {
     });
     let backend = MockBackend::with_scripts(vec![MockScript::single_shot_json(&report)]);
     let spec = session_spec(PromptMode::SingleShot("build".to_string()));
-    let outcome =
-        run_session(&backend, spec, &mut log, &p, worker_meta("run-r"), None).await.unwrap();
+    let outcome = run_session(&backend, spec, &mut log, &p, worker_meta("run-r"), None)
+        .await
+        .unwrap();
 
     // The parsed report is redacted (it feeds worker.completed and the
     // orchestrator judgement turn); so is the outcome's final text.
     let parsed = outcome.report.expect("report parses from scrubbed text");
     assert_eq!(parsed.result, RunResult::Pass);
-    assert!(parsed.summary.contains("[REDACTED]"), "summary: {}", parsed.summary);
+    assert!(
+        parsed.summary.contains("[REDACTED]"),
+        "summary: {}",
+        parsed.summary
+    );
     assert!(
         parsed.test_evidence.contains("[REDACTED]"),
         "testEvidence: {}",
         parsed.test_evidence
     );
     assert!(!parsed.test_evidence.contains(token));
-    assert!(!outcome.final_text.contains(token), "final_text must be scrubbed");
+    assert!(
+        !outcome.final_text.contains(token),
+        "final_text must be scrubbed"
+    );
 
     // Nothing on events.jsonl carries the raw token.
     drop(log);
@@ -671,8 +769,13 @@ async fn run_session_scrubs_worker_report_structured_fields() {
     assert!(!raw_log.contains(token), "event log leaked the token");
     let events = read_log(&p);
     match &events.last().unwrap().kind {
-        EventKind::WorkerCompleted { report: Some(r), .. } => {
-            assert!(r.test_evidence.contains("[REDACTED]"), "event report: {r:?}");
+        EventKind::WorkerCompleted {
+            report: Some(r), ..
+        } => {
+            assert!(
+                r.test_evidence.contains("[REDACTED]"),
+                "event report: {r:?}"
+            );
         }
         other => panic!("expected worker.completed with a report, got {other:?}"),
     }
@@ -688,11 +791,12 @@ fn parse_worker_report_strict_and_fallbacks() {
     assert!(parse_worker_report(&strict).is_some(), "strict parse");
 
     let braces = format!("Here is my report. {strict} That's all.");
-    assert!(parse_worker_report(&braces).is_some(), "brace-substring parse");
-
-    let fenced = format!(
-        "Work finished {{with caveats}}.\n```json\n{strict}\n```\nGoodbye."
+    assert!(
+        parse_worker_report(&braces).is_some(),
+        "brace-substring parse"
     );
+
+    let fenced = format!("Work finished {{with caveats}}.\n```json\n{strict}\n```\nGoodbye.");
     let report = parse_worker_report(&fenced).expect("fenced parse");
     assert_eq!(report.summary, "built the login endpoint");
 
@@ -754,7 +858,10 @@ async fn run_worker_builds_spec_and_uses_report_result() {
     assert_eq!(specs.len(), 1);
     let spec = &specs[0];
     assert_eq!(spec.cwd, p.repo_root);
-    assert!(!spec.env.contains_key("KRANZ_BASE_SHA"), "no base sha means no env var");
+    assert!(
+        !spec.env.contains_key("KRANZ_BASE_SHA"),
+        "no base sha means no env var"
+    );
     assert_eq!(spec.model, cfg.worker.model);
     assert_eq!(spec.effort, cfg.worker.reasoning_effort);
     assert_eq!(spec.max_turns, cfg.worker.max_turns);
@@ -762,11 +869,20 @@ async fn run_worker_builds_spec_and_uses_report_result() {
     assert_eq!(spec.permission_mode.as_deref(), Some("acceptEdits"));
     assert_eq!(spec.allowed_tools, vec!["Bash".to_string()]);
     assert!(spec.disallowed_tools.iter().any(|d| d == "Bash(git push*)"));
-    assert!(uuid::Uuid::parse_str(&spec.session_id).is_ok(), "session id is a uuid");
+    assert!(
+        uuid::Uuid::parse_str(&spec.session_id).is_ok(),
+        "session id is a uuid"
+    );
 
     // Role prompt rendered into append_system_prompt; task body is the prompt.
-    let system = spec.append_system_prompt.as_deref().expect("role prompt set");
-    assert!(system.contains("f-1"), "featureId rendered into role prompt");
+    let system = spec
+        .append_system_prompt
+        .as_deref()
+        .expect("role prompt set");
+    assert!(
+        system.contains("f-1"),
+        "featureId rendered into role prompt"
+    );
     assert!(!system.contains("{featureId}"), "no unrendered placeholder");
     match &spec.prompt {
         PromptMode::SingleShot(task) => {
@@ -806,8 +922,10 @@ async fn run_validator_builds_spec_permissions_and_parses_report() {
         allow_validator_commands: vec!["npm run lint".to_string()],
         ..MissionConfig::default()
     };
-    let contract =
-        vec![assertion("a-1", Some("cargo test --all")), assertion("a-2", None)];
+    let contract = vec![
+        assertion("a-1", Some("cargo test --all")),
+        assertion("a-2", None),
+    ];
 
     let report = json!({ "findings": [], "summary": "everything holds" });
     let backend = MockBackend::with_scripts(vec![MockScript::single_shot_json(&report)]);
@@ -833,15 +951,27 @@ async fn run_validator_builds_spec_permissions_and_parses_report() {
 
     let specs = backend.started_specs();
     let spec = &specs[0];
-    assert!(!spec.env.contains_key("KRANZ_BASE_SHA"), "no base sha means no env var");
+    assert!(
+        !spec.env.contains_key("KRANZ_BASE_SHA"),
+        "no base sha means no env var"
+    );
     assert_eq!(spec.model, cfg.validator_scrutiny.model);
     assert_eq!(spec.permission_mode.as_deref(), Some("default"));
-    assert!(spec.allowed_tools.iter().any(|a| a == "Bash(cargo test --all*)"));
-    assert!(spec.allowed_tools.iter().any(|a| a == "Bash(npm run lint*)"));
+    assert!(spec
+        .allowed_tools
+        .iter()
+        .any(|a| a == "Bash(cargo test --all*)"));
+    assert!(spec
+        .allowed_tools
+        .iter()
+        .any(|a| a == "Bash(npm run lint*)"));
     assert!(spec.disallowed_tools.iter().any(|d| d == "Write"));
 
     let system = spec.append_system_prompt.as_deref().unwrap();
-    assert!(system.contains("abc123"), "startSha rendered into role prompt");
+    assert!(
+        system.contains("abc123"),
+        "startSha rendered into role prompt"
+    );
     match &spec.prompt {
         PromptMode::SingleShot(task) => {
             assert!(task.contains("abc123..HEAD"));
@@ -901,7 +1031,10 @@ fn validator_command_patterns_cover_natural_variations() {
     let pats = command_allow_patterns("python3 extract_links.py && echo EXIT_OK");
     let covers = |cmd: &str| {
         pats.iter().any(|p| {
-            let inner = p.strip_prefix("Bash(").and_then(|s| s.strip_suffix(")")).unwrap();
+            let inner = p
+                .strip_prefix("Bash(")
+                .and_then(|s| s.strip_suffix(")"))
+                .unwrap();
             match inner.strip_suffix('*') {
                 Some(prefix) => cmd.starts_with(prefix),
                 None => cmd == inner,
@@ -911,7 +1044,9 @@ fn validator_command_patterns_cover_natural_variations() {
     // Verbatim, bare segment, and heredoc-ish/arg-extended reinvocations.
     assert!(covers("python3 extract_links.py && echo EXIT_OK"));
     assert!(covers("python3 extract_links.py"));
-    assert!(covers("python3 extract_links.py operator@example.com out.txt"));
+    assert!(covers(
+        "python3 extract_links.py operator@example.com out.txt"
+    ));
     assert!(covers("echo EXIT_OK"));
     // Heredoc contract command: leading-two-token rule admits `python3 -`.
     let heredoc = command_allow_patterns("python3 - <<'PY'\nprint('ok')\nPY");
@@ -927,7 +1062,10 @@ fn validator_command_patterns_cover_natural_variations() {
         &cfg,
         &["python3 -m pytest test_x.py -v".to_string()],
     );
-    assert!(profile.allowed_tools.iter().any(|p| p == "Bash(python3 -m*)"));
+    assert!(profile
+        .allowed_tools
+        .iter()
+        .any(|p| p == "Bash(python3 -m*)"));
 }
 
 // ---------------------------------------------------------------------------
@@ -984,24 +1122,46 @@ async fn run_worker_in_buffered_collects_kinds_without_touching_the_log() {
     // construction — the buffered path never held the log.
     drop(log);
     let events = read_log(&p);
-    assert_eq!(event_types(&events), vec!["mission.created"], "buffered run appends nothing");
+    assert_eq!(
+        event_types(&events),
+        vec!["mission.created"],
+        "buffered run appends nothing"
+    );
 
     // The buffer holds spawned first, at least one message, completed last —
     // the same kinds, same order, the live path would have appended.
     assert!(
-        matches!(buffered.first(), Some(EventKind::WorkerSpawned { role: Role::Worker, .. })),
+        matches!(
+            buffered.first(),
+            Some(EventKind::WorkerSpawned {
+                role: Role::Worker,
+                ..
+            })
+        ),
         "first buffered kind is worker.spawned: {buffered:?}"
     );
     assert!(
-        matches!(buffered.last(), Some(EventKind::WorkerCompleted { result: RunResult::Pass, .. })),
+        matches!(
+            buffered.last(),
+            Some(EventKind::WorkerCompleted {
+                result: RunResult::Pass,
+                ..
+            })
+        ),
         "last buffered kind is a passing worker.completed: {buffered:?}"
     );
     assert!(
-        buffered.iter().any(|k| matches!(k, EventKind::WorkerMessage { tag, .. } if tag == "tool-use")),
+        buffered
+            .iter()
+            .any(|k| matches!(k, EventKind::WorkerMessage { tag, .. } if tag == "tool-use")),
         "a tool-use worker.message is buffered: {buffered:?}"
     );
 
     // The transcript file WAS written live (per-run file, not the log).
     let transcript = std::fs::read_to_string(p.transcript_file(&outcome.run_id)).unwrap();
-    assert_eq!(transcript.lines().count(), 4, "init + tool-use + text + result");
+    assert_eq!(
+        transcript.lines().count(),
+        4,
+        "init + tool-use + text + result"
+    );
 }

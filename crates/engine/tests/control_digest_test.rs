@@ -46,9 +46,17 @@ fn enqueue_drain_round_trip_preserves_order() {
 
     let cmds = vec![
         ControlCommand::Pause,
-        ControlCommand::Msg { text: "status update please".into(), interrupt: false },
-        ControlCommand::Msg { text: "stop now".into(), interrupt: true },
-        ControlCommand::ConfigChange { patch: json!({ "worker": { "model": "opus" } }) },
+        ControlCommand::Msg {
+            text: "status update please".into(),
+            interrupt: false,
+        },
+        ControlCommand::Msg {
+            text: "stop now".into(),
+            interrupt: true,
+        },
+        ControlCommand::ConfigChange {
+            patch: json!({ "worker": { "model": "opus" } }),
+        },
         ControlCommand::Resume,
     ];
 
@@ -62,7 +70,10 @@ fn enqueue_drain_round_trip_preserves_order() {
 
     let drained = control::drain(&paths).unwrap();
     assert_eq!(
-        drained.iter().map(|(_, cmd)| as_json(cmd)).collect::<Vec<_>>(),
+        drained
+            .iter()
+            .map(|(_, cmd)| as_json(cmd))
+            .collect::<Vec<_>>(),
         cmds.iter().map(as_json).collect::<Vec<_>>(),
         "drain must return commands in enqueue order"
     );
@@ -71,15 +82,26 @@ fn enqueue_drain_round_trip_preserves_order() {
     // durably applied its command and deletes it. A crash between drain and
     // apply therefore re-processes commands instead of losing them.
     for (path, _) in &drained {
-        assert!(path.exists(), "drained file must survive drain: {}", path.display());
+        assert!(
+            path.exists(),
+            "drained file must survive drain: {}",
+            path.display()
+        );
     }
-    assert_eq!(control_entries(&paths).len(), cmds.len(), "inbox untouched by drain");
+    assert_eq!(
+        control_entries(&paths).len(),
+        cmds.len(),
+        "inbox untouched by drain"
+    );
 
     // Processing stopped before any delete (simulated crash): a second drain
     // sees the exact same queue again.
     let again = control::drain(&paths).unwrap();
     assert_eq!(
-        again.iter().map(|(_, cmd)| as_json(cmd)).collect::<Vec<_>>(),
+        again
+            .iter()
+            .map(|(_, cmd)| as_json(cmd))
+            .collect::<Vec<_>>(),
         cmds.iter().map(as_json).collect::<Vec<_>>(),
         "undeleted files drain again after a crash"
     );
@@ -88,7 +110,10 @@ fn enqueue_drain_round_trip_preserves_order() {
     for (path, _) in drained {
         std::fs::remove_file(path).unwrap();
     }
-    assert!(control_entries(&paths).is_empty(), "inbox empty once the caller deletes");
+    assert!(
+        control_entries(&paths).is_empty(),
+        "inbox empty once the caller deletes"
+    );
     assert!(control::drain(&paths).unwrap().is_empty());
 }
 
@@ -99,10 +124,20 @@ fn enqueue_names_sort_chronologically() {
     let name = path.file_name().unwrap().to_str().unwrap();
 
     // <20-digit zero-padded millis>-<8 hex>.json
-    assert_eq!(name.len(), 20 + 1 + 8 + ".json".len(), "unexpected name shape: {name}");
-    assert!(name[..20].chars().all(|c| c.is_ascii_digit()), "millis prefix: {name}");
+    assert_eq!(
+        name.len(),
+        20 + 1 + 8 + ".json".len(),
+        "unexpected name shape: {name}"
+    );
+    assert!(
+        name[..20].chars().all(|c| c.is_ascii_digit()),
+        "millis prefix: {name}"
+    );
     assert_eq!(&name[20..21], "-");
-    assert!(name[21..29].chars().all(|c| c.is_ascii_hexdigit()), "rand suffix: {name}");
+    assert!(
+        name[21..29].chars().all(|c| c.is_ascii_hexdigit()),
+        "rand suffix: {name}"
+    );
     assert!(name.ends_with(".json"));
 }
 
@@ -131,8 +166,14 @@ fn corrupt_file_is_quarantined_and_never_blocks_the_queue() {
 
     let drained = control::drain(&paths).unwrap();
     assert_eq!(
-        drained.iter().map(|(_, cmd)| as_json(cmd)).collect::<Vec<_>>(),
-        vec![as_json(&ControlCommand::Pause), as_json(&ControlCommand::Resume)],
+        drained
+            .iter()
+            .map(|(_, cmd)| as_json(cmd))
+            .collect::<Vec<_>>(),
+        vec![
+            as_json(&ControlCommand::Pause),
+            as_json(&ControlCommand::Resume)
+        ],
         "valid commands drain despite the corrupt file"
     );
 
@@ -141,7 +182,10 @@ fn corrupt_file_is_quarantined_and_never_blocks_the_queue() {
         entries.contains(&format!("{corrupt_name}.bad")),
         "corrupt file renamed .bad: {entries:?}"
     );
-    assert!(entries.contains(&"notes.txt".to_string()), "stray file untouched: {entries:?}");
+    assert!(
+        entries.contains(&"notes.txt".to_string()),
+        "stray file untouched: {entries:?}"
+    );
     assert_eq!(
         entries.len(),
         4,
@@ -167,15 +211,33 @@ fn peek_interrupt_only_on_interrupt_msg_and_is_non_destructive() {
 
     control::enqueue(&paths, &ControlCommand::Pause).unwrap();
     std::thread::sleep(Duration::from_millis(3));
-    control::enqueue(&paths, &ControlCommand::Msg { text: "fyi".into(), interrupt: false })
-        .unwrap();
-    assert!(!control::peek_interrupt(&paths).unwrap(), "no interrupt queued yet");
+    control::enqueue(
+        &paths,
+        &ControlCommand::Msg {
+            text: "fyi".into(),
+            interrupt: false,
+        },
+    )
+    .unwrap();
+    assert!(
+        !control::peek_interrupt(&paths).unwrap(),
+        "no interrupt queued yet"
+    );
 
     std::thread::sleep(Duration::from_millis(3));
-    control::enqueue(&paths, &ControlCommand::Msg { text: "stop".into(), interrupt: true })
-        .unwrap();
+    control::enqueue(
+        &paths,
+        &ControlCommand::Msg {
+            text: "stop".into(),
+            interrupt: true,
+        },
+    )
+    .unwrap();
     assert!(control::peek_interrupt(&paths).unwrap());
-    assert!(control::peek_interrupt(&paths).unwrap(), "peek must not consume");
+    assert!(
+        control::peek_interrupt(&paths).unwrap(),
+        "peek must not consume"
+    );
 
     // Everything (including the interrupt Msg) still drains, in order.
     let drained = control::drain(&paths).unwrap();
@@ -194,8 +256,14 @@ fn peek_interrupt_only_on_interrupt_msg_and_is_non_destructive() {
 #[tokio::test]
 async fn wait_for_interrupt_fires_notify_within_bounded_time() {
     let (_dir, paths) = temp_paths();
-    control::enqueue(&paths, &ControlCommand::Msg { text: "abort".into(), interrupt: true })
-        .unwrap();
+    control::enqueue(
+        &paths,
+        &ControlCommand::Msg {
+            text: "abort".into(),
+            interrupt: true,
+        },
+    )
+    .unwrap();
 
     let notify = Arc::new(Notify::new());
     let notified = notify.notified();
@@ -219,7 +287,13 @@ async fn wait_for_interrupt_fires_notify_within_bounded_time() {
     // The watcher peeks; the interrupt message is still queued for drain.
     let drained = control::drain(&paths).unwrap();
     assert_eq!(drained.len(), 1);
-    assert!(matches!(drained[0].1, ControlCommand::Msg { interrupt: true, .. }));
+    assert!(matches!(
+        drained[0].1,
+        ControlCommand::Msg {
+            interrupt: true,
+            ..
+        }
+    ));
 }
 
 /// Regression (interrupt loss): the watcher must fire `notify_one`, which
@@ -230,8 +304,14 @@ async fn wait_for_interrupt_fires_notify_within_bounded_time() {
 #[tokio::test]
 async fn wait_for_interrupt_permit_survives_until_a_late_waiter() {
     let (_dir, paths) = temp_paths();
-    control::enqueue(&paths, &ControlCommand::Msg { text: "abort".into(), interrupt: true })
-        .unwrap();
+    control::enqueue(
+        &paths,
+        &ControlCommand::Msg {
+            text: "abort".into(),
+            interrupt: true,
+        },
+    )
+    .unwrap();
 
     // Run the watcher TO COMPLETION with nobody listening.
     let notify = Arc::new(Notify::new());
@@ -256,8 +336,14 @@ async fn wait_for_interrupt_permit_survives_until_a_late_waiter() {
 async fn wait_for_interrupt_does_not_fire_without_interrupt() {
     let (_dir, paths) = temp_paths();
     control::enqueue(&paths, &ControlCommand::Pause).unwrap();
-    control::enqueue(&paths, &ControlCommand::Msg { text: "fyi".into(), interrupt: false })
-        .unwrap();
+    control::enqueue(
+        &paths,
+        &ControlCommand::Msg {
+            text: "fyi".into(),
+            interrupt: false,
+        },
+    )
+    .unwrap();
 
     let notify = Arc::new(Notify::new());
     let notified = notify.notified();
@@ -271,7 +357,10 @@ async fn wait_for_interrupt_does_not_fire_without_interrupt() {
     ));
 
     let fired = tokio::time::timeout(Duration::from_millis(250), notified).await;
-    assert!(fired.is_err(), "notify must NOT fire without an interrupt message");
+    assert!(
+        fired.is_err(),
+        "notify must NOT fire without an interrupt message"
+    );
     assert!(!watcher.is_finished(), "watcher keeps polling");
     watcher.abort();
 }
@@ -343,38 +432,75 @@ fn plan() -> Plan {
 fn digest_events() -> Vec<Event> {
     vec![
         ev(1, created()),
-        ev(2, EventKind::PlanApproved { plan: plan(), base_sha: None }),
-        ev(3, EventKind::MilestoneStarted {
-            milestone_id: "ms-1".to_string(),
-            start_sha: "abc123".to_string(),
-        }),
-        ev(4, EventKind::FeatureStarted { feature_id: "f-1-1".to_string() }),
-        ev(5, EventKind::WorkerSpawned {
-            run_id: "r-1".to_string(),
-            role: Role::Worker,
-            feature_id: Some("f-1-1".to_string()),
-            milestone_id: Some("ms-1".to_string()),
-            sdk_session_id: "sess-r-1".to_string(),
-            model: "sonnet".to_string(),
-            prompt_hash: "deadbeef".to_string(),
-            transcript_path: "runs/r-1.jsonl".to_string(),
-        }),
-        ev(6, EventKind::WorkerCompleted {
-            run_id: "r-1".to_string(),
-            result: RunResult::Pass,
-            tokens: TokenUsage { input: 1200, output: 340, cache_read: 0, cache_write: 0 },
-            cost_usd: Some(0.5),
-            report: None,
-        }),
-        ev(7, EventKind::UserMessage { text: "please add docs".to_string(), interrupt: false }),
-        ev(8, EventKind::OrchestratorDecision {
-            summary: "started milestone one; alpha implemented".to_string(),
-            detail: None,
-        }),
-        ev(9, EventKind::UserMessage {
-            text: "and update the readme".to_string(),
-            interrupt: false,
-        }),
+        ev(
+            2,
+            EventKind::PlanApproved {
+                plan: plan(),
+                base_sha: None,
+            },
+        ),
+        ev(
+            3,
+            EventKind::MilestoneStarted {
+                milestone_id: "ms-1".to_string(),
+                start_sha: "abc123".to_string(),
+            },
+        ),
+        ev(
+            4,
+            EventKind::FeatureStarted {
+                feature_id: "f-1-1".to_string(),
+            },
+        ),
+        ev(
+            5,
+            EventKind::WorkerSpawned {
+                run_id: "r-1".to_string(),
+                role: Role::Worker,
+                feature_id: Some("f-1-1".to_string()),
+                milestone_id: Some("ms-1".to_string()),
+                sdk_session_id: "sess-r-1".to_string(),
+                model: "sonnet".to_string(),
+                prompt_hash: "deadbeef".to_string(),
+                transcript_path: "runs/r-1.jsonl".to_string(),
+            },
+        ),
+        ev(
+            6,
+            EventKind::WorkerCompleted {
+                run_id: "r-1".to_string(),
+                result: RunResult::Pass,
+                tokens: TokenUsage {
+                    input: 1200,
+                    output: 340,
+                    cache_read: 0,
+                    cache_write: 0,
+                },
+                cost_usd: Some(0.5),
+                report: None,
+            },
+        ),
+        ev(
+            7,
+            EventKind::UserMessage {
+                text: "please add docs".to_string(),
+                interrupt: false,
+            },
+        ),
+        ev(
+            8,
+            EventKind::OrchestratorDecision {
+                summary: "started milestone one; alpha implemented".to_string(),
+                detail: None,
+            },
+        ),
+        ev(
+            9,
+            EventKind::UserMessage {
+                text: "and update the readme".to_string(),
+                interrupt: false,
+            },
+        ),
     ]
 }
 
@@ -411,12 +537,17 @@ fn digest_matches_committed_snapshot_and_is_deterministic() {
     assert!(rendered.contains("  f-1-1 [active|plan] Alpha (runs 1, respawns 0)"));
     assert!(rendered.contains("- started milestone one; alpha implemented"));
     assert!(rendered.contains("- and update the readme"));
-    assert!(rendered
-        .ends_with("You are resuming from durable state; the event log is authoritative."));
+    assert!(
+        rendered.ends_with("You are resuming from durable state; the event log is authoritative.")
+    );
 
     // Exact committed snapshot, stable across runs.
     assert_eq!(rendered, EXPECTED_DIGEST);
-    assert_eq!(digest::render(&state), rendered, "same state renders byte-identically");
+    assert_eq!(
+        digest::render(&state),
+        rendered,
+        "same state renders byte-identically"
+    );
 }
 
 #[test]
@@ -436,20 +567,44 @@ fn digest_truncates_long_titles_and_decisions() {
 
     let state = fold(&[
         ev(1, created()),
-        ev(2, EventKind::PlanApproved { plan, base_sha: None }),
-        ev(3, EventKind::OrchestratorDecision { summary: long_decision, detail: None }),
+        ev(
+            2,
+            EventKind::PlanApproved {
+                plan,
+                base_sha: None,
+            },
+        ),
+        ev(
+            3,
+            EventKind::OrchestratorDecision {
+                summary: long_decision,
+                detail: None,
+            },
+        ),
     ])
     .unwrap();
     let rendered = digest::render(&state);
 
     // Titles cut at 160 chars, decisions at 200; marker appended.
     let cut_title = format!("{}… [truncated]", "x".repeat(160));
-    assert!(rendered.contains(&cut_title), "title truncated at 160 chars");
-    assert!(!rendered.contains(&"x".repeat(161)), "no more than 160 title chars survive");
+    assert!(
+        rendered.contains(&cut_title),
+        "title truncated at 160 chars"
+    );
+    assert!(
+        !rendered.contains(&"x".repeat(161)),
+        "no more than 160 title chars survive"
+    );
 
     let cut_decision = format!("{}… [truncated]", "d".repeat(200));
-    assert!(rendered.contains(&cut_decision), "decision truncated at 200 chars");
-    assert!(!rendered.contains(&"d".repeat(201)), "no more than 200 decision chars survive");
+    assert!(
+        rendered.contains(&cut_decision),
+        "decision truncated at 200 chars"
+    );
+    assert!(
+        !rendered.contains(&"d".repeat(201)),
+        "no more than 200 decision chars survive"
+    );
 }
 
 #[test]
@@ -460,7 +615,13 @@ fn render_reseed_appends_plan_json_verbatim() {
     let reseed = digest::render_reseed(&state, &plan_json);
     assert_eq!(
         reseed,
-        format!("{}\n\nAPPROVED PLAN (plan.json):\n{plan_json}", digest::render(&state))
+        format!(
+            "{}\n\nAPPROVED PLAN (plan.json):\n{plan_json}",
+            digest::render(&state)
+        )
     );
-    assert!(reseed.ends_with(&plan_json), "plan JSON is appended verbatim");
+    assert!(
+        reseed.ends_with(&plan_json),
+        "plan JSON is appended verbatim"
+    );
 }

@@ -11,7 +11,9 @@
 //! distinct assistant `message.id` values are counted and the session is
 //! aborted once the count exceeds `SessionSpec::max_turns`.
 
-use crate::backend::{AgentBackend, AgentEvent, AgentSession, PromptMode, SessionExit, SessionSpec};
+use crate::backend::{
+    AgentBackend, AgentEvent, AgentSession, PromptMode, SessionExit, SessionSpec,
+};
 use crate::error::{EngineError, Result};
 use crate::types::TokenUsage;
 use serde_json::{json, Value};
@@ -63,8 +65,8 @@ pub(crate) mod win_job {
     use std::os::windows::io::RawHandle;
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::System::JobObjects::{
-        AssignProcessToJobObject, SetInformationJobObject, TerminateJobObject,
-        JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        AssignProcessToJobObject, JobObjectExtendedLimitInformation, SetInformationJobObject,
+        TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
 
@@ -113,9 +115,7 @@ pub(crate) mod win_job {
         /// Errors carry the failing Win32 call so a CI failure is diagnosable;
         /// the caller treats a job-setup failure as non-fatal (the child still
         /// runs, just without tree-kill — same as the pre-job behaviour).
-        pub(crate) fn create_and_assign(
-            child_handle: RawHandle,
-        ) -> windows::core::Result<Self> {
+        pub(crate) fn create_and_assign(child_handle: RawHandle) -> windows::core::Result<Self> {
             // SAFETY: CreateJobObjectW with a null SECURITY_ATTRIBUTES pointer
             // and a null name creates an unnamed, default-security job. It
             // returns a null handle on failure (GetLastError set), which we map
@@ -374,7 +374,9 @@ pub fn user_message_line(text: &str) -> String {
 pub fn parse_stream_line(line: &str) -> Vec<AgentEvent> {
     match serde_json::from_str::<Value>(line) {
         Ok(value) => parse_stream_value(value),
-        Err(_) => vec![AgentEvent::Other { raw: json!({ "unparsed": line }) }],
+        Err(_) => vec![AgentEvent::Other {
+            raw: json!({ "unparsed": line }),
+        }],
     }
 }
 
@@ -397,14 +399,21 @@ pub fn parse_stream_value(value: Value) -> Vec<AgentEvent> {
 }
 
 fn str_field(value: &Value, key: &str) -> String {
-    value.get(key).and_then(Value::as_str).unwrap_or_default().to_string()
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// One event per content block: text → `Text` (empty skipped), tool_use →
 /// `ToolUse`, anything else (thinking, ...) → `Other`. Every event carries
 /// the full raw line.
 fn parse_assistant(value: Value) -> Vec<AgentEvent> {
-    let Some(blocks) = value.pointer("/message/content").and_then(Value::as_array).cloned()
+    let Some(blocks) = value
+        .pointer("/message/content")
+        .and_then(Value::as_array)
+        .cloned()
     else {
         return vec![AgentEvent::Other { raw: value }];
     };
@@ -427,7 +436,11 @@ fn parse_assistant(value: Value) -> Vec<AgentEvent> {
                     .unwrap_or("unknown")
                     .to_string();
                 let summary = tool_use_summary(&tool, block.get("input"));
-                events.push(AgentEvent::ToolUse { tool, summary, raw: value.clone() });
+                events.push(AgentEvent::ToolUse {
+                    tool,
+                    summary,
+                    raw: value.clone(),
+                });
             }
             _ => events.push(AgentEvent::Other { raw: value.clone() }),
         }
@@ -466,7 +479,10 @@ fn parse_user(value: Value) -> Vec<AgentEvent> {
             continue;
         }
         let text = tool_result_text(block);
-        let is_error = block.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+        let is_error = block
+            .get("is_error")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let lower = text.to_lowercase();
         let denied = (is_error && lower.contains("permission")) || lower.contains("hook");
         events.push(AgentEvent::ToolResult {
@@ -510,8 +526,15 @@ fn parse_result(value: Value) -> AgentEvent {
             .unwrap_or(0)
     };
     AgentEvent::Result {
-        text: value.get("result").and_then(Value::as_str).unwrap_or("").to_string(),
-        is_error: value.get("is_error").and_then(Value::as_bool).unwrap_or(false),
+        text: value
+            .get("result")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        is_error: value
+            .get("is_error")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         usage: TokenUsage {
             input: usage_field("input_tokens"),
             output: usage_field("output_tokens"),
@@ -519,7 +542,10 @@ fn parse_result(value: Value) -> AgentEvent {
             cache_write: usage_field("cache_creation_input_tokens"),
         },
         cost_usd: value.get("total_cost_usd").and_then(Value::as_f64),
-        num_turns: value.get("num_turns").and_then(Value::as_u64).map(|n| n as u32),
+        num_turns: value
+            .get("num_turns")
+            .and_then(Value::as_u64)
+            .map(|n| n as u32),
         raw: value,
     }
 }
@@ -553,12 +579,16 @@ pub struct ClaudeBackend {
 impl ClaudeBackend {
     /// Use an explicit binary path (no validation performed).
     pub fn new(binary: impl Into<PathBuf>) -> Self {
-        ClaudeBackend { binary: binary.into() }
+        ClaudeBackend {
+            binary: binary.into(),
+        }
     }
 
     /// Discover the binary via [`discover_claude_binary`].
     pub fn discover(configured: Option<&str>) -> Result<Self> {
-        Ok(ClaudeBackend { binary: discover_claude_binary(configured)? })
+        Ok(ClaudeBackend {
+            binary: discover_claude_binary(configured)?,
+        })
     }
 
     /// The binary this backend spawns.
@@ -578,7 +608,11 @@ impl AgentBackend for ClaudeBackend {
             .args(&args)
             .current_dir(&spec.cwd)
             .envs(&spec.env)
-            .stdin(if streaming { Stdio::piped() } else { Stdio::null() })
+            .stdin(if streaming {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -592,10 +626,7 @@ impl AgentBackend for ClaudeBackend {
         command.process_group(0);
 
         let mut child = command.spawn().map_err(|e| {
-            EngineError::Backend(format!(
-                "failed to spawn {}: {e}",
-                self.binary.display()
-            ))
+            EngineError::Backend(format!("failed to spawn {}: {e}", self.binary.display()))
         })?;
 
         // Windows: assign the child to a kill-on-close Job Object so its whole
@@ -619,12 +650,14 @@ impl AgentBackend for ClaudeBackend {
             None => None,
         };
 
-        let stdout = child.stdout.take().ok_or_else(|| {
-            EngineError::Backend("claude child has no stdout pipe".to_string())
-        })?;
-        let stderr = child.stderr.take().ok_or_else(|| {
-            EngineError::Backend("claude child has no stderr pipe".to_string())
-        })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| EngineError::Backend("claude child has no stdout pipe".to_string()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| EngineError::Backend("claude child has no stderr pipe".to_string()))?;
         let mut stdin = if streaming { child.stdin.take() } else { None };
 
         // Capture stderr concurrently so a chatty child never blocks on a
@@ -648,7 +681,9 @@ impl AgentBackend for ClaudeBackend {
                     "claude child has no stdin pipe for streaming input".to_string(),
                 ));
             };
-            handle.write_all(user_message_line(initial).as_bytes()).await?;
+            handle
+                .write_all(user_message_line(initial).as_bytes())
+                .await?;
             handle.flush().await?;
         }
 
@@ -736,7 +771,9 @@ impl ClaudeSession {
     /// True when this line pushes the distinct-assistant-id count over the
     /// turn budget.
     fn over_turn_budget(&mut self, value: &Value) -> bool {
-        let Some(max_turns) = self.max_turns else { return false };
+        let Some(max_turns) = self.max_turns else {
+            return false;
+        };
         if value.get("type").and_then(Value::as_str) != Some("assistant") {
             return false;
         }
@@ -830,7 +867,11 @@ impl ClaudeSession {
             Ok(status) if status.success() && self.saw_result => SessionExit::Completed,
             Ok(status) => SessionExit::Failed(format!(
                 "claude exited with {status}{}; stderr tail: {}",
-                if self.saw_result { "" } else { " without emitting a result message" },
+                if self.saw_result {
+                    ""
+                } else {
+                    " without emitting a result message"
+                },
                 self.stderr_tail(),
             )),
             Err(e) => SessionExit::Failed(format!(
@@ -888,8 +929,9 @@ impl AgentSession for ClaudeSession {
             let value: Value = match serde_json::from_str(&line) {
                 Ok(value) => value,
                 Err(_) => {
-                    self.queue
-                        .push_back(AgentEvent::Other { raw: json!({ "unparsed": line }) });
+                    self.queue.push_back(AgentEvent::Other {
+                        raw: json!({ "unparsed": line }),
+                    });
                     continue;
                 }
             };

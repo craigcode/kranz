@@ -63,7 +63,10 @@ pub fn classify(event: &Event, state: &MissionState) -> Option<Outbound> {
             assertion_count: plan.validation_contract.len(),
         })),
 
-        EventKind::MilestoneBlocked { milestone_id, reason } => Some(Outbound::Blocked(Blocked {
+        EventKind::MilestoneBlocked {
+            milestone_id,
+            reason,
+        } => Some(Outbound::Blocked(Blocked {
             mission_id: state.mission.id.clone(),
             milestone_id: milestone_id.clone(),
             reason: reason.clone(),
@@ -151,7 +154,12 @@ mod tests {
     }
 
     fn ev(kind: EventKind) -> Event {
-        Event { seq: 1, ts: Utc::now(), mission_id: "m-1".into(), kind }
+        Event {
+            seq: 1,
+            ts: Utc::now(),
+            mission_id: "m-1".into(),
+            kind,
+        }
     }
 
     #[test]
@@ -164,13 +172,23 @@ mod tests {
                 check: AssertionCheck::Command,
                 command: Some("pytest".into()),
             }],
-            milestones: vec![PlanMilestone { title: "Token bucket".into(), features: vec![] }],
+            milestones: vec![PlanMilestone {
+                title: "Token bucket".into(),
+                features: vec![],
+            }],
         };
-        let out =
-            classify(&ev(EventKind::PlanApproved { plan, base_sha: None }), &base_state())
-                .unwrap();
+        let out = classify(
+            &ev(EventKind::PlanApproved {
+                plan,
+                base_sha: None,
+            }),
+            &base_state(),
+        )
+        .unwrap();
         assert_eq!(out.class(), NotifyClass::PlanReady);
-        let Outbound::PlanReady(p) = out else { panic!("wrong variant") };
+        let Outbound::PlanReady(p) = out else {
+            panic!("wrong variant")
+        };
         assert_eq!(p.mission_id, "m-1");
         assert_eq!(p.milestone_titles, vec!["Token bucket".to_string()]);
         assert_eq!(p.assertion_count, 1);
@@ -209,7 +227,9 @@ mod tests {
         let mut state = base_state();
         state.total_cost_usd = 0.0;
         let out = classify(
-            &ev(EventKind::MissionFailed { reason: "worker exhausted respawns".into() }),
+            &ev(EventKind::MissionFailed {
+                reason: "worker exhausted respawns".into(),
+            }),
             &state,
         )
         .unwrap();
@@ -223,7 +243,9 @@ mod tests {
     fn unremarkable_events_classify_none() {
         assert!(classify(&ev(EventKind::MissionPaused {}), &base_state()).is_none());
         assert!(classify(
-            &ev(EventKind::FeatureStarted { feature_id: "f-1-1".into() }),
+            &ev(EventKind::FeatureStarted {
+                feature_id: "f-1-1".into()
+            }),
             &base_state()
         )
         .is_none());

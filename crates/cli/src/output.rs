@@ -112,7 +112,10 @@ pub fn render_status(state: &MissionState) -> String {
         }
     }
 
-    let skip = state.recent_decisions.len().saturating_sub(STATUS_DECISIONS);
+    let skip = state
+        .recent_decisions
+        .len()
+        .saturating_sub(STATUS_DECISIONS);
     let recent = &state.recent_decisions[skip..];
     if !recent.is_empty() {
         out.push_str(&format!("last {} decision(s):\n", recent.len()));
@@ -135,7 +138,11 @@ pub fn render_plan(plan: &Plan) -> String {
         out.push_str("  (none)\n");
     }
     for assertion in &plan.validation_contract {
-        let id = if assertion.id.trim().is_empty() { "?" } else { assertion.id.as_str() };
+        let id = if assertion.id.trim().is_empty() {
+            "?"
+        } else {
+            assertion.id.as_str()
+        };
         match assertion.check {
             AssertionCheck::Command => {
                 let command = assertion
@@ -143,10 +150,16 @@ pub fn render_plan(plan: &Plan) -> String {
                     .as_deref()
                     .map(|c| format!(" — `{c}`"))
                     .unwrap_or_default();
-                out.push_str(&format!("  [{id}] (command) {}{command}\n", assertion.statement));
+                out.push_str(&format!(
+                    "  [{id}] (command) {}{command}\n",
+                    assertion.statement
+                ));
             }
             AssertionCheck::AgentJudgement => {
-                out.push_str(&format!("  [{id}] (agent-judgement) {}\n", assertion.statement));
+                out.push_str(&format!(
+                    "  [{id}] (agent-judgement) {}\n",
+                    assertion.statement
+                ));
             }
         }
     }

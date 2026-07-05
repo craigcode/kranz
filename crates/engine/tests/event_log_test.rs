@@ -18,7 +18,10 @@ fn paths(dir: &std::path::Path) -> MissionPaths {
 }
 
 fn lifecycle(text: &str) -> EventKind {
-    EventKind::UserMessage { text: text.to_string(), interrupt: false }
+    EventKind::UserMessage {
+        text: text.to_string(),
+        interrupt: false,
+    }
 }
 
 fn delta(content: &str) -> EventKind {
@@ -76,7 +79,10 @@ fn identity_token_for(pid: u32) -> String {
         .args(["-p", &pid.to_string(), "-o", "lstart="])
         .output()
         .unwrap();
-    assert!(out.status.success(), "ps -o lstart= must succeed for a live pid");
+    assert!(
+        out.status.success(),
+        "ps -o lstart= must succeed for a live pid"
+    );
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
@@ -140,7 +146,10 @@ fn acquire_creates_dirs_and_lock() {
     );
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     assert_eq!(
-        lines.next().expect("third lock line: identity token").trim(),
+        lines
+            .next()
+            .expect("third lock line: identity token")
+            .trim(),
         identity_token_for(std::process::id()),
         "the recorded token must be OUR OWN process identity"
     );
@@ -244,7 +253,10 @@ fn append_assigns_contiguous_seq_and_round_trips() {
     assert_eq!(events.len(), 3);
     assert_eq!(events[0].seq, 1);
     match &events[2].kind {
-        EventKind::MilestoneStarted { milestone_id, start_sha } => {
+        EventKind::MilestoneStarted {
+            milestone_id,
+            start_sha,
+        } => {
             assert_eq!(milestone_id, "ms-1");
             assert_eq!(start_sha, "abc123");
         }
@@ -283,9 +295,17 @@ fn deltas_buffer_and_lifecycle_drains_in_order() {
     let kinds: Vec<&str> = events.iter().map(|e| e.kind.type_name()).collect();
     assert_eq!(
         kinds,
-        vec!["user.message", "worker.message", "worker.message", "user.message"]
+        vec![
+            "user.message",
+            "worker.message",
+            "worker.message",
+            "user.message"
+        ]
     );
-    assert_eq!(events.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+    assert_eq!(
+        events.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4]
+    );
     let contents: Vec<String> = events
         .iter()
         .filter_map(|e| match &e.kind {
@@ -345,11 +365,17 @@ fn buffer_age_reports_oldest_and_none_when_empty() {
     assert_eq!(log.buffer_age(), None, "fresh log has no buffered deltas");
 
     log.append(delta("d1")).unwrap();
-    assert!(log.buffer_age().is_some(), "buffer_age must report the oldest delta's age");
+    assert!(
+        log.buffer_age().is_some(),
+        "buffer_age must report the oldest delta's age"
+    );
 
     // Throttle is NEVER (1 hour): the buffer is far too young to flush.
     let due = log.flush_if_due().unwrap();
-    assert!(!due, "flush_if_due must not drain a buffer younger than the throttle");
+    assert!(
+        !due,
+        "flush_if_due must not drain a buffer younger than the throttle"
+    );
     assert_eq!(
         EventLog::read_events(&p.events_file()).unwrap().len(),
         0,
@@ -511,7 +537,10 @@ fn reacquire_truncates_torn_final_line_without_newline() {
     // Without truncation the first append would glue onto the torn line,
     // making it a non-final garbage line and poisoning every future read.
     let events = EventLog::read_events(&p.events_file()).unwrap();
-    assert_eq!(events.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+    assert_eq!(
+        events.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4]
+    );
 }
 
 #[test]
@@ -533,7 +562,10 @@ fn reacquire_truncates_torn_final_line_with_newline() {
     drop(log);
 
     let events = EventLog::read_events(&p.events_file()).unwrap();
-    assert_eq!(events.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+    assert_eq!(
+        events.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4]
+    );
 }
 
 #[test]
@@ -555,7 +587,10 @@ fn reacquire_repairs_valid_final_line_missing_its_newline() {
     drop(log);
 
     let events = EventLog::read_events(&p.events_file()).unwrap();
-    assert_eq!(events.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2, 3]);
+    assert_eq!(
+        events.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
 }
 
 #[test]
@@ -626,7 +661,10 @@ fn read_events_after_returns_suffix() {
         }
     }
     let tail = EventLog::read_events_after(&p.events_file(), 2).unwrap();
-    assert_eq!(tail.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![3, 4, 5]);
+    assert_eq!(
+        tail.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        vec![3, 4, 5]
+    );
 
     let all = EventLog::read_events_after(&p.events_file(), 0).unwrap();
     assert_eq!(all.len(), 5);
@@ -677,8 +715,13 @@ fn alive_holder_lock_needs_the_dangerous_tier() {
         other => panic!("expected LockHeld, got {other:?}"),
     }
 
-    let err = EventLog::acquire(&paths, "m-lock", Duration::from_millis(50), LockForce::IfNotLive)
-        .unwrap_err();
+    let err = EventLog::acquire(
+        &paths,
+        "m-lock",
+        Duration::from_millis(50),
+        LockForce::IfNotLive,
+    )
+    .unwrap_err();
     match err {
         EngineError::LockHeld(msg) => {
             assert!(msg.contains("ALIVE"), "must say the holder is alive: {msg}");
@@ -694,8 +737,13 @@ fn alive_holder_lock_needs_the_dangerous_tier() {
         other => panic!("expected LockHeld, got {other:?}"),
     }
 
-    let log = EventLog::acquire(&paths, "m-lock", Duration::from_millis(50), LockForce::EvenIfLive)
-        .expect("EvenIfLive must steal even from a live holder");
+    let log = EventLog::acquire(
+        &paths,
+        "m-lock",
+        Duration::from_millis(50),
+        LockForce::EvenIfLive,
+    )
+    .expect("EvenIfLive must steal even from a live holder");
     drop(log);
     drop(holder);
 }
@@ -752,7 +800,11 @@ fn reused_pid_lock_is_stale_at_every_tier() {
         // A recorded token no real process can present: provable reuse.
         std::fs::write(
             paths.lock_file(),
-            format!("{}\n{}\nsome-other-boot-id:12345\n", holder.pid(), now_epoch_secs()),
+            format!(
+                "{}\n{}\nsome-other-boot-id:12345\n",
+                holder.pid(),
+                now_epoch_secs()
+            ),
         )
         .unwrap();
         let log = EventLog::acquire(&paths, "m-lock", Duration::from_millis(50), force)
@@ -790,11 +842,19 @@ fn live_holder_with_matching_token_survives_clock_steps() {
     let err =
         EventLog::acquire(&paths, "m-lock", Duration::from_millis(50), LockForce::No).unwrap_err();
     assert!(matches!(err, EngineError::LockHeld(_)), "got {err:?}");
-    let err = EventLog::acquire(&paths, "m-lock", Duration::from_millis(50), LockForce::IfNotLive)
-        .unwrap_err();
+    let err = EventLog::acquire(
+        &paths,
+        "m-lock",
+        Duration::from_millis(50),
+        LockForce::IfNotLive,
+    )
+    .unwrap_err();
     match err {
         EngineError::LockHeld(msg) => {
-            assert!(msg.contains("ALIVE"), "matching token ⇒ alive holder refusal: {msg}")
+            assert!(
+                msg.contains("ALIVE"),
+                "matching token ⇒ alive holder refusal: {msg}"
+            )
         }
         other => panic!("expected LockHeld, got {other:?}"),
     }
@@ -819,8 +879,13 @@ fn two_line_lock_without_token_degrades_to_plain_liveness() {
         format!("{}\n{}\n", holder.pid(), now_epoch_secs() - 3600),
     )
     .unwrap();
-    let err = EventLog::acquire(&paths, "m-lock", Duration::from_millis(50), LockForce::IfNotLive)
-        .unwrap_err();
+    let err = EventLog::acquire(
+        &paths,
+        "m-lock",
+        Duration::from_millis(50),
+        LockForce::IfNotLive,
+    )
+    .unwrap_err();
     match err {
         EngineError::LockHeld(msg) => {
             assert!(msg.contains("ALIVE"), "tokenless lock ⇒ plain alive: {msg}")
@@ -841,8 +906,13 @@ fn garbage_acquire_time_degrades_to_plain_liveness() {
 
     let holder = LiveHolder::spawn();
     std::fs::write(paths.lock_file(), format!("{}\nnot-a-time\n", holder.pid())).unwrap();
-    let err = EventLog::acquire(&paths, "m-lock", Duration::from_millis(50), LockForce::IfNotLive)
-        .unwrap_err();
+    let err = EventLog::acquire(
+        &paths,
+        "m-lock",
+        Duration::from_millis(50),
+        LockForce::IfNotLive,
+    )
+    .unwrap_err();
     assert!(matches!(err, EngineError::LockHeld(_)), "got {err:?}");
     drop(holder);
 }
@@ -860,7 +930,11 @@ fn own_pid_with_foreign_token_is_provably_reused() {
 
     std::fs::write(
         paths.lock_file(),
-        format!("{}\n{}\nsome-other-boot-id:12345\n", std::process::id(), now_epoch_secs()),
+        format!(
+            "{}\n{}\nsome-other-boot-id:12345\n",
+            std::process::id(),
+            now_epoch_secs()
+        ),
     )
     .unwrap();
     let log = EventLog::acquire(&paths, "m-lock", Duration::from_millis(50), LockForce::No)
@@ -882,18 +956,31 @@ fn lock_holder_is_alive_understands_every_lock_format() {
     let tmp = tempfile::tempdir().unwrap();
     let lock = tmp.path().join("events.jsonl.lock");
 
-    assert!(!lock_holder_is_alive(&lock), "missing lock has no live holder");
+    assert!(
+        !lock_holder_is_alive(&lock),
+        "missing lock has no live holder"
+    );
 
     std::fs::write(&lock, "garbage\n").unwrap();
-    assert!(lock_holder_is_alive(&lock), "unparseable lock is conservatively alive");
+    assert!(
+        lock_holder_is_alive(&lock),
+        "unparseable lock is conservatively alive"
+    );
 
-    std::fs::write(&lock, format!("{}\n{}\n", std::process::id(), now_epoch_secs())).unwrap();
+    std::fs::write(
+        &lock,
+        format!("{}\n{}\n", std::process::id(), now_epoch_secs()),
+    )
+    .unwrap();
     assert!(lock_holder_is_alive(&lock), "our own pid is alive");
 
     #[cfg(unix)]
     {
-        std::fs::write(&lock, format!("{}\n{}\nsome-token\n", i32::MAX, now_epoch_secs()))
-            .unwrap();
+        std::fs::write(
+            &lock,
+            format!("{}\n{}\nsome-token\n", i32::MAX, now_epoch_secs()),
+        )
+        .unwrap();
         assert!(
             !lock_holder_is_alive(&lock),
             "a multi-line lock with a dead pid must read NOT alive"
@@ -914,17 +1001,29 @@ fn mission_lock_is_live_delegates_to_the_canonical_probe() {
     assert!(!mission_lock_is_live(&p), "missing lock is not live");
 
     std::fs::write(p.lock_file(), "not-a-pid\n").unwrap();
-    assert!(mission_lock_is_live(&p), "unparseable lock is conservatively live");
+    assert!(
+        mission_lock_is_live(&p),
+        "unparseable lock is conservatively live"
+    );
 
-    std::fs::write(p.lock_file(), format!("{}\n{}\n", std::process::id(), now_epoch_secs()))
-        .unwrap();
+    std::fs::write(
+        p.lock_file(),
+        format!("{}\n{}\n", std::process::id(), now_epoch_secs()),
+    )
+    .unwrap();
     assert!(mission_lock_is_live(&p), "a live holder (us) is live");
 
     #[cfg(unix)]
     {
-        std::fs::write(p.lock_file(), format!("{}\n{}\ntok\n", i32::MAX, now_epoch_secs()))
-            .unwrap();
-        assert!(!mission_lock_is_live(&p), "dead-holder multi-line lock is not live");
+        std::fs::write(
+            p.lock_file(),
+            format!("{}\n{}\ntok\n", i32::MAX, now_epoch_secs()),
+        )
+        .unwrap();
+        assert!(
+            !mission_lock_is_live(&p),
+            "dead-holder multi-line lock is not live"
+        );
     }
 }
 

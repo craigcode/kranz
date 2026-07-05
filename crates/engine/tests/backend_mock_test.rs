@@ -43,7 +43,10 @@ fn spec(session_id: &str, prompt: PromptMode) -> SessionSpec {
 }
 
 fn single_shot_spec(session_id: &str) -> SessionSpec {
-    spec(session_id, PromptMode::SingleShot("do the thing".to_string()))
+    spec(
+        session_id,
+        PromptMode::SingleShot("do the thing".to_string()),
+    )
 }
 
 fn streaming_spec(session_id: &str) -> SessionSpec {
@@ -51,7 +54,10 @@ fn streaming_spec(session_id: &str) -> SessionSpec {
 }
 
 async fn next(session: &mut Box<dyn AgentSession>) -> Option<AgentEvent> {
-    session.next_event().await.expect("next_event should not error")
+    session
+        .next_event()
+        .await
+        .expect("next_event should not error")
 }
 
 /// Drain the stream to closure and return the text of the final Result event.
@@ -86,8 +92,14 @@ async fn scripts_are_consumed_fifo_and_empty_queue_errors() {
         .await
         .err()
         .expect("empty script queue must error");
-    assert!(matches!(err, EngineError::Backend(_)), "unexpected error kind: {err:?}");
-    assert!(err.to_string().contains("no script queued"), "unexpected message: {err}");
+    assert!(
+        matches!(err, EngineError::Backend(_)),
+        "unexpected error kind: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("no script queued"),
+        "unexpected message: {err}"
+    );
 }
 
 #[tokio::test]
@@ -96,10 +108,17 @@ async fn single_shot_yields_init_text_result_then_none_completed() {
     let mut session = backend.start(single_shot_spec("sid-1")).await.unwrap();
 
     assert_eq!(session.session_id(), "sid-1");
-    assert!(session.exit_status().is_none(), "exit must be unavailable before close");
+    assert!(
+        session.exit_status().is_none(),
+        "exit must be unavailable before close"
+    );
 
     match next(&mut session).await.expect("init event") {
-        AgentEvent::Init { session_id, model, raw } => {
+        AgentEvent::Init {
+            session_id,
+            model,
+            raw,
+        } => {
             assert_eq!(session_id, "mock-session");
             assert_eq!(model, "mock-model");
             assert_eq!(raw["mock"], true);
@@ -114,7 +133,14 @@ async fn single_shot_yields_init_text_result_then_none_completed() {
         other => panic!("expected Text, got {other:?}"),
     }
     match next(&mut session).await.expect("result event") {
-        AgentEvent::Result { text, is_error, usage, cost_usd, num_turns, raw } => {
+        AgentEvent::Result {
+            text,
+            is_error,
+            usage,
+            cost_usd,
+            num_turns,
+            raw,
+        } => {
             assert_eq!(text, "all done");
             assert!(!is_error);
             assert_eq!(usage.input, 1000);
@@ -164,12 +190,21 @@ async fn streaming_blocks_until_message_then_yields_batch() {
     let backend = MockBackend::with_scripts(vec![script]);
     let mut session = backend.start(streaming_spec("sid-stream")).await.unwrap();
 
-    assert!(matches!(next(&mut session).await, Some(AgentEvent::Init { .. })));
-    assert!(matches!(next(&mut session).await, Some(AgentEvent::Text { .. })));
+    assert!(matches!(
+        next(&mut session).await,
+        Some(AgentEvent::Init { .. })
+    ));
+    assert!(matches!(
+        next(&mut session).await,
+        Some(AgentEvent::Text { .. })
+    ));
 
     // Queue exhausted: a streaming session must NOT return None early.
     let blocked = timeout(BLOCK_PROOF, session.next_event()).await;
-    assert!(blocked.is_err(), "streaming next_event must block on an empty queue");
+    assert!(
+        blocked.is_err(),
+        "streaming next_event must block on an empty queue"
+    );
     assert!(session.exit_status().is_none());
 
     session.send_user_message("continue please").await.unwrap();
@@ -197,12 +232,15 @@ async fn streaming_blocks_until_message_then_yields_batch() {
         }
         other => panic!("expected ToolResult, got {other:?}"),
     }
-    assert!(matches!(next(&mut session).await, Some(AgentEvent::Result { .. })));
+    assert!(matches!(
+        next(&mut session).await,
+        Some(AgentEvent::Result { .. })
+    ));
 
-    assert_eq!(backend.injected_messages(), vec![vec![
-        "continue please".to_string(),
-        "and then?".to_string(),
-    ]]);
+    assert_eq!(
+        backend.injected_messages(),
+        vec![vec!["continue please".to_string(), "and then?".to_string(),]]
+    );
 }
 
 #[tokio::test]
@@ -211,11 +249,17 @@ async fn abort_closes_stream_with_aborted_exit() {
     let backend = MockBackend::with_scripts(vec![script]);
     let mut session = backend.start(streaming_spec("sid-abort")).await.unwrap();
 
-    assert!(matches!(next(&mut session).await, Some(AgentEvent::Text { .. })));
+    assert!(matches!(
+        next(&mut session).await,
+        Some(AgentEvent::Text { .. })
+    ));
 
     // Parked on the empty queue; timeout cancels the pending future.
     let blocked = timeout(BLOCK_PROOF, session.next_event()).await;
-    assert!(blocked.is_err(), "streaming next_event must block before abort");
+    assert!(
+        blocked.is_err(),
+        "streaming next_event must block before abort"
+    );
 
     session.abort().await.unwrap();
     // Wakes/returns promptly with None instead of blocking again.
@@ -234,7 +278,10 @@ async fn abort_drops_pending_events_like_a_killed_process() {
 
     session.abort().await.unwrap();
     assert_eq!(session.exit_status(), Some(SessionExit::Aborted));
-    assert!(next(&mut session).await.is_none(), "aborted session must not drain events");
+    assert!(
+        next(&mut session).await.is_none(),
+        "aborted session must not drain events"
+    );
     // Abort after close must not overwrite a finished exit.
     let backend2 = MockBackend::with_scripts(vec![MockScript::single_shot("done")]);
     let mut finished = backend2.start(single_shot_spec("sid-done")).await.unwrap();
@@ -250,8 +297,14 @@ async fn send_user_message_errors_on_non_streaming_session() {
     let mut session = backend.start(single_shot_spec("sid-1")).await.unwrap();
 
     let err = session.send_user_message("hello?").await.unwrap_err();
-    assert!(matches!(err, EngineError::Backend(_)), "unexpected error kind: {err:?}");
-    assert!(err.to_string().contains("non-streaming"), "unexpected message: {err}");
+    assert!(
+        matches!(err, EngineError::Backend(_)),
+        "unexpected error kind: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("non-streaming"),
+        "unexpected message: {err}"
+    );
     // Rejected messages are not recorded.
     assert_eq!(backend.injected_messages(), vec![Vec::<String>::new()]);
 }
@@ -277,7 +330,10 @@ async fn started_specs_record_what_the_engine_asked_for() {
     assert_eq!(specs[0].model, "opus");
     assert_eq!(specs[0].effort, "high");
     assert!(matches!(specs[0].prompt, PromptMode::SingleShot(ref p) if p == "do the thing"));
-    assert_eq!(specs[0].allowed_tools, vec!["Bash(cargo test*)".to_string()]);
+    assert_eq!(
+        specs[0].allowed_tools,
+        vec!["Bash(cargo test*)".to_string()]
+    );
     assert_eq!(specs[1].session_id, "sid-second");
     assert!(matches!(specs[1].prompt, PromptMode::Streaming(ref p) if p == "orchestrate"));
 
@@ -366,9 +422,20 @@ async fn worker_session_carries_configured_tools_onto_the_spec() {
 
     let backend =
         MockBackend::with_scripts(vec![MockScript::single_shot_json(&worker_report_json())]);
-    run_worker(&backend, &mut log, &p, &cfg, &feature(), "ship auth", "Auth", None, None, None)
-        .await
-        .unwrap();
+    run_worker(
+        &backend,
+        &mut log,
+        &p,
+        &cfg,
+        &feature(),
+        "ship auth",
+        "Auth",
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
 
     let specs = backend.started_specs();
     assert_eq!(specs.len(), 1);
@@ -425,7 +492,9 @@ async fn functional_validator_tools_are_carried_and_allowed() {
     let specs = backend.started_specs();
     assert_eq!(specs.len(), 1);
     assert_eq!(specs[0].tools, cfg.validator_functional.tools);
-    assert!(specs[0].allowed_tools.contains(&"FakeBrowserTool".to_string()));
+    assert!(specs[0]
+        .allowed_tools
+        .contains(&"FakeBrowserTool".to_string()));
     assert!(!specs[0].allowed_tools.contains(&"Bash".to_string()));
     assert!(specs[0].disallowed_tools.contains(&"Write".to_string()));
     assert!(specs[0].disallowed_tools.contains(&"Edit".to_string()));
@@ -465,5 +534,7 @@ async fn scrutiny_validator_does_not_get_extra_tools_folded_into_allowed() {
 
     let specs = backend.started_specs();
     assert_eq!(specs.len(), 1);
-    assert!(!specs[0].allowed_tools.contains(&"FakeBrowserTool".to_string()));
+    assert!(!specs[0]
+        .allowed_tools
+        .contains(&"FakeBrowserTool".to_string()));
 }

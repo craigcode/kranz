@@ -105,7 +105,11 @@ pub fn render(state: &MissionState) -> String {
 /// verbatim. Digest + plan.json is the ENTIRE context a fresh orchestrator
 /// session is seeded with.
 pub fn render_reseed(state: &MissionState, plan_json: &str) -> String {
-    format!("{}\n\nAPPROVED PLAN (plan.json):\n{}", render(state), plan_json)
+    format!(
+        "{}\n\nAPPROVED PLAN (plan.json):\n{}",
+        render(state),
+        plan_json
+    )
 }
 
 fn mission_status(status: MissionStatus) -> &'static str {
