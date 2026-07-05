@@ -1112,6 +1112,11 @@ async fn cmd_serve(
     let url = format!("http://{display_host}:{port}/");
     let token = token.unwrap_or_else(kranz_server::generate_token);
 
+    // Filesystem read access to .kranz/serve.token confers mutation
+    // authority — the same trust boundary as the .kranz/ directory itself,
+    // so this file must never be written world- or group-readable.
+    let token_file = write_serve_token(&repo, &token).ok();
+
     println!("kranz server on {url}");
     println!("mutation token: {token}");
     match &dashboard_assets {
@@ -1145,9 +1150,43 @@ async fn cmd_serve(
         });
     }
 
-    match kranz_server::serve_with_shared_host(host, bind, port, static_assets, Some(token)).await {
+    let result = kranz_server::serve_with_shared_host(host, bind, port, static_assets, Some(token)).await;
+    if token_file.is_some() {
+        remove_serve_token(&repo);
+    }
+    match result {
         Ok(()) => Ok(0),
         Err(e) => Err(anyhow!("server failed: {e}")),
+    }
+}
+
+/// Write the per-serve mutation token to `<repo>/.kranz/serve.token` so
+/// local CLI commands can read it automatically instead of requiring
+/// `--token`/`$KRANZ_TOKEN`. Filesystem read access to this file confers
+/// mutation authority over the served repo — the same trust boundary as the
+/// `.kranz/` directory itself, so it is written owner-only (0600 on Unix).
+fn write_serve_token(repo: &Path, token: &str) -> std::io::Result<PathBuf> {
+    let dir = repo.join(".kranz");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("serve.token");
+    std::fs::write(&path, token)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(path)
+}
+
+/// Remove `<repo>/.kranz/serve.token` on clean shutdown. A process killed by
+/// SIGKILL may leave a stale file behind; that's acceptable since the next
+/// `kranz serve` overwrites it.
+fn remove_serve_token(repo: &Path) {
+    let path = repo.join(".kranz").join("serve.token");
+    if let Err(err) = std::fs::remove_file(&path) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            eprintln!("kranz: could not remove {}: {err}", path.display());
+        }
     }
 }
 
@@ -1423,6 +1462,41 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("--token"), "{msg}");
         assert!(msg.contains("KRANZ_TOKEN"), "{msg}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serve_token_file_is_written_with_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().to_path_buf();
+        let path = write_serve_token(&repo, "secret").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[tokio::test]
+    async fn serve_token_file_is_removed_after_graceful_shutdown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().to_path_buf();
+        write_serve_token(&repo, "tok").unwrap();
+        let path = repo.join(".kranz").join("serve.token");
+        assert!(path.exists());
+
+        let host = std::sync::Arc::new(kranz_server::MissionHost::new(repo.clone()));
+        kranz_server::serve_with_shutdown(
+            host,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            0,
+            None,
+            None,
+            std::future::ready(()),
+        )
+        .await
+        .unwrap();
+        remove_serve_token(&repo);
+
+        assert!(!path.exists());
     }
 
     fn dashboard_at(path: PathBuf) -> PathBuf {

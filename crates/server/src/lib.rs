@@ -384,12 +384,33 @@ pub async fn serve_with_shared_host(
     static_assets: Option<DashboardStatic>,
     token: Option<String>,
 ) -> anyhow::Result<()> {
+    let shutdown = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::error!(error = %e, "failed to install ctrl-c handler");
+        }
+    };
+    serve_with_shutdown(host, bind, port, static_assets, token, shutdown).await
+}
+
+/// Same as [`serve_with_shared_host`], but takes an explicit shutdown
+/// signal instead of always waiting on Ctrl-C — the testable seam that lets
+/// callers (and tests) make the serve future return deterministically.
+pub async fn serve_with_shutdown(
+    host: Arc<MissionHost>,
+    bind: IpAddr,
+    port: u16,
+    static_assets: Option<DashboardStatic>,
+    token: Option<String>,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
     let app = router_with_shared_host(host, static_assets, token);
     let addr = SocketAddr::from((bind, port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local_addr = listener.local_addr()?;
     tracing::info!("kranz server listening on http://{local_addr}");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await?;
     Ok(())
 }
 
