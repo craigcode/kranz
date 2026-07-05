@@ -45,6 +45,15 @@ Deny rules take precedence over allows in Claude Code.
 `--dangerously-allow-all` → `bypassPermissions`, loud in UI, never default.
 Denied tool results are tagged `denied` on `worker.message` events.
 
+Live-QA mode (functional validator only): any EXTRA tool configured in
+`validatorFunctional.tools` beyond the standard inspect set
+(`Bash,Read,Glob,Grep`) — e.g. a browser/computer-use tool — is also folded
+into that validator's `allow` list, since a tool call that exists in `--tools`
+but isn't auto-approved fails outright in `-p` mode (no interactive prompt to
+fall back on). This lets the functional validator drive the built app against
+acceptance criteria. Write/Edit/WebFetch/WebSearch/git-push stay denied, and
+the scrutiny validator never receives this treatment.
+
 ## Cross-process control
 
 Single writer rule (§4.3): only the engine process appends `events.jsonl`
