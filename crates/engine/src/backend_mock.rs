@@ -241,6 +241,37 @@ pub fn mock_result_text(text: &str) -> AgentEvent {
     }
 }
 
+/// Terminal error result: same shape as [`mock_result_text`] but `is_error`
+/// is set, so `pump_turn` treats the turn as failed (best-effort capture-turn
+/// abort scripting).
+pub fn mock_result_error(text: &str) -> AgentEvent {
+    match mock_result_text(text) {
+        AgentEvent::Result { usage, cost_usd, num_turns, .. } => AgentEvent::Result {
+            text: text.to_string(),
+            is_error: true,
+            usage,
+            cost_usd,
+            num_turns,
+            raw: json!({
+                "mock": true,
+                "type": "result",
+                "subtype": "error",
+                "is_error": true,
+                "result": text,
+                "total_cost_usd": 0.01,
+                "num_turns": 1,
+                "usage": {
+                    "input_tokens": 1000,
+                    "output_tokens": 200,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                },
+            }),
+        },
+        _ => unreachable!("mock_result_text always builds a Result event"),
+    }
+}
+
 /// Like [`mock_result_text`] but the result text is the serialized JSON value
 /// (structured-output runs).
 pub fn mock_result_json(value: &serde_json::Value) -> AgentEvent {

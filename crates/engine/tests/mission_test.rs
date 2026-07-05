@@ -19,7 +19,9 @@
 //! All tests skip cleanly when `git` is not on PATH.
 
 use kranz_engine::backend::{AgentBackend, PromptMode, SessionExit};
-use kranz_engine::backend_mock::{mock_init, mock_result_text, mock_text, MockBackend, MockScript};
+use kranz_engine::backend_mock::{
+    mock_init, mock_result_error, mock_result_text, mock_text, MockBackend, MockScript,
+};
 use kranz_engine::control;
 use kranz_engine::event_log::{EventLog, LockForce};
 use kranz_engine::events::{Event, EventKind};
@@ -304,7 +306,7 @@ async fn happy_path_completes_mission_with_tag_and_contract_gate() {
             judgement("complete", ""),
             judgement("complete", ""),
             verdicts_pass(&["a-2"]),
-            no_lesson(),
+            "Always add a regression test alongside the fix it covers.".to_string(),
         ]),
         worker_pass(),
         validator_with(json!([])),
@@ -390,11 +392,22 @@ async fn happy_path_completes_mission_with_tag_and_contract_gate() {
     assert_eq!(
         files,
         vec![
+            ".kranz/lessons/index.md".to_string(),
+            format!(".kranz/lessons/{mission_id}.md"),
             ".kranz/missions/index.md".to_string(),
             format!(".kranz/missions/{mission_id}/report.md"),
         ],
-        "the report commit carries report.md + the refreshed index"
+        "the FINDINGS-EMPTY completion's prose lesson lands in the SAME report commit \
+         as report.md (not a separate commit)"
     );
+    let lesson = std::fs::read_to_string(
+        root.join(".kranz").join("lessons").join(format!("{mission_id}.md")),
+    )
+    .expect("lesson file written");
+    assert!(lesson.contains("regression test"), "{lesson}");
+    let lessons_index =
+        std::fs::read_to_string(root.join(".kranz").join("lessons").join("index.md")).unwrap();
+    assert!(lessons_index.contains(&format!("{mission_id}.md")), "{lessons_index}");
 
     // The mission's index line kept its format and gained the report link.
     let index =
@@ -768,6 +781,61 @@ async fn waive_at_final_gate_completes_mission() {
     assert!(files.contains(&format!(".kranz/lessons/{mission_id}.md").as_str()), "{files:?}");
     assert!(files.contains(&".kranz/lessons/index.md"), "{files:?}");
     assert!(files.iter().any(|f| f.ends_with("report.md")), "{files:?}");
+}
+
+// ---------------------------------------------------------------------------
+// 3e. Capture-turn best-effort: an erroring capture turn never stalls
+// completion (mission.completed still fires, no lesson is written).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn capture_turn_error_still_completes_mission() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    // Orchestrator turns: seed, judgement f-1-1 (FINDINGS-EMPTY gate, empty
+    // contract), then the capture turn — scripted as an ERROR result rather
+    // than a reply. `orch_turn` retries once via force_reseed, but no further
+    // orchestrator script is queued, so the retry's fresh session fails to
+    // start and the turn ultimately errors. `capture_lesson` must swallow
+    // that error (best-effort) rather than stall `mission.completed`.
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        MockScript::streaming(vec![mock_init("orch-session"), mock_result_text("ready")])
+            .responding(vec![
+                vec![mock_text(&judgement("complete", "")), mock_result_text(&judgement("complete", ""))],
+                vec![mock_text("boom"), mock_result_error("boom")],
+            ]),
+    ]));
+
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run()).await.expect("run must not hang").unwrap();
+    assert_eq!(status, MissionStatus::Complete, "completion must proceed despite the capture-turn error");
+
+    let mission_id = engine.mission_id().to_string();
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+    let types = event_types(&events);
+    assert!(types.contains(&"mission.completed"), "mission completed: {types:?}");
+
+    // No lesson was captured, and completion says so on the event feed.
+    assert!(events.iter().any(|e| matches!(
+        &e.kind,
+        EventKind::OrchestratorDecision { summary, .. } if summary == "no cross-mission lesson captured"
+    )));
+    assert!(
+        !root.join(".kranz").join("lessons").join(format!("{mission_id}.md")).exists(),
+        "no lesson file written when the capture turn errors"
+    );
+
+    // The report commit still lands, just without any lesson files.
+    let subject = raw_git(&root, &["log", "-1", "--format=%s"]);
+    assert_eq!(subject.trim(), format!("[kranz] mission report for {mission_id}"));
 }
 
 // ---------------------------------------------------------------------------
@@ -2069,6 +2137,7 @@ async fn parallel_batch_runs_both_features_and_leaks_no_worktrees() {
             parallel_plan(&["f-1-1", "f-1-2"]),
             judgement("complete", ""),
             judgement("complete", ""),
+            no_lesson(),
         ]),
         worker_pass(),
         worker_pass(),
@@ -2192,6 +2261,7 @@ async fn parallel_batch_sessions_overlap_in_wall_clock() {
             parallel_plan(&["f-1-1", "f-1-2"]),
             judgement("complete", ""),
             judgement("complete", ""),
+            no_lesson(),
         ]),
         worker_pass().rendezvous(3),
         worker_pass().rendezvous(3),
