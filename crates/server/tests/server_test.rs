@@ -64,7 +64,7 @@ fn seed_mission(repo_root: &Path) -> MissionPaths {
         config: MissionConfig::default(),
     })
     .unwrap();
-    log.append(EventKind::PlanApproved { plan: sample_plan() }).unwrap();
+    log.append(EventKind::PlanApproved { plan: sample_plan(), base_sha: None }).unwrap();
     log.append(EventKind::MilestoneStarted {
         milestone_id: "ms-1".into(),
         start_sha: "abc1234".into(),

@@ -45,7 +45,13 @@ pub enum EventKind {
     },
 
     #[serde(rename = "plan.approved")]
-    PlanApproved { plan: Plan },
+    PlanApproved {
+        plan: Plan,
+        /// Base-branch commit SHA pinned at approval time (validation
+        /// contract diffs against this, not the moving base branch).
+        #[serde(rename = "baseSha", default, skip_serializing_if = "Option::is_none")]
+        base_sha: Option<String>,
+    },
 
     #[serde(rename = "milestone.started")]
     MilestoneStarted {
@@ -240,5 +246,55 @@ impl EventKind {
     /// may be batched (§4.3).
     pub fn is_stream_delta(&self) -> bool {
         matches!(self, EventKind::WorkerMessage { .. })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Plan;
+
+    fn sample_plan() -> Plan {
+        Plan { goal: "g".into(), validation_contract: vec![], milestones: vec![] }
+    }
+
+    #[test]
+    fn plan_approved_base_sha_backcompat() {
+        // Some(sha) round-trips through serialization.
+        let with_sha = EventKind::PlanApproved {
+            plan: sample_plan(),
+            base_sha: Some("deadbeef".to_string()),
+        };
+        let json = serde_json::to_value(&with_sha).unwrap();
+        assert_eq!(json["payload"]["baseSha"], "deadbeef");
+        let back: EventKind = serde_json::from_value(json).unwrap();
+        match back {
+            EventKind::PlanApproved { base_sha, .. } => {
+                assert_eq!(base_sha, Some("deadbeef".to_string()))
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // None is omitted from the wire (byte-identical to pre-baseSha logs)
+        // and round-trips back to None.
+        let without_sha = EventKind::PlanApproved { plan: sample_plan(), base_sha: None };
+        let json = serde_json::to_value(&without_sha).unwrap();
+        assert!(
+            !json["payload"].as_object().unwrap().contains_key("baseSha"),
+            "payload must not contain baseSha when None: {json}"
+        );
+        let back: EventKind = serde_json::from_value(json).unwrap();
+        match back {
+            EventKind::PlanApproved { base_sha, .. } => assert_eq!(base_sha, None),
+            _ => panic!("wrong variant"),
+        }
+
+        // Old-log event JSON with no baseSha key at all still deserializes.
+        let old_log = r#"{"type":"plan.approved","payload":{"plan":{"goal":"g","validationContract":[],"milestones":[]}}}"#;
+        let event: EventKind = serde_json::from_str(old_log).unwrap();
+        match event {
+            EventKind::PlanApproved { base_sha, .. } => assert_eq!(base_sha, None),
+            _ => panic!("wrong variant"),
+        }
     }
 }

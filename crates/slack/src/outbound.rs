@@ -56,7 +56,7 @@ pub enum NotifyClass {
 /// don't warrant a Slack post (worker deltas, feature transitions, …).
 pub fn classify(event: &Event, state: &MissionState) -> Option<Outbound> {
     match &event.kind {
-        EventKind::PlanApproved { plan } => Some(Outbound::PlanReady(PlanReady {
+        EventKind::PlanApproved { plan, .. } => Some(Outbound::PlanReady(PlanReady {
             mission_id: state.mission.id.clone(),
             goal: plan.goal.clone(),
             milestone_titles: plan.milestones.iter().map(|m| m.title.clone()).collect(),
@@ -137,6 +137,7 @@ mod tests {
                 status: MissionStatus::Running,
                 created_at: Utc::now(),
                 base_branch: "main".into(),
+                base_sha: None,
                 mission_branch: "kranz/mission-m-1".into(),
             },
             runs: Default::default(),
@@ -165,7 +166,9 @@ mod tests {
             }],
             milestones: vec![PlanMilestone { title: "Token bucket".into(), features: vec![] }],
         };
-        let out = classify(&ev(EventKind::PlanApproved { plan }), &base_state()).unwrap();
+        let out =
+            classify(&ev(EventKind::PlanApproved { plan, base_sha: None }), &base_state())
+                .unwrap();
         assert_eq!(out.class(), NotifyClass::PlanReady);
         let Outbound::PlanReady(p) = out else { panic!("wrong variant") };
         assert_eq!(p.mission_id, "m-1");

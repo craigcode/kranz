@@ -2001,6 +2001,7 @@ mod tests {
                         }],
                     }],
                 },
+                base_sha: None,
             },
         };
         let line = serde_json::to_string(&event).unwrap();

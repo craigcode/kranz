@@ -343,7 +343,7 @@ fn plan() -> Plan {
 fn digest_events() -> Vec<Event> {
     vec![
         ev(1, created()),
-        ev(2, EventKind::PlanApproved { plan: plan() }),
+        ev(2, EventKind::PlanApproved { plan: plan(), base_sha: None }),
         ev(3, EventKind::MilestoneStarted {
             milestone_id: "ms-1".to_string(),
             start_sha: "abc123".to_string(),
@@ -436,7 +436,7 @@ fn digest_truncates_long_titles_and_decisions() {
 
     let state = fold(&[
         ev(1, created()),
-        ev(2, EventKind::PlanApproved { plan }),
+        ev(2, EventKind::PlanApproved { plan, base_sha: None }),
         ev(3, EventKind::OrchestratorDecision { summary: long_decision, detail: None }),
     ])
     .unwrap();

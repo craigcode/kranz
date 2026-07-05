@@ -242,7 +242,7 @@ fn status_renders_tree_icons_totals_messages_and_decisions() {
         "m-test",
         vec![
             created_kind("ship it", "m-test"),
-            EventKind::PlanApproved { plan: sample_plan() },
+            EventKind::PlanApproved { plan: sample_plan(), base_sha: None },
             EventKind::MilestoneStarted {
                 milestone_id: "ms-1".to_string(),
                 start_sha: "abc123".to_string(),
@@ -311,7 +311,7 @@ fn status_icons_cover_terminal_states() {
         "m-icons",
         vec![
             created_kind("icon check", "m-icons"),
-            EventKind::PlanApproved { plan: sample_plan() },
+            EventKind::PlanApproved { plan: sample_plan(), base_sha: None },
             EventKind::MilestoneStarted {
                 milestone_id: "ms-1".to_string(),
                 start_sha: "abc".to_string(),
@@ -555,7 +555,7 @@ fn missions_lists_ids_status_and_goal() {
     write_events(
         repo,
         "m-b",
-        vec![created_kind("goal b", "m-b"), EventKind::PlanApproved { plan: sample_plan() }],
+        vec![created_kind("goal b", "m-b"), EventKind::PlanApproved { plan: sample_plan(), base_sha: None }],
     );
 
     let listing = commands::cmd_missions(repo).unwrap();
@@ -656,7 +656,7 @@ fn select_planning_mission_prefers_newest_planning_only() {
         "m-run",
         vec![
             created_kind("running goal", "m-run"),
-            EventKind::PlanApproved { plan: sample_plan() },
+            EventKind::PlanApproved { plan: sample_plan(), base_sha: None },
         ],
     );
     let newest = write_events(repo, "m-new", vec![created_kind("new goal", "m-new")]);
@@ -674,7 +674,7 @@ fn select_planning_mission_prefers_newest_planning_only() {
         "m-run",
         vec![
             created_kind("g", "m-run"),
-            EventKind::PlanApproved { plan: sample_plan() },
+            EventKind::PlanApproved { plan: sample_plan(), base_sha: None },
         ],
     );
     let err = commands::select_planning_mission(tmp2.path(), None).unwrap_err();

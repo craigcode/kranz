@@ -47,7 +47,8 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             )));
         }
 
-        EventKind::PlanApproved { plan } => {
+        EventKind::PlanApproved { plan, base_sha } => {
+            state.mission.base_sha = base_sha.clone();
             state.mission.goal = plan.goal.clone();
             state.mission.validation_contract = plan.validation_contract.clone();
             state.mission.milestones = plan
@@ -289,6 +290,7 @@ fn initial_state(event: &Event) -> Result<MissionState> {
             status: MissionStatus::Planning,
             created_at: event.ts,
             base_branch: base_branch.clone(),
+            base_sha: None,
             mission_branch: mission_branch.clone(),
         },
         runs: BTreeMap::new(),

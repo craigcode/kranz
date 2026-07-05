@@ -655,7 +655,7 @@ impl MissionEngine {
             &format!("[kranz] approved plan for {}", self.state.mission.id),
         )?;
 
-        self.emit(EventKind::PlanApproved { plan })?;
+        self.emit(EventKind::PlanApproved { plan, base_sha: None })?;
         Ok(())
     }
 

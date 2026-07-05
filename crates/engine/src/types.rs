@@ -41,6 +41,10 @@ pub struct Mission {
     pub created_at: DateTime<Utc>,
     /// e.g. "main"
     pub base_branch: String,
+    /// Base-branch commit SHA pinned at plan approval; `None` until approved
+    /// or for missions created before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_sha: Option<String>,
     /// e.g. "kranz/mission-<id>"
     pub mission_branch: String,
 }

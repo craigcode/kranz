@@ -141,7 +141,7 @@ fn golden_happy_path() {
     assert_eq!(state.config, MissionConfig::default());
 
     // Stage 2: plan approved -> deterministic ids, all pending, Running.
-    apply(&mut state, &ev(2, EventKind::PlanApproved { plan: plan() })).unwrap();
+    apply(&mut state, &ev(2, EventKind::PlanApproved { plan: plan(), base_sha: None })).unwrap();
     assert_eq!(state.mission.status, MissionStatus::Running);
     assert_eq!(state.mission.goal, "build the thing, planned");
     assert_eq!(state.mission.validation_contract.len(), 1);
@@ -313,7 +313,7 @@ fn apply_rejects_non_contiguous_seq_and_second_created() {
 
 #[test]
 fn unknown_ids_are_invalid_state() {
-    let base = vec![ev(1, created()), ev(2, EventKind::PlanApproved { plan: plan() })];
+    let base = vec![ev(1, created()), ev(2, EventKind::PlanApproved { plan: plan(), base_sha: None })];
     let cases = vec![
         EventKind::MilestoneStarted { milestone_id: "ms-99".into(), start_sha: "x".into() },
         EventKind::FeatureStarted { feature_id: "f-9-9".into() },
@@ -337,7 +337,7 @@ fn unknown_ids_are_invalid_state() {
 
 #[test]
 fn respawns_count_second_and_later_runs() {
-    let mut state = fold(&[ev(1, created()), ev(2, EventKind::PlanApproved { plan: plan() })])
+    let mut state = fold(&[ev(1, created()), ev(2, EventKind::PlanApproved { plan: plan(), base_sha: None })])
         .unwrap();
     apply(&mut state, &ev(3, spawn("r-1", Some("f-1-1"), None))).unwrap();
     assert_eq!(feature(&state, "f-1-1").respawns, 0);
@@ -360,7 +360,7 @@ fn respawns_count_second_and_later_runs() {
 fn fix_cycles_increment_once_per_validation_round() {
     let mut state = fold(&[
         ev(1, created()),
-        ev(2, EventKind::PlanApproved { plan: plan() }),
+        ev(2, EventKind::PlanApproved { plan: plan(), base_sha: None }),
         ev(3, EventKind::MilestoneStarted { milestone_id: "ms-1".into(), start_sha: "s".into() }),
         ev(4, EventKind::MilestoneValidating { milestone_id: "ms-1".into() }),
         ev(5, spawn("r-v1", None, Some("ms-1"))),
@@ -426,7 +426,7 @@ fn fix_cycles_increment_once_per_validation_round() {
 fn blocked_and_unblocked_transition_milestone_and_mission() {
     let mut state = fold(&[
         ev(1, created()),
-        ev(2, EventKind::PlanApproved { plan: plan() }),
+        ev(2, EventKind::PlanApproved { plan: plan(), base_sha: None }),
         ev(3, EventKind::MilestoneStarted { milestone_id: "ms-1".into(), start_sha: "s".into() }),
     ])
     .unwrap();
@@ -465,7 +465,7 @@ fn every_status_value_is_reachable() {
 
     let kinds = vec![
         created(),                                                                   // Planning
-        EventKind::PlanApproved { plan: plan() },        // Running; ms/f Pending
+        EventKind::PlanApproved { plan: plan(), base_sha: None },        // Running; ms/f Pending
         EventKind::MilestoneStarted { milestone_id: "ms-1".into(), start_sha: "s".into() }, // ms Active
         EventKind::FeatureStarted { feature_id: "f-1-1".into() },                    // f Active
         EventKind::FeatureCompleted { feature_id: "f-1-1".into(), commits: vec![] }, // f Complete
@@ -635,7 +635,7 @@ fn snapshot_round_trips_atomically() {
 
     let state = fold_kinds(vec![
         created(),
-        EventKind::PlanApproved { plan: plan() },
+        EventKind::PlanApproved { plan: plan(), base_sha: None },
         EventKind::MilestoneStarted { milestone_id: "ms-1".into(), start_sha: "s".into() },
         spawn("r-1", Some("f-1-1"), Some("ms-1")),
         completed("r-1", tokens(7, 3), Some(0.1)),
@@ -808,7 +808,7 @@ fn interpret(actions: &[Action]) -> Vec<Event> {
         json!({ "skipScrutiny": true, "validatorFunctional": { "reasoningEffort": "high" } }),
     ];
 
-    let mut events = vec![ev(1, created()), ev(2, EventKind::PlanApproved { plan: prop_plan() })];
+    let mut events = vec![ev(1, created()), ev(2, EventKind::PlanApproved { plan: prop_plan(), base_sha: None })];
     let mut runs: Vec<String> = Vec::new();
     let mut run_counter = 0u32;
     let mut fix_counter = 0u32;
@@ -967,12 +967,12 @@ fn validation_finding_accepts_reserved_engine_run_id() {
 
     let events = vec![
         ev(1, created()),
-        ev(2, EventKind::PlanApproved { plan: plan() }),
+        ev(2, EventKind::PlanApproved { plan: plan(), base_sha: None }),
         ev(3, finding(kranz_engine::reducer::ENGINE_RUN_ID)),
     ];
     fold(&events).expect("engine run id must fold cleanly");
 
-    let events = vec![ev(1, created()), ev(2, EventKind::PlanApproved { plan: plan() }), ev(3, finding("r-77"))];
+    let events = vec![ev(1, created()), ev(2, EventKind::PlanApproved { plan: plan(), base_sha: None }), ev(3, finding("r-77"))];
     assert!(matches!(fold(&events), Err(EngineError::InvalidState(_))));
 }
 
@@ -980,7 +980,7 @@ fn validation_finding_accepts_reserved_engine_run_id() {
 /// `<ms>-replan-N`) is rejected loudly rather than silently shadowing.
 #[test]
 fn fixfeature_created_rejects_a_duplicate_feature_id() {
-    let mut state = fold(&[ev(1, created()), ev(2, EventKind::PlanApproved { plan: plan() })])
+    let mut state = fold(&[ev(1, created()), ev(2, EventKind::PlanApproved { plan: plan(), base_sha: None })])
         .expect("fold base");
     let ms = state.mission.milestones[0].id.clone();
 
