@@ -212,6 +212,22 @@ fn status_block_kit() {
 }
 
 #[test]
+fn approved_status_card_reads_approved_not_running() {
+    let blocks = build_status(&StatusSummary {
+        mission_id: "m-8".into(),
+        status: "Approved".into(),
+        summary: "0/3 milestones complete · cost $0.00".into(),
+    });
+    assert_valid_blocks(&blocks);
+    let text = all_text(&blocks);
+    assert!(text.contains("Approved"), "status pill reads Approved");
+    assert!(
+        !text.contains("Running"),
+        "an approved mission's card must not read Running"
+    );
+}
+
+#[test]
 fn plan_review_block_kit_has_start_and_queue_buttons() {
     let blocks = build_plan_review(&PlanReview {
         mission_id: "m-42".into(),

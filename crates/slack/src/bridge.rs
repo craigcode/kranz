@@ -2242,8 +2242,9 @@ mod tests {
             MissionStatus::Planning
         );
 
-        // Append a PlanApproved: the reducer folds it to Running (approved,
-        // executable) — the state the approve_flow no-pending path may queue.
+        // Append a PlanApproved: the reducer folds it to Approved (the run
+        // loop hasn't started yet — Running is reserved for after a
+        // milestone or worker spawns).
         seed_mission(tmp.path(), "m-a", "approved");
         let paths = MissionPaths::new(tmp.path(), "m-a");
         let event = Event {
@@ -2273,7 +2274,7 @@ mod tests {
         std::fs::write(paths.events_file(), existing).unwrap();
         assert_eq!(
             mission_status(tmp.path(), "m-a").unwrap(),
-            MissionStatus::Running
+            MissionStatus::Approved
         );
 
         assert!(
@@ -2389,6 +2390,12 @@ mod tests {
     fn status_word_reflects_mission_status() {
         assert_eq!(status_word(MissionStatus::Planning), "Planning");
         assert_eq!(status_word(MissionStatus::Complete), "Complete");
+    }
+
+    #[test]
+    fn approved_status_word_reads_approved_not_running() {
+        assert_eq!(status_word(MissionStatus::Approved), "Approved");
+        assert_ne!(status_word(MissionStatus::Approved), status_word(MissionStatus::Running));
     }
 
     #[test]
