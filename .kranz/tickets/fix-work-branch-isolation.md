@@ -24,6 +24,14 @@ unvalidated commits in main's local history. Related: the checkout-restore
 ticket (fix-checkout-restore-on-completion) and M7 tier-1 worktree-always
 (docs/scoping/worker-sandboxing.md) both reduce blast radius here.
 
+More evidence from the same train: the engine's checkpoint commit
+(af3787a, m-468277 f-1-3) swept the operator's uncommitted notes.txt
+edits into mission history — the dirty-tree commit-as-is policy absorbs
+operator working-tree changes when missions run in the primary checkout.
+Branch/worktree isolation fixes this class too; until then checkpoint
+commits should scope to worker-declared paths or record a refusal
+decision instead of committing foreign changes.
+
 ## Scoping answers
 
 ## Acceptance hints
