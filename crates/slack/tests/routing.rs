@@ -201,6 +201,7 @@ fn slash_command_config_fixture_routes_to_config() {
             effort: Some("high".into()),
             user_id: Some("U0263M3QW".into()),
             response_url: Some("https://hooks.slack.com/commands/T024BE7LD/1234/configurl".into()),
+            channel: Some("C0G9QF9GW".into()),
         }
     );
 }

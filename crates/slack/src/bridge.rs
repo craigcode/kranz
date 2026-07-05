@@ -698,6 +698,29 @@ async fn dispatch_action(
             }
         }
 
+        // Bare `/kranz config`: open the role/model/effort picker modal.
+        // Inline for the same trigger_id-expiry reason as the goal modal.
+        Action::ConfigModal { trigger_id, user_id, response_url, channel } => {
+            if !cfg.is_authorized(user_id.as_deref()) {
+                reply_ephemeral(cfg, client, response_url.as_deref(), &not_authorized_blocks()).await;
+                return;
+            }
+            let view = crate::format::build_config_modal(channel);
+            if let Err(e) = client.open_view(trigger_id, &view).await {
+                tracing::warn!(error = %e, "failed to open config modal");
+                reply_ephemeral(
+                    cfg,
+                    client,
+                    response_url.as_deref(),
+                    &error_blocks(&format!(
+                        "Couldn't open the config form: {e}. One-line fallback: \
+                         `/kranz config [<id>] <role> <model> [effort]`."
+                    )),
+                )
+                .await;
+            }
+        }
+
         // Bare `/kranz new`: open the multiline goal modal. MUST run inline —
         // the trigger_id expires ~3 s after the slash — and it's one Web API
         // call, well inside the ack budget.
@@ -806,9 +829,9 @@ async fn dispatch_action(
 
         // Per-role config change. SPEND-ADJACENT (it re-shapes future turns'
         // spend), so it is gated on the allowlist exactly like `/kranz new`.
-        Action::Config { mission_id, role, model, effort, user_id, response_url } => {
+        Action::Config { mission_id, role, model, effort, user_id, response_url, channel } => {
             if !cfg.is_authorized(user_id.as_deref()) {
-                reply_ephemeral(cfg, client, response_url.as_deref(), &not_authorized_blocks()).await;
+                user_reply(cfg, client, response_url.as_deref(), channel.as_deref().unwrap_or(&cfg.channel), user_id.as_deref(), &not_authorized_blocks()).await;
                 return;
             }
             match config_change(repo_root, mission_id.as_deref(), role, model, effort.as_deref()) {
@@ -817,10 +840,9 @@ async fn dispatch_action(
                         .as_deref()
                         .map(|e| format!(", effort `{e}`"))
                         .unwrap_or_default();
-                    reply_ephemeral(
-                        cfg,
-                        client,
-                        response_url.as_deref(),
+                    user_reply(
+                        cfg, client, response_url.as_deref(),
+                        channel.as_deref().unwrap_or(&cfg.channel), user_id.as_deref(),
                         &error_blocks(&format!(
                             ":gear: Set `{role}` model `{model}`{effort_note} on `{applied_to}`."
                         )),
@@ -829,10 +851,9 @@ async fn dispatch_action(
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "failed to apply config change from Slack");
-                    reply_ephemeral(
-                        cfg,
-                        client,
-                        response_url.as_deref(),
+                    user_reply(
+                        cfg, client, response_url.as_deref(),
+                        channel.as_deref().unwrap_or(&cfg.channel), user_id.as_deref(),
                         &error_blocks(&format!("Couldn't change config: {e}")),
                     )
                     .await
@@ -1351,6 +1372,7 @@ fn apply_action(repo_root: &Path, action: &Action) -> Result<()> {
         | Action::Status { .. }
         | Action::NewMission { .. }
         | Action::NewMissionModal { .. }
+        | Action::ConfigModal { .. }
         | Action::RequestPlan { .. }
         | Action::ApproveMission { .. }
         | Action::ApproveStart { .. }
@@ -2416,6 +2438,7 @@ mod tests {
                 effort: None,
                 user_id: None,
                 response_url: None,
+                channel: None,
             },
         )
         .unwrap();

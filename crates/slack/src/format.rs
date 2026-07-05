@@ -31,6 +31,18 @@ pub const NEW_MISSION_CALLBACK_ID: &str = "kranz_new_mission";
 pub const NEW_MISSION_GOAL_BLOCK: &str = "goal";
 pub const NEW_MISSION_GOAL_ACTION: &str = "goal_text";
 
+/// `callback_id` of the config modal ([`build_config_modal`]); its
+/// `view_submission` routes to [`crate::inbound::Action::Config`].
+pub const CONFIG_CALLBACK_ID: &str = "kranz_config";
+pub const CONFIG_MISSION_BLOCK: &str = "mission";
+pub const CONFIG_MISSION_ACTION: &str = "mission_id";
+pub const CONFIG_ROLE_BLOCK: &str = "role";
+pub const CONFIG_ROLE_ACTION: &str = "role_select";
+pub const CONFIG_MODEL_BLOCK: &str = "model";
+pub const CONFIG_MODEL_ACTION: &str = "model_text";
+pub const CONFIG_EFFORT_BLOCK: &str = "effort";
+pub const CONFIG_EFFORT_ACTION: &str = "effort_select";
+
 /// A mission whose plan is ready for review. The `value` carried by the approve
 /// button is the mission id, so a click round-trips back to the right mission.
 #[derive(Debug, Clone)]
@@ -397,6 +409,68 @@ pub fn build_new_mission_modal(channel: &str) -> Value {
                              thread opens in this channel — reply there to keep shaping \
                              the plan."
                 }]
+            }
+        ]
+    })
+}
+
+/// The config modal: role select + free-form model + optional effort — the
+/// structured twin of `/kranz config [<id>] <role> <model> [effort]`, for
+/// people who prefer pickers to positional args. Channel rides in
+/// `private_metadata` (for the ephemeral reply); the mission id input is
+/// optional — blank targets the single active mission, same resolution as
+/// the slash form. Pure; unit-tested.
+pub fn build_config_modal(channel: &str) -> Value {
+    let opt = |v: &str| json!({ "text": { "type": "plain_text", "text": v }, "value": v });
+    json!({
+        "type": "modal",
+        "callback_id": CONFIG_CALLBACK_ID,
+        "private_metadata": channel,
+        "title": { "type": "plain_text", "text": "Mission config" },
+        "submit": { "type": "plain_text", "text": "Apply" },
+        "close": { "type": "plain_text", "text": "Cancel" },
+        "blocks": [
+            {
+                "type": "input",
+                "block_id": CONFIG_MISSION_BLOCK,
+                "optional": true,
+                "label": { "type": "plain_text", "text": "Mission id (blank = the single active mission)" },
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": CONFIG_MISSION_ACTION,
+                    "placeholder": { "type": "plain_text", "text": "m-…" }
+                }
+            },
+            {
+                "type": "input",
+                "block_id": CONFIG_ROLE_BLOCK,
+                "label": { "type": "plain_text", "text": "Role" },
+                "element": {
+                    "type": "static_select",
+                    "action_id": CONFIG_ROLE_ACTION,
+                    "options": [opt("orchestrator"), opt("worker"), opt("scrutiny"), opt("functional")]
+                }
+            },
+            {
+                "type": "input",
+                "block_id": CONFIG_MODEL_BLOCK,
+                "label": { "type": "plain_text", "text": "Model" },
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": CONFIG_MODEL_ACTION,
+                    "placeholder": { "type": "plain_text", "text": "haiku · sonnet · opus · fable · a model id" }
+                }
+            },
+            {
+                "type": "input",
+                "block_id": CONFIG_EFFORT_BLOCK,
+                "optional": true,
+                "label": { "type": "plain_text", "text": "Reasoning effort (optional)" },
+                "element": {
+                    "type": "static_select",
+                    "action_id": CONFIG_EFFORT_ACTION,
+                    "options": [opt("low"), opt("medium"), opt("high"), opt("xhigh"), opt("max")]
+                }
             }
         ]
     })

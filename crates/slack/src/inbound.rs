@@ -30,8 +30,10 @@
 //! - anything else → [`Action::Ignore`].
 
 use crate::format::{
-    APPROVE_ACTION_ID, NEW_MISSION_CALLBACK_ID, NEW_MISSION_GOAL_ACTION, NEW_MISSION_GOAL_BLOCK,
-    START_ACTION_ID,
+    APPROVE_ACTION_ID, CONFIG_CALLBACK_ID, CONFIG_EFFORT_ACTION, CONFIG_EFFORT_BLOCK,
+    CONFIG_MISSION_ACTION, CONFIG_MISSION_BLOCK, CONFIG_MODEL_ACTION, CONFIG_MODEL_BLOCK,
+    CONFIG_ROLE_ACTION, CONFIG_ROLE_BLOCK, NEW_MISSION_CALLBACK_ID, NEW_MISSION_GOAL_ACTION,
+    NEW_MISSION_GOAL_BLOCK, START_ACTION_ID,
 };
 use serde_json::Value;
 
@@ -105,6 +107,19 @@ pub enum Action {
         effort: Option<String>,
         user_id: Option<String>,
         response_url: Option<String>,
+        /// Where a user-only reply can go when there is no response_url
+        /// (the modal path): chat.postEphemeral needs the channel.
+        channel: Option<String>,
+    },
+    /// Bare `/kranz config` → open the config modal (role/model/effort
+    /// pickers). Free to open; the SUBMISSION is the gated change. The
+    /// trigger_id expires ~3 s after the slash, so the bridge opens the view
+    /// inline.
+    ConfigModal {
+        trigger_id: String,
+        user_id: Option<String>,
+        response_url: Option<String>,
+        channel: String,
     },
     /// `/kranz pause [<id>]` → enqueue a `Pause` control command on the target
     /// mission. STEERING (not spend), but it disrupts a running mission, so it is
@@ -233,8 +248,10 @@ fn route_view_submission(payload: &Value) -> Action {
     let Some(view) = payload.get("view") else {
         return Action::Ignore;
     };
-    if view.get("callback_id").and_then(Value::as_str) != Some(NEW_MISSION_CALLBACK_ID) {
-        return Action::Ignore;
+    match view.get("callback_id").and_then(Value::as_str) {
+        Some(NEW_MISSION_CALLBACK_ID) => {}
+        Some(CONFIG_CALLBACK_ID) => return route_config_submission(payload, view),
+        _ => return Action::Ignore,
     }
     let goal = view
         .pointer(&format!(
@@ -261,6 +278,45 @@ fn route_view_submission(payload: &Value) -> Action {
         response_url: None,
         channel,
     }
+}
+
+/// The config modal's `view_submission` → [`Action::Config`], canonicalized
+/// through the same [`parse_role`]/[`parse_effort`] tables as the slash form
+/// so the bridge never sees an unvalidated role/effort. Missing/blank
+/// mission id targets the single active mission (bridge-side resolution).
+fn route_config_submission(payload: &Value, view: &Value) -> Action {
+    let val = |block: &str, action: &str| -> Option<String> {
+        view.pointer(&format!("/state/values/{block}/{action}/value"))
+            .or_else(|| {
+                view.pointer(&format!("/state/values/{block}/{action}/selected_option/value"))
+            })
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let Some(role) = val(CONFIG_ROLE_BLOCK, CONFIG_ROLE_ACTION).and_then(|r| parse_role(&r).map(str::to_string)) else {
+        return Action::Ignore;
+    };
+    let Some(model) = val(CONFIG_MODEL_BLOCK, CONFIG_MODEL_ACTION) else {
+        return Action::Ignore;
+    };
+    let effort = val(CONFIG_EFFORT_BLOCK, CONFIG_EFFORT_ACTION)
+        .and_then(|e| parse_effort(&e).map(str::to_string));
+    let mission_id =
+        val(CONFIG_MISSION_BLOCK, CONFIG_MISSION_ACTION).map(|id| clean_id(&id).to_string());
+    let user_id = payload
+        .get("user")
+        .and_then(|u| u.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let channel = view
+        .get("private_metadata")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(str::to_string);
+    Action::Config { mission_id, role, model, effort, user_id, response_url: None, channel }
 }
 
 /// `events_api` → a threaded human message on a known mission thread becomes
@@ -409,7 +465,20 @@ fn route_slash(payload: &Value) -> Action {
     // (spend-adjacent, gated in the bridge). A bad role/effort or too few args
     // falls through to help so a typo is discoverable rather than silent.
     if let Some(rest) = strip_ci_prefix(text, "config") {
-        if let Some(cfg) = parse_config_args(rest, user_id.clone(), response_url.clone()) {
+        if rest.trim().is_empty() {
+            // Bare `config` → the modal (pickers beat positional args).
+            if let Some(trigger_id) =
+                payload.get("trigger_id").and_then(Value::as_str).filter(|t| !t.is_empty())
+            {
+                return Action::ConfigModal {
+                    trigger_id: trigger_id.to_string(),
+                    user_id,
+                    response_url,
+                    channel,
+                };
+            }
+        }
+        if let Some(cfg) = parse_config_args(rest, user_id.clone(), response_url.clone(), Some(channel.clone()).filter(|c| !c.is_empty())) {
             return cfg;
         }
         // Malformed config → help.
@@ -480,6 +549,7 @@ fn parse_config_args(
     rest: &str,
     user_id: Option<String>,
     response_url: Option<String>,
+    channel: Option<String>,
 ) -> Option<Action> {
     let tokens: Vec<&str> = rest.split_whitespace().collect();
     if tokens.is_empty() {
@@ -512,6 +582,7 @@ fn parse_config_args(
         effort,
         user_id,
         response_url,
+        channel,
     })
 }
 
@@ -920,6 +991,88 @@ mod tests {
     }
 
     #[test]
+    fn bare_config_opens_the_modal() {
+        let env = json!({
+            "type": "slash_commands",
+            "payload": { "command": "/kranz", "text": "config",
+                         "trigger_id": "t-123", "user_id": "U777",
+                         "channel_id": "C123", "response_url": "https://hooks.slack/c" }
+        });
+        assert_eq!(
+            route(&env, &lookup_none()).action,
+            Action::ConfigModal {
+                trigger_id: "t-123".into(),
+                user_id: Some("U777".into()),
+                response_url: Some("https://hooks.slack/c".into()),
+                channel: "C123".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn config_modal_submission_routes_canonicalized() {
+        let env = json!({
+            "type": "interactive",
+            "envelope_id": "env-cfg",
+            "payload": {
+                "type": "view_submission",
+                "user": { "id": "U777" },
+                "view": {
+                    "callback_id": CONFIG_CALLBACK_ID,
+                    "private_metadata": "C123",
+                    "state": { "values": {
+                        CONFIG_MISSION_BLOCK: { CONFIG_MISSION_ACTION: { "type": "plain_text_input", "value": " `m-42` " } },
+                        CONFIG_ROLE_BLOCK: { CONFIG_ROLE_ACTION: { "type": "static_select", "selected_option": { "value": "worker" } } },
+                        CONFIG_MODEL_BLOCK: { CONFIG_MODEL_ACTION: { "type": "plain_text_input", "value": "sonnet" } },
+                        CONFIG_EFFORT_BLOCK: { CONFIG_EFFORT_ACTION: { "type": "static_select", "selected_option": { "value": "high" } } }
+                    }}
+                }
+            }
+        });
+        assert_eq!(
+            route(&env, &lookup_none()).action,
+            Action::Config {
+                mission_id: Some("m-42".into()),
+                role: "worker".into(),
+                model: "sonnet".into(),
+                effort: Some("high".into()),
+                user_id: Some("U777".into()),
+                response_url: None,
+                channel: Some("C123".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn config_modal_submission_blank_mission_and_effort_are_none() {
+        let env = json!({
+            "type": "interactive",
+            "envelope_id": "env-cfg2",
+            "payload": {
+                "type": "view_submission",
+                "user": { "id": "U777" },
+                "view": {
+                    "callback_id": CONFIG_CALLBACK_ID,
+                    "private_metadata": "C123",
+                    "state": { "values": {
+                        CONFIG_ROLE_BLOCK: { CONFIG_ROLE_ACTION: { "type": "static_select", "selected_option": { "value": "orchestrator" } } },
+                        CONFIG_MODEL_BLOCK: { CONFIG_MODEL_ACTION: { "type": "plain_text_input", "value": "opus" } }
+                    }}
+                }
+            }
+        });
+        match route(&env, &lookup_none()).action {
+            Action::Config { mission_id, effort, role, model, .. } => {
+                assert_eq!(mission_id, None, "blank id -> single-active resolution");
+                assert_eq!(effort, None);
+                assert_eq!(role, "orchestrator");
+                assert_eq!(model, "opus");
+            }
+            other => panic!("expected Config, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn foreign_view_submission_is_ignored() {
         let env = json!({
             "type": "interactive",
@@ -1093,6 +1246,7 @@ mod tests {
                 effort: None,
                 user_id: Some("Ucfg".into()),
                 response_url: Some("https://hooks.slack/c".into()),
+                channel: None,
             }
         );
     }
@@ -1108,6 +1262,7 @@ mod tests {
                 effort: Some("xhigh".into()),
                 user_id: Some("Ucfg".into()),
                 response_url: Some("https://hooks.slack/c".into()),
+                channel: None,
             }
         );
     }
@@ -1124,6 +1279,7 @@ mod tests {
                 effort: Some("high".into()),
                 user_id: Some("Ucfg".into()),
                 response_url: Some("https://hooks.slack/c".into()),
+                channel: None,
             }
         );
     }
