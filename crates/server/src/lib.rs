@@ -262,7 +262,8 @@ fn origin_allowed(origin: &str) -> bool {
     })
 }
 
-/// Reject any `POST /api/...` whose content-type is not `application/json`.
+/// Reject any `POST /api/...` with a non-empty body whose content-type is
+/// not `application/json`.
 ///
 /// The control handler parses raw bytes, so without this gate a drive-by
 /// page could bypass the CORS preflight entirely: `text/plain` (or
@@ -271,15 +272,29 @@ fn origin_allowed(origin: &str) -> bool {
 /// ControlCommand side effect would already have happened. Requiring JSON
 /// forces every browser POST into the preflighted path that
 /// [`cors_layer`] guards.
+///
+/// An EMPTY body (no `Content-Length`, or `Content-Length: 0`) is exempt
+/// from the content-type check: it carries no payload for a drive-by page
+/// to control, so relaxing the mime requirement here doesn't reopen the
+/// CSRF vector above — bodyless POSTs still have to clear
+/// [`require_mutation_token`] downstream, which is the gate actually
+/// closing it. (A chunked/streaming request that omits `Content-Length`
+/// but streams a non-empty body is not treated as empty here — that's an
+/// accepted non-goal, not a bypass this middleware promises to catch.)
 async fn require_json_api_posts(request: Request, next: Next) -> Response {
     if request.method() == Method::POST && request.uri().path().starts_with("/api/") {
+        let is_empty_body = request
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .is_none_or(|value| value == "0");
         let is_json = request
             .headers()
             .get(header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.split(';').next())
             .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"));
-        if !is_json {
+        if !is_empty_body && !is_json {
             return (
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 Json(json!({ "error": "POST bodies must be application/json" })),

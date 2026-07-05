@@ -1160,6 +1160,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bodyless_post_with_valid_token_is_not_rejected_as_unsupported_media_type() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+        let host = MissionHost::with_backend(root, backend);
+        let id = host.create("ship it", None).await.expect("create mission");
+
+        let app = crate::router_with_host(host, None, Some("tok".to_string()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/missions/{id}/start"))
+                    // No content-type and no content-length: an empty
+                    // bodyless POST, the case `curl -X POST .../start`
+                    // (no `-d`) sends.
+                    .header("x-kranz-token", "tok")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // A freshly created mission has no approved plan, so `start` 409s —
+        // the point of this test is that it is NOT 415, i.e. the missing
+        // content-type on an empty body no longer trips the media-type gate.
+        assert_ne!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn bodyless_post_gate_still_rejects_non_empty_non_json_bodies() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+        let host = MissionHost::with_backend(root, backend);
+        let id = host.create("ship it", None).await.expect("create mission");
+
+        let app = crate::router_with_host(host, None, Some("tok".to_string()));
+        let payload = "not json";
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/missions/{id}/release"))
+                    .header("content-type", "text/plain")
+                    .header("content-length", payload.len().to_string())
+                    .header("x-kranz-token", "tok")
+                    .body(Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
     async fn create_rejects_an_invalid_config_patch() {
         let Some((_dir, root)) = init_repo() else {
             return;

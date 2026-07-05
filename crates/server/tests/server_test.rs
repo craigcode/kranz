@@ -532,7 +532,8 @@ async fn control_post_rejects_non_json_content_types() {
         let mut builder = Request::builder()
             .method("POST")
             .uri(&uri)
-            .header("origin", "https://evil.example");
+            .header("origin", "https://evil.example")
+            .header("content-length", body.len().to_string());
         if let Some(ct) = content_type {
             builder = builder.header("content-type", ct);
         }
