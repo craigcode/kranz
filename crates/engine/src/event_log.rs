@@ -22,7 +22,12 @@ use std::time::{Duration, Instant};
 ///
 /// A holder that is provably DEAD is always stolen (a stale lock from a
 /// crashed engine), regardless of tier. The tiers only govern holders that
-/// are alive or of indeterminate liveness:
+/// are alive or of indeterminate liveness. Automatic Dead detection is
+/// unix-only (`kill(pid, 0)` returning `ESRCH`, plus the own-pid
+/// token-reuse screen on any platform): on non-unix targets only the
+/// own-pid token-reuse screen can ever yield Dead, so recovering the lock
+/// from a foreign crashed holder there always requires an explicit force
+/// tier (`--force-lock` / `--dangerously-steal-live-lock`).
 ///
 /// | holder liveness | `No`       | `IfNotLive` | `EvenIfLive` |
 /// |-----------------|------------|-------------|--------------|
@@ -363,6 +368,17 @@ impl EventLog {
                     event.seq
                 )));
             }
+            if let Some(first_mission_id) = events.first().map(|e: &Event| &e.mission_id) {
+                if event.mission_id != *first_mission_id {
+                    return Err(EngineError::LogCorruption(format!(
+                        "mission_id mismatch at {}:{}: expected '{}' (from first event), found '{}'",
+                        path.display(),
+                        line_no,
+                        first_mission_id,
+                        event.mission_id
+                    )));
+                }
+            }
             events.push(event);
             offset += step;
             valid_len = offset;
@@ -683,8 +699,27 @@ fn probe_liveness(info: &LockInfo) -> LockLiveness {
     }
     #[cfg(not(unix))]
     {
-        LockLiveness::Unknown
+        // No non-unix equivalent of `kill(pid, 0)` is wired up here, and
+        // `process_identity_token`'s non-unix stub always returns `None`, so
+        // `alive_or_reused` can never reach `Dead` for a foreign pid on this
+        // platform. Liveness is therefore unprovable for a foreign holder:
+        // report Unknown rather than guessing, and never Dead.
+        tracing::debug!(
+            pid,
+            "liveness cannot be proven for a foreign pid on this platform; \
+             reporting Unknown (Dead is unreachable here)"
+        );
+        non_unix_liveness_fallback()
     }
+}
+
+/// The verdict `probe_liveness` reports for a foreign pid on non-unix
+/// targets, where liveness cannot be proven. Factored out (and compiled on
+/// every platform) so a cross-platform test can pin that it is `Unknown` and
+/// never `Dead` — uncertainty must never demote to Dead.
+#[cfg_attr(unix, allow(dead_code))]
+fn non_unix_liveness_fallback() -> LockLiveness {
+    LockLiveness::Unknown
 }
 
 /// Screen an Alive pid for reuse by comparing process identity tokens: the
@@ -751,8 +786,22 @@ fn process_identity_token(pid: i32) -> Option<String> {
 /// pinned so the acquire-time and probe-time renderings of the SAME stored
 /// value are byte-identical; the strings are compared for equality, never
 /// parsed back into clock arithmetic.
+///
+/// This is the actual `ps` spawn — the seam [`process_identity_token`] caches
+/// in front of. Kept as a separate function (rather than inlining the
+/// `Command` call) so a test can observe how many times it actually ran, via
+/// [`PS_SPAWN_COUNT`].
 #[cfg(target_os = "macos")]
-fn process_identity_token(pid: i32) -> Option<String> {
+fn ps_identity_token(pid: i32) -> Option<String> {
+    #[cfg(test)]
+    {
+        *PS_SPAWN_COUNTS
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+            .lock()
+            .unwrap()
+            .entry(pid)
+            .or_insert(0) += 1;
+    }
     let out = std::process::Command::new("ps")
         .env("LC_ALL", "C")
         .env("TZ", "UTC")
@@ -770,6 +819,57 @@ fn process_identity_token(pid: i32) -> Option<String> {
     }
 }
 
+/// Counts real `ps` spawns from [`ps_identity_token`], keyed by pid, so a
+/// test can prove the cache in [`process_identity_token`] collapses repeated
+/// checks for one pid into a single spawn — without being confused by other
+/// tests in this file concurrently spawning `ps` for a DIFFERENT pid.
+/// Test-only: it exists purely to observe the seam.
+#[cfg(all(test, target_os = "macos"))]
+static PS_SPAWN_COUNTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<i32, usize>>> =
+    std::sync::OnceLock::new();
+
+/// How long a cached macOS identity token may be served before a fresh `ps`
+/// spawn is required. This window only needs to be long enough to collapse
+/// the handful of `alive_or_reused` calls a single steal decision or hygiene
+/// sweep makes for the SAME pid (microseconds to low milliseconds apart in
+/// practice); it must stay far shorter than any realistic pid-reuse
+/// turnaround (the OS has to fully tear down the old process and allocate a
+/// new one, which takes at least tens of milliseconds, typically much more).
+/// A cached token therefore can never span an actual reuse: by the time a
+/// pid is recycled, the cache entry for it has long since expired and the
+/// next probe spawns fresh `ps`.
+#[cfg(target_os = "macos")]
+const IDENTITY_TOKEN_CACHE_TTL: Duration = Duration::from_millis(50);
+
+/// Per-pid cache of [`ps_identity_token`] results, so a burst of liveness
+/// checks against the same pid (queue-busy checks, hygiene sweeps, a single
+/// steal decision) spawns at most one `ps`. Keyed by pid so a lookup for one
+/// pid can never return another pid's token. Guarded by a `Mutex` for safe
+/// concurrent access.
+#[cfg(target_os = "macos")]
+type IdentityTokenCache = std::sync::Mutex<std::collections::HashMap<i32, (Option<String>, Instant)>>;
+
+#[cfg(target_os = "macos")]
+static IDENTITY_TOKEN_CACHE: std::sync::OnceLock<IdentityTokenCache> = std::sync::OnceLock::new();
+
+/// Cache layer in front of [`ps_identity_token`]: the real `ps` spawn seam.
+/// The VERDICT (Alive/Dead) is never cached or short-circuited here — only
+/// the raw token lookup is memoized; [`alive_or_reused`] still compares
+/// `recorded == current` on every call, using whatever token this returns.
+#[cfg(target_os = "macos")]
+fn process_identity_token(pid: i32) -> Option<String> {
+    let cache = IDENTITY_TOKEN_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let now = Instant::now();
+    if let Some((token, captured)) = cache.lock().unwrap().get(&pid) {
+        if now.duration_since(*captured) < IDENTITY_TOKEN_CACHE_TTL {
+            return token.clone();
+        }
+    }
+    let token = ps_identity_token(pid);
+    cache.lock().unwrap().insert(pid, (token.clone(), now));
+    token
+}
+
 /// Everywhere else (windows, exotic unix): no identity token, so pid reuse
 /// cannot be proven and an alive holder stays Alive.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -780,6 +880,17 @@ fn process_identity_token(_pid: i32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // `probe_liveness`'s non-unix arm (the actual code path this pins) only
+    // compiles under `#[cfg(not(unix))]`, and our CI runs macOS/Linux, so it
+    // cannot be exercised directly here. `non_unix_liveness_fallback` is
+    // factored out and compiled on ALL platforms so this cross-platform test
+    // can still pin its invariant: uncertainty must never demote to Dead.
+    #[test]
+    fn non_unix_liveness_fallback_is_never_dead() {
+        assert_eq!(non_unix_liveness_fallback(), LockLiveness::Unknown);
+        assert_ne!(non_unix_liveness_fallback(), LockLiveness::Dead);
+    }
 
     #[test]
     fn lock_info_parses_all_formats() {
@@ -867,6 +978,59 @@ mod tests {
         assert_eq!(probe_liveness(&info), LockLiveness::Dead);
     }
 
+    /// Two `process_identity_token` calls for the SAME pid in quick
+    /// succession must spawn `ps` only once — the cache should serve the
+    /// second call from memory, and both returned tokens must still match.
+    ///
+    /// Uses pid 1 (launchd — always alive on macOS) rather than our own pid,
+    /// so this test's spawn-count delta is not polluted by other tests in
+    /// this file that concurrently probe `process_identity_token` for the
+    /// test process's own pid.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_identity_token_caches_one_ps_per_pid() {
+        let pid = 1;
+        let count_for_pid = |p: i32| {
+            *PS_SPAWN_COUNTS
+                .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+                .lock()
+                .unwrap()
+                .get(&p)
+                .unwrap_or(&0)
+        };
+        let before = count_for_pid(pid);
+
+        let a = process_identity_token(pid).expect("own token must be obtainable");
+        let b = process_identity_token(pid).expect("own token must be obtainable");
+
+        let after = count_for_pid(pid);
+        assert_eq!(after - before, 1, "second call within the cache window must not spawn ps again");
+        assert_eq!(a, b, "cached token must match the freshly spawned one");
+    }
+
+    /// The cache must never mask pid reuse: it only ever memoizes the
+    /// CURRENT token lookup, never the recorded-vs-current comparison. Even
+    /// though `current` is served from cache here, a differing `recorded`
+    /// token must still yield Dead.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_cache_never_masks_pid_reuse() {
+        let pid = std::process::id() as i32;
+        // Prime the cache for this pid.
+        let own = process_identity_token(pid).expect("own token must be obtainable");
+
+        let info = LockInfo {
+            holder: pid.to_string(),
+            pid: Some(pid),
+            acquired_secs: Some(0),
+            token: Some(format!("{own}-not")),
+        };
+        // `current` comes from the cache primed above, but the differing
+        // `recorded` token must still be judged Dead — the comparison is
+        // never skipped just because `current` was cached.
+        assert_eq!(probe_liveness(&info), LockLiveness::Dead);
+    }
+
     /// A writer that succeeds for the first `fail_at` writes and then always
     /// errors, recording every line it actually wrote.
     struct FlakyWriter {
@@ -925,5 +1089,86 @@ mod tests {
             retry_writer.writes,
             (k..n).map(|i| format!("line-{i}\n")).collect::<Vec<_>>()
         );
+    }
+
+    /// Build a raw JSONL line for a `mission.paused` event with the given
+    /// `seq`/`mission_id` — enough to exercise seq continuity and mission-id
+    /// consistency without pulling in the full Event field set.
+    fn event_line(seq: u64, mission_id: &str) -> String {
+        let event = Event {
+            seq,
+            ts: Utc::now(),
+            mission_id: mission_id.to_string(),
+            kind: EventKind::MissionPaused {},
+        };
+        let mut line = serde_json::to_string(&event).unwrap();
+        line.push('\n');
+        line
+    }
+
+    #[test]
+    fn acquire_rejects_foreign_mission_id_in_later_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = MissionPaths::new(dir.path(), "m-a");
+        std::fs::create_dir_all(paths.mission_dir()).unwrap();
+        let events_path = paths.events_file();
+
+        // Only defect: seq 2's mission_id differs from seq 1's.
+        std::fs::write(
+            &events_path,
+            format!("{}{}", event_line(1, "m-a"), event_line(2, "m-b")),
+        )
+        .unwrap();
+
+        let err = EventLog::acquire(&paths, "m-a", Duration::from_secs(1), LockForce::No)
+            .expect_err("mixed mission_id log must be rejected");
+        assert!(
+            matches!(err, EngineError::LogCorruption(_)),
+            "expected LogCorruption, got {err:?}"
+        );
+
+        // Control: identical seqs, single consistent mission_id, acquires cleanly.
+        let dir2 = tempfile::tempdir().unwrap();
+        let paths2 = MissionPaths::new(dir2.path(), "m-a");
+        std::fs::create_dir_all(paths2.mission_dir()).unwrap();
+        std::fs::write(
+            paths2.events_file(),
+            format!("{}{}", event_line(1, "m-a"), event_line(2, "m-a")),
+        )
+        .unwrap();
+        let log = EventLog::acquire(&paths2, "m-a", Duration::from_secs(1), LockForce::No)
+            .expect("consistent-mission log must acquire cleanly");
+        assert_eq!(log.last_seq(), 2);
+    }
+
+    #[test]
+    fn parse_log_rejects_mixed_mission_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        std::fs::write(&path, format!("{}{}", event_line(1, "m-a"), event_line(2, "m-b")))
+            .unwrap();
+
+        let err = EventLog::read_events(&path).expect_err("mixed mission_id must be rejected");
+        assert!(
+            matches!(err, EngineError::LogCorruption(_)),
+            "expected LogCorruption, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn acquire_adopts_empty_preexisting_log_as_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = MissionPaths::new(dir.path(), "m-a");
+        std::fs::create_dir_all(paths.mission_dir()).unwrap();
+        std::fs::write(paths.events_file(), "").unwrap();
+
+        let log = EventLog::acquire(&paths, "m-a", Duration::from_secs(1), LockForce::No)
+            .expect("empty pre-existing log must be adopted as fresh");
+        assert_eq!(log.last_seq(), 0);
+        let appended = {
+            let mut log = log;
+            log.append(EventKind::MissionPaused {}).unwrap()
+        };
+        assert_eq!(appended.seq, 1);
     }
 }

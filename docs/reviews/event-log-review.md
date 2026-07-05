@@ -263,6 +263,19 @@ per `mission_id` ever appends to a given path) makes the trigger reachable
 only via an already-anomalous precondition, not ordinary operation. Finding
 survives unchanged.
 
+**Remediated (F3):** `parse_log`'s single existing per-line walk now also
+asserts every event's `mission_id` matches the first successfully parsed
+event's `mission_id`, returning `EngineError::LogCorruption` (naming the
+path, line number, expected, and found mission_id) on a mismatch anywhere in
+the file — closing gap (2) for all `parse_log` callers (`acquire`,
+`read_events`, `read_events_after`). `acquire`'s own first-event-vs-expected
+check is unchanged (`EngineError::InvalidState`). Gap (1), the empty
+pre-existing log, is unchanged behavior (adopted as fresh, no error) and is
+now pinned by a dedicated test. See `acquire_rejects_foreign_mission_id_in_later_event`,
+`parse_log_rejects_mixed_mission_ids`, and
+`acquire_adopts_empty_preexisting_log_as_fresh` in `event_log.rs`'s test
+module (feature f-1-1).
+
 ## F4 — "Dead" liveness verdict is unreachable on non-unix builds (Low)
 
 **Location:** event_log.rs:640-643 (`probe_liveness`, `#[cfg(not(unix))]` branch), event_log.rs:26-30 (LockForce table), event_log.rs:731-734 (`process_identity_token` non-unix stub).
@@ -324,6 +337,20 @@ that route is closed too. Cross-checked the LockForce table text
 wording carries no platform caveat there, only in `probe_liveness`'s own doc
 comment (event_log.rs:617). Not a correctness bug — `Unknown` is handled
 conservatively everywhere it's consumed. Finding survives unchanged.
+
+**Remediated (F4):** The `LockForce` table's intro now states that
+automatic Dead detection is unix-only (`kill(pid, 0)` ESRCH plus the own-pid
+token-reuse screen), and that non-unix recovery from a foreign crashed
+holder always requires an explicit force tier (`--force-lock` /
+`--dangerously-steal-live-lock`). `probe_liveness`'s `#[cfg(not(unix))]` arm
+now emits a `tracing::debug!` noting that liveness cannot be proven on this
+platform and Dead is unreachable there, before returning `Unknown` exactly
+as before — no steal behavior changed on any platform. The non-unix verdict
+itself is factored into `non_unix_liveness_fallback`, compiled on every
+platform, so the cross-platform test `non_unix_liveness_fallback_is_never_dead`
+in `event_log.rs`'s test module can pin that it returns `Unknown` and never
+`Dead` even though CI cannot execute the `#[cfg(not(unix))]` arm directly
+(feature f-2-1).
 
 ## F5 — macOS liveness probe depends on a `ps` subprocess (Low)
 
@@ -489,3 +516,27 @@ unrelated concurrent development (e.g. Slack approve-button and Web UI
 mission-management work), so an unqualified `git diff --name-only main` on
 this branch also lists those sibling commits' files — those files are not
 part of, and were not touched by, this review.
+
+## Remediated (F5)
+
+Fixed in commit f2c6340 (`[f-3-1] cache the macOS ps identity-token probe
+behind a spawn seam`). `process_identity_token` on macOS (event_log.rs) is
+now a thin cache layer in front of a new `ps_identity_token` function, which
+is the actual `ps` spawn seam. The cache is a per-pid `HashMap<i32, (Option
+<String>, Instant)>` behind a `Mutex` in a `OnceLock` (std-only, no new
+dependencies), so concurrent liveness checks are safe. It is keyed by pid —
+a lookup for one pid can never return another pid's token — with a 50ms
+TTL: long enough to collapse the handful of `alive_or_reused` calls a single
+steal decision or hygiene sweep makes against the same pid, but far shorter
+than any realistic pid-reuse turnaround (tearing down and reallocating a
+pid takes at least tens of milliseconds), so a cached token can never span
+an actual reuse. Critically, only the raw token *lookup* is cached — the
+Alive/Dead verdict itself is never cached or short-circuited;
+`alive_or_reused` still performs `current == recorded` on every call,
+using whatever token the cache (or a fresh `ps`) returns. Tests
+`macos_identity_token_caches_one_ps_per_pid` and
+`macos_cache_never_masks_pid_reuse` (both `cfg(target_os = "macos")`) pin,
+respectively, that two calls for the same pid spawn `ps` only once, and
+that a differing recorded token still yields `Dead` even when the current
+token was served from cache. linux and the other-platforms stub are
+unchanged.
