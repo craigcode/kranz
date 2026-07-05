@@ -6,4 +6,4 @@
 
 pub mod map;
 
-pub use map::{span_id, trace_id, AttrValue, MissionSpan, SpanStatus};
+pub use map::{map_mission, span_id, trace_id, AttrValue, MissionSpan, SpanStatus};
