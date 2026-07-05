@@ -176,6 +176,27 @@ container and delivers a reviewable `kranz/*` branch; a Railway-hosted
 local Kranz install; a leaked dashboard URL without the token reveals
 nothing and mutates nothing.
 
+## M7 — Worker sandboxing ○ (scoped 2026-07-05, unscheduled — docs/scoping/worker-sandboxing.md)
+
+Containment, not just detection: today every guard is policy-level (scrutiny
+validators, tool patterns, pinned base SHAs) while the worker's `claude`
+process keeps the operator's full user privileges — out-of-repo writes and
+arbitrary egress are both possible and invisible. Receipts: the Gas City
+spike's letter-over-spirit incident, wrong-cwd blast radius, injection reach
+on third-party repo content. Three independently shippable tiers: (1)
+workers/validators always in dedicated worktrees + out-of-contract write
+audit + env hygiene; (2) OS-enforced FS/network allowlists (macOS Seatbelt /
+Linux bwrap), config-gated `sandbox: {enforce, extraWrite, egress}` with a
+floor-for-autonomous-runs posture mirroring the scrutiny floor; (3)
+container backend (the Gas City fleet stepping stone). Complements scrutiny —
+the sandbox bounds what CAN happen; validators judge what DID.
+
+Done when: a deliberately hostile brief under `enforce: "fs+net"` leaves zero
+writes outside its worktree + mission dir with blocked attempts surfaced as
+findings; a normal mission's contract commands still pass under the sandbox
+at <~10% wall-clock overhead; and the primary checkout never changes branch
+during any mission, sequential included.
+
 ## Continuous UX backlog (no milestone, picked up opportunistically)
 
 - `kranz run` status header / richer TUI (dashboard remains the primary
