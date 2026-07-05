@@ -2394,6 +2394,65 @@ impl MissionEngine {
     }
 
     // -----------------------------------------------------------------------
+    // Cross-mission lesson capture
+    // -----------------------------------------------------------------------
+
+    /// One final orchestrator turn at mission completion: distill at most one
+    /// reusable lesson for a future mission in this repo, write it to
+    /// `.kranz/lessons/<mission-id>.md`, and append it to the lesson index.
+    ///
+    /// Best-effort BY DESIGN, same contract as [`Self::write_mission_report`]:
+    /// the orchestrator only PRODUCES the lesson text — this engine method is
+    /// the one that writes files — and any turn/parse/write failure is
+    /// downgraded to a warning rather than stranding a mission that already
+    /// passed its final gate. Returns the paths written (lesson file, index),
+    /// or `None` if there was nothing worth carrying forward or capture
+    /// failed.
+    pub async fn capture_lesson(&mut self) -> Option<Vec<PathBuf>> {
+        match self.try_capture_lesson().await {
+            Ok(written) => written,
+            Err(e) => {
+                tracing::warn!(error = %e, "lesson capture failed; completing without a lesson");
+                None
+            }
+        }
+    }
+
+    /// Fallible body of [`Self::capture_lesson`].
+    async fn try_capture_lesson(&mut self) -> Result<Option<Vec<PathBuf>>> {
+        let message = format!(
+            "MISSION GOAL:\n{}\n\nThe mission has just completed. Distill at most ONE \
+             reusable lesson that a FUTURE mission in THIS repository would need — as a \
+             short imperative note — or reply with the single word NONE if there is \
+             nothing worth carrying forward.",
+            self.state.mission.goal
+        );
+        let text = self.orch_turn(&message).await?;
+        let trimmed = text.trim();
+        if trimmed.is_empty() || is_none_reply(trimmed) {
+            return Ok(None);
+        }
+
+        let lessons_dir = self.paths.lessons_dir();
+        std::fs::create_dir_all(&lessons_dir)?;
+        let mission_id = self.state.mission.id.clone();
+        let lesson_file = lessons_dir.join(format!("{mission_id}.md"));
+        let body = normalize_lesson_body(trimmed);
+        std::fs::write(&lesson_file, &body)?;
+
+        let summary = first_nonempty_line(&body);
+        let index = self.paths.lessons_index();
+        let line = format!("- {mission_id}.md · {summary}\n");
+        {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&index)?;
+            file.write_all(line.as_bytes())?;
+        }
+
+        Ok(Some(vec![lesson_file, index]))
+    }
+
+    // -----------------------------------------------------------------------
     // Orchestrator session management (i)
     // -----------------------------------------------------------------------
 
@@ -3511,6 +3570,33 @@ fn first_nonempty_line(text: &str) -> &str {
     text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("")
 }
 
+/// Whether a lesson-turn reply is the single word NONE (case-insensitive,
+/// ignoring surrounding whitespace/punctuation).
+fn is_none_reply(text: &str) -> bool {
+    text.trim()
+        .trim_matches(|c: char| c.is_whitespace() || c.is_ascii_punctuation())
+        .eq_ignore_ascii_case("none")
+}
+
+/// Cap on the lesson index-entry line, so a long paragraph reply can't
+/// masquerade as the one-line summary read by the injection step.
+const LESSON_SUMMARY_CAP: usize = 140;
+
+/// Normalize a lesson reply so its first line is a short, usable one-line
+/// summary (the injection step reads the first line as the index entry).
+/// If the reply's first line already fits under the cap it is left as-is;
+/// otherwise a capped version of it is prepended as a new first line, ahead
+/// of the reply's full prose.
+fn normalize_lesson_body(text: &str) -> String {
+    let trimmed = text.trim();
+    let first_line = first_nonempty_line(trimmed);
+    if first_line.chars().count() <= LESSON_SUMMARY_CAP {
+        return trimmed.to_string();
+    }
+    let capped: String = first_line.chars().take(LESSON_SUMMARY_CAP - 1).collect();
+    format!("{capped}…\n\n{trimmed}")
+}
+
 /// Canonicalize the repo root when possible (macOS tempdirs are symlinks
 /// under /var → /private/var; git pathspec matching needs the real path).
 fn canonical_root(root: PathBuf) -> PathBuf {
@@ -4233,5 +4319,142 @@ mod tests {
             ),
             "idle Paused loop must age-flush the buffered delta to disk without a lifecycle event"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Lesson capture (roadmap: cross-mission learning)
+    // -----------------------------------------------------------------------
+
+    /// A throwaway git repo (seeded, `main` branch), or `None` (with a skip
+    /// note) when `git` is not on PATH.
+    fn lessons_test_repo() -> Option<(tempfile::TempDir, PathBuf)> {
+        let git_ok = std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !git_ok {
+            eprintln!("skipping test: git is not on PATH");
+            return None;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .expect("spawn git");
+            assert!(out.status.success(), "git {args:?} failed: {:?}", out);
+        };
+        if !std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(dir.path())
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            run(&["init"]);
+            run(&["symbolic-ref", "HEAD", "refs/heads/main"]);
+        }
+        run(&["config", "user.name", "test"]);
+        run(&["config", "user.email", "test@example.com"]);
+        std::fs::write(dir.path().join("README.md"), "seed\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-m", "seed"]);
+        let root = std::fs::canonicalize(dir.path()).expect("canonicalize repo root");
+        Some((dir, root))
+    }
+
+    /// One streaming orchestrator script: session init + one turn reply.
+    fn lesson_orch_script(reply: &str) -> crate::backend_mock::MockScript {
+        use crate::backend_mock::{mock_init, mock_result_text, mock_text};
+        crate::backend_mock::MockScript::streaming(vec![
+            mock_init("orch-session"),
+            mock_result_text("ready"),
+        ])
+        .responding(vec![vec![mock_text(reply), mock_result_text(reply)]])
+    }
+
+    #[tokio::test]
+    async fn lessons_capture_writes_file_and_index() {
+        let Some((_dir, root)) = lessons_test_repo() else { return };
+        let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::with_scripts(
+            vec![lesson_orch_script(
+                "Always check the plan for a base_branch override before assuming main.",
+            )],
+        ));
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+        let mission_id = engine.state.mission.id.clone();
+
+        let written = engine.capture_lesson().await.expect("lesson written");
+        assert_eq!(written.len(), 2, "expects lesson file + index path");
+
+        let lesson_file = engine.paths.lessons_dir().join(format!("{mission_id}.md"));
+        assert!(written.contains(&lesson_file));
+        let body = std::fs::read_to_string(&lesson_file).expect("lesson file exists");
+        assert_eq!(
+            first_nonempty_line(&body),
+            "Always check the plan for a base_branch override before assuming main."
+        );
+
+        let index = engine.paths.lessons_index();
+        assert!(written.contains(&index));
+        let index_text = std::fs::read_to_string(&index).expect("index exists");
+        assert_eq!(index_text.lines().count(), 1, "one manifest line per capture");
+        assert!(index_text.contains(&format!("{mission_id}.md")));
+        assert!(index_text.contains("Always check the plan for a base_branch override"));
+    }
+
+    #[tokio::test]
+    async fn lessons_capture_none_reply_writes_nothing() {
+        let Some((_dir, root)) = lessons_test_repo() else { return };
+        let backend: Arc<dyn AgentBackend> =
+            Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![lesson_orch_script(
+                "  none.  ",
+            )]));
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+
+        let written = engine.capture_lesson().await;
+        assert!(written.is_none(), "NONE reply must write nothing");
+        assert!(!engine.paths.lessons_dir().exists(), "lessons dir must not be created");
+    }
+
+    #[tokio::test]
+    async fn lessons_capture_turn_error_returns_none() {
+        let Some((_dir, root)) = lessons_test_repo() else { return };
+        // No scripts queued: the orchestrator turn fails immediately.
+        let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+
+        let written = engine.capture_lesson().await;
+        assert!(written.is_none(), "a failed turn must downgrade to None, not panic");
+        assert!(!engine.paths.lessons_dir().exists());
+    }
+
+    #[test]
+    fn lessons_is_none_reply_matches_case_and_punctuation() {
+        assert!(is_none_reply("NONE"));
+        assert!(is_none_reply("  none.  "));
+        assert!(is_none_reply("None!"));
+        assert!(!is_none_reply("none of this applies, still worth a lesson"));
+    }
+
+    #[test]
+    fn lessons_normalize_body_prepends_capped_summary_when_first_line_too_long() {
+        let long_first_line = "x".repeat(200);
+        let text = format!("{long_first_line}\nmore detail");
+        let normalized = normalize_lesson_body(&text);
+        let first = first_nonempty_line(&normalized);
+        assert!(first.chars().count() <= LESSON_SUMMARY_CAP);
+        assert!(normalized.contains("more detail"));
+    }
+
+    #[test]
+    fn lessons_normalize_body_keeps_short_first_line_as_is() {
+        let text = "Short imperative note.\n\nMore context below.";
+        assert_eq!(normalize_lesson_body(text), text);
     }
 }
