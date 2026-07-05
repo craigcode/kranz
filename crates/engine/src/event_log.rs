@@ -786,8 +786,22 @@ fn process_identity_token(pid: i32) -> Option<String> {
 /// pinned so the acquire-time and probe-time renderings of the SAME stored
 /// value are byte-identical; the strings are compared for equality, never
 /// parsed back into clock arithmetic.
+///
+/// This is the actual `ps` spawn — the seam [`process_identity_token`] caches
+/// in front of. Kept as a separate function (rather than inlining the
+/// `Command` call) so a test can observe how many times it actually ran, via
+/// [`PS_SPAWN_COUNT`].
 #[cfg(target_os = "macos")]
-fn process_identity_token(pid: i32) -> Option<String> {
+fn ps_identity_token(pid: i32) -> Option<String> {
+    #[cfg(test)]
+    {
+        *PS_SPAWN_COUNTS
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+            .lock()
+            .unwrap()
+            .entry(pid)
+            .or_insert(0) += 1;
+    }
     let out = std::process::Command::new("ps")
         .env("LC_ALL", "C")
         .env("TZ", "UTC")
@@ -803,6 +817,57 @@ fn process_identity_token(pid: i32) -> Option<String> {
     } else {
         Some(token)
     }
+}
+
+/// Counts real `ps` spawns from [`ps_identity_token`], keyed by pid, so a
+/// test can prove the cache in [`process_identity_token`] collapses repeated
+/// checks for one pid into a single spawn — without being confused by other
+/// tests in this file concurrently spawning `ps` for a DIFFERENT pid.
+/// Test-only: it exists purely to observe the seam.
+#[cfg(all(test, target_os = "macos"))]
+static PS_SPAWN_COUNTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<i32, usize>>> =
+    std::sync::OnceLock::new();
+
+/// How long a cached macOS identity token may be served before a fresh `ps`
+/// spawn is required. This window only needs to be long enough to collapse
+/// the handful of `alive_or_reused` calls a single steal decision or hygiene
+/// sweep makes for the SAME pid (microseconds to low milliseconds apart in
+/// practice); it must stay far shorter than any realistic pid-reuse
+/// turnaround (the OS has to fully tear down the old process and allocate a
+/// new one, which takes at least tens of milliseconds, typically much more).
+/// A cached token therefore can never span an actual reuse: by the time a
+/// pid is recycled, the cache entry for it has long since expired and the
+/// next probe spawns fresh `ps`.
+#[cfg(target_os = "macos")]
+const IDENTITY_TOKEN_CACHE_TTL: Duration = Duration::from_millis(50);
+
+/// Per-pid cache of [`ps_identity_token`] results, so a burst of liveness
+/// checks against the same pid (queue-busy checks, hygiene sweeps, a single
+/// steal decision) spawns at most one `ps`. Keyed by pid so a lookup for one
+/// pid can never return another pid's token. Guarded by a `Mutex` for safe
+/// concurrent access.
+#[cfg(target_os = "macos")]
+type IdentityTokenCache = std::sync::Mutex<std::collections::HashMap<i32, (Option<String>, Instant)>>;
+
+#[cfg(target_os = "macos")]
+static IDENTITY_TOKEN_CACHE: std::sync::OnceLock<IdentityTokenCache> = std::sync::OnceLock::new();
+
+/// Cache layer in front of [`ps_identity_token`]: the real `ps` spawn seam.
+/// The VERDICT (Alive/Dead) is never cached or short-circuited here — only
+/// the raw token lookup is memoized; [`alive_or_reused`] still compares
+/// `recorded == current` on every call, using whatever token this returns.
+#[cfg(target_os = "macos")]
+fn process_identity_token(pid: i32) -> Option<String> {
+    let cache = IDENTITY_TOKEN_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let now = Instant::now();
+    if let Some((token, captured)) = cache.lock().unwrap().get(&pid) {
+        if now.duration_since(*captured) < IDENTITY_TOKEN_CACHE_TTL {
+            return token.clone();
+        }
+    }
+    let token = ps_identity_token(pid);
+    cache.lock().unwrap().insert(pid, (token.clone(), now));
+    token
 }
 
 /// Everywhere else (windows, exotic unix): no identity token, so pid reuse
@@ -910,6 +975,59 @@ mod tests {
         assert_eq!(probe_liveness(&info), LockLiveness::Alive);
 
         let info = LockInfo { token: Some(format!("{own}-not")), ..info };
+        assert_eq!(probe_liveness(&info), LockLiveness::Dead);
+    }
+
+    /// Two `process_identity_token` calls for the SAME pid in quick
+    /// succession must spawn `ps` only once — the cache should serve the
+    /// second call from memory, and both returned tokens must still match.
+    ///
+    /// Uses pid 1 (launchd — always alive on macOS) rather than our own pid,
+    /// so this test's spawn-count delta is not polluted by other tests in
+    /// this file that concurrently probe `process_identity_token` for the
+    /// test process's own pid.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_identity_token_caches_one_ps_per_pid() {
+        let pid = 1;
+        let count_for_pid = |p: i32| {
+            *PS_SPAWN_COUNTS
+                .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+                .lock()
+                .unwrap()
+                .get(&p)
+                .unwrap_or(&0)
+        };
+        let before = count_for_pid(pid);
+
+        let a = process_identity_token(pid).expect("own token must be obtainable");
+        let b = process_identity_token(pid).expect("own token must be obtainable");
+
+        let after = count_for_pid(pid);
+        assert_eq!(after - before, 1, "second call within the cache window must not spawn ps again");
+        assert_eq!(a, b, "cached token must match the freshly spawned one");
+    }
+
+    /// The cache must never mask pid reuse: it only ever memoizes the
+    /// CURRENT token lookup, never the recorded-vs-current comparison. Even
+    /// though `current` is served from cache here, a differing `recorded`
+    /// token must still yield Dead.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_cache_never_masks_pid_reuse() {
+        let pid = std::process::id() as i32;
+        // Prime the cache for this pid.
+        let own = process_identity_token(pid).expect("own token must be obtainable");
+
+        let info = LockInfo {
+            holder: pid.to_string(),
+            pid: Some(pid),
+            acquired_secs: Some(0),
+            token: Some(format!("{own}-not")),
+        };
+        // `current` comes from the cache primed above, but the differing
+        // `recorded` token must still be judged Dead — the comparison is
+        // never skipped just because `current` was cached.
         assert_eq!(probe_liveness(&info), LockLiveness::Dead);
     }
 
