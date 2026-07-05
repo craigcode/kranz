@@ -1,0 +1,50 @@
+#!/bin/sh
+# kranz-dispatch — Gas City → kranz bridge (spike).
+#
+# FAST PATH ONLY: drains READY beads carrying the kranz label by claiming
+# each, writing its ticket-shaped mission.md, and detaching kranz-run-bead
+# (nohup) to run the mission and report back into City state. Returns in
+# milliseconds — gc order exec enforces a context deadline, so orders
+# dispatch and get out of the way (learned live; see docs/gascity.md).
+#
+# Exit-code contract applied by kranz-run-bead:
+#   0 complete -> bd close · 2 blocked -> set-state blocked + mail human
+#   3 underspecified -> reopen with refine comment · 1 failed -> reopen
+#
+# City sees ONE opaque agent type: brief in, validated branch + report out.
+#
+# Env:
+#   KRANZ_RIG_DIR    (required) rig checkout kranz exec runs in
+#   KRANZ_LABEL      (default "kranz") bead label this dispatcher drains
+#   KRANZ_MAX_CYCLES (default 1) fix-cycle bound per mission (spend control)
+set -u
+
+RIG_DIR=${KRANZ_RIG_DIR:?KRANZ_RIG_DIR is required}
+LABEL=${KRANZ_LABEL:-kranz}
+MAX_CYCLES=${KRANZ_MAX_CYCLES:-1}
+CITY=${GC_CITY:?GC_CITY is required (run via a gc order)}
+BIN_DIR=$(dirname "$0")
+
+READY=$(gc bd ready --label "$LABEL" --json 2>/dev/null | jq -r '.[].id') || READY=""
+[ -n "$READY" ] || { echo "kranz-dispatch: no ready beads labeled '$LABEL'"; exit 0; }
+
+for ID in $READY; do
+    BEAD=$(gc bd show "$ID" --json) || continue
+    TITLE=$(printf '%s' "$BEAD" | jq -r '.[0].title // .title // empty')
+    DESC=$(printf '%s' "$BEAD" | jq -r '.[0].description // .description // ""')
+    ACCEPT=$(printf '%s' "$BEAD" | jq -r '.[0].acceptance_criteria // .acceptance_criteria // ""')
+
+    MDIR=$(mktemp -d) || continue
+    MFILE="$MDIR/mission.md"
+    {
+        printf '## Goal\n%s\n\n' "$TITLE"
+        printf '## Context\nDispatched from Gas City bead %s (label %s). Work fully autonomously.\n\n%s\n\n' "$ID" "$LABEL" "$DESC"
+        printf '## Scoping answers\nNo human is available during this run. Prefer the smallest faithful interpretation; if materially ambiguous, block rather than guess.\n\n'
+        printf '## Acceptance hints\n%s\n' "${ACCEPT:-The goal above is demonstrably met.}"
+    } > "$MFILE"
+
+    gc bd update "$ID" --status in_progress >/dev/null 2>&1
+    nohup "$BIN_DIR/kranz-run-bead" "$CITY" "$ID" "$MFILE" "$RIG_DIR" "$MAX_CYCLES" \
+        >"$MDIR/runner.log" 2>&1 &
+    echo "kranz-dispatch: bead $ID -> detached kranz mission (pid $!, workdir $MDIR)"
+done

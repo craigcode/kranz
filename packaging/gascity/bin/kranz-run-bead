@@ -1,0 +1,39 @@
+#!/bin/sh
+# kranz-run-bead — detached per-bead mission runner (spike).
+#
+# Invoked by kranz-dispatch with nohup: runs ONE bead's mission to a terminal
+# state and translates the exit code back into City state. Detached because
+# gc order exec enforces a context deadline — orders dispatch, they must not
+# host multi-minute missions (learned live; see docs/gascity.md).
+#
+# Usage: kranz-run-bead <city-dir> <bead-id> <mission.md> <rig-dir> <max-cycles>
+set -u
+CITY=$1; ID=$2; MFILE=$3; RIG_DIR=$4; MAX_CYCLES=$5
+
+bd() { gc --city "$CITY" bd "$@"; }
+
+LINE=$( cd "$RIG_DIR" && kranz exec -f "$MFILE" --max-cycles "$MAX_CYCLES" 2>>"${MFILE%.md}.events.log" )
+CODE=$?
+
+# bd flag shapes (learned live): close takes --reason, comment takes the
+# text positionally; -m belongs to neither.
+case $CODE in
+    0)
+        bd close "$ID" --reason "kranz mission COMPLETE — $LINE" >/dev/null
+        ;;
+    2)
+        bd set-state "$ID" blocked >/dev/null 2>&1 || bd update "$ID" --status blocked >/dev/null 2>&1
+        bd comment "$ID" "kranz mission BLOCKED — $LINE (event log in the rig's .kranz/missions dir)" >/dev/null
+        gc --city "$CITY" mail send human -s "ESCALATION: bead $ID blocked in kranz" \
+            -m "kranz mission for bead $ID blocked awaiting guidance. $LINE. Steer via kranz (web/Slack/CLI) or refine the bead and re-ready it." \
+            --notify >/dev/null 2>&1 || true
+        ;;
+    3)
+        bd update "$ID" --status open >/dev/null 2>&1
+        bd comment "$ID" "kranz refused headless run: UNDERSPECIFIED — refine title/description/acceptance so the brief is self-sufficient, then re-ready. $LINE" >/dev/null
+        ;;
+    *)
+        bd update "$ID" --status open >/dev/null 2>&1
+        bd comment "$ID" "kranz mission FAILED (exit $CODE) — $LINE (inspect the rig's .kranz/missions dir)" >/dev/null
+        ;;
+esac

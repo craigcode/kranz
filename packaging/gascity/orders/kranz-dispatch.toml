@@ -1,0 +1,12 @@
+# Drain ready kranz-labeled beads into headless kranz missions.
+#
+# City-side setup (see packaging/gascity/README.md):
+#   - KRANZ_RIG_DIR must point at the rig checkout kranz runs in
+#     (spike-era limitation: one dispatcher order per rig; a multi-rig
+#     dispatcher derives the rig from the bead prefix — see docs/gascity.md)
+#   - kranz and the pack's bin/ must be on PATH (or use absolute paths)
+#   - trigger is manual for spikes; production uses cooldown (e.g. "5m")
+[order]
+description = "Drain ready kranz-labeled beads into headless kranz missions"
+trigger = "manual"
+exec = "KRANZ_RIG_DIR=/path/to/rig kranz-dispatch"
