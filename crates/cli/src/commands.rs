@@ -152,7 +152,7 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
         } => cmd_serve(repo, host, port, open, dashboard, token, slack).await,
         Command::Release { url, token } => {
             let mission = select_mission(&repo, cli.mission.as_deref())?;
-            cmd_release(&mission, &url, token).await
+            cmd_release(&repo, &mission, &url, token).await
         }
         Command::Config { command } => {
             crate::config_cmd::cmd_config(&repo, command, cli.mission.as_deref())
@@ -1376,15 +1376,29 @@ fn open_browser(url: &str) {
 /// serve`'s release endpoint to free the mission's single-writer lock. The
 /// CLI runs in a different process and cannot reach serve's in-memory
 /// registry directly, so this always goes over HTTP — never the event log.
-async fn cmd_release(mission_id: &str, url: &str, token: Option<String>) -> Result<i32> {
-    let token = token
-        .or_else(|| std::env::var("KRANZ_TOKEN").ok())
-        .ok_or_else(|| {
-            anyhow!(
-                "no mutation token available — pass --token or set $KRANZ_TOKEN \
-                 (the token `kranz serve` prints on startup)"
-            )
-        })?;
+/// Resolve the mutation token for `kranz release`, in precedence order:
+/// `--token` flag > `$KRANZ_TOKEN` > `<repo>/.kranz/serve.token`.
+fn resolve_release_token(repo: &Path, flag: Option<String>) -> Option<String> {
+    flag.or_else(|| std::env::var("KRANZ_TOKEN").ok()).or_else(|| {
+        std::fs::read_to_string(repo.join(".kranz").join("serve.token"))
+            .ok()
+            .map(|s| s.trim_end().to_string())
+    })
+}
+
+async fn cmd_release(
+    repo: &Path,
+    mission_id: &str,
+    url: &str,
+    token: Option<String>,
+) -> Result<i32> {
+    let token = resolve_release_token(repo, token).ok_or_else(|| {
+        anyhow!(
+            "no mutation token available — pass --token, set $KRANZ_TOKEN, or run from a repo \
+             with a `kranz serve` still holding <repo>/.kranz/serve.token \
+             (the token `kranz serve` prints on startup)"
+        )
+    })?;
 
     let base = url.trim_end_matches('/');
     let endpoint = format!("{base}/api/missions/{mission_id}/release");
@@ -1446,22 +1460,102 @@ mod tests {
     use super::*;
     use std::fs;
 
+    /// `cargo test` runs unit tests concurrently on multiple threads by
+    /// default, but `$KRANZ_TOKEN` is process-global state. Every test below
+    /// that reads or writes it must hold this lock for its whole body so the
+    /// mutations don't interleave across threads.
+    static KRANZ_TOKEN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// With no --token and no $KRANZ_TOKEN, `cmd_release` fails fast with an
     /// actionable error instead of attempting the HTTP call.
     #[tokio::test]
+    // The guard is a plain std Mutex held only to serialize this test's
+    // $KRANZ_TOKEN mutation against sibling tests in this module; the await
+    // below never touches the lock itself.
+    #[allow(clippy::await_holding_lock)]
     async fn release_without_a_token_errors_clearly() {
-        // SAFETY: single-threaded w.r.t. this var — no other test reads/writes
-        // KRANZ_TOKEN, and #[tokio::test] runs this test body to completion
-        // before any assertion on the env var elsewhere could interleave.
+        let _guard = KRANZ_TOKEN_ENV_LOCK.lock().unwrap();
+        // SAFETY: serialized by KRANZ_TOKEN_ENV_LOCK above.
         unsafe {
             std::env::remove_var("KRANZ_TOKEN");
         }
-        let err = cmd_release("m-1", "http://127.0.0.1:4560", None)
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().to_path_buf();
+        let err = cmd_release(&repo, "m-1", "http://127.0.0.1:4560", None)
             .await
             .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("--token"), "{msg}");
         assert!(msg.contains("KRANZ_TOKEN"), "{msg}");
+    }
+
+    /// With no --token and no $KRANZ_TOKEN, resolution falls back to
+    /// `<repo>/.kranz/serve.token`.
+    #[test]
+    fn release_reads_token_file_when_flag_and_env_absent() {
+        let _guard = KRANZ_TOKEN_ENV_LOCK.lock().unwrap();
+        // SAFETY: serialized by KRANZ_TOKEN_ENV_LOCK above.
+        unsafe {
+            std::env::remove_var("KRANZ_TOKEN");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().to_path_buf();
+        write_serve_token(&repo, "file-token").unwrap();
+
+        assert_eq!(
+            resolve_release_token(&repo, None),
+            Some("file-token".to_string())
+        );
+    }
+
+    #[test]
+    fn release_reads_token_file_but_flag_overrides() {
+        let _guard = KRANZ_TOKEN_ENV_LOCK.lock().unwrap();
+        // SAFETY: serialized by KRANZ_TOKEN_ENV_LOCK above.
+        unsafe {
+            std::env::remove_var("KRANZ_TOKEN");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().to_path_buf();
+        write_serve_token(&repo, "file-token").unwrap();
+
+        assert_eq!(
+            resolve_release_token(&repo, Some("flag-token".to_string())),
+            Some("flag-token".to_string())
+        );
+    }
+
+    #[test]
+    fn release_reads_token_file_but_env_overrides() {
+        let _guard = KRANZ_TOKEN_ENV_LOCK.lock().unwrap();
+        // SAFETY: serialized by KRANZ_TOKEN_ENV_LOCK above.
+        unsafe {
+            std::env::set_var("KRANZ_TOKEN", "env-token");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().to_path_buf();
+        write_serve_token(&repo, "file-token").unwrap();
+
+        let result = resolve_release_token(&repo, None);
+        unsafe {
+            std::env::remove_var("KRANZ_TOKEN");
+        }
+        assert_eq!(result, Some("env-token".to_string()));
+    }
+
+    /// When flag, env, and file are all absent, resolution yields `None` so
+    /// `cmd_release` can raise its actionable error.
+    #[test]
+    fn release_reads_token_file_none_present_yields_none() {
+        let _guard = KRANZ_TOKEN_ENV_LOCK.lock().unwrap();
+        // SAFETY: serialized by KRANZ_TOKEN_ENV_LOCK above.
+        unsafe {
+            std::env::remove_var("KRANZ_TOKEN");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().to_path_buf();
+
+        assert_eq!(resolve_release_token(&repo, None), None);
     }
 
     #[cfg(unix)]
