@@ -365,6 +365,221 @@ different iteration limits and no clear precedence between them. Reject:
 kranz's own fix cycles subsume converge's role for the scope kranz owns
 (one bead, one validated branch).
 
+### gc agent — adopt
+
+`gc agent` "manage[s] agent configuration in city.toml"; runtime operations
+(attach/list/peek/nudge/kill/start/stop/destroy) have moved to `gc session`
+and `gc runtime`, leaving `gc agent` as config-only: `add` (scaffold),
+`list`, `resume`, `suspend`. This is the registration step the pack's
+`agents/kranz-worker/agent.toml` already targets — a `long_running`
+`[agent]` block with `command = "kranz-city-worker"` and, deliberately, no
+`[[named_session]]`, so "the City sees one opaque agent type, not a
+resident mayor." Citizenship here is narrow and mechanical: `gc agent add`
+(or hand-authoring the equivalent city.toml stanza) makes that scaffold
+visible to the city at all, which is the prerequisite for `gc status`, the
+dashboard, and (later) `gc hook`/`gc sling` targeting it. It adds nothing
+resident and costs nothing while the spool is empty — a config-registration
+step, not a behavioral one. Whether the *agent* should ever grow an LLM
+cast (a `prompt_template`, hence `gc prime` applicability — see the next
+subsection) is a distinct, undecided question, flagged for design decision
+D1. Adopt: registering the existing non-LLM scaffold is pure config, adds
+no named-session surface, and directly enables the status/dashboard
+visibility this assessment treats as adopt below — independent of any of
+the three futures, though it's also the floor requirement for all of them.
+
+### gc prime — defer
+
+`gc prime [agent-name]` "outputs the behavioral prompt for an agent," e.g.
+`claude "$(gc prime mayor)"` — priming a CLI coding agent with city-aware
+instructions from a configured `prompt_template`. It explicitly tolerates
+"agents whose config intentionally lacks a prompt_template (a supported
+minimal config)" as a legitimate quiet state, not an error. `kranz-worker`
+is exactly that minimal config today: a `long_running` agent with no
+`prompt_template` and no LLM cast, because `kranz exec` already carries its
+own orchestrator/worker/validator prompting internally — there is no CLI
+coding agent on the City side for `gc prime` to prime. So `gc prime
+kranz-worker` today would fall back to (or, under `--strict`, refuse to
+run without) a default worker prompt that nothing consumes. Whether kranz
+should ever grow a City-visible, primeable LLM session — for interactive
+triage of a blocked mission, say — is exactly the question flagged as D1 in
+the `gc agent` subsection above, and constraint 5 (no named sessions, kept
+narrow specifically to stay out of the mayor's restart/tmux surface) is the
+invariant any such move would need to clear. This subsection does not
+decide that question. Defer, named trigger: D1 resolves in favor of a
+City-visible, named LLM session for kranz-shaped work; until then, `gc
+prime` has no `prompt_template` to render for a non-LLM worker.
+
+### gc session — reject
+
+`gc session` creates, resumes, suspends, and closes "persistent
+conversations with agents" — `new`/`attach`/`nudge`/`submit`/`wake`/`pin`
+and friends, all built around a named, controller-managed, interactive
+chat session with continuity across suspend/resume. Kranz already has
+three interactive surfaces of its own for steering a mission — web
+dashboard, Slack thread, CLI — and docs/gascity.md is explicit that a
+blocked mission is steered "from kranz's own surfaces," not from a second
+channel. Declaring a `gc session` for kranz-worker would mean giving it
+exactly the `[[named_session]]` block constraint 5 and the pack's own
+`agent.toml` comment ("no resident mayor") deliberately omit, adding kranz
+to the same controller-restart/tmux-lifecycle surface `gc init`'s mayor
+occupies. Reject: violates invariant 5 (no named sessions) and duplicates
+kranz's own interactive surfaces — the same capability-neutral overlap the
+spike verdict already priced in.
+
+### gc status — adopt
+
+`gc status [path]` "shows a city-wide overview: controller state,
+suspension, all agents with running status, rigs, and a summary count," in
+text or `--json`. Once `kranz-worker` is registered (`gc agent`, above),
+it appears in this overview for free — no kranz-side code, just the
+registration step. That is exactly what a citizen should report upward:
+whether the worker process is alive, without needing to reimplement
+liveness reporting as a separate City-facing surface. This is read-only
+observability, costs nothing beyond registration, and doesn't compete with
+kranz's own dashboard, which reports mission-level detail (which bead,
+which cycle, which validator) that `gc status`'s agent-level view was
+never going to carry. Adopt: pure upward visibility of "is the worker
+running," gated only on the `gc agent` registration step, valuable for the
+single-operator case today and a prerequisite for all three futures'
+observability needs.
+
+### gc dashboard — adopt
+
+`gc dashboard` "open[s] the static GC dashboard against the machine-wide
+supervisor API"; scoped to a city directory (or `--city`), it enables
+"city-specific panels and action forms." Citizenship means the same thing
+here as for `gc status`, one level up in fidelity: once `kranz-worker` is a
+registered agent, the City dashboard's per-agent panel shows it running
+(or suspended, or dead) alongside every other agent in the city, which is
+the aggregate, cross-agent view kranz's own dashboard is not positioned to
+provide (kranz's dashboard knows about kranz missions; it has no notion of
+sibling City agents). The two dashboards report at different altitudes and
+don't compete: City's shows "is kranz's worker alive, among N agents";
+kranz's own shows "what is this specific mission doing." Adopt: read-only,
+gated on the same `gc agent` registration as `gc status`, and the natural
+place a human watching the whole city — not just kranz — would look first,
+which matters most once there's more than one agent or rig to watch
+(heterogeneous fleets, cross-machine).
+
+### gc doctor — defer
+
+`gc doctor` runs diagnostic health checks — "city structure, config
+validity, binary dependencies … controller status, agent sessions,
+zombie/orphan sessions, bead stores, Dolt server health, event log
+integrity," formula-compiler and v2-config deprecations, and "per-rig
+health," with `--fix` for safe mechanical remediation. Registering
+`kranz-worker` as an agent gets the generic checks (config validity,
+zombie/orphan session detection, bead-store health) for free, the same way
+`gc status`/`gc dashboard` visibility does. What `--help` does not show is
+any extension point for a *pack-contributed* check — there's no documented
+way for the kranz pack to register "probe spool depth" or "probe
+mission-lock liveness" as an additional doctor check; every check listed is
+generic to city/rig structure, not agent-specific health kranz would define
+itself. Contributing that kranz-specific signal today would mean inventing
+an undocumented hook, which this assessment won't do on spec alone. Defer,
+named trigger: `gc doctor` documents (or is observed live to support) a
+pack- or agent-contributed health-check extension point; until then, kranz
+gets doctor's generic per-rig checks passively via registration and nothing
+more.
+
+### gc pack — defer
+
+`gc pack` "manage[s] remote pack sources that provide agent
+configurations" — git repositories containing `pack.toml`, cached locally
+and pinnable to a ref, with `fetch`/`list`/`registry`/`release`
+subcommands. This is precisely the distribution future the spike verdict
+named: "a published `kranz` pack as the validated-mission rig type in the
+gastown ecosystem." The kranz pack (`packaging/gascity/`, schema 2) is
+already shaped like a pack — `pack.toml` plus `bin/` plus `agents/` — but
+Current state is explicit that it is **stub-verified only**, never
+validated against a live registered city supervisor. Publishing an
+unvalidated pack to a remote registry (`gc pack registry`, `gc pack
+release`) so other operators' cities can `gc pack fetch` it would export
+that gap beyond this machine. Defer, named trigger: the pack is validated
+against a live registered city supervisor (closing the Current-state gap
+shared with `gc agent`/`gc hook`) — only then does publishing it as a
+fetchable remote pack source make sense.
+
+### gc lint — adopt
+
+`gc lint <pack>` "validate[s] a pack before merge" — checks `pack.toml`,
+reports non-fatal loader warnings, and parses prompt templates with
+runtime's missing-key behavior; `gc lint .` recurses to find every
+`pack.toml` below a path. This is the one exception in this mission's
+read-only rules, because it is a validator by construction, not a
+mutation. Run live against this pack:
+
+```
+$ gc lint packaging/gascity
+gc lint: <operator-home>/Data/kranz/packaging/gascity: ok
+```
+
+The pack lints clean today. Adopt: it's free, non-mutating, and exactly the
+gate a "pack" citizenship story needs before any future publication step
+(`gc pack release`, above) — run it in CI on any change under
+`packaging/gascity/` so pack drift is caught the same commit it's
+introduced, independent of any of the three futures.
+
+### gc mcp — defer
+
+`gc mcp list` shows the "projected MCP catalog for a concrete target" —
+`--agent <name>` for an agent with a single deterministic projection, or
+`--session <id>` for a live session target. Projected MCP is how a City
+agent's tool surface gets exposed to whatever provider consumes it.
+Kranz's own REST surface (mission/task status, control endpoints) is a
+plausible source to project as MCP config, so that other City-side agents
+(codex/gemini sessions under the same router) could query or drive kranz
+missions as MCP tools rather than needing City-specific glue. But `gc mcp
+list` only *inspects* a projection that must already exist from config or a
+live session — it does not build one, and kranz has no MCP server today
+projecting its REST surface. Building that projection is a kranz-side
+feature this assessment doesn't scope; this subsection only judges whether
+citizenship via `gc mcp` is worth pursuing. It is, but only once there's a
+second agent that would consume it — the heterogeneous-fleets future.
+Defer, named trigger: a heterogeneous fleet is assembled (naming the same
+trigger as `gc sling`, above) *and* kranz has built an MCP projection of
+its REST surface for `gc mcp list` to report.
+
+### gc skill — adopt
+
+`gc skill list` shows "skills visible to the current city": city pack
+skills (`skills/<name>/SKILL.md`), imported pack shared skills
+(binding-qualified), compatibility bootstrap skills, and — with
+`--agent`/`--session` — that agent's own skills catalog. It's explicitly a
+diagnostic view of what's *available*, not a precedence resolver. Adding a
+`skills/kranz-mission-brief/SKILL.md` to the pack — documenting constraint
+2 (title is the prompt; description carries constraints; acceptance
+carries testable outcomes) and the exit-code contract — would make that
+guidance discoverable by any City agent authoring or reviewing a
+kranz-labelled bead, not just a human who's read this doc. This is
+documentation-only, costs nothing, doesn't touch runtime, and directly
+mitigates the single sharpest failure mode this plan has already observed
+live (docs/gascity.md lesson 2's goal-in-acceptance bead). Adopt: a pure
+documentation addition to the pack that pays off as soon as any second
+author — human or agent — writes a kranz-labelled bead, which matters most
+once kranz is either shared across a fleet or distributed to other
+operators' cities.
+
+This feature assessed ten more mechanisms: 5 adopt (`gc agent`, `gc
+status`, `gc dashboard`, `gc lint`, `gc skill`), 4 defer (`gc prime`, `gc
+doctor`, `gc pack`, `gc mcp`), 1 reject (`gc session`). Counting every
+`### gc ` subsection in this document, earlier and current, across all
+twenty assessed mechanisms: **7 adopt** (`gc order`, `gc events`, `gc
+agent`, `gc status`, `gc dashboard`, `gc lint`, `gc skill`), **7 defer**
+(`gc hook`, `gc sling`, `gc formula`, `gc prime`, `gc doctor`, `gc pack`,
+`gc mcp`), **6 reject** (`gc mail`, `gc handoff`, `gc nudge`, `gc convoy`,
+`gc converge`, `gc session`). The pattern from the first ten mechanisms
+holds for this second batch:
+citizenship is cheapest and clearest for pure upward visibility (status,
+dashboard, lint, skill, agent registration itself) and for extending the
+documented exit-code contract; it stays deferred wherever it needs either a
+live-validated supervisor (agent registration, doctor extension, pack
+publication) or a second party to route to or compose with (mcp, sling,
+formula); and it's rejected wherever the City mechanism would duplicate a
+rail kranz already owns (session, mail, convoy) or add kranz to the
+named-session surface constraint 5 exists to keep it out of (handoff,
+nudge, session).
+
 ## Staged roadmap
 
 *Populated by a later feature.*
