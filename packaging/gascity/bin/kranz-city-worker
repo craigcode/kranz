@@ -1,0 +1,52 @@
+#!/bin/sh
+# kranz-city-worker — Gas City → kranz bridge, execution side.
+#
+# Long-lived, SUPERVISED drain loop (replaces the spike's unsupervised nohup):
+# picks the oldest spooled brief, runs it through kranz-run-bead (which owns
+# the exit-code → City-state mapping), removes the spool entry, repeats.
+# Strictly serial — kranz missions serialize per repo anyway, and one worker
+# per city keeps the spend faucet single-valved.
+#
+# Intended to run under the City supervisor as a named non-LLM session (see
+# packaging/gascity/agents/kranz-worker/) or any process manager. --once
+# drains at most one entry and exits (tests, cron).
+#
+# Env: KRANZ_SPOOL (default $GC_CITY/.gc/kranz-spool)
+set -u
+
+CITY=${GC_CITY:?GC_CITY is required}
+SPOOL=${KRANZ_SPOOL:-$CITY/.gc/kranz-spool}
+BIN_DIR=$(dirname "$0")
+ONCE=${1:-}
+mkdir -p "$SPOOL"
+
+# Single-instance guard: a second worker exits quietly rather than racing.
+LOCK="$SPOOL/.worker-lock"
+if ! mkdir "$LOCK" 2>/dev/null; then
+    echo "kranz-city-worker: another worker holds $LOCK; exiting"
+    exit 0
+fi
+trap 'rmdir "$LOCK" 2>/dev/null' EXIT INT TERM
+
+drain_one() {
+    ENV_FILE=$(ls "$SPOOL"/*.env 2>/dev/null | sort | head -1)
+    [ -n "$ENV_FILE" ] || return 1
+    MFILE="${ENV_FILE%.env}.md"
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+    echo "kranz-city-worker: bead $ID -> kranz exec (rig $RIG_DIR)"
+    "$BIN_DIR/kranz-run-bead" "$CITY" "$ID" "$MFILE" "$RIG_DIR" "$MAX_CYCLES"
+    # Sweep the whole entry (brief, env, the runner's events.log sidecar).
+    rm -f "${ENV_FILE%.env}".*
+    return 0
+}
+
+if [ "$ONCE" = "--once" ]; then
+    drain_one || echo "kranz-city-worker: spool empty"
+    exit 0
+fi
+
+echo "kranz-city-worker: watching $SPOOL"
+while :; do
+    drain_one || sleep 15
+done

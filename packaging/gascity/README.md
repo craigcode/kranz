@@ -9,15 +9,21 @@ side.
 
 ## How it works
 
-`bin/kranz-dispatch` (invoked by the `kranz-dispatch` order, manually or on a
-cooldown) drains READY beads labeled `kranz`:
+Two halves, split by Gas City's order-exec deadline: `bin/kranz-dispatch`
+(the order, on a cooldown) CLAIMS ready `kranz`-labeled beads and spools
+mission briefs; `bin/kranz-city-worker` (a supervised long-running session —
+see `agents/kranz-worker/`) drains the spool strictly serially, running each
+brief and mapping the exit code back into City state. Dispatch flow:
 
 1. Bead fields → ticket-shaped `mission.md`
    (`title → ## Goal`, `description → ## Context`,
    `acceptance_criteria → ## Acceptance hints`).
-2. Bead claimed (`in_progress`), then `kranz exec -f mission.md` runs in the
-   rig checkout — fully autonomous, auto-approved plan, bounded fix cycles
-   (`KRANZ_MAX_CYCLES`, default 1).
+2. Bead claimed (`in_progress`) and spooled; the worker runs
+   `kranz exec -f mission.md` in the rig checkout — fully autonomous,
+   auto-approved plan, bounded fix cycles (`KRANZ_MAX_CYCLES`, default 1).
+   Rigs that disable the scrutiny validator are REFUSED (letter-over-spirit
+   risk; docs/gascity.md lesson 3) unless `KRANZ_ALLOW_UNVALIDATED=1`.
+   Multi-rig cities route by bead-id prefix via `gc rig list --json`.
 3. Exit code → City state:
 
    | exit | meaning        | City effect                                      |

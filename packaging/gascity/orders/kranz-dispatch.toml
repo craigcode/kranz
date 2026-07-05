@@ -1,12 +1,15 @@
-# Drain ready kranz-labeled beads into headless kranz missions.
+# Spool ready kranz-labeled beads for the kranz-city-worker (v2: the order
+# only dispatches — missions run under the supervised worker, because
+# gc order exec enforces a context deadline).
 #
 # City-side setup (see packaging/gascity/README.md):
-#   - KRANZ_RIG_DIR must point at the rig checkout kranz runs in
-#     (spike-era limitation: one dispatcher order per rig; a multi-rig
-#     dispatcher derives the rig from the bead prefix — see docs/gascity.md)
-#   - kranz and the pack's bin/ must be on PATH (or use absolute paths)
-#   - trigger is manual for spikes; production uses cooldown (e.g. "5m")
+#   - run kranz-city-worker as a supervised session (agents/kranz-worker/)
+#   - multi-rig cities: routing derives the rig from the bead id prefix via
+#     `gc rig list --json`; single-rig setups may pin KRANZ_RIG_DIR
+#   - kranz, jq, and the pack's bin/ must be on PATH (or absolute paths)
+#   - rigs with skipScrutiny=true are refused unless KRANZ_ALLOW_UNVALIDATED=1
 [order]
-description = "Drain ready kranz-labeled beads into headless kranz missions"
-trigger = "manual"
-exec = "KRANZ_RIG_DIR=/path/to/rig kranz-dispatch"
+description = "Spool ready kranz-labeled beads for the kranz-city-worker"
+trigger = "cooldown"
+interval = "5m"
+exec = "kranz-dispatch"
