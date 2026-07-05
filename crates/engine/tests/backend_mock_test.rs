@@ -9,8 +9,10 @@ use kranz_engine::backend_mock::{
 use kranz_engine::error::EngineError;
 use kranz_engine::event_log::{EventLog, LockForce};
 use kranz_engine::paths::MissionPaths;
-use kranz_engine::runner::run_worker;
-use kranz_engine::types::{Feature, FeatureOrigin, FeatureStatus, MissionConfig};
+use kranz_engine::runner::{run_validator, run_worker};
+use kranz_engine::types::{
+    Feature, FeatureOrigin, FeatureStatus, Milestone, MilestoneStatus, MissionConfig, Role,
+};
 use serde_json::json;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -371,4 +373,97 @@ async fn worker_session_carries_configured_tools_onto_the_spec() {
     let specs = backend.started_specs();
     assert_eq!(specs.len(), 1);
     assert_eq!(specs[0].tools, cfg.worker.tools);
+}
+
+fn validator_report_json() -> serde_json::Value {
+    json!({ "findings": [], "summary": "all good" })
+}
+
+fn milestone() -> Milestone {
+    Milestone {
+        id: "ms-1".to_string(),
+        title: "Ship auth".to_string(),
+        features: vec![feature()],
+        status: MilestoneStatus::Validating,
+        fix_cycles: 0,
+        start_sha: None,
+    }
+}
+
+#[tokio::test]
+async fn functional_validator_tools_are_carried_and_allowed() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = MissionPaths::new(dir.path(), "m-test");
+    let mut log = EventLog::acquire(&p, "m-test", Duration::from_millis(0), LockForce::No).unwrap();
+
+    let mut cfg = MissionConfig::default();
+    cfg.validator_functional.tools = vec![
+        "Bash".to_string(),
+        "Read".to_string(),
+        "Glob".to_string(),
+        "Grep".to_string(),
+        "FakeBrowserTool".to_string(),
+    ];
+
+    let backend =
+        MockBackend::with_scripts(vec![MockScript::single_shot_json(&validator_report_json())]);
+    run_validator(
+        &backend,
+        &mut log,
+        &p,
+        &cfg,
+        Role::ValidatorFunctional,
+        &milestone(),
+        &[],
+        "start-sha",
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let specs = backend.started_specs();
+    assert_eq!(specs.len(), 1);
+    assert_eq!(specs[0].tools, cfg.validator_functional.tools);
+    assert!(specs[0].allowed_tools.contains(&"FakeBrowserTool".to_string()));
+    assert!(!specs[0].allowed_tools.contains(&"Bash".to_string()));
+    assert!(specs[0].disallowed_tools.contains(&"Write".to_string()));
+    assert!(specs[0].disallowed_tools.contains(&"Edit".to_string()));
+}
+
+#[tokio::test]
+async fn scrutiny_validator_does_not_get_extra_tools_folded_into_allowed() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = MissionPaths::new(dir.path(), "m-test");
+    let mut log = EventLog::acquire(&p, "m-test", Duration::from_millis(0), LockForce::No).unwrap();
+
+    let mut cfg = MissionConfig::default();
+    cfg.validator_scrutiny.tools = vec![
+        "Bash".to_string(),
+        "Read".to_string(),
+        "Glob".to_string(),
+        "Grep".to_string(),
+        "FakeBrowserTool".to_string(),
+    ];
+
+    let backend =
+        MockBackend::with_scripts(vec![MockScript::single_shot_json(&validator_report_json())]);
+    run_validator(
+        &backend,
+        &mut log,
+        &p,
+        &cfg,
+        Role::ValidatorScrutiny,
+        &milestone(),
+        &[],
+        "start-sha",
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let specs = backend.started_specs();
+    assert_eq!(specs.len(), 1);
+    assert!(!specs[0].allowed_tools.contains(&"FakeBrowserTool".to_string()));
 }

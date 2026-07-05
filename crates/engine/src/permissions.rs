@@ -155,6 +155,19 @@ pub fn for_role(role: Role, cfg: &MissionConfig, validator_commands: &[String]) 
             {
                 allowed.extend(command_allow_patterns(command));
             }
+            if role == Role::ValidatorFunctional {
+                // Live-QA mode (functional only): a browser/computer-use tool
+                // configured in `--tools` still needs auto-approval in `-p`
+                // mode or every call fails (docs/design.md §4.7). The
+                // standard inspect tools are excluded because they are
+                // already governed by the precise patterns above — folding
+                // a bare `Bash` in here would broaden it to any command.
+                for tool in &cfg.validator_functional.tools {
+                    if !INSPECT_TOOLS.contains(&tool.as_str()) {
+                        allowed.push(tool.clone());
+                    }
+                }
+            }
             dedup_preserving_order(&mut allowed);
             PermissionProfile {
                 permission_mode: Some("default".to_string()),
