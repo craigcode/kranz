@@ -192,12 +192,23 @@ fn parses_missions() {
 #[test]
 fn parses_serve() {
     let cli = Cli::try_parse_from(["kranz", "serve"]).unwrap();
-    assert!(matches!(
-        cli.command,
-        Command::Serve { port: 4560, open: false, dashboard: None, token: None, slack: false }
-    ));
+    match cli.command {
+        Command::Serve { port, ref host, open, ref dashboard, ref token, slack } => {
+            assert_eq!(port, 4560);
+            assert_eq!(host, "127.0.0.1", "default bind stays loopback");
+            assert!(!open && !slack);
+            assert!(dashboard.is_none() && token.is_none());
+        }
+        other => panic!("expected Serve, got {other:?}"),
+    }
     let cli = Cli::try_parse_from(["kranz", "serve", "--port", "5001", "--open"]).unwrap();
     assert!(matches!(cli.command, Command::Serve { port: 5001, open: true, .. }));
+    // --host widens the bind (glasses/LAN clients).
+    let cli = Cli::try_parse_from(["kranz", "serve", "--host", "0.0.0.0"]).unwrap();
+    match cli.command {
+        Command::Serve { ref host, .. } => assert_eq!(host, "0.0.0.0"),
+        other => panic!("expected Serve, got {other:?}"),
+    }
     // --token pins the mutation token (scripting).
     let cli = Cli::try_parse_from(["kranz", "serve", "--token", "sesame"]).unwrap();
     match cli.command {

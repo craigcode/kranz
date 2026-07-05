@@ -209,9 +209,16 @@ pub enum Command {
 
     /// Serve the REST/WebSocket API (and the dashboard, if built)
     Serve {
-        /// TCP port to bind on 127.0.0.1
+        /// TCP port to bind
         #[arg(long, default_value_t = 4560)]
         port: u16,
+
+        /// Bind address. Default loopback; set e.g. 0.0.0.0 (LAN) or a
+        /// tailnet IP to reach the API from other devices (glasses app,
+        /// phones). POSTs stay token-gated; GETs (states, transcripts) are
+        /// tokenless — widen only on networks where that is acceptable.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
 
         /// Open the dashboard in the default browser
         #[arg(long)]

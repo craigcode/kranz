@@ -29,7 +29,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::json;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -319,19 +319,31 @@ pub async fn serve_with_static(
     static_assets: Option<DashboardStatic>,
     token: Option<String>,
 ) -> anyhow::Result<()> {
-    serve_with_shared_host(Arc::new(MissionHost::new(repo_root)), port, static_assets, token).await
+    serve_with_shared_host(
+        Arc::new(MissionHost::new(repo_root)),
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        port,
+        static_assets,
+        token,
+    )
+    .await
 }
 
 /// [`serve_with_static`] over an already-shared registry (see
 /// [`router_with_shared_host`]).
+/// `bind` widens reachability beyond loopback (e.g. for the glasses app on
+/// the same LAN / tailnet). Every POST stays mutation-token-gated, but GETs
+/// (states, transcripts) are tokenless by design — bind beyond loopback only
+/// on networks where that is acceptable. The CLI prints a loud warning.
 pub async fn serve_with_shared_host(
     host: Arc<MissionHost>,
+    bind: IpAddr,
     port: u16,
     static_assets: Option<DashboardStatic>,
     token: Option<String>,
 ) -> anyhow::Result<()> {
     let app = router_with_shared_host(host, static_assets, token);
-    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let addr = SocketAddr::from((bind, port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local_addr = listener.local_addr()?;
     tracing::info!("kranz server listening on http://{local_addr}");
