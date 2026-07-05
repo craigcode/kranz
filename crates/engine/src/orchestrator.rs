@@ -4036,7 +4036,8 @@ fn write_kranz_gitignore(paths: &MissionPaths) -> Result<()> {
              missions/*/runs/\n\
              slack-threads.json\n\
              queue/\n\
-             tickets/*.status\n",
+             tickets/*.status\n\
+             serve.token\n",
         )?;
     }
     Ok(())
