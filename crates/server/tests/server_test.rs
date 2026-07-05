@@ -112,6 +112,27 @@ fn seed_mission(repo_root: &Path) -> MissionPaths {
     paths
 }
 
+/// Seed a mission that has an approved plan but no run loop activity yet
+/// (mission.created + plan.approved, no milestone.started/worker.spawned).
+fn seed_approved_mission(repo_root: &Path, id: &str) -> MissionPaths {
+    let paths = MissionPaths::new(repo_root, id);
+    let mut log = EventLog::acquire(&paths, id, Duration::ZERO, LockForce::No).unwrap();
+    log.append(EventKind::MissionCreated {
+        goal: "Ship the demo".into(),
+        base_branch: "main".into(),
+        mission_branch: format!("kranz/mission-{id}"),
+        config: MissionConfig::default(),
+    })
+    .unwrap();
+    log.append(EventKind::PlanApproved {
+        plan: sample_plan(),
+        base_sha: None,
+    })
+    .unwrap();
+    drop(log); // flush + release events.jsonl.lock
+    paths
+}
+
 fn fixture() -> (tempfile::TempDir, PathBuf, MissionPaths, axum::Router) {
     let tmp = tempfile::tempdir().unwrap();
     let repo_root = tmp.path().to_path_buf();
@@ -183,6 +204,20 @@ async fn missions_list_folds_and_tolerates_corrupt_logs() {
     let bad = rows.iter().find(|r| r["id"] == "zz-bad").unwrap();
     assert_eq!(bad["status"], "failed");
     assert!(bad["error"].is_string());
+}
+
+#[tokio::test]
+async fn approved_status_shows_for_a_plan_approved_mission_with_no_run_loop() {
+    let (_tmp, repo_root, _paths, app) = fixture();
+    seed_approved_mission(&repo_root, "m-02");
+
+    let (status, body) = get_json(&app, "/api/missions").await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = body.as_array().unwrap();
+
+    let approved = rows.iter().find(|r| r["id"] == "m-02").unwrap();
+    assert_eq!(approved["status"], "approved");
+    assert_ne!(approved["status"], "running");
 }
 
 #[tokio::test]
