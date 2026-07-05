@@ -7,8 +7,9 @@
 //! validators. The profiles here express every restriction through
 //! `permission_mode` + `allowed_tools` + `disallowed_tools`: the CLI `--tools`
 //! built-in restriction is recorded on the profile for future wiring, but
-//! [`apply`] does not map it because [`SessionSpec`] (contract) has no field
-//! for it yet.
+//! [`apply`] does not map it — [`SessionSpec`] carries a separate `tools`
+//! field populated straight from per-role config (see [`MissionConfig`]),
+//! by design left disconnected from this read-only profile field.
 
 use crate::backend::SessionSpec;
 use crate::types::{MissionConfig, Role};
@@ -166,8 +167,9 @@ pub fn for_role(role: Role, cfg: &MissionConfig, validator_commands: &[String]) 
 }
 
 /// Copy a profile onto a [`SessionSpec`]. `profile.tools` is intentionally
-/// not mapped: the spec (contract) has no `--tools` field, and the profiles
-/// already express the restriction through allowed/disallowed patterns.
+/// not mapped here: `spec.tools` is populated separately from per-role
+/// config (opt-in `--tools` allow-list), while the profiles already express
+/// this read-only restriction through allowed/disallowed patterns.
 pub fn apply(profile: PermissionProfile, spec: &mut SessionSpec) {
     spec.permission_mode = profile.permission_mode;
     spec.allowed_tools = profile.allowed_tools;

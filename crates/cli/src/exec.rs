@@ -53,6 +53,28 @@ pub fn exit_code_for(status: MissionStatus) -> i32 {
     }
 }
 
+/// The unattended scrutiny floor: `exec` runs with no human present, so a
+/// mission whose config disables the scrutiny validator (`skipScrutiny`) has
+/// no adversarial reader at all and can satisfy its own acceptance
+/// tautologically (docs/gascity.md lesson 3 records exactly this incident).
+/// Interactive `run`/`plan` are not gated — a human is present there. Passing
+/// `--allow-unvalidated` (or setting `KRANZ_ALLOW_UNVALIDATED=1`) is an
+/// explicit, auditable acknowledgment that overrides the floor.
+pub fn scrutiny_gate(skip_scrutiny: bool, allow_unvalidated: bool) -> Result<(), String> {
+    if skip_scrutiny && !allow_unvalidated {
+        Err(
+            "kranz exec: refusing to run an unattended mission with skipScrutiny set. \
+             A headless run has no adversarial reader when the scrutiny validator is \
+             disabled, so the mission can pass its own tautological acceptance (see \
+             docs/gascity.md lesson 3). Pass --allow-unvalidated (or set \
+             KRANZ_ALLOW_UNVALIDATED=1) to explicitly override this floor."
+                .to_string(),
+        )
+    } else {
+        Ok(())
+    }
+}
+
 /// Parse a ticket-shaped plan file into a [`Ticket`]. The slug is derived from
 /// the file stem (like [`Ticket::load`]), so the folded [`Ticket::mission_goal`]
 /// carries the goal, scoping answers, acceptance hints, and context verbatim.
@@ -76,12 +98,16 @@ fn read_mission_file(path: &Path) -> Result<Ticket> {
     parse_mission_markdown(slug, &markdown)
 }
 
-/// `kranz exec -f <mission.md> [--repo <path>] [--yes] [--max-cycles N]`.
+/// `kranz exec -f <mission.md> [--repo <path>] [--yes] [--max-cycles N] [--allow-unvalidated]`.
 ///
 /// `--yes` is accepted for symmetry with the interactive commands but is a
 /// no-op: a headless run always auto-approves. `--max-cycles`, when given,
 /// overrides `maxFixCyclesPerMilestone` for the run (recorded as a
 /// config.changed event via the control inbox) so CI can bound spend.
+///
+/// Immediately after config loads and before any mission directory is
+/// created, [`scrutiny_gate`] enforces the unattended scrutiny floor: see its
+/// doc comment for the rationale.
 pub async fn cmd_exec(
     repo: PathBuf,
     file: PathBuf,
@@ -89,9 +115,18 @@ pub async fn cmd_exec(
     max_cycles: Option<u32>,
     push: Option<String>,
     dangerously_allow_all: bool,
+    allow_unvalidated: bool,
 ) -> Result<i32> {
     let ticket = read_mission_file(&file)?;
     let cfg = load_config(&repo, dangerously_allow_all)?;
+
+    let allow_unvalidated = allow_unvalidated
+        || std::env::var("KRANZ_ALLOW_UNVALIDATED").ok().as_deref() == Some("1");
+    if let Err(msg) = scrutiny_gate(cfg.skip_scrutiny, allow_unvalidated) {
+        eprintln!("{msg}");
+        return Ok(1);
+    }
+
     let backend = build_backend(&cfg)?;
 
     let goal = ticket.mission_goal();

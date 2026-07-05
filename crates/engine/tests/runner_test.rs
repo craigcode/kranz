@@ -115,6 +115,7 @@ fn session_spec(prompt: PromptMode) -> SessionSpec {
         permission_mode: Some("acceptEdits".to_string()),
         allowed_tools: vec!["Bash".to_string()],
         disallowed_tools: vec!["Bash(git push*)".to_string()],
+        tools: vec![],
         settings_json: None,
         json_schema: None,
         max_budget_usd: Some(1.0),

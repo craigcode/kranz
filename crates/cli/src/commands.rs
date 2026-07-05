@@ -116,10 +116,18 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
         Command::Draft { slug, yes } => backlog::cmd_draft(repo, &slug, yes, cli.dangerously_allow_all)
             .await
             .map_err(augment_limit_hint),
-        Command::Exec { file, yes, max_cycles, push } => {
-            crate::exec::cmd_exec(repo, file, yes, max_cycles, push, cli.dangerously_allow_all)
-                .await
-                .map_err(augment_limit_hint)
+        Command::Exec { file, yes, max_cycles, push, allow_unvalidated } => {
+            crate::exec::cmd_exec(
+                repo,
+                file,
+                yes,
+                max_cycles,
+                push,
+                cli.dangerously_allow_all,
+                allow_unvalidated,
+            )
+            .await
+            .map_err(augment_limit_hint)
         }
         Command::Queue => {
             print!("{}", backlog::cmd_queue(&repo));

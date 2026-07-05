@@ -319,6 +319,8 @@ pub struct RoleConfig {
     pub max_turns: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_budget_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -356,24 +358,28 @@ impl Default for MissionConfig {
                 reasoning_effort: "high".into(),
                 max_turns: None,
                 max_budget_usd: Some(20.0),
+                tools: vec![],
             },
             worker: RoleConfig {
                 model: "sonnet".into(),
                 reasoning_effort: "medium".into(),
                 max_turns: Some(50),
                 max_budget_usd: Some(10.0),
+                tools: vec![],
             },
             validator_scrutiny: RoleConfig {
                 model: "opus".into(),
                 reasoning_effort: "high".into(),
                 max_turns: Some(40),
                 max_budget_usd: Some(10.0),
+                tools: vec![],
             },
             validator_functional: RoleConfig {
                 model: "sonnet".into(),
                 reasoning_effort: "medium".into(),
                 max_turns: Some(40),
                 max_budget_usd: Some(5.0),
+                tools: vec![],
             },
             skip_scrutiny: false,
             skip_functional: false,

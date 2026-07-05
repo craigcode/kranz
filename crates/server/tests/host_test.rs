@@ -207,6 +207,83 @@ async fn wait_for_status(app: &axum::Router, id: &str, status: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// Pending plan: one parked cache for every approve surface
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_plan_parks_on_ready_and_approve_pending_commits() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let orch = MockScript::streaming(vec![mock_init("orch-pp"), mock_result_text("seed")])
+        .responding(vec![turn("scoping"), turn(&plan_json().to_string())]);
+    let backend = Arc::new(MockBackend::with_scripts(vec![orch]));
+    let app = hosted_app(&root, backend);
+
+    let (status, body) =
+        post_json(&app, "/api/missions", Some(TOKEN), json!({ "goal": "park a plan" })).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id = body["id"].as_str().unwrap().to_string();
+
+    // Nothing pending before a Ready request-plan.
+    let (status, body) = get_json(&app, &format!("/api/missions/{id}/pending-plan")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["pending"], false);
+    // Approving with nothing parked is an honest 409.
+    let (status, _) =
+        post_json(&app, &format!("/api/missions/{id}/approve-pending"), Some(TOKEN), json!({}))
+            .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // One conversational turn, then a Ready request-plan parks the plan.
+    let (status, _) = post_json(
+        &app,
+        &format!("/api/missions/{id}/planning/turn"),
+        Some(TOKEN),
+        json!({ "text": "go" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/missions/{id}/planning/request-plan"),
+        Some(TOKEN),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ready"], true);
+
+    let (status, body) = get_json(&app, &format!("/api/missions/{id}/pending-plan")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["pending"], true);
+    assert_eq!(body["plan"]["milestones"][0]["features"][0]["title"], "F1");
+
+    // approve-pending commits the SAME files the body-approve path does…
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/missions/{id}/approve-pending"),
+        Some(TOKEN),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["branch"], format!("kranz/mission-{id}"));
+    assert_eq!(body["started"], false);
+    assert!(MissionPaths::new(&root, &id).plan_file().is_file(), "plan.json committed");
+
+    // …consumes the parked plan, and a second approve is a clean 409.
+    let (status, body) = get_json(&app, &format!("/api/missions/{id}/pending-plan")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["pending"], false, "{body}");
+    let (status, _) =
+        post_json(&app, &format!("/api/missions/{id}/approve-pending"), Some(TOKEN), json!({}))
+            .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+// ---------------------------------------------------------------------------
 // Abandon / delete (web twins of `kranz abandon` / `kranz clean`)
 // ---------------------------------------------------------------------------
 

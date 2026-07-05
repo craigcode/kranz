@@ -194,6 +194,14 @@ pub enum Command {
         /// and opens the PR). Refuses to push anything but a kranz/* ref.
         #[arg(long, value_name = "REMOTE")]
         push: Option<String>,
+
+        /// Override the unattended scrutiny floor: without this, exec refuses
+        /// to run a mission whose config has skipScrutiny set, since a headless
+        /// run with the scrutiny validator disabled has no adversarial reader
+        /// and can pass its own tautological acceptance (see docs/gascity.md
+        /// lesson 3). The `KRANZ_ALLOW_UNVALIDATED=1` env var is equivalent.
+        #[arg(long)]
+        allow_unvalidated: bool,
     },
 
     /// Show the per-repo execution queue

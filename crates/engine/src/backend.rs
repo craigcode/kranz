@@ -50,6 +50,9 @@ pub struct SessionSpec {
     pub allowed_tools: Vec<String>,
     /// Passed to --disallowedTools (patterns like "Bash(git push*)").
     pub disallowed_tools: Vec<String>,
+    /// Passed to `--tools` (the built-in exclusive tool allow-list): empty = CLI default set, no flag emitted.
+    /// Distinct from `allowed_tools`/`disallowed_tools`, which are permission patterns.
+    pub tools: Vec<String>,
     /// Extra settings JSON (hooks etc.) passed via --settings.
     pub settings_json: Option<serde_json::Value>,
     /// JSON Schema enforced on the session's structured output (--json-schema).

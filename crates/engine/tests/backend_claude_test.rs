@@ -47,6 +47,7 @@ fn base_spec(prompt: PromptMode) -> SessionSpec {
         permission_mode: None,
         allowed_tools: vec![],
         disallowed_tools: vec![],
+        tools: vec![],
         settings_json: None,
         json_schema: None,
         max_budget_usd: None,
@@ -398,6 +399,21 @@ fn build_args_each_tool_pattern_is_its_own_arg() {
     let d = index_of(&args, "--disallowedTools");
     assert_eq!(args[d + 1], "Bash(git push*)");
     assert_eq!(args[d + 2], "WebFetch");
+}
+
+#[test]
+fn build_args_emits_tools_flag_only_when_configured() {
+    let mut spec = base_spec(PromptMode::SingleShot("go".to_string()));
+    spec.tools = vec!["Bash".to_string(), "Read".to_string()];
+    let args = build_args(&spec);
+
+    let t = index_of(&args, "--tools");
+    assert_eq!(args[t + 1], "Bash");
+    assert_eq!(args[t + 2], "Read");
+
+    let empty_spec = base_spec(PromptMode::SingleShot("go".to_string()));
+    let empty_args = build_args(&empty_spec);
+    assert!(!empty_args.iter().any(|a| a == "--tools"), "no --tools token when spec.tools is empty");
 }
 
 #[test]
@@ -888,6 +904,7 @@ async fn real_single_shot() {
         permission_mode: None,
         allowed_tools: vec![],
         disallowed_tools: vec![],
+        tools: vec![],
         settings_json: None,
         json_schema: None,
         max_budget_usd: None,

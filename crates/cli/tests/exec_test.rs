@@ -9,7 +9,7 @@
 
 use clap::Parser;
 use kranz_cli::cli::{Cli, Command};
-use kranz_cli::exec::{exit_code_for, parse_mission_markdown, EXIT_UNDERSPECIFIED};
+use kranz_cli::exec::{exit_code_for, parse_mission_markdown, scrutiny_gate, EXIT_UNDERSPECIFIED};
 use kranz_engine::types::MissionStatus;
 
 // ---------------------------------------------------------------------------
@@ -79,6 +79,45 @@ fn exec_rejects_non_numeric_max_cycles() {
     assert!(
         Cli::try_parse_from(["kranz", "exec", "-f", "mission.md", "--max-cycles", "lots"]).is_err()
     );
+}
+
+#[test]
+fn allow_unvalidated_defaults_to_false() {
+    let cli = Cli::try_parse_from(["kranz", "exec", "-f", "mission.md"]).unwrap();
+    match cli.command {
+        Command::Exec { allow_unvalidated, .. } => assert!(!allow_unvalidated),
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn parses_exec_with_allow_unvalidated_flag() {
+    let cli =
+        Cli::try_parse_from(["kranz", "exec", "-f", "mission.md", "--allow-unvalidated"]).unwrap();
+    match cli.command {
+        Command::Exec { allow_unvalidated, .. } => assert!(allow_unvalidated),
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// scrutiny_gate — the unattended scrutiny floor (pure fn)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn scrutiny_gate_refuses_skip_scrutiny_without_override() {
+    let err = scrutiny_gate(true, false).unwrap_err();
+    assert!(err.contains("--allow-unvalidated"), "message: {err}");
+}
+
+#[test]
+fn scrutiny_gate_allows_skip_scrutiny_with_override() {
+    assert!(scrutiny_gate(true, true).is_ok());
+}
+
+#[test]
+fn scrutiny_gate_allows_normal_config() {
+    assert!(scrutiny_gate(false, false).is_ok());
 }
 
 // ---------------------------------------------------------------------------

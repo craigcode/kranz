@@ -6,3 +6,4 @@ Approved plans, newest last.
 - 2026-07-05 · [m-b9ce7a](m-b9ce7a/plan.md) — Pin the validation-contract diff base at plan approval by recording the mission's base-branch commit SHA, exposing it to… [truncated] · [report](m-b9ce7a/report.md)
 - 2026-07-05 · [m-a78225](m-a78225/plan.md) — Free the single-writer lock held by serve's adopted in-planning engines when they go idle (time-based auto-release plus … [truncated] · [report](m-a78225/report.md)
 - 2026-07-05 · [m-9f926f](m-9f926f/plan.md) — Close review findings F3, F4, and F5 in crates/engine/src/event_log.rs — validate mission identity across every parsed l… [truncated] · [report](m-9f926f/report.md)
+- 2026-07-05 · [m-2bc647](m-2bc647/plan.md) — Enforce a scrutiny floor in `kranz exec` and close two long-parked gaps (SessionSpec `tools` plumbing; a documented find… [truncated] · [report](m-2bc647/report.md)
