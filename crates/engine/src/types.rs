@@ -18,6 +18,10 @@ use std::collections::BTreeMap;
 #[serde(rename_all = "lowercase")]
 pub enum MissionStatus {
     Planning,
+    /// Plan approved; run loop has not yet started (folded on `plan.approved`,
+    /// transitions to `Running` on the first `milestone.started` or
+    /// `worker.spawned`).
+    Approved,
     Running,
     Paused,
     Blocked,

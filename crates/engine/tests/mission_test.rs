@@ -1730,9 +1730,9 @@ async fn plan_approval_writes_plan_branch_and_commit() {
     assert_eq!(main_subject.trim(), "seed");
 
     // Reducer state: plan.approved materialized milestones/features with the
-    // documented ids, and the mission is Running.
+    // documented ids, and the mission is Approved (run loop hasn't started).
     let state = engine.state();
-    assert_eq!(state.mission.status, MissionStatus::Running);
+    assert_eq!(state.mission.status, MissionStatus::Approved);
     assert_eq!(state.mission.milestones.len(), 1);
     assert_eq!(state.mission.milestones[0].id, "ms-1");
     assert_eq!(state.mission.milestones[0].features[0].id, "f-1-1");
@@ -2247,10 +2247,10 @@ async fn request_and_approve_revised_plan_drops_and_adds_features() {
     ])]));
 
     let mut engine = make_engine(&backend, &root, test_cfg());
-    // Approve a 3-feature plan: mission goes Running, milestone ms-1 Pending
+    // Approve a 3-feature plan: mission goes Approved, milestone ms-1 Pending
     // with features f-1-1, f-1-2, f-1-3 (all pending, none started).
     engine.approve_plan(simple_plan(3, vec![])).unwrap();
-    assert_eq!(engine.state().mission.status, MissionStatus::Running);
+    assert_eq!(engine.state().mission.status, MissionStatus::Approved);
 
     // Propose the revision.
     let request = timeout(TEST_TIMEOUT, engine.request_revised_plan())

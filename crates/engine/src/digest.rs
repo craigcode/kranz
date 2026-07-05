@@ -115,6 +115,7 @@ pub fn render_reseed(state: &MissionState, plan_json: &str) -> String {
 fn mission_status(status: MissionStatus) -> &'static str {
     match status {
         MissionStatus::Planning => "planning",
+        MissionStatus::Approved => "approved",
         MissionStatus::Running => "running",
         MissionStatus::Paused => "paused",
         MissionStatus::Blocked => "blocked",

@@ -24,6 +24,7 @@ pub mod ansi {
 pub fn mission_status_label(status: MissionStatus) -> &'static str {
     match status {
         MissionStatus::Planning => "PLANNING",
+        MissionStatus::Approved => "APPROVED",
         MissionStatus::Running => "RUNNING",
         MissionStatus::Paused => "PAUSED",
         MissionStatus::Blocked => "BLOCKED",
@@ -211,4 +212,66 @@ pub fn one_line(text: &str, max: usize) -> String {
     let mut truncated: String = collapsed.chars().take(max.saturating_sub(1)).collect();
     truncated.push('…');
     truncated
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+    use kranz_engine::events::{Event, EventKind};
+    use kranz_engine::reducer::fold;
+    use kranz_engine::types::{Assertion, AssertionCheck, MissionConfig, Plan, PlanFeature, PlanMilestone};
+
+    #[test]
+    fn approved_status_label_is_uppercase() {
+        assert_eq!(mission_status_label(MissionStatus::Approved), "APPROVED");
+    }
+
+    #[test]
+    fn approved_status_folded_from_events_labels_as_approved_not_running() {
+        let ts = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
+        let plan = Plan {
+            goal: "build the thing".to_string(),
+            validation_contract: vec![Assertion {
+                id: "a-1".to_string(),
+                statement: "cargo test passes".to_string(),
+                check: AssertionCheck::Command,
+                command: Some("cargo test".to_string()),
+            }],
+            milestones: vec![PlanMilestone {
+                title: "milestone one".to_string(),
+                features: vec![PlanFeature {
+                    title: "alpha".to_string(),
+                    spec: "spec for alpha".to_string(),
+                    validation_criteria: vec!["alpha works".to_string()],
+                }],
+            }],
+        };
+        let events = vec![
+            Event {
+                seq: 1,
+                ts,
+                mission_id: "m-1".to_string(),
+                kind: EventKind::MissionCreated {
+                    goal: "build the thing".to_string(),
+                    base_branch: "main".to_string(),
+                    mission_branch: "kranz/mission-m-1".to_string(),
+                    config: MissionConfig::default(),
+                },
+            },
+            Event {
+                seq: 2,
+                ts,
+                mission_id: "m-1".to_string(),
+                kind: EventKind::PlanApproved {
+                    plan,
+                    base_sha: None,
+                },
+            },
+        ];
+        let state = fold(&events).unwrap();
+        let label = mission_status_label(state.mission.status);
+        assert_eq!(label, "APPROVED");
+        assert_ne!(label, "RUNNING");
+    }
 }

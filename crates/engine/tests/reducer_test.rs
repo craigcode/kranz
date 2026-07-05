@@ -160,7 +160,7 @@ fn golden_happy_path() {
     assert_eq!(state.last_seq, 1);
     assert_eq!(state.config, MissionConfig::default());
 
-    // Stage 2: plan approved -> deterministic ids, all pending, Running.
+    // Stage 2: plan approved -> deterministic ids, all pending, Approved.
     apply(
         &mut state,
         &ev(
@@ -172,7 +172,7 @@ fn golden_happy_path() {
         ),
     )
     .unwrap();
-    assert_eq!(state.mission.status, MissionStatus::Running);
+    assert_eq!(state.mission.status, MissionStatus::Approved);
     assert_eq!(state.mission.goal, "build the thing, planned");
     assert_eq!(state.mission.validation_contract.len(), 1);
     let ms_ids: Vec<&str> = state
@@ -217,6 +217,7 @@ fn golden_happy_path() {
         milestone(&state, "ms-1").start_sha.as_deref(),
         Some("sha-1")
     );
+    assert_eq!(state.mission.status, MissionStatus::Running);
 
     // Stage 4: feature + worker run.
     apply(
@@ -691,11 +692,11 @@ fn every_status_value_is_reachable() {
         EventKind::PlanApproved {
             plan: plan(),
             base_sha: None,
-        }, // Running; ms/f Pending
+        }, // Approved; ms/f Pending
         EventKind::MilestoneStarted {
             milestone_id: "ms-1".into(),
             start_sha: "s".into(),
-        }, // ms Active
+        }, // Approved -> Running; ms Active
         EventKind::FeatureStarted {
             feature_id: "f-1-1".into(),
         }, // f Active
@@ -772,6 +773,7 @@ fn every_status_value_is_reachable() {
 
     for status in [
         MissionStatus::Planning,
+        MissionStatus::Approved,
         MissionStatus::Running,
         MissionStatus::Paused,
         MissionStatus::Blocked,
@@ -808,6 +810,134 @@ fn every_status_value_is_reachable() {
             "dead FeatureStatus: {status:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Approved status
+// ---------------------------------------------------------------------------
+
+#[test]
+fn approved_status_folds_on_plan_approved() {
+    let state = fold_kinds(vec![
+        created(),
+        EventKind::PlanApproved {
+            plan: plan(),
+            base_sha: None,
+        },
+    ]);
+    assert_eq!(state.mission.status, MissionStatus::Approved);
+}
+
+#[test]
+fn approved_status_transitions_to_running_on_milestone_started() {
+    let state = fold_kinds(vec![
+        created(),
+        EventKind::PlanApproved {
+            plan: plan(),
+            base_sha: None,
+        },
+        EventKind::MilestoneStarted {
+            milestone_id: "ms-1".into(),
+            start_sha: "s".into(),
+        },
+    ]);
+    assert_eq!(state.mission.status, MissionStatus::Running);
+}
+
+#[test]
+fn approved_status_transitions_to_running_on_worker_spawned() {
+    let state = fold_kinds(vec![
+        created(),
+        EventKind::PlanApproved {
+            plan: plan(),
+            base_sha: None,
+        },
+        spawn("r-1", None, None),
+    ]);
+    assert_eq!(state.mission.status, MissionStatus::Running);
+}
+
+#[test]
+fn approved_status_full_lifecycle_still_folds_to_complete() {
+    let state = fold_kinds(vec![
+        created(),
+        EventKind::PlanApproved {
+            plan: plan(),
+            base_sha: None,
+        },
+        EventKind::MilestoneStarted {
+            milestone_id: "ms-1".into(),
+            start_sha: "s".into(),
+        },
+        EventKind::FeatureStarted {
+            feature_id: "f-1-1".into(),
+        },
+        EventKind::FeatureCompleted {
+            feature_id: "f-1-1".into(),
+            commits: vec![],
+        },
+        EventKind::FeatureStarted {
+            feature_id: "f-1-2".into(),
+        },
+        EventKind::FeatureCompleted {
+            feature_id: "f-1-2".into(),
+            commits: vec![],
+        },
+        EventKind::MilestoneCompleted {
+            milestone_id: "ms-1".into(),
+            tag: None,
+        },
+        EventKind::MilestoneStarted {
+            milestone_id: "ms-2".into(),
+            start_sha: "s2".into(),
+        },
+        EventKind::FeatureStarted {
+            feature_id: "f-2-1".into(),
+        },
+        EventKind::FeatureCompleted {
+            feature_id: "f-2-1".into(),
+            commits: vec![],
+        },
+        EventKind::MilestoneCompleted {
+            milestone_id: "ms-2".into(),
+            tag: None,
+        },
+        EventKind::MissionCompleted {},
+    ]);
+    assert_eq!(state.mission.status, MissionStatus::Complete);
+}
+
+#[test]
+fn approved_status_guard_never_overwrites_terminal_status() {
+    let mut state = fold_kinds(vec![
+        created(),
+        EventKind::MissionFailed {
+            reason: "budget exhausted".into(),
+        },
+    ]);
+    assert_eq!(state.mission.status, MissionStatus::Failed);
+
+    // The guard on MilestoneStarted/WorkerSpawned only fires when the
+    // mission is Approved; a terminal status must survive it untouched.
+    let next_seq = state.last_seq + 1;
+    apply(
+        &mut state,
+        &ev(
+            next_seq,
+            EventKind::WorkerSpawned {
+                run_id: "r-after-failure".to_string(),
+                role: Role::ValidatorScrutiny,
+                feature_id: None,
+                milestone_id: None,
+                sdk_session_id: "sess-r-after-failure".to_string(),
+                model: "sonnet".to_string(),
+                prompt_hash: "deadbeef".to_string(),
+                transcript_path: "runs/r-after-failure.jsonl".to_string(),
+            },
+        ),
+    )
+    .unwrap();
+    assert_eq!(state.mission.status, MissionStatus::Failed);
 }
 
 // ---------------------------------------------------------------------------

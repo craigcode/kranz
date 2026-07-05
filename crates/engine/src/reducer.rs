@@ -79,7 +79,7 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
                     start_sha: None,
                 })
                 .collect();
-            state.mission.status = MissionStatus::Running;
+            state.mission.status = MissionStatus::Approved;
         }
 
         EventKind::MilestoneStarted {
@@ -89,6 +89,9 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             let ms = milestone_mut(state, milestone_id)?;
             ms.status = MilestoneStatus::Active;
             ms.start_sha = Some(start_sha.clone());
+            if state.mission.status == MissionStatus::Approved {
+                state.mission.status = MissionStatus::Running;
+            }
         }
 
         EventKind::FeatureStarted { feature_id } => {
@@ -140,6 +143,9 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
                     prompt_hash: prompt_hash.clone(),
                 },
             );
+            if state.mission.status == MissionStatus::Approved {
+                state.mission.status = MissionStatus::Running;
+            }
         }
 
         EventKind::WorkerMessage { run_id, .. } => {
