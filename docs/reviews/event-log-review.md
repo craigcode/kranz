@@ -516,3 +516,27 @@ unrelated concurrent development (e.g. Slack approve-button and Web UI
 mission-management work), so an unqualified `git diff --name-only main` on
 this branch also lists those sibling commits' files — those files are not
 part of, and were not touched by, this review.
+
+## Remediated (F5)
+
+Fixed in commit f2c6340 (`[f-3-1] cache the macOS ps identity-token probe
+behind a spawn seam`). `process_identity_token` on macOS (event_log.rs) is
+now a thin cache layer in front of a new `ps_identity_token` function, which
+is the actual `ps` spawn seam. The cache is a per-pid `HashMap<i32, (Option
+<String>, Instant)>` behind a `Mutex` in a `OnceLock` (std-only, no new
+dependencies), so concurrent liveness checks are safe. It is keyed by pid —
+a lookup for one pid can never return another pid's token — with a 50ms
+TTL: long enough to collapse the handful of `alive_or_reused` calls a single
+steal decision or hygiene sweep makes against the same pid, but far shorter
+than any realistic pid-reuse turnaround (tearing down and reallocating a
+pid takes at least tens of milliseconds), so a cached token can never span
+an actual reuse. Critically, only the raw token *lookup* is cached — the
+Alive/Dead verdict itself is never cached or short-circuited;
+`alive_or_reused` still performs `current == recorded` on every call,
+using whatever token the cache (or a fresh `ps`) returns. Tests
+`macos_identity_token_caches_one_ps_per_pid` and
+`macos_cache_never_masks_pid_reuse` (both `cfg(target_os = "macos")`) pin,
+respectively, that two calls for the same pid spawn `ps` only once, and
+that a differing recorded token still yields `Dead` even when the current
+token was served from cache. linux and the other-platforms stub are
+unchanged.
