@@ -337,7 +337,8 @@ pub struct RoleConfig {
     pub tools: Vec<String>,
     /// Backend override: only meaningful (and only accepted by
     /// `config::validate`) on `validatorScrutiny`; `None` or `"claude"` keeps
-    /// the default Claude Code backend, `"codex"` selects [`crate::backend_codex::CodexBackend`].
+    /// the default Claude Code backend, `"codex"` selects [`crate::backend_codex::CodexBackend`],
+    /// `"droid"` selects [`crate::backend_droid::DroidBackend`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
 }
@@ -347,6 +348,7 @@ pub struct RoleConfig {
 pub enum BackendKind {
     Claude,
     Codex,
+    Droid,
 }
 
 /// How worker/validator sessions are isolated from the primary checkout.
@@ -461,6 +463,7 @@ impl MissionConfig {
     pub fn scrutiny_backend_kind(&self) -> BackendKind {
         match self.validator_scrutiny.backend.as_deref() {
             Some("codex") => BackendKind::Codex,
+            Some("droid") => BackendKind::Droid,
             _ => BackendKind::Claude,
         }
     }
