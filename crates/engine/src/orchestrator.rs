@@ -673,6 +673,7 @@ impl MissionEngine {
         // without recomputing it — `calibrate` never fails.
         let calibration = cost::calibrate(&self.paths.repo_root);
         let estimate = cost::estimate(&plan, &self.state.config, &calibration.params);
+        let estimate = cost::apply_shape(estimate, &plan, &calibration);
         let plan_md = plan_file.with_file_name("plan.md");
         std::fs::write(
             &plan_md,

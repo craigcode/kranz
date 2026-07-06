@@ -1199,6 +1199,7 @@ impl TuiRun {
                 // missions (built-in defaults when there are none yet).
                 let calibration = cost::calibrate(&engine.paths().repo_root);
                 let estimate = cost::estimate(&plan, &engine.state().config, &calibration.params);
+                let estimate = cost::apply_shape(estimate, &plan, &calibration);
                 self.app
                     .push(TranscriptEntry::Block(output::render_cost_estimate(
                         &estimate,

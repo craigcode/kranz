@@ -466,6 +466,8 @@ fn cost_estimate_renders_range_and_calibration_provenance() {
         low_usd: 9.175,
         expected_usd: 18.35,
         high_usd: 45.875,
+        shape: kranz_engine::cost::MissionShape::Unknown,
+        confidence: kranz_engine::cost::Confidence::High,
     };
 
     // Calibrated from completed missions: says how many.
