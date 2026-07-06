@@ -186,6 +186,10 @@ mod tests {
         }
     }
 
+    fn no_repo() -> &'static Path {
+        Path::new("/nonexistent/kranz-test-repo-root")
+    }
+
     #[test]
     fn plan_approved_classifies_plan_ready() {
         let plan = Plan {
@@ -239,7 +243,12 @@ mod tests {
 
     #[test]
     fn mission_completed_classifies_complete_with_cost() {
-        let out = classify(&ev(EventKind::MissionCompleted {}), &base_state()).unwrap();
+        let out = classify(
+            &ev(EventKind::MissionCompleted {}),
+            &base_state(),
+            no_repo(),
+        )
+        .unwrap();
         let Outbound::Complete(c) = out else { panic!() };
         assert_eq!(c.outcome, Outcome::Completed);
         assert_eq!(c.branch, "kranz/mission-m-1");
@@ -257,6 +266,7 @@ mod tests {
                 reason: "worker exhausted respawns".into(),
             }),
             &state,
+            no_repo(),
         )
         .unwrap();
         let Outbound::Complete(c) = out else { panic!() };
@@ -267,12 +277,13 @@ mod tests {
 
     #[test]
     fn unremarkable_events_classify_none() {
-        assert!(classify(&ev(EventKind::MissionPaused {}), &base_state()).is_none());
+        assert!(classify(&ev(EventKind::MissionPaused {}), &base_state(), no_repo()).is_none());
         assert!(classify(
             &ev(EventKind::FeatureStarted {
                 feature_id: "f-1-1".into()
             }),
-            &base_state()
+            &base_state(),
+            no_repo()
         )
         .is_none());
     }

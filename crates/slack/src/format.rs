@@ -381,7 +381,12 @@ pub fn build_complete(c: &Complete, dashboard_url: Option<&str>) -> Vec<Value> {
         header(&format!("{emoji} Mission {verb} — {}", c.mission_id)),
         section(&clip(c.summary.trim())),
     ];
-    if let Some(diff_stat) = c.diff_stat.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+    if let Some(diff_stat) = c
+        .diff_stat
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+    {
         blocks.push(section(&format!("*Diff stat*\n```{}```", clip(diff_stat))));
     }
     blocks.push(context(&meta));

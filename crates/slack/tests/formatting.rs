@@ -118,6 +118,7 @@ fn complete_block_kit() {
             summary: "Added rate limiting; all tests pass.".into(),
             branch: "kranz/mission-m-9".into(),
             cost_usd: Some(4.2),
+            diff_stat: None,
         },
         None,
     );
@@ -139,6 +140,7 @@ fn failed_block_kit_reads_failed() {
             summary: "worker exhausted respawns".into(),
             branch: "kranz/mission-m-9".into(),
             cost_usd: None,
+            diff_stat: None,
         },
         None,
     );
