@@ -34,6 +34,7 @@ pub mod work;
 
 pub mod backend_claude;
 pub mod backend_codex;
+pub mod backend_droid;
 pub mod backend_mock;
 pub mod control;
 pub mod digest;
