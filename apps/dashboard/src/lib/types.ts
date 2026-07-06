@@ -348,3 +348,30 @@ export interface TranscriptEntry {
 }
 
 export type ConnectionStatus = 'connecting' | 'live' | 'lost';
+
+// ---------------------------------------------------------------------------
+// Queue (crates/engine/src/queue.rs, crates/server/src/host.rs — GET /api/queue,
+// POST /api/queue/drain)
+// ---------------------------------------------------------------------------
+
+/** One queued mission (`kranz_engine::queue::QueueEntry`). */
+export interface QueueEntry {
+  missionId: string;
+  ticketSlug?: string;
+  priority: number;
+  seq: number;
+}
+
+/** This host's queue-drain tracker (`MissionHost::drain` / `drain_state_json`). */
+export interface DrainState {
+  live: boolean;
+  currentMissionId: string | null;
+  ran: string[];
+}
+
+/** `GET /api/queue` response shape. */
+export interface QueueState {
+  entries: QueueEntry[];
+  busyWith: string | null;
+  drain: DrainState;
+}

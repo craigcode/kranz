@@ -4,6 +4,7 @@
 
 import { useEffect } from 'react';
 import { useKranzStore } from '../lib/store';
+import { RunQueueButton } from './RunQueueButton';
 import type { TicketSummary } from '../lib/types';
 
 export function BacklogPanel() {
@@ -74,6 +75,7 @@ export function BacklogPanel() {
             </button>
           </div>
         )}
+        <RunQueueButton />
         {ticketsError === null && tickets.length === 0 && (
           <div className="dim picker-empty" role="status">
             No tickets found. Create one with <code>kranz ticket new</code>.

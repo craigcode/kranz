@@ -181,4 +181,35 @@ mod tests {
         let cfg = load_layers(&[layer_path]).unwrap();
         assert_eq!(cfg.planning_idle_release_minutes, 30);
     }
+
+    #[test]
+    fn default_auto_work_is_false() {
+        assert!(!MissionConfig::default().auto_work);
+    }
+
+    #[test]
+    fn default_serializes_camel_case_auto_work() {
+        let value = serde_json::to_value(MissionConfig::default()).unwrap();
+        assert_eq!(value["autoWork"], false);
+    }
+
+    #[test]
+    fn layer_overrides_auto_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let layer_path = dir.path().join("config.json");
+        std::fs::write(&layer_path, r#"{"autoWork": true}"#).unwrap();
+
+        let cfg = load_layers(&[layer_path]).unwrap();
+        assert!(cfg.auto_work);
+    }
+
+    #[test]
+    fn absent_auto_work_key_keeps_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let layer_path = dir.path().join("config.json");
+        std::fs::write(&layer_path, r#"{"maxRespawns": 3}"#).unwrap();
+
+        let cfg = load_layers(&[layer_path]).unwrap();
+        assert!(!cfg.auto_work);
+    }
 }

@@ -343,6 +343,9 @@ pub struct MissionConfig {
     /// An in-planning mission whose hosted engine sits idle this many minutes
     /// is released (its events.jsonl lock freed); 0 disables auto-release.
     pub planning_idle_release_minutes: u64,
+    /// When true, the serve process drains the queue automatically whenever
+    /// entries are waiting. Default off.
+    pub auto_work: bool,
     /// Extra Bash deny patterns beyond the built-in list (§4.7).
     pub deny_patterns: Vec<String>,
     /// Commands validators may run, in addition to contract `command`s.
@@ -392,6 +395,7 @@ impl Default for MissionConfig {
             max_parallel_workers: 1,
             event_stream_throttle_ms: 250,
             planning_idle_release_minutes: 30,
+            auto_work: false,
             deny_patterns: vec![],
             allow_validator_commands: vec![],
             dangerously_allow_all: false,

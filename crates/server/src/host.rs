@@ -84,6 +84,59 @@ pub struct MissionHost {
     /// The lazily-spawned idle-release background task, started at most once
     /// (see [`MissionHost::ensure_sweeper_started`]).
     sweeper: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The single tracked background queue drain slot (see
+    /// [`MissionHost::drain`]).
+    drain: Mutex<DrainSlot>,
+    /// The lazily-spawned autoWork background task, started at most once
+    /// (see [`MissionHost::ensure_auto_work_started`]).
+    auto_work: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+/// One background drain task's observable progress — shared between the task
+/// (which updates it as it goes) and [`MissionHost::drain`] /
+/// [`MissionHost::queue_state`] (which read it back as JSON).
+#[derive(Debug, Clone, Default)]
+struct DrainState {
+    live: bool,
+    current_mission_id: Option<String>,
+    ran: Vec<String>,
+}
+
+/// The autoWork watcher's decision function, factored out so it's testable
+/// without standing up a full mission: drain only when autoWork is enabled,
+/// the queue has something waiting, and no drain is already live.
+fn should_auto_drain(auto_work: bool, queue_non_empty: bool, drain_live: bool) -> bool {
+    auto_work && queue_non_empty && !drain_live
+}
+
+fn drain_state_json(state: &DrainState) -> Value {
+    json!({
+        "live": state.live,
+        "currentMissionId": state.current_mission_id,
+        "ran": state.ran,
+    })
+}
+
+/// A tracked background drain: the task handle plus the state it shares with
+/// this host. `join.is_finished()` is how [`MissionHost::drain`] decides
+/// whether a tracked drain is still live.
+struct DrainHandle {
+    join: tokio::task::JoinHandle<()>,
+    state: Arc<Mutex<DrainState>>,
+}
+
+/// The drain tracker's state machine. `Starting` is a reservation held while
+/// `config::load` + `self.backend(...)` run with NO lock held (both can
+/// `.await`); it closes the race where two concurrent [`MissionHost::drain`]
+/// calls both observe "nothing tracked yet" and both spawn a task. A racing
+/// caller that sees `Starting` returns its shared [`DrainState`] instead of
+/// starting a second drain; the caller that installed the reservation later
+/// upgrades it to `Running` (same `Arc<Mutex<DrainState>>`), or clears it back
+/// to `Idle` on failure so a later call can retry.
+enum DrainSlot {
+    Idle,
+    Starting(Arc<Mutex<DrainState>>),
+    Running(DrainHandle),
 }
 
 impl MissionHost {
@@ -94,6 +147,8 @@ impl MissionHost {
             backend: tokio::sync::OnceCell::new(),
             missions: Arc::new(Mutex::new(HashMap::new())),
             sweeper: Mutex::new(None),
+            drain: Mutex::new(DrainSlot::Idle),
+            auto_work: Mutex::new(None),
         }
     }
 
@@ -105,6 +160,8 @@ impl MissionHost {
             backend: tokio::sync::OnceCell::new_with(Some(backend)),
             missions: Arc::new(Mutex::new(HashMap::new())),
             sweeper: Mutex::new(None),
+            drain: Mutex::new(DrainSlot::Idle),
+            auto_work: Mutex::new(None),
         }
     }
 
@@ -499,6 +556,55 @@ impl MissionHost {
         }));
     }
 
+    /// Whether a tracked drain is currently live (a `Starting` reservation or
+    /// a `Running` handle that hasn't finished). Read-only: never installs a
+    /// reservation, so it never races [`Self::drain`]'s own check.
+    fn drain_is_live(&self) -> bool {
+        match &*self.drain.lock().expect("drain tracker lock") {
+            DrainSlot::Idle => false,
+            DrainSlot::Starting(_) => true,
+            DrainSlot::Running(handle) => !handle.join.is_finished(),
+        }
+    }
+
+    /// One autoWork check: re-read config fresh (so a live `autoWork` toggle
+    /// takes effect without a restart, exactly like the idle sweeper reads
+    /// `planningIdleReleaseMinutes`), and kick off a drain when
+    /// [`should_auto_drain`] says to. Split out from
+    /// [`Self::ensure_auto_work_started`] so tests can invoke a single tick
+    /// directly instead of waiting on the real interval.
+    async fn auto_work_tick(&self) {
+        let cfg = match config::load(&self.repo_root) {
+            Ok(cfg) => cfg,
+            Err(_) => return,
+        };
+        let queue_non_empty = kranz_engine::queue::peek(&self.repo_root).is_some();
+        if should_auto_drain(cfg.auto_work, queue_non_empty, self.drain_is_live()) {
+            if let Err(e) = self.drain().await {
+                tracing::error!(error = %e.message, "autoWork drain failed");
+            }
+        }
+    }
+
+    /// Spawn the autoWork watcher at most once. It loops for the lifetime of
+    /// the host, sleeping between [`Self::auto_work_tick`] calls. Started
+    /// explicitly from `kranz serve` (not from [`Self::new`]) so test hosts
+    /// stay inert unless they opt in.
+    pub fn ensure_auto_work_started(self: &Arc<Self>) {
+        let mut guard = self.auto_work.lock().expect("auto_work lock");
+        if guard.is_some() {
+            return;
+        }
+        let host = Arc::clone(self);
+        *guard = Some(tokio::spawn(async move {
+            const AUTO_WORK_INTERVAL: Duration = Duration::from_secs(10);
+            loop {
+                tokio::time::sleep(AUTO_WORK_INTERVAL).await;
+                host.auto_work_tick().await;
+            }
+        }));
+    }
+
     /// `POST /api/missions/:id/abandon`: retire a mission through the
     /// engine's canonical abandon path (terminal-refusing, event-recorded).
     /// A mission hosted HERE is taken out of the registry first — an idle
@@ -671,6 +777,114 @@ impl MissionHost {
         })
     }
 
+    /// `POST /api/queue/drain`: run the queue drain/claim/skip loop
+    /// ([`kranz_engine::work::drain_queue`]) as a background task on this
+    /// serve process. This is just ANOTHER dispatcher: it does not register
+    /// missions in the `missions` planning registry, and arbitrates against
+    /// an external `kranz work` process exactly as today — through the queue
+    /// claim files and the events.jsonl single-writer lock, no new locking.
+    ///
+    /// IDEMPOTENT while a drain is live: a second call while the tracked
+    /// drain task has not finished returns THAT drain's current state
+    /// instead of spawning a second one.
+    pub async fn drain(&self) -> Result<Value, ApiError> {
+        // Reserve the drain slot BEFORE the `.await`s below, under the same
+        // lock acquisition that checks for an existing live drain. This
+        // closes the time-of-check/time-of-use gap: a concurrent caller can
+        // never observe "nothing tracked yet" while this call is still
+        // constructing its backend, because the reservation is installed
+        // before the lock is released.
+        let state = {
+            let mut guard = self.drain.lock().expect("drain tracker lock");
+            match &*guard {
+                DrainSlot::Starting(state) => {
+                    return Ok(drain_state_json(&state.lock().expect("drain state lock")));
+                }
+                DrainSlot::Running(handle) if !handle.join.is_finished() => {
+                    return Ok(drain_state_json(
+                        &handle.state.lock().expect("drain state lock"),
+                    ));
+                }
+                DrainSlot::Idle | DrainSlot::Running(_) => {}
+            }
+            let state = Arc::new(Mutex::new(DrainState {
+                live: true,
+                current_mission_id: None,
+                ran: Vec::new(),
+            }));
+            *guard = DrainSlot::Starting(Arc::clone(&state));
+            state
+        };
+
+        let cfg = match config::load(&self.repo_root) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                *self.drain.lock().expect("drain tracker lock") = DrainSlot::Idle;
+                return Err(e.into());
+            }
+        };
+        let backend = match self.backend(cfg.claude_binary.as_deref()).await {
+            Ok(backend) => backend,
+            Err(e) => {
+                *self.drain.lock().expect("drain tracker lock") = DrainSlot::Idle;
+                return Err(e);
+            }
+        };
+        let repo_root = self.repo_root.clone();
+
+        let task_state = Arc::clone(&state);
+        let join = tokio::spawn(async move {
+            let result = kranz_engine::work::drain_queue(&repo_root, false, |mission_id| {
+                let backend = Arc::clone(&backend);
+                let repo_root = repo_root.clone();
+                let state = Arc::clone(&task_state);
+                async move {
+                    state.lock().expect("drain state lock").current_mission_id =
+                        Some(mission_id.clone());
+                    let outcome =
+                        run_mission_headless(backend, repo_root, mission_id.clone()).await;
+                    let mut guard = state.lock().expect("drain state lock");
+                    guard.current_mission_id = None;
+                    if outcome.is_ok() {
+                        guard.ran.push(mission_id);
+                    }
+                    outcome
+                }
+            })
+            .await;
+            if let Err(e) = result {
+                tracing::error!(error = %e, "hosted queue drain errored");
+            }
+            task_state.lock().expect("drain state lock").live = false;
+        });
+
+        let initial = drain_state_json(&state.lock().expect("drain state lock"));
+        *self.drain.lock().expect("drain tracker lock") =
+            DrainSlot::Running(DrainHandle { join, state });
+        Ok(initial)
+    }
+
+    /// `GET /api/queue`: the queue front-to-back, who (if anyone) currently
+    /// holds the busy lock, and this host's own drain tracker.
+    pub fn queue_state(&self) -> Value {
+        let entries = kranz_engine::queue::list(&self.repo_root);
+        let busy_with = kranz_engine::queue::is_repo_busy(&self.repo_root);
+        let drain = match &*self.drain.lock().expect("drain tracker lock") {
+            DrainSlot::Running(handle) => {
+                drain_state_json(&handle.state.lock().expect("drain state lock"))
+            }
+            DrainSlot::Starting(state) => {
+                drain_state_json(&state.lock().expect("drain state lock"))
+            }
+            DrainSlot::Idle => drain_state_json(&DrainState::default()),
+        };
+        json!({
+            "entries": entries,
+            "busyWith": busy_with,
+            "drain": drain,
+        })
+    }
+
     // -----------------------------------------------------------------------
     // Registry plumbing
     // -----------------------------------------------------------------------
@@ -788,6 +1002,31 @@ async fn run_to_end(
         .lock()
         .expect("missions registry lock")
         .remove(&mission_id);
+}
+
+/// Headless `run_mission` injected into [`kranz_engine::work::drain_queue`]
+/// by [`MissionHost::drain`]: resume the mission under the single-writer
+/// lock and run it to a terminal state, with no live tail/printer attached
+/// (unlike the CLI's `kranz work`) since no terminal is attached to a serve
+/// process.
+async fn run_mission_headless(
+    backend: Arc<dyn AgentBackend>,
+    repo_root: PathBuf,
+    mission_id: String,
+) -> anyhow::Result<i32> {
+    let mut engine = MissionEngine::resume(backend, repo_root, &mission_id, LockForce::No)?;
+    let status = engine.run().await?;
+    Ok(exit_code_for(status))
+}
+
+/// Map a terminal [`MissionStatus`] to the exit code the CLI's
+/// `kranz work`/`kranz exec` report, matching `kranz_cli::exec::exit_code_for`.
+fn exit_code_for(status: MissionStatus) -> i32 {
+    match status {
+        MissionStatus::Complete => 0,
+        MissionStatus::Blocked => 2,
+        _ => 1,
+    }
 }
 
 /// Apply a ticket's per-ticket budget override to the orchestrator role
@@ -1115,6 +1354,24 @@ pub(crate) async fn start_mission(
     Ok((StatusCode::ACCEPTED, Json(json!({ "running": true }))))
 }
 
+/// `POST /api/queue/drain` — no required body → `200 <drain-state JSON>`.
+/// See [`MissionHost::drain`]; idempotent while a drain is already live.
+pub(crate) async fn drain_queue_route(
+    State(server): State<Arc<ServerState>>,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let _ = parse_body(&body)?;
+    Ok(Json(server.host.drain().await?))
+}
+
+/// `GET /api/queue` → `200 {"entries":[...], "busyWith": <id|null>, "drain": {...}}`.
+/// See [`MissionHost::queue_state`]. Tokenless: read-only.
+pub(crate) async fn queue_state_route(
+    State(server): State<Arc<ServerState>>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(server.host.queue_state()))
+}
+
 /// Validate the URL id with the same traversal rules as the read endpoints.
 fn valid_id(server: &ServerState, id: &str) -> Result<String, ApiError> {
     crate::rest::mission_paths(server, id)?;
@@ -1139,7 +1396,7 @@ pub(crate) fn parse_body(body: &Bytes) -> Result<Value, ApiError> {
 mod tests {
     use super::*;
     use axum::http::StatusCode;
-    use kranz_engine::backend_mock::MockBackend;
+    use kranz_engine::backend_mock::{mock_init, mock_result_text, MockBackend, MockScript};
     use std::process::Command;
     use std::sync::Once;
 
@@ -1401,5 +1658,470 @@ mod tests {
             .await
             .expect_err("must reject");
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    // -----------------------------------------------------------------------
+    // Queue drain (roadmap f-1-2)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn empty_queue_drain_returns_ok_and_settles_idle() {
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+        let host = MissionHost::with_backend(root, backend);
+
+        let body = host
+            .drain()
+            .await
+            .expect("drain must not error on an empty queue");
+        assert!(body.get("live").is_some(), "{body}");
+
+        // The background task finds nothing queued and settles quickly.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let state = host.queue_state();
+            if state["drain"]["live"] == false {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "drain never settled idle: {state}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn second_drain_while_live_returns_tracked_state_without_spawning_second() {
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+        let host = MissionHost::with_backend(root, backend);
+
+        // Fabricate a live drain tracker directly — deterministic, instead
+        // of racing a real queue against a fast mock backend.
+        let state = Arc::new(Mutex::new(DrainState {
+            live: true,
+            current_mission_id: Some("m-fake".to_string()),
+            ran: vec!["m-earlier".to_string()],
+        }));
+        let never_finishes = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        *host.drain.lock().expect("drain tracker lock") = DrainSlot::Running(DrainHandle {
+            join: never_finishes,
+            state: Arc::clone(&state),
+        });
+        let before = Arc::as_ptr(&state);
+
+        let first = host.drain().await.expect("drain must not error");
+        let second = host.drain().await.expect("drain must not error");
+        assert_eq!(first, second);
+        assert_eq!(first["live"], true);
+        assert_eq!(first["currentMissionId"], "m-fake");
+        assert_eq!(first["ran"], json!(["m-earlier"]));
+
+        // The tracker still points at the SAME state Arc: no second task
+        // was spawned to replace it.
+        let after = {
+            let guard = host.drain.lock().expect("drain tracker lock");
+            match &*guard {
+                DrainSlot::Running(handle) => Arc::as_ptr(&handle.state),
+                _ => panic!("expected the tracker to still be Running"),
+            }
+        };
+        assert_eq!(before, after, "a second drain must not replace the tracker");
+    }
+
+    #[tokio::test]
+    async fn two_concurrent_cold_drains_spawn_exactly_one() {
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+        let host = MissionHost::with_backend(root, backend);
+
+        // Fire two drains concurrently from a cold (Idle) tracker. Neither
+        // `config::load` nor `self.backend(...)` yields here (the backend
+        // is pre-populated via `with_backend`, and this test runs on the
+        // default current-thread flavor), so the first call's poll runs
+        // synchronously all the way through installing the `Starting`
+        // reservation, spawning the task, and upgrading to `Running` before
+        // the second call is ever polled. The second call therefore always
+        // observes an in-progress drain (`Starting` or `Running`, task not
+        // yet scheduled) and returns its tracked state instead of spawning
+        // a second drain task.
+        //
+        // NOTE: because nothing yields here, this test alone cannot catch a
+        // regression that deletes the `DrainSlot::Starting` deflection arm —
+        // see `starting_reservation_is_not_overwritten_or_double_spawned`
+        // below for the deterministic test that actually guards that arm.
+        let (first, second) = tokio::join!(host.drain(), host.drain());
+        let first = first.expect("first drain must not error");
+        let second = second.expect("second drain must not error");
+        assert_eq!(first["live"], true, "{first}");
+        assert_eq!(second["live"], true, "{second}");
+
+        // Exactly one drain is tracked: a single Starting-or-Running slot,
+        // never two independently spawned tasks.
+        match &*host.drain.lock().expect("drain tracker lock") {
+            DrainSlot::Running(_) | DrainSlot::Starting(_) => {}
+            DrainSlot::Idle => {
+                panic!("expected a live drain to be tracked after two concurrent calls")
+            }
+        }
+
+        // The single tracked drain settles idle on its own — nothing is
+        // left running forever, which would indicate a leaked second task.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let state = host.queue_state();
+            if state["drain"]["live"] == false {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "drain never settled idle: {state}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Deterministically guards the `DrainSlot::Starting(state) => return
+    /// ...` deflection arm in [`MissionHost::drain`]: manually install a
+    /// `Starting` reservation, call `drain()`, and assert it returns the
+    /// tracked live state WITHOUT overwriting the slot or spawning a task.
+    /// If that match arm is deleted (falling through to the Idle/Running
+    /// catch-all), this test fails because the slot gets overwritten with a
+    /// fresh `Starting`/`Running` reservation (different `Arc::as_ptr`) and a
+    /// real drain task gets spawned against this test's (git-less) repo.
+    #[tokio::test]
+    async fn starting_reservation_is_not_overwritten_or_double_spawned() {
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+        let host = MissionHost::with_backend(root, backend);
+
+        let state = Arc::new(Mutex::new(DrainState {
+            live: true,
+            current_mission_id: Some("m-reserved".to_string()),
+            ran: Vec::new(),
+        }));
+        *host.drain.lock().expect("drain tracker lock") = DrainSlot::Starting(Arc::clone(&state));
+        let before = Arc::as_ptr(&state);
+
+        let result = host.drain().await.expect("drain must not error");
+        assert_eq!(result["live"], true, "{result}");
+        assert_eq!(result["currentMissionId"], "m-reserved");
+
+        // The slot must STILL be the same Starting reservation: not
+        // overwritten to a new Starting/Running, and no task spawned.
+        let after = match &*host.drain.lock().expect("drain tracker lock") {
+            DrainSlot::Starting(tracked) => Arc::as_ptr(tracked),
+            DrainSlot::Running(_) => panic!(
+                "the Starting reservation was upgraded/replaced by this call — the deflection \
+                 arm was bypassed and a second drain was spawned"
+            ),
+            DrainSlot::Idle => panic!("the Starting reservation was cleared by this call"),
+        };
+        assert_eq!(
+            before, after,
+            "drain() must return the SAME tracked reservation, not install a new one"
+        );
+    }
+
+    /// A failed drain construction (here: an unparseable `.kranz/config.json`)
+    /// must clear the reservation back to `Idle` so a later call can retry —
+    /// otherwise every future drain would deflect forever onto a dead
+    /// reservation that no task will ever settle.
+    #[tokio::test]
+    async fn failed_drain_construction_clears_the_reservation_to_idle() {
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
+        std::fs::create_dir_all(root.join(".kranz")).expect("mkdir .kranz");
+        std::fs::write(root.join(".kranz").join("config.json"), "not json")
+            .expect("write malformed config");
+
+        let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+        let host = MissionHost::with_backend(root, backend);
+
+        host.drain()
+            .await
+            .expect_err("malformed config must fail drain construction");
+
+        let is_idle = matches!(
+            &*host.drain.lock().expect("drain tracker lock"),
+            DrainSlot::Idle
+        );
+        assert!(
+            is_idle,
+            "a failed drain construction must reset the tracker to Idle"
+        );
+    }
+
+    /// `queue_state()` must report the transient `Starting` reservation
+    /// window as a live drain — a caller polling `GET /api/queue` right after
+    /// `POST /api/queue/drain` must not observe a false "not live" gap.
+    #[tokio::test]
+    async fn queue_state_reports_a_starting_reservation_as_live() {
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+        let host = MissionHost::with_backend(root, backend);
+
+        let state = Arc::new(Mutex::new(DrainState {
+            live: true,
+            current_mission_id: Some("m-starting".to_string()),
+            ran: Vec::new(),
+        }));
+        *host.drain.lock().expect("drain tracker lock") = DrainSlot::Starting(state);
+
+        let queue_state = host.queue_state();
+        assert_eq!(queue_state["drain"]["live"], true, "{queue_state}");
+        assert_eq!(queue_state["drain"]["currentMissionId"], "m-starting");
+    }
+
+    #[tokio::test]
+    async fn queue_drain_route_requires_token_but_queue_route_does_not() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+        let host = MissionHost::with_backend(root, backend);
+        let app = crate::router_with_host(host, None, Some("tok".to_string()));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/queue/drain")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/queue/drain")
+                    .header("x-kranz-token", "tok")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/queue")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // -----------------------------------------------------------------------
+    // autoWork watcher (roadmap f-2-3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn should_auto_drain_truth_table() {
+        // Only true when all three conditions line up.
+        assert!(should_auto_drain(true, true, false));
+        // autoWork off: never drain, regardless of the queue or live state.
+        assert!(!should_auto_drain(false, true, false));
+        assert!(!should_auto_drain(false, false, false));
+        // Queue empty: nothing to drain even with autoWork on.
+        assert!(!should_auto_drain(true, false, false));
+        // A drain is already live: never start a second one.
+        assert!(!should_auto_drain(true, true, true));
+        assert!(!should_auto_drain(false, false, true));
+    }
+
+    /// Writes `{"autoWork": enabled}` to the repo's `.kranz/config.json`
+    /// (the project config layer `config::load` reads on every call,
+    /// including the watcher's per-tick reload).
+    fn write_auto_work_config(root: &std::path::Path, enabled: bool) {
+        let dir = root.join(".kranz");
+        std::fs::create_dir_all(&dir).expect("create .kranz dir");
+        std::fs::write(
+            dir.join("config.json"),
+            json!({ "autoWork": enabled }).to_string(),
+        )
+        .expect("write config.json");
+    }
+
+    /// One orchestrator turn batch: text + matching Result (mirrors the
+    /// identical helper in `tests/host_test.rs`).
+    fn turn(reply: &str) -> Vec<kranz_engine::backend::AgentEvent> {
+        vec![
+            kranz_engine::backend_mock::mock_text(reply),
+            mock_result_text(reply),
+        ]
+    }
+
+    /// Worker script: completed single-shot run with a passing WorkerReport.
+    fn worker_pass() -> MockScript {
+        MockScript::single_shot_json(&json!({
+            "result": "pass",
+            "summary": "implemented and tested",
+            "filesTouched": [],
+            "testsAdded": [],
+            "testEvidence": "all green",
+            "commits": []
+        }))
+    }
+
+    /// A minimal one-milestone/one-feature plan in wire (camelCase) shape.
+    fn plan_json() -> Value {
+        json!({
+            "goal": "ship the demo",
+            "validationContract": [],
+            "milestones": [{
+                "title": "M1",
+                "features": [{
+                    "title": "F1",
+                    "spec": "build the thing",
+                    "validationCriteria": ["it works"]
+                }]
+            }]
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn auto_work_tick_drains_a_queued_mission_when_enabled() {
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
+        write_auto_work_config(&root, true);
+
+        let judgement =
+            json!({ "decision": "complete", "guidance": "", "summary": "worker did the job" });
+        let orch = MockScript::streaming(vec![mock_init("orch-auto"), mock_result_text("seed-hi")])
+            .responding(vec![
+                turn("scoping the demo"),
+                turn(&plan_json().to_string()),
+            ]);
+        let orch_run = MockScript::streaming(vec![
+            mock_init("orch-auto-run"),
+            mock_result_text("resumed"),
+        ])
+        .responding(vec![turn(&judgement.to_string()), turn("NONE")]);
+        let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::with_scripts(vec![
+            orch,
+            worker_pass(),
+            orch_run,
+        ]));
+        let host = MissionHost::with_backend(root.clone(), backend);
+
+        let id = host
+            .create(
+                "drain me via autoWork",
+                Some(&json!({ "skipScrutiny": true, "skipFunctional": true })),
+            )
+            .await
+            .expect("create mission");
+        host.planning_turn(&id, "go").await.expect("planning turn");
+        let plan_body = host.request_plan(&id).await.expect("request plan");
+        assert_eq!(plan_body["ready"], true, "{plan_body}");
+        let plan: Plan =
+            serde_json::from_value(plan_body["plan"].clone()).expect("plan deserializes");
+        host.approve(&id, plan).await.expect("approve");
+        host.release(&id).expect("release");
+
+        kranz_engine::queue::enqueue(
+            &root,
+            kranz_engine::queue::QueueEntry {
+                mission_id: id.clone(),
+                ticket_slug: None,
+                priority: 2,
+                seq: 0,
+            },
+        )
+        .expect("enqueue");
+
+        // No explicit drain()/POST call — the watcher's tick alone must
+        // notice the queued entry and kick a drain off.
+        host.auto_work_tick().await;
+        assert!(
+            host.drain_is_live(),
+            "autoWork tick with autoWork=true and a non-empty queue must start a drain"
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let state = host.queue_state();
+            if state["entries"]
+                .as_array()
+                .map(|a| a.is_empty())
+                .unwrap_or(false)
+                && state["drain"]["live"] == false
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "autoWork drain never completed: {state}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_work_tick_leaves_the_queue_untouched_when_disabled() {
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
+        // Absent key: default is false, exercised the same as an explicit
+        // `{"autoWork": false}` layer. No mission needs to actually be
+        // runnable here — the watcher must never even attempt a drain, so a
+        // bare queue entry is enough to prove it's left alone.
+        let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+        let host = MissionHost::with_backend(root.clone(), backend);
+
+        kranz_engine::queue::enqueue(
+            &root,
+            kranz_engine::queue::QueueEntry {
+                mission_id: "m-untouched".to_string(),
+                ticket_slug: None,
+                priority: 2,
+                seq: 0,
+            },
+        )
+        .expect("enqueue");
+
+        host.auto_work_tick().await;
+
+        assert!(
+            !host.drain_is_live(),
+            "autoWork=false must never start a drain"
+        );
+        let entries = kranz_engine::queue::list(&root);
+        assert_eq!(
+            entries.len(),
+            1,
+            "queue entry must be left untouched when autoWork is disabled: {entries:?}"
+        );
+        assert_eq!(entries[0].mission_id, "m-untouched");
     }
 }

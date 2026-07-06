@@ -91,6 +91,14 @@ pub trait PlanningHost: Send + Sync + 'static {
     /// mission was queued; `Err` carries the engine's refusal message
     /// VERBATIM (never paraphrased) for the bridge to forward unchanged.
     fn approve_ticket<'a>(&'a self, slug: &'a str) -> BoxFuture<'a, anyhow::Result<String>>;
+
+    /// `/kranz work run` → trigger the queue drain/claim/skip loop THROUGH
+    /// the host (`POST /api/queue/drain`'s seam): the host spawns the drain
+    /// as a background task on the serve process and returns once it has
+    /// been kicked off (idempotent while a drain is already live) — this
+    /// call never itself drives a mission turn, so the bridge caller never
+    /// resumes/runs a mission on the socket read loop.
+    fn drain<'a>(&'a self) -> BoxFuture<'a, anyhow::Result<()>>;
 }
 
 /// How the bridge holds the host: shared, optional (a bridge without a host —

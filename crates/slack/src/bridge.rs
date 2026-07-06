@@ -435,6 +435,7 @@ fn is_slow_action(action: &Action) -> bool {
             | Action::ApproveStart { .. }
             | Action::ApproveMission { .. }
             | Action::Draft { .. }
+            | Action::WorkRun { .. }
     )
 }
 
@@ -612,6 +613,11 @@ pub fn not_authorized_blocks() -> Vec<Value> {
 ///   mission on the socket read loop, so it reports the queue state
 ///   (`queue::list` + `is_repo_busy`, [`build_work_reply`]) and points at the
 ///   `kranz work` CLI / dispatcher for actually draining it. Read-only, no gate.
+/// - **Work run** (`/kranz work run`) — SPEND action, gated EXACTLY like
+///   `draft` ([`gate_work_run_command`] / [`run_work_run`]). On authorization
+///   it triggers the drain THROUGH the host ([`crate::host::PlanningHost::drain`]) —
+///   the seam that spawns the background drain on the serve process — never
+///   by resuming/running a mission on the socket read loop.
 ///
 /// ## Ack budget (docs must-have #3)
 /// `connect_once` acks every envelope FIRST and runs the slow actions
@@ -699,6 +705,51 @@ pub async fn run_draft(host: &SharedHost, slug: &str) -> Vec<Value> {
             error_blocks(text.trim_end())
         }
         Err(e) => error_blocks(&format!("Couldn't draft `{slug}`: {e}")),
+    }
+}
+
+/// The outcome of the SYNCHRONOUS `gate_work_run_command` phase — mirrors
+/// [`DraftGate`]. No [`crate::host::PlanningHost::drain`] call has happened
+/// by the time any of these variants is returned; `Ready` carries the
+/// immediate ack the caller must post BEFORE awaiting [`run_work_run`].
+pub enum WorkRunGate {
+    Unauthorized,
+    NoHost(Vec<Value>),
+    Ready(Vec<Value>),
+}
+
+/// `/kranz work run` gate/ack phase — SPEND action, gated EXACTLY like
+/// `/kranz new` / `/kranz draft` (same gate, same standard refusal). Makes NO
+/// `PlanningHost::drain` call — that is the caller's job via
+/// [`run_work_run`], AFTER posting the `Ready` ack — so this phase stays
+/// synchronous and unit-testable without a live `SlackClient`.
+pub fn gate_work_run_command(
+    cfg: &SlackConfig,
+    host: Option<&SharedHost>,
+    user_id: Option<&str>,
+) -> WorkRunGate {
+    if !cfg.is_authorized(user_id) {
+        return WorkRunGate::Unauthorized;
+    }
+    if host.is_none() {
+        return WorkRunGate::NoHost(error_blocks(
+            "This bridge has no hosted planning engine (it was started without \
+             `kranz serve`). Use `kranz work` in a terminal to drain the queue.",
+        ));
+    }
+    WorkRunGate::Ready(error_blocks(
+        ":hourglass_flowing_sand: Running the queue — draining now; progress posts per mission.",
+    ))
+}
+
+/// The async run phase of `/kranz work run`, called ONLY after the caller has
+/// posted the `WorkRunGate::Ready` ack. Drives [`crate::host::PlanningHost::drain`]
+/// — the bridge itself never resumes/runs a mission on the socket read loop;
+/// the host spawns the drain as a background task on the serve process.
+pub async fn run_work_run(host: &SharedHost) -> Vec<Value> {
+    match host.drain().await {
+        Ok(()) => error_blocks(":white_check_mark: Queue drain triggered."),
+        Err(e) => error_blocks(&format!("Couldn't drain the queue: {e}")),
     }
 }
 
@@ -1228,6 +1279,35 @@ async fn dispatch_action(
             )
             .await;
         }
+
+        // `/kranz work run` — SPEND action, gated EXACTLY like `draft`
+        // ([`gate_work_run_command`] holds the gate + ack logic so it's
+        // unit-testable without a live SlackClient). The ack MUST post before
+        // the slow `run_work_run` await, mirroring Draft — never build both
+        // and post them back to back after the drain call returns.
+        Action::WorkRun {
+            user_id,
+            response_url,
+        } => match gate_work_run_command(cfg, host, user_id.as_deref()) {
+            WorkRunGate::Unauthorized => {
+                reply_ephemeral(
+                    cfg,
+                    client,
+                    response_url.as_deref(),
+                    &not_authorized_blocks(),
+                )
+                .await;
+            }
+            WorkRunGate::NoHost(blocks) => {
+                reply_ephemeral(cfg, client, response_url.as_deref(), &blocks).await;
+            }
+            WorkRunGate::Ready(ack) => {
+                reply_ephemeral(cfg, client, response_url.as_deref(), &ack).await;
+                let host = host.expect("WorkRunGate::Ready only returned with a host present");
+                let result = run_work_run(host).await;
+                reply_ephemeral(cfg, client, response_url.as_deref(), &result).await;
+            }
+        },
 
         // App Home tab: fold the repo read-only and publish this user's home
         // view. Read-only (no allowlist gate); a publish failure is logged, not
@@ -1815,6 +1895,7 @@ fn apply_action(repo_root: &Path, action: &Action) -> Result<()> {
         | Action::Pause { .. }
         | Action::Resume { .. }
         | Action::Work { .. }
+        | Action::WorkRun { .. }
         | Action::AppHome { .. }
         | Action::Ignore => Ok(()),
     }
@@ -3269,6 +3350,12 @@ mod tests {
         // read loop, same as NewMission.
         assert!(is_slow_action(&Action::Draft {
             slug: "s-1".into(),
+            user_id: None,
+            response_url: None,
+        }));
+        // WorkRun triggers a live-host drain (spawns work) → must run off the
+        // read loop, same as Draft.
+        assert!(is_slow_action(&Action::WorkRun {
             user_id: None,
             response_url: None,
         }));

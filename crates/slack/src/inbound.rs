@@ -193,6 +193,16 @@ pub enum Action {
     /// on the socket loop, so this reads the queue and hands off. Read-only, so
     /// not gated (`response_url` delivers the ephemeral).
     Work { response_url: Option<String> },
+    /// `/kranz work run` → trigger the queue drain/claim/skip loop THROUGH the
+    /// host (never on the socket read loop). A money-spending action (it can
+    /// spawn `claude` sessions via the drained missions): gated on the
+    /// allowlist EXACTLY like [`Action::NewMission`] / [`Action::Draft`].
+    /// `work run <extra>` (any trailing token past `run`) falls through to
+    /// help, same as a malformed `work <anything>`.
+    WorkRun {
+        user_id: Option<String>,
+        response_url: Option<String>,
+    },
     /// `app_home_opened` events_api envelope → publish this user's App Home tab
     /// (active missions + queue + open tickets). Read-only, so not spend-gated.
     AppHome { user_id: String },
@@ -685,14 +695,24 @@ fn route_slash(payload: &Value) -> Action {
         // Too many tokens → help.
     }
 
-    // `work` → report the queue state and point at the `kranz work` dispatcher.
-    // Read-only (report-only): the bridge never drains the queue on the socket
-    // loop. Any trailing token is a typo → help.
+    // `work` → report the queue state and point at the `kranz work` dispatcher
+    // (report-only); `work run` → actually trigger the drain THROUGH the host
+    // (spend-gated in the bridge). Any other trailing text is a typo → help.
     if let Some(rest) = strip_ci_prefix(text, "work") {
-        if rest.trim().is_empty() {
+        let rest = rest.trim();
+        if rest.is_empty() {
             return Action::Work { response_url };
         }
-        // `work <anything>` → help.
+        if let Some(after_run) = strip_ci_prefix(rest, "run") {
+            if after_run.trim().is_empty() {
+                return Action::WorkRun {
+                    user_id,
+                    response_url,
+                };
+            }
+            // `work run <extra>` → help.
+        }
+        // `work <anything-else>` → help.
     }
 
     Action::Help { response_url }
@@ -1715,6 +1735,38 @@ mod tests {
     fn slash_pause_resume_work_with_extra_tokens_fall_through_to_help() {
         // Two-token pause/resume, or work with an argument, are typos → help.
         for text in ["pause m-1 extra", "resume a b", "work now", "work m-1"] {
+            assert_eq!(
+                route(&steer_env(text), &lookup_none()).action,
+                Action::Help {
+                    response_url: Some("https://hooks.slack/steer".into())
+                },
+                "text={text:?} should route to help"
+            );
+        }
+    }
+
+    #[test]
+    fn slash_work_run_routes_to_work_run() {
+        assert_eq!(
+            route(&steer_env("work run"), &lookup_none()).action,
+            Action::WorkRun {
+                user_id: Some("Usteer".into()),
+                response_url: Some("https://hooks.slack/steer".into())
+            }
+        );
+        // Case-insensitive, trailing whitespace tolerated.
+        assert_eq!(
+            route(&steer_env("WORK  RUN   "), &lookup_none()).action,
+            Action::WorkRun {
+                user_id: Some("Usteer".into()),
+                response_url: Some("https://hooks.slack/steer".into())
+            }
+        );
+    }
+
+    #[test]
+    fn slash_work_run_with_extra_tokens_falls_through_to_help() {
+        for text in ["work run extra", "work run now"] {
             assert_eq!(
                 route(&steer_env(text), &lookup_none()).action,
                 Action::Help {

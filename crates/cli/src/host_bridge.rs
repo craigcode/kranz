@@ -79,6 +79,12 @@ impl PlanningHost for HostedPlanning {
                 .map_err(plain)
         })
     }
+
+    fn drain<'a>(&'a self) -> BoxFuture<'a, anyhow::Result<()>> {
+        // Same seam as `POST /api/queue/drain`: the host spawns the drain
+        // task and returns; this adapter never drives a mission turn itself.
+        Box::pin(async move { self.0.drain().await.map(|_| ()).map_err(plain) })
+    }
 }
 
 /// The host's errors already carry user-presentable messages (409 "a turn is
