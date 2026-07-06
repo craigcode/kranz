@@ -1657,6 +1657,106 @@ mod tests {
         );
     }
 
+    /// `/kranz ticket new <slug> <title...>` must open the multiline
+    /// goal/context modal, carrying the slug (first token) and title (the
+    /// remainder) through, not scaffold immediately.
+    #[test]
+    fn pipeline_slash_ticket_new_routes_to_new_ticket_modal() {
+        let env = json!({
+            "type": "slash_commands",
+            "payload": { "command": "/kranz", "text": "ticket new my-slug Fix the thing",
+                         "trigger_id": "t-999", "user_id": "U9",
+                         "channel_id": "C1", "response_url": "https://hooks.slack/a" }
+        });
+        assert_eq!(
+            route(&env, &lookup_none()).action,
+            Action::NewTicketModal {
+                trigger_id: "t-999".into(),
+                slug: "my-slug".into(),
+                title: "Fix the thing".into(),
+                user_id: Some("U9".into()),
+                response_url: Some("https://hooks.slack/a".into()),
+                channel: "C1".into(),
+            }
+        );
+    }
+
+    /// The new-ticket modal's `view_submission` → `Action::CreateTicket`,
+    /// carrying slug/title/channel out of `private_metadata` and goal/context
+    /// out of the modal's typed inputs. A missing slug in `private_metadata`
+    /// (malformed/foreign payload) must be ignored, never half-create.
+    #[test]
+    fn pipeline_new_ticket_modal_submission_routes_to_create_ticket() {
+        let env = json!({
+            "type": "interactive",
+            "envelope_id": "env-ticket",
+            "payload": {
+                "type": "view_submission",
+                "user": { "id": "U777" },
+                "view": {
+                    "callback_id": NEW_TICKET_CALLBACK_ID,
+                    "private_metadata": "{\"slug\":\"my-slug\",\"title\":\"Fix the thing\",\"channel\":\"C1\"}",
+                    "state": { "values": {
+                        NEW_TICKET_GOAL_BLOCK: {
+                            NEW_TICKET_GOAL_ACTION: { "type": "plain_text_input", "value": "the goal" }
+                        },
+                        NEW_TICKET_CONTEXT_BLOCK: {
+                            NEW_TICKET_CONTEXT_ACTION: { "type": "plain_text_input", "value": "the context" }
+                        }
+                    }}
+                }
+            }
+        });
+        assert_eq!(
+            route(&env, &lookup_none()).action,
+            Action::CreateTicket {
+                slug: "my-slug".into(),
+                title: "Fix the thing".into(),
+                goal: "the goal".into(),
+                context: "the context".into(),
+                channel: "C1".into(),
+            }
+        );
+
+        let missing_slug_env = json!({
+            "type": "interactive",
+            "envelope_id": "env-ticket-2",
+            "payload": {
+                "type": "view_submission",
+                "user": { "id": "U777" },
+                "view": {
+                    "callback_id": NEW_TICKET_CALLBACK_ID,
+                    "private_metadata": "{\"title\":\"Fix the thing\",\"channel\":\"C1\"}",
+                    "state": { "values": {} }
+                }
+            }
+        });
+        assert_eq!(
+            route(&missing_slug_env, &lookup_none()).action,
+            Action::Ignore
+        );
+    }
+
+    /// `new` must not swallow the generic-title branch: a ticket whose title
+    /// happens to start with something other than the `new` subcommand
+    /// keyword still scaffolds via the pre-existing single-line path.
+    #[test]
+    fn pipeline_slash_ticket_bare_title_still_routes_to_new_ticket() {
+        let env = json!({
+            "type": "slash_commands",
+            "payload": { "command": "/kranz", "text": "ticket Fix the thing",
+                         "channel_id": "C1" }
+        });
+        assert_eq!(
+            route(&env, &lookup_none()).action,
+            Action::NewTicket {
+                title: "Fix the thing".into(),
+                channel: "C1".into(),
+                thread_ts: None,
+            }
+        );
+    }
+
     /// D-A: `/kranz approve <id>` remains the canonical plan-approval verb —
     /// it still routes to `Action::ApproveMission`.
     #[test]
