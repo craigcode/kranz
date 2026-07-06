@@ -35,6 +35,12 @@ stage model and verb renames, reviewed by the operator BEFORE the build
 mission — the verb rename especially is a product decision, not an
 implementation detail.
 
+Scoping doc written 2026-07-05 night: docs/scoping/pipeline-view.md —
+stage model, gap map, three flagged decisions (D-A verb renames, D-B
+serve autoWork drain resolving gascity D5, D-C gated merge that never
+pushes), five-slice build plan. OPERATOR REVIEW of the three decisions
+required before drafting this ticket.
+
 ## Scoping answers
 
 ## Acceptance hints
