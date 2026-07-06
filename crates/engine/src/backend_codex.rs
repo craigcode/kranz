@@ -225,8 +225,19 @@ pub fn parse_codex_value(value: Value, model: &str) -> Vec<AgentEvent> {
                 .pointer("/item/aggregated_output")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            let lower = output.to_lowercase();
-            let denied = lower.contains("permission") || lower.contains("not permitted");
+            // A sandbox refusal reports a null exit_code alongside
+            // status == "failed" (see docs/scoping/codex-backend.md); a
+            // command that merely exits non-zero has a real exit_code and is
+            // a normal failure, not a denial.
+            let exit_code_is_null = value
+                .pointer("/item/exit_code")
+                .map(Value::is_null)
+                .unwrap_or(true);
+            let status = value
+                .pointer("/item/status")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let denied = exit_code_is_null && status == "failed";
             vec![AgentEvent::ToolResult {
                 tool: Some("command_execution".to_string()),
                 denied,
@@ -354,7 +365,7 @@ fn parse_terminal(value: Value, model: &str) -> AgentEvent {
             .unwrap_or(false),
         usage,
         cost_usd,
-        num_turns: None,
+        num_turns: Some(1),
         raw: value,
     }
 }
@@ -708,33 +719,86 @@ mod tests {
             "expected at least one Text event"
         );
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::ToolUse { .. })),
-            "expected a ToolUse event"
+            events.iter().any(
+                |e| matches!(e, AgentEvent::ToolUse { tool, .. } if tool == "command_execution")
+            ),
+            "expected a ToolUse event with tool == \"command_execution\""
         );
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::ToolResult { .. })),
-            "expected a ToolResult event"
+            events.iter().any(
+                |e| matches!(e, AgentEvent::ToolResult { tool, .. } if tool.as_deref() == Some("command_execution"))
+            ),
+            "expected a ToolResult event with tool == Some(\"command_execution\")"
         );
 
         let terminal = events
             .iter()
             .find_map(|e| match e {
                 AgentEvent::Result {
-                    usage, cost_usd, ..
-                } => Some((usage, cost_usd)),
+                    usage,
+                    cost_usd,
+                    num_turns,
+                    ..
+                } => Some((usage, cost_usd, num_turns)),
                 _ => None,
             })
             .expect("expected a terminal Result event");
-        let (usage, cost_usd) = terminal;
+        let (usage, cost_usd, num_turns) = terminal;
         assert!(
             usage.input > 0 || usage.output > 0 || usage.cache_read > 0,
             "expected non-zero usage on the terminal Result"
         );
         assert!(cost_usd.is_some(), "expected cost_usd to be Some");
+        assert_eq!(
+            *num_turns,
+            Some(1),
+            "expected the terminal Result's num_turns to be Some(1)"
+        );
+    }
+
+    #[test]
+    fn command_execution_denied_derives_from_structured_fields_not_output_text() {
+        let completed = json!({
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "command": "grep foo bar.txt",
+                "aggregated_output": "",
+                "exit_code": 0,
+                "status": "completed"
+            }
+        });
+        let events = parse_codex_value(completed, DEFAULT_CODEX_MODEL);
+        match &events[0] {
+            AgentEvent::ToolResult { denied, .. } => {
+                assert!(
+                    !denied,
+                    "a real exit_code with status completed must not be denied"
+                )
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+
+        let refused = json!({
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "command": "rm -rf /",
+                "aggregated_output": "",
+                "exit_code": null,
+                "status": "failed"
+            }
+        });
+        let events = parse_codex_value(refused, DEFAULT_CODEX_MODEL);
+        match &events[0] {
+            AgentEvent::ToolResult { denied, .. } => {
+                assert!(
+                    *denied,
+                    "a null exit_code with status failed must be denied"
+                )
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
     }
 
     #[test]
