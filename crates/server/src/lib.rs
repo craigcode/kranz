@@ -16,6 +16,7 @@
 mod error;
 mod host;
 mod rest;
+mod tickets;
 mod ws;
 
 pub use error::ApiError;
@@ -166,6 +167,8 @@ pub fn router_with_shared_host(
             post(host::delete_mission_route),
         )
         .route("/api/missions/{id}/ws", get(ws::ws_handler))
+        .route("/api/tickets", get(tickets::list_tickets))
+        .route("/api/tickets/{slug}", get(tickets::get_ticket))
         .with_state(state);
 
     let app = match static_assets {
