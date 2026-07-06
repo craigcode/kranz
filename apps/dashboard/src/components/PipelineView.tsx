@@ -1,9 +1,8 @@
 // #/ (default route) — the pipeline view: one flat list, one row per work
-// item, reduced through the nine-stage model (lib/pipelineStage.ts). Replaces
-// the old two-list landing (MissionPicker + BacklogPanel) — the picker/backlog
-// panels stay reachable at their own hashes for now, this is just no longer
-// the default. Every ticket is a row; every mission with no originating
-// ticket ("kranz new") is also a row, so nothing in progress is hidden.
+// item, reduced through the nine-stage model (lib/pipelineStage.ts). The
+// browsable ticket backlog lives at #/backlog (BacklogPanel). Every ticket
+// is a row; every mission with no originating ticket ("kranz new") is also
+// a row, so nothing in progress is hidden.
 
 import { useEffect, useState } from 'react';
 import { useKranzStore } from '../lib/store';

@@ -353,7 +353,7 @@ describe('PipelineView', () => {
 });
 
 describe('App default route', () => {
-  it('renders the pipeline view (not the old MissionPicker landing) at the default hash', async () => {
+  it('renders the pipeline view at the default hash', async () => {
     window.location.hash = '';
     vi.mocked(api.tickets).mockResolvedValueOnce([]);
     vi.mocked(api.missions).mockResolvedValueOnce([]);
