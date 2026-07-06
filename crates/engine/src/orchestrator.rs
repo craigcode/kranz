@@ -6480,4 +6480,352 @@ mod tests {
             "fix feature from the retry's findings must be folded into mission state"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Droid scrutiny integration (f-2-3): a stubbed `droid exec -o json`
+    // binary drives real ValidatorReport findings into the fix-cycle
+    // machinery, priced with the droid (Fireworks GLM) table. No real API
+    // spend: everything comes from a POSIX shell stub streaming the
+    // committed fixture, mirroring the codex integration tests above.
+    // -----------------------------------------------------------------------
+
+    /// Writes an executable POSIX shell stub that stands in for the real
+    /// `droid` CLI closely enough to drive
+    /// [`crate::backend_droid::DroidBackend`]: `--version` prints a
+    /// plausible version string and any `exec ...` invocation streams the
+    /// committed fixture (a single JSON result object) to stdout, exiting 0.
+    /// Not portable to windows-latest (no `/bin/sh`), hence `cfg(unix)`.
+    #[cfg(unix)]
+    fn write_droid_stub() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fixture = std::fs::canonicalize(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/droid_exec_scrutiny.json"),
+        )
+        .expect("fixture exists");
+        let script_path = dir.path().join("droid-stub.sh");
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'droid-cli 0.0.0-test'\n  exit 0\nfi\ncat '{}'\nexit 0\n",
+                fixture.display()
+            ),
+        )
+        .expect("write stub script");
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat stub script")
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod stub script");
+        (dir, script_path)
+    }
+
+    /// Like [`write_droid_stub`] but the stub cats
+    /// `droid_exec_scrutiny_no_report.json` — a result object with an empty
+    /// `result` string — so `parse_validator_report` returns `None` even
+    /// though the stub exits 0. Models a droid run that completed but never
+    /// emitted a parseable report.
+    #[cfg(unix)]
+    fn write_droid_stub_no_report() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fixture = std::fs::canonicalize(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/droid_exec_scrutiny_no_report.json"),
+        )
+        .expect("fixture exists");
+        let script_path = dir.path().join("droid-stub-no-report.sh");
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'droid-cli 0.0.0-test'\n  exit 0\nfi\ncat '{}'\nexit 0\n",
+                fixture.display()
+            ),
+        )
+        .expect("write stub script");
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat stub script")
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod stub script");
+        (dir, script_path)
+    }
+
+    /// RAII guard: points `KRANZ_DROID_BIN` at a working stub so
+    /// `discover_droid_binary` deterministically resolves it as the FIRST
+    /// (exclusive) candidate, regardless of whatever real `droid` install
+    /// happens to sit on the host running the suite. Serialized on the same
+    /// [`DROID_ENV_LOCK`] used by the other `KRANZ_DROID_BIN`-mutating tests
+    /// so they never race each other.
+    #[cfg(unix)]
+    struct DroidStubEnvGuard {
+        prev_bin: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    #[cfg(unix)]
+    impl DroidStubEnvGuard {
+        fn engage(stub: &std::path::Path) -> Self {
+            let lock = DROID_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let prev_bin = std::env::var_os("KRANZ_DROID_BIN");
+            std::env::set_var("KRANZ_DROID_BIN", stub);
+            DroidStubEnvGuard {
+                prev_bin,
+                _lock: lock,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for DroidStubEnvGuard {
+        fn drop(&mut self) {
+            match self.prev_bin.take() {
+                Some(v) => std::env::set_var("KRANZ_DROID_BIN", v),
+                None => std::env::remove_var("KRANZ_DROID_BIN"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn droid_scrutiny_cfg() -> MissionConfig {
+        let mut cfg = MissionConfig::default();
+        cfg.validator_scrutiny.backend = Some("droid".to_string());
+        cfg.skip_functional = true;
+        cfg
+    }
+
+    /// The stub droid's ValidatorReport findings (>=1, per the fixture) fold
+    /// into the run loop through the normal machinery: `validation.finding`
+    /// events, an orchestrator conversion turn, and a `fixfeature.created`
+    /// event that lands the fix feature in state — exactly like a claude
+    /// scrutiny run's findings would. Also asserts the run actually went
+    /// through droid (droid model on the spawn event, no fallback decision).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn droid_scrutiny_findings_flow() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let (_stub_dir, stub_path) = write_droid_stub();
+
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            lesson_orch_script(&codex_fix_features_reply(1)),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock;
+        let mut engine = MissionEngine::create(backend, &root, "goal", droid_scrutiny_cfg())
+            .expect("create engine");
+        engine
+            .state
+            .mission
+            .milestones
+            .push(codex_scrutiny_milestone());
+
+        let env_guard = DroidStubEnvGuard::engage(&stub_path);
+        engine
+            .validation_round(0)
+            .await
+            .expect("validation round must complete through the stub droid backend");
+        drop(env_guard);
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events.jsonl");
+
+        assert!(
+            !events.iter().any(|e| matches!(
+                &e.kind,
+                EventKind::OrchestratorDecision { summary, .. }
+                    if summary.contains("droid") && summary.contains("not available")
+            )),
+            "droid must not have fallen back to claude: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            !events.iter().any(|e| matches!(
+                &e.kind,
+                EventKind::OrchestratorDecision { summary, .. }
+                    if summary.contains("retrying once")
+            )),
+            "droid must not have triggered the runtime retry fallback: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.kind,
+                EventKind::WorkerSpawned { role, model, .. }
+                    if *role == Role::ValidatorScrutiny && model == cost::DEFAULT_DROID_MODEL
+            )),
+            "expected the scrutiny run spawned with the droid model: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::ValidationFinding { .. })),
+            "expected the stub droid's findings as validation.finding events: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::FixFeatureCreated { .. })),
+            "expected findings converted into a fix feature: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            engine.state().mission.milestones[0]
+                .features
+                .iter()
+                .any(|f| f.origin == FeatureOrigin::Fix),
+            "fix feature must be folded into mission state"
+        );
+    }
+
+    /// The droid validator run's cost is priced with the droid (Fireworks
+    /// GLM) table: the run's recorded `cost_usd` equals
+    /// `cost::usage_cost_usd(usage, DEFAULT_DROID_MODEL)` for the fixture's
+    /// token usage.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn droid_scrutiny_run_priced_with_droid_table() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let (_stub_dir, stub_path) = write_droid_stub();
+
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            lesson_orch_script(&codex_fix_features_reply(1)),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock;
+        let mut engine = MissionEngine::create(backend, &root, "goal", droid_scrutiny_cfg())
+            .expect("create engine");
+        engine
+            .state
+            .mission
+            .milestones
+            .push(codex_scrutiny_milestone());
+
+        let env_guard = DroidStubEnvGuard::engage(&stub_path);
+        engine
+            .validation_round(0)
+            .await
+            .expect("validation round must complete through the stub droid backend");
+        drop(env_guard);
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events.jsonl");
+        let (usage, cost_usd) = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::WorkerCompleted {
+                    tokens, cost_usd, ..
+                } => Some((tokens.clone(), *cost_usd)),
+                _ => None,
+            })
+            .expect("expected a worker.completed event for the droid scrutiny run");
+
+        let expected = cost::usage_cost_usd(&usage, cost::DEFAULT_DROID_MODEL);
+        assert!(expected > 0.0, "expected nonzero droid-priced cost");
+        assert_eq!(
+            cost_usd,
+            Some(expected),
+            "the run's recorded cost_usd must equal droid pricing for its usage"
+        );
+    }
+
+    /// A droid scrutiny run that exits 0 but never emits a parseable
+    /// `ValidatorReport` (empty `result` string) must trigger the bounded
+    /// runtime-retry fallback exactly once: a loud `orchestrator.decision`
+    /// naming the retry, mentioning "droid" and "retrying once", and that
+    /// retry actually ran on the injected claude (mock) backend.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn droid_runtime_retry_falls_back_to_claude() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let (_stub_dir, stub_path) = write_droid_stub_no_report();
+
+        let retry_report = serde_json::json!({
+            "findings": [{
+                "subject": "retry-finding",
+                "severity": "major",
+                "evidence": "claude retry scrutiny run found this after droid produced no report",
+                "suggestedFix": "address it"
+            }],
+            "summary": "one finding from the claude retry run"
+        });
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            crate::backend_mock::MockScript::single_shot_json(&retry_report),
+            lesson_orch_script(&codex_fix_features_reply(1)),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock.clone();
+        let mut engine = MissionEngine::create(backend, &root, "goal", droid_scrutiny_cfg())
+            .expect("create engine");
+        engine
+            .state
+            .mission
+            .milestones
+            .push(codex_scrutiny_milestone());
+
+        let env_guard = DroidStubEnvGuard::engage(&stub_path);
+        engine
+            .validation_round(0)
+            .await
+            .expect("validation round must complete via the claude retry fallback");
+        drop(env_guard);
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events.jsonl");
+
+        let retry_decisions: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.kind,
+                    EventKind::OrchestratorDecision { summary, .. }
+                        if summary.contains("droid") && summary.contains("retrying once")
+                )
+            })
+            .collect();
+        assert_eq!(
+            retry_decisions.len(),
+            1,
+            "expected exactly one loud retry decision naming droid: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+
+        let scrutiny_spawns = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.kind,
+                    EventKind::WorkerSpawned { role, .. } if *role == Role::ValidatorScrutiny
+                )
+            })
+            .count();
+        assert_eq!(
+            scrutiny_spawns,
+            2,
+            "expected the initial droid run plus one claude retry run: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+
+        assert_eq!(
+            mock.started_specs().len(),
+            2,
+            "the injected claude/mock backend must have started once for the retry \
+             validator run and once for the fix-feature conversion turn"
+        );
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::FixFeatureCreated { .. })),
+            "expected the claude retry's findings converted into a fix feature: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            engine.state().mission.milestones[0]
+                .features
+                .iter()
+                .any(|f| f.origin == FeatureOrigin::Fix),
+            "fix feature from the retry's findings must be folded into mission state"
+        );
+    }
 }
