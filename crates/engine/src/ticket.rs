@@ -434,15 +434,48 @@ impl Ticket {
             text.push('\n');
         }
         text.push_str("\n## Needs context (from orchestrator)\n");
-        for q in questions {
+        for q in bound_questions(questions) {
             text.push_str("- ");
-            text.push_str(q);
+            text.push_str(&q);
             text.push('\n');
         }
         atomic_write(&md, text.as_bytes())?;
         Self::write_state(repo_root, slug, TicketState::NeedsContext, None)?;
         Ok(())
     }
+}
+
+/// Per-question length cap (in chars) and total-count cap applied before
+/// writing clarifying questions into a ticket's needs-context section, so a
+/// multi-KB orchestrator reply cannot blow up the ticket file.
+const MAX_QUESTION_CHARS: usize = 500;
+const MAX_QUESTION_COUNT: usize = 20;
+
+/// Truncate each question to [`MAX_QUESTION_CHARS`] characters (char-boundary
+/// safe) and cap the total number of questions to [`MAX_QUESTION_COUNT`],
+/// appending a single "N more omitted" marker when truncated.
+fn bound_questions(questions: &[String]) -> Vec<String> {
+    let truncate_one = |q: &String| -> String {
+        if q.chars().count() > MAX_QUESTION_CHARS {
+            let mut truncated: String = q.chars().take(MAX_QUESTION_CHARS).collect();
+            truncated.push_str(" … (truncated)");
+            truncated
+        } else {
+            q.clone()
+        }
+    };
+
+    if questions.len() <= MAX_QUESTION_COUNT {
+        return questions.iter().map(truncate_one).collect();
+    }
+
+    let mut out: Vec<String> = questions[..MAX_QUESTION_COUNT]
+        .iter()
+        .map(truncate_one)
+        .collect();
+    let omitted = questions.len() - MAX_QUESTION_COUNT;
+    out.push(format!("… ({omitted} more omitted)"));
+    out
 }
 
 /// Atomic write via a sibling temp file + rename (POSIX rename is atomic; on
