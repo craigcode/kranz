@@ -611,8 +611,24 @@ fn route_slash(payload: &Value) -> Action {
         // `plan` with no id → help.
     }
 
-    // `approve <id>` → approve + queue (spend-gated). The slash twin of the
-    // approve button.
+    // `queue <id>` → approve + queue (spend-gated). The slash twin of the
+    // approve button. This is the D-A ticket-queueing verb (see
+    // docs/scoping/pipeline-view.md) — not to be confused with plan
+    // approval, which stays "approve" everywhere else.
+    if let Some(rest) = strip_ci_prefix(text, "queue") {
+        let id = clean_id(rest);
+        if !id.is_empty() {
+            return Action::ApproveMission {
+                mission_id: id.to_string(),
+                user_id,
+                response_url,
+            };
+        }
+        // `queue` with no id → help.
+    }
+
+    // `approve <id>` → deprecated alias for `queue <id>` (D-A). Kept one
+    // release for compatibility; routes to the same Action.
     if let Some(rest) = strip_ci_prefix(text, "approve") {
         let id = clean_id(rest);
         if !id.is_empty() {
@@ -1476,6 +1492,44 @@ mod tests {
 
     #[test]
     fn slash_approve_routes_to_approve_mission() {
+        let env = json!({
+            "type": "slash_commands",
+            "payload": { "command": "/kranz", "text": "approve m-7", "user_id": "U9",
+                         "response_url": "https://hooks.slack/a" }
+        });
+        assert_eq!(
+            route(&env, &lookup_none()).action,
+            Action::ApproveMission {
+                mission_id: "m-7".into(),
+                user_id: Some("U9".into()),
+                response_url: Some("https://hooks.slack/a".into())
+            }
+        );
+    }
+
+    /// D-A: `/kranz queue <id>` is the ticket-queueing verb; proves it
+    /// routes to the same `Action::ApproveMission` as `/kranz approve <id>`.
+    #[test]
+    fn pipeline_slash_queue_routes_to_approve_mission_action() {
+        let env = json!({
+            "type": "slash_commands",
+            "payload": { "command": "/kranz", "text": "queue m-7", "user_id": "U9",
+                         "response_url": "https://hooks.slack/a" }
+        });
+        assert_eq!(
+            route(&env, &lookup_none()).action,
+            Action::ApproveMission {
+                mission_id: "m-7".into(),
+                user_id: Some("U9".into()),
+                response_url: Some("https://hooks.slack/a".into())
+            }
+        );
+    }
+
+    /// D-A: `/kranz approve <id>` is kept as a deprecated alias for
+    /// `/kranz queue <id>` — it must still route to the same Action.
+    #[test]
+    fn pipeline_slash_approve_still_routes_to_approve_mission_action_as_deprecated_alias() {
         let env = json!({
             "type": "slash_commands",
             "payload": { "command": "/kranz", "text": "approve m-7", "user_id": "U9",

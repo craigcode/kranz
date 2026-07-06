@@ -379,11 +379,11 @@ pub async fn cmd_draft(
     Ok(0)
 }
 
-/// `kranz ticket approve <slug> [--mission <id>]`: enqueue the parked (Review)
+/// `kranz ticket queue <slug> [--mission <id>]`: enqueue the parked (Review)
 /// mission for the ticket and set the ticket Queued.
 ///
 /// `draft` (no `--yes`) leaves the ticket in Review with a committed plan.md on
-/// a mission branch but nothing in the queue. Approving picks that mission:
+/// a mission branch but nothing in the queue. Queueing picks that mission:
 /// the explicit `--mission` if given, else the newest mission on the repo
 /// whose recorded goal equals the ticket's folded [`Ticket::mission_goal`]
 /// (that is exactly what `draft` seeded it with).
@@ -392,7 +392,10 @@ pub async fn cmd_draft(
 /// side effects live in [`deps::approve_ticket`] — the same core the REST
 /// `POST /api/tickets/:slug/approve` handler calls, so the two surfaces can
 /// never drift on what "approvable" means.
-pub fn cmd_ticket_approve(
+///
+/// Ticket-queueing is verb "Queue" (see docs/scoping/pipeline-view.md
+/// decision D-A); "Approve" is reserved for plan approval.
+pub fn cmd_ticket_queue(
     repo: &Path,
     slug: &str,
     explicit_mission: Option<&str>,
@@ -404,6 +407,21 @@ pub fn cmd_ticket_approve(
         approved.mission_id, approved.priority
     );
     Ok(0)
+}
+
+/// Deprecated alias for [`cmd_ticket_queue`]. `kranz ticket approve` used to
+/// be the only spelling for ticket-queueing; D-A renamed it to `queue` and
+/// reserved "approve" for plan approval. Kept one release for compatibility.
+pub fn cmd_ticket_approve(
+    repo: &Path,
+    slug: &str,
+    explicit_mission: Option<&str>,
+    force: bool,
+) -> Result<i32> {
+    eprintln!(
+        "warning: `kranz ticket approve` is deprecated, use `kranz ticket queue` instead"
+    );
+    cmd_ticket_queue(repo, slug, explicit_mission, force)
 }
 
 /// Find the mission `draft` created for a ticket: the newest-by-event-log

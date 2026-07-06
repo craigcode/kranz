@@ -182,12 +182,21 @@ fn dispatch_ticket(repo: &Path, command: TicketCommand, mission: Option<&str>) -
             println!("created ticket '{slug}' at {}", path.display());
             Ok(0)
         }
+        TicketCommand::Queue {
+            slug,
+            mission: explicit,
+            force,
+        } => {
+            // A `ticket queue --mission` wins over the global `--mission`.
+            backlog::cmd_ticket_queue(repo, &slug, explicit.as_deref().or(mission), force)
+        }
         TicketCommand::Approve {
             slug,
             mission: explicit,
             force,
         } => {
-            // A `ticket approve --mission` wins over the global `--mission`.
+            // Deprecated alias for `ticket queue` (D-A); `--mission` still
+            // wins over the global `--mission`.
             backlog::cmd_ticket_approve(repo, &slug, explicit.as_deref().or(mission), force)
         }
     }

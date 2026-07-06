@@ -142,7 +142,7 @@ pub enum Command {
         all: bool,
     },
 
-    /// Work with mission tickets (the backlog): list, show, new, approve
+    /// Work with mission tickets (the backlog): list, show, new, queue
     Ticket {
         #[command(subcommand)]
         command: TicketCommand,
@@ -327,7 +327,24 @@ pub enum TicketCommand {
         goal: Option<String>,
     },
 
-    /// Approve a drafted (REVIEW) ticket: enqueue its mission and mark it QUEUED
+    /// Queue a drafted (REVIEW) ticket: enqueue its mission and mark it QUEUED
+    Queue {
+        /// The ticket slug
+        slug: String,
+
+        /// The drafted mission id (auto-detected from the ticket goal if omitted)
+        #[arg(long, value_name = "ID")]
+        mission: Option<String>,
+
+        /// Queue despite unsatisfied `blocked-by` dependencies (a
+        /// blocked-by cycle is never overridable)
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Deprecated alias for `ticket queue` (kept for one release; prints a
+    /// deprecation note to stderr). Do not confuse with plan approval — see
+    /// docs/scoping/pipeline-view.md decision D-A.
     Approve {
         /// The ticket slug
         slug: String,
