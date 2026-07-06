@@ -33,6 +33,12 @@ Questions the doc must answer:
 - Trust: knowledge-store content is model-generated + human-edited;
   how errors get caught (it grounds planners — a wrong "fact" steers
   missions wrong silently).
+- Per-mission research artifact: should each draft park a research.md
+  beside plan.md capturing what the drafter learned and grounded on?
+  Today that research is ephemeral (dies in the planning transcript),
+  so the approve gate cannot audit the plan's grounding. Decide whether
+  research.md is the per-mission feed INTO the persistent store, its
+  input FROM it, or both.
 
 ## Context
 
