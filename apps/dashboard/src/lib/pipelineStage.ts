@@ -54,9 +54,10 @@ function stageFromMission(mission: WorkItemMission): PipelineStage {
   if (mission.status === 'failed') return 'failed';
   if (mission.status === 'complete') return mission.merged === true ? 'landed' : 'delivered';
   if (MISSION_TAIL_RUNNING.has(mission.status)) return 'running';
-  // planning / approved / abandoned: no mission-tail mapping is documented;
-  // treat as running since the mission is the governing state at this point.
-  return 'running';
+  if (mission.status === 'planning') return 'reviewable';
+  if (mission.status === 'approved') return 'queued';
+  // abandoned
+  return 'failed';
 }
 
 /** Pure derivation: WorkItem -> one of the nine canonical pipeline stages. */
@@ -65,10 +66,9 @@ export function pipelineStage(item: WorkItem): PipelineStage {
     return stageFromMission(item.mission);
   }
 
-  if (item.mission) {
-    return stageFromMission(item.mission);
-  }
-
+  // A ticket's own state tracks its whole lifecycle; the joined mission is
+  // only consulted to split the terminal 'done' state into delivered/landed.
+  // Mission.status must NOT influence a ticket-backed row's head stages.
   switch (item.ticket.state) {
     case 'new':
       return 'captured';
@@ -83,7 +83,7 @@ export function pipelineStage(item: WorkItem): PipelineStage {
     case 'running':
       return 'running';
     case 'done':
-      return 'delivered';
+      return item.mission?.merged === true ? 'landed' : 'delivered';
     case 'failed':
       return 'failed';
     default:

@@ -6,7 +6,7 @@ function ticket(state: 'new' | 'drafting' | 'needs-context' | 'review' | 'queued
 }
 
 function ticketWithMission(
-  state: 'running' | 'done' | 'failed',
+  state: 'new' | 'drafting' | 'needs-context' | 'review' | 'queued' | 'running' | 'done' | 'failed',
   mission: { status: any; merged: boolean | null },
 ): WorkItem {
   return { kind: 'ticket', ticket: { slug: 't-1', state }, mission };
@@ -25,8 +25,16 @@ describe('pipelineStage', () => {
     expect(pipelineStage(ticket('queued'))).toBe('queued');
   });
 
+  it('maps ticket state running to running', () => {
+    expect(pipelineStage(ticket('running'))).toBe('running');
+  });
+
   it('maps ticket state failed directly to failed', () => {
     expect(pipelineStage(ticket('failed'))).toBe('failed');
+  });
+
+  it('maps a done ticket with no joined mission to delivered', () => {
+    expect(pipelineStage(ticket('done'))).toBe('delivered');
   });
 
   it('maps a complete ticketless mission with merged=false to delivered', () => {
@@ -41,29 +49,55 @@ describe('pipelineStage', () => {
     expect(pipelineStage(missionItem('complete', true))).toBe('landed');
   });
 
-  it('maps a complete ticket-joined mission with merged=false to delivered', () => {
-    expect(pipelineStage(ticketWithMission('running', { status: 'complete', merged: false }))).toBe('delivered');
+  it('maps a done ticket with joined mission merged=false to delivered', () => {
+    expect(pipelineStage(ticketWithMission('done', { status: 'complete', merged: false }))).toBe('delivered');
   });
 
-  it('maps a complete ticket-joined mission with merged=true to landed', () => {
-    expect(pipelineStage(ticketWithMission('running', { status: 'complete', merged: true }))).toBe('landed');
+  it('maps a done ticket with joined mission merged=true to landed', () => {
+    expect(pipelineStage(ticketWithMission('done', { status: 'complete', merged: true }))).toBe('landed');
   });
 
-  it('maps running/paused/blocked/validating mission statuses to running', () => {
+  it('maps running/paused/blocked/validating ticketless mission statuses to running', () => {
     for (const status of ['running', 'paused', 'blocked', 'validating']) {
       expect(pipelineStage(missionItem(status))).toBe('running');
-      expect(pipelineStage(ticketWithMission('running', { status, merged: null }))).toBe('running');
     }
   });
 
-  it('maps a failed mission to failed', () => {
+  it('maps a failed ticketless mission to failed', () => {
     expect(pipelineStage(missionItem('failed'))).toBe('failed');
-    expect(pipelineStage(ticketWithMission('failed', { status: 'failed', merged: null }))).toBe('failed');
   });
 
-  it('mission status governs the tail once a ticket has a joined mission, even mid-flow ticket states', () => {
-    // ticket state is stale/irrelevant once a mission exists; the mission governs.
-    expect(pipelineStage(ticketWithMission('done', { status: 'running', merged: null }))).toBe('running');
+  it('maps ticketless mission status planning to reviewable', () => {
+    expect(pipelineStage(missionItem('planning'))).toBe('reviewable');
+  });
+
+  it('maps ticketless mission status approved to queued', () => {
+    expect(pipelineStage(missionItem('approved'))).toBe('queued');
+  });
+
+  it('maps ticketless mission status abandoned to failed', () => {
+    expect(pipelineStage(missionItem('abandoned'))).toBe('failed');
+  });
+
+  // Regression coverage: the ticket's own state governs its head stages.
+  // A joined mission (recorded on the ticket as soon as drafting starts)
+  // must NOT override the ticket's state for anything before 'done'.
+  it('a review-state ticket with a joined approved mission stays reviewable', () => {
+    expect(pipelineStage(ticketWithMission('review', { status: 'approved', merged: null }))).toBe('reviewable');
+  });
+
+  it('a queued-state ticket with a joined approved mission stays queued', () => {
+    expect(pipelineStage(ticketWithMission('queued', { status: 'approved', merged: null }))).toBe('queued');
+  });
+
+  it('a drafting-state ticket with a joined planning mission stays drafting', () => {
+    expect(pipelineStage(ticketWithMission('drafting', { status: 'planning', merged: null }))).toBe('drafting');
+  });
+
+  it('a needs-context ticket with a joined planning mission stays needs-you', () => {
+    expect(pipelineStage(ticketWithMission('needs-context', { status: 'planning', merged: null }))).toBe(
+      'needs-you',
+    );
   });
 });
 
