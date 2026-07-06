@@ -126,3 +126,16 @@ mission, sequential included.
    escape hatch — is the perf worth the hole for autonomous runs?
 5. Does `enforce` ever default on for attended runs, or is the floor-for-
    autonomous / freedom-for-attended split (scrutiny precedent) permanent?
+
+## Design note — policy scaling (2026-07-06)
+
+Enforcement rigor should be a function of two independent inputs, not a
+single global setting: **declared blast radius** (touch-set breadth,
+diff scale, milestone shape) and **run autonomy** (interactive vs
+queued vs headless). The scrutiny floor for autonomous runs and the
+sandbox tiers above are points on that surface; the deferred per-ticket
+priced consent (pipeline-view.md D-D, `auto-queue-under`) rejoins it
+once calibration matures. When tier-2 config lands, prefer expressing
+defaults as this function (e.g. a mission whose touch-set spans crates/
+gets `enforce: fs` by default; a docs-only touch-set may run lighter)
+over hand-set per-mission values.
