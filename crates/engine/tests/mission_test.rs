@@ -1918,6 +1918,89 @@ fn mission_index_report_link_appends_once() {
     assert_eq!(unknown, marked, "unknown id leaves the index unchanged");
 }
 
+/// Pruning a mission's line removes exactly that line, keeps the header and
+/// every other line byte-for-byte, and is a no-op for an id with no line.
+#[test]
+fn mission_index_prune_removes_only_named_line() {
+    use kranz_engine::orchestrator::{prune_mission_index, upsert_mission_index};
+    let d = chrono::NaiveDate::from_ymd_opt(2026, 7, 3).unwrap();
+    let index = upsert_mission_index("", "m-aaa", "first goal", d);
+    let index = upsert_mission_index(&index, "m-bbb", "second goal", d);
+
+    let pruned = prune_mission_index(&index, "m-aaa");
+    assert!(!pruned.contains("[m-aaa]("), "{pruned}");
+    assert!(pruned.contains("[m-bbb]("), "{pruned}");
+    assert!(pruned.starts_with("# Kranz missions"), "{pruned}");
+    assert!(
+        pruned.contains("- 2026-07-03 · [m-bbb](m-bbb/plan.md) — second goal"),
+        "{pruned}"
+    );
+
+    let noop = prune_mission_index(&pruned, "m-zzz");
+    assert_eq!(noop, pruned, "unknown id leaves the index unchanged");
+
+    let empty = prune_mission_index("", "m-aaa");
+    assert_eq!(empty, "", "empty input returns unchanged");
+}
+
+/// `mission_index_ids` returns exactly the catalog's ids, in file order,
+/// taking the plan.md bracket (not the trailing `[report]` link) as the id.
+#[test]
+fn mission_index_ids_lists_ids_in_order() {
+    use kranz_engine::orchestrator::{
+        mark_mission_index_report, mission_index_ids, upsert_mission_index,
+    };
+    let d = chrono::NaiveDate::from_ymd_opt(2026, 7, 3).unwrap();
+    let index = upsert_mission_index("", "m-aaa", "first goal", d);
+    let index = upsert_mission_index(&index, "m-bbb", "second goal", d);
+    let index = mark_mission_index_report(&index, "m-aaa");
+
+    assert_eq!(
+        mission_index_ids(&index),
+        vec!["m-aaa".to_string(), "m-bbb".to_string()]
+    );
+}
+
+/// Deleting a mission prunes its line from the on-disk catalog, leaving the
+/// other mission's line intact.
+#[test]
+fn delete_prunes_missions_index() {
+    use kranz_engine::orchestrator::{prune_mission_index_file, upsert_mission_index};
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let root = std::fs::canonicalize(dir.path()).expect("canonicalize repo root");
+    let d = chrono::NaiveDate::from_ymd_opt(2026, 7, 3).unwrap();
+
+    let index_dir = root.join(".kranz").join("missions");
+    std::fs::create_dir_all(&index_dir).unwrap();
+    let index_path = index_dir.join("index.md");
+    let index = upsert_mission_index("", "m-aaa", "first goal", d);
+    let index = upsert_mission_index(&index, "m-bbb", "second goal", d);
+    std::fs::write(&index_path, &index).unwrap();
+
+    prune_mission_index_file(&root, "m-aaa");
+
+    let after = std::fs::read_to_string(&index_path).unwrap();
+    assert!(!after.contains("[m-aaa]("), "{after}");
+    assert!(after.contains("[m-bbb]("), "{after}");
+}
+
+/// Pruning against a repo with no index file at all is a no-op: it must not
+/// create one.
+#[test]
+fn delete_prunes_missions_index_missing_file_is_noop() {
+    use kranz_engine::orchestrator::prune_mission_index_file;
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let root = std::fs::canonicalize(dir.path()).expect("canonicalize repo root");
+
+    prune_mission_index_file(&root, "m-aaa");
+
+    assert!(!root
+        .join(".kranz")
+        .join("missions")
+        .join("index.md")
+        .exists());
+}
+
 // ---------------------------------------------------------------------------
 // 9. Mission hygiene: abandon (roadmap M2)
 // ---------------------------------------------------------------------------
