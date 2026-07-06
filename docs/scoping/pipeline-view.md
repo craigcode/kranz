@@ -96,6 +96,25 @@ reviewed click while keeping publication human. Foreclosed if rejected:
 the Delivered stage keeps a copy-paste command block instead of a button
 (acceptable fallback; the view ships either way).
 
+## D-D — the queue gate stays human (DECIDED 2026-07-05)
+
+The Reviewable → Queued transition keeps a human, permanently as the
+default. Rationale: the gate is contract review as much as cost consent —
+thin contracts must die before they produce unaudited work — and today's
+gate is uninformed theater (the operator never sees the estimate). Slice 1
++ slice 2 make it a ten-second informed act: plan, contract, and estimate
+WITH calibration confidence, on every surface, one Queue button.
+
+Deferred middle path (explicitly NOT in this build): per-ticket priced
+consent — opt-in frontmatter `auto-queue-under: <usd>` meaning "queue
+without asking iff the estimate's HIGH bound is under the cap, validators
+are on, and blockers are satisfied." Mirrors the scrutiny-floor
+philosophy. Hard-gated on fix-calibration-mission-shape landing first:
+auto-queueing on 4x-miss estimates is automated surprise.
+
+Also DECIDED 2026-07-05: ticket capture from both web and Slack (slice 5)
+is confirmed, not optional.
+
 ## Build slicing (each a single mission brief)
 
 1. **Persist estimates + serve stage artifacts.** Estimate into plan.md at
