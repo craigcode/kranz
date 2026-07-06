@@ -660,6 +660,7 @@ pub fn build_help() -> Vec<Value> {
              • `/kranz pause [<id>]` — pause a running mission (between worker runs)\n\
              • `/kranz resume [<id>]` — resume a paused mission\n\
              • `/kranz work` — show the execution queue (drain it with the `kranz work` dispatcher)\n\
+             • `/kranz work run` — trigger the queue drain through the host (progress posts per mission)\n\
              • `/kranz status [<id>]` — show a mission's status\n\
              • `/kranz ticket <title>` — file a new backlog ticket\n\
              • `/kranz ticket list` — list backlog tickets\n\

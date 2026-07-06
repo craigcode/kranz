@@ -276,6 +276,9 @@ struct FakeHost {
     /// `approve_ticket` (the draft-only tests).
     repo_root: Option<std::path::PathBuf>,
     approve_ticket_calls: AtomicUsize,
+    /// Records how many times `drain` (the `/kranz work run` host call) is
+    /// called. `None` never errors in these tests.
+    drain_calls: AtomicUsize,
 }
 
 #[derive(Clone, Copy)]
@@ -291,6 +294,7 @@ impl FakeHost {
             outcome,
             repo_root: None,
             approve_ticket_calls: AtomicUsize::new(0),
+            drain_calls: AtomicUsize::new(0),
         }
     }
 
@@ -300,6 +304,7 @@ impl FakeHost {
             outcome: DraftOutcomeKind::ParkedForReview,
             repo_root: Some(repo_root),
             approve_ticket_calls: AtomicUsize::new(0),
+            drain_calls: AtomicUsize::new(0),
         }
     }
 }
@@ -370,6 +375,11 @@ impl PlanningHost for FakeHost {
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             Ok(approved.mission_id)
         })
+    }
+
+    fn drain<'a>(&'a self) -> BoxFuture<'a, anyhow::Result<()>> {
+        self.drain_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -607,4 +617,121 @@ async fn approve_slug_blocked_by_unsatisfied_dependency_refuses_verbatim_and_que
         kranz_engine::queue::list(tmp.path()).is_empty(),
         "a blocked approve must queue nothing"
     );
+}
+
+// -- `/kranz work run` routing + gate ---------------------------------------
+
+use kranz_slack::bridge::{gate_work_run_command, run_work_run, WorkRunGate};
+
+#[test]
+fn work_run_dispatches_from_single_line_slash_with_user() {
+    let env = json!({
+        "type": "slash_commands",
+        "envelope_id": "env-workrun",
+        "payload": {
+            "command": "/kranz",
+            "text": "work run",
+            "channel_id": "C1",
+            "user_id": "U123",
+            "response_url": "https://hooks.slack/tix"
+        }
+    });
+    let routed = route(&env, &no_lookup());
+    assert_eq!(
+        routed.action,
+        Action::WorkRun {
+            user_id: Some("U123".into()),
+            response_url: Some("https://hooks.slack/tix".into()),
+        }
+    );
+}
+
+#[test]
+fn bare_work_still_routes_to_work_report_only() {
+    let routed = route(&slash_env("work"), &no_lookup());
+    assert_eq!(
+        routed.action,
+        Action::Work {
+            response_url: Some("https://hooks.slack/tix".into())
+        }
+    );
+}
+
+#[test]
+fn work_run_extra_falls_through_to_help() {
+    for text in ["work run extra", "work now"] {
+        let routed = route(&slash_env(text), &no_lookup());
+        assert_eq!(
+            routed.action,
+            Action::Help {
+                response_url: Some("https://hooks.slack/tix".into())
+            },
+            "text={text:?} should route to help"
+        );
+    }
+}
+
+#[tokio::test]
+async fn work_run_denies_an_unlisted_user_and_drains_nothing() {
+    let cfg = gated_cfg(vec!["U-allowed".into()]);
+    let fake = Arc::new(FakeHost::new(DraftOutcomeKind::ParkedForReview));
+    let host: SharedHost = fake.clone();
+
+    let gate = gate_work_run_command(&cfg, Some(&host), Some("U-outsider"));
+
+    assert!(
+        matches!(gate, WorkRunGate::Unauthorized),
+        "unlisted user must be refused"
+    );
+    assert_eq!(
+        fake.drain_calls.load(Ordering::SeqCst),
+        0,
+        "an unlisted user's work run must trigger zero drains"
+    );
+    let refusal = serde_json::to_string(&not_authorized_blocks()).unwrap();
+    assert!(refusal.contains("not authorized to spend"));
+}
+
+#[tokio::test]
+async fn work_run_gate_acks_before_any_drain_call_then_run_triggers_exactly_once() {
+    let cfg = gated_cfg(vec!["U-allowed".into()]);
+    let fake = Arc::new(FakeHost::new(DraftOutcomeKind::ParkedForReview));
+    let host: SharedHost = fake.clone();
+
+    let gate = gate_work_run_command(&cfg, Some(&host), Some("U-allowed"));
+
+    let ack = match gate {
+        WorkRunGate::Ready(ack) => ack,
+        _ => panic!("authorized work run with a host must be Ready"),
+    };
+    assert_eq!(
+        fake.drain_calls.load(Ordering::SeqCst),
+        0,
+        "the gate/ack phase must not call host.drain — the ack must be postable BEFORE the drain runs"
+    );
+    let ack_text = serde_json::to_string(&ack).unwrap().to_lowercase();
+    assert!(
+        ack_text.contains("draining"),
+        "authorized work run acks immediately: {ack_text}"
+    );
+
+    let _ = run_work_run(&host).await;
+    assert_eq!(
+        fake.drain_calls.load(Ordering::SeqCst),
+        1,
+        "run_work_run triggers exactly one drain — no mission is resumed/run inline"
+    );
+}
+
+#[tokio::test]
+async fn work_run_without_a_host_is_an_honest_refusal_pointing_at_the_cli() {
+    let cfg = gated_cfg(vec!["U-allowed".into()]);
+    let gate = gate_work_run_command(&cfg, None, Some("U-allowed"));
+    let blocks = match gate {
+        WorkRunGate::NoHost(blocks) => blocks,
+        _ => panic!("no host must gate to NoHost"),
+    };
+    let result_text = serde_json::to_string(&blocks).unwrap().to_lowercase();
+    assert!(result_text.contains("no hosted planning engine"));
+    assert!(result_text.contains("kranz work"));
 }
