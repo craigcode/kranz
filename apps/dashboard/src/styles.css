@@ -1429,14 +1429,24 @@ button {
 }
 
 /* A list row plus its management action: the row keeps the click-to-open
-   area, the action sits beside it (never nested — buttons can't nest). */
+   area, the action sits beside it (never nested — buttons can't nest).
+   .picker-item is a column: the header line (row + actions) on top, and
+   a full-width slot below for inline artifact panels/errors, so failure
+   text never shares the horizontal band with the row's badges. */
 .picker-item {
   display: flex;
-  align-items: center;
+  flex-direction: column;
   gap: 6px;
 }
 
-.picker-item .picker-row {
+.picker-item-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+}
+
+.picker-item-header .picker-row {
   flex: 1;
   min-width: 0;
 }
@@ -1470,6 +1480,9 @@ button {
 
 .picker-id {
   flex: none;
+  min-width: max-content;
+  white-space: nowrap;
+  overflow: visible;
   color: var(--dim);
 }
 

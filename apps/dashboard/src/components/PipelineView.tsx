@@ -354,26 +354,28 @@ export function PipelineView() {
 
     return (
       <li key={r.key} className="picker-item">
-        <div className="picker-row">
-          <span className={`status-pill pill-${stage}`}>
-            <span className="status-dot" aria-hidden="true" />
-            {stage}
-          </span>
-          <span className="mono picker-id">{r.id}</span>
-          <span className="picker-goal">{r.title}</span>
-          {showBlockedBadge && (
-            <span className="ticket-blocker-badge" title={`blocked by ${r.blockedBy.join(', ')}`}>
-              blocked by {r.blockedBy.join(', ')}
+        <div className="picker-item-header">
+          <div className="picker-row">
+            <span className={`status-pill pill-${stage}`}>
+              <span className="status-dot" aria-hidden="true" />
+              {stage}
             </span>
-          )}
-          {stage === 'delivered' && (
-            <span className="unmerged-badge" title="mission complete, not yet merged">
-              UNMERGED
-            </span>
-          )}
+            <span className="mono picker-id">{r.id}</span>
+            <span className="picker-goal">{r.title}</span>
+            {showBlockedBadge && (
+              <span className="ticket-blocker-badge" title={`blocked by ${r.blockedBy.join(', ')}`}>
+                blocked by {r.blockedBy.join(', ')}
+              </span>
+            )}
+            {stage === 'delivered' && (
+              <span className="unmerged-badge" title="mission complete, not yet merged">
+                UNMERGED
+              </span>
+            )}
+          </div>
+          {renderPrimary(r, stage)}
+          {renderSecondary(r, stage)}
         </div>
-        {renderPrimary(r, stage)}
-        {renderSecondary(r, stage)}
         {stage === 'reviewable' && r.missionId !== undefined && (
           <ReviewablePlan missionId={r.missionId} />
         )}
