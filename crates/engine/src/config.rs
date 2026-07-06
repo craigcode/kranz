@@ -240,7 +240,12 @@ mod tests {
     #[test]
     fn default_config_serializes_without_backend_field() {
         let value = serde_json::to_value(MissionConfig::default()).unwrap();
-        for role in ["orchestrator", "worker", "validatorScrutiny", "validatorFunctional"] {
+        for role in [
+            "orchestrator",
+            "worker",
+            "validatorScrutiny",
+            "validatorFunctional",
+        ] {
             let obj = value[role].as_object().unwrap();
             assert!(
                 !obj.contains_key("backend"),
@@ -254,7 +259,10 @@ mod tests {
         for backend in [None, Some("claude"), Some("codex")] {
             let mut cfg = MissionConfig::default();
             cfg.validator_scrutiny.backend = backend.map(|s| s.to_string());
-            assert!(validate(&cfg).is_ok(), "backend {backend:?} should be accepted");
+            assert!(
+                validate(&cfg).is_ok(),
+                "backend {backend:?} should be accepted"
+            );
         }
     }
 

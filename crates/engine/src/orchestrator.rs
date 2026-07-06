@@ -4606,7 +4606,10 @@ mod tests {
             let prev_bin = std::env::var_os("KRANZ_CODEX_BIN");
             let prev_home = std::env::var_os("HOME");
             let prev_path = std::env::var_os("PATH");
-            std::env::set_var("KRANZ_CODEX_BIN", "/nonexistent/kranz-test-codex-binary-absent");
+            std::env::set_var(
+                "KRANZ_CODEX_BIN",
+                "/nonexistent/kranz-test-codex-binary-absent",
+            );
             std::env::set_var("HOME", "/nonexistent/kranz-test-home-absent");
             std::env::set_var("PATH", "");
             CodexEnvGuard {
@@ -4734,8 +4737,7 @@ mod tests {
 
         drop(env_guard);
 
-        let events =
-            EventLog::read_events(&engine.paths.events_file()).expect("read events.jsonl");
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events.jsonl");
         assert!(
             events.iter().any(|e| matches!(
                 &e.kind,
@@ -5344,6 +5346,36 @@ mod tests {
         (dir, script_path)
     }
 
+    /// Like [`write_codex_stub`] but the stub's JSONL has no `agent_message`
+    /// item at all — only a `thread.started` and a `turn.completed` with
+    /// `usage` — so `parse_validator_report` returns `None` even though the
+    /// stub exits 0. Models a codex run that completed but never emitted a
+    /// parseable report (e.g. auth/network hiccup mid-turn).
+    #[cfg(unix)]
+    fn write_codex_stub_no_report() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fixture = std::fs::canonicalize(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/codex_exec_scrutiny_no_report.jsonl"),
+        )
+        .expect("fixture exists");
+        let script_path = dir.path().join("codex-stub-no-report.sh");
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'codex-cli 0.0.0-test'\n  exit 0\nfi\ncat '{}'\nexit 0\n",
+                fixture.display()
+            ),
+        )
+        .expect("write stub script");
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat stub script")
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod stub script");
+        (dir, script_path)
+    }
+
     /// RAII guard: points `KRANZ_CODEX_BIN` at a working stub so
     /// `discover_codex_binary` deterministically resolves it as the FIRST
     /// candidate, regardless of whatever real `codex` install happens to sit
@@ -5450,8 +5482,7 @@ mod tests {
             .expect("validation round must complete through the stub codex backend");
         drop(env_guard);
 
-        let events =
-            EventLog::read_events(&engine.paths.events_file()).expect("read events.jsonl");
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events.jsonl");
 
         assert!(
             !events.iter().any(|e| matches!(
@@ -5526,8 +5557,7 @@ mod tests {
             .expect("validation round must complete through the stub codex backend");
         drop(env_guard);
 
-        let events =
-            EventLog::read_events(&engine.paths.events_file()).expect("read events.jsonl");
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events.jsonl");
         let (usage, cost_usd) = events
             .iter()
             .find_map(|e| match &e.kind {
@@ -5566,6 +5596,101 @@ mod tests {
             engine.state().total_cost_usd,
             all_runs_cost,
             "mission totals must equal the sum of every run's recorded cost, codex included"
+        );
+    }
+
+    /// A codex scrutiny run that exits 0 but never emits a parseable
+    /// `ValidatorReport` (usage present, no `agent_message`) must trigger the
+    /// bounded runtime-retry fallback exactly once: a loud
+    /// `orchestrator.decision` naming the retry, a second `ValidatorScrutiny`
+    /// run actually executed against the claude (mock) backend, and that
+    /// retry's findings folded into a fix feature like any other scrutiny
+    /// run's would.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_scrutiny_no_report_falls_back_to_claude_once() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let (_stub_dir, stub_path) = write_codex_stub_no_report();
+
+        let retry_report = serde_json::json!({
+            "findings": [{
+                "subject": "retry-finding",
+                "severity": "major",
+                "evidence": "claude retry scrutiny run found this after codex produced no report",
+                "suggestedFix": "address it"
+            }],
+            "summary": "one finding from the claude retry run"
+        });
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            crate::backend_mock::MockScript::single_shot_json(&retry_report),
+            lesson_orch_script(&codex_fix_features_reply(1)),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock;
+        let mut engine = MissionEngine::create(backend, &root, "goal", codex_scrutiny_cfg())
+            .expect("create engine");
+        engine
+            .state
+            .mission
+            .milestones
+            .push(codex_scrutiny_milestone());
+
+        let env_guard = CodexStubEnvGuard::engage(&stub_path);
+        engine
+            .validation_round(0)
+            .await
+            .expect("validation round must complete via the claude retry fallback");
+        drop(env_guard);
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events.jsonl");
+
+        let retry_decisions: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.kind,
+                    EventKind::OrchestratorDecision { summary, .. }
+                        if summary.contains("retrying once with the claude scrutiny validator")
+                )
+            })
+            .collect();
+        assert_eq!(
+            retry_decisions.len(),
+            1,
+            "expected exactly one loud retry decision: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+
+        let scrutiny_spawns = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.kind,
+                    EventKind::WorkerSpawned { role, .. } if *role == Role::ValidatorScrutiny
+                )
+            })
+            .count();
+        assert_eq!(
+            scrutiny_spawns,
+            2,
+            "expected the initial codex run plus one claude retry run: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::FixFeatureCreated { .. })),
+            "expected the claude retry's findings converted into a fix feature: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            engine.state().mission.milestones[0]
+                .features
+                .iter()
+                .any(|f| f.origin == FeatureOrigin::Fix),
+            "fix feature from the retry's findings must be folded into mission state"
         );
     }
 }
