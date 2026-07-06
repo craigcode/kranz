@@ -1,0 +1,112 @@
+# Mission plan — m-ba8d58
+
+**Goal:** Fix five render bugs in the dashboard pipeline view (apps/dashboard): honest inert stages for abandoned/deleted missions and direct-fixed done tickets, a dedicated failure slot so artifact-fetch errors don't collide with the UNMERGED badge, non-truncating mission-id rendering, and a non-JSON fetch guard that reports 'endpoint unavailable — server restart needed?' instead of a raw JSON parse exception.
+
+Branch `kranz/mission-m-ba8d58` (from `main`). Approved plan of record; the machine-readable twin is [plan.json](plan.json). Live status: `kranz status` or the dashboard.
+
+## Cost estimate
+
+Estimated **$6.15 – $30.76** (expected ~$12.30). Rough estimate — live usage is authoritative; based on 25 completed mission(s).
+
+## Validation contract
+
+Defined before any feature; gates mission completion.
+
+- **[a1]** Abandoned (and deleted/ghost) missions derive to an inert 'abandoned' stage and render zero primary/secondary action controls (no Merge/Iterate/Redraft), while genuinely failed missions and tickets still offer Redraft. 
+  `cd apps/dashboard && npx vitest run src/lib/pipelineStage.test.ts src/components/PipelineView.test.tsx`
+- **[a2]** A ticket in state 'done' with no linked mission (direct-fixed) derives to a terminal inert stage ('landed'), rendering no UNMERGED badge and no Draft/Merge/Iterate control — it is neither 'captured' nor 'delivered'. 
+  `cd apps/dashboard && npx vitest run src/lib/pipelineStage.test.ts src/components/PipelineView.test.tsx`
+- **[a3]** The api fetch layer (getJson and postJson) throws an ApiError whose message is exactly 'endpoint unavailable — server restart needed?' when a 200 response body is non-JSON HTML, never surfacing a raw JSON-parse SyntaxError; a valid application/json 200 still parses and returns normally. 
+  `cd apps/dashboard && npx vitest run src/lib/api.test.ts`
+- **[a4]** The full dashboard test suite, TypeScript typecheck, and production build all pass together. 
+  `cd apps/dashboard && npm ci && npx tsc --noEmit && npm run test && npm run build`
+- **[a5]** The dashboard sources lint clean under oxlint. 
+  `cd apps/dashboard && npm run lint`
+- **[a6]** When an artifact fetch (plan.md / report.md / diff-stat) fails on a complete/Delivered row, the error message renders in its own dedicated layout slot beneath the row header and does not overlap or collide with the UNMERGED badge. *(agent judgement)*
+- **[a7]** A mission row whose title is absent renders its full mission id with no left-side truncation or clipping — the entire id string is visible in a stable slot. *(agent judgement)*
+
+## Milestone 1 — Honest stage derivation & inert dead rows
+
+### 1.1 Inert stages for abandoned missions and direct-fixed done tickets
+
+Fix two stage-derivation bugs in the dashboard pipeline view so dead and direct-fixed rows are honest and inert. Everything is under apps/dashboard.
+
+FILES: apps/dashboard/src/lib/pipelineStage.ts (+ its unit test src/lib/pipelineStage.test.ts); apps/dashboard/src/components/PipelineView.tsx (+ component test src/components/PipelineView.test.tsx); apps/dashboard/src/styles.css; apps/dashboard/src/lib/types.ts (read-only reference for the MissionStatus / TicketState enums — do NOT invent fields).
+
+BACKGROUND: pipelineStage.ts reduces a WorkItem to one canonical PipelineStage (a union) and exposes primaryAction(stage) backed by a `Record<PipelineStage, ActionDescriptor|null>` named PRIMARY_ACTIONS. PipelineView.tsx renders a pill `pill-${stage}` plus, via renderPrimary/renderSecondary, at most one action; both early-return null when primaryAction(stage) is null. Current defects:
+(3) stageFromMission maps mission.status 'abandoned' to 'failed' (see the trailing `// abandoned` / `return 'failed'`), and PRIMARY_ACTIONS.failed offers 'Redraft', so abandoned missions get a live Redraft link.
+(5) pipelineStage's `case 'done'` returns `item.mission?.merged === true ? 'landed' : 'delivered'`. A direct-fixed ticket (ticket state 'done' with NO linked mission — e.g. fix-work-branch-isolation, whose .status is {"state":"done"} and carries no mission_id, so the server emits state 'done' and missionId null) therefore derives to 'delivered', which in PipelineView.row() unconditionally renders the UNMERGED badge (`stage === 'delivered'`). That is dishonest: there is no mission to merge.
+
+CHANGES:
+1) pipelineStage.ts: add 'abandoned' to the PipelineStage union and add `PRIMARY_ACTIONS.abandoned = null` (the Record is exhaustive, so this is required to compile).
+2) stageFromMission: map mission.status 'abandoned' → 'abandoned' (inert). Also defensively map a 'deleted' status → 'abandoned' (mission summaries cast status via `as`, so the string 'deleted' can arrive even though MissionStatus does not list it — compare as a string). Keep: failed→'failed', complete→ merged?'landed':'delivered', the running set→'running', planning→'reviewable', approved→'queued'. Change the final default `return 'failed'` to `return 'abandoned'`.
+3) pipelineStage `case 'done'`: a done ticket whose joined mission is absent OR whose joined mission status is 'abandoned'/'deleted' is terminal and already landed — return 'landed' (NOT 'delivered', NOT 'captured'). When a live mission is joined: merged===true → 'landed', otherwise → 'delivered'. In short: no-live-mission behaves like merged → 'landed'.
+4) PipelineView.tsx should need no new action branches: primaryAction('abandoned') is null so renderPrimary/renderSecondary already return null; a landed direct-fix row has missionId===undefined so the existing 'landed' Iterate branch (which requires missionId) returns null. VERIFY both hold. Ensure the 'abandoned' pill renders an honest label — the pill text is the stage string 'abandoned'; `.pill-abandoned` already exists in styles.css (~line 307, struck-through). Grep for other exhaustive uses of PipelineStage and fix any that break by adding the new variant. Do not add UNMERGED to 'abandoned' or 'landed' rows (the badge stays gated to 'delivered').
+
+TESTS — encode BEFORE implementing:
+- pipelineStage.test.ts: CHANGE the existing 'ticketless mission status abandoned → failed' expectation to expect 'abandoned'. CHANGE the existing 'done ticket (no mission) → delivered' expectation to expect 'landed'. ADD: primaryAction('abandoned') === null; a done ticket joined to a mission with status 'deleted' or 'abandoned' → 'landed'; keep done + unmerged-mission → 'delivered' and done + merged-mission → 'landed'.
+- PipelineView.test.tsx (testing-library, mirrors the existing mock setup): ADD an abandoned-mission-row case asserting the row renders zero `.pipeline-primary-action` and zero `.pipeline-secondary-action`, shows an 'abandoned' pill, no `.unmerged-badge`, and NO 'Redraft'/'Merge'/'Iterate' text (assert the OLD Redraft affordance is ABSENT). ADD a direct-fixed done-ticket case (a TicketSummary with state:'done' and no missionId) asserting a 'landed' pill, no `.unmerged-badge`, and no 'Draft'/'Merge' control present. Confirm a genuinely failed row still offers 'Redraft'.
+
+SCOPE GUARD: do NOT touch the api fetch layer (src/lib/api.ts) or the row-layout CSS/DOM (.picker-item/.picker-id/failure slot) — those are separate features. Before reporting, run `cd apps/dashboard && npx tsc --noEmit && npm run test` and confirm green.
+
+Done when:
+- pipelineStage(an abandoned ticketless mission) === 'abandoned', and primaryAction('abandoned') === null (unit test).
+- pipelineStage(a done ticket with no joined mission) === 'landed' (not 'delivered', not 'captured'); a done ticket joined to a mission whose status is 'deleted' or 'abandoned' also === 'landed'; done+unmerged-mission still === 'delivered' and done+merged-mission still === 'landed' (unit tests).
+- In PipelineView, an abandoned mission row renders zero .pipeline-primary-action and zero .pipeline-secondary-action controls, an 'abandoned' pill, no .unmerged-badge, and no Redraft/Merge/Iterate text (component test asserting those control texts are absent).
+- In PipelineView, a done ticket with no missionId renders a 'landed' pill, no .unmerged-badge, and no Draft/Merge control (component test).
+- A genuinely failed mission/ticket still offers Redraft (regression test preserved).
+- `cd apps/dashboard && npx tsc --noEmit && npm run test` passes.
+
+
+## Milestone 2 — Resilient artifact fetch & row layout
+
+### 2.1 Detect non-JSON (HTML fallback) responses in the fetch layer
+
+Make the dashboard's fetch layer report a clear 'endpoint unavailable' message when a stale/upgraded serve returns an HTML fallback (SPA index.html) with a 200 for an /api route, instead of throwing a raw JSON-parse SyntaxError. Every future binary upgrade reproduces this stale-serve mismatch, so this is the durable fix.
+
+FILES: apps/dashboard/src/lib/api.ts; new test file apps/dashboard/src/lib/api.test.ts.
+
+BACKGROUND: In api.ts, getJson (after its `res.ok` check) does `return (await res.json()) as T`, and postJson does the same on its success path. When serve is stale, an unknown /api route returns 200 with content-type text/html and an HTML body; `res.json()` then throws `SyntaxError: Unexpected token '<'`, which surfaces raw to the UI. The inline panels (ReviewablePlan/DeliveredReport in PipelineView) render `err.message`, so a friendly ApiError message will display verbatim. There is an existing `ApiError extends Error` with a `status` field and a `readonly name = 'ApiError'`.
+
+CHANGES (apply to BOTH getJson and postJson success paths):
+- After confirming `res.ok`, guard the JSON parse. Robust approach: read the body once as text and `JSON.parse` it inside try/catch; if parsing fails (or, as a fast pre-check, the `content-type` header does not include 'application/json'), throw `new ApiError(res.status, 'endpoint unavailable — server restart needed?')`. Use that message string EXACTLY, including the em dash (—). Do not let a SyntaxError escape.
+- Leave the existing error-body path (errorFrom, used on non-ok responses) unchanged — it already tolerates a non-JSON body via try/catch.
+- Preserve current behavior for valid JSON responses (parse and return the typed value).
+
+TESTS — encode BEFORE implementing (api.test.ts, mocking global fetch via `vi.fn()`):
+- getJson with a 200 response, content-type 'text/html', body '<!doctype html><html>…' → the returned promise REJECTS with an ApiError whose `.message` === 'endpoint unavailable — server restart needed?' and whose `.name` === 'ApiError'; assert the rejection is NOT a raw SyntaxError and its message does not contain 'Unexpected token' (assert the OLD raw-parse failure is ABSENT).
+- getJson with a 200 response, content-type 'application/json', body '{"ok":true}' → RESOLVES to the parsed object (regression).
+- postJson: exercise the same non-JSON guard on its success path. postJson calls resolveToken()/awaitToken() from '../lib/token'; mock '../lib/token' so resolveToken returns a token string (avoid the token gate) and the mocked fetch returns a 200 HTML body → REJECTS with the same friendly ApiError.
+- Restore/reset the fetch mock between tests.
+
+SCOPE GUARD: do NOT change pipelineStage.ts, PipelineView derivation, or row CSS. Before reporting, run `cd apps/dashboard && npx vitest run src/lib/api.test.ts` and `cd apps/dashboard && npx tsc --noEmit` green.
+
+Done when:
+- getJson rejects with an ApiError whose message is exactly 'endpoint unavailable — server restart needed?' when a 200 response carries a non-JSON (HTML) body, and never surfaces a raw JSON SyntaxError / 'Unexpected token' message (api.test.ts).
+- getJson still resolves to the parsed value for a valid application/json 200 response (regression, api.test.ts).
+- postJson applies the same non-JSON guard on its success path and rejects with the identical friendly ApiError (api.test.ts, with '../lib/token' mocked).
+- `cd apps/dashboard && npx vitest run src/lib/api.test.ts` passes and `cd apps/dashboard && npx tsc --noEmit` is clean.
+
+### 2.2 Failure layout slot and non-truncating mission id in the pipeline row
+
+Fix two visual/layout bugs in the pipeline row so failure text gets its own slot and mission ids never left-truncate. Everything is under apps/dashboard.
+
+FILES: apps/dashboard/src/components/PipelineView.tsx (row markup/structure), apps/dashboard/src/styles.css (.picker-item / .picker-row / .picker-id / .picker-goal / .unmerged-badge / .pipeline-inline-error / .pipeline-inline-panel), apps/dashboard/src/components/PipelineView.test.tsx (structural tests).
+
+BUG 1 — error overlaps the UNMERGED badge. `.picker-item` is `display:flex; align-items:center` (styles.css ~line 1433) laid out as a horizontal row. In PipelineView.row(), the li's children are: `.picker-row` (flex:1, contains the pill, id, title, badges including `.unmerged-badge`), then the primary action, the secondary action, then the inline artifact panels (ReviewablePlan / DeliveredReport). On an artifact-fetch failure those panels render `<div className="picker-error pipeline-inline-error">Could not load report: …</div>`. Because they are flex siblings in the horizontal `.picker-item`, the error text lays out BESIDE the row and collides with the UNMERGED badge. FIX: give the inline panels AND their failure/error states their own full-width layout slot that drops onto its own line beneath the row header, never sharing the horizontal band with the badge. A clean approach: restructure `.picker-item` into a header line (pill + id + title + badges + actions) plus a full-width block region below it for panels/errors — e.g. make `.picker-item` a column wrapper, or add `flex-wrap:wrap` with the panel/error elements forced to `width:100%` so they wrap to their own row. Keep the primary/secondary action beside the row header as today. Ensure Reviewable/Delivered success panels also sit in that below-the-row slot (they already intend to via `width:100%` + `margin-top`).
+
+BUG 2 — mission id truncates from the left when the title is absent. `.picker-id` is `flex:none; color:var(--dim)` (styles.css ~line 1471) with no clip styling, yet ids visibly truncate from the left when a row's `.picker-goal` (title) is empty. The mechanism is not obvious from static CSS — DIAGNOSE IT LIVE (start the dev server per apps/dashboard/README: `npm install` then `npm run dev` on http://localhost:5173, and inspect the computed layout — check whether the `.mono` font, a parent's overflow/`min-width`, or a flex-basis interaction clips the id when the sibling title is empty). Then give the id its own stable, non-shrinking, non-left-clipping slot so the COMPLETE id always renders regardless of whether a title is present. Do not simply widen everything — the fix must be principled (e.g. `flex:none` + `min-width` on the id column, and ensure no ancestor applies a left-clipping overflow/`direction` to it).
+
+TESTS — add where meaningful (PipelineView.test.tsx, testing-library, mirroring the existing mock setup):
+- A Delivered/complete row whose report fetch REJECTS (mock api.reportMd/diffStat to reject) renders the error in a dedicated failure-slot element (give it a stable class) that is placed after / outside the `.picker-row` header — assert the error element is NOT a descendant of `.picker-row` and shares no inline row container with `.unmerged-badge`.
+- A mission row whose title is absent (empty goal/title) renders the complete id string in the DOM (assert the full id text is present in the id slot).
+Note: jsdom cannot measure pixels; these tests assert DOM structure only. The true no-overlap / no-clip judgement is covered by mission assertions a6/a7 — document a clear before/after explanation of the reproduction and the fix (attach screenshots if a browser/computer-use tool is available in your session; if not, describe the computed-layout cause and why the change removes it).
+
+SCOPE GUARD: do NOT change pipelineStage.ts derivation logic or api.ts; you inherit the M1 'abandoned'/'landed' rendering — do not regress it. Before reporting, run `cd apps/dashboard && npx tsc --noEmit && npm run test && npm run build` green.
+
+Done when:
+- On a Delivered/complete row whose artifact fetch rejects, the error message renders in a dedicated failure slot (stable class, block-level, beneath the row header) that is not a descendant of .picker-row and does not share an inline row container with the .unmerged-badge (component/structural test).
+- A mission row whose title is absent renders its full, complete mission id string in the DOM in a dedicated id slot with no characters dropped (component test).
+- A clear before/after account (and screenshots if a browser tool is available) demonstrates the failure text no longer overlaps the UNMERGED badge and the id is no longer left-truncated, as evidence for the agent-judgement assertions.
+- `cd apps/dashboard && npx tsc --noEmit && npm run test && npm run build` passes.
+

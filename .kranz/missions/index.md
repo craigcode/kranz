@@ -25,3 +25,4 @@ Approved plans, newest last.
 - 2026-07-06 · [m-d309c0](m-d309c0/plan.md) — Make the engine draft core detect a plan-shaped NotReady reply and either recover it through the plan channel or fail ho… [truncated] · [report](m-d309c0/report.md)
 - 2026-07-06 · [m-5d2c79](m-5d2c79/plan.md) — Add a CodexBackend (AgentBackend over `codex exec --json`) selectable only for the scrutiny validator via an optional va… [truncated] · [report](m-5d2c79/report.md)
 - 2026-07-06 · [m-0b8da7](m-0b8da7/plan.md) — Make pre-mission cost estimates shape-aware: detect doc-heavy/judgement-heavy plan shapes the calibration corpus doesn't… [truncated] · [report](m-0b8da7/report.md)
+- 2026-07-06 · [m-ba8d58](m-ba8d58/plan.md) — Fix five render bugs in the dashboard pipeline view (apps/dashboard): honest inert stages for abandoned/deleted missions… [truncated]
