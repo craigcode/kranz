@@ -655,3 +655,347 @@ async fn mission_branch_carries_deliverables_in_worktree_mode() {
         "report.md twin must be readable in the primary runtime dir"
     );
 }
+
+// -----------------------------------------------------------------------
+// f-3-1: end-to-end guarantees across a MULTI-feature/MULTI-milestone
+// mission that exercises BOTH the sequential and parallel-batch paths,
+// leak-free cleanup, and the checkout-mode regression guard.
+// -----------------------------------------------------------------------
+
+/// Two milestones: M1 has two plan-origin features (the parallel-batch
+/// candidate pair), M2 has one (always sequential — `try_parallel_batch`
+/// short-circuits below 2 candidates). Feature ids follow the reducer's
+/// `f-<milestone-number>-<feature-number>` scheme: f-1-1, f-1-2, f-2-1.
+fn two_milestone_plan() -> Plan {
+    Plan {
+        goal: GOAL.to_string(),
+        validation_contract: vec![],
+        milestones: vec![
+            PlanMilestone {
+                title: "M1".to_string(),
+                features: vec![
+                    PlanFeature {
+                        title: "feature 1".to_string(),
+                        spec: "build part 1".to_string(),
+                        validation_criteria: vec!["part 1 works".to_string()],
+                    },
+                    PlanFeature {
+                        title: "feature 2".to_string(),
+                        spec: "build part 2".to_string(),
+                        validation_criteria: vec!["part 2 works".to_string()],
+                    },
+                ],
+            },
+            PlanMilestone {
+                title: "M2".to_string(),
+                features: vec![PlanFeature {
+                    title: "feature 3".to_string(),
+                    spec: "build part 3".to_string(),
+                    validation_criteria: vec!["part 3 works".to_string()],
+                }],
+            },
+        ],
+        command_grants: vec![],
+    }
+}
+
+/// Parallelization-decision reply (roadmap M3): the listed feature ids are
+/// independent and merge in the given order.
+fn parallel_plan(ids: &[&str]) -> String {
+    json!({
+        "independent": ids,
+        "mergeOrder": ids,
+        "summary": format!("{} features are independent", ids.len())
+    })
+    .to_string()
+}
+
+/// General streaming orchestrator script: one entry per engine turn after
+/// the seed (mirrors `orch_script` in mission_test.rs / soak_test.rs).
+fn orch_multi_script(replies: Vec<String>) -> MockScript {
+    MockScript::streaming(vec![mock_init("orch-session"), mock_result_text("ready")]).responding(
+        replies
+            .iter()
+            .map(|reply| vec![mock_text(reply), mock_result_text(reply)])
+            .collect(),
+    )
+}
+
+/// Scripts for the two-milestone mission: orchestrator (parallel-plan for
+/// M1, one judgement turn per feature, then the capture-lesson turn), then
+/// one single-shot worker script per feature (3 total — 2 parallel, 1
+/// sequential; the mock backend pops these FIFO regardless of which feature
+/// binds to which, so all three being identical `worker_pass()` scripts is
+/// sufficient).
+fn two_milestone_scripts() -> Vec<MockScript> {
+    vec![
+        orch_multi_script(vec![
+            parallel_plan(&["f-1-1", "f-1-2"]),
+            judgement_complete(),
+            judgement_complete(),
+            judgement_complete(),
+            "NONE".to_string(),
+        ]),
+        worker_pass(),
+        worker_pass(),
+        worker_pass(),
+    ]
+}
+
+/// `worktrees_removed_at_mission_end_in_worktree_mode`: after a completed
+/// worktree-mode mission that runs BOTH the sequential path (M2's single
+/// feature) and the parallel-batch path (M1's two independent features,
+/// `maxParallelWorkers=2`), `list_worktrees()` shows only the primary
+/// working tree — the integration worktree and every per-feature worktree
+/// are gone, `prune_worktrees` leaves no dangling admin records, and nothing
+/// leaked into the temp dir.
+#[tokio::test(flavor = "multi_thread")]
+async fn worktrees_removed_at_mission_end_in_worktree_mode() {
+    let Some((_dir, root)) = mission_init_repo() else {
+        return;
+    };
+    let repo = GitRepo::open(&root).expect("open repo");
+
+    let backend = Arc::new(MockBackend::with_scripts(two_milestone_scripts()));
+    let backend_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend) as Arc<dyn AgentBackend>;
+    let mut cfg = worktree_cfg();
+    cfg.max_parallel_workers = 2;
+    let mut engine = MissionEngine::create(backend_dyn, &root, GOAL, cfg).expect("create engine");
+    let mission_id = engine.mission_id().to_string();
+    engine.approve_plan(two_milestone_plan()).unwrap();
+
+    let status = timeout(TokioDuration::from_secs(90), engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+
+    // Only the primary working tree remains registered.
+    let worktrees = repo.list_worktrees().unwrap();
+    assert_eq!(
+        worktrees.len(),
+        1,
+        "only the primary worktree remains: {worktrees:?}"
+    );
+
+    // `prune_worktrees` is a no-op (idempotent) and leaves no dangling admin
+    // records under `.git/worktrees`.
+    repo.prune_worktrees().expect("prune");
+    let worktrees_after_prune = repo.list_worktrees().unwrap();
+    assert_eq!(worktrees_after_prune.len(), 1);
+    let admin_dir = root.join(".git").join("worktrees");
+    if admin_dir.is_dir() {
+        let leftover: Vec<_> = std::fs::read_dir(&admin_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "dangling worktree admin records remain: {leftover:?}"
+        );
+    }
+
+    // Per-feature worktree branches were cleaned up.
+    for fid in ["f-1-1", "f-1-2"] {
+        assert!(
+            !repo
+                .branch_exists(&format!("kranz/wt/{mission_id}/{fid}"))
+                .unwrap_or(false),
+            "per-feature worktree branch {fid} must be deleted"
+        );
+    }
+
+    // No leaked worktree dir (parallel OR integration) for this mission.
+    let leak_prefix = format!("kranz-wt-{mission_id}-");
+    for entry in std::fs::read_dir(std::env::temp_dir()).unwrap().flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        assert!(
+            !name.starts_with(&leak_prefix),
+            "a worktree dir leaked into temp: {name}"
+        );
+    }
+}
+
+/// `checkout_mode_matches_legacy_sequential`: the SAME multi-feature/
+/// multi-milestone mission (including the parallel-batch path — which
+/// always uses its own per-feature worktrees, regardless of
+/// `workerIsolation`, per roadmap M3) run in checkout mode (default)
+/// preserves legacy invariants: the mission branch is checked out in the
+/// primary tree for the whole run, the SEQUENTIAL feature's worker spawns
+/// with cwd = repo_root, and the primary tree ends on the mission branch.
+#[tokio::test(flavor = "multi_thread")]
+async fn checkout_mode_matches_legacy_sequential() {
+    let Some((_dir, root)) = mission_init_repo() else {
+        return;
+    };
+
+    let mut cfg = checkout_cfg();
+    cfg.max_parallel_workers = 2;
+
+    let backend = Arc::new(MockBackend::with_scripts(two_milestone_scripts()));
+    let backend_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend) as Arc<dyn AgentBackend>;
+    let mut engine = MissionEngine::create(backend_dyn, &root, GOAL, cfg).expect("create engine");
+    let mission_branch = engine.state().mission.mission_branch.clone();
+    engine.approve_plan(two_milestone_plan()).unwrap();
+
+    // Legacy invariant: `approve_plan` checks the mission branch out in the
+    // primary tree BEFORE `run()` even starts, and nothing in checkout mode
+    // ever moves it off that branch again.
+    let branch_right_after_approval = raw_git(&root, &["branch", "--show-current"])
+        .trim()
+        .to_string();
+    assert_eq!(branch_right_after_approval, mission_branch);
+
+    let status = timeout(TokioDuration::from_secs(90), engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+
+    let specs = backend.started_specs();
+    let worker_specs: Vec<_> = specs
+        .iter()
+        .filter(|s| matches!(s.prompt, PromptMode::SingleShot(ref t) if t.contains("Implement feature")))
+        .collect();
+    assert_eq!(worker_specs.len(), 3, "three worker sessions ran");
+    // M2's single feature cannot start until M1 (the parallel batch) fully
+    // completes, so the LAST worker spec started is the sequential one.
+    let sequential_worker = worker_specs.last().expect("a sequential worker ran");
+    assert_eq!(
+        sequential_worker.cwd, root,
+        "checkout mode must still spawn the sequential feature's worker in the primary repo root"
+    );
+
+    let branch_after = raw_git(&root, &["branch", "--show-current"])
+        .trim()
+        .to_string();
+    assert_eq!(
+        branch_after, mission_branch,
+        "checkout mode must leave the primary checkout on the mission branch"
+    );
+}
+
+/// Strengthens a1/a6/a7 to a MULTI-feature, MULTI-milestone worktree-mode
+/// mission that exercises the parallel-batch path (M1, `maxParallelWorkers=2`)
+/// as well as the sequential path (M2): the primary checkout stays
+/// byte-untouched for the whole run (a1), the mission branch tip carries the
+/// engine's deliverable commits and BOTH milestone tags (a6), and
+/// `KRANZ_BASE_SHA` reaches every worker session env and the final-gate
+/// contract-command env (a7).
+#[tokio::test(flavor = "multi_thread")]
+async fn multi_milestone_worktree_mode_preserves_a1_a6_a7() {
+    let Some((_dir, root)) = mission_init_repo() else {
+        return;
+    };
+    let repo = GitRepo::open(&root).expect("open repo");
+    let branch_before = repo.current_branch().unwrap();
+    let head_before = repo.head_sha().unwrap();
+    let status_before = raw_git(&root, &["status", "--porcelain", "--untracked-files=no"]);
+
+    let capture_dir = tempfile::tempdir().expect("capture dir");
+    let capture_file = capture_dir.path().join("gate_base_sha.txt");
+
+    let mut cfg = worktree_cfg();
+    cfg.max_parallel_workers = 2;
+
+    let backend = Arc::new(MockBackend::with_scripts(two_milestone_scripts()));
+    let backend_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend) as Arc<dyn AgentBackend>;
+    let mut engine = MissionEngine::create(backend_dyn, &root, GOAL, cfg).expect("create engine");
+    let mission_branch = engine.state().mission.mission_branch.clone();
+    let mission_id = engine.mission_id().to_string();
+
+    let mut plan = two_milestone_plan();
+    plan.validation_contract.push(Assertion {
+        id: "capture-base-sha".to_string(),
+        statement: "the final gate command env carries KRANZ_BASE_SHA".to_string(),
+        check: AssertionCheck::Command,
+        command: Some(format!(
+            "printf '%s' \"$KRANZ_BASE_SHA\" > {}",
+            capture_file.display()
+        )),
+    });
+    engine.approve_plan(plan).unwrap();
+
+    let base_sha = engine
+        .state()
+        .mission
+        .base_sha
+        .clone()
+        .expect("mission must pin a base sha at approval");
+
+    let status = timeout(TokioDuration::from_secs(90), engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+
+    // a1: primary checkout byte-untouched across the whole multi-feature,
+    // multi-milestone, parallel+sequential mission.
+    assert_eq!(
+        repo.current_branch().unwrap(),
+        branch_before,
+        "primary checkout must never change branches across the whole mission"
+    );
+    assert_eq!(
+        repo.head_sha().unwrap(),
+        head_before,
+        "primary HEAD sha must be unchanged across the whole mission"
+    );
+    assert_eq!(
+        raw_git(&root, &["status", "--porcelain", "--untracked-files=no"]),
+        status_before,
+        "primary tracked-tree status must be byte-identical across the whole mission"
+    );
+
+    // a6: the engine's own commits and both milestone tags landed on the
+    // mission branch.
+    let log = raw_git(&root, &["log", "--format=%s", &mission_branch]);
+    assert!(
+        log.contains(&format!("approved plan for {mission_id}")),
+        "mission branch log missing the plan-approval commit: {log}"
+    );
+    assert!(
+        log.contains(&format!("mission report for {mission_id}")),
+        "mission branch log missing the mission-report commit: {log}"
+    );
+    let tags = raw_git(&root, &["tag", "--list", &format!("kranz/{mission_id}/*")]);
+    assert!(
+        tags.contains(&format!("kranz/{mission_id}/ms-1")),
+        "M1's milestone tag missing: {tags}"
+    );
+    assert!(
+        tags.contains(&format!("kranz/{mission_id}/ms-2")),
+        "M2's milestone tag missing: {tags}"
+    );
+
+    // a7: KRANZ_BASE_SHA reached every worker session env...
+    let specs = backend.started_specs();
+    let worker_specs: Vec<_> = specs
+        .iter()
+        .filter(|s| matches!(s.prompt, PromptMode::SingleShot(ref t) if t.contains("Implement feature")))
+        .collect();
+    assert_eq!(worker_specs.len(), 3, "three worker sessions ran");
+    for spec in &worker_specs {
+        assert_eq!(
+            spec.env.get("KRANZ_BASE_SHA"),
+            Some(&base_sha),
+            "every worker session env must carry KRANZ_BASE_SHA"
+        );
+    }
+    // ...and the final-gate contract-command env.
+    let gate_capture =
+        std::fs::read_to_string(&capture_file).expect("final gate must have run the command");
+    assert_eq!(
+        gate_capture, base_sha,
+        "final-gate contract-command env must carry KRANZ_BASE_SHA"
+    );
+
+    // No worktrees leaked either.
+    let worktrees = repo.list_worktrees().unwrap();
+    assert_eq!(
+        worktrees.len(),
+        1,
+        "only the primary worktree remains: {worktrees:?}"
+    );
+}

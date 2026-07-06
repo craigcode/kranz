@@ -1067,18 +1067,50 @@ impl MissionEngine {
         // writes and commits — the orchestrator never touches files, like
         // approve_plan). Git first: a failure here leaves no event emitted, so
         // approve_revised_plan can simply be retried.
-        let revised_md = self.paths.mission_dir().join("revised-plan.md");
-        if let Some(parent) = revised_md.parent() {
-            std::fs::create_dir_all(parent)?;
+        //
+        // Worktree mode (M7 tier 1): this is called between `run()` calls, so
+        // `self.active_tree` is None here — mirror `approve_plan`'s own
+        // setup/teardown of a scratch integration worktree rather than
+        // committing straight to the primary tree.
+        let worktree_mode = self.state.config.isolation() == WorkerIsolation::Worktree;
+        let revised_md_body =
+            render_revised_plan_markdown(&plan, &self.state.mission, &to_skip, &to_add);
+        if worktree_mode {
+            let (wt_path, wt_repo) = self.setup_mission_worktree()?;
+            let commit_result = (|| -> Result<()> {
+                let wt_paths = MissionPaths::new(wt_path.clone(), self.state.mission.id.clone());
+                let revised_md = wt_paths.mission_dir().join("revised-plan.md");
+                if let Some(parent) = revised_md.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&revised_md, &revised_md_body)?;
+                wt_repo.commit_paths(
+                    &[revised_md.as_path()],
+                    &format!("[kranz] revised plan for {}", self.state.mission.id),
+                )?;
+                Ok(())
+            })();
+            self.teardown_mission_worktree();
+            commit_result?;
+
+            // Untracked human-readable twin in the primary runtime dir, same
+            // rationale as `approve_plan`'s `primary_plan_md` twin.
+            let primary_revised_md = self.paths.mission_dir().join("revised-plan.md");
+            if let Some(parent) = primary_revised_md.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&primary_revised_md, &revised_md_body)?;
+        } else {
+            let revised_md = self.paths.mission_dir().join("revised-plan.md");
+            if let Some(parent) = revised_md.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&revised_md, &revised_md_body)?;
+            self.repo.commit_paths(
+                &[revised_md.as_path()],
+                &format!("[kranz] revised plan for {}", self.state.mission.id),
+            )?;
         }
-        std::fs::write(
-            &revised_md,
-            render_revised_plan_markdown(&plan, &self.state.mission, &to_skip, &to_add),
-        )?;
-        self.repo.commit_paths(
-            &[revised_md.as_path()],
-            &format!("[kranz] revised plan for {}", self.state.mission.id),
-        )?;
 
         // (5) Record the revision, then apply the expressible subset.
         let target_id = target.id.clone();
