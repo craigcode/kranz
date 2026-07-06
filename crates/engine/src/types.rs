@@ -340,6 +340,31 @@ pub struct RoleConfig {
     /// the default Claude Code backend, `"codex"` selects [`crate::backend_codex::CodexBackend`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
+    /// Per-role macOS Seatbelt filesystem sandbox opt-in.
+    #[serde(default)]
+    pub sandbox: SandboxConfig,
+}
+
+/// Filesystem sandbox enforcement level for a role's sessions.
+///
+/// Only `Fs` is implemented by this ticket; a future `fs+net` variant is
+/// intentionally not yet a valid value (see `config::validate` tests).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SandboxEnforce {
+    #[default]
+    Off,
+    Fs,
+}
+
+/// Per-role macOS Seatbelt (`sandbox-exec`) filesystem sandbox config.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SandboxConfig {
+    pub enforce: SandboxEnforce,
+    /// Extra paths the operator opts into as writable (e.g. "~/.cargo").
+    /// Stored as raw strings; not expanded or canonicalized here.
+    pub extra_write: Vec<String>,
 }
 
 /// Which [`AgentBackend`](crate::backend::AgentBackend) drives a role's sessions.
@@ -400,6 +425,7 @@ impl Default for MissionConfig {
                 max_budget_usd: Some(20.0),
                 tools: vec![],
                 backend: None,
+                sandbox: SandboxConfig::default(),
             },
             worker: RoleConfig {
                 model: "sonnet".into(),
@@ -408,6 +434,7 @@ impl Default for MissionConfig {
                 max_budget_usd: Some(10.0),
                 tools: vec![],
                 backend: None,
+                sandbox: SandboxConfig::default(),
             },
             validator_scrutiny: RoleConfig {
                 model: "opus".into(),
@@ -416,6 +443,7 @@ impl Default for MissionConfig {
                 max_budget_usd: Some(10.0),
                 tools: vec![],
                 backend: None,
+                sandbox: SandboxConfig::default(),
             },
             validator_functional: RoleConfig {
                 model: "sonnet".into(),
@@ -424,6 +452,7 @@ impl Default for MissionConfig {
                 max_budget_usd: Some(5.0),
                 tools: vec![],
                 backend: None,
+                sandbox: SandboxConfig::default(),
             },
             skip_scrutiny: false,
             skip_functional: false,
