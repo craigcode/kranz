@@ -197,6 +197,42 @@ findings; a normal mission's contract commands still pass under the sandbox
 at <~10% wall-clock overhead; and the primary checkout never changes branch
 during any mission, sequential included.
 
+## M8 — Multi-repo operation ○ (captured 2026-07-06, unscoped)
+
+Kranz is per-repo by construction (`.kranz/` state, tickets, missions,
+calibration, lessons all live in the repo) — but the operator surfaces
+assume exactly one repo. Make "point kranz at any repo" true end to end,
+in any language.
+
+- **Per-repo merge gates**: the gated Merge's suite is a hardcoded
+  `RUST_GATES` constant mirroring this repo's ci.yml — unusable in a
+  Python/TS repo (mission validation contracts are already per-plan
+  commands and work anywhere). Gates become repo config (or CI-file
+  detection) with the Rust suite as this repo's config, not the engine's
+  assumption. Non-Rust repos get the Merge button.
+- **One Slack bridge, many repos**: per-repo bridges can't work — Slack
+  socket mode load-balances events across connections from one app, so N
+  bridges each see 1/N of commands. Instead the single bridge routes:
+  channel→repo default mapping in config plus an explicit repo tag to
+  override in shared channels; mission threads already carry affinity
+  (slack-threads.json). Spend-adjacent verbs keep the allowlist gate
+  per repo.
+- **Serve story**: port allocation for concurrent serves (or one serve
+  hosting N repos — decide at scoping; the MissionHost registry is
+  already keyed by mission, not repo-global). Dashboard repo picker if
+  one-serve-many-repos wins.
+- **Fresh-repo onboarding**: `kranz init`-shaped first run (scaffold,
+  gitignore template, config prompts), cold-start calibration honesty
+  ("based on 0 missions" must read as the warning it is), and promoting
+  proven per-repo defaults (workerIsolation=worktree post-soak) to
+  global config so new repos start isolated.
+
+Done when: a TypeScript repo goes ticket → draft → queue → worktree run →
+gated merge (its own gates) without touching this repo's config; two
+repos operate from one Slack workspace with unambiguous routing; and a
+brand-new repo's first mission runs with no hand-editing beyond
+`kranz init` answers.
+
 ## Continuous UX backlog (no milestone, picked up opportunistically)
 
 - `kranz run` status header / richer TUI (dashboard remains the primary
