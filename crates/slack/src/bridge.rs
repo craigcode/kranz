@@ -619,64 +619,61 @@ pub fn not_authorized_blocks() -> Vec<Value> {
 /// deduped by envelope id ([`SeenEnvelopes`]) so a Slack redelivery can't
 /// double-create or double-approve. Only pure-local actions run inline on the
 /// read loop.
-/// The outcome of `run_draft_command`: whether the invoker was authorized,
-/// the immediate hourglass ack (posted first, mirroring [`Action::NewMission`]),
-/// and the terminal result blocks (posted once the draft finishes). `ack` and
-/// `result` are both `None` on an unauthorized invocation (nothing is posted
-/// beyond the caller's standard refusal, and NOTHING is spawned).
-pub struct DraftInvocation {
-    pub authorized: bool,
-    pub ack: Option<Vec<Value>>,
-    pub result: Option<Vec<Value>>,
+/// The outcome of the SYNCHRONOUS `gate_draft_command` phase — no
+/// `PlanningHost::draft` call has happened by the time any of these variants
+/// is returned. `Ready` carries the immediate hourglass ack (posted first,
+/// mirroring [`Action::NewMission`]) that the caller must post BEFORE
+/// awaiting [`run_draft`], so the invoker sees the ack immediately rather
+/// than only once the multi-minute draft turn completes.
+pub enum DraftGate {
+    Unauthorized,
+    NoHost(Vec<Value>),
+    InvalidSlug(Vec<Value>),
+    Ready(Vec<Value>),
 }
 
-/// `/kranz draft <slug>` — SPEND action, gated EXACTLY like `/kranz new` (same
-/// gate, same standard refusal, same "ack immediately then run" shape). Holds
-/// the gate + host-call logic so it is unit-testable without a live
-/// `SlackClient`: an unauthorized invocation returns immediately with NO host
-/// call (no engine spawn whatsoever); an authorized one validates the slug via
-/// [`kranz_engine::ticket::Ticket::ensure_valid_slug`], then — with a host
-/// wired in — builds the hourglass ack and drives [`PlanningHost::draft`] to a
-/// terminal [`DraftOutcome`], posting the orchestrator's clarifying questions
-/// back to the invoker on `NeedsContext`.
-pub async fn run_draft_command(
+/// `/kranz draft <slug>` gate/ack phase — SPEND action, gated EXACTLY like
+/// `/kranz new` (same gate, same standard refusal). Runs
+/// `cfg.is_authorized`, [`kranz_engine::ticket::Ticket::ensure_valid_slug`],
+/// and the host-presence check, and builds the hourglass ack for the `Ready`
+/// case. Makes NO `PlanningHost::draft` call — that is the caller's job via
+/// [`run_draft`], AFTER posting the `Ready` ack — so this phase stays
+/// synchronous and unit-testable without a live `SlackClient`.
+pub fn gate_draft_command(
     cfg: &SlackConfig,
     host: Option<&SharedHost>,
     slug: &str,
     user_id: Option<&str>,
-) -> DraftInvocation {
+) -> DraftGate {
     if !cfg.is_authorized(user_id) {
-        return DraftInvocation {
-            authorized: false,
-            ack: None,
-            result: None,
-        };
+        return DraftGate::Unauthorized;
     }
     if let Err(e) = kranz_engine::ticket::Ticket::ensure_valid_slug(slug) {
-        return DraftInvocation {
-            authorized: true,
-            ack: None,
-            result: Some(error_blocks(&format!("Couldn't draft `{slug}`: {e}"))),
-        };
+        return DraftGate::InvalidSlug(error_blocks(&format!("Couldn't draft `{slug}`: {e}")));
     }
-    let Some(host) = host else {
-        return DraftInvocation {
-            authorized: true,
-            ack: None,
-            result: Some(error_blocks(&format!(
-                "This bridge has no hosted planning engine (it was started without \
-                 `kranz serve`). Use `kranz ticket draft {slug}` in a terminal, or the \
-                 web UI via `kranz serve --open`."
-            ))),
-        };
-    };
+    if host.is_none() {
+        return DraftGate::NoHost(error_blocks(&format!(
+            "This bridge has no hosted planning engine (it was started without \
+             `kranz serve`). Use `kranz ticket draft {slug}` in a terminal, or the \
+             web UI via `kranz serve --open`."
+        )));
+    }
     // Ack IMMEDIATELY: the draft turn (create + seed + drive to a terminal
-    // outcome) takes minutes, same reasoning as NewMission/RequestPlan.
-    let ack = error_blocks(&format!(
+    // outcome) takes minutes, same reasoning as NewMission/RequestPlan. The
+    // caller must post this BEFORE calling `run_draft`.
+    DraftGate::Ready(error_blocks(&format!(
         ":hourglass_flowing_sand: Drafting `{slug}` — the seeding planning turn \
          usually takes a minute or two; the result will post here."
-    ));
-    let result = match host.draft(slug).await {
+    )))
+}
+
+/// The async run phase of `/kranz draft <slug>`, called ONLY after the
+/// caller has posted the `DraftGate::Ready` ack. Drives [`PlanningHost::draft`]
+/// to a terminal [`DraftOutcome`] and maps it to the terminal result blocks,
+/// posting the orchestrator's clarifying questions back to the invoker on
+/// `NeedsContext`.
+pub async fn run_draft(host: &SharedHost, slug: &str) -> Vec<Value> {
+    match host.draft(slug).await {
         Ok(DraftOutcome::ParkedForReview {
             mission_id,
             mission_branch,
@@ -702,11 +699,6 @@ pub async fn run_draft_command(
             error_blocks(text.trim_end())
         }
         Err(e) => error_blocks(&format!("Couldn't draft `{slug}`: {e}")),
-    };
-    DraftInvocation {
-        authorized: true,
-        ack: Some(ack),
-        result: Some(result),
     }
 }
 
@@ -724,7 +716,7 @@ fn is_ticket_slug(repo_root: &Path, arg: &str) -> bool {
 
 /// The outcome of `run_approve_ticket_command`: whether the invoker was
 /// authorized, and the reply blocks to post (`None` only when unauthorized,
-/// mirroring [`DraftInvocation`]).
+/// mirroring [`DraftGate`]).
 pub struct ApproveTicketInvocation {
     pub authorized: bool,
     pub result: Option<Vec<Value>>,
@@ -1091,15 +1083,17 @@ async fn dispatch_action(
         }
 
         // `/kranz draft <slug>` — SPEND action, gated EXACTLY like `new`
-        // ([`run_draft_command`] holds the gate + host-call logic so it's
-        // unit-testable without a live SlackClient).
+        // ([`gate_draft_command`] holds the gate + ack logic so it's
+        // unit-testable without a live SlackClient). The hourglass ack MUST
+        // post before the slow `run_draft` await, mirroring
+        // NewMission/RequestPlan — never build both and post them back to
+        // back after the draft finishes.
         Action::Draft {
             slug,
             user_id,
             response_url,
-        } => {
-            let invocation = run_draft_command(cfg, host, slug, user_id.as_deref()).await;
-            if !invocation.authorized {
+        } => match gate_draft_command(cfg, host, slug, user_id.as_deref()) {
+            DraftGate::Unauthorized => {
                 reply_ephemeral(
                     cfg,
                     client,
@@ -1107,17 +1101,17 @@ async fn dispatch_action(
                     &not_authorized_blocks(),
                 )
                 .await;
-                return;
             }
-            // Ack IMMEDIATELY: the draft turn takes minutes, same reasoning
-            // as NewMission/RequestPlan.
-            if let Some(ack) = &invocation.ack {
-                reply_ephemeral(cfg, client, response_url.as_deref(), ack).await;
+            DraftGate::NoHost(blocks) | DraftGate::InvalidSlug(blocks) => {
+                reply_ephemeral(cfg, client, response_url.as_deref(), &blocks).await;
             }
-            if let Some(result) = &invocation.result {
-                reply_ephemeral(cfg, client, response_url.as_deref(), result).await;
+            DraftGate::Ready(ack) => {
+                reply_ephemeral(cfg, client, response_url.as_deref(), &ack).await;
+                let host = host.expect("DraftGate::Ready only returned with a host present");
+                let result = run_draft(host, slug).await;
+                reply_ephemeral(cfg, client, response_url.as_deref(), &result).await;
             }
-        }
+        },
 
         // Per-role config change. SPEND-ADJACENT (it re-shapes future turns'
         // spend), so it is gated on the allowlist exactly like `/kranz new`.

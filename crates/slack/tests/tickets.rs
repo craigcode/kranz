@@ -10,8 +10,8 @@
 use kranz_engine::draft::DraftOutcome;
 use kranz_engine::ticket::{Ticket, TicketState};
 use kranz_slack::bridge::{
-    build_ticket_list_reply, build_ticket_show_reply, not_authorized_blocks,
-    run_approve_ticket_command, run_draft_command,
+    build_ticket_list_reply, build_ticket_show_reply, gate_draft_command, not_authorized_blocks,
+    run_approve_ticket_command, run_draft, DraftGate,
 };
 use kranz_slack::host::BoxFuture;
 use kranz_slack::inbound::{route, Action, ThreadLookup};
@@ -394,51 +394,57 @@ async fn draft_denies_an_unlisted_user_and_spawns_nothing() {
     let fake = Arc::new(FakeHost::new(DraftOutcomeKind::ParkedForReview));
     let host: SharedHost = fake.clone();
 
-    let invocation =
-        run_draft_command(&cfg, Some(&host), "rate-limit-notes", Some("U-outsider")).await;
+    let gate = gate_draft_command(&cfg, Some(&host), "rate-limit-notes", Some("U-outsider"));
 
-    assert!(!invocation.authorized, "unlisted user must be refused");
-    assert!(invocation.ack.is_none(), "unauthorized draft acks nothing");
     assert!(
-        invocation.result.is_none(),
-        "unauthorized draft posts nothing beyond the refusal"
+        matches!(gate, DraftGate::Unauthorized),
+        "unlisted user must be refused"
     );
     assert_eq!(
         fake.draft_calls.load(Ordering::SeqCst),
         0,
         "an unlisted user's draft must spawn zero engine turns"
     );
-    // The refusal the caller posts on `!authorized` is the exact standard one
-    // shared with `/kranz new`.
+    // The refusal the caller posts on `Unauthorized` is the exact standard
+    // one shared with `/kranz new`.
     let refusal = serde_json::to_string(&not_authorized_blocks()).unwrap();
     assert!(refusal.contains("not authorized to spend"));
 }
 
 #[tokio::test]
-async fn draft_allows_a_listed_user_acks_immediately_and_spawns_exactly_once() {
+async fn draft_gate_acks_before_any_draft_call_then_run_draft_spawns_exactly_once() {
+    // The j5 fix under test: the synchronous gate phase must produce the
+    // hourglass ack WITHOUT having called `host.draft` yet — proving the ack
+    // can be posted before the slow draft turn starts, not after.
     let cfg = gated_cfg(vec!["U-allowed".into()]);
     let fake = Arc::new(FakeHost::new(DraftOutcomeKind::ParkedForReview));
     let host: SharedHost = fake.clone();
 
-    let invocation =
-        run_draft_command(&cfg, Some(&host), "rate-limit-notes", Some("U-allowed")).await;
+    let gate = gate_draft_command(&cfg, Some(&host), "rate-limit-notes", Some("U-allowed"));
 
-    assert!(invocation.authorized);
-    let ack_text = serde_json::to_string(&invocation.ack.expect("authorized draft acks"))
-        .unwrap()
-        .to_lowercase();
+    let ack = match gate {
+        DraftGate::Ready(ack) => ack,
+        _ => panic!("authorized draft with a host must be Ready"),
+    };
+    assert_eq!(
+        fake.draft_calls.load(Ordering::SeqCst),
+        0,
+        "the gate/ack phase must not call host.draft — the ack must be postable BEFORE the slow draft runs"
+    );
+    let ack_text = serde_json::to_string(&ack).unwrap().to_lowercase();
     assert!(
         ack_text.contains("hourglass"),
-        "authorized draft posts an immediate hourglass ack: {ack_text}"
+        "authorized draft acks with the immediate hourglass: {ack_text}"
     );
-    let result_text =
-        serde_json::to_string(&invocation.result.expect("authorized draft posts a result"))
-            .unwrap();
+
+    // Only now — after the caller would have posted the ack — does the slow
+    // run phase call the host, exactly once.
+    let result_text = serde_json::to_string(&run_draft(&host, "rate-limit-notes").await).unwrap();
     assert!(result_text.contains("m-draft"), "result names the mission");
     assert_eq!(
         fake.draft_calls.load(Ordering::SeqCst),
         1,
-        "authorized draft spawns exactly one engine turn"
+        "run_draft spawns exactly one engine turn"
     );
 }
 
@@ -450,9 +456,10 @@ async fn draft_allowlist_empty_authorizes_everyone_same_as_new() {
     let fake = Arc::new(FakeHost::new(DraftOutcomeKind::ParkedForReview));
     let host: SharedHost = fake.clone();
 
-    let invocation = run_draft_command(&cfg, Some(&host), "rate-limit-notes", None).await;
+    let gate = gate_draft_command(&cfg, Some(&host), "rate-limit-notes", None);
 
-    assert!(invocation.authorized);
+    assert!(matches!(gate, DraftGate::Ready(_)));
+    let _ = run_draft(&host, "rate-limit-notes").await;
     assert_eq!(fake.draft_calls.load(Ordering::SeqCst), 1);
 }
 
@@ -462,12 +469,10 @@ async fn draft_needs_context_posts_the_orchestrators_questions_back() {
     let fake = Arc::new(FakeHost::new(DraftOutcomeKind::NeedsContext));
     let host: SharedHost = fake.clone();
 
-    let invocation =
-        run_draft_command(&cfg, Some(&host), "rate-limit-notes", Some("U-allowed")).await;
+    let gate = gate_draft_command(&cfg, Some(&host), "rate-limit-notes", Some("U-allowed"));
+    assert!(matches!(gate, DraftGate::Ready(_)));
 
-    assert!(invocation.authorized);
-    let result_text =
-        serde_json::to_string(&invocation.result.expect("needs-context posts a result")).unwrap();
+    let result_text = serde_json::to_string(&run_draft(&host, "rate-limit-notes").await).unwrap();
     assert!(
         result_text.contains("Which endpoint exactly?"),
         "posts the orchestrator's clarifying questions back to the invoker: {result_text}"
@@ -482,15 +487,13 @@ async fn draft_invalid_slug_errors_gracefully_with_no_host_call() {
     let fake = Arc::new(FakeHost::new(DraftOutcomeKind::ParkedForReview));
     let host: SharedHost = fake.clone();
 
-    let invocation =
-        run_draft_command(&cfg, Some(&host), "../../etc/passwd", Some("U-allowed")).await;
+    let gate = gate_draft_command(&cfg, Some(&host), "../../etc/passwd", Some("U-allowed"));
 
-    assert!(invocation.authorized, "gate already passed");
-    assert!(invocation.ack.is_none(), "invalid slug never acks a draft");
-    let result_text =
-        serde_json::to_string(&invocation.result.expect("invalid slug errors gracefully"))
-            .unwrap()
-            .to_lowercase();
+    let blocks = match gate {
+        DraftGate::InvalidSlug(blocks) => blocks,
+        _ => panic!("invalid slug must gate to InvalidSlug"),
+    };
+    let result_text = serde_json::to_string(&blocks).unwrap().to_lowercase();
     assert!(result_text.contains("invalid"), "got: {result_text}");
     assert_eq!(
         fake.draft_calls.load(Ordering::SeqCst),
@@ -502,13 +505,12 @@ async fn draft_invalid_slug_errors_gracefully_with_no_host_call() {
 #[tokio::test]
 async fn draft_without_a_host_is_an_honest_refusal() {
     let cfg = gated_cfg(vec!["U-allowed".into()]);
-    let invocation = run_draft_command(&cfg, None, "rate-limit-notes", Some("U-allowed")).await;
-    assert!(invocation.authorized);
-    assert!(invocation.ack.is_none());
-    let result_text =
-        serde_json::to_string(&invocation.result.expect("no-host case errors gracefully"))
-            .unwrap()
-            .to_lowercase();
+    let gate = gate_draft_command(&cfg, None, "rate-limit-notes", Some("U-allowed"));
+    let blocks = match gate {
+        DraftGate::NoHost(blocks) => blocks,
+        _ => panic!("no host must gate to NoHost"),
+    };
+    let result_text = serde_json::to_string(&blocks).unwrap().to_lowercase();
     assert!(result_text.contains("no hosted planning engine"));
 }
 
