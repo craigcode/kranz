@@ -30,6 +30,19 @@ And the end-to-end gap map (post those fixes):
 | Review deliverable       | none (git only)         | completion ping  |
 | Merge                    | none (git only)         | none             |
 
+## Design principles (DECIDED 2026-07-05)
+
+1. **Simple lists, easy buttons.** Every surface is a flat list with one
+   obvious action per row — the operator's next move is always one tap.
+   No nested navigation to reach a gate; detail views are for reading,
+   never the only place an action lives.
+2. **Iterate is always on offer.** Work is never a dead end: Reviewable
+   offers **Reshape** (a feedback line → planning turn → re-parked plan);
+   Delivered and Landed offer **Iterate** (one tap creates a follow-up
+   ticket pre-seeded with the mission's report and the operator's one-line
+   direction); Failed offers **Redraft**. The pipeline loops; the UI must
+   show the loop.
+
 ## The stage model
 
 Canonical stages of one piece of work, each with its artifact and its one
@@ -40,11 +53,11 @@ next action. Surfaces render THIS model — never raw internal states.
 | Captured   | ticket NEW                 | the ticket itself            | Draft              |
 | Drafting   | ticket DRAFTING            | live orchestrator feed (WS)  | (watch / answer)   |
 | Needs you  | ticket NEEDS-CONTEXT       | the orchestrator's questions | Answer + redraft   |
-| Reviewable | ticket REVIEW              | plan.md + estimate           | Queue (or reshape) |
+| Reviewable | ticket REVIEW              | plan.md + estimate           | Queue / Reshape    |
 | Queued     | ticket QUEUED              | queue position               | (reorder later)    |
 | Running    | mission Running + live run | mission feed, cost ticker    | steer / pause      |
-| Delivered  | mission Complete, unmerged | report.md + diff stat        | Merge              |
-| Landed     | branch merged to base      | merge commit link            | —                  |
+| Delivered  | mission Complete, unmerged | report.md + diff stat        | Merge / Iterate    |
+| Landed     | branch merged to base      | merge commit link            | Iterate            |
 | Failed     | mission Failed/ticket FAIL | report + failure note        | Redraft / abandon  |
 
 Notes: "Delivered ≠ Landed" is the distinction today's UI erases — the
