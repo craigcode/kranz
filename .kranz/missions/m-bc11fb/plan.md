@@ -1,0 +1,182 @@
+# Mission plan — m-bc11fb
+
+**Goal:** Add a dashboard backlog panel (ticket list, detail, Draft-with-live-progress, blocked-by-aware Approve) and Slack `/kranz ticket list|show`, `/kranz draft <slug>` (spend-gated), and approve-by-slug — all riding the REST/host surface landed by backlog-host-draft-deps.
+
+Branch `kranz/mission-m-bc11fb` (from `main`). Approved plan of record; the machine-readable twin is [plan.json](plan.json). Live status: `kranz status` or the dashboard.
+
+## Validation contract
+
+Defined before any feature; gates mission completion.
+
+- **[a1]** The dashboard typechecks cleanly: `npx tsc --noEmit` succeeds in apps/dashboard. 
+  `cd apps/dashboard && npx tsc --noEmit`
+- **[a2]** The dashboard production build succeeds: `npm run build` passes in apps/dashboard. 
+  `cd apps/dashboard && npm run build`
+- **[a3]** The full Rust workspace test suite runs and reports passing tests. 
+  `cargo test --workspace 2>&1 | grep -qE 'result: ok\. [1-9][0-9]* passed'`
+- **[a4]** Clippy is clean across the workspace with warnings denied. 
+  `cargo clippy --workspace --all-targets -- -D warnings`
+- **[a5]** Rust formatting is clean. 
+  `cargo fmt --all --check`
+- **[a6]** The Slack backlog-verb fake-host test suite (crates/slack/tests/tickets.rs) exists and passes: ticket list/show ephemeral, draft allowlist-gate + no-spawn-on-refusal, and approve-by-slug end-to-end. 
+  `cargo test -p kranz-slack --test tickets 2>&1 | grep -qE 'result: ok\. [1-9][0-9]* passed'`
+- **[j1]** A backlog panel reachable from the mission picker lists the live .kranz/tickets/ state — each row showing slug, priority, a state chip, title, and blocked-by badges — sourced from GET /api/tickets. *(agent judgement)*
+- **[j2]** Drafting a ticket from the browser fires POST /api/tickets/:slug/draft and shows live progress via the returned mission's existing WS feed (the planning-chat-pane pattern), parking a reviewable plan without a terminal. *(agent judgement)*
+- **[j3]** The Approve button appears only on REVIEW tickets and is disabled with the blocker named when a blocked-by dependency is unsatisfied; the server 409 refusal stays authoritative and its message is surfaced verbatim if returned. *(agent judgement)*
+- **[j4]** Slack `/kranz ticket list` and `/kranz ticket show <slug>` are read-only (no allowlist gate) and reply ephemerally to the invoker. *(agent judgement)*
+- **[j5]** Slack `/kranz draft <slug>` is allowlist-gated exactly like `/kranz new`: unauthorized users get the standard refusal and no engine/draft spawns; authorized invokers get an immediate hourglass ack, the draft runs off the socket loop, and NEEDS-CONTEXT questions are posted back to the invoker. *(agent judgement)*
+- **[j6]** Slack `/kranz approve <slug>` resolves the slug to its drafted mission and queues a REVIEW ticket end-to-end via kranz_engine::deps::approve_ticket; blocked-by refusals surface the engine's message verbatim and queue nothing. *(agent judgement)*
+- **[j7]** Slash-command platform rules are honored for the new verbs: single-line commands only, no dispatch in threads. *(agent judgement)*
+- **[j8]** docs/tickets.md's listing/Slack sections and docs/slack-management.md's Build-slices ledger are updated to describe the new dashboard panel and Slack backlog verbs, accurate to what shipped. *(agent judgement)*
+
+## Milestone 1 — Dashboard backlog panel
+
+### 1.1 Ticket data layer: types, api wrappers, and store actions
+
+Add the ticket data layer to apps/dashboard (React 19 + Zustand v5; the backend REST already exists and is wired in crates/server/src/lib.rs).
+
+(1) apps/dashboard/src/lib/types.ts — add, mirroring crates/server/src/tickets.rs exactly (camelCase JSON):
+- `type TicketState = 'new'|'drafting'|'needs-context'|'review'|'queued'|'running'|'done'|'failed'` (the Rust enum at crates/engine/src/ticket.rs:71 is serde rename_all=kebab-case; NeedsContext serializes as 'needs-context').
+- `interface TicketSummary { slug:string; priority:number; state:TicketState; title:string; blockedBy:string[] }` (from ticket_summary_json).
+- `interface Ticket { slug:string; title:string; priority:number; schedule:'once'|'nightly'|'weekly'; blockedBy:string[]; goal:string; context:string; scopingAnswers:string[]; acceptanceHints:string[]; state:TicketState; needsContext:string[] }` (from ticket_full_json).
+
+(2) apps/dashboard/src/lib/api.ts — add to the exported `api` object, reusing the existing getJson/postJson helpers (postJson already sends x-kranz-token, handles 401 via the token gate, and throws ApiError carrying the server's {error} text on non-2xx):
+- `tickets(): Promise<TicketSummary[]>` → getJson('/api/tickets')
+- `ticket(slug): Promise<Ticket>` → getJson(`/api/tickets/${encodeURIComponent(slug)}`)
+- `draftTicket(slug): Promise<{missionId:string}>` → postJson(`/api/tickets/${encodeURIComponent(slug)}/draft`, {}) (server returns 202; postJson treats any 2xx as ok)
+- `approveTicket(slug, force:boolean): Promise<{approved:boolean; missionId:string}>` → postJson(`/api/tickets/${encodeURIComponent(slug)}/approve`, {force})
+The approve 409 refusal message must reach callers via ApiError.message unchanged.
+
+(3) apps/dashboard/src/lib/store.ts — add state fields `tickets: TicketSummary[]`, `ticketsError: string|null`, `ticketError: string|null`, and actions (declare them in the KranzStore interface too):
+- `loadTickets` — model exactly on the existing `loadMissions` action (clear error, await api.tickets(), set tickets, catch → set ticketsError).
+- `draftTicket(slug)` — await api.draftTicket(slug); on success call the EXISTING `connectMission(missionId)` action so the mission's live WS feed streams (do NOT write new WS code — connectMission owns the MissionSocket singleton); on failure set ticketError.
+- `approveTicket(slug, force)` — await api.approveTicket(slug, force) then await loadTickets(); on ApiError set ticketError to the server message VERBATIM (so the UI can display the blocker).
+
+(4) Tests — add a vitest test file (import { describe, it, expect, vi, beforeEach } from 'vitest'; the config sets globals:false, jsdom) that mocks ../lib/api with vi.mock and drives the real store via useKranzStore.setState/getState (see components/StatusStrip.test.tsx for the mock+store pattern): assert loadTickets populates tickets and records ticketsError on failure, and that approveTicket propagates a rejected ApiError's message into ticketError verbatim.
+
+Do not build any components or routes in this feature — that is the next feature. Keep everything type-clean.
+
+Done when:
+- types.ts exports TicketState, TicketSummary, and Ticket matching the REST JSON shapes exactly (camelCase fields, kebab-case state strings).
+- api.tickets/ticket/draftTicket/approveTicket hit the correct endpoints; draftTicket and approveTicket go through postJson (token + ApiError propagation).
+- approveTicket surfaces the server's 409 refusal message verbatim via ApiError.message into ticketError.
+- store loadTickets/draftTicket/approveTicket actions are added and declared in the KranzStore interface; draftTicket connects the returned missionId via the existing connectMission action (no new WS code).
+- New vitest tests for the store actions pass (`npm test` in apps/dashboard).
+- `npx tsc --noEmit` and `npm run build` both succeed in apps/dashboard.
+
+### 1.2 Backlog UI: routes, panel, detail, Draft-live, blocked-aware Approve
+
+Build the backlog UI in apps/dashboard on top of the data layer from the previous feature (assume types.ts ticket types, api.tickets/ticket/draftTicket/approveTicket, and store fields/actions tickets/loadTickets/draftTicket/approveTicket already exist).
+
+(1) Routing — apps/dashboard/src/App.tsx: extend the Route union with `{view:'backlog'}` and `{view:'ticket'; slug:string}`; in parseHash() add, before the picker fallback, `if (hash==='#/backlog') return {view:'backlog'}` and a `/^#\/backlog\/(.+)$/` match → `{view:'ticket', slug:decodeURIComponent(m[1])}`; add early-return render branches mirroring the existing picker/new blocks, each rendering the new component wrapped with <TokenPrompt/>.
+
+(2) Entry point — add a button on MissionPicker (next to '+ new mission', reuse .btn-small) that sets window.location.hash='#/backlog'.
+
+(3) BacklogPanel component: on mount `void loadTickets()`; render each ticket as a row reusing the management-row styling (.picker-item / .picker-row / .btn-small) showing a state chip `<span className={`status-pill pill-${t.state}`}><span className="status-dot" aria-hidden="true"/>{t.state}</span>`, the slug (mono), priority, title, and a blocked-by badge per blocker; clicking a row sets hash to `#/backlog/<slug>`. Surface ticketsError with a retry like MissionPicker does.
+
+(4) TicketDetail component: load the full ticket (api.ticket(slug) via a store action or local effect); render goal and context via renderMarkdown (apps/dashboard/src/lib/markdown.tsx) and scopingAnswers/acceptanceHints/needsContext as lists. A Draft button calls store.draftTicket(slug) and then shows live progress by reading the store's events/state — the draftTicket action already called connectMission(missionId), so render the same live event/status stream the PlanningView pane derives from s.events/s.state (a compact progress log is fine). An Approve button is shown ONLY when state==='review' and calls store.approveTicket(slug,false); when blockedBy is non-empty and the blockers are unsatisfied the Approve button is DISABLED and its label/title names the blocker(s) — this is a courtesy mirror, the server refusal stays authoritative, so if a POST approve still returns 409, display ticketError (the server message) verbatim.
+
+(5) Styling — apps/dashboard/src/styles.css: add `.pill-new`, `.pill-drafting`, `.pill-needs-context`, `.pill-review`, `.pill-queued`, `.pill-done` color rules (reuse the existing .status-pill/.status-dot structure; .pill-running and .pill-failed already exist), plus any blocked-by badge styling.
+
+(6) Tests — add component vitest tests (testing-library/react + useKranzStore.setState, per components/StatusStrip.test.tsx): the backlog list renders ticket rows from store state; Approve is disabled and names the blocker for a blocked REVIEW ticket; clicking Draft dispatches draftTicket.
+
+(7) Docs — add a short note to docs/tickets.md's listing section that the backlog is also browsable, draftable, and approvable from the dashboard backlog panel (#/backlog).
+
+Must remain type-clean and build.
+
+Done when:
+- #/backlog renders the backlog panel (reachable from the mission picker) and #/backlog/<slug> renders the ticket detail.
+- Backlog rows show slug, priority, a state chip (pill-<state>), title, and blocked-by badges, reflecting live GET /api/tickets data.
+- Ticket detail renders goal/context via renderMarkdown and lists the needs-context questions; the Draft button dispatches draftTicket and shows live progress from the returned mission's WS feed.
+- Approve renders only for review tickets and is disabled naming the blocker when a blocked-by dependency is unsatisfied; a server 409 message is shown verbatim if returned.
+- New component vitest tests pass; `npx tsc --noEmit`, `npm run build`, and `npm test` all succeed in apps/dashboard.
+- docs/tickets.md's listing section mentions the dashboard backlog panel.
+
+
+## Milestone 2 — Slack backlog verbs
+
+### 2.1 Read-only Slack ticket verbs: /kranz ticket list and show
+
+In crates/slack, add read-only backlog verbs to the `/kranz` slash command: `/kranz ticket list` and `/kranz ticket show <slug>`.
+
+Study the existing verb dispatch in crates/slack/src/inbound.rs (the match on the sub-verb after `/kranz`) and mirror an existing READ-ONLY command (e.g. `/kranz status`). These two verbs:
+- are NOT allowlist-gated (any user may run them),
+- MUST reply EPHEMERALLY (visible only to the invoker — use the same ephemeral-reply mechanism the existing read-only commands use),
+- MUST honor the platform rules already enforced in the crate: single-line commands and NO dispatch in threads (see crates/slack/src/threads.rs and crates/slack/tests/threads.rs).
+
+Data source: reuse kranz_engine::ticket::Ticket — Ticket::list(repo_root) for the list, and Ticket::load + Ticket::read_state for show — the exact primitives the REST list/show routes use (crates/server/src/tickets.rs). Do NOT re-implement ticket parsing. Validate the slug with Ticket::ensure_valid_slug before touching the filesystem.
+- `ticket list`: one line per ticket — slug, priority, state, title, and a blocked-by note.
+- `ticket show <slug>`: the ticket's title/goal/state/blocked-by and its needs-context questions; a graceful ephemeral error for an unknown or invalid slug (no panic).
+
+If the Slack host abstraction (crates/slack/src/host.rs) needs a method to read tickets, add it to the host trait and its fake/test implementation.
+
+Tests: create a NEW file crates/slack/tests/tickets.rs (this exact path — a workspace validation command references `--test tickets`) with fake-host tests asserting: `ticket list` replies ephemerally with the ticket rows; `ticket show <slug>` replies ephemerally with the ticket detail; neither is refused for a non-allowlisted user; a thread-context invocation is not dispatched. Follow the harness style in crates/slack/tests/routing.rs and authz.rs.
+
+Run cargo fmt after writing tests — rustfmt reflows long assert!/match-arm lines in fresh test files, and the fmt gate is checked separately from clippy.
+
+Done when:
+- `/kranz ticket list` and `/kranz ticket show <slug>` dispatch from the single-line command path and reply ephemerally.
+- Neither verb is allowlist-gated — a non-allowlisted user receives the ticket data, not the standard refusal.
+- An unknown or invalid slug yields a graceful ephemeral error (validated via Ticket::ensure_valid_slug; no panic).
+- Ticket data is read via kranz_engine::ticket::Ticket (no re-implemented parsing).
+- crates/slack/tests/tickets.rs exists and its tests cover list-ephemeral, show-ephemeral, no-allowlist-gate, and no-thread-dispatch, and pass.
+- cargo test --workspace passes; cargo clippy --workspace --all-targets -- -D warnings is clean; cargo fmt --all --check is clean.
+
+### 2.2 Spend-gated Slack /kranz draft <slug>
+
+In crates/slack, add `/kranz draft <slug>` to the `/kranz` command. This is a SPEND action.
+
+Allowlist gating: it MUST be gated EXACTLY like `/kranz new`. Study how `/kranz new` checks the allowlist and refuses unauthorized users (crates/slack/src/inbound.rs, the authz logic, and crates/slack/tests/authz.rs) and reuse the SAME gate and the SAME standard refusal message. For an unauthorized user: reply with the standard refusal and spawn NOTHING (no engine/draft spawn whatsoever).
+
+Authorized path (slow action): mirror `/kranz new` — spawn the work OFF the Socket Mode receive loop (never block it), post an IMMEDIATE hourglass ack (the same ack mechanism `/kranz new` uses), run the draft, and when it finishes post the result back to the invoker. If the draft ends in NEEDS-CONTEXT, post the orchestrator's clarifying questions back to the invoker.
+
+Reuse the hoisted draft core from the prerequisite (kranz_server::MissionHost::draft_async, or the kranz_engine drive_draft core it wraps — whichever the Slack host can reach). Add a draft method to the Slack host trait (crates/slack/src/host.rs) and its fake implementation if needed so tests can observe spawns. Validate the slug via Ticket::ensure_valid_slug; error gracefully on an unknown ticket. Honor single-line + no-thread-dispatch rules.
+
+Tests: extend crates/slack/tests/tickets.rs with fake-host tests asserting: an unauthorized `/kranz draft <slug>` returns the standard refusal AND records ZERO draft/engine spawns on the fake host; an authorized `/kranz draft <slug>` produces the immediate hourglass ack and records exactly one draft spawn.
+
+Run cargo fmt after writing tests (rustfmt reflows long assert!/match-arm lines; the fmt gate is separate from clippy).
+
+Done when:
+- `/kranz draft <slug>` is allowlist-gated with the identical gate and standard refusal message as `/kranz new`.
+- An unauthorized invocation returns the standard refusal and spawns no engine/draft (the fake host records zero spawns).
+- An authorized invocation posts an immediate hourglass ack, spawns the draft off the socket loop, and posts NEEDS-CONTEXT questions back to the invoker on that outcome.
+- The slug is validated via Ticket::ensure_valid_slug and an unknown slug errors gracefully.
+- crates/slack/tests/tickets.rs covers the unauthorized-no-spawn and authorized-ack-and-spawn cases and passes.
+- cargo test --workspace passes; clippy is clean; cargo fmt --all --check is clean.
+
+### 2.3 Slack approve-by-slug
+
+In crates/slack, extend the existing `/kranz approve` verb to also accept a ticket SLUG (in addition to whatever it accepts today, e.g. a mission id).
+
+When the argument resolves to a ticket slug, resolve it to the drafted mission (the ticket's .status mission_id link) and run the SAME approve gate the REST/CLI path runs: kranz_engine::deps::approve_ticket (the exact core crates/server/src/host.rs's approve_ticket calls). That gate queues the mission when the ticket is in REVIEW and its blockers are satisfied, refuses when blocked, and detects cycles. A blocked-by refusal MUST surface the engine's refusal message VERBATIM to the invoker (do not paraphrase). Preserve the existing `/kranz approve <mission-id>` behavior and keep approve's existing allowlist gating unchanged (it is a spend/mutation action). Honor single-line + no-thread-dispatch.
+
+If the Slack host trait (crates/slack/src/host.rs) needs an approve-by-slug method, add it and its fake implementation so tests can observe the queued mission.
+
+Tests: extend crates/slack/tests/tickets.rs with fake-host tests asserting: `/kranz approve <slug>` for a REVIEW ticket queues the drafted mission end-to-end (the fake host records the queued/approved mission id); a blocked ticket's approve surfaces the engine's blocked-by refusal message verbatim and queues nothing.
+
+Run cargo fmt after writing tests (rustfmt reflows long assert!/match-arm lines; the fmt gate is separate from clippy).
+
+Done when:
+- `/kranz approve <slug>` resolves the slug to its drafted mission and queues it end-to-end when the ticket is in REVIEW with satisfied blockers.
+- A blocked-by refusal surfaces the engine's message verbatim and queues nothing.
+- The approve gate reuses kranz_engine::deps::approve_ticket (no divergent re-implementation).
+- Existing `/kranz approve <mission-id>` behavior is preserved and approve's allowlist gating is unchanged.
+- crates/slack/tests/tickets.rs covers the queues-a-REVIEW-ticket and blocked-refusal-verbatim cases and passes.
+- cargo test --workspace passes; clippy is clean; cargo fmt --all --check is clean.
+
+### 2.4 Docs: tickets.md Slack verbs and slack-management slice ledger
+
+Update documentation to describe the shipped Slack backlog verbs and the dashboard backlog panel.
+
+(1) docs/tickets.md — in the listing and Slack-related sections, document `/kranz ticket list` and `/kranz ticket show <slug>` (read-only, ephemeral, no allowlist gate), `/kranz draft <slug>` (SPEND, allowlist-gated like `/kranz new`, hourglass ack, NEEDS-CONTEXT posted back), and `/kranz approve <slug>` (approve-by-slug, resolves the drafted mission, blocked-by refusal surfaced verbatim).
+
+(2) docs/slack-management.md — add a new entry to the Build slices ledger (the `## Build slices (ship incrementally)` section) recording this slice: the backlog verbs (ticket list/show, draft, approve-by-slug) marked DONE, in the same style as the existing slice entries.
+
+Keep everything accurate to what actually shipped — do not document behavior that is not implemented. This is a docs-only feature; make no code changes, and confirm the workspace still builds and tests cleanly.
+
+Done when:
+- docs/tickets.md documents `/kranz ticket list`, `ticket show`, `draft`, and approve-by-slug with their gating and ephemerality.
+- docs/slack-management.md's Build slices ledger has a new entry for the backlog-verbs slice in the existing style.
+- The documentation matches the implemented behavior (no invented features).
+- No code changed; cargo test --workspace still passes and cargo fmt --all --check is clean.
+
