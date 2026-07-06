@@ -114,6 +114,32 @@ pub struct StatusSummary {
     pub summary: String,
 }
 
+/// One backlog ticket row for `/kranz ticket list`: slug, priority, pipeline
+/// state, title, and its `blocked-by` slugs (empty when unblocked).
+#[derive(Debug, Clone)]
+pub struct TicketRow {
+    pub slug: String,
+    pub priority: u8,
+    /// Pipeline state word (e.g. `New`, `Drafting`, `Review`).
+    pub state: String,
+    pub title: String,
+    pub blocked_by: Vec<String>,
+}
+
+/// The full detail for `/kranz ticket show <slug>`: everything a reviewer
+/// needs to decide without opening the web UI.
+#[derive(Debug, Clone)]
+pub struct TicketDetail {
+    pub slug: String,
+    pub title: String,
+    pub goal: String,
+    /// Pipeline state word (e.g. `New`, `Drafting`, `Review`).
+    pub state: String,
+    pub blocked_by: Vec<String>,
+    /// Clarifying questions the orchestrator appended (empty when none).
+    pub needs_context: Vec<String>,
+}
+
 /// A plan awaiting review, with the pieces a reviewer needs before spending:
 /// the goal, milestone list, and validation-assertion count. Renders with
 /// **Approve & start** / **Approve & queue** buttons carrying the mission id.
@@ -509,6 +535,58 @@ pub fn build_status(s: &StatusSummary) -> Vec<Value> {
     ]
 }
 
+/// `/kranz ticket list` reply: one compact line per ticket (slug, priority,
+/// state, title, blocked-by note), or a friendly empty-backlog line.
+pub fn build_ticket_list(rows: &[TicketRow]) -> Vec<Value> {
+    if rows.is_empty() {
+        return vec![section(
+            "_No backlog tickets yet. File one with_ `/kranz ticket <title>`.",
+        )];
+    }
+    let mut body = String::new();
+    for row in rows {
+        body.push_str(&format!(
+            "• `{}` (p{}) — *{}* — {}",
+            row.slug, row.priority, row.state, row.title
+        ));
+        if !row.blocked_by.is_empty() {
+            body.push_str(&format!(" _(blocked by: {})_", row.blocked_by.join(", ")));
+        }
+        body.push('\n');
+    }
+    vec![
+        header(":clipboard: Backlog tickets"),
+        section(&clip(body.trim_end())),
+    ]
+}
+
+/// `/kranz ticket show <slug>` reply: title/goal/state/blocked-by plus any
+/// needs-context questions.
+pub fn build_ticket_show(t: &TicketDetail) -> Vec<Value> {
+    let mut body = format!("*State:* {}\n", t.state);
+    if !t.blocked_by.is_empty() {
+        body.push_str(&format!("*Blocked by:* {}\n", t.blocked_by.join(", ")));
+    }
+    let goal = t.goal.trim();
+    if !goal.is_empty() {
+        body.push_str(&format!("\n*Goal*\n{goal}\n"));
+    }
+    let mut blocks = vec![
+        header(&format!("{} — {}", t.slug, t.title)),
+        section(&clip(&body)),
+    ];
+    if !t.needs_context.is_empty() {
+        let mut q = String::from("*Needs context*\n");
+        for question in &t.needs_context {
+            q.push_str("• ");
+            q.push_str(question);
+            q.push('\n');
+        }
+        blocks.push(section(&clip(q.trim_end())));
+    }
+    blocks
+}
+
 /// Plan-review message: goal + milestones + assertion count + optional
 /// estimate, then an actions block with **Approve & start** ([`START_ACTION_ID`])
 /// and **Approve & queue** ([`APPROVE_ACTION_ID`]) buttons, both carrying the
@@ -584,6 +662,8 @@ pub fn build_help() -> Vec<Value> {
              • `/kranz work` — show the execution queue (drain it with the `kranz work` dispatcher)\n\
              • `/kranz status [<id>]` — show a mission's status\n\
              • `/kranz ticket <title>` — file a new backlog ticket\n\
+             • `/kranz ticket list` — list backlog tickets\n\
+             • `/kranz ticket show <slug>` — show a ticket's detail\n\
              • `/kranz help` — show this message",
         ),
         section(

@@ -15,6 +15,8 @@ import type {
   MissionSummary,
   Plan,
   PlanRequestResponse,
+  Ticket,
+  TicketSummary,
   TranscriptEntry,
 } from './types';
 
@@ -169,5 +171,23 @@ export const api = {
 
   startMission(id: string): Promise<{ running: boolean }> {
     return postJson(`/api/missions/${encodeURIComponent(id)}/start`, {});
+  },
+
+  // --- tickets (backlog panel) ----------------------------------------------
+
+  tickets(): Promise<TicketSummary[]> {
+    return getJson('/api/tickets');
+  },
+
+  ticket(slug: string): Promise<Ticket> {
+    return getJson(`/api/tickets/${encodeURIComponent(slug)}`);
+  },
+
+  draftTicket(slug: string): Promise<{ missionId: string }> {
+    return postJson(`/api/tickets/${encodeURIComponent(slug)}/draft`, {});
+  },
+
+  approveTicket(slug: string, force: boolean): Promise<{ approved: boolean; missionId: string }> {
+    return postJson(`/api/tickets/${encodeURIComponent(slug)}/approve`, { force });
   },
 };

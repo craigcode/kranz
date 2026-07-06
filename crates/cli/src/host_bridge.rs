@@ -4,6 +4,7 @@
 //! only place the two crates meet; `kranz_slack` stays server-free and
 //! `kranz_server` stays Slack-free.
 
+use kranz_engine::draft::DraftOutcome;
 use kranz_engine::types::Plan;
 use kranz_server::{ApiError, MissionHost};
 use kranz_slack::host::{BoxFuture, PlanOutcome, PlanningHost};
@@ -58,6 +59,25 @@ impl PlanningHost for HostedPlanning {
 
     fn release<'a>(&'a self, id: &'a str) -> BoxFuture<'a, anyhow::Result<bool>> {
         Box::pin(async move { self.0.release(id).map_err(plain) })
+    }
+
+    fn draft<'a>(&'a self, slug: &'a str) -> BoxFuture<'a, anyhow::Result<DraftOutcome>> {
+        // `then_enqueue: false` — the Slack draft verb parks for review, same
+        // as `kranz ticket draft <slug>` without `--yes`; queueing is a
+        // separate approve step.
+        Box::pin(async move { self.0.draft(slug, false).await.map_err(plain) })
+    }
+
+    fn approve_ticket<'a>(&'a self, slug: &'a str) -> BoxFuture<'a, anyhow::Result<String>> {
+        // `force: false` — `/kranz approve <slug>` runs the plain gate, same
+        // as REST's default body; a blocked-by refusal is a refusal, not a
+        // reason to silently override it from Slack.
+        Box::pin(async move {
+            self.0
+                .approve_ticket(slug, false)
+                .map(|a| a.mission_id)
+                .map_err(plain)
+        })
     }
 }
 

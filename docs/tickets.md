@@ -49,7 +49,38 @@ kranz queue                # the execution queue (approved, awaiting a run)
 ```
 
 Slack: `/kranz work` reports the queue read-only; the App Home tab shows
-the overview.
+the overview. The backlog is also browsable, draftable, and approvable
+from the dashboard's backlog panel (`#/backlog`, linked from the mission
+picker) — it lists the same slug/priority/state/title/blocked-by columns,
+drills into a ticket for its goal/context/needs-context, and drives
+draft/approve with the same blocked-by-aware gate described below.
+
+Slack also has direct backlog verbs:
+
+- **`/kranz ticket list`** — one line per ticket (slug, priority, state,
+  title). Read-only: no allowlist gate, and the reply is ephemeral (visible
+  only to the invoker).
+- **`/kranz ticket show <slug>`** — one ticket's full detail (goal, state,
+  blocked-by, any parked NEEDS-CONTEXT questions). Also read-only and
+  ephemeral, no allowlist gate; an unknown or invalid slug replies with a
+  graceful ephemeral error rather than failing silently.
+- **`/kranz draft <slug>`** — runs a non-interactive draft turn for a
+  backlog ticket through the hosted engine (create the mission, seed it,
+  demand the plan). A SPEND action: gated on the `slack.allowUsers`
+  allowlist exactly like `/kranz new`, same "not authorized" refusal for
+  unlisted users. On authorization it acks immediately with an
+  `:hourglass_flowing_sand:` ephemeral (the draft turn takes a minute or
+  two), then posts the terminal outcome back to the invoker: ready-for-review
+  (mission id + branch), approved-and-queued, or — if the ticket was
+  underspecified — **NEEDS-CONTEXT** with the orchestrator's questions
+  appended, the same as the CLI/REST draft path.
+- **`/kranz approve <slug>`** — the slug-resolving twin of `/kranz approve
+  <mission-id>`; approve-by-slug. Gated on the same allowlist as `/kranz
+  new`/`draft`. It resolves the ticket's drafted mission and runs the exact
+  same `kranz_engine::deps::approve_ticket` gate the CLI and REST approve
+  paths run, so a blocked-by refusal (or a cycle, or a not-REVIEW ticket) is
+  surfaced to the Slack user **verbatim** — never paraphrased. On success it
+  replies with the mission id now queued for `kranz work`.
 
 ## The pipeline: draft → review → approve → drain
 

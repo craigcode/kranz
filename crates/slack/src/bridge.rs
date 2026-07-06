@@ -27,6 +27,7 @@ use crate::outbound::{classify, NotifyClass, Outbound};
 use crate::threads::ThreadMap;
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
+use kranz_engine::draft::DraftOutcome;
 use kranz_engine::event_log::EventLog;
 use kranz_engine::paths::MissionPaths;
 use kranz_engine::reducer;
@@ -433,6 +434,7 @@ fn is_slow_action(action: &Action) -> bool {
             | Action::Approve { .. }
             | Action::ApproveStart { .. }
             | Action::ApproveMission { .. }
+            | Action::Draft { .. }
     )
 }
 
@@ -544,8 +546,10 @@ async fn user_reply(
 }
 
 /// A one-line ephemeral "not authorized" reply for a spend-gated action from an
-/// unlisted user (docs/slack-management.md must-have #1).
-fn not_authorized_blocks() -> Vec<Value> {
+/// unlisted user (docs/slack-management.md must-have #1). `pub` so tests
+/// (including external ones, e.g. `tests/tickets.rs`) can assert a refusal is
+/// byte-for-byte this standard message, not just "some" error.
+pub fn not_authorized_blocks() -> Vec<Value> {
     vec![json!({
         "type": "section",
         "text": {
@@ -615,6 +619,154 @@ fn not_authorized_blocks() -> Vec<Value> {
 /// deduped by envelope id ([`SeenEnvelopes`]) so a Slack redelivery can't
 /// double-create or double-approve. Only pure-local actions run inline on the
 /// read loop.
+/// The outcome of the SYNCHRONOUS `gate_draft_command` phase — no
+/// `PlanningHost::draft` call has happened by the time any of these variants
+/// is returned. `Ready` carries the immediate hourglass ack (posted first,
+/// mirroring [`Action::NewMission`]) that the caller must post BEFORE
+/// awaiting [`run_draft`], so the invoker sees the ack immediately rather
+/// than only once the multi-minute draft turn completes.
+pub enum DraftGate {
+    Unauthorized,
+    NoHost(Vec<Value>),
+    InvalidSlug(Vec<Value>),
+    Ready(Vec<Value>),
+}
+
+/// `/kranz draft <slug>` gate/ack phase — SPEND action, gated EXACTLY like
+/// `/kranz new` (same gate, same standard refusal). Runs
+/// `cfg.is_authorized`, [`kranz_engine::ticket::Ticket::ensure_valid_slug`],
+/// and the host-presence check, and builds the hourglass ack for the `Ready`
+/// case. Makes NO `PlanningHost::draft` call — that is the caller's job via
+/// [`run_draft`], AFTER posting the `Ready` ack — so this phase stays
+/// synchronous and unit-testable without a live `SlackClient`.
+pub fn gate_draft_command(
+    cfg: &SlackConfig,
+    host: Option<&SharedHost>,
+    slug: &str,
+    user_id: Option<&str>,
+) -> DraftGate {
+    if !cfg.is_authorized(user_id) {
+        return DraftGate::Unauthorized;
+    }
+    if let Err(e) = kranz_engine::ticket::Ticket::ensure_valid_slug(slug) {
+        return DraftGate::InvalidSlug(error_blocks(&format!("Couldn't draft `{slug}`: {e}")));
+    }
+    if host.is_none() {
+        return DraftGate::NoHost(error_blocks(&format!(
+            "This bridge has no hosted planning engine (it was started without \
+             `kranz serve`). Use `kranz ticket draft {slug}` in a terminal, or the \
+             web UI via `kranz serve --open`."
+        )));
+    }
+    // Ack IMMEDIATELY: the draft turn (create + seed + drive to a terminal
+    // outcome) takes minutes, same reasoning as NewMission/RequestPlan. The
+    // caller must post this BEFORE calling `run_draft`.
+    DraftGate::Ready(error_blocks(&format!(
+        ":hourglass_flowing_sand: Drafting `{slug}` — the seeding planning turn \
+         usually takes a minute or two; the result will post here."
+    )))
+}
+
+/// The async run phase of `/kranz draft <slug>`, called ONLY after the
+/// caller has posted the `DraftGate::Ready` ack. Drives [`PlanningHost::draft`]
+/// to a terminal [`DraftOutcome`] and maps it to the terminal result blocks,
+/// posting the orchestrator's clarifying questions back to the invoker on
+/// `NeedsContext`.
+pub async fn run_draft(host: &SharedHost, slug: &str) -> Vec<Value> {
+    match host.draft(slug).await {
+        Ok(DraftOutcome::ParkedForReview {
+            mission_id,
+            mission_branch,
+        }) => error_blocks(&format!(
+            ":white_check_mark: Draft ready for review — mission `{mission_id}`, \
+             branch `{mission_branch}`. Ticket `{slug}` is now in review."
+        )),
+        Ok(DraftOutcome::Enqueued { mission_id }) => error_blocks(&format!(
+            ":white_check_mark: Draft approved and queued — mission `{mission_id}`. \
+             Ticket `{slug}` is now queued."
+        )),
+        Ok(DraftOutcome::NeedsContext {
+            mission_id,
+            questions,
+        }) => {
+            let mut text = format!(
+                ":question: Mission `{mission_id}` needs more context before drafting \
+                 `{slug}` can continue:\n"
+            );
+            for q in &questions {
+                text.push_str(&format!("• {q}\n"));
+            }
+            error_blocks(text.trim_end())
+        }
+        Err(e) => error_blocks(&format!("Couldn't draft `{slug}`: {e}")),
+    }
+}
+
+/// Does `arg` name an on-disk backlog ticket? `/kranz approve <arg>` uses this
+/// to decide whether `arg` is a ticket slug (resolve through
+/// [`run_approve_ticket_command`]) or a mission id (the original
+/// pending-plan `approve_flow`). A syntactically invalid slug never matches
+/// (no filesystem access for path-traversal attempts).
+fn is_ticket_slug(repo_root: &Path, arg: &str) -> bool {
+    kranz_engine::ticket::Ticket::valid_slug(arg)
+        && kranz_engine::ticket::Ticket::tickets_dir(repo_root)
+            .join(format!("{arg}.md"))
+            .is_file()
+}
+
+/// The outcome of `run_approve_ticket_command`: whether the invoker was
+/// authorized, and the reply blocks to post (`None` only when unauthorized,
+/// mirroring [`DraftGate`]).
+pub struct ApproveTicketInvocation {
+    pub authorized: bool,
+    pub result: Option<Vec<Value>>,
+}
+
+/// `/kranz approve <slug>` — the slug-resolving twin of `/kranz approve
+/// <mission-id>`, gated EXACTLY like it (same allowlist, same standard
+/// refusal). Holds the gate + host-call logic so it is unit-testable without
+/// a live `SlackClient`. Runs [`crate::host::PlanningHost::approve_ticket`] —
+/// the SAME `kranz_engine::deps::approve_ticket` gate the REST/CLI approve
+/// path runs — and forwards a blocked-by / not-REVIEW / cycle refusal
+/// VERBATIM (never paraphrased).
+pub async fn run_approve_ticket_command(
+    cfg: &SlackConfig,
+    host: Option<&SharedHost>,
+    slug: &str,
+    user_id: Option<&str>,
+) -> ApproveTicketInvocation {
+    if !cfg.is_authorized(user_id) {
+        return ApproveTicketInvocation {
+            authorized: false,
+            result: None,
+        };
+    }
+    let Some(host) = host else {
+        return ApproveTicketInvocation {
+            authorized: true,
+            result: Some(error_blocks(&format!(
+                "This bridge has no hosted planning engine (it was started without \
+                 `kranz serve`). Use `kranz ticket approve {slug}` in a terminal, or the \
+                 web UI via `kranz serve --open`."
+            ))),
+        };
+    };
+    let result = match host.approve_ticket(slug).await {
+        Ok(mission_id) => error_blocks(&format!(
+            ":white_check_mark: Approved and queued — ticket `{slug}` \u{2192} mission \
+             `{mission_id}`. The `kranz work` dispatcher runs it next."
+        )),
+        // VERBATIM: `e` is the engine's own refusal message (blocked-by,
+        // not-REVIEW, or a blocked-by cycle) — forwarded unchanged, never
+        // wrapped in extra prose that would obscure it.
+        Err(e) => error_blocks(&e.to_string()),
+    };
+    ApproveTicketInvocation {
+        authorized: true,
+        result: Some(result),
+    }
+}
+
 async fn dispatch_action(
     cfg: &SlackConfig,
     client: &SlackClient,
@@ -650,6 +802,28 @@ async fn dispatch_action(
                 .await;
             }
         },
+
+        // Read-only backlog verbs (no `user_id`, so structurally not
+        // allowlist-gated — same shape as Status).
+        Action::TicketList { response_url } => {
+            reply_ephemeral(
+                cfg,
+                client,
+                response_url.as_deref(),
+                &build_ticket_list_reply(repo_root),
+            )
+            .await;
+        }
+
+        Action::TicketShow { slug, response_url } => {
+            reply_ephemeral(
+                cfg,
+                client,
+                response_url.as_deref(),
+                &build_ticket_show_reply(repo_root, slug),
+            )
+            .await;
+        }
 
         Action::NewMission {
             goal,
@@ -873,20 +1047,71 @@ async fn dispatch_action(
             user_id,
             response_url,
         } => {
-            approve_flow(
-                cfg,
-                client,
-                repo_root,
-                threads,
-                host,
-                mission_id,
-                user_id.as_deref(),
-                response_url.as_deref(),
-                false,
-                false,
-            )
-            .await;
+            // `/kranz approve <arg>` accepts EITHER a mission id or a ticket
+            // slug: an arg naming an on-disk backlog ticket resolves through
+            // the ticket-approve gate (kranz_engine::deps::approve_ticket);
+            // anything else keeps the original pending-plan approve flow.
+            if is_ticket_slug(repo_root, mission_id) {
+                let invocation =
+                    run_approve_ticket_command(cfg, host, mission_id, user_id.as_deref()).await;
+                if !invocation.authorized {
+                    reply_ephemeral(
+                        cfg,
+                        client,
+                        response_url.as_deref(),
+                        &not_authorized_blocks(),
+                    )
+                    .await;
+                } else if let Some(result) = &invocation.result {
+                    reply_ephemeral(cfg, client, response_url.as_deref(), result).await;
+                }
+            } else {
+                approve_flow(
+                    cfg,
+                    client,
+                    repo_root,
+                    threads,
+                    host,
+                    mission_id,
+                    user_id.as_deref(),
+                    response_url.as_deref(),
+                    false,
+                    false,
+                )
+                .await;
+            }
         }
+
+        // `/kranz draft <slug>` — SPEND action, gated EXACTLY like `new`
+        // ([`gate_draft_command`] holds the gate + ack logic so it's
+        // unit-testable without a live SlackClient). The hourglass ack MUST
+        // post before the slow `run_draft` await, mirroring
+        // NewMission/RequestPlan — never build both and post them back to
+        // back after the draft finishes.
+        Action::Draft {
+            slug,
+            user_id,
+            response_url,
+        } => match gate_draft_command(cfg, host, slug, user_id.as_deref()) {
+            DraftGate::Unauthorized => {
+                reply_ephemeral(
+                    cfg,
+                    client,
+                    response_url.as_deref(),
+                    &not_authorized_blocks(),
+                )
+                .await;
+            }
+            DraftGate::NoHost(blocks) | DraftGate::InvalidSlug(blocks) => {
+                reply_ephemeral(cfg, client, response_url.as_deref(), &blocks).await;
+            }
+            DraftGate::Ready(ack) => {
+                reply_ephemeral(cfg, client, response_url.as_deref(), &ack).await;
+                let host = host.expect("DraftGate::Ready only returned with a host present");
+                let result = run_draft(host, slug).await;
+                reply_ephemeral(cfg, client, response_url.as_deref(), &result).await;
+            }
+        },
 
         // Per-role config change. SPEND-ADJACENT (it re-shapes future turns'
         // spend), so it is gated on the allowlist exactly like `/kranz new`.
@@ -1577,12 +1802,15 @@ fn apply_action(repo_root: &Path, action: &Action) -> Result<()> {
         Action::NewTicket { title, .. } => scaffold_ticket(repo_root, title),
         Action::Help { .. }
         | Action::Status { .. }
+        | Action::TicketList { .. }
+        | Action::TicketShow { .. }
         | Action::NewMission { .. }
         | Action::NewMissionModal { .. }
         | Action::ConfigModal { .. }
         | Action::RequestPlan { .. }
         | Action::ApproveMission { .. }
         | Action::ApproveStart { .. }
+        | Action::Draft { .. }
         | Action::Config { .. }
         | Action::Pause { .. }
         | Action::Resume { .. }
@@ -1616,6 +1844,106 @@ fn build_status_reply(repo_root: &Path, mission_id: Option<&str>) -> Result<Vec<
         summary: render_status_body(&state),
     };
     Ok(crate::format::build_status(&summary))
+}
+
+/// `/kranz ticket list` reply: one row per parseable ticket under
+/// `.kranz/tickets/`, via [`kranz_engine::ticket::Ticket::list`] (the same
+/// primitive the REST `GET /api/tickets` route uses). Pure read + render, so
+/// it is unit-tested directly; never fails (an empty/missing tickets dir just
+/// yields an empty list).
+pub fn build_ticket_list_reply(repo_root: &Path) -> Vec<Value> {
+    let rows: Vec<crate::format::TicketRow> = kranz_engine::ticket::Ticket::list(repo_root)
+        .iter()
+        .map(|t| crate::format::TicketRow {
+            slug: t.slug.clone(),
+            priority: t.priority,
+            state: format!(
+                "{:?}",
+                kranz_engine::ticket::Ticket::read_state(repo_root, &t.slug)
+            ),
+            title: t.title.clone(),
+            blocked_by: t.blocked_by.clone(),
+        })
+        .collect();
+    crate::format::build_ticket_list(&rows)
+}
+
+/// `/kranz ticket show <slug>` reply: the ticket's detail via
+/// [`kranz_engine::ticket::Ticket::load`] + `read_state`. A graceful ephemeral
+/// error (never a panic) for an invalid slug (checked with
+/// [`kranz_engine::ticket::Ticket::ensure_valid_slug`] BEFORE touching the
+/// filesystem) or one with no ticket file.
+pub fn build_ticket_show_reply(repo_root: &Path, slug: &str) -> Vec<Value> {
+    use kranz_engine::ticket::Ticket;
+
+    if let Err(e) = Ticket::ensure_valid_slug(slug) {
+        return error_blocks(&format!("Invalid ticket slug `{slug}`: {e}"));
+    }
+    let path = Ticket::tickets_dir(repo_root).join(format!("{slug}.md"));
+    if !path.is_file() {
+        return error_blocks(&format!("Unknown ticket `{slug}`."));
+    }
+    let ticket = match Ticket::load(&path) {
+        Ok(t) => t,
+        Err(e) => return error_blocks(&format!("Couldn't read ticket `{slug}`: {e}")),
+    };
+    let state = format!("{:?}", Ticket::read_state(repo_root, slug));
+    let detail = crate::format::TicketDetail {
+        slug: ticket.slug.clone(),
+        title: ticket.title.clone(),
+        goal: ticket.goal.clone(),
+        state,
+        blocked_by: ticket.blocked_by.clone(),
+        needs_context: needs_context_questions(&ticket.raw_body),
+    };
+    crate::format::build_ticket_show(&detail)
+}
+
+/// The orchestrator's clarifying questions appended under a `## Needs
+/// context` heading in a ticket's raw body. Mirrors
+/// `kranz_server::tickets::needs_context_questions` (itself a port of
+/// `kranz_cli::backlog::needs_context_block`'s heading scan) — a small
+/// derived-data extraction, not ticket parsing, so it stays a thin per-crate
+/// copy rather than a shared engine primitive.
+fn needs_context_questions(raw_body: &str) -> Vec<String> {
+    let mut collecting = false;
+    let mut out = Vec::new();
+    for line in raw_body.lines() {
+        let is_section = line.trim_start().starts_with("##");
+        if collecting && is_section {
+            break;
+        }
+        if is_section
+            && line
+                .trim_start_matches('#')
+                .trim()
+                .to_ascii_lowercase()
+                .starts_with("needs context")
+        {
+            collecting = true;
+            continue;
+        }
+        if collecting {
+            if let Some(item) = bullet_item(line) {
+                out.push(item);
+            }
+        }
+    }
+    out
+}
+
+/// The content of a dash bullet (`- item`), trimmed, else `None`.
+fn bullet_item(line: &str) -> Option<String> {
+    let t = line.trim_start();
+    for marker in ["- ", "* ", "+ "] {
+        if let Some(rest) = t.strip_prefix(marker) {
+            let item = rest.trim().to_string();
+            if !item.is_empty() {
+                return Some(item);
+            }
+        }
+    }
+    None
 }
 
 /// The most-recently-created mission id under `repo_root`, if any. Missions are
@@ -2936,6 +3264,13 @@ mod tests {
             mission_id: "m-1".into(),
             text: "hi".into(),
             user_id: None,
+        }));
+        // Draft runs a full mission create+seed+drive turn → must run off the
+        // read loop, same as NewMission.
+        assert!(is_slow_action(&Action::Draft {
+            slug: "s-1".into(),
+            user_id: None,
+            response_url: None,
         }));
         // Fast local/one-call actions stay inline.
         assert!(!is_slow_action(&Action::Status {

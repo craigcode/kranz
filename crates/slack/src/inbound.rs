@@ -75,6 +75,17 @@ pub enum Action {
         channel: String,
         thread_ts: Option<String>,
     },
+    /// `/kranz ticket list` → one row per backlog ticket. Read-only, so not
+    /// gated (no `user_id`); replies over `response_url`, same as
+    /// [`Action::Status`].
+    TicketList { response_url: Option<String> },
+    /// `/kranz ticket show <slug>` → the ticket's detail (goal/state/blocked-by
+    /// /needs-context). Read-only, so not gated; an unknown or invalid slug is
+    /// a graceful ephemeral error, never a panic.
+    TicketShow {
+        slug: String,
+        response_url: Option<String>,
+    },
     /// `/kranz new <goal>` (or a new-mission modal submission) → create a
     /// mission and seed planning. A money-spending action: gated by the spend
     /// allowlist. `user_id` is the invoking Slack user (for the gate);
@@ -116,6 +127,17 @@ pub enum Action {
     /// slash-command twin of the [`Action::Approve`] button; spend-gated.
     ApproveMission {
         mission_id: String,
+        user_id: Option<String>,
+        response_url: Option<String>,
+    },
+    /// `/kranz draft <slug>` → run a non-interactive draft turn for a backlog
+    /// ticket through the hosted engine (create the mission, seed it, demand
+    /// the plan). A money-spending action: gated on the allowlist EXACTLY
+    /// like [`Action::NewMission`] (same gate, same standard refusal). `slug`
+    /// is validated via `Ticket::ensure_valid_slug` before any host call; an
+    /// unknown ticket is a graceful error.
+    Draft {
+        slug: String,
         user_id: Option<String>,
         response_url: Option<String>,
     },
@@ -453,13 +475,14 @@ fn route_event(payload: &Value, lookup: &impl ThreadLookup) -> Action {
 }
 
 /// `slash_commands` → the `/kranz` subcommand router. Recognized subcommands:
-/// `ticket <title>`, `new <goal>`, `status [<id>]`, `plan <id>`, `approve <id>`,
+/// `ticket <title>`, `ticket list`, `ticket show <slug>`, `new <goal>`,
+/// `status [<id>]`, `plan <id>`, `approve <id>`, `draft <slug>`,
 /// `config [<id>] <role> <model> [effort]`, `pause [<id>]`, `resume [<id>]`,
 /// `work`. A bare `/kranz`, `help`, or an unrecognized/incomplete subcommand
 /// shows the command list — a typo lands on help rather than silently doing
 /// something surprising, which is what keeps the surface discoverable.
 ///
-/// The spend-gated subcommands (`new`, `plan`, `approve`) carry the invoking
+/// The spend-gated subcommands (`new`, `plan`, `approve`, `draft`) carry the invoking
 /// `user_id` so [`crate::bridge`] can consult the allowlist before acting; the
 /// gate itself lives in [`crate::config::SlackConfig::is_authorized`], not here
 /// (routing stays pure and config-free).
@@ -488,10 +511,28 @@ fn route_slash(payload: &Value) -> Action {
         .unwrap_or("")
         .to_string();
 
-    // `ticket <title>` scaffolds a ticket; the thread is captured so the
-    // scaffolder can seed from it and reply in place.
+    // `ticket list` / `ticket show <slug>` are the read-only backlog verbs
+    // (not gated — checked BEFORE the title branch so a ticket literally
+    // titled "list" or "show ..." is the one surprising edge case; see the
+    // module doc). `ticket <title>` scaffolds a ticket; the thread is
+    // captured so the scaffolder can seed from it and reply in place.
     if let Some(rest) = strip_ci_prefix(text, "ticket") {
-        let title = rest.trim();
+        let arg = rest.trim();
+        if let Some(after_list) = strip_ci_prefix(arg, "list") {
+            if after_list.trim().is_empty() {
+                return Action::TicketList { response_url };
+            }
+        }
+        if let Some(after_show) = strip_ci_prefix(arg, "show") {
+            let slug = after_show.trim();
+            if !slug.is_empty() {
+                return Action::TicketShow {
+                    slug: slug.to_string(),
+                    response_url,
+                };
+            }
+        }
+        let title = arg;
         if !title.is_empty() {
             // Slash commands can be invoked from a thread; `thread_ts` is present then.
             let thread_ts = payload
@@ -572,6 +613,20 @@ fn route_slash(payload: &Value) -> Action {
             };
         }
         // `approve` with no id → help.
+    }
+
+    // `draft <slug>` → run a non-interactive draft turn for a backlog ticket
+    // (spend-gated, same gate as `new`). No slug → help.
+    if let Some(rest) = strip_ci_prefix(text, "draft") {
+        let slug = rest.trim();
+        if !slug.is_empty() {
+            return Action::Draft {
+                slug: slug.to_string(),
+                user_id,
+                response_url,
+            };
+        }
+        // `draft` with no slug → help.
     }
 
     // `config [<id>] <role> <model> [effort]` → per-role model/effort change
@@ -1028,6 +1083,73 @@ mod tests {
             route(&env, &lookup_none()).action,
             Action::NewTicket {
                 title: "Fix the thing".into(),
+                channel: "C1".into(),
+                thread_ts: None
+            }
+        );
+    }
+
+    #[test]
+    fn slash_ticket_list_routes_to_ticket_list() {
+        let env = json!({
+            "type": "slash_commands",
+            "envelope_id": "env-tl",
+            "payload": { "command": "/kranz", "text": "ticket list",
+                         "channel_id": "C1", "response_url": "https://hooks.slack/tl" }
+        });
+        let routed = route(&env, &lookup_none());
+        assert_eq!(routed.envelope_id.as_deref(), Some("env-tl"));
+        assert_eq!(
+            routed.action,
+            Action::TicketList {
+                response_url: Some("https://hooks.slack/tl".into())
+            }
+        );
+        // Case-insensitive, trailing whitespace tolerated.
+        let env = json!({
+            "type": "slash_commands",
+            "payload": { "command": "/kranz", "text": "TICKET  LIST  ",
+                         "channel_id": "C1", "response_url": "https://hooks.slack/tl" }
+        });
+        assert_eq!(
+            route(&env, &lookup_none()).action,
+            Action::TicketList {
+                response_url: Some("https://hooks.slack/tl".into())
+            }
+        );
+    }
+
+    #[test]
+    fn slash_ticket_show_routes_to_ticket_show() {
+        let env = json!({
+            "type": "slash_commands",
+            "envelope_id": "env-ts",
+            "payload": { "command": "/kranz", "text": "ticket show rate-limit-notes",
+                         "channel_id": "C1", "response_url": "https://hooks.slack/ts" }
+        });
+        let routed = route(&env, &lookup_none());
+        assert_eq!(routed.envelope_id.as_deref(), Some("env-ts"));
+        assert_eq!(
+            routed.action,
+            Action::TicketShow {
+                slug: "rate-limit-notes".into(),
+                response_url: Some("https://hooks.slack/ts".into())
+            }
+        );
+    }
+
+    #[test]
+    fn slash_ticket_show_without_slug_falls_through_to_title() {
+        // `ticket show` with nothing after it isn't a valid show — it becomes
+        // the (unusual but not our job to police) ticket title "show".
+        let env = json!({
+            "type": "slash_commands",
+            "payload": { "command": "/kranz", "text": "ticket show   ", "channel_id": "C1" }
+        });
+        assert_eq!(
+            route(&env, &lookup_none()).action,
+            Action::NewTicket {
+                title: "show".into(),
                 channel: "C1".into(),
                 thread_ts: None
             }

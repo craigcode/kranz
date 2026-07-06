@@ -15,6 +15,7 @@ import type {
   MissionState,
   MissionSummary,
   Plan,
+  TicketSummary,
   WsFrame,
 } from './types';
 
@@ -72,6 +73,9 @@ let nextLocalId = 1;
 interface KranzStore {
   missions: MissionSummary[];
   missionsError: string | null;
+  tickets: TicketSummary[];
+  ticketsError: string | null;
+  ticketError: string | null;
   missionId: string | null;
   state: MissionState | null;
   events: MissionEvent[];
@@ -96,6 +100,14 @@ interface KranzStore {
   startRunError: string | null;
 
   loadMissions: () => Promise<void>;
+  /** Load the backlog list for the dashboard panel (`GET /api/tickets`). */
+  loadTickets: () => Promise<void>;
+  /** POST draft for a ticket, then connect to the returned mission's live
+   *  feed via the existing `connectMission` action. */
+  draftTicket: (slug: string) => Promise<void>;
+  /** POST approve for a ticket; refreshes the backlog list on success and
+   *  surfaces the server's refusal message verbatim on failure. */
+  approveTicket: (slug: string, force: boolean) => Promise<void>;
   connectMission: (id: string) => void;
   disconnect: () => void;
   selectRun: (runId: string | null) => void;
@@ -256,6 +268,9 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
   return {
     missions: [],
     missionsError: null,
+    tickets: [],
+    ticketsError: null,
+    ticketError: null,
     missionId: null,
     state: null,
     events: [],
@@ -274,6 +289,36 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
         set({ missions });
       } catch (err) {
         set({ missionsError: err instanceof Error ? err.message : String(err) });
+      }
+    },
+
+    loadTickets: async () => {
+      set({ ticketsError: null });
+      try {
+        const tickets = await api.tickets();
+        set({ tickets });
+      } catch (err) {
+        set({ ticketsError: err instanceof Error ? err.message : String(err) });
+      }
+    },
+
+    draftTicket: async (slug: string) => {
+      set({ ticketError: null });
+      try {
+        const { missionId } = await api.draftTicket(slug);
+        get().connectMission(missionId);
+      } catch (err) {
+        set({ ticketError: err instanceof Error ? err.message : String(err) });
+      }
+    },
+
+    approveTicket: async (slug: string, force: boolean) => {
+      set({ ticketError: null });
+      try {
+        await api.approveTicket(slug, force);
+        await get().loadTickets();
+      } catch (err) {
+        set({ ticketError: err instanceof Error ? err.message : String(err) });
       }
     },
 

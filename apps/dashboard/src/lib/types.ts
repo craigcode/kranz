@@ -53,6 +53,44 @@ export type WorkerMessageTag =
   | 'system';
 
 // ---------------------------------------------------------------------------
+// Tickets (crates/server/src/tickets.rs, crates/engine/src/ticket.rs)
+// ---------------------------------------------------------------------------
+
+export type TicketState =
+  | 'new'
+  | 'drafting'
+  | 'needs-context'
+  | 'review'
+  | 'queued'
+  | 'running'
+  | 'done'
+  | 'failed';
+
+/** Row shape from `GET /api/tickets` — enough to render a backlog table. */
+export interface TicketSummary {
+  slug: string;
+  priority: number;
+  state: TicketState;
+  title: string;
+  blockedBy: string[];
+}
+
+/** Full ticket shape from `GET /api/tickets/:slug`. */
+export interface Ticket {
+  slug: string;
+  title: string;
+  priority: number;
+  schedule: 'once' | 'nightly' | 'weekly';
+  blockedBy: string[];
+  goal: string;
+  context: string;
+  scopingAnswers: string[];
+  acceptanceHints: string[];
+  state: TicketState;
+  needsContext: string[];
+}
+
+// ---------------------------------------------------------------------------
 // Core model
 // ---------------------------------------------------------------------------
 

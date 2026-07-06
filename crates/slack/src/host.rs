@@ -11,6 +11,7 @@
 //! `BoxFuture` (from `futures-util`, already a dependency) keeps the trait
 //! object-safe without an `async-trait` dependency.
 
+use kranz_engine::draft::DraftOutcome;
 use kranz_engine::types::Plan;
 use std::sync::Arc;
 
@@ -71,6 +72,25 @@ pub trait PlanningHost: Send + Sync + 'static {
     /// `true` = the mission is now free of this host (released or never
     /// hosted); `false` = it is actively running here and was left alone.
     fn release<'a>(&'a self, id: &'a str) -> BoxFuture<'a, anyhow::Result<bool>>;
+
+    /// Run a non-interactive draft turn for backlog ticket `slug` (`/kranz
+    /// draft <slug>`): validates the slug, creates + seeds the mission
+    /// through this host, and drives it to a terminal [`DraftOutcome`]. A
+    /// money-spending, multi-minute operation — the bridge runs it off the
+    /// socket read loop after posting an immediate ack, mirroring
+    /// [`Self::create`] + [`Self::planning_turn`].
+    fn draft<'a>(&'a self, slug: &'a str) -> BoxFuture<'a, anyhow::Result<DraftOutcome>>;
+
+    /// Approve backlog ticket `slug` into the queue (`/kranz approve <slug>`,
+    /// the slug-resolving twin of `/kranz approve <mission-id>`): runs the
+    /// EXACT SAME gate the REST/CLI approve path runs
+    /// (`kranz_engine::deps::approve_ticket`, mirrored by
+    /// `kranz_server::MissionHost::approve_ticket`) — refuses when the ticket
+    /// isn't REVIEW, when a blocked-by cycle is reachable, or when an
+    /// unsatisfied blocker exists. `Ok(mission_id)` = the ticket's drafted
+    /// mission was queued; `Err` carries the engine's refusal message
+    /// VERBATIM (never paraphrased) for the bridge to forward unchanged.
+    fn approve_ticket<'a>(&'a self, slug: &'a str) -> BoxFuture<'a, anyhow::Result<String>>;
 }
 
 /// How the bridge holds the host: shared, optional (a bridge without a host —
