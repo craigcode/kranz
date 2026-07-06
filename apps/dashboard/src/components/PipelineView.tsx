@@ -5,10 +5,12 @@
 // the default. Every ticket is a row; every mission with no originating
 // ticket ("kranz new") is also a row, so nothing in progress is hidden.
 
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { useKranzStore } from '../lib/store';
 import { RunQueueButton } from './RunQueueButton';
-import { pipelineStage, primaryAction } from '../lib/pipelineStage';
+import { api } from '../lib/api';
+import { renderMarkdown } from '../lib/markdown';
+import { pipelineStage, primaryAction, parseEstimateFromPlanMd } from '../lib/pipelineStage';
 import type { WorkItem, WorkItemMission } from '../lib/pipelineStage';
 import type { MissionSummary, TicketSummary } from '../lib/types';
 
@@ -65,6 +67,161 @@ function buildRows(tickets: TicketSummary[], missions: MissionSummary[]): Row[] 
   return [...ticketRows, ...missionRows];
 }
 
+/** Reviewable rows: the persisted plan + cost estimate, read inline off
+ *  `GET /api/missions/:id/plan.md` — no navigation away from the pipeline. */
+function ReviewablePlan({ missionId }: { missionId: string }) {
+  const [markdown, setMarkdown] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setMarkdown(null);
+    setError(null);
+    api
+      .planMd(missionId)
+      .then((res) => {
+        if (!cancelled) setMarkdown(res.markdown);
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [missionId]);
+
+  if (error !== null) {
+    return <div className="picker-error pipeline-inline-error">Could not load plan: {error}</div>;
+  }
+  if (markdown === null) {
+    return <div className="dim pipeline-inline-loading">Loading plan…</div>;
+  }
+
+  const estimate = parseEstimateFromPlanMd(markdown);
+
+  return (
+    <div className="pipeline-inline-panel pipeline-inline-plan">
+      {estimate !== null && (
+        <div className="pipeline-estimate">
+          Estimate: ${estimate.lowUsd.toFixed(2)} – ${estimate.highUsd.toFixed(2)} (expected $
+          {estimate.expectedUsd.toFixed(2)})
+        </div>
+      )}
+      {renderMarkdown(markdown)}
+    </div>
+  );
+}
+
+/** Delivered rows: the mission report + diff summary, read inline off
+ *  `GET /api/missions/:id/report.md` and `GET /api/missions/:id/diff-stat`. */
+function DeliveredReport({ missionId }: { missionId: string }) {
+  const [report, setReport] = useState<string | null>(null);
+  const [diffStat, setDiffStat] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setReport(null);
+    setDiffStat(null);
+    setError(null);
+    Promise.all([api.reportMd(missionId), api.diffStat(missionId)])
+      .then(([reportRes, diffRes]) => {
+        if (cancelled) return;
+        setReport(reportRes.markdown);
+        setDiffStat(diffRes.diffStat);
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [missionId]);
+
+  if (error !== null) {
+    return (
+      <div className="picker-error pipeline-inline-error">Could not load report: {error}</div>
+    );
+  }
+  if (report === null || diffStat === null) {
+    return <div className="dim pipeline-inline-loading">Loading report…</div>;
+  }
+
+  return (
+    <div className="pipeline-inline-panel pipeline-inline-report">
+      <pre className="pipeline-diff-stat">{diffStat}</pre>
+      {renderMarkdown(report)}
+    </div>
+  );
+}
+
+/** Iterate (Delivered + Landed): one tap opens an inline one-line-direction
+ *  box; submitting creates a follow-up ticket via `POST /api/tickets`,
+ *  seeded with the finished mission's report as context, then routes to the
+ *  new ticket's row. */
+function IterateControl({ missionId, className }: { missionId: string; className: string }) {
+  const [open, setOpen] = useState(false);
+  const [direction, setDirection] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const submit = async () => {
+    const trimmed = direction.trim();
+    if (trimmed === '') return;
+    setSubmitting(true);
+    setError(null);
+    try {
+      const report = await api
+        .reportMd(missionId)
+        .then((res) => res.markdown)
+        .catch(() => '');
+      const context =
+        report !== ''
+          ? `Follow-up on ${missionId}:\n\n${trimmed}\n\n---\n\n${report}`
+          : trimmed;
+      const created = await api.createTicket({
+        slug: `iterate-${missionId}-${Math.random().toString(36).slice(2, 8)}`,
+        title: trimmed,
+        goal: trimmed,
+        context,
+      });
+      window.location.hash = `#/backlog/${encodeURIComponent(created.slug)}`;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      setSubmitting(false);
+    }
+  };
+
+  if (!open) {
+    return (
+      <button type="button" className={`btn-small ${className}`} onClick={() => setOpen(true)}>
+        Iterate
+      </button>
+    );
+  }
+
+  return (
+    <div className="pipeline-iterate-form">
+      <input
+        type="text"
+        className="pipeline-iterate-input"
+        placeholder="One-line direction for the follow-up"
+        value={direction}
+        onChange={(e) => setDirection(e.target.value)}
+      />
+      <button
+        type="button"
+        className="btn-small pipeline-iterate-submit"
+        disabled={submitting || direction.trim() === ''}
+        onClick={() => void submit()}
+      >
+        Iterate
+      </button>
+      {error !== null && <span className="pipeline-inline-error">{error}</span>}
+    </div>
+  );
+}
+
 export function PipelineView() {
   const tickets = useKranzStore((s) => s.tickets);
   const ticketsError = useKranzStore((s) => s.ticketsError);
@@ -113,7 +270,7 @@ export function PipelineView() {
       );
     }
 
-    if ((stage === 'delivered' || stage === 'landed') && row.missionId !== undefined) {
+    if (stage === 'delivered' && row.missionId !== undefined) {
       return (
         <a
           className="btn-small pipeline-primary-action"
@@ -122,6 +279,10 @@ export function PipelineView() {
           {action.label}
         </a>
       );
+    }
+
+    if (stage === 'landed' && row.missionId !== undefined) {
+      return <IterateControl missionId={row.missionId} className="pipeline-primary-action" />;
     }
 
     if (stage === 'failed') {
@@ -169,14 +330,7 @@ export function PipelineView() {
     }
 
     if (stage === 'delivered' && row.missionId !== undefined) {
-      return (
-        <a
-          className="btn-small pipeline-secondary-action"
-          href={`#/m/${encodeURIComponent(row.missionId)}`}
-        >
-          {action.secondary}
-        </a>
-      );
+      return <IterateControl missionId={row.missionId} className="pipeline-secondary-action" />;
     }
 
     return null;
@@ -201,9 +355,20 @@ export function PipelineView() {
               blocked by {r.blockedBy.join(', ')}
             </span>
           )}
+          {stage === 'delivered' && (
+            <span className="unmerged-badge" title="mission complete, not yet merged">
+              UNMERGED
+            </span>
+          )}
         </div>
         {renderPrimary(r, stage)}
         {renderSecondary(r, stage)}
+        {stage === 'reviewable' && r.missionId !== undefined && (
+          <ReviewablePlan missionId={r.missionId} />
+        )}
+        {stage === 'delivered' && r.missionId !== undefined && (
+          <DeliveredReport missionId={r.missionId} />
+        )}
       </li>
     );
   };

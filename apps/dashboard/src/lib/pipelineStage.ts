@@ -112,3 +112,22 @@ const PRIMARY_ACTIONS: Record<PipelineStage, ActionDescriptor | null> = {
 export function primaryAction(stage: PipelineStage): ActionDescriptor | null {
   return PRIMARY_ACTIONS[stage];
 }
+
+export interface PlanEstimate {
+  lowUsd: number;
+  expectedUsd: number;
+  highUsd: number;
+}
+
+// Matches the "## Cost estimate" line rendered by
+// `orchestrator::render_plan_markdown` — "Estimated **$1.00 – $2.00**
+// (expected ~$1.50)." — the estimate is not exposed on any other GET, so the
+// pipeline view reads it out of the plan markdown it already fetches.
+const ESTIMATE_RE = /Estimated \*\*\$([0-9.]+)\s*[–-]\s*\$([0-9.]+)\*\*\s*\(expected ~\$([0-9.]+)\)/;
+
+/** Pulls the persisted low/expected/high USD estimate out of plan.md. */
+export function parseEstimateFromPlanMd(markdown: string): PlanEstimate | null {
+  const m = ESTIMATE_RE.exec(markdown);
+  if (m === null) return null;
+  return { lowUsd: Number(m[1]), highUsd: Number(m[2]), expectedUsd: Number(m[3]) };
+}

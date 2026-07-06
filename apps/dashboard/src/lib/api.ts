@@ -119,6 +119,18 @@ export const api = {
     return getJson(`/api/missions/${encodeURIComponent(id)}/plan`);
   },
 
+  planMd(id: string): Promise<{ markdown: string }> {
+    return getJson(`/api/missions/${encodeURIComponent(id)}/plan.md`);
+  },
+
+  reportMd(id: string): Promise<{ markdown: string }> {
+    return getJson(`/api/missions/${encodeURIComponent(id)}/report.md`);
+  },
+
+  diffStat(id: string): Promise<{ diffStat: string; baseSha: string; tip: string }> {
+    return getJson(`/api/missions/${encodeURIComponent(id)}/diff-stat`);
+  },
+
   transcript(id: string, runId: string): Promise<TranscriptEntry[]> {
     return getJson(
       `/api/missions/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}/transcript`,
@@ -183,6 +195,15 @@ export const api = {
 
   ticket(slug: string): Promise<Ticket> {
     return getJson(`/api/tickets/${encodeURIComponent(slug)}`);
+  },
+
+  createTicket(fields: {
+    slug: string;
+    title: string;
+    goal?: string;
+    context?: string;
+  }): Promise<TicketSummary> {
+    return postJson('/api/tickets', fields);
   },
 
   draftTicket(slug: string): Promise<{ missionId: string }> {
