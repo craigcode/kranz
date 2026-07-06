@@ -1,0 +1,97 @@
+# Mission plan — m-5d2c79
+
+**Goal:** Add a CodexBackend (AgentBackend over `codex exec --json`) selectable only for the scrutiny validator via an optional validatorScrutiny.backend config field, with engine-side fallbacks (codex pricing, engine-side report parsing, loud claude fallback) and default config byte-identical to today.
+
+Branch `kranz/mission-m-5d2c79` (from `main`). Approved plan of record; the machine-readable twin is [plan.json](plan.json). Live status: `kranz status` or the dashboard.
+
+## Cost estimate
+
+Estimated **$9.61 – $48.04** (expected ~$19.22). Rough estimate — live usage is authoritative; based on 19 completed mission(s).
+
+## Validation contract
+
+Defined before any feature; gates mission completion.
+
+- **[a1]** With no `backend` field configured, the scrutiny validator is dispatched through the injected (Claude) backend, unchanged. 
+  `cargo test -p kranz-engine default_scrutiny_backend_is_claude -- --nocapture`
+- **[a2]** The CodexBackend translates a real-shape `codex exec --json` JSONL stream into AgentEvents (Init, Text, ToolUse, ToolResult, and a terminal Result carrying token usage). 
+  `cargo test -p kranz-engine backend_codex_parse_fixture -- --nocapture`
+- **[a3]** A codex-family model prices distinctly from Claude models and usage_cost_usd applies the codex table. 
+  `cargo test -p kranz-engine codex_pricing_applied -- --nocapture`
+- **[a4]** With validatorScrutiny.backend="codex" and a stubbed codex binary emitting canned JSONL findings, scrutiny validation runs through codex and its findings flow into the fix-cycle machinery (fix-features get created). 
+  `cargo test -p kranz-engine codex_scrutiny_findings_flow -- --nocapture`
+- **[a5]** When backend="codex" but codex is not discoverable, preflight emits an issue AND a loud recorded fallback decision to the claude validator — never a silent swap. 
+  `cargo test -p kranz-engine codex_absent_loud_fallback -- --nocapture`
+- **[a6]** Cost/tokens from a codex validator session appear in mission totals priced with codex pricing. 
+  `cargo test -p kranz-engine codex_validator_cost_in_totals -- --nocapture`
+- **[a7]** The whole workspace test suite passes. 
+  `cargo test --workspace 2>&1 | grep -qE 'result: ok\. [1-9][0-9]* passed'`
+- **[a8]** Clippy is clean across the workspace with warnings denied. 
+  `cargo clippy --workspace --all-targets -- -D warnings`
+- **[a9]** Formatting is clean. 
+  `cargo fmt --all -- --check`
+- **[a10]** Claude-specific SessionSpec fields are documented as claude-specific marking the backend boundary, and the CodexBackend deliberately ignores them rather than misapplying them. *(agent judgement)*
+
+## Milestone 1 — CodexBackend: faithful codex exec --json translation, priced and unit-tested (not yet wired to a mission)
+
+### 1.1 Codex pricing table in cost.rs
+
+In crates/engine/src/cost.rs, extend `pricing_for_model` so codex/OpenAI model ids resolve to a codex pricing tier. Match (case-insensitive substring, consistent with the existing fable/opus/sonnet/haiku matching) on `codex` and `gpt` BEFORE the opus fallback. Use input $1.25/Mtok and output $10.00/Mtok as the seeded default (cache-read stays 10% of input, cache-write 125%, via the existing Pricing helpers). Add a clearly-marked default codex model id `gpt-5-codex` that other features can import (e.g. `pub const DEFAULT_CODEX_MODEL: &str = "gpt-5-codex";` in cost.rs or backend_codex.rs — put it wherever it reads cleanest and is importable engine-wide). Do NOT change any existing Claude tiers or the opus fallback. Add a unit test named exactly `codex_pricing_applied` asserting: (1) `pricing_for_model("gpt-5-codex")` returns input 1.25 / output 10.0; (2) it differs from `pricing_for_model("opus")`; (3) `usage_cost_usd(&usage, "gpt-5-codex")` for a known TokenUsage equals the hand-computed codex-priced figure. Keep the existing 'unknown model falls back to opus-tier' behavior intact and covered.
+
+Done when:
+- A test `codex_pricing_applied` exists in cost.rs and passes, asserting gpt-5-codex prices at input 1.25 / output 10.0 and differs from opus.
+- usage_cost_usd applied to a codex model uses the codex table (verified against a hand-computed value).
+- All pre-existing cost.rs tests remain green and Claude/unknown pricing is unchanged.
+
+### 1.2 Golden codex exec --json fixture + event-schema notes
+
+Produce a committed fixture `crates/engine/tests/fixtures/codex_exec_scrutiny.jsonl` representing a realistic single-shot `codex exec --json` run of a scrutiny validator: a session/init-style opening event, one or more assistant text events, at least one tool call + tool result (codex running a shell/read command under its read-only sandbox), and a TERMINAL event carrying token usage (input/output, and cached tokens if codex reports them) and the final assistant message whose text is a valid kranz ValidatorReport JSON (fields: findings[] with subject/severity/evidence[/suggestedFix], and summary — see crates/engine/src/runner.rs `validator_report_schema`). codex IS installed at ~/.npm-global/bin/codex; if it is authenticated in this environment, capture ONE real minimal `codex exec --json` sample (trivial prompt, ~$0.01) to ground the exact event field names and shape, then adapt it into the fixture; if codex is not authenticated, derive the shape from `codex exec --help` / codex docs and author the fixture to that documented shape. Alongside the fixture, add a concise doc note (e.g. `docs/scoping/codex-backend.md` or a module-doc block reserved for the next feature's backend_codex.rs) enumerating each codex JSONL event type kranz consumes and how it maps to AgentEvent (Init/Text/ToolUse/ToolResult/Result). The fixture MUST be self-contained (no network needed to consume it) so the next feature's parser tests run offline in CI.
+
+Done when:
+- crates/engine/tests/fixtures/codex_exec_scrutiny.jsonl exists, is valid JSONL, includes an init-style event, >=1 text event, >=1 tool call+result, and a terminal event bearing token usage.
+- The terminal event's final assistant text parses as a valid ValidatorReport (findings + summary).
+- A short doc/module note enumerates each consumed codex event type and its AgentEvent mapping.
+
+### 1.3 backend_codex.rs: CodexBackend + CodexSession translating codex exec --json to AgentEvent
+
+Create crates/engine/src/backend_codex.rs implementing `AgentBackend` (CodexBackend) and `AgentSession` (CodexSession) mirroring backend_claude.rs's structure, and register the module in crates/engine/src/lib.rs. Binary discovery: `discover_codex_binary(configured: Option<&str>) -> Result<PathBuf>` checking configured -> `KRANZ_CODEX_BIN` env -> `codex` on PATH -> well-known npm-global fallbacks, validated with `--version` (mirror discover_claude_binary, including Windows .cmd/.exe handling). Argv: `exec --json --sandbox read-only --model <model> <PROMPT>` where PROMPT = append_system_prompt (if any) concatenated ahead of the single-shot prompt text (codex has no --append-system-prompt); the CLI-reported model on the init event may differ and is fine. This ticket is validator-scoped and SINGLE-SHOT ONLY: `send_user_message` returns an error (no streaming), `resume` is unsupported. DELIBERATELY IGNORE these SessionSpec claude-isms and do not emit flags for them: json_schema, max_budget_usd, resume, permission_mode, allowed_tools/disallowed_tools, tools, settings_json, effort. Parse the codex JSONL into AgentEvent using crates/engine/tests/fixtures/codex_exec_scrutiny.jsonl as ground truth: init-style -> AgentEvent::Init; assistant text -> Text; tool call -> ToolUse; tool result -> ToolResult; terminal -> Result with TokenUsage populated from codex's usage fields. In the Result event, set cost_usd: if codex reports a dollar cost use it, otherwise compute `Some(cost::usage_cost_usd(&usage, <codex model used>))` so codex spend still lands in mission totals. Tolerate unknown line types -> AgentEvent::Other (keep raw). Reuse the process-tree kill from backend_claude.rs: on unix spawn with process_group(0) and SIGKILL the group (promote backend_claude::kill_group to pub(crate) if needed, or replicate the small helper), on windows reuse `crate::backend_claude::win_job::JobHandle`. Provide `pub fn parse_codex_line`/`parse_codex_value` mirroring backend_claude's public parsers so tests assert mapping without spawning. Add a unit test named exactly `backend_codex_parse_fixture` that reads the committed fixture line-by-line, feeds each through the parser, and asserts: an Init, at least one Text, a ToolUse+ToolResult, and a terminal Result whose usage is non-zero and whose cost_usd is Some. Do NOT modify crates/engine/src/backend.rs behavior (the boundary doc-comments there are handled by the M2 config/boundary feature).
+
+Done when:
+- backend_codex.rs compiles, is registered in lib.rs, and CodexBackend/CodexSession implement AgentBackend/AgentSession.
+- Test `backend_codex_parse_fixture` passes: the committed fixture maps to Init + Text + ToolUse + ToolResult + a terminal Result with non-zero usage and cost_usd = Some(codex-priced).
+- send_user_message and resume are rejected (single-shot only); claude-only SessionSpec fields emit no codex flags.
+- Process-tree kill reuses the unix process-group / windows Job-Object approach from backend_claude.rs.
+
+
+## Milestone 2 — Scrutiny validation runs end-to-end through codex with a loud claude fallback
+
+### 2.1 Config: validatorScrutiny.backend field + SessionSpec claude-ism boundary comments
+
+Add `pub backend: Option<String>` to `RoleConfig` in crates/engine/src/types.rs with `#[serde(default, skip_serializing_if = "Option::is_none")]` so a default config serializes byte-for-byte as before (CRITICAL for a2/a7 and the 'byte-identical' acceptance). In crates/engine/src/config.rs `validate`, reject an unknown scrutiny backend value: allow only None, Some("claude"), Some("codex"); a `backend` set on any role OTHER than validatorScrutiny must be rejected with a clear Config error (this ticket scopes backend selection to scrutiny only). Add a helper on MissionConfig or RoleConfig, e.g. `fn scrutiny_backend_kind(&self) -> BackendKind` (Claude default | Codex), for the engine to consult. In crates/engine/src/backend.rs add DOC-COMMENTS ONLY (no field or behavior changes) to the SessionSpec fields that are claude-specific — append_system_prompt, effort, resume, permission_mode, allowed_tools, disallowed_tools, tools, settings_json, json_schema, max_budget_usd — marking each as a Claude-CLI-ism a non-claude backend may ignore, so future backends know the boundary (this satisfies a10). If the dashboard mirrors RoleConfig in apps/dashboard/src/lib/types.ts, add the optional field there too as optional (non-breaking); do not touch the model-picker UI. Heed the kranz-slack/RoleConfig-fanout lesson: RoleConfig is constructed in MissionConfig::default() (4 roles) and serialized widely — grep for every RoleConfig literal and confirm the new Option field defaults cleanly at each site. Add a test named exactly `default_config_serializes_without_backend_field` asserting serde_json::to_value(MissionConfig::default()) contains no `backend` key under any role, and a test that `validate` rejects backend="gemini" and rejects backend set on worker/functional.
+
+Done when:
+- RoleConfig has an optional `backend` field that is absent from serialized default config (no key emitted).
+- config::validate accepts backend None/"claude"/"codex" on scrutiny and rejects unknown values and backend set on non-scrutiny roles.
+- SessionSpec claude-specific fields carry doc-comments marking the backend boundary (a10).
+- Test `default_config_serializes_without_backend_field` passes; all existing config tests stay green.
+
+### 2.2 Engine backend selection: lazy codex construction, preflight probe, loud fallback
+
+Wire scrutiny-only backend selection into the MissionEngine (crates/engine/src/orchestrator.rs) WITHOUT changing the create/resume constructor signatures. Add an internal, lazily-built cache field `codex_backend: Option<Arc<dyn AgentBackend>>` (init None in both create and resume). Add `fn select_scrutiny_backend(&mut self) -> (Arc<dyn AgentBackend>, Option<String>)` returning (backend to use, Some(loud-decision-reason) when a fallback occurred): if `validator_scrutiny.backend` is Some("codex"), probe availability via `backend_codex::discover_codex_binary(None)`; on success construct/cache a CodexBackend and return it with None; on failure return the injected `self.backend` (claude/mock) with Some(reason like 'codex backend requested but not available (<why>); falling back to the claude scrutiny validator'). At the validator run loop (currently orchestrator.rs ~2081-2099) select the backend per role: for Role::ValidatorScrutiny call select_scrutiny_backend and, when it reports a fallback reason, emit it via `self.emit_decision(&reason, None)?` BEFORE spawning (loud, recorded — never silent); Role::ValidatorFunctional always uses self.backend. Also add RUNTIME fallback: if the codex scrutiny run comes back Failed/errored (auth/network) with no validator_report, emit a loud emit_decision and re-run the scrutiny validator ONCE using self.backend (claude), folding its findings in instead — bound it to exactly one retry so a persistently broken codex can't loop. Extend `MissionEngine::preflight()` (orchestrator.rs ~483) to add a `warn` PreflightIssue when validator_scrutiny.backend==Some("codex") and discover_codex_binary(None) fails, message naming codex and that the run will fall back to the claude validator. Keep model handling correct: when using the codex backend, if `validator_scrutiny.model` is not codex-family, use DEFAULT_CODEX_MODEL for both the spec.model passed to codex AND the RunMeta.model (so pricing/totals use codex pricing); document this substitution. Add a test named exactly `codex_absent_loud_fallback`: default injected backend = MockBackend, config validator_scrutiny.backend=Some("codex"), KRANZ_CODEX_BIN pointed at a nonexistent path so discovery fails; assert preflight yields the codex warn issue AND that a decision event recording the loud fallback is emitted AND the scrutiny validator still runs (through the mock) — never silently swapped. Also add `default_scrutiny_backend_is_claude`: with default config, select_scrutiny_backend returns the injected backend and emits no fallback decision.
+
+Done when:
+- select_scrutiny_backend returns the codex backend only when codex is discoverable, else the injected backend plus a loud fallback reason; create/resume signatures are unchanged.
+- Test `default_scrutiny_backend_is_claude` passes (default config → injected backend, no fallback decision).
+- Test `codex_absent_loud_fallback` passes: preflight warn issue + recorded fallback decision + scrutiny still runs; nothing silent.
+- A failed codex scrutiny run falls back to the claude backend exactly once, loudly, and its findings are used.
+- When codex is used with a non-codex model, DEFAULT_CODEX_MODEL is substituted for both dispatch and RunMeta so codex pricing is applied.
+
+### 2.3 Integration: stubbed codex binary drives scrutiny findings into fix-cycles, priced in totals
+
+Add integration coverage (in crates/engine/tests/, e.g. mission_test.rs or a new codex_scrutiny_test.rs) proving the full path with NO real API spend. Gate the stub-binary tests with `#[cfg(unix)]` (a POSIX shell stub isn't portable to the windows-latest runner — follow the existing queue-liveness cfg(unix) split precedent). The stub: write a small executable shell script to a tempfile (chmod +x) that (a) prints a plausible version for `--version` and (b) for `exec ...` streams the canned codex JSONL (reuse/adapt crates/engine/tests/fixtures/codex_exec_scrutiny.jsonl, whose terminal event's text is a ValidatorReport containing at least one finding) to stdout and exits 0; point the engine at it via KRANZ_CODEX_BIN. Drive a mission whose non-scrutiny roles use the existing MockBackend scripts (worker produces a milestone, functional validator passes) with config validator_scrutiny.backend=Some("codex"); assert: (1) the scrutiny validator's findings (from the stub codex) are folded into the run loop and produce fix-feature(s) via the normal machinery — name this test exactly `codex_scrutiny_findings_flow`; (2) the codex validator run's cost/tokens appear in mission totals priced with codex pricing (assert total_cost_usd increased by the codex-priced amount for that run, or that the run's recorded cost_usd equals usage_cost_usd(usage, codex model)) — name this test exactly `codex_validator_cost_in_totals`. Do not require codex auth or network; everything comes from the stub. Ensure the tests clean up the tempfiles and avoid leaking KRANZ_CODEX_BIN into other tests (scope it to the session/child env or use a scoped guard, not process-global if avoidable).
+
+Done when:
+- Test `codex_scrutiny_findings_flow` (cfg(unix)) passes: a stubbed codex binary's ValidatorReport findings flow into the fix-cycle machinery and create fix-feature(s).
+- Test `codex_validator_cost_in_totals` (cfg(unix)) passes: the codex validator run's cost/tokens land in mission totals priced with the codex table.
+- Tests spend no real API (stub only), are Windows-safe via cfg(unix), and clean up their temp stub + env.
+
