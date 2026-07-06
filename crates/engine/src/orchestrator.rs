@@ -3321,12 +3321,25 @@ pub fn render_plan_markdown(
     } else {
         format!("based on {missions_used} completed mission(s)")
     };
-    let _ = writeln!(
-        md,
-        "Estimated **${:.2} – ${:.2}** (expected ~${:.2}). Rough estimate — live usage is \
-         authoritative; {provenance}.\n",
-        estimate.low_usd, estimate.high_usd, estimate.expected_usd
-    );
+    match estimate.confidence {
+        cost::Confidence::High => {
+            let _ = writeln!(
+                md,
+                "Estimated **${:.2} – ${:.2}** (expected ~${:.2}). Rough estimate — live usage is \
+                 authoritative; {provenance}.\n",
+                estimate.low_usd, estimate.high_usd, estimate.expected_usd
+            );
+        }
+        cost::Confidence::Low => {
+            let _ = writeln!(
+                md,
+                "Estimated **${:.2} – ${:.2}** (expected ~${:.2}). Doc-heavy / judgement-heavy \
+                 shape — the calibration corpus lacks a comparable mission, so this is **LOW \
+                 CONFIDENCE** and ${:.2} is a soft ceiling, not a tight bound; {provenance}.\n",
+                estimate.low_usd, estimate.high_usd, estimate.expected_usd, estimate.high_usd
+            );
+        }
+    }
 
     let _ = writeln!(md, "## Validation contract\n");
     let _ = writeln!(

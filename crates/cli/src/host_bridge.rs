@@ -109,9 +109,18 @@ fn estimate_line(value: &Value) -> Option<String> {
     let low = est.get("lowUsd").and_then(Value::as_f64)?;
     let expected = est.get("expectedUsd").and_then(Value::as_f64)?;
     let high = est.get("highUsd").and_then(Value::as_f64)?;
-    Some(format!(
-        "estimated ${low:.2}–${high:.2} (expected ~${expected:.2})"
-    ))
+    let low_confidence = est.get("confidence").and_then(Value::as_str) == Some("low");
+    if low_confidence {
+        Some(format!(
+            "estimated ${low:.2}–${high:.2} (expected ~${expected:.2}; doc-heavy / \
+             judgement-heavy shape — LOW CONFIDENCE, corpus lacks a comparable mission, \
+             ${high:.2} is a soft ceiling)"
+        ))
+    } else {
+        Some(format!(
+            "estimated ${low:.2}–${high:.2} (expected ~${expected:.2})"
+        ))
+    }
 }
 
 #[cfg(test)]

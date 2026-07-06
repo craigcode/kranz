@@ -497,6 +497,52 @@ fn cost_estimate_renders_range_and_calibration_provenance() {
     );
 }
 
+#[test]
+fn cost_estimate_low_confidence_names_shape() {
+    let low_confidence = kranz_engine::cost::CostEstimate {
+        worker_runs: 8.4,
+        validator_runs: 6.0,
+        low_usd: 9.175,
+        expected_usd: 18.35,
+        high_usd: 275.25,
+        shape: kranz_engine::cost::MissionShape::DocHeavy,
+        confidence: kranz_engine::cost::Confidence::Low,
+    };
+    let rendered = output::render_cost_estimate(&low_confidence, 2);
+    assert!(
+        !rendered.contains('\n'),
+        "rendered line must be single-line: {rendered}"
+    );
+    let lower = rendered.to_ascii_lowercase();
+    assert!(
+        lower.contains("doc") || lower.contains("judgement"),
+        "shape named in: {rendered}"
+    );
+    assert!(
+        lower.contains("low confidence")
+            || lower.contains("corpus lacks")
+            || lower.contains("rough"),
+        "low-confidence phrase in: {rendered}"
+    );
+
+    let high_confidence = kranz_engine::cost::CostEstimate {
+        worker_runs: 8.4,
+        validator_runs: 6.0,
+        low_usd: 9.175,
+        expected_usd: 18.35,
+        high_usd: 45.875,
+        shape: kranz_engine::cost::MissionShape::CodeChange,
+        confidence: kranz_engine::cost::Confidence::High,
+    };
+    let rendered_high = output::render_cost_estimate(&high_confidence, 2);
+    assert!(
+        !rendered_high
+            .to_ascii_lowercase()
+            .contains("low confidence"),
+        "high-confidence line must not carry the low-confidence phrase: {rendered_high}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Control enqueueing (msg / pause / resume)
 // ---------------------------------------------------------------------------

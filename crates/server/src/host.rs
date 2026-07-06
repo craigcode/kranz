@@ -1289,12 +1289,17 @@ fn prepend_seed(seed: Option<String>, reply: String) -> String {
 /// [`CostEstimate`] as protocol camelCase JSON (the engine type is a plain
 /// contract struct without serde derives).
 fn estimate_json(estimate: &CostEstimate) -> Value {
+    let confidence = match estimate.confidence {
+        kranz_engine::cost::Confidence::High => "high",
+        kranz_engine::cost::Confidence::Low => "low",
+    };
     json!({
         "workerRuns": estimate.worker_runs,
         "validatorRuns": estimate.validator_runs,
         "lowUsd": estimate.low_usd,
         "expectedUsd": estimate.expected_usd,
         "highUsd": estimate.high_usd,
+        "confidence": confidence,
     })
 }
 
