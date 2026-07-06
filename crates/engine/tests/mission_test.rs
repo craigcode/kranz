@@ -157,6 +157,7 @@ fn simple_plan(features: usize, contract: Vec<Assertion>) -> Plan {
                 })
                 .collect(),
         }],
+        command_grants: vec![],
     }
 }
 
@@ -2589,6 +2590,7 @@ async fn approve_revised_plan_rejects_dropping_a_completed_milestone() {
                 }],
             },
         ],
+        command_grants: vec![],
     };
     engine.approve_plan(plan).unwrap();
 
@@ -2620,6 +2622,7 @@ async fn approve_revised_plan_rejects_dropping_a_completed_milestone() {
                 validation_criteria: vec!["part 2 works".to_string()],
             }],
         }],
+        command_grants: vec![],
     };
     let err = engine
         .approve_revised_plan(drops_completed)
@@ -2655,6 +2658,7 @@ async fn approve_revised_plan_rejects_dropping_a_completed_milestone() {
                 }],
             },
         ],
+        command_grants: vec![],
     };
     let err = engine
         .approve_revised_plan(alters_completed)

@@ -200,6 +200,7 @@ fn soak_plan(milestones: usize, features: usize) -> Plan {
                     .collect(),
             })
             .collect(),
+        command_grants: vec![],
     }
 }
 

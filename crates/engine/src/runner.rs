@@ -453,7 +453,8 @@ pub fn worker_report_schema() -> serde_json::Value {
             "testEvidence": { "type": "string" },
             "dependenciesAdded": { "type": "array", "items": { "type": "string" } },
             "knownGaps": { "type": "array", "items": { "type": "string" } },
-            "commits": { "type": "array", "items": { "type": "string" } }
+            "commits": { "type": "array", "items": { "type": "string" } },
+            "commandsRun": { "type": "array", "items": { "type": "string" } }
         }
     })
 }
@@ -521,6 +522,7 @@ pub async fn run_worker(
     extra_guidance: Option<&str>,
     cancel: Option<Arc<Notify>>,
     base_sha: Option<&str>,
+    grants: &[String],
 ) -> Result<RunOutcome> {
     let cwd = paths.repo_root.clone();
     run_worker_in(
@@ -535,6 +537,7 @@ pub async fn run_worker(
         cancel,
         &cwd,
         base_sha,
+        grants,
     )
     .await
 }
@@ -560,6 +563,7 @@ pub async fn run_worker_in(
     cancel: Option<Arc<Notify>>,
     session_cwd: &std::path::Path,
     base_sha: Option<&str>,
+    grants: &[String],
 ) -> Result<RunOutcome> {
     let (spec, run_meta) = build_worker_spec(
         cfg,
@@ -569,6 +573,7 @@ pub async fn run_worker_in(
         extra_guidance,
         session_cwd,
         base_sha,
+        grants,
     );
     let mut target = LogTarget::Live(log);
     run_session_to(backend, spec, &mut target, paths, run_meta, cancel).await
@@ -602,6 +607,7 @@ pub async fn run_worker_in_buffered(
     extra_guidance: Option<&str>,
     session_cwd: &std::path::Path,
     base_sha: Option<&str>,
+    grants: &[String],
 ) -> Result<(Vec<EventKind>, RunOutcome)> {
     let (spec, run_meta) = build_worker_spec(
         cfg,
@@ -611,6 +617,7 @@ pub async fn run_worker_in_buffered(
         extra_guidance,
         session_cwd,
         base_sha,
+        grants,
     );
     let mut target = LogTarget::Buffer(Vec::new());
     let outcome = run_session_to(backend, spec, &mut target, paths, run_meta, None).await?;
@@ -634,6 +641,7 @@ fn build_worker_spec(
     extra_guidance: Option<&str>,
     session_cwd: &std::path::Path,
     base_sha: Option<&str>,
+    grants: &[String],
 ) -> (SessionSpec, RunMeta) {
     let role = Role::Worker;
     let role_cfg = cfg.role(role);
@@ -692,7 +700,7 @@ fn build_worker_spec(
         env: HashMap::new(),
     };
     spec.env = contract_env(base_sha);
-    permissions::apply(permissions::for_role(role, cfg, &[]), &mut spec);
+    permissions::apply(permissions::for_role(role, cfg, &[], grants), &mut spec);
 
     let run_meta = RunMeta {
         run_id: uuid::Uuid::new_v4().to_string(),
@@ -708,7 +716,8 @@ fn build_worker_spec(
 /// Run one validator session for a milestone (plan §4.4/§4.6).
 ///
 /// `kind` must be [`Role::ValidatorScrutiny`] or [`Role::ValidatorFunctional`].
-/// Contract `command` strings (plus config `allow_validator_commands`) become
+/// Contract `command` strings (plus config `allow_validator_commands`,
+/// `grants`, and the milestone's worker-executed `worker_commands`) become
 /// `Bash(<command>*)` allows via [`permissions::for_role`].
 #[allow(clippy::too_many_arguments)]
 pub async fn run_validator(
@@ -722,6 +731,8 @@ pub async fn run_validator(
     start_sha: &str,
     cancel: Option<Arc<Notify>>,
     base_sha: Option<&str>,
+    grants: &[String],
+    worker_commands: &[String],
 ) -> Result<RunOutcome> {
     if !matches!(kind, Role::ValidatorScrutiny | Role::ValidatorFunctional) {
         return Err(EngineError::InvalidState(format!(
@@ -764,7 +775,13 @@ pub async fn run_validator(
 
     let contract_commands: Vec<String> =
         contract.iter().filter_map(|a| a.command.clone()).collect();
-    let mut allowed_commands = contract_commands.clone();
+    let mut combined_commands = contract_commands.clone();
+    for command in worker_commands {
+        if !combined_commands.contains(command) {
+            combined_commands.push(command.clone());
+        }
+    }
+    let mut allowed_commands = combined_commands.clone();
     allowed_commands.extend(cfg.allow_validator_commands.iter().cloned());
     let commands = bullet_list(&allowed_commands);
 
@@ -806,7 +823,7 @@ pub async fn run_validator(
     };
     spec.env = contract_env(base_sha);
     permissions::apply(
-        permissions::for_role(kind, cfg, &contract_commands),
+        permissions::for_role(kind, cfg, &combined_commands, grants),
         &mut spec,
     );
 

@@ -1293,6 +1293,7 @@ impl MissionEngine {
             let milestone_title = self.state.mission.milestones[mi].title.clone();
             let cfg = self.state.config.clone();
             let base_sha = self.state.mission.base_sha.clone();
+            let grants = self.state.mission.command_grants.clone();
             let pre_run_sha = self.repo.head_sha()?;
 
             // Interrupt wiring: a control watcher polls the inbox and fires
@@ -1316,6 +1317,7 @@ impl MissionEngine {
                 guidance.as_deref(),
                 Some(cancel),
                 base_sha.as_deref(),
+                &grants,
             )
             .await;
             watcher.abort();
@@ -1768,6 +1770,7 @@ impl MissionEngine {
         let milestone_title = self.state.mission.milestones[mi].title.clone();
         let cfg = self.state.config.clone();
         let base_sha = self.state.mission.base_sha.clone();
+        let grants = self.state.mission.command_grants.clone();
         let tracker = ConcurrencyTracker::new();
 
         let mut set: tokio::task::JoinSet<(usize, BufferedRunResult)> = tokio::task::JoinSet::new();
@@ -1782,6 +1785,7 @@ impl MissionEngine {
             let ws_path = ws.path.clone();
             let guard = tracker.clone();
             let base_sha = base_sha.clone();
+            let grants = grants.clone();
             set.spawn(async move {
                 let _live = guard.enter(); // count this session as live
                 let result = runner::run_worker_in_buffered(
@@ -1794,6 +1798,7 @@ impl MissionEngine {
                     None,
                     &ws_path,
                     base_sha.as_deref(),
+                    &grants,
                 )
                 .await;
                 (idx, result)
@@ -2083,6 +2088,8 @@ impl MissionEngine {
             let contract = self.state.mission.validation_contract.clone();
             let cfg = self.state.config.clone();
             let base_sha = self.state.mission.base_sha.clone();
+            let grants = self.state.mission.command_grants.clone();
+            let worker_commands = worker_commands_for_milestone(&self.state, &milestone);
             let backend = Arc::clone(&self.backend);
             let outcome = runner::run_validator(
                 backend.as_ref(),
@@ -2095,6 +2102,8 @@ impl MissionEngine {
                 &start_sha,
                 None,
                 base_sha.as_deref(),
+                &grants,
+                &worker_commands,
             )
             .await;
             let caught = self.catch_up();
@@ -2818,7 +2827,7 @@ impl MissionEngine {
             env: HashMap::new(),
         };
         permissions::apply(
-            permissions::for_role(Role::Orchestrator, &cfg, &[]),
+            permissions::for_role(Role::Orchestrator, &cfg, &[], &[]),
             &mut spec,
         );
 
@@ -3067,6 +3076,7 @@ impl MissionEngine {
                                 .collect(),
                         })
                         .collect(),
+                    command_grants: mission.command_grants.clone(),
                 };
                 Ok(serde_json::to_string_pretty(&plan)?)
             }
@@ -3256,6 +3266,33 @@ fn next_feature(milestone: &Milestone) -> Option<usize> {
         .features
         .iter()
         .position(|f| matches!(f.status, FeatureStatus::Pending | FeatureStatus::Active))
+}
+
+/// De-duplicated, first-seen-order commands run by this milestone's workers,
+/// gathered from each feature's `worker_runs` reports so validators can
+/// re-run what workers already cited as evidence.
+pub(crate) fn worker_commands_for_milestone(
+    state: &MissionState,
+    milestone: &Milestone,
+) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut commands = Vec::new();
+    for feature in &milestone.features {
+        for run_id in &feature.worker_runs {
+            let Some(run) = state.runs.get(run_id) else {
+                continue;
+            };
+            let Some(report) = &run.report else {
+                continue;
+            };
+            for command in &report.commands_run {
+                if seen.insert(command.clone()) {
+                    commands.push(command.clone());
+                }
+            }
+        }
+    }
+    commands
 }
 
 /// Upsert one mission's line in the missions catalog (`missions/index.md`):
@@ -4454,6 +4491,10 @@ fn plan_schema() -> serde_json::Value {
                         }
                     }
                 }
+            },
+            "commandGrants": {
+                "type": "array",
+                "items": { "type": "string" }
             }
         }
     })
@@ -4529,6 +4570,84 @@ mod tests {
         done.features[3].status = FeatureStatus::Complete;
         done.features[4].status = FeatureStatus::Complete;
         assert_eq!(next_feature(&done), None);
+    }
+
+    #[test]
+    fn worker_commands_for_milestone_dedupes_across_feature_reports() {
+        let report = WorkerReport {
+            result: RunResult::Pass,
+            summary: String::new(),
+            files_touched: vec![],
+            tests_added: vec![],
+            test_evidence: String::new(),
+            dependencies_added: vec![],
+            known_gaps: vec![],
+            commits: vec![],
+            commands_run: vec!["gc lint".to_string(), "gc lint".to_string()],
+        };
+        let run = WorkerRun {
+            id: "run-1".to_string(),
+            role: Role::Worker,
+            feature_id: Some("f1".to_string()),
+            milestone_id: None,
+            sdk_session_id: "sdk-1".to_string(),
+            model: "m".to_string(),
+            started_at: chrono::Utc::now(),
+            ended_at: None,
+            tokens: TokenUsage::default(),
+            cost_usd: None,
+            transcript_path: "t.jsonl".to_string(),
+            result: Some(RunResult::Pass),
+            report: Some(report),
+            prompt_hash: "h".to_string(),
+        };
+        let feature = Feature {
+            id: "f1".to_string(),
+            title: String::new(),
+            spec: String::new(),
+            validation_criteria: vec![],
+            origin: FeatureOrigin::Plan,
+            status: FeatureStatus::Complete,
+            worker_runs: vec!["run-1".to_string()],
+            commits: vec![],
+            respawns: 0,
+        };
+        let milestone = Milestone {
+            id: "ms-1".to_string(),
+            title: String::new(),
+            features: vec![feature],
+            status: MilestoneStatus::Active,
+            fix_cycles: 0,
+            start_sha: None,
+        };
+        let mut runs = std::collections::BTreeMap::new();
+        runs.insert("run-1".to_string(), run);
+        let state = MissionState {
+            mission: Mission {
+                id: "m-1".to_string(),
+                goal: String::new(),
+                validation_contract: vec![],
+                milestones: vec![milestone.clone()],
+                status: MissionStatus::Running,
+                created_at: chrono::Utc::now(),
+                base_branch: "main".to_string(),
+                base_sha: None,
+                mission_branch: "kranz/mission-m-1".to_string(),
+                command_grants: vec![],
+            },
+            runs,
+            totals: TokenUsage::default(),
+            total_cost_usd: 0.0,
+            pending_user_messages: vec![],
+            recent_decisions: vec![],
+            config: MissionConfig::default(),
+            last_seq: 0,
+        };
+
+        assert_eq!(
+            worker_commands_for_milestone(&state, &milestone),
+            vec!["gc lint".to_string()]
+        );
     }
 
     #[test]
@@ -4657,6 +4776,7 @@ mod tests {
                     validation_criteria: vec!["c".into()],
                 }],
             }],
+            command_grants: vec!["gc lint".into()],
         };
         let value = serde_json::to_value(&plan).unwrap();
         let schema = plan_schema();

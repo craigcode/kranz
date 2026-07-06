@@ -77,9 +77,14 @@ Approval never happens inside this conversation: the human triggers a FORMAL pla
         }
       ]
     }
+  ],
+  "commandGrants": [
+    "gc lint"
   ]
 }
 ```
+
+`commandGrants` is an optional, top-level array of read-only shell commands granted mission-wide: every worker AND validator session may run them (and their `--help` forms), regardless of which feature or milestone they're working. It is the single source of truth shared by both surfaces, so use it for brief-granted command exceptions — e.g. a project CLI like `gc lint` — that validators must be able to re-run to independently verify a worker's claim rather than trusting it blind.
 
 ---
 

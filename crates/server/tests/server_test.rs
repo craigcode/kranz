@@ -50,6 +50,7 @@ fn sample_plan() -> Plan {
                 validation_criteria: vec!["it works".into()],
             }],
         }],
+        command_grants: vec![],
     }
 }
 
