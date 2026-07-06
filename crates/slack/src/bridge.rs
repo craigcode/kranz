@@ -710,6 +710,71 @@ pub async fn run_draft_command(
     }
 }
 
+/// Does `arg` name an on-disk backlog ticket? `/kranz approve <arg>` uses this
+/// to decide whether `arg` is a ticket slug (resolve through
+/// [`run_approve_ticket_command`]) or a mission id (the original
+/// pending-plan `approve_flow`). A syntactically invalid slug never matches
+/// (no filesystem access for path-traversal attempts).
+fn is_ticket_slug(repo_root: &Path, arg: &str) -> bool {
+    kranz_engine::ticket::Ticket::valid_slug(arg)
+        && kranz_engine::ticket::Ticket::tickets_dir(repo_root)
+            .join(format!("{arg}.md"))
+            .is_file()
+}
+
+/// The outcome of `run_approve_ticket_command`: whether the invoker was
+/// authorized, and the reply blocks to post (`None` only when unauthorized,
+/// mirroring [`DraftInvocation`]).
+pub struct ApproveTicketInvocation {
+    pub authorized: bool,
+    pub result: Option<Vec<Value>>,
+}
+
+/// `/kranz approve <slug>` — the slug-resolving twin of `/kranz approve
+/// <mission-id>`, gated EXACTLY like it (same allowlist, same standard
+/// refusal). Holds the gate + host-call logic so it is unit-testable without
+/// a live `SlackClient`. Runs [`crate::host::PlanningHost::approve_ticket`] —
+/// the SAME `kranz_engine::deps::approve_ticket` gate the REST/CLI approve
+/// path runs — and forwards a blocked-by / not-REVIEW / cycle refusal
+/// VERBATIM (never paraphrased).
+pub async fn run_approve_ticket_command(
+    cfg: &SlackConfig,
+    host: Option<&SharedHost>,
+    slug: &str,
+    user_id: Option<&str>,
+) -> ApproveTicketInvocation {
+    if !cfg.is_authorized(user_id) {
+        return ApproveTicketInvocation {
+            authorized: false,
+            result: None,
+        };
+    }
+    let Some(host) = host else {
+        return ApproveTicketInvocation {
+            authorized: true,
+            result: Some(error_blocks(&format!(
+                "This bridge has no hosted planning engine (it was started without \
+                 `kranz serve`). Use `kranz ticket approve {slug}` in a terminal, or the \
+                 web UI via `kranz serve --open`."
+            ))),
+        };
+    };
+    let result = match host.approve_ticket(slug).await {
+        Ok(mission_id) => error_blocks(&format!(
+            ":white_check_mark: Approved and queued — ticket `{slug}` \u{2192} mission \
+             `{mission_id}`. The `kranz work` dispatcher runs it next."
+        )),
+        // VERBATIM: `e` is the engine's own refusal message (blocked-by,
+        // not-REVIEW, or a blocked-by cycle) — forwarded unchanged, never
+        // wrapped in extra prose that would obscure it.
+        Err(e) => error_blocks(&e.to_string()),
+    };
+    ApproveTicketInvocation {
+        authorized: true,
+        result: Some(result),
+    }
+}
+
 async fn dispatch_action(
     cfg: &SlackConfig,
     client: &SlackClient,
@@ -990,19 +1055,39 @@ async fn dispatch_action(
             user_id,
             response_url,
         } => {
-            approve_flow(
-                cfg,
-                client,
-                repo_root,
-                threads,
-                host,
-                mission_id,
-                user_id.as_deref(),
-                response_url.as_deref(),
-                false,
-                false,
-            )
-            .await;
+            // `/kranz approve <arg>` accepts EITHER a mission id or a ticket
+            // slug: an arg naming an on-disk backlog ticket resolves through
+            // the ticket-approve gate (kranz_engine::deps::approve_ticket);
+            // anything else keeps the original pending-plan approve flow.
+            if is_ticket_slug(repo_root, mission_id) {
+                let invocation =
+                    run_approve_ticket_command(cfg, host, mission_id, user_id.as_deref()).await;
+                if !invocation.authorized {
+                    reply_ephemeral(
+                        cfg,
+                        client,
+                        response_url.as_deref(),
+                        &not_authorized_blocks(),
+                    )
+                    .await;
+                } else if let Some(result) = &invocation.result {
+                    reply_ephemeral(cfg, client, response_url.as_deref(), result).await;
+                }
+            } else {
+                approve_flow(
+                    cfg,
+                    client,
+                    repo_root,
+                    threads,
+                    host,
+                    mission_id,
+                    user_id.as_deref(),
+                    response_url.as_deref(),
+                    false,
+                    false,
+                )
+                .await;
+            }
         }
 
         // `/kranz draft <slug>` — SPEND action, gated EXACTLY like `new`

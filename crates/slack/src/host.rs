@@ -80,6 +80,17 @@ pub trait PlanningHost: Send + Sync + 'static {
     /// socket read loop after posting an immediate ack, mirroring
     /// [`Self::create`] + [`Self::planning_turn`].
     fn draft<'a>(&'a self, slug: &'a str) -> BoxFuture<'a, anyhow::Result<DraftOutcome>>;
+
+    /// Approve backlog ticket `slug` into the queue (`/kranz approve <slug>`,
+    /// the slug-resolving twin of `/kranz approve <mission-id>`): runs the
+    /// EXACT SAME gate the REST/CLI approve path runs
+    /// (`kranz_engine::deps::approve_ticket`, mirrored by
+    /// `kranz_server::MissionHost::approve_ticket`) — refuses when the ticket
+    /// isn't REVIEW, when a blocked-by cycle is reachable, or when an
+    /// unsatisfied blocker exists. `Ok(mission_id)` = the ticket's drafted
+    /// mission was queued; `Err` carries the engine's refusal message
+    /// VERBATIM (never paraphrased) for the bridge to forward unchanged.
+    fn approve_ticket<'a>(&'a self, slug: &'a str) -> BoxFuture<'a, anyhow::Result<String>>;
 }
 
 /// How the bridge holds the host: shared, optional (a bridge without a host —

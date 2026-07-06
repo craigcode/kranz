@@ -8,8 +8,10 @@
 //! even one that says "ticket list", stays on the thread-guidance path).
 
 use kranz_engine::draft::DraftOutcome;
+use kranz_engine::ticket::{Ticket, TicketState};
 use kranz_slack::bridge::{
-    build_ticket_list_reply, build_ticket_show_reply, not_authorized_blocks, run_draft_command,
+    build_ticket_list_reply, build_ticket_show_reply, not_authorized_blocks,
+    run_approve_ticket_command, run_draft_command,
 };
 use kranz_slack::host::BoxFuture;
 use kranz_slack::inbound::{route, Action, ThreadLookup};
@@ -267,6 +269,13 @@ fn bare_draft_falls_through_to_help() {
 struct FakeHost {
     draft_calls: AtomicUsize,
     outcome: DraftOutcomeKind,
+    /// Backs `approve_ticket`: calling through to the REAL
+    /// `kranz_engine::deps::approve_ticket` against this repo root, so the
+    /// approve tests exercise the exact same shared gate the REST/CLI paths
+    /// run (never a re-implementation). `None` when a test never calls
+    /// `approve_ticket` (the draft-only tests).
+    repo_root: Option<std::path::PathBuf>,
+    approve_ticket_calls: AtomicUsize,
 }
 
 #[derive(Clone, Copy)]
@@ -280,6 +289,17 @@ impl FakeHost {
         FakeHost {
             draft_calls: AtomicUsize::new(0),
             outcome,
+            repo_root: None,
+            approve_ticket_calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn with_repo_root(repo_root: std::path::PathBuf) -> Self {
+        FakeHost {
+            draft_calls: AtomicUsize::new(0),
+            outcome: DraftOutcomeKind::ParkedForReview,
+            repo_root: Some(repo_root),
+            approve_ticket_calls: AtomicUsize::new(0),
         }
     }
 }
@@ -335,6 +355,20 @@ impl PlanningHost for FakeHost {
         Box::pin(async move {
             let _ = slug;
             Ok(outcome)
+        })
+    }
+
+    fn approve_ticket<'a>(&'a self, slug: &'a str) -> BoxFuture<'a, anyhow::Result<String>> {
+        self.approve_ticket_calls.fetch_add(1, Ordering::SeqCst);
+        let repo_root = self
+            .repo_root
+            .clone()
+            .expect("approve_ticket tests must construct FakeHost::with_repo_root");
+        let slug = slug.to_string();
+        Box::pin(async move {
+            let approved = kranz_engine::deps::approve_ticket(&repo_root, &slug, None, false)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(approved.mission_id)
         })
     }
 }
@@ -476,4 +510,99 @@ async fn draft_without_a_host_is_an_honest_refusal() {
             .unwrap()
             .to_lowercase();
     assert!(result_text.contains("no hosted planning engine"));
+}
+
+// -- `/kranz approve <slug>` — the slug-resolving twin of `/kranz approve
+// <mission-id>`, routed through the exact same
+// `kranz_engine::deps::approve_ticket` gate the REST/CLI approve paths run
+// (never a divergent re-implementation — `FakeHost::approve_ticket` calls
+// through to the real engine function against a temp repo root). ------------
+
+#[tokio::test]
+async fn approve_slug_for_review_ticket_queues_the_drafted_mission_end_to_end() {
+    let tmp = TempDir::new().unwrap();
+    write_ticket(
+        tmp.path(),
+        "rate-limit-notes",
+        "---\ntitle: Rate-limit the notes API\npriority: 1\n---\n## Goal\nAdd a token bucket.\n",
+    );
+    Ticket::record_mission(tmp.path(), "rate-limit-notes", "m-rl").unwrap();
+    Ticket::write_state(tmp.path(), "rate-limit-notes", TicketState::Review, None).unwrap();
+
+    let cfg = gated_cfg(vec![]);
+    let fake = Arc::new(FakeHost::with_repo_root(tmp.path().to_path_buf()));
+    let host: SharedHost = fake.clone();
+
+    let invocation = run_approve_ticket_command(&cfg, Some(&host), "rate-limit-notes", None).await;
+
+    assert!(invocation.authorized);
+    let result_text =
+        serde_json::to_string(&invocation.result.expect("approve posts a result")).unwrap();
+    assert!(
+        result_text.contains("m-rl"),
+        "result names the queued mission: {result_text}"
+    );
+    assert!(result_text.to_lowercase().contains("queued"));
+    assert_eq!(fake.approve_ticket_calls.load(Ordering::SeqCst), 1);
+
+    // The real side effects of `kranz_engine::deps::approve_ticket` happened:
+    // the ticket flipped to Queued and the mission is really on the queue.
+    assert_eq!(
+        Ticket::read_state(tmp.path(), "rate-limit-notes"),
+        TicketState::Queued
+    );
+    let entries = kranz_engine::queue::list(tmp.path());
+    assert_eq!(
+        entries.len(),
+        1,
+        "the drafted mission was queued exactly once"
+    );
+    assert_eq!(entries[0].mission_id, "m-rl");
+    assert_eq!(entries[0].ticket_slug.as_deref(), Some("rate-limit-notes"));
+}
+
+#[tokio::test]
+async fn approve_slug_blocked_by_unsatisfied_dependency_refuses_verbatim_and_queues_nothing() {
+    let tmp = TempDir::new().unwrap();
+    write_ticket(
+        tmp.path(),
+        "upstream",
+        "---\ntitle: Upstream thing\npriority: 1\n---\n## Goal\nDo the base work.\n",
+    );
+    write_ticket(
+        tmp.path(),
+        "downstream",
+        "---\ntitle: Downstream thing\npriority: 2\nblocked-by: [upstream]\n---\n## Goal\nBuild on top.\n",
+    );
+    Ticket::record_mission(tmp.path(), "downstream", "m-down").unwrap();
+    Ticket::write_state(tmp.path(), "downstream", TicketState::Review, None).unwrap();
+
+    let cfg = gated_cfg(vec![]);
+    let fake = Arc::new(FakeHost::with_repo_root(tmp.path().to_path_buf()));
+    let host: SharedHost = fake.clone();
+
+    let invocation = run_approve_ticket_command(&cfg, Some(&host), "downstream", None).await;
+
+    assert!(invocation.authorized);
+    let result_text =
+        serde_json::to_string(&invocation.result.expect("blocked approve posts a result")).unwrap();
+    // The engine's own refusal message (crates/engine/src/deps.rs), forwarded
+    // VERBATIM — not paraphrased, not summarized.
+    assert!(
+        result_text.contains(
+            "cannot approve downstream: blocked by upstream (its mission is not Complete)"
+        ),
+        "expected the engine's verbatim blocked-by refusal in: {result_text}"
+    );
+    assert_eq!(fake.approve_ticket_calls.load(Ordering::SeqCst), 1);
+
+    assert_eq!(
+        Ticket::read_state(tmp.path(), "downstream"),
+        TicketState::Review,
+        "a blocked approve must not flip the ticket's state"
+    );
+    assert!(
+        kranz_engine::queue::list(tmp.path()).is_empty(),
+        "a blocked approve must queue nothing"
+    );
 }
