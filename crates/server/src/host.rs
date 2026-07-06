@@ -84,6 +84,35 @@ pub struct MissionHost {
     /// The lazily-spawned idle-release background task, started at most once
     /// (see [`MissionHost::ensure_sweeper_started`]).
     sweeper: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The single tracked background queue drain, if one has ever been
+    /// started (see [`MissionHost::drain`]).
+    drain: Mutex<Option<DrainHandle>>,
+}
+
+/// One background drain task's observable progress — shared between the task
+/// (which updates it as it goes) and [`MissionHost::drain`] /
+/// [`MissionHost::queue_state`] (which read it back as JSON).
+#[derive(Debug, Clone, Default)]
+struct DrainState {
+    live: bool,
+    current_mission_id: Option<String>,
+    ran: Vec<String>,
+}
+
+fn drain_state_json(state: &DrainState) -> Value {
+    json!({
+        "live": state.live,
+        "currentMissionId": state.current_mission_id,
+        "ran": state.ran,
+    })
+}
+
+/// A tracked background drain: the task handle plus the state it shares with
+/// this host. `join.is_finished()` is how [`MissionHost::drain`] decides
+/// whether a tracked drain is still live.
+struct DrainHandle {
+    join: tokio::task::JoinHandle<()>,
+    state: Arc<Mutex<DrainState>>,
 }
 
 impl MissionHost {
@@ -94,6 +123,7 @@ impl MissionHost {
             backend: tokio::sync::OnceCell::new(),
             missions: Arc::new(Mutex::new(HashMap::new())),
             sweeper: Mutex::new(None),
+            drain: Mutex::new(None),
         }
     }
 
@@ -105,6 +135,7 @@ impl MissionHost {
             backend: tokio::sync::OnceCell::new_with(Some(backend)),
             missions: Arc::new(Mutex::new(HashMap::new())),
             sweeper: Mutex::new(None),
+            drain: Mutex::new(None),
         }
     }
 
@@ -671,6 +702,83 @@ impl MissionHost {
         })
     }
 
+    /// `POST /api/queue/drain`: run the queue drain/claim/skip loop
+    /// ([`kranz_engine::work::drain_queue`]) as a background task on this
+    /// serve process. This is just ANOTHER dispatcher: it does not register
+    /// missions in the `missions` planning registry, and arbitrates against
+    /// an external `kranz work` process exactly as today — through the queue
+    /// claim files and the events.jsonl single-writer lock, no new locking.
+    ///
+    /// IDEMPOTENT while a drain is live: a second call while the tracked
+    /// drain task has not finished returns THAT drain's current state
+    /// instead of spawning a second one.
+    pub async fn drain(&self) -> Result<Value, ApiError> {
+        {
+            let guard = self.drain.lock().expect("drain tracker lock");
+            if let Some(handle) = guard.as_ref() {
+                if !handle.join.is_finished() {
+                    return Ok(drain_state_json(
+                        &handle.state.lock().expect("drain state lock"),
+                    ));
+                }
+            }
+        }
+
+        let cfg = config::load(&self.repo_root)?;
+        let backend = self.backend(cfg.claude_binary.as_deref()).await?;
+        let repo_root = self.repo_root.clone();
+
+        let state = Arc::new(Mutex::new(DrainState {
+            live: true,
+            current_mission_id: None,
+            ran: Vec::new(),
+        }));
+        let task_state = Arc::clone(&state);
+        let join = tokio::spawn(async move {
+            let result = kranz_engine::work::drain_queue(&repo_root, false, |mission_id| {
+                let backend = Arc::clone(&backend);
+                let repo_root = repo_root.clone();
+                let state = Arc::clone(&task_state);
+                async move {
+                    state.lock().expect("drain state lock").current_mission_id =
+                        Some(mission_id.clone());
+                    let outcome = run_mission_headless(backend, repo_root, mission_id.clone()).await;
+                    let mut guard = state.lock().expect("drain state lock");
+                    guard.current_mission_id = None;
+                    if outcome.is_ok() {
+                        guard.ran.push(mission_id);
+                    }
+                    outcome
+                }
+            })
+            .await;
+            if let Err(e) = result {
+                tracing::error!(error = %e, "hosted queue drain errored");
+            }
+            task_state.lock().expect("drain state lock").live = false;
+        });
+
+        let initial = drain_state_json(&state.lock().expect("drain state lock"));
+        *self.drain.lock().expect("drain tracker lock") = Some(DrainHandle { join, state });
+        Ok(initial)
+    }
+
+    /// `GET /api/queue`: the queue front-to-back, who (if anyone) currently
+    /// holds the busy lock, and this host's own drain tracker.
+    pub fn queue_state(&self) -> Value {
+        let entries = kranz_engine::queue::list(&self.repo_root);
+        let busy_with = kranz_engine::queue::is_repo_busy(&self.repo_root);
+        let drain = match self.drain.lock().expect("drain tracker lock").as_ref() {
+            Some(handle) => drain_state_json(&handle.state.lock().expect("drain state lock")),
+            None => drain_state_json(&DrainState::default()),
+        };
+        json!({
+            "entries": entries,
+            "busyWith": busy_with,
+            "drain": drain,
+        })
+    }
+
     // -----------------------------------------------------------------------
     // Registry plumbing
     // -----------------------------------------------------------------------
@@ -788,6 +896,31 @@ async fn run_to_end(
         .lock()
         .expect("missions registry lock")
         .remove(&mission_id);
+}
+
+/// Headless `run_mission` injected into [`kranz_engine::work::drain_queue`]
+/// by [`MissionHost::drain`]: resume the mission under the single-writer
+/// lock and run it to a terminal state, with no live tail/printer attached
+/// (unlike the CLI's `kranz work`) since no terminal is attached to a serve
+/// process.
+async fn run_mission_headless(
+    backend: Arc<dyn AgentBackend>,
+    repo_root: PathBuf,
+    mission_id: String,
+) -> anyhow::Result<i32> {
+    let mut engine = MissionEngine::resume(backend, repo_root, &mission_id, LockForce::No)?;
+    let status = engine.run().await?;
+    Ok(exit_code_for(status))
+}
+
+/// Map a terminal [`MissionStatus`] to the exit code the CLI's
+/// `kranz work`/`kranz exec` report, matching `kranz_cli::exec::exit_code_for`.
+fn exit_code_for(status: MissionStatus) -> i32 {
+    match status {
+        MissionStatus::Complete => 0,
+        MissionStatus::Blocked => 2,
+        _ => 1,
+    }
 }
 
 /// Apply a ticket's per-ticket budget override to the orchestrator role
@@ -1115,6 +1248,24 @@ pub(crate) async fn start_mission(
     Ok((StatusCode::ACCEPTED, Json(json!({ "running": true }))))
 }
 
+/// `POST /api/queue/drain` — no required body → `200 <drain-state JSON>`.
+/// See [`MissionHost::drain`]; idempotent while a drain is already live.
+pub(crate) async fn drain_queue_route(
+    State(server): State<Arc<ServerState>>,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let _ = parse_body(&body)?;
+    Ok(Json(server.host.drain().await?))
+}
+
+/// `GET /api/queue` → `200 {"entries":[...], "busyWith": <id|null>, "drain": {...}}`.
+/// See [`MissionHost::queue_state`]. Tokenless: read-only.
+pub(crate) async fn queue_state_route(
+    State(server): State<Arc<ServerState>>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(server.host.queue_state()))
+}
+
 /// Validate the URL id with the same traversal rules as the read endpoints.
 fn valid_id(server: &ServerState, id: &str) -> Result<String, ApiError> {
     crate::rest::mission_paths(server, id)?;
@@ -1401,5 +1552,131 @@ mod tests {
             .await
             .expect_err("must reject");
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    // -----------------------------------------------------------------------
+    // Queue drain (roadmap f-1-2)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn empty_queue_drain_returns_ok_and_settles_idle() {
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+        let host = MissionHost::with_backend(root, backend);
+
+        let body = host
+            .drain()
+            .await
+            .expect("drain must not error on an empty queue");
+        assert!(body.get("live").is_some(), "{body}");
+
+        // The background task finds nothing queued and settles quickly.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let state = host.queue_state();
+            if state["drain"]["live"] == false {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "drain never settled idle: {state}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn second_drain_while_live_returns_tracked_state_without_spawning_second() {
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+        let host = MissionHost::with_backend(root, backend);
+
+        // Fabricate a live drain tracker directly — deterministic, instead
+        // of racing a real queue against a fast mock backend.
+        let state = Arc::new(Mutex::new(DrainState {
+            live: true,
+            current_mission_id: Some("m-fake".to_string()),
+            ran: vec!["m-earlier".to_string()],
+        }));
+        let never_finishes = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        *host.drain.lock().expect("drain tracker lock") = Some(DrainHandle {
+            join: never_finishes,
+            state: Arc::clone(&state),
+        });
+        let before = Arc::as_ptr(&state);
+
+        let first = host.drain().await.expect("drain must not error");
+        let second = host.drain().await.expect("drain must not error");
+        assert_eq!(first, second);
+        assert_eq!(first["live"], true);
+        assert_eq!(first["currentMissionId"], "m-fake");
+        assert_eq!(first["ran"], json!(["m-earlier"]));
+
+        // The tracker still points at the SAME state Arc: no second task
+        // was spawned to replace it.
+        let after = {
+            let guard = host.drain.lock().expect("drain tracker lock");
+            Arc::as_ptr(&guard.as_ref().unwrap().state)
+        };
+        assert_eq!(before, after, "a second drain must not replace the tracker");
+    }
+
+    #[tokio::test]
+    async fn queue_drain_route_requires_token_but_queue_route_does_not() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+        let host = MissionHost::with_backend(root, backend);
+        let app = crate::router_with_host(host, None, Some("tok".to_string()));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/queue/drain")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/queue/drain")
+                    .header("x-kranz-token", "tok")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/queue")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

@@ -655,6 +655,7 @@ async fn mutation_token_gates_every_post_and_no_get() {
         "/api/missions/m-01/approve",
         "/api/missions/m-01/start",
         "/api/missions/m-01/release",
+        "/api/queue/drain",
     ] {
         let (status, _) = post_json(&app, uri, None, json!({})).await;
         assert_eq!(
@@ -675,6 +676,8 @@ async fn mutation_token_gates_every_post_and_no_get() {
     let (status, _) = get_json(&app, "/api/missions/m-01/state").await;
     assert_eq!(status, StatusCode::OK);
     let (status, _) = get_json(&app, "/api/health").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = get_json(&app, "/api/queue").await;
     assert_eq!(status, StatusCode::OK);
 }
 
@@ -1037,4 +1040,122 @@ async fn planning_endpoints_attach_non_hosted_missions_and_404_unknown() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ---------------------------------------------------------------------------
+// Queue drain (roadmap f-1-2): POST /api/queue/drain over the full router
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn queue_drain_route_runs_a_queued_mission_to_complete() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let judgement =
+        json!({ "decision": "complete", "guidance": "", "summary": "worker did the job" });
+    let orch = MockScript::streaming(vec![mock_init("orch-drain"), mock_result_text("seed-hi")])
+        .responding(vec![
+            turn("scoping the demo"),
+            turn(&plan_json().to_string()),
+            turn(&judgement.to_string()),
+            turn("NONE"),
+        ]);
+    let backend = Arc::new(MockBackend::with_scripts(vec![orch, worker_pass()]));
+    let app = hosted_app(&root, backend);
+
+    let (status, body) = post_json(
+        &app,
+        "/api/missions",
+        Some(TOKEN),
+        json!({
+            "goal": "drain me",
+            "config": { "skipScrutiny": true, "skipFunctional": true }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id = body["id"].as_str().expect("created mission id").to_string();
+
+    let (status, _) = post_json(
+        &app,
+        &format!("/api/missions/{id}/planning/turn"),
+        Some(TOKEN),
+        json!({ "text": "go" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/missions/{id}/planning/request-plan"),
+        Some(TOKEN),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ready"], true);
+    let plan = body["plan"].clone();
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/missions/{id}/approve"),
+        Some(TOKEN),
+        json!({ "plan": plan }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Free the mission from this host's planning registry (and its lock) so
+    // the drain's OWN headless resume can claim it — exactly the same
+    // release an external `kranz work` dispatcher would need.
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/missions/{id}/release"),
+        Some(TOKEN),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["released"], true);
+
+    // Enqueue it directly (bypassing the ticket-approve path — a bare entry
+    // is exactly what the queue-runnable dashboard affordance would enqueue).
+    kranz_engine::queue::enqueue(
+        &root,
+        kranz_engine::queue::QueueEntry {
+            mission_id: id.clone(),
+            ticket_slug: None,
+            priority: 2,
+            seq: 0,
+        },
+    )
+    .expect("enqueue");
+
+    let (status, body) = post_json(&app, "/api/queue/drain", Some(TOKEN), json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["live"], true, "{body}");
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let (_, ev) = get_json(&app, &format!("/api/missions/{id}/events")).await;
+    eprintln!("EVENTS: {}", serde_json::to_string_pretty(&ev).unwrap());
+    let (_, st) = get_json(&app, &format!("/api/missions/{id}/state")).await;
+    eprintln!("STATE: {}", serde_json::to_string_pretty(&st).unwrap());
+    panic!("debug stop");
+
+    // The queue entry's claim was retired by the drain.
+    let deadline = tokio::time::Instant::now() + RUN_TIMEOUT;
+    loop {
+        let (status, body) = get_json(&app, "/api/queue").await;
+        assert_eq!(status, StatusCode::OK);
+        if body["entries"].as_array().unwrap().is_empty() && body["drain"]["live"] == false {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "queue never drained: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }

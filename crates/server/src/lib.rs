@@ -171,6 +171,8 @@ pub fn router_with_shared_host(
         .route("/api/tickets/{slug}", get(tickets::get_ticket))
         .route("/api/tickets/{slug}/draft", post(tickets::draft_ticket))
         .route("/api/tickets/{slug}/approve", post(tickets::approve_ticket))
+        .route("/api/queue", get(host::queue_state_route))
+        .route("/api/queue/drain", post(host::drain_queue_route))
         .with_state(state);
 
     let app = match static_assets {
