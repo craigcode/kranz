@@ -574,6 +574,7 @@ pub async fn run_worker_in(
         session_cwd,
         base_sha,
         grants,
+        paths.mission_dir(),
     );
     let mut target = LogTarget::Live(log);
     run_session_to(backend, spec, &mut target, paths, run_meta, cancel).await
@@ -618,6 +619,7 @@ pub async fn run_worker_in_buffered(
         session_cwd,
         base_sha,
         grants,
+        paths.mission_dir(),
     );
     let mut target = LogTarget::Buffer(Vec::new());
     let outcome = run_session_to(backend, spec, &mut target, paths, run_meta, None).await?;
@@ -642,6 +644,7 @@ fn build_worker_spec(
     session_cwd: &std::path::Path,
     base_sha: Option<&str>,
     grants: &[String],
+    mission_dir: std::path::PathBuf,
 ) -> (SessionSpec, RunMeta) {
     let role = Role::Worker;
     let role_cfg = cfg.role(role);
@@ -698,8 +701,18 @@ fn build_worker_spec(
         max_budget_usd: role_cfg.max_budget_usd,
         max_turns: role_cfg.max_turns,
         env: HashMap::new(),
+        sandbox: None,
     };
     spec.env = contract_env(base_sha);
+    let (sandbox, warn) = crate::sandbox::resolve_for_session(
+        &role_cfg.sandbox,
+        session_cwd,
+        &mission_dir,
+    );
+    if let Some(warn) = warn {
+        tracing::warn!("{warn}");
+    }
+    spec.sandbox = sandbox;
     permissions::apply(permissions::for_role(role, cfg, &[], grants), &mut spec);
 
     let run_meta = RunMeta {
@@ -863,8 +876,18 @@ pub async fn run_validator_in(
         max_budget_usd: role_cfg.max_budget_usd,
         max_turns: role_cfg.max_turns,
         env: HashMap::new(),
+        sandbox: None,
     };
     spec.env = contract_env(base_sha);
+    let (sandbox, warn) = crate::sandbox::resolve_for_session(
+        &role_cfg.sandbox,
+        session_cwd,
+        &paths.mission_dir(),
+    );
+    if let Some(warn) = warn {
+        tracing::warn!("{warn}");
+    }
+    spec.sandbox = sandbox;
     permissions::apply(
         permissions::for_role(kind, cfg, &combined_commands, grants),
         &mut spec,

@@ -53,6 +53,7 @@ fn base_spec(prompt: PromptMode) -> SessionSpec {
         max_budget_usd: None,
         max_turns: None,
         env: HashMap::new(),
+        sandbox: None,
     }
 }
 
@@ -1008,6 +1009,7 @@ async fn real_single_shot() {
         max_budget_usd: None,
         max_turns: None,
         env: HashMap::new(),
+        sandbox: None,
     };
 
     let mut session = backend.start(spec).await.expect("spawn real claude");

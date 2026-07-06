@@ -95,6 +95,13 @@ pub struct SessionSpec {
     pub max_turns: Option<u32>,
     /// Extra environment variables for the child process.
     pub env: HashMap<String, String>,
+    /// Resolved macOS Seatbelt filesystem sandbox, when the role opted into
+    /// `enforce:fs` and the platform supports it (`None` otherwise).
+    ///
+    /// Additive field (docs/scoping/worker-sandboxing.md): populated by
+    /// `runner.rs` for worker/validator sessions; wiring it into the actual
+    /// `claude` spawn is a separate feature. Non-claude backends ignore it.
+    pub sandbox: Option<crate::sandbox::ResolvedSandbox>,
 }
 
 /// Normalized events surfaced from a session's output stream.

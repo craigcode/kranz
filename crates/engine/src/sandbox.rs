@@ -7,11 +7,109 @@
 use std::path::{Path, PathBuf};
 
 /// Inputs used to build a session's write-allowlist.
+#[derive(Debug, Clone)]
 pub struct SandboxInputs {
     pub session_cwd: PathBuf,
     pub mission_dir: PathBuf,
     pub tmpdir: PathBuf,
     pub extra_write: Vec<PathBuf>,
+}
+
+/// How a role's `enforce` setting maps onto the current platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxDecision {
+    /// Enforcement is off; no sandbox is attached.
+    Off,
+    /// Enforcement is requested and the platform supports it (macOS).
+    Enforce,
+    /// Enforcement is requested but the platform can't honor it; the caller
+    /// should warn once and proceed unsandboxed.
+    UnsupportedWarn,
+}
+
+/// Pure decision fn: given a role's `enforce` setting and the target OS
+/// (`std::env::consts::OS`-shaped string), decide whether the session gets an
+/// enforced sandbox. Parameterized on `target_os` so it is testable
+/// cross-platform.
+pub fn platform_support(
+    enforce: crate::types::SandboxEnforce,
+    target_os: &str,
+) -> SandboxDecision {
+    match enforce {
+        crate::types::SandboxEnforce::Off => SandboxDecision::Off,
+        crate::types::SandboxEnforce::Fs => {
+            if target_os == "macos" {
+                SandboxDecision::Enforce
+            } else {
+                SandboxDecision::UnsupportedWarn
+            }
+        }
+    }
+}
+
+/// A resolved, enforced filesystem sandbox for one session. Only produced
+/// when [`platform_support`] decides `Enforce`; the profile itself is
+/// generated from `inputs` at spawn time (a separate feature wires it into
+/// the `claude` spawn).
+#[derive(Debug, Clone)]
+pub struct ResolvedSandbox {
+    pub inputs: SandboxInputs,
+}
+
+/// Expand a leading `~/` in `raw` using the `HOME` env var; otherwise return
+/// `raw` unchanged as a `PathBuf`.
+fn expand_tilde(raw: &str) -> PathBuf {
+    if let Some(rest) = raw.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(raw)
+}
+
+/// Resolve a role's sandbox config into an (optional) enforced sandbox for
+/// one session, plus an optional one-time warning string.
+///
+/// Returns `(Some(ResolvedSandbox), None)` when enforcement is requested and
+/// supported (macOS), `(None, None)` when enforcement is off, and
+/// `(None, Some(warning))` when enforcement is requested but unsupported on
+/// this platform.
+pub fn resolve_for_session(
+    role_sandbox: &crate::types::SandboxConfig,
+    session_cwd: &Path,
+    mission_dir: &Path,
+) -> (Option<ResolvedSandbox>, Option<String>) {
+    match platform_support(role_sandbox.enforce, std::env::consts::OS) {
+        SandboxDecision::Off => (None, None),
+        SandboxDecision::UnsupportedWarn => (
+            None,
+            Some(format!(
+                "sandbox enforce:fs requested but unsupported on target_os={}; running unsandboxed",
+                std::env::consts::OS
+            )),
+        ),
+        SandboxDecision::Enforce => {
+            let tmpdir = std::env::var_os("TMPDIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            let extra_write = role_sandbox
+                .extra_write
+                .iter()
+                .map(|s| expand_tilde(s))
+                .collect();
+            (
+                Some(ResolvedSandbox {
+                    inputs: SandboxInputs {
+                        session_cwd: session_cwd.to_path_buf(),
+                        mission_dir: mission_dir.to_path_buf(),
+                        tmpdir,
+                        extra_write,
+                    },
+                }),
+                None,
+            )
+        }
+    }
 }
 
 /// Absolutize a path without requiring it to exist: canonicalize if possible,
@@ -150,6 +248,79 @@ mod tests {
         let path = write_profile_file(dir.path(), profile).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), profile);
         assert!(path.starts_with(dir.path()));
+    }
+
+    #[test]
+    fn sandbox_platform_support_matrix() {
+        use crate::types::SandboxEnforce;
+
+        assert_eq!(
+            platform_support(SandboxEnforce::Off, "macos"),
+            SandboxDecision::Off
+        );
+        assert_eq!(
+            platform_support(SandboxEnforce::Fs, "macos"),
+            SandboxDecision::Enforce
+        );
+        assert_eq!(
+            platform_support(SandboxEnforce::Fs, "linux"),
+            SandboxDecision::UnsupportedWarn
+        );
+        assert_eq!(
+            platform_support(SandboxEnforce::Off, "linux"),
+            SandboxDecision::Off
+        );
+    }
+
+    #[test]
+    fn sandbox_resolve_off_yields_none() {
+        let cfg = crate::types::SandboxConfig {
+            enforce: crate::types::SandboxEnforce::Off,
+            extra_write: vec![],
+        };
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+
+        let (resolved, warn) = resolve_for_session(&cfg, session.path(), mission.path());
+        assert!(resolved.is_none());
+        assert!(warn.is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_resolve_fs_on_macos_yields_resolved_sandbox() {
+        let cfg = crate::types::SandboxConfig {
+            enforce: crate::types::SandboxEnforce::Fs,
+            extra_write: vec![],
+        };
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+
+        let (resolved, warn) = resolve_for_session(&cfg, session.path(), mission.path());
+        assert!(warn.is_none());
+        let resolved = resolved.expect("expected an enforced sandbox on macos");
+        assert_eq!(resolved.inputs.session_cwd, session.path());
+        assert_eq!(resolved.inputs.mission_dir, mission.path());
+        assert!(!resolved.inputs.tmpdir.as_os_str().is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_resolve_expands_tilde_extra_write_via_home() {
+        let cfg = crate::types::SandboxConfig {
+            enforce: crate::types::SandboxEnforce::Fs,
+            extra_write: vec!["~/.cargo".to_string()],
+        };
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+        let home = std::env::var("HOME").expect("HOME must be set to run this test");
+
+        let (resolved, _warn) = resolve_for_session(&cfg, session.path(), mission.path());
+        let resolved = resolved.expect("expected an enforced sandbox on macos");
+        assert_eq!(
+            resolved.inputs.extra_write,
+            vec![PathBuf::from(home).join(".cargo")]
+        );
     }
 
     #[cfg(target_os = "macos")]

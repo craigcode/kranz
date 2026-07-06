@@ -862,6 +862,7 @@ mod tests {
             max_budget_usd: Some(5.0),
             max_turns: Some(10),
             env: Default::default(),
+            sandbox: None,
         };
         let args = build_args(&spec);
         assert_eq!(

@@ -3212,6 +3212,7 @@ impl MissionEngine {
             max_budget_usd: role_cfg.max_budget_usd,
             max_turns: role_cfg.max_turns,
             env: HashMap::new(),
+            sandbox: None,
         };
         permissions::apply(
             permissions::for_role(Role::Orchestrator, &cfg, &[], &[]),
