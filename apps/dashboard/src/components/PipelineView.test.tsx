@@ -124,6 +124,29 @@ describe('PipelineView', () => {
     );
   });
 
+  it('renders a plan-approval link for a ticketless Reviewable mission, and keeps Queue for run for the ticket-backed one', async () => {
+    vi.mocked(api.tickets).mockResolvedValueOnce([
+      makeTicket({ slug: 'fix-b', title: 'Fix B', state: 'review' }),
+    ]);
+    vi.mocked(api.missions).mockResolvedValueOnce([
+      makeMission({ id: 'm-orphan-plan', goal: 'Ticketless awaiting review', status: 'planning' }),
+    ]);
+    vi.mocked(api.planMd).mockResolvedValue({ markdown: 'Plan body.' });
+
+    render(<PipelineView />);
+
+    const orphanRow = (await screen.findByText('Ticketless awaiting review')).closest('li');
+    const orphanAction = orphanRow?.querySelector('.pipeline-primary-action');
+    expect(orphanAction?.tagName).toBe('A');
+    expect(orphanAction?.getAttribute('href')).toBe('#/m/m-orphan-plan');
+    expect(orphanAction?.textContent).toBe('Approve plan');
+
+    const ticketRow = (await screen.findByText('fix-b')).closest('li');
+    const ticketAction = ticketRow?.querySelector('.pipeline-primary-action');
+    expect(ticketAction?.tagName).toBe('BUTTON');
+    expect(ticketAction?.textContent).toBe('Queue for run');
+  });
+
   it('disables the Reviewable action and shows the blocked badge when isBlocked', async () => {
     vi.mocked(api.tickets).mockResolvedValueOnce([
       makeTicket({

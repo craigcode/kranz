@@ -270,6 +270,17 @@ export function PipelineView() {
       );
     }
 
+    if (stage === 'reviewable' && row.slug === undefined && row.missionId !== undefined) {
+      return (
+        <a
+          className="btn-small pipeline-primary-action"
+          href={`#/m/${encodeURIComponent(row.missionId)}`}
+        >
+          Approve plan
+        </a>
+      );
+    }
+
     if (stage === 'delivered' && row.missionId !== undefined) {
       return (
         <a
