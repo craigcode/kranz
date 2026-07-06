@@ -57,11 +57,12 @@ describe('approvePlan', () => {
     });
 
     useKranzStore.getState().approvePlan();
-    await Promise.resolve();
-    await Promise.resolve();
+
+    await vi.waitFor(() => {
+      expect(useKranzStore.getState().planning.approvedBranch).toBe('kranz/mission-m-test');
+    });
 
     expect(api.approvePending).toHaveBeenCalledOnce();
     expect(api.approvePending).toHaveBeenCalledWith('m-test');
-    expect(useKranzStore.getState().planning.approvedBranch).toBe('kranz/mission-m-test');
   });
 });
