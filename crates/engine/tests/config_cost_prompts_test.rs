@@ -8,8 +8,8 @@ use kranz_engine::error::EngineError;
 use kranz_engine::events::{Event, EventKind};
 use kranz_engine::prompts;
 use kranz_engine::types::{
-    Feature, FeatureOrigin, FeatureStatus, Finding, MissionConfig, Plan, PlanFeature,
-    PlanMilestone, Role, RunResult, TokenUsage,
+    Assertion, AssertionCheck, Feature, FeatureOrigin, FeatureStatus, Finding, MissionConfig,
+    Plan, PlanFeature, PlanMilestone, Role, RunResult, TokenUsage,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -704,4 +704,70 @@ fn load_layers_takes_pathbuf_slices() {
     let layers: Vec<PathBuf> = vec![];
     let cfg = config::load_layers(&layers).unwrap();
     assert_eq!(cfg, MissionConfig::default());
+}
+
+// ---------------------------------------------------------------------------
+// cost::classify_shape
+// ---------------------------------------------------------------------------
+
+fn judgement_assertion(id: &str) -> Assertion {
+    Assertion {
+        id: id.into(),
+        statement: "orchestrator judges the full diff".into(),
+        check: AssertionCheck::AgentJudgement,
+        command: None,
+    }
+}
+
+fn command_assertion(id: &str, command: &str) -> Assertion {
+    Assertion {
+        id: id.into(),
+        statement: "a command gate".into(),
+        check: AssertionCheck::Command,
+        command: Some(command.into()),
+    }
+}
+
+fn plan_with_contract(validation_contract: Vec<Assertion>) -> Plan {
+    let mut plan = plan_with(&[1]);
+    plan.validation_contract = validation_contract;
+    plan
+}
+
+#[test]
+fn classify_shape_judgement_heavy_grep_only_contract_is_doc_heavy() {
+    // Mirrors m-d341a7's contract shape: judgement assertions plus grep/git
+    // command assertions, but nothing that gates on a build or test.
+    let plan = plan_with_contract(vec![
+        judgement_assertion("a1"),
+        judgement_assertion("a2"),
+        command_assertion("a3", "bash -c 'grep -q foo doc.md'"),
+        command_assertion("a4", "bash -c 'git diff --stat'"),
+        command_assertion("a5", "bash -c 'grep -c bar doc.md'"),
+    ]);
+    assert_eq!(cost::classify_shape(&plan), cost::MissionShape::DocHeavy);
+}
+
+#[test]
+fn classify_shape_empty_contract_is_unknown() {
+    let plan = plan_with_contract(vec![]);
+    assert_eq!(cost::classify_shape(&plan), cost::MissionShape::Unknown);
+}
+
+#[test]
+fn classify_shape_cargo_test_command_wins_even_with_judgement() {
+    let plan = plan_with_contract(vec![
+        judgement_assertion("a1"),
+        command_assertion("a2", "cargo test --workspace"),
+    ]);
+    assert_eq!(cost::classify_shape(&plan), cost::MissionShape::CodeChange);
+}
+
+#[test]
+fn classify_shape_grep_only_no_judgement_is_unknown() {
+    let plan = plan_with_contract(vec![
+        command_assertion("a1", "bash -c 'grep -q foo doc.md'"),
+        command_assertion("a2", "bash -c 'grep -c bar doc.md'"),
+    ]);
+    assert_eq!(cost::classify_shape(&plan), cost::MissionShape::Unknown);
 }

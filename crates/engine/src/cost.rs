@@ -9,7 +9,8 @@ use crate::event_log::EventLog;
 use crate::paths::MissionPaths;
 use crate::reducer;
 use crate::types::{
-    FeatureOrigin, MissionConfig, MissionState, MissionStatus, Plan, Role, TokenUsage, WorkerRun,
+    AssertionCheck, FeatureOrigin, MissionConfig, MissionState, MissionStatus, Plan, Role,
+    TokenUsage, WorkerRun,
 };
 use std::path::Path;
 
@@ -160,6 +161,77 @@ pub fn estimate(plan: &Plan, cfg: &MissionConfig, p: &EstimateParams) -> CostEst
         low_usd: 0.5 * expected_usd,
         expected_usd,
         high_usd: 2.5 * expected_usd,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mission shape classification (observable at plan time)
+// ---------------------------------------------------------------------------
+
+/// The plan-observable shape of a mission, used to flag validation contracts
+/// [`estimate`]'s calibration corpus doesn't cover (later features will widen
+/// ranges / lower confidence for these; this type is inert on its own).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissionShape {
+    /// Contract gates on a build/test/lint command — the calibration corpus's
+    /// typical shape.
+    CodeChange,
+    /// Contract leans on agent judgement with no build/test gate — expensive
+    /// to validate and not represented in the calibration corpus.
+    DocHeavy,
+    /// Neither signal present (empty or grep-only contract): treated as
+    /// neutral, never widened.
+    Unknown,
+}
+
+/// Classify a plan's shape from its validation contract alone (observable
+/// before any run happens).
+///
+/// `AgentJudgement` assertions are re-evaluated by validators and the
+/// orchestrator against the *entire, growing* mission diff on every
+/// validation pass — m-d341a7 had 2 judgement assertions over a 1074-line
+/// doc and that alone drove 21.5M cache-read tokens across 17 judgement
+/// turns. Missions that instead gate on a build/test/lint command bound that
+/// cost (the command runs once, deterministically, regardless of diff size),
+/// so any `Command` assertion invoking cargo/npm/pytest/go test/make wins
+/// over an `AgentJudgement` signal — the code-change shape doesn't scale
+/// with diff size the way a judgement-only contract does.
+pub fn classify_shape(plan: &Plan) -> MissionShape {
+    const BUILD_TEST_TOKENS: &[&str] = &[
+        "cargo test",
+        "cargo build",
+        "cargo check",
+        "cargo clippy",
+        "npm test",
+        "npm run",
+        "pytest",
+        "go test",
+        "make ",
+    ];
+
+    let judgements = plan
+        .validation_contract
+        .iter()
+        .filter(|a| a.check == AssertionCheck::AgentJudgement)
+        .count();
+
+    let build_test_cmd = plan.validation_contract.iter().any(|a| {
+        a.check == AssertionCheck::Command
+            && a.command
+                .as_deref()
+                .map(|c| {
+                    let lower = c.to_ascii_lowercase();
+                    BUILD_TEST_TOKENS.iter().any(|tok| lower.contains(tok))
+                })
+                .unwrap_or(false)
+    });
+
+    if build_test_cmd {
+        MissionShape::CodeChange
+    } else if judgements >= 1 {
+        MissionShape::DocHeavy
+    } else {
+        MissionShape::Unknown
     }
 }
 
