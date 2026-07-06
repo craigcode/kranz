@@ -325,6 +325,18 @@ pub struct RoleConfig {
     pub max_budget_usd: Option<f64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<String>,
+    /// Backend override: only meaningful (and only accepted by
+    /// `config::validate`) on `validatorScrutiny`; `None` or `"claude"` keeps
+    /// the default Claude Code backend, `"codex"` selects [`crate::backend_codex::CodexBackend`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+}
+
+/// Which [`AgentBackend`](crate::backend::AgentBackend) drives a role's sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendKind {
+    Claude,
+    Codex,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -366,6 +378,7 @@ impl Default for MissionConfig {
                 max_turns: None,
                 max_budget_usd: Some(20.0),
                 tools: vec![],
+                backend: None,
             },
             worker: RoleConfig {
                 model: "sonnet".into(),
@@ -373,6 +386,7 @@ impl Default for MissionConfig {
                 max_turns: Some(50),
                 max_budget_usd: Some(10.0),
                 tools: vec![],
+                backend: None,
             },
             validator_scrutiny: RoleConfig {
                 model: "opus".into(),
@@ -380,6 +394,7 @@ impl Default for MissionConfig {
                 max_turns: Some(40),
                 max_budget_usd: Some(10.0),
                 tools: vec![],
+                backend: None,
             },
             validator_functional: RoleConfig {
                 model: "sonnet".into(),
@@ -387,6 +402,7 @@ impl Default for MissionConfig {
                 max_turns: Some(40),
                 max_budget_usd: Some(5.0),
                 tools: vec![],
+                backend: None,
             },
             skip_scrutiny: false,
             skip_functional: false,
@@ -411,6 +427,15 @@ impl MissionConfig {
             Role::Worker => &self.worker,
             Role::ValidatorScrutiny => &self.validator_scrutiny,
             Role::ValidatorFunctional => &self.validator_functional,
+        }
+    }
+
+    /// Which backend drives `validatorScrutiny` sessions. Only this role may
+    /// set `backend`; `config::validate` rejects it elsewhere.
+    pub fn scrutiny_backend_kind(&self) -> BackendKind {
+        match self.validator_scrutiny.backend.as_deref() {
+            Some("codex") => BackendKind::Codex,
+            _ => BackendKind::Claude,
         }
     }
 }
