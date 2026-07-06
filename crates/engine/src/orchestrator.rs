@@ -486,6 +486,15 @@ impl MissionEngine {
         }
     }
 
+    /// [`MissionPaths`] rooted at [`Self::active_root`] (mirrors `self.paths`'
+    /// join logic, just against whichever tree mission-branch git ops run in
+    /// right now). Use this instead of `self.paths` for any file that gets
+    /// committed onto the mission branch, so worktree mode writes land in the
+    /// integration worktree rather than the primary checkout.
+    fn active_paths(&self) -> MissionPaths {
+        MissionPaths::new(self.active_root(), self.state.mission.id.clone())
+    }
+
     /// Shrink the orchestrator stall timeout (tests exercise the death/reseed
     /// path without waiting ten minutes).
     pub fn set_orch_stall_timeout(&mut self, timeout: Duration) {
@@ -718,9 +727,16 @@ impl MissionEngine {
         }
     }
 
-    /// Approve a plan: normalize it, create + check out the mission branch,
-    /// write and commit `plan.json` (the engine writes and commits — the
-    /// orchestrator never touches files, plan §4.4), and emit `plan.approved`.
+    /// Approve a plan: normalize it, create the mission branch, write and
+    /// commit `plan.json` (the engine writes and commits — the orchestrator
+    /// never touches files, plan §4.4), and emit `plan.approved`.
+    ///
+    /// Worktree mode (M7 tier 1): the branch is created but never checked
+    /// out in the primary tree; the commit instead happens in a short-lived
+    /// integration worktree (`setup_mission_worktree`/`teardown_mission_worktree`,
+    /// same helpers `run()` uses for the rest of the mission), so the primary
+    /// checkout never moves off its starting branch. Checkout mode is
+    /// unchanged: check out the branch in the primary tree and commit there.
     pub fn approve_plan(&mut self, mut plan: Plan) -> Result<()> {
         if self.state.mission.status != MissionStatus::Planning {
             return Err(EngineError::InvalidState(format!(
@@ -748,18 +764,19 @@ impl MissionEngine {
         if !self.repo.branch_exists(&branch)? {
             self.repo.create_branch(&branch, Some(&base))?;
         }
-        self.repo.checkout(&branch)?;
+        let worktree_mode = self.state.config.isolation() == WorkerIsolation::Worktree;
+        if !worktree_mode {
+            self.repo.checkout(&branch)?;
+        }
         // Committing plan files onto the mission branch below does not move
         // the base branch ref, so resolving it anywhere in approve_plan pins
         // the base tip as of approval (plan §f-1-2: never re-resolve later —
         // that would reintroduce the moving-base-branch race this fixes).
+        // Unaffected by worktree_mode: `base` is resolved against the primary
+        // repo either way, and creating (but not checking out) the mission
+        // branch never moves it.
         let base_sha = self.repo.rev_parse(&base)?;
 
-        let plan_file = self.paths.plan_file();
-        if let Some(parent) = plan_file.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&plan_file, serde_json::to_string_pretty(&plan)?)?;
         // Human-readable twin, committed alongside: reviewable in any git UI
         // and diffable across re-plans (plan.json stays the durable source).
         // The calibrated cost estimate is baked in here so the Reviewable
@@ -768,30 +785,74 @@ impl MissionEngine {
         let calibration = cost::calibrate(&self.paths.repo_root);
         let estimate = cost::estimate(&plan, &self.state.config, &calibration.params);
         let estimate = cost::apply_shape(estimate, &plan, &calibration);
-        let plan_md = plan_file.with_file_name("plan.md");
-        std::fs::write(
-            &plan_md,
-            render_plan_markdown(
-                &plan,
-                &self.state.mission,
-                &estimate,
-                calibration.missions_used,
-            ),
-        )?;
-        // Browsable catalog: date + goal-as-title + link per mission. The
-        // canonical plan path stays stable; discovery lives here.
-        let index = self.paths.missions_dir().join("index.md");
-        let index_body = upsert_mission_index(
-            &std::fs::read_to_string(&index).unwrap_or_default(),
-            &self.state.mission.id,
-            &plan.goal,
-            chrono::Utc::now().date_naive(),
+        let plan_md_body = render_plan_markdown(
+            &plan,
+            &self.state.mission,
+            &estimate,
+            calibration.missions_used,
         );
-        std::fs::write(&index, index_body)?;
-        self.repo.commit_paths(
-            &[plan_file.as_path(), plan_md.as_path(), index.as_path()],
-            &format!("[kranz] approved plan for {}", self.state.mission.id),
-        )?;
+
+        if worktree_mode {
+            let (wt_path, wt_repo) = self.setup_mission_worktree()?;
+            let commit_result = (|| -> Result<()> {
+                let wt_paths = MissionPaths::new(wt_path.clone(), self.state.mission.id.clone());
+                let plan_file = wt_paths.plan_file();
+                if let Some(parent) = plan_file.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&plan_file, serde_json::to_string_pretty(&plan)?)?;
+                let plan_md = wt_paths.plan_md_file();
+                std::fs::write(&plan_md, &plan_md_body)?;
+                // Browsable catalog: date + goal-as-title + link per mission.
+                // The canonical plan path stays stable; discovery lives here.
+                let index = wt_paths.missions_dir().join("index.md");
+                let index_body = upsert_mission_index(
+                    &std::fs::read_to_string(&index).unwrap_or_default(),
+                    &self.state.mission.id,
+                    &plan.goal,
+                    chrono::Utc::now().date_naive(),
+                );
+                std::fs::write(&index, index_body)?;
+                wt_repo.commit_paths(
+                    &[plan_file.as_path(), plan_md.as_path(), index.as_path()],
+                    &format!("[kranz] approved plan for {}", self.state.mission.id),
+                )?;
+                Ok(())
+            })();
+            self.teardown_mission_worktree();
+            commit_result?;
+
+            // Deliverable visibility (plan §f-2-3): the primary never checks
+            // out the mission branch in worktree mode, so this untracked twin
+            // in the runtime dir is how an operator reads plan.md without
+            // leaving the primary checkout. Never committed — the canonical,
+            // committed copy lives on the mission branch above.
+            let primary_plan_md = self.paths.plan_md_file();
+            if let Some(parent) = primary_plan_md.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&primary_plan_md, &plan_md_body)?;
+        } else {
+            let plan_file = self.paths.plan_file();
+            if let Some(parent) = plan_file.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&plan_file, serde_json::to_string_pretty(&plan)?)?;
+            let plan_md = self.paths.plan_md_file();
+            std::fs::write(&plan_md, &plan_md_body)?;
+            let index = self.paths.missions_dir().join("index.md");
+            let index_body = upsert_mission_index(
+                &std::fs::read_to_string(&index).unwrap_or_default(),
+                &self.state.mission.id,
+                &plan.goal,
+                chrono::Utc::now().date_naive(),
+            );
+            std::fs::write(&index, index_body)?;
+            self.repo.commit_paths(
+                &[plan_file.as_path(), plan_md.as_path(), index.as_path()],
+                &format!("[kranz] approved plan for {}", self.state.mission.id),
+            )?;
+        }
 
         self.emit(EventKind::PlanApproved {
             plan,
@@ -1090,12 +1151,20 @@ impl MissionEngine {
     /// (returned so the user can intervene), or the process is killed (safe:
     /// the log is the source of truth). Paused missions loop in place,
     /// draining the control inbox, until a Resume arrives.
-    /// NOTE on checkout lifetime: run() leaves the checkout on the MISSION
-    /// branch at terminal states deliberately — report.md/plan.md are
-    /// committed there, and yanking the checkout back to base would make the
-    /// mission's own artifacts vanish from the working tree at the exact
-    /// moment the operator reads them. The dispatcher (`kranz work`) and
-    /// `kranz draft` restore the operator's checkout at THEIR boundaries.
+    /// NOTE on checkout lifetime: in CHECKOUT mode, run() leaves the checkout
+    /// on the MISSION branch at terminal states deliberately — report.md/
+    /// plan.md are committed there, and yanking the checkout back to base
+    /// would make the mission's own artifacts vanish from the working tree at
+    /// the exact moment the operator reads them. The dispatcher (`kranz work`)
+    /// and `kranz draft` restore the operator's checkout at THEIR boundaries.
+    ///
+    /// In WORKTREE mode (M7 tier 1) the primary checkout never moves at all —
+    /// plan.md/report.md are committed on the mission branch via the
+    /// integration worktree (`approve_plan`/`write_mission_report`), and a
+    /// human-readable, untracked twin of each is written straight to the
+    /// primary runtime dir (`.kranz/missions/<id>/`) so an operator reading
+    /// the primary checkout still sees them, without the primary ever leaving
+    /// its starting branch.
     pub async fn run(&mut self) -> Result<MissionStatus> {
         if self.state.mission.status == MissionStatus::Planning {
             return Err(EngineError::InvalidState(
@@ -2822,6 +2891,13 @@ impl MissionEngine {
     /// link to this mission's line in `missions/index.md`, and commit both
     /// (plus any `extra_paths`) in one `[kranz] mission report for <id>`
     /// commit.
+    ///
+    /// Worktree mode (M7 tier 1): this runs inside `run()`, so `active_paths`/
+    /// `active_repo` already route to the integration worktree — the report,
+    /// index update, and any extra paths (e.g. a captured lesson) are written
+    /// and committed there, never in the primary tree. A human-readable
+    /// report.md twin is also written (untracked) to the primary runtime dir
+    /// so it stays readable without leaving the primary checkout.
     fn try_write_mission_report(&mut self, extra_paths: Option<Vec<PathBuf>>) -> Result<()> {
         // Flush buffered stream deltas so the replayed history is complete.
         self.log.flush()?;
@@ -2830,17 +2906,18 @@ impl MissionEngine {
         let estimate = cost::estimate(&plan, &self.state.config, &cost::EstimateParams::default());
         let report = render_mission_report(&self.state, &events, &plan, &estimate);
 
-        let report_file = self.paths.mission_dir().join("report.md");
+        let active_paths = self.active_paths();
+        let report_file = active_paths.mission_dir().join("report.md");
         if let Some(parent) = report_file.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&report_file, report)?;
+        std::fs::write(&report_file, &report)?;
 
         // Index line: append " · [report](<id>/report.md)" to this mission's
         // entry; the line format is otherwise kept stable (see
         // upsert_mission_index). A missing index or line is tolerated — the
         // report itself is the deliverable.
-        let index = self.paths.missions_dir().join("index.md");
+        let index = active_paths.missions_dir().join("index.md");
         let mut commit: Vec<&std::path::Path> = vec![report_file.as_path()];
         let index_changed = match std::fs::read_to_string(&index) {
             Ok(existing) => {
@@ -2858,10 +2935,18 @@ impl MissionEngine {
         }
         let extra_paths = extra_paths.unwrap_or_default();
         commit.extend(extra_paths.iter().map(PathBuf::as_path));
-        self.repo.commit_paths(
+        self.active_repo().commit_paths(
             &commit,
             &format!("[kranz] mission report for {}", self.state.mission.id),
         )?;
+
+        if self.state.config.isolation() == WorkerIsolation::Worktree {
+            let primary_report = self.paths.mission_dir().join("report.md");
+            if let Some(parent) = primary_report.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&primary_report, &report)?;
+        }
         Ok(())
     }
 
@@ -2905,7 +2990,11 @@ impl MissionEngine {
             return Ok(None);
         }
 
-        let lessons_dir = self.paths.lessons_dir();
+        // Written under active_paths (the integration worktree in worktree
+        // mode) because these files are folded into write_mission_report's
+        // commit, which commits via active_repo — see that method's doc note.
+        let active_paths = self.active_paths();
+        let lessons_dir = active_paths.lessons_dir();
         std::fs::create_dir_all(&lessons_dir)?;
         let mission_id = self.state.mission.id.clone();
         let lesson_file = lessons_dir.join(format!("{mission_id}.md"));
@@ -2913,7 +3002,7 @@ impl MissionEngine {
         std::fs::write(&lesson_file, &body)?;
 
         let summary = first_nonempty_line(&body);
-        let index = self.paths.lessons_index();
+        let index = active_paths.lessons_index();
         let line = format!("- {mission_id}.md · {summary}\n");
         {
             use std::io::Write as _;

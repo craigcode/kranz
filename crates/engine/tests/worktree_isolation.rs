@@ -277,13 +277,10 @@ async fn worker_session_cwd_is_worktree() {
     let mut engine =
         MissionEngine::create(backend_dyn, &root, GOAL, worktree_cfg()).expect("create engine");
     engine.approve_plan(one_feature_plan()).unwrap();
-    // `approve_plan`'s primary-tree checkout + artifact commit is out of
-    // scope for f-2-1 (later features route it through the integration
-    // worktree too). Model the dispatcher boundary that already restores
-    // the operator's checkout between `kranz draft` and `kranz work`
-    // (see `run()`'s doc comment) so `run()` starts from a primary tree
-    // that isn't sitting on the mission branch — exactly the real-world
-    // precondition `setup_mission_worktree` needs.
+    // `approve_plan` (f-2-3) never checks out the mission branch in the
+    // primary tree in worktree mode, so the primary is already on `main`
+    // here; this is just belt-and-suspenders (a no-op checkout of the
+    // branch already checked out).
     raw_git(&root, &["checkout", "main"]);
     let branch_before = raw_git(&root, &["branch", "--show-current"])
         .trim()
@@ -520,5 +517,141 @@ async fn base_sha_reaches_sessions_in_worktree_mode() {
     assert_eq!(
         gate_capture, base_sha,
         "final-gate contract-command env must carry KRANZ_BASE_SHA"
+    );
+}
+
+// -----------------------------------------------------------------------
+// f-2-3: committed artifacts + approval route to the worktree; the primary
+// checkout stays byte-untouched across an entire mission in worktree mode.
+// -----------------------------------------------------------------------
+
+/// End-to-end (approval through completion): in worktree mode the primary
+/// checkout's branch, HEAD sha, and tracked-tree status are byte-identical
+/// before and after the whole mission — proving neither `approve_plan` nor
+/// `write_mission_report` (nor anything else `run()` does) ever checks out
+/// or commits in the primary tree.
+#[tokio::test(flavor = "multi_thread")]
+async fn primary_checkout_untouched_in_worktree_mode() {
+    let Some((_dir, root)) = mission_init_repo() else {
+        return;
+    };
+    let repo = GitRepo::open(&root).expect("open repo");
+
+    let branch_before = repo.current_branch().unwrap();
+    let head_before = repo.head_sha().unwrap();
+    let status_before = raw_git(&root, &["status", "--porcelain", "--untracked-files=no"]);
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script_complete_no_lesson(),
+    ]));
+    let backend_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend) as Arc<dyn AgentBackend>;
+    let mut engine =
+        MissionEngine::create(backend_dyn, &root, GOAL, worktree_cfg()).expect("create engine");
+    engine.approve_plan(one_feature_plan()).unwrap();
+
+    let status = timeout(TokioDuration::from_secs(60), engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+
+    let branch_after = repo.current_branch().unwrap();
+    let head_after = repo.head_sha().unwrap();
+    let status_after = raw_git(&root, &["status", "--porcelain", "--untracked-files=no"]);
+
+    assert_eq!(
+        branch_before, branch_after,
+        "primary checkout must never change branches across the whole mission"
+    );
+    assert_eq!(
+        head_before, head_after,
+        "primary HEAD sha must be unchanged across the whole mission"
+    );
+    assert_eq!(
+        status_before, status_after,
+        "primary tracked-tree status must be byte-identical across the whole mission"
+    );
+}
+
+/// After the mission, the mission branch tip carries the committed plan.json
+/// and report.md (and the engine's approval/report commits), while the
+/// primary HEAD is unchanged from before the mission — and human-readable
+/// plan.md/report.md twins are readable via the primary runtime dir.
+#[tokio::test(flavor = "multi_thread")]
+async fn mission_branch_carries_deliverables_in_worktree_mode() {
+    let Some((_dir, root)) = mission_init_repo() else {
+        return;
+    };
+    let repo = GitRepo::open(&root).expect("open repo");
+    let head_before = repo.head_sha().unwrap();
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script_complete_no_lesson(),
+    ]));
+    let backend_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend) as Arc<dyn AgentBackend>;
+    let mut engine =
+        MissionEngine::create(backend_dyn, &root, GOAL, worktree_cfg()).expect("create engine");
+    let mission_branch = engine.state().mission.mission_branch.clone();
+    let mission_id = engine.mission_id().to_string();
+    engine.approve_plan(one_feature_plan()).unwrap();
+
+    let status = timeout(TokioDuration::from_secs(60), engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+
+    // Primary HEAD/branch unchanged from before the mission.
+    assert_eq!(repo.head_sha().unwrap(), head_before);
+    assert_eq!(repo.current_branch().unwrap(), "main");
+
+    // The mission branch tip carries the committed deliverables.
+    let plan_json = raw_git(
+        &root,
+        &[
+            "show",
+            &format!("{mission_branch}:.kranz/missions/{mission_id}/plan.json"),
+        ],
+    );
+    assert!(
+        !plan_json.trim().is_empty(),
+        "plan.json must be committed on the mission branch"
+    );
+    let report_md = raw_git(
+        &root,
+        &[
+            "show",
+            &format!("{mission_branch}:.kranz/missions/{mission_id}/report.md"),
+        ],
+    );
+    assert!(
+        !report_md.trim().is_empty(),
+        "report.md must be committed on the mission branch"
+    );
+
+    // The engine's own approval + report commits (this feature's git-side
+    // mutations) landed on the mission branch, never on the primary tree.
+    let log = raw_git(&root, &["log", "--format=%s", &mission_branch]);
+    assert!(
+        log.contains(&format!("approved plan for {mission_id}")),
+        "mission branch log missing the plan-approval commit: {log}"
+    );
+    assert!(
+        log.contains(&format!("mission report for {mission_id}")),
+        "mission branch log missing the mission-report commit: {log}"
+    );
+
+    // Deliverables stay readable: human-readable twins in the primary
+    // runtime dir (untracked, never committed there).
+    let mission_dir = root.join(".kranz/missions").join(&mission_id);
+    assert!(
+        mission_dir.join("plan.md").is_file(),
+        "plan.md twin must be readable in the primary runtime dir"
+    );
+    assert!(
+        mission_dir.join("report.md").is_file(),
+        "report.md twin must be readable in the primary runtime dir"
     );
 }
