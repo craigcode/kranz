@@ -1,0 +1,97 @@
+# Mission plan — m-9f13d2
+
+**Goal:** Every contract-command execution context — worker, validator, and the engine's own final gate — carries the same approval-pinned KRANZ_BASE_SHA, constructed by one shared function.
+
+Branch `kranz/mission-m-9f13d2` (from `main`). Approved plan of record; the machine-readable twin is [plan.json](plan.json). Live status: `kranz status` or the dashboard.
+
+## Cost estimate
+
+Estimated **$2.55 – $12.77** (expected ~$5.11). Rough estimate — live usage is authoritative; based on 19 completed mission(s).
+
+## Validation contract
+
+Defined before any feature; gates mission completion.
+
+- **[a1]** A contract command executed through the engine's final-gate path resolves $KRANZ_BASE_SHA to the SHA pinned at plan approval (not empty). 
+  `cargo test -p kranz-engine base_sha_reaches_final_gate_env 2>&1 | grep -qE 'result: ok\. [1-9][0-9]* passed'`
+- **[a2]** When no base SHA is pinned (base_sha = None), the final-gate command environment does not define KRANZ_BASE_SHA — no empty-variable regression. 
+  `cargo test -p kranz-engine no_base_sha_means_no_gate_env_var 2>&1 | grep -qE 'result: ok\. [1-9][0-9]* passed'`
+- **[a3]** The existing worker-session and validator-session KRANZ_BASE_SHA env behaviour is preserved: both carry the pinned SHA. 
+  `cargo test -p kranz-engine base_sha_reaches_worker_and_validator_env 2>&1 | grep -qE 'result: ok\. [1-9][0-9]* passed'`
+- **[a4]** The worker, validator, and final-gate KRANZ_BASE_SHA environments are all produced by a single shared constructor function; the KRANZ_BASE_SHA insertion is not duplicated across the three execution paths. *(agent judgement)*
+- **[a5]** The full workspace test suite passes with no regressions. 
+  `cargo test --workspace 2>&1 | grep -qE 'result: ok\. [1-9][0-9]* passed'`
+
+## Milestone 1 — KRANZ_BASE_SHA reaches every contract-command execution context via one shared env constructor
+
+### 1.1 Centralize contract-command env construction and thread it through the final gate
+
+PROBLEM: The engine has three contexts that execute contract `command` assertions, and only two carry the approval-pinned `KRANZ_BASE_SHA`. The final mission-level gate omits it, which produced a false CRITICAL (mission m-d341a7). Fix this by introducing ONE shared env constructor and adopting it in all three sites, so they can never diverge.
+
+All code is in the `kranz-engine` crate (package name `kranz-engine`, at crates/engine). Make read-only orientation reads first; the line numbers below are from the current tree and may drift a little.
+
+=== THE THREE CONTEXTS (audit + rewire) ===
+
+1. WORKER — `crates/engine/src/runner.rs`, in `run_worker` (~lines 683-686). Currently:
+```
+if let Some(sha) = base_sha.filter(|s| !s.is_empty()) {
+    spec.env.insert("KRANZ_BASE_SHA".to_string(), sha.to_string());
+}
+```
+2. VALIDATOR — `crates/engine/src/runner.rs`, in `run_validator` (~lines 799-802). Currently a byte-identical block to the worker one.
+3. FINAL GATE — `crates/engine/src/orchestrator.rs`. `final_gate` (~line 2329) runs each command assertion via `run_shell_command(self.paths.repo_root.as_path(), command)` (~line 2351). `run_shell_command` (~line 4281) delegates to `run_shell_command_with_timeout` (~line 4301), which spawns `sh -c <command>` (or `cmd /C` on windows) with `current_dir(cwd)` but sets NO environment variables — it inherits only the engine process env. THIS is the defect: `$KRANZ_BASE_SHA` is undefined here.
+
+Confirm there is no OTHER contract-command executor before you finish: `preflight` only probes program names on PATH and must NOT be changed; `merge_gate.rs` runs the CI gate suite (fmt/clippy/test), not contract commands; `judge_contract_assertions` handles only agent-judgement assertions. `final_gate` is the sole engine-side contract-command executor. State in your WorkerReport that you verified this.
+
+=== THE SHARED CONSTRUCTOR ===
+
+Add, in `crates/engine/src/runner.rs`, a single public function (this is the ONE source of truth — no other place may build a KRANZ_BASE_SHA env map):
+```
+/// The environment every contract-command execution context must carry, so
+/// worker, validator, and the engine's final gate can never diverge. Adds
+/// KRANZ_BASE_SHA only when a non-empty base SHA was pinned at approval.
+pub fn contract_env(base_sha: Option<&str>) -> std::collections::HashMap<String, String> {
+    let mut env = std::collections::HashMap::new();
+    if let Some(sha) = base_sha.filter(|s| !s.is_empty()) {
+        env.insert("KRANZ_BASE_SHA".to_string(), sha.to_string());
+    }
+    env
+}
+```
+Adjust the exact `HashMap` import path to match the file's existing style (runner.rs already uses `HashMap`).
+
+=== ADOPT IT (all three sites) ===
+
+- Worker: replace the inline insert with `spec.env = contract_env(base_sha);` (call it directly since it's in the same module). Do this BEFORE `permissions::apply(...)`, preserving current ordering. Since `spec.env` is initialized to `HashMap::new()` just above, assigning the constructor result is equivalent and removes the duplicated insert.
+- Validator: identical replacement in `run_validator`.
+- Final gate: change `run_shell_command` and `run_shell_command_with_timeout` to accept an env map parameter (e.g. `env: &std::collections::HashMap<String, String>`) and apply it to the spawned command via `cmd.envs(env)` (place the `.envs(...)` call alongside the existing `.current_dir(cwd)` configuration, after the cfg branches where `.current_dir` is already set once, so it applies on both the windows and non-windows `cmd`). In `final_gate`, build the map once before the loop: `let env = crate::runner::contract_env(self.state.mission.base_sha.as_deref());` and pass `&env` into `run_shell_command`.
+- Update the ONE existing caller of `run_shell_command_with_timeout` — the `shell_command_timeout_kills_the_whole_process_tree` test (~line 4565) — to pass an empty map (e.g. `&std::collections::HashMap::new()`).
+
+Do NOT change the timeout kill semantics, process-group / Job Object handling, stdout/stderr piping, or the COMMAND_TIMEOUT behaviour. Env threading only.
+
+=== TESTS (write these FIRST, then implement) ===
+
+Add to the inline `#[cfg(test)] mod tests` in `crates/engine/src/orchestrator.rs` (same module as `shell_command_timeout_kills_the_whole_process_tree`), TWO async tests with these EXACT names (the contract greps for them):
+
+1. `base_sha_reaches_final_gate_env` — call `run_shell_command_with_timeout` (or `run_shell_command`) with cwd = a tempdir, env = `contract_env(Some("deadbeefcafe"))`, and the command string `test "$KRANZ_BASE_SHA" = deadbeefcafe` (run_shell_command already wraps in `sh -c`, so the var resolves inside the shell). Assert the returned `ok` is true. Unix-gate it (`#[cfg(unix)]`), mirroring the existing timeout test, since it relies on `sh`/`test`.
+
+2. `no_base_sha_means_no_gate_env_var` — same shape but env = `contract_env(None)` and command `test -z "$KRANZ_BASE_SHA"`; assert `ok` is true. This locks in that None yields no KRANZ_BASE_SHA key at all (not an empty-string value).
+
+The existing test `base_sha_reaches_worker_and_validator_env` (crates/engine/tests/mission_test.rs ~1886) must continue to pass unchanged — it proves the worker/validator adoption (contract a3). Do not weaken it.
+
+=== ACCEPTANCE (must all pass) ===
+- `cargo test -p kranz-engine base_sha_reaches_final_gate_env 2>&1 | grep -qE 'result: ok\. [1-9][0-9]* passed'`
+- `cargo test -p kranz-engine no_base_sha_means_no_gate_env_var 2>&1 | grep -qE 'result: ok\. [1-9][0-9]* passed'`
+- `cargo test -p kranz-engine base_sha_reaches_worker_and_validator_env 2>&1 | grep -qE 'result: ok\. [1-9][0-9]* passed'`
+- `cargo test --workspace 2>&1 | grep -qE 'result: ok\. [1-9][0-9]* passed'`
+- `cargo fmt --all --check` is clean and `cargo clippy --workspace --all-targets` has no new warnings (the CI merge gate enforces both — run them before reporting).
+
+Include the actual test-runner output for the new tests in your WorkerReport's testEvidence.
+
+Done when:
+- A test named `base_sha_reaches_final_gate_env` exercises the final-gate execution path (run_shell_command / run_shell_command_with_timeout) with a pinned base SHA and asserts a command referencing $KRANZ_BASE_SHA resolves to that exact SHA; it passes.
+- A test named `no_base_sha_means_no_gate_env_var` asserts that with base_sha = None the final-gate command env does not define KRANZ_BASE_SHA; it passes.
+- The existing `base_sha_reaches_worker_and_validator_env` test still passes, proving worker and validator env behaviour is preserved.
+- A single shared function (`contract_env`) is the only place KRANZ_BASE_SHA is inserted into a contract-command env, and worker, validator, and final-gate paths all call it; the two previously-duplicated inline inserts in runner.rs are gone.
+- `cargo test --workspace 2>&1 | grep -qE 'result: ok\. [1-9][0-9]* passed'` succeeds, and `cargo fmt --all --check` and `cargo clippy --workspace --all-targets` are clean.
+

@@ -2333,6 +2333,7 @@ impl MissionEngine {
 
         let contract = self.state.mission.validation_contract.clone();
         let mut findings: Vec<Finding> = Vec::new();
+        let env = runner::contract_env(self.state.mission.base_sha.as_deref());
 
         // command assertions — engine-run (design.md: the hard gate).
         for assertion in contract
@@ -2348,7 +2349,8 @@ impl MissionEngine {
                 });
                 continue;
             };
-            let (ok, output) = run_shell_command(self.paths.repo_root.as_path(), command).await;
+            let (ok, output) =
+                run_shell_command(self.paths.repo_root.as_path(), command, &env).await;
             if !ok {
                 findings.push(Finding {
                     subject: assertion.id.clone(),
@@ -4278,8 +4280,12 @@ fn preview_config_patch(current: &MissionConfig, patch: &serde_json::Value) -> R
 /// are user-authored shell lines ("npm test -- --grep auth") that need real
 /// shell semantics — argument splitting here would corrupt them. `cmd /C` on
 /// Windows, `sh -c` elsewhere; cwd = repo root; 10-minute cap.
-async fn run_shell_command(cwd: &std::path::Path, command: &str) -> (bool, String) {
-    run_shell_command_with_timeout(cwd, command, COMMAND_TIMEOUT).await
+async fn run_shell_command(
+    cwd: &std::path::Path,
+    command: &str,
+    env: &HashMap<String, String>,
+) -> (bool, String) {
+    run_shell_command_with_timeout(cwd, command, COMMAND_TIMEOUT, env).await
 }
 
 /// [`run_shell_command`] with an explicit timeout (separated so tests can
@@ -4302,6 +4308,7 @@ async fn run_shell_command_with_timeout(
     cwd: &std::path::Path,
     command: &str,
     timeout: Duration,
+    env: &HashMap<String, String>,
 ) -> (bool, String) {
     #[cfg(windows)]
     let mut cmd = {
@@ -4316,6 +4323,7 @@ async fn run_shell_command_with_timeout(
         c
     };
     cmd.current_dir(cwd)
+        .envs(env)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -4562,7 +4570,12 @@ mod tests {
 
         let (ok, output) = tokio::time::timeout(
             Duration::from_secs(10),
-            run_shell_command_with_timeout(dir.path(), &command, Duration::from_millis(500)),
+            run_shell_command_with_timeout(
+                dir.path(),
+                &command,
+                Duration::from_millis(500),
+                &std::collections::HashMap::new(),
+            ),
         )
         .await
         .expect("timed-out command must return promptly");
@@ -4585,6 +4598,44 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// The final gate's command executor must carry the same
+    /// KRANZ_BASE_SHA env that worker/validator sessions get, via the one
+    /// shared `runner::contract_env` constructor (mission m-d341a7's false
+    /// CRITICAL came from this gate omitting it).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn base_sha_reaches_final_gate_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = runner::contract_env(Some("deadbeefcafe"));
+        let (ok, output) = run_shell_command_with_timeout(
+            dir.path(),
+            "test \"$KRANZ_BASE_SHA\" = deadbeefcafe",
+            Duration::from_secs(10),
+            &env,
+        )
+        .await;
+        assert!(ok, "expected command to succeed: {output}");
+    }
+
+    /// `contract_env(None)` must yield no KRANZ_BASE_SHA key at all (not an
+    /// empty-string value) — locks in the None case for the final gate.
+    ///
+    /// This asserts directly on the map rather than spawning a subprocess:
+    /// `.envs()` overlays onto the inherited process env without clearing
+    /// it, so a subprocess-based check would pass or fail depending on
+    /// whether KRANZ_BASE_SHA happens to be set in the ambient environment
+    /// (e.g. because the engine's own final gate set it for this mission),
+    /// which is exactly the false-CRITICAL failure mode this test exists to
+    /// prevent.
+    #[test]
+    fn no_base_sha_means_no_gate_env_var() {
+        let env = runner::contract_env(None);
+        assert!(
+            !env.contains_key("KRANZ_BASE_SHA"),
+            "None base_sha must not define KRANZ_BASE_SHA in the gate env"
+        );
     }
 
     #[test]

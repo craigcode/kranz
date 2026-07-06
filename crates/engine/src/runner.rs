@@ -488,6 +488,17 @@ pub fn validator_report_schema() -> serde_json::Value {
 // Wrappers: worker / validator runs
 // ---------------------------------------------------------------------------
 
+/// The environment every contract-command execution context must carry, so
+/// worker, validator, and the engine's final gate can never diverge. Adds
+/// KRANZ_BASE_SHA only when a non-empty base SHA was pinned at approval.
+pub fn contract_env(base_sha: Option<&str>) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    if let Some(sha) = base_sha.filter(|s| !s.is_empty()) {
+        env.insert("KRANZ_BASE_SHA".to_string(), sha.to_string());
+    }
+    env
+}
+
 /// Run one worker session for a feature (plan §4.6).
 ///
 /// The rendered role prompt goes to `append_system_prompt`; the single-shot
@@ -680,10 +691,7 @@ fn build_worker_spec(
         max_turns: role_cfg.max_turns,
         env: HashMap::new(),
     };
-    if let Some(sha) = base_sha.filter(|s| !s.is_empty()) {
-        spec.env
-            .insert("KRANZ_BASE_SHA".to_string(), sha.to_string());
-    }
+    spec.env = contract_env(base_sha);
     permissions::apply(permissions::for_role(role, cfg, &[]), &mut spec);
 
     let run_meta = RunMeta {
@@ -796,10 +804,7 @@ pub async fn run_validator(
         max_turns: role_cfg.max_turns,
         env: HashMap::new(),
     };
-    if let Some(sha) = base_sha.filter(|s| !s.is_empty()) {
-        spec.env
-            .insert("KRANZ_BASE_SHA".to_string(), sha.to_string());
-    }
+    spec.env = contract_env(base_sha);
     permissions::apply(
         permissions::for_role(kind, cfg, &contract_commands),
         &mut spec,
