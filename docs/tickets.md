@@ -49,7 +49,11 @@ kranz queue                # the execution queue (approved, awaiting a run)
 ```
 
 Slack: `/kranz work` reports the queue read-only; the App Home tab shows
-the overview.
+the overview. The backlog is also browsable, draftable, and approvable
+from the dashboard's backlog panel (`#/backlog`, linked from the mission
+picker) — it lists the same slug/priority/state/title/blocked-by columns,
+drills into a ticket for its goal/context/needs-context, and drives
+draft/approve with the same blocked-by-aware gate described below.
 
 ## The pipeline: draft → review → approve → drain
 

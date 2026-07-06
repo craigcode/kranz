@@ -311,6 +311,61 @@ button {
   text-decoration-thickness: 1px;
 }
 
+/* ------------------------------------------------------- ticket states */
+
+.pill-new {
+  color: var(--dim);
+  background: var(--border);
+}
+
+.pill-drafting {
+  color: var(--blue);
+  background: var(--blue-soft);
+}
+
+.pill-drafting .status-dot {
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+.pill-needs-context {
+  color: var(--amber);
+  background: var(--amber-soft);
+}
+
+.pill-review {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.pill-queued {
+  color: var(--dim);
+  background: var(--border);
+}
+
+.pill-done {
+  color: #fff;
+  background: var(--green);
+}
+
+.ticket-blocker-badge {
+  flex: none;
+  font-size: 11px;
+  color: var(--red);
+  border: 1px solid var(--red);
+  border-radius: 10px;
+  padding: 0 6px;
+}
+
+.ticket-detail {
+  padding: 12px 16px 16px;
+  max-height: 80vh;
+  overflow-y: auto;
+}
+
+.ticket-section {
+  margin-top: 14px;
+}
+
 @keyframes pulse {
   0%,
   100% {

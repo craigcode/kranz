@@ -23,18 +23,28 @@ import { ModelPanel } from './components/ModelPanel';
 import { FeaturesPanel } from './components/FeaturesPanel';
 import { ProgressLog } from './components/ProgressLog';
 import { TokenPrompt } from './components/TokenPrompt';
+import { BacklogPanel } from './components/BacklogPanel';
+import { TicketDetail } from './components/TicketDetail';
 
 // Capture a `#token=<t>` from `kranz serve --open` BEFORE the router reads
 // the hash (resolveToken strips it and persists to sessionStorage).
 resolveToken();
 
-type Route = { view: 'picker' } | { view: 'new' } | { view: 'mission'; id: string };
+type Route =
+  | { view: 'picker' }
+  | { view: 'new' }
+  | { view: 'mission'; id: string }
+  | { view: 'backlog' }
+  | { view: 'ticket'; slug: string };
 
 function parseHash(): Route {
   const hash = window.location.hash;
   if (hash === '#/new') return { view: 'new' };
   const match = /^#\/m\/(.+)$/.exec(hash);
   if (match) return { view: 'mission', id: decodeURIComponent(match[1]) };
+  if (hash === '#/backlog') return { view: 'backlog' };
+  const ticketMatch = /^#\/backlog\/(.+)$/.exec(hash);
+  if (ticketMatch) return { view: 'ticket', slug: decodeURIComponent(ticketMatch[1]) };
   return { view: 'picker' };
 }
 
@@ -77,6 +87,22 @@ export default function App() {
     return (
       <>
         <NewMission />
+        <TokenPrompt />
+      </>
+    );
+  }
+  if (route.view === 'backlog') {
+    return (
+      <>
+        <BacklogPanel />
+        <TokenPrompt />
+      </>
+    );
+  }
+  if (route.view === 'ticket') {
+    return (
+      <>
+        <TicketDetail slug={route.slug} />
         <TokenPrompt />
       </>
     );

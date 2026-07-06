@@ -126,6 +126,15 @@ export function MissionPicker() {
           >
             + new mission
           </button>
+          <button
+            type="button"
+            className="btn-small"
+            onClick={() => {
+              window.location.hash = '#/backlog';
+            }}
+          >
+            backlog
+          </button>
         </div>
         {missionsError !== null && (
           <div className="picker-error" role="alert">
