@@ -635,21 +635,49 @@ pub async fn run_worker_in_buffered(
 /// instead of the real `~/.claude` (worker env hygiene). Worker-role sessions
 /// only — validator/orchestrator env is untouched by this function.
 ///
+/// Also injects `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL`/`GIT_COMMITTER_NAME`/
+/// `GIT_COMMITTER_EMAIL` carrying the engine's resolved git identity (see
+/// [`GitRepo::resolved_identity`]): relocating `HOME` hides the operator's
+/// global `~/.gitconfig` from the worker, and `GitRepo::ensure_identity`'s
+/// local-config write is conditional on no identity resolving anywhere — on
+/// a host where a *global* identity resolves, that write is skipped, so
+/// without this env injection a relocated-HOME worker's `git commit` would
+/// fail with "Author identity unknown."
+///
+/// The scratch-config-dir COPY source honors an operator `CLAUDE_CONFIG_DIR`
+/// override (falling back to `$HOME/.claude`) — the same resolution order
+/// `claude` itself uses.
+///
 /// Best-effort: if seeding the scratch dir fails (e.g. an unwritable temp
 /// dir), the worker falls back to inheriting the real `HOME`/`CLAUDE_CONFIG_DIR`
-/// (i.e. this function is a no-op) rather than failing spec construction.
+/// (i.e. the scratch-HOME half of this function is a no-op) rather than
+/// failing spec construction.
 fn seed_worker_env(spec: &mut SessionSpec) {
     let scratch_root = crate::backend_claude::scratch_home_root(&spec.session_id);
     let real_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    if let Ok((home, config_dir)) =
-        crate::backend_claude::seed_worker_scratch_home(&scratch_root, real_home.as_deref())
-    {
+    let real_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(std::path::PathBuf::from);
+    if let Ok((home, config_dir)) = crate::backend_claude::seed_worker_scratch_home(
+        &scratch_root,
+        real_home.as_deref(),
+        real_config_dir.as_deref(),
+    ) {
         spec.env
             .insert("HOME".to_string(), home.display().to_string());
         spec.env.insert(
             "CLAUDE_CONFIG_DIR".to_string(),
             config_dir.display().to_string(),
         );
+    }
+
+    if let Ok(repo) = crate::git_ops::GitRepo::open(&spec.cwd) {
+        if let Ok((name, email)) = repo.resolved_identity() {
+            for key in ["GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"] {
+                spec.env.insert(key.to_string(), name.clone());
+            }
+            for key in ["GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"] {
+                spec.env.insert(key.to_string(), email.clone());
+            }
+        }
     }
 }
 
@@ -958,5 +986,141 @@ mod tests {
         }"#;
         let report: ValidatorReport = serde_json::from_str(without_class).unwrap();
         assert_eq!(report.findings[0].class, "");
+    }
+
+    // -- worker env hygiene (ms-2-fix-1-1) ----------------------------------
+
+    fn minimal_worker_spec(cwd: std::path::PathBuf) -> SessionSpec {
+        SessionSpec {
+            cwd,
+            prompt: PromptMode::SingleShot("task".to_string()),
+            append_system_prompt: None,
+            model: "claude-sonnet-5".to_string(),
+            effort: "medium".to_string(),
+            session_id: uuid::Uuid::new_v4().to_string(),
+            resume: None,
+            permission_mode: None,
+            allowed_tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+            tools: Vec::new(),
+            settings_json: None,
+            json_schema: None,
+            max_budget_usd: None,
+            max_turns: None,
+            env: contract_env(Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")),
+        }
+    }
+
+    fn git(repo: &std::path::Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("git spawns")
+    }
+
+    /// Finding 1: a worker whose scratch HOME has no `.gitconfig` must still
+    /// be able to `git commit` — proving the injected `GIT_AUTHOR_*` /
+    /// `GIT_COMMITTER_*` env vars actually carry the identity through, not
+    /// merely that the keys are present.
+    #[test]
+    fn worker_env_hygiene_scratch_home_worker_can_commit() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        assert!(git(repo_dir.path(), &["init", "-q"]).status.success());
+
+        let mut spec = minimal_worker_spec(repo_dir.path().to_path_buf());
+        seed_worker_env(&mut spec);
+
+        // Existing contract env survives the scratch-env layering.
+        assert_eq!(
+            spec.env.get("KRANZ_BASE_SHA").map(String::as_str),
+            Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+        );
+
+        let home = spec.env.get("HOME").expect("scratch HOME set").clone();
+        assert!(
+            !std::path::Path::new(&home).join(".gitconfig").exists(),
+            "scratch HOME must carry no .gitconfig — that's the gap this test proves around"
+        );
+
+        for key in [
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "GIT_COMMITTER_NAME",
+            "GIT_COMMITTER_EMAIL",
+        ] {
+            assert!(spec.env.contains_key(key), "missing {key}");
+        }
+
+        std::fs::write(repo_dir.path().join("file.txt"), "content").unwrap();
+        assert!(git(repo_dir.path(), &["add", "."]).status.success());
+
+        let commit_status = std::process::Command::new("git")
+            .args(["commit", "-m", "worker commit under scratch HOME"])
+            .current_dir(repo_dir.path())
+            .envs(&spec.env)
+            .status()
+            .expect("git commit spawns");
+        assert!(
+            commit_status.success(),
+            "worker must be able to commit with the scratch HOME + injected git identity env"
+        );
+
+        let log = git(repo_dir.path(), &["log", "-1", "--format=%an <%ae>"]);
+        let logged = String::from_utf8_lossy(&log.stdout).trim().to_string();
+        let expected = format!(
+            "{} <{}>",
+            spec.env["GIT_AUTHOR_NAME"], spec.env["GIT_AUTHOR_EMAIL"]
+        );
+        assert_eq!(logged, expected);
+    }
+
+    /// Finding 2: the credential-copy SOURCE dir honors an operator
+    /// `CLAUDE_CONFIG_DIR` override rather than hardcoding `$HOME/.claude`.
+    #[test]
+    fn worker_env_hygiene_credential_source_honors_config_dir_override() {
+        let scratch = tempfile::tempdir().unwrap();
+        let real_home = tempfile::tempdir().unwrap();
+        let relocated_config = tempfile::tempdir().unwrap();
+
+        // Real $HOME/.claude has no credentials (operator relocated config).
+        std::fs::create_dir_all(real_home.path().join(".claude")).unwrap();
+
+        // The relocated CLAUDE_CONFIG_DIR does have credentials.
+        std::fs::write(
+            relocated_config.path().join(".credentials.json"),
+            "{\"secret\":true}",
+        )
+        .unwrap();
+
+        let (_, config_dir) = crate::backend_claude::seed_worker_scratch_home(
+            scratch.path(),
+            Some(real_home.path()),
+            Some(relocated_config.path()),
+        )
+        .unwrap();
+
+        let copied = config_dir.join(".credentials.json");
+        assert!(
+            copied.is_file(),
+            "credentials must be copied from the CLAUDE_CONFIG_DIR override, not $HOME/.claude"
+        );
+        assert_eq!(
+            std::fs::read_to_string(copied).unwrap(),
+            "{\"secret\":true}"
+        );
+    }
+
+    /// Validator sessions are untouched by worker env hygiene: no injected
+    /// HOME/CLAUDE_CONFIG_DIR or git identity env vars.
+    #[test]
+    fn worker_env_hygiene_validator_env_unaffected() {
+        let mut spec = minimal_worker_spec(std::env::temp_dir());
+        spec.env = contract_env(None);
+        // Validator spec construction never calls seed_worker_env at all;
+        // this asserts the baseline it must remain at.
+        assert!(!spec.env.contains_key("HOME"));
+        assert!(!spec.env.contains_key("CLAUDE_CONFIG_DIR"));
+        assert!(!spec.env.contains_key("GIT_AUTHOR_NAME"));
     }
 }

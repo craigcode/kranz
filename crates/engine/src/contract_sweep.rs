@@ -75,10 +75,7 @@ fn compile_touch_set(patterns: &[String]) -> Result<Vec<TouchPattern>, globset::
 /// Whether `path` is inside the touch-set: gitignore semantics, the LAST
 /// matching pattern decides; a plain (non-negated) match includes the path,
 /// a `!`-prefixed match excludes it; no match at all excludes by default.
-pub fn touch_set_includes(
-    patterns: &[String],
-    path: &str,
-) -> Result<bool, globset::Error> {
+pub fn touch_set_includes(patterns: &[String], path: &str) -> Result<bool, globset::Error> {
     let compiled = compile_touch_set(patterns)?;
     let mut included = false;
     for pat in &compiled {
@@ -147,7 +144,10 @@ pub fn primary_checkout_finding(
 ) -> Option<Finding> {
     let mut issues = Vec::new();
     if !is_clean {
-        issues.push("primary checkout has uncommitted changes (git status --porcelain is non-empty)".to_string());
+        issues.push(
+            "primary checkout has uncommitted changes (git status --porcelain is non-empty)"
+                .to_string(),
+        );
     }
     if current_branch != branch_at_start {
         issues.push(format!(
@@ -217,7 +217,11 @@ mod tests {
             commit: &c,
         }];
         let findings = path_findings(&touch_set, &changes);
-        assert_eq!(findings.len(), 1, "negated path must be flagged as out-of-contract");
+        assert_eq!(
+            findings.len(),
+            1,
+            "negated path must be flagged as out-of-contract"
+        );
     }
 
     #[test]
@@ -262,9 +266,15 @@ mod tests {
     #[test]
     fn engine_commit_exempt_meta_paths_never_flagged() {
         let mission_id = "m-abc123";
-        assert!(is_meta_path(mission_id, ".kranz/missions/m-abc123/plan.json"));
+        assert!(is_meta_path(
+            mission_id,
+            ".kranz/missions/m-abc123/plan.json"
+        ));
         assert!(is_meta_path(mission_id, ".kranz/missions/m-abc123/plan.md"));
-        assert!(is_meta_path(mission_id, ".kranz/missions/m-abc123/report.md"));
+        assert!(is_meta_path(
+            mission_id,
+            ".kranz/missions/m-abc123/report.md"
+        ));
         assert!(is_meta_path(mission_id, ".kranz/missions/index.md"));
         assert!(!is_meta_path(mission_id, "src/lib.rs"));
     }
@@ -305,8 +315,8 @@ mod tests {
 
     #[test]
     fn primary_checkout_moved_branch_yields_critical_finding() {
-        let finding =
-            primary_checkout_finding(true, "kranz/mission-m-abc123", "main").expect("moved branch must flag");
+        let finding = primary_checkout_finding(true, "kranz/mission-m-abc123", "main")
+            .expect("moved branch must flag");
         assert_eq!(finding.severity, "critical");
         assert!(finding.evidence.contains("main"));
     }

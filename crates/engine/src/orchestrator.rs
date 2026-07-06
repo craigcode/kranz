@@ -38,13 +38,13 @@
 
 use crate::backend::{AgentBackend, AgentEvent, AgentSession, PromptMode, SessionSpec};
 use crate::config;
+use crate::contract_sweep;
 use crate::control;
 use crate::cost;
 use crate::digest;
 use crate::error::{EngineError, Result};
 use crate::event_log::{EventLog, LockForce};
 use crate::events::{Event, EventKind};
-use crate::contract_sweep;
 use crate::git_ops::{CommitInfo, GitRepo};
 use crate::lessons;
 use crate::paths::MissionPaths;
@@ -5113,7 +5113,10 @@ mod tests {
         let start_sha = engine.repo.head_sha().unwrap();
 
         std::fs::write(root.join("anything.md"), "whatever\n").unwrap();
-        engine.repo.add_all_and_commit("[f-1] add anything").unwrap();
+        engine
+            .repo
+            .add_all_and_commit("[f-1] add anything")
+            .unwrap();
 
         let findings = engine.out_of_contract_sweep(&start_sha).unwrap();
         assert!(findings.is_empty(), "findings: {findings:?}");
@@ -5133,10 +5136,7 @@ mod tests {
         let start_sha = engine.repo.head_sha().unwrap();
 
         let mission_id = engine.state.mission.id.clone();
-        let plan_dir = root
-            .join(".kranz")
-            .join("missions")
-            .join(&mission_id);
+        let plan_dir = root.join(".kranz").join("missions").join(&mission_id);
         std::fs::create_dir_all(&plan_dir).unwrap();
         std::fs::write(plan_dir.join("plan.json"), "{}\n").unwrap();
         engine
@@ -5171,7 +5171,10 @@ mod tests {
         std::fs::write(root.join("README.md"), "should never change\n").unwrap();
 
         let findings = engine.out_of_contract_sweep(&start_sha).unwrap();
-        let primary_findings: Vec<_> = findings.iter().filter(|f| f.subject == "primary-checkout").collect();
+        let primary_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.subject == "primary-checkout")
+            .collect();
         assert_eq!(primary_findings.len(), 1, "findings: {findings:?}");
         assert_eq!(primary_findings[0].severity, "critical");
 

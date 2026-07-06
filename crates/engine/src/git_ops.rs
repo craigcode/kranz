@@ -553,6 +553,31 @@ impl GitRepo {
         Ok(())
     }
 
+    /// The git identity this repo resolves to right now: `(user.name,
+    /// user.email)` from any config scope (local/global/system) visible to
+    /// the calling process's environment, falling back to the same
+    /// `kranz`/`kranz@localhost` pair [`ensure_identity`] would write when
+    /// neither key resolves.
+    ///
+    /// Used to carry the *engine's* resolved identity into a worker session
+    /// whose relocated `HOME` can no longer see the operator's global
+    /// `~/.gitconfig` (see `GIT_AUTHOR_NAME` etc. injection in
+    /// `runner::seed_worker_env`).
+    pub fn resolved_identity(&self) -> Result<(String, String)> {
+        let resolve = |key: &str, fallback: &str| -> Result<String> {
+            let probe = self.probe(&["config", "--get", key])?;
+            let value = String::from_utf8_lossy(&probe.stdout).trim().to_string();
+            if probe.status.success() && !value.is_empty() {
+                Ok(value)
+            } else {
+                Ok(fallback.to_string())
+            }
+        };
+        let name = resolve("user.name", "kranz")?;
+        let email = resolve("user.email", "kranz@localhost")?;
+        Ok((name, email))
+    }
+
     // -- plumbing ----------------------------------------------------------
 
     /// Run git and return the raw `Output` without checking the exit status

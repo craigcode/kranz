@@ -315,7 +315,12 @@ pub fn scratch_home_root(session_id: &str) -> std::path::PathBuf {
 
 /// Seed `scratch_root` with a scratch `HOME` containing exactly the
 /// [`claude_min_config_entries`] allowlist, copied opaquely (bytes only, no
-/// parsing/logging of contents) from `real_home`'s `.claude` dir when present.
+/// parsing/logging of contents) from the real config dir when present.
+///
+/// The source config dir is `real_config_dir` when given (the operator's
+/// `CLAUDE_CONFIG_DIR` override, if set), else falls back to `real_home`'s
+/// `.claude` dir — mirroring how the `claude` CLI itself resolves its config
+/// location. Passing neither yields an empty (but present) scratch config.
 ///
 /// Returns `(home_dir, config_dir)`: `home_dir` is what the caller should set
 /// `HOME` to (so `$HOME/.claude.json` resolves inside the sandbox), and
@@ -326,15 +331,18 @@ pub fn scratch_home_root(session_id: &str) -> std::path::PathBuf {
 pub fn seed_worker_scratch_home(
     scratch_root: &std::path::Path,
     real_home: Option<&std::path::Path>,
+    real_config_dir: Option<&std::path::Path>,
 ) -> std::io::Result<(std::path::PathBuf, std::path::PathBuf)> {
     let home_dir = scratch_root.join("home");
     let config_dir = home_dir.join(".claude");
     std::fs::create_dir_all(&config_dir)?;
 
-    if let Some(real_home) = real_home {
-        let real_config_dir = real_home.join(".claude");
+    let source_config_dir = real_config_dir
+        .map(std::path::Path::to_path_buf)
+        .or_else(|| real_home.map(|home| home.join(".claude")));
+    if let Some(source_config_dir) = source_config_dir {
         for entry in claude_min_config_entries() {
-            let src = real_config_dir.join(entry);
+            let src = source_config_dir.join(entry);
             if src.is_file() {
                 std::fs::copy(&src, config_dir.join(entry))?;
             }
