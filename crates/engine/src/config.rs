@@ -184,7 +184,7 @@ mod tests {
 
     #[test]
     fn default_auto_work_is_false() {
-        assert_eq!(MissionConfig::default().auto_work, false);
+        assert!(!MissionConfig::default().auto_work);
     }
 
     #[test]
@@ -200,7 +200,7 @@ mod tests {
         std::fs::write(&layer_path, r#"{"autoWork": true}"#).unwrap();
 
         let cfg = load_layers(&[layer_path]).unwrap();
-        assert_eq!(cfg.auto_work, true);
+        assert!(cfg.auto_work);
     }
 
     #[test]
@@ -210,6 +210,6 @@ mod tests {
         std::fs::write(&layer_path, r#"{"maxRespawns": 3}"#).unwrap();
 
         let cfg = load_layers(&[layer_path]).unwrap();
-        assert_eq!(cfg.auto_work, false);
+        assert!(!cfg.auto_work);
     }
 }

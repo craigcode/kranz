@@ -1396,7 +1396,7 @@ pub(crate) fn parse_body(body: &Bytes) -> Result<Value, ApiError> {
 mod tests {
     use super::*;
     use axum::http::StatusCode;
-    use kranz_engine::backend_mock::MockBackend;
+    use kranz_engine::backend_mock::{mock_init, mock_result_text, MockBackend, MockScript};
     use std::process::Command;
     use std::sync::Once;
 
@@ -1938,5 +1938,190 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // -----------------------------------------------------------------------
+    // autoWork watcher (roadmap f-2-3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn should_auto_drain_truth_table() {
+        // Only true when all three conditions line up.
+        assert!(should_auto_drain(true, true, false));
+        // autoWork off: never drain, regardless of the queue or live state.
+        assert!(!should_auto_drain(false, true, false));
+        assert!(!should_auto_drain(false, false, false));
+        // Queue empty: nothing to drain even with autoWork on.
+        assert!(!should_auto_drain(true, false, false));
+        // A drain is already live: never start a second one.
+        assert!(!should_auto_drain(true, true, true));
+        assert!(!should_auto_drain(false, false, true));
+    }
+
+    /// Writes `{"autoWork": enabled}` to the repo's `.kranz/config.json`
+    /// (the project config layer `config::load` reads on every call,
+    /// including the watcher's per-tick reload).
+    fn write_auto_work_config(root: &std::path::Path, enabled: bool) {
+        let dir = root.join(".kranz");
+        std::fs::create_dir_all(&dir).expect("create .kranz dir");
+        std::fs::write(
+            dir.join("config.json"),
+            json!({ "autoWork": enabled }).to_string(),
+        )
+        .expect("write config.json");
+    }
+
+    /// One orchestrator turn batch: text + matching Result (mirrors the
+    /// identical helper in `tests/host_test.rs`).
+    fn turn(reply: &str) -> Vec<kranz_engine::backend::AgentEvent> {
+        vec![
+            kranz_engine::backend_mock::mock_text(reply),
+            mock_result_text(reply),
+        ]
+    }
+
+    /// Worker script: completed single-shot run with a passing WorkerReport.
+    fn worker_pass() -> MockScript {
+        MockScript::single_shot_json(&json!({
+            "result": "pass",
+            "summary": "implemented and tested",
+            "filesTouched": [],
+            "testsAdded": [],
+            "testEvidence": "all green",
+            "commits": []
+        }))
+    }
+
+    /// A minimal one-milestone/one-feature plan in wire (camelCase) shape.
+    fn plan_json() -> Value {
+        json!({
+            "goal": "ship the demo",
+            "validationContract": [],
+            "milestones": [{
+                "title": "M1",
+                "features": [{
+                    "title": "F1",
+                    "spec": "build the thing",
+                    "validationCriteria": ["it works"]
+                }]
+            }]
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn auto_work_tick_drains_a_queued_mission_when_enabled() {
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
+        write_auto_work_config(&root, true);
+
+        let judgement =
+            json!({ "decision": "complete", "guidance": "", "summary": "worker did the job" });
+        let orch = MockScript::streaming(vec![mock_init("orch-auto"), mock_result_text("seed-hi")])
+            .responding(vec![
+                turn("scoping the demo"),
+                turn(&plan_json().to_string()),
+            ]);
+        let orch_run = MockScript::streaming(vec![
+            mock_init("orch-auto-run"),
+            mock_result_text("resumed"),
+        ])
+        .responding(vec![turn(&judgement.to_string()), turn("NONE")]);
+        let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::with_scripts(vec![
+            orch,
+            worker_pass(),
+            orch_run,
+        ]));
+        let host = MissionHost::with_backend(root.clone(), backend);
+
+        let id = host
+            .create(
+                "drain me via autoWork",
+                Some(&json!({ "skipScrutiny": true, "skipFunctional": true })),
+            )
+            .await
+            .expect("create mission");
+        host.planning_turn(&id, "go").await.expect("planning turn");
+        let plan_body = host.request_plan(&id).await.expect("request plan");
+        assert_eq!(plan_body["ready"], true, "{plan_body}");
+        let plan: Plan =
+            serde_json::from_value(plan_body["plan"].clone()).expect("plan deserializes");
+        host.approve(&id, plan).await.expect("approve");
+        host.release(&id).expect("release");
+
+        kranz_engine::queue::enqueue(
+            &root,
+            kranz_engine::queue::QueueEntry {
+                mission_id: id.clone(),
+                ticket_slug: None,
+                priority: 2,
+                seq: 0,
+            },
+        )
+        .expect("enqueue");
+
+        // No explicit drain()/POST call — the watcher's tick alone must
+        // notice the queued entry and kick a drain off.
+        host.auto_work_tick().await;
+        assert!(
+            host.drain_is_live(),
+            "autoWork tick with autoWork=true and a non-empty queue must start a drain"
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let state = host.queue_state();
+            if state["entries"]
+                .as_array()
+                .map(|a| a.is_empty())
+                .unwrap_or(false)
+                && state["drain"]["live"] == false
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "autoWork drain never completed: {state}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_work_tick_leaves_the_queue_untouched_when_disabled() {
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
+        // Absent key: default is false, exercised the same as an explicit
+        // `{"autoWork": false}` layer. No mission needs to actually be
+        // runnable here — the watcher must never even attempt a drain, so a
+        // bare queue entry is enough to prove it's left alone.
+        let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+        let host = MissionHost::with_backend(root.clone(), backend);
+
+        kranz_engine::queue::enqueue(
+            &root,
+            kranz_engine::queue::QueueEntry {
+                mission_id: "m-untouched".to_string(),
+                ticket_slug: None,
+                priority: 2,
+                seq: 0,
+            },
+        )
+        .expect("enqueue");
+
+        host.auto_work_tick().await;
+
+        assert!(
+            !host.drain_is_live(),
+            "autoWork=false must never start a drain"
+        );
+        let entries = kranz_engine::queue::list(&root);
+        assert_eq!(
+            entries.len(),
+            1,
+            "queue entry must be left untouched when autoWork is disabled: {entries:?}"
+        );
+        assert_eq!(entries[0].mission_id, "m-untouched");
     }
 }
