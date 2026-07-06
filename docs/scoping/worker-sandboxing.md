@@ -116,8 +116,13 @@ mission, sequential included.
 
 ## Open questions
 
-1. Minimal file/dir set the `claude` CLI needs to authenticate and run —
-   probe before Tier 1 env hygiene lands.
+1. **Resolved 2026-07-06** — minimal file/dir set the `claude` CLI needs to
+   authenticate and run headless: see
+   `docs/scoping/claude-cli-min-env.md` for the full probe (credential
+   path, `CLAUDE_CONFIG_DIR` relocation semantics, macOS Keychain-vs-file
+   distinction). The entry set is encoded as
+   `crates/engine/src/backend_claude.rs::claude_min_config_entries` for the
+   scratch-HOME-seeding feature to consume.
 2. Seatbelt is deprecated-but-ubiquitous; acceptable dependency? (Fallbacks
    are all heavier.)
 3. Do MCP servers spawned inside a session inherit the sandbox? (Should, as

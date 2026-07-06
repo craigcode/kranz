@@ -278,6 +278,30 @@ fn probe_version(binary: &Path) -> std::result::Result<String, String> {
 }
 
 // ---------------------------------------------------------------------------
+// Minimal config-dir entry set (worker-sandboxing open question 1)
+// ---------------------------------------------------------------------------
+
+/// The credential entry the `claude` CLI reads for file-based (non-Keychain)
+/// OAuth auth, relative to `CLAUDE_CONFIG_DIR` (default `$HOME/.claude`).
+pub const CLAUDE_CREDENTIALS_ENTRY: &str = ".credentials.json";
+
+/// Single source of truth for the minimal `CLAUDE_CONFIG_DIR` entry set a
+/// scratch worker HOME/config dir needs to carry so the `claude` CLI can
+/// authenticate and run headless (`-p --output-format stream-json`).
+///
+/// See `docs/scoping/claude-cli-min-env.md` for the full probe: why
+/// `.credentials.json` is required for file-based auth but irrelevant when
+/// auth comes from the macOS Keychain or `ANTHROPIC_API_KEY`, and why
+/// `CLAUDE_CONFIG_DIR` relocation does not also relocate `$HOME/.claude.json`
+/// (a worker HOME must be set too for that file to land in the sandbox).
+///
+/// Names only — never actual secret values. Consumed by the (not-yet-built)
+/// scratch-HOME-seeding feature; not wired into spawning here.
+pub fn claude_min_config_entries() -> &'static [&'static str] {
+    &[CLAUDE_CREDENTIALS_ENTRY]
+}
+
+// ---------------------------------------------------------------------------
 // Argument construction
 // ---------------------------------------------------------------------------
 

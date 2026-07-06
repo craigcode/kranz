@@ -9,7 +9,8 @@ use kranz_engine::backend::{
     AgentBackend, AgentEvent, AgentSession, PromptMode, SessionExit, SessionSpec,
 };
 use kranz_engine::backend_claude::{
-    build_args, discover_claude_binary, parse_stream_line, user_message_line, ClaudeBackend,
+    build_args, claude_min_config_entries, discover_claude_binary, parse_stream_line,
+    user_message_line, ClaudeBackend, CLAUDE_CREDENTIALS_ENTRY,
 };
 use kranz_engine::error::EngineError;
 use serde_json::json;
@@ -1035,4 +1036,18 @@ async fn real_single_shot() {
         "expected a successful Result containing KRANZ_OK"
     );
     assert_eq!(session.exit_status(), Some(SessionExit::Completed));
+}
+
+#[test]
+fn claude_min_set_is_non_empty_and_includes_credentials() {
+    let entries = claude_min_config_entries();
+    assert!(
+        !entries.is_empty(),
+        "minimal claude config entry set must not be empty"
+    );
+    assert!(
+        entries.contains(&CLAUDE_CREDENTIALS_ENTRY),
+        "minimal claude config entry set must include the credentials entry: {entries:?}"
+    );
+    assert_eq!(CLAUDE_CREDENTIALS_ENTRY, ".credentials.json");
 }
