@@ -98,6 +98,7 @@ fn ticket_summary_json(repo_root: &std::path::Path, ticket: &Ticket) -> Value {
         "state": state,
         "title": ticket.title,
         "blockedBy": ticket.blocked_by,
+        "isBlocked": kranz_engine::deps::is_blocked(repo_root, &ticket.slug).unwrap_or(false),
     })
 }
 
@@ -117,6 +118,7 @@ fn ticket_full_json(repo_root: &std::path::Path, ticket: &Ticket) -> Value {
         "acceptanceHints": ticket.acceptance_hints,
         "state": state,
         "needsContext": needs_context_questions(&ticket.raw_body),
+        "isBlocked": kranz_engine::deps::is_blocked(repo_root, &ticket.slug).unwrap_or(false),
     })
 }
 
