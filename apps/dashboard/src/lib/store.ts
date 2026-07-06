@@ -493,7 +493,7 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
       if (id === null || review === null) return;
       patchPlanning({ error: null });
       api
-        .approvePlan(id, review.plan)
+        .approvePending(id)
         .then(({ branch }) => {
           if (get().missionId !== id) return;
           patchPlanning({ approvedBranch: branch });
