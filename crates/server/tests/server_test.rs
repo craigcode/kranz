@@ -504,6 +504,33 @@ async fn diff_stat_404s_when_mission_branch_does_not_exist() {
 }
 
 #[tokio::test]
+async fn diff_stat_500s_when_pinned_base_sha_does_not_resolve() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo_root, base_sha) = init_repo();
+    // Branch exists (create_branch=true), but the pinned base_sha is bogus, so
+    // `git diff --stat <bogus>..<tip>` fails inside git and the handler's `?`
+    // must degrade to a 500 with a JSON error body, not panic.
+    let bogus_base = "0000000000000000000000000000000000000000";
+    seed_diffable_mission(&repo_root, "m-badbase", &base_sha, true);
+    // Overwrite the pinned base_sha to the bogus value directly in the log.
+    let paths = MissionPaths::new(&repo_root, "m-badbase");
+    let mut log = EventLog::acquire(&paths, "m-badbase", Duration::ZERO, LockForce::No).unwrap();
+    log.append(EventKind::PlanApproved {
+        plan: sample_plan(),
+        base_sha: Some(bogus_base.to_string()),
+    })
+    .unwrap();
+    drop(log);
+    let app = kranz_server::router(repo_root.clone(), None);
+
+    let (status, body) = get_json(&app, "/api/missions/m-badbase/diff-stat").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(body["error"].is_string());
+}
+
+#[tokio::test]
 async fn missions_list_reports_merged_true_when_branch_is_merged_into_base() {
     if !setup() {
         return;

@@ -822,6 +822,26 @@ fn is_ancestor_true_for_a_commit_and_itself() {
 }
 
 #[test]
+fn is_ancestor_errs_on_non_resolving_ref() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo, seed) = seeded_repo();
+
+    // A well-formed but non-existent sha (not flag-shaped) makes `git
+    // merge-base --is-ancestor` exit 128 — neither 0 nor 1 — which must
+    // surface as a genuine EngineError::Git, not Ok(true)/Ok(false).
+    let bogus = "0000000000000000000000000000000000000000";
+    let err = repo
+        .is_ancestor(bogus, &seed)
+        .expect_err("non-resolving ref must be a git error, not Ok");
+    assert!(
+        matches!(err, EngineError::Git(_)),
+        "expected EngineError::Git, got: {err:?}"
+    );
+}
+
+#[test]
 fn is_ancestor_rejects_flag_shaped_refs() {
     if !setup() {
         return;
