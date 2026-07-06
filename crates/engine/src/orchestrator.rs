@@ -4755,6 +4755,54 @@ mod tests {
         assert!(!path.exists(), "integration worktree dir must be gone");
     }
 
+    /// A mission integration worktree left behind by a crashed engine (never
+    /// torn down) is reaped by `resume()`'s crash-recovery sweep, the same
+    /// way per-feature worktrees are (orchestrator.rs:~408-414, M7 tier 1).
+    #[test]
+    fn resume_reaps_leaked_integration_worktree() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
+        let engine =
+            MissionEngine::create(backend.clone(), &root, "goal", MissionConfig::default())
+                .unwrap();
+        let mission_id = engine.state.mission.id.clone();
+
+        let (path, _wt_repo) = engine.setup_mission_worktree().expect("setup");
+        assert_eq!(path, mission_worktree_path(&mission_id));
+        assert!(path.exists(), "integration worktree dir must exist");
+
+        let listed = engine.repo.list_worktrees().unwrap();
+        let canon_path = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        assert!(
+            listed
+                .iter()
+                .any(|p| std::path::Path::new(p) == canon_path.as_path()),
+            "integration worktree not in list_worktrees before crash: {listed:?}"
+        );
+
+        // Simulate a crash: drop the engine WITHOUT tearing down the
+        // integration worktree, releasing the single-writer lock so resume()
+        // can re-acquire it.
+        drop(engine);
+
+        let resumed = MissionEngine::resume(backend, &root, &mission_id, LockForce::No)
+            .expect("resume should reap the leaked integration worktree and succeed");
+
+        let after = resumed.repo.list_worktrees().unwrap();
+        assert!(
+            !after
+                .iter()
+                .any(|p| std::path::Path::new(p) == canon_path.as_path()),
+            "integration worktree still listed after resume: {after:?}"
+        );
+        assert!(
+            !path.exists(),
+            "integration worktree dir must be pruned after resume"
+        );
+    }
+
     /// `mission_worktree_path` never collides with a per-feature
     /// `parallel_worktree_path`, even for an adversarial feature id.
     #[test]

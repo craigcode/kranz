@@ -350,17 +350,12 @@ pub enum BackendKind {
 }
 
 /// How worker/validator sessions are isolated from the primary checkout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum WorkerIsolation {
     Worktree,
+    #[default]
     Checkout,
-}
-
-impl Default for WorkerIsolation {
-    fn default() -> Self {
-        WorkerIsolation::Checkout
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
