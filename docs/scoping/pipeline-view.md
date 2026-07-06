@@ -66,20 +66,18 @@ Reviewable can show them — today they die in draft stdout.
 **Recommendation:** as above. Foreclosed if rejected: nothing — copy is
 cheap; deciding twice is not.
 
-## D-B — who drains the queue (resolves gascity-citizenship D5)
+## D-B — who drains the queue (DECIDED 2026-07-05, resolves gascity D5)
 
-Options: (1) serve grows an OPT-IN background drain (`autoWork: true` in
-config); (2) `kranz work` stays the only dispatcher, run manually or under
-a supervisor (launchd/Gas City).
-
-**Recommendation: (1), opt-in, default off.** Serve already hosts runs and
-holds the registry; the queue is crash-safe (atomic claims, dead-claim
-recovery); opt-in preserves the human-on-the-trigger posture for anyone
-who wants it, and the Gas City pack keeps using the external dispatcher
-unchanged. With autoWork on, "Queue" from any surface IS end-to-end: the
-run starts when the repo frees up, no terminal anywhere. Foreclosed:
-nothing — the external dispatcher path remains fully supported (the two
-dispatchers already contend safely via the claim machinery).
+DECIDED: running the queue must be available from BOTH web UI and Slack.
+Shape: serve owns the drain as a background task; both surfaces get an
+explicit trigger — a "Run queue" affordance in the dashboard and
+`/kranz work run` in Slack (the bridge NEVER runs missions on the socket
+loop; the verb POSTs to serve, which spawns the drain task — same pattern
+as start). REST: token-gated POST /api/queue/drain (idempotent: a drain
+already running returns its state). Config `autoWork: true` additionally
+drains automatically whenever entries queue (opt-in, default off). The
+external `kranz work` dispatcher remains fully supported — the claim
+machinery already arbitrates concurrent dispatchers safely.
 
 ## D-C — does kranz merge? (OPERATOR DECISION)
 
@@ -91,10 +89,13 @@ tests, clippy -D warnings, fmt, dashboard tsc+build when touched); merges
 --no-ff to the base branch on success; NEVER pushes. Push remains a human
 git command. Failure shows the failing gate verbatim.
 
-**Recommendation: yes.** This converts the merge from git archaeology to a
-reviewed click while keeping publication human. Foreclosed if rejected:
-the Delivered stage keeps a copy-paste command block instead of a button
-(acceptable fallback; the view ships either way).
+DECIDED 2026-07-05: yes — and BOTH deliverable review and the merge act
+must be available from web UI and Slack alike. Web: report.md + diff stat
+rendered inline at Delivered, Merge button. Slack: a Delivered card
+(report summary + diff stat + deep link for the long read) with a gated
+Merge button/verb (`/kranz merge <slug|id>`, allowlist-gated — merging
+shapes main, so it is spend-adjacent in trust terms). The merge remains
+HUMAN-triggered on every surface; kranz still never pushes.
 
 ## D-D — the queue gate stays human (DECIDED 2026-07-05)
 
@@ -124,12 +125,15 @@ is confirmed, not optional.
 2. **The pipeline view.** One screen, one row per work item, stage chips
    per the model above, artifacts and actions inline. Consumes slice 1.
    Includes the D-A verb copy.
-3. **autoWork drain** (if D-B accepted): config-gated serve background
-   drain reusing the dispatcher's claim/skip logic verbatim from
-   cli backlog (hoist to engine if needed — same pattern as the draft
-   hoist).
-4. **Merge affordance** (if D-C accepted): the gated merge, REST + button
-   + Slack verb.
+3. **Queue running via serve** (D-B decided): hoist the dispatcher's
+   drain/claim/skip loop to be host-callable (same pattern as the draft
+   hoist); POST /api/queue/drain; dashboard "Run queue" affordance;
+   Slack `/kranz work run` (posts to serve, never runs on the socket
+   loop); optional autoWork config.
+4. **Deliverable review + merge on both surfaces** (D-C decided): the
+   gated merge (gates → --no-ff → never push); report/diff rendered at
+   Delivered in the dashboard; Slack Delivered card + allowlist-gated
+   /kranz merge.
 5. **Ticket capture everywhere:** dashboard new-ticket form; Slack
    `/kranz ticket new <slug> <title...>` opening the modal pattern for
    goal/context. (Small; can ride with slice 2.)
