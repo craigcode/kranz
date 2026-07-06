@@ -317,6 +317,80 @@ async fn pending_plan_parks_on_ready_and_approve_pending_commits() {
     assert_eq!(status, StatusCode::CONFLICT);
 }
 
+#[tokio::test]
+async fn approve_clears_parked_plan_so_no_stale_slack_approve() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let orch = MockScript::streaming(vec![mock_init("orch-pp"), mock_result_text("seed")])
+        .responding(vec![turn("scoping"), turn(&plan_json().to_string())]);
+    let backend = Arc::new(MockBackend::with_scripts(vec![orch]));
+    let app = hosted_app(&root, backend);
+
+    let (status, body) = post_json(
+        &app,
+        "/api/missions",
+        Some(TOKEN),
+        json!({ "goal": "park a plan" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id = body["id"].as_str().unwrap().to_string();
+
+    let (status, _) = post_json(
+        &app,
+        &format!("/api/missions/{id}/planning/turn"),
+        Some(TOKEN),
+        json!({ "text": "go" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/missions/{id}/planning/request-plan"),
+        Some(TOKEN),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ready"], true);
+    let plan = body["plan"].clone();
+
+    let (status, body) = get_json(&app, &format!("/api/missions/{id}/pending-plan")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["pending"], true);
+
+    // Reproduce the OLD dashboard path: direct POST /approve with a
+    // client-held copy of the plan, bypassing the pending-plan cache.
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/missions/{id}/approve"),
+        Some(TOKEN),
+        json!({ "plan": plan }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["branch"], format!("kranz/mission-{id}"));
+
+    // The parked plan must be cleared by the direct approve too.
+    let (status, body) = get_json(&app, &format!("/api/missions/{id}/pending-plan")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["pending"], false, "{body}");
+
+    // A later Slack /kranz approve must not re-run against the
+    // already-approved mission — it should be an honest 409, not a
+    // stale re-approve or a 500.
+    let (status, _) = post_json(
+        &app,
+        &format!("/api/missions/{id}/approve-pending"),
+        Some(TOKEN),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
 // ---------------------------------------------------------------------------
 // Abandon / delete (web twins of `kranz abandon` / `kranz clean`)
 // ---------------------------------------------------------------------------
