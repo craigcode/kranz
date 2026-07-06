@@ -776,6 +776,100 @@ fn add_worktree_rejects_flag_shaped_arguments() {
 }
 
 // ---------------------------------------------------------------------------
+// add_worktree_checkout (M7 tier 1 mission integration worktree primitive)
+// ---------------------------------------------------------------------------
+
+/// add_worktree_checkout puts an EXISTING branch into a new worktree whose
+/// HEAD equals that branch's tip.
+#[test]
+fn add_worktree_checkout_existing_branch_at_its_tip() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo, seed) = seeded_repo();
+    repo.create_branch("feature-x", Some(&seed)).unwrap();
+    // Advance feature-x one commit past the seed, via its own worktree, so
+    // "main" (checked out in the primary tree) is never touched twice.
+    let advance_base = tempfile::tempdir().unwrap();
+    let advance_wt = worktree_dir(&advance_base, "advance");
+    repo.add_worktree_checkout(&advance_wt, "feature-x")
+        .unwrap();
+    let advance_repo = GitRepo::open(&advance_wt).unwrap();
+    std::fs::write(advance_wt.join("on-branch.txt"), "branch work\n").unwrap();
+    let tip = advance_repo
+        .add_all_and_commit("advance feature-x")
+        .unwrap();
+    assert_ne!(seed, tip);
+    repo.remove_worktree(&advance_wt).unwrap();
+    repo.prune_worktrees().unwrap();
+
+    let wt_base = tempfile::tempdir().unwrap();
+    let wt = worktree_dir(&wt_base, "checkout-existing");
+    repo.add_worktree_checkout(&wt, "feature-x").unwrap();
+
+    let wt_repo = GitRepo::open(&wt).expect("open worktree as repo");
+    assert_eq!(wt_repo.head_sha().unwrap(), tip);
+    assert_eq!(wt_repo.current_branch().unwrap(), "feature-x");
+
+    // No new branch was created; the primary checkout is untouched.
+    assert_eq!(repo.current_branch().unwrap(), "main");
+
+    repo.remove_worktree(&wt).unwrap();
+    repo.prune_worktrees().unwrap();
+}
+
+/// add_worktree_checkout refuses a flag-shaped branch before spawning git.
+#[test]
+fn add_worktree_checkout_rejects_flag_shaped_branch() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo, _seed) = seeded_repo();
+    let wt_base = tempfile::tempdir().unwrap();
+    let wt = worktree_dir(&wt_base, "flag");
+    let err = repo
+        .add_worktree_checkout(&wt, "--force")
+        .expect_err("flag-shaped branch must be refused");
+    assert!(
+        matches!(err, EngineError::Git(_)),
+        "expected EngineError::Git, got: {err:?}"
+    );
+    assert!(
+        !wt.exists(),
+        "no worktree dir should exist after a refused add"
+    );
+}
+
+/// A branch already checked out in one worktree cannot be checked out again
+/// in a second worktree (git's own rule) — add_worktree_checkout surfaces
+/// that as an EngineError::Git rather than silently succeeding.
+#[test]
+fn add_worktree_checkout_rejects_branch_already_checked_out_elsewhere() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo, seed) = seeded_repo();
+    repo.create_branch("kranz/mission-x", Some(&seed)).unwrap();
+
+    let wt_base = tempfile::tempdir().unwrap();
+    let wt_a = worktree_dir(&wt_base, "first");
+    repo.add_worktree_checkout(&wt_a, "kranz/mission-x")
+        .unwrap();
+
+    let wt_b = worktree_dir(&wt_base, "second");
+    let err = repo
+        .add_worktree_checkout(&wt_b, "kranz/mission-x")
+        .expect_err("git must refuse checking out the same branch twice");
+    assert!(
+        matches!(err, EngineError::Git(_)),
+        "expected EngineError::Git, got: {err:?}"
+    );
+
+    repo.remove_worktree(&wt_a).unwrap();
+    repo.prune_worktrees().unwrap();
+}
+
+// ---------------------------------------------------------------------------
 // is_ancestor
 // ---------------------------------------------------------------------------
 

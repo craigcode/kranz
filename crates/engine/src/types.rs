@@ -349,6 +349,15 @@ pub enum BackendKind {
     Codex,
 }
 
+/// How worker/validator sessions are isolated from the primary checkout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkerIsolation {
+    Worktree,
+    #[default]
+    Checkout,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct MissionConfig {
@@ -377,6 +386,8 @@ pub struct MissionConfig {
     /// Path to the claude binary (auto-discovered when None).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claude_binary: Option<String>,
+    /// How worker/validator sessions are isolated (§M7 tier 1).
+    pub worker_isolation: WorkerIsolation,
 }
 
 impl Default for MissionConfig {
@@ -426,11 +437,16 @@ impl Default for MissionConfig {
             allow_validator_commands: vec![],
             dangerously_allow_all: false,
             claude_binary: None,
+            worker_isolation: WorkerIsolation::Checkout,
         }
     }
 }
 
 impl MissionConfig {
+    pub fn isolation(&self) -> WorkerIsolation {
+        self.worker_isolation
+    }
+
     pub fn role(&self, role: Role) -> &RoleConfig {
         match role {
             Role::Orchestrator => &self.orchestrator,

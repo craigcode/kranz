@@ -57,7 +57,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -272,6 +272,13 @@ pub struct MissionEngine {
     /// successful probe; a failed probe is never cached (so a codex install
     /// that appears mid-mission is picked up on the next scrutiny round).
     codex_backend: Option<Arc<dyn AgentBackend>>,
+    /// The tree mission-branch work runs in for the current `run()` call
+    /// (M7 tier 1). `None` in checkout mode (and before the first `run()`),
+    /// where [`Self::active_root`]/[`Self::active_repo`] fall back to
+    /// `self.paths.repo_root`/`self.repo`. In worktree mode, `run()` sets
+    /// this to the mission integration worktree from `setup_mission_worktree`
+    /// for the duration of the run.
+    active_tree: Option<(PathBuf, GitRepo)>,
 }
 
 impl MissionEngine {
@@ -341,6 +348,7 @@ impl MissionEngine {
             orch_stall_timeout: DEFAULT_ORCH_STALL_TIMEOUT,
             pending_seed_reply: None,
             codex_backend: None,
+            active_tree: None,
         })
     }
 
@@ -405,6 +413,13 @@ impl MissionEngine {
                 }
             }
         }
+        // A leaked mission integration worktree (M7 tier 1) is the same story:
+        // it exists only while a lock-holding engine has one set up, so with
+        // the lock now held it is a crash leak. Reap it the same way.
+        let integration_path = mission_worktree_path(mission_id);
+        if integration_path.exists() {
+            let _ = repo.remove_worktree(&integration_path);
+        }
         let _ = repo.prune_worktrees();
         for milestone in &state.mission.milestones {
             for feature in &milestone.features {
@@ -429,6 +444,7 @@ impl MissionEngine {
             orch_stall_timeout: DEFAULT_ORCH_STALL_TIMEOUT,
             pending_seed_reply: None,
             codex_backend: None,
+            active_tree: None,
         })
     }
 
@@ -449,6 +465,34 @@ impl MissionEngine {
     /// Mission data paths.
     pub fn paths(&self) -> &MissionPaths {
         &self.paths
+    }
+
+    /// The tree mission-branch git operations run in for the current run
+    /// (M7 tier 1). Checkout mode (or before the first `run()` in worktree
+    /// mode): the primary repo root. Worktree mode mid-run: the mission
+    /// integration worktree set up by `run()`.
+    fn active_root(&self) -> &Path {
+        match &self.active_tree {
+            Some((root, _)) => root.as_path(),
+            None => self.paths.repo_root.as_path(),
+        }
+    }
+
+    /// The [`GitRepo`] paired with [`Self::active_root`].
+    fn active_repo(&self) -> &GitRepo {
+        match &self.active_tree {
+            Some((_, repo)) => repo,
+            None => &self.repo,
+        }
+    }
+
+    /// [`MissionPaths`] rooted at [`Self::active_root`] (mirrors `self.paths`'
+    /// join logic, just against whichever tree mission-branch git ops run in
+    /// right now). Use this instead of `self.paths` for any file that gets
+    /// committed onto the mission branch, so worktree mode writes land in the
+    /// integration worktree rather than the primary checkout.
+    fn active_paths(&self) -> MissionPaths {
+        MissionPaths::new(self.active_root(), self.state.mission.id.clone())
     }
 
     /// Shrink the orchestrator stall timeout (tests exercise the death/reseed
@@ -683,9 +727,16 @@ impl MissionEngine {
         }
     }
 
-    /// Approve a plan: normalize it, create + check out the mission branch,
-    /// write and commit `plan.json` (the engine writes and commits — the
-    /// orchestrator never touches files, plan §4.4), and emit `plan.approved`.
+    /// Approve a plan: normalize it, create the mission branch, write and
+    /// commit `plan.json` (the engine writes and commits — the orchestrator
+    /// never touches files, plan §4.4), and emit `plan.approved`.
+    ///
+    /// Worktree mode (M7 tier 1): the branch is created but never checked
+    /// out in the primary tree; the commit instead happens in a short-lived
+    /// integration worktree (`setup_mission_worktree`/`teardown_mission_worktree`,
+    /// same helpers `run()` uses for the rest of the mission), so the primary
+    /// checkout never moves off its starting branch. Checkout mode is
+    /// unchanged: check out the branch in the primary tree and commit there.
     pub fn approve_plan(&mut self, mut plan: Plan) -> Result<()> {
         if self.state.mission.status != MissionStatus::Planning {
             return Err(EngineError::InvalidState(format!(
@@ -713,18 +764,19 @@ impl MissionEngine {
         if !self.repo.branch_exists(&branch)? {
             self.repo.create_branch(&branch, Some(&base))?;
         }
-        self.repo.checkout(&branch)?;
+        let worktree_mode = self.state.config.isolation() == WorkerIsolation::Worktree;
+        if !worktree_mode {
+            self.repo.checkout(&branch)?;
+        }
         // Committing plan files onto the mission branch below does not move
         // the base branch ref, so resolving it anywhere in approve_plan pins
         // the base tip as of approval (plan §f-1-2: never re-resolve later —
         // that would reintroduce the moving-base-branch race this fixes).
+        // Unaffected by worktree_mode: `base` is resolved against the primary
+        // repo either way, and creating (but not checking out) the mission
+        // branch never moves it.
         let base_sha = self.repo.rev_parse(&base)?;
 
-        let plan_file = self.paths.plan_file();
-        if let Some(parent) = plan_file.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&plan_file, serde_json::to_string_pretty(&plan)?)?;
         // Human-readable twin, committed alongside: reviewable in any git UI
         // and diffable across re-plans (plan.json stays the durable source).
         // The calibrated cost estimate is baked in here so the Reviewable
@@ -733,30 +785,74 @@ impl MissionEngine {
         let calibration = cost::calibrate(&self.paths.repo_root);
         let estimate = cost::estimate(&plan, &self.state.config, &calibration.params);
         let estimate = cost::apply_shape(estimate, &plan, &calibration);
-        let plan_md = plan_file.with_file_name("plan.md");
-        std::fs::write(
-            &plan_md,
-            render_plan_markdown(
-                &plan,
-                &self.state.mission,
-                &estimate,
-                calibration.missions_used,
-            ),
-        )?;
-        // Browsable catalog: date + goal-as-title + link per mission. The
-        // canonical plan path stays stable; discovery lives here.
-        let index = self.paths.missions_dir().join("index.md");
-        let index_body = upsert_mission_index(
-            &std::fs::read_to_string(&index).unwrap_or_default(),
-            &self.state.mission.id,
-            &plan.goal,
-            chrono::Utc::now().date_naive(),
+        let plan_md_body = render_plan_markdown(
+            &plan,
+            &self.state.mission,
+            &estimate,
+            calibration.missions_used,
         );
-        std::fs::write(&index, index_body)?;
-        self.repo.commit_paths(
-            &[plan_file.as_path(), plan_md.as_path(), index.as_path()],
-            &format!("[kranz] approved plan for {}", self.state.mission.id),
-        )?;
+
+        if worktree_mode {
+            let (wt_path, wt_repo) = self.setup_mission_worktree()?;
+            let commit_result = (|| -> Result<()> {
+                let wt_paths = MissionPaths::new(wt_path.clone(), self.state.mission.id.clone());
+                let plan_file = wt_paths.plan_file();
+                if let Some(parent) = plan_file.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&plan_file, serde_json::to_string_pretty(&plan)?)?;
+                let plan_md = wt_paths.plan_md_file();
+                std::fs::write(&plan_md, &plan_md_body)?;
+                // Browsable catalog: date + goal-as-title + link per mission.
+                // The canonical plan path stays stable; discovery lives here.
+                let index = wt_paths.missions_dir().join("index.md");
+                let index_body = upsert_mission_index(
+                    &std::fs::read_to_string(&index).unwrap_or_default(),
+                    &self.state.mission.id,
+                    &plan.goal,
+                    chrono::Utc::now().date_naive(),
+                );
+                std::fs::write(&index, index_body)?;
+                wt_repo.commit_paths(
+                    &[plan_file.as_path(), plan_md.as_path(), index.as_path()],
+                    &format!("[kranz] approved plan for {}", self.state.mission.id),
+                )?;
+                Ok(())
+            })();
+            self.teardown_mission_worktree();
+            commit_result?;
+
+            // Deliverable visibility (plan §f-2-3): the primary never checks
+            // out the mission branch in worktree mode, so this untracked twin
+            // in the runtime dir is how an operator reads plan.md without
+            // leaving the primary checkout. Never committed — the canonical,
+            // committed copy lives on the mission branch above.
+            let primary_plan_md = self.paths.plan_md_file();
+            if let Some(parent) = primary_plan_md.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&primary_plan_md, &plan_md_body)?;
+        } else {
+            let plan_file = self.paths.plan_file();
+            if let Some(parent) = plan_file.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&plan_file, serde_json::to_string_pretty(&plan)?)?;
+            let plan_md = self.paths.plan_md_file();
+            std::fs::write(&plan_md, &plan_md_body)?;
+            let index = self.paths.missions_dir().join("index.md");
+            let index_body = upsert_mission_index(
+                &std::fs::read_to_string(&index).unwrap_or_default(),
+                &self.state.mission.id,
+                &plan.goal,
+                chrono::Utc::now().date_naive(),
+            );
+            std::fs::write(&index, index_body)?;
+            self.repo.commit_paths(
+                &[plan_file.as_path(), plan_md.as_path(), index.as_path()],
+                &format!("[kranz] approved plan for {}", self.state.mission.id),
+            )?;
+        }
 
         self.emit(EventKind::PlanApproved {
             plan,
@@ -971,18 +1067,50 @@ impl MissionEngine {
         // writes and commits — the orchestrator never touches files, like
         // approve_plan). Git first: a failure here leaves no event emitted, so
         // approve_revised_plan can simply be retried.
-        let revised_md = self.paths.mission_dir().join("revised-plan.md");
-        if let Some(parent) = revised_md.parent() {
-            std::fs::create_dir_all(parent)?;
+        //
+        // Worktree mode (M7 tier 1): this is called between `run()` calls, so
+        // `self.active_tree` is None here — mirror `approve_plan`'s own
+        // setup/teardown of a scratch integration worktree rather than
+        // committing straight to the primary tree.
+        let worktree_mode = self.state.config.isolation() == WorkerIsolation::Worktree;
+        let revised_md_body =
+            render_revised_plan_markdown(&plan, &self.state.mission, &to_skip, &to_add);
+        if worktree_mode {
+            let (wt_path, wt_repo) = self.setup_mission_worktree()?;
+            let commit_result = (|| -> Result<()> {
+                let wt_paths = MissionPaths::new(wt_path.clone(), self.state.mission.id.clone());
+                let revised_md = wt_paths.mission_dir().join("revised-plan.md");
+                if let Some(parent) = revised_md.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&revised_md, &revised_md_body)?;
+                wt_repo.commit_paths(
+                    &[revised_md.as_path()],
+                    &format!("[kranz] revised plan for {}", self.state.mission.id),
+                )?;
+                Ok(())
+            })();
+            self.teardown_mission_worktree();
+            commit_result?;
+
+            // Untracked human-readable twin in the primary runtime dir, same
+            // rationale as `approve_plan`'s `primary_plan_md` twin.
+            let primary_revised_md = self.paths.mission_dir().join("revised-plan.md");
+            if let Some(parent) = primary_revised_md.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&primary_revised_md, &revised_md_body)?;
+        } else {
+            let revised_md = self.paths.mission_dir().join("revised-plan.md");
+            if let Some(parent) = revised_md.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&revised_md, &revised_md_body)?;
+            self.repo.commit_paths(
+                &[revised_md.as_path()],
+                &format!("[kranz] revised plan for {}", self.state.mission.id),
+            )?;
         }
-        std::fs::write(
-            &revised_md,
-            render_revised_plan_markdown(&plan, &self.state.mission, &to_skip, &to_add),
-        )?;
-        self.repo.commit_paths(
-            &[revised_md.as_path()],
-            &format!("[kranz] revised plan for {}", self.state.mission.id),
-        )?;
 
         // (5) Record the revision, then apply the expressible subset.
         let target_id = target.id.clone();
@@ -1055,12 +1183,20 @@ impl MissionEngine {
     /// (returned so the user can intervene), or the process is killed (safe:
     /// the log is the source of truth). Paused missions loop in place,
     /// draining the control inbox, until a Resume arrives.
-    /// NOTE on checkout lifetime: run() leaves the checkout on the MISSION
-    /// branch at terminal states deliberately — report.md/plan.md are
-    /// committed there, and yanking the checkout back to base would make the
-    /// mission's own artifacts vanish from the working tree at the exact
-    /// moment the operator reads them. The dispatcher (`kranz work`) and
-    /// `kranz draft` restore the operator's checkout at THEIR boundaries.
+    /// NOTE on checkout lifetime: in CHECKOUT mode, run() leaves the checkout
+    /// on the MISSION branch at terminal states deliberately — report.md/
+    /// plan.md are committed there, and yanking the checkout back to base
+    /// would make the mission's own artifacts vanish from the working tree at
+    /// the exact moment the operator reads them. The dispatcher (`kranz work`)
+    /// and `kranz draft` restore the operator's checkout at THEIR boundaries.
+    ///
+    /// In WORKTREE mode (M7 tier 1) the primary checkout never moves at all —
+    /// plan.md/report.md are committed on the mission branch via the
+    /// integration worktree (`approve_plan`/`write_mission_report`), and a
+    /// human-readable, untracked twin of each is written straight to the
+    /// primary runtime dir (`.kranz/missions/<id>/`) so an operator reading
+    /// the primary checkout still sees them, without the primary ever leaving
+    /// its starting branch.
     pub async fn run(&mut self) -> Result<MissionStatus> {
         if self.state.mission.status == MissionStatus::Planning {
             return Err(EngineError::InvalidState(
@@ -1083,25 +1219,63 @@ impl MissionEngine {
         // checked out. Approval created and checked out the branch, but
         // nothing re-asserted it at run time — the first live `kranz work`
         // train committed three missions straight to main.
-        let mission_branch = self.state.mission.mission_branch.clone();
-        if self.repo.current_branch()? != mission_branch {
-            if !self.repo.branch_exists(&mission_branch)? {
-                // A deleted branch is recreated at the pinned approval base.
-                let from = self
-                    .state
-                    .mission
-                    .base_sha
-                    .clone()
-                    .unwrap_or_else(|| self.state.mission.base_branch.clone());
-                self.repo.create_branch(&mission_branch, Some(&from))?;
+        //
+        // Worktree mode (M7 tier 1): the PRIMARY checkout must never change
+        // branches, so mission-branch work instead runs in a dedicated
+        // integration worktree (`setup_mission_worktree`); `self.active_tree`
+        // routes every mission-branch git op there for the rest of this run.
+        let worktree_mode = self.state.config.isolation() == WorkerIsolation::Worktree;
+        if worktree_mode {
+            let (path, wt_repo) = self.setup_mission_worktree()?;
+            self.active_tree = Some((path, wt_repo));
+        } else {
+            let mission_branch = self.state.mission.mission_branch.clone();
+            if self.repo.current_branch()? != mission_branch {
+                if !self.repo.branch_exists(&mission_branch)? {
+                    // A deleted branch is recreated at the pinned approval base.
+                    let from = self
+                        .state
+                        .mission
+                        .base_sha
+                        .clone()
+                        .unwrap_or_else(|| self.state.mission.base_branch.clone());
+                    self.repo.create_branch(&mission_branch, Some(&from))?;
+                }
+                self.repo.checkout(&mission_branch)?;
+                self.emit_decision(
+                    &format!(
+                        "run: re-asserted mission branch {mission_branch} (checkout had drifted)"
+                    ),
+                    None,
+                )?;
             }
-            self.repo.checkout(&mission_branch)?;
-            self.emit_decision(
-                &format!("run: re-asserted mission branch {mission_branch} (checkout had drifted)"),
-                None,
-            )?;
         }
 
+        let result = self.run_loop().await;
+
+        // Integration worktree lifetime: torn down once the mission reaches
+        // a status the resume/reconcile path already accounts for (terminal,
+        // or an error that ends this process) — never on Blocked/Paused,
+        // where the mission may resume and wants its worktree intact
+        // (a leaked one is reaped by `resume()`'s crash sweep regardless).
+        if worktree_mode {
+            let should_teardown = match &result {
+                Ok(status) => is_terminal_status(*status),
+                Err(_) => true,
+            };
+            if should_teardown {
+                self.teardown_mission_worktree();
+                self.active_tree = None;
+            }
+        }
+
+        result
+    }
+
+    /// The §4.5 preflight + loop body of [`Self::run`], factored out so the
+    /// caller can wrap it with integration-worktree setup/teardown (M7 tier 1)
+    /// without duplicating every early-return site inside the loop.
+    async fn run_loop(&mut self) -> Result<MissionStatus> {
         // Environment preflight (roadmap M2): surface obvious missing
         // prerequisites of the contract commands as ONE advisory decision
         // before the first worker spawns. Never blocks — the contract gate at
@@ -1163,7 +1337,7 @@ impl MissionEngine {
 
             // (f) milestone start + next feature, else (g) validation round.
             if self.state.mission.milestones[mi].status == MilestoneStatus::Pending {
-                let start_sha = self.repo.head_sha()?;
+                let start_sha = self.active_repo().head_sha()?;
                 let milestone_id = self.state.mission.milestones[mi].id.clone();
                 self.emit(EventKind::MilestoneStarted {
                     milestone_id,
@@ -1354,7 +1528,7 @@ impl MissionEngine {
             let cfg = self.state.config.clone();
             let base_sha = self.state.mission.base_sha.clone();
             let grants = self.state.mission.command_grants.clone();
-            let pre_run_sha = self.repo.head_sha()?;
+            let pre_run_sha = self.active_repo().head_sha()?;
 
             // Interrupt wiring: a control watcher polls the inbox and fires
             // the notify on `Msg { interrupt: true }`; run_session aborts the
@@ -1366,20 +1540,42 @@ impl MissionEngine {
                 Arc::clone(&cancel),
             ));
             let backend = Arc::clone(&self.backend);
-            let outcome = runner::run_worker(
-                backend.as_ref(),
-                &mut self.log,
-                &self.paths,
-                &cfg,
-                &feature,
-                &goal,
-                &milestone_title,
-                guidance.as_deref(),
-                Some(cancel),
-                base_sha.as_deref(),
-                &grants,
-            )
-            .await;
+            // Worktree mode (M7 tier 1): the worker session's cwd is the
+            // mission integration worktree, never the primary repo root.
+            // Checkout mode keeps the exact `run_worker` call it always had.
+            let outcome = if self.state.config.isolation() == WorkerIsolation::Worktree {
+                let session_cwd = self.active_root().to_path_buf();
+                runner::run_worker_in(
+                    backend.as_ref(),
+                    &mut self.log,
+                    &self.paths,
+                    &cfg,
+                    &feature,
+                    &goal,
+                    &milestone_title,
+                    guidance.as_deref(),
+                    Some(cancel),
+                    &session_cwd,
+                    base_sha.as_deref(),
+                    &grants,
+                )
+                .await
+            } else {
+                runner::run_worker(
+                    backend.as_ref(),
+                    &mut self.log,
+                    &self.paths,
+                    &cfg,
+                    &feature,
+                    &goal,
+                    &milestone_title,
+                    guidance.as_deref(),
+                    Some(cancel),
+                    base_sha.as_deref(),
+                    &grants,
+                )
+                .await
+            };
             watcher.abort();
             // Fold the runner's events into state even when the run errored
             // (worker.spawned may already be on disk).
@@ -1392,17 +1588,17 @@ impl MissionEngine {
             self.drain_control()?;
 
             // §4.4 dirty-tree discipline (applies to interrupted runs too).
-            if !self.repo.is_clean()? && !self.resolve_dirty_tree(&feature.id).await? {
+            if !self.active_repo().is_clean()? && !self.resolve_dirty_tree(&feature.id).await? {
                 return Ok(()); // orchestrator chose fail-feature
             }
             let commits: Vec<String> = self
-                .repo
+                .active_repo()
                 .commits_between(&pre_run_sha, "HEAD")?
                 .iter()
                 .map(|c| format!("{} {}", c.sha, c.subject))
                 .collect();
             let diff_stat = self
-                .repo
+                .active_repo()
                 .diff_stat(&pre_run_sha, "HEAD")
                 .unwrap_or_default();
 
@@ -1474,7 +1670,7 @@ impl MissionEngine {
             })?;
             return Ok(false);
         }
-        self.repo
+        self.active_repo()
             .add_all_and_commit(&format!("[{feature_id}] checkpoint (engine commit)"))?;
         Ok(true)
     }
@@ -1764,6 +1960,50 @@ impl MissionEngine {
         batch_result
     }
 
+    /// Set up the mission integration worktree (M7 tier 1 primitive): ensures
+    /// the mission branch exists, then checks it out into a dedicated
+    /// worktree at [`mission_worktree_path`] — WITHOUT touching the primary
+    /// checkout's current branch.
+    ///
+    /// Called from `run()` when `workerIsolation = worktree`, which routes
+    /// mission-branch mutations through the returned worktree for the run.
+    fn setup_mission_worktree(&self) -> Result<(PathBuf, GitRepo)> {
+        let mission_branch = self.state.mission.mission_branch.clone();
+        if !self.repo.branch_exists(&mission_branch)? {
+            let from = self
+                .state
+                .mission
+                .base_sha
+                .clone()
+                .unwrap_or_else(|| self.state.mission.base_branch.clone());
+            self.repo.create_branch(&mission_branch, Some(&from))?;
+        }
+
+        let path = mission_worktree_path(&self.state.mission.id);
+        // Idempotent: a stale integration worktree from a prior crash must be
+        // gone before checking the branch out again (git refuses to check the
+        // same branch out twice).
+        let _ = self.repo.remove_worktree(&path);
+        let _ = self.repo.prune_worktrees();
+
+        self.repo.add_worktree_checkout(&path, &mission_branch)?;
+        let wt_repo = GitRepo::open(&path)?;
+        Ok((path, wt_repo))
+    }
+
+    /// Tear down the mission integration worktree created by
+    /// [`Self::setup_mission_worktree`]. Best-effort and idempotent, mirroring
+    /// the parallel-batch cleanup guard: failures are logged, never fatal.
+    fn teardown_mission_worktree(&self) {
+        let path = mission_worktree_path(&self.state.mission.id);
+        if let Err(e) = self.repo.remove_worktree(&path) {
+            tracing::warn!(path = %path.display(), error = %e, "mission worktree cleanup failed");
+        }
+        if let Err(e) = self.repo.prune_worktrees() {
+            tracing::warn!(error = %e, "mission worktree prune failed");
+        }
+    }
+
     /// Fallible body of [`Self::run_parallel_batch`] (the caller's cleanup guard
     /// runs regardless of how this returns).
     ///
@@ -1918,11 +2158,11 @@ impl MissionEngine {
                 })?;
                 continue;
             }
-            let pre_merge_sha = self.repo.head_sha()?;
-            match self.repo.merge_no_ff(&ws.branch)? {
+            let pre_merge_sha = self.active_repo().head_sha()?;
+            match self.active_repo().merge_no_ff(&ws.branch)? {
                 crate::git_ops::MergeOutcome::Clean => {
                     let commits: Vec<String> = self
-                        .repo
+                        .active_repo()
                         .commits_between(&pre_merge_sha, "HEAD")?
                         .iter()
                         .map(|c| format!("{} {}", c.sha, c.subject))
@@ -2179,7 +2419,8 @@ impl MissionEngine {
                 cfg.validator_scrutiny.model = cost::DEFAULT_CODEX_MODEL.to_string();
             }
 
-            let outcome = runner::run_validator(
+            let session_cwd = self.active_root().to_path_buf();
+            let outcome = runner::run_validator_in(
                 backend.as_ref(),
                 &mut self.log,
                 &self.paths,
@@ -2189,6 +2430,7 @@ impl MissionEngine {
                 &contract,
                 &start_sha,
                 None,
+                &session_cwd,
                 base_sha.as_deref(),
                 &grants,
                 &worker_commands,
@@ -2210,7 +2452,8 @@ impl MissionEngine {
                 )?;
                 let retry_cfg = self.state.config.clone();
                 let retry_backend = Arc::clone(&self.backend);
-                let retry_outcome = runner::run_validator(
+                let retry_session_cwd = self.active_root().to_path_buf();
+                let retry_outcome = runner::run_validator_in(
                     retry_backend.as_ref(),
                     &mut self.log,
                     &self.paths,
@@ -2220,6 +2463,7 @@ impl MissionEngine {
                     &contract,
                     &start_sha,
                     None,
+                    &retry_session_cwd,
                     base_sha.as_deref(),
                     &grants,
                     &worker_commands,
@@ -2305,7 +2549,7 @@ impl MissionEngine {
     /// mission.
     fn tag_milestone(&self, milestone_id: &str) -> Option<String> {
         let name = format!("kranz/{}/{}", self.state.mission.id, milestone_id);
-        match self.repo.tag(&name, "kranz milestone complete") {
+        match self.active_repo().tag(&name, "kranz milestone complete") {
             Ok(()) => Some(name),
             Err(e) => {
                 tracing::warn!(tag = %name, error = %e, "milestone tag failed; completing untagged");
@@ -2479,8 +2723,7 @@ impl MissionEngine {
                 });
                 continue;
             };
-            let (ok, output) =
-                run_shell_command(self.paths.repo_root.as_path(), command, &env).await;
+            let (ok, output) = run_shell_command(self.active_root(), command, &env).await;
             if !ok {
                 findings.push(Finding {
                     subject: assertion.id.clone(),
@@ -2577,7 +2820,10 @@ impl MissionEngine {
             .collect::<Vec<_>>()
             .join("\n");
         let base = self.state.mission.base_branch.clone();
-        let diff_stat = self.repo.diff_stat(&base, "HEAD").unwrap_or_default();
+        let diff_stat = self
+            .active_repo()
+            .diff_stat(&base, "HEAD")
+            .unwrap_or_default();
         let message = format!(
             "Final contract gate. Verify each of these agent-judgement assertions against \
              the mission's work (diff stat of {base}..HEAD below). Inspect the repository \
@@ -2677,6 +2923,13 @@ impl MissionEngine {
     /// link to this mission's line in `missions/index.md`, and commit both
     /// (plus any `extra_paths`) in one `[kranz] mission report for <id>`
     /// commit.
+    ///
+    /// Worktree mode (M7 tier 1): this runs inside `run()`, so `active_paths`/
+    /// `active_repo` already route to the integration worktree — the report,
+    /// index update, and any extra paths (e.g. a captured lesson) are written
+    /// and committed there, never in the primary tree. A human-readable
+    /// report.md twin is also written (untracked) to the primary runtime dir
+    /// so it stays readable without leaving the primary checkout.
     fn try_write_mission_report(&mut self, extra_paths: Option<Vec<PathBuf>>) -> Result<()> {
         // Flush buffered stream deltas so the replayed history is complete.
         self.log.flush()?;
@@ -2685,17 +2938,18 @@ impl MissionEngine {
         let estimate = cost::estimate(&plan, &self.state.config, &cost::EstimateParams::default());
         let report = render_mission_report(&self.state, &events, &plan, &estimate);
 
-        let report_file = self.paths.mission_dir().join("report.md");
+        let active_paths = self.active_paths();
+        let report_file = active_paths.mission_dir().join("report.md");
         if let Some(parent) = report_file.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&report_file, report)?;
+        std::fs::write(&report_file, &report)?;
 
         // Index line: append " · [report](<id>/report.md)" to this mission's
         // entry; the line format is otherwise kept stable (see
         // upsert_mission_index). A missing index or line is tolerated — the
         // report itself is the deliverable.
-        let index = self.paths.missions_dir().join("index.md");
+        let index = active_paths.missions_dir().join("index.md");
         let mut commit: Vec<&std::path::Path> = vec![report_file.as_path()];
         let index_changed = match std::fs::read_to_string(&index) {
             Ok(existing) => {
@@ -2713,10 +2967,18 @@ impl MissionEngine {
         }
         let extra_paths = extra_paths.unwrap_or_default();
         commit.extend(extra_paths.iter().map(PathBuf::as_path));
-        self.repo.commit_paths(
+        self.active_repo().commit_paths(
             &commit,
             &format!("[kranz] mission report for {}", self.state.mission.id),
         )?;
+
+        if self.state.config.isolation() == WorkerIsolation::Worktree {
+            let primary_report = self.paths.mission_dir().join("report.md");
+            if let Some(parent) = primary_report.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&primary_report, &report)?;
+        }
         Ok(())
     }
 
@@ -2760,7 +3022,11 @@ impl MissionEngine {
             return Ok(None);
         }
 
-        let lessons_dir = self.paths.lessons_dir();
+        // Written under active_paths (the integration worktree in worktree
+        // mode) because these files are folded into write_mission_report's
+        // commit, which commits via active_repo — see that method's doc note.
+        let active_paths = self.active_paths();
+        let lessons_dir = active_paths.lessons_dir();
         std::fs::create_dir_all(&lessons_dir)?;
         let mission_id = self.state.mission.id.clone();
         let lesson_file = lessons_dir.join(format!("{mission_id}.md"));
@@ -2768,7 +3034,7 @@ impl MissionEngine {
         std::fs::write(&lesson_file, &body)?;
 
         let summary = first_nonempty_line(&body);
-        let index = self.paths.lessons_index();
+        let index = active_paths.lessons_index();
         let line = format!("- {mission_id}.md · {summary}\n");
         {
             use std::io::Write as _;
@@ -3365,6 +3631,16 @@ fn parallel_worktree_path(mission_id: &str, feature_id: &str) -> PathBuf {
         })
         .collect();
     std::env::temp_dir().join(format!("kranz-wt-{mission_id}-{safe}"))
+}
+
+/// Absolute directory for one mission's INTEGRATION worktree (M7 tier 1):
+/// the single worktree, checked out to the mission branch, that all
+/// mission-branch mutations run in when `workerIsolation = worktree`. Lives
+/// under the same temp-dir base as [`parallel_worktree_path`], namespaced
+/// with a `_integration` suffix that no real feature id can produce (feature
+/// ids never start with `_`), so it never collides with a per-feature path.
+fn mission_worktree_path(mission_id: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("kranz-wt-{mission_id}-_integration"))
 }
 
 // ---------------------------------------------------------------------------
@@ -4641,6 +4917,119 @@ fn plan_schema() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Mission integration worktree primitive (M7 tier 1, feature f-1-2)
+    // -----------------------------------------------------------------------
+
+    /// `setup_mission_worktree` creates the integration worktree on the
+    /// mission branch WITHOUT moving the primary checkout off `main`, and
+    /// `teardown_mission_worktree` removes it (proven via `list_worktrees`).
+    #[test]
+    fn setup_and_teardown_mission_worktree_round_trip() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
+        let engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+        let mission_id = engine.state.mission.id.clone();
+        let mission_branch = engine.state.mission.mission_branch.clone();
+
+        let (path, wt_repo) = engine.setup_mission_worktree().expect("setup");
+        assert_eq!(path, mission_worktree_path(&mission_id));
+        assert!(path.exists(), "integration worktree dir must exist");
+
+        // The mission branch now exists and is checked out in the new
+        // worktree...
+        assert!(engine.repo.branch_exists(&mission_branch).unwrap());
+        assert_eq!(wt_repo.current_branch().unwrap(), mission_branch);
+
+        // ...while the PRIMARY checkout never moved off main.
+        assert_eq!(engine.repo.current_branch().unwrap(), "main");
+
+        let listed = engine.repo.list_worktrees().unwrap();
+        let canon_path = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        assert!(
+            listed
+                .iter()
+                .any(|p| std::path::Path::new(p) == canon_path.as_path()),
+            "integration worktree not in list_worktrees: {listed:?}"
+        );
+
+        engine.teardown_mission_worktree();
+        let after = engine.repo.list_worktrees().unwrap();
+        assert!(
+            !after
+                .iter()
+                .any(|p| std::path::Path::new(p) == canon_path.as_path()),
+            "integration worktree still listed after teardown: {after:?}"
+        );
+        assert!(!path.exists(), "integration worktree dir must be gone");
+    }
+
+    /// A mission integration worktree left behind by a crashed engine (never
+    /// torn down) is reaped by `resume()`'s crash-recovery sweep, the same
+    /// way per-feature worktrees are (orchestrator.rs:~408-414, M7 tier 1).
+    #[test]
+    fn resume_reaps_leaked_integration_worktree() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
+        let engine =
+            MissionEngine::create(backend.clone(), &root, "goal", MissionConfig::default())
+                .unwrap();
+        let mission_id = engine.state.mission.id.clone();
+
+        let (path, _wt_repo) = engine.setup_mission_worktree().expect("setup");
+        assert_eq!(path, mission_worktree_path(&mission_id));
+        assert!(path.exists(), "integration worktree dir must exist");
+
+        let listed = engine.repo.list_worktrees().unwrap();
+        let canon_path = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        assert!(
+            listed
+                .iter()
+                .any(|p| std::path::Path::new(p) == canon_path.as_path()),
+            "integration worktree not in list_worktrees before crash: {listed:?}"
+        );
+
+        // Simulate a crash: drop the engine WITHOUT tearing down the
+        // integration worktree, releasing the single-writer lock so resume()
+        // can re-acquire it.
+        drop(engine);
+
+        let resumed = MissionEngine::resume(backend, &root, &mission_id, LockForce::No)
+            .expect("resume should reap the leaked integration worktree and succeed");
+
+        let after = resumed.repo.list_worktrees().unwrap();
+        assert!(
+            !after
+                .iter()
+                .any(|p| std::path::Path::new(p) == canon_path.as_path()),
+            "integration worktree still listed after resume: {after:?}"
+        );
+        assert!(
+            !path.exists(),
+            "integration worktree dir must be pruned after resume"
+        );
+    }
+
+    /// `mission_worktree_path` never collides with a per-feature
+    /// `parallel_worktree_path`, even for an adversarial feature id.
+    #[test]
+    fn mission_worktree_path_does_not_collide_with_feature_paths() {
+        let mission_id = "m-collide-test";
+        let integration = mission_worktree_path(mission_id);
+        for feature_id in ["f-1-1", "f-1-2", "ms-collide-test-1"] {
+            assert_ne!(
+                integration,
+                parallel_worktree_path(mission_id, feature_id),
+                "collided with feature id {feature_id:?}"
+            );
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Scrutiny backend selection (f-2-2)
