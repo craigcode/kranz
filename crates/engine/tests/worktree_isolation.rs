@@ -770,6 +770,29 @@ async fn worktrees_removed_at_mission_end_in_worktree_mode() {
         .unwrap();
     assert_eq!(status, MissionStatus::Complete);
 
+    // Positively prove the parallel-batch path actually engaged for M1
+    // BEFORE asserting cleanup: at least one worker spawned in a per-feature
+    // parallel worktree (distinct from the "_integration" tree) named after
+    // one of M1's independent features. Without this, the cleanup assertions
+    // below would pass vacuously even if the parallel path silently ran
+    // sequentially instead.
+    let specs = backend.started_specs();
+    let parallel_worker_cwd = specs
+        .iter()
+        .filter(|s| matches!(s.prompt, PromptMode::SingleShot(ref t) if t.contains("Implement feature")))
+        .find(|s| {
+            let cwd = s.cwd.to_string_lossy();
+            (cwd.contains(&format!("kranz-wt-{mission_id}-f-1-1"))
+                || cwd.contains(&format!("kranz-wt-{mission_id}-f-1-2")))
+                && !cwd.contains("_integration")
+        });
+    assert!(
+        parallel_worker_cwd.is_some(),
+        "expected at least one M1 worker to run in a per-feature parallel worktree \
+         (kranz-wt-{mission_id}-f-1-1 or -f-1-2), proving the parallel-batch path engaged: {:?}",
+        specs.iter().map(|s| &s.cwd).collect::<Vec<_>>()
+    );
+
     // Only the primary working tree remains registered.
     let worktrees = repo.list_worktrees().unwrap();
     assert_eq!(
@@ -874,6 +897,130 @@ async fn checkout_mode_matches_legacy_sequential() {
         branch_after, mission_branch,
         "checkout mode must leave the primary checkout on the mission branch"
     );
+}
+
+/// End-to-end (approval through re-plan): in worktree mode
+/// `approve_revised_plan` — the branch f-3-1 added that routes
+/// revised-plan.md through `setup_mission_worktree` → commit →
+/// `teardown_mission_worktree` — leaves the primary checkout's branch, HEAD
+/// sha, and tracked porcelain status byte-identical, commits revised-plan.md
+/// on the mission branch (never in the primary tree's HEAD), and leaks no
+/// worktree. This exercises the revision leg of a1's "approval through
+/// completion" guarantee in worktree mode, which was previously only
+/// exercised in checkout mode (`mission_test.rs`'s `approve_revised_plan`
+/// tests all use the default `WorkerIsolation::Checkout`).
+#[tokio::test(flavor = "multi_thread")]
+async fn approve_revised_plan_untouched_primary_in_worktree_mode() {
+    let Some((_dir, root)) = mission_init_repo() else {
+        return;
+    };
+    let repo = GitRepo::open(&root).expect("open repo");
+
+    // Revised plan the orchestrator proposes: same single milestone "M1",
+    // "feature 1" kept, a new "extra feature" added.
+    let revised_json = json!({
+        "goal": GOAL,
+        "validationContract": [],
+        "milestones": [{
+            "title": "M1",
+            "features": [
+                { "title": "feature 1", "spec": "build part 1", "validationCriteria": ["part 1 works"] },
+                { "title": "extra feature", "spec": "build the newly-needed part", "validationCriteria": ["extra works"] }
+            ]
+        }]
+    })
+    .to_string();
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![orch_multi_script(vec![
+        revised_json,
+    ])]));
+    let backend_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend) as Arc<dyn AgentBackend>;
+    let mut engine =
+        MissionEngine::create(backend_dyn, &root, GOAL, worktree_cfg()).expect("create engine");
+    let mission_branch = engine.state().mission.mission_branch.clone();
+    let mission_id = engine.mission_id().to_string();
+    engine.approve_plan(one_feature_plan()).unwrap();
+
+    // Requesting the revision spawns the orchestrator (one `WorkerSpawned`
+    // event), which flips the mission from `Approved` to `Running` — the
+    // state `approve_revised_plan` requires. Neither step touches the
+    // primary tree in worktree mode.
+    let request = timeout(TokioDuration::from_secs(60), engine.request_revised_plan())
+        .await
+        .expect("request_revised_plan must not hang")
+        .expect("scripted plan JSON is not a backend error");
+    let plan = match request {
+        kranz_engine::orchestrator::PlanRequest::Ready(plan) => plan,
+        kranz_engine::orchestrator::PlanRequest::NotReady(text) => {
+            panic!("scripted revised plan must parse: {text}")
+        }
+    };
+
+    // Snapshot the primary checkout right before the call under test.
+    let branch_before = repo.current_branch().unwrap();
+    let head_before = repo.head_sha().unwrap();
+    let status_before = raw_git(&root, &["status", "--porcelain", "--untracked-files=no"]);
+
+    engine
+        .approve_revised_plan(plan)
+        .expect("apply the revised plan");
+
+    // The primary checkout is untouched by the revision.
+    assert_eq!(
+        repo.current_branch().unwrap(),
+        branch_before,
+        "approve_revised_plan must never change the primary checkout's branch"
+    );
+    assert_eq!(
+        repo.head_sha().unwrap(),
+        head_before,
+        "approve_revised_plan must never move the primary HEAD"
+    );
+    assert_eq!(
+        raw_git(&root, &["status", "--porcelain", "--untracked-files=no"]),
+        status_before,
+        "approve_revised_plan must never dirty the primary tracked tree"
+    );
+
+    // revised-plan.md is committed on the mission branch...
+    let revised_md_path = format!(".kranz/missions/{mission_id}/revised-plan.md");
+    let committed = raw_git(
+        &root,
+        &["show", &format!("{mission_branch}:{revised_md_path}")],
+    );
+    assert!(
+        !committed.trim().is_empty(),
+        "revised-plan.md must be committed on the mission branch"
+    );
+
+    // ...but is NOT committed in the primary tree's HEAD (it may exist only
+    // as an untracked twin on disk).
+    let show_on_primary_head = Command::new("git")
+        .args(["show", &format!("{branch_before}:{revised_md_path}")])
+        .current_dir(&root)
+        .output()
+        .expect("spawn git show");
+    assert!(
+        !show_on_primary_head.status.success(),
+        "revised-plan.md must not be committed on the primary tree's HEAD ({branch_before})"
+    );
+
+    // No integration worktree leaked.
+    let worktrees = repo.list_worktrees().unwrap();
+    assert_eq!(
+        worktrees.len(),
+        1,
+        "only the primary worktree remains: {worktrees:?}"
+    );
+    let leak_prefix = format!("kranz-wt-{mission_id}-");
+    for entry in std::fs::read_dir(std::env::temp_dir()).unwrap().flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        assert!(
+            !name.starts_with(&leak_prefix),
+            "a worktree dir leaked into temp: {name}"
+        );
+    }
 }
 
 /// Strengthens a1/a6/a7 to a MULTI-feature, MULTI-milestone worktree-mode
