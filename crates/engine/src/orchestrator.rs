@@ -3065,6 +3065,7 @@ impl MissionEngine {
                                 .collect(),
                         })
                         .collect(),
+                    command_grants: mission.command_grants.clone(),
                 };
                 Ok(serde_json::to_string_pretty(&plan)?)
             }
@@ -4446,6 +4447,10 @@ fn plan_schema() -> serde_json::Value {
                         }
                     }
                 }
+            },
+            "commandGrants": {
+                "type": "array",
+                "items": { "type": "string" }
             }
         }
     })
@@ -4606,6 +4611,7 @@ mod tests {
                     validation_criteria: vec!["c".into()],
                 }],
             }],
+            command_grants: vec!["gc lint".into()],
         };
         let value = serde_json::to_value(&plan).unwrap();
         let schema = plan_schema();

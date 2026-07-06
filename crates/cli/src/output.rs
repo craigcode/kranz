@@ -248,6 +248,7 @@ mod tests {
                     validation_criteria: vec!["alpha works".to_string()],
                 }],
             }],
+            command_grants: vec![],
         };
         let events = vec![
             Event {

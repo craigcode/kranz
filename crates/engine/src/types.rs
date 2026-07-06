@@ -51,6 +51,10 @@ pub struct Mission {
     pub base_sha: Option<String>,
     /// e.g. "kranz/mission-<id>"
     pub mission_branch: String,
+    /// Read-only shell commands granted mission-wide to worker AND validator
+    /// sessions; single source of truth carried from the approved `Plan`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command_grants: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -65,6 +69,10 @@ pub struct Plan {
     pub goal: String,
     pub validation_contract: Vec<Assertion>,
     pub milestones: Vec<PlanMilestone>,
+    /// Read-only shell commands the plan declares as runnable by BOTH worker
+    /// and validator sessions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command_grants: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

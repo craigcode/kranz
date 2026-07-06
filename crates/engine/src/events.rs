@@ -259,6 +259,42 @@ mod tests {
             goal: "g".into(),
             validation_contract: vec![],
             milestones: vec![],
+            command_grants: vec![],
+        }
+    }
+
+    #[test]
+    fn command_grants_backcompat_defaults_empty() {
+        // A Plan JSON that omits commandGrants deserializes to an empty vec.
+        let plan_json = r#"{
+            "goal": "g",
+            "validationContract": [],
+            "milestones": []
+        }"#;
+        let plan: Plan = serde_json::from_str(plan_json).unwrap();
+        assert!(plan.command_grants.is_empty());
+
+        // A plan.approved event payload omitting commandGrants folds to an
+        // empty vec on the nested plan too.
+        let event_json = r#"{
+            "seq": 1,
+            "ts": "2026-01-02T03:04:05Z",
+            "missionId": "m-1",
+            "type": "plan.approved",
+            "payload": {
+                "plan": {
+                    "goal": "g",
+                    "validationContract": [],
+                    "milestones": []
+                }
+            }
+        }"#;
+        let event: Event = serde_json::from_str(event_json).unwrap();
+        match event.kind {
+            EventKind::PlanApproved { plan, .. } => {
+                assert!(plan.command_grants.is_empty())
+            }
+            _ => panic!("wrong variant"),
         }
     }
 

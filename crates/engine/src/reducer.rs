@@ -79,6 +79,7 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
                     start_sha: None,
                 })
                 .collect();
+            state.mission.command_grants = plan.command_grants.clone();
             state.mission.status = MissionStatus::Approved;
         }
 
@@ -322,6 +323,7 @@ fn initial_state(event: &Event) -> Result<MissionState> {
             base_branch: base_branch.clone(),
             base_sha: None,
             mission_branch: mission_branch.clone(),
+            command_grants: Vec::new(),
         },
         runs: BTreeMap::new(),
         totals: TokenUsage::default(),

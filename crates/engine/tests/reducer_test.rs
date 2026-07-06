@@ -58,6 +58,7 @@ fn plan() -> Plan {
                 features: vec![feature("gamma")],
             },
         ],
+        command_grants: vec![],
     }
 }
 
@@ -829,6 +830,20 @@ fn approved_status_folds_on_plan_approved() {
 }
 
 #[test]
+fn plan_approved_copies_command_grants_into_mission() {
+    let mut granted_plan = plan();
+    granted_plan.command_grants = vec!["gc lint".to_string()];
+    let state = fold_kinds(vec![
+        created(),
+        EventKind::PlanApproved {
+            plan: granted_plan,
+            base_sha: None,
+        },
+    ]);
+    assert_eq!(state.mission.command_grants, vec!["gc lint".to_string()]);
+}
+
+#[test]
 fn approved_status_transitions_to_running_on_milestone_started() {
     let state = fold_kinds(vec![
         created(),
@@ -1259,6 +1274,7 @@ fn prop_plan() -> Plan {
                 features: vec![feature("c"), feature("d")],
             },
         ],
+        command_grants: vec![],
     }
 }
 

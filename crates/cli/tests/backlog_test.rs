@@ -43,6 +43,7 @@ fn sample_plan() -> Plan {
                 validation_criteria: vec!["works".to_string()],
             }],
         }],
+        command_grants: vec![],
     }
 }
 

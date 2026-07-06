@@ -166,6 +166,7 @@ mod tests {
                 base_branch: "main".into(),
                 base_sha: None,
                 mission_branch: "kranz/mission-m-1".into(),
+                command_grants: vec![],
             },
             runs: Default::default(),
             totals: TokenUsage::default(),
@@ -204,6 +205,7 @@ mod tests {
                 title: "Token bucket".into(),
                 features: vec![],
             }],
+            command_grants: vec![],
         };
         let out = classify(
             &ev(EventKind::PlanApproved {

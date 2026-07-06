@@ -62,6 +62,7 @@ fn sample_plan() -> Plan {
                 },
             ],
         }],
+        command_grants: vec![],
     }
 }
 
