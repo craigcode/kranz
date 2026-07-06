@@ -561,10 +561,13 @@ impl MissionHost {
     /// opts in to deleting Complete missions (which otherwise stay: they feed
     /// the cost-calibration corpus), and a live lock is re-checked immediately
     /// before removal so nothing is ever deleted under a running engine.
-    /// Only the mission directory goes; branches, tags, and missions/index.md
-    /// are never touched (same contract as the CLI).
+    /// Only the mission directory and its own `missions/index.md` line go;
+    /// branches, tags, and every other mission's index line are left intact
+    /// (same contract as the CLI).
     pub fn clean(&self, id: &str, all: bool) -> Result<(), ApiError> {
-        use kranz_engine::orchestrator::{cleanable_class, mission_lock_is_live, CleanClass};
+        use kranz_engine::orchestrator::{
+            cleanable_class, mission_lock_is_live, prune_mission_index_file, CleanClass,
+        };
         if self
             .missions
             .lock()
@@ -608,6 +611,7 @@ impl MissionHost {
         kranz_engine::queue::remove(&self.repo_root, id);
         std::fs::remove_dir_all(paths.mission_dir())
             .map_err(|e| ApiError::internal(format!("removing mission '{id}': {e}")))?;
+        prune_mission_index_file(&self.repo_root, id);
         Ok(())
     }
 

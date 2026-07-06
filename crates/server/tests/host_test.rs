@@ -423,6 +423,52 @@ async fn delete_guards_live_and_complete_missions() {
     assert!(!MissionPaths::new(&root, "m-done").mission_dir().exists());
 }
 
+#[tokio::test]
+async fn delete_prunes_missions_index() {
+    isolate_git_env();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+    let host = kranz_server::MissionHost::with_backend(root.clone(), backend);
+    let app = kranz_server::router_with_host(host, None, Some(TOKEN.to_string()));
+
+    seed_mission_log(&root, "m-husk");
+    seed_mission_log(&root, "m-other");
+
+    let paths = MissionPaths::new(&root, "m-husk");
+    std::fs::write(
+        paths.missions_dir().join("index.md"),
+        "# Kranz missions\n\
+         - 2026-01-01 · [m-husk](m-husk/plan.md) — goal one\n\
+         - 2026-01-02 · [m-other](m-other/plan.md) — goal two\n",
+    )
+    .unwrap();
+
+    let (status, body) = post_json(
+        &app,
+        "/api/missions/m-husk/abandon",
+        Some(TOKEN),
+        json!({ "reason": "prune test" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) =
+        post_json(&app, "/api/missions/m-husk/delete", Some(TOKEN), json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!MissionPaths::new(&root, "m-husk").mission_dir().exists());
+
+    let index = std::fs::read_to_string(paths.missions_dir().join("index.md")).unwrap();
+    assert!(
+        !index.contains("m-husk"),
+        "deleted mission's line pruned: {index}"
+    );
+    assert!(
+        index.contains("[m-other](m-other/plan.md) — goal two"),
+        "unrelated mission's line kept: {index}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Release: an attached engine frees the single-writer lock
 // ---------------------------------------------------------------------------

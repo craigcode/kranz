@@ -1208,3 +1208,44 @@ fn remove_missions_deletes_selected_and_keeps_index_and_others() {
         vec!["index.md".to_string(), "m-planned".to_string()]
     );
 }
+
+#[test]
+fn clean_prunes_missions_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+
+    write_events(
+        repo,
+        "m-failed",
+        vec![
+            created_kind("g", "m-failed"),
+            EventKind::MissionFailed { reason: "x".into() },
+        ],
+    );
+    write_events(repo, "m-planned", vec![created_kind("g", "m-planned")]);
+    write_plan_json(repo, "m-planned");
+
+    let missions_dir = repo.join(".kranz").join("missions");
+    fs::write(
+        missions_dir.join("index.md"),
+        "# Kranz missions\n\
+         - 2026-01-01 · [m-failed](m-failed/plan.md) — goal one\n\
+         - 2026-01-02 · [m-planned](m-planned/plan.md) — goal two\n",
+    )
+    .unwrap();
+
+    let entries = commands::select_cleanable(repo, false);
+    let removed = commands::remove_missions(repo, &entries, false);
+    assert_eq!(removed, vec!["m-failed".to_string()]);
+
+    let index = fs::read_to_string(missions_dir.join("index.md")).unwrap();
+    assert!(
+        !index.contains("m-failed"),
+        "removed mission's line pruned from index: {index}"
+    );
+    assert!(
+        index.contains("[m-planned](m-planned/plan.md) — goal two"),
+        "unrelated mission's line kept: {index}"
+    );
+    assert!(index.contains("# Kranz missions"), "header kept: {index}");
+}
