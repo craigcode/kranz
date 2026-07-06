@@ -651,6 +651,28 @@ async fn dispatch_action(
             }
         },
 
+        // Read-only backlog verbs (no `user_id`, so structurally not
+        // allowlist-gated — same shape as Status).
+        Action::TicketList { response_url } => {
+            reply_ephemeral(
+                cfg,
+                client,
+                response_url.as_deref(),
+                &build_ticket_list_reply(repo_root),
+            )
+            .await;
+        }
+
+        Action::TicketShow { slug, response_url } => {
+            reply_ephemeral(
+                cfg,
+                client,
+                response_url.as_deref(),
+                &build_ticket_show_reply(repo_root, slug),
+            )
+            .await;
+        }
+
         Action::NewMission {
             goal,
             user_id,
@@ -1577,6 +1599,8 @@ fn apply_action(repo_root: &Path, action: &Action) -> Result<()> {
         Action::NewTicket { title, .. } => scaffold_ticket(repo_root, title),
         Action::Help { .. }
         | Action::Status { .. }
+        | Action::TicketList { .. }
+        | Action::TicketShow { .. }
         | Action::NewMission { .. }
         | Action::NewMissionModal { .. }
         | Action::ConfigModal { .. }
@@ -1616,6 +1640,106 @@ fn build_status_reply(repo_root: &Path, mission_id: Option<&str>) -> Result<Vec<
         summary: render_status_body(&state),
     };
     Ok(crate::format::build_status(&summary))
+}
+
+/// `/kranz ticket list` reply: one row per parseable ticket under
+/// `.kranz/tickets/`, via [`kranz_engine::ticket::Ticket::list`] (the same
+/// primitive the REST `GET /api/tickets` route uses). Pure read + render, so
+/// it is unit-tested directly; never fails (an empty/missing tickets dir just
+/// yields an empty list).
+pub fn build_ticket_list_reply(repo_root: &Path) -> Vec<Value> {
+    let rows: Vec<crate::format::TicketRow> = kranz_engine::ticket::Ticket::list(repo_root)
+        .iter()
+        .map(|t| crate::format::TicketRow {
+            slug: t.slug.clone(),
+            priority: t.priority,
+            state: format!(
+                "{:?}",
+                kranz_engine::ticket::Ticket::read_state(repo_root, &t.slug)
+            ),
+            title: t.title.clone(),
+            blocked_by: t.blocked_by.clone(),
+        })
+        .collect();
+    crate::format::build_ticket_list(&rows)
+}
+
+/// `/kranz ticket show <slug>` reply: the ticket's detail via
+/// [`kranz_engine::ticket::Ticket::load`] + `read_state`. A graceful ephemeral
+/// error (never a panic) for an invalid slug (checked with
+/// [`kranz_engine::ticket::Ticket::ensure_valid_slug`] BEFORE touching the
+/// filesystem) or one with no ticket file.
+pub fn build_ticket_show_reply(repo_root: &Path, slug: &str) -> Vec<Value> {
+    use kranz_engine::ticket::Ticket;
+
+    if let Err(e) = Ticket::ensure_valid_slug(slug) {
+        return error_blocks(&format!("Invalid ticket slug `{slug}`: {e}"));
+    }
+    let path = Ticket::tickets_dir(repo_root).join(format!("{slug}.md"));
+    if !path.is_file() {
+        return error_blocks(&format!("Unknown ticket `{slug}`."));
+    }
+    let ticket = match Ticket::load(&path) {
+        Ok(t) => t,
+        Err(e) => return error_blocks(&format!("Couldn't read ticket `{slug}`: {e}")),
+    };
+    let state = format!("{:?}", Ticket::read_state(repo_root, slug));
+    let detail = crate::format::TicketDetail {
+        slug: ticket.slug.clone(),
+        title: ticket.title.clone(),
+        goal: ticket.goal.clone(),
+        state,
+        blocked_by: ticket.blocked_by.clone(),
+        needs_context: needs_context_questions(&ticket.raw_body),
+    };
+    crate::format::build_ticket_show(&detail)
+}
+
+/// The orchestrator's clarifying questions appended under a `## Needs
+/// context` heading in a ticket's raw body. Mirrors
+/// `kranz_server::tickets::needs_context_questions` (itself a port of
+/// `kranz_cli::backlog::needs_context_block`'s heading scan) — a small
+/// derived-data extraction, not ticket parsing, so it stays a thin per-crate
+/// copy rather than a shared engine primitive.
+fn needs_context_questions(raw_body: &str) -> Vec<String> {
+    let mut collecting = false;
+    let mut out = Vec::new();
+    for line in raw_body.lines() {
+        let is_section = line.trim_start().starts_with("##");
+        if collecting && is_section {
+            break;
+        }
+        if is_section
+            && line
+                .trim_start_matches('#')
+                .trim()
+                .to_ascii_lowercase()
+                .starts_with("needs context")
+        {
+            collecting = true;
+            continue;
+        }
+        if collecting {
+            if let Some(item) = bullet_item(line) {
+                out.push(item);
+            }
+        }
+    }
+    out
+}
+
+/// The content of a dash bullet (`- item`), trimmed, else `None`.
+fn bullet_item(line: &str) -> Option<String> {
+    let t = line.trim_start();
+    for marker in ["- ", "* ", "+ "] {
+        if let Some(rest) = t.strip_prefix(marker) {
+            let item = rest.trim().to_string();
+            if !item.is_empty() {
+                return Some(item);
+            }
+        }
+    }
+    None
 }
 
 /// The most-recently-created mission id under `repo_root`, if any. Missions are
