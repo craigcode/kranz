@@ -268,6 +268,63 @@ fn str_field(value: &Value, key: &str) -> String {
         .to_string()
 }
 
+// ---------------------------------------------------------------------------
+// Stateful stream parsing (stitches agent_message text into the terminal
+// Result — see module docs / docs/scoping/codex-backend.md)
+// ---------------------------------------------------------------------------
+
+/// Stateful wrapper around [`parse_codex_line`] that remembers the most
+/// recent `agent_message` [`AgentEvent::Text`] and stitches it into the
+/// terminal [`AgentEvent::Result`] when a `turn.completed` line arrives.
+///
+/// `turn.completed` carries no text of its own; the final `agent_message` of
+/// the turn is the codex analogue of Claude's terminal result text (the
+/// validator report JSON), so "last agent_message wins".
+#[derive(Debug, Default)]
+pub struct CodexStreamParser {
+    last_text: Option<String>,
+}
+
+impl CodexStreamParser {
+    pub fn new() -> Self {
+        CodexStreamParser::default()
+    }
+
+    /// Parse one stdout line, filling in any remembered `agent_message` text
+    /// on a terminal `Result` event.
+    pub fn push(&mut self, line: &str, model: &str) -> Vec<AgentEvent> {
+        parse_codex_line(line, model)
+            .into_iter()
+            .map(|event| self.observe(event))
+            .collect()
+    }
+
+    fn observe(&mut self, event: AgentEvent) -> AgentEvent {
+        match event {
+            AgentEvent::Text { text, raw } => {
+                self.last_text = Some(text.clone());
+                AgentEvent::Text { text, raw }
+            }
+            AgentEvent::Result {
+                text,
+                is_error,
+                usage,
+                cost_usd,
+                num_turns,
+                raw,
+            } if text.is_empty() => AgentEvent::Result {
+                text: self.last_text.take().unwrap_or_default(),
+                is_error,
+                usage,
+                cost_usd,
+                num_turns,
+                raw,
+            },
+            other => other,
+        }
+    }
+}
+
 fn parse_terminal(value: Value, model: &str) -> AgentEvent {
     let usage_field = |key: &str| {
         value
@@ -425,6 +482,7 @@ impl AgentBackend for CodexBackend {
             stderr_buf,
             stderr_task: Some(stderr_task),
             queue: VecDeque::new(),
+            stream_parser: CodexStreamParser::new(),
             saw_result: false,
             saw_success_result: false,
             exit: None,
@@ -451,6 +509,7 @@ pub struct CodexSession {
     stderr_task: Option<JoinHandle<()>>,
     /// Multi-block lines queue several events; popped one per `next_event`.
     queue: VecDeque<AgentEvent>,
+    stream_parser: CodexStreamParser,
     saw_result: bool,
     saw_success_result: bool,
     exit: Option<SessionExit>,
@@ -581,7 +640,7 @@ impl AgentSession for CodexSession {
             if line.trim().is_empty() {
                 continue;
             }
-            let events = parse_codex_line(&line, &self.model);
+            let events = self.stream_parser.push(&line, &self.model);
             for event in &events {
                 self.observe(event);
             }
@@ -676,6 +735,34 @@ mod tests {
             "expected non-zero usage on the terminal Result"
         );
         assert!(cost_usd.is_some(), "expected cost_usd to be Some");
+    }
+
+    #[test]
+    fn backend_codex_stream_parser_stitches_terminal_text() {
+        let mut parser = CodexStreamParser::new();
+        let mut events: Vec<AgentEvent> = Vec::new();
+        for line in fixture_lines() {
+            events.extend(parser.push(&line, DEFAULT_CODEX_MODEL));
+        }
+
+        let terminal_text = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::Result { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .expect("expected a terminal Result event");
+        assert!(
+            !terminal_text.is_empty(),
+            "expected the terminal Result text to be stitched from the last agent_message"
+        );
+
+        let report = crate::runner::parse_validator_report(&terminal_text)
+            .expect("terminal text should parse as a ValidatorReport");
+        assert!(
+            !report.findings.is_empty(),
+            "expected the fixture's ValidatorReport to have findings"
+        );
     }
 
     #[test]

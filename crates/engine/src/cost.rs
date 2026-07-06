@@ -330,7 +330,10 @@ mod tests {
         };
         let expected = 2.0 * 1.25 + 1.0 * 10.0 + 0.5 * (0.1 * 1.25) + 0.2 * (1.25 * 1.25);
         let got = usage_cost_usd(&usage, DEFAULT_CODEX_MODEL);
-        assert!((got - expected).abs() < 1e-9, "got {got}, expected {expected}");
+        assert!(
+            (got - expected).abs() < 1e-9,
+            "got {got}, expected {expected}"
+        );
     }
 
     #[test]
