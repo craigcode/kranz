@@ -25,6 +25,8 @@
 //!   mission) → [`Action::Guidance`]. Bot's own messages, thread roots, and
 //!   messages in unknown threads are ignored (else the bridge echoes itself).
 //! - `slash_commands` `/kranz ticket <title>` → [`Action::NewTicket`];
+//!   `/kranz ticket new <slug> <title...>` → [`Action::NewTicketModal`] (a
+//!   multiline goal/context modal, carrying the slug/title through);
 //!   `/kranz help`, bare `/kranz`, or any unrecognized subcommand →
 //!   [`Action::Help`] (the command list).
 //! - anything else → [`Action::Ignore`].
@@ -33,7 +35,8 @@ use crate::format::{
     APPROVE_ACTION_ID, CONFIG_CALLBACK_ID, CONFIG_EFFORT_ACTION, CONFIG_EFFORT_BLOCK,
     CONFIG_MISSION_ACTION, CONFIG_MISSION_BLOCK, CONFIG_MODEL_ACTION, CONFIG_MODEL_BLOCK,
     CONFIG_ROLE_ACTION, CONFIG_ROLE_BLOCK, NEW_MISSION_CALLBACK_ID, NEW_MISSION_GOAL_ACTION,
-    NEW_MISSION_GOAL_BLOCK, START_ACTION_ID,
+    NEW_MISSION_GOAL_BLOCK, NEW_TICKET_CALLBACK_ID, NEW_TICKET_CONTEXT_ACTION,
+    NEW_TICKET_CONTEXT_BLOCK, NEW_TICKET_GOAL_ACTION, NEW_TICKET_GOAL_BLOCK, START_ACTION_ID,
 };
 use serde_json::Value;
 
@@ -74,6 +77,34 @@ pub enum Action {
         title: String,
         channel: String,
         thread_ts: Option<String>,
+    },
+    /// `/kranz ticket new <slug> <title...>` → open the multiline
+    /// goal/context modal (a slash command is single-line, so a real ticket
+    /// body needs this escape hatch, mirroring [`Action::NewMissionModal`]).
+    /// `slug`/`title` are already fixed by the command line and ride through
+    /// to the `view_submission` via the modal's `private_metadata`.
+    /// `trigger_id` expires ~3s after the slash, so the bridge must open the
+    /// view inline, never on a spawned task.
+    NewTicketModal {
+        trigger_id: String,
+        slug: String,
+        title: String,
+        user_id: Option<String>,
+        response_url: Option<String>,
+        channel: String,
+    },
+    /// The new-ticket modal's `view_submission` → create the backlog ticket
+    /// (slug/title carried from `private_metadata`, goal/context typed into
+    /// the modal). Mirrors [`Action::NewTicket`] but with the richer body a
+    /// single-line slash command can't carry; the bridge creates it through
+    /// the same primitive `POST /api/tickets` uses
+    /// (`kranz_engine::ticket::Ticket::scaffold`), off the socket read loop.
+    CreateTicket {
+        slug: String,
+        title: String,
+        goal: String,
+        context: String,
+        channel: String,
     },
     /// `/kranz ticket list` → one row per backlog ticket. Read-only, so not
     /// gated (no `user_id`); replies over `response_url`, same as
@@ -346,6 +377,7 @@ fn route_view_submission(payload: &Value) -> Action {
     match view.get("callback_id").and_then(Value::as_str) {
         Some(NEW_MISSION_CALLBACK_ID) => {}
         Some(CONFIG_CALLBACK_ID) => return route_config_submission(payload, view),
+        Some(NEW_TICKET_CALLBACK_ID) => return route_new_ticket_submission(view),
         _ => return Action::Ignore,
     }
     let goal = view
@@ -427,6 +459,61 @@ fn route_config_submission(payload: &Value, view: &Value) -> Action {
         user_id,
         response_url: None,
         channel,
+    }
+}
+
+/// The new-ticket modal's `view_submission` → [`Action::CreateTicket`].
+/// `slug`/`title`/`channel` come back out of `private_metadata` (the JSON
+/// object [`crate::format::build_new_ticket_modal`] stashed at open — a
+/// `view_submission` carries no other way to recover them); `goal`/`context`
+/// come from the modal's two (optional) multiline inputs. A malformed/foreign
+/// payload (missing slug/title/channel) is ignored — nothing sane to create.
+fn route_new_ticket_submission(view: &Value) -> Action {
+    let metadata = view
+        .get("private_metadata")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let Ok(metadata) = serde_json::from_str::<Value>(metadata) else {
+        return Action::Ignore;
+    };
+    let slug = metadata
+        .get("slug")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let title = metadata
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let channel = metadata
+        .get("channel")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if slug.is_empty() || title.is_empty() || channel.is_empty() {
+        return Action::Ignore;
+    }
+    let goal = view
+        .pointer(&format!(
+            "/state/values/{NEW_TICKET_GOAL_BLOCK}/{NEW_TICKET_GOAL_ACTION}/value"
+        ))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let context = view
+        .pointer(&format!(
+            "/state/values/{NEW_TICKET_CONTEXT_BLOCK}/{NEW_TICKET_CONTEXT_ACTION}/value"
+        ))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    Action::CreateTicket {
+        slug: slug.to_string(),
+        title: title.to_string(),
+        goal: goal.to_string(),
+        context: context.to_string(),
+        channel: channel.to_string(),
     }
 }
 
@@ -553,6 +640,35 @@ fn route_slash(payload: &Value) -> Action {
                     response_url,
                 };
             }
+        }
+        // `ticket new <slug> <title...>` → the multiline goal/context modal
+        // (checked BEFORE the title fallback, same reasoning as list/show:
+        // a ticket literally titled "new ..." is the one surprising edge
+        // case). Requires a slug, a title, AND a trigger_id (always present
+        // on a real slash command) — anything short of that is malformed and
+        // routes to help rather than silently misfiring.
+        if let Some(after_new) = strip_ci_prefix(arg, "new") {
+            let rest = after_new.trim();
+            let mut parts = rest.splitn(2, char::is_whitespace);
+            let slug = parts.next().unwrap_or("").trim();
+            let title = parts.next().unwrap_or("").trim();
+            if !slug.is_empty() && !title.is_empty() {
+                if let Some(trigger_id) = payload
+                    .get("trigger_id")
+                    .and_then(Value::as_str)
+                    .filter(|t| !t.is_empty())
+                {
+                    return Action::NewTicketModal {
+                        trigger_id: trigger_id.to_string(),
+                        slug: slug.to_string(),
+                        title: title.to_string(),
+                        user_id,
+                        response_url,
+                        channel,
+                    };
+                }
+            }
+            return Action::Help { response_url };
         }
         let title = arg;
         if !title.is_empty() {

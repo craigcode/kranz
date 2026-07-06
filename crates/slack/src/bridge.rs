@@ -437,6 +437,7 @@ fn is_slow_action(action: &Action) -> bool {
             | Action::QueueTicket { .. }
             | Action::Draft { .. }
             | Action::WorkRun { .. }
+            | Action::CreateTicket { .. }
     )
 }
 
@@ -1008,6 +1009,85 @@ async fn dispatch_action(
                     )),
                 )
                 .await;
+            }
+        }
+
+        // `/kranz ticket new <slug> <title...>`: open the multiline
+        // goal/context modal. MUST run inline — the trigger_id expires ~3s
+        // after the slash — mirroring [`Action::NewMissionModal`].
+        Action::NewTicketModal {
+            trigger_id,
+            slug,
+            title,
+            user_id,
+            response_url,
+            channel,
+        } => {
+            if !cfg.is_authorized(user_id.as_deref()) {
+                reply_ephemeral(
+                    cfg,
+                    client,
+                    response_url.as_deref(),
+                    &not_authorized_blocks(),
+                )
+                .await;
+                return;
+            }
+            let view = crate::format::build_new_ticket_modal(slug, title, channel);
+            if let Err(e) = client.open_view(trigger_id, &view).await {
+                tracing::warn!(error = %e, "failed to open new-ticket modal");
+                reply_ephemeral(
+                    cfg,
+                    client,
+                    response_url.as_deref(),
+                    &error_blocks(&format!(
+                        "Couldn't open the new-ticket form: {e}. One-line fallback: \
+                         `/kranz ticket <title>`."
+                    )),
+                )
+                .await;
+            }
+        }
+
+        // The new-ticket modal's `view_submission`: scaffold the ticket
+        // through the same primitive `POST /api/tickets` uses
+        // (`Ticket::scaffold`). No `response_url` (a modal submission has
+        // none), so the confirmation/error posts straight into `channel`.
+        Action::CreateTicket {
+            slug,
+            title,
+            goal,
+            context,
+            channel,
+        } => {
+            let goal = (!goal.trim().is_empty()).then_some(goal.as_str());
+            let context = (!context.trim().is_empty()).then_some(context.as_str());
+            match create_ticket(repo_root, slug, title, goal, context) {
+                Ok(()) => {
+                    let blocks = vec![json!({
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": format!(
+                                ":ticket: Created ticket `{}` — {}",
+                                crate::format::escape_mrkdwn(slug),
+                                crate::format::escape_mrkdwn(title)
+                            )
+                        }
+                    })];
+                    if let Err(e) = client.post_message(channel, &blocks, None).await {
+                        tracing::warn!(error = %e, "failed to post ticket-created confirmation");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to create ticket from Slack modal");
+                    if let Err(e) = client
+                        .post_message(channel, &error_blocks(&format!("Couldn't create ticket `{slug}`: {e}")), None)
+                        .await
+                    {
+                        tracing::warn!(error = %e, "failed to post ticket-creation error");
+                    }
+                }
             }
         }
 
@@ -1929,6 +2009,8 @@ fn apply_action(repo_root: &Path, action: &Action) -> Result<()> {
         | Action::TicketShow { .. }
         | Action::NewMission { .. }
         | Action::NewMissionModal { .. }
+        | Action::NewTicketModal { .. }
+        | Action::CreateTicket { .. }
         | Action::ConfigModal { .. }
         | Action::RequestPlan { .. }
         | Action::ApproveMission { .. }
@@ -2494,6 +2576,26 @@ fn scaffold_ticket(repo_root: &Path, title: &str) -> Result<()> {
     );
     std::fs::write(&path, body).with_context(|| format!("writing ticket {}", path.display()))?;
     tracing::info!(slug = %slug, "ticket scaffolded from Slack slash command");
+    Ok(())
+}
+
+/// Create a ticket from `/kranz ticket new`'s modal submission, through the
+/// same primitive `POST /api/tickets` uses
+/// (`kranz_engine::ticket::Ticket::scaffold`) rather than the bare-bones
+/// template [`scaffold_ticket`] writes — this path already has a validated
+/// slug, and an optional goal/context to seed the ticket body with.
+fn create_ticket(
+    repo_root: &Path,
+    slug: &str,
+    title: &str,
+    goal: Option<&str>,
+    context: Option<&str>,
+) -> Result<()> {
+    use kranz_engine::ticket::Ticket;
+    Ticket::ensure_valid_slug(slug).with_context(|| format!("invalid ticket slug '{slug}'"))?;
+    Ticket::scaffold(repo_root, slug, title, goal, context)
+        .with_context(|| format!("scaffolding ticket '{slug}'"))?;
+    tracing::info!(slug = %slug, "ticket created from Slack new-ticket modal");
     Ok(())
 }
 
