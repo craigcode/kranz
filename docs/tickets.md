@@ -37,6 +37,9 @@ code. Pipeline state (NEW → REVIEW → QUEUED → done) lives in a sidecar
 state file, not the markdown — editing a ticket never corrupts its state.
 Slugs are validated (ascii alphanumerics, `-`, `_`, `.`; no traversal).
 
+A ticket can also declare `blocked-by: [slug, ...]` in its frontmatter to
+depend on other tickets — see §Dependencies (`blocked-by`) below.
+
 ## Listing the backlog
 
 ```sh
@@ -77,6 +80,80 @@ What each step really does:
   entry and exits (exit 0 if the repo is busy). Crash recovery is
   automatic: claims are atomic file renames, and dead dispatchers' claims
   are recovered on the next run.
+
+## Dependencies (`blocked-by`)
+
+A ticket can name other tickets it depends on:
+
+```markdown
+---
+title: Wire the new client into the dashboard
+priority: 2
+blocked-by: [add-client-lib, add-client-tests]
+---
+```
+
+A blocker is **satisfied only when its mission reaches `Complete`** —
+approved, queued, running, or failed all still count as blocked. There is
+no partial credit: satisfaction is authoritative on mission status alone,
+never on ticket/queue pipeline state.
+
+- **`kranz ticket approve <slug>`** refuses an approval with an unsatisfied
+  blocker, naming it honestly:
+
+  ```
+  cannot approve <slug>: blocked by <blocker>, <blocker> (its mission is not Complete)
+  ```
+
+- **`kranz ticket approve <slug> --force`** overrides unsatisfied blockers
+  (approve anyway, at your own risk) — but never a cycle (below); a cycle
+  is refused unconditionally.
+- **Cycle detection** runs at approve time regardless of `--force`: the
+  `blocked-by` graph is walked from `slug`, and a reachable cycle refuses
+  the approval with the path spelled out:
+
+  ```
+  blocked-by cycle: a -> b -> a
+  ```
+
+- **`kranz work` re-checks blockers at work time**, not just at approve
+  time: batch-approving a night's worth of tickets can queue a dependent
+  right alongside a blocker that later fails mid-drain. When the
+  dispatcher is about to run a queued entry and finds a `blocked-by` ticket
+  that reached `Failed`, it skips the entry — retiring its claim, marking
+  the ticket `Failed` with a note naming the blocker, and printing:
+
+  ```
+  warning: skipping ticket '<slug>' — blocked-by '<blocker>' failed
+  ```
+
+  This is a one-shot skip, not a retry loop — re-driving a mission whose
+  dependency failed can never succeed on its own.
+
+The CLI and the REST `POST /api/tickets/:slug/approve` route share this
+exact gate (`kranz_engine::deps::approve_ticket`), so the two surfaces can
+never drift on what "approvable" means.
+
+## The backlog over REST
+
+`kranz serve` exposes the same backlog as a REST surface, as an
+alternative to the CLI pipeline above:
+
+```
+GET  /api/tickets              # list: slug, priority, state, title, blockedBy
+GET  /api/tickets/:slug        # full ticket + needsContext
+POST /api/tickets/:slug/draft  # kick off a draft (202, long-running)
+POST /api/tickets/:slug/approve  # {"force": bool} -> approve into the queue
+```
+
+`draft` is asynchronous: it returns `202 {"missionId":"m-…"}` immediately
+and the draft turns run as a background task. Watch progress over that
+mission's `GET /api/missions/:id/ws` feed, and poll `GET /api/tickets/:slug`
+for the terminal outcome (Review vs NEEDS-CONTEXT). Both `POST` routes
+require the mutation token like every other `POST` (docs/protocol.md
+§Authority); `approve` returns the same `409` shapes described above for
+an unsatisfied blocker or a cycle. See docs/protocol.md §Tickets for the
+full request/response reference.
 
 ## Batch pattern
 
