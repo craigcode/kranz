@@ -1,8 +1,8 @@
 # M5 scoping — Real secret scanning (gate the write; the log never forgets)
 
-Status: scoped 2026-07-06, DESIGN-FIRST — the four flagged decisions (D-A…D-D) are the operator's;
-review this doc before any mission is drafted against it. Roadmap contract: "real secret scanning
-replacing the regex scrub" (docs/roadmap.md:146, M5).
+Status: scoped 2026-07-06 — ALL FOUR decisions (D-A…D-D) DECIDED 2026-07-06, each
+as recommended. Draft-ready; the Open questions are build-time probes. Roadmap
+contract: "real secret scanning replacing the regex scrub" (docs/roadmap.md:146, M5).
 
 ## Why
 
@@ -71,7 +71,7 @@ All of it is hand-wired, site by site. Nothing guarantees the next emit path get
 Read-side auth (tokenless transcript REST, rest.rs:211-224; tokenless WS) stays M6's ("token required
 on reads too", roadmap.md:164-165). This build shrinks what a read reveals; M6 shrinks who can read.
 
-## D-A — which choke points gate (OPERATOR DECISION)
+## D-A — which choke points gate (DECIDED 2026-07-06)
 
 **Proposal.** Move scanning INTO the write boundary: `emit`/`EventLog::append` scans every event
 payload; `commit_paths` scans staged content; human ingress is scanned like model output. Existing
@@ -81,7 +81,9 @@ layer — they render the canonical, already-gated log; scanning there would inv
 **Recommendation: all four write-side gates (event ingest, human ingress, commit, merge); nothing
 read-side.** The alternative — hardening emit sites one by one — already failed twice (Why 2, Why 3).
 
-## D-B — detection engine: external binary vs built-in (OPERATOR DECISION)
+DECIDED 2026-07-06: as recommended.
+
+## D-B — detection engine: external binary vs built-in (DECIDED 2026-07-06)
 
 The dependency-discipline lens, applied:
 
@@ -101,7 +103,10 @@ absent — **the gate never silently skips**.
 **Recommendation: the hybrid.** No new crate dependency, no bundled binary, one optional tool the
 operator can install; verify the from-memory license/size claims before deciding.
 
-## D-C — the merge-gate and CI slot (OPERATOR DECISION)
+DECIDED 2026-07-06: as recommended — the hybrid; license/size claims still
+verified at build time.
+
+## D-C — the merge-gate and CI slot (DECIDED 2026-07-06)
 
 **Proposal.** A dedicated secret-scan pre-gate in `merge_mission`, ahead of the gate suite: scan the
 mission branch's diff against the merge base — cheap, fails in seconds, before any cargo gate spends
@@ -117,7 +122,9 @@ hook catches it pre-commit. Layered, honestly labeled.
 
 **Recommendation: dedicated pre-gate + CI job + `kranz scan`, all three.**
 
-## D-D — false-positive flow (OPERATOR DECISION)
+DECIDED 2026-07-06: as recommended — all three lanes.
+
+## D-D — false-positive flow (DECIDED 2026-07-06)
 
 The asymmetry is the design driver: a wrongly-redacted string is a mission inconvenience; a
 wrongly-passed secret is unrecoverable (principle 2).
@@ -133,6 +140,9 @@ wrongly-passed secret is unrecoverable (principle 2).
   `9b21172` tracked-content policy — verify at build time.
 
 **Recommendation: as proposed.** No global "disable scanning" switch on any surface.
+
+DECIDED 2026-07-06: as proposed — no interactive waiver on the write path,
+committed-fingerprint waivers at the merge gate, no global off switch.
 
 ## Adjacent scopes (owned elsewhere — do not re-scope)
 
