@@ -882,6 +882,48 @@ pub async fn run_validator_in(
     run_session(backend, spec, log, paths, run_meta, cancel).await
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validator_report_schema_marks_finding_class_optional() {
+        let schema = validator_report_schema();
+        let finding_props = &schema["properties"]["findings"]["items"]["properties"];
+        assert!(finding_props.get("class").is_some());
+        let required = schema["properties"]["findings"]["items"]["required"]
+            .as_array()
+            .unwrap();
+        assert!(!required.iter().any(|v| v == "class"));
+    }
+
+    #[test]
+    fn validator_report_schema_finding_class_accepts_with_and_without() {
+        let with_class = r#"{
+            "findings": [{
+                "subject": "a-1",
+                "severity": "major",
+                "evidence": "wrote outside touch-set",
+                "class": "out-of-contract-write"
+            }],
+            "summary": "s"
+        }"#;
+        let report: ValidatorReport = serde_json::from_str(with_class).unwrap();
+        assert_eq!(report.findings[0].class, "out-of-contract-write");
+
+        let without_class = r#"{
+            "findings": [{
+                "subject": "a-1",
+                "severity": "major",
+                "evidence": "it broke"
+            }],
+            "summary": "s"
+        }"#;
+        let report: ValidatorReport = serde_json::from_str(without_class).unwrap();
+        assert_eq!(report.findings[0].class, "");
+    }
+}
+
 /// `- item` per line; `- (none)` for an empty list.
 fn bullet_list(items: &[String]) -> String {
     if items.is_empty() {

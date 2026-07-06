@@ -502,4 +502,30 @@ mod tests {
         let report: WorkerReport = serde_json::from_str(json).unwrap();
         assert!(report.commands_run.is_empty());
     }
+
+    #[test]
+    fn finding_class_round_trips_through_serde() {
+        let finding = Finding {
+            subject: "a-1".to_string(),
+            severity: "major".to_string(),
+            evidence: "wrote outside touch-set".to_string(),
+            suggested_fix: String::new(),
+            class: "out-of-contract-write".to_string(),
+        };
+        let json = serde_json::to_value(&finding).unwrap();
+        assert_eq!(json["class"], "out-of-contract-write");
+        let round_tripped: Finding = serde_json::from_value(json).unwrap();
+        assert_eq!(round_tripped.class, "out-of-contract-write");
+    }
+
+    #[test]
+    fn finding_class_backcompat_defaults_empty() {
+        let json = r#"{
+            "subject": "a-1",
+            "severity": "major",
+            "evidence": "it broke"
+        }"#;
+        let finding: Finding = serde_json::from_str(json).unwrap();
+        assert_eq!(finding.class, "");
+    }
 }
