@@ -15,6 +15,16 @@ use std::path::Path;
 
 const TOKENS_PER_MTOK: f64 = 1_000_000.0;
 
+/// Default model id for the Codex backend, importable engine-wide.
+pub const DEFAULT_CODEX_MODEL: &str = "gpt-5-codex";
+
+/// Whether `model` names a codex-family model (same substring match
+/// [`pricing_for_model`] uses to select codex pricing).
+pub fn is_codex_model(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    m.contains("codex") || m.contains("gpt")
+}
+
 /// Per-model token pricing in USD per million tokens.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Pricing {
@@ -43,6 +53,11 @@ pub fn pricing_for_model(model: &str) -> Pricing {
         Pricing {
             input_per_mtok: 10.0,
             output_per_mtok: 50.0,
+        }
+    } else if m.contains("codex") || m.contains("gpt") {
+        Pricing {
+            input_per_mtok: 1.25,
+            output_per_mtok: 10.0,
         }
     } else if m.contains("opus") {
         Pricing {
@@ -298,5 +313,40 @@ fn mission_actuals(state: &MissionState) -> EstimateParams {
         avg_worker_run_usd: mean_run_cost(&[Role::Worker]),
         avg_validator_run_usd: mean_run_cost(&[Role::ValidatorScrutiny, Role::ValidatorFunctional]),
         orchestrator_overhead_usd_per_feature: safe_div(orchestrator_total, total_features),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_pricing_applied() {
+        let codex = pricing_for_model(DEFAULT_CODEX_MODEL);
+        assert_eq!(codex.input_per_mtok, 1.25);
+        assert_eq!(codex.output_per_mtok, 10.0);
+
+        let opus = pricing_for_model("opus");
+        assert_ne!(codex, opus);
+
+        let usage = TokenUsage {
+            input: 2_000_000,
+            output: 1_000_000,
+            cache_read: 500_000,
+            cache_write: 200_000,
+        };
+        let expected = 2.0 * 1.25 + 1.0 * 10.0 + 0.5 * (0.1 * 1.25) + 0.2 * (1.25 * 1.25);
+        let got = usage_cost_usd(&usage, DEFAULT_CODEX_MODEL);
+        assert!(
+            (got - expected).abs() < 1e-9,
+            "got {got}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn unknown_model_falls_back_to_opus_tier() {
+        let unknown = pricing_for_model("some-unknown-model-xyz");
+        let opus = pricing_for_model("opus");
+        assert_eq!(unknown, opus);
     }
 }

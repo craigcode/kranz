@@ -34,30 +34,61 @@ pub struct SessionSpec {
     pub cwd: PathBuf,
     pub prompt: PromptMode,
     /// Appended to the default Claude Code system prompt (role prompt).
+    ///
+    /// Claude-CLI-ism: `--append-system-prompt` has no equivalent on other
+    /// backends, which may ignore this field.
     pub append_system_prompt: Option<String>,
     /// Model alias or full id (passed to --model).
     pub model: String,
     /// low | medium | high | xhigh | max (passed to --effort).
+    ///
+    /// Claude-CLI-ism: `--effort` is a Claude Code flag; a non-claude backend
+    /// may ignore this field.
     pub effort: String,
     /// Engine-chosen session UUID (passed to --session-id) so resume
     /// bookkeeping never depends on parsing CLI output.
     pub session_id: String,
     /// When set, resume this previous session id instead of starting fresh.
+    ///
+    /// Claude-CLI-ism: session resume is a Claude Code capability; a
+    /// non-claude backend may ignore (or reject) this field.
     pub resume: Option<String>,
     /// Passed to --permission-mode (e.g. "acceptEdits", "plan", "dontAsk").
+    ///
+    /// Claude-CLI-ism: `--permission-mode` has no equivalent on other
+    /// backends, which may ignore this field.
     pub permission_mode: Option<String>,
     /// Passed to --allowedTools (patterns like "Bash(npm test*)").
+    ///
+    /// Claude-CLI-ism: `--allowedTools` is a Claude Code permission concept; a
+    /// non-claude backend may ignore this field.
     pub allowed_tools: Vec<String>,
     /// Passed to --disallowedTools (patterns like "Bash(git push*)").
+    ///
+    /// Claude-CLI-ism: `--disallowedTools` is a Claude Code permission
+    /// concept; a non-claude backend may ignore this field.
     pub disallowed_tools: Vec<String>,
     /// Passed to `--tools` (the built-in exclusive tool allow-list): empty = CLI default set, no flag emitted.
     /// Distinct from `allowed_tools`/`disallowed_tools`, which are permission patterns.
+    ///
+    /// Claude-CLI-ism: `--tools` is a Claude Code flag; a non-claude backend
+    /// may ignore this field.
     pub tools: Vec<String>,
     /// Extra settings JSON (hooks etc.) passed via --settings.
+    ///
+    /// Claude-CLI-ism: `--settings` (hooks, etc.) is a Claude Code concept; a
+    /// non-claude backend may ignore this field.
     pub settings_json: Option<serde_json::Value>,
     /// JSON Schema enforced on the session's structured output (--json-schema).
+    ///
+    /// Claude-CLI-ism: `--json-schema` is a Claude Code flag; a non-claude
+    /// backend may ignore this field.
     pub json_schema: Option<serde_json::Value>,
     /// Hard dollar cap for the run (--max-budget-usd).
+    ///
+    /// Claude-CLI-ism: `--max-budget-usd` is a Claude Code flag; a non-claude
+    /// backend may ignore this field (and should enforce cost caps engine-side
+    /// via its own pricing table instead).
     pub max_budget_usd: Option<f64>,
     /// Soft turn budget: the engine counts assistant turns and aborts the
     /// session when exceeded (the CLI no longer has --max-turns).

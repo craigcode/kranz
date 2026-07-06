@@ -267,6 +267,11 @@ pub struct MissionEngine {
     /// planning seed's reply routinely ends with scoping questions the user
     /// must see. Drained by [`MissionEngine::take_seed_reply`].
     pending_seed_reply: Option<String>,
+    /// Lazily-built [`crate::backend_codex::CodexBackend`] cache for
+    /// `validatorScrutiny.backend = "codex"`. `None` until the first
+    /// successful probe; a failed probe is never cached (so a codex install
+    /// that appears mid-mission is picked up on the next scrutiny round).
+    codex_backend: Option<Arc<dyn AgentBackend>>,
 }
 
 impl MissionEngine {
@@ -335,6 +340,7 @@ impl MissionEngine {
             orch_transcript: None,
             orch_stall_timeout: DEFAULT_ORCH_STALL_TIMEOUT,
             pending_seed_reply: None,
+            codex_backend: None,
         })
     }
 
@@ -422,6 +428,7 @@ impl MissionEngine {
             orch_transcript: None,
             orch_stall_timeout: DEFAULT_ORCH_STALL_TIMEOUT,
             pending_seed_reply: None,
+            codex_backend: None,
         })
     }
 
@@ -498,6 +505,18 @@ impl MissionEngine {
             });
         }
 
+        if self.state.config.validator_scrutiny.backend.as_deref() == Some("codex") {
+            if let Err(err) = crate::backend_codex::discover_codex_binary(None) {
+                issues.push(PreflightIssue {
+                    severity: "warn",
+                    message: format!(
+                        "validatorScrutiny.backend is \"codex\" but no codex binary was found \
+                         ({err}); the scrutiny validator will fall back to the claude backend"
+                    ),
+                });
+            }
+        }
+
         // Contract command programs: probe the leading token of each distinct
         // command, flagging only ones that clearly do not resolve on PATH.
         let mut probed: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -561,6 +580,46 @@ impl MissionEngine {
             detail: detail.map(|d| scrub::scrub(&d)),
         })?;
         Ok(())
+    }
+
+    /// Choose the backend for a `ValidatorScrutiny` run.
+    ///
+    /// `validatorScrutiny.backend == Some("codex")` selects
+    /// [`crate::backend_codex::CodexBackend`], probing availability via
+    /// [`crate::backend_codex::discover_codex_binary`] and lazily caching the
+    /// constructed backend in `self.codex_backend` on success. Any other
+    /// config value (including the default `None`) keeps the injected
+    /// `self.backend`.
+    ///
+    /// On probe failure this falls back to `self.backend` and returns
+    /// `Some(reason)` describing the fallback — the caller MUST surface that
+    /// reason via [`Self::emit_decision`] before spawning, so a codex
+    /// unavailability never silently swaps in a different validator.
+    fn select_scrutiny_backend(&mut self) -> (Arc<dyn AgentBackend>, Option<String>) {
+        if !matches!(
+            self.state.config.scrutiny_backend_kind(),
+            BackendKind::Codex
+        ) {
+            return (Arc::clone(&self.backend), None);
+        }
+        if let Some(cached) = &self.codex_backend {
+            return (Arc::clone(cached), None);
+        }
+        match crate::backend_codex::discover_codex_binary(None) {
+            Ok(binary) => {
+                let backend: Arc<dyn AgentBackend> =
+                    Arc::new(crate::backend_codex::CodexBackend::new(binary));
+                self.codex_backend = Some(Arc::clone(&backend));
+                (backend, None)
+            }
+            Err(err) => (
+                Arc::clone(&self.backend),
+                Some(format!(
+                    "codex backend requested but not available ({err}); falling back to \
+                     the claude scrutiny validator"
+                )),
+            ),
+        }
     }
 
     /// Fold events appended by `runner::run_*` (which writes to the log
@@ -2086,11 +2145,39 @@ impl MissionEngine {
         for role in roles {
             let milestone = self.state.mission.milestones[mi].clone();
             let contract = self.state.mission.validation_contract.clone();
-            let cfg = self.state.config.clone();
+            let mut cfg = self.state.config.clone();
             let base_sha = self.state.mission.base_sha.clone();
             let grants = self.state.mission.command_grants.clone();
             let worker_commands = worker_commands_for_milestone(&self.state, &milestone);
-            let backend = Arc::clone(&self.backend);
+
+            // Only `ValidatorScrutiny` may run on a non-claude backend
+            // (config::validate enforces this); `ValidatorFunctional` always
+            // uses the injected backend.
+            let mut used_codex = false;
+            let backend = if role == Role::ValidatorScrutiny {
+                let (backend, fallback_reason) = self.select_scrutiny_backend();
+                if let Some(reason) = fallback_reason {
+                    // Loud, recorded — a codex probe failure never silently
+                    // swaps the validator backend.
+                    self.emit_decision(&reason, None)?;
+                } else if matches!(
+                    self.state.config.scrutiny_backend_kind(),
+                    BackendKind::Codex
+                ) {
+                    used_codex = true;
+                }
+                backend
+            } else {
+                Arc::clone(&self.backend)
+            };
+
+            // Codex pricing/totals only apply to codex-family models: swap in
+            // DEFAULT_CODEX_MODEL for both the dispatch spec and RunMeta when
+            // validatorScrutiny.model isn't already one.
+            if used_codex && !cost::is_codex_model(&cfg.validator_scrutiny.model) {
+                cfg.validator_scrutiny.model = cost::DEFAULT_CODEX_MODEL.to_string();
+            }
+
             let outcome = runner::run_validator(
                 backend.as_ref(),
                 &mut self.log,
@@ -2107,8 +2194,41 @@ impl MissionEngine {
             )
             .await;
             let caught = self.catch_up();
-            let outcome = outcome?;
+            let mut outcome = outcome?;
             caught?;
+
+            // Bounded (exactly one retry) runtime fallback: a codex scrutiny
+            // run that errored out with no report (auth/network failure)
+            // falls back to the claude backend so a persistently broken
+            // codex install can't loop.
+            if used_codex && outcome.validator_report.is_none() {
+                self.emit_decision(
+                    "codex scrutiny run failed with no validator report; retrying once with \
+                     the claude scrutiny validator",
+                    None,
+                )?;
+                let retry_cfg = self.state.config.clone();
+                let retry_backend = Arc::clone(&self.backend);
+                let retry_outcome = runner::run_validator(
+                    retry_backend.as_ref(),
+                    &mut self.log,
+                    &self.paths,
+                    &retry_cfg,
+                    role,
+                    &milestone,
+                    &contract,
+                    &start_sha,
+                    None,
+                    base_sha.as_deref(),
+                    &grants,
+                    &worker_commands,
+                )
+                .await;
+                let caught = self.catch_up();
+                outcome = retry_outcome?;
+                caught?;
+            }
+
             if let Some(report) = outcome.validator_report {
                 for finding in report.findings {
                     findings.push((outcome.run_id.clone(), finding));
@@ -4508,6 +4628,170 @@ fn plan_schema() -> serde_json::Value {
 mod tests {
     use super::*;
 
+    // -----------------------------------------------------------------------
+    // Scrutiny backend selection (f-2-2)
+    // -----------------------------------------------------------------------
+
+    /// Serializes tests that mutate process-global env vars (`HOME`, `PATH`,
+    /// `KRANZ_CODEX_BIN`) to force [`crate::backend_codex::discover_codex_binary`]
+    /// to fail, regardless of whatever codex install happens to sit on the
+    /// host running the suite.
+    static CODEX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard: points `KRANZ_CODEX_BIN` at a path that cannot exist, so
+    /// codex discovery misses. Since `KRANZ_CODEX_BIN` is an exclusive
+    /// override (see `discover_codex_binary`), this alone makes codex
+    /// deterministically "absent" without touching `PATH`/`HOME` — other
+    /// tests that shell out to `git` in parallel are unaffected. Restores the
+    /// previous value on drop, including on panic, so a failed assertion
+    /// never leaks a poisoned environment into later tests.
+    struct CodexEnvGuard {
+        prev_bin: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl CodexEnvGuard {
+        fn engage() -> Self {
+            let lock = CODEX_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let prev_bin = std::env::var_os("KRANZ_CODEX_BIN");
+            std::env::set_var(
+                "KRANZ_CODEX_BIN",
+                "/nonexistent/kranz-test-codex-binary-absent",
+            );
+            CodexEnvGuard {
+                prev_bin,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for CodexEnvGuard {
+        fn drop(&mut self) {
+            match self.prev_bin.take() {
+                Some(v) => std::env::set_var("KRANZ_CODEX_BIN", v),
+                None => std::env::remove_var("KRANZ_CODEX_BIN"),
+            }
+        }
+    }
+
+    /// Default config never selects codex: `select_scrutiny_backend` must
+    /// hand back the injected backend untouched and never emit a fallback
+    /// decision (there is nothing to fall back from).
+    #[test]
+    fn default_scrutiny_backend_is_claude() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).unwrap_or_else(|_| dir.path().to_path_buf());
+        let _ = std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&root)
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.name", "test"])
+            .current_dir(&root)
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(&root)
+            .output();
+        std::fs::write(root.join("README.md"), "seed\n").unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&root)
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["commit", "-m", "seed"])
+            .current_dir(&root)
+            .output();
+
+        let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
+        let mut engine =
+            MissionEngine::create(backend.clone(), &root, "goal", MissionConfig::default())
+                .expect("create engine");
+
+        let before = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+
+        let (selected, reason) = engine.select_scrutiny_backend();
+        assert!(reason.is_none(), "default config must not fall back");
+        assert!(
+            Arc::ptr_eq(&selected, &backend),
+            "default config must select the injected backend"
+        );
+
+        let after = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "select_scrutiny_backend must not emit any event on the claude-default path"
+        );
+    }
+
+    /// `validatorScrutiny.backend = "codex"` with no codex binary reachable:
+    /// preflight must warn, the run loop's fallback decision must land in the
+    /// event log, and the scrutiny validator must still run — through the
+    /// injected (mock) backend, never silently skipped.
+    #[tokio::test]
+    async fn codex_absent_loud_fallback() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+
+        let mut cfg = MissionConfig::default();
+        cfg.validator_scrutiny.backend = Some("codex".to_string());
+        cfg.skip_functional = true;
+
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            crate::backend_mock::MockScript::single_shot_json(&serde_json::json!({
+                "findings": [],
+                "summary": "clean"
+            })),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock.clone();
+        let mut engine = MissionEngine::create(backend, &root, "goal", cfg).expect("create engine");
+        engine.state.mission.milestones.push(Milestone {
+            id: "ms-1".to_string(),
+            title: "m".to_string(),
+            features: vec![],
+            status: MilestoneStatus::Active,
+            fix_cycles: 0,
+            start_sha: Some("HEAD".to_string()),
+        });
+
+        let env_guard = CodexEnvGuard::engage();
+
+        let issues = engine.preflight();
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.severity == "warn" && i.message.contains("codex")),
+            "expected a codex preflight warning, got {issues:?}"
+        );
+
+        engine
+            .validation_round(0)
+            .await
+            .expect("validation round must complete through the mock fallback, not error");
+
+        drop(env_guard);
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events.jsonl");
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.kind,
+                EventKind::OrchestratorDecision { summary, .. }
+                    if summary.contains("codex") && summary.contains("not available")
+            )),
+            "expected a loud fallback decision recorded in the event log; got {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+
+        let started = mock.started_specs();
+        assert_eq!(
+            started.len(),
+            1,
+            "the scrutiny validator must still run exactly once, through the injected backend"
+        );
+    }
+
     fn assertion(id: &str) -> Assertion {
         Assertion {
             id: id.to_string(),
@@ -5181,5 +5465,390 @@ mod tests {
         assert_eq!(specs.len(), 1);
         let seed = streaming_seed(&specs[0]);
         assert!(!seed.contains("Lessons from past missions"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Codex scrutiny integration (f-2-3): a stubbed `codex exec --json`
+    // binary drives real ValidatorReport findings into the fix-cycle
+    // machinery, priced with the codex table. No real API spend: everything
+    // comes from a POSIX shell stub streaming the committed fixture.
+    // -----------------------------------------------------------------------
+
+    /// Writes an executable POSIX shell stub that stands in for the real
+    /// `codex` CLI closely enough to drive [`crate::backend_codex::CodexBackend`]:
+    /// `--version` prints a plausible version string and any `exec ...`
+    /// invocation streams the committed fixture JSONL to stdout, exiting 0.
+    /// Not portable to windows-latest (no `/bin/sh`), hence `cfg(unix)`.
+    #[cfg(unix)]
+    fn write_codex_stub() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fixture = std::fs::canonicalize(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/codex_exec_scrutiny.jsonl"),
+        )
+        .expect("fixture exists");
+        let script_path = dir.path().join("codex-stub.sh");
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'codex-cli 0.0.0-test'\n  exit 0\nfi\ncat '{}'\nexit 0\n",
+                fixture.display()
+            ),
+        )
+        .expect("write stub script");
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat stub script")
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod stub script");
+        (dir, script_path)
+    }
+
+    /// Like [`write_codex_stub`] but the stub's JSONL has no `agent_message`
+    /// item at all — only a `thread.started` and a `turn.completed` with
+    /// `usage` — so `parse_validator_report` returns `None` even though the
+    /// stub exits 0. Models a codex run that completed but never emitted a
+    /// parseable report (e.g. auth/network hiccup mid-turn).
+    #[cfg(unix)]
+    fn write_codex_stub_no_report() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fixture = std::fs::canonicalize(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/codex_exec_scrutiny_no_report.jsonl"),
+        )
+        .expect("fixture exists");
+        let script_path = dir.path().join("codex-stub-no-report.sh");
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'codex-cli 0.0.0-test'\n  exit 0\nfi\ncat '{}'\nexit 0\n",
+                fixture.display()
+            ),
+        )
+        .expect("write stub script");
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat stub script")
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod stub script");
+        (dir, script_path)
+    }
+
+    /// RAII guard: points `KRANZ_CODEX_BIN` at a working stub so
+    /// `discover_codex_binary` deterministically resolves it as the FIRST
+    /// candidate, regardless of whatever real `codex` install happens to sit
+    /// on the host running the suite. Unlike [`CodexEnvGuard`], `HOME`/`PATH`
+    /// are left untouched — validation contract commands may still need git
+    /// on PATH, and the stub wins over PATH lookups either way. Serialized on
+    /// the same [`CODEX_ENV_LOCK`] so it never races the other codex-env
+    /// tests.
+    #[cfg(unix)]
+    struct CodexStubEnvGuard {
+        prev_bin: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    #[cfg(unix)]
+    impl CodexStubEnvGuard {
+        fn engage(stub: &std::path::Path) -> Self {
+            let lock = CODEX_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let prev_bin = std::env::var_os("KRANZ_CODEX_BIN");
+            std::env::set_var("KRANZ_CODEX_BIN", stub);
+            CodexStubEnvGuard {
+                prev_bin,
+                _lock: lock,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for CodexStubEnvGuard {
+        fn drop(&mut self) {
+            match self.prev_bin.take() {
+                Some(v) => std::env::set_var("KRANZ_CODEX_BIN", v),
+                None => std::env::remove_var("KRANZ_CODEX_BIN"),
+            }
+        }
+    }
+
+    /// One conversion-turn reply (§4.5 g) converting every finding into `n`
+    /// fix features.
+    #[cfg(unix)]
+    fn codex_fix_features_reply(n: usize) -> String {
+        let features: Vec<serde_json::Value> = (1..=n)
+            .map(|i| {
+                serde_json::json!({
+                    "title": format!("fix issue {i}"),
+                    "spec": format!("resolve validation finding {i}"),
+                    "validationCriteria": [format!("finding {i} resolved")]
+                })
+            })
+            .collect();
+        serde_json::json!({ "fixFeatures": features, "summary": format!("{n} fix feature(s)") })
+            .to_string()
+    }
+
+    #[cfg(unix)]
+    fn codex_scrutiny_cfg() -> MissionConfig {
+        let mut cfg = MissionConfig::default();
+        cfg.validator_scrutiny.backend = Some("codex".to_string());
+        cfg.skip_functional = true;
+        cfg
+    }
+
+    fn codex_scrutiny_milestone() -> Milestone {
+        Milestone {
+            id: "ms-1".to_string(),
+            title: "m".to_string(),
+            features: vec![],
+            status: MilestoneStatus::Active,
+            fix_cycles: 0,
+            start_sha: Some("HEAD".to_string()),
+        }
+    }
+
+    /// The stub codex's ValidatorReport findings (>=1, per the fixture) fold
+    /// into the run loop through the normal machinery: `validation.finding`
+    /// events, an orchestrator conversion turn, and a `fixfeature.created`
+    /// event that lands the fix feature in state — exactly like a claude
+    /// scrutiny run's findings would. Also asserts the run actually went
+    /// through codex (codex model on the spawn event, no fallback decision).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_scrutiny_findings_flow() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let (_stub_dir, stub_path) = write_codex_stub();
+
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            lesson_orch_script(&codex_fix_features_reply(1)),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock;
+        let mut engine = MissionEngine::create(backend, &root, "goal", codex_scrutiny_cfg())
+            .expect("create engine");
+        engine
+            .state
+            .mission
+            .milestones
+            .push(codex_scrutiny_milestone());
+
+        let env_guard = CodexStubEnvGuard::engage(&stub_path);
+        engine
+            .validation_round(0)
+            .await
+            .expect("validation round must complete through the stub codex backend");
+        drop(env_guard);
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events.jsonl");
+
+        assert!(
+            !events.iter().any(|e| matches!(
+                &e.kind,
+                EventKind::OrchestratorDecision { summary, .. }
+                    if summary.contains("codex") && summary.contains("not available")
+            )),
+            "codex must not have fallen back to claude: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.kind,
+                EventKind::WorkerSpawned { role, model, .. }
+                    if *role == Role::ValidatorScrutiny && model == cost::DEFAULT_CODEX_MODEL
+            )),
+            "expected the scrutiny run spawned with the codex model: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::ValidationFinding { .. })),
+            "expected the stub codex's findings as validation.finding events: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::FixFeatureCreated { .. })),
+            "expected findings converted into a fix feature: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            engine.state().mission.milestones[0]
+                .features
+                .iter()
+                .any(|f| f.origin == FeatureOrigin::Fix),
+            "fix feature must be folded into mission state"
+        );
+    }
+
+    /// The codex validator run's cost/tokens are priced with the codex table
+    /// and land in mission totals: the run's recorded `cost_usd` equals
+    /// `cost::usage_cost_usd(usage, DEFAULT_CODEX_MODEL)` for the fixture's
+    /// token usage, and `total_cost_usd` increases by exactly that amount.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_validator_cost_in_totals() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let (_stub_dir, stub_path) = write_codex_stub();
+
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            lesson_orch_script(&codex_fix_features_reply(1)),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock;
+        let mut engine = MissionEngine::create(backend, &root, "goal", codex_scrutiny_cfg())
+            .expect("create engine");
+        engine
+            .state
+            .mission
+            .milestones
+            .push(codex_scrutiny_milestone());
+        assert_eq!(engine.state().total_cost_usd, 0.0, "totals start at zero");
+
+        let env_guard = CodexStubEnvGuard::engage(&stub_path);
+        engine
+            .validation_round(0)
+            .await
+            .expect("validation round must complete through the stub codex backend");
+        drop(env_guard);
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events.jsonl");
+        let (usage, cost_usd) = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::WorkerCompleted {
+                    tokens, cost_usd, ..
+                } => Some((tokens.clone(), *cost_usd)),
+                _ => None,
+            })
+            .expect("expected a worker.completed event for the codex scrutiny run");
+
+        let expected = cost::usage_cost_usd(&usage, cost::DEFAULT_CODEX_MODEL);
+        assert!(expected > 0.0, "expected nonzero codex-priced cost");
+        assert_eq!(
+            cost_usd,
+            Some(expected),
+            "the run's recorded cost_usd must equal codex pricing for its usage"
+        );
+
+        // Mission totals fold in every run's cost (including the mock
+        // orchestrator conversion turn), so isolate the codex run's
+        // contribution by summing every worker.completed cost_usd recorded
+        // and checking the total accounts for exactly that sum — with the
+        // codex-priced `expected` amount as one addend (asserted above).
+        let all_runs_cost: f64 = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::WorkerCompleted { cost_usd, .. } => *cost_usd,
+                _ => None,
+            })
+            .sum();
+        assert!(
+            all_runs_cost >= expected,
+            "total run cost ({all_runs_cost}) must include the codex-priced run cost ({expected})"
+        );
+        assert_eq!(
+            engine.state().total_cost_usd,
+            all_runs_cost,
+            "mission totals must equal the sum of every run's recorded cost, codex included"
+        );
+    }
+
+    /// A codex scrutiny run that exits 0 but never emits a parseable
+    /// `ValidatorReport` (usage present, no `agent_message`) must trigger the
+    /// bounded runtime-retry fallback exactly once: a loud
+    /// `orchestrator.decision` naming the retry, a second `ValidatorScrutiny`
+    /// run actually executed against the claude (mock) backend, and that
+    /// retry's findings folded into a fix feature like any other scrutiny
+    /// run's would.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_scrutiny_no_report_falls_back_to_claude_once() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let (_stub_dir, stub_path) = write_codex_stub_no_report();
+
+        let retry_report = serde_json::json!({
+            "findings": [{
+                "subject": "retry-finding",
+                "severity": "major",
+                "evidence": "claude retry scrutiny run found this after codex produced no report",
+                "suggestedFix": "address it"
+            }],
+            "summary": "one finding from the claude retry run"
+        });
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            crate::backend_mock::MockScript::single_shot_json(&retry_report),
+            lesson_orch_script(&codex_fix_features_reply(1)),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock;
+        let mut engine = MissionEngine::create(backend, &root, "goal", codex_scrutiny_cfg())
+            .expect("create engine");
+        engine
+            .state
+            .mission
+            .milestones
+            .push(codex_scrutiny_milestone());
+
+        let env_guard = CodexStubEnvGuard::engage(&stub_path);
+        engine
+            .validation_round(0)
+            .await
+            .expect("validation round must complete via the claude retry fallback");
+        drop(env_guard);
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events.jsonl");
+
+        let retry_decisions: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.kind,
+                    EventKind::OrchestratorDecision { summary, .. }
+                        if summary.contains("retrying once with the claude scrutiny validator")
+                )
+            })
+            .collect();
+        assert_eq!(
+            retry_decisions.len(),
+            1,
+            "expected exactly one loud retry decision: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+
+        let scrutiny_spawns = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.kind,
+                    EventKind::WorkerSpawned { role, .. } if *role == Role::ValidatorScrutiny
+                )
+            })
+            .count();
+        assert_eq!(
+            scrutiny_spawns,
+            2,
+            "expected the initial codex run plus one claude retry run: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::FixFeatureCreated { .. })),
+            "expected the claude retry's findings converted into a fix feature: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            engine.state().mission.milestones[0]
+                .features
+                .iter()
+                .any(|f| f.origin == FeatureOrigin::Fix),
+            "fix feature from the retry's findings must be folded into mission state"
+        );
     }
 }

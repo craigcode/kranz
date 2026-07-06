@@ -144,6 +144,30 @@ pub fn validate(cfg: &MissionConfig) -> Result<()> {
         )));
     }
 
+    // `backend` selection is scoped to validatorScrutiny only (this ticket);
+    // other roles must leave it unset, and scrutiny may only pick a known backend.
+    for (name, role) in [
+        ("orchestrator", &cfg.orchestrator),
+        ("worker", &cfg.worker),
+        ("validatorFunctional", &cfg.validator_functional),
+    ] {
+        if role.backend.is_some() {
+            return Err(EngineError::Config(format!(
+                "{name}.backend is not supported: backend selection is scoped to \
+                 validatorScrutiny only, got {:?}",
+                role.backend
+            )));
+        }
+    }
+    match cfg.validator_scrutiny.backend.as_deref() {
+        None | Some("claude") | Some("codex") => {}
+        Some(other) => {
+            return Err(EngineError::Config(format!(
+                "validatorScrutiny.backend must be one of None, \"claude\", \"codex\", got {other:?}"
+            )));
+        }
+    }
+
     Ok(())
 }
 
@@ -211,5 +235,56 @@ mod tests {
 
         let cfg = load_layers(&[layer_path]).unwrap();
         assert!(!cfg.auto_work);
+    }
+
+    #[test]
+    fn default_config_serializes_without_backend_field() {
+        let value = serde_json::to_value(MissionConfig::default()).unwrap();
+        for role in [
+            "orchestrator",
+            "worker",
+            "validatorScrutiny",
+            "validatorFunctional",
+        ] {
+            let obj = value[role].as_object().unwrap();
+            assert!(
+                !obj.contains_key("backend"),
+                "{role} should not serialize a backend key by default"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_known_scrutiny_backends() {
+        for backend in [None, Some("claude"), Some("codex")] {
+            let mut cfg = MissionConfig::default();
+            cfg.validator_scrutiny.backend = backend.map(|s| s.to_string());
+            assert!(
+                validate(&cfg).is_ok(),
+                "backend {backend:?} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_unknown_scrutiny_backend() {
+        let mut cfg = MissionConfig::default();
+        cfg.validator_scrutiny.backend = Some("gemini".into());
+        assert!(validate(&cfg).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_backend_on_non_scrutiny_roles() {
+        let mut cfg = MissionConfig::default();
+        cfg.worker.backend = Some("codex".into());
+        assert!(validate(&cfg).is_err());
+
+        let mut cfg = MissionConfig::default();
+        cfg.validator_functional.backend = Some("codex".into());
+        assert!(validate(&cfg).is_err());
+
+        let mut cfg = MissionConfig::default();
+        cfg.orchestrator.backend = Some("codex".into());
+        assert!(validate(&cfg).is_err());
     }
 }

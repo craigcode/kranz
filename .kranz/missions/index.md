@@ -23,3 +23,4 @@ Approved plans, newest last.
 - 2026-07-06 · [m-78410b](m-78410b/plan.md) — Make plan-level command grants and worker-executed verification commands first-class allowlist entries so worker and val… [truncated] · [report](m-78410b/report.md)
 - 2026-07-06 · [m-43b20d](m-43b20d/plan.md) — A successful approve on any surface consumes the host-parked plan, and the dashboard approves through the unified pendin… [truncated] · [report](m-43b20d/report.md)
 - 2026-07-06 · [m-d309c0](m-d309c0/plan.md) — Make the engine draft core detect a plan-shaped NotReady reply and either recover it through the plan channel or fail ho… [truncated] · [report](m-d309c0/report.md)
+- 2026-07-06 · [m-5d2c79](m-5d2c79/plan.md) — Add a CodexBackend (AgentBackend over `codex exec --json`) selectable only for the scrutiny validator via an optional va… [truncated] · [report](m-5d2c79/report.md)

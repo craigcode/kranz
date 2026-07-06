@@ -714,7 +714,7 @@ impl AgentBackend for ClaudeBackend {
 /// Send SIGKILL to the process group `pgid`. Returns whether the signal was
 /// delivered to at least one process (false means the group is gone).
 #[cfg(unix)]
-fn kill_group(pgid: i32) -> bool {
+pub(crate) fn kill_group(pgid: i32) -> bool {
     debug_assert!(pgid > 0, "kill_group needs a positive group id");
     // SAFETY: kill(2) takes a pid and a signal number; no pointers or shared
     // state are involved. A negative pid targets the whole process group.

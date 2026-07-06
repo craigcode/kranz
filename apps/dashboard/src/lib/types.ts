@@ -201,6 +201,7 @@ export interface RoleConfig {
   reasoningEffort: string;
   maxTurns?: number;
   maxBudgetUsd?: number;
+  backend?: string;
 }
 
 export interface MissionConfig {
