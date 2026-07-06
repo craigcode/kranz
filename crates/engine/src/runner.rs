@@ -882,6 +882,18 @@ pub async fn run_validator_in(
     run_session(backend, spec, log, paths, run_meta, cancel).await
 }
 
+/// `- item` per line; `- (none)` for an empty list.
+fn bullet_list(items: &[String]) -> String {
+    if items.is_empty() {
+        return "- (none)".to_string();
+    }
+    items
+        .iter()
+        .map(|item| format!("- {item}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -922,16 +934,4 @@ mod tests {
         let report: ValidatorReport = serde_json::from_str(without_class).unwrap();
         assert_eq!(report.findings[0].class, "");
     }
-}
-
-/// `- item` per line; `- (none)` for an empty list.
-fn bullet_list(items: &[String]) -> String {
-    if items.is_empty() {
-        return "- (none)".to_string();
-    }
-    items
-        .iter()
-        .map(|item| format!("- {item}"))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
