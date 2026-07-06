@@ -238,6 +238,9 @@ export interface MissionSummary {
   goal: string;
   createdAt: string;
   error?: string;
+  /** Ancestry-probe bit: mission branch tip is an ancestor of the live base
+   *  branch tip. `null`/absent when there's no branch or the probe failed. */
+  merged?: boolean | null;
 }
 
 // ---------------------------------------------------------------------------

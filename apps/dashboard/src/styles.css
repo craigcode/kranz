@@ -347,6 +347,33 @@ button {
   background: var(--green);
 }
 
+/* ------------------------------------------------------- pipeline stages */
+
+.pill-captured {
+  color: var(--dim);
+  background: var(--border);
+}
+
+.pill-needs-you {
+  color: var(--amber);
+  background: var(--amber-soft);
+}
+
+.pill-reviewable {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.pill-delivered {
+  color: var(--green);
+  background: var(--green-soft);
+}
+
+.pill-landed {
+  color: #fff;
+  background: var(--green);
+}
+
 .ticket-blocker-badge {
   flex: none;
   font-size: 11px;
