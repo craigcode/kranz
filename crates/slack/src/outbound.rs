@@ -20,6 +20,7 @@
 use crate::format::{Blocked, Complete, Outcome, PlanReady};
 use kranz_engine::events::{Event, EventKind};
 use kranz_engine::types::MissionState;
+use std::path::Path;
 
 /// A notification to post, tagged by class so the bridge can gate on
 /// [`crate::config::NotifyFlags`] and pick the formatter.
@@ -54,7 +55,13 @@ pub enum NotifyClass {
 /// Classify one event, given the mission state *after* applying it, into an
 /// optional outbound notification. Returns `None` for the many events that
 /// don't warrant a Slack post (worker deltas, feature transitions, …).
-pub fn classify(event: &Event, state: &MissionState) -> Option<Outbound> {
+///
+/// `repo_root` is only consulted for `MissionCompleted` (to source the
+/// Delivered card's diff stat, plan §M3 "Merge on both human surfaces"); every
+/// other branch stays a pure function of `event` + `state`. Git access is
+/// best-effort — any failure (no repo, unpinned base, missing branch) just
+/// degrades `diff_stat` to `None`, same as an unset cost.
+pub fn classify(event: &Event, state: &MissionState, repo_root: &Path) -> Option<Outbound> {
     match &event.kind {
         EventKind::PlanApproved { plan, .. } => Some(Outbound::PlanReady(PlanReady {
             mission_id: state.mission.id.clone(),
@@ -78,6 +85,7 @@ pub fn classify(event: &Event, state: &MissionState) -> Option<Outbound> {
             summary: completion_summary(state),
             branch: state.mission.mission_branch.clone(),
             cost_usd: nonzero(state.total_cost_usd),
+            diff_stat: mission_diff_stat(repo_root, &state.mission),
         })),
 
         EventKind::MissionFailed { reason } => Some(Outbound::Complete(Complete {
@@ -86,10 +94,26 @@ pub fn classify(event: &Event, state: &MissionState) -> Option<Outbound> {
             summary: reason.clone(),
             branch: state.mission.mission_branch.clone(),
             cost_usd: nonzero(state.total_cost_usd),
+            diff_stat: None,
         })),
 
         _ => None,
     }
+}
+
+/// `git diff --stat` of `base_sha..mission_branch`, best-effort. `None` when
+/// the base isn't pinned yet, the repo can't be opened, the mission branch
+/// doesn't exist, or any git step fails — mirrors the tolerance of
+/// `crates/server`'s `mission_diff_stat` REST handler, which sources the same
+/// value for the dashboard's Delivered panel.
+fn mission_diff_stat(repo_root: &Path, mission: &kranz_engine::types::Mission) -> Option<String> {
+    let base_sha = mission.base_sha.as_deref()?;
+    let repo = kranz_engine::git_ops::GitRepo::open(repo_root).ok()?;
+    if !repo.branch_exists(&mission.mission_branch).ok()? {
+        return None;
+    }
+    let tip = repo.rev_parse(&mission.mission_branch).ok()?;
+    repo.diff_stat(base_sha, &tip).ok()
 }
 
 /// A one-line completion summary from the folded state: the mission goal plus a
@@ -183,6 +207,7 @@ mod tests {
                 base_sha: None,
             }),
             &base_state(),
+            no_repo(),
         )
         .unwrap();
         assert_eq!(out.class(), NotifyClass::PlanReady);
@@ -202,6 +227,7 @@ mod tests {
                 reason: "fix-cycle cap exceeded".into(),
             }),
             &base_state(),
+            no_repo(),
         )
         .unwrap();
         assert_eq!(out.class(), NotifyClass::Blocked);

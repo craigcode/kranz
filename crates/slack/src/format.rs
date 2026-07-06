@@ -23,6 +23,13 @@ pub const APPROVE_ACTION_ID: &str = "kranz_approve";
 /// button `value` carries the mission id, same as approve.
 pub const START_ACTION_ID: &str = "kranz_start";
 
+/// `action_id` of the "Merge" button on a Delivered card ([`build_complete`])
+/// for a completed-and-unmerged mission. The button `value` carries the
+/// mission id, same as approve/start. Routing + gating (dirty-tree refusal,
+/// token/allowlist check, running the gate suite) is a sibling concern; this
+/// crate only renders the button.
+pub const MERGE_ACTION_ID: &str = "kranz_merge";
+
 /// `callback_id` of the new-mission modal ([`build_new_mission_modal`]); its
 /// `view_submission` routes to [`crate::inbound::Action::NewMission`].
 pub const NEW_MISSION_CALLBACK_ID: &str = "kranz_new_mission";
@@ -88,6 +95,10 @@ pub struct Complete {
     pub branch: String,
     /// Total cost in USD, if known (rendered to cents).
     pub cost_usd: Option<f64>,
+    /// `git diff --stat` of `base_sha..mission_branch`, if it could be
+    /// computed (needs a pinned `base_sha` and a live git repo). `None`
+    /// degrades to omitting the diff-stat line, same as `cost_usd`.
+    pub diff_stat: Option<String>,
 }
 
 /// A just-created mission whose planning conversation opened in a thread. The
@@ -348,8 +359,13 @@ pub fn build_blocked(b: &Blocked, dashboard_url: Option<&str>) -> Vec<Value> {
     blocks
 }
 
-/// Completion message: outcome header + summary + branch + optional cost. When
-/// `dashboard_url` is set, an "Open in dashboard" deep-link button is appended.
+/// Completion message: outcome header + summary + branch + optional cost +
+/// optional diff stat. When `dashboard_url` is set, an "Open in dashboard"
+/// deep-link button is appended. A completed mission also carries a **Merge**
+/// button ([`MERGE_ACTION_ID`]) — this is the Delivered card for a
+/// completed-and-unmerged mission; the button's routing/gating (dirty-tree
+/// refusal, token/allowlist check, gate suite) lives elsewhere, this only
+/// renders it.
 pub fn build_complete(c: &Complete, dashboard_url: Option<&str>) -> Vec<Value> {
     let (emoji, verb) = match c.outcome {
         Outcome::Completed => (":white_check_mark:", "completed"),
@@ -364,9 +380,26 @@ pub fn build_complete(c: &Complete, dashboard_url: Option<&str>) -> Vec<Value> {
     let mut blocks = vec![
         header(&format!("{emoji} Mission {verb} — {}", c.mission_id)),
         section(&clip(c.summary.trim())),
-        context(&meta),
     ];
+    if let Some(diff_stat) = c.diff_stat.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        blocks.push(section(&format!("*Diff stat*\n```{}```", clip(diff_stat))));
+    }
+    blocks.push(context(&meta));
     push_dashboard_button(&mut blocks, dashboard_url, &c.mission_id);
+    if c.outcome == Outcome::Completed {
+        blocks.push(json!({
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "style": "primary",
+                    "text": { "type": "plain_text", "text": "Merge" },
+                    "action_id": MERGE_ACTION_ID,
+                    "value": c.mission_id,
+                }
+            ]
+        }));
+    }
     blocks
 }
 
@@ -971,6 +1004,7 @@ mod tests {
                 summary: "Added rate limiting; all tests pass.".into(),
                 branch: "kranz/mission-m-9".into(),
                 cost_usd: Some(4.2),
+                diff_stat: None,
             },
             None,
         );
@@ -983,6 +1017,40 @@ mod tests {
     }
 
     #[test]
+    fn delivered_card_carries_diff_stat_deep_link_and_merge_button() {
+        let blocks = build_complete(
+            &Complete {
+                mission_id: "m-9".into(),
+                outcome: Outcome::Completed,
+                summary: "Added rate limiting; all tests pass.".into(),
+                branch: "kranz/mission-m-9".into(),
+                cost_usd: Some(4.2),
+                diff_stat: Some(" 2 files changed, 40 insertions(+), 3 deletions(-)".into()),
+            },
+            Some("http://dash"),
+        );
+        let text = all_text(&blocks);
+        assert!(
+            text.contains("Added rate limiting"),
+            "report summary present"
+        );
+        assert!(
+            text.contains("2 files changed, 40 insertions(+), 3 deletions(-)"),
+            "diff stat present: {text}"
+        );
+        assert_eq!(
+            all_button_urls(&blocks),
+            vec!["http://dash/#/m/m-9".to_string()],
+            "dashboard deep-link button present"
+        );
+        let merge = all_buttons(&blocks)
+            .into_iter()
+            .find(|b| b["action_id"] == MERGE_ACTION_ID)
+            .expect("merge button present");
+        assert_eq!(merge["value"], "m-9");
+    }
+
+    #[test]
     fn failed_mission_reads_failed_and_omits_cost_when_absent() {
         let blocks = build_complete(
             &Complete {
@@ -991,6 +1059,7 @@ mod tests {
                 summary: "worker exhausted respawns".into(),
                 branch: "kranz/mission-m-9".into(),
                 cost_usd: None,
+                diff_stat: None,
             },
             None,
         );
@@ -998,6 +1067,12 @@ mod tests {
         assert!(text.contains("failed"), "failure verb present");
         assert!(text.contains("worker exhausted respawns"));
         assert!(!text.contains("cost $"), "no cost line when unknown");
+        assert!(
+            all_buttons(&blocks)
+                .iter()
+                .all(|b| b["action_id"] != MERGE_ACTION_ID),
+            "a failed mission has nothing to merge"
+        );
     }
 
     #[test]
@@ -1271,6 +1346,7 @@ mod tests {
                 summary: "done".into(),
                 branch: "b".into(),
                 cost_usd: None,
+                diff_stat: None,
             },
             Some("http://dash"),
         );
@@ -1286,6 +1362,7 @@ mod tests {
                 summary: "done".into(),
                 branch: "b".into(),
                 cost_usd: None,
+                diff_stat: None,
             },
             None,
         );
@@ -1392,6 +1469,7 @@ mod tests {
                     summary: "s".into(),
                     branch: "b".into(),
                     cost_usd: Some(1.0),
+                    diff_stat: None,
                 },
                 None,
             ),
@@ -1475,6 +1553,7 @@ mod tests {
                     summary: "s".into(),
                     branch: "b".into(),
                     cost_usd: None,
+                    diff_stat: None,
                 },
                 None,
             ),

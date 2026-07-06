@@ -197,7 +197,7 @@ async fn poll_mission(
         }
         cursor.last_seq = event.seq;
 
-        if let Some(outbound) = classify(event, &cursor.state) {
+        if let Some(outbound) = classify(event, &cursor.state, repo_root) {
             if class_enabled(&cfg.notify, outbound.class()) {
                 if let Err(e) = post_outbound(cfg, client, threads, mission_id, &outbound).await {
                     tracing::warn!(mission = %mission_id, error = %e, "slack post failed");
