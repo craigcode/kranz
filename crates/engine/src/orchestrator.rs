@@ -668,8 +668,21 @@ impl MissionEngine {
         std::fs::write(&plan_file, serde_json::to_string_pretty(&plan)?)?;
         // Human-readable twin, committed alongside: reviewable in any git UI
         // and diffable across re-plans (plan.json stays the durable source).
+        // The calibrated cost estimate is baked in here so the Reviewable
+        // human queue gate (and any future surface reading plan.md) sees it
+        // without recomputing it — `calibrate` never fails.
+        let calibration = cost::calibrate(&self.paths.repo_root);
+        let estimate = cost::estimate(&plan, &self.state.config, &calibration.params);
         let plan_md = plan_file.with_file_name("plan.md");
-        std::fs::write(&plan_md, render_plan_markdown(&plan, &self.state.mission))?;
+        std::fs::write(
+            &plan_md,
+            render_plan_markdown(
+                &plan,
+                &self.state.mission,
+                &estimate,
+                calibration.missions_used,
+            ),
+        )?;
         // Browsable catalog: date + goal-as-title + link per mission. The
         // canonical plan path stays stable; discovery lives here.
         let index = self.paths.missions_dir().join("index.md");
@@ -3282,8 +3295,14 @@ pub fn upsert_mission_index(
 
 /// Render the approved plan as human-readable markdown — committed to the
 /// mission branch beside plan.json for later review and reference. Pure and
-/// deterministic (no timestamps; git history carries the when).
-pub fn render_plan_markdown(plan: &Plan, mission: &Mission) -> String {
+/// deterministic given its inputs (no wall-clock reads; the estimate is
+/// computed by the caller and passed in).
+pub fn render_plan_markdown(
+    plan: &Plan,
+    mission: &Mission,
+    estimate: &cost::CostEstimate,
+    missions_used: usize,
+) -> String {
     use std::fmt::Write as _;
     let mut md = String::new();
     let _ = writeln!(md, "# Mission plan — {}", mission.id);
@@ -3293,6 +3312,19 @@ pub fn render_plan_markdown(plan: &Plan, mission: &Mission) -> String {
         "Branch `{}` (from `{}`). Approved plan of record; the machine-readable \
          twin is [plan.json](plan.json). Live status: `kranz status` or the dashboard.\n",
         mission.mission_branch, mission.base_branch
+    );
+
+    let _ = writeln!(md, "## Cost estimate\n");
+    let provenance = if missions_used == 0 {
+        "built-in defaults — no completed missions yet".to_string()
+    } else {
+        format!("based on {missions_used} completed mission(s)")
+    };
+    let _ = writeln!(
+        md,
+        "Estimated **${:.2} – ${:.2}** (expected ~${:.2}). Rough estimate — live usage is \
+         authoritative; {provenance}.\n",
+        estimate.low_usd, estimate.high_usd, estimate.expected_usd
     );
 
     let _ = writeln!(md, "## Validation contract\n");
