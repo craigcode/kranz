@@ -170,7 +170,10 @@ pub fn router_with_shared_host(
             post(host::delete_mission_route),
         )
         .route("/api/missions/{id}/ws", get(ws::ws_handler))
-        .route("/api/tickets", get(tickets::list_tickets))
+        .route(
+            "/api/tickets",
+            get(tickets::list_tickets).post(tickets::create_ticket),
+        )
         .route("/api/tickets/{slug}", get(tickets::get_ticket))
         .route("/api/tickets/{slug}/draft", post(tickets::draft_ticket))
         .route("/api/tickets/{slug}/approve", post(tickets::approve_ticket))

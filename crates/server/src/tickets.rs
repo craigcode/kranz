@@ -66,6 +66,45 @@ pub(crate) async fn draft_ticket(
     ))
 }
 
+/// `POST /api/tickets` — create a ticket from `{"slug", "title", "goal"?,
+/// "context"?}`. Scaffolds `.kranz/tickets/<slug>.md` via
+/// [`kranz_engine::ticket::Ticket::scaffold`] — the same template the CLI's
+/// `kranz ticket new` uses, so goal/context land in the ticket body and a
+/// subsequent `GET /api/tickets/:slug` round-trips them. 400 for an invalid
+/// slug or a missing/blank `title`, 409 if the slug already has a ticket,
+/// `201` with the created ticket's summary JSON (same shape as a list row).
+pub(crate) async fn create_ticket(
+    State(server): State<Arc<ServerState>>,
+    body: Bytes,
+) -> Result<impl IntoResponse, ApiError> {
+    let value = crate::host::parse_body(&body)?;
+    let slug = value
+        .get("slug")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ApiError::bad_request("missing required field 'slug'"))?;
+    let title = value
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ApiError::bad_request("missing required field 'title'"))?;
+    let goal = value.get("goal").and_then(Value::as_str);
+    let context = value.get("context").and_then(Value::as_str);
+
+    Ticket::ensure_valid_slug(slug)
+        .map_err(|e| ApiError::bad_request(format!("invalid ticket slug '{slug}': {e}")))?;
+
+    let path = Ticket::scaffold(server.host.repo_root(), slug, title, goal, context)?;
+    let ticket = Ticket::load(&path).map_err(|e| {
+        ApiError::internal(format!("failed to parse scaffolded ticket '{slug}': {e}"))
+    })?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(ticket_summary_json(server.host.repo_root(), &ticket)),
+    ))
+}
+
 /// `POST /api/tickets/:slug/approve` — optional body `{"force": bool}`
 /// (default `false`) → `200 {"approved":true,"missionId":"m-…"}`. Runs the
 /// same gate the CLI's `kranz ticket approve` runs
@@ -173,7 +212,11 @@ fn bullet_item(line: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
     use tempfile::TempDir;
+    use tower::ServiceExt;
 
     const TICKET_BODY: &str = "\
 ---
@@ -231,5 +274,125 @@ Ship the thing.
             ticket_full_json(tmp.path(), &ticket)["missionId"],
             Value::Null
         );
+    }
+
+    async fn body_json(response: axum::response::Response) -> Value {
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn post(uri: &str, body: Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header(crate::TOKEN_HEADER, "tok")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn pipeline_create_ticket_succeeds_and_appears_in_list_as_new() {
+        let tmp = TempDir::new().unwrap();
+        let app = crate::router_with_token(tmp.path().to_path_buf(), None, Some("tok".into()));
+
+        let response = app
+            .clone()
+            .oneshot(post(
+                "/api/tickets",
+                json!({"slug": "new-thing", "title": "New Thing"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let created = body_json(response).await;
+        assert_eq!(created["slug"], "new-thing");
+        assert_eq!(created["title"], "New Thing");
+        assert_eq!(created["state"], "new");
+        assert_eq!(created["missionId"], Value::Null);
+
+        let list_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tickets")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let rows = body_json(list_response).await;
+        let rows = rows.as_array().unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r["slug"] == "new-thing")
+            .expect("created ticket present in list");
+        assert_eq!(row["state"], "new");
+    }
+
+    #[tokio::test]
+    async fn pipeline_create_ticket_invalid_slug_returns_400() {
+        let tmp = TempDir::new().unwrap();
+        let app = crate::router_with_token(tmp.path().to_path_buf(), None, Some("tok".into()));
+
+        let response = app
+            .oneshot(post(
+                "/api/tickets",
+                json!({"slug": "../escape", "title": "Bad"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn pipeline_create_ticket_duplicate_slug_returns_409() {
+        let tmp = TempDir::new().unwrap();
+        write_ticket(tmp.path(), "dup");
+        let app = crate::router_with_token(tmp.path().to_path_buf(), None, Some("tok".into()));
+
+        let response = app
+            .oneshot(post(
+                "/api/tickets",
+                json!({"slug": "dup", "title": "Duplicate"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn pipeline_create_ticket_goal_and_context_round_trip_through_get() {
+        let tmp = TempDir::new().unwrap();
+        let app = crate::router_with_token(tmp.path().to_path_buf(), None, Some("tok".into()));
+
+        let response = app
+            .clone()
+            .oneshot(post(
+                "/api/tickets",
+                json!({
+                    "slug": "round-trip",
+                    "title": "Round Trip",
+                    "goal": "ship the thing",
+                    "context": "some background",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let get_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tickets/round-trip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_response.status(), StatusCode::OK);
+        let json = body_json(get_response).await;
+        assert_eq!(json["goal"], "ship the thing");
+        assert_eq!(json["context"], "some background");
     }
 }
