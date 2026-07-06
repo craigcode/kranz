@@ -305,6 +305,30 @@ impl GitRepo {
         Ok(())
     }
 
+    /// Create a new worktree at `path`, checked out to the EXISTING branch
+    /// `branch` (`git worktree add <path> <branch>`, no `-b`).
+    ///
+    /// `path` may be absolute or relative to the repo root; git records the
+    /// absolute path either way. `branch` must already exist and must NOT
+    /// already be checked out in another worktree — git refuses to check the
+    /// same branch out twice and that failure surfaces as [`EngineError::Git`].
+    pub fn add_worktree_checkout(&self, path: &Path, branch: &str) -> Result<()> {
+        // Guard against a caller sneaking a flag through the branch slot.
+        if branch.starts_with('-') {
+            return Err(EngineError::Git(format!(
+                "refusing worktree add with flag-shaped argument {branch:?}"
+            )));
+        }
+        let args: Vec<OsString> = vec![
+            "worktree".into(),
+            "add".into(),
+            path.as_os_str().to_os_string(),
+            branch.into(),
+        ];
+        self.run_os(&args)?;
+        Ok(())
+    }
+
     /// Remove a worktree at `path` (`git worktree remove --force <path>`),
     /// tolerating a worktree that is already gone.
     ///

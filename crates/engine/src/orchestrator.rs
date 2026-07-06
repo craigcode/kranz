@@ -405,6 +405,13 @@ impl MissionEngine {
                 }
             }
         }
+        // A leaked mission integration worktree (M7 tier 1) is the same story:
+        // it exists only while a lock-holding engine has one set up, so with
+        // the lock now held it is a crash leak. Reap it the same way.
+        let integration_path = mission_worktree_path(mission_id);
+        if integration_path.exists() {
+            let _ = repo.remove_worktree(&integration_path);
+        }
         let _ = repo.prune_worktrees();
         for milestone in &state.mission.milestones {
             for feature in &milestone.features {
@@ -1762,6 +1769,52 @@ impl MissionEngine {
         }
 
         batch_result
+    }
+
+    /// Set up the mission integration worktree (M7 tier 1 primitive): ensures
+    /// the mission branch exists, then checks it out into a dedicated
+    /// worktree at [`mission_worktree_path`] — WITHOUT touching the primary
+    /// checkout's current branch.
+    ///
+    /// Not yet called from `run()`; a later milestone re-routes mission-branch
+    /// mutations through this worktree when `workerIsolation = worktree`.
+    #[allow(dead_code)]
+    fn setup_mission_worktree(&self) -> Result<(PathBuf, GitRepo)> {
+        let mission_branch = self.state.mission.mission_branch.clone();
+        if !self.repo.branch_exists(&mission_branch)? {
+            let from = self
+                .state
+                .mission
+                .base_sha
+                .clone()
+                .unwrap_or_else(|| self.state.mission.base_branch.clone());
+            self.repo.create_branch(&mission_branch, Some(&from))?;
+        }
+
+        let path = mission_worktree_path(&self.state.mission.id);
+        // Idempotent: a stale integration worktree from a prior crash must be
+        // gone before checking the branch out again (git refuses to check the
+        // same branch out twice).
+        let _ = self.repo.remove_worktree(&path);
+        let _ = self.repo.prune_worktrees();
+
+        self.repo.add_worktree_checkout(&path, &mission_branch)?;
+        let wt_repo = GitRepo::open(&path)?;
+        Ok((path, wt_repo))
+    }
+
+    /// Tear down the mission integration worktree created by
+    /// [`Self::setup_mission_worktree`]. Best-effort and idempotent, mirroring
+    /// the parallel-batch cleanup guard: failures are logged, never fatal.
+    #[allow(dead_code)]
+    fn teardown_mission_worktree(&self) {
+        let path = mission_worktree_path(&self.state.mission.id);
+        if let Err(e) = self.repo.remove_worktree(&path) {
+            tracing::warn!(path = %path.display(), error = %e, "mission worktree cleanup failed");
+        }
+        if let Err(e) = self.repo.prune_worktrees() {
+            tracing::warn!(error = %e, "mission worktree prune failed");
+        }
     }
 
     /// Fallible body of [`Self::run_parallel_batch`] (the caller's cleanup guard
@@ -3367,6 +3420,16 @@ fn parallel_worktree_path(mission_id: &str, feature_id: &str) -> PathBuf {
     std::env::temp_dir().join(format!("kranz-wt-{mission_id}-{safe}"))
 }
 
+/// Absolute directory for one mission's INTEGRATION worktree (M7 tier 1):
+/// the single worktree, checked out to the mission branch, that all
+/// mission-branch mutations run in when `workerIsolation = worktree`. Lives
+/// under the same temp-dir base as [`parallel_worktree_path`], namespaced
+/// with a `_integration` suffix that no real feature id can produce (feature
+/// ids never start with `_`), so it never collides with a per-feature path.
+fn mission_worktree_path(mission_id: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("kranz-wt-{mission_id}-_integration"))
+}
+
 // ---------------------------------------------------------------------------
 // Pure helpers
 // ---------------------------------------------------------------------------
@@ -4641,6 +4704,71 @@ fn plan_schema() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Mission integration worktree primitive (M7 tier 1, feature f-1-2)
+    // -----------------------------------------------------------------------
+
+    /// `setup_mission_worktree` creates the integration worktree on the
+    /// mission branch WITHOUT moving the primary checkout off `main`, and
+    /// `teardown_mission_worktree` removes it (proven via `list_worktrees`).
+    #[test]
+    fn setup_and_teardown_mission_worktree_round_trip() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
+        let engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+        let mission_id = engine.state.mission.id.clone();
+        let mission_branch = engine.state.mission.mission_branch.clone();
+
+        let (path, wt_repo) = engine.setup_mission_worktree().expect("setup");
+        assert_eq!(path, mission_worktree_path(&mission_id));
+        assert!(path.exists(), "integration worktree dir must exist");
+
+        // The mission branch now exists and is checked out in the new
+        // worktree...
+        assert!(engine.repo.branch_exists(&mission_branch).unwrap());
+        assert_eq!(wt_repo.current_branch().unwrap(), mission_branch);
+
+        // ...while the PRIMARY checkout never moved off main.
+        assert_eq!(engine.repo.current_branch().unwrap(), "main");
+
+        let listed = engine.repo.list_worktrees().unwrap();
+        let canon_path = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        assert!(
+            listed
+                .iter()
+                .any(|p| std::path::Path::new(p) == canon_path.as_path()),
+            "integration worktree not in list_worktrees: {listed:?}"
+        );
+
+        engine.teardown_mission_worktree();
+        let after = engine.repo.list_worktrees().unwrap();
+        assert!(
+            !after
+                .iter()
+                .any(|p| std::path::Path::new(p) == canon_path.as_path()),
+            "integration worktree still listed after teardown: {after:?}"
+        );
+        assert!(!path.exists(), "integration worktree dir must be gone");
+    }
+
+    /// `mission_worktree_path` never collides with a per-feature
+    /// `parallel_worktree_path`, even for an adversarial feature id.
+    #[test]
+    fn mission_worktree_path_does_not_collide_with_feature_paths() {
+        let mission_id = "m-collide-test";
+        let integration = mission_worktree_path(mission_id);
+        for feature_id in ["f-1-1", "f-1-2", "ms-collide-test-1"] {
+            assert_ne!(
+                integration,
+                parallel_worktree_path(mission_id, feature_id),
+                "collided with feature id {feature_id:?}"
+            );
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Scrutiny backend selection (f-2-2)
