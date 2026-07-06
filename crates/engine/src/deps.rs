@@ -44,6 +44,12 @@ pub fn unsatisfied_blockers(repo_root: &Path, slug: &str) -> Result<Vec<String>>
     Ok(unsatisfied)
 }
 
+/// Single source of blocked-ness. Approve gates (dashboard + Slack) and
+/// every rendering surface MUST call this, never re-derive.
+pub fn is_blocked(repo_root: &Path, slug: &str) -> Result<bool> {
+    Ok(!unsatisfied_blockers(repo_root, slug)?.is_empty())
+}
+
 /// DFS the `blocked-by` edges across ticket files starting from `slug`. When
 /// a cycle is reachable, returns `Some(path)` listing the slugs that form it
 /// in order (e.g. `[a, b, a]`); a ticket file missing along the way

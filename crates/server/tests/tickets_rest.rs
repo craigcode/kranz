@@ -484,6 +484,134 @@ async fn rest_ticket_mutations_approve_409s_on_a_cycle_even_with_force() {
     assert!(message.contains("blocked-by cycle"), "{message}");
 }
 
+// ---------------------------------------------------------------------------
+// isBlocked projection (f-1-1)
+// ---------------------------------------------------------------------------
+
+const CHILD_BODY: &str = "\
+---
+title: Child
+priority: 2
+blocked-by: [parent]
+---
+
+## Goal
+Ship the child feature.
+";
+
+const PARENT_BODY: &str = "\
+---
+title: Parent
+priority: 2
+---
+
+## Goal
+Ship the parent feature.
+";
+
+/// Writes a minimal events.jsonl for `mission_id` that folds to
+/// `MissionStatus::Complete` (MissionCreated then MissionCompleted), mirroring
+/// `write_mission_events` in `crates/engine/tests/ticket_queue_test.rs`.
+fn write_complete_mission_events(root: &Path, mission_id: &str) {
+    use kranz_engine::events::{Event, EventKind};
+    use kranz_engine::types::MissionConfig;
+
+    let paths = kranz_engine::paths::MissionPaths::new(root, mission_id);
+    let dir = paths.events_file().parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let ts = chrono::Utc::now();
+    let events = [
+        Event {
+            seq: 1,
+            ts,
+            mission_id: mission_id.to_string(),
+            kind: EventKind::MissionCreated {
+                goal: "do the thing".to_string(),
+                base_branch: "main".to_string(),
+                mission_branch: format!("kranz/mission-{mission_id}"),
+                config: MissionConfig::default(),
+            },
+        },
+        Event {
+            seq: 2,
+            ts,
+            mission_id: mission_id.to_string(),
+            kind: EventKind::MissionCompleted {},
+        },
+    ];
+
+    let body: String = events
+        .iter()
+        .map(|e| serde_json::to_string(e).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    std::fs::write(paths.events_file(), body).unwrap();
+}
+
+#[tokio::test]
+async fn list_tickets_is_blocked_false_when_blocker_mission_complete() {
+    let tmp = TempDir::new().unwrap();
+    write_ticket(tmp.path(), "child", CHILD_BODY);
+    write_status(tmp.path(), "child", "done");
+    write_ticket(tmp.path(), "parent", PARENT_BODY);
+    write_status(tmp.path(), "parent", "done");
+    Ticket::record_mission(tmp.path(), "parent", "m-parent").unwrap();
+    write_complete_mission_events(tmp.path(), "m-parent");
+
+    let app = kranz_server::router(tmp.path().to_path_buf(), None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/tickets")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let json = body_json(response).await;
+    let rows = json.as_array().expect("array response");
+    let child = rows
+        .iter()
+        .find(|r| r["slug"] == "child")
+        .expect("child row present");
+    assert_eq!(child["isBlocked"], false);
+    assert_eq!(child["blockedBy"], serde_json::json!(["parent"]));
+}
+
+#[tokio::test]
+async fn list_tickets_is_blocked_true_when_blocker_mission_absent() {
+    let tmp = TempDir::new().unwrap();
+    write_ticket(tmp.path(), "child", CHILD_BODY);
+    write_status(tmp.path(), "child", "done");
+    write_ticket(tmp.path(), "parent", PARENT_BODY);
+    // No mission recorded/linked for "parent" — unsatisfied.
+
+    let app = kranz_server::router(tmp.path().to_path_buf(), None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/tickets")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let json = body_json(response).await;
+    let rows = json.as_array().expect("array response");
+    let child = rows
+        .iter()
+        .find(|r| r["slug"] == "child")
+        .expect("child row present");
+    assert_eq!(child["isBlocked"], true);
+    assert_eq!(child["blockedBy"], serde_json::json!(["parent"]));
+}
+
 #[tokio::test]
 async fn get_ticket_400s_for_a_traversal_slug() {
     let tmp = TempDir::new().unwrap();

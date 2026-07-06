@@ -26,6 +26,7 @@ function makeTicket(overrides: Partial<Ticket> = {}): Ticket {
     priority: 2,
     schedule: 'once',
     blockedBy: [],
+    isBlocked: false,
     goal: 'Ship the fix.',
     context: 'Some context.',
     scopingAnswers: [],
@@ -43,6 +44,7 @@ function makeSummary(overrides: Partial<TicketSummary> = {}): TicketSummary {
     state: 'new',
     title: 'Dependency',
     blockedBy: [],
+    isBlocked: false,
     ...overrides,
   };
 }
@@ -64,7 +66,9 @@ beforeEach(() => {
 
 describe('TicketDetail', () => {
   it('disables Approve and names the blocker for a blocked review ticket', async () => {
-    vi.mocked(api.ticket).mockResolvedValueOnce(makeTicket({ blockedBy: ['dep-a'] }));
+    vi.mocked(api.ticket).mockResolvedValueOnce(
+      makeTicket({ blockedBy: ['dep-a'], isBlocked: true }),
+    );
     vi.mocked(api.tickets).mockResolvedValue([makeSummary({ slug: 'dep-a', state: 'new' })]);
 
     render(<TicketDetail slug="fix-b" />);
@@ -75,8 +79,22 @@ describe('TicketDetail', () => {
   });
 
   it('enables Approve when the blocker is done', async () => {
-    vi.mocked(api.ticket).mockResolvedValueOnce(makeTicket({ blockedBy: ['dep-a'] }));
+    vi.mocked(api.ticket).mockResolvedValueOnce(
+      makeTicket({ blockedBy: ['dep-a'], isBlocked: false }),
+    );
     vi.mocked(api.tickets).mockResolvedValue([makeSummary({ slug: 'dep-a', state: 'done' })]);
+
+    render(<TicketDetail slug="fix-b" />);
+
+    const approve = await screen.findByRole('button', { name: 'Approve' });
+    expect(approve.hasAttribute('disabled')).toBe(false);
+  });
+
+  it('enables Approve when isBlocked is false even if blockedBy is non-empty', async () => {
+    vi.mocked(api.ticket).mockResolvedValueOnce(
+      makeTicket({ blockedBy: ['dep-a'], isBlocked: false }),
+    );
+    vi.mocked(api.tickets).mockResolvedValue([makeSummary({ slug: 'dep-a', state: 'new' })]);
 
     render(<TicketDetail slug="fix-b" />);
 

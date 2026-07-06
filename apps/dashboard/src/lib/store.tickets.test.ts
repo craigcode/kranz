@@ -19,7 +19,14 @@ vi.mock('./api', async () => {
 import { api } from './api';
 
 function makeSummary(slug: string): TicketSummary {
-  return { slug, priority: 1, state: 'review', title: `Ticket ${slug}`, blockedBy: [] };
+  return {
+    slug,
+    priority: 1,
+    state: 'review',
+    title: `Ticket ${slug}`,
+    blockedBy: [],
+    isBlocked: false,
+  };
 }
 
 const INITIAL_STORE_STATE = useKranzStore.getState();

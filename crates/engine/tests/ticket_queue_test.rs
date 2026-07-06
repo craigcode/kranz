@@ -603,6 +603,61 @@ fn blocked_by_cycle_detects_direct_and_transitive_cycles_none_for_acyclic() {
     assert_eq!(cycle, None);
 }
 
+#[test]
+fn is_blocked_false_when_no_blocked_by() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let dir = Ticket::tickets_dir(root);
+    fs::create_dir_all(&dir).unwrap();
+
+    write_ticket(&dir, "solo", "---\ntitle: solo\n---\nbody\n");
+
+    assert!(!deps::is_blocked(root, "solo").unwrap());
+}
+
+#[test]
+fn is_blocked_true_when_blocker_mission_absent_or_incomplete() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let dir = Ticket::tickets_dir(root);
+    fs::create_dir_all(&dir).unwrap();
+
+    // no-mission: dep exists but has no recorded mission at all.
+    write_ticket(
+        &dir,
+        "waits-on-no-mission",
+        "---\nblocked-by: [no-mission]\n---\nbody\n",
+    );
+    write_ticket(&dir, "no-mission", "---\ntitle: nm\n---\nbody\n");
+    assert!(deps::is_blocked(root, "waits-on-no-mission").unwrap());
+
+    // incomplete: dep's recorded mission never reached Complete.
+    write_ticket(
+        &dir,
+        "waits-on-incomplete",
+        "---\nblocked-by: [incomplete]\n---\nbody\n",
+    );
+    write_ticket(&dir, "incomplete", "---\ntitle: inc\n---\nbody\n");
+    Ticket::record_mission(root, "incomplete", "m-incomplete").unwrap();
+    write_mission_events(root, "m-incomplete", false);
+    assert!(deps::is_blocked(root, "waits-on-incomplete").unwrap());
+}
+
+#[test]
+fn is_blocked_false_when_blocker_mission_complete() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let dir = Ticket::tickets_dir(root);
+    fs::create_dir_all(&dir).unwrap();
+
+    write_ticket(&dir, "child", "---\nblocked-by: [dep]\n---\nbody\n");
+    write_ticket(&dir, "dep", "---\ntitle: dep\n---\nbody\n");
+    Ticket::record_mission(root, "dep", "m-dep").unwrap();
+    write_mission_events(root, "m-dep", true);
+
+    assert!(!deps::is_blocked(root, "child").unwrap());
+}
+
 // --- review P1: queue concurrency + crash-safe claims -----------------------
 
 #[test]

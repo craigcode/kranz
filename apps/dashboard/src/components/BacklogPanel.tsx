@@ -31,11 +31,21 @@ export function BacklogPanel() {
         <span className="mono picker-id">{t.slug}</span>
         <span className="dim">p{t.priority}</span>
         <span className="picker-goal">{t.title}</span>
-        {t.blockedBy.map((b) => (
-          <span key={b} className="ticket-blocker-badge" title={`blocked by ${b}`}>
-            blocked by {b}
-          </span>
-        ))}
+        {t.blockedBy.length > 0 &&
+          (t.isBlocked && t.state !== 'done' ? (
+            t.blockedBy.map((b) => (
+              <span key={b} className="ticket-blocker-badge" title={`blocked by ${b}`}>
+                blocked by {b}
+              </span>
+            ))
+          ) : (
+            <span
+              className="ticket-blocker-badge ticket-blocker-badge--satisfied dim"
+              title={`was blocked by ${t.blockedBy.join(', ')}`}
+            >
+              was blocked by {t.blockedBy.join(', ')}
+            </span>
+          ))}
       </button>
     </li>
   );
