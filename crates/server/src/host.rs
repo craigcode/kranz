@@ -1173,6 +1173,13 @@ fn draft_outcome_json(outcome: &DraftOutcome) -> Value {
             "outcome": "enqueued",
             "missionId": mission_id,
         }),
+        DraftOutcome::PlanAsProse { mission_id } => json!({
+            "outcome": "planAsProse",
+            "missionId": mission_id,
+            "message": "the orchestrator produced a plan but emitted it as prose instead of \
+                        through the plan channel, so nothing was queued; re-run draft for \
+                        this ticket",
+        }),
         DraftOutcome::NeedsContext {
             mission_id,
             questions,

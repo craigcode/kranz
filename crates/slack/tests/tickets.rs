@@ -288,6 +288,7 @@ struct FakeHost {
 enum DraftOutcomeKind {
     ParkedForReview,
     NeedsContext,
+    PlanAsProse,
 }
 
 impl FakeHost {
@@ -359,6 +360,9 @@ impl PlanningHost for FakeHost {
                     "Which endpoint exactly?".into(),
                     "Per-user or per-token?".into(),
                 ],
+            },
+            DraftOutcomeKind::PlanAsProse => DraftOutcome::PlanAsProse {
+                mission_id: "m-draft".into(),
             },
         };
         let slug = slug.to_string();
@@ -498,6 +502,32 @@ async fn draft_needs_context_posts_the_orchestrators_questions_back() {
         "posts the orchestrator's clarifying questions back to the invoker: {result_text}"
     );
     assert!(result_text.contains("Per-user or per-token?"));
+    assert_eq!(fake.draft_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn draft_plan_as_prose_posts_an_honest_not_queued_message() {
+    let cfg = gated_cfg(vec!["U-allowed".into()]);
+    let fake = Arc::new(FakeHost::new(DraftOutcomeKind::PlanAsProse));
+    let host: SharedHost = fake.clone();
+
+    let gate = gate_draft_command(&cfg, Some(&host), "rate-limit-notes", Some("U-allowed"));
+    assert!(matches!(gate, DraftGate::Ready(_)));
+
+    let result_text = serde_json::to_string(&run_draft(&host, "rate-limit-notes").await).unwrap();
+    assert!(
+        result_text.contains("m-draft"),
+        "names the mission: {result_text}"
+    );
+    assert!(
+        result_text.contains("prose") && result_text.contains("NOT queued"),
+        "conveys the plan was emitted as prose and nothing was queued: {result_text}"
+    );
+    assert!(
+        !result_text.contains("approved and queued")
+            && !result_text.contains("Draft ready for review"),
+        "never claims success: {result_text}"
+    );
     assert_eq!(fake.draft_calls.load(Ordering::SeqCst), 1);
 }
 
