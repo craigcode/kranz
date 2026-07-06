@@ -22,13 +22,20 @@ use kranz_engine::git_ops::GitRepo;
 use kranz_engine::orchestrator::MissionEngine;
 use kranz_engine::queue::{self, QueueEntry};
 use kranz_engine::ticket::{Ticket, TicketState};
-use kranz_engine::types::MissionStatus;
 use std::path::{Path, PathBuf};
 
 // Relocated into kranz-engine (roadmap f-1-1): the pure draft decision helpers
 // live in `kranz_engine::draft` now so any surface can reuse the sequencing
 // core. Re-exported here so existing CLI callers/tests keep working.
 pub use kranz_engine::draft::{draft_decision, split_questions, DraftDecision};
+
+// Relocated into kranz-engine (roadmap f-1-1): the drain/claim/skip loop and
+// its pure decision helpers live in `kranz_engine::work` now so any surface
+// (CLI, REST, Slack) can drain a repo's queue. Re-exported here so existing
+// CLI callers/tests keep working.
+pub use kranz_engine::work::{
+    next_work_action, ticket_state_for_mission, work_skip_for_failed_blocker, WorkAction,
+};
 
 // ---------------------------------------------------------------------------
 // ticket new — scaffold
@@ -251,66 +258,6 @@ pub fn render_queue(entries: &[QueueEntry], busy_with: Option<&str>) -> String {
         ));
     }
     out
-}
-
-// ---------------------------------------------------------------------------
-// work dispatcher — pure decision helper
-// ---------------------------------------------------------------------------
-
-/// The dispatcher's next action given the queue front and repo-busy state.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WorkAction {
-    /// Nothing queued: the dispatcher exits.
-    Empty,
-    /// The repo is busy running `mission_id`: wait (default) or exit (`--once`).
-    Busy { mission_id: String },
-    /// Free to run the front mission.
-    Run {
-        mission_id: String,
-        ticket_slug: Option<String>,
-    },
-}
-
-/// Decide the dispatcher's next step from the queue front + busy state.
-/// Pure: `front` is `queue::peek`, `busy_with` is `queue::is_repo_busy`.
-pub fn next_work_action(front: Option<&QueueEntry>, busy_with: Option<&str>) -> WorkAction {
-    match front {
-        None => WorkAction::Empty,
-        Some(_) if busy_with.is_some() => WorkAction::Busy {
-            mission_id: busy_with.expect("checked is_some").to_string(),
-        },
-        Some(entry) => WorkAction::Run {
-            mission_id: entry.mission_id.clone(),
-            ticket_slug: entry.ticket_slug.clone(),
-        },
-    }
-}
-
-/// Work-time re-check for a claimed queue entry with a ticket: `Some(blocker)`
-/// when one of the ticket's unsatisfied `blocked-by` entries is unsatisfied
-/// because that blocker's own ticket ended up Failed (its mission reached a
-/// terminal non-Complete state — Failed/Abandoned/Blocked — after
-/// batch-approval queued this entry alongside it). The dispatcher must skip
-/// such an entry rather than run it: re-driving a mission whose dependency
-/// failed can never succeed, and retrying forever would hot-loop.
-pub fn work_skip_for_failed_blocker(repo_root: &Path, slug: &str) -> Result<Option<String>> {
-    let unsatisfied = deps::unsatisfied_blockers(repo_root, slug)?;
-    for blocker in unsatisfied {
-        if Ticket::read_state(repo_root, &blocker) == TicketState::Failed {
-            return Ok(Some(blocker));
-        }
-    }
-    Ok(None)
-}
-
-/// Map a terminal mission status to the ticket state recorded after a run.
-pub fn ticket_state_for_mission(status: MissionStatus) -> TicketState {
-    match status {
-        MissionStatus::Complete => TicketState::Done,
-        // Blocked/Failed/anything-non-complete leaves the ticket Failed so it
-        // resurfaces in `ticket list` for a human to pick back up.
-        _ => TicketState::Failed,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -545,6 +492,12 @@ fn restore_draft_checkout(repo: &Path, original: Option<&str>, mission_branch: &
 /// `kranz work [--once]`: the dispatcher. Drains the per-repo queue one
 /// mission at a time; `--once` processes exactly one front entry (or exits if
 /// the repo is busy). Per-repo serialization is enforced by `is_repo_busy`.
+///
+/// Thin wrapper over [`kranz_engine::work::drain_queue`] (roadmap f-1-1): the
+/// core loop lives in the engine so any surface can drive it headlessly; this
+/// wrapper keeps the CLI-only concerns — operator checkout capture/restore,
+/// live progress printing, and tailing each mission's events to stderr via
+/// [`run_mission_loop`].
 pub async fn cmd_work(repo: PathBuf, once: bool) -> Result<i32> {
     // Remember the operator's checkout: each mission's run() asserts its own
     // branch, so when the dispatcher exits it puts the checkout back where
@@ -553,6 +506,9 @@ pub async fn cmd_work(repo: PathBuf, once: bool) -> Result<i32> {
         .ok()
         .and_then(|g| g.current_branch().ok());
     // Claims abandoned by a crashed dispatcher come back first (review P1).
+    // Reported here (rather than inside the engine core) so the CLI keeps its
+    // pre-hoist wording; the core's own `recover_dead_claims` call is a no-op
+    // second pass over whatever's left.
     let recovered = queue::recover_dead_claims(&repo);
     if recovered > 0 {
         println!(
@@ -560,104 +516,32 @@ pub async fn cmd_work(repo: PathBuf, once: bool) -> Result<i32> {
             if recovered == 1 { "y" } else { "ies" }
         );
     }
-    loop {
-        let front = queue::peek(&repo);
-        let busy = queue::is_repo_busy(&repo);
-        match next_work_action(front.as_ref(), busy.as_deref()) {
-            WorkAction::Empty => {
-                println!("queue empty — nothing to do.");
-                restore_work_checkout(&repo, dispatch_branch.as_deref());
-                return Ok(0);
+
+    let report = kranz_engine::work::drain_queue(&repo, once, |mission_id| {
+        let repo = repo.clone();
+        async move {
+            println!("running mission {mission_id} from the queue");
+            let status = drive_mission(repo, &mission_id).await;
+            if let Err(e) = &status {
+                eprintln!("kranz: mission {mission_id} errored: {e:#}");
             }
-            WorkAction::Busy { mission_id } => {
-                println!("repo busy with {mission_id}, waiting");
-                if once {
-                    // --once must not block: report and exit cleanly.
-                    return Ok(0);
-                }
-                // Poll until the running mission releases the repo. Async
-                // sleep so this never blocks a runtime worker thread.
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                continue;
-            }
-            WorkAction::Run {
-                mission_id: _,
-                ticket_slug,
-            } => {
-                // Claim the entry ATOMICALLY (rename, not remove): a peer
-                // dispatcher can't double-run it, and a crash here leaves a
-                // recoverable claim file instead of dropped work (review P1).
-                let Some(claim) = queue::claim_front(&repo) else {
-                    // Raced with a sibling (or the queue is transiently
-                    // unclaimable): brief pause so this can never hot-spin.
-                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                    continue;
-                };
-                // The front may have moved between peek and claim — the
-                // CLAIMED entry is authoritative, so run that one.
-                let mission_id = claim.entry.mission_id.clone();
-                if let Some(slug) = &ticket_slug {
-                    // Re-check blockers at work time: batch-approval can queue
-                    // a dependent alongside a blocker that fails before its
-                    // turn comes up. Retire the claim (never release it — that
-                    // would re-claim this same doomed entry forever) and mark
-                    // the ticket Failed with a note naming the blocker.
-                    if let Some(blocker) = work_skip_for_failed_blocker(&repo, slug)? {
-                        queue::finish_claim(claim);
-                        Ticket::write_state(
-                            &repo,
-                            slug,
-                            TicketState::Failed,
-                            Some(format!("skipped: blocked-by {blocker} failed")),
-                        )?;
-                        eprintln!(
-                            "warning: skipping ticket '{slug}' — blocked-by '{blocker}' failed"
-                        );
-                        continue;
-                    }
-                    Ticket::write_state(&repo, slug, TicketState::Running, None)?;
-                }
-                println!("running mission {mission_id} from the queue");
-
-                let status = drive_mission(repo.clone(), &mission_id).await;
-
-                // Terminal outcome (any) retires the claim. A mission we
-                // could not RUN (lock held, config, spawn failure): for a
-                // ticket-born entry the ticket is marked Failed below and the
-                // claim retires with it (matching pre-claim semantics, no
-                // re-run loop); a bare entry is RELEASED so the work isn't
-                // lost, and the `status?` below stops this dispatcher rather
-                // than hot-looping on the same failing entry.
-                match &status {
-                    Ok(_) => queue::finish_claim(claim),
-                    Err(_) if ticket_slug.is_some() => queue::finish_claim(claim),
-                    Err(_) => queue::release_claim(claim),
-                }
-
-                if let Some(slug) = &ticket_slug {
-                    let (next, ok) = match &status {
-                        Ok(code) => (mission_state_from_code(*code), true),
-                        Err(_) => (TicketState::Failed, false),
-                    };
-                    Ticket::write_state(&repo, slug, next, None)?;
-                    if !ok {
-                        // Surface the error but keep draining the rest.
-                        if let Err(e) = status {
-                            eprintln!("kranz: mission {mission_id} errored: {e:#}");
-                        }
-                    }
-                } else {
-                    status?;
-                }
-
-                if once {
-                    restore_work_checkout(&repo, dispatch_branch.as_deref());
-                    return Ok(0);
-                }
-                // Loop: re-check the queue for the next mission.
-            }
+            status
         }
+    })
+    .await?;
+
+    if report.stopped_busy {
+        // `--once` against a busy repo: nothing was claimed or run, so the
+        // checkout is left exactly where the busy sibling dispatcher needs
+        // it — restoring here would switch branches out from under its
+        // still-running mission.
+        return Ok(0);
     }
+    if report.ran.is_empty() && report.skipped.is_empty() {
+        println!("queue empty — nothing to do.");
+    }
+    restore_work_checkout(&repo, dispatch_branch.as_deref());
+    Ok(0)
 }
 
 /// Run one queued mission to a terminal state, returning the `run_mission_loop`
@@ -671,14 +555,4 @@ async fn drive_mission(repo: PathBuf, mission_id: &str) -> Result<i32> {
         false,
     )
     .await
-}
-
-/// Map a `run_mission_loop` exit code to the ticket's terminal state (0 → Done,
-/// anything else → Failed, matching [`ticket_state_for_mission`]).
-fn mission_state_from_code(code: i32) -> TicketState {
-    if code == 0 {
-        TicketState::Done
-    } else {
-        TicketState::Failed
-    }
 }

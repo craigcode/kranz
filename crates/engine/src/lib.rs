@@ -29,6 +29,7 @@ pub mod queue;
 pub mod reducer;
 pub mod scrub;
 pub mod ticket;
+pub mod work;
 
 pub mod backend_claude;
 pub mod backend_mock;
