@@ -704,11 +704,8 @@ fn build_worker_spec(
         sandbox: None,
     };
     spec.env = contract_env(base_sha);
-    let (sandbox, warn) = crate::sandbox::resolve_for_session(
-        &role_cfg.sandbox,
-        session_cwd,
-        &mission_dir,
-    );
+    let (sandbox, warn) =
+        crate::sandbox::resolve_for_session(&role_cfg.sandbox, session_cwd, &mission_dir);
     if let Some(warn) = warn {
         tracing::warn!("{warn}");
     }
@@ -879,11 +876,8 @@ pub async fn run_validator_in(
         sandbox: None,
     };
     spec.env = contract_env(base_sha);
-    let (sandbox, warn) = crate::sandbox::resolve_for_session(
-        &role_cfg.sandbox,
-        session_cwd,
-        &paths.mission_dir(),
-    );
+    let (sandbox, warn) =
+        crate::sandbox::resolve_for_session(&role_cfg.sandbox, session_cwd, &paths.mission_dir());
     if let Some(warn) = warn {
         tracing::warn!("{warn}");
     }

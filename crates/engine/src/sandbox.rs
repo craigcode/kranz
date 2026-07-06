@@ -31,10 +31,7 @@ pub enum SandboxDecision {
 /// (`std::env::consts::OS`-shaped string), decide whether the session gets an
 /// enforced sandbox. Parameterized on `target_os` so it is testable
 /// cross-platform.
-pub fn platform_support(
-    enforce: crate::types::SandboxEnforce,
-    target_os: &str,
-) -> SandboxDecision {
+pub fn platform_support(enforce: crate::types::SandboxEnforce, target_os: &str) -> SandboxDecision {
     match enforce {
         crate::types::SandboxEnforce::Off => SandboxDecision::Off,
         crate::types::SandboxEnforce::Fs => {
@@ -180,7 +177,12 @@ pub fn write_profile_file(dir: &Path, profile: &str) -> std::io::Result<PathBuf>
 mod tests {
     use super::*;
 
-    fn inputs(session_cwd: &Path, mission_dir: &Path, tmpdir: &Path, extra: Vec<PathBuf>) -> SandboxInputs {
+    fn inputs(
+        session_cwd: &Path,
+        mission_dir: &Path,
+        tmpdir: &Path,
+        extra: Vec<PathBuf>,
+    ) -> SandboxInputs {
         SandboxInputs {
             session_cwd: session_cwd.to_path_buf(),
             mission_dir: mission_dir.to_path_buf(),
@@ -328,7 +330,12 @@ mod tests {
     fn sandbox_enforcement_macos_allows_inside_denies_outside() {
         use std::process::Command;
 
-        if Command::new("which").arg("sandbox-exec").output().map(|o| !o.status.success()).unwrap_or(true) {
+        if Command::new("which")
+            .arg("sandbox-exec")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
             eprintln!("sandbox-exec not found on this host; skipping");
             return;
         }
@@ -357,7 +364,10 @@ mod tests {
         );
         assert!(inside_file.exists(), "expected inside file to be created");
 
-        let outside_file = outside.path().join(format!("kranz_sandbox_should_fail_{}", uuid::Uuid::new_v4()));
+        let outside_file = outside.path().join(format!(
+            "kranz_sandbox_should_fail_{}",
+            uuid::Uuid::new_v4()
+        ));
         let outside_status = Command::new("sandbox-exec")
             .arg("-f")
             .arg(&profile_path)
