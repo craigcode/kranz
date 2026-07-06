@@ -136,6 +136,18 @@ Slack; forensics one tap away in the browser.
   file write (LOW RISK). `work` is **report-only**: it reads the queue and points
   at the `kranz work` dispatcher (the bridge never runs a mission on the socket
   loop). See "Slice 4 implementation notes" below.
+- **Slice 6 — backlog verbs** (DONE): `/kranz ticket list` and `/kranz ticket
+  show <slug>` (read-only, no allowlist gate, ephemeral replies — same shape as
+  `/kranz status`); `/kranz draft <slug>` (SPEND, gated on `slack.allowUsers`
+  exactly like `/kranz new`: an `:hourglass_flowing_sand:` ack posts
+  immediately, then the terminal draft outcome — ready-for-review, approved
+  and queued, or NEEDS-CONTEXT with the orchestrator's questions appended);
+  and approve-by-slug, `/kranz approve <slug>` (the slug-resolving twin of
+  `/kranz approve <mission-id>`, same allowlist gate, running the identical
+  `kranz_engine::deps::approve_ticket` gate the CLI/REST approve paths run so
+  a blocked-by/cycle/not-REVIEW refusal is forwarded to the user verbatim).
+  The dashboard's backlog panel (`#/backlog`) rides the same REST surface, so
+  Slack and the web UI never drift on what "approvable" means.
 
 ## Slice 2 & 3 implementation notes
 
