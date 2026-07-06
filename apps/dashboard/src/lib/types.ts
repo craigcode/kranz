@@ -236,6 +236,9 @@ export interface MissionSummary {
   goal: string;
   createdAt: string;
   error?: string;
+  /** Whether the mission branch tip is an ancestor of the base branch.
+   *  Undefined/null when there is no branch to probe (see rest.rs merged_bit). */
+  merged?: boolean;
 }
 
 // ---------------------------------------------------------------------------

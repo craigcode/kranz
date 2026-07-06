@@ -202,4 +202,18 @@ export const api = {
   drainQueue(): Promise<DrainState> {
     return postJson('/api/queue/drain', {});
   },
+
+  // --- delivered stage (gated Merge action) --------------------------------
+
+  reportMd(id: string): Promise<{ markdown: string }> {
+    return getJson(`/api/missions/${encodeURIComponent(id)}/report.md`);
+  },
+
+  diffStat(id: string): Promise<{ diffStat: string; baseSha: string; tip: string }> {
+    return getJson(`/api/missions/${encodeURIComponent(id)}/diff-stat`);
+  },
+
+  merge(id: string): Promise<{ merged: boolean; commit?: string }> {
+    return postJson(`/api/missions/${encodeURIComponent(id)}/merge`, {});
+  },
 };
