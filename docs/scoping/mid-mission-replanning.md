@@ -64,7 +64,7 @@ DECIDED 2026-07-06: as recommended — the verb is **Revise**; the consent
 act on the revision card remains **Approve**. (D-B through D-F remain
 open.)
 
-## D-B — trigger paths (OPERATOR DECISION)
+## D-B — trigger paths (DECIDED 2026-07-06)
 
 1. **Operator-initiated**: Revise on a Running/Paused/Blocked row (secondary-action slot, pipelineStage.ts:113
    pattern) takes a one-line "what changed" → `POST /api/missions/:id/revise` → control inbox → in-loop
@@ -78,6 +78,10 @@ open.)
 `kranz exec` auto-approves plans (exec.rs:180–183) and would silently swallow this gate: in exec mode,
 orchestrator-initiated revisions are REFUSED — the mission proceeds or blocks honestly — mirroring the
 floor-for-autonomous posture (worker-sandboxing.md:37–38).
+
+DECIDED 2026-07-06: as recommended — both trigger paths, operator-initiated
+built first; orchestrator proposals land in the same human gate and are
+refused entirely in headless exec mode.
 
 ## D-C — the in-flight milestone (OPERATOR DECISION)
 
