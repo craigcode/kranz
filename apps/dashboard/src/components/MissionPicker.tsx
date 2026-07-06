@@ -120,6 +120,9 @@ export function MissionPicker() {
         <div className="picker-title">
           <span className="picker-brand mono">KRANZ</span>
           <span className="section-label">Missions</span>
+          <span className="picker-counts dim">
+            {finished} finished · {running} running
+          </span>
           <button
             type="button"
             className="btn-small new-mission-btn"
@@ -153,14 +156,9 @@ export function MissionPicker() {
           </div>
         )}
         <ul className="picker-list">{active.map(row)}</ul>
-        <span className="picker-counts dim">
-          {finished} finished · {running} running
-        </span>
         {closed.length > 0 && (
           <details className="picker-closed">
-            <summary className="dim">
-              {closed.length} closed mission{closed.length === 1 ? '' : 's'}
-            </summary>
+            <summary className="dim">closed</summary>
             <ul className="picker-list">{closed.map(row)}</ul>
           </details>
         )}

@@ -53,6 +53,12 @@ describe('MissionPicker header and placeholder row', () => {
     expect(screen.getByText('3 finished · 3 running')).toBeTruthy();
   });
 
+  it('does not render the old "N closed mission(s)" count', () => {
+    useKranzStore.setState({ missions: FIXTURE });
+    render(<MissionPicker />);
+    expect(screen.queryByText(/\d+ closed missions?/i)).toBeNull();
+  });
+
   it('renders a deleted row as a placeholder with no abandon/delete action', () => {
     useKranzStore.setState({ missions: FIXTURE });
     render(<MissionPicker />);
