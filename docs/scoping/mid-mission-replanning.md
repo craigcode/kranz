@@ -51,7 +51,7 @@ Live use exposed the lifecycle edges v1 cut (roadmap M2 preamble). The receipts:
 2. **A revision IS a plan approval.** Same sacred Approve ceremony (pipeline-view.md D-A), same three surfaces, same token/allowlist gates. No cheaper consent path exists.
 3. **The loop never changes owners.** The run task keeps the engine and the single-writer lock through the gate; consent rides the control inbox; the append-only log records everything.
 
-## D-A — the verb (OPERATOR DECISION)
+## D-A — the verb (DECIDED 2026-07-06)
 
 Approve, Queue, Start are spoken for (pipeline-view.md D-A); Reshape is the pre-approval sibling at Reviewable. This is its post-approval sibling on Running/Paused/Blocked rows.
 
@@ -59,6 +59,10 @@ Approve, Queue, Start are spoken for (pipeline-view.md D-A); Reshape is the pre-
 contractChangeRequest, the artifact is already revised-plan.md. Rejected: *Replan* reads as start-over, contradicting
 the immutability promise in its own name; *Amend* is git-loaded (history rewriting — exactly what this must never
 imply). The consent button on the card stays **Approve** — per D-A discipline it is a plan approval, not a new verb.
+
+DECIDED 2026-07-06: as recommended — the verb is **Revise**; the consent
+act on the revision card remains **Approve**. (D-B through D-F remain
+open.)
 
 ## D-B — trigger paths (OPERATOR DECISION)
 
