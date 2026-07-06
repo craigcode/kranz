@@ -742,7 +742,8 @@ impl MissionHost {
                 async move {
                     state.lock().expect("drain state lock").current_mission_id =
                         Some(mission_id.clone());
-                    let outcome = run_mission_headless(backend, repo_root, mission_id.clone()).await;
+                    let outcome =
+                        run_mission_headless(backend, repo_root, mission_id.clone()).await;
                     let mut guard = state.lock().expect("drain state lock");
                     guard.current_mission_id = None;
                     if outcome.is_ok() {

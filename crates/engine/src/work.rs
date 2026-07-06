@@ -366,7 +366,11 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(ran.load(Ordering::SeqCst), 0, "the doomed entry must not run");
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "the doomed entry must not run"
+        );
         assert_eq!(report.skipped, vec!["mission-dep".to_string()]);
         assert!(report.ran.is_empty());
         assert_eq!(Ticket::read_state(repo, "dependent"), TicketState::Failed);
@@ -403,7 +407,11 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(ran.load(Ordering::SeqCst), 1, "--once must run exactly one entry");
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            1,
+            "--once must run exactly one entry"
+        );
         assert_eq!(report.ran.len(), 1);
         // One entry remains queued.
         assert_eq!(queue::list(repo).len(), 1);

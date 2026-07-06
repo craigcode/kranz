@@ -1055,14 +1055,25 @@ async fn queue_drain_route_runs_a_queued_mission_to_complete() {
 
     let judgement =
         json!({ "decision": "complete", "guidance": "", "summary": "worker did the job" });
+    // Planning happens in one orchestrator session; `/release` (below) drops
+    // that engine — and its live backend session — so the drain's headless
+    // resume starts a BRAND NEW orchestrator session for the run-phase
+    // judgement, which needs its own init/result pair and turns.
     let orch = MockScript::streaming(vec![mock_init("orch-drain"), mock_result_text("seed-hi")])
         .responding(vec![
             turn("scoping the demo"),
             turn(&plan_json().to_string()),
-            turn(&judgement.to_string()),
-            turn("NONE"),
         ]);
-    let backend = Arc::new(MockBackend::with_scripts(vec![orch, worker_pass()]));
+    let orch_run = MockScript::streaming(vec![
+        mock_init("orch-drain-run"),
+        mock_result_text("resumed"),
+    ])
+    .responding(vec![turn(&judgement.to_string()), turn("NONE")]);
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        orch,
+        worker_pass(),
+        orch_run,
+    ]));
     let app = hosted_app(&root, backend);
 
     let (status, body) = post_json(
@@ -1136,13 +1147,6 @@ async fn queue_drain_route_runs_a_queued_mission_to_complete() {
     let (status, body) = post_json(&app, "/api/queue/drain", Some(TOKEN), json!({})).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["live"], true, "{body}");
-
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    let (_, ev) = get_json(&app, &format!("/api/missions/{id}/events")).await;
-    eprintln!("EVENTS: {}", serde_json::to_string_pretty(&ev).unwrap());
-    let (_, st) = get_json(&app, &format!("/api/missions/{id}/state")).await;
-    eprintln!("STATE: {}", serde_json::to_string_pretty(&st).unwrap());
-    panic!("debug stop");
 
     // The queue entry's claim was retired by the drain.
     let deadline = tokio::time::Instant::now() + RUN_TIMEOUT;
