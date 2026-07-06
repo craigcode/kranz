@@ -73,6 +73,7 @@ export interface TicketSummary {
   state: TicketState;
   title: string;
   blockedBy: string[];
+  isBlocked: boolean;
 }
 
 /** Full ticket shape from `GET /api/tickets/:slug`. */
@@ -82,6 +83,7 @@ export interface Ticket {
   priority: number;
   schedule: 'once' | 'nightly' | 'weekly';
   blockedBy: string[];
+  isBlocked: boolean;
   goal: string;
   context: string;
   scopingAnswers: string[];

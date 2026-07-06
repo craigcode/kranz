@@ -48,7 +48,6 @@ export function TicketDetail({ slug }: { slug: string }) {
   const [ticket, setTicket] = useState<Ticket | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
 
-  const tickets = useKranzStore((s) => s.tickets);
   const loadTickets = useKranzStore((s) => s.loadTickets);
   const ticketError = useKranzStore((s) => s.ticketError);
   const draftTicket = useKranzStore((s) => s.draftTicket);
@@ -91,15 +90,10 @@ export function TicketDetail({ slug }: { slug: string }) {
     );
   }
 
-  const unsatisfiedBlockers = ticket.blockedBy.filter((b) => {
-    const dep = tickets.find((t) => t.slug === b);
-    return dep === undefined || dep.state !== 'done';
-  });
-
   const showApprove = ticket.state === 'review';
-  const approveDisabled = unsatisfiedBlockers.length > 0;
+  const approveDisabled = ticket.isBlocked;
   const approveTitle = approveDisabled
-    ? `blocked by ${unsatisfiedBlockers.join(', ')}`
+    ? `blocked by ${ticket.blockedBy.join(', ')}`
     : 'approve into the queue';
 
   return (
