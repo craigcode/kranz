@@ -28,6 +28,7 @@ pub mod merge;
 pub mod prompts;
 pub mod queue;
 pub mod reducer;
+pub mod sandbox;
 pub mod scrub;
 pub mod ticket;
 pub mod work;
