@@ -8,8 +8,8 @@ use kranz_engine::error::EngineError;
 use kranz_engine::events::{Event, EventKind};
 use kranz_engine::prompts;
 use kranz_engine::types::{
-    Feature, FeatureOrigin, FeatureStatus, Finding, MissionConfig, Plan, PlanFeature,
-    PlanMilestone, Role, RunResult, TokenUsage,
+    Assertion, AssertionCheck, Feature, FeatureOrigin, FeatureStatus, Finding, MissionConfig,
+    Plan, PlanFeature, PlanMilestone, Role, RunResult, TokenUsage,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -705,4 +705,146 @@ fn load_layers_takes_pathbuf_slices() {
     let layers: Vec<PathBuf> = vec![];
     let cfg = config::load_layers(&layers).unwrap();
     assert_eq!(cfg, MissionConfig::default());
+}
+
+// ---------------------------------------------------------------------------
+// cost::classify_shape
+// ---------------------------------------------------------------------------
+
+fn judgement_assertion(id: &str) -> Assertion {
+    Assertion {
+        id: id.into(),
+        statement: "orchestrator judges the full diff".into(),
+        check: AssertionCheck::AgentJudgement,
+        command: None,
+    }
+}
+
+fn command_assertion(id: &str, command: &str) -> Assertion {
+    Assertion {
+        id: id.into(),
+        statement: "a command gate".into(),
+        check: AssertionCheck::Command,
+        command: Some(command.into()),
+    }
+}
+
+fn plan_with_contract(validation_contract: Vec<Assertion>) -> Plan {
+    let mut plan = plan_with(&[1]);
+    plan.validation_contract = validation_contract;
+    plan
+}
+
+#[test]
+fn classify_shape_judgement_heavy_grep_only_contract_is_doc_heavy() {
+    // Mirrors m-d341a7's contract shape: judgement assertions plus grep/git
+    // command assertions, but nothing that gates on a build or test.
+    let plan = plan_with_contract(vec![
+        judgement_assertion("a1"),
+        judgement_assertion("a2"),
+        command_assertion("a3", "bash -c 'grep -q foo doc.md'"),
+        command_assertion("a4", "bash -c 'git diff --stat'"),
+        command_assertion("a5", "bash -c 'grep -c bar doc.md'"),
+    ]);
+    assert_eq!(cost::classify_shape(&plan), cost::MissionShape::DocHeavy);
+}
+
+#[test]
+fn classify_shape_empty_contract_is_unknown() {
+    let plan = plan_with_contract(vec![]);
+    assert_eq!(cost::classify_shape(&plan), cost::MissionShape::Unknown);
+}
+
+#[test]
+fn classify_shape_cargo_test_command_wins_even_with_judgement() {
+    let plan = plan_with_contract(vec![
+        judgement_assertion("a1"),
+        command_assertion("a2", "cargo test --workspace"),
+    ]);
+    assert_eq!(cost::classify_shape(&plan), cost::MissionShape::CodeChange);
+}
+
+#[test]
+fn classify_shape_grep_only_no_judgement_is_unknown() {
+    let plan = plan_with_contract(vec![
+        command_assertion("a1", "bash -c 'grep -q foo doc.md'"),
+        command_assertion("a2", "bash -c 'grep -c bar doc.md'"),
+    ]);
+    assert_eq!(cost::classify_shape(&plan), cost::MissionShape::Unknown);
+}
+
+// ---------------------------------------------------------------------------
+// cost::apply_shape (confidence-gated shape widening)
+// ---------------------------------------------------------------------------
+
+/// m-d341a7's recorded actual cost, per its report.md / event log — the
+/// judgement-heavy mission that motivated shape-aware widening: its
+/// contract has 2 agent-judgement assertions and no build/test command, so
+/// it classifies as DocHeavy, yet ran ~9x over an $18.35 base estimate.
+const M_D341A7_ACTUAL_USD: f64 = 163.64;
+
+fn code_only_calibration(repo: &Path) -> cost::Calibration {
+    write_events(repo, "m-a", mission_a_events());
+    write_events(repo, "m-b", mission_b_events());
+    cost::calibrate(repo)
+}
+
+#[test]
+fn backtest_m_d341a7_doc_heavy_lands_in_range() {
+    let plan: Plan = serde_json::from_str(include_str!("fixtures/m-d341a7-plan.json")).unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let calibration = code_only_calibration(tmp.path());
+    assert_eq!(calibration.doc_heavy_missions_used, 0);
+
+    let cfg = MissionConfig::default();
+    let base = cost::estimate(&plan, &cfg, &calibration.params);
+    let est = cost::apply_shape(base, &plan, &calibration);
+
+    assert_eq!(est.shape, cost::MissionShape::DocHeavy);
+    assert_eq!(est.confidence, cost::Confidence::Low);
+    assert!(
+        est.low_usd <= M_D341A7_ACTUAL_USD && M_D341A7_ACTUAL_USD <= est.high_usd,
+        "range [{}, {}] must bracket the recorded actual {}",
+        est.low_usd,
+        est.high_usd,
+        M_D341A7_ACTUAL_USD
+    );
+}
+
+#[test]
+fn estimate_code_shape_unchanged_by_apply_shape() {
+    let mut plan = plan_with(&[3, 2]);
+    plan.validation_contract = vec![command_assertion("a1", "cargo test --workspace")];
+    let cfg = MissionConfig::default();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let calibration = code_only_calibration(tmp.path());
+
+    let base = cost::estimate(&plan, &cfg, &calibration.params);
+    let est = cost::apply_shape(base, &plan, &calibration);
+
+    assert_eq!(est.shape, cost::MissionShape::CodeChange);
+    assert_eq!(est.confidence, cost::Confidence::High);
+    approx(est.low_usd, base.low_usd);
+    approx(est.expected_usd, base.expected_usd);
+    approx(est.high_usd, base.high_usd);
+}
+
+#[test]
+fn apply_shape_noop_for_unknown_contract() {
+    let plan = plan_with_contract(vec![]);
+    let cfg = MissionConfig::default();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let calibration = code_only_calibration(tmp.path());
+
+    let base = cost::estimate(&plan, &cfg, &calibration.params);
+    let est = cost::apply_shape(base, &plan, &calibration);
+
+    assert_eq!(est.shape, cost::MissionShape::Unknown);
+    assert_eq!(est.confidence, cost::Confidence::High);
+    approx(est.low_usd, base.low_usd);
+    approx(est.expected_usd, base.expected_usd);
+    approx(est.high_usd, base.high_usd);
 }

@@ -424,6 +424,7 @@ impl MissionHost {
                 // missions (built-in defaults when there are none yet).
                 let calibration = cost::calibrate(&self.repo_root);
                 let estimate = cost::estimate(&plan, &engine.state().config, &calibration.params);
+                let estimate = cost::apply_shape(estimate, &plan, &calibration);
                 // Park the reviewed plan so ANY surface's approve affordance
                 // (Slack buttons, web, glasses ring) can commit it later.
                 self.set_pending_plan(id, Some(plan.clone()));
@@ -1299,12 +1300,17 @@ fn prepend_seed(seed: Option<String>, reply: String) -> String {
 /// [`CostEstimate`] as protocol camelCase JSON (the engine type is a plain
 /// contract struct without serde derives).
 fn estimate_json(estimate: &CostEstimate) -> Value {
+    let confidence = match estimate.confidence {
+        kranz_engine::cost::Confidence::High => "high",
+        kranz_engine::cost::Confidence::Low => "low",
+    };
     json!({
         "workerRuns": estimate.worker_runs,
         "validatorRuns": estimate.validator_runs,
         "lowUsd": estimate.low_usd,
         "expectedUsd": estimate.expected_usd,
         "highUsd": estimate.high_usd,
+        "confidence": confidence,
     })
 }
 

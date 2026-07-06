@@ -9,7 +9,8 @@ use crate::event_log::EventLog;
 use crate::paths::MissionPaths;
 use crate::reducer;
 use crate::types::{
-    FeatureOrigin, MissionConfig, MissionState, MissionStatus, Plan, Role, TokenUsage, WorkerRun,
+    AssertionCheck, FeatureOrigin, MissionConfig, MissionState, MissionStatus, Plan, PlanFeature,
+    PlanMilestone, Role, TokenUsage, WorkerRun,
 };
 use std::path::Path;
 
@@ -132,6 +133,23 @@ pub struct CostEstimate {
     pub low_usd: f64,
     pub expected_usd: f64,
     pub high_usd: f64,
+    /// Plan-observable shape. [`estimate`] itself is shape-neutral and always
+    /// reports `Unknown` here — only [`apply_shape`] classifies it.
+    pub shape: MissionShape,
+    /// Whether the calibration corpus covers this shape. [`estimate`] always
+    /// reports `High` — only [`apply_shape`] can lower it.
+    pub confidence: Confidence,
+}
+
+/// How much the calibration corpus backs a [`CostEstimate`]'s range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Confidence {
+    /// The calibration corpus has (or is assumed to have) comparable
+    /// missions.
+    High,
+    /// The plan's shape has zero comparable missions in the calibration
+    /// corpus — the range has been widened accordingly.
+    Low,
 }
 
 /// Estimate mission cost from the approved plan (plan §5 Phase 1 formula):
@@ -175,6 +193,79 @@ pub fn estimate(plan: &Plan, cfg: &MissionConfig, p: &EstimateParams) -> CostEst
         low_usd: 0.5 * expected_usd,
         expected_usd,
         high_usd: 2.5 * expected_usd,
+        shape: MissionShape::Unknown,
+        confidence: Confidence::High,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mission shape classification (observable at plan time)
+// ---------------------------------------------------------------------------
+
+/// The plan-observable shape of a mission, used to flag validation contracts
+/// [`estimate`]'s calibration corpus doesn't cover (later features will widen
+/// ranges / lower confidence for these; this type is inert on its own).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissionShape {
+    /// Contract gates on a build/test/lint command — the calibration corpus's
+    /// typical shape.
+    CodeChange,
+    /// Contract leans on agent judgement with no build/test gate — expensive
+    /// to validate and not represented in the calibration corpus.
+    DocHeavy,
+    /// Neither signal present (empty or grep-only contract): treated as
+    /// neutral, never widened.
+    Unknown,
+}
+
+/// Classify a plan's shape from its validation contract alone (observable
+/// before any run happens).
+///
+/// `AgentJudgement` assertions are re-evaluated by validators and the
+/// orchestrator against the *entire, growing* mission diff on every
+/// validation pass — m-d341a7 had 2 judgement assertions over a 1074-line
+/// doc and that alone drove 21.5M cache-read tokens across 17 judgement
+/// turns. Missions that instead gate on a build/test/lint command bound that
+/// cost (the command runs once, deterministically, regardless of diff size),
+/// so any `Command` assertion invoking cargo/npm/pytest/go test/make wins
+/// over an `AgentJudgement` signal — the code-change shape doesn't scale
+/// with diff size the way a judgement-only contract does.
+pub fn classify_shape(plan: &Plan) -> MissionShape {
+    const BUILD_TEST_TOKENS: &[&str] = &[
+        "cargo test",
+        "cargo build",
+        "cargo check",
+        "cargo clippy",
+        "npm test",
+        "npm run",
+        "pytest",
+        "go test",
+        "make ",
+    ];
+
+    let judgements = plan
+        .validation_contract
+        .iter()
+        .filter(|a| a.check == AssertionCheck::AgentJudgement)
+        .count();
+
+    let build_test_cmd = plan.validation_contract.iter().any(|a| {
+        a.check == AssertionCheck::Command
+            && a.command
+                .as_deref()
+                .map(|c| {
+                    let lower = c.to_ascii_lowercase();
+                    BUILD_TEST_TOKENS.iter().any(|tok| lower.contains(tok))
+                })
+                .unwrap_or(false)
+    });
+
+    if build_test_cmd {
+        MissionShape::CodeChange
+    } else if judgements >= 1 {
+        MissionShape::DocHeavy
+    } else {
+        MissionShape::Unknown
     }
 }
 
@@ -189,6 +280,10 @@ pub fn estimate(plan: &Plan, cfg: &MissionConfig, p: &EstimateParams) -> CostEst
 pub struct Calibration {
     pub params: EstimateParams,
     pub missions_used: usize,
+    /// How many of the completed missions folded into `params` classified as
+    /// [`MissionShape::DocHeavy`] (from their recorded plan). Zero means the
+    /// doc-heavy shape is uncovered by this corpus — see [`apply_shape`].
+    pub doc_heavy_missions_used: usize,
 }
 
 /// Derive [`EstimateParams`] from the actuals recorded in this repo's
@@ -207,6 +302,7 @@ pub struct Calibration {
 /// zero out future estimates.
 pub fn calibrate(repo_root: &Path) -> Calibration {
     let mut per_mission: Vec<EstimateParams> = Vec::new();
+    let mut doc_heavy_missions_used = 0usize;
     for mission_id in MissionPaths::list_missions(repo_root) {
         let paths = MissionPaths::new(repo_root, &mission_id);
         let Ok(events) = EventLog::read_events(&paths.events_file()) else {
@@ -218,6 +314,9 @@ pub fn calibrate(repo_root: &Path) -> Calibration {
         if state.mission.status != MissionStatus::Complete {
             continue;
         }
+        if classify_shape(&mission_plan(&state)) == MissionShape::DocHeavy {
+            doc_heavy_missions_used += 1;
+        }
         per_mission.push(mission_actuals(&state));
     }
 
@@ -225,6 +324,7 @@ pub fn calibrate(repo_root: &Path) -> Calibration {
         return Calibration {
             params: EstimateParams::default(),
             missions_used: 0,
+            doc_heavy_missions_used: 0,
         };
     }
 
@@ -242,8 +342,75 @@ pub fn calibrate(repo_root: &Path) -> Calibration {
     Calibration {
         params,
         missions_used: per_mission.len(),
+        doc_heavy_missions_used,
     }
 }
+
+/// Reconstruct the [`Plan`] a completed mission's state was approved from —
+/// only the fields [`classify_shape`] reads (validation contract) matter, so
+/// the milestone/feature reconstruction just needs consistent counts.
+fn mission_plan(state: &MissionState) -> Plan {
+    Plan {
+        goal: state.mission.goal.clone(),
+        validation_contract: state.mission.validation_contract.clone(),
+        milestones: state
+            .mission
+            .milestones
+            .iter()
+            .map(|m| PlanMilestone {
+                title: m.title.clone(),
+                features: m
+                    .features
+                    .iter()
+                    .map(|f| PlanFeature {
+                        title: f.title.clone(),
+                        spec: f.spec.clone(),
+                        validation_criteria: f.validation_criteria.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
+/// Widen and confidence-label a base [`estimate`] for shapes the calibration
+/// corpus doesn't cover.
+///
+/// [`estimate`] itself stays shape-neutral (existing callers/tests see
+/// identical numbers). This is the post-processing step: classify the plan,
+/// and only if it is [`MissionShape::DocHeavy`] AND the corpus has zero
+/// doc-heavy missions (`cal.doc_heavy_missions_used == 0`) do we act — the
+/// corpus's pooled per-run costs are tuned for code-change missions, so a
+/// judgement-heavy plan's `expected_usd` is a reasonable central guess (same
+/// per-run rates) but its upper bound is not: a comparable mission
+/// (m-d341a7) ran to $163.64 against an $18.35 base estimate, ~9x over.
+/// `expected_usd` and `low_usd` are left alone (no evidence they're
+/// mis-centered); `high_usd` is widened to `expected_usd *
+/// LOW_CONFIDENCE_HIGH_MULT` so the range brackets that kind of overrun with
+/// margin, and `confidence` drops to `Low` so callers can flag it.
+///
+/// Every other case (`CodeChange`, `Unknown`, or a `DocHeavy` shape the
+/// corpus now has examples of) is a strict no-op beyond stamping `shape` and
+/// `confidence: High`.
+pub fn apply_shape(base: CostEstimate, plan: &Plan, cal: &Calibration) -> CostEstimate {
+    let shape = classify_shape(plan);
+    let mut est = base;
+    est.shape = shape;
+
+    if shape == MissionShape::DocHeavy && cal.doc_heavy_missions_used == 0 {
+        est.confidence = Confidence::Low;
+        est.high_usd = est.expected_usd * LOW_CONFIDENCE_HIGH_MULT;
+    } else {
+        est.confidence = Confidence::High;
+    }
+    est
+}
+
+/// Multiplier applied to `expected_usd` to get `high_usd` when a plan's shape
+/// is uncovered by the calibration corpus (see [`apply_shape`]). Chosen so
+/// the widened high comfortably exceeds m-d341a7's recorded actual
+/// ($163.64) from its own $18.35 base estimate: 15.0 * 18.35 = $275.25.
+const LOW_CONFIDENCE_HIGH_MULT: f64 = 15.0;
 
 /// One completed mission's actuals, expressed in [`EstimateParams`] terms so
 /// [`calibrate`] can average them directly:

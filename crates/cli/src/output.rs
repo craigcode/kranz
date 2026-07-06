@@ -2,7 +2,7 @@
 //! pre-mission cost estimate line. No I/O here — everything returns String
 //! so tests can assert on the exact output.
 
-use kranz_engine::cost::CostEstimate;
+use kranz_engine::cost::{Confidence, CostEstimate};
 use kranz_engine::types::{
     AssertionCheck, FeatureStatus, MilestoneStatus, MissionState, MissionStatus, Plan,
 };
@@ -195,11 +195,19 @@ pub fn render_cost_estimate(estimate: &CostEstimate, missions_used: usize) -> St
     } else {
         format!("based on {missions_used} completed mission(s)")
     };
-    format!(
-        "estimated ${:.2}-${:.2} (expected ~${:.2}; rough estimate — live usage is \
-         authoritative; {provenance})",
-        estimate.low_usd, estimate.high_usd, estimate.expected_usd
-    )
+    match estimate.confidence {
+        Confidence::High => format!(
+            "estimated ${:.2}-${:.2} (expected ~${:.2}; rough estimate — live usage is \
+             authoritative; {provenance})",
+            estimate.low_usd, estimate.high_usd, estimate.expected_usd
+        ),
+        Confidence::Low => format!(
+            "estimated ${:.2}-${:.2} (expected ~${:.2}; doc-heavy / judgement-heavy shape — \
+             the calibration corpus lacks a comparable mission, so this is LOW CONFIDENCE and \
+             ${:.2} is a soft ceiling, not a tight bound; {provenance})",
+            estimate.low_usd, estimate.high_usd, estimate.expected_usd, estimate.high_usd
+        ),
+    }
 }
 
 /// Collapse whitespace/newlines into single spaces and truncate to `max`
