@@ -2616,7 +2616,14 @@ impl MissionEngine {
         // mode: in checkout mode the primary IS the active repo, and it is
         // expected to be on the mission branch while work is in progress.
         if let Some(branch_at_start) = &self.primary_branch_at_start {
-            let is_clean = self.repo.is_clean()?;
+            // Tracked-only: the primary root always carries the engine's own
+            // untracked mission housekeeping files (events.jsonl, state.json,
+            // runs/, control/ — see paths.rs) regardless of worktree mode.
+            // Those are gitignored in this repo but not guaranteed to be in
+            // every host repo, so a full `is_clean` would false-positive on
+            // ordinary engine operation; only a TRACKED change means a
+            // worker/validator session actually wrote into the primary.
+            let is_clean = self.repo.is_clean_tracked()?;
             let current_branch = self.repo.current_branch()?;
             if let Some(finding) =
                 contract_sweep::primary_checkout_finding(is_clean, &current_branch, branch_at_start)
@@ -5157,8 +5164,11 @@ mod tests {
         engine.active_tree = Some((path, wt_repo));
         engine.primary_branch_at_start = Some("main".to_string());
 
-        // Dirty the PRIMARY checkout (untracked file), not the worktree.
-        std::fs::write(root.join("stray.txt"), "should never be here\n").unwrap();
+        // Dirty the PRIMARY checkout's TRACKED content (not the worktree):
+        // an untracked file wouldn't count (see `is_clean_tracked`), since
+        // the engine's own housekeeping files are legitimately untracked
+        // there in every worktree-mode run.
+        std::fs::write(root.join("README.md"), "should never change\n").unwrap();
 
         let findings = engine.out_of_contract_sweep(&start_sha).unwrap();
         let primary_findings: Vec<_> = findings.iter().filter(|f| f.subject == "primary-checkout").collect();
