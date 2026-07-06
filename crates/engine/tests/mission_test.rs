@@ -23,6 +23,7 @@ use kranz_engine::backend_mock::{
     mock_init, mock_result_error, mock_result_text, mock_text, MockBackend, MockScript,
 };
 use kranz_engine::control;
+use kranz_engine::cost;
 use kranz_engine::event_log::{EventLog, LockForce};
 use kranz_engine::events::{Event, EventKind};
 use kranz_engine::git_ops::GitRepo;
@@ -1721,6 +1722,29 @@ async fn plan_approval_writes_plan_branch_and_commit() {
         md.starts_with(&format!("# Mission plan — {mission_id}")),
         "{md}"
     );
+    // Cost estimate section: fresh repo, no completed missions, so the
+    // provenance pins to the built-in-defaults wording and the figures come
+    // from the same calibrate+estimate call the engine makes internally.
+    let calibration = cost::calibrate(&root);
+    assert_eq!(calibration.missions_used, 0);
+    let expected_estimate = cost::estimate(&written, &test_cfg(), &calibration.params);
+    assert!(md.contains("## Cost estimate"), "{md}");
+    assert!(
+        md.contains(&format!("${:.2}", expected_estimate.low_usd)),
+        "{md}"
+    );
+    assert!(
+        md.contains(&format!("${:.2}", expected_estimate.expected_usd)),
+        "{md}"
+    );
+    assert!(
+        md.contains(&format!("${:.2}", expected_estimate.high_usd)),
+        "{md}"
+    );
+    assert!(
+        md.contains("built-in defaults — no completed missions yet"),
+        "{md}"
+    );
     assert!(md.contains("## Validation contract"), "{md}");
     assert!(md.contains("**[a-1]**"), "{md}");
     assert!(md.contains("## Milestone 1 —"), "{md}");
@@ -1750,6 +1774,64 @@ async fn plan_approval_writes_plan_branch_and_commit() {
     let mut engine = MissionEngine::resume(backend_dyn, &root, &mission_id, LockForce::No).unwrap();
     let err = engine.approve_plan(simple_plan(1, vec![])).unwrap_err();
     assert!(err.to_string().contains("Planning"), "got: {err}");
+}
+
+/// Once a prior mission has COMPLETED in the repo, a later `approve_plan`'s
+/// plan.md cites calibrated params (not the built-in defaults) and the
+/// "based on N completed mission(s)" provenance wording.
+#[tokio::test(flavor = "multi_thread")]
+async fn plan_md_cost_estimate_uses_calibration_once_a_mission_completes() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    // Run one mission to completion so `cost::calibrate` has actuals to
+    // average (single feature, empty contract: worker report -> judgement
+    // -> capture-lesson turn, per the happy-path helpers above).
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![judgement("complete", ""), no_lesson()]),
+    ]));
+    let mut first = make_engine(&backend, &root, test_cfg());
+    first.approve_plan(simple_plan(1, vec![])).unwrap();
+    let status = timeout(TEST_TIMEOUT, first.run())
+        .await
+        .expect("first mission must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+    drop(first);
+    raw_git(&root, &["checkout", "main"]);
+
+    // A brand-new mission's plan approval must now see missions_used == 1.
+    let backend2 = Arc::new(MockBackend::new());
+    let mut second = make_engine(&backend2, &root, test_cfg());
+    let plan = simple_plan(1, vec![]);
+    let calibration = cost::calibrate(&root);
+    assert_eq!(
+        calibration.missions_used, 1,
+        "the completed first mission must calibrate the second's estimate"
+    );
+    let expected_estimate = cost::estimate(&plan, &test_cfg(), &calibration.params);
+    second.approve_plan(plan).unwrap();
+
+    let mission_id = second.mission_id().to_string();
+    let md = std::fs::read_to_string(
+        root.join(".kranz")
+            .join("missions")
+            .join(&mission_id)
+            .join("plan.md"),
+    )
+    .expect("plan.md written");
+    assert!(md.contains("based on 1 completed mission(s)"), "{md}");
+    assert!(
+        !md.contains("built-in defaults — no completed missions yet"),
+        "{md}"
+    );
+    assert!(
+        md.contains(&format!("${:.2}", expected_estimate.expected_usd)),
+        "{md}"
+    );
 }
 
 /// approve_plan resolves the base branch's tip and records it as

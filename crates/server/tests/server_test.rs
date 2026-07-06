@@ -133,6 +133,122 @@ fn seed_approved_mission(repo_root: &Path, id: &str) -> MissionPaths {
     paths
 }
 
+// ---------------------------------------------------------------------------
+// Git fixture for diff-stat tests (same isolation discipline as
+// crates/engine/tests/mission_test.rs)
+// ---------------------------------------------------------------------------
+
+static ENV_ISOLATION: std::sync::Once = std::sync::Once::new();
+
+/// Mask the host's global/system git config so identity, signing and hooks
+/// never leak into the throwaway repos.
+fn isolate_git_env() {
+    ENV_ISOLATION.call_once(|| {
+        let missing = std::env::temp_dir().join(format!(
+            "kranz-server-test-no-config-{}",
+            std::process::id()
+        ));
+        std::env::set_var("GIT_CONFIG_GLOBAL", &missing);
+        std::env::set_var("GIT_CONFIG_SYSTEM", &missing);
+        if let Ok(ceiling) = std::fs::canonicalize(std::env::temp_dir()) {
+            std::env::set_var("GIT_CEILING_DIRECTORIES", ceiling);
+        }
+    });
+}
+
+fn git_available() -> bool {
+    std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Returns false (after a skip note) when git is missing.
+fn setup() -> bool {
+    isolate_git_env();
+    if git_available() {
+        true
+    } else {
+        eprintln!("skipping test: git is not on PATH");
+        false
+    }
+}
+
+fn raw_git(dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("spawn git");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Fresh repo on branch `main` with one seed commit; returns (tempdir,
+/// canonicalized root, seed commit sha).
+fn init_repo() -> (tempfile::TempDir, PathBuf, String) {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let init = std::process::Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(dir.path())
+        .output()
+        .expect("spawn git init");
+    if !init.status.success() {
+        raw_git(dir.path(), &["init"]);
+        raw_git(dir.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    }
+    raw_git(dir.path(), &["config", "user.name", "test"]);
+    raw_git(dir.path(), &["config", "user.email", "test@example.com"]);
+    std::fs::write(dir.path().join("README.md"), "seed\n").unwrap();
+    raw_git(dir.path(), &["add", "-A"]);
+    raw_git(dir.path(), &["commit", "-m", "seed"]);
+    let root = std::fs::canonicalize(dir.path()).expect("canonicalize repo root");
+    let base_sha = raw_git(&root, &["rev-parse", "HEAD"]).trim().to_string();
+    (dir, root, base_sha)
+}
+
+/// Seed a mission whose plan is approved with `base_sha` pinned to the repo's
+/// seed commit, optionally creating the mission branch with one extra commit
+/// ahead of it.
+fn seed_diffable_mission(
+    repo_root: &Path,
+    id: &str,
+    base_sha: &str,
+    create_branch: bool,
+) -> MissionPaths {
+    let paths = MissionPaths::new(repo_root, id);
+    let branch = format!("kranz/mission-{id}");
+    let mut log = EventLog::acquire(&paths, id, Duration::ZERO, LockForce::No).unwrap();
+    log.append(EventKind::MissionCreated {
+        goal: "Ship the demo".into(),
+        base_branch: "main".into(),
+        mission_branch: branch.clone(),
+        config: MissionConfig::default(),
+    })
+    .unwrap();
+    log.append(EventKind::PlanApproved {
+        plan: sample_plan(),
+        base_sha: Some(base_sha.to_string()),
+    })
+    .unwrap();
+    drop(log);
+
+    if create_branch {
+        raw_git(repo_root, &["checkout", "-b", &branch, base_sha]);
+        std::fs::write(repo_root.join("feature.txt"), "new feature\n").unwrap();
+        raw_git(repo_root, &["add", "--", "feature.txt"]);
+        raw_git(repo_root, &["commit", "-m", "add feature"]);
+        raw_git(repo_root, &["checkout", "main"]);
+    }
+
+    paths
+}
+
 fn fixture() -> (tempfile::TempDir, PathBuf, MissionPaths, axum::Router) {
     let tmp = tempfile::tempdir().unwrap();
     let repo_root = tmp.path().to_path_buf();
@@ -309,6 +425,191 @@ async fn plan_404_until_plan_json_exists() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["goal"], "Ship the demo");
     assert_eq!(body["milestones"][0]["features"][0]["title"], "F1");
+}
+
+#[tokio::test]
+async fn plan_md_404_until_file_exists_then_returns_markdown() {
+    let (_tmp, _repo_root, paths, app) = fixture();
+    let uri = format!("/api/missions/{MISSION_ID}/plan.md");
+
+    let (status, body) = get_json(&app, &uri).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body["error"].is_string());
+
+    std::fs::write(paths.plan_md_file(), "# Plan\n\nGoal: ship it\n").unwrap();
+    let (status, body) = get_json(&app, &uri).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["markdown"], "# Plan\n\nGoal: ship it\n");
+}
+
+#[tokio::test]
+async fn report_md_404_until_file_exists_then_returns_markdown() {
+    let (_tmp, _repo_root, paths, app) = fixture();
+    let uri = format!("/api/missions/{MISSION_ID}/report.md");
+
+    let (status, body) = get_json(&app, &uri).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body["error"].is_string());
+
+    std::fs::write(paths.report_file(), "# Report\n\nAll green\n").unwrap();
+    let (status, body) = get_json(&app, &uri).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["markdown"], "# Report\n\nAll green\n");
+}
+
+#[tokio::test]
+async fn diff_stat_returns_stat_baseline_and_tip_when_diffable() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo_root, base_sha) = init_repo();
+    seed_diffable_mission(&repo_root, "m-diff", &base_sha, true);
+    let app = kranz_server::router(repo_root.clone(), None);
+
+    let (status, body) = get_json(&app, "/api/missions/m-diff/diff-stat").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["baseSha"], base_sha);
+    let tip = raw_git(&repo_root, &["rev-parse", "kranz/mission-m-diff"])
+        .trim()
+        .to_string();
+    assert_eq!(body["tip"], tip);
+    let diff_stat = body["diffStat"].as_str().unwrap();
+    assert!(
+        diff_stat.contains("feature.txt"),
+        "diffStat should mention the changed file: {diff_stat}"
+    );
+}
+
+#[tokio::test]
+async fn diff_stat_404s_when_mission_has_no_pinned_base_sha() {
+    let (_tmp, _repo_root, _paths, app) = fixture();
+    // MISSION_ID's PlanApproved carries base_sha: None (unapproved-for-diff).
+    let (status, body) = get_json(&app, &format!("/api/missions/{MISSION_ID}/diff-stat")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body["error"].is_string());
+}
+
+#[tokio::test]
+async fn diff_stat_404s_when_mission_branch_does_not_exist() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo_root, base_sha) = init_repo();
+    seed_diffable_mission(&repo_root, "m-nobranch", &base_sha, false);
+    let app = kranz_server::router(repo_root.clone(), None);
+
+    let (status, body) = get_json(&app, "/api/missions/m-nobranch/diff-stat").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body["error"].is_string());
+}
+
+#[tokio::test]
+async fn diff_stat_500s_when_pinned_base_sha_does_not_resolve() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo_root, base_sha) = init_repo();
+    // Branch exists (create_branch=true), but the pinned base_sha is bogus, so
+    // `git diff --stat <bogus>..<tip>` fails inside git and the handler's `?`
+    // must degrade to a 500 with a JSON error body, not panic.
+    let bogus_base = "0000000000000000000000000000000000000000";
+    seed_diffable_mission(&repo_root, "m-badbase", &base_sha, true);
+    // Overwrite the pinned base_sha to the bogus value directly in the log.
+    let paths = MissionPaths::new(&repo_root, "m-badbase");
+    let mut log = EventLog::acquire(&paths, "m-badbase", Duration::ZERO, LockForce::No).unwrap();
+    log.append(EventKind::PlanApproved {
+        plan: sample_plan(),
+        base_sha: Some(bogus_base.to_string()),
+    })
+    .unwrap();
+    drop(log);
+    let app = kranz_server::router(repo_root.clone(), None);
+
+    let (status, body) = get_json(&app, "/api/missions/m-badbase/diff-stat").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(body["error"].is_string());
+}
+
+#[tokio::test]
+async fn missions_list_reports_merged_true_when_branch_is_merged_into_base() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo_root, base_sha) = init_repo();
+    seed_diffable_mission(&repo_root, "m-merged", &base_sha, true);
+    raw_git(&repo_root, &["checkout", "main"]);
+    raw_git(
+        &repo_root,
+        &["merge", "--no-ff", "--no-edit", "kranz/mission-m-merged"],
+    );
+    let app = kranz_server::router(repo_root.clone(), None);
+
+    let (status, body) = get_json(&app, "/api/missions").await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = body.as_array().unwrap();
+    let row = rows.iter().find(|r| r["id"] == "m-merged").unwrap();
+    assert_eq!(row["merged"], true);
+}
+
+#[tokio::test]
+async fn missions_list_reports_merged_false_when_branch_is_not_merged() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo_root, base_sha) = init_repo();
+    seed_diffable_mission(&repo_root, "m-unmerged", &base_sha, true);
+    let app = kranz_server::router(repo_root.clone(), None);
+
+    let (status, body) = get_json(&app, "/api/missions").await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = body.as_array().unwrap();
+    let row = rows.iter().find(|r| r["id"] == "m-unmerged").unwrap();
+    assert_eq!(row["merged"], false);
+}
+
+#[tokio::test]
+async fn missions_list_reports_merged_null_when_mission_has_no_branch() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo_root, base_sha) = init_repo();
+    seed_diffable_mission(&repo_root, "m-nobranch-list", &base_sha, false);
+    let app = kranz_server::router(repo_root.clone(), None);
+
+    let (status, body) = get_json(&app, "/api/missions").await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = body.as_array().unwrap();
+    let row = rows.iter().find(|r| r["id"] == "m-nobranch-list").unwrap();
+    assert!(row["merged"].is_null());
+}
+
+#[tokio::test]
+async fn missions_list_still_returns_when_repo_root_is_not_a_git_repo() {
+    // fixture()'s repo_root has no .git dir at all: GitRepo::open fails, so
+    // every row's `merged` degrades to null but the list itself still 200s.
+    let (_tmp, _repo_root, _paths, app) = fixture();
+
+    let (status, body) = get_json(&app, "/api/missions").await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = body.as_array().unwrap();
+    let row = rows.iter().find(|r| r["id"] == MISSION_ID).unwrap();
+    assert!(row["merged"].is_null());
+}
+
+#[tokio::test]
+async fn plan_md_and_report_md_reject_traversal_ids() {
+    let (_tmp, _repo_root, _paths, app) = fixture();
+    // "%2e%2e" percent-decodes to ".." as a single path segment (the `id`
+    // capture), which `safe_id` must reject rather than reading outside the
+    // missions dir.
+    for uri in [
+        "/api/missions/%2e%2e/plan.md",
+        "/api/missions/%2e%2e/report.md",
+    ] {
+        let (status, body) = get_json(&app, uri).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+        assert!(body["error"].is_string(), "{uri}");
+    }
 }
 
 #[tokio::test]

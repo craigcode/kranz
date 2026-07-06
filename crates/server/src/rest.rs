@@ -37,6 +37,9 @@ pub(crate) async fn list_missions(State(server): State<Arc<ServerState>>) -> Jso
         }
     }
     ids.sort();
+    // Opened once for the whole list; a failure here just means every row's
+    // `merged` degrades to null (no git ancestry to probe).
+    let repo = kranz_engine::git_ops::GitRepo::open(&server.repo_root).ok();
     let mut rows = Vec::new();
     for id in ids {
         let paths = MissionPaths::new(&server.repo_root, &id);
@@ -49,17 +52,40 @@ pub(crate) async fn list_missions(State(server): State<Arc<ServerState>>) -> Jso
             continue;
         }
         let row = match fold_log(&paths) {
-            Ok(state) => json!({
-                "id": id,
-                "status": state.mission.status,
-                "goal": state.mission.goal,
-                "createdAt": state.mission.created_at,
-            }),
+            Ok(state) => {
+                let merged = repo
+                    .as_ref()
+                    .and_then(|repo| merged_bit(repo, &state.mission));
+                json!({
+                    "id": id,
+                    "status": state.mission.status,
+                    "goal": state.mission.goal,
+                    "createdAt": state.mission.created_at,
+                    "merged": merged,
+                })
+            }
             Err(error) => json!({ "id": id, "status": "failed", "error": error }),
         };
         rows.push(row);
     }
     Json(Value::Array(rows))
+}
+
+/// Whether `mission`'s branch tip is an ancestor of the LIVE base branch tip
+/// (not the pinned `base_sha` — merged-detection tracks whatever the base
+/// branch has absorbed as of now). `None` when there is no mission branch, or
+/// when any ref fails to resolve; a per-mission git failure here must not
+/// fail the whole list.
+fn merged_bit(
+    repo: &kranz_engine::git_ops::GitRepo,
+    mission: &kranz_engine::types::Mission,
+) -> Option<bool> {
+    if !repo.branch_exists(&mission.mission_branch).ok()? {
+        return None;
+    }
+    let mission_tip = repo.rev_parse(&mission.mission_branch).ok()?;
+    let base_tip = repo.rev_parse(&mission.base_branch).ok()?;
+    repo.is_ancestor(&mission_tip, &base_tip).ok()
 }
 
 /// `<repo>/.kranz/missions/index.md` contents, or `""` if the file is absent
@@ -122,6 +148,64 @@ pub(crate) async fn mission_plan(
     let plan: Value = serde_json::from_str(&content)
         .map_err(|e| ApiError::internal(format!("plan.json is not valid JSON: {e}")))?;
     Ok(Json(plan))
+}
+
+/// `GET /api/missions/:id/plan.md` — rendered plan markdown; 404 until
+/// plan.md has been written (alongside plan.json, at approval time).
+pub(crate) async fn mission_plan_md(
+    State(server): State<Arc<ServerState>>,
+    UrlPath(id): UrlPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let paths = mission_paths(&server, &id)?;
+    let markdown = read_file_or_404(&paths.plan_md_file(), || {
+        format!("mission '{id}' has no approved plan yet")
+    })?;
+    Ok(Json(json!({ "markdown": markdown })))
+}
+
+/// `GET /api/missions/:id/report.md` — rendered mission report markdown;
+/// 404 until the mission completes and report.md is written.
+pub(crate) async fn mission_report_md(
+    State(server): State<Arc<ServerState>>,
+    UrlPath(id): UrlPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let paths = mission_paths(&server, &id)?;
+    let markdown = read_file_or_404(&paths.report_file(), || {
+        format!("mission '{id}' has no report yet")
+    })?;
+    Ok(Json(json!({ "markdown": markdown })))
+}
+
+/// `GET /api/missions/:id/diff-stat` — `git diff --stat` of the pinned
+/// `base_sha` against the mission branch tip; 404 until the plan is
+/// approved (`base_sha` set) and the mission branch exists.
+pub(crate) async fn mission_diff_stat(
+    State(server): State<Arc<ServerState>>,
+    UrlPath(id): UrlPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let paths = mission_paths(&server, &id)?;
+    if !paths.events_file().is_file() {
+        return Err(unknown_mission(&id));
+    }
+    let state = fold_log(&paths).map_err(ApiError::internal)?;
+    let Some(base_sha) = state.mission.base_sha else {
+        return Err(ApiError::not_found(format!(
+            "mission '{id}' has no pinned base yet"
+        )));
+    };
+    let repo = kranz_engine::git_ops::GitRepo::open(&server.repo_root)?;
+    if !repo.branch_exists(&state.mission.mission_branch)? {
+        return Err(ApiError::not_found(format!(
+            "mission '{id}' has no mission branch yet"
+        )));
+    }
+    let tip = repo.rev_parse(&state.mission.mission_branch)?;
+    let diff_stat = repo.diff_stat(&base_sha, &tip)?;
+    Ok(Json(json!({
+        "diffStat": diff_stat,
+        "baseSha": base_sha,
+        "tip": tip,
+    })))
 }
 
 /// `GET /api/missions/:id/runs/:runId/transcript` — the run's JSONL parsed

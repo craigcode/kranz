@@ -15,3 +15,4 @@ Approved plans, newest last.
 - 2026-07-06 · [m-bc11fb](m-bc11fb/plan.md) — Add a dashboard backlog panel (ticket list, detail, Draft-with-live-progress, blocked-by-aware Approve) and Slack `/kran… [truncated] · [report](m-bc11fb/report.md)
 - 2026-07-06 · [m-c4f925](m-c4f925/plan.md) — Compute blocked-ness in one engine-side predicate, serve it as isBlocked on both ticket REST endpoints, and make every r… [truncated] · [report](m-c4f925/report.md)
 - 2026-07-06 · [m-dffbad](m-dffbad/plan.md) — Deleting a mission prunes its missions/index.md catalog line, and list surfaces render a residual orphan (index line wit… [truncated] · [report](m-dffbad/report.md)
+- 2026-07-06 · [m-836459](m-836459/plan.md) — Serve the pipeline view's data layer: persist the calibrated cost estimate into plan.md at park time, expose GET endpoin… [truncated] · [report](m-836459/report.md)

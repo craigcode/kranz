@@ -46,6 +46,16 @@ impl MissionPaths {
         self.mission_dir().join("plan.json")
     }
 
+    /// Rendered plan markdown (distinct from `plan_file`'s plan.json).
+    pub fn plan_md_file(&self) -> PathBuf {
+        self.mission_dir().join("plan.md")
+    }
+
+    /// Mission report markdown, written on completion.
+    pub fn report_file(&self) -> PathBuf {
+        self.mission_dir().join("report.md")
+    }
+
     pub fn events_file(&self) -> PathBuf {
         self.mission_dir().join("events.jsonl")
     }
@@ -126,6 +136,19 @@ mod tests {
         assert_eq!(
             paths.lessons_index(),
             PathBuf::from("/repo/.kranz/lessons/index.md")
+        );
+    }
+
+    #[test]
+    fn plan_md_and_report_paths_are_per_mission() {
+        let paths = MissionPaths::new("/repo", "m-abc123");
+        assert_eq!(
+            paths.plan_md_file(),
+            PathBuf::from("/repo/.kranz/missions/m-abc123/plan.md")
+        );
+        assert_eq!(
+            paths.report_file(),
+            PathBuf::from("/repo/.kranz/missions/m-abc123/report.md")
         );
     }
 }
