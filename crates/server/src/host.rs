@@ -84,9 +84,9 @@ pub struct MissionHost {
     /// The lazily-spawned idle-release background task, started at most once
     /// (see [`MissionHost::ensure_sweeper_started`]).
     sweeper: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// The single tracked background queue drain, if one has ever been
-    /// started (see [`MissionHost::drain`]).
-    drain: Mutex<Option<DrainHandle>>,
+    /// The single tracked background queue drain slot (see
+    /// [`MissionHost::drain`]).
+    drain: Mutex<DrainSlot>,
 }
 
 /// One background drain task's observable progress — shared between the task
@@ -115,6 +115,20 @@ struct DrainHandle {
     state: Arc<Mutex<DrainState>>,
 }
 
+/// The drain tracker's state machine. `Starting` is a reservation held while
+/// `config::load` + `self.backend(...)` run with NO lock held (both can
+/// `.await`); it closes the race where two concurrent [`MissionHost::drain`]
+/// calls both observe "nothing tracked yet" and both spawn a task. A racing
+/// caller that sees `Starting` returns its shared [`DrainState`] instead of
+/// starting a second drain; the caller that installed the reservation later
+/// upgrades it to `Running` (same `Arc<Mutex<DrainState>>`), or clears it back
+/// to `Idle` on failure so a later call can retry.
+enum DrainSlot {
+    Idle,
+    Starting(Arc<Mutex<DrainState>>),
+    Running(DrainHandle),
+}
+
 impl MissionHost {
     /// Host for `repo_root`, discovering the Claude backend on first use.
     pub fn new(repo_root: PathBuf) -> Self {
@@ -123,7 +137,7 @@ impl MissionHost {
             backend: tokio::sync::OnceCell::new(),
             missions: Arc::new(Mutex::new(HashMap::new())),
             sweeper: Mutex::new(None),
-            drain: Mutex::new(None),
+            drain: Mutex::new(DrainSlot::Idle),
         }
     }
 
@@ -135,7 +149,7 @@ impl MissionHost {
             backend: tokio::sync::OnceCell::new_with(Some(backend)),
             missions: Arc::new(Mutex::new(HashMap::new())),
             sweeper: Mutex::new(None),
-            drain: Mutex::new(None),
+            drain: Mutex::new(DrainSlot::Idle),
         }
     }
 
@@ -713,26 +727,50 @@ impl MissionHost {
     /// drain task has not finished returns THAT drain's current state
     /// instead of spawning a second one.
     pub async fn drain(&self) -> Result<Value, ApiError> {
-        {
-            let guard = self.drain.lock().expect("drain tracker lock");
-            if let Some(handle) = guard.as_ref() {
-                if !handle.join.is_finished() {
+        // Reserve the drain slot BEFORE the `.await`s below, under the same
+        // lock acquisition that checks for an existing live drain. This
+        // closes the time-of-check/time-of-use gap: a concurrent caller can
+        // never observe "nothing tracked yet" while this call is still
+        // constructing its backend, because the reservation is installed
+        // before the lock is released.
+        let state = {
+            let mut guard = self.drain.lock().expect("drain tracker lock");
+            match &*guard {
+                DrainSlot::Starting(state) => {
+                    return Ok(drain_state_json(&state.lock().expect("drain state lock")));
+                }
+                DrainSlot::Running(handle) if !handle.join.is_finished() => {
                     return Ok(drain_state_json(
                         &handle.state.lock().expect("drain state lock"),
                     ));
                 }
+                DrainSlot::Idle | DrainSlot::Running(_) => {}
             }
-        }
+            let state = Arc::new(Mutex::new(DrainState {
+                live: true,
+                current_mission_id: None,
+                ran: Vec::new(),
+            }));
+            *guard = DrainSlot::Starting(Arc::clone(&state));
+            state
+        };
 
-        let cfg = config::load(&self.repo_root)?;
-        let backend = self.backend(cfg.claude_binary.as_deref()).await?;
+        let cfg = match config::load(&self.repo_root) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                *self.drain.lock().expect("drain tracker lock") = DrainSlot::Idle;
+                return Err(e.into());
+            }
+        };
+        let backend = match self.backend(cfg.claude_binary.as_deref()).await {
+            Ok(backend) => backend,
+            Err(e) => {
+                *self.drain.lock().expect("drain tracker lock") = DrainSlot::Idle;
+                return Err(e);
+            }
+        };
         let repo_root = self.repo_root.clone();
 
-        let state = Arc::new(Mutex::new(DrainState {
-            live: true,
-            current_mission_id: None,
-            ran: Vec::new(),
-        }));
         let task_state = Arc::clone(&state);
         let join = tokio::spawn(async move {
             let result = kranz_engine::work::drain_queue(&repo_root, false, |mission_id| {
@@ -760,7 +798,8 @@ impl MissionHost {
         });
 
         let initial = drain_state_json(&state.lock().expect("drain state lock"));
-        *self.drain.lock().expect("drain tracker lock") = Some(DrainHandle { join, state });
+        *self.drain.lock().expect("drain tracker lock") =
+            DrainSlot::Running(DrainHandle { join, state });
         Ok(initial)
     }
 
@@ -769,9 +808,12 @@ impl MissionHost {
     pub fn queue_state(&self) -> Value {
         let entries = kranz_engine::queue::list(&self.repo_root);
         let busy_with = kranz_engine::queue::is_repo_busy(&self.repo_root);
-        let drain = match self.drain.lock().expect("drain tracker lock").as_ref() {
-            Some(handle) => drain_state_json(&handle.state.lock().expect("drain state lock")),
-            None => drain_state_json(&DrainState::default()),
+        let drain = match &*self.drain.lock().expect("drain tracker lock") {
+            DrainSlot::Running(handle) => {
+                drain_state_json(&handle.state.lock().expect("drain state lock"))
+            }
+            DrainSlot::Starting(state) => drain_state_json(&state.lock().expect("drain state lock")),
+            DrainSlot::Idle => drain_state_json(&DrainState::default()),
         };
         json!({
             "entries": entries,
@@ -1606,7 +1648,7 @@ mod tests {
         let never_finishes = tokio::spawn(async {
             std::future::pending::<()>().await;
         });
-        *host.drain.lock().expect("drain tracker lock") = Some(DrainHandle {
+        *host.drain.lock().expect("drain tracker lock") = DrainSlot::Running(DrainHandle {
             join: never_finishes,
             state: Arc::clone(&state),
         });
@@ -1623,7 +1665,10 @@ mod tests {
         // was spawned to replace it.
         let after = {
             let guard = host.drain.lock().expect("drain tracker lock");
-            Arc::as_ptr(&guard.as_ref().unwrap().state)
+            match &*guard {
+                DrainSlot::Running(handle) => Arc::as_ptr(&handle.state),
+                _ => panic!("expected the tracker to still be Running"),
+            }
         };
         assert_eq!(before, after, "a second drain must not replace the tracker");
     }
