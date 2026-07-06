@@ -982,13 +982,19 @@ mod win_process_tree {
 mod sandbox_wrap {
     use super::*;
     use kranz_engine::backend_claude::sandbox_command;
-    use kranz_engine::sandbox::{generate_profile, write_profile_file, ResolvedSandbox, SandboxInputs};
+    use kranz_engine::sandbox::{
+        generate_profile, write_profile_file, ResolvedSandbox, SandboxInputs,
+    };
 
     #[test]
     fn sandbox_wrap_pure_builder_produces_exact_argv() {
         let profile_path = PathBuf::from("/tmp/kranz-sandbox-abc.sb");
         let binary = PathBuf::from("/usr/local/bin/claude");
-        let args = vec!["-p".to_string(), "--model".to_string(), "sonnet".to_string()];
+        let args = vec![
+            "-p".to_string(),
+            "--model".to_string(),
+            "sonnet".to_string(),
+        ];
 
         let (program, full_args) = sandbox_command(&profile_path, &binary, &args);
 
@@ -1088,7 +1094,10 @@ mod sandbox_wrap {
             .args(&args)
             .status()
             .expect("failed to run sandbox-exec");
-        assert!(inside_status.success(), "write inside session_cwd must succeed");
+        assert!(
+            inside_status.success(),
+            "write inside session_cwd must succeed"
+        );
         assert!(session.path().join("inside.txt").exists());
 
         let outside_file = outside.path().join("should_fail.txt");
@@ -1104,8 +1113,85 @@ mod sandbox_wrap {
             .args(&args)
             .status()
             .expect("failed to run sandbox-exec");
-        assert!(!outside_status.success(), "write outside allowlist must be denied");
+        assert!(
+            !outside_status.success(),
+            "write outside allowlist must be denied"
+        );
         assert!(!outside_file.exists());
+    }
+
+    /// Drives `ClaudeBackend::start` end-to-end (not `sandbox_command`
+    /// directly) with `spec.sandbox = Some(..)`. Non-vacuity: if start()'s
+    /// `Some(resolved) if cfg!(target_os = "macos")` wrapping arm were
+    /// deleted (falling through to the unwrapped `None`/`Some(_)` branches
+    /// that spawn the binary directly), the script's write under `$HOME`
+    /// would succeed and the `!outside.exists()` assertion below would fail.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn sandbox_wrap_macos_start_confines_spawned_process() {
+        if std::process::Command::new("which")
+            .arg("sandbox-exec")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("sandbox-exec not found on this host; skipping");
+            return;
+        }
+
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let script_dir = tempfile::tempdir().unwrap();
+
+        let outside_path = std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir())
+            .join(format!("kranz_start_probe_{}", uuid::Uuid::new_v4()));
+
+        // Ignores its args ($@, i.e. the claude CLI flags start() appends) and
+        // performs exactly the two writes the assertions below inspect: one
+        // inside the allowlisted session cwd, one outside it under $HOME.
+        let script_body = format!(
+            "#!/bin/sh\necho hi > ./inside.txt\necho hi > {}\nexit 0\n",
+            outside_path.display()
+        );
+        let script = write_script(script_dir.path(), "probe-claude.sh", &script_body);
+
+        let inputs = SandboxInputs {
+            session_cwd: session.path().to_path_buf(),
+            mission_dir: mission.path().to_path_buf(),
+            tmpdir: tmp.path().to_path_buf(),
+            extra_write: vec![],
+        };
+        let resolved = ResolvedSandbox { inputs };
+
+        let backend = ClaudeBackend::new(script);
+        let mut spec = base_spec(PromptMode::SingleShot("hello".to_string()));
+        spec.cwd = session.path().to_path_buf();
+        spec.sandbox = Some(resolved);
+
+        let mut agent_session = backend.start(spec).await.expect("start sandboxed session");
+        while tokio::time::timeout(Duration::from_secs(10), agent_session.next_event())
+            .await
+            .expect("session timed out")
+            .expect("next_event errored")
+            .is_some()
+        {}
+
+        let outside_exists = outside_path.exists();
+        if outside_exists {
+            std::fs::remove_file(&outside_path).ok();
+        }
+
+        assert!(
+            session.path().join("inside.txt").exists(),
+            "write inside session_cwd (allowlisted by start()'s sandbox wrapping) must succeed"
+        );
+        assert!(
+            !outside_exists,
+            "write outside the allowlist (under $HOME) must be denied by start()'s sandbox-exec wrapping"
+        );
     }
 }
 

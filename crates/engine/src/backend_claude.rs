@@ -357,7 +357,11 @@ pub fn build_args(spec: &SessionSpec) -> Vec<String> {
 ///
 /// Pure and platform-independent so it is unit-testable without spawning;
 /// callers gate its use on `cfg!(target_os = "macos")`.
-pub fn sandbox_command(profile_path: &Path, binary: &Path, args: &[String]) -> (PathBuf, Vec<String>) {
+pub fn sandbox_command(
+    profile_path: &Path,
+    binary: &Path,
+    args: &[String],
+) -> (PathBuf, Vec<String>) {
     let mut full_args: Vec<String> = vec!["-f".to_string(), profile_path.display().to_string()];
     full_args.push(binary.display().to_string());
     full_args.extend(args.iter().cloned());
@@ -627,8 +631,7 @@ impl AgentBackend for ClaudeBackend {
                     .map_err(|e| {
                         EngineError::Backend(format!("failed to write sandbox profile: {e}"))
                     })?;
-                let (program, sandboxed_args) =
-                    sandbox_command(&profile_path, &self.binary, &args);
+                let (program, sandboxed_args) = sandbox_command(&profile_path, &self.binary, &args);
                 let mut command = tokio::process::Command::new(program);
                 command.args(&sandboxed_args);
                 command
