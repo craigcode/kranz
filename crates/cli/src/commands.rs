@@ -869,7 +869,16 @@ pub fn cmd_msg(repo: &Path, mission_id: &str, text: &str, interrupt: bool) -> Re
 /// One line per mission: `<id>  <STATUS>  <goal>`. Corrupt/unreadable logs
 /// are reported inline instead of failing the whole listing.
 pub fn cmd_missions(repo: &Path) -> Result<String> {
-    let ids = MissionPaths::list_missions(repo);
+    let index_contents =
+        std::fs::read_to_string(MissionPaths::new(repo, "_").missions_dir().join("index.md"))
+            .unwrap_or_default();
+    let mut ids = MissionPaths::list_missions(repo);
+    for id in kranz_engine::orchestrator::mission_index_ids(&index_contents) {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids.sort();
     if ids.is_empty() {
         return Ok("no missions\n".to_string());
     }
@@ -888,6 +897,13 @@ pub fn cmd_missions(repo: &Path) -> Result<String> {
             .get(&id)
             .map(|s| format!("  [ticket: {s}]"))
             .unwrap_or_default();
+        if !MissionPaths::new(repo, &id).events_file().is_file() {
+            out.push_str(&format!(
+                "{id}  {:<10}  deleted mission (no data recorded)\n",
+                "DELETED"
+            ));
+            continue;
+        }
         match load_state(repo, &id) {
             Ok(state) => out.push_str(&format!(
                 "{id}  {:<10}  {}{ticket}\n",
@@ -982,7 +998,9 @@ pub fn render_clean_listing(entries: &[CleanEntry]) -> String {
 
 /// `kranz clean [--yes] [--all]`: list cleanable mission directories, confirm
 /// (unless `--yes`), then `remove_dir_all` each. Only mission directories are
-/// removed — branches, tags, and `missions/index.md` are never touched.
+/// removed — branches and tags are never touched, and each removed mission's
+/// own `missions/index.md` line is pruned while every other line is left
+/// intact.
 fn cmd_clean(repo: &Path, yes: bool, all: bool) -> Result<i32> {
     let entries = select_cleanable(repo, all);
     if entries.is_empty() {
@@ -1016,10 +1034,11 @@ fn cmd_clean(repo: &Path, yes: bool, all: bool) -> Result<i32> {
     Ok(0)
 }
 
-/// `remove_dir_all` each entry's `.kranz/missions/<id>` directory (nothing
-/// else — never a git branch/tag, never the missions index). Returns the ids
-/// actually removed; `verbose` echoes each removal. Removal failures are
-/// reported on stderr and skipped, never aborting the batch.
+/// `remove_dir_all` each entry's `.kranz/missions/<id>` directory, then prune
+/// that mission's own line from `missions/index.md` (never a git branch/tag,
+/// never any other mission's index line). Returns the ids actually removed;
+/// `verbose` echoes each removal. Removal failures are reported on stderr and
+/// skipped, never aborting the batch.
 pub fn remove_missions(repo: &Path, entries: &[CleanEntry], verbose: bool) -> Vec<String> {
     let mut removed = Vec::new();
     for e in entries {
@@ -1039,6 +1058,7 @@ pub fn remove_missions(repo: &Path, entries: &[CleanEntry], verbose: bool) -> Ve
                 if verbose {
                     println!("removed {}", dir.display());
                 }
+                orchestrator::prune_mission_index_file(repo, &e.id);
                 removed.push(e.id.clone());
             }
             Err(err) => eprintln!("kranz: could not remove {}: {err}", dir.display()),

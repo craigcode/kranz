@@ -735,6 +735,53 @@ fn missions_lists_ids_status_and_goal() {
     );
 }
 
+#[test]
+fn missions_forged_orphan_renders_placeholder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+    write_events(repo, "m-real", vec![created_kind("goal real", "m-real")]);
+
+    let missions_dir = repo.join(".kranz").join("missions");
+    fs::create_dir_all(&missions_dir).unwrap();
+    fs::write(
+        missions_dir.join("index.md"),
+        "# Kranz missions\n\n- [m-ghost](m-ghost/plan.md)\n",
+    )
+    .unwrap();
+
+    let listing = commands::cmd_missions(repo).unwrap();
+    let ghost_line = listing
+        .lines()
+        .find(|line| line.contains("m-ghost"))
+        .unwrap_or_else(|| panic!("no m-ghost line in: {listing}"));
+    assert!(
+        ghost_line.contains("deleted mission (no data recorded)"),
+        "in: {ghost_line}"
+    );
+    assert!(!ghost_line.contains("unreadable"), "in: {ghost_line}");
+    assert!(!ghost_line.contains("not found"), "in: {ghost_line}");
+}
+
+#[test]
+fn corrupt_log_stays_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+    let dir = repo.join(".kranz").join("missions").join("m-corrupt");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("events.jsonl"), "not valid json\n").unwrap();
+
+    let listing = commands::cmd_missions(repo).unwrap();
+    let corrupt_line = listing
+        .lines()
+        .find(|line| line.contains("m-corrupt"))
+        .unwrap_or_else(|| panic!("no m-corrupt line in: {listing}"));
+    assert!(corrupt_line.contains("unreadable"), "in: {corrupt_line}");
+    assert!(
+        !corrupt_line.contains("deleted mission (no data recorded)"),
+        "in: {corrupt_line}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Live-printer event rendering
 // ---------------------------------------------------------------------------
@@ -1207,4 +1254,45 @@ fn remove_missions_deletes_selected_and_keeps_index_and_others() {
         remaining,
         vec!["index.md".to_string(), "m-planned".to_string()]
     );
+}
+
+#[test]
+fn clean_prunes_missions_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+
+    write_events(
+        repo,
+        "m-failed",
+        vec![
+            created_kind("g", "m-failed"),
+            EventKind::MissionFailed { reason: "x".into() },
+        ],
+    );
+    write_events(repo, "m-planned", vec![created_kind("g", "m-planned")]);
+    write_plan_json(repo, "m-planned");
+
+    let missions_dir = repo.join(".kranz").join("missions");
+    fs::write(
+        missions_dir.join("index.md"),
+        "# Kranz missions\n\
+         - 2026-01-01 · [m-failed](m-failed/plan.md) — goal one\n\
+         - 2026-01-02 · [m-planned](m-planned/plan.md) — goal two\n",
+    )
+    .unwrap();
+
+    let entries = commands::select_cleanable(repo, false);
+    let removed = commands::remove_missions(repo, &entries, false);
+    assert_eq!(removed, vec!["m-failed".to_string()]);
+
+    let index = fs::read_to_string(missions_dir.join("index.md")).unwrap();
+    assert!(
+        !index.contains("m-failed"),
+        "removed mission's line pruned from index: {index}"
+    );
+    assert!(
+        index.contains("[m-planned](m-planned/plan.md) — goal two"),
+        "unrelated mission's line kept: {index}"
+    );
+    assert!(index.contains("# Kranz missions"), "header kept: {index}");
 }

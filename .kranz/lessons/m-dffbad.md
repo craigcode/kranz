@@ -1,0 +1,3 @@
+For UI-copy REPLACEMENT requirements ("X becomes Y"), the validation contract must assert the OLD string is ABSENT, not just that the new o…
+
+For UI-copy REPLACEMENT requirements ("X becomes Y"), the validation contract must assert the OLD string is ABSENT, not just that the new one renders — in this mission f-1-4 satisfied a7 (`'3 finished · 3 running'` present) while still rendering the old `'N closed missions'` copy beside it, which cost a full fix cycle (ms-1-fix-1-1). When a goal says one label/string replaces another, add a negative assertion (e.g. vitest `queryByText(...).toBeNull()`) for the retired copy.

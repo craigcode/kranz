@@ -3421,6 +3421,65 @@ pub fn render_revised_plan_markdown(
     md
 }
 
+/// Remove a single mission's line from the missions catalog (deletion
+/// counterpart to [`upsert_mission_index`]), matched by the same
+/// `[<id>](` marker. Every other line and the header stay byte-for-byte;
+/// pruning an id with no line is a no-op (modulo trailing-newline
+/// normalization, same as [`mark_mission_index_report`]).
+pub fn prune_mission_index(existing: &str, mission_id: &str) -> String {
+    if existing.trim().is_empty() {
+        return existing.to_string();
+    }
+    let marker = format!("[{mission_id}](");
+    let mut out = String::new();
+    for l in existing.lines() {
+        if l.contains(&marker) {
+            continue;
+        }
+        out.push_str(l);
+        out.push('\n');
+    }
+    out
+}
+
+/// Every mission id appearing as `[<id>](` in the catalog body, in file
+/// order, de-duplicated. Tolerant of the trailing ` · [report](<id>/report.md)`
+/// link: the FIRST bracket on a line (the plan.md link) is taken as the id.
+pub fn mission_index_ids(existing: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    for l in existing.lines() {
+        if !l.contains("](") {
+            continue;
+        }
+        let Some(start) = l.find('[') else {
+            continue;
+        };
+        let rest = &l[start + 1..];
+        let Some(end) = rest.find("](") else {
+            continue;
+        };
+        let id = &rest[..end];
+        if !ids.iter().any(|existing_id: &String| existing_id == id) {
+            ids.push(id.to_string());
+        }
+    }
+    ids
+}
+
+/// Prune one mission's line from `<repo>/.kranz/missions/index.md` and
+/// write the result back. A missing index file is a no-op — it is never
+/// created here.
+pub fn prune_mission_index_file(repo_root: &std::path::Path, mission_id: &str) {
+    let index = MissionPaths::new(repo_root, "_")
+        .missions_dir()
+        .join("index.md");
+    let Ok(existing) = std::fs::read_to_string(&index) else {
+        return;
+    };
+    let updated = prune_mission_index(&existing, mission_id);
+    let _ = std::fs::write(&index, updated);
+}
+
 /// Add a completion-report link to one mission's line in the missions
 /// catalog, turning
 /// `- <date> · [<id>](<id>/plan.md) — <goal>` into

@@ -29,9 +29,25 @@ pub(crate) async fn health() -> Json<Value> {
 /// corrupt (or unreadable) log yields that entry with `"status": "failed"`
 /// and an `"error"` field instead of failing the whole list.
 pub(crate) async fn list_missions(State(server): State<Arc<ServerState>>) -> Json<Value> {
+    let index_contents = read_missions_index(&server.repo_root);
+    let mut ids = MissionPaths::list_missions(&server.repo_root);
+    for id in kranz_engine::orchestrator::mission_index_ids(&index_contents) {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids.sort();
     let mut rows = Vec::new();
-    for id in MissionPaths::list_missions(&server.repo_root) {
+    for id in ids {
         let paths = MissionPaths::new(&server.repo_root, &id);
+        if !paths.events_file().is_file() {
+            rows.push(json!({
+                "id": id,
+                "status": "deleted",
+                "goal": "deleted mission (no data recorded)",
+            }));
+            continue;
+        }
         let row = match fold_log(&paths) {
             Ok(state) => json!({
                 "id": id,
@@ -44,6 +60,17 @@ pub(crate) async fn list_missions(State(server): State<Arc<ServerState>>) -> Jso
         rows.push(row);
     }
     Json(Value::Array(rows))
+}
+
+/// `<repo>/.kranz/missions/index.md` contents, or `""` if the file is absent
+/// (never created here — callers only read the catalog).
+fn read_missions_index(repo_root: &Path) -> String {
+    std::fs::read_to_string(
+        MissionPaths::new(repo_root, "_")
+            .missions_dir()
+            .join("index.md"),
+    )
+    .unwrap_or_default()
 }
 
 /// `GET /api/missions/:id/state` — full [`MissionState`], folded from

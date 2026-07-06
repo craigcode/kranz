@@ -10,12 +10,14 @@
 import { useEffect, useRef, useState } from 'react';
 import { useKranzStore } from '../lib/store';
 import { relTime } from '../lib/format';
+import { missionCounts } from '../lib/missionCounts';
 import type { MissionSummary } from '../lib/types';
 
 // MissionSummary.status is a plain string (the list endpoint stays lenient
 // about rows it couldn't fold), so these sets match on strings.
 const TERMINAL: ReadonlySet<string> = new Set(['complete', 'failed', 'abandoned']);
 const ABANDONABLE: ReadonlySet<string> = new Set(['planning', 'paused', 'blocked']);
+const DELETED = 'deleted';
 
 export function MissionPicker() {
   const missions = useKranzStore((s) => s.missions);
@@ -39,8 +41,9 @@ export function MissionPicker() {
     void loadMissions();
   }, [loadMissions]);
 
-  const active = missions.filter((m) => !TERMINAL.has(m.status));
-  const closed = missions.filter((m) => TERMINAL.has(m.status));
+  const active = missions.filter((m) => !TERMINAL.has(m.status) && m.status !== DELETED);
+  const closed = missions.filter((m) => TERMINAL.has(m.status) || m.status === DELETED);
+  const { finished, running } = missionCounts(missions);
 
   const row = (m: MissionSummary) => (
     <li key={m.id} className="picker-item">
@@ -57,9 +60,9 @@ export function MissionPicker() {
         </span>
         <span className="mono picker-id">{m.id}</span>
         <span className="picker-goal">{m.goal}</span>
-        <span className="picker-age dim">{relTime(m.createdAt)}</span>
+        <span className="picker-age dim">{m.createdAt ? relTime(m.createdAt) : '?'}</span>
       </button>
-      {ABANDONABLE.has(m.status) &&
+      {m.status !== DELETED && ABANDONABLE.has(m.status) &&
         (armed === m.id ? (
           <button
             type="button"
@@ -81,7 +84,7 @@ export function MissionPicker() {
             abandon
           </button>
         ))}
-      {TERMINAL.has(m.status) &&
+      {m.status !== DELETED && TERMINAL.has(m.status) &&
         (armed === m.id ? (
           <button
             type="button"
@@ -117,6 +120,9 @@ export function MissionPicker() {
         <div className="picker-title">
           <span className="picker-brand mono">KRANZ</span>
           <span className="section-label">Missions</span>
+          <span className="picker-counts dim">
+            {finished} finished · {running} running
+          </span>
           <button
             type="button"
             className="btn-small new-mission-btn"
@@ -152,9 +158,7 @@ export function MissionPicker() {
         <ul className="picker-list">{active.map(row)}</ul>
         {closed.length > 0 && (
           <details className="picker-closed">
-            <summary className="dim">
-              {closed.length} closed mission{closed.length === 1 ? '' : 's'}
-            </summary>
+            <summary className="dim">closed</summary>
             <ul className="picker-list">{closed.map(row)}</ul>
           </details>
         )}
