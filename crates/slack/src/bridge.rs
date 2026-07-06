@@ -594,7 +594,6 @@ pub fn not_authorized_blocks() -> Vec<Value> {
 ///   but resolves ONLY through [`run_approve_ticket_command`] — it never
 ///   falls back to [`approve_flow`], so it can never trigger plan approval.
 ///
-
 /// Without a host every engine-needing surface degrades to an honest
 /// ephemeral refusal pointing at the CLI ([`no_host_blocks`]).
 ///
