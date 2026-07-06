@@ -10,6 +10,11 @@ Four render bugs from the view's first live morning (screenshot-verified): (1) a
 ## Context
 
 
+Fifth bug (observed same morning): direct-fixed tickets — done state but
+no linked mission (fix-work-branch-isolation etc.) — render as 'captured'
+with a Draft button; the stage derivation must respect ticket state done
+even when no missionId is recorded.
+
 ## Scoping answers
 
 ## Acceptance hints
