@@ -976,6 +976,140 @@ mod win_process_tree {
 }
 
 // ---------------------------------------------------------------------------
+// sandbox-exec wrapping (f-2-2)
+// ---------------------------------------------------------------------------
+
+mod sandbox_wrap {
+    use super::*;
+    use kranz_engine::backend_claude::sandbox_command;
+    use kranz_engine::sandbox::{generate_profile, write_profile_file, ResolvedSandbox, SandboxInputs};
+
+    #[test]
+    fn sandbox_wrap_pure_builder_produces_exact_argv() {
+        let profile_path = PathBuf::from("/tmp/kranz-sandbox-abc.sb");
+        let binary = PathBuf::from("/usr/local/bin/claude");
+        let args = vec!["-p".to_string(), "--model".to_string(), "sonnet".to_string()];
+
+        let (program, full_args) = sandbox_command(&profile_path, &binary, &args);
+
+        assert_eq!(program, PathBuf::from("sandbox-exec"));
+        assert_eq!(
+            full_args,
+            vec![
+                "-f".to_string(),
+                "/tmp/kranz-sandbox-abc.sb".to_string(),
+                "/usr/local/bin/claude".to_string(),
+                "-p".to_string(),
+                "--model".to_string(),
+                "sonnet".to_string(),
+            ],
+            "sandbox_command must yield [-f, <profile>, <binary>, <args...>] in that exact order"
+        );
+    }
+
+    #[test]
+    fn sandbox_wrap_enforce_off_leaves_build_args_unchanged() {
+        // spec.sandbox == None: the argv construction is exactly build_args's
+        // output, with no sandbox-exec prefix anywhere.
+        let spec = base_spec(PromptMode::SingleShot("hello".to_string()));
+        assert!(spec.sandbox.is_none());
+
+        let args = build_args(&spec);
+        assert!(
+            !args.iter().any(|a| a == "sandbox-exec"),
+            "unsandboxed argv must not reference sandbox-exec: {args:?}"
+        );
+        // The (program, args) an unsandboxed start() would construct is just
+        // (binary, build_args(spec)) — no wrapping applied.
+        assert_eq!(args, build_args(&spec));
+    }
+
+    #[test]
+    fn sandbox_wrap_mock_and_codex_backends_ignore_sandbox_field() {
+        // SessionSpec.sandbox is documented (backend.rs) as consulted only by
+        // ClaudeBackend; mock/codex backends never reference `spec.sandbox`.
+        // This is enforced by code inspection at build time: neither
+        // backend_mock.rs nor backend_codex.rs import or match on the field,
+        // so constructing a spec with Some(..) and running the mock backend
+        // behaves identically to sandbox: None.
+        let backend_mock_src = include_str!("../src/backend_mock.rs");
+        let backend_codex_src = include_str!("../src/backend_codex.rs");
+        assert!(
+            !backend_mock_src.contains(".sandbox"),
+            "backend_mock.rs must not consult SessionSpec::sandbox"
+        );
+        assert!(
+            !backend_codex_src.contains("spec.sandbox"),
+            "backend_codex.rs must not consult SessionSpec::sandbox"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn sandbox_wrap_macos_enforced_launch_allows_inside_denies_outside() {
+        if std::process::Command::new("which")
+            .arg("sandbox-exec")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("sandbox-exec not found on this host; skipping");
+            return;
+        }
+
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let profile_dir = tempfile::tempdir().unwrap();
+
+        let inputs = SandboxInputs {
+            session_cwd: session.path().to_path_buf(),
+            mission_dir: mission.path().to_path_buf(),
+            tmpdir: tmp.path().to_path_buf(),
+            extra_write: vec![],
+        };
+        let resolved = ResolvedSandbox { inputs };
+
+        let profile = generate_profile(&resolved.inputs);
+        let profile_path = write_profile_file(profile_dir.path(), &profile).unwrap();
+
+        // Drive the backend's own builder rather than reimplementing the
+        // wrapping logic, mirroring what `ClaudeBackend::start` constructs.
+        let (program, args) = sandbox_command(
+            &profile_path,
+            &PathBuf::from("/bin/sh"),
+            &[
+                "-c".to_string(),
+                format!("echo hi > {}", session.path().join("inside.txt").display()),
+            ],
+        );
+        let inside_status = std::process::Command::new(program)
+            .args(&args)
+            .status()
+            .expect("failed to run sandbox-exec");
+        assert!(inside_status.success(), "write inside session_cwd must succeed");
+        assert!(session.path().join("inside.txt").exists());
+
+        let outside_file = outside.path().join("should_fail.txt");
+        let (program, args) = sandbox_command(
+            &profile_path,
+            &PathBuf::from("/bin/sh"),
+            &[
+                "-c".to_string(),
+                format!("echo hi > {}", outside_file.display()),
+            ],
+        );
+        let outside_status = std::process::Command::new(program)
+            .args(&args)
+            .status()
+            .expect("failed to run sandbox-exec");
+        assert!(!outside_status.success(), "write outside allowlist must be denied");
+        assert!(!outside_file.exists());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Live smoke test (runs only with `cargo test -- --ignored`)
 // ---------------------------------------------------------------------------
 

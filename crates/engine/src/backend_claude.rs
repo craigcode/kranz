@@ -351,6 +351,19 @@ pub fn build_args(spec: &SessionSpec) -> Vec<String> {
     args
 }
 
+/// Build the `sandbox-exec` argv that wraps a `binary` invocation with a
+/// generated Seatbelt `profile_path`: program `sandbox-exec`, args
+/// `["-f", <profile_path>, <binary>, <args...>]` in that exact order.
+///
+/// Pure and platform-independent so it is unit-testable without spawning;
+/// callers gate its use on `cfg!(target_os = "macos")`.
+pub fn sandbox_command(profile_path: &Path, binary: &Path, args: &[String]) -> (PathBuf, Vec<String>) {
+    let mut full_args: Vec<String> = vec!["-f".to_string(), profile_path.display().to_string()];
+    full_args.push(binary.display().to_string());
+    full_args.extend(args.iter().cloned());
+    (PathBuf::from("sandbox-exec"), full_args)
+}
+
 /// One stdin line injecting a user message into a streaming-input session.
 pub fn user_message_line(text: &str) -> String {
     let value = json!({
@@ -603,9 +616,40 @@ impl AgentBackend for ClaudeBackend {
         let streaming = matches!(spec.prompt, PromptMode::Streaming(_));
         let args = build_args(&spec);
 
-        let mut command = tokio::process::Command::new(&self.binary);
+        let mut command = match &spec.sandbox {
+            Some(resolved) if cfg!(target_os = "macos") => {
+                let profile = crate::sandbox::generate_profile(&resolved.inputs);
+                let profile_dir = resolved.inputs.mission_dir.clone();
+                let profile_path = crate::sandbox::write_profile_file(&profile_dir, &profile)
+                    .or_else(|_| {
+                        crate::sandbox::write_profile_file(&resolved.inputs.tmpdir, &profile)
+                    })
+                    .map_err(|e| {
+                        EngineError::Backend(format!("failed to write sandbox profile: {e}"))
+                    })?;
+                let (program, sandboxed_args) =
+                    sandbox_command(&profile_path, &self.binary, &args);
+                let mut command = tokio::process::Command::new(program);
+                command.args(&sandboxed_args);
+                command
+            }
+            Some(_) => {
+                tracing::warn!(
+                    target_os = std::env::consts::OS,
+                    "sandbox enforce:fs requested but sandbox-exec wrapping is unavailable on \
+                     this platform; running unsandboxed"
+                );
+                let mut command = tokio::process::Command::new(&self.binary);
+                command.args(&args);
+                command
+            }
+            None => {
+                let mut command = tokio::process::Command::new(&self.binary);
+                command.args(&args);
+                command
+            }
+        };
         command
-            .args(&args)
             .current_dir(&spec.cwd)
             .envs(&spec.env)
             .stdin(if streaming {
