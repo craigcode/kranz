@@ -1461,8 +1461,12 @@ button {
 /* ------------------------------------------------- new mission (M2.5) */
 
 .new-mission-btn {
-  margin-left: auto;
   margin-right: 10px;
+}
+
+.new-ticket-btn {
+  margin-left: auto;
+  margin-right: 6px;
 }
 
 .new-mission-back {

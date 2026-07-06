@@ -14,6 +14,7 @@ import { useKranzStore } from './lib/store';
 import { resolveToken } from './lib/token';
 import { PipelineView } from './components/PipelineView';
 import { NewMission } from './components/NewMission';
+import { NewTicket } from './components/NewTicket';
 import { TopBar } from './components/TopBar';
 import { StatusStrip } from './components/StatusStrip';
 import { Sidebar } from './components/Sidebar';
@@ -34,6 +35,7 @@ resolveToken();
 type Route =
   | { view: 'pipeline' }
   | { view: 'new' }
+  | { view: 'new-ticket' }
   | { view: 'mission'; id: string }
   | { view: 'backlog' }
   | { view: 'ticket'; slug: string };
@@ -41,6 +43,7 @@ type Route =
 function parseHash(): Route {
   const hash = window.location.hash;
   if (hash === '#/new') return { view: 'new' };
+  if (hash === '#/new-ticket') return { view: 'new-ticket' };
   const match = /^#\/m\/(.+)$/.exec(hash);
   if (match) return { view: 'mission', id: decodeURIComponent(match[1]) };
   if (hash === '#/backlog') return { view: 'backlog' };
@@ -88,6 +91,14 @@ export default function App() {
     return (
       <>
         <NewMission />
+        <TokenPrompt />
+      </>
+    );
+  }
+  if (route.view === 'new-ticket') {
+    return (
+      <>
+        <NewTicket />
         <TokenPrompt />
       </>
     );

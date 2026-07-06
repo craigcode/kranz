@@ -392,6 +392,15 @@ export function PipelineView() {
           <span className="section-label">Pipeline</span>
           <button
             type="button"
+            className="btn-small new-ticket-btn"
+            onClick={() => {
+              window.location.hash = '#/new-ticket';
+            }}
+          >
+            + new ticket
+          </button>
+          <button
+            type="button"
             className="btn-small new-mission-btn"
             onClick={() => {
               window.location.hash = '#/new';
