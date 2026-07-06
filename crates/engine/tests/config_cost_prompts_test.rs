@@ -8,8 +8,8 @@ use kranz_engine::error::EngineError;
 use kranz_engine::events::{Event, EventKind};
 use kranz_engine::prompts;
 use kranz_engine::types::{
-    Assertion, AssertionCheck, Feature, FeatureOrigin, FeatureStatus, Finding, MissionConfig,
-    Plan, PlanFeature, PlanMilestone, Role, RunResult, TokenUsage,
+    Assertion, AssertionCheck, Feature, FeatureOrigin, FeatureStatus, Finding, MissionConfig, Plan,
+    PlanFeature, PlanMilestone, Role, RunResult, TokenUsage,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
