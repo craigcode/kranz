@@ -150,6 +150,38 @@ pub(crate) async fn mission_report_md(
     Ok(Json(json!({ "markdown": markdown })))
 }
 
+/// `GET /api/missions/:id/diff-stat` — `git diff --stat` of the pinned
+/// `base_sha` against the mission branch tip; 404 until the plan is
+/// approved (`base_sha` set) and the mission branch exists.
+pub(crate) async fn mission_diff_stat(
+    State(server): State<Arc<ServerState>>,
+    UrlPath(id): UrlPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let paths = mission_paths(&server, &id)?;
+    if !paths.events_file().is_file() {
+        return Err(unknown_mission(&id));
+    }
+    let state = fold_log(&paths).map_err(ApiError::internal)?;
+    let Some(base_sha) = state.mission.base_sha else {
+        return Err(ApiError::not_found(format!(
+            "mission '{id}' has no pinned base yet"
+        )));
+    };
+    let repo = kranz_engine::git_ops::GitRepo::open(&server.repo_root)?;
+    if !repo.branch_exists(&state.mission.mission_branch)? {
+        return Err(ApiError::not_found(format!(
+            "mission '{id}' has no mission branch yet"
+        )));
+    }
+    let tip = repo.rev_parse(&state.mission.mission_branch)?;
+    let diff_stat = repo.diff_stat(&base_sha, &tip)?;
+    Ok(Json(json!({
+        "diffStat": diff_stat,
+        "baseSha": base_sha,
+        "tip": tip,
+    })))
+}
+
 /// `GET /api/missions/:id/runs/:runId/transcript` — the run's JSONL parsed
 /// into a JSON array of raw stream values; 404 if the file is missing.
 pub(crate) async fn run_transcript(
