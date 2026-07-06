@@ -125,11 +125,12 @@ fn parses_ticket_approve_with_mission() {
     .unwrap();
     match cli.command {
         Command::Ticket {
-            command: TicketCommand::Approve {
-                slug,
-                mission,
-                force,
-            },
+            command:
+                TicketCommand::Approve {
+                    slug,
+                    mission,
+                    force,
+                },
         } => {
             assert_eq!(slug, "slug");
             assert_eq!(mission.as_deref(), Some("m-abc123"));
@@ -595,7 +596,10 @@ fn blocked_by_approve_refuses_and_names_unsatisfied_blocker() {
 
     let err = backlog::cmd_ticket_approve(repo, "blocked", Some("m-blocked"), false).unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("dep"), "message should name the blocker: {msg}");
+    assert!(
+        msg.contains("dep"),
+        "message should name the blocker: {msg}"
+    );
     assert!(
         msg.contains("not Complete"),
         "message should explain why: {msg}"
