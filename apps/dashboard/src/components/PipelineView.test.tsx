@@ -185,6 +185,56 @@ describe('PipelineView', () => {
     expect(landedRow?.querySelector('.unmerged-badge')).toBeNull();
   });
 
+  it('renders an abandoned mission row as inert: no actions, abandoned pill, no old Redraft affordance', async () => {
+    vi.mocked(api.tickets).mockResolvedValueOnce([]);
+    vi.mocked(api.missions).mockResolvedValueOnce([
+      makeMission({ id: 'm-dead', goal: 'Abandoned mission work', status: 'abandoned' }),
+    ]);
+
+    render(<PipelineView />);
+
+    const row = (await screen.findByText('Abandoned mission work')).closest('li') as HTMLElement;
+    expect(row.querySelectorAll('.pipeline-primary-action').length).toBe(0);
+    expect(row.querySelectorAll('.pipeline-secondary-action').length).toBe(0);
+    expect(row.querySelector('.pill-abandoned')?.textContent).toContain('abandoned');
+    expect(row.querySelector('.unmerged-badge')).toBeNull();
+    expect(row.textContent).not.toContain('Redraft');
+    expect(row.textContent).not.toContain('Merge');
+    expect(row.textContent).not.toContain('Iterate');
+  });
+
+  it('renders a direct-fixed done ticket (no mission) as landed, not delivered', async () => {
+    vi.mocked(api.tickets).mockResolvedValueOnce([
+      makeTicket({ slug: 'fix-work-branch-isolation', title: 'Fix branch isolation', state: 'done' }),
+    ]);
+    vi.mocked(api.missions).mockResolvedValueOnce([]);
+
+    render(<PipelineView />);
+
+    const row = (await screen.findByText('fix-work-branch-isolation')).closest('li') as HTMLElement;
+    expect(row.querySelector('.pill-landed')?.textContent).toContain('landed');
+    expect(row.querySelector('.unmerged-badge')).toBeNull();
+    expect(row.textContent).not.toContain('Draft');
+    expect(row.textContent).not.toContain('Merge');
+  });
+
+  it('still offers Redraft for a genuinely failed mission/ticket', async () => {
+    vi.mocked(api.tickets).mockResolvedValueOnce([
+      makeTicket({ slug: 'fix-failed', title: 'Failed ticket', state: 'failed' }),
+    ]);
+    vi.mocked(api.missions).mockResolvedValueOnce([
+      makeMission({ id: 'm-failed', goal: 'Failed mission work', status: 'failed' }),
+    ]);
+
+    render(<PipelineView />);
+
+    const ticketRow = (await screen.findByText('fix-failed')).closest('li') as HTMLElement;
+    expect(ticketRow.querySelector('.pipeline-primary-action')?.textContent).toBe('Redraft');
+
+    const missionRow = (await screen.findByText('Failed mission work')).closest('li') as HTMLElement;
+    expect(missionRow.querySelector('.pipeline-primary-action')?.textContent).toBe('Redraft');
+  });
+
   it('fetches plan.md and shows the persisted estimate for a Reviewable row', async () => {
     vi.mocked(api.tickets).mockResolvedValueOnce([]);
     vi.mocked(api.missions).mockResolvedValueOnce([
