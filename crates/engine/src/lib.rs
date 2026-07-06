@@ -36,6 +36,7 @@ pub mod backend_mock;
 pub mod control;
 pub mod digest;
 pub mod draft;
+pub mod merge_gate;
 pub mod orchestrator;
 pub mod permissions;
 pub mod runner;
