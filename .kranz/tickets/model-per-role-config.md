@@ -36,6 +36,12 @@ fail silently. Estimates: the calibration corpus is claude-shaped;
 per-model pricing tables and a calibration-confidence penalty for
 uncalibrated models must ship with this, or estimates lie.
 
+Verified lanes awaiting this ticket: claude-fable-5 via DroidBackend
+(Factory Max billing — a second frontier pool independent of the
+Anthropic subscription; probe 2026-07-06) for worker/planner roles.
+Scrutiny selection should weight model-family diversity, not just
+backend diversity.
+
 Seams: select_scrutiny_backend (generalize to select_backend(role)),
 SessionSpec (model/cwd/tools already per-session; claude-isms tagged
 during m-5d2c79), cost.rs pricing tables, config.rs layers +

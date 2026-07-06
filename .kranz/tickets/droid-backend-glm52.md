@@ -41,6 +41,15 @@ CLI probe (2026-07-06, live against GLM 5.2):
   session — include in the pricing entry so estimates stay honest.
 - droid also has `--mission/--worker-model` orchestration flags: NOT
   used; kranz remains the orchestrator, droid is a session runner only.
+- Second probe (2026-07-06): Factory-native frontier models work through
+  the same lane — `droid exec -m claude-fable-5 -o json` returned
+  PROBE_OK with usage reported, billed to the operator's Factory Max
+  plan. The backend is model-agnostic via -m; this makes it a second
+  independent billing pool for Claude-family models. POLICY NOTE:
+  Claude-family-via-droid must NOT satisfy the cross-vendor scrutiny
+  intent (same family, same blind spots) — scrutiny selection should
+  prefer model-family diversity (GLM/Codex); Claude-via-droid's value
+  is in worker/planner lanes once model-per-role-config lands.
 
 Engine seams (all proven by m-5d2c79): AgentBackend trait,
 select_scrutiny_backend with loud fallback decision, config::validate
