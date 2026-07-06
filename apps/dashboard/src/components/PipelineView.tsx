@@ -353,7 +353,7 @@ export function PipelineView() {
       (stage === 'captured' || stage === 'reviewable') && r.blockedBy.length > 0 && r.isBlocked;
 
     return (
-      <li key={r.key} className="picker-item">
+      <li key={r.key} className="picker-item picker-item--stacked">
         <div className="picker-item-header">
           <div className="picker-row">
             <span className={`status-pill pill-${stage}`}>

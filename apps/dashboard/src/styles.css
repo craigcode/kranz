@@ -1429,14 +1429,20 @@ button {
 }
 
 /* A list row plus its management action: the row keeps the click-to-open
-   area, the action sits beside it (never nested — buttons can't nest).
-   .picker-item is a column: the header line (row + actions) on top, and
-   a full-width slot below for inline artifact panels/errors, so failure
-   text never shares the horizontal band with the row's badges. */
+   area, the action sits beside it (never nested — buttons can't nest). */
 .picker-item {
   display: flex;
-  flex-direction: column;
+  align-items: center;
   gap: 6px;
+}
+
+/* Pipeline rows stack instead: the header line (row + actions) on top and
+   a full-width slot below for inline artifact panels/errors, so failure
+   text never shares the horizontal band with the row's badges. Scoped via
+   modifier — MissionPicker/BacklogPanel keep the plain row layout. */
+.picker-item--stacked {
+  flex-direction: column;
+  align-items: stretch;
 }
 
 .picker-item-header {
@@ -1446,6 +1452,7 @@ button {
   width: 100%;
 }
 
+.picker-item .picker-row,
 .picker-item-header .picker-row {
   flex: 1;
   min-width: 0;
