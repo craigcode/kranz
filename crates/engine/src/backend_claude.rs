@@ -302,6 +302,49 @@ pub fn claude_min_config_entries() -> &'static [&'static str] {
 }
 
 // ---------------------------------------------------------------------------
+// Scratch worker HOME/config-dir seeding (worker env hygiene)
+// ---------------------------------------------------------------------------
+
+/// Where a worker session's scratch `HOME` lives for a given session id.
+///
+/// Unique per session under the system temp dir so concurrent worker
+/// sessions never share (or race on) scratch state.
+pub fn scratch_home_root(session_id: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("kranz-worker-home-{session_id}"))
+}
+
+/// Seed `scratch_root` with a scratch `HOME` containing exactly the
+/// [`claude_min_config_entries`] allowlist, copied opaquely (bytes only, no
+/// parsing/logging of contents) from `real_home`'s `.claude` dir when present.
+///
+/// Returns `(home_dir, config_dir)`: `home_dir` is what the caller should set
+/// `HOME` to (so `$HOME/.claude.json` resolves inside the sandbox), and
+/// `config_dir` — `home_dir/.claude` — is what the caller should set
+/// `CLAUDE_CONFIG_DIR` to. The resulting `config_dir` contains only
+/// allowlisted entries that existed in the source, and nothing else: no
+/// arbitrary operator dotfiles are copied.
+pub fn seed_worker_scratch_home(
+    scratch_root: &std::path::Path,
+    real_home: Option<&std::path::Path>,
+) -> std::io::Result<(std::path::PathBuf, std::path::PathBuf)> {
+    let home_dir = scratch_root.join("home");
+    let config_dir = home_dir.join(".claude");
+    std::fs::create_dir_all(&config_dir)?;
+
+    if let Some(real_home) = real_home {
+        let real_config_dir = real_home.join(".claude");
+        for entry in claude_min_config_entries() {
+            let src = real_config_dir.join(entry);
+            if src.is_file() {
+                std::fs::copy(&src, config_dir.join(entry))?;
+            }
+        }
+    }
+
+    Ok((home_dir, config_dir))
+}
+
+// ---------------------------------------------------------------------------
 // Argument construction
 // ---------------------------------------------------------------------------
 

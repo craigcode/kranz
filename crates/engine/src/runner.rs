@@ -629,6 +629,30 @@ pub async fn run_worker_in_buffered(
     Ok((buffered, outcome))
 }
 
+/// Extend `spec.env` (already carrying [`contract_env`]) with a scratch
+/// `HOME`/`CLAUDE_CONFIG_DIR` pair so the worker's `claude` CLI process
+/// authenticates against an isolated, minimal copy of the operator's config
+/// instead of the real `~/.claude` (worker env hygiene). Worker-role sessions
+/// only — validator/orchestrator env is untouched by this function.
+///
+/// Best-effort: if seeding the scratch dir fails (e.g. an unwritable temp
+/// dir), the worker falls back to inheriting the real `HOME`/`CLAUDE_CONFIG_DIR`
+/// (i.e. this function is a no-op) rather than failing spec construction.
+fn seed_worker_env(spec: &mut SessionSpec) {
+    let scratch_root = crate::backend_claude::scratch_home_root(&spec.session_id);
+    let real_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    if let Ok((home, config_dir)) =
+        crate::backend_claude::seed_worker_scratch_home(&scratch_root, real_home.as_deref())
+    {
+        spec.env
+            .insert("HOME".to_string(), home.display().to_string());
+        spec.env.insert(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            config_dir.display().to_string(),
+        );
+    }
+}
+
 /// Build the worker [`SessionSpec`] + [`RunMeta`] shared by the live and
 /// buffered worker paths. Identical spec construction guarantees a buffered
 /// run and a live run are byte-for-byte the same session, differing only in
@@ -701,6 +725,7 @@ fn build_worker_spec(
         env: HashMap::new(),
     };
     spec.env = contract_env(base_sha);
+    seed_worker_env(&mut spec);
     permissions::apply(permissions::for_role(role, cfg, &[], grants), &mut spec);
 
     let run_meta = RunMeta {
