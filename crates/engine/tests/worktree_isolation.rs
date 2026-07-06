@@ -12,7 +12,8 @@ use kranz_engine::config::load_layers;
 use kranz_engine::git_ops::GitRepo;
 use kranz_engine::orchestrator::MissionEngine;
 use kranz_engine::types::{
-    MissionConfig, MissionStatus, Plan, PlanFeature, PlanMilestone, WorkerIsolation,
+    Assertion, AssertionCheck, MissionConfig, MissionStatus, Plan, PlanFeature, PlanMilestone,
+    WorkerIsolation,
 };
 use serde_json::json;
 use std::path::PathBuf;
@@ -371,5 +372,153 @@ async fn checkout_mode_runs_worker_in_primary_root() {
     assert_eq!(
         branch_after, mission_branch,
         "checkout mode must leave the primary checkout on the mission branch"
+    );
+}
+
+// -----------------------------------------------------------------------
+// f-2-2: validators, parallel merge-back, milestone tags, and the final
+// gate routed through the integration worktree in worktree mode.
+// -----------------------------------------------------------------------
+
+fn validator_findings_empty() -> MockScript {
+    MockScript::single_shot_json(&json!({
+        "findings": [],
+        "summary": "clean"
+    }))
+}
+
+/// In worktree mode, a spawned validator's `SessionSpec.cwd` is the mission
+/// integration worktree (not `paths.repo_root`) — mirrors
+/// `worker_session_cwd_is_worktree` but for `run_validator_in`.
+#[tokio::test(flavor = "multi_thread")]
+async fn validator_session_cwd_is_worktree() {
+    let Some((_dir, root)) = mission_init_repo() else {
+        return;
+    };
+
+    let mut cfg = worktree_cfg();
+    cfg.skip_scrutiny = false; // only scrutiny runs; functional stays skipped
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script_complete_no_lesson(),
+        validator_findings_empty(),
+    ]));
+    let backend_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend) as Arc<dyn AgentBackend>;
+    let mut engine = MissionEngine::create(backend_dyn, &root, GOAL, cfg).expect("create engine");
+    engine.approve_plan(one_feature_plan()).unwrap();
+    raw_git(&root, &["checkout", "main"]);
+
+    let status = timeout(TokioDuration::from_secs(60), engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+
+    let specs = backend.started_specs();
+    let validator_spec = specs
+        .iter()
+        .find(|s| matches!(s.prompt, PromptMode::SingleShot(ref t) if t.contains("Validate milestone")))
+        .expect("a validator spec was started");
+
+    assert_ne!(
+        validator_spec.cwd, root,
+        "worktree mode must not spawn the validator in the primary repo root"
+    );
+    assert!(
+        validator_spec
+            .cwd
+            .to_string_lossy()
+            .contains("_integration"),
+        "validator cwd should be the mission integration worktree path: {:?}",
+        validator_spec.cwd
+    );
+
+    // The primary checkout never left its starting branch across the run.
+    let branch_after = raw_git(&root, &["branch", "--show-current"])
+        .trim()
+        .to_string();
+    assert_eq!(
+        branch_after, "main",
+        "worktree mode must never check out the mission branch in the primary tree"
+    );
+}
+
+/// In worktree mode, `KRANZ_BASE_SHA` reaches the worker session env, the
+/// validator session env, and the final-gate contract-command env, all
+/// equal to the pinned base sha — proving the shared `contract_env`
+/// constructor is fed the same base sha regardless of which tree the
+/// command/session actually runs in.
+#[tokio::test(flavor = "multi_thread")]
+async fn base_sha_reaches_sessions_in_worktree_mode() {
+    let Some((_dir, root)) = mission_init_repo() else {
+        return;
+    };
+    let capture_dir = tempfile::tempdir().expect("capture dir");
+    let capture_file = capture_dir.path().join("gate_base_sha.txt");
+
+    let mut cfg = worktree_cfg();
+    cfg.skip_scrutiny = false; // only scrutiny runs; functional stays skipped
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script_complete_no_lesson(),
+        validator_findings_empty(),
+    ]));
+    let backend_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend) as Arc<dyn AgentBackend>;
+    let mut engine = MissionEngine::create(backend_dyn, &root, GOAL, cfg).expect("create engine");
+
+    let mut plan = one_feature_plan();
+    plan.validation_contract.push(Assertion {
+        id: "capture-base-sha".to_string(),
+        statement: "the final gate command env carries KRANZ_BASE_SHA".to_string(),
+        check: AssertionCheck::Command,
+        command: Some(format!(
+            "printf '%s' \"$KRANZ_BASE_SHA\" > {}",
+            capture_file.display()
+        )),
+    });
+    engine.approve_plan(plan).unwrap();
+    raw_git(&root, &["checkout", "main"]);
+
+    let base_sha = engine
+        .state()
+        .mission
+        .base_sha
+        .clone()
+        .expect("mission must pin a base sha at approval");
+
+    let status = timeout(TokioDuration::from_secs(60), engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+
+    let specs = backend.started_specs();
+    let worker_spec = specs
+        .iter()
+        .find(|s| matches!(s.prompt, PromptMode::SingleShot(ref t) if t.contains("Implement feature")))
+        .expect("a worker spec was started");
+    assert_eq!(
+        worker_spec.env.get("KRANZ_BASE_SHA"),
+        Some(&base_sha),
+        "worker session env must carry KRANZ_BASE_SHA"
+    );
+
+    let validator_spec = specs
+        .iter()
+        .find(|s| matches!(s.prompt, PromptMode::SingleShot(ref t) if t.contains("Validate milestone")))
+        .expect("a validator spec was started");
+    assert_eq!(
+        validator_spec.env.get("KRANZ_BASE_SHA"),
+        Some(&base_sha),
+        "validator session env must carry KRANZ_BASE_SHA"
+    );
+
+    let gate_capture =
+        std::fs::read_to_string(&capture_file).expect("final gate must have run the command");
+    assert_eq!(
+        gate_capture, base_sha,
+        "final-gate contract-command env must carry KRANZ_BASE_SHA"
     );
 }

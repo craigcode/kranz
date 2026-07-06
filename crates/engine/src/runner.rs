@@ -734,6 +734,49 @@ pub async fn run_validator(
     grants: &[String],
     worker_commands: &[String],
 ) -> Result<RunOutcome> {
+    let cwd = paths.repo_root.clone();
+    run_validator_in(
+        backend,
+        log,
+        paths,
+        cfg,
+        kind,
+        milestone,
+        contract,
+        start_sha,
+        cancel,
+        &cwd,
+        base_sha,
+        grants,
+        worker_commands,
+    )
+    .await
+}
+
+/// [`run_validator`] with an explicit session working directory (mirrors
+/// [`run_worker_in`]).
+///
+/// Identical to [`run_validator`] except the spawned validator session's
+/// `cwd` is `session_cwd` instead of `paths.repo_root`. `KRANZ_BASE_SHA` (via
+/// [`contract_env`]) is preserved regardless of `session_cwd`. `run_validator`
+/// is the thin wrapper that passes `paths.repo_root`, keeping the checkout-mode
+/// path byte-for-byte.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_validator_in(
+    backend: &dyn AgentBackend,
+    log: &mut EventLog,
+    paths: &MissionPaths,
+    cfg: &MissionConfig,
+    kind: Role,
+    milestone: &Milestone,
+    contract: &[Assertion],
+    start_sha: &str,
+    cancel: Option<Arc<Notify>>,
+    session_cwd: &std::path::Path,
+    base_sha: Option<&str>,
+    grants: &[String],
+    worker_commands: &[String],
+) -> Result<RunOutcome> {
     if !matches!(kind, Role::ValidatorScrutiny | Role::ValidatorFunctional) {
         return Err(EngineError::InvalidState(format!(
             "run_validator requires a validator role, got {kind:?}"
@@ -804,7 +847,7 @@ pub async fn run_validator(
     );
 
     let mut spec = SessionSpec {
-        cwd: paths.repo_root.clone(),
+        cwd: session_cwd.to_path_buf(),
         prompt: PromptMode::SingleShot(task),
         append_system_prompt: Some(role_prompt),
         model: role_cfg.model.clone(),

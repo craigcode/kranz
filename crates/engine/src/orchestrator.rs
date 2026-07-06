@@ -1236,7 +1236,7 @@ impl MissionEngine {
 
             // (f) milestone start + next feature, else (g) validation round.
             if self.state.mission.milestones[mi].status == MilestoneStatus::Pending {
-                let start_sha = self.repo.head_sha()?;
+                let start_sha = self.active_repo().head_sha()?;
                 let milestone_id = self.state.mission.milestones[mi].id.clone();
                 self.emit(EventKind::MilestoneStarted {
                     milestone_id,
@@ -2057,11 +2057,11 @@ impl MissionEngine {
                 })?;
                 continue;
             }
-            let pre_merge_sha = self.repo.head_sha()?;
-            match self.repo.merge_no_ff(&ws.branch)? {
+            let pre_merge_sha = self.active_repo().head_sha()?;
+            match self.active_repo().merge_no_ff(&ws.branch)? {
                 crate::git_ops::MergeOutcome::Clean => {
                     let commits: Vec<String> = self
-                        .repo
+                        .active_repo()
                         .commits_between(&pre_merge_sha, "HEAD")?
                         .iter()
                         .map(|c| format!("{} {}", c.sha, c.subject))
@@ -2318,7 +2318,8 @@ impl MissionEngine {
                 cfg.validator_scrutiny.model = cost::DEFAULT_CODEX_MODEL.to_string();
             }
 
-            let outcome = runner::run_validator(
+            let session_cwd = self.active_root().to_path_buf();
+            let outcome = runner::run_validator_in(
                 backend.as_ref(),
                 &mut self.log,
                 &self.paths,
@@ -2328,6 +2329,7 @@ impl MissionEngine {
                 &contract,
                 &start_sha,
                 None,
+                &session_cwd,
                 base_sha.as_deref(),
                 &grants,
                 &worker_commands,
@@ -2349,7 +2351,8 @@ impl MissionEngine {
                 )?;
                 let retry_cfg = self.state.config.clone();
                 let retry_backend = Arc::clone(&self.backend);
-                let retry_outcome = runner::run_validator(
+                let retry_session_cwd = self.active_root().to_path_buf();
+                let retry_outcome = runner::run_validator_in(
                     retry_backend.as_ref(),
                     &mut self.log,
                     &self.paths,
@@ -2359,6 +2362,7 @@ impl MissionEngine {
                     &contract,
                     &start_sha,
                     None,
+                    &retry_session_cwd,
                     base_sha.as_deref(),
                     &grants,
                     &worker_commands,
@@ -2444,7 +2448,7 @@ impl MissionEngine {
     /// mission.
     fn tag_milestone(&self, milestone_id: &str) -> Option<String> {
         let name = format!("kranz/{}/{}", self.state.mission.id, milestone_id);
-        match self.repo.tag(&name, "kranz milestone complete") {
+        match self.active_repo().tag(&name, "kranz milestone complete") {
             Ok(()) => Some(name),
             Err(e) => {
                 tracing::warn!(tag = %name, error = %e, "milestone tag failed; completing untagged");
@@ -2618,8 +2622,7 @@ impl MissionEngine {
                 });
                 continue;
             };
-            let (ok, output) =
-                run_shell_command(self.paths.repo_root.as_path(), command, &env).await;
+            let (ok, output) = run_shell_command(self.active_root(), command, &env).await;
             if !ok {
                 findings.push(Finding {
                     subject: assertion.id.clone(),
@@ -2716,7 +2719,10 @@ impl MissionEngine {
             .collect::<Vec<_>>()
             .join("\n");
         let base = self.state.mission.base_branch.clone();
-        let diff_stat = self.repo.diff_stat(&base, "HEAD").unwrap_or_default();
+        let diff_stat = self
+            .active_repo()
+            .diff_stat(&base, "HEAD")
+            .unwrap_or_default();
         let message = format!(
             "Final contract gate. Verify each of these agent-judgement assertions against \
              the mission's work (diff stat of {base}..HEAD below). Inspect the repository \

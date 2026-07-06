@@ -792,10 +792,13 @@ fn add_worktree_checkout_existing_branch_at_its_tip() {
     // "main" (checked out in the primary tree) is never touched twice.
     let advance_base = tempfile::tempdir().unwrap();
     let advance_wt = worktree_dir(&advance_base, "advance");
-    repo.add_worktree_checkout(&advance_wt, "feature-x").unwrap();
+    repo.add_worktree_checkout(&advance_wt, "feature-x")
+        .unwrap();
     let advance_repo = GitRepo::open(&advance_wt).unwrap();
     std::fs::write(advance_wt.join("on-branch.txt"), "branch work\n").unwrap();
-    let tip = advance_repo.add_all_and_commit("advance feature-x").unwrap();
+    let tip = advance_repo
+        .add_all_and_commit("advance feature-x")
+        .unwrap();
     assert_ne!(seed, tip);
     repo.remove_worktree(&advance_wt).unwrap();
     repo.prune_worktrees().unwrap();
