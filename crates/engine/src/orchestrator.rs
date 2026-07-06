@@ -4621,19 +4621,21 @@ mod tests {
 
     /// `contract_env(None)` must yield no KRANZ_BASE_SHA key at all (not an
     /// empty-string value) — locks in the None case for the final gate.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn no_base_sha_means_no_gate_env_var() {
-        let dir = tempfile::tempdir().unwrap();
+    ///
+    /// This asserts directly on the map rather than spawning a subprocess:
+    /// `.envs()` overlays onto the inherited process env without clearing
+    /// it, so a subprocess-based check would pass or fail depending on
+    /// whether KRANZ_BASE_SHA happens to be set in the ambient environment
+    /// (e.g. because the engine's own final gate set it for this mission),
+    /// which is exactly the false-CRITICAL failure mode this test exists to
+    /// prevent.
+    #[test]
+    fn no_base_sha_means_no_gate_env_var() {
         let env = runner::contract_env(None);
-        let (ok, output) = run_shell_command_with_timeout(
-            dir.path(),
-            "test -z \"$KRANZ_BASE_SHA\"",
-            Duration::from_secs(10),
-            &env,
-        )
-        .await;
-        assert!(ok, "expected command to succeed: {output}");
+        assert!(
+            !env.contains_key("KRANZ_BASE_SHA"),
+            "None base_sha must not define KRANZ_BASE_SHA in the gate env"
+        );
     }
 
     #[test]
