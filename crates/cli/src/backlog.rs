@@ -16,6 +16,7 @@
 use crate::commands::{build_backend, load_config, run_mission_loop};
 use crate::output;
 use anyhow::{anyhow, bail, Context, Result};
+use kranz_engine::deps;
 use kranz_engine::draft::{drive_draft, DraftOutcome};
 use kranz_engine::git_ops::GitRepo;
 use kranz_engine::orchestrator::MissionEngine;
@@ -451,7 +452,17 @@ pub async fn cmd_draft(
 /// the explicit `--mission` if given, else the newest mission on the repo
 /// whose recorded goal equals the ticket's folded [`Ticket::mission_goal`]
 /// (that is exactly what `draft` seeded it with).
-pub fn cmd_ticket_approve(repo: &Path, slug: &str, explicit_mission: Option<&str>) -> Result<i32> {
+///
+/// Before enqueuing, the shared `blocked-by` checks gate approval: a cycle
+/// reachable from `slug` is always refused (a structural data error, never
+/// overridable by `--force`); an unsatisfied blocker (its mission has not
+/// reached [`MissionStatus::Complete`]) is refused unless `force` is set.
+pub fn cmd_ticket_approve(
+    repo: &Path,
+    slug: &str,
+    explicit_mission: Option<&str>,
+    force: bool,
+) -> Result<i32> {
     let ticket = load_ticket(repo, slug)?;
     let state = Ticket::read_state(repo, slug);
     if state != TicketState::Review {
@@ -461,6 +472,18 @@ pub fn cmd_ticket_approve(repo: &Path, slug: &str, explicit_mission: Option<&str
             ticket_state_label(state)
         );
     }
+
+    if let Some(cycle) = deps::detect_cycle(repo, slug)? {
+        bail!("blocked-by cycle: {}", cycle.join(" -> "));
+    }
+    let unsatisfied = deps::unsatisfied_blockers(repo, slug)?;
+    if !unsatisfied.is_empty() && !force {
+        bail!(
+            "cannot approve {slug}: blocked by {} (its mission is not Complete)",
+            unsatisfied.join(", ")
+        );
+    }
+
     let mission_id = match explicit_mission {
         Some(id) => id.to_string(),
         None => Ticket::mission_for(repo, slug)

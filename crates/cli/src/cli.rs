@@ -335,5 +335,10 @@ pub enum TicketCommand {
         /// The drafted mission id (auto-detected from the ticket goal if omitted)
         #[arg(long, value_name = "ID")]
         mission: Option<String>,
+
+        /// Approve despite unsatisfied `blocked-by` dependencies (a
+        /// blocked-by cycle is never overridable)
+        #[arg(long)]
+        force: bool,
     },
 }

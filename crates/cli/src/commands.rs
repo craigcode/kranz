@@ -185,9 +185,10 @@ fn dispatch_ticket(repo: &Path, command: TicketCommand, mission: Option<&str>) -
         TicketCommand::Approve {
             slug,
             mission: explicit,
+            force,
         } => {
             // A `ticket approve --mission` wins over the global `--mission`.
-            backlog::cmd_ticket_approve(repo, &slug, explicit.as_deref().or(mission))
+            backlog::cmd_ticket_approve(repo, &slug, explicit.as_deref().or(mission), force)
         }
     }
 }
