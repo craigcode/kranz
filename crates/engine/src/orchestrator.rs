@@ -44,7 +44,8 @@ use crate::digest;
 use crate::error::{EngineError, Result};
 use crate::event_log::{EventLog, LockForce};
 use crate::events::{Event, EventKind};
-use crate::git_ops::GitRepo;
+use crate::contract_sweep;
+use crate::git_ops::{CommitInfo, GitRepo};
 use crate::lessons;
 use crate::paths::MissionPaths;
 use crate::permissions;
@@ -279,6 +280,12 @@ pub struct MissionEngine {
     /// this to the mission integration worktree from `setup_mission_worktree`
     /// for the duration of the run.
     active_tree: Option<(PathBuf, GitRepo)>,
+    /// Primary checkout's branch as of the start of this `run()` call, in
+    /// worktree mode only (M7 tier 1, feature f-1-2). Compared against the
+    /// primary's current branch by the out-of-contract sweep's
+    /// primary-checkout cleanliness check: the primary must never move once
+    /// mission-branch work is routed to the integration worktree.
+    primary_branch_at_start: Option<String>,
 }
 
 impl MissionEngine {
@@ -349,6 +356,7 @@ impl MissionEngine {
             pending_seed_reply: None,
             codex_backend: None,
             active_tree: None,
+            primary_branch_at_start: None,
         })
     }
 
@@ -445,6 +453,7 @@ impl MissionEngine {
             pending_seed_reply: None,
             codex_backend: None,
             active_tree: None,
+            primary_branch_at_start: None,
         })
     }
 
@@ -1226,6 +1235,10 @@ impl MissionEngine {
         // routes every mission-branch git op there for the rest of this run.
         let worktree_mode = self.state.config.isolation() == WorkerIsolation::Worktree;
         if worktree_mode {
+            // Recorded BEFORE `setup_mission_worktree` (which never touches
+            // the primary anyway) so the sweep's primary-checkout cleanliness
+            // check has a baseline branch to compare against for this run.
+            self.primary_branch_at_start = Some(self.repo.current_branch()?);
             let (path, wt_repo) = self.setup_mission_worktree()?;
             self.active_tree = Some((path, wt_repo));
         } else {
@@ -2481,6 +2494,14 @@ impl MissionEngine {
             }
         }
 
+        // Engine-computed out-of-contract-write sweep (M7 tier 1, feature
+        // f-1-2): deterministic, side-effect-free, runs alongside the spawned
+        // validator sessions above. Attributed to the reserved engine run id,
+        // exactly like `final_gate`'s synthesized findings.
+        for finding in self.out_of_contract_sweep(&start_sha)? {
+            findings.push((crate::reducer::ENGINE_RUN_ID.to_string(), finding));
+        }
+
         for (run_id, finding) in &findings {
             self.emit(EventKind::ValidationFinding {
                 milestone_id: milestone_id.clone(),
@@ -2542,6 +2563,69 @@ impl MissionEngine {
     fn fix_cycle_exhausted(&self, mi: usize) -> bool {
         self.state.mission.milestones[mi].fix_cycles + 1
             > self.state.config.max_fix_cycles_per_milestone
+    }
+
+    /// Engine-computed out-of-contract-write sweep (M7 tier 1, feature
+    /// f-1-2): deterministic, read-only, no LLM validator involved. Compares
+    /// worker-authored paths changed since `milestone_start_sha` against the
+    /// mission's declared `touch_set`, and — in worktree mode — asserts the
+    /// primary checkout stayed clean and on its original branch. Findings use
+    /// `class = "out-of-contract-write"` and flow through the same
+    /// `convert_findings` path as validator findings (see `final_gate` for
+    /// the identical engine-synthesized-finding pattern).
+    fn out_of_contract_sweep(&self, milestone_start_sha: &str) -> Result<Vec<Finding>> {
+        let mut findings = Vec::new();
+
+        let touch_set = &self.state.mission.touch_set;
+        if touch_set.is_empty() {
+            tracing::info!(
+                "out-of-contract-write path sweep is advisory-off: mission has no declared touchSet"
+            );
+        } else {
+            let repo = self.active_repo();
+            let commits = repo.commits_between(milestone_start_sha, "HEAD")?;
+            let mission_id = self.state.mission.id.clone();
+
+            // Attribute each changed path to the commit that made it, via a
+            // per-commit diff against its predecessor in the range; engine
+            // ([kranz]-authored) commits are skipped entirely so their paths
+            // never enter the candidate set, even when outside the touch-set.
+            let mut changes: Vec<(String, CommitInfo)> = Vec::new();
+            let mut prev_sha = milestone_start_sha.to_string();
+            for commit in &commits {
+                if contract_sweep::is_meta_commit(&commit.subject) {
+                    prev_sha = commit.sha.clone();
+                    continue;
+                }
+                let paths = repo.changed_paths(&prev_sha, &commit.sha)?;
+                for path in paths {
+                    if !contract_sweep::is_meta_path(&mission_id, &path) {
+                        changes.push((path, commit.clone()));
+                    }
+                }
+                prev_sha = commit.sha.clone();
+            }
+            let attributed: Vec<contract_sweep::AttributedChange> = changes
+                .iter()
+                .map(|(path, commit)| contract_sweep::AttributedChange { path, commit })
+                .collect();
+            findings.extend(contract_sweep::path_findings(touch_set, &attributed));
+        }
+
+        // Primary-checkout cleanliness only asserts anything in worktree
+        // mode: in checkout mode the primary IS the active repo, and it is
+        // expected to be on the mission branch while work is in progress.
+        if let Some(branch_at_start) = &self.primary_branch_at_start {
+            let is_clean = self.repo.is_clean()?;
+            let current_branch = self.repo.current_branch()?;
+            if let Some(finding) =
+                contract_sweep::primary_checkout_finding(is_clean, &current_branch, branch_at_start)
+            {
+                findings.push(finding);
+            }
+        }
+
+        Ok(findings)
     }
 
     /// Annotated milestone tag; a pre-existing tag (milestone re-completed
@@ -4976,6 +5060,136 @@ mod tests {
             "integration worktree still listed after teardown: {after:?}"
         );
         assert!(!path.exists(), "integration worktree dir must be gone");
+    }
+
+    // -----------------------------------------------------------------------
+    // Out-of-contract-write sweep (M7 tier 1, feature f-1-2)
+    // -----------------------------------------------------------------------
+
+    /// End-to-end: a real commit outside the declared touch-set produces
+    /// exactly one out-of-contract-write finding; a commit inside it produces
+    /// none.
+    #[test]
+    fn out_of_contract_sweep_flags_path_outside_touch_set() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+        engine.state.mission.touch_set = vec!["src/**".to_string()];
+        let start_sha = engine.repo.head_sha().unwrap();
+
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src").join("widget.rs"), "// in contract\n").unwrap();
+        std::fs::write(root.join("oops.md"), "out of contract\n").unwrap();
+        engine.repo.add_all_and_commit("[f-1] add widget").unwrap();
+
+        let findings = engine.out_of_contract_sweep(&start_sha).unwrap();
+        assert_eq!(findings.len(), 1, "findings: {findings:?}");
+        assert_eq!(findings[0].class, contract_sweep::FINDING_CLASS);
+        assert_eq!(findings[0].subject, "oops.md");
+    }
+
+    /// An empty (undeclared) touch-set skips the path sweep entirely: no
+    /// out-of-contract-write path findings, even for a path that would
+    /// otherwise be flagged.
+    #[test]
+    fn out_of_contract_sweep_empty_touch_set_is_advisory_off() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
+        let engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+        assert!(engine.state.mission.touch_set.is_empty());
+        let start_sha = engine.repo.head_sha().unwrap();
+
+        std::fs::write(root.join("anything.md"), "whatever\n").unwrap();
+        engine.repo.add_all_and_commit("[f-1] add anything").unwrap();
+
+        let findings = engine.out_of_contract_sweep(&start_sha).unwrap();
+        assert!(findings.is_empty(), "findings: {findings:?}");
+    }
+
+    /// A `[kranz]`-authored commit that touches a path outside the touch-set
+    /// (e.g. the approved-plan commit writing plan.json) is never flagged.
+    #[test]
+    fn out_of_contract_sweep_engine_commit_exempt() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+        engine.state.mission.touch_set = vec!["src/**".to_string()];
+        let start_sha = engine.repo.head_sha().unwrap();
+
+        let mission_id = engine.state.mission.id.clone();
+        let plan_dir = root
+            .join(".kranz")
+            .join("missions")
+            .join(&mission_id);
+        std::fs::create_dir_all(&plan_dir).unwrap();
+        std::fs::write(plan_dir.join("plan.json"), "{}\n").unwrap();
+        engine
+            .repo
+            .add_all_and_commit(&format!("[kranz] approved plan for {mission_id}"))
+            .unwrap();
+
+        let findings = engine.out_of_contract_sweep(&start_sha).unwrap();
+        assert!(findings.is_empty(), "findings: {findings:?}");
+    }
+
+    /// A dirty primary checkout in worktree mode yields a critical
+    /// `primary-checkout` finding.
+    #[test]
+    fn primary_checkout_sweep_dirty_primary_flags_critical_finding() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+        let start_sha = engine.repo.head_sha().unwrap();
+
+        let (path, wt_repo) = engine.setup_mission_worktree().unwrap();
+        engine.active_tree = Some((path, wt_repo));
+        engine.primary_branch_at_start = Some("main".to_string());
+
+        // Dirty the PRIMARY checkout (untracked file), not the worktree.
+        std::fs::write(root.join("stray.txt"), "should never be here\n").unwrap();
+
+        let findings = engine.out_of_contract_sweep(&start_sha).unwrap();
+        let primary_findings: Vec<_> = findings.iter().filter(|f| f.subject == "primary-checkout").collect();
+        assert_eq!(primary_findings.len(), 1, "findings: {findings:?}");
+        assert_eq!(primary_findings[0].severity, "critical");
+
+        engine.teardown_mission_worktree();
+    }
+
+    /// A clean, unmoved primary checkout in worktree mode yields no finding.
+    #[test]
+    fn primary_checkout_sweep_clean_primary_yields_no_finding() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+        let start_sha = engine.repo.head_sha().unwrap();
+
+        let (path, wt_repo) = engine.setup_mission_worktree().unwrap();
+        engine.active_tree = Some((path, wt_repo));
+        engine.primary_branch_at_start = Some("main".to_string());
+
+        let findings = engine.out_of_contract_sweep(&start_sha).unwrap();
+        assert!(
+            !findings.iter().any(|f| f.subject == "primary-checkout"),
+            "findings: {findings:?}"
+        );
+
+        engine.teardown_mission_worktree();
     }
 
     /// A mission integration worktree left behind by a crashed engine (never
