@@ -65,7 +65,7 @@ UNMERGED badge is mandatory. `isBlocked` renders at Captured/Reviewable.
 Estimates must be PERSISTED at plan-park time (into plan.md's header) so
 Reviewable can show them — today they die in draft stdout.
 
-## D-A — verb renames (OPERATOR DECISION)
+## D-A — verb renames (DECIDED 2026-07-06, by operator delegation)
 
 "Approve" currently names both plan-commit and ticket-queueing. Proposal:
 
@@ -76,8 +76,9 @@ Reviewable can show them — today they die in draft stdout.
   alias one release).
 - Start (an approved mission with no run) stays **Start**.
 
-**Recommendation:** as above. Foreclosed if rejected: nothing — copy is
-cheap; deciding twice is not.
+DECIDED: as recommended — Approve reserved for plan approval, Queue for
+ticket-queueing, Start unchanged. (Operator delegated remaining decisions
+2026-07-06: "build everything".)
 
 ## D-B — who drains the queue (DECIDED 2026-07-05, resolves gascity D5)
 

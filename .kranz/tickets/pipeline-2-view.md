@@ -13,7 +13,7 @@ Design of record: docs/scoping/pipeline-view.md (stage model, decided
 D-B/D-C/D-D, design principles: simple lists / easy buttons / iterate
 always on offer). Read it in full before planning; do not contradict a
 decided section. D-A verb copy: Approve reserved for plan approval,
-Queue for ticket-queueing, pending final operator confirmation.
+Queue for ticket-queueing, CONFIRMED (D-A decided).
 
 ## Scoping answers
 
