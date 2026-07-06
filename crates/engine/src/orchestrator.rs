@@ -5306,4 +5306,266 @@ mod tests {
         let seed = streaming_seed(&specs[0]);
         assert!(!seed.contains("Lessons from past missions"));
     }
+
+    // -----------------------------------------------------------------------
+    // Codex scrutiny integration (f-2-3): a stubbed `codex exec --json`
+    // binary drives real ValidatorReport findings into the fix-cycle
+    // machinery, priced with the codex table. No real API spend: everything
+    // comes from a POSIX shell stub streaming the committed fixture.
+    // -----------------------------------------------------------------------
+
+    /// Writes an executable POSIX shell stub that stands in for the real
+    /// `codex` CLI closely enough to drive [`crate::backend_codex::CodexBackend`]:
+    /// `--version` prints a plausible version string and any `exec ...`
+    /// invocation streams the committed fixture JSONL to stdout, exiting 0.
+    /// Not portable to windows-latest (no `/bin/sh`), hence `cfg(unix)`.
+    #[cfg(unix)]
+    fn write_codex_stub() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fixture = std::fs::canonicalize(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/codex_exec_scrutiny.jsonl"),
+        )
+        .expect("fixture exists");
+        let script_path = dir.path().join("codex-stub.sh");
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'codex-cli 0.0.0-test'\n  exit 0\nfi\ncat '{}'\nexit 0\n",
+                fixture.display()
+            ),
+        )
+        .expect("write stub script");
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat stub script")
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod stub script");
+        (dir, script_path)
+    }
+
+    /// RAII guard: points `KRANZ_CODEX_BIN` at a working stub so
+    /// `discover_codex_binary` deterministically resolves it as the FIRST
+    /// candidate, regardless of whatever real `codex` install happens to sit
+    /// on the host running the suite. Unlike [`CodexEnvGuard`], `HOME`/`PATH`
+    /// are left untouched — validation contract commands may still need git
+    /// on PATH, and the stub wins over PATH lookups either way. Serialized on
+    /// the same [`CODEX_ENV_LOCK`] so it never races the other codex-env
+    /// tests.
+    #[cfg(unix)]
+    struct CodexStubEnvGuard {
+        prev_bin: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    #[cfg(unix)]
+    impl CodexStubEnvGuard {
+        fn engage(stub: &std::path::Path) -> Self {
+            let lock = CODEX_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let prev_bin = std::env::var_os("KRANZ_CODEX_BIN");
+            std::env::set_var("KRANZ_CODEX_BIN", stub);
+            CodexStubEnvGuard {
+                prev_bin,
+                _lock: lock,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for CodexStubEnvGuard {
+        fn drop(&mut self) {
+            match self.prev_bin.take() {
+                Some(v) => std::env::set_var("KRANZ_CODEX_BIN", v),
+                None => std::env::remove_var("KRANZ_CODEX_BIN"),
+            }
+        }
+    }
+
+    /// One conversion-turn reply (§4.5 g) converting every finding into `n`
+    /// fix features.
+    #[cfg(unix)]
+    fn codex_fix_features_reply(n: usize) -> String {
+        let features: Vec<serde_json::Value> = (1..=n)
+            .map(|i| {
+                serde_json::json!({
+                    "title": format!("fix issue {i}"),
+                    "spec": format!("resolve validation finding {i}"),
+                    "validationCriteria": [format!("finding {i} resolved")]
+                })
+            })
+            .collect();
+        serde_json::json!({ "fixFeatures": features, "summary": format!("{n} fix feature(s)") })
+            .to_string()
+    }
+
+    #[cfg(unix)]
+    fn codex_scrutiny_cfg() -> MissionConfig {
+        let mut cfg = MissionConfig::default();
+        cfg.validator_scrutiny.backend = Some("codex".to_string());
+        cfg.skip_functional = true;
+        cfg
+    }
+
+    fn codex_scrutiny_milestone() -> Milestone {
+        Milestone {
+            id: "ms-1".to_string(),
+            title: "m".to_string(),
+            features: vec![],
+            status: MilestoneStatus::Active,
+            fix_cycles: 0,
+            start_sha: Some("HEAD".to_string()),
+        }
+    }
+
+    /// The stub codex's ValidatorReport findings (>=1, per the fixture) fold
+    /// into the run loop through the normal machinery: `validation.finding`
+    /// events, an orchestrator conversion turn, and a `fixfeature.created`
+    /// event that lands the fix feature in state — exactly like a claude
+    /// scrutiny run's findings would. Also asserts the run actually went
+    /// through codex (codex model on the spawn event, no fallback decision).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_scrutiny_findings_flow() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let (_stub_dir, stub_path) = write_codex_stub();
+
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            lesson_orch_script(&codex_fix_features_reply(1)),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock;
+        let mut engine = MissionEngine::create(backend, &root, "goal", codex_scrutiny_cfg())
+            .expect("create engine");
+        engine
+            .state
+            .mission
+            .milestones
+            .push(codex_scrutiny_milestone());
+
+        let env_guard = CodexStubEnvGuard::engage(&stub_path);
+        engine
+            .validation_round(0)
+            .await
+            .expect("validation round must complete through the stub codex backend");
+        drop(env_guard);
+
+        let events =
+            EventLog::read_events(&engine.paths.events_file()).expect("read events.jsonl");
+
+        assert!(
+            !events.iter().any(|e| matches!(
+                &e.kind,
+                EventKind::OrchestratorDecision { summary, .. }
+                    if summary.contains("codex") && summary.contains("not available")
+            )),
+            "codex must not have fallen back to claude: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.kind,
+                EventKind::WorkerSpawned { role, model, .. }
+                    if *role == Role::ValidatorScrutiny && model == cost::DEFAULT_CODEX_MODEL
+            )),
+            "expected the scrutiny run spawned with the codex model: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::ValidationFinding { .. })),
+            "expected the stub codex's findings as validation.finding events: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::FixFeatureCreated { .. })),
+            "expected findings converted into a fix feature: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            engine.state().mission.milestones[0]
+                .features
+                .iter()
+                .any(|f| f.origin == FeatureOrigin::Fix),
+            "fix feature must be folded into mission state"
+        );
+    }
+
+    /// The codex validator run's cost/tokens are priced with the codex table
+    /// and land in mission totals: the run's recorded `cost_usd` equals
+    /// `cost::usage_cost_usd(usage, DEFAULT_CODEX_MODEL)` for the fixture's
+    /// token usage, and `total_cost_usd` increases by exactly that amount.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_validator_cost_in_totals() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let (_stub_dir, stub_path) = write_codex_stub();
+
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            lesson_orch_script(&codex_fix_features_reply(1)),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock;
+        let mut engine = MissionEngine::create(backend, &root, "goal", codex_scrutiny_cfg())
+            .expect("create engine");
+        engine
+            .state
+            .mission
+            .milestones
+            .push(codex_scrutiny_milestone());
+        assert_eq!(engine.state().total_cost_usd, 0.0, "totals start at zero");
+
+        let env_guard = CodexStubEnvGuard::engage(&stub_path);
+        engine
+            .validation_round(0)
+            .await
+            .expect("validation round must complete through the stub codex backend");
+        drop(env_guard);
+
+        let events =
+            EventLog::read_events(&engine.paths.events_file()).expect("read events.jsonl");
+        let (usage, cost_usd) = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::WorkerCompleted {
+                    tokens, cost_usd, ..
+                } => Some((tokens.clone(), *cost_usd)),
+                _ => None,
+            })
+            .expect("expected a worker.completed event for the codex scrutiny run");
+
+        let expected = cost::usage_cost_usd(&usage, cost::DEFAULT_CODEX_MODEL);
+        assert!(expected > 0.0, "expected nonzero codex-priced cost");
+        assert_eq!(
+            cost_usd,
+            Some(expected),
+            "the run's recorded cost_usd must equal codex pricing for its usage"
+        );
+
+        // Mission totals fold in every run's cost (including the mock
+        // orchestrator conversion turn), so isolate the codex run's
+        // contribution by summing every worker.completed cost_usd recorded
+        // and checking the total accounts for exactly that sum — with the
+        // codex-priced `expected` amount as one addend (asserted above).
+        let all_runs_cost: f64 = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::WorkerCompleted { cost_usd, .. } => *cost_usd,
+                _ => None,
+            })
+            .sum();
+        assert!(
+            all_runs_cost >= expected,
+            "total run cost ({all_runs_cost}) must include the codex-priced run cost ({expected})"
+        );
+        assert_eq!(
+            engine.state().total_cost_usd,
+            all_runs_cost,
+            "mission totals must equal the sum of every run's recorded cost, codex included"
+        );
+    }
 }
