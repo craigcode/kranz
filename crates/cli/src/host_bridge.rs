@@ -85,6 +85,13 @@ impl PlanningHost for HostedPlanning {
         // task and returns; this adapter never drives a mission turn itself.
         Box::pin(async move { self.0.drain().await.map(|_| ()).map_err(plain) })
     }
+
+    fn merge<'a>(&'a self, id: &'a str) -> BoxFuture<'a, anyhow::Result<Value>> {
+        // Same seam as `POST /api/missions/:id/merge`: `MissionHost::merge`
+        // already carries a user-presentable refusal (dirty tree / failing
+        // gate with its verbatim output / conflict) in `ApiError::message`.
+        Box::pin(async move { self.0.merge(id).await.map_err(plain) })
+    }
 }
 
 /// The host's errors already carry user-presentable messages (409 "a turn is

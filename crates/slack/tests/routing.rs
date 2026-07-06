@@ -49,6 +49,25 @@ fn block_actions_approve_fixture_routes_to_approve() {
 }
 
 #[test]
+fn block_actions_merge_fixture_routes_to_merge() {
+    let routed = route(&fixture("block_actions_merge.json"), &no_lookup());
+    assert_eq!(
+        routed.envelope_id.as_deref(),
+        Some("c2f6b8d3-0a4e-5b21-9d3c-8f7a1e2b3c4d")
+    );
+    // Same regression guard as the approve button: user_id + response_url
+    // must be captured so the bridge can gate Merge on the spend allowlist.
+    assert_eq!(
+        routed.action,
+        Action::Merge {
+            mission_id: "m-42".into(),
+            user_id: Some("U0263M3QW".into()),
+            response_url: Some("https://hooks.slack.com/actions/T024BE7LD/5678/efgh".into()),
+        }
+    );
+}
+
+#[test]
 fn thread_message_fixture_routes_to_guidance() {
     let routed = route(&fixture("message_thread_reply.json"), &lookup());
     assert_eq!(

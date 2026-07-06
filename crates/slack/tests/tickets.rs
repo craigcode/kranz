@@ -279,6 +279,9 @@ struct FakeHost {
     /// Records how many times `drain` (the `/kranz work run` host call) is
     /// called. `None` never errors in these tests.
     drain_calls: AtomicUsize,
+    /// Records how many times `merge` (the `/kranz merge` host call) is
+    /// called.
+    merge_calls: AtomicUsize,
 }
 
 #[derive(Clone, Copy)]
@@ -295,6 +298,7 @@ impl FakeHost {
             repo_root: None,
             approve_ticket_calls: AtomicUsize::new(0),
             drain_calls: AtomicUsize::new(0),
+            merge_calls: AtomicUsize::new(0),
         }
     }
 
@@ -305,6 +309,7 @@ impl FakeHost {
             repo_root: Some(repo_root),
             approve_ticket_calls: AtomicUsize::new(0),
             drain_calls: AtomicUsize::new(0),
+            merge_calls: AtomicUsize::new(0),
         }
     }
 }
@@ -380,6 +385,11 @@ impl PlanningHost for FakeHost {
     fn drain<'a>(&'a self) -> BoxFuture<'a, anyhow::Result<()>> {
         self.drain_calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { Ok(()) })
+    }
+
+    fn merge<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, anyhow::Result<Value>> {
+        self.merge_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(json!({ "merged": true, "commit": "abc123" })) })
     }
 }
 
@@ -734,4 +744,108 @@ async fn work_run_without_a_host_is_an_honest_refusal_pointing_at_the_cli() {
     let result_text = serde_json::to_string(&blocks).unwrap().to_lowercase();
     assert!(result_text.contains("no hosted planning engine"));
     assert!(result_text.contains("kranz work"));
+}
+
+// -- `/kranz merge <slug|id>` routing + gate ---------------------------------
+
+use kranz_slack::bridge::{gate_merge_command, run_merge, MergeGate};
+
+#[test]
+fn merge_dispatches_from_single_line_slash_with_id_and_user() {
+    let env = json!({
+        "type": "slash_commands",
+        "envelope_id": "env-merge",
+        "payload": {
+            "command": "/kranz",
+            "text": "merge m-42",
+            "channel_id": "C1",
+            "user_id": "U123",
+            "response_url": "https://hooks.slack/tix"
+        }
+    });
+    let routed = route(&env, &no_lookup());
+    assert_eq!(
+        routed.action,
+        Action::Merge {
+            mission_id: "m-42".into(),
+            user_id: Some("U123".into()),
+            response_url: Some("https://hooks.slack/tix".into()),
+        }
+    );
+}
+
+#[test]
+fn merge_with_no_id_falls_through_to_help() {
+    let routed = route(&slash_env("merge"), &no_lookup());
+    assert_eq!(
+        routed.action,
+        Action::Help {
+            response_url: Some("https://hooks.slack/tix".into())
+        }
+    );
+}
+
+#[tokio::test]
+async fn merge_denies_an_unlisted_user_and_merges_nothing() {
+    let cfg = gated_cfg(vec!["U-allowed".into()]);
+    let fake = Arc::new(FakeHost::new(DraftOutcomeKind::ParkedForReview));
+    let host: SharedHost = fake.clone();
+
+    let gate = gate_merge_command(&cfg, Some(&host), Some("U-outsider"));
+
+    assert!(
+        matches!(gate, MergeGate::Unauthorized),
+        "unlisted user must be refused"
+    );
+    assert_eq!(
+        fake.merge_calls.load(Ordering::SeqCst),
+        0,
+        "an unlisted user's merge must trigger zero host.merge calls"
+    );
+    let refusal = serde_json::to_string(&not_authorized_blocks()).unwrap();
+    assert!(refusal.contains("not authorized to spend"));
+}
+
+#[tokio::test]
+async fn merge_gate_acks_before_any_merge_call_then_run_triggers_exactly_once() {
+    let cfg = gated_cfg(vec!["U-allowed".into()]);
+    let fake = Arc::new(FakeHost::new(DraftOutcomeKind::ParkedForReview));
+    let host: SharedHost = fake.clone();
+
+    let gate = gate_merge_command(&cfg, Some(&host), Some("U-allowed"));
+
+    let ack = match gate {
+        MergeGate::Ready(ack) => ack,
+        _ => panic!("authorized merge with a host must be Ready"),
+    };
+    assert_eq!(
+        fake.merge_calls.load(Ordering::SeqCst),
+        0,
+        "the gate/ack phase must not call host.merge — the ack must be postable BEFORE the merge runs"
+    );
+    let ack_text = serde_json::to_string(&ack).unwrap().to_lowercase();
+    assert!(
+        ack_text.contains("merging"),
+        "authorized merge acks immediately: {ack_text}"
+    );
+
+    let _ = run_merge(&host, "m-42").await;
+    assert_eq!(
+        fake.merge_calls.load(Ordering::SeqCst),
+        1,
+        "run_merge triggers exactly one host.merge call"
+    );
+}
+
+#[tokio::test]
+async fn merge_without_a_host_is_an_honest_refusal_pointing_at_the_cli() {
+    let cfg = gated_cfg(vec!["U-allowed".into()]);
+    let gate = gate_merge_command(&cfg, None, Some("U-allowed"));
+    let blocks = match gate {
+        MergeGate::NoHost(blocks) => blocks,
+        _ => panic!("no host must gate to NoHost"),
+    };
+    let result_text = serde_json::to_string(&blocks).unwrap().to_lowercase();
+    assert!(result_text.contains("no hosted planning engine"));
+    assert!(result_text.contains("kranz merge"));
 }

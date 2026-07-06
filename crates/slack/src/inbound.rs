@@ -32,8 +32,8 @@
 use crate::format::{
     APPROVE_ACTION_ID, CONFIG_CALLBACK_ID, CONFIG_EFFORT_ACTION, CONFIG_EFFORT_BLOCK,
     CONFIG_MISSION_ACTION, CONFIG_MISSION_BLOCK, CONFIG_MODEL_ACTION, CONFIG_MODEL_BLOCK,
-    CONFIG_ROLE_ACTION, CONFIG_ROLE_BLOCK, NEW_MISSION_CALLBACK_ID, NEW_MISSION_GOAL_ACTION,
-    NEW_MISSION_GOAL_BLOCK, START_ACTION_ID,
+    CONFIG_ROLE_ACTION, CONFIG_ROLE_BLOCK, MERGE_ACTION_ID, NEW_MISSION_CALLBACK_ID,
+    NEW_MISSION_GOAL_ACTION, NEW_MISSION_GOAL_BLOCK, START_ACTION_ID,
 };
 use serde_json::Value;
 
@@ -203,6 +203,17 @@ pub enum Action {
         user_id: Option<String>,
         response_url: Option<String>,
     },
+    /// Merge button pressed for `mission_id` (Delivered card) OR `/kranz merge
+    /// <slug|id>` (its slash twin). Spend-adjacent (runs the CI gate suite and
+    /// a `--no-ff` merge): gated on the allowlist EXACTLY like
+    /// [`Action::Approve`] / [`Action::WorkRun`]. `user_id` (the clicker/
+    /// invoker) and `response_url` are captured so the bridge can refuse an
+    /// unlisted user before touching the host.
+    Merge {
+        mission_id: String,
+        user_id: Option<String>,
+        response_url: Option<String>,
+    },
     /// `app_home_opened` events_api envelope → publish this user's App Home tab
     /// (active missions + queue + open tickets). Read-only, so not spend-gated.
     AppHome { user_id: String },
@@ -279,10 +290,16 @@ fn route_interactive(payload: &Value) -> Action {
     let Some(actions) = payload.get("actions").and_then(Value::as_array) else {
         return Action::Ignore;
     };
+    enum ButtonKind {
+        Approve,
+        Start,
+        Merge,
+    }
     for action in actions {
-        let start = match action.get("action_id").and_then(Value::as_str) {
-            Some(id) if id == APPROVE_ACTION_ID => false,
-            Some(id) if id == START_ACTION_ID => true,
+        let kind = match action.get("action_id").and_then(Value::as_str) {
+            Some(id) if id == APPROVE_ACTION_ID => ButtonKind::Approve,
+            Some(id) if id == START_ACTION_ID => ButtonKind::Start,
+            Some(id) if id == MERGE_ACTION_ID => ButtonKind::Merge,
             _ => continue,
         };
         // The mission id rides in the button `value`.
@@ -302,18 +319,22 @@ fn route_interactive(payload: &Value) -> Action {
                     .and_then(Value::as_str)
                     .map(str::to_string);
                 let mission_id = mission_id.to_string();
-                return if start {
-                    Action::ApproveStart {
+                return match kind {
+                    ButtonKind::Start => Action::ApproveStart {
                         mission_id,
                         user_id,
                         response_url,
-                    }
-                } else {
-                    Action::Approve {
+                    },
+                    ButtonKind::Approve => Action::Approve {
                         mission_id,
                         user_id,
                         response_url,
-                    }
+                    },
+                    ButtonKind::Merge => Action::Merge {
+                        mission_id,
+                        user_id,
+                        response_url,
+                    },
                 };
             }
         }
@@ -623,6 +644,20 @@ fn route_slash(payload: &Value) -> Action {
             };
         }
         // `approve` with no id → help.
+    }
+
+    // `merge <slug|id>` → the gated Merge action (spend-adjacent, gated like
+    // `work run`). The slash twin of the Delivered card's Merge button.
+    if let Some(rest) = strip_ci_prefix(text, "merge") {
+        let id = clean_id(rest);
+        if !id.is_empty() {
+            return Action::Merge {
+                mission_id: id.to_string(),
+                user_id,
+                response_url,
+            };
+        }
+        // `merge` with no id → help.
     }
 
     // `draft <slug>` → run a non-interactive draft turn for a backlog ticket

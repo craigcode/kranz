@@ -436,6 +436,7 @@ fn is_slow_action(action: &Action) -> bool {
             | Action::ApproveMission { .. }
             | Action::Draft { .. }
             | Action::WorkRun { .. }
+            | Action::Merge { .. }
     )
 }
 
@@ -750,6 +751,57 @@ pub async fn run_work_run(host: &SharedHost) -> Vec<Value> {
     match host.drain().await {
         Ok(()) => error_blocks(":white_check_mark: Queue drain triggered."),
         Err(e) => error_blocks(&format!("Couldn't drain the queue: {e}")),
+    }
+}
+
+/// The outcome of the SYNCHRONOUS `gate_merge_command` phase — mirrors
+/// [`WorkRunGate`]. No [`crate::host::PlanningHost::merge`] call has happened
+/// by the time any of these variants is returned; `Ready` carries the
+/// immediate ack the caller must post BEFORE awaiting [`run_merge`].
+pub enum MergeGate {
+    Unauthorized,
+    NoHost(Vec<Value>),
+    Ready(Vec<Value>),
+}
+
+/// `/kranz merge <slug|id>` / Delivered-card Merge button gate/ack phase —
+/// spend-adjacent, gated EXACTLY like [`gate_work_run_command`]. Makes NO
+/// `PlanningHost::merge` call — that is the caller's job via [`run_merge`],
+/// AFTER posting the `Ready` ack — so this phase stays synchronous and
+/// unit-testable without a live `SlackClient`.
+pub fn gate_merge_command(
+    cfg: &SlackConfig,
+    host: Option<&SharedHost>,
+    user_id: Option<&str>,
+) -> MergeGate {
+    if !cfg.is_authorized(user_id) {
+        return MergeGate::Unauthorized;
+    }
+    if host.is_none() {
+        return MergeGate::NoHost(error_blocks(
+            "This bridge has no hosted planning engine (it was started without \
+             `kranz serve`). Use `kranz merge <id>` in a terminal.",
+        ));
+    }
+    MergeGate::Ready(error_blocks(
+        ":hourglass_flowing_sand: Merging — running the gate suite now; the result posts here.",
+    ))
+}
+
+/// The async run phase of `/kranz merge <slug|id>`, called ONLY after the
+/// caller has posted the `MergeGate::Ready` ack. Drives
+/// [`crate::host::PlanningHost::merge`] and forwards its outcome — merged
+/// commit, or the refusal (dirty tree / failing gate with verbatim output /
+/// conflict) — unchanged.
+pub async fn run_merge(host: &SharedHost, mission_id: &str) -> Vec<Value> {
+    match host.merge(mission_id).await {
+        Ok(value) => {
+            let commit = value.get("commit").and_then(Value::as_str).unwrap_or("?");
+            error_blocks(&format!(
+                ":white_check_mark: Merged `{mission_id}` — commit `{commit}`."
+            ))
+        }
+        Err(e) => error_blocks(&format!("Couldn't merge `{mission_id}`: {e}")),
     }
 }
 
@@ -1305,6 +1357,35 @@ async fn dispatch_action(
                 reply_ephemeral(cfg, client, response_url.as_deref(), &ack).await;
                 let host = host.expect("WorkRunGate::Ready only returned with a host present");
                 let result = run_work_run(host).await;
+                reply_ephemeral(cfg, client, response_url.as_deref(), &result).await;
+            }
+        },
+
+        // `/kranz merge <slug|id>` / Delivered-card Merge button — gated
+        // EXACTLY like `work run` ([`gate_merge_command`] holds the gate + ack
+        // logic so it's unit-testable without a live SlackClient). The ack
+        // MUST post before the slow `run_merge` await, mirroring WorkRun.
+        Action::Merge {
+            mission_id,
+            user_id,
+            response_url,
+        } => match gate_merge_command(cfg, host, user_id.as_deref()) {
+            MergeGate::Unauthorized => {
+                reply_ephemeral(
+                    cfg,
+                    client,
+                    response_url.as_deref(),
+                    &not_authorized_blocks(),
+                )
+                .await;
+            }
+            MergeGate::NoHost(blocks) => {
+                reply_ephemeral(cfg, client, response_url.as_deref(), &blocks).await;
+            }
+            MergeGate::Ready(ack) => {
+                reply_ephemeral(cfg, client, response_url.as_deref(), &ack).await;
+                let host = host.expect("MergeGate::Ready only returned with a host present");
+                let result = run_merge(host, mission_id).await;
                 reply_ephemeral(cfg, client, response_url.as_deref(), &result).await;
             }
         },
