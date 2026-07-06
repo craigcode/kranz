@@ -470,61 +470,20 @@ pub async fn cmd_draft(
 /// whose recorded goal equals the ticket's folded [`Ticket::mission_goal`]
 /// (that is exactly what `draft` seeded it with).
 ///
-/// Before enqueuing, the shared `blocked-by` checks gate approval: a cycle
-/// reachable from `slug` is always refused (a structural data error, never
-/// overridable by `--force`); an unsatisfied blocker (its mission has not
-/// reached [`MissionStatus::Complete`]) is refused unless `force` is set.
+/// The gate (cycle detection, unsatisfied-blocker refusal) and the enqueue
+/// side effects live in [`deps::approve_ticket`] — the same core the REST
+/// `POST /api/tickets/:slug/approve` handler calls, so the two surfaces can
+/// never drift on what "approvable" means.
 pub fn cmd_ticket_approve(
     repo: &Path,
     slug: &str,
     explicit_mission: Option<&str>,
     force: bool,
 ) -> Result<i32> {
-    let ticket = load_ticket(repo, slug)?;
-    let state = Ticket::read_state(repo, slug);
-    if state != TicketState::Review {
-        bail!(
-            "ticket '{slug}' is {} — only a REVIEW ticket (drafted, plan committed) \
-             can be approved; run `kranz draft {slug}` first",
-            ticket_state_label(state)
-        );
-    }
-
-    if let Some(cycle) = deps::detect_cycle(repo, slug)? {
-        bail!("blocked-by cycle: {}", cycle.join(" -> "));
-    }
-    let unsatisfied = deps::unsatisfied_blockers(repo, slug)?;
-    if !unsatisfied.is_empty() && !force {
-        bail!(
-            "cannot approve {slug}: blocked by {} (its mission is not Complete)",
-            unsatisfied.join(", ")
-        );
-    }
-
-    let mission_id = match explicit_mission {
-        Some(id) => id.to_string(),
-        None => Ticket::mission_for(repo, slug)
-            .or_else(|| find_mission_for_ticket(repo, &ticket))
-            .ok_or_else(|| {
-                anyhow!(
-                    "could not find the drafted mission for ticket '{slug}' automatically — \
-                 pass it with `kranz ticket approve {slug} --mission <id>` (see `kranz missions`)"
-                )
-            })?,
-    };
-    let entry = queue::enqueue(
-        repo,
-        QueueEntry {
-            mission_id: mission_id.clone(),
-            ticket_slug: Some(slug.to_string()),
-            priority: ticket.priority,
-            seq: 0,
-        },
-    )?;
-    Ticket::write_state(repo, slug, TicketState::Queued, None)?;
+    let approved = deps::approve_ticket(repo, slug, explicit_mission, force)?;
     println!(
         "ticket '{slug}' QUEUED (mission {}, priority {}). Run it with `kranz work`.",
-        entry.mission_id, entry.priority
+        approved.mission_id, approved.priority
     );
     Ok(0)
 }
@@ -581,30 +540,6 @@ fn restore_draft_checkout(repo: &Path, original: Option<&str>, mission_branch: &
             "warning: could not probe the working tree ({e}); checkout left on {mission_branch}"
         ),
     }
-}
-
-/// Legacy fallback when no recorded link exists (missions drafted before the
-/// sidecar carried `missionId`): newest mission whose goal matches.
-fn find_mission_for_ticket(repo: &Path, ticket: &Ticket) -> Option<String> {
-    use kranz_engine::paths::MissionPaths;
-    let goal = ticket.mission_goal();
-    let mut best: Option<(std::time::SystemTime, String)> = None;
-    for id in MissionPaths::list_missions(repo) {
-        let Ok(state) = crate::commands::load_state(repo, &id) else {
-            continue;
-        };
-        if state.mission.goal != goal {
-            continue;
-        }
-        let events = MissionPaths::new(repo, &id).events_file();
-        let mtime = std::fs::metadata(&events)
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        if best.as_ref().is_none_or(|(t, _)| mtime >= *t) {
-            best = Some((mtime, id));
-        }
-    }
-    best.map(|(_, id)| id)
 }
 
 /// `kranz work [--once]`: the dispatcher. Drains the per-repo queue one

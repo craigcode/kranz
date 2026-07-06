@@ -2,11 +2,12 @@
 //! approve paths both call so a ticket can't be approved (or drafted into a
 //! cycle) while a dependency is outstanding.
 
-use crate::error::Result;
+use crate::error::{EngineError, Result};
 use crate::event_log::EventLog;
 use crate::paths::MissionPaths;
+use crate::queue::{self, QueueEntry};
 use crate::reducer;
-use crate::ticket::Ticket;
+use crate::ticket::{Ticket, TicketState};
 use crate::types::MissionStatus;
 use std::collections::HashSet;
 use std::path::Path;
@@ -90,4 +91,130 @@ fn dfs(
     }
 
     Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// approve_ticket — the shared gate + side effects (CLI `ticket approve` and
+// REST `POST /api/tickets/:slug/approve`)
+// ---------------------------------------------------------------------------
+
+/// A ticket approved into the queue: the mission id and priority it was
+/// enqueued with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovedTicket {
+    pub mission_id: String,
+    pub priority: u8,
+}
+
+/// The one approve gate + enqueue side effect shared by the CLI (`kranz
+/// ticket approve`) and the REST `POST /api/tickets/:slug/approve` handler,
+/// so the two surfaces can never drift apart on what "approvable" means.
+///
+/// Refuses (via [`EngineError::InvalidState`]) when: the ticket is not
+/// [`TicketState::Review`]; a `blocked-by` cycle is reachable from `slug`
+/// (never overridable by `force`); or an unsatisfied blocker exists and
+/// `force` is false. On success, enqueues the ticket's drafted mission
+/// (`explicit_mission`, else the recorded/discovered one) and sets the
+/// ticket [`TicketState::Queued`].
+pub fn approve_ticket(
+    repo_root: &Path,
+    slug: &str,
+    explicit_mission: Option<&str>,
+    force: bool,
+) -> Result<ApprovedTicket> {
+    Ticket::ensure_valid_slug(slug)?;
+    let ticket_path = Ticket::tickets_dir(repo_root).join(format!("{slug}.md"));
+    let ticket = Ticket::load(&ticket_path)?;
+
+    let state = Ticket::read_state(repo_root, slug);
+    if state != TicketState::Review {
+        return Err(EngineError::InvalidState(format!(
+            "ticket '{slug}' is {} — only a REVIEW ticket (drafted, plan committed) \
+             can be approved; run `kranz draft {slug}` first",
+            ticket_state_label(state)
+        )));
+    }
+
+    if let Some(cycle) = detect_cycle(repo_root, slug)? {
+        return Err(EngineError::InvalidState(format!(
+            "blocked-by cycle: {}",
+            cycle.join(" -> ")
+        )));
+    }
+    let unsatisfied = unsatisfied_blockers(repo_root, slug)?;
+    if !unsatisfied.is_empty() && !force {
+        return Err(EngineError::InvalidState(format!(
+            "cannot approve {slug}: blocked by {} (its mission is not Complete)",
+            unsatisfied.join(", ")
+        )));
+    }
+
+    let mission_id = match explicit_mission {
+        Some(id) => id.to_string(),
+        None => Ticket::mission_for(repo_root, slug)
+            .or_else(|| find_mission_for_ticket(repo_root, &ticket))
+            .ok_or_else(|| {
+                EngineError::InvalidState(format!(
+                    "could not find the drafted mission for ticket '{slug}' automatically — \
+                     pass one explicitly (see `kranz missions`)"
+                ))
+            })?,
+    };
+
+    let entry = queue::enqueue(
+        repo_root,
+        QueueEntry {
+            mission_id,
+            ticket_slug: Some(slug.to_string()),
+            priority: ticket.priority,
+            seq: 0,
+        },
+    )?;
+    Ticket::write_state(repo_root, slug, TicketState::Queued, None)?;
+    Ok(ApprovedTicket {
+        mission_id: entry.mission_id,
+        priority: entry.priority,
+    })
+}
+
+/// UPPERCASE label for a ticket pipeline state, matching
+/// `kranz_cli::backlog::ticket_state_label` — duplicated here (rather than
+/// depended on) since the CLI crate depends on this one, not the reverse.
+fn ticket_state_label(state: TicketState) -> &'static str {
+    match state {
+        TicketState::New => "NEW",
+        TicketState::Drafting => "DRAFTING",
+        TicketState::NeedsContext => "NEEDS-CONTEXT",
+        TicketState::Review => "REVIEW",
+        TicketState::Queued => "QUEUED",
+        TicketState::Running => "RUNNING",
+        TicketState::Done => "DONE",
+        TicketState::Failed => "FAILED",
+    }
+}
+
+/// Legacy fallback when no recorded link exists (missions drafted before the
+/// sidecar carried `missionId`): newest mission whose goal matches.
+fn find_mission_for_ticket(repo_root: &Path, ticket: &Ticket) -> Option<String> {
+    let goal = ticket.mission_goal();
+    let mut best: Option<(std::time::SystemTime, String)> = None;
+    for id in MissionPaths::list_missions(repo_root) {
+        let paths = MissionPaths::new(repo_root, &id);
+        let Ok(events) = EventLog::read_events(&paths.events_file()) else {
+            continue;
+        };
+        let Ok(state) = reducer::fold(&events) else {
+            continue;
+        };
+        if state.mission.goal != goal {
+            continue;
+        }
+        let mtime = std::fs::metadata(paths.events_file())
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        if best.as_ref().is_none_or(|(t, _)| mtime >= *t) {
+            best = Some((mtime, id));
+        }
+    }
+    best.map(|(_, id)| id)
 }

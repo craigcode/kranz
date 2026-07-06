@@ -5,7 +5,10 @@
 
 use crate::error::ApiError;
 use crate::ServerState;
+use axum::body::Bytes;
 use axum::extract::{Path as UrlPath, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::Json;
 use kranz_engine::ticket::Ticket;
 use serde_json::{json, Value};
@@ -40,6 +43,49 @@ pub(crate) async fn get_ticket(
         .map_err(|e| ApiError::internal(format!("failed to parse ticket '{slug}': {e}")))?;
 
     Ok(Json(ticket_full_json(server.host.repo_root(), &ticket)))
+}
+
+/// `POST /api/tickets/:slug/draft` — long-running: mirrors `POST
+/// /api/missions/:id/start` by creating the planning mission synchronously
+/// (so a real mission id is available for the response) and spawning the
+/// draft turns as a background task via [`kranz_server::MissionHost::draft_async`].
+/// `202 {"missionId":"m-…"}`; progress is observable over that mission's
+/// `GET /api/missions/:id/ws` feed and the terminal outcome (Review vs
+/// NeedsContext) via `GET /api/tickets/:slug`. 400 for an invalid slug, 404
+/// for a missing ticket — both checked synchronously before anything spawns.
+pub(crate) async fn draft_ticket(
+    State(server): State<Arc<ServerState>>,
+    UrlPath(slug): UrlPath<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ticket::ensure_valid_slug(&slug)
+        .map_err(|e| ApiError::bad_request(format!("invalid ticket slug '{slug}': {e}")))?;
+    let mission_id = server.host.draft_async(&slug, false).await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({ "missionId": mission_id })),
+    ))
+}
+
+/// `POST /api/tickets/:slug/approve` — optional body `{"force": bool}`
+/// (default `false`) → `200 {"approved":true,"missionId":"m-…"}`. Runs the
+/// same gate the CLI's `kranz ticket approve` runs
+/// ([`kranz_engine::deps::approve_ticket`]): 409 naming the unsatisfied
+/// blocker when blocked and `force` is false; 409 with the cycle path on a
+/// `blocked-by` cycle even when `force` is true; 409 when the ticket is not
+/// in Review.
+pub(crate) async fn approve_ticket(
+    State(server): State<Arc<ServerState>>,
+    UrlPath(slug): UrlPath<String>,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    Ticket::ensure_valid_slug(&slug)
+        .map_err(|e| ApiError::bad_request(format!("invalid ticket slug '{slug}': {e}")))?;
+    let value = crate::host::parse_body(&body)?;
+    let force = value.get("force").and_then(Value::as_bool).unwrap_or(false);
+    let approved = server.host.approve_ticket(&slug, force)?;
+    Ok(Json(
+        json!({ "approved": true, "missionId": approved.mission_id }),
+    ))
 }
 
 /// Summary projection for the list route: no goal/context/body text, just
