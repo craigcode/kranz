@@ -27,6 +27,7 @@ use crate::outbound::{classify, NotifyClass, Outbound};
 use crate::threads::ThreadMap;
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
+use kranz_engine::draft::DraftOutcome;
 use kranz_engine::event_log::EventLog;
 use kranz_engine::paths::MissionPaths;
 use kranz_engine::reducer;
@@ -544,8 +545,10 @@ async fn user_reply(
 }
 
 /// A one-line ephemeral "not authorized" reply for a spend-gated action from an
-/// unlisted user (docs/slack-management.md must-have #1).
-fn not_authorized_blocks() -> Vec<Value> {
+/// unlisted user (docs/slack-management.md must-have #1). `pub` so tests
+/// (including external ones, e.g. `tests/tickets.rs`) can assert a refusal is
+/// byte-for-byte this standard message, not just "some" error.
+pub fn not_authorized_blocks() -> Vec<Value> {
     vec![json!({
         "type": "section",
         "text": {
@@ -908,6 +911,35 @@ async fn dispatch_action(
                 false,
             )
             .await;
+        }
+
+        // `/kranz draft <slug>` — SPEND action, gated EXACTLY like `new`
+        // ([`run_draft_command`] holds the gate + host-call logic so it's
+        // unit-testable without a live SlackClient).
+        Action::Draft {
+            slug,
+            user_id,
+            response_url,
+        } => {
+            let invocation = run_draft_command(cfg, host, slug, user_id.as_deref()).await;
+            if !invocation.authorized {
+                reply_ephemeral(
+                    cfg,
+                    client,
+                    response_url.as_deref(),
+                    &not_authorized_blocks(),
+                )
+                .await;
+                return;
+            }
+            // Ack IMMEDIATELY: the draft turn takes minutes, same reasoning
+            // as NewMission/RequestPlan.
+            if let Some(ack) = &invocation.ack {
+                reply_ephemeral(cfg, client, response_url.as_deref(), ack).await;
+            }
+            if let Some(result) = &invocation.result {
+                reply_ephemeral(cfg, client, response_url.as_deref(), result).await;
+            }
         }
 
         // Per-role config change. SPEND-ADJACENT (it re-shapes future turns'

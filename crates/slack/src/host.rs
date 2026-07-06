@@ -11,6 +11,7 @@
 //! `BoxFuture` (from `futures-util`, already a dependency) keeps the trait
 //! object-safe without an `async-trait` dependency.
 
+use kranz_engine::draft::DraftOutcome;
 use kranz_engine::types::Plan;
 use std::sync::Arc;
 
@@ -71,6 +72,14 @@ pub trait PlanningHost: Send + Sync + 'static {
     /// `true` = the mission is now free of this host (released or never
     /// hosted); `false` = it is actively running here and was left alone.
     fn release<'a>(&'a self, id: &'a str) -> BoxFuture<'a, anyhow::Result<bool>>;
+
+    /// Run a non-interactive draft turn for backlog ticket `slug` (`/kranz
+    /// draft <slug>`): validates the slug, creates + seeds the mission
+    /// through this host, and drives it to a terminal [`DraftOutcome`]. A
+    /// money-spending, multi-minute operation — the bridge runs it off the
+    /// socket read loop after posting an immediate ack, mirroring
+    /// [`Self::create`] + [`Self::planning_turn`].
+    fn draft<'a>(&'a self, slug: &'a str) -> BoxFuture<'a, anyhow::Result<DraftOutcome>>;
 }
 
 /// How the bridge holds the host: shared, optional (a bridge without a host —

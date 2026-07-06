@@ -130,6 +130,17 @@ pub enum Action {
         user_id: Option<String>,
         response_url: Option<String>,
     },
+    /// `/kranz draft <slug>` → run a non-interactive draft turn for a backlog
+    /// ticket through the hosted engine (create the mission, seed it, demand
+    /// the plan). A money-spending action: gated on the allowlist EXACTLY
+    /// like [`Action::NewMission`] (same gate, same standard refusal). `slug`
+    /// is validated via `Ticket::ensure_valid_slug` before any host call; an
+    /// unknown ticket is a graceful error.
+    Draft {
+        slug: String,
+        user_id: Option<String>,
+        response_url: Option<String>,
+    },
     /// `/kranz config [<id>] <role> <model> [effort]` → change a role's model
     /// (and optionally reasoning effort) mid-mission via a `config-change`
     /// control command. SPEND-ADJACENT (it re-shapes what future turns spend),
@@ -465,13 +476,13 @@ fn route_event(payload: &Value, lookup: &impl ThreadLookup) -> Action {
 
 /// `slash_commands` → the `/kranz` subcommand router. Recognized subcommands:
 /// `ticket <title>`, `ticket list`, `ticket show <slug>`, `new <goal>`,
-/// `status [<id>]`, `plan <id>`, `approve <id>`,
+/// `status [<id>]`, `plan <id>`, `approve <id>`, `draft <slug>`,
 /// `config [<id>] <role> <model> [effort]`, `pause [<id>]`, `resume [<id>]`,
 /// `work`. A bare `/kranz`, `help`, or an unrecognized/incomplete subcommand
 /// shows the command list — a typo lands on help rather than silently doing
 /// something surprising, which is what keeps the surface discoverable.
 ///
-/// The spend-gated subcommands (`new`, `plan`, `approve`) carry the invoking
+/// The spend-gated subcommands (`new`, `plan`, `approve`, `draft`) carry the invoking
 /// `user_id` so [`crate::bridge`] can consult the allowlist before acting; the
 /// gate itself lives in [`crate::config::SlackConfig::is_authorized`], not here
 /// (routing stays pure and config-free).
@@ -602,6 +613,20 @@ fn route_slash(payload: &Value) -> Action {
             };
         }
         // `approve` with no id → help.
+    }
+
+    // `draft <slug>` → run a non-interactive draft turn for a backlog ticket
+    // (spend-gated, same gate as `new`). No slug → help.
+    if let Some(rest) = strip_ci_prefix(text, "draft") {
+        let slug = rest.trim();
+        if !slug.is_empty() {
+            return Action::Draft {
+                slug: slug.to_string(),
+                user_id,
+                response_url,
+            };
+        }
+        // `draft` with no slug → help.
     }
 
     // `config [<id>] <role> <model> [effort]` → per-role model/effort change
