@@ -434,6 +434,7 @@ fn is_slow_action(action: &Action) -> bool {
             | Action::Approve { .. }
             | Action::ApproveStart { .. }
             | Action::ApproveMission { .. }
+            | Action::Draft { .. }
     )
 }
 
@@ -618,6 +619,97 @@ pub fn not_authorized_blocks() -> Vec<Value> {
 /// deduped by envelope id ([`SeenEnvelopes`]) so a Slack redelivery can't
 /// double-create or double-approve. Only pure-local actions run inline on the
 /// read loop.
+/// The outcome of `run_draft_command`: whether the invoker was authorized,
+/// the immediate hourglass ack (posted first, mirroring [`Action::NewMission`]),
+/// and the terminal result blocks (posted once the draft finishes). `ack` and
+/// `result` are both `None` on an unauthorized invocation (nothing is posted
+/// beyond the caller's standard refusal, and NOTHING is spawned).
+pub struct DraftInvocation {
+    pub authorized: bool,
+    pub ack: Option<Vec<Value>>,
+    pub result: Option<Vec<Value>>,
+}
+
+/// `/kranz draft <slug>` — SPEND action, gated EXACTLY like `/kranz new` (same
+/// gate, same standard refusal, same "ack immediately then run" shape). Holds
+/// the gate + host-call logic so it is unit-testable without a live
+/// `SlackClient`: an unauthorized invocation returns immediately with NO host
+/// call (no engine spawn whatsoever); an authorized one validates the slug via
+/// [`kranz_engine::ticket::Ticket::ensure_valid_slug`], then — with a host
+/// wired in — builds the hourglass ack and drives [`PlanningHost::draft`] to a
+/// terminal [`DraftOutcome`], posting the orchestrator's clarifying questions
+/// back to the invoker on `NeedsContext`.
+pub async fn run_draft_command(
+    cfg: &SlackConfig,
+    host: Option<&SharedHost>,
+    slug: &str,
+    user_id: Option<&str>,
+) -> DraftInvocation {
+    if !cfg.is_authorized(user_id) {
+        return DraftInvocation {
+            authorized: false,
+            ack: None,
+            result: None,
+        };
+    }
+    if let Err(e) = kranz_engine::ticket::Ticket::ensure_valid_slug(slug) {
+        return DraftInvocation {
+            authorized: true,
+            ack: None,
+            result: Some(error_blocks(&format!("Couldn't draft `{slug}`: {e}"))),
+        };
+    }
+    let Some(host) = host else {
+        return DraftInvocation {
+            authorized: true,
+            ack: None,
+            result: Some(error_blocks(&format!(
+                "This bridge has no hosted planning engine (it was started without \
+                 `kranz serve`). Use `kranz ticket draft {slug}` in a terminal, or the \
+                 web UI via `kranz serve --open`."
+            ))),
+        };
+    };
+    // Ack IMMEDIATELY: the draft turn (create + seed + drive to a terminal
+    // outcome) takes minutes, same reasoning as NewMission/RequestPlan.
+    let ack = error_blocks(&format!(
+        ":hourglass_flowing_sand: Drafting `{slug}` — the seeding planning turn \
+         usually takes a minute or two; the result will post here."
+    ));
+    let result = match host.draft(slug).await {
+        Ok(DraftOutcome::ParkedForReview {
+            mission_id,
+            mission_branch,
+        }) => error_blocks(&format!(
+            ":white_check_mark: Draft ready for review — mission `{mission_id}`, \
+             branch `{mission_branch}`. Ticket `{slug}` is now in review."
+        )),
+        Ok(DraftOutcome::Enqueued { mission_id }) => error_blocks(&format!(
+            ":white_check_mark: Draft approved and queued — mission `{mission_id}`. \
+             Ticket `{slug}` is now queued."
+        )),
+        Ok(DraftOutcome::NeedsContext {
+            mission_id,
+            questions,
+        }) => {
+            let mut text = format!(
+                ":question: Mission `{mission_id}` needs more context before drafting \
+                 `{slug}` can continue:\n"
+            );
+            for q in &questions {
+                text.push_str(&format!("• {q}\n"));
+            }
+            error_blocks(text.trim_end())
+        }
+        Err(e) => error_blocks(&format!("Couldn't draft `{slug}`: {e}")),
+    };
+    DraftInvocation {
+        authorized: true,
+        ack: Some(ack),
+        result: Some(result),
+    }
+}
+
 async fn dispatch_action(
     cfg: &SlackConfig,
     client: &SlackClient,
@@ -1639,6 +1731,7 @@ fn apply_action(repo_root: &Path, action: &Action) -> Result<()> {
         | Action::RequestPlan { .. }
         | Action::ApproveMission { .. }
         | Action::ApproveStart { .. }
+        | Action::Draft { .. }
         | Action::Config { .. }
         | Action::Pause { .. }
         | Action::Resume { .. }
@@ -3092,6 +3185,13 @@ mod tests {
             mission_id: "m-1".into(),
             text: "hi".into(),
             user_id: None,
+        }));
+        // Draft runs a full mission create+seed+drive turn → must run off the
+        // read loop, same as NewMission.
+        assert!(is_slow_action(&Action::Draft {
+            slug: "s-1".into(),
+            user_id: None,
+            response_url: None,
         }));
         // Fast local/one-call actions stay inline.
         assert!(!is_slow_action(&Action::Status {

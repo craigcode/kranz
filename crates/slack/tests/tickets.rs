@@ -7,9 +7,16 @@
 //! these verbs (only `slash_commands` envelopes do — an `events_api` message,
 //! even one that says "ticket list", stays on the thread-guidance path).
 
-use kranz_slack::bridge::{build_ticket_list_reply, build_ticket_show_reply};
+use kranz_engine::draft::DraftOutcome;
+use kranz_slack::bridge::{
+    build_ticket_list_reply, build_ticket_show_reply, not_authorized_blocks, run_draft_command,
+};
+use kranz_slack::host::BoxFuture;
 use kranz_slack::inbound::{route, Action, ThreadLookup};
+use kranz_slack::{NotifyFlags, PlanOutcome, PlanningHost, SharedHost, SlackConfig};
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use tempfile::TempDir;
 
 fn no_lookup() -> impl ThreadLookup {
@@ -213,4 +220,260 @@ fn ticket_verbs_typed_in_a_thread_message_are_not_dispatched() {
             _ => {}
         }
     }
+}
+
+// -- `/kranz draft <slug>` routing -------------------------------------------
+
+#[test]
+fn draft_dispatches_from_single_line_slash_with_slug_and_user() {
+    let env = json!({
+        "type": "slash_commands",
+        "envelope_id": "env-draft",
+        "payload": {
+            "command": "/kranz",
+            "text": "draft rate-limit-notes",
+            "channel_id": "C1",
+            "user_id": "U123",
+            "response_url": "https://hooks.slack/tix"
+        }
+    });
+    let routed = route(&env, &no_lookup());
+    assert_eq!(
+        routed.action,
+        Action::Draft {
+            slug: "rate-limit-notes".into(),
+            user_id: Some("U123".into()),
+            response_url: Some("https://hooks.slack/tix".into()),
+        }
+    );
+}
+
+#[test]
+fn bare_draft_falls_through_to_help() {
+    let routed = route(&slash_env("draft"), &no_lookup());
+    assert_eq!(
+        routed.action,
+        Action::Help {
+            response_url: Some("https://hooks.slack/tix".into())
+        }
+    );
+}
+
+// -- `/kranz draft <slug>`: spend-gated exactly like `/kranz new` -----------
+
+/// A fake `PlanningHost` for draft tests: records how many times `draft` is
+/// called (an engine spawn) and returns a canned, switchable outcome. Every
+/// other method panics if reached — no draft test exercises them.
+struct FakeHost {
+    draft_calls: AtomicUsize,
+    outcome: DraftOutcomeKind,
+}
+
+#[derive(Clone, Copy)]
+enum DraftOutcomeKind {
+    ParkedForReview,
+    NeedsContext,
+}
+
+impl FakeHost {
+    fn new(outcome: DraftOutcomeKind) -> Self {
+        FakeHost {
+            draft_calls: AtomicUsize::new(0),
+            outcome,
+        }
+    }
+}
+
+impl PlanningHost for FakeHost {
+    fn create<'a>(&'a self, _goal: &'a str) -> BoxFuture<'a, anyhow::Result<String>> {
+        Box::pin(async { unreachable!("draft tests never call create") })
+    }
+
+    fn planning_turn<'a>(
+        &'a self,
+        _id: &'a str,
+        _text: &'a str,
+    ) -> BoxFuture<'a, anyhow::Result<String>> {
+        Box::pin(async { unreachable!("draft tests never call planning_turn") })
+    }
+
+    fn request_plan<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, anyhow::Result<PlanOutcome>> {
+        Box::pin(async { unreachable!("draft tests never call request_plan") })
+    }
+
+    fn approve_pending<'a>(
+        &'a self,
+        _id: &'a str,
+    ) -> BoxFuture<'a, anyhow::Result<Option<String>>> {
+        Box::pin(async { unreachable!("draft tests never call approve_pending") })
+    }
+
+    fn start<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async { unreachable!("draft tests never call start") })
+    }
+
+    fn release<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, anyhow::Result<bool>> {
+        Box::pin(async { unreachable!("draft tests never call release") })
+    }
+
+    fn draft<'a>(&'a self, slug: &'a str) -> BoxFuture<'a, anyhow::Result<DraftOutcome>> {
+        self.draft_calls.fetch_add(1, Ordering::SeqCst);
+        let outcome = match self.outcome {
+            DraftOutcomeKind::ParkedForReview => DraftOutcome::ParkedForReview {
+                mission_id: "m-draft".into(),
+                mission_branch: "kranz/mission-m-draft".into(),
+            },
+            DraftOutcomeKind::NeedsContext => DraftOutcome::NeedsContext {
+                mission_id: "m-draft".into(),
+                questions: vec![
+                    "Which endpoint exactly?".into(),
+                    "Per-user or per-token?".into(),
+                ],
+            },
+        };
+        let slug = slug.to_string();
+        Box::pin(async move {
+            let _ = slug;
+            Ok(outcome)
+        })
+    }
+}
+
+fn gated_cfg(allow_users: Vec<String>) -> SlackConfig {
+    SlackConfig {
+        bot_token: "xoxb".into(),
+        app_token: "xapp".into(),
+        channel: "C1".into(),
+        notify: NotifyFlags::default(),
+        allow_users,
+        dashboard_url: None,
+        instance_name: None,
+    }
+}
+
+#[tokio::test]
+async fn draft_denies_an_unlisted_user_and_spawns_nothing() {
+    // Model: steer_denies_an_unlisted_user_and_enqueues_nothing. A non-empty
+    // allowlist gates draft exactly like `/kranz new`: an unlisted user gets
+    // the standard refusal and the fake host's draft counter never moves.
+    let cfg = gated_cfg(vec!["U-allowed".into()]);
+    let fake = Arc::new(FakeHost::new(DraftOutcomeKind::ParkedForReview));
+    let host: SharedHost = fake.clone();
+
+    let invocation =
+        run_draft_command(&cfg, Some(&host), "rate-limit-notes", Some("U-outsider")).await;
+
+    assert!(!invocation.authorized, "unlisted user must be refused");
+    assert!(invocation.ack.is_none(), "unauthorized draft acks nothing");
+    assert!(
+        invocation.result.is_none(),
+        "unauthorized draft posts nothing beyond the refusal"
+    );
+    assert_eq!(
+        fake.draft_calls.load(Ordering::SeqCst),
+        0,
+        "an unlisted user's draft must spawn zero engine turns"
+    );
+    // The refusal the caller posts on `!authorized` is the exact standard one
+    // shared with `/kranz new`.
+    let refusal = serde_json::to_string(&not_authorized_blocks()).unwrap();
+    assert!(refusal.contains("not authorized to spend"));
+}
+
+#[tokio::test]
+async fn draft_allows_a_listed_user_acks_immediately_and_spawns_exactly_once() {
+    let cfg = gated_cfg(vec!["U-allowed".into()]);
+    let fake = Arc::new(FakeHost::new(DraftOutcomeKind::ParkedForReview));
+    let host: SharedHost = fake.clone();
+
+    let invocation =
+        run_draft_command(&cfg, Some(&host), "rate-limit-notes", Some("U-allowed")).await;
+
+    assert!(invocation.authorized);
+    let ack_text = serde_json::to_string(&invocation.ack.expect("authorized draft acks"))
+        .unwrap()
+        .to_lowercase();
+    assert!(
+        ack_text.contains("hourglass"),
+        "authorized draft posts an immediate hourglass ack: {ack_text}"
+    );
+    let result_text =
+        serde_json::to_string(&invocation.result.expect("authorized draft posts a result"))
+            .unwrap();
+    assert!(result_text.contains("m-draft"), "result names the mission");
+    assert_eq!(
+        fake.draft_calls.load(Ordering::SeqCst),
+        1,
+        "authorized draft spawns exactly one engine turn"
+    );
+}
+
+#[tokio::test]
+async fn draft_allowlist_empty_authorizes_everyone_same_as_new() {
+    // Empty allow_users = no gate at all (mirrors `/kranz new`'s degrade when
+    // unconfigured).
+    let cfg = gated_cfg(vec![]);
+    let fake = Arc::new(FakeHost::new(DraftOutcomeKind::ParkedForReview));
+    let host: SharedHost = fake.clone();
+
+    let invocation = run_draft_command(&cfg, Some(&host), "rate-limit-notes", None).await;
+
+    assert!(invocation.authorized);
+    assert_eq!(fake.draft_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn draft_needs_context_posts_the_orchestrators_questions_back() {
+    let cfg = gated_cfg(vec!["U-allowed".into()]);
+    let fake = Arc::new(FakeHost::new(DraftOutcomeKind::NeedsContext));
+    let host: SharedHost = fake.clone();
+
+    let invocation =
+        run_draft_command(&cfg, Some(&host), "rate-limit-notes", Some("U-allowed")).await;
+
+    assert!(invocation.authorized);
+    let result_text =
+        serde_json::to_string(&invocation.result.expect("needs-context posts a result")).unwrap();
+    assert!(
+        result_text.contains("Which endpoint exactly?"),
+        "posts the orchestrator's clarifying questions back to the invoker: {result_text}"
+    );
+    assert!(result_text.contains("Per-user or per-token?"));
+    assert_eq!(fake.draft_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn draft_invalid_slug_errors_gracefully_with_no_host_call() {
+    let cfg = gated_cfg(vec!["U-allowed".into()]);
+    let fake = Arc::new(FakeHost::new(DraftOutcomeKind::ParkedForReview));
+    let host: SharedHost = fake.clone();
+
+    let invocation =
+        run_draft_command(&cfg, Some(&host), "../../etc/passwd", Some("U-allowed")).await;
+
+    assert!(invocation.authorized, "gate already passed");
+    assert!(invocation.ack.is_none(), "invalid slug never acks a draft");
+    let result_text =
+        serde_json::to_string(&invocation.result.expect("invalid slug errors gracefully"))
+            .unwrap()
+            .to_lowercase();
+    assert!(result_text.contains("invalid"), "got: {result_text}");
+    assert_eq!(
+        fake.draft_calls.load(Ordering::SeqCst),
+        0,
+        "an invalid slug must never reach the host"
+    );
+}
+
+#[tokio::test]
+async fn draft_without_a_host_is_an_honest_refusal() {
+    let cfg = gated_cfg(vec!["U-allowed".into()]);
+    let invocation = run_draft_command(&cfg, None, "rate-limit-notes", Some("U-allowed")).await;
+    assert!(invocation.authorized);
+    assert!(invocation.ack.is_none());
+    let result_text =
+        serde_json::to_string(&invocation.result.expect("no-host case errors gracefully"))
+            .unwrap()
+            .to_lowercase();
+    assert!(result_text.contains("no hosted planning engine"));
 }
