@@ -169,6 +169,7 @@ pub fn router_with_shared_host(
             "/api/missions/{id}/delete",
             post(host::delete_mission_route),
         )
+        .route("/api/missions/{id}/merge", post(host::merge_mission_route))
         .route("/api/missions/{id}/ws", get(ws::ws_handler))
         .route("/api/tickets", get(tickets::list_tickets))
         .route("/api/tickets/{slug}", get(tickets::get_ticket))
