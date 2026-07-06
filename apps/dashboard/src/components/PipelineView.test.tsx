@@ -185,6 +185,56 @@ describe('PipelineView', () => {
     expect(landedRow?.querySelector('.unmerged-badge')).toBeNull();
   });
 
+  it('renders an abandoned mission row as inert: no actions, abandoned pill, no old Redraft affordance', async () => {
+    vi.mocked(api.tickets).mockResolvedValueOnce([]);
+    vi.mocked(api.missions).mockResolvedValueOnce([
+      makeMission({ id: 'm-dead', goal: 'Abandoned mission work', status: 'abandoned' }),
+    ]);
+
+    render(<PipelineView />);
+
+    const row = (await screen.findByText('Abandoned mission work')).closest('li') as HTMLElement;
+    expect(row.querySelectorAll('.pipeline-primary-action').length).toBe(0);
+    expect(row.querySelectorAll('.pipeline-secondary-action').length).toBe(0);
+    expect(row.querySelector('.pill-abandoned')?.textContent).toContain('abandoned');
+    expect(row.querySelector('.unmerged-badge')).toBeNull();
+    expect(row.textContent).not.toContain('Redraft');
+    expect(row.textContent).not.toContain('Merge');
+    expect(row.textContent).not.toContain('Iterate');
+  });
+
+  it('renders a direct-fixed done ticket (no mission) as landed, not delivered', async () => {
+    vi.mocked(api.tickets).mockResolvedValueOnce([
+      makeTicket({ slug: 'fix-work-branch-isolation', title: 'Fix branch isolation', state: 'done' }),
+    ]);
+    vi.mocked(api.missions).mockResolvedValueOnce([]);
+
+    render(<PipelineView />);
+
+    const row = (await screen.findByText('fix-work-branch-isolation')).closest('li') as HTMLElement;
+    expect(row.querySelector('.pill-landed')?.textContent).toContain('landed');
+    expect(row.querySelector('.unmerged-badge')).toBeNull();
+    expect(row.textContent).not.toContain('Draft');
+    expect(row.textContent).not.toContain('Merge');
+  });
+
+  it('still offers Redraft for a genuinely failed mission/ticket', async () => {
+    vi.mocked(api.tickets).mockResolvedValueOnce([
+      makeTicket({ slug: 'fix-failed', title: 'Failed ticket', state: 'failed' }),
+    ]);
+    vi.mocked(api.missions).mockResolvedValueOnce([
+      makeMission({ id: 'm-failed', goal: 'Failed mission work', status: 'failed' }),
+    ]);
+
+    render(<PipelineView />);
+
+    const ticketRow = (await screen.findByText('fix-failed')).closest('li') as HTMLElement;
+    expect(ticketRow.querySelector('.pipeline-primary-action')?.textContent).toBe('Redraft');
+
+    const missionRow = (await screen.findByText('Failed mission work')).closest('li') as HTMLElement;
+    expect(missionRow.querySelector('.pipeline-primary-action')?.textContent).toBe('Redraft');
+  });
+
   it('fetches plan.md and shows the persisted estimate for a Reviewable row', async () => {
     vi.mocked(api.tickets).mockResolvedValueOnce([]);
     vi.mocked(api.missions).mockResolvedValueOnce([
@@ -260,6 +310,45 @@ describe('PipelineView', () => {
     expect(call.goal).toBe('Polish the thing');
     expect(call.context).toContain('Polish the thing');
     expect(call.context).toContain('Report: shipped the thing.');
+  });
+  it('renders a Delivered row report-fetch failure in a dedicated slot outside the row header, not overlapping the UNMERGED badge', async () => {
+    vi.mocked(api.tickets).mockResolvedValueOnce([]);
+    vi.mocked(api.missions).mockResolvedValueOnce([
+      makeMission({ id: 'm-broken-report', goal: 'Fetch will fail', status: 'complete', merged: false }),
+    ]);
+    vi.mocked(api.reportMd).mockRejectedValueOnce(new Error('network error'));
+    vi.mocked(api.diffStat).mockResolvedValueOnce({ diffStat: '1 file changed', baseSha: 'a', tip: 'b' });
+
+    render(<PipelineView />);
+
+    const row = (await screen.findByText('m-broken-report')).closest('li') as HTMLElement;
+    const errorEl = await waitFor(() => {
+      const el = row.querySelector('.pipeline-inline-error');
+      if (el === null) throw new Error('error slot not rendered yet');
+      return el;
+    });
+
+    expect(errorEl.textContent).toContain('Could not load report');
+    const pickerRow = row.querySelector('.picker-row') as HTMLElement;
+    expect(pickerRow.contains(errorEl)).toBe(false);
+    expect(errorEl.querySelector('.unmerged-badge')).toBeNull();
+    expect(pickerRow.contains(row.querySelector('.unmerged-badge'))).toBe(true);
+    // the error slot and the badge must not sit in the same inline row container
+    expect(errorEl.closest('.picker-row')).toBeNull();
+  });
+
+  it('renders the full mission id with no characters dropped when the title is absent', async () => {
+    vi.mocked(api.tickets).mockResolvedValueOnce([]);
+    const longId = 'm-2026-07-06-abcdef1234567890-extra-long-suffix-keeps-going';
+    vi.mocked(api.missions).mockResolvedValueOnce([
+      makeMission({ id: longId, goal: '', status: 'running' }),
+    ]);
+
+    render(<PipelineView />);
+
+    const idEl = await screen.findByText(longId);
+    expect(idEl.className).toContain('picker-id');
+    expect(idEl.textContent).toBe(longId);
   });
 });
 

@@ -14,7 +14,8 @@ export type PipelineStage =
   | 'running'
   | 'delivered'
   | 'landed'
-  | 'failed';
+  | 'failed'
+  | 'abandoned';
 
 /**
  * Minimal mission shape the stage derivation needs. `merged` is the
@@ -56,8 +57,9 @@ function stageFromMission(mission: WorkItemMission): PipelineStage {
   if (MISSION_TAIL_RUNNING.has(mission.status)) return 'running';
   if (mission.status === 'planning') return 'reviewable';
   if (mission.status === 'approved') return 'queued';
-  // abandoned
-  return 'failed';
+  // 'abandoned', plus a defensive 'deleted' (mission summaries cast status
+  // via `as`, so that string can arrive even though MissionStatus omits it).
+  return 'abandoned';
 }
 
 /** Pure derivation: WorkItem -> one of the nine canonical pipeline stages. */
@@ -82,8 +84,16 @@ export function pipelineStage(item: WorkItem): PipelineStage {
       return 'queued';
     case 'running':
       return 'running';
-    case 'done':
-      return item.mission?.merged === true ? 'landed' : 'delivered';
+    case 'done': {
+      const mission = item.mission;
+      // No live mission joined (direct-fixed) or the joined mission is dead
+      // (abandoned/deleted) — the ticket's work already landed; there's
+      // nothing left to merge.
+      if (mission === undefined || mission.status === 'abandoned' || (mission.status as string) === 'deleted') {
+        return 'landed';
+      }
+      return mission.merged === true ? 'landed' : 'delivered';
+    }
     case 'failed':
       return 'failed';
     default:
@@ -106,6 +116,7 @@ const PRIMARY_ACTIONS: Record<PipelineStage, ActionDescriptor | null> = {
   delivered: { label: 'Merge', secondary: 'Iterate' },
   landed: { label: 'Iterate' },
   failed: { label: 'Redraft' },
+  abandoned: null,
 };
 
 /** The one primary action (plus any secondary offer) documented per stage. */

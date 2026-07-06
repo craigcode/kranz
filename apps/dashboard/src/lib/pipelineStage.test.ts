@@ -33,8 +33,8 @@ describe('pipelineStage', () => {
     expect(pipelineStage(ticket('failed'))).toBe('failed');
   });
 
-  it('maps a done ticket with no joined mission to delivered', () => {
-    expect(pipelineStage(ticket('done'))).toBe('delivered');
+  it('maps a done ticket with no joined mission to landed (direct-fixed, terminal)', () => {
+    expect(pipelineStage(ticket('done'))).toBe('landed');
   });
 
   it('maps a complete ticketless mission with merged=false to delivered', () => {
@@ -75,8 +75,20 @@ describe('pipelineStage', () => {
     expect(pipelineStage(missionItem('approved'))).toBe('queued');
   });
 
-  it('maps ticketless mission status abandoned to failed', () => {
-    expect(pipelineStage(missionItem('abandoned'))).toBe('failed');
+  it('maps ticketless mission status abandoned to abandoned (inert)', () => {
+    expect(pipelineStage(missionItem('abandoned'))).toBe('abandoned');
+  });
+
+  it('maps ticketless mission status deleted to abandoned (inert)', () => {
+    expect(pipelineStage(missionItem('deleted'))).toBe('abandoned');
+  });
+
+  it('maps a done ticket joined to a deleted mission to landed', () => {
+    expect(pipelineStage(ticketWithMission('done', { status: 'deleted', merged: null }))).toBe('landed');
+  });
+
+  it('maps a done ticket joined to an abandoned mission to landed', () => {
+    expect(pipelineStage(ticketWithMission('done', { status: 'abandoned', merged: null }))).toBe('landed');
   });
 
   // Regression coverage: the ticket's own state governs its head stages.
@@ -121,5 +133,9 @@ describe('primaryAction', () => {
     expect(primaryAction('drafting')).toBeNull();
     expect(primaryAction('queued')).toBeNull();
     expect(primaryAction('running')).toBeNull();
+  });
+
+  it('has no primary action for abandoned (inert, dead row)', () => {
+    expect(primaryAction('abandoned')).toBeNull();
   });
 });
