@@ -424,6 +424,7 @@ fn plan() -> Plan {
             },
         ],
         command_grants: vec![],
+        touch_set: vec![],
     }
 }
 

@@ -167,6 +167,7 @@ mod tests {
                 base_sha: None,
                 mission_branch: "kranz/mission-m-1".into(),
                 command_grants: vec![],
+                touch_set: vec![],
             },
             runs: Default::default(),
             totals: TokenUsage::default(),
@@ -206,6 +207,7 @@ mod tests {
                 features: vec![],
             }],
             command_grants: vec![],
+            touch_set: vec![],
         };
         let out = classify(
             &ev(EventKind::PlanApproved {

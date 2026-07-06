@@ -915,6 +915,60 @@ async fn run_worker_builds_spec_and_uses_report_result() {
 }
 
 #[tokio::test]
+async fn run_worker_seeds_scratch_home_and_config_dir_worker_env_hygiene() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    let mut log = seeded_log(&p);
+    let cfg = MissionConfig::default();
+
+    let backend =
+        MockBackend::with_scripts(vec![MockScript::single_shot_json(&worker_report_json())]);
+    let base_sha = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+    run_worker(
+        &backend,
+        &mut log,
+        &p,
+        &cfg,
+        &feature(),
+        "ship the auth system",
+        "Auth",
+        None,
+        None,
+        Some(base_sha),
+        &[],
+    )
+    .await
+    .unwrap();
+
+    let specs = backend.started_specs();
+    let spec = &specs[0];
+
+    // Contract env is preserved alongside the scratch env.
+    assert_eq!(
+        spec.env.get("KRANZ_BASE_SHA").map(String::as_str),
+        Some(base_sha)
+    );
+
+    let home = spec
+        .env
+        .get("HOME")
+        .expect("worker spec.env must set a scratch HOME");
+    let config_dir = spec
+        .env
+        .get("CLAUDE_CONFIG_DIR")
+        .expect("worker spec.env must set a scratch CLAUDE_CONFIG_DIR");
+    assert!(
+        home.contains(&spec.session_id),
+        "scratch HOME must be unique per session id: {home}"
+    );
+    assert!(
+        config_dir.starts_with(home.as_str()),
+        "CLAUDE_CONFIG_DIR must live under the scratch HOME: {config_dir}"
+    );
+    assert!(config_dir.ends_with(".claude"));
+}
+
+#[tokio::test]
 async fn run_validator_builds_spec_permissions_and_parses_report() {
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
@@ -957,6 +1011,11 @@ async fn run_validator_builds_spec_permissions_and_parses_report() {
     assert!(
         !spec.env.contains_key("KRANZ_BASE_SHA"),
         "no base sha means no env var"
+    );
+    assert!(
+        !spec.env.contains_key("HOME") && !spec.env.contains_key("CLAUDE_CONFIG_DIR"),
+        "worker_env_hygiene scratch env is worker-role only — validator env must be unchanged: {:?}",
+        spec.env
     );
     assert_eq!(spec.model, cfg.validator_scrutiny.model);
     assert_eq!(spec.permission_mode.as_deref(), Some("default"));

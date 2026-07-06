@@ -9,7 +9,8 @@ use kranz_engine::backend::{
     AgentBackend, AgentEvent, AgentSession, PromptMode, SessionExit, SessionSpec,
 };
 use kranz_engine::backend_claude::{
-    build_args, discover_claude_binary, parse_stream_line, user_message_line, ClaudeBackend,
+    build_args, claude_min_config_entries, discover_claude_binary, parse_stream_line,
+    seed_worker_scratch_home, user_message_line, ClaudeBackend, CLAUDE_CREDENTIALS_ENTRY,
 };
 use kranz_engine::error::EngineError;
 use serde_json::json;
@@ -1035,4 +1036,114 @@ async fn real_single_shot() {
         "expected a successful Result containing KRANZ_OK"
     );
     assert_eq!(session.exit_status(), Some(SessionExit::Completed));
+}
+
+#[test]
+fn claude_min_set_is_non_empty_and_includes_credentials() {
+    let entries = claude_min_config_entries();
+    assert!(
+        !entries.is_empty(),
+        "minimal claude config entry set must not be empty"
+    );
+    assert!(
+        entries.contains(&CLAUDE_CREDENTIALS_ENTRY),
+        "minimal claude config entry set must include the credentials entry: {entries:?}"
+    );
+    assert_eq!(CLAUDE_CREDENTIALS_ENTRY, ".credentials.json");
+}
+
+// ---------------------------------------------------------------------------
+// Scratch worker HOME/config-dir seeding (worker env hygiene)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn seed_worker_scratch_home_worker_env_hygiene_copies_only_allowlisted_entries() {
+    let source = tempfile::tempdir().unwrap();
+    let source_config = source.path().join(".claude");
+    std::fs::create_dir_all(&source_config).unwrap();
+    std::fs::write(
+        source_config.join(CLAUDE_CREDENTIALS_ENTRY),
+        r#"{"claudeAiOauth":{"accessToken":"fixture-token"}}"#,
+    )
+    .unwrap();
+    // Non-allowlisted: must NOT be copied into the scratch config dir.
+    std::fs::write(source_config.join("settings.json"), "{}").unwrap();
+    std::fs::write(source_config.join("history.jsonl"), "not allowlisted").unwrap();
+    std::fs::create_dir_all(source_config.join("plugins")).unwrap();
+
+    let scratch = tempfile::tempdir().unwrap();
+    let (home, config_dir) = seed_worker_scratch_home(scratch.path(), Some(source.path()), None)
+        .expect("seeding must succeed");
+
+    assert_eq!(home, scratch.path().join("home"));
+    assert_eq!(config_dir, home.join(".claude"));
+    assert!(
+        config_dir.join(CLAUDE_CREDENTIALS_ENTRY).is_file(),
+        "allowlisted credentials entry must be copied"
+    );
+
+    let mut entries: Vec<String> = std::fs::read_dir(&config_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    entries.sort();
+    assert_eq!(
+        entries,
+        vec![CLAUDE_CREDENTIALS_ENTRY.to_string()],
+        "scratch config dir must contain exactly the allowlisted entries and nothing else: {entries:?}"
+    );
+}
+
+#[test]
+fn seed_worker_scratch_home_worker_env_hygiene_tolerates_missing_source_home() {
+    let source = tempfile::tempdir().unwrap(); // no .claude dir under here at all
+    let scratch = tempfile::tempdir().unwrap();
+
+    let (_home, config_dir) = seed_worker_scratch_home(scratch.path(), Some(source.path()), None)
+        .expect("seeding must succeed even with nothing to copy");
+
+    assert!(
+        std::fs::read_dir(&config_dir).unwrap().next().is_none(),
+        "no source entries to copy means an empty (but present) scratch config dir"
+    );
+
+    // No real_home at all (e.g. HOME unset): still produces an empty, usable
+    // scratch config dir rather than erroring.
+    let scratch2 = tempfile::tempdir().unwrap();
+    let (_home2, config_dir2) = seed_worker_scratch_home(scratch2.path(), None, None)
+        .expect("seeding without a source home");
+    assert!(std::fs::read_dir(&config_dir2).unwrap().next().is_none());
+}
+
+#[test]
+fn seed_worker_scratch_home_worker_env_hygiene_config_dir_override_takes_precedence() {
+    let real_home = tempfile::tempdir().unwrap();
+    let real_home_config = real_home.path().join(".claude");
+    std::fs::create_dir_all(&real_home_config).unwrap();
+    std::fs::write(
+        real_home_config.join(CLAUDE_CREDENTIALS_ENTRY),
+        "home-creds",
+    )
+    .unwrap();
+
+    let relocated_config = tempfile::tempdir().unwrap();
+    std::fs::write(
+        relocated_config.path().join(CLAUDE_CREDENTIALS_ENTRY),
+        "relocated-creds",
+    )
+    .unwrap();
+
+    let scratch = tempfile::tempdir().unwrap();
+    let (_home, config_dir) = seed_worker_scratch_home(
+        scratch.path(),
+        Some(real_home.path()),
+        Some(relocated_config.path()),
+    )
+    .expect("seeding must succeed");
+
+    let copied = std::fs::read_to_string(config_dir.join(CLAUDE_CREDENTIALS_ENTRY)).unwrap();
+    assert_eq!(
+        copied, "relocated-creds",
+        "an explicit CLAUDE_CONFIG_DIR override must win over $HOME/.claude as the copy source"
+    );
 }

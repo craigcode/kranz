@@ -59,6 +59,7 @@ fn plan() -> Plan {
             },
         ],
         command_grants: vec![],
+        touch_set: vec![],
     }
 }
 
@@ -551,6 +552,7 @@ fn fix_cycles_increment_once_per_validation_round() {
                     severity: "major".into(),
                     evidence: "it broke".into(),
                     suggested_fix: "fix it".into(),
+                    class: String::new(),
                 },
             },
         ),
@@ -841,6 +843,37 @@ fn plan_approved_copies_command_grants_into_mission() {
         },
     ]);
     assert_eq!(state.mission.command_grants, vec!["gc lint".to_string()]);
+}
+
+#[test]
+fn mission_touch_set_round_trips_through_serde() {
+    let mut touchy_plan = plan();
+    touchy_plan.touch_set = vec!["src/**/*.rs".to_string()];
+    let state = fold_kinds(vec![
+        created(),
+        EventKind::PlanApproved {
+            plan: touchy_plan,
+            base_sha: None,
+        },
+    ]);
+    let json = serde_json::to_value(&state.mission).unwrap();
+    assert_eq!(json["touchSet"], serde_json::json!(["src/**/*.rs"]));
+    let round_tripped: Mission = serde_json::from_value(json).unwrap();
+    assert_eq!(round_tripped.touch_set, state.mission.touch_set);
+}
+
+#[test]
+fn plan_approved_copies_touch_set_into_mission() {
+    let mut touchy_plan = plan();
+    touchy_plan.touch_set = vec!["src/**/*.rs".to_string()];
+    let state = fold_kinds(vec![
+        created(),
+        EventKind::PlanApproved {
+            plan: touchy_plan,
+            base_sha: None,
+        },
+    ]);
+    assert_eq!(state.mission.touch_set, vec!["src/**/*.rs".to_string()]);
 }
 
 #[test]
@@ -1275,6 +1308,7 @@ fn prop_plan() -> Plan {
             },
         ],
         command_grants: vec![],
+        touch_set: vec![],
     }
 }
 
@@ -1379,6 +1413,7 @@ fn interpret(actions: &[Action]) -> Vec<Event> {
                         severity: "minor".into(),
                         evidence: "e".into(),
                         suggested_fix: String::new(),
+                        class: String::new(),
                     },
                 }
             }
@@ -1461,6 +1496,7 @@ fn validation_finding_accepts_reserved_engine_run_id() {
             severity: "major".to_string(),
             evidence: "command failed".to_string(),
             suggested_fix: String::new(),
+            class: String::new(),
         },
     };
 

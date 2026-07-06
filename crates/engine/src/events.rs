@@ -260,6 +260,7 @@ mod tests {
             validation_contract: vec![],
             milestones: vec![],
             command_grants: vec![],
+            touch_set: vec![],
         }
     }
 
@@ -296,6 +297,31 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn touch_set_backcompat_defaults_empty() {
+        // A Plan JSON that omits touchSet deserializes to an empty vec.
+        let plan_json = r#"{
+            "goal": "g",
+            "validationContract": [],
+            "milestones": []
+        }"#;
+        let plan: Plan = serde_json::from_str(plan_json).unwrap();
+        assert!(plan.touch_set.is_empty());
+    }
+
+    #[test]
+    fn touch_set_round_trips_through_serde() {
+        let mut plan = sample_plan();
+        plan.touch_set = vec!["src/**/*.rs".to_string(), "!src/generated/**".to_string()];
+        let json = serde_json::to_value(&plan).unwrap();
+        assert_eq!(
+            json["touchSet"],
+            serde_json::json!(["src/**/*.rs", "!src/generated/**"])
+        );
+        let round_tripped: Plan = serde_json::from_value(json).unwrap();
+        assert_eq!(round_tripped.touch_set, plan.touch_set);
     }
 
     #[test]

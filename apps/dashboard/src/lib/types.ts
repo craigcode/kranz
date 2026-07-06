@@ -141,6 +141,7 @@ export interface Plan {
   goal: string;
   validationContract: Assertion[];
   milestones: PlanMilestone[];
+  touchSet?: string[];
 }
 
 export interface PlanMilestone {
@@ -177,6 +178,7 @@ export interface Finding {
   severity: string; // "critical" | "major" | "minor"
   evidence: string;
   suggestedFix?: string;
+  class?: string;
 }
 
 export interface WorkerRun {
