@@ -20,6 +20,7 @@ pub mod types;
 
 pub mod config;
 pub mod cost;
+pub mod deps;
 pub mod event_log;
 pub mod git_ops;
 pub mod lessons;

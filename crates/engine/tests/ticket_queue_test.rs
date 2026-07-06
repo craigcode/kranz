@@ -1,8 +1,11 @@
 //! Integration tests for the ticket parser + status files (M2.75 backlog) and
 //! the per-repo priority execution queue.
 
+use kranz_engine::deps;
+use kranz_engine::events::{Event, EventKind};
 use kranz_engine::queue::{self, QueueEntry};
 use kranz_engine::ticket::{Schedule, Ticket, TicketState};
+use kranz_engine::types::MissionConfig;
 use std::fs;
 use std::path::Path;
 
@@ -66,6 +69,8 @@ fn parses_full_frontmatter_and_all_sections() {
     // raw_body carries the whole body after the frontmatter fence.
     assert!(t.raw_body.contains("## Goal"));
     assert!(!t.raw_body.contains("title:"));
+    // No `blocked-by` key: tickets predating the field parse unchanged.
+    assert!(t.blocked_by.is_empty());
 }
 
 #[test]
