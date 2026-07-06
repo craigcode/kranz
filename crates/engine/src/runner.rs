@@ -453,7 +453,8 @@ pub fn worker_report_schema() -> serde_json::Value {
             "testEvidence": { "type": "string" },
             "dependenciesAdded": { "type": "array", "items": { "type": "string" } },
             "knownGaps": { "type": "array", "items": { "type": "string" } },
-            "commits": { "type": "array", "items": { "type": "string" } }
+            "commits": { "type": "array", "items": { "type": "string" } },
+            "commandsRun": { "type": "array", "items": { "type": "string" } }
         }
     })
 }

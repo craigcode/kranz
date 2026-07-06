@@ -32,12 +32,14 @@ Your very last message must be **ONLY** the WorkerReport JSON — no prose befor
   "testEvidence": "actual test-runner output proving the criteria tests pass — paste it, do not paraphrase",
   "dependenciesAdded": ["every dependency you added, with version"],
   "knownGaps": ["anything the spec asked for that is not done or not verified"],
-  "commits": ["sha and subject of each commit you made"]
+  "commits": ["sha and subject of each commit you made"],
+  "commandsRun": ["exact shell commands you ran to verify your work, e.g. cargo test -p kranz-engine foo, gc lint"]
 }
 ```
 
 - `result` is `"pass"` only when every validation criterion has a passing test and lint/build are clean. Otherwise `"partial"` (progress committed, gaps listed) or `"fail"` (approach unworkable — explain in `summary`).
 - `testEvidence` is the load-bearing field. The orchestrator distrusts claims without it.
+- `commandsRun` must list the exact verification commands you executed (test/build/lint invocations) so a validator can re-run them independently to confirm your claim.
 
 ---
 

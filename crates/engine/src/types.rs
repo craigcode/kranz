@@ -270,6 +270,8 @@ pub struct WorkerReport {
     pub known_gaps: Vec<String>,
     #[serde(default)]
     pub commits: Vec<String>,
+    #[serde(default)]
+    pub commands_run: Vec<String>,
 }
 
 /// A finding emitted by a validator (scrutiny or functional).
@@ -434,4 +436,16 @@ pub enum ControlCommand {
     Resume,
     Msg { text: String, interrupt: bool },
     ConfigChange { patch: serde_json::Value },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commands_run_backcompat_defaults_empty() {
+        let json = r#"{"result": "pass", "summary": "did the thing"}"#;
+        let report: WorkerReport = serde_json::from_str(json).unwrap();
+        assert!(report.commands_run.is_empty());
+    }
 }
