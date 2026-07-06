@@ -59,6 +59,9 @@ pub struct Ticket {
     pub context: String,
     pub scoping_answers: Vec<String>,
     pub acceptance_hints: Vec<String>,
+    /// Slugs of tickets that must reach a Complete mission before this one
+    /// can be approved (`blocked-by: [a, b]` frontmatter).
+    pub blocked_by: Vec<String>,
     /// The full markdown body (everything after the frontmatter block).
     pub raw_body: String,
 }
@@ -132,6 +135,7 @@ impl Ticket {
         let mut repo_refs: Vec<String> = Vec::new();
         let mut schedule = Schedule::Once;
         let mut max_budget_usd: Option<f64> = None;
+        let mut blocked_by: Vec<String> = Vec::new();
 
         for (key, value) in front {
             match key.as_str() {
@@ -146,6 +150,7 @@ impl Ticket {
                 // Both spellings — frontmatter is kebab-case per the design doc,
                 // but tolerate the camelCase a hand-editor might type.
                 "repo-refs" | "reporefs" => repo_refs = value.list(),
+                "blocked-by" | "blockedby" => blocked_by = value.list(),
                 "schedule" => schedule = Schedule::parse(&value.scalar()),
                 "maxbudgetusd" | "max-budget-usd" => {
                     if let Ok(b) = value.scalar().parse::<f64>() {
@@ -181,6 +186,7 @@ impl Ticket {
             context,
             scoping_answers: sections.scoping_answers,
             acceptance_hints: sections.acceptance_hints,
+            blocked_by,
             raw_body: body,
         })
     }

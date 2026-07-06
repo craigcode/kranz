@@ -11,7 +11,8 @@
 use clap::Parser;
 use kranz_cli::backlog::{
     self, draft_decision, next_work_action, render_queue, render_ticket_list, render_ticket_show,
-    ticket_state_for_mission, ticket_template, DraftDecision, TicketRow, WorkAction,
+    ticket_state_for_mission, ticket_template, work_skip_for_failed_blocker, DraftDecision,
+    TicketRow, WorkAction,
 };
 use kranz_cli::cli::{Cli, Command, TicketCommand};
 use kranz_engine::orchestrator::PlanRequest;
@@ -124,10 +125,30 @@ fn parses_ticket_approve_with_mission() {
     .unwrap();
     match cli.command {
         Command::Ticket {
-            command: TicketCommand::Approve { slug, mission },
+            command:
+                TicketCommand::Approve {
+                    slug,
+                    mission,
+                    force,
+                },
         } => {
             assert_eq!(slug, "slug");
             assert_eq!(mission.as_deref(), Some("m-abc123"));
+            assert!(!force);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn parses_ticket_approve_with_force() {
+    let cli = Cli::try_parse_from(["kranz", "ticket", "approve", "slug", "--force"]).unwrap();
+    match cli.command {
+        Command::Ticket {
+            command: TicketCommand::Approve { slug, force, .. },
+        } => {
+            assert_eq!(slug, "slug");
+            assert!(force);
         }
         other => panic!("unexpected: {other:?}"),
     }
@@ -477,7 +498,7 @@ fn ticket_approve_enqueues_review_ticket_and_sets_queued() {
     Ticket::write_state(repo, "approve-me", TicketState::Review, None).unwrap();
 
     // Explicit --mission avoids needing a real drafted mission on disk.
-    let code = backlog::cmd_ticket_approve(repo, "approve-me", Some("m-explicit")).unwrap();
+    let code = backlog::cmd_ticket_approve(repo, "approve-me", Some("m-explicit"), false).unwrap();
     assert_eq!(code, 0);
 
     assert_eq!(Ticket::read_state(repo, "approve-me"), TicketState::Queued);
@@ -494,7 +515,202 @@ fn ticket_approve_refuses_non_review_ticket() {
     let repo = tmp.path();
     backlog::cmd_ticket_new(repo, "fresh", "Fresh", None).unwrap();
     // Still New → cannot approve.
-    let err = backlog::cmd_ticket_approve(repo, "fresh", Some("m-x")).unwrap_err();
+    let err = backlog::cmd_ticket_approve(repo, "fresh", Some("m-x"), false).unwrap_err();
     assert!(err.to_string().contains("REVIEW"));
     assert!(queue::list(repo).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// ticket approve — blocked-by gating (`blocked_by_approve_*`)
+// ---------------------------------------------------------------------------
+
+/// Writes a minimal events.jsonl for `mission_id` whose fold reaches
+/// `MissionStatus::Complete` (MissionCreated then MissionCompleted), or stops
+/// after MissionCreated when `complete` is false (leaves it Drafting).
+/// Mirrors the twin helper in `engine/tests/ticket_queue_test.rs`.
+fn write_mission_events(root: &Path, mission_id: &str, complete: bool) {
+    use kranz_engine::events::{Event, EventKind};
+    use kranz_engine::types::MissionConfig;
+
+    let paths = kranz_engine::paths::MissionPaths::new(root, mission_id);
+    let dir = paths.events_file().parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let ts = chrono::Utc::now();
+    let mut events = vec![Event {
+        seq: 1,
+        ts,
+        mission_id: mission_id.to_string(),
+        kind: EventKind::MissionCreated {
+            goal: "do the thing".to_string(),
+            base_branch: "main".to_string(),
+            mission_branch: format!("kranz/mission-{mission_id}"),
+            config: MissionConfig::default(),
+        },
+    }];
+    if complete {
+        events.push(Event {
+            seq: 2,
+            ts,
+            mission_id: mission_id.to_string(),
+            kind: EventKind::MissionCompleted {},
+        });
+    }
+
+    let body: String = events
+        .iter()
+        .map(|e| serde_json::to_string(e).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    std::fs::write(paths.events_file(), body).unwrap();
+}
+
+/// Parks a REVIEW ticket with an optional `blocked-by` list, matching the
+/// state `draft` (no `--yes`) leaves behind.
+fn park_for_review(repo: &Path, slug: &str, blocked_by: &[&str]) {
+    let body = if blocked_by.is_empty() {
+        format!("---\ntitle: {slug}\n---\nbody\n")
+    } else {
+        format!(
+            "---\ntitle: {slug}\nblocked-by: [{}]\n---\nbody\n",
+            blocked_by.join(", ")
+        )
+    };
+    write_ticket(repo, slug, &body);
+    Ticket::write_state(repo, slug, TicketState::Review, None).unwrap();
+}
+
+#[test]
+fn blocked_by_approve_refuses_and_names_unsatisfied_blocker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+
+    // The blocker exists as a ticket with a recorded mission that hasn't
+    // reached Complete.
+    write_ticket(repo, "dep", "---\ntitle: dep\n---\nbody\n");
+    Ticket::record_mission(repo, "dep", "m-dep").unwrap();
+    write_mission_events(repo, "m-dep", false);
+
+    park_for_review(repo, "blocked", &["dep"]);
+
+    let err = backlog::cmd_ticket_approve(repo, "blocked", Some("m-blocked"), false).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("dep"),
+        "message should name the blocker: {msg}"
+    );
+    assert!(
+        msg.contains("not Complete"),
+        "message should explain why: {msg}"
+    );
+    // Refused: ticket stays Review, nothing queued.
+    assert_eq!(Ticket::read_state(repo, "blocked"), TicketState::Review);
+    assert!(queue::list(repo).is_empty());
+}
+
+#[test]
+fn blocked_by_approve_force_overrides_unsatisfied_blocker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+
+    write_ticket(repo, "dep", "---\ntitle: dep\n---\nbody\n");
+    Ticket::record_mission(repo, "dep", "m-dep").unwrap();
+    write_mission_events(repo, "m-dep", false);
+
+    park_for_review(repo, "blocked", &["dep"]);
+
+    let code = backlog::cmd_ticket_approve(repo, "blocked", Some("m-blocked"), true).unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(Ticket::read_state(repo, "blocked"), TicketState::Queued);
+    let queued = queue::list(repo);
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].mission_id, "m-blocked");
+}
+
+#[test]
+fn blocked_by_approve_succeeds_without_force_once_blocker_complete() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+
+    write_ticket(repo, "dep", "---\ntitle: dep\n---\nbody\n");
+    Ticket::record_mission(repo, "dep", "m-dep").unwrap();
+    write_mission_events(repo, "m-dep", true);
+
+    park_for_review(repo, "blocked", &["dep"]);
+
+    let code = backlog::cmd_ticket_approve(repo, "blocked", Some("m-blocked"), false).unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(Ticket::read_state(repo, "blocked"), TicketState::Queued);
+}
+
+#[test]
+fn blocked_by_approve_refuses_cycle_with_path_even_with_force() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+
+    // a <-> b cycle: park "a" for review with blocked-by b, and b blocked-by a.
+    park_for_review(repo, "a", &["b"]);
+    write_ticket(repo, "b", "---\nblocked-by: [a]\n---\nbody\n");
+
+    for force in [false, true] {
+        let err = backlog::cmd_ticket_approve(repo, "a", Some("m-a"), force).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("blocked-by cycle: a -> b -> a"),
+            "message should include the cycle path: {msg}"
+        );
+    }
+    // Refused in both cases: ticket stays Review, nothing queued.
+    assert_eq!(Ticket::read_state(repo, "a"), TicketState::Review);
+    assert!(queue::list(repo).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// work dispatcher — work-time blocker re-check (`work_skips_failed_blocker`)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn work_skips_failed_blocker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+
+    // Batch-approval queued both "dep" and "blocked" before "dep"'s mission
+    // ran; by the time `work` gets to "blocked", "dep" has since failed.
+    write_ticket(repo, "dep", "---\ntitle: dep\n---\nbody\n");
+    Ticket::record_mission(repo, "dep", "m-dep").unwrap();
+    Ticket::write_state(repo, "dep", TicketState::Failed, None).unwrap();
+
+    write_ticket(
+        repo,
+        "blocked",
+        "---\ntitle: blocked\nblocked-by: [dep]\n---\nbody\n",
+    );
+    Ticket::write_state(repo, "blocked", TicketState::Queued, None).unwrap();
+
+    let skip = work_skip_for_failed_blocker(repo, "blocked").unwrap();
+    assert_eq!(skip, Some("dep".to_string()));
+}
+
+#[test]
+fn work_does_not_skip_when_blocker_merely_incomplete() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+
+    // "dep" is still Running (not yet Complete, but not Failed either) — the
+    // required behavior only skips on a failed blocker, never on a merely
+    // not-yet-complete one.
+    write_ticket(repo, "dep", "---\ntitle: dep\n---\nbody\n");
+    Ticket::record_mission(repo, "dep", "m-dep").unwrap();
+    Ticket::write_state(repo, "dep", TicketState::Running, None).unwrap();
+
+    write_ticket(
+        repo,
+        "blocked",
+        "---\ntitle: blocked\nblocked-by: [dep]\n---\nbody\n",
+    );
+    Ticket::write_state(repo, "blocked", TicketState::Queued, None).unwrap();
+
+    let skip = work_skip_for_failed_blocker(repo, "blocked").unwrap();
+    assert_eq!(skip, None);
 }

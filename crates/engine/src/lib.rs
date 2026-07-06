@@ -20,6 +20,7 @@ pub mod types;
 
 pub mod config;
 pub mod cost;
+pub mod deps;
 pub mod event_log;
 pub mod git_ops;
 pub mod lessons;
@@ -33,6 +34,11 @@ pub mod backend_claude;
 pub mod backend_mock;
 pub mod control;
 pub mod digest;
+pub mod draft;
 pub mod orchestrator;
 pub mod permissions;
 pub mod runner;
+
+// Re-exported at the crate root so callers (and tests) that only need to
+// inject a scripted backend don't need the full `backend_mock` path.
+pub use backend_mock::MockBackend;

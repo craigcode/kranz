@@ -35,11 +35,14 @@ use kranz_engine::backend::AgentBackend;
 use kranz_engine::backend_claude::ClaudeBackend;
 use kranz_engine::config;
 use kranz_engine::cost::{self, CostEstimate};
+use kranz_engine::deps;
+use kranz_engine::draft::{drive_draft, DraftOutcome};
 use kranz_engine::error::EngineError;
 use kranz_engine::event_log::{EventLog, LockForce};
 use kranz_engine::orchestrator::{MissionEngine, PlanRequest};
 use kranz_engine::paths::MissionPaths;
-use kranz_engine::types::{MissionStatus, Plan};
+use kranz_engine::ticket::Ticket;
+use kranz_engine::types::{MissionConfig, MissionStatus, Plan};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -163,6 +166,118 @@ impl MissionHost {
             .insert(id.clone(), new_planning(new_cell(Box::new(engine))));
         self.ensure_sweeper_started();
         Ok(id)
+    }
+
+    /// Entry point any surface (REST, Slack, CLI-over-HTTP) can call to draft
+    /// a backlog ticket non-interactively: validate the slug, load the ticket,
+    /// create its planning mission through this host — so the create path
+    /// registers it in `missions` and its lifecycle events stream over
+    /// `GET /api/missions/:id/ws` exactly like `POST /api/missions` — then run
+    /// [`drive_draft`] (roadmap f-1-1) to completion against that hosted
+    /// engine. The engine is dropped and the registry entry removed once the
+    /// draft turn ends (mirroring [`run_to_end`]'s drop-then-remove ordering)
+    /// so the mission stays observable/resumable afterward; no operator
+    /// checkout restoration happens here — a headless server has no checkout
+    /// to restore.
+    pub async fn draft(&self, slug: &str, then_enqueue: bool) -> Result<DraftOutcome, ApiError> {
+        Ticket::ensure_valid_slug(slug)?;
+        let ticket_path = Ticket::tickets_dir(&self.repo_root).join(format!("{slug}.md"));
+        if !ticket_path.is_file() {
+            return Err(ApiError::not_found(format!("ticket '{slug}' not found")));
+        }
+        let ticket = Ticket::load(&ticket_path)?;
+
+        let cfg = config_for_ticket(config::load(&self.repo_root)?, &ticket);
+        let backend = self.backend(cfg.claude_binary.as_deref()).await?;
+        let engine =
+            MissionEngine::create(backend, self.repo_root.clone(), &ticket.mission_goal(), cfg)?;
+        let id = engine.mission_id().to_string();
+        let cell = new_cell(Box::new(engine));
+        self.missions
+            .lock()
+            .expect("missions registry lock")
+            .insert(id.clone(), new_planning(Arc::clone(&cell)));
+        self.ensure_sweeper_started();
+
+        let drive_result = {
+            let mut engine = cell.lock().await;
+            drive_draft(&mut engine, &self.repo_root, &ticket, then_enqueue).await
+        };
+
+        // Drop the engine (flushes the log, frees the single-writer lock),
+        // then remove the registry entry — from that moment the mission is
+        // observable and resumable anywhere, same as `run_to_end`.
+        self.missions
+            .lock()
+            .expect("missions registry lock")
+            .remove(&id);
+        drop(cell);
+
+        Ok(drive_result?.outcome)
+    }
+
+    /// `POST /api/tickets/:slug/draft`: fire-and-observe twin of
+    /// [`Self::draft`] for the REST surface — a draft can run for a while (a
+    /// planning conversation with the orchestrator), so this creates the
+    /// planning mission SYNCHRONOUSLY (registering it exactly like `create`,
+    /// so its lifecycle streams over `GET /api/missions/:id/ws` immediately),
+    /// then spawns [`drive_draft`] as a background task and returns the
+    /// mission id right away. The final outcome (Review vs NeedsContext) is
+    /// read back later via `GET /api/tickets/:slug`.
+    pub async fn draft_async(&self, slug: &str, then_enqueue: bool) -> Result<String, ApiError> {
+        Ticket::ensure_valid_slug(slug)?;
+        let ticket_path = Ticket::tickets_dir(&self.repo_root).join(format!("{slug}.md"));
+        if !ticket_path.is_file() {
+            return Err(ApiError::not_found(format!("ticket '{slug}' not found")));
+        }
+        let ticket = Ticket::load(&ticket_path)?;
+
+        let cfg = config_for_ticket(config::load(&self.repo_root)?, &ticket);
+        let backend = self.backend(cfg.claude_binary.as_deref()).await?;
+        let engine =
+            MissionEngine::create(backend, self.repo_root.clone(), &ticket.mission_goal(), cfg)?;
+        let id = engine.mission_id().to_string();
+        let cell = new_cell(Box::new(engine));
+        self.missions
+            .lock()
+            .expect("missions registry lock")
+            .insert(id.clone(), new_planning(Arc::clone(&cell)));
+        self.ensure_sweeper_started();
+
+        let repo_root = self.repo_root.clone();
+        let missions = Arc::clone(&self.missions);
+        let mission_id = id.clone();
+        tokio::spawn(async move {
+            let drive_result = {
+                let mut engine = cell.lock().await;
+                drive_draft(&mut engine, &repo_root, &ticket, then_enqueue).await
+            };
+            // Same drop-then-remove ordering as `draft`/`run_to_end`: the
+            // engine flushes its log and frees the single-writer lock before
+            // the mission stops being "hosted here".
+            missions
+                .lock()
+                .expect("missions registry lock")
+                .remove(&mission_id);
+            drop(cell);
+            if let Err(e) = drive_result {
+                tracing::error!(mission = %mission_id, error = %e, "hosted ticket draft errored");
+            }
+        });
+
+        Ok(id)
+    }
+
+    /// `POST /api/tickets/:slug/approve`: the shared `kranz_engine::deps`
+    /// gate (cycle detection, unsatisfied-blocker refusal) plus the
+    /// enqueue side effects — the exact same core [`kranz_cli`]'s `kranz
+    /// ticket approve` calls, so the CLI and REST surfaces can never drift.
+    pub fn approve_ticket(
+        &self,
+        slug: &str,
+        force: bool,
+    ) -> Result<deps::ApprovedTicket, ApiError> {
+        deps::approve_ticket(&self.repo_root, slug, None, force).map_err(ApiError::from)
     }
 
     /// `POST /api/missions/:id/planning/turn`: one conversational turn. A
@@ -671,6 +786,46 @@ async fn run_to_end(
         .remove(&mission_id);
 }
 
+/// Apply a ticket's per-ticket budget override to the orchestrator role
+/// (mirrors `kranz_cli::backlog::config_for_ticket`), so draft spend is
+/// bounded by the ticket's `maxBudgetUsd` when it sets one.
+fn config_for_ticket(mut cfg: MissionConfig, ticket: &Ticket) -> MissionConfig {
+    if let Some(budget) = ticket.max_budget_usd {
+        cfg.orchestrator.max_budget_usd = Some(budget);
+    }
+    cfg
+}
+
+/// [`DraftOutcome`] as protocol camelCase JSON (the engine type is a plain
+/// contract enum without serde derives) — the shape a REST `draft` handler
+/// hands back. Not yet wired to a route (that's a later feature); kept here
+/// so [`MissionHost::draft`]'s result has a ready serialization.
+#[allow(dead_code)]
+fn draft_outcome_json(outcome: &DraftOutcome) -> Value {
+    match outcome {
+        DraftOutcome::ParkedForReview {
+            mission_id,
+            mission_branch,
+        } => json!({
+            "outcome": "parkedForReview",
+            "missionId": mission_id,
+            "missionBranch": mission_branch,
+        }),
+        DraftOutcome::Enqueued { mission_id } => json!({
+            "outcome": "enqueued",
+            "missionId": mission_id,
+        }),
+        DraftOutcome::NeedsContext {
+            mission_id,
+            questions,
+        } => json!({
+            "outcome": "needsContext",
+            "missionId": mission_id,
+            "questions": questions,
+        }),
+    }
+}
+
 fn new_cell(engine: Box<MissionEngine>) -> EngineCell {
     Arc::new(tokio::sync::Mutex::new(engine))
 }
@@ -962,7 +1117,7 @@ fn valid_id(server: &ServerState, id: &str) -> Result<String, ApiError> {
     Ok(id.to_string())
 }
 
-fn parse_body(body: &Bytes) -> Result<Value, ApiError> {
+pub(crate) fn parse_body(body: &Bytes) -> Result<Value, ApiError> {
     if body.is_empty() {
         return Ok(json!({}));
     }

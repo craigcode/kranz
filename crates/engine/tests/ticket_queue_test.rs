@@ -1,8 +1,11 @@
 //! Integration tests for the ticket parser + status files (M2.75 backlog) and
 //! the per-repo priority execution queue.
 
+use kranz_engine::deps;
+use kranz_engine::events::{Event, EventKind};
 use kranz_engine::queue::{self, QueueEntry};
 use kranz_engine::ticket::{Schedule, Ticket, TicketState};
+use kranz_engine::types::MissionConfig;
 use std::fs;
 use std::path::Path;
 
@@ -66,6 +69,8 @@ fn parses_full_frontmatter_and_all_sections() {
     // raw_body carries the whole body after the frontmatter fence.
     assert!(t.raw_body.contains("## Goal"));
     assert!(!t.raw_body.contains("title:"));
+    // No `blocked-by` key: tickets predating the field parse unchanged.
+    assert!(t.blocked_by.is_empty());
 }
 
 #[test]
@@ -455,6 +460,147 @@ fn ordinary_slugs_still_work() {
     for good in ["rate-limit", "fix_f1", "a1", "v0.1.0-notes"] {
         assert!(Ticket::valid_slug(good), "must accept {good:?}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// blocked-by dependency primitive
+// ---------------------------------------------------------------------------
+
+/// Writes a minimal events.jsonl for `mission_id` whose fold reaches
+/// `MissionStatus::Complete` (MissionCreated then MissionCompleted), or stops
+/// after MissionCreated when `complete` is false (leaves it Drafting).
+fn write_mission_events(root: &Path, mission_id: &str, complete: bool) {
+    let paths = kranz_engine::paths::MissionPaths::new(root, mission_id);
+    let dir = paths.events_file().parent().unwrap().to_path_buf();
+    fs::create_dir_all(&dir).unwrap();
+
+    let ts = chrono::Utc::now();
+    let mut events = vec![Event {
+        seq: 1,
+        ts,
+        mission_id: mission_id.to_string(),
+        kind: EventKind::MissionCreated {
+            goal: "do the thing".to_string(),
+            base_branch: "main".to_string(),
+            mission_branch: format!("kranz/mission-{mission_id}"),
+            config: MissionConfig::default(),
+        },
+    }];
+    if complete {
+        events.push(Event {
+            seq: 2,
+            ts,
+            mission_id: mission_id.to_string(),
+            kind: EventKind::MissionCompleted {},
+        });
+    }
+
+    let body: String = events
+        .iter()
+        .map(|e| serde_json::to_string(e).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(paths.events_file(), body).unwrap();
+}
+
+#[test]
+fn blocked_by_frontmatter_parses_into_list() {
+    let md = "---\ntitle: needs review\nblocked-by: [a, b]\n---\nbody\n";
+    let t = Ticket::parse("needs-review", md).unwrap();
+    assert_eq!(t.blocked_by, vec!["a", "b"]);
+}
+
+#[test]
+fn blocked_by_accepts_the_no_hyphen_key_alias() {
+    let md = "---\nblockedby: [x]\n---\nbody\n";
+    let t = Ticket::parse("aliased", md).unwrap();
+    assert_eq!(t.blocked_by, vec!["x"]);
+}
+
+#[test]
+fn blocked_by_unsatisfied_for_every_non_complete_or_missing_state() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let dir = Ticket::tickets_dir(root);
+    fs::create_dir_all(&dir).unwrap();
+
+    // slug's ticket lists three blockers: not-complete, no-mission, missing.
+    write_ticket(
+        &dir,
+        "slug",
+        "---\nblocked-by: [not-complete, no-mission, missing]\n---\nbody\n",
+    );
+    // A ticket file for the blockers that exist on disk (missing has none).
+    write_ticket(&dir, "not-complete", "---\ntitle: nc\n---\nbody\n");
+    write_ticket(&dir, "no-mission", "---\ntitle: nm\n---\nbody\n");
+
+    // not-complete: recorded mission exists but hasn't reached Complete.
+    Ticket::record_mission(root, "not-complete", "m-not-complete").unwrap();
+    write_mission_events(root, "m-not-complete", false);
+
+    // no-mission: no recorded mission at all.
+    // missing: no ticket file at all.
+
+    let unsatisfied = deps::unsatisfied_blockers(root, "slug").unwrap();
+    assert_eq!(
+        unsatisfied,
+        vec!["not-complete", "no-mission", "missing"],
+        "every non-Complete/missing blocker is unsatisfied"
+    );
+
+    // Now fold not-complete's mission to Complete and re-record the others.
+    write_mission_events(root, "m-not-complete", true);
+    Ticket::record_mission(root, "no-mission", "m-no-mission").unwrap();
+    write_mission_events(root, "m-no-mission", true);
+    write_ticket(&dir, "missing", "---\ntitle: now-exists\n---\nbody\n");
+    Ticket::record_mission(root, "missing", "m-missing").unwrap();
+    write_mission_events(root, "m-missing", true);
+
+    let unsatisfied = deps::unsatisfied_blockers(root, "slug").unwrap();
+    assert!(
+        unsatisfied.is_empty(),
+        "empty once every blocker's recorded mission is Complete, got {unsatisfied:?}"
+    );
+}
+
+#[test]
+fn blocked_by_cycle_detects_direct_and_transitive_cycles_none_for_acyclic() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let dir = Ticket::tickets_dir(root);
+    fs::create_dir_all(&dir).unwrap();
+
+    // Direct a<->b cycle.
+    write_ticket(&dir, "a", "---\nblocked-by: [b]\n---\nbody\n");
+    write_ticket(&dir, "b", "---\nblocked-by: [a]\n---\nbody\n");
+    let cycle = deps::detect_cycle(root, "a").unwrap();
+    assert_eq!(
+        cycle,
+        Some(vec!["a".to_string(), "b".to_string(), "a".to_string()])
+    );
+
+    // Longer a->b->c->a cycle.
+    write_ticket(&dir, "a", "---\nblocked-by: [b]\n---\nbody\n");
+    write_ticket(&dir, "b", "---\nblocked-by: [c]\n---\nbody\n");
+    write_ticket(&dir, "c", "---\nblocked-by: [a]\n---\nbody\n");
+    let cycle = deps::detect_cycle(root, "a").unwrap();
+    assert_eq!(
+        cycle,
+        Some(vec![
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+            "a".to_string()
+        ])
+    );
+
+    // Acyclic a->b->c chain: no cycle.
+    write_ticket(&dir, "a", "---\nblocked-by: [b]\n---\nbody\n");
+    write_ticket(&dir, "b", "---\nblocked-by: [c]\n---\nbody\n");
+    write_ticket(&dir, "c", "---\ntitle: leaf\n---\nbody\n");
+    let cycle = deps::detect_cycle(root, "a").unwrap();
+    assert_eq!(cycle, None);
 }
 
 // --- review P1: queue concurrency + crash-safe claims -----------------------

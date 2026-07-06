@@ -22,6 +22,26 @@ the engine's serde shapes.
 Static dashboard files served from a configurable dir at `/` (SPA fallback to
 index.html).
 
+## Tickets (backlog over REST)
+
+Read-only routes re-parse `.kranz/tickets/<slug>.md` from disk on every
+request (no cache, matching the rest of this crate). Both `POST` routes are
+mutation-token gated like every other `POST` (see §Authority below), and
+every route validates `:slug` at the route boundary before touching the
+filesystem — an invalid slug (bad chars, traversal) is `400`, never a
+filesystem error.
+
+| Method/Path | Behavior |
+|---|---|
+| `GET /api/tickets` | `[{ "slug", "priority", "state", "title", "blockedBy" }]` — one summary row per parseable ticket under `.kranz/tickets/`, matching what `kranz ticket list` renders |
+| `GET /api/tickets/:slug` | the full parsed ticket — `slug`, `title`, `priority`, `schedule`, `blockedBy`, `goal`, `context`, `scopingAnswers`, `acceptanceHints`, `state` — plus `needsContext`, the orchestrator's clarifying questions if a prior draft came back NEEDS-CONTEXT. `400` for an invalid slug, `404` when no ticket file exists for it |
+| `POST /api/tickets/:slug/draft` | long-running: mirrors `POST /api/missions/:id/start` by creating the planning mission synchronously (so a real mission id exists for the response) and spawning the draft turns as a background task. `202 {"missionId":"m-…"}`. Draft progress is observable over that mission's existing `GET /api/missions/:id/ws` WebSocket feed — **not** an SSE feed, since this server has no SSE transport. The terminal outcome (drafted into Review vs NEEDS-CONTEXT) shows up back on `GET /api/tickets/:slug`. `400` for an invalid slug, `404` for an unknown ticket — both checked synchronously before anything spawns |
+| `POST /api/tickets/:slug/approve` | body `{"force": bool}` (default `false`) → `200 {"approved":true,"missionId":"m-…"}`. Runs the same gate as `kranz ticket approve`: `409` when the ticket is not in REVIEW; `409` naming the unsatisfied blocker(s) when a `blocked-by` entry has not reached mission-Complete and `force` is false; `409` with the cycle path (e.g. `a -> b -> a`) when a `blocked-by` cycle is reachable from `:slug` — a cycle is never overridable by `force`. `400` for an invalid slug |
+
+See docs/tickets.md for the `blocked-by` dependency primitive itself
+(satisfaction semantics, cycle detection, the CLI's `--force`, and the
+work-time skip-with-warning) — this section covers only the REST shapes.
+
 ## Mission lifecycle (server-hosted engine; M2.5)
 
 `kranz serve` can HOST missions: for missions it creates, the server process
