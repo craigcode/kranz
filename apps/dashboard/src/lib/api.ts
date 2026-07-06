@@ -67,12 +67,30 @@ async function errorFrom(res: Response, fallback: string): Promise<ApiError> {
   return new ApiError(res.status, message);
 }
 
-async function getJson<T>(path: string): Promise<T> {
+const STALE_SERVE_MESSAGE = 'endpoint unavailable — server restart needed?';
+
+/** Parses a successful response body, guarding against a stale `serve`
+ *  returning the SPA's HTML fallback (200 text/html) for an /api route —
+ *  `res.json()` would otherwise throw a raw JSON-parse SyntaxError. */
+async function parseJsonBody<T>(res: Response): Promise<T> {
+  const contentType = res.headers.get('content-type') ?? '';
+  const text = await res.text();
+  if (!contentType.includes('application/json')) {
+    throw new ApiError(res.status, STALE_SERVE_MESSAGE);
+  }
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new ApiError(res.status, STALE_SERVE_MESSAGE);
+  }
+}
+
+export async function getJson<T>(path: string): Promise<T> {
   const res = await fetch(serverBase() + path);
   if (!res.ok) {
     throw new Error(`GET ${path} failed: ${res.status} ${res.statusText}`);
   }
-  return (await res.json()) as T;
+  return parseJsonBody<T>(res);
 }
 
 /**
@@ -80,7 +98,7 @@ async function getJson<T>(path: string): Promise<T> {
  * and retries with the newly pasted token (loops until success, a non-401
  * failure, or the user cancels the prompt).
  */
-async function postJson<T>(path: string, body: unknown): Promise<T> {
+export async function postJson<T>(path: string, body: unknown): Promise<T> {
   for (;;) {
     const token = resolveToken();
     const headers: Record<string, string> = { 'content-type': 'application/json' };
@@ -97,7 +115,7 @@ async function postJson<T>(path: string, body: unknown): Promise<T> {
     if (!res.ok) {
       throw await errorFrom(res, `POST ${path} failed: ${res.status} ${res.statusText}`);
     }
-    return (await res.json()) as T;
+    return parseJsonBody<T>(res);
   }
 }
 
