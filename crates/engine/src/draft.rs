@@ -242,7 +242,14 @@ pub async fn drive_draft(
                 unreachable!("Approve decision implies a Ready plan");
             };
             approve(
-                engine, repo, slug, &mission_id, ticket, plan, then_enqueue, seed_reply,
+                engine,
+                repo,
+                slug,
+                &mission_id,
+                ticket,
+                plan,
+                then_enqueue,
+                seed_reply,
             )
         }
     }

@@ -351,7 +351,9 @@ async fn plan_as_prose_recovers_via_bounded_retry_and_approves() {
         other => panic!("expected ParkedForReview, got {other:?}"),
     }
     assert_eq!(Ticket::read_state(&root, "rl4"), TicketState::Review);
-    let plan = drive.plan.expect("recovered Approve path must surface the plan");
+    let plan = drive
+        .plan
+        .expect("recovered Approve path must surface the plan");
     assert_eq!(plan.goal, goal);
 
     let path = Ticket::tickets_dir(&root).join("rl4.md");
