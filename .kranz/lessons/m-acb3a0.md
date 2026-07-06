@@ -1,0 +1,7 @@
+NONE is tempting since the code landed cleanly, but one trap here was genuinely non-obvious, repo-specific, and cost a full respawn cycle —…
+
+NONE is tempting since the code landed cleanly, but one trap here was genuinely non-obvious, repo-specific, and cost a full respawn cycle — worth carrying forward.
+
+Lesson (imperative note for future planners in this repo):
+
+**When a mission edits multiple files in one crate, bake crate-wide formatting into the plan explicitly — add a final feature (or fold into the last one) that runs `cargo fmt -p <crate>` across the whole crate and gates on `cargo fmt -p <crate> -- --check` reporting no diffs, and state in feature specs that formatting the mission's *own* branch is always in scope.** Otherwise per-feature workers invoke the "don't touch other features' files" rule and *revert* fmt's reformatting of files an earlier feature created/modified (e.g. a new `sandbox.rs`, wiring added to `runner.rs`), leaving the branch failing the repo's CI fmt gate on merge. That misread cost a full respawn this mission: the fix-feature added the required test but only formatted its own file, so `cargo fmt --check` stayed dirty crate-wide and a second run was needed. Every commit lands on one mission branch — the whole branch is the mission's to format, and unformatted new files are the mission's own violation, not a third party's.
