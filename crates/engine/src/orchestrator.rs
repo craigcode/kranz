@@ -4587,16 +4587,15 @@ mod tests {
     /// host running the suite.
     static CODEX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// RAII guard: blanks `HOME`/`PATH` and points `KRANZ_CODEX_BIN` at a path
-    /// that cannot exist, so every codex discovery candidate (env var, PATH
-    /// lookup, and the `~/.npm-global`/`/opt/homebrew`/etc. fallback
-    /// locations) misses. Restores the previous values on drop, including on
-    /// panic, so a failed assertion never leaks a poisoned environment into
-    /// later tests.
+    /// RAII guard: points `KRANZ_CODEX_BIN` at a path that cannot exist, so
+    /// codex discovery misses. Since `KRANZ_CODEX_BIN` is an exclusive
+    /// override (see `discover_codex_binary`), this alone makes codex
+    /// deterministically "absent" without touching `PATH`/`HOME` — other
+    /// tests that shell out to `git` in parallel are unaffected. Restores the
+    /// previous value on drop, including on panic, so a failed assertion
+    /// never leaks a poisoned environment into later tests.
     struct CodexEnvGuard {
         prev_bin: Option<std::ffi::OsString>,
-        prev_home: Option<std::ffi::OsString>,
-        prev_path: Option<std::ffi::OsString>,
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
@@ -4604,18 +4603,12 @@ mod tests {
         fn engage() -> Self {
             let lock = CODEX_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
             let prev_bin = std::env::var_os("KRANZ_CODEX_BIN");
-            let prev_home = std::env::var_os("HOME");
-            let prev_path = std::env::var_os("PATH");
             std::env::set_var(
                 "KRANZ_CODEX_BIN",
                 "/nonexistent/kranz-test-codex-binary-absent",
             );
-            std::env::set_var("HOME", "/nonexistent/kranz-test-home-absent");
-            std::env::set_var("PATH", "");
             CodexEnvGuard {
                 prev_bin,
-                prev_home,
-                prev_path,
                 _lock: lock,
             }
         }
@@ -4626,14 +4619,6 @@ mod tests {
             match self.prev_bin.take() {
                 Some(v) => std::env::set_var("KRANZ_CODEX_BIN", v),
                 None => std::env::remove_var("KRANZ_CODEX_BIN"),
-            }
-            match self.prev_home.take() {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-            match self.prev_path.take() {
-                Some(v) => std::env::set_var("PATH", v),
-                None => std::env::remove_var("PATH"),
             }
         }
     }

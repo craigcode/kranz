@@ -45,15 +45,29 @@ const STDERR_TAIL_CHARS: usize = 500;
 /// well-known install locations. Each candidate is validated by running it
 /// with `--version`; the first one that succeeds wins. Errors list every
 /// attempt so the user can see what was tried.
+///
+/// `KRANZ_CODEX_BIN`, when set and non-empty, is an *exclusive* override: only
+/// that path is probed, and a failure is returned immediately rather than
+/// falling through to PATH or the well-known fallback locations. Naming the
+/// binary explicitly and having it not work is an error, not a reason to
+/// search elsewhere.
 pub fn discover_codex_binary(configured: Option<&str>) -> Result<PathBuf> {
+    if let Some(env_bin) = std::env::var_os("KRANZ_CODEX_BIN") {
+        if !env_bin.is_empty() {
+            let candidate = PathBuf::from(env_bin);
+            return match probe_version(&candidate) {
+                Ok(_version) => Ok(candidate),
+                Err(why) => Err(EngineError::Config(format!(
+                    "KRANZ_CODEX_BIN points at {} which did not work: {why}",
+                    candidate.display()
+                ))),
+            };
+        }
+    }
+
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(configured) = configured {
         candidates.push(PathBuf::from(configured));
-    }
-    if let Some(env_bin) = std::env::var_os("KRANZ_CODEX_BIN") {
-        if !env_bin.is_empty() {
-            candidates.push(PathBuf::from(env_bin));
-        }
     }
     // Bare names resolve through PATH (std::process handles .cmd/.exe lookup
     // rules per-platform).
