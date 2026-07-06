@@ -1293,6 +1293,7 @@ impl MissionEngine {
             let milestone_title = self.state.mission.milestones[mi].title.clone();
             let cfg = self.state.config.clone();
             let base_sha = self.state.mission.base_sha.clone();
+            let grants = self.state.mission.command_grants.clone();
             let pre_run_sha = self.repo.head_sha()?;
 
             // Interrupt wiring: a control watcher polls the inbox and fires
@@ -1316,6 +1317,7 @@ impl MissionEngine {
                 guidance.as_deref(),
                 Some(cancel),
                 base_sha.as_deref(),
+                &grants,
             )
             .await;
             watcher.abort();
@@ -1768,6 +1770,7 @@ impl MissionEngine {
         let milestone_title = self.state.mission.milestones[mi].title.clone();
         let cfg = self.state.config.clone();
         let base_sha = self.state.mission.base_sha.clone();
+        let grants = self.state.mission.command_grants.clone();
         let tracker = ConcurrencyTracker::new();
 
         let mut set: tokio::task::JoinSet<(usize, BufferedRunResult)> = tokio::task::JoinSet::new();
@@ -1782,6 +1785,7 @@ impl MissionEngine {
             let ws_path = ws.path.clone();
             let guard = tracker.clone();
             let base_sha = base_sha.clone();
+            let grants = grants.clone();
             set.spawn(async move {
                 let _live = guard.enter(); // count this session as live
                 let result = runner::run_worker_in_buffered(
@@ -1794,6 +1798,7 @@ impl MissionEngine {
                     None,
                     &ws_path,
                     base_sha.as_deref(),
+                    &grants,
                 )
                 .await;
                 (idx, result)
@@ -2083,6 +2088,7 @@ impl MissionEngine {
             let contract = self.state.mission.validation_contract.clone();
             let cfg = self.state.config.clone();
             let base_sha = self.state.mission.base_sha.clone();
+            let grants = self.state.mission.command_grants.clone();
             let backend = Arc::clone(&self.backend);
             let outcome = runner::run_validator(
                 backend.as_ref(),
@@ -2095,6 +2101,7 @@ impl MissionEngine {
                 &start_sha,
                 None,
                 base_sha.as_deref(),
+                &grants,
             )
             .await;
             let caught = self.catch_up();
@@ -2816,7 +2823,7 @@ impl MissionEngine {
             env: HashMap::new(),
         };
         permissions::apply(
-            permissions::for_role(Role::Orchestrator, &cfg, &[]),
+            permissions::for_role(Role::Orchestrator, &cfg, &[], &[]),
             &mut spec,
         );
 

@@ -510,6 +510,7 @@ pub async fn run_worker(
     extra_guidance: Option<&str>,
     cancel: Option<Arc<Notify>>,
     base_sha: Option<&str>,
+    grants: &[String],
 ) -> Result<RunOutcome> {
     let cwd = paths.repo_root.clone();
     run_worker_in(
@@ -524,6 +525,7 @@ pub async fn run_worker(
         cancel,
         &cwd,
         base_sha,
+        grants,
     )
     .await
 }
@@ -549,6 +551,7 @@ pub async fn run_worker_in(
     cancel: Option<Arc<Notify>>,
     session_cwd: &std::path::Path,
     base_sha: Option<&str>,
+    grants: &[String],
 ) -> Result<RunOutcome> {
     let (spec, run_meta) = build_worker_spec(
         cfg,
@@ -558,6 +561,7 @@ pub async fn run_worker_in(
         extra_guidance,
         session_cwd,
         base_sha,
+        grants,
     );
     let mut target = LogTarget::Live(log);
     run_session_to(backend, spec, &mut target, paths, run_meta, cancel).await
@@ -591,6 +595,7 @@ pub async fn run_worker_in_buffered(
     extra_guidance: Option<&str>,
     session_cwd: &std::path::Path,
     base_sha: Option<&str>,
+    grants: &[String],
 ) -> Result<(Vec<EventKind>, RunOutcome)> {
     let (spec, run_meta) = build_worker_spec(
         cfg,
@@ -600,6 +605,7 @@ pub async fn run_worker_in_buffered(
         extra_guidance,
         session_cwd,
         base_sha,
+        grants,
     );
     let mut target = LogTarget::Buffer(Vec::new());
     let outcome = run_session_to(backend, spec, &mut target, paths, run_meta, None).await?;
@@ -623,6 +629,7 @@ fn build_worker_spec(
     extra_guidance: Option<&str>,
     session_cwd: &std::path::Path,
     base_sha: Option<&str>,
+    grants: &[String],
 ) -> (SessionSpec, RunMeta) {
     let role = Role::Worker;
     let role_cfg = cfg.role(role);
@@ -684,7 +691,7 @@ fn build_worker_spec(
         spec.env
             .insert("KRANZ_BASE_SHA".to_string(), sha.to_string());
     }
-    permissions::apply(permissions::for_role(role, cfg, &[]), &mut spec);
+    permissions::apply(permissions::for_role(role, cfg, &[], grants), &mut spec);
 
     let run_meta = RunMeta {
         run_id: uuid::Uuid::new_v4().to_string(),
@@ -700,8 +707,8 @@ fn build_worker_spec(
 /// Run one validator session for a milestone (plan §4.4/§4.6).
 ///
 /// `kind` must be [`Role::ValidatorScrutiny`] or [`Role::ValidatorFunctional`].
-/// Contract `command` strings (plus config `allow_validator_commands`) become
-/// `Bash(<command>*)` allows via [`permissions::for_role`].
+/// Contract `command` strings (plus config `allow_validator_commands` and
+/// `grants`) become `Bash(<command>*)` allows via [`permissions::for_role`].
 #[allow(clippy::too_many_arguments)]
 pub async fn run_validator(
     backend: &dyn AgentBackend,
@@ -714,6 +721,7 @@ pub async fn run_validator(
     start_sha: &str,
     cancel: Option<Arc<Notify>>,
     base_sha: Option<&str>,
+    grants: &[String],
 ) -> Result<RunOutcome> {
     if !matches!(kind, Role::ValidatorScrutiny | Role::ValidatorFunctional) {
         return Err(EngineError::InvalidState(format!(
@@ -801,7 +809,7 @@ pub async fn run_validator(
             .insert("KRANZ_BASE_SHA".to_string(), sha.to_string());
     }
     permissions::apply(
-        permissions::for_role(kind, cfg, &contract_commands),
+        permissions::for_role(kind, cfg, &contract_commands, grants),
         &mut spec,
     );
 

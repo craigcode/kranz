@@ -433,6 +433,7 @@ async fn worker_session_carries_configured_tools_onto_the_spec() {
         None,
         None,
         None,
+        &[],
     )
     .await
     .unwrap();
@@ -485,6 +486,7 @@ async fn functional_validator_tools_are_carried_and_allowed() {
         "start-sha",
         None,
         None,
+        &[],
     )
     .await
     .unwrap();
@@ -528,6 +530,7 @@ async fn scrutiny_validator_does_not_get_extra_tools_folded_into_allowed() {
         "start-sha",
         None,
         None,
+        &[],
     )
     .await
     .unwrap();

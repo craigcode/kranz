@@ -115,12 +115,21 @@ pub struct PermissionProfile {
 /// folded in the same way, so callers may pass either just the contract
 /// commands or the full union — duplicates are removed.
 ///
+/// `grants` are the plan-level `Mission.command_grants` — commands the plan
+/// itself has authorized. Each becomes a `Bash(<grant>*)` allow (via
+/// [`command_allow_patterns`]) folded into BOTH the worker profile (alongside
+/// the worker's existing bare `Bash` allow) and the validator profiles
+/// (alongside `validator_commands`), so a command the plan grants is runnable
+/// by the worker AND re-runnable by the validators verifying it — one source
+/// of truth for both surfaces. The orchestrator role ignores `grants`.
+///
 /// `cfg.dangerously_allow_all` short-circuits every role to
 /// `bypassPermissions` with empty lists (loud escape hatch, never default).
 pub fn for_role(
     role: Role,
     cfg: &MissionConfig,
     validator_commands: &[String],
+    grants: &[String],
 ) -> PermissionProfile {
     if cfg.dangerously_allow_all {
         return PermissionProfile {
@@ -138,10 +147,15 @@ pub fn for_role(
                 disallowed.push(as_tool_rule(pattern));
             }
             dedup_preserving_order(&mut disallowed);
+            let mut allowed = vec!["Bash".to_string()];
+            for grant in grants {
+                allowed.extend(command_allow_patterns(grant));
+            }
+            dedup_preserving_order(&mut allowed);
             PermissionProfile {
                 permission_mode: Some("acceptEdits".to_string()),
                 tools: None,
-                allowed_tools: vec!["Bash".to_string()],
+                allowed_tools: allowed,
                 disallowed_tools: disallowed,
             }
         }
@@ -163,6 +177,7 @@ pub fn for_role(
             for command in validator_commands
                 .iter()
                 .chain(cfg.allow_validator_commands.iter())
+                .chain(grants.iter())
             {
                 allowed.extend(command_allow_patterns(command));
             }
@@ -265,4 +280,30 @@ fn to_strings(items: &[&str]) -> Vec<String> {
 fn dedup_preserving_order(items: &mut Vec<String>) {
     let mut seen = std::collections::HashSet::new();
     items.retain(|item| seen.insert(item.clone()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grants_reach_worker_and_validator() {
+        let cfg = MissionConfig::default();
+        let grants = vec!["gc lint".to_string()];
+
+        // Granting a base command also covers `<cmd> --help`: the pattern is
+        // a `*`-suffixed prefix match, not a verbatim match.
+        assert!(command_allow_patterns("gc lint").contains(&"Bash(gc lint*)".to_string()));
+
+        let worker = for_role(Role::Worker, &cfg, &[], &grants);
+        assert!(worker.allowed_tools.contains(&"Bash(gc lint*)".to_string()));
+        // Grants are additive: the bare worker Bash allow must survive.
+        assert!(worker.allowed_tools.contains(&"Bash".to_string()));
+        assert_eq!(worker.permission_mode, Some("acceptEdits".to_string()));
+
+        let validator = for_role(Role::ValidatorScrutiny, &cfg, &[], &grants);
+        assert!(validator
+            .allowed_tools
+            .contains(&"Bash(gc lint*)".to_string()));
+    }
 }
