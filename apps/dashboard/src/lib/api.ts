@@ -10,11 +10,13 @@
 import { awaitToken, resolveToken } from './token';
 import type {
   ControlCommand,
+  DrainState,
   MissionEvent,
   MissionState,
   MissionSummary,
   Plan,
   PlanRequestResponse,
+  QueueState,
   Ticket,
   TicketSummary,
   TranscriptEntry,
@@ -189,5 +191,15 @@ export const api = {
 
   approveTicket(slug: string, force: boolean): Promise<{ approved: boolean; missionId: string }> {
     return postJson(`/api/tickets/${encodeURIComponent(slug)}/approve`, { force });
+  },
+
+  // --- queue (run-the-queue affordance) ------------------------------------
+
+  queue(): Promise<QueueState> {
+    return getJson('/api/queue');
+  },
+
+  drainQueue(): Promise<DrainState> {
+    return postJson('/api/queue/drain', {});
   },
 };
