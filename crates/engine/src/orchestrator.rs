@@ -4577,6 +4577,183 @@ fn plan_schema() -> serde_json::Value {
 mod tests {
     use super::*;
 
+    // -----------------------------------------------------------------------
+    // Scrutiny backend selection (f-2-2)
+    // -----------------------------------------------------------------------
+
+    /// Serializes tests that mutate process-global env vars (`HOME`, `PATH`,
+    /// `KRANZ_CODEX_BIN`) to force [`crate::backend_codex::discover_codex_binary`]
+    /// to fail, regardless of whatever codex install happens to sit on the
+    /// host running the suite.
+    static CODEX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard: blanks `HOME`/`PATH` and points `KRANZ_CODEX_BIN` at a path
+    /// that cannot exist, so every codex discovery candidate (env var, PATH
+    /// lookup, and the `~/.npm-global`/`/opt/homebrew`/etc. fallback
+    /// locations) misses. Restores the previous values on drop, including on
+    /// panic, so a failed assertion never leaks a poisoned environment into
+    /// later tests.
+    struct CodexEnvGuard {
+        prev_bin: Option<std::ffi::OsString>,
+        prev_home: Option<std::ffi::OsString>,
+        prev_path: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl CodexEnvGuard {
+        fn engage() -> Self {
+            let lock = CODEX_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let prev_bin = std::env::var_os("KRANZ_CODEX_BIN");
+            let prev_home = std::env::var_os("HOME");
+            let prev_path = std::env::var_os("PATH");
+            std::env::set_var("KRANZ_CODEX_BIN", "/nonexistent/kranz-test-codex-binary-absent");
+            std::env::set_var("HOME", "/nonexistent/kranz-test-home-absent");
+            std::env::set_var("PATH", "");
+            CodexEnvGuard {
+                prev_bin,
+                prev_home,
+                prev_path,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for CodexEnvGuard {
+        fn drop(&mut self) {
+            match self.prev_bin.take() {
+                Some(v) => std::env::set_var("KRANZ_CODEX_BIN", v),
+                None => std::env::remove_var("KRANZ_CODEX_BIN"),
+            }
+            match self.prev_home.take() {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match self.prev_path.take() {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+
+    /// Default config never selects codex: `select_scrutiny_backend` must
+    /// hand back the injected backend untouched and never emit a fallback
+    /// decision (there is nothing to fall back from).
+    #[test]
+    fn default_scrutiny_backend_is_claude() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).unwrap_or_else(|_| dir.path().to_path_buf());
+        let _ = std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&root)
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.name", "test"])
+            .current_dir(&root)
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(&root)
+            .output();
+        std::fs::write(root.join("README.md"), "seed\n").unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&root)
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["commit", "-m", "seed"])
+            .current_dir(&root)
+            .output();
+
+        let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
+        let mut engine =
+            MissionEngine::create(backend.clone(), &root, "goal", MissionConfig::default())
+                .expect("create engine");
+
+        let before = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+
+        let (selected, reason) = engine.select_scrutiny_backend();
+        assert!(reason.is_none(), "default config must not fall back");
+        assert!(
+            Arc::ptr_eq(&selected, &backend),
+            "default config must select the injected backend"
+        );
+
+        let after = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "select_scrutiny_backend must not emit any event on the claude-default path"
+        );
+    }
+
+    /// `validatorScrutiny.backend = "codex"` with no codex binary reachable:
+    /// preflight must warn, the run loop's fallback decision must land in the
+    /// event log, and the scrutiny validator must still run — through the
+    /// injected (mock) backend, never silently skipped.
+    #[tokio::test]
+    async fn codex_absent_loud_fallback() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+
+        let mut cfg = MissionConfig::default();
+        cfg.validator_scrutiny.backend = Some("codex".to_string());
+        cfg.skip_functional = true;
+
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            crate::backend_mock::MockScript::single_shot_json(&serde_json::json!({
+                "findings": [],
+                "summary": "clean"
+            })),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock.clone();
+        let mut engine = MissionEngine::create(backend, &root, "goal", cfg).expect("create engine");
+        engine.state.mission.milestones.push(Milestone {
+            id: "ms-1".to_string(),
+            title: "m".to_string(),
+            features: vec![],
+            status: MilestoneStatus::Active,
+            fix_cycles: 0,
+            start_sha: Some("HEAD".to_string()),
+        });
+
+        let env_guard = CodexEnvGuard::engage();
+
+        let issues = engine.preflight();
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.severity == "warn" && i.message.contains("codex")),
+            "expected a codex preflight warning, got {issues:?}"
+        );
+
+        engine
+            .validation_round(0)
+            .await
+            .expect("validation round must complete through the mock fallback, not error");
+
+        drop(env_guard);
+
+        let events =
+            EventLog::read_events(&engine.paths.events_file()).expect("read events.jsonl");
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.kind,
+                EventKind::OrchestratorDecision { summary, .. }
+                    if summary.contains("codex") && summary.contains("not available")
+            )),
+            "expected a loud fallback decision recorded in the event log; got {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+
+        let started = mock.started_specs();
+        assert_eq!(
+            started.len(),
+            1,
+            "the scrutiny validator must still run exactly once, through the injected backend"
+        );
+    }
+
     fn assertion(id: &str) -> Assertion {
         Assertion {
             id: id.to_string(),
