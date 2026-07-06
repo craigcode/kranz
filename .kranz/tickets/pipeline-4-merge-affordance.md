@@ -16,5 +16,11 @@ decided section. D-A verb copy: Approve reserved for plan approval,
 Queue for ticket-queueing, CONFIRMED (D-A decided).
 
 ## Scoping answers
+A previous draft attempt produced a complete, high-quality plan but
+emitted it as PROSE, so it was misclassified as clarifying questions.
+There are no open questions — the ticket is fully specified. Produce the
+plan and return it ONLY through the structured plan channel (the plan
+request), never as message text.
 
 ## Acceptance hints
+
