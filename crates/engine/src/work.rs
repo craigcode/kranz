@@ -416,4 +416,59 @@ mod tests {
         // One entry remains queued.
         assert_eq!(queue::list(repo).len(), 1);
     }
+
+    #[tokio::test]
+    async fn drain_queue_runs_a_ticket_born_entry_to_done() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+
+        write_ticket(
+            repo,
+            "satisfiable",
+            "---\ntitle: satisfiable\npriority: 2\nschedule: once\n---\n\n## Goal\nship\n",
+        );
+
+        queue::enqueue(
+            repo,
+            QueueEntry {
+                mission_id: "mission-ticket".to_string(),
+                ticket_slug: Some("satisfiable".to_string()),
+                priority: 2,
+                seq: 0,
+            },
+        )
+        .unwrap();
+
+        let ran = Arc::new(AtomicUsize::new(0));
+        let ran_clone = ran.clone();
+        let report = drain_queue(repo, false, move |mission_id| {
+            let ran = ran_clone.clone();
+            async move {
+                assert_eq!(mission_id, "mission-ticket");
+                ran.fetch_add(1, Ordering::SeqCst);
+                Ok(0)
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+        assert_eq!(report.ran, vec!["mission-ticket".to_string()]);
+        assert!(report.skipped.is_empty());
+        assert_eq!(Ticket::read_state(repo, "satisfiable"), TicketState::Done);
+        // The claim was retired: nothing left queued or claimed on disk.
+        assert!(queue::list(repo).is_empty());
+        let dir = queue::queue_dir(repo);
+        let leftover: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.path()
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains(".claimed."))
+            })
+            .collect();
+        assert!(leftover.is_empty(), "claim file was not retired");
+    }
 }

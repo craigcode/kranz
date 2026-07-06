@@ -1693,6 +1693,11 @@ mod tests {
         // observes an in-progress drain (`Starting` or `Running`, task not
         // yet scheduled) and returns its tracked state instead of spawning
         // a second drain task.
+        //
+        // NOTE: because nothing yields here, this test alone cannot catch a
+        // regression that deletes the `DrainSlot::Starting` deflection arm —
+        // see `starting_reservation_is_not_overwritten_or_double_spawned`
+        // below for the deterministic test that actually guards that arm.
         let (first, second) = tokio::join!(host.drain(), host.drain());
         let first = first.expect("first drain must not error");
         let second = second.expect("second drain must not error");
@@ -1722,6 +1727,103 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// Deterministically guards the `DrainSlot::Starting(state) => return
+    /// ...` deflection arm in [`MissionHost::drain`]: manually install a
+    /// `Starting` reservation, call `drain()`, and assert it returns the
+    /// tracked live state WITHOUT overwriting the slot or spawning a task.
+    /// If that match arm is deleted (falling through to the Idle/Running
+    /// catch-all), this test fails because the slot gets overwritten with a
+    /// fresh `Starting`/`Running` reservation (different `Arc::as_ptr`) and a
+    /// real drain task gets spawned against this test's (git-less) repo.
+    #[tokio::test]
+    async fn starting_reservation_is_not_overwritten_or_double_spawned() {
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+        let host = MissionHost::with_backend(root, backend);
+
+        let state = Arc::new(Mutex::new(DrainState {
+            live: true,
+            current_mission_id: Some("m-reserved".to_string()),
+            ran: Vec::new(),
+        }));
+        *host.drain.lock().expect("drain tracker lock") = DrainSlot::Starting(Arc::clone(&state));
+        let before = Arc::as_ptr(&state);
+
+        let result = host.drain().await.expect("drain must not error");
+        assert_eq!(result["live"], true, "{result}");
+        assert_eq!(result["currentMissionId"], "m-reserved");
+
+        // The slot must STILL be the same Starting reservation: not
+        // overwritten to a new Starting/Running, and no task spawned.
+        let after = match &*host.drain.lock().expect("drain tracker lock") {
+            DrainSlot::Starting(tracked) => Arc::as_ptr(tracked),
+            DrainSlot::Running(_) => panic!(
+                "the Starting reservation was upgraded/replaced by this call — the deflection \
+                 arm was bypassed and a second drain was spawned"
+            ),
+            DrainSlot::Idle => panic!("the Starting reservation was cleared by this call"),
+        };
+        assert_eq!(
+            before, after,
+            "drain() must return the SAME tracked reservation, not install a new one"
+        );
+    }
+
+    /// A failed drain construction (here: an unparseable `.kranz/config.json`)
+    /// must clear the reservation back to `Idle` so a later call can retry —
+    /// otherwise every future drain would deflect forever onto a dead
+    /// reservation that no task will ever settle.
+    #[tokio::test]
+    async fn failed_drain_construction_clears_the_reservation_to_idle() {
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
+        std::fs::create_dir_all(root.join(".kranz")).expect("mkdir .kranz");
+        std::fs::write(root.join(".kranz").join("config.json"), "not json")
+            .expect("write malformed config");
+
+        let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+        let host = MissionHost::with_backend(root, backend);
+
+        host.drain()
+            .await
+            .expect_err("malformed config must fail drain construction");
+
+        let is_idle = matches!(
+            &*host.drain.lock().expect("drain tracker lock"),
+            DrainSlot::Idle
+        );
+        assert!(
+            is_idle,
+            "a failed drain construction must reset the tracker to Idle"
+        );
+    }
+
+    /// `queue_state()` must report the transient `Starting` reservation
+    /// window as a live drain — a caller polling `GET /api/queue` right after
+    /// `POST /api/queue/drain` must not observe a false "not live" gap.
+    #[tokio::test]
+    async fn queue_state_reports_a_starting_reservation_as_live() {
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+        let host = MissionHost::with_backend(root, backend);
+
+        let state = Arc::new(Mutex::new(DrainState {
+            live: true,
+            current_mission_id: Some("m-starting".to_string()),
+            ran: Vec::new(),
+        }));
+        *host.drain.lock().expect("drain tracker lock") = DrainSlot::Starting(state);
+
+        let queue_state = host.queue_state();
+        assert_eq!(queue_state["drain"]["live"], true, "{queue_state}");
+        assert_eq!(queue_state["drain"]["currentMissionId"], "m-starting");
     }
 
     #[tokio::test]
