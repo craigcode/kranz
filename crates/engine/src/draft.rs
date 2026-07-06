@@ -54,6 +54,13 @@ pub fn draft_decision(request: &PlanRequest, yes: bool) -> DraftDecision {
     }
 }
 
+/// Does a NotReady reply look like a COMPLETE plan the orchestrator chatted
+/// out as prose instead of returning through the plan channel? Matches the
+/// plan schema's two distinctive top-level keys.
+pub fn looks_like_plan_json(reply: &str) -> bool {
+    reply.contains("\"validationContract\"") && reply.contains("\"milestones\"")
+}
+
 /// Split the orchestrator's "not ready" prose into individual questions: each
 /// non-empty line, with any leading bullet/number marker stripped. A reply
 /// with no line breaks becomes a single one-item list.
@@ -117,6 +124,11 @@ pub enum DraftOutcome {
         mission_id: String,
         questions: Vec<String>,
     },
+    /// The orchestrator produced a plan but emitted it as prose instead of
+    /// through the plan channel, and a bounded retry did not recover it. No
+    /// plan JSON is filed to the ticket body; the ticket is parked in
+    /// NeedsContext with a short .status note and the user re-runs draft.
+    PlanAsProse { mission_id: String },
 }
 
 /// [`drive_draft`]'s return: the terminal [`DraftOutcome`] plus the display
@@ -171,6 +183,45 @@ pub async fn drive_draft(
         }
     };
 
+    // A NotReady reply that reads as a complete plan JSON blob means the
+    // orchestrator chatted the plan out instead of returning through the plan
+    // channel — filing that blob as "questions" would dump multi-KB plan JSON
+    // into the ticket body. Give it exactly one more chance via the plan
+    // channel before giving up honestly.
+    if let PlanRequest::NotReady(text) = &request {
+        if looks_like_plan_json(text) {
+            return match engine.request_plan().await {
+                Ok(PlanRequest::Ready(plan)) => Ok(approve(
+                    engine,
+                    repo,
+                    slug,
+                    &mission_id,
+                    ticket,
+                    plan,
+                    then_enqueue,
+                    seed_reply,
+                )?),
+                _ => {
+                    Ticket::write_state(
+                        repo,
+                        slug,
+                        TicketState::NeedsContext,
+                        Some(
+                            "The orchestrator produced a plan but emitted it as prose instead \
+                             of through the plan channel — re-run `kranz draft` for this ticket."
+                                .to_string(),
+                        ),
+                    )?;
+                    Ok(DraftDrive {
+                        outcome: DraftOutcome::PlanAsProse { mission_id },
+                        seed_reply,
+                        plan: None,
+                    })
+                }
+            };
+        }
+    }
+
     match draft_decision(&request, then_enqueue) {
         DraftDecision::NeedsContext { questions } => {
             Ticket::append_needs_context(repo, slug, &questions)?;
@@ -185,42 +236,63 @@ pub async fn drive_draft(
         }
         DraftDecision::Approve {
             then_enqueue,
-            next_state,
+            next_state: _,
         } => {
             let PlanRequest::Ready(plan) = request else {
                 unreachable!("Approve decision implies a Ready plan");
             };
-            let approved_plan = plan.clone();
-            engine.approve_plan(plan)?;
-            let mission_branch = engine.state().mission.mission_branch.clone();
-
-            if then_enqueue {
-                queue::enqueue(
-                    repo,
-                    QueueEntry {
-                        mission_id: mission_id.clone(),
-                        ticket_slug: Some(slug.to_string()),
-                        priority: ticket.priority,
-                        seq: 0, // assigned by enqueue
-                    },
-                )?;
-                Ticket::write_state(repo, slug, next_state, None)?;
-                Ok(DraftDrive {
-                    outcome: DraftOutcome::Enqueued { mission_id },
-                    seed_reply,
-                    plan: Some(approved_plan),
-                })
-            } else {
-                Ticket::write_state(repo, slug, next_state, None)?;
-                Ok(DraftDrive {
-                    outcome: DraftOutcome::ParkedForReview {
-                        mission_id,
-                        mission_branch,
-                    },
-                    seed_reply,
-                    plan: Some(approved_plan),
-                })
-            }
+            approve(
+                engine, repo, slug, &mission_id, ticket, plan, then_enqueue, seed_reply,
+            )
         }
+    }
+}
+
+/// Shared approval side effects for a [`PlanRequest::Ready`] plan, whether it
+/// arrived via the normal path or the plan-as-prose bounded retry: commit the
+/// plan (`approve_plan`), then either enqueue+park `Queued` or park `Review`.
+#[allow(clippy::too_many_arguments)]
+fn approve(
+    engine: &mut MissionEngine,
+    repo: &Path,
+    slug: &str,
+    mission_id: &str,
+    ticket: &Ticket,
+    plan: Plan,
+    then_enqueue: bool,
+    seed_reply: Option<String>,
+) -> Result<DraftDrive> {
+    let approved_plan = plan.clone();
+    engine.approve_plan(plan)?;
+    let mission_branch = engine.state().mission.mission_branch.clone();
+
+    if then_enqueue {
+        queue::enqueue(
+            repo,
+            QueueEntry {
+                mission_id: mission_id.to_string(),
+                ticket_slug: Some(slug.to_string()),
+                priority: ticket.priority,
+                seq: 0, // assigned by enqueue
+            },
+        )?;
+        Ticket::write_state(repo, slug, TicketState::Queued, None)?;
+        Ok(DraftDrive {
+            outcome: DraftOutcome::Enqueued {
+                mission_id: mission_id.to_string(),
+            },
+            seed_reply,
+            plan: Some(approved_plan),
+        })
+    } else {
+        Ticket::write_state(repo, slug, TicketState::Review, None)?;
+        Ok(DraftDrive {
+            outcome: DraftOutcome::ParkedForReview {
+                mission_id: mission_id.to_string(),
+                mission_branch,
+            },
+            seed_reply,
+            plan: Some(approved_plan),
+        })
     }
 }
