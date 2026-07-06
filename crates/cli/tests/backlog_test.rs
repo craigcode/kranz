@@ -155,6 +155,100 @@ fn parses_ticket_approve_with_force() {
 }
 
 #[test]
+fn parses_ticket_queue_with_mission() {
+    let cli = Cli::try_parse_from([
+        "kranz",
+        "ticket",
+        "queue",
+        "slug",
+        "--mission",
+        "m-abc123",
+    ])
+    .unwrap();
+    match cli.command {
+        Command::Ticket {
+            command:
+                TicketCommand::Queue {
+                    slug,
+                    mission,
+                    force,
+                },
+        } => {
+            assert_eq!(slug, "slug");
+            assert_eq!(mission.as_deref(), Some("m-abc123"));
+            assert!(!force);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn parses_ticket_queue_with_force() {
+    let cli = Cli::try_parse_from(["kranz", "ticket", "queue", "slug", "--force"]).unwrap();
+    match cli.command {
+        Command::Ticket {
+            command: TicketCommand::Queue { slug, force, .. },
+        } => {
+            assert_eq!(slug, "slug");
+            assert!(force);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+/// D-A: `ticket queue` is the ticket-queueing verb; `ticket approve` is kept
+/// as a deprecated alias. Both must parse to the same slug/mission/force
+/// shape (just a different enum variant) — proving the alias carries no
+/// behavioral drift from the renamed command.
+#[test]
+fn ticket_queue_alias_parses_same_as_approve() {
+    let queue_cli =
+        Cli::try_parse_from(["kranz", "ticket", "queue", "slug", "--mission", "m-1"]).unwrap();
+    let approve_cli =
+        Cli::try_parse_from(["kranz", "ticket", "approve", "slug", "--mission", "m-1"]).unwrap();
+
+    let Command::Ticket {
+        command:
+            TicketCommand::Queue {
+                slug: qs,
+                mission: qm,
+                force: qf,
+            },
+    } = queue_cli.command
+    else {
+        panic!("expected TicketCommand::Queue");
+    };
+    let Command::Ticket {
+        command:
+            TicketCommand::Approve {
+                slug: as_,
+                mission: am,
+                force: af,
+            },
+    } = approve_cli.command
+    else {
+        panic!("expected TicketCommand::Approve");
+    };
+
+    assert_eq!(qs, as_);
+    assert_eq!(qm, am);
+    assert_eq!(qf, af);
+}
+
+/// D-A: `ticket approve` must still parse — it is a deprecated alias kept
+/// for one release, not removed.
+#[test]
+fn ticket_queue_alias_approve_still_parses() {
+    let cli = Cli::try_parse_from(["kranz", "ticket", "approve", "slug"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Command::Ticket {
+            command: TicketCommand::Approve { .. }
+        }
+    ));
+}
+
+#[test]
 fn parses_draft_and_draft_yes() {
     let plain = Cli::try_parse_from(["kranz", "draft", "slug"]).unwrap();
     match plain.command {
@@ -506,6 +600,26 @@ fn ticket_approve_enqueues_review_ticket_and_sets_queued() {
     assert_eq!(queued.len(), 1);
     assert_eq!(queued[0].mission_id, "m-explicit");
     assert_eq!(queued[0].ticket_slug.as_deref(), Some("approve-me"));
+    assert_eq!(queued[0].priority, 2);
+}
+
+/// D-A: `cmd_ticket_queue` is the renamed core; proves it has the same
+/// enqueue/state-transition behavior as the (now-deprecated) approve path.
+#[test]
+fn ticket_queue_alias_queue_enqueues_review_ticket_and_sets_queued() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+    backlog::cmd_ticket_new(repo, "queue-me", "Queue Me", Some("g")).unwrap();
+    Ticket::write_state(repo, "queue-me", TicketState::Review, None).unwrap();
+
+    let code = backlog::cmd_ticket_queue(repo, "queue-me", Some("m-explicit"), false).unwrap();
+    assert_eq!(code, 0);
+
+    assert_eq!(Ticket::read_state(repo, "queue-me"), TicketState::Queued);
+    let queued = queue::list(repo);
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].mission_id, "m-explicit");
+    assert_eq!(queued[0].ticket_slug.as_deref(), Some("queue-me"));
     assert_eq!(queued[0].priority, 2);
 }
 

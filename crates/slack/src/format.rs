@@ -31,6 +31,17 @@ pub const NEW_MISSION_CALLBACK_ID: &str = "kranz_new_mission";
 pub const NEW_MISSION_GOAL_BLOCK: &str = "goal";
 pub const NEW_MISSION_GOAL_ACTION: &str = "goal_text";
 
+/// `callback_id` of the new-ticket modal ([`build_new_ticket_modal`]); its
+/// `view_submission` routes to [`crate::inbound::Action::CreateTicket`].
+/// The slug/title (already fixed by `/kranz ticket new <slug> <title...>`)
+/// ride in `private_metadata` as a small JSON object rather than as
+/// modal inputs — they were already given on the command line.
+pub const NEW_TICKET_CALLBACK_ID: &str = "kranz_new_ticket";
+pub const NEW_TICKET_GOAL_BLOCK: &str = "ticket_goal";
+pub const NEW_TICKET_GOAL_ACTION: &str = "ticket_goal_text";
+pub const NEW_TICKET_CONTEXT_BLOCK: &str = "ticket_context";
+pub const NEW_TICKET_CONTEXT_ACTION: &str = "ticket_context_text";
+
 /// `callback_id` of the config modal ([`build_config_modal`]); its
 /// `view_submission` routes to [`crate::inbound::Action::Config`].
 pub const CONFIG_CALLBACK_ID: &str = "kranz_config";
@@ -438,6 +449,64 @@ pub fn build_new_mission_modal(channel: &str) -> Value {
     })
 }
 
+/// The new-ticket modal opened from `/kranz ticket new <slug> <title...>` —
+/// the multiline escape hatch for goal/context that a single-line slash
+/// command can't carry. `slug`/`title` are already fixed by the command line,
+/// so they ride in `private_metadata` as JSON (never re-entered) and are only
+/// shown back to the human as read-only context; the two inputs collect the
+/// goal and context bodies that land in the scaffolded ticket. Pure;
+/// unit-tested.
+pub fn build_new_ticket_modal(slug: &str, title: &str, channel: &str) -> Value {
+    let metadata = json!({ "slug": slug, "title": title, "channel": channel }).to_string();
+    json!({
+        "type": "modal",
+        "callback_id": NEW_TICKET_CALLBACK_ID,
+        "private_metadata": metadata,
+        "title": { "type": "plain_text", "text": "New ticket" },
+        "submit": { "type": "plain_text", "text": "Create" },
+        "close": { "type": "plain_text", "text": "Cancel" },
+        "blocks": [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": format!("*{}* — `{}`", escape_mrkdwn(title), escape_mrkdwn(slug))
+                }
+            },
+            {
+                "type": "input",
+                "block_id": NEW_TICKET_GOAL_BLOCK,
+                "optional": true,
+                "label": { "type": "plain_text", "text": "Goal" },
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": NEW_TICKET_GOAL_ACTION,
+                    "multiline": true,
+                    "placeholder": {
+                        "type": "plain_text",
+                        "text": "One paragraph — becomes the mission goal."
+                    }
+                }
+            },
+            {
+                "type": "input",
+                "block_id": NEW_TICKET_CONTEXT_BLOCK,
+                "optional": true,
+                "label": { "type": "plain_text", "text": "Context" },
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": NEW_TICKET_CONTEXT_ACTION,
+                    "multiline": true,
+                    "placeholder": {
+                        "type": "plain_text",
+                        "text": "Anything the drafter needs: file paths, constraints, prior discussion."
+                    }
+                }
+            }
+        ]
+    })
+}
+
 /// The config modal: role select + free-form model + optional effort — the
 /// structured twin of `/kranz config [<id>] <role> <model> [effort]`, for
 /// people who prefer pickers to positional args. Channel rides in
@@ -655,6 +724,7 @@ pub fn build_help() -> Vec<Value> {
              (bare `/kranz new` opens a form with a full multiline goal field)\n\
              • `/kranz plan <id>` — request the plan for review\n\
              • `/kranz approve <id>` — approve the plan and queue the mission\n\
+             • `/kranz queue <slug>` — queue a reviewed backlog ticket\n\
              • `/kranz config [<id>] <role> <model> [effort]` — change a role's model/effort \
              (roles: orchestrator·worker·scrutiny·functional; effort: low·medium·high·xhigh·max)\n\
              • `/kranz pause [<id>]` — pause a running mission (between worker runs)\n\

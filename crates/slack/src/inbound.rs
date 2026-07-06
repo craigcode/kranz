@@ -25,6 +25,8 @@
 //!   mission) → [`Action::Guidance`]. Bot's own messages, thread roots, and
 //!   messages in unknown threads are ignored (else the bridge echoes itself).
 //! - `slash_commands` `/kranz ticket <title>` → [`Action::NewTicket`];
+//!   `/kranz ticket new <slug> <title...>` → [`Action::NewTicketModal`] (a
+//!   multiline goal/context modal, carrying the slug/title through);
 //!   `/kranz help`, bare `/kranz`, or any unrecognized subcommand →
 //!   [`Action::Help`] (the command list).
 //! - anything else → [`Action::Ignore`].
@@ -33,7 +35,8 @@ use crate::format::{
     APPROVE_ACTION_ID, CONFIG_CALLBACK_ID, CONFIG_EFFORT_ACTION, CONFIG_EFFORT_BLOCK,
     CONFIG_MISSION_ACTION, CONFIG_MISSION_BLOCK, CONFIG_MODEL_ACTION, CONFIG_MODEL_BLOCK,
     CONFIG_ROLE_ACTION, CONFIG_ROLE_BLOCK, NEW_MISSION_CALLBACK_ID, NEW_MISSION_GOAL_ACTION,
-    NEW_MISSION_GOAL_BLOCK, START_ACTION_ID,
+    NEW_MISSION_GOAL_BLOCK, NEW_TICKET_CALLBACK_ID, NEW_TICKET_CONTEXT_ACTION,
+    NEW_TICKET_CONTEXT_BLOCK, NEW_TICKET_GOAL_ACTION, NEW_TICKET_GOAL_BLOCK, START_ACTION_ID,
 };
 use serde_json::Value;
 
@@ -74,6 +77,34 @@ pub enum Action {
         title: String,
         channel: String,
         thread_ts: Option<String>,
+    },
+    /// `/kranz ticket new <slug> <title...>` → open the multiline
+    /// goal/context modal (a slash command is single-line, so a real ticket
+    /// body needs this escape hatch, mirroring [`Action::NewMissionModal`]).
+    /// `slug`/`title` are already fixed by the command line and ride through
+    /// to the `view_submission` via the modal's `private_metadata`.
+    /// `trigger_id` expires ~3s after the slash, so the bridge must open the
+    /// view inline, never on a spawned task.
+    NewTicketModal {
+        trigger_id: String,
+        slug: String,
+        title: String,
+        user_id: Option<String>,
+        response_url: Option<String>,
+        channel: String,
+    },
+    /// The new-ticket modal's `view_submission` → create the backlog ticket
+    /// (slug/title carried from `private_metadata`, goal/context typed into
+    /// the modal). Mirrors [`Action::NewTicket`] but with the richer body a
+    /// single-line slash command can't carry; the bridge creates it through
+    /// the same primitive `POST /api/tickets` uses
+    /// (`kranz_engine::ticket::Ticket::scaffold`), off the socket read loop.
+    CreateTicket {
+        slug: String,
+        title: String,
+        goal: String,
+        context: String,
+        channel: String,
     },
     /// `/kranz ticket list` → one row per backlog ticket. Read-only, so not
     /// gated (no `user_id`); replies over `response_url`, same as
@@ -127,6 +158,18 @@ pub enum Action {
     /// slash-command twin of the [`Action::Approve`] button; spend-gated.
     ApproveMission {
         mission_id: String,
+        user_id: Option<String>,
+        response_url: Option<String>,
+    },
+    /// `/kranz queue <slug>` → the D-A ticket-queueing verb (see
+    /// docs/scoping/pipeline-view.md). Distinct from [`Action::ApproveMission`]:
+    /// this can NEVER trigger plan approval — the bridge must resolve `slug`
+    /// through the ticket-queue gate only (`is_ticket_slug` +
+    /// `run_approve_ticket_command`) and refuse with a helpful error when
+    /// `slug` doesn't name an on-disk backlog ticket. Spend/allowlist-gated
+    /// identically to the ticket-slug path of `/kranz approve`.
+    QueueTicket {
+        slug: String,
         user_id: Option<String>,
         response_url: Option<String>,
     },
@@ -334,6 +377,7 @@ fn route_view_submission(payload: &Value) -> Action {
     match view.get("callback_id").and_then(Value::as_str) {
         Some(NEW_MISSION_CALLBACK_ID) => {}
         Some(CONFIG_CALLBACK_ID) => return route_config_submission(payload, view),
+        Some(NEW_TICKET_CALLBACK_ID) => return route_new_ticket_submission(view),
         _ => return Action::Ignore,
     }
     let goal = view
@@ -415,6 +459,61 @@ fn route_config_submission(payload: &Value, view: &Value) -> Action {
         user_id,
         response_url: None,
         channel,
+    }
+}
+
+/// The new-ticket modal's `view_submission` → [`Action::CreateTicket`].
+/// `slug`/`title`/`channel` come back out of `private_metadata` (the JSON
+/// object [`crate::format::build_new_ticket_modal`] stashed at open — a
+/// `view_submission` carries no other way to recover them); `goal`/`context`
+/// come from the modal's two (optional) multiline inputs. A malformed/foreign
+/// payload (missing slug/title/channel) is ignored — nothing sane to create.
+fn route_new_ticket_submission(view: &Value) -> Action {
+    let metadata = view
+        .get("private_metadata")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let Ok(metadata) = serde_json::from_str::<Value>(metadata) else {
+        return Action::Ignore;
+    };
+    let slug = metadata
+        .get("slug")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let title = metadata
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let channel = metadata
+        .get("channel")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if slug.is_empty() || title.is_empty() || channel.is_empty() {
+        return Action::Ignore;
+    }
+    let goal = view
+        .pointer(&format!(
+            "/state/values/{NEW_TICKET_GOAL_BLOCK}/{NEW_TICKET_GOAL_ACTION}/value"
+        ))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let context = view
+        .pointer(&format!(
+            "/state/values/{NEW_TICKET_CONTEXT_BLOCK}/{NEW_TICKET_CONTEXT_ACTION}/value"
+        ))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    Action::CreateTicket {
+        slug: slug.to_string(),
+        title: title.to_string(),
+        goal: goal.to_string(),
+        context: context.to_string(),
+        channel: channel.to_string(),
     }
 }
 
@@ -542,6 +641,35 @@ fn route_slash(payload: &Value) -> Action {
                 };
             }
         }
+        // `ticket new <slug> <title...>` → the multiline goal/context modal
+        // (checked BEFORE the title fallback, same reasoning as list/show:
+        // a ticket literally titled "new ..." is the one surprising edge
+        // case). Requires a slug, a title, AND a trigger_id (always present
+        // on a real slash command) — anything short of that is malformed and
+        // routes to help rather than silently misfiring.
+        if let Some(after_new) = strip_ci_prefix(arg, "new") {
+            let rest = after_new.trim();
+            let mut parts = rest.splitn(2, char::is_whitespace);
+            let slug = parts.next().unwrap_or("").trim();
+            let title = parts.next().unwrap_or("").trim();
+            if !slug.is_empty() && !title.is_empty() {
+                if let Some(trigger_id) = payload
+                    .get("trigger_id")
+                    .and_then(Value::as_str)
+                    .filter(|t| !t.is_empty())
+                {
+                    return Action::NewTicketModal {
+                        trigger_id: trigger_id.to_string(),
+                        slug: slug.to_string(),
+                        title: title.to_string(),
+                        user_id,
+                        response_url,
+                        channel,
+                    };
+                }
+            }
+            return Action::Help { response_url };
+        }
         let title = arg;
         if !title.is_empty() {
             // Slash commands can be invoked from a thread; `thread_ts` is present then.
@@ -611,8 +739,26 @@ fn route_slash(payload: &Value) -> Action {
         // `plan` with no id → help.
     }
 
-    // `approve <id>` → approve + queue (spend-gated). The slash twin of the
-    // approve button.
+    // `queue <slug>` → the D-A ticket-queueing verb (see
+    // docs/scoping/pipeline-view.md). Routes to its own Action so it can
+    // NEVER trigger plan approval — the bridge resolves `slug` through the
+    // ticket-queue gate only, and refuses a non-ticket arg.
+    if let Some(rest) = strip_ci_prefix(text, "queue") {
+        let slug = clean_id(rest);
+        if !slug.is_empty() {
+            return Action::QueueTicket {
+                slug: slug.to_string(),
+                user_id,
+                response_url,
+            };
+        }
+        // `queue` with no slug → help.
+    }
+
+    // `approve <id>` → approve the plan and queue the mission (spend-gated).
+    // The slash twin of the approve button. Also accepts a ticket slug (the
+    // bridge resolves which gate applies) — that usage is superseded by
+    // `/kranz queue <slug>` but still works here.
     if let Some(rest) = strip_ci_prefix(text, "approve") {
         let id = clean_id(rest);
         if !id.is_empty() {
@@ -1476,6 +1622,145 @@ mod tests {
 
     #[test]
     fn slash_approve_routes_to_approve_mission() {
+        let env = json!({
+            "type": "slash_commands",
+            "payload": { "command": "/kranz", "text": "approve m-7", "user_id": "U9",
+                         "response_url": "https://hooks.slack/a" }
+        });
+        assert_eq!(
+            route(&env, &lookup_none()).action,
+            Action::ApproveMission {
+                mission_id: "m-7".into(),
+                user_id: Some("U9".into()),
+                response_url: Some("https://hooks.slack/a".into())
+            }
+        );
+    }
+
+    /// D-A: `/kranz queue <slug>` is the ticket-queueing verb; it must route
+    /// to its own `Action::QueueTicket`, never to `Action::ApproveMission`
+    /// (queue can never trigger plan approval).
+    #[test]
+    fn pipeline_slash_queue_routes_to_queue_ticket_action() {
+        let env = json!({
+            "type": "slash_commands",
+            "payload": { "command": "/kranz", "text": "queue rate-limit-notes", "user_id": "U9",
+                         "response_url": "https://hooks.slack/a" }
+        });
+        assert_eq!(
+            route(&env, &lookup_none()).action,
+            Action::QueueTicket {
+                slug: "rate-limit-notes".into(),
+                user_id: Some("U9".into()),
+                response_url: Some("https://hooks.slack/a".into())
+            }
+        );
+    }
+
+    /// `/kranz ticket new <slug> <title...>` must open the multiline
+    /// goal/context modal, carrying the slug (first token) and title (the
+    /// remainder) through, not scaffold immediately.
+    #[test]
+    fn pipeline_slash_ticket_new_routes_to_new_ticket_modal() {
+        let env = json!({
+            "type": "slash_commands",
+            "payload": { "command": "/kranz", "text": "ticket new my-slug Fix the thing",
+                         "trigger_id": "t-999", "user_id": "U9",
+                         "channel_id": "C1", "response_url": "https://hooks.slack/a" }
+        });
+        assert_eq!(
+            route(&env, &lookup_none()).action,
+            Action::NewTicketModal {
+                trigger_id: "t-999".into(),
+                slug: "my-slug".into(),
+                title: "Fix the thing".into(),
+                user_id: Some("U9".into()),
+                response_url: Some("https://hooks.slack/a".into()),
+                channel: "C1".into(),
+            }
+        );
+    }
+
+    /// The new-ticket modal's `view_submission` → `Action::CreateTicket`,
+    /// carrying slug/title/channel out of `private_metadata` and goal/context
+    /// out of the modal's typed inputs. A missing slug in `private_metadata`
+    /// (malformed/foreign payload) must be ignored, never half-create.
+    #[test]
+    fn pipeline_new_ticket_modal_submission_routes_to_create_ticket() {
+        let env = json!({
+            "type": "interactive",
+            "envelope_id": "env-ticket",
+            "payload": {
+                "type": "view_submission",
+                "user": { "id": "U777" },
+                "view": {
+                    "callback_id": NEW_TICKET_CALLBACK_ID,
+                    "private_metadata": "{\"slug\":\"my-slug\",\"title\":\"Fix the thing\",\"channel\":\"C1\"}",
+                    "state": { "values": {
+                        NEW_TICKET_GOAL_BLOCK: {
+                            NEW_TICKET_GOAL_ACTION: { "type": "plain_text_input", "value": "the goal" }
+                        },
+                        NEW_TICKET_CONTEXT_BLOCK: {
+                            NEW_TICKET_CONTEXT_ACTION: { "type": "plain_text_input", "value": "the context" }
+                        }
+                    }}
+                }
+            }
+        });
+        assert_eq!(
+            route(&env, &lookup_none()).action,
+            Action::CreateTicket {
+                slug: "my-slug".into(),
+                title: "Fix the thing".into(),
+                goal: "the goal".into(),
+                context: "the context".into(),
+                channel: "C1".into(),
+            }
+        );
+
+        let missing_slug_env = json!({
+            "type": "interactive",
+            "envelope_id": "env-ticket-2",
+            "payload": {
+                "type": "view_submission",
+                "user": { "id": "U777" },
+                "view": {
+                    "callback_id": NEW_TICKET_CALLBACK_ID,
+                    "private_metadata": "{\"title\":\"Fix the thing\",\"channel\":\"C1\"}",
+                    "state": { "values": {} }
+                }
+            }
+        });
+        assert_eq!(
+            route(&missing_slug_env, &lookup_none()).action,
+            Action::Ignore
+        );
+    }
+
+    /// `new` must not swallow the generic-title branch: a ticket whose title
+    /// happens to start with something other than the `new` subcommand
+    /// keyword still scaffolds via the pre-existing single-line path.
+    #[test]
+    fn pipeline_slash_ticket_bare_title_still_routes_to_new_ticket() {
+        let env = json!({
+            "type": "slash_commands",
+            "payload": { "command": "/kranz", "text": "ticket Fix the thing",
+                         "channel_id": "C1" }
+        });
+        assert_eq!(
+            route(&env, &lookup_none()).action,
+            Action::NewTicket {
+                title: "Fix the thing".into(),
+                channel: "C1".into(),
+                thread_ts: None,
+            }
+        );
+    }
+
+    /// D-A: `/kranz approve <id>` remains the canonical plan-approval verb —
+    /// it still routes to `Action::ApproveMission`.
+    #[test]
+    fn pipeline_slash_approve_still_routes_to_approve_mission_action() {
         let env = json!({
             "type": "slash_commands",
             "payload": { "command": "/kranz", "text": "approve m-7", "user_id": "U9",

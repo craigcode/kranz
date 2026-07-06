@@ -434,8 +434,10 @@ fn is_slow_action(action: &Action) -> bool {
             | Action::Approve { .. }
             | Action::ApproveStart { .. }
             | Action::ApproveMission { .. }
+            | Action::QueueTicket { .. }
             | Action::Draft { .. }
             | Action::WorkRun { .. }
+            | Action::CreateTicket { .. }
     )
 }
 
@@ -587,6 +589,10 @@ pub fn not_authorized_blocks() -> Vec<Value> {
 ///   [`approve_flow`]: commit the pending plan through the host, then queue
 ///   (`Approve`/slash) or start execution through the host (`ApproveStart`).
 ///   State-aware without a pending plan (see [`approve_flow`]).
+/// - **QueueTicket** (`/kranz queue <slug>`, D-A) — the ticket-queueing verb;
+///   allowlist-gated identically to the ticket-slug path of `/kranz approve`,
+///   but resolves ONLY through [`run_approve_ticket_command`] — it never
+///   falls back to [`approve_flow`], so it can never trigger plan approval.
 ///
 /// Without a host every engine-needing surface degrades to an honest
 /// ephemeral refusal pointing at the CLI ([`no_host_blocks`]).
@@ -1005,6 +1011,85 @@ async fn dispatch_action(
             }
         }
 
+        // `/kranz ticket new <slug> <title...>`: open the multiline
+        // goal/context modal. MUST run inline — the trigger_id expires ~3s
+        // after the slash — mirroring [`Action::NewMissionModal`].
+        Action::NewTicketModal {
+            trigger_id,
+            slug,
+            title,
+            user_id,
+            response_url,
+            channel,
+        } => {
+            if !cfg.is_authorized(user_id.as_deref()) {
+                reply_ephemeral(
+                    cfg,
+                    client,
+                    response_url.as_deref(),
+                    &not_authorized_blocks(),
+                )
+                .await;
+                return;
+            }
+            let view = crate::format::build_new_ticket_modal(slug, title, channel);
+            if let Err(e) = client.open_view(trigger_id, &view).await {
+                tracing::warn!(error = %e, "failed to open new-ticket modal");
+                reply_ephemeral(
+                    cfg,
+                    client,
+                    response_url.as_deref(),
+                    &error_blocks(&format!(
+                        "Couldn't open the new-ticket form: {e}. One-line fallback: \
+                         `/kranz ticket <title>`."
+                    )),
+                )
+                .await;
+            }
+        }
+
+        // The new-ticket modal's `view_submission`: scaffold the ticket
+        // through the same primitive `POST /api/tickets` uses
+        // (`Ticket::scaffold`). No `response_url` (a modal submission has
+        // none), so the confirmation/error posts straight into `channel`.
+        Action::CreateTicket {
+            slug,
+            title,
+            goal,
+            context,
+            channel,
+        } => {
+            let goal = (!goal.trim().is_empty()).then_some(goal.as_str());
+            let context = (!context.trim().is_empty()).then_some(context.as_str());
+            match create_ticket(repo_root, slug, title, goal, context) {
+                Ok(()) => {
+                    let blocks = vec![json!({
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": format!(
+                                ":ticket: Created ticket `{}` — {}",
+                                crate::format::escape_mrkdwn(slug),
+                                crate::format::escape_mrkdwn(title)
+                            )
+                        }
+                    })];
+                    if let Err(e) = client.post_message(channel, &blocks, None).await {
+                        tracing::warn!(error = %e, "failed to post ticket-created confirmation");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to create ticket from Slack modal");
+                    if let Err(e) = client
+                        .post_message(channel, &error_blocks(&format!("Couldn't create ticket `{slug}`: {e}")), None)
+                        .await
+                    {
+                        tracing::warn!(error = %e, "failed to post ticket-creation error");
+                    }
+                }
+            }
+        }
+
         Action::RequestPlan {
             mission_id,
             user_id,
@@ -1130,6 +1215,43 @@ async fn dispatch_action(
                     false,
                 )
                 .await;
+            }
+        }
+
+        // `/kranz queue <slug>` — the D-A ticket-queueing verb. MUST NEVER
+        // fall back to `approve_flow` (plan approval stays "approve"
+        // wholesale): a non-ticket arg is refused with a pointer at
+        // `/kranz approve <id>` instead of being interpreted as a mission id.
+        Action::QueueTicket {
+            slug,
+            user_id,
+            response_url,
+        } => {
+            if !is_ticket_slug(repo_root, slug) {
+                reply_ephemeral(
+                    cfg,
+                    client,
+                    response_url.as_deref(),
+                    &error_blocks(&format!(
+                        "`{slug}` isn't a backlog ticket — `queue` is for tickets. \
+                         To approve a mission plan, use `/kranz approve <mission-id>`."
+                    )),
+                )
+                .await;
+                return;
+            }
+            let invocation =
+                run_approve_ticket_command(cfg, host, slug, user_id.as_deref()).await;
+            if !invocation.authorized {
+                reply_ephemeral(
+                    cfg,
+                    client,
+                    response_url.as_deref(),
+                    &not_authorized_blocks(),
+                )
+                .await;
+            } else if let Some(result) = &invocation.result {
+                reply_ephemeral(cfg, client, response_url.as_deref(), result).await;
             }
         }
 
@@ -1886,9 +2008,12 @@ fn apply_action(repo_root: &Path, action: &Action) -> Result<()> {
         | Action::TicketShow { .. }
         | Action::NewMission { .. }
         | Action::NewMissionModal { .. }
+        | Action::NewTicketModal { .. }
+        | Action::CreateTicket { .. }
         | Action::ConfigModal { .. }
         | Action::RequestPlan { .. }
         | Action::ApproveMission { .. }
+        | Action::QueueTicket { .. }
         | Action::ApproveStart { .. }
         | Action::Draft { .. }
         | Action::Config { .. }
@@ -2453,6 +2578,26 @@ fn scaffold_ticket(repo_root: &Path, title: &str) -> Result<()> {
     Ok(())
 }
 
+/// Create a ticket from `/kranz ticket new`'s modal submission, through the
+/// same primitive `POST /api/tickets` uses
+/// (`kranz_engine::ticket::Ticket::scaffold`) rather than the bare-bones
+/// template [`scaffold_ticket`] writes — this path already has a validated
+/// slug, and an optional goal/context to seed the ticket body with.
+fn create_ticket(
+    repo_root: &Path,
+    slug: &str,
+    title: &str,
+    goal: Option<&str>,
+    context: Option<&str>,
+) -> Result<()> {
+    use kranz_engine::ticket::Ticket;
+    Ticket::ensure_valid_slug(slug).with_context(|| format!("invalid ticket slug '{slug}'"))?;
+    Ticket::scaffold(repo_root, slug, title, goal, context)
+        .with_context(|| format!("scaffolding ticket '{slug}'"))?;
+    tracing::info!(slug = %slug, "ticket created from Slack new-ticket modal");
+    Ok(())
+}
+
 /// A filesystem-safe slug from a free-text title (lowercase, alnum + single
 /// dashes). Mirrors the ticket file-stem convention.
 fn slugify(title: &str) -> String {
@@ -2594,6 +2739,101 @@ mod tests {
         .unwrap();
         // Neither queued anything nor created a mission dir.
         assert!(queue::list(tmp.path()).is_empty());
+    }
+
+    fn test_cfg() -> SlackConfig {
+        SlackConfig {
+            bot_token: "xoxb".into(),
+            app_token: "xapp".into(),
+            channel: "C1".into(),
+            notify: NotifyFlags::default(),
+            allow_users: vec![],
+            dashboard_url: None,
+            instance_name: None,
+        }
+    }
+
+    /// D-A: `is_ticket_slug` is the gate `Action::QueueTicket` uses to decide
+    /// whether an arg is a backlog ticket at all.
+    #[test]
+    fn is_ticket_slug_true_for_on_disk_ticket_false_for_mission_id() {
+        let tmp = TempDir::new().unwrap();
+        scaffold_ticket(tmp.path(), "Rate-limit the notes API").unwrap();
+        assert!(is_ticket_slug(tmp.path(), "rate-limit-the-notes-api"));
+        assert!(!is_ticket_slug(tmp.path(), "m-42"));
+    }
+
+    /// D-A regression: `Action::QueueTicket` with a mission-id-shaped arg
+    /// must be refused (queue is for tickets), and — critically — must NEVER
+    /// fall through to `approve_flow`. Prove it by seeding a mission in the
+    /// exact state `approve_flow` would happily queue (`Approved`, no host)
+    /// and asserting the queue stays empty after dispatching `QueueTicket`.
+    #[tokio::test]
+    async fn queue_ticket_action_never_invokes_approve_flow_for_a_non_ticket_arg() {
+        use kranz_engine::events::{Event, EventKind};
+        use kranz_engine::types::{Plan, PlanFeature, PlanMilestone};
+
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-a", "approved mission");
+        let paths = MissionPaths::new(tmp.path(), "m-a");
+        let event = Event {
+            seq: 2,
+            ts: chrono::Utc::now(),
+            mission_id: "m-a".to_string(),
+            kind: EventKind::PlanApproved {
+                plan: Plan {
+                    goal: "approved mission".into(),
+                    validation_contract: vec![],
+                    milestones: vec![PlanMilestone {
+                        title: "M1".into(),
+                        features: vec![PlanFeature {
+                            title: "F1".into(),
+                            spec: "s".into(),
+                            validation_criteria: vec!["c".into()],
+                        }],
+                    }],
+                },
+                base_sha: None,
+            },
+        };
+        let line = serde_json::to_string(&event).unwrap();
+        let mut existing = std::fs::read_to_string(paths.events_file()).unwrap();
+        existing.push_str(&line);
+        existing.push('\n');
+        std::fs::write(paths.events_file(), existing).unwrap();
+        assert_eq!(
+            mission_status(tmp.path(), "m-a").unwrap(),
+            MissionStatus::Approved,
+            "mission is exactly the state approve_flow would queue with no host"
+        );
+        assert!(!is_ticket_slug(tmp.path(), "m-a"), "m-a is not a ticket slug");
+
+        let cfg = test_cfg();
+        let client = SlackClient::new(&cfg).unwrap();
+        let threads = SharedThreads::load(tmp.path()).unwrap();
+        dispatch_action(
+            &cfg,
+            &client,
+            tmp.path(),
+            &threads,
+            None,
+            &Action::QueueTicket {
+                slug: "m-a".into(),
+                user_id: None,
+                response_url: None,
+            },
+        )
+        .await;
+
+        assert!(
+            queue::list(tmp.path()).is_empty(),
+            "QueueTicket with a non-ticket arg must never queue the mission via approve_flow"
+        );
+        assert_eq!(
+            mission_status(tmp.path(), "m-a").unwrap(),
+            MissionStatus::Approved,
+            "mission state must be untouched by the refused queue attempt"
+        );
     }
 
     /// Seed a mission's `events.jsonl` with a single `mission.created` event,

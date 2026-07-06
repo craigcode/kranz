@@ -3,7 +3,7 @@
 // Draft button with live progress from the drafted mission's WS feed
 // (draftTicket already calls connectMission — this pane just renders
 // s.events/s.state the same way ProgressLog does), and a blocked-by-aware
-// Approve button (courtesy mirror only: the server's 409 stays authoritative
+// Queue button (courtesy mirror only: the server's 409 stays authoritative
 // — see docs/tickets.md "Dependencies (blocked-by)").
 
 import { useEffect, useState } from 'react';
@@ -94,7 +94,7 @@ export function TicketDetail({ slug }: { slug: string }) {
   const approveDisabled = ticket.isBlocked;
   const approveTitle = approveDisabled
     ? `blocked by ${ticket.blockedBy.join(', ')}`
-    : 'approve into the queue';
+    : 'queue for run';
 
   return (
     <div className="picker">
@@ -151,7 +151,7 @@ export function TicketDetail({ slug }: { slug: string }) {
               title={approveTitle}
               onClick={() => void approveTicket(slug, false)}
             >
-              {approveDisabled ? `Approve (${approveTitle})` : 'Approve'}
+              Queue for run
             </button>
           )}
         </div>

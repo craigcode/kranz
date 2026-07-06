@@ -125,6 +125,68 @@ impl Ticket {
         }
     }
 
+    /// The scaffolded body of a new ticket. Frontmatter carries the title;
+    /// the body is the four sections the orchestrator expects (`## Goal`,
+    /// `## Context`, `## Scoping answers`, `## Acceptance hints`), pre-seeded
+    /// with the goal/context when supplied. The result parses back cleanly
+    /// through [`Ticket::parse`].
+    pub fn ticket_template(title: &str, goal: Option<&str>, context: Option<&str>) -> String {
+        let goal_body = goal.map(str::trim).filter(|g| !g.is_empty()).unwrap_or("");
+        let context_body = context
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .unwrap_or("");
+        format!(
+            "---\n\
+             title: {title}\n\
+             priority: 2\n\
+             schedule: once\n\
+             ---\n\
+             \n\
+             ## Goal\n\
+             {goal_body}\n\
+             \n\
+             ## Context\n\
+             {context_body}\n\
+             \n\
+             ## Scoping answers\n\
+             \n\
+             ## Acceptance hints\n"
+        )
+    }
+
+    /// Scaffold `.kranz/tickets/<slug>.md` from the template. Shared by the
+    /// CLI (`kranz ticket new`) and the REST `POST /api/tickets` handler so
+    /// the template lives in exactly one place. `EngineError::Config` for an
+    /// invalid slug, `EngineError::InvalidState` (→ 409 over REST) if a
+    /// ticket with that slug already exists. Returns the written path.
+    pub fn scaffold(
+        repo_root: &Path,
+        slug: &str,
+        title: &str,
+        goal: Option<&str>,
+        context: Option<&str>,
+    ) -> Result<PathBuf> {
+        Self::ensure_valid_slug(slug)?;
+        let dir = Self::tickets_dir(repo_root);
+        let path = dir.join(format!("{slug}.md"));
+        if path.exists() {
+            return Err(EngineError::InvalidState(format!(
+                "ticket '{slug}' already exists at {}",
+                path.display()
+            )));
+        }
+        std::fs::create_dir_all(&dir)?;
+        let body = Self::ticket_template(title, goal, context);
+        Self::parse(slug, &body).map_err(|e| {
+            EngineError::Other(format!(
+                "internal error: scaffolded ticket does not parse: {e}"
+            ))
+        })?;
+        std::fs::write(&path, body)?;
+        Ok(path)
+    }
+
     /// Parse ticket markdown. `slug` is supplied by the caller (usually the
     /// file stem). Malformed frontmatter is an [`EngineError::Config`].
     pub fn parse(slug: &str, markdown: &str) -> Result<Ticket> {

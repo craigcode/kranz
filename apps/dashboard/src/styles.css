@@ -347,6 +347,33 @@ button {
   background: var(--green);
 }
 
+/* ------------------------------------------------------- pipeline stages */
+
+.pill-captured {
+  color: var(--dim);
+  background: var(--border);
+}
+
+.pill-needs-you {
+  color: var(--amber);
+  background: var(--amber-soft);
+}
+
+.pill-reviewable {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.pill-delivered {
+  color: var(--green);
+  background: var(--green-soft);
+}
+
+.pill-landed {
+  color: #fff;
+  background: var(--green);
+}
+
 .ticket-blocker-badge {
   flex: none;
   font-size: 11px;
@@ -354,6 +381,56 @@ button {
   border: 1px solid var(--red);
   border-radius: 10px;
   padding: 0 6px;
+}
+
+.unmerged-badge {
+  flex: none;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--amber, #b45309);
+  border: 1px solid currentColor;
+  border-radius: 10px;
+  padding: 0 6px;
+}
+
+.pipeline-inline-panel {
+  width: 100%;
+  margin-top: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border, #ddd);
+  border-radius: 8px;
+  font-size: 13px;
+}
+
+.pipeline-estimate {
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.pipeline-diff-stat {
+  white-space: pre-wrap;
+  font-size: 12px;
+  margin: 0 0 8px;
+}
+
+.pipeline-inline-loading,
+.pipeline-inline-error {
+  width: 100%;
+  margin-top: 8px;
+  font-size: 12px;
+}
+
+.pipeline-iterate-form {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.pipeline-iterate-input {
+  flex: 1;
+  min-width: 0;
 }
 
 .ticket-detail {
@@ -1384,8 +1461,12 @@ button {
 /* ------------------------------------------------- new mission (M2.5) */
 
 .new-mission-btn {
-  margin-left: auto;
   margin-right: 10px;
+}
+
+.new-ticket-btn {
+  margin-left: auto;
+  margin-right: 6px;
 }
 
 .new-mission-back {

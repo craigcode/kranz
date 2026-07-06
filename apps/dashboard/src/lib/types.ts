@@ -74,6 +74,7 @@ export interface TicketSummary {
   title: string;
   blockedBy: string[];
   isBlocked: boolean;
+  missionId?: string;
 }
 
 /** Full ticket shape from `GET /api/tickets/:slug`. */
@@ -90,6 +91,7 @@ export interface Ticket {
   acceptanceHints: string[];
   state: TicketState;
   needsContext: string[];
+  missionId?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -236,6 +238,9 @@ export interface MissionSummary {
   goal: string;
   createdAt: string;
   error?: string;
+  /** Ancestry-probe bit: mission branch tip is an ancestor of the live base
+   *  branch tip. `null`/absent when there's no branch or the probe failed. */
+  merged?: boolean | null;
 }
 
 // ---------------------------------------------------------------------------

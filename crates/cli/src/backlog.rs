@@ -15,7 +15,7 @@
 
 use crate::commands::{build_backend, load_config, run_mission_loop};
 use crate::output;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use kranz_engine::deps;
 use kranz_engine::draft::{drive_draft, DraftOutcome};
 use kranz_engine::git_ops::GitRepo;
@@ -41,47 +41,18 @@ pub use kranz_engine::work::{
 // ticket new — scaffold
 // ---------------------------------------------------------------------------
 
-/// The scaffolded body of a new ticket. Frontmatter carries the title,
-/// priority and schedule; the body is the four sections the orchestrator
-/// expects (`## Goal`, `## Context`, `## Scoping answers`, `## Acceptance
-/// hints`), pre-seeded with the goal when one is supplied. The result parses
-/// back cleanly through [`Ticket::parse`].
+/// Back-compat wrapper (no context) over [`Ticket::ticket_template`], which
+/// now lives in `kranz-engine` so the REST `POST /api/tickets` handler shares
+/// it instead of duplicating.
 pub fn ticket_template(title: &str, goal: Option<&str>) -> String {
-    let goal_body = goal.map(str::trim).filter(|g| !g.is_empty()).unwrap_or("");
-    format!(
-        "---\n\
-         title: {title}\n\
-         priority: 2\n\
-         schedule: once\n\
-         ---\n\
-         \n\
-         ## Goal\n\
-         {goal_body}\n\
-         \n\
-         ## Context\n\
-         \n\
-         ## Scoping answers\n\
-         \n\
-         ## Acceptance hints\n"
-    )
+    Ticket::ticket_template(title, goal, None)
 }
 
-/// Scaffold `.kranz/tickets/<slug>.md` from the template. Refuses (error) if a
-/// ticket with that slug already exists. Returns the written path.
+/// Scaffold `.kranz/tickets/<slug>.md`. Refuses (error) if a ticket with that
+/// slug already exists. Thin wrapper over [`Ticket::scaffold`]. Returns the
+/// written path.
 pub fn cmd_ticket_new(repo: &Path, slug: &str, title: &str, goal: Option<&str>) -> Result<PathBuf> {
-    Ticket::ensure_valid_slug(slug)?;
-    let dir = Ticket::tickets_dir(repo);
-    let path = dir.join(format!("{slug}.md"));
-    if path.exists() {
-        bail!("ticket '{slug}' already exists at {}", path.display());
-    }
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    let body = ticket_template(title, goal);
-    // Fail loudly if the template ever stops parsing (guards future edits).
-    Ticket::parse(slug, &body)
-        .map_err(|e| anyhow!("internal error: scaffolded ticket does not parse: {e}"))?;
-    std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
-    Ok(path)
+    Ticket::scaffold(repo, slug, title, goal, None).map_err(anyhow::Error::from)
 }
 
 // ---------------------------------------------------------------------------
@@ -408,11 +379,11 @@ pub async fn cmd_draft(
     Ok(0)
 }
 
-/// `kranz ticket approve <slug> [--mission <id>]`: enqueue the parked (Review)
+/// `kranz ticket queue <slug> [--mission <id>]`: enqueue the parked (Review)
 /// mission for the ticket and set the ticket Queued.
 ///
 /// `draft` (no `--yes`) leaves the ticket in Review with a committed plan.md on
-/// a mission branch but nothing in the queue. Approving picks that mission:
+/// a mission branch but nothing in the queue. Queueing picks that mission:
 /// the explicit `--mission` if given, else the newest mission on the repo
 /// whose recorded goal equals the ticket's folded [`Ticket::mission_goal`]
 /// (that is exactly what `draft` seeded it with).
@@ -421,7 +392,10 @@ pub async fn cmd_draft(
 /// side effects live in [`deps::approve_ticket`] — the same core the REST
 /// `POST /api/tickets/:slug/approve` handler calls, so the two surfaces can
 /// never drift on what "approvable" means.
-pub fn cmd_ticket_approve(
+///
+/// Ticket-queueing is verb "Queue" (see docs/scoping/pipeline-view.md
+/// decision D-A); "Approve" is reserved for plan approval.
+pub fn cmd_ticket_queue(
     repo: &Path,
     slug: &str,
     explicit_mission: Option<&str>,
@@ -433,6 +407,21 @@ pub fn cmd_ticket_approve(
         approved.mission_id, approved.priority
     );
     Ok(0)
+}
+
+/// Deprecated alias for [`cmd_ticket_queue`]. `kranz ticket approve` used to
+/// be the only spelling for ticket-queueing; D-A renamed it to `queue` and
+/// reserved "approve" for plan approval. Kept one release for compatibility.
+pub fn cmd_ticket_approve(
+    repo: &Path,
+    slug: &str,
+    explicit_mission: Option<&str>,
+    force: bool,
+) -> Result<i32> {
+    eprintln!(
+        "warning: `kranz ticket approve` is deprecated, use `kranz ticket queue` instead"
+    );
+    cmd_ticket_queue(repo, slug, explicit_mission, force)
 }
 
 /// Find the mission `draft` created for a ticket: the newest-by-event-log

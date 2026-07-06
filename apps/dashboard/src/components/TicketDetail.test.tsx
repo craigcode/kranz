@@ -65,7 +65,7 @@ beforeEach(() => {
 });
 
 describe('TicketDetail', () => {
-  it('disables Approve and names the blocker for a blocked review ticket', async () => {
+  it('disables Queue for run and names the blocker for a blocked review ticket', async () => {
     vi.mocked(api.ticket).mockResolvedValueOnce(
       makeTicket({ blockedBy: ['dep-a'], isBlocked: true }),
     );
@@ -73,12 +73,13 @@ describe('TicketDetail', () => {
 
     render(<TicketDetail slug="fix-b" />);
 
-    const approve = await screen.findByRole('button', { name: /Approve/ });
-    expect(approve.hasAttribute('disabled')).toBe(true);
-    expect(approve.getAttribute('title')).toContain('dep-a');
+    const queue = await screen.findByRole('button', { name: 'Queue for run' });
+    expect(queue.hasAttribute('disabled')).toBe(true);
+    expect(queue.getAttribute('title')).toContain('dep-a');
+    expect(screen.queryByRole('button', { name: /Approve/ })).toBeFalsy();
   });
 
-  it('enables Approve when the blocker is done', async () => {
+  it('enables Queue for run when the blocker is done', async () => {
     vi.mocked(api.ticket).mockResolvedValueOnce(
       makeTicket({ blockedBy: ['dep-a'], isBlocked: false }),
     );
@@ -86,11 +87,12 @@ describe('TicketDetail', () => {
 
     render(<TicketDetail slug="fix-b" />);
 
-    const approve = await screen.findByRole('button', { name: 'Approve' });
-    expect(approve.hasAttribute('disabled')).toBe(false);
+    const queue = await screen.findByRole('button', { name: 'Queue for run' });
+    expect(queue.hasAttribute('disabled')).toBe(false);
+    expect(queue.getAttribute('title')).toBe('queue for run');
   });
 
-  it('enables Approve when isBlocked is false even if blockedBy is non-empty', async () => {
+  it('enables Queue for run when isBlocked is false even if blockedBy is non-empty', async () => {
     vi.mocked(api.ticket).mockResolvedValueOnce(
       makeTicket({ blockedBy: ['dep-a'], isBlocked: false }),
     );
@@ -98,8 +100,8 @@ describe('TicketDetail', () => {
 
     render(<TicketDetail slug="fix-b" />);
 
-    const approve = await screen.findByRole('button', { name: 'Approve' });
-    expect(approve.hasAttribute('disabled')).toBe(false);
+    const queue = await screen.findByRole('button', { name: 'Queue for run' });
+    expect(queue.hasAttribute('disabled')).toBe(false);
   });
 
   it('renders goal/context via markdown and lists needs-context questions', async () => {

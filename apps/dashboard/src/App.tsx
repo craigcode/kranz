@@ -2,7 +2,8 @@
 // left sidebar (sessions) | top bar | status strip | centre (conversation,
 // planning, or transcript) | right column (models / features / progress log).
 //
-// Routes (location.hash): ''  → mission picker, '#/new' → new-mission form,
+// Routes (location.hash): ''  → the pipeline view (default screen, one row
+// per work item across all nine stages), '#/new' → new-mission form,
 // '#/m/<id>' → mission view. While the mission's status is "planning" the
 // centre pane is the PlanningView (M2.5 lifecycle); once execution starts the
 // live conversation view takes over. <TokenPrompt/> is global: any mutation
@@ -11,8 +12,9 @@
 import { useEffect, useState } from 'react';
 import { useKranzStore } from './lib/store';
 import { resolveToken } from './lib/token';
-import { MissionPicker } from './components/MissionPicker';
+import { PipelineView } from './components/PipelineView';
 import { NewMission } from './components/NewMission';
+import { NewTicket } from './components/NewTicket';
 import { TopBar } from './components/TopBar';
 import { StatusStrip } from './components/StatusStrip';
 import { Sidebar } from './components/Sidebar';
@@ -31,8 +33,9 @@ import { TicketDetail } from './components/TicketDetail';
 resolveToken();
 
 type Route =
-  | { view: 'picker' }
+  | { view: 'pipeline' }
   | { view: 'new' }
+  | { view: 'new-ticket' }
   | { view: 'mission'; id: string }
   | { view: 'backlog' }
   | { view: 'ticket'; slug: string };
@@ -40,12 +43,13 @@ type Route =
 function parseHash(): Route {
   const hash = window.location.hash;
   if (hash === '#/new') return { view: 'new' };
+  if (hash === '#/new-ticket') return { view: 'new-ticket' };
   const match = /^#\/m\/(.+)$/.exec(hash);
   if (match) return { view: 'mission', id: decodeURIComponent(match[1]) };
   if (hash === '#/backlog') return { view: 'backlog' };
   const ticketMatch = /^#\/backlog\/(.+)$/.exec(hash);
   if (ticketMatch) return { view: 'ticket', slug: decodeURIComponent(ticketMatch[1]) };
-  return { view: 'picker' };
+  return { view: 'pipeline' };
 }
 
 function useRoute(): Route {
@@ -75,10 +79,10 @@ export default function App() {
     return () => disconnect();
   }, [missionId, connectMission, disconnect]);
 
-  if (route.view === 'picker') {
+  if (route.view === 'pipeline') {
     return (
       <>
-        <MissionPicker />
+        <PipelineView />
         <TokenPrompt />
       </>
     );
@@ -87,6 +91,14 @@ export default function App() {
     return (
       <>
         <NewMission />
+        <TokenPrompt />
+      </>
+    );
+  }
+  if (route.view === 'new-ticket') {
+    return (
+      <>
+        <NewTicket />
         <TokenPrompt />
       </>
     );
