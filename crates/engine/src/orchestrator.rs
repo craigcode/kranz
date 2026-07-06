@@ -57,7 +57,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -272,6 +272,13 @@ pub struct MissionEngine {
     /// successful probe; a failed probe is never cached (so a codex install
     /// that appears mid-mission is picked up on the next scrutiny round).
     codex_backend: Option<Arc<dyn AgentBackend>>,
+    /// The tree mission-branch work runs in for the current `run()` call
+    /// (M7 tier 1). `None` in checkout mode (and before the first `run()`),
+    /// where [`Self::active_root`]/[`Self::active_repo`] fall back to
+    /// `self.paths.repo_root`/`self.repo`. In worktree mode, `run()` sets
+    /// this to the mission integration worktree from `setup_mission_worktree`
+    /// for the duration of the run.
+    active_tree: Option<(PathBuf, GitRepo)>,
 }
 
 impl MissionEngine {
@@ -341,6 +348,7 @@ impl MissionEngine {
             orch_stall_timeout: DEFAULT_ORCH_STALL_TIMEOUT,
             pending_seed_reply: None,
             codex_backend: None,
+            active_tree: None,
         })
     }
 
@@ -436,6 +444,7 @@ impl MissionEngine {
             orch_stall_timeout: DEFAULT_ORCH_STALL_TIMEOUT,
             pending_seed_reply: None,
             codex_backend: None,
+            active_tree: None,
         })
     }
 
@@ -456,6 +465,25 @@ impl MissionEngine {
     /// Mission data paths.
     pub fn paths(&self) -> &MissionPaths {
         &self.paths
+    }
+
+    /// The tree mission-branch git operations run in for the current run
+    /// (M7 tier 1). Checkout mode (or before the first `run()` in worktree
+    /// mode): the primary repo root. Worktree mode mid-run: the mission
+    /// integration worktree set up by `run()`.
+    fn active_root(&self) -> &Path {
+        match &self.active_tree {
+            Some((root, _)) => root.as_path(),
+            None => self.paths.repo_root.as_path(),
+        }
+    }
+
+    /// The [`GitRepo`] paired with [`Self::active_root`].
+    fn active_repo(&self) -> &GitRepo {
+        match &self.active_tree {
+            Some((_, repo)) => repo,
+            None => &self.repo,
+        }
     }
 
     /// Shrink the orchestrator stall timeout (tests exercise the death/reseed
@@ -1090,25 +1118,63 @@ impl MissionEngine {
         // checked out. Approval created and checked out the branch, but
         // nothing re-asserted it at run time — the first live `kranz work`
         // train committed three missions straight to main.
-        let mission_branch = self.state.mission.mission_branch.clone();
-        if self.repo.current_branch()? != mission_branch {
-            if !self.repo.branch_exists(&mission_branch)? {
-                // A deleted branch is recreated at the pinned approval base.
-                let from = self
-                    .state
-                    .mission
-                    .base_sha
-                    .clone()
-                    .unwrap_or_else(|| self.state.mission.base_branch.clone());
-                self.repo.create_branch(&mission_branch, Some(&from))?;
+        //
+        // Worktree mode (M7 tier 1): the PRIMARY checkout must never change
+        // branches, so mission-branch work instead runs in a dedicated
+        // integration worktree (`setup_mission_worktree`); `self.active_tree`
+        // routes every mission-branch git op there for the rest of this run.
+        let worktree_mode = self.state.config.isolation() == WorkerIsolation::Worktree;
+        if worktree_mode {
+            let (path, wt_repo) = self.setup_mission_worktree()?;
+            self.active_tree = Some((path, wt_repo));
+        } else {
+            let mission_branch = self.state.mission.mission_branch.clone();
+            if self.repo.current_branch()? != mission_branch {
+                if !self.repo.branch_exists(&mission_branch)? {
+                    // A deleted branch is recreated at the pinned approval base.
+                    let from = self
+                        .state
+                        .mission
+                        .base_sha
+                        .clone()
+                        .unwrap_or_else(|| self.state.mission.base_branch.clone());
+                    self.repo.create_branch(&mission_branch, Some(&from))?;
+                }
+                self.repo.checkout(&mission_branch)?;
+                self.emit_decision(
+                    &format!(
+                        "run: re-asserted mission branch {mission_branch} (checkout had drifted)"
+                    ),
+                    None,
+                )?;
             }
-            self.repo.checkout(&mission_branch)?;
-            self.emit_decision(
-                &format!("run: re-asserted mission branch {mission_branch} (checkout had drifted)"),
-                None,
-            )?;
         }
 
+        let result = self.run_loop().await;
+
+        // Integration worktree lifetime: torn down once the mission reaches
+        // a status the resume/reconcile path already accounts for (terminal,
+        // or an error that ends this process) — never on Blocked/Paused,
+        // where the mission may resume and wants its worktree intact
+        // (a leaked one is reaped by `resume()`'s crash sweep regardless).
+        if worktree_mode {
+            let should_teardown = match &result {
+                Ok(status) => is_terminal_status(*status),
+                Err(_) => true,
+            };
+            if should_teardown {
+                self.teardown_mission_worktree();
+                self.active_tree = None;
+            }
+        }
+
+        result
+    }
+
+    /// The §4.5 preflight + loop body of [`Self::run`], factored out so the
+    /// caller can wrap it with integration-worktree setup/teardown (M7 tier 1)
+    /// without duplicating every early-return site inside the loop.
+    async fn run_loop(&mut self) -> Result<MissionStatus> {
         // Environment preflight (roadmap M2): surface obvious missing
         // prerequisites of the contract commands as ONE advisory decision
         // before the first worker spawns. Never blocks — the contract gate at
@@ -1361,7 +1427,7 @@ impl MissionEngine {
             let cfg = self.state.config.clone();
             let base_sha = self.state.mission.base_sha.clone();
             let grants = self.state.mission.command_grants.clone();
-            let pre_run_sha = self.repo.head_sha()?;
+            let pre_run_sha = self.active_repo().head_sha()?;
 
             // Interrupt wiring: a control watcher polls the inbox and fires
             // the notify on `Msg { interrupt: true }`; run_session aborts the
@@ -1373,20 +1439,42 @@ impl MissionEngine {
                 Arc::clone(&cancel),
             ));
             let backend = Arc::clone(&self.backend);
-            let outcome = runner::run_worker(
-                backend.as_ref(),
-                &mut self.log,
-                &self.paths,
-                &cfg,
-                &feature,
-                &goal,
-                &milestone_title,
-                guidance.as_deref(),
-                Some(cancel),
-                base_sha.as_deref(),
-                &grants,
-            )
-            .await;
+            // Worktree mode (M7 tier 1): the worker session's cwd is the
+            // mission integration worktree, never the primary repo root.
+            // Checkout mode keeps the exact `run_worker` call it always had.
+            let outcome = if self.state.config.isolation() == WorkerIsolation::Worktree {
+                let session_cwd = self.active_root().to_path_buf();
+                runner::run_worker_in(
+                    backend.as_ref(),
+                    &mut self.log,
+                    &self.paths,
+                    &cfg,
+                    &feature,
+                    &goal,
+                    &milestone_title,
+                    guidance.as_deref(),
+                    Some(cancel),
+                    &session_cwd,
+                    base_sha.as_deref(),
+                    &grants,
+                )
+                .await
+            } else {
+                runner::run_worker(
+                    backend.as_ref(),
+                    &mut self.log,
+                    &self.paths,
+                    &cfg,
+                    &feature,
+                    &goal,
+                    &milestone_title,
+                    guidance.as_deref(),
+                    Some(cancel),
+                    base_sha.as_deref(),
+                    &grants,
+                )
+                .await
+            };
             watcher.abort();
             // Fold the runner's events into state even when the run errored
             // (worker.spawned may already be on disk).
@@ -1399,17 +1487,17 @@ impl MissionEngine {
             self.drain_control()?;
 
             // §4.4 dirty-tree discipline (applies to interrupted runs too).
-            if !self.repo.is_clean()? && !self.resolve_dirty_tree(&feature.id).await? {
+            if !self.active_repo().is_clean()? && !self.resolve_dirty_tree(&feature.id).await? {
                 return Ok(()); // orchestrator chose fail-feature
             }
             let commits: Vec<String> = self
-                .repo
+                .active_repo()
                 .commits_between(&pre_run_sha, "HEAD")?
                 .iter()
                 .map(|c| format!("{} {}", c.sha, c.subject))
                 .collect();
             let diff_stat = self
-                .repo
+                .active_repo()
                 .diff_stat(&pre_run_sha, "HEAD")
                 .unwrap_or_default();
 
@@ -1481,7 +1569,7 @@ impl MissionEngine {
             })?;
             return Ok(false);
         }
-        self.repo
+        self.active_repo()
             .add_all_and_commit(&format!("[{feature_id}] checkpoint (engine commit)"))?;
         Ok(true)
     }
@@ -1776,9 +1864,8 @@ impl MissionEngine {
     /// worktree at [`mission_worktree_path`] — WITHOUT touching the primary
     /// checkout's current branch.
     ///
-    /// Not yet called from `run()`; a later milestone re-routes mission-branch
-    /// mutations through this worktree when `workerIsolation = worktree`.
-    #[allow(dead_code)]
+    /// Called from `run()` when `workerIsolation = worktree`, which routes
+    /// mission-branch mutations through the returned worktree for the run.
     fn setup_mission_worktree(&self) -> Result<(PathBuf, GitRepo)> {
         let mission_branch = self.state.mission.mission_branch.clone();
         if !self.repo.branch_exists(&mission_branch)? {
@@ -1806,7 +1893,6 @@ impl MissionEngine {
     /// Tear down the mission integration worktree created by
     /// [`Self::setup_mission_worktree`]. Best-effort and idempotent, mirroring
     /// the parallel-batch cleanup guard: failures are logged, never fatal.
-    #[allow(dead_code)]
     fn teardown_mission_worktree(&self) {
         let path = mission_worktree_path(&self.state.mission.id);
         if let Err(e) = self.repo.remove_worktree(&path) {
