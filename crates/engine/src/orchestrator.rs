@@ -267,6 +267,11 @@ pub struct MissionEngine {
     /// planning seed's reply routinely ends with scoping questions the user
     /// must see. Drained by [`MissionEngine::take_seed_reply`].
     pending_seed_reply: Option<String>,
+    /// Lazily-built [`crate::backend_codex::CodexBackend`] cache for
+    /// `validatorScrutiny.backend = "codex"`. `None` until the first
+    /// successful probe; a failed probe is never cached (so a codex install
+    /// that appears mid-mission is picked up on the next scrutiny round).
+    codex_backend: Option<Arc<dyn AgentBackend>>,
 }
 
 impl MissionEngine {
@@ -335,6 +340,7 @@ impl MissionEngine {
             orch_transcript: None,
             orch_stall_timeout: DEFAULT_ORCH_STALL_TIMEOUT,
             pending_seed_reply: None,
+            codex_backend: None,
         })
     }
 
@@ -422,6 +428,7 @@ impl MissionEngine {
             orch_transcript: None,
             orch_stall_timeout: DEFAULT_ORCH_STALL_TIMEOUT,
             pending_seed_reply: None,
+            codex_backend: None,
         })
     }
 
@@ -498,6 +505,18 @@ impl MissionEngine {
             });
         }
 
+        if self.state.config.validator_scrutiny.backend.as_deref() == Some("codex") {
+            if let Err(err) = crate::backend_codex::discover_codex_binary(None) {
+                issues.push(PreflightIssue {
+                    severity: "warn",
+                    message: format!(
+                        "validatorScrutiny.backend is \"codex\" but no codex binary was found \
+                         ({err}); the scrutiny validator will fall back to the claude backend"
+                    ),
+                });
+            }
+        }
+
         // Contract command programs: probe the leading token of each distinct
         // command, flagging only ones that clearly do not resolve on PATH.
         let mut probed: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -561,6 +580,46 @@ impl MissionEngine {
             detail: detail.map(|d| scrub::scrub(&d)),
         })?;
         Ok(())
+    }
+
+    /// Choose the backend for a `ValidatorScrutiny` run.
+    ///
+    /// `validatorScrutiny.backend == Some("codex")` selects
+    /// [`crate::backend_codex::CodexBackend`], probing availability via
+    /// [`crate::backend_codex::discover_codex_binary`] and lazily caching the
+    /// constructed backend in `self.codex_backend` on success. Any other
+    /// config value (including the default `None`) keeps the injected
+    /// `self.backend`.
+    ///
+    /// On probe failure this falls back to `self.backend` and returns
+    /// `Some(reason)` describing the fallback — the caller MUST surface that
+    /// reason via [`Self::emit_decision`] before spawning, so a codex
+    /// unavailability never silently swaps in a different validator.
+    fn select_scrutiny_backend(&mut self) -> (Arc<dyn AgentBackend>, Option<String>) {
+        if !matches!(
+            self.state.config.scrutiny_backend_kind(),
+            BackendKind::Codex
+        ) {
+            return (Arc::clone(&self.backend), None);
+        }
+        if let Some(cached) = &self.codex_backend {
+            return (Arc::clone(cached), None);
+        }
+        match crate::backend_codex::discover_codex_binary(None) {
+            Ok(binary) => {
+                let backend: Arc<dyn AgentBackend> =
+                    Arc::new(crate::backend_codex::CodexBackend::new(binary));
+                self.codex_backend = Some(Arc::clone(&backend));
+                (backend, None)
+            }
+            Err(err) => (
+                Arc::clone(&self.backend),
+                Some(format!(
+                    "codex backend requested but not available ({err}); falling back to \
+                     the claude scrutiny validator"
+                )),
+            ),
+        }
     }
 
     /// Fold events appended by `runner::run_*` (which writes to the log
@@ -2081,9 +2140,37 @@ impl MissionEngine {
         for role in roles {
             let milestone = self.state.mission.milestones[mi].clone();
             let contract = self.state.mission.validation_contract.clone();
-            let cfg = self.state.config.clone();
+            let mut cfg = self.state.config.clone();
             let base_sha = self.state.mission.base_sha.clone();
-            let backend = Arc::clone(&self.backend);
+
+            // Only `ValidatorScrutiny` may run on a non-claude backend
+            // (config::validate enforces this); `ValidatorFunctional` always
+            // uses the injected backend.
+            let mut used_codex = false;
+            let backend = if role == Role::ValidatorScrutiny {
+                let (backend, fallback_reason) = self.select_scrutiny_backend();
+                if let Some(reason) = fallback_reason {
+                    // Loud, recorded — a codex probe failure never silently
+                    // swaps the validator backend.
+                    self.emit_decision(&reason, None)?;
+                } else if matches!(
+                    self.state.config.scrutiny_backend_kind(),
+                    BackendKind::Codex
+                ) {
+                    used_codex = true;
+                }
+                backend
+            } else {
+                Arc::clone(&self.backend)
+            };
+
+            // Codex pricing/totals only apply to codex-family models: swap in
+            // DEFAULT_CODEX_MODEL for both the dispatch spec and RunMeta when
+            // validatorScrutiny.model isn't already one.
+            if used_codex && !cost::is_codex_model(&cfg.validator_scrutiny.model) {
+                cfg.validator_scrutiny.model = cost::DEFAULT_CODEX_MODEL.to_string();
+            }
+
             let outcome = runner::run_validator(
                 backend.as_ref(),
                 &mut self.log,
@@ -2098,8 +2185,39 @@ impl MissionEngine {
             )
             .await;
             let caught = self.catch_up();
-            let outcome = outcome?;
+            let mut outcome = outcome?;
             caught?;
+
+            // Bounded (exactly one retry) runtime fallback: a codex scrutiny
+            // run that errored out with no report (auth/network failure)
+            // falls back to the claude backend so a persistently broken
+            // codex install can't loop.
+            if used_codex && outcome.validator_report.is_none() {
+                self.emit_decision(
+                    "codex scrutiny run failed with no validator report; retrying once with \
+                     the claude scrutiny validator",
+                    None,
+                )?;
+                let retry_cfg = self.state.config.clone();
+                let retry_backend = Arc::clone(&self.backend);
+                let retry_outcome = runner::run_validator(
+                    retry_backend.as_ref(),
+                    &mut self.log,
+                    &self.paths,
+                    &retry_cfg,
+                    role,
+                    &milestone,
+                    &contract,
+                    &start_sha,
+                    None,
+                    base_sha.as_deref(),
+                )
+                .await;
+                let caught = self.catch_up();
+                outcome = retry_outcome?;
+                caught?;
+            }
+
             if let Some(report) = outcome.validator_report {
                 for finding in report.findings {
                     findings.push((outcome.run_id.clone(), finding));

@@ -18,6 +18,13 @@ const TOKENS_PER_MTOK: f64 = 1_000_000.0;
 /// Default model id for the Codex backend, importable engine-wide.
 pub const DEFAULT_CODEX_MODEL: &str = "gpt-5-codex";
 
+/// Whether `model` names a codex-family model (same substring match
+/// [`pricing_for_model`] uses to select codex pricing).
+pub fn is_codex_model(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    m.contains("codex") || m.contains("gpt")
+}
+
 /// Per-model token pricing in USD per million tokens.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Pricing {
