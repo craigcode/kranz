@@ -444,9 +444,13 @@ impl MissionHost {
     /// the mission branch exactly like the CLI. Returns the mission branch.
     pub async fn approve(&self, id: &str, plan: Plan) -> Result<String, ApiError> {
         let cell = self.planning_cell_or_attach(id).await?;
-        let mut engine = try_lock(&cell)?;
-        engine.approve_plan(plan)?;
-        Ok(engine.state().mission.mission_branch.clone())
+        let branch = {
+            let mut engine = try_lock(&cell)?;
+            engine.approve_plan(plan)?;
+            engine.state().mission.mission_branch.clone()
+        };
+        self.set_pending_plan(id, None);
+        Ok(branch)
     }
 
     /// `POST /api/missions/:id/start`: consume the hosted engine into a

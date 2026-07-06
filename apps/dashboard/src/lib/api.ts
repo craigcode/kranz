@@ -179,8 +179,8 @@ export const api = {
     return postJson(`/api/missions/${encodeURIComponent(id)}/delete`, { all });
   },
 
-  approvePlan(id: string, plan: Plan): Promise<{ branch: string }> {
-    return postJson(`/api/missions/${encodeURIComponent(id)}/approve`, { plan });
+  approvePending(id: string): Promise<{ branch: string; started: boolean }> {
+    return postJson(`/api/missions/${encodeURIComponent(id)}/approve-pending`, { start: false });
   },
 
   startMission(id: string): Promise<{ running: boolean }> {

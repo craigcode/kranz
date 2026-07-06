@@ -21,3 +21,4 @@ Approved plans, newest last.
 - 2026-07-06 · [m-3b2f03](m-3b2f03/plan.md) — Add a human-triggered, token/allowlist-gated Merge action at the Delivered stage on both the dashboard and Slack that re… [truncated] · [report](m-3b2f03/report.md)
 - 2026-07-06 · [m-9f13d2](m-9f13d2/plan.md) — Every contract-command execution context — worker, validator, and the engine's own final gate — carries the same approva… [truncated] · [report](m-9f13d2/report.md)
 - 2026-07-06 · [m-78410b](m-78410b/plan.md) — Make plan-level command grants and worker-executed verification commands first-class allowlist entries so worker and val… [truncated] · [report](m-78410b/report.md)
+- 2026-07-06 · [m-43b20d](m-43b20d/plan.md) — A successful approve on any surface consumes the host-parked plan, and the dashboard approves through the unified pendin… [truncated] · [report](m-43b20d/report.md)
