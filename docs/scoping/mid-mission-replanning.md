@@ -1,8 +1,8 @@
 # M2 scoping — Mid-mission re-planning (the past is frozen, the remainder is negotiable)
 
-Status: scoped 2026-07-06, DESIGN-FIRST — the six flagged decisions (D-A…D-F) are the operator's.
-D-A through D-D DECIDED 2026-07-06 (verb Revise; both triggers, operator-first, exec-refused; feature
-boundary; gate mechanics as proposed). D-E and D-F remain open — settle them before drafting. Roadmap home: M2
+Status: scoped 2026-07-06 — ALL SIX decisions (D-A…D-F) DECIDED 2026-07-06,
+each as recommended. The doc is draft-ready; remaining Open questions are
+build-time probes for the mission drafter, not operator gates. Roadmap home: M2
 (docs/roadmap.md:29–48, "re-planning = safe subset"). Claims the "Re-planning UI (M2)" territory pipeline-view.md:160 reserved.
 
 ## Why
@@ -132,7 +132,7 @@ DECIDED 2026-07-06: as recommended — (2) feature boundary; abort-the-worker
    remainder rebuilt, coexisting with fix/replan id minting and the duplicate-id guard (reducer.rs:218–223). Reject
    emits `plan.revision.rejected {revision}`. The append-only log records propose → approve/reject, always.
 
-## D-E — contract implications (OPERATOR DECISION)
+## D-E — contract implications (DECIDED 2026-07-06)
 
 **base_sha is never re-pinned.** Resolved once at first approval (orchestrator.rs:717–721), it feeds every contract
 command as KRANZ_BASE_SHA (runner.rs:495–501) and every validator round (orchestrator.rs:2203/2245/2276). Completed
@@ -151,7 +151,12 @@ has started is spend-adjacent in trust terms. If remaining scope genuinely inval
 is `kranz abandon` plus a new mission. Preflight re-runs against newly added contract commands before workers resume
 (orchestrator.rs:497–555). Versioning is deferred, not rejected.
 
-## D-F — run/queue interaction (OPERATOR DECISION)
+DECIDED 2026-07-06: as proposed — extend-only; base_sha never re-pinned;
+added grants/assertions render loudly in the review diff; weakening the
+contract mid-flight means abandon + new mission. The moving-base judgement
+diff is ticketed separately (fix-final-gate-judgement-diff-base).
+
+## D-F — run/queue interaction (DECIDED 2026-07-06)
 
 - **Does re-planning pause the mission? Proposal: the proposal parks the loop.** After emitting
   `plan.revision.proposed`, the engine idles in the same inbox-poll Paused uses (orchestrator.rs:1141–1145) until
@@ -164,6 +169,10 @@ is `kranz abandon` plus a new mission. Preflight re-runs against newly added con
   mission per repo unchanged (queue.rs:9–13). A parked mission is still live.
 - **Rejection = resume.** `plan.revision.rejected`, then the loop picks up the ORIGINAL plan exactly where it
   parked. Rejection is not failure — iterate is always on offer (pipeline-view.md design principle 2).
+
+DECIDED 2026-07-06: as proposed on all four points — the proposal parks the
+loop, the run task owns the engine throughout, the repo slot stays busy,
+rejection resumes the original plan.
 
 ## Build slicing (each a single mission brief)
 
