@@ -286,6 +286,23 @@ pub fn next_work_action(front: Option<&QueueEntry>, busy_with: Option<&str>) -> 
     }
 }
 
+/// Work-time re-check for a claimed queue entry with a ticket: `Some(blocker)`
+/// when one of the ticket's unsatisfied `blocked-by` entries is unsatisfied
+/// because that blocker's own ticket ended up Failed (its mission reached a
+/// terminal non-Complete state — Failed/Abandoned/Blocked — after
+/// batch-approval queued this entry alongside it). The dispatcher must skip
+/// such an entry rather than run it: re-driving a mission whose dependency
+/// failed can never succeed, and retrying forever would hot-loop.
+pub fn work_skip_for_failed_blocker(repo_root: &Path, slug: &str) -> Result<Option<String>> {
+    let unsatisfied = deps::unsatisfied_blockers(repo_root, slug)?;
+    for blocker in unsatisfied {
+        if Ticket::read_state(repo_root, &blocker) == TicketState::Failed {
+            return Ok(Some(blocker));
+        }
+    }
+    Ok(None)
+}
+
 /// Map a terminal mission status to the ticket state recorded after a run.
 pub fn ticket_state_for_mission(status: MissionStatus) -> TicketState {
     match status {
@@ -645,6 +662,24 @@ pub async fn cmd_work(repo: PathBuf, once: bool) -> Result<i32> {
                 // CLAIMED entry is authoritative, so run that one.
                 let mission_id = claim.entry.mission_id.clone();
                 if let Some(slug) = &ticket_slug {
+                    // Re-check blockers at work time: batch-approval can queue
+                    // a dependent alongside a blocker that fails before its
+                    // turn comes up. Retire the claim (never release it — that
+                    // would re-claim this same doomed entry forever) and mark
+                    // the ticket Failed with a note naming the blocker.
+                    if let Some(blocker) = work_skip_for_failed_blocker(&repo, slug)? {
+                        queue::finish_claim(claim);
+                        Ticket::write_state(
+                            &repo,
+                            slug,
+                            TicketState::Failed,
+                            Some(format!("skipped: blocked-by {blocker} failed")),
+                        )?;
+                        eprintln!(
+                            "warning: skipping ticket '{slug}' — blocked-by '{blocker}' failed"
+                        );
+                        continue;
+                    }
                     Ticket::write_state(&repo, slug, TicketState::Running, None)?;
                 }
                 println!("running mission {mission_id} from the queue");

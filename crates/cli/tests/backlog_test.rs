@@ -11,7 +11,8 @@
 use clap::Parser;
 use kranz_cli::backlog::{
     self, draft_decision, next_work_action, render_queue, render_ticket_list, render_ticket_show,
-    ticket_state_for_mission, ticket_template, DraftDecision, TicketRow, WorkAction,
+    ticket_state_for_mission, ticket_template, work_skip_for_failed_blocker, DraftDecision,
+    TicketRow, WorkAction,
 };
 use kranz_cli::cli::{Cli, Command, TicketCommand};
 use kranz_engine::orchestrator::PlanRequest;
@@ -659,4 +660,53 @@ fn blocked_by_approve_refuses_cycle_with_path_even_with_force() {
     // Refused in both cases: ticket stays Review, nothing queued.
     assert_eq!(Ticket::read_state(repo, "a"), TicketState::Review);
     assert!(queue::list(repo).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// work dispatcher — work-time blocker re-check (`work_skips_failed_blocker`)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn work_skips_failed_blocker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+
+    // Batch-approval queued both "dep" and "blocked" before "dep"'s mission
+    // ran; by the time `work` gets to "blocked", "dep" has since failed.
+    write_ticket(repo, "dep", "---\ntitle: dep\n---\nbody\n");
+    Ticket::record_mission(repo, "dep", "m-dep").unwrap();
+    Ticket::write_state(repo, "dep", TicketState::Failed, None).unwrap();
+
+    write_ticket(
+        repo,
+        "blocked",
+        "---\ntitle: blocked\nblocked-by: [dep]\n---\nbody\n",
+    );
+    Ticket::write_state(repo, "blocked", TicketState::Queued, None).unwrap();
+
+    let skip = work_skip_for_failed_blocker(repo, "blocked").unwrap();
+    assert_eq!(skip, Some("dep".to_string()));
+}
+
+#[test]
+fn work_does_not_skip_when_blocker_merely_incomplete() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+
+    // "dep" is still Running (not yet Complete, but not Failed either) — the
+    // required behavior only skips on a failed blocker, never on a merely
+    // not-yet-complete one.
+    write_ticket(repo, "dep", "---\ntitle: dep\n---\nbody\n");
+    Ticket::record_mission(repo, "dep", "m-dep").unwrap();
+    Ticket::write_state(repo, "dep", TicketState::Running, None).unwrap();
+
+    write_ticket(
+        repo,
+        "blocked",
+        "---\ntitle: blocked\nblocked-by: [dep]\n---\nbody\n",
+    );
+    Ticket::write_state(repo, "blocked", TicketState::Queued, None).unwrap();
+
+    let skip = work_skip_for_failed_blocker(repo, "blocked").unwrap();
+    assert_eq!(skip, None);
 }
