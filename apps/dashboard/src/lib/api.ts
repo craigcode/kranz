@@ -226,10 +226,6 @@ export const api = {
 
   // --- delivered stage (gated Merge action) --------------------------------
 
-  reportMd(id: string): Promise<{ markdown: string }> {
-    return getJson(`/api/missions/${encodeURIComponent(id)}/report.md`);
-  },
-
   merge(id: string): Promise<{ merged: boolean; commit?: string }> {
     return postJson(`/api/missions/${encodeURIComponent(id)}/merge`, {});
   },
