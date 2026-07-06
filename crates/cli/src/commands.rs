@@ -1118,6 +1118,10 @@ async fn cmd_serve(
     // (when --slack) the bridge. Handing the bridge its own MissionHost would
     // mean two engines contending for one mission's single-writer lock.
     let host = Arc::new(kranz_server::MissionHost::new(repo.clone()));
+    // autoWork (default off) drains the queue automatically whenever entries
+    // are waiting; started here (not in `MissionHost::new`) so test hosts
+    // stay inert unless they opt in.
+    host.ensure_auto_work_started();
 
     // Opt-in Slack bridge, spawned alongside the server and stopped when the
     // process exits. serve_slack is a no-op (logs) when Slack is unconfigured,

@@ -87,6 +87,9 @@ pub struct MissionHost {
     /// The single tracked background queue drain slot (see
     /// [`MissionHost::drain`]).
     drain: Mutex<DrainSlot>,
+    /// The lazily-spawned autoWork background task, started at most once
+    /// (see [`MissionHost::ensure_auto_work_started`]).
+    auto_work: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// One background drain task's observable progress — shared between the task
@@ -97,6 +100,13 @@ struct DrainState {
     live: bool,
     current_mission_id: Option<String>,
     ran: Vec<String>,
+}
+
+/// The autoWork watcher's decision function, factored out so it's testable
+/// without standing up a full mission: drain only when autoWork is enabled,
+/// the queue has something waiting, and no drain is already live.
+fn should_auto_drain(auto_work: bool, queue_non_empty: bool, drain_live: bool) -> bool {
+    auto_work && queue_non_empty && !drain_live
 }
 
 fn drain_state_json(state: &DrainState) -> Value {
@@ -138,6 +148,7 @@ impl MissionHost {
             missions: Arc::new(Mutex::new(HashMap::new())),
             sweeper: Mutex::new(None),
             drain: Mutex::new(DrainSlot::Idle),
+            auto_work: Mutex::new(None),
         }
     }
 
@@ -150,6 +161,7 @@ impl MissionHost {
             missions: Arc::new(Mutex::new(HashMap::new())),
             sweeper: Mutex::new(None),
             drain: Mutex::new(DrainSlot::Idle),
+            auto_work: Mutex::new(None),
         }
     }
 
@@ -540,6 +552,55 @@ impl MissionHost {
                 for id in released {
                     tracing::info!(mission = %id, "released idle planning engine");
                 }
+            }
+        }));
+    }
+
+    /// Whether a tracked drain is currently live (a `Starting` reservation or
+    /// a `Running` handle that hasn't finished). Read-only: never installs a
+    /// reservation, so it never races [`Self::drain`]'s own check.
+    fn drain_is_live(&self) -> bool {
+        match &*self.drain.lock().expect("drain tracker lock") {
+            DrainSlot::Idle => false,
+            DrainSlot::Starting(_) => true,
+            DrainSlot::Running(handle) => !handle.join.is_finished(),
+        }
+    }
+
+    /// One autoWork check: re-read config fresh (so a live `autoWork` toggle
+    /// takes effect without a restart, exactly like the idle sweeper reads
+    /// `planningIdleReleaseMinutes`), and kick off a drain when
+    /// [`should_auto_drain`] says to. Split out from
+    /// [`Self::ensure_auto_work_started`] so tests can invoke a single tick
+    /// directly instead of waiting on the real interval.
+    async fn auto_work_tick(&self) {
+        let cfg = match config::load(&self.repo_root) {
+            Ok(cfg) => cfg,
+            Err(_) => return,
+        };
+        let queue_non_empty = kranz_engine::queue::peek(&self.repo_root).is_some();
+        if should_auto_drain(cfg.auto_work, queue_non_empty, self.drain_is_live()) {
+            if let Err(e) = self.drain().await {
+                tracing::error!(error = %e.message, "autoWork drain failed");
+            }
+        }
+    }
+
+    /// Spawn the autoWork watcher at most once. It loops for the lifetime of
+    /// the host, sleeping between [`Self::auto_work_tick`] calls. Started
+    /// explicitly from `kranz serve` (not from [`Self::new`]) so test hosts
+    /// stay inert unless they opt in.
+    pub fn ensure_auto_work_started(self: &Arc<Self>) {
+        let mut guard = self.auto_work.lock().expect("auto_work lock");
+        if guard.is_some() {
+            return;
+        }
+        let host = Arc::clone(self);
+        *guard = Some(tokio::spawn(async move {
+            const AUTO_WORK_INTERVAL: Duration = Duration::from_secs(10);
+            loop {
+                tokio::time::sleep(AUTO_WORK_INTERVAL).await;
+                host.auto_work_tick().await;
             }
         }));
     }
