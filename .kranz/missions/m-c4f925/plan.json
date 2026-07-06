@@ -1,0 +1,80 @@
+{
+  "goal": "Compute blocked-ness in one engine-side predicate, serve it as isBlocked on both ticket REST endpoints, and make every render surface (backlog chip + ticket-detail approve gate) derive from it so a done ticket whose blocker is done never shows an active blocked chip.",
+  "validationContract": [
+    {
+      "id": "a1",
+      "statement": "Engine unit tests prove deps::is_blocked: blocker's mission Complete -> false; blocker mission absent or non-Complete -> true; empty blocked_by -> false.",
+      "check": "command",
+      "command": "cargo test -p kranz-engine is_blocked 2>&1 | grep -qE 'result: ok\\. [1-9][0-9]* passed'"
+    },
+    {
+      "id": "a2",
+      "statement": "GET /api/tickets returns isBlocked:false with blockedBy intact for a done ticket whose blocker's mission is Complete (tickets_rest integration test).",
+      "check": "command",
+      "command": "cargo test -p kranz-server --test tickets_rest is_blocked 2>&1 | grep -qE 'result: ok\\. [1-9][0-9]* passed'"
+    },
+    {
+      "id": "a3",
+      "statement": "The dashboard vitest suite (including new BacklogPanel chip-logic and TicketDetail approve-gate cases) passes.",
+      "check": "command",
+      "command": "cd apps/dashboard && npm test"
+    },
+    {
+      "id": "a4",
+      "statement": "The dashboard typechecks and builds.",
+      "check": "command",
+      "command": "cd apps/dashboard && npx tsc --noEmit && npm run build"
+    },
+    {
+      "id": "a5",
+      "statement": "The Rust workspace is clippy-clean under -D warnings and fmt-clean.",
+      "check": "command",
+      "command": "cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all --check"
+    },
+    {
+      "id": "a6",
+      "statement": "No event-log schema or reducer change: the mission diff touches neither crates/engine/src/reducer.rs nor crates/engine/src/event_log.rs.",
+      "check": "command",
+      "command": "git rev-parse -q --verify \"$KRANZ_BASE_SHA^{commit}\" >/dev/null && ! git diff --name-only \"$KRANZ_BASE_SHA\" | grep -qE 'crates/engine/src/(reducer|event_log)\\.rs'"
+    },
+    {
+      "id": "a7",
+      "statement": "One engine predicate is the sole source of blocked-ness: it is documented as such, every render surface (backlog chip, ticket-detail approve gate) and the isBlocked REST field derive from it with no client re-deriving blockedness locally, non-empty-but-satisfied edges render as muted 'was blocked by …' provenance rather than an active chip, and a done ticket never renders an active chip even against a payload that claims isBlocked:true.",
+      "check": "agent-judgement"
+    }
+  ],
+  "milestones": [
+    {
+      "title": "Server computes and serves a single blocked-ness predicate",
+      "features": [
+        {
+          "title": "deps::is_blocked wrapper + isBlocked on both ticket REST projections",
+          "spec": "This repo (kranz) is a Rust workspace: crates/engine (kranz-engine), crates/server (kranz-server). The approve gate already defines the ONLY correct notion of blocked-ness in crates/engine/src/deps.rs: `unsatisfied_blockers(repo_root, slug) -> Result<Vec<String>>` returns blocker slugs whose recorded mission has not reached MissionStatus::Complete (a blocker with no ticket file, no recorded mission, or any non-Complete status counts as unsatisfied). Do NOT invent a second notion.\n\n1) ADD to crates/engine/src/deps.rs a thin wrapper:\n```\n/// Single source of blocked-ness. Approve gates (dashboard + Slack) and\n/// every rendering surface MUST call this, never re-derive.\npub fn is_blocked(repo_root: &Path, slug: &str) -> Result<bool> {\n    Ok(!unsatisfied_blockers(repo_root, slug)?.is_empty())\n}\n```\nKeep the doc-comment text as a marker comment verbatim (it is the design invariant). Match surrounding style; run cargo fmt.\n\n2) ADD engine unit tests. Put them where the existing blocked-by tests live: crates/engine/tests/ticket_queue_test.rs (it already imports `deps`, has `write_ticket`, and a `write_mission_events(root, mission_id, complete)` helper that writes a minimal events.jsonl folding to MissionStatus::Complete when complete=true, plus `Ticket::record_mission`). Add tests whose function names CONTAIN the substring `is_blocked` (the validation command filters on it), covering exactly:\n   - is_blocked_false_when_blocker_mission_complete: ticket blocked-by [dep]; dep has a ticket file, record_mission + write_mission_events(..., true) -> deps::is_blocked == false.\n   - is_blocked_true_when_blocker_mission_absent_or_incomplete: dep with no recorded mission -> true; and a dep whose mission is written with complete=false -> true.\n   - is_blocked_false_when_no_blocked_by: ticket with empty blocked-by -> false.\n\n3) SERVE the field. In crates/server/src/tickets.rs, both `ticket_summary_json` (~line 93) and `ticket_full_json` (~line 106) build a `json!({...})` and already receive `repo_root`. Add `\"isBlocked\": kranz_engine::deps::is_blocked(repo_root, &ticket.slug).unwrap_or(false)` to BOTH objects (camelCase key). On error default to false — an unreadable/invalid ticket should not falsely block. Keep `blockedBy` exactly as-is (provenance must persist).\n\n4) ADD a tickets_rest integration test in crates/server/tests/tickets_rest.rs with a function name CONTAINING `is_blocked`. That file already has `init_git_repo()`, `write_ticket`, `write_status`, `body_json`, and drives the tokenless router via `kranz_server::router`. It does NOT yet write mission event logs; you must create a Complete-mission fixture for the blocker so unsatisfied_blockers sees it satisfied. Use kranz_engine public API: `Ticket::record_mission(repo, blocker_slug, mission_id)` to link the sidecar, then write the mission's events.jsonl at `kranz_engine::paths::MissionPaths::new(repo, mission_id).events_file()` containing a MissionCreated event followed by a MissionCompleted event so the reducer folds to Complete (mirror the shape of `write_mission_events` in crates/engine/tests/ticket_queue_test.rs — EventKind::MissionCreated{ goal, base_branch, mission_branch, config: MissionConfig::default() } then EventKind::MissionCompleted{}; serialize each Event as one JSON line). The test: write a `done` ticket `child` with `blocked-by: [parent]` and status done; write ticket `parent` with status done and a Complete mission linked as above; GET /api/tickets; assert the `child` row has `isBlocked == false` AND `blockedBy == [\"parent\"]`. Also assert a positive control if convenient (a child whose parent mission is absent -> isBlocked true), but the passed-count guard only requires the is_blocked test(s) to pass.\n\nDo NOT touch crates/engine/src/reducer.rs or crates/engine/src/event_log.rs (contract a6). Ensure `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check` stay clean. Do NOT change any TypeScript in this feature.",
+          "validationCriteria": [
+            "cargo test -p kranz-engine is_blocked 2>&1 | grep -qE 'result: ok\\. [1-9][0-9]* passed' (the three predicate cases pass under is_blocked-named tests).",
+            "cargo test -p kranz-server --test tickets_rest is_blocked 2>&1 | grep -qE 'result: ok\\. [1-9][0-9]* passed' (GET /api/tickets shows isBlocked:false with blockedBy intact for a done ticket whose blocker mission is Complete).",
+            "Both ticket_summary_json and ticket_full_json emit an isBlocked boolean derived from kranz_engine::deps::is_blocked; blockedBy is unchanged.",
+            "deps::is_blocked carries the 'Single source of blocked-ness … MUST call this, never re-derive' comment and wraps unsatisfied_blockers.",
+            "cargo clippy --workspace --all-targets -- -D warnings and cargo fmt --all --check are clean; reducer.rs and event_log.rs are untouched."
+          ]
+        }
+      ]
+    },
+    {
+      "title": "Every render surface derives the chip and approve gate from isBlocked",
+      "features": [
+        {
+          "title": "Backlog chip + ticket-detail approve gate consume server isBlocked",
+          "spec": "This is the dashboard (apps/dashboard, React + TypeScript + vitest/jsdom; run everything from apps/dashboard). The server now returns a camelCase boolean `isBlocked` on both GET /api/tickets rows and GET /api/tickets/:slug (feature f-1-1, already landed on this branch — verify by reading crates/server/src/tickets.rs). Make ALL client render surfaces derive blocked-ness from that field and STOP re-deriving it locally.\n\n1) TYPES — apps/dashboard/src/lib/types.ts: add `isBlocked: boolean;` to BOTH `interface TicketSummary` (~line 70) and `interface Ticket` (~line 79). Leave `blockedBy: string[]` in place on both (it is provenance).\n\n2) BACKLOG PANEL — apps/dashboard/src/components/BacklogPanel.tsx. Today (line ~34) it maps `t.blockedBy` straight to red `ticket-blocker-badge` spans. Change the per-ticket badge logic to:\n   - Render the ACTIVE red blocked chip ONLY when `t.isBlocked === true` AND `t.state !== 'done'` (belt-and-braces: a done ticket never shows an active chip even if the payload lies and sets isBlocked true). Keep the existing red styling/className (`ticket-blocker-badge`) and the 'blocked by <slug>' text for the active case so existing styling holds.\n   - When `t.blockedBy` is non-empty but the ticket is NOT actively blocked (isBlocked false, or state done), render MUTED provenance instead of the red chip: text 'was blocked by <slug>' with a distinct muted className (e.g. add a `ticket-blocker-badge--satisfied` modifier or reuse an existing dim/muted class such as `dim`; do not use the active red class). Provenance may render the full blockedBy list.\n   - When blockedBy is empty, render nothing.\n\n3) TICKET DETAIL — apps/dashboard/src/components/TicketDetail.tsx (lines ~94-103). It currently computes `unsatisfiedBlockers = ticket.blockedBy.filter(b => dep === undefined || dep.state !== 'done')` and sets `approveDisabled = unsatisfiedBlockers.length > 0`. This is a FORBIDDEN parallel, ticket-state-based notion. REPLACE it: drive `approveDisabled` from the server value — `const approveDisabled = ticket.isBlocked;`. Remove the local `unsatisfiedBlockers` derivation and its dependence on the `tickets` list for blocked-ness. For the disabled tooltip/label, use `ticket.blockedBy` purely as provenance text (e.g. `blocked by ${ticket.blockedBy.join(', ')}`) — it names edges, but the DISABLED decision must come only from ticket.isBlocked. Keep the rest of the component (Draft/Approve buttons, showApprove = state==='review') unchanged.\n\n4) TESTS & MOCKS. Update every test helper that constructs a TicketSummary or Ticket to include the new required `isBlocked` field, so tsc and vitest stay green — at least: apps/dashboard/src/components/BacklogPanel.test.tsx (makeSummary), apps/dashboard/src/components/TicketDetail.test.tsx (makeTicket/makeSummary), apps/dashboard/src/lib/store.tickets.test.ts (its ticket factory). Give each a sensible default (isBlocked: false).\n   Extend BacklogPanel.test.tsx to cover the chip logic explicitly:\n   - No red (active) chip when isBlocked false (blockedBy empty).\n   - Red active chip present when isBlocked true and state !== 'done'.\n   - blockedBy non-empty but isBlocked false -> muted 'was blocked by …' provenance shown, NO active red chip.\n   - A done ticket with a payload of isBlocked:true renders NO active chip (render-guard case).\n   Distinguish active vs muted by className or by the 'blocked by' vs 'was blocked by' text.\n   Update TicketDetail.test.tsx so the existing 'disables Approve and names the blocker for a blocked review ticket' case now drives off isBlocked:true (blocked) and add/adjust a case where isBlocked:false leaves Approve enabled even if blockedBy is non-empty.\n\nDo NOT touch any Rust. Keep oxlint/tsc happy. Verify with: `npm test`, `npx tsc --noEmit`, and `npm run build` (all from apps/dashboard).",
+          "validationCriteria": [
+            "npm test (apps/dashboard) passes, including BacklogPanel cases: no active chip when isBlocked false; red active chip when isBlocked true and not done; muted 'was blocked by …' provenance when blockedBy non-empty but isBlocked false; and no active chip for a done ticket even when the payload sets isBlocked true.",
+            "TicketDetail's Approve disabled state derives from ticket.isBlocked (server value); the local ticket.blockedBy state-based unsatisfiedBlockers derivation is removed; TicketDetail.test.tsx reflects this.",
+            "TicketSummary and Ticket TS interfaces include isBlocked: boolean; all test factories construct it; blockedBy remains present for provenance.",
+            "npx tsc --noEmit and npm run build (apps/dashboard) both pass.",
+            "No Rust files are modified by this feature."
+          ]
+        }
+      ]
+    }
+  ]
+}
