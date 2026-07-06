@@ -28,4 +28,4 @@ Approved plans, newest last.
 - 2026-07-06 · [m-0b8da7](m-0b8da7/plan.md) — Make pre-mission cost estimates shape-aware: detect doc-heavy/judgement-heavy plan shapes the calibration corpus doesn't… [truncated] · [report](m-0b8da7/report.md)
 - 2026-07-06 · [m-ba8d58](m-ba8d58/plan.md) — Fix five render bugs in the dashboard pipeline view (apps/dashboard): honest inert stages for abandoned/deleted missions… [truncated] · [report](m-ba8d58/report.md)
 - 2026-07-06 · [m-079c36](m-079c36/plan.md) — M7 tier 1: when workerIsolation=worktree, every worker and validator session runs in a dedicated git worktree and all mi… [truncated] · [report](m-079c36/report.md)
-- 2026-07-06 · [m-836e99](m-836e99/plan.md) — Delete the unrouted dead MissionPicker component and its now-orphaned helper/tests, and scrub every remaining source ref… [truncated]
+- 2026-07-06 · [m-836e99](m-836e99/plan.md) — Delete the unrouted dead MissionPicker component and its now-orphaned helper/tests, and scrub every remaining source ref… [truncated] · [report](m-836e99/report.md)
