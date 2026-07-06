@@ -2720,6 +2720,7 @@ impl MissionEngine {
                     severity: "critical".to_string(),
                     evidence: "assertion has check=command but no command".to_string(),
                     suggested_fix: String::new(),
+                    class: String::new(),
                 });
                 continue;
             };
@@ -2730,6 +2731,7 @@ impl MissionEngine {
                     severity: "critical".to_string(),
                     evidence: format!("command failed: {command}\n{output}"),
                     suggested_fix: String::new(),
+                    class: String::new(),
                 });
             }
         }
@@ -2848,12 +2850,14 @@ impl MissionEngine {
                                 v.evidence.clone()
                             },
                             suggested_fix: String::new(),
+                            class: String::new(),
                         }),
                         None => findings.push(Finding {
                             subject: assertion.id.clone(),
                             severity: "critical".to_string(),
                             evidence: "no verdict returned for this assertion".to_string(),
                             suggested_fix: String::new(),
+                            class: String::new(),
                         }),
                     }
                 }
@@ -2867,6 +2871,7 @@ impl MissionEngine {
                         evidence: "verdict turn unparseable; assertion could not be verified"
                             .to_string(),
                         suggested_fix: String::new(),
+                        class: String::new(),
                     });
                 }
                 "unparseable verdicts; all judgement assertions failed conservatively".to_string()
@@ -3464,6 +3469,7 @@ impl MissionEngine {
                         })
                         .collect(),
                     command_grants: mission.command_grants.clone(),
+                    touch_set: mission.touch_set.clone(),
                 };
                 Ok(serde_json::to_string_pretty(&plan)?)
             }
@@ -4905,6 +4911,10 @@ fn plan_schema() -> serde_json::Value {
             "commandGrants": {
                 "type": "array",
                 "items": { "type": "string" }
+            },
+            "touchSet": {
+                "type": "array",
+                "items": { "type": "string" }
             }
         }
     })
@@ -5321,6 +5331,7 @@ mod tests {
                 base_sha: None,
                 mission_branch: "kranz/mission-m-1".to_string(),
                 command_grants: vec![],
+                touch_set: vec![],
             },
             runs,
             totals: TokenUsage::default(),
@@ -5464,6 +5475,7 @@ mod tests {
                 }],
             }],
             command_grants: vec!["gc lint".into()],
+            touch_set: vec!["src/**".into()],
         };
         let value = serde_json::to_value(&plan).unwrap();
         let schema = plan_schema();

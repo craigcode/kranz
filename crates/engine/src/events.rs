@@ -260,6 +260,7 @@ mod tests {
             validation_contract: vec![],
             milestones: vec![],
             command_grants: vec![],
+            touch_set: vec![],
         }
     }
 

@@ -261,6 +261,7 @@ fn plan_with(features_per_milestone: &[usize]) -> Plan {
             })
             .collect(),
         command_grants: vec![],
+        touch_set: vec![],
     }
 }
 
@@ -435,6 +436,7 @@ fn mission_a_events() -> Vec<EventKind> {
                 severity: "major".into(),
                 evidence: "it broke".into(),
                 suggested_fix: "fix it".into(),
+                class: String::new(),
             },
         },
         // First fix-feature after milestone.validating: fix cycle #1.

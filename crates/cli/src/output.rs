@@ -257,6 +257,7 @@ mod tests {
                 }],
             }],
             command_grants: vec![],
+            touch_set: vec![],
         };
         let events = vec![
             Event {

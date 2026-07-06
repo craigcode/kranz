@@ -353,6 +353,7 @@ fn mission_plan(state: &MissionState) -> Plan {
     Plan {
         goal: state.mission.goal.clone(),
         command_grants: state.mission.command_grants.clone(),
+        touch_set: state.mission.touch_set.clone(),
         validation_contract: state.mission.validation_contract.clone(),
         milestones: state
             .mission

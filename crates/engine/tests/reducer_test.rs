@@ -59,6 +59,7 @@ fn plan() -> Plan {
             },
         ],
         command_grants: vec![],
+        touch_set: vec![],
     }
 }
 
@@ -551,6 +552,7 @@ fn fix_cycles_increment_once_per_validation_round() {
                     severity: "major".into(),
                     evidence: "it broke".into(),
                     suggested_fix: "fix it".into(),
+                    class: String::new(),
                 },
             },
         ),
@@ -1275,6 +1277,7 @@ fn prop_plan() -> Plan {
             },
         ],
         command_grants: vec![],
+        touch_set: vec![],
     }
 }
 
@@ -1379,6 +1382,7 @@ fn interpret(actions: &[Action]) -> Vec<Event> {
                         severity: "minor".into(),
                         evidence: "e".into(),
                         suggested_fix: String::new(),
+                        class: String::new(),
                     },
                 }
             }
@@ -1461,6 +1465,7 @@ fn validation_finding_accepts_reserved_engine_run_id() {
             severity: "major".to_string(),
             evidence: "command failed".to_string(),
             suggested_fix: String::new(),
+            class: String::new(),
         },
     };
 

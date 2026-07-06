@@ -55,6 +55,11 @@ pub struct Mission {
     /// sessions; single source of truth carried from the approved `Plan`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command_grants: Vec<String>,
+    /// Gitignore/glob-style repo-relative path patterns the mission is
+    /// allowed to touch; single source of truth carried from the approved
+    /// `Plan`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub touch_set: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -73,6 +78,10 @@ pub struct Plan {
     /// and validator sessions.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command_grants: Vec<String>,
+    /// Gitignore/glob-style repo-relative path patterns the mission is
+    /// allowed to touch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub touch_set: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -285,6 +294,10 @@ pub struct Finding {
     pub evidence: String,
     #[serde(default)]
     pub suggested_fix: String,
+    /// Free-form finding class, e.g. "out-of-contract-write"; default "" for
+    /// existing scrutiny/functional/gate findings.
+    #[serde(default)]
+    pub class: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

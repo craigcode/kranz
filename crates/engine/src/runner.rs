@@ -476,7 +476,8 @@ pub fn validator_report_schema() -> serde_json::Value {
                         "subject": { "type": "string" },
                         "severity": { "type": "string", "enum": ["critical", "major", "minor"] },
                         "evidence": { "type": "string" },
-                        "suggestedFix": { "type": "string" }
+                        "suggestedFix": { "type": "string" },
+                        "class": { "type": "string" }
                     }
                 }
             },
