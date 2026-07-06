@@ -233,6 +233,89 @@ fn append_needs_context_mutates_md_and_status() {
     assert_eq!(Ticket::read_state(root, "feat"), TicketState::NeedsContext);
 }
 
+#[test]
+fn append_needs_context_truncates_long_question() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let dir = Ticket::tickets_dir(root);
+    fs::create_dir_all(&dir).unwrap();
+    let md = dir.join("feat.md");
+    fs::write(&md, "---\ntitle: Feature\n---\n\n## Goal\nDo the thing.\n").unwrap();
+
+    let long_question = "a".repeat(5000);
+    Ticket::append_needs_context(root, "feat", std::slice::from_ref(&long_question)).unwrap();
+
+    let after = fs::read_to_string(&md).unwrap();
+    assert!(!after.contains(&long_question));
+    let expected = format!("- {} … (truncated)", "a".repeat(500));
+    assert!(after.contains(&expected));
+}
+
+#[test]
+fn append_needs_context_caps_total_count() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let dir = Ticket::tickets_dir(root);
+    fs::create_dir_all(&dir).unwrap();
+    let md = dir.join("feat.md");
+    fs::write(&md, "---\ntitle: Feature\n---\n\n## Goal\nDo the thing.\n").unwrap();
+
+    let questions: Vec<String> = (0..30).map(|i| format!("Question {i}")).collect();
+    Ticket::append_needs_context(root, "feat", &questions).unwrap();
+
+    let after = fs::read_to_string(&md).unwrap();
+    let heading_idx = after.find("## Needs context (from orchestrator)").unwrap();
+    let block = &after[heading_idx..];
+    let bullet_lines: Vec<&str> = block.lines().filter(|l| l.starts_with("- ")).collect();
+    assert_eq!(bullet_lines.len(), 21);
+    for (i, line) in bullet_lines.iter().enumerate().take(20) {
+        assert_eq!(*line, format!("- Question {i}"));
+    }
+    assert_eq!(bullet_lines[20], "- … (10 more omitted)");
+}
+
+#[test]
+fn append_needs_context_leaves_short_questions_unchanged() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let dir = Ticket::tickets_dir(root);
+    fs::create_dir_all(&dir).unwrap();
+    let md = dir.join("feat.md");
+    fs::write(&md, "---\ntitle: Feature\n---\n\n## Goal\nDo the thing.\n").unwrap();
+
+    let questions = vec![
+        "Which auth backend?".to_string(),
+        "Is Postgres available?".to_string(),
+        "What about rate limits?".to_string(),
+    ];
+    Ticket::append_needs_context(root, "feat", &questions).unwrap();
+
+    let after = fs::read_to_string(&md).unwrap();
+    assert!(after.contains("- Which auth backend?\n"));
+    assert!(after.contains("- Is Postgres available?\n"));
+    assert!(after.contains("- What about rate limits?\n"));
+    assert!(!after.contains("truncated"));
+    assert!(!after.contains("omitted"));
+}
+
+#[test]
+fn append_needs_context_truncates_multibyte_on_char_boundary() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let dir = Ticket::tickets_dir(root);
+    fs::create_dir_all(&dir).unwrap();
+    let md = dir.join("feat.md");
+    fs::write(&md, "---\ntitle: Feature\n---\n\n## Goal\nDo the thing.\n").unwrap();
+
+    // Multibyte characters (each 3 bytes in UTF-8), well over 500 chars.
+    let long_question = "な".repeat(600);
+    Ticket::append_needs_context(root, "feat", &[long_question]).unwrap();
+
+    let after = fs::read_to_string(&md).unwrap();
+    let expected = format!("- {} … (truncated)", "な".repeat(500));
+    assert!(after.contains(&expected));
+}
+
 // ---------------------------------------------------------------------------
 // Ticket listing
 // ---------------------------------------------------------------------------

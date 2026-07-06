@@ -694,6 +694,11 @@ pub async fn run_draft(host: &SharedHost, slug: &str) -> Vec<Value> {
             ":white_check_mark: Draft ready for review — mission `{mission_id}`, \
              branch `{mission_branch}`. Ticket `{slug}` is now in review."
         )),
+        Ok(DraftOutcome::PlanAsProse { mission_id }) => error_blocks(&format!(
+            ":warning: Draft for `{slug}` NOT queued — mission `{mission_id}`'s orchestrator \
+             produced a plan but emitted it as prose instead of through the plan channel, so \
+             nothing was queued. Run `/kranz draft {slug}` again."
+        )),
         Ok(DraftOutcome::Enqueued { mission_id }) => error_blocks(&format!(
             ":white_check_mark: Draft approved and queued — mission `{mission_id}`. \
              Ticket `{slug}` is now queued."

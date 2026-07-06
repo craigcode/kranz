@@ -359,6 +359,13 @@ pub async fn cmd_draft(
                     .display()
             );
         }
+        DraftOutcome::PlanAsProse { mission_id } => {
+            println!(
+                "ticket '{slug}' NOT queued: mission {mission_id}'s orchestrator produced a \
+                 plan but emitted it as prose instead of through the plan channel, so nothing \
+                 was queued. Run `kranz draft {slug}` again."
+            );
+        }
         DraftOutcome::Enqueued { mission_id } => {
             println!(
                 "plan committed on {mission_branch}; mission {mission_id} approved and QUEUED. \

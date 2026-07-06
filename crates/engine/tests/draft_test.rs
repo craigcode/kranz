@@ -5,7 +5,7 @@
 
 use kranz_engine::backend::AgentBackend;
 use kranz_engine::backend_mock::{mock_init, mock_result_text, mock_text, MockScript};
-use kranz_engine::draft::{drive_draft, DraftOutcome};
+use kranz_engine::draft::{drive_draft, looks_like_plan_json, DraftOutcome};
 use kranz_engine::orchestrator::MissionEngine;
 use kranz_engine::queue;
 use kranz_engine::ticket::{Ticket, TicketState};
@@ -124,6 +124,17 @@ fn plan_json(goal: &str) -> String {
         }]
     })
     .to_string()
+}
+
+/// A plan-shaped reply that reads as prose: contains a complete plan JSON
+/// object (so it has both `"validationContract"` and `"milestones"`), but a
+/// trailing brace outside the object breaks `parse_report`'s first-`{`..last-`}`
+/// slice, and there is no fenced code block to fall back on.
+fn plan_prose(goal: &str) -> String {
+    format!(
+        "Here is my plan:\n{}\nLet me know if you'd like changes {{done}}",
+        plan_json(goal)
+    )
 }
 
 fn write_ticket(repo: &Path, slug: &str, body: &str) -> Ticket {
@@ -282,4 +293,163 @@ async fn not_ready_reply_appends_needs_context_and_flips_state() {
     assert!(body.contains("## Needs context (from orchestrator)"));
     assert!(body.contains("- which auth backend?"));
     assert!(body.contains("- is postgres available?"));
+}
+
+// ---------------------------------------------------------------------------
+// looks_like_plan_json heuristic
+// ---------------------------------------------------------------------------
+
+#[test]
+fn looks_like_plan_json_matches_both_keys_only() {
+    assert!(looks_like_plan_json(
+        r#"{"validationContract": [], "milestones": []}"#
+    ));
+    assert!(!looks_like_plan_json(r#"{"validationContract": []}"#));
+    assert!(!looks_like_plan_json(r#"{"milestones": []}"#));
+    assert!(!looks_like_plan_json("just some prose"));
+}
+
+// ---------------------------------------------------------------------------
+// Plan-as-prose → bounded plan-channel retry recovers → approved like Ready
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn plan_as_prose_recovers_via_bounded_retry_and_approves() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let ticket = write_ticket(&root, "rl4", TICKET_BODY);
+
+    let goal = ticket.mission_goal();
+    // Turn order: seed ("ready") -> planning_turn -> request_plan#1 attempt
+    // (plan-shaped prose, fails parse) -> request_plan#1 retry (still prose,
+    // still fails parse) -> drive_draft's bounded extra request_plan#2 attempt
+    // (clean JSON, parses immediately).
+    let backend: Arc<dyn AgentBackend> =
+        Arc::new(MockBackend::with_scripts(vec![orch_script(vec![
+            "seeded, thinking...".to_string(),
+            plan_prose(&goal),
+            plan_prose(&goal),
+            plan_json(&goal),
+        ])]));
+    let mut engine = MissionEngine::create(backend, root.clone(), &goal, test_cfg()).unwrap();
+    let mission_id = engine.mission_id().to_string();
+
+    let drive = drive_draft(&mut engine, &root, &ticket, false)
+        .await
+        .unwrap();
+
+    match &drive.outcome {
+        DraftOutcome::ParkedForReview {
+            mission_id: out_id,
+            mission_branch,
+        } => {
+            assert_eq!(out_id, &mission_id);
+            assert_eq!(mission_branch, &format!("kranz/mission-{mission_id}"));
+        }
+        other => panic!("expected ParkedForReview, got {other:?}"),
+    }
+    assert_eq!(Ticket::read_state(&root, "rl4"), TicketState::Review);
+    let plan = drive
+        .plan
+        .expect("recovered Approve path must surface the plan");
+    assert_eq!(plan.goal, goal);
+
+    let path = Ticket::tickets_dir(&root).join("rl4.md");
+    let body = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !body.contains("validationContract"),
+        "plan JSON must never be filed to the ticket body"
+    );
+}
+
+#[tokio::test]
+async fn plan_as_prose_recovers_via_bounded_retry_and_enqueues() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let ticket = write_ticket(&root, "rl5", TICKET_BODY);
+
+    let goal = ticket.mission_goal();
+    let backend: Arc<dyn AgentBackend> =
+        Arc::new(MockBackend::with_scripts(vec![orch_script(vec![
+            "seeded, thinking...".to_string(),
+            plan_prose(&goal),
+            plan_prose(&goal),
+            plan_json(&goal),
+        ])]));
+    let mut engine = MissionEngine::create(backend, root.clone(), &goal, test_cfg()).unwrap();
+    let mission_id = engine.mission_id().to_string();
+
+    let drive = drive_draft(&mut engine, &root, &ticket, true)
+        .await
+        .unwrap();
+
+    match &drive.outcome {
+        DraftOutcome::Enqueued { mission_id: out_id } => assert_eq!(out_id, &mission_id),
+        other => panic!("expected Enqueued, got {other:?}"),
+    }
+    assert_eq!(Ticket::read_state(&root, "rl5"), TicketState::Queued);
+    assert!(queue::contains(&root, &mission_id));
+    assert!(drive.plan.is_some());
+
+    let path = Ticket::tickets_dir(&root).join("rl5.md");
+    let body = std::fs::read_to_string(&path).unwrap();
+    assert!(!body.contains("validationContract"));
+}
+
+// ---------------------------------------------------------------------------
+// Plan-as-prose on BOTH the initial request and the bounded retry → honest
+// PlanAsProse outcome, no questions filed, no plan JSON in the ticket body.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn plan_as_prose_persists_through_retry_yields_honest_outcome() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let ticket = write_ticket(&root, "rl6", TICKET_BODY);
+
+    let goal = ticket.mission_goal();
+    // request_plan#1: attempt + retry, both plan-shaped prose. drive_draft's
+    // bounded extra request_plan#2: attempt + retry, both plan-shaped prose
+    // again. Exactly one extra request_plan call — no looping.
+    let backend: Arc<dyn AgentBackend> =
+        Arc::new(MockBackend::with_scripts(vec![orch_script(vec![
+            "seeded, thinking...".to_string(),
+            plan_prose(&goal),
+            plan_prose(&goal),
+            plan_prose(&goal),
+            plan_prose(&goal),
+        ])]));
+    let mut engine = MissionEngine::create(backend, root.clone(), &goal, test_cfg()).unwrap();
+    let mission_id = engine.mission_id().to_string();
+
+    let drive = drive_draft(&mut engine, &root, &ticket, false)
+        .await
+        .unwrap();
+
+    match &drive.outcome {
+        DraftOutcome::PlanAsProse { mission_id: out_id } => {
+            assert_eq!(out_id, &mission_id);
+        }
+        other => panic!("expected PlanAsProse, got {other:?}"),
+    }
+    assert!(drive.plan.is_none());
+    assert_eq!(Ticket::read_state(&root, "rl6"), TicketState::NeedsContext);
+
+    let path = Ticket::tickets_dir(&root).join("rl6.md");
+    let body = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !body.contains("## Needs context (from orchestrator)"),
+        "plan-as-prose must not append the plan JSON as filed questions"
+    );
+    assert!(!body.contains("validationContract"));
+
+    let status_path = Ticket::tickets_dir(&root).join("rl6.status");
+    let status = std::fs::read_to_string(&status_path).unwrap();
+    assert!(status.contains("emitted it as prose"));
 }
