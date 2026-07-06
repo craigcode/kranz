@@ -229,6 +229,39 @@ impl GitRepo {
         self.run(&["diff", &range])
     }
 
+    /// Paths changed in `from..to` (`git diff --name-only <from>..<to>`),
+    /// one per line as git reports them.
+    ///
+    /// Rejects a flag-shaped `from`/`to` (leading `-`) before invoking git,
+    /// mirroring the guard on [`GitRepo::is_ancestor`]/[`GitRepo::rev_parse`].
+    pub fn changed_paths(&self, from: &str, to: &str) -> Result<Vec<String>> {
+        for slot in [from, to] {
+            if slot.starts_with('-') {
+                return Err(EngineError::Git(format!(
+                    "refusing changed_paths with flag-shaped ref {slot:?}"
+                )));
+            }
+        }
+        let range = format!("{from}..{to}");
+        let out = self.run(&["diff", "--name-only", &range])?;
+        Ok(out
+            .lines()
+            .map(|l| l.trim_end_matches('\r').trim())
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// Whether `from..to` touches anything under `apps/dashboard/` — the
+    /// signal the gate suite uses to decide whether to run the dashboard
+    /// gates (roadmap M6 gated merge).
+    pub fn dashboard_touched(&self, from: &str, to: &str) -> Result<bool> {
+        Ok(self
+            .changed_paths(from, to)?
+            .iter()
+            .any(|p| p.starts_with("apps/dashboard/")))
+    }
+
     /// Create an annotated tag at `HEAD` (`git tag -a <name> -m <message>`).
     pub fn tag(&self, name: &str, message: &str) -> Result<()> {
         self.run(&["tag", "-a", name, "-m", message])?;
