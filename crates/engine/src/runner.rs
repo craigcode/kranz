@@ -708,8 +708,9 @@ fn build_worker_spec(
 /// Run one validator session for a milestone (plan §4.4/§4.6).
 ///
 /// `kind` must be [`Role::ValidatorScrutiny`] or [`Role::ValidatorFunctional`].
-/// Contract `command` strings (plus config `allow_validator_commands` and
-/// `grants`) become `Bash(<command>*)` allows via [`permissions::for_role`].
+/// Contract `command` strings (plus config `allow_validator_commands`,
+/// `grants`, and the milestone's worker-executed `worker_commands`) become
+/// `Bash(<command>*)` allows via [`permissions::for_role`].
 #[allow(clippy::too_many_arguments)]
 pub async fn run_validator(
     backend: &dyn AgentBackend,
@@ -723,6 +724,7 @@ pub async fn run_validator(
     cancel: Option<Arc<Notify>>,
     base_sha: Option<&str>,
     grants: &[String],
+    worker_commands: &[String],
 ) -> Result<RunOutcome> {
     if !matches!(kind, Role::ValidatorScrutiny | Role::ValidatorFunctional) {
         return Err(EngineError::InvalidState(format!(
@@ -765,7 +767,13 @@ pub async fn run_validator(
 
     let contract_commands: Vec<String> =
         contract.iter().filter_map(|a| a.command.clone()).collect();
-    let mut allowed_commands = contract_commands.clone();
+    let mut combined_commands = contract_commands.clone();
+    for command in worker_commands {
+        if !combined_commands.contains(command) {
+            combined_commands.push(command.clone());
+        }
+    }
+    let mut allowed_commands = combined_commands.clone();
     allowed_commands.extend(cfg.allow_validator_commands.iter().cloned());
     let commands = bullet_list(&allowed_commands);
 
@@ -810,7 +818,7 @@ pub async fn run_validator(
             .insert("KRANZ_BASE_SHA".to_string(), sha.to_string());
     }
     permissions::apply(
-        permissions::for_role(kind, cfg, &contract_commands, grants),
+        permissions::for_role(kind, cfg, &combined_commands, grants),
         &mut spec,
     );
 

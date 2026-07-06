@@ -942,6 +942,7 @@ async fn run_validator_builds_spec_permissions_and_parses_report() {
         None,
         None,
         &[],
+        &[],
     )
     .await
     .unwrap();
@@ -1017,6 +1018,7 @@ async fn run_validator_rejects_non_validator_roles() {
         "abc123",
         None,
         None,
+        &[],
         &[],
     )
     .await

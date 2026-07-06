@@ -306,4 +306,26 @@ mod tests {
             .allowed_tools
             .contains(&"Bash(gc lint*)".to_string()));
     }
+
+    #[test]
+    fn validator_allowlist_includes_contract_and_worker_commands() {
+        let cfg = MissionConfig::default();
+        let contract_commands = vec!["cargo test".to_string()];
+        let worker_commands = vec!["gc lint".to_string()];
+
+        let mut combined = contract_commands.clone();
+        for command in &worker_commands {
+            if !combined.contains(command) {
+                combined.push(command.clone());
+            }
+        }
+
+        let validator = for_role(Role::ValidatorScrutiny, &cfg, &combined, &[]);
+        assert!(validator
+            .allowed_tools
+            .contains(&"Bash(cargo test*)".to_string()));
+        assert!(validator
+            .allowed_tools
+            .contains(&"Bash(gc lint*)".to_string()));
+    }
 }

@@ -487,6 +487,7 @@ async fn functional_validator_tools_are_carried_and_allowed() {
         None,
         None,
         &[],
+        &[],
     )
     .await
     .unwrap();
@@ -530,6 +531,7 @@ async fn scrutiny_validator_does_not_get_extra_tools_folded_into_allowed() {
         "start-sha",
         None,
         None,
+        &[],
         &[],
     )
     .await
