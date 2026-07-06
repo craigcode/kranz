@@ -131,6 +131,8 @@ pub fn router_with_shared_host(
         .route("/api/missions/{id}/state", get(rest::mission_state))
         .route("/api/missions/{id}/events", get(rest::mission_events))
         .route("/api/missions/{id}/plan", get(rest::mission_plan))
+        .route("/api/missions/{id}/plan.md", get(rest::mission_plan_md))
+        .route("/api/missions/{id}/report.md", get(rest::mission_report_md))
         .route(
             "/api/missions/{id}/runs/{run_id}/transcript",
             get(rest::run_transcript),

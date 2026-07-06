@@ -124,6 +124,32 @@ pub(crate) async fn mission_plan(
     Ok(Json(plan))
 }
 
+/// `GET /api/missions/:id/plan.md` — rendered plan markdown; 404 until
+/// plan.md has been written (alongside plan.json, at approval time).
+pub(crate) async fn mission_plan_md(
+    State(server): State<Arc<ServerState>>,
+    UrlPath(id): UrlPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let paths = mission_paths(&server, &id)?;
+    let markdown = read_file_or_404(&paths.plan_md_file(), || {
+        format!("mission '{id}' has no approved plan yet")
+    })?;
+    Ok(Json(json!({ "markdown": markdown })))
+}
+
+/// `GET /api/missions/:id/report.md` — rendered mission report markdown;
+/// 404 until the mission completes and report.md is written.
+pub(crate) async fn mission_report_md(
+    State(server): State<Arc<ServerState>>,
+    UrlPath(id): UrlPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let paths = mission_paths(&server, &id)?;
+    let markdown = read_file_or_404(&paths.report_file(), || {
+        format!("mission '{id}' has no report yet")
+    })?;
+    Ok(Json(json!({ "markdown": markdown })))
+}
+
 /// `GET /api/missions/:id/runs/:runId/transcript` — the run's JSONL parsed
 /// into a JSON array of raw stream values; 404 if the file is missing.
 pub(crate) async fn run_transcript(

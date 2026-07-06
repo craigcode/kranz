@@ -312,6 +312,52 @@ async fn plan_404_until_plan_json_exists() {
 }
 
 #[tokio::test]
+async fn plan_md_404_until_file_exists_then_returns_markdown() {
+    let (_tmp, _repo_root, paths, app) = fixture();
+    let uri = format!("/api/missions/{MISSION_ID}/plan.md");
+
+    let (status, body) = get_json(&app, &uri).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body["error"].is_string());
+
+    std::fs::write(paths.plan_md_file(), "# Plan\n\nGoal: ship it\n").unwrap();
+    let (status, body) = get_json(&app, &uri).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["markdown"], "# Plan\n\nGoal: ship it\n");
+}
+
+#[tokio::test]
+async fn report_md_404_until_file_exists_then_returns_markdown() {
+    let (_tmp, _repo_root, paths, app) = fixture();
+    let uri = format!("/api/missions/{MISSION_ID}/report.md");
+
+    let (status, body) = get_json(&app, &uri).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body["error"].is_string());
+
+    std::fs::write(paths.report_file(), "# Report\n\nAll green\n").unwrap();
+    let (status, body) = get_json(&app, &uri).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["markdown"], "# Report\n\nAll green\n");
+}
+
+#[tokio::test]
+async fn plan_md_and_report_md_reject_traversal_ids() {
+    let (_tmp, _repo_root, _paths, app) = fixture();
+    // "%2e%2e" percent-decodes to ".." as a single path segment (the `id`
+    // capture), which `safe_id` must reject rather than reading outside the
+    // missions dir.
+    for uri in [
+        "/api/missions/%2e%2e/plan.md",
+        "/api/missions/%2e%2e/report.md",
+    ] {
+        let (status, body) = get_json(&app, uri).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+        assert!(body["error"].is_string(), "{uri}");
+    }
+}
+
+#[tokio::test]
 async fn transcript_404_then_parsed_jsonl_array() {
     let (_tmp, _repo_root, paths, app) = fixture();
     let uri = format!("/api/missions/{MISSION_ID}/runs/run-1/transcript");

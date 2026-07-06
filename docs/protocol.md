@@ -15,6 +15,8 @@ the engine's serde shapes.
 | `GET /api/missions/:id/state` | full `MissionState` JSON (fold of events.jsonl; NOT the state.json cache) |
 | `GET /api/missions/:id/events?since=<seq>` | `[Event]` with `seq > since` (omit `since` → all) |
 | `GET /api/missions/:id/plan` | contents of plan.json (404 if not approved yet) |
+| `GET /api/missions/:id/plan.md` | `{"markdown": "<plan.md contents>"}` (404 if not approved yet) |
+| `GET /api/missions/:id/report.md` | `{"markdown": "<report.md contents>"}` (404 until the mission completes) |
 | `GET /api/missions/:id/runs/:runId/transcript` | JSONL parsed into a JSON array of raw stream values (404 if missing) |
 | `POST /api/missions/:id/control` | body = `ControlCommand` JSON (`{"kind":"msg","text":"...","interrupt":false}`, `{"kind":"pause"}`, `{"kind":"resume"}`, `{"kind":"config-change","patch":{...}}`) → `202 {"queued":true}` |
 | `GET /api/health` | `{"ok":true,"version":"<crate version>"}` |
