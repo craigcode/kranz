@@ -1133,7 +1133,11 @@ async fn dispatch_action(
                 Err(e) => {
                     tracing::warn!(error = %e, "failed to create ticket from Slack modal");
                     if let Err(e) = client
-                        .post_message(channel, &error_blocks(&format!("Couldn't create ticket `{slug}`: {e}")), None)
+                        .post_message(
+                            channel,
+                            &error_blocks(&format!("Couldn't create ticket `{slug}`: {e}")),
+                            None,
+                        )
                         .await
                     {
                         tracing::warn!(error = %e, "failed to post ticket-creation error");
@@ -1292,8 +1296,7 @@ async fn dispatch_action(
                 .await;
                 return;
             }
-            let invocation =
-                run_approve_ticket_command(cfg, host, slug, user_id.as_deref()).await;
+            let invocation = run_approve_ticket_command(cfg, host, slug, user_id.as_deref()).await;
             if !invocation.authorized {
                 reply_ephemeral(
                     cfg,
@@ -2888,7 +2891,10 @@ mod tests {
             MissionStatus::Approved,
             "mission is exactly the state approve_flow would queue with no host"
         );
-        assert!(!is_ticket_slug(tmp.path(), "m-a"), "m-a is not a ticket slug");
+        assert!(
+            !is_ticket_slug(tmp.path(), "m-a"),
+            "m-a is not a ticket slug"
+        );
 
         let cfg = test_cfg();
         let client = SlackClient::new(&cfg).unwrap();

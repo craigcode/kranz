@@ -156,15 +156,8 @@ fn parses_ticket_approve_with_force() {
 
 #[test]
 fn parses_ticket_queue_with_mission() {
-    let cli = Cli::try_parse_from([
-        "kranz",
-        "ticket",
-        "queue",
-        "slug",
-        "--mission",
-        "m-abc123",
-    ])
-    .unwrap();
+    let cli =
+        Cli::try_parse_from(["kranz", "ticket", "queue", "slug", "--mission", "m-abc123"]).unwrap();
     match cli.command {
         Command::Ticket {
             command:

@@ -418,9 +418,7 @@ pub fn cmd_ticket_approve(
     explicit_mission: Option<&str>,
     force: bool,
 ) -> Result<i32> {
-    eprintln!(
-        "warning: `kranz ticket approve` is deprecated, use `kranz ticket queue` instead"
-    );
+    eprintln!("warning: `kranz ticket approve` is deprecated, use `kranz ticket queue` instead");
     cmd_ticket_queue(repo, slug, explicit_mission, force)
 }
 
