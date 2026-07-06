@@ -812,7 +812,9 @@ impl MissionHost {
             DrainSlot::Running(handle) => {
                 drain_state_json(&handle.state.lock().expect("drain state lock"))
             }
-            DrainSlot::Starting(state) => drain_state_json(&state.lock().expect("drain state lock")),
+            DrainSlot::Starting(state) => {
+                drain_state_json(&state.lock().expect("drain state lock"))
+            }
             DrainSlot::Idle => drain_state_json(&DrainState::default()),
         };
         json!({
@@ -1671,6 +1673,55 @@ mod tests {
             }
         };
         assert_eq!(before, after, "a second drain must not replace the tracker");
+    }
+
+    #[tokio::test]
+    async fn two_concurrent_cold_drains_spawn_exactly_one() {
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+        let host = MissionHost::with_backend(root, backend);
+
+        // Fire two drains concurrently from a cold (Idle) tracker. Neither
+        // `config::load` nor `self.backend(...)` yields here (the backend
+        // is pre-populated via `with_backend`, and this test runs on the
+        // default current-thread flavor), so the first call's poll runs
+        // synchronously all the way through installing the `Starting`
+        // reservation, spawning the task, and upgrading to `Running` before
+        // the second call is ever polled. The second call therefore always
+        // observes an in-progress drain (`Starting` or `Running`, task not
+        // yet scheduled) and returns its tracked state instead of spawning
+        // a second drain task.
+        let (first, second) = tokio::join!(host.drain(), host.drain());
+        let first = first.expect("first drain must not error");
+        let second = second.expect("second drain must not error");
+        assert_eq!(first["live"], true, "{first}");
+        assert_eq!(second["live"], true, "{second}");
+
+        // Exactly one drain is tracked: a single Starting-or-Running slot,
+        // never two independently spawned tasks.
+        match &*host.drain.lock().expect("drain tracker lock") {
+            DrainSlot::Running(_) | DrainSlot::Starting(_) => {}
+            DrainSlot::Idle => {
+                panic!("expected a live drain to be tracked after two concurrent calls")
+            }
+        }
+
+        // The single tracked drain settles idle on its own — nothing is
+        // left running forever, which would indicate a leaked second task.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let state = host.queue_state();
+            if state["drain"]["live"] == false {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "drain never settled idle: {state}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     #[tokio::test]
