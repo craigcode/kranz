@@ -83,7 +83,7 @@ DECIDED 2026-07-06: as recommended — both trigger paths, operator-initiated
 built first; orchestrator proposals land in the same human gate and are
 refused entirely in headless exec mode.
 
-## D-C — the in-flight milestone (OPERATOR DECISION)
+## D-C — the in-flight milestone (DECIDED 2026-07-06)
 
 Completed milestones are frozen — that part is roadmap contract. The milestone in flight:
 
@@ -96,7 +96,10 @@ Completed milestones are frozen — that part is roadmap contract. The milestone
 
 **Proposal: (2), feature boundary.** No new abort machinery, matches the shipped merge semantics, bounds wasted spend to one feature. (3) is explicitly deferred, not rejected.
 
-## D-D — gate mechanics (OPERATOR DECISION)
+DECIDED 2026-07-06: as recommended — (2) feature boundary; abort-the-worker
+(3) stays deferred, not rejected.
+
+## D-D — gate mechanics (DECIDED 2026-07-06)
 
 **Proposal**, end to end:
 
