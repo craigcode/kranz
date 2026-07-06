@@ -1,7 +1,8 @@
 # M2 scoping — Mid-mission re-planning (the past is frozen, the remainder is negotiable)
 
-Status: scoped 2026-07-06, DESIGN-FIRST — the six flagged decisions (D-A…D-F) are the operator's; each carries a
-recommendation, none is DECIDED. Review before any mission is drafted against this. Roadmap home: M2
+Status: scoped 2026-07-06, DESIGN-FIRST — the six flagged decisions (D-A…D-F) are the operator's.
+D-A through D-D DECIDED 2026-07-06 (verb Revise; both triggers, operator-first, exec-refused; feature
+boundary; gate mechanics as proposed). D-E and D-F remain open — settle them before drafting. Roadmap home: M2
 (docs/roadmap.md:29–48, "re-planning = safe subset"). Claims the "Re-planning UI (M2)" territory pipeline-view.md:160 reserved.
 
 ## Why
@@ -61,8 +62,7 @@ the immutability promise in its own name; *Amend* is git-loaded (history rewriti
 imply). The consent button on the card stays **Approve** — per D-A discipline it is a plan approval, not a new verb.
 
 DECIDED 2026-07-06: as recommended — the verb is **Revise**; the consent
-act on the revision card remains **Approve**. (D-B through D-F remain
-open.)
+act on the revision card remains **Approve**.
 
 ## D-B — trigger paths (DECIDED 2026-07-06)
 
