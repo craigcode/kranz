@@ -37,6 +37,9 @@ pub(crate) async fn list_missions(State(server): State<Arc<ServerState>>) -> Jso
         }
     }
     ids.sort();
+    // Opened once for the whole list; a failure here just means every row's
+    // `merged` degrades to null (no git ancestry to probe).
+    let repo = kranz_engine::git_ops::GitRepo::open(&server.repo_root).ok();
     let mut rows = Vec::new();
     for id in ids {
         let paths = MissionPaths::new(&server.repo_root, &id);
@@ -49,17 +52,40 @@ pub(crate) async fn list_missions(State(server): State<Arc<ServerState>>) -> Jso
             continue;
         }
         let row = match fold_log(&paths) {
-            Ok(state) => json!({
-                "id": id,
-                "status": state.mission.status,
-                "goal": state.mission.goal,
-                "createdAt": state.mission.created_at,
-            }),
+            Ok(state) => {
+                let merged = repo
+                    .as_ref()
+                    .and_then(|repo| merged_bit(repo, &state.mission));
+                json!({
+                    "id": id,
+                    "status": state.mission.status,
+                    "goal": state.mission.goal,
+                    "createdAt": state.mission.created_at,
+                    "merged": merged,
+                })
+            }
             Err(error) => json!({ "id": id, "status": "failed", "error": error }),
         };
         rows.push(row);
     }
     Json(Value::Array(rows))
+}
+
+/// Whether `mission`'s branch tip is an ancestor of the LIVE base branch tip
+/// (not the pinned `base_sha` — merged-detection tracks whatever the base
+/// branch has absorbed as of now). `None` when there is no mission branch, or
+/// when any ref fails to resolve; a per-mission git failure here must not
+/// fail the whole list.
+fn merged_bit(
+    repo: &kranz_engine::git_ops::GitRepo,
+    mission: &kranz_engine::types::Mission,
+) -> Option<bool> {
+    if !repo.branch_exists(&mission.mission_branch).ok()? {
+        return None;
+    }
+    let mission_tip = repo.rev_parse(&mission.mission_branch).ok()?;
+    let base_tip = repo.rev_parse(&mission.base_branch).ok()?;
+    repo.is_ancestor(&mission_tip, &base_tip).ok()
 }
 
 /// `<repo>/.kranz/missions/index.md` contents, or `""` if the file is absent

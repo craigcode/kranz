@@ -95,6 +95,33 @@ impl GitRepo {
         Ok(self.run(&["rev-parse", refname])?.trim().to_string())
     }
 
+    /// Whether `ancestor` is an ancestor of (or equal to) `descendant`
+    /// (`git merge-base --is-ancestor <ancestor> <descendant>`).
+    ///
+    /// git's contract: exit 0 => `Ok(true)`; exit 1 => `Ok(false)`; any other
+    /// exit code is a real git failure, surfaced as [`EngineError::Git`].
+    /// Rejects a flag-shaped `ancestor`/`descendant` (leading `-`) before
+    /// invoking git, mirroring [`GitRepo::rev_parse`]/[`GitRepo::merge_no_ff`].
+    pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool> {
+        for slot in [ancestor, descendant] {
+            if slot.starts_with('-') {
+                return Err(EngineError::Git(format!(
+                    "refusing is_ancestor with flag-shaped ref {slot:?}"
+                )));
+            }
+        }
+        let out = self.probe(&["merge-base", "--is-ancestor", ancestor, descendant])?;
+        match out.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(EngineError::Git(format!(
+                "git merge-base --is-ancestor {ancestor} {descendant} failed ({}): {}",
+                out.status,
+                failure_detail(&out)
+            ))),
+        }
+    }
+
     /// Whether a local branch of this name exists.
     pub fn branch_exists(&self, name: &str) -> Result<bool> {
         let git_ref = format!("refs/heads/{name}");

@@ -504,6 +504,72 @@ async fn diff_stat_404s_when_mission_branch_does_not_exist() {
 }
 
 #[tokio::test]
+async fn missions_list_reports_merged_true_when_branch_is_merged_into_base() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo_root, base_sha) = init_repo();
+    seed_diffable_mission(&repo_root, "m-merged", &base_sha, true);
+    raw_git(&repo_root, &["checkout", "main"]);
+    raw_git(
+        &repo_root,
+        &["merge", "--no-ff", "--no-edit", "kranz/mission-m-merged"],
+    );
+    let app = kranz_server::router(repo_root.clone(), None);
+
+    let (status, body) = get_json(&app, "/api/missions").await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = body.as_array().unwrap();
+    let row = rows.iter().find(|r| r["id"] == "m-merged").unwrap();
+    assert_eq!(row["merged"], true);
+}
+
+#[tokio::test]
+async fn missions_list_reports_merged_false_when_branch_is_not_merged() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo_root, base_sha) = init_repo();
+    seed_diffable_mission(&repo_root, "m-unmerged", &base_sha, true);
+    let app = kranz_server::router(repo_root.clone(), None);
+
+    let (status, body) = get_json(&app, "/api/missions").await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = body.as_array().unwrap();
+    let row = rows.iter().find(|r| r["id"] == "m-unmerged").unwrap();
+    assert_eq!(row["merged"], false);
+}
+
+#[tokio::test]
+async fn missions_list_reports_merged_null_when_mission_has_no_branch() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo_root, base_sha) = init_repo();
+    seed_diffable_mission(&repo_root, "m-nobranch-list", &base_sha, false);
+    let app = kranz_server::router(repo_root.clone(), None);
+
+    let (status, body) = get_json(&app, "/api/missions").await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = body.as_array().unwrap();
+    let row = rows.iter().find(|r| r["id"] == "m-nobranch-list").unwrap();
+    assert!(row["merged"].is_null());
+}
+
+#[tokio::test]
+async fn missions_list_still_returns_when_repo_root_is_not_a_git_repo() {
+    // fixture()'s repo_root has no .git dir at all: GitRepo::open fails, so
+    // every row's `merged` degrades to null but the list itself still 200s.
+    let (_tmp, _repo_root, _paths, app) = fixture();
+
+    let (status, body) = get_json(&app, "/api/missions").await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = body.as_array().unwrap();
+    let row = rows.iter().find(|r| r["id"] == MISSION_ID).unwrap();
+    assert!(row["merged"].is_null());
+}
+
+#[tokio::test]
 async fn plan_md_and_report_md_reject_traversal_ids() {
     let (_tmp, _repo_root, _paths, app) = fixture();
     // "%2e%2e" percent-decodes to ".." as a single path segment (the `id`

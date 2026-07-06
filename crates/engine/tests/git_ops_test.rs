@@ -774,3 +774,67 @@ fn add_worktree_rejects_flag_shaped_arguments() {
         "no worktree dir should exist after a refused add"
     );
 }
+
+// ---------------------------------------------------------------------------
+// is_ancestor
+// ---------------------------------------------------------------------------
+
+#[test]
+fn is_ancestor_true_for_earlier_commit_on_same_branch() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, seed) = seeded_repo();
+    write(&dir, "second.txt", "more\n");
+    let second = repo.add_all_and_commit("second commit").unwrap();
+
+    assert!(
+        repo.is_ancestor(&seed, &second).unwrap(),
+        "seed commit is an ancestor of a later commit on the same branch"
+    );
+}
+
+#[test]
+fn is_ancestor_false_for_later_commit_checked_against_earlier() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, seed) = seeded_repo();
+    write(&dir, "second.txt", "more\n");
+    let second = repo.add_all_and_commit("second commit").unwrap();
+
+    assert!(
+        !repo.is_ancestor(&second, &seed).unwrap(),
+        "a later commit is not an ancestor of an earlier one"
+    );
+}
+
+#[test]
+fn is_ancestor_true_for_a_commit_and_itself() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo, seed) = seeded_repo();
+    assert!(
+        repo.is_ancestor(&seed, &seed).unwrap(),
+        "a commit is an ancestor of itself"
+    );
+}
+
+#[test]
+fn is_ancestor_rejects_flag_shaped_refs() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo, seed) = seeded_repo();
+
+    let err = repo
+        .is_ancestor("--force", &seed)
+        .expect_err("flag-shaped ancestor ref must be refused");
+    assert!(matches!(err, EngineError::Git(_)));
+
+    let err = repo
+        .is_ancestor(&seed, "--force")
+        .expect_err("flag-shaped descendant ref must be refused");
+    assert!(matches!(err, EngineError::Git(_)));
+}
