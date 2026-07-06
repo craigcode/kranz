@@ -654,8 +654,8 @@ pub fn build_help() -> Vec<Value> {
              • `/kranz new <goal>` — create a mission and open its planning thread \
              (bare `/kranz new` opens a form with a full multiline goal field)\n\
              • `/kranz plan <id>` — request the plan for review\n\
-             • `/kranz queue <id>` — queue the reviewed mission for the drain \
-             (`/kranz approve <id>` still works as a deprecated alias)\n\
+             • `/kranz approve <id>` — approve the plan and queue the mission\n\
+             • `/kranz queue <slug>` — queue a reviewed backlog ticket\n\
              • `/kranz config [<id>] <role> <model> [effort]` — change a role's model/effort \
              (roles: orchestrator·worker·scrutiny·functional; effort: low·medium·high·xhigh·max)\n\
              • `/kranz pause [<id>]` — pause a running mission (between worker runs)\n\
