@@ -82,6 +82,15 @@ All of it asks the agent nicely. None of it constrains the process.
   global config, npm). Mitigation: detected-toolchain allowlist defaults +
   a preflight probe that runs the contract's validation commands under the
   profile and reports failures as preflight issues, not mid-run mysteries.
+- **Shipped (macOS, `enforce: "fs"`)**: Seatbelt profile generation
+  (`crate::sandbox::generate_profile`), the per-role `sandbox` config surface,
+  the enforced `claude` spawn wrap (`backend_claude` shells out via
+  `sandbox-exec -f <profile>` when a role opts in), and the mission preflight
+  probe described above (`MissionEngine::preflight` runs each distinct
+  contract `command` assertion under the generated worker profile and
+  surfaces a `warn` `PreflightIssue` for any that fail under it — advisory
+  only, never blocking). `fs+net` egress allowlisting, Linux bwrap parity, and
+  Windows support remain open (see Sequencing below).
 
 ### Tier 3 — container backend (the Gas City / fleet stepping stone)
 
