@@ -869,7 +869,16 @@ pub fn cmd_msg(repo: &Path, mission_id: &str, text: &str, interrupt: bool) -> Re
 /// One line per mission: `<id>  <STATUS>  <goal>`. Corrupt/unreadable logs
 /// are reported inline instead of failing the whole listing.
 pub fn cmd_missions(repo: &Path) -> Result<String> {
-    let ids = MissionPaths::list_missions(repo);
+    let index_contents =
+        std::fs::read_to_string(MissionPaths::new(repo, "_").missions_dir().join("index.md"))
+            .unwrap_or_default();
+    let mut ids = MissionPaths::list_missions(repo);
+    for id in kranz_engine::orchestrator::mission_index_ids(&index_contents) {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids.sort();
     if ids.is_empty() {
         return Ok("no missions\n".to_string());
     }
@@ -888,6 +897,13 @@ pub fn cmd_missions(repo: &Path) -> Result<String> {
             .get(&id)
             .map(|s| format!("  [ticket: {s}]"))
             .unwrap_or_default();
+        if !MissionPaths::new(repo, &id).events_file().is_file() {
+            out.push_str(&format!(
+                "{id}  {:<10}  deleted mission (no data recorded)\n",
+                "DELETED"
+            ));
+            continue;
+        }
         match load_state(repo, &id) {
             Ok(state) => out.push_str(&format!(
                 "{id}  {:<10}  {}{ticket}\n",

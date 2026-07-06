@@ -207,6 +207,27 @@ async fn missions_list_folds_and_tolerates_corrupt_logs() {
 }
 
 #[tokio::test]
+async fn missions_forged_orphan_renders_placeholder() {
+    let (_tmp, repo_root, _paths, app) = fixture();
+
+    let missions_dir = repo_root.join(".kranz").join("missions");
+    std::fs::create_dir_all(&missions_dir).unwrap();
+    std::fs::write(
+        missions_dir.join("index.md"),
+        "# Kranz missions\n\n- [m-ghost](m-ghost/plan.md)\n",
+    )
+    .unwrap();
+
+    let (status, body) = get_json(&app, "/api/missions").await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = body.as_array().unwrap();
+
+    let ghost = rows.iter().find(|r| r["id"] == "m-ghost").unwrap();
+    assert_eq!(ghost["status"], "deleted");
+    assert_eq!(ghost["goal"], "deleted mission (no data recorded)");
+}
+
+#[tokio::test]
 async fn approved_status_shows_for_a_plan_approved_mission_with_no_run_loop() {
     let (_tmp, repo_root, _paths, app) = fixture();
     seed_approved_mission(&repo_root, "m-02");
