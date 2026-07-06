@@ -1978,6 +1978,7 @@ fn apply_action(repo_root: &Path, action: &Action) -> Result<()> {
         | Action::Work { .. }
         | Action::WorkRun { .. }
         | Action::AppHome { .. }
+        | Action::Merge { .. }
         | Action::Ignore => Ok(()),
     }
 }
