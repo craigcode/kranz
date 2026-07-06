@@ -99,6 +99,7 @@ fn ticket_summary_json(repo_root: &std::path::Path, ticket: &Ticket) -> Value {
         "title": ticket.title,
         "blockedBy": ticket.blocked_by,
         "isBlocked": kranz_engine::deps::is_blocked(repo_root, &ticket.slug).unwrap_or(false),
+        "missionId": Ticket::mission_for(repo_root, &ticket.slug),
     })
 }
 
@@ -119,6 +120,7 @@ fn ticket_full_json(repo_root: &std::path::Path, ticket: &Ticket) -> Value {
         "state": state,
         "needsContext": needs_context_questions(&ticket.raw_body),
         "isBlocked": kranz_engine::deps::is_blocked(repo_root, &ticket.slug).unwrap_or(false),
+        "missionId": Ticket::mission_for(repo_root, &ticket.slug),
     })
 }
 
@@ -166,4 +168,68 @@ fn bullet_item(line: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    const TICKET_BODY: &str = "\
+---
+title: Sample
+priority: 2
+---
+
+## Goal
+Ship the thing.
+";
+
+    fn write_ticket(repo: &std::path::Path, slug: &str) {
+        let dir = Ticket::tickets_dir(repo);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{slug}.md")), TICKET_BODY).unwrap();
+    }
+
+    fn load(repo: &std::path::Path, slug: &str) -> Ticket {
+        Ticket::load(&Ticket::tickets_dir(repo).join(format!("{slug}.md"))).unwrap()
+    }
+
+    #[test]
+    fn pipeline_summary_json_surfaces_recorded_mission_id() {
+        let tmp = TempDir::new().unwrap();
+        write_ticket(tmp.path(), "linked");
+        Ticket::record_mission(tmp.path(), "linked", "m-abc123").unwrap();
+
+        let ticket = load(tmp.path(), "linked");
+        let json = ticket_summary_json(tmp.path(), &ticket);
+        assert_eq!(json["missionId"], "m-abc123");
+    }
+
+    #[test]
+    fn pipeline_full_json_surfaces_recorded_mission_id() {
+        let tmp = TempDir::new().unwrap();
+        write_ticket(tmp.path(), "linked");
+        Ticket::record_mission(tmp.path(), "linked", "m-abc123").unwrap();
+
+        let ticket = load(tmp.path(), "linked");
+        let json = ticket_full_json(tmp.path(), &ticket);
+        assert_eq!(json["missionId"], "m-abc123");
+    }
+
+    #[test]
+    fn pipeline_missing_mission_id_is_null_in_both_projections() {
+        let tmp = TempDir::new().unwrap();
+        write_ticket(tmp.path(), "unlinked");
+
+        let ticket = load(tmp.path(), "unlinked");
+        assert_eq!(
+            ticket_summary_json(tmp.path(), &ticket)["missionId"],
+            Value::Null
+        );
+        assert_eq!(
+            ticket_full_json(tmp.path(), &ticket)["missionId"],
+            Value::Null
+        );
+    }
 }

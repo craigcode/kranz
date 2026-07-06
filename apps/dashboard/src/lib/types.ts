@@ -74,6 +74,7 @@ export interface TicketSummary {
   title: string;
   blockedBy: string[];
   isBlocked: boolean;
+  missionId?: string;
 }
 
 /** Full ticket shape from `GET /api/tickets/:slug`. */
@@ -90,6 +91,7 @@ export interface Ticket {
   acceptanceHints: string[];
   state: TicketState;
   needsContext: string[];
+  missionId?: string;
 }
 
 // ---------------------------------------------------------------------------
