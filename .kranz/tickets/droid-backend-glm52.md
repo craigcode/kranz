@@ -1,6 +1,6 @@
 ---
 title: DroidBackend — GLM 5.2 (Fireworks) as a second scrutiny-validator vendor
-priority: 3
+priority: 2
 schedule: once
 ---
 
