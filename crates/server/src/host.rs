@@ -952,31 +952,17 @@ impl MissionHost {
         };
         let repo_root = self.repo_root.clone();
 
+        // Cold spawn path only (never the early-return branches above): the
+        // dispatch branch is still whatever the operator's checkout was, so
+        // capture it now, before the spawned task (or any concurrent racer)
+        // can ever land on a mission branch. See `drain_task` for the
+        // restore-on-exit half of this contract.
         let task_state = Arc::clone(&state);
-        let join = tokio::spawn(async move {
-            let result = kranz_engine::work::drain_queue(&repo_root, false, |mission_id| {
-                let backend = Arc::clone(&backend);
-                let repo_root = repo_root.clone();
-                let state = Arc::clone(&task_state);
-                async move {
-                    state.lock().expect("drain state lock").current_mission_id =
-                        Some(mission_id.clone());
-                    let outcome =
-                        run_mission_headless(backend, repo_root, mission_id.clone()).await;
-                    let mut guard = state.lock().expect("drain state lock");
-                    guard.current_mission_id = None;
-                    if outcome.is_ok() {
-                        guard.ran.push(mission_id);
-                    }
-                    outcome
-                }
-            })
-            .await;
-            if let Err(e) = result {
-                tracing::error!(error = %e, "hosted queue drain errored");
-            }
-            task_state.lock().expect("drain state lock").live = false;
-        });
+        let join = tokio::spawn(drain_task(repo_root.clone(), task_state, move |mission_id| {
+            let backend = Arc::clone(&backend);
+            let repo_root = repo_root.clone();
+            async move { run_mission_headless(backend, repo_root, mission_id).await }
+        }));
 
         let initial = drain_state_json(&state.lock().expect("drain state lock"));
         *self.drain.lock().expect("drain tracker lock") =
@@ -1122,6 +1108,87 @@ async fn run_to_end(
         .lock()
         .expect("missions registry lock")
         .remove(&mission_id);
+}
+
+/// The spawned-task body behind [`MissionHost::drain`], factored out so a
+/// host-level test can drive it directly (no `tokio::spawn`, so it stays
+/// deterministic) with a fake `run_mission`. Captures the operator's dispatch
+/// checkout, runs [`kranz_engine::work::drain_queue`] to completion, then
+/// restores that checkout — honoring the SAME contract as the CLI
+/// dispatcher's `restore_work_checkout` (`crates/cli/src/backlog.rs`), so a
+/// hosted drain can never leave the repo stranded on a
+/// `kranz/mission-*` branch.
+async fn drain_task<R, Fut>(repo_root: PathBuf, state: Arc<Mutex<DrainState>>, run_mission: R)
+where
+    R: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<i32>>,
+{
+    // Capture BEFORE `drain_queue` runs anything — nothing has touched the
+    // checkout yet, so this is genuinely the operator's dispatch-time branch.
+    let dispatch_branch = GitRepo::open(&repo_root)
+        .ok()
+        .and_then(|g| g.current_branch().ok());
+
+    let result = kranz_engine::work::drain_queue(&repo_root, false, |mission_id| {
+        let state = Arc::clone(&state);
+        let fut = run_mission(mission_id.clone());
+        async move {
+            state.lock().expect("drain state lock").current_mission_id = Some(mission_id.clone());
+            let outcome = fut.await;
+            let mut guard = state.lock().expect("drain state lock");
+            guard.current_mission_id = None;
+            if outcome.is_ok() {
+                guard.ran.push(mission_id);
+            }
+            outcome
+        }
+    })
+    .await;
+
+    match &result {
+        Ok(report) if !report.stopped_busy => {
+            restore_drain_checkout(&repo_root, dispatch_branch.as_deref());
+        }
+        Ok(_) => {
+            // `stopped_busy` (only possible with `once`, which the hosted
+            // drain never sets — wired for parity with `cmd_work` anyway):
+            // a sibling dispatcher may still be mid-mission, so leave the
+            // checkout exactly where it is.
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "hosted queue drain errored");
+        }
+    }
+    state.lock().expect("drain state lock").live = false;
+}
+
+/// Dispatcher-exit checkout restore for the hosted queue drain: mirrors
+/// `restore_work_checkout` in `crates/cli/src/backlog.rs` verbatim. `None`
+/// (capture failed, or nothing to restore) is a no-op; restoring TO a
+/// `kranz/mission-*` branch is refused (that would recreate the very
+/// stranding this exists to end); already back on the captured branch is a
+/// no-op; a dirty TRACKED working tree aborts the restore (never carry
+/// uncommitted operator edits across a branch switch) and leaves the
+/// checkout on the mission branch with a warning logged.
+fn restore_drain_checkout(repo_root: &Path, original: Option<&str>) {
+    let Some(original) = original else { return };
+    if original.starts_with("kranz/mission-") {
+        return;
+    }
+    let Ok(git) = GitRepo::open(repo_root) else { return };
+    if git.current_branch().ok().as_deref() == Some(original) {
+        return;
+    }
+    match git.is_clean_tracked() {
+        Ok(true) => match git.checkout(original) {
+            Ok(()) => tracing::info!(branch = %original, "hosted drain restored operator checkout"),
+            Err(e) => tracing::warn!(branch = %original, error = %e, "hosted drain could not restore checkout"),
+        },
+        Ok(false) => tracing::warn!(
+            "hosted drain leaving checkout in place: tracked files have uncommitted changes"
+        ),
+        Err(e) => tracing::warn!(error = %e, "hosted drain could not probe the working tree; checkout left in place"),
+    }
 }
 
 /// Headless `run_mission` injected into [`kranz_engine::work::drain_queue`]
@@ -1931,6 +1998,171 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Hosted-drain checkout capture/restore (mirrors `restore_work_checkout`
+    // in `crates/cli/src/backlog.rs` — see `drain_task`/`restore_drain_checkout`)
+    // -----------------------------------------------------------------------
+
+    /// A fresh `DrainState` and one queued entry for `mission_id`, ready to
+    /// feed [`drain_task`] directly (bypassing `tokio::spawn` for a
+    /// deterministic test).
+    fn seed_one_queued(root: &Path, mission_id: &str) -> Arc<Mutex<DrainState>> {
+        kranz_engine::queue::enqueue(
+            root,
+            kranz_engine::queue::QueueEntry {
+                mission_id: mission_id.to_string(),
+                ticket_slug: None,
+                priority: 5,
+                seq: 0,
+            },
+        )
+        .expect("enqueue");
+        Arc::new(Mutex::new(DrainState::default()))
+    }
+
+    #[tokio::test]
+    async fn hosted_drain_restores_dispatch_checkout() {
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
+        let state = seed_one_queued(&root, "m-restore");
+
+        let run_root = root.clone();
+        drain_task(root.clone(), state, move |mission_id| {
+            let root = run_root.clone();
+            async move {
+                let git = GitRepo::open(&root)?;
+                let branch = format!("kranz/mission-{mission_id}");
+                git.create_branch(&branch, None)?;
+                git.checkout(&branch)?;
+                Ok(0)
+            }
+        })
+        .await;
+
+        let git = GitRepo::open(&root).expect("open repo");
+        assert_eq!(
+            git.current_branch().expect("current branch"),
+            "main",
+            "the operator's dispatch-time checkout must be restored on drain exit"
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_drain_skips_restore_when_started_on_mission_branch() {
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
+        {
+            let git = GitRepo::open(&root).expect("open repo");
+            git.create_branch("kranz/mission-existing", None)
+                .expect("create existing mission branch");
+            git.checkout("kranz/mission-existing")
+                .expect("checkout existing mission branch");
+        }
+        let state = seed_one_queued(&root, "m-skip");
+
+        drain_task(root.clone(), state, |_mission_id| async { Ok(0) }).await;
+
+        let git = GitRepo::open(&root).expect("open repo");
+        assert_eq!(
+            git.current_branch().expect("current branch"),
+            "kranz/mission-existing",
+            "started on a mission branch: no restore must be attempted"
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_drain_leaves_checkout_when_tracked_tree_dirty() {
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
+        let state = seed_one_queued(&root, "m-dirty");
+
+        let run_root = root.clone();
+        drain_task(root.clone(), state, move |mission_id| {
+            let root = run_root.clone();
+            async move {
+                let git = GitRepo::open(&root)?;
+                let branch = format!("kranz/mission-{mission_id}");
+                git.create_branch(&branch, None)?;
+                git.checkout(&branch)?;
+                std::fs::write(root.join("README.md"), "dirty tracked edit\n")?;
+                Ok(0)
+            }
+        })
+        .await;
+
+        let git = GitRepo::open(&root).expect("open repo");
+        assert_eq!(
+            git.current_branch().expect("current branch"),
+            "kranz/mission-m-dirty",
+            "a dirty tracked tree must abort the restore, leaving the checkout on the mission \
+             branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_drain_second_call_does_not_capture_or_restore() {
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
+        {
+            let git = GitRepo::open(&root).expect("open repo");
+            git.create_branch("feature-branch", None)
+                .expect("create feature branch");
+            git.checkout("feature-branch")
+                .expect("checkout feature branch");
+        }
+        let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+        let host = MissionHost::with_backend(root.clone(), backend);
+
+        // Fabricate a live drain tracker (same pattern as
+        // `second_drain_while_live_returns_tracked_state_without_spawning_second`)
+        // so the idempotent early-return path is exercised without racing a
+        // real spawn.
+        let tracked_state = Arc::new(Mutex::new(DrainState {
+            live: true,
+            current_mission_id: Some("m-inflight".to_string()),
+            ran: Vec::new(),
+        }));
+        let never_finishes = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        *host.drain.lock().expect("drain tracker lock") = DrainSlot::Running(DrainHandle {
+            join: never_finishes,
+            state: Arc::clone(&tracked_state),
+        });
+
+        let result = host
+            .drain()
+            .await
+            .expect("second drain call must not error");
+        assert_eq!(result["live"], true, "{result}");
+
+        // No capture/restore happened: the checkout this test set up before
+        // the second call is untouched.
+        let git = GitRepo::open(&root).expect("open repo");
+        assert_eq!(
+            git.current_branch().expect("current branch"),
+            "feature-branch",
+            "the idempotent second drain() must not mutate the checkout"
+        );
+
+        // No second task was spawned: the tracker still points at the same
+        // state Arc installed above.
+        match &*host.drain.lock().expect("drain tracker lock") {
+            DrainSlot::Running(handle) => {
+                assert_eq!(
+                    Arc::as_ptr(&handle.state),
+                    Arc::as_ptr(&tracked_state),
+                    "a second drain must not replace the tracker or spawn a second task"
+                );
+            }
+            _ => panic!("expected the tracker to still be Running"),
+        };
     }
 
     /// Deterministically guards the `DrainSlot::Starting(state) => return
