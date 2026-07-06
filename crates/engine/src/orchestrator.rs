@@ -5339,8 +5339,7 @@ mod tests {
         cfg.validator_scrutiny.backend = Some("droid".to_string());
 
         let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
-        let engine =
-            MissionEngine::create(backend, &root, "goal", cfg).expect("create engine");
+        let engine = MissionEngine::create(backend, &root, "goal", cfg).expect("create engine");
 
         let env_guard = DroidEnvGuard::engage();
         let issues = engine.preflight();
