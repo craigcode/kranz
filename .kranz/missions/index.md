@@ -13,4 +13,4 @@ Approved plans, newest last.
 - 2026-07-05 · [m-d341a7](m-d341a7/plan.md) — Produce docs/gascity-citizenship.md — the grounded plan of record for making kranz a full citizen of Gas City: current-s… [truncated] · [report](m-d341a7/report.md)
 - 2026-07-05 · [m-b397e4](m-b397e4/plan.md) — Hoist the non-interactive draft loop into the engine/MissionHost so any surface can draft a ticket, expose the backlog o… [truncated] · [report](m-b397e4/report.md)
 - 2026-07-06 · [m-bc11fb](m-bc11fb/plan.md) — Add a dashboard backlog panel (ticket list, detail, Draft-with-live-progress, blocked-by-aware Approve) and Slack `/kran… [truncated] · [report](m-bc11fb/report.md)
-- 2026-07-06 · [m-dffbad](m-dffbad/plan.md) — Deleting a mission prunes its missions/index.md catalog line, and list surfaces render a residual orphan (index line wit… [truncated]
+- 2026-07-06 · [m-dffbad](m-dffbad/plan.md) — Deleting a mission prunes its missions/index.md catalog line, and list surfaces render a residual orphan (index line wit… [truncated] · [report](m-dffbad/report.md)
