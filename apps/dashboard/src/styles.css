@@ -1364,6 +1364,34 @@ button {
   padding: 8px 14px;
 }
 
+.delivered-panel {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin: 8px 14px;
+  padding: 10px 14px;
+}
+
+.delivered-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.pill-unmerged {
+  background: var(--yellow, #b58900);
+  color: var(--bg);
+}
+
+.delivered-diff-stat {
+  font-family: var(--mono);
+  white-space: pre-wrap;
+  margin: 8px 0;
+}
+
+.delivered-report {
+  margin: 8px 0;
+}
+
 .picker-empty {
   padding: 12px 14px;
 }

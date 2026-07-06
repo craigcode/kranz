@@ -43,6 +43,15 @@ impl ApiError {
             message: message.into(),
         }
     }
+
+    /// A gated merge whose gate suite failed — the request was well-formed
+    /// but the mission's state is not mergeable yet.
+    pub fn unprocessable(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message: message.into(),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {

@@ -17,6 +17,7 @@ import { NewMission } from './components/NewMission';
 import { NewTicket } from './components/NewTicket';
 import { TopBar } from './components/TopBar';
 import { StatusStrip } from './components/StatusStrip';
+import { DeliveredPanel } from './components/DeliveredPanel';
 import { Sidebar } from './components/Sidebar';
 import { OrchestratorView } from './components/OrchestratorView';
 import { PlanningView } from './components/PlanningView';
@@ -130,6 +131,9 @@ export default function App() {
       <div className="app-east">
         <TopBar />
         <StatusStrip />
+        {missionId !== null && status === 'complete' && (
+          <DeliveredPanel missionId={missionId} status={status} />
+        )}
         <div className="app-main">
           <main className="centre">{centre}</main>
           <aside className="right-col" aria-label="Mission panels">

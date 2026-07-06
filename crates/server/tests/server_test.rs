@@ -15,7 +15,7 @@ use kranz_engine::types::{
     Assertion, AssertionCheck, ControlCommand, MissionConfig, Plan, PlanFeature, PlanMilestone,
     Role, RunResult, TokenUsage,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -1149,4 +1149,162 @@ async fn ws_unknown_mission_is_rejected() {
         .await
         .unwrap();
     assert!(result.is_err(), "handshake to an unknown mission must fail");
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/missions/:id/merge (gated merge action, roadmap M6)
+// ---------------------------------------------------------------------------
+
+const MERGE_TOKEN: &str = "merge-sesame";
+
+/// A router over `repo_root` with the mutation token armed and the gate
+/// suite stubbed (never shells out to `cargo`/`npm` in tests).
+fn merge_app<F>(repo_root: &Path, gate_executor: F) -> axum::Router
+where
+    F: Fn(&str, &Path) -> (bool, String) + Send + Sync + 'static,
+{
+    let host =
+        kranz_server::MissionHost::with_gate_executor(repo_root.to_path_buf(), gate_executor);
+    kranz_server::router_with_host(host, None, Some(MERGE_TOKEN.to_string()))
+}
+
+async fn post_json(
+    app: &axum::Router,
+    uri: &str,
+    token: Option<&str>,
+    body: Value,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(token) = token {
+        builder = builder.header("x-kranz-token", token);
+    }
+    let request = builder
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    (status, value)
+}
+
+#[tokio::test]
+async fn merge_route_requires_token() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo_root, base_sha) = init_repo();
+    seed_diffable_mission(&repo_root, "m-tok", &base_sha, true);
+    let app = merge_app(&repo_root, |_cmd, _cwd| (true, String::new()));
+
+    let (status, _) = post_json(&app, "/api/missions/m-tok/merge", None, json!({})).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, body) = post_json(
+        &app,
+        "/api/missions/m-tok/merge",
+        Some(MERGE_TOKEN),
+        json!({}),
+    )
+    .await;
+    assert_ne!(status, StatusCode::UNAUTHORIZED, "{body}");
+}
+
+#[tokio::test]
+async fn merge_route_merges_on_green_gates_and_flips_the_merged_bit() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo_root, base_sha) = init_repo();
+    seed_diffable_mission(&repo_root, "m-green", &base_sha, true);
+    let app = merge_app(&repo_root, |_cmd, _cwd| (true, String::new()));
+
+    let (status, body) = post_json(
+        &app,
+        "/api/missions/m-green/merge",
+        Some(MERGE_TOKEN),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["merged"], true);
+    assert!(body["commit"].is_string(), "{body}");
+
+    let (status, body) = get_json(&app, "/api/missions").await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = body.as_array().unwrap();
+    let row = rows.iter().find(|r| r["id"] == "m-green").unwrap();
+    assert_eq!(row["merged"], true, "{row}");
+}
+
+#[tokio::test]
+async fn merge_route_refuses_a_dirty_tracked_tree_and_leaves_base_unchanged() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo_root, base_sha) = init_repo();
+    seed_diffable_mission(&repo_root, "m-dirty", &base_sha, true);
+    // Dirty the TRACKED working tree (README.md is already tracked).
+    std::fs::write(repo_root.join("README.md"), "dirty\n").unwrap();
+    let app = merge_app(&repo_root, |_cmd, _cwd| (true, String::new()));
+
+    let base_before = raw_git(&repo_root, &["rev-parse", "main"])
+        .trim()
+        .to_string();
+    let (status, body) = post_json(
+        &app,
+        "/api/missions/m-dirty/merge",
+        Some(MERGE_TOKEN),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("dirty"), "{body}");
+    let base_after = raw_git(&repo_root, &["rev-parse", "main"])
+        .trim()
+        .to_string();
+    assert_eq!(base_before, base_after, "base branch must not advance");
+}
+
+#[tokio::test]
+async fn merge_route_surfaces_a_failing_gates_verbatim_output_and_leaves_base_unchanged() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo_root, base_sha) = init_repo();
+    seed_diffable_mission(&repo_root, "m-red", &base_sha, true);
+    let app = merge_app(&repo_root, |cmd, _cwd| {
+        if cmd == "cargo test --workspace" {
+            (false, "FAILED: it_broke\nassertion failed".to_string())
+        } else {
+            (true, String::new())
+        }
+    });
+
+    let base_before = raw_git(&repo_root, &["rev-parse", "main"])
+        .trim()
+        .to_string();
+    let (status, body) = post_json(
+        &app,
+        "/api/missions/m-red/merge",
+        Some(MERGE_TOKEN),
+        json!({}),
+    )
+    .await;
+    assert!(!status.is_success(), "{body}");
+    let error = body["error"].as_str().unwrap();
+    assert!(error.contains("cargo test --workspace"), "{body}");
+    assert!(error.contains("FAILED: it_broke"), "{body}");
+    assert!(error.contains("assertion failed"), "{body}");
+    let base_after = raw_git(&repo_root, &["rev-parse", "main"])
+        .trim()
+        .to_string();
+    assert_eq!(base_before, base_after, "base branch must not advance");
 }

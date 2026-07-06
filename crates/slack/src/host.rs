@@ -13,6 +13,7 @@
 
 use kranz_engine::draft::DraftOutcome;
 use kranz_engine::types::Plan;
+use serde_json::Value;
 use std::sync::Arc;
 
 /// Re-exported so implementers (the CLI's serve adapter) box their futures
@@ -99,6 +100,15 @@ pub trait PlanningHost: Send + Sync + 'static {
     /// call never itself drives a mission turn, so the bridge caller never
     /// resumes/runs a mission on the socket read loop.
     fn drain<'a>(&'a self) -> BoxFuture<'a, anyhow::Result<()>>;
+
+    /// `/kranz merge <slug|id>` / the Delivered card's Merge button → the
+    /// human-triggered gated Merge action (`POST /api/missions/:id/merge`'s
+    /// seam): refuses on a dirty tracked tree, runs the full CI gate suite,
+    /// and merges `--no-ff` into the base branch on green — never pushes.
+    /// `Ok(value)` carries the host's `{"merged":true,"commit":…}`; `Err`
+    /// carries the refusal VERBATIM (dirty tree / failing gate with its
+    /// captured output / merge conflict) for the bridge to forward unchanged.
+    fn merge<'a>(&'a self, id: &'a str) -> BoxFuture<'a, anyhow::Result<Value>>;
 }
 
 /// How the bridge holds the host: shared, optional (a bridge without a host —

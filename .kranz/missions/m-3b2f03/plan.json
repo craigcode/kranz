@@ -1,0 +1,150 @@
+{
+  "goal": "Add a human-triggered, token/allowlist-gated Merge action at the Delivered stage on both the dashboard and Slack that refuses on a dirty tracked tree, runs the full CI gate suite, merges --no-ff into the base branch on green, surfaces the failing gate verbatim on red, and never pushes.",
+  "validationContract": [
+    {
+      "id": "a1",
+      "statement": "The engine merge orchestration refuses to merge when the working tree has a dirty TRACKED file: it does not run any gate and does not create a merge commit, returning a refusal outcome.",
+      "check": "command",
+      "command": "cargo test -p kranz-engine"
+    },
+    {
+      "id": "a2",
+      "statement": "When every gate in the suite passes, the merge orchestration integrates the mission branch into its base branch with a --no-ff merge commit (a commit with two parents) such that the mission-branch tip becomes an ancestor of the base-branch tip.",
+      "check": "command",
+      "command": "cargo test -p kranz-engine"
+    },
+    {
+      "id": "a3",
+      "statement": "When a gate fails, the merge orchestration returns that gate's verbatim captured output, runs no subsequent gate, creates no merge commit, and leaves the base branch tip unchanged.",
+      "check": "command",
+      "command": "cargo test -p kranz-engine"
+    },
+    {
+      "id": "a4",
+      "statement": "The dashboard tsc+build gate is included in the suite only when the mission diff (base_sha..mission_branch) touches a path under apps/dashboard/, and is omitted otherwise.",
+      "check": "command",
+      "command": "cargo test -p kranz-engine"
+    },
+    {
+      "id": "a5",
+      "statement": "No code path in the merge orchestration ever invokes `git push` under any outcome (refused, gate-failed, conflict, or merged); merging is a purely local operation.",
+      "check": "command",
+      "command": "cargo test -p kranz-engine"
+    },
+    {
+      "id": "a6",
+      "statement": "POST /api/missions/:id/merge is rejected (401) when the x-kranz-token header is missing or wrong, and is accepted when the correct token is supplied.",
+      "check": "command",
+      "command": "cargo test -p kranz-server"
+    },
+    {
+      "id": "a7",
+      "statement": "The merge endpoint returns a merged result on green (after which the missions-list `merged` bit reads true for that mission) and, on a failing gate, returns a non-2xx response whose body carries the failing gate's verbatim output without advancing the base branch.",
+      "check": "command",
+      "command": "cargo test -p kranz-server"
+    },
+    {
+      "id": "a8",
+      "statement": "The Slack `/kranz merge <slug|id>` slash verb and the Delivered card's Merge button are denied for a user not on the spend allowlist (no host merge call is made) and, when the user is authorized, trigger the merge through the in-process PlanningHost seam (like work run) rather than on the socket read loop.",
+      "check": "command",
+      "command": "cargo test -p kranz-slack"
+    },
+    {
+      "id": "a9",
+      "statement": "The Slack Delivered card built for a Complete-and-unmerged mission contains the report summary, the diff stat, an Open-in-dashboard deep link, and a Merge button.",
+      "check": "command",
+      "command": "cargo test -p kranz-slack"
+    },
+    {
+      "id": "a10",
+      "statement": "The dashboard type-checks, builds, and its unit tests pass, covering: a Merge button that appears only for a Complete-and-unmerged mission and POSTs to the merge endpoint, inline rendering of report.md and the diff stat at the Delivered affordance, and verbatim display of a failed gate's output.",
+      "check": "command",
+      "command": "cd apps/dashboard && npm ci && npx tsc --noEmit && npm run test && npm run build"
+    },
+    {
+      "id": "a11",
+      "statement": "Across the full mission diff, the standing 'kranz never pushes' rule is preserved: nothing in the merge feature calls, enables, or reaches the push path on any surface.",
+      "check": "agent-judgement"
+    },
+    {
+      "id": "a12",
+      "statement": "The operator-facing Delivered surfaces (dashboard panel and Slack card) present the report, the diff stat, and an explicit unmerged distinction with a single Merge action per the design of record (docs/scoping/pipeline-view.md D-C), and a gate failure is shown to the operator verbatim rather than as a generic error.",
+      "check": "agent-judgement"
+    }
+  ],
+  "milestones": [
+    {
+      "title": "The gated merge, end-to-end via REST",
+      "features": [
+        {
+          "title": "Gate-suite runner (pure, injectable)",
+          "spec": "Add a new module to the kranz-engine crate (crates/engine/src, e.g. merge_gate.rs, exported from lib.rs) that runs the Kranz CI gate suite and reports the result. The canonical gates are defined in .github/workflows/ci.yml and MUST be matched exactly, in this order, stopping at the first failure:\n  1. `cargo fmt --all --check`\n  2. `cargo clippy --workspace --all-targets -- -D warnings`\n  3. `cargo test --workspace`\n  4. (only when dashboard_touched) run, with cwd apps/dashboard: `npm ci`, then `npx tsc --noEmit`, then `npm run build`.\n\nDesign for testability via dependency injection: the runner MUST NOT call a real shell directly. Define a small command-executor abstraction (a trait or an `Fn(&str, &Path) -> (bool, String)`-style closure that returns (success, combined_stdout_stderr)). The runner takes: the repo root, a `dashboard_touched: bool`, and the executor. The production wiring will pass an executor backed by the existing `run_shell_command_with_timeout` in crates/engine/src/orchestrator.rs (~line 4301: `sh -c`/`cmd /C`, cwd=repo root, returns (bool ok, String output) with stderr appended). Do NOT change orchestrator.rs's runner behaviour; only reuse or wrap it.\n\nReturn a structured result enum, e.g. `GateSuiteResult::{ Passed, Failed { gate: String, output: String } }`, where `gate` is a human label identifying which gate command failed (e.g. the command string) and `output` is that gate's verbatim captured output. When a gate fails, later gates MUST NOT run.\n\nWrite unit tests in the module (or crates/engine/tests) that inject fake executors and assert: (a) all gates green -> Passed; (b) a specific gate failing -> Failed carrying that gate's label and its verbatim output, AND that no later gate executor was invoked (track call order/count in the fake); (c) dashboard_touched=false omits the three dashboard commands entirely; dashboard_touched=true includes them after the rust gates; (d) the exact gate command strings issued match the four CI commands above.",
+          "validationCriteria": [
+            "With an injected executor that passes every command, the runner returns Passed and issues exactly the four CI gate commands (in ci.yml order) when dashboard_touched=true.",
+            "With an injected executor that fails a chosen gate, the runner returns Failed{gate,output} carrying that gate's label and its verbatim output, and no gate after the failing one is executed.",
+            "When dashboard_touched=false, none of `npm ci`, `npx tsc --noEmit`, or `npm run build` is issued; when true, all three are issued with cwd apps/dashboard.",
+            "The issued gate command strings equal `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and (dashboard) the three npm/npx commands."
+          ]
+        },
+        {
+          "title": "Dashboard-touched diff probe + merge orchestration",
+          "spec": "In the kranz-engine crate, add (1) a GitRepo helper to list changed paths for a revision range and (2) the merge orchestration that ties the gate suite to a real --no-ff merge, never pushing.\n\n(1) In crates/engine/src/git_ops.rs add a name-only diff helper, e.g. `changed_paths(&self, from: &str, to: &str) -> Result<Vec<String>>` running `git diff --name-only <from>..<to>` (follow the existing pattern of diff_stat at ~git_ops.rs:221 / diff_full at ~:227; reject flag-shaped refs as is_ancestor does at ~:105). Add a `dashboard_touched` predicate: true iff any changed path starts with `apps/dashboard/`. The range to probe is base_sha..mission_branch (the mission's pinned base_sha from Mission.base_sha, and Mission.mission_branch — see the Mission struct at crates/engine/src/types.rs:38-54).\n\n(2) Add a merge orchestration function (e.g. in a new merge module, or alongside git_ops) `merge_mission(...)` that, given the mission's base_branch, base_sha, mission_branch, the repo, and an injected gate executor (the abstraction from the gate-suite runner feature):\n  - STEP 0 (before anything else): if `repo.is_clean_tracked()` (git_ops.rs:~159, `git status --porcelain --untracked-files=no`) is false, return a Refused outcome (dirty tracked tree). Do NOT run gates, do NOT merge.\n  - Compute dashboard_touched via the helper above.\n  - Run the gate suite (the runner feature). If it returns Failed{gate,output}, return a GateFailed outcome carrying gate+output. Do NOT merge; base branch must be untouched.\n  - On Passed: integrate the mission branch into base. NOTE: `merge_no_ff` (git_ops.rs:~325) merges the given branch INTO THE CURRENTLY CHECKED-OUT branch and auto-aborts on conflict to keep the tree clean; the hosted server has no checkout to restore. So this step must place base_branch as the checkout (e.g. `repo.checkout(&base_branch)` at git_ops.rs:~144, or a dedicated worktree — your choice) and then `repo.merge_no_ff(&mission_branch)`. On MergeOutcome::Conflict return a Conflict outcome (the tree is left clean by the existing abort); on MergeOutcome::Clean capture the new merge commit sha (git_ops.rs head_sha ~:71) and return a Merged{commit} outcome.\n  - NEVER call `push_mission_branch` or any push. The only push path (git_ops.rs:~453) must remain uncalled.\n\nDefine the outcome enum (e.g. `MergeReport::{ RefusedDirtyTree, GateFailed { gate, output }, Conflict { files }, Merged { commit } }`).\n\nTests: use the temp-repo fixtures in crates/engine/tests/git_ops_test.rs (isolate_git_env, init_repo, raw_git, seeded merge fixtures ~:591). Configure NO git remote so a push would fail if ever attempted. Assert: dirty tracked tree -> RefusedDirtyTree and base tip unchanged and no gate executor invoked; injected-passing gates -> base advances by a --no-ff merge commit (two parents) and mission tip is now ancestor of base tip; injected-failing gate -> GateFailed{gate,output} and base tip unchanged; changed_paths/dashboard_touched true for a diff touching apps/dashboard and false otherwise; the whole merged path completes without any push (a recording executor/git shim or the remoteless repo proves no push occurred).",
+          "validationCriteria": [
+            "merge_mission returns RefusedDirtyTree (running no gates and leaving base unchanged) when a tracked file is modified.",
+            "With injected passing gates, merge_mission produces a --no-ff merge commit (two parents) on base and the mission tip becomes an ancestor of the base tip.",
+            "With an injected failing gate, merge_mission returns GateFailed{gate,output} with verbatim output and the base tip is unchanged.",
+            "changed_paths / dashboard_touched report true for a base_sha..mission_branch diff that touches apps/dashboard and false when it does not.",
+            "No merge_mission outcome invokes any git push (verified against a repo with no remote and/or a recording git shim)."
+          ]
+        },
+        {
+          "title": "MissionHost::merge + token-gated POST /api/missions/:id/merge",
+          "spec": "Expose the engine merge orchestration as a token-gated REST endpoint and a MissionHost method, so an operator can land a Delivered mission over HTTP.\n\nServer (crates/server): add `MissionHost::merge(&self, id: &str) -> Result<Value, ApiError>` on the host (host.rs, alongside drain ~:790 and start ~:497). It loads the mission's base_branch/base_sha/mission_branch, and runs the engine merge orchestration; because git and the gate suite are blocking, wrap the work in `tokio::task::spawn_blocking` (git_ops docs require this). The gate executor MUST be injectable at the host layer for hermetic tests: mirror the existing mock-backend seam (`MissionHost::with_backend`, host.rs:~157) by providing a way to construct a host with a stub gate executor (default = the real shell executor from the gate-suite feature). Add the axum route in crates/server/src/lib.rs next to the other mission POSTs (~:150-171): `.route(\"/api/missions/{id}/merge\", post(host::merge_mission_route))`, and a handler modeled on `start_mission` (host.rs:~1348): extract State<Arc<ServerState>> + UrlPath(id), call `valid_id`, delegate to `server.host.merge(&id)`. Token gating is automatic via `require_mutation_token` (lib.rs:~326, header x-kranz-token) because it is a POST /api/ route — no per-handler token code needed.\n\nResponse shape (stable, so dashboard and Slack can consume it uniformly): on Merged -> 200 `{\"merged\": true, \"commit\": \"<sha>\"}`; on RefusedDirtyTree -> 409 `{\"error\": \"refusing to merge: tracked working tree is dirty\"}`; on GateFailed -> a non-2xx (e.g. 422) `{\"error\": \"<gate> failed:\\n<verbatim output>\"}` so the failing gate is carried verbatim in the error body; on Conflict -> 409 `{\"error\": \"merge conflicted in: <files>\"}`. Reuse ApiError (crates/server/src/error.rs) and its EngineError mapping. Merge may run inline within spawn_blocking (returning the final outcome) rather than as a pollable background slot — the caller waits for the outcome.\n\nTests (crates/server/tests/server_test.rs style): use init_repo + seed_diffable_mission(create_branch=true) (server_test.rs ~:218) and a router built with Some(TOKEN) and an injected stub gate executor. Assert: (a) POST /api/missions/<id>/merge without token -> 401 (mirror host.rs:~1890); (b) with token + stubbed-green gates -> 200 merged and the missions-list `merged` bit (rest.rs merged_bit ~:79) now reads true for that mission; (c) dirty tracked tree -> 409 refusal, base unchanged; (d) stubbed-failing gate -> non-2xx whose body contains the gate's verbatim output, base unchanged.",
+          "validationCriteria": [
+            "POST /api/missions/:id/merge returns 401 without a valid x-kranz-token and proceeds with one.",
+            "With a stubbed passing gate suite, the endpoint returns 200 {merged:true,commit} and the missions-list merged bit for that mission flips to true.",
+            "A dirty tracked tree yields a 409 refusal and the base branch is not advanced.",
+            "A stubbed failing gate yields a non-2xx response whose body carries that gate's verbatim output, and the base branch is not advanced."
+          ]
+        }
+      ]
+    },
+    {
+      "title": "Merge on both human surfaces",
+      "features": [
+        {
+          "title": "Dashboard Delivered panel: report + diff + Merge button",
+          "spec": "The dashboard pipeline view (design slice 2) is NOT built, so attach a SELF-CONTAINED Delivered affordance to the existing mission surface (the mission detail / StatusStrip area, and/or the MissionPicker row) keyed off backing state, not a new pipeline model.\n\nApp: apps/dashboard (React 19 + TypeScript + Vite; token handling and API wrappers already exist). Steps:\n  - types.ts (~:233-239): add `merged?: boolean` to MissionSummary so the UI can distinguish Delivered (Complete + merged==false) from Landed (merged==true); the server already emits this bit on the missions list.\n  - api.ts: add `merge(id)` via the existing `postJson` wrapper (~:104-205) hitting `/api/missions/${encodeURIComponent(id)}/merge` with an empty body (token + 401-retry handling is automatic). Add `reportMd(id)` and `diffStat(id)` via the existing `getJson` wrapper (~:70) hitting the slice-1 endpoints GET /api/missions/:id/report.md (returns {markdown}) and GET /api/missions/:id/diff-stat (returns {diffStat,baseSha,tip}).\n  - A Delivered panel component (model on RunQueueButton.tsx for the button; use renderMarkdown from lib/markdown.tsx to render report.md and the diff stat) that renders ONLY when a mission is Complete AND merged==false: show an UNMERGED badge, the report.md and diff-stat inline, and a Merge button. On click it calls api.merge(id); on success reflect the landed state (clear the UNMERGED badge / disable the button); on failure (ApiError) render the server error message verbatim in a role=\"alert\" block using a <pre> (gate output is multi-line) — the endpoint's error body carries the failing gate verbatim, and ApiError.message already surfaces it. Do not show the Merge button for missions that are not Complete or are already merged.\n  - Keep the change buildable: `npx tsc --noEmit` and `npm run build` must pass.\n\nTests (Vitest + @testing-library/react; model on apps/dashboard/src/components/RunQueueButton.test.tsx which mocks ../lib/api with vi.mock and asserts role=\"alert\" text): assert the Merge button appears only for Complete+unmerged; a successful merge clears the UNMERGED state / disables the button; a failed merge (reject api.merge with an ApiError whose message is a multi-line gate output) renders that verbatim text in the alert; the report/diff panel renders the fetched markdown.",
+          "validationCriteria": [
+            "The Merge button renders only for a mission that is Complete and merged==false, and not for other states.",
+            "Clicking Merge calls api.merge(id) and, on success, clears the UNMERGED indication / disables the button.",
+            "A failed merge renders the ApiError message (multi-line gate output) verbatim in a role=\"alert\" block.",
+            "report.md and the diff stat are fetched and rendered inline at the Delivered affordance.",
+            "`npx tsc --noEmit`, `npm run test`, and `npm run build` all pass in apps/dashboard."
+          ]
+        },
+        {
+          "title": "Slack Delivered card: report summary + diff stat + deep link + Merge button",
+          "spec": "Enrich the Slack completion notification into a Delivered card for a Complete-and-unmerged mission, in crates/slack.\n\nToday MissionCompleted classifies to Outbound::Complete (crates/slack/src/outbound.rs ~:75) and is rendered by `build_complete` (crates/slack/src/format.rs ~:353) as header + summary + a context meta line + an Open-in-dashboard deep-link button. Extend the Delivered card (either by extending the Complete struct+build_complete, or by adding a new Outbound/NotifyClass variant + builder — follow the existing outbound classifier + build_* + push_dashboard_button patterns) so that for a Complete-and-unmerged mission the posted card carries:\n  - the report summary (already present),\n  - the diff stat (source it from the mission via GitRepo diff_stat over base_sha..mission_branch; thread the value into the card the same way summary/cost are),\n  - an Open-in-dashboard deep link (existing dashboard_deep_link / push_dashboard_button, format.rs ~:244/:272, gated on dashboard_url being configured),\n  - a Merge button: add a `MERGE_ACTION_ID` const (format.rs, next to APPROVE_ACTION_ID ~:18 / START_ACTION_ID ~:24) and append an actions block with a button carrying action_id=MERGE_ACTION_ID and value=mission_id, exactly as build_plan_review (~:594-644) builds its Approve/Start buttons. (The button's routing + gating is the sibling feature; here you only build the card.)\n\nTests (crates/slack card-builder tests: format.rs inline tests around build_complete ~:967/:1267, and/or tests/formatting.rs; outbound classifier tests outbound.rs ~:119): assert the Delivered card for a Complete-and-unmerged mission contains the report summary text, the diff-stat text, the dashboard deep-link button, and a Merge button whose action_id is MERGE_ACTION_ID and whose value is the mission id.",
+          "validationCriteria": [
+            "The Delivered card for a Complete-and-unmerged mission includes the report summary and the diff-stat text.",
+            "The card includes an Open-in-dashboard deep-link button when a dashboard URL is configured.",
+            "The card includes a Merge button with action_id=MERGE_ACTION_ID and value=<mission id>.",
+            "A MERGE_ACTION_ID constant is defined alongside the existing action-id constants."
+          ]
+        },
+        {
+          "title": "Slack /kranz merge verb + Merge button, allowlist-gated via PlanningHost seam",
+          "spec": "Wire the Slack merge action end-to-end IN-PROCESS. IMPORTANT: the Slack bridge does NOT HTTP-POST to serve; it programs against the PlanningHost trait (crates/slack/src/host.rs) whose adapter HostedPlanning (crates/cli/src/host_bridge.rs) calls the same MissionHost methods the REST routes use. Follow the `work run` path exactly.\n\n  - Trait seam: add `merge(&self, mission_id: &str) -> ...` to the PlanningHost trait (crates/slack/src/host.rs, modeled on `drain` ~:95) and implement it in HostedPlanning (crates/cli/src/host_bridge.rs, modeled on the drain adapter ~:83) by calling `MissionHost::merge` (built in milestone 1). Add a `merge` method to the FakeHost test double (crates/slack/tests/tickets.rs ~:269) with a `merge_calls` counter, mirroring drain.\n  - Routing (pure, in crates/slack/src/inbound.rs): add `Action::Merge { mission_id, user_id, response_url }` (doc it as spend-adjacent, gated like work run). In route_slash (~:499) parse `/kranz merge <slug|id>` as a single-arg verb (mirror `approve <id>` ~:616 / `draft <slug>` ~:630, using clean_id; extra tokens fall through to Help). In route_interactive (~:272) add a match arm for action_id==MERGE_ACTION_ID producing the SAME Action::Merge, capturing user.id and response_url from the payload (heed the tests/routing.rs regression note that buttons must capture user_id or they bypass the allowlist).\n  - Bridge gating + dispatch (crates/slack/src/bridge.rs): add Action::Merge to `is_slow_action` (~:428) so it runs off the socket read loop after the ack. Add a synchronous gate `gate_merge_command` (model on gate_work_run_command ~:726) that calls `cfg.is_authorized(user_id)` (config.rs ~:91) and returns Unauthorized / NoHost / Ready(ack); on Unauthorized post `not_authorized_blocks()` (~:553) and make NO host call. Add a dispatch arm (model on the WorkRun arm ~:1288) that posts the ack FIRST, then awaits `run_merge(host, id)` (model on run_work_run ~:749) which calls `host.merge(id)`, then posts the outcome (merged / verbatim failing gate / dirty-tree refusal) back to the user.\n\nTests (crates/slack/tests/tickets.rs + inbound.rs routing tests, model on the work_run tests ~:626-737): `/kranz merge <id>` routes to Action::Merge; the MERGE_ACTION_ID button routes to Action::Merge WITH user_id captured; an unlisted user is denied (not_authorized_blocks, merge_calls==0); the gate acks before any host call (Ready ack with merge_calls==0) and run_merge then drives exactly one host.merge; a missing host is an honest NoHost refusal. Assert the merge is never driven on the socket read loop (it goes through the slow-action spawn + PlanningHost seam).",
+          "validationCriteria": [
+            "`/kranz merge <slug|id>` parses to Action::Merge, and the MERGE_ACTION_ID button parses to Action::Merge with user_id captured.",
+            "A user not on the spend allowlist is refused with not_authorized_blocks and no host.merge call is made.",
+            "The gate returns Ready with the ack postable before any host call (merge_calls==0), and run_merge then invokes host.merge exactly once.",
+            "A missing host yields an honest NoHost refusal pointing at the CLI.",
+            "Action::Merge is classified as a slow action so it runs off the socket read loop through the PlanningHost seam."
+          ]
+        }
+      ]
+    }
+  ]
+}

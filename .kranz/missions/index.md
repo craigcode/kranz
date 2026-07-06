@@ -18,3 +18,4 @@ Approved plans, newest last.
 - 2026-07-06 · [m-836459](m-836459/plan.md) — Serve the pipeline view's data layer: persist the calibrated cost estimate into plan.md at park time, expose GET endpoin… [truncated] · [report](m-836459/report.md)
 - 2026-07-06 · [m-db35a6](m-db35a6/plan.md) — Make the queue dispatcher's drain/claim/skip loop host-callable and expose it as a token-gated POST /api/queue/drain (id… [truncated] · [report](m-db35a6/report.md)
 - 2026-07-06 · [m-673f53](m-673f53/plan.md) — Ship the pipeline view: one dashboard screen with one row per work item rendering the nine-stage model (chips, inline pl… [truncated] · [report](m-673f53/report.md)
+- 2026-07-06 · [m-3b2f03](m-3b2f03/plan.md) — Add a human-triggered, token/allowlist-gated Merge action at the Delivered stage on both the dashboard and Slack that re… [truncated] · [report](m-3b2f03/report.md)

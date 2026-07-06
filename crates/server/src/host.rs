@@ -39,13 +39,15 @@ use kranz_engine::deps;
 use kranz_engine::draft::{drive_draft, DraftOutcome};
 use kranz_engine::error::EngineError;
 use kranz_engine::event_log::{EventLog, LockForce};
+use kranz_engine::git_ops::GitRepo;
+use kranz_engine::merge::{merge_mission, MergeReport};
 use kranz_engine::orchestrator::{MissionEngine, PlanRequest};
 use kranz_engine::paths::MissionPaths;
 use kranz_engine::ticket::Ticket;
 use kranz_engine::types::{MissionConfig, MissionStatus, Plan};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -90,6 +92,10 @@ pub struct MissionHost {
     /// The lazily-spawned autoWork background task, started at most once
     /// (see [`MissionHost::ensure_auto_work_started`]).
     auto_work: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The gate-suite executor [`MissionHost::merge`] runs under
+    /// `spawn_blocking`; real shell commands by default, a scripted stub in
+    /// tests (see [`MissionHost::with_gate_executor`]).
+    gate_executor: GateExecutor,
 }
 
 /// One background drain task's observable progress — shared between the task
@@ -100,6 +106,42 @@ struct DrainState {
     live: bool,
     current_mission_id: Option<String>,
     ran: Vec<String>,
+}
+
+/// One gate-suite command execution: `executor(command, cwd)` →
+/// `(success, combined_stdout_stderr)`. Boxed so [`MissionHost`] can hold a
+/// real shell-backed default and tests can inject a scripted stub — the same
+/// seam shape as [`MissionHost::with_backend`] for the agent backend.
+type GateExecutor = Arc<dyn Fn(&str, &Path) -> (bool, String) + Send + Sync>;
+
+/// The real gate executor: shells out synchronously (`sh -c` / `cmd /C`),
+/// combining stdout+stderr so a failing gate's captured output can be
+/// surfaced verbatim. Runs only from inside `tokio::task::spawn_blocking`
+/// (see [`MissionHost::merge`]), so blocking here never stalls the runtime.
+fn real_gate_executor() -> GateExecutor {
+    Arc::new(|command: &str, cwd: &Path| -> (bool, String) {
+        let output = if cfg!(windows) {
+            std::process::Command::new("cmd")
+                .arg("/C")
+                .arg(command)
+                .current_dir(cwd)
+                .output()
+        } else {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(command)
+                .current_dir(cwd)
+                .output()
+        };
+        match output {
+            Ok(out) => {
+                let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+                combined.push_str(&String::from_utf8_lossy(&out.stderr));
+                (out.status.success(), combined)
+            }
+            Err(e) => (false, format!("failed to spawn shell: {e}")),
+        }
+    })
 }
 
 /// The autoWork watcher's decision function, factored out so it's testable
@@ -149,6 +191,7 @@ impl MissionHost {
             sweeper: Mutex::new(None),
             drain: Mutex::new(DrainSlot::Idle),
             auto_work: Mutex::new(None),
+            gate_executor: real_gate_executor(),
         }
     }
 
@@ -162,6 +205,26 @@ impl MissionHost {
             sweeper: Mutex::new(None),
             drain: Mutex::new(DrainSlot::Idle),
             auto_work: Mutex::new(None),
+            gate_executor: real_gate_executor(),
+        }
+    }
+
+    /// Host with an injected gate-suite executor (tests script CI gate
+    /// outcomes for [`MissionHost::merge`] hermetically, without ever
+    /// shelling out to `cargo`/`npm`). Mirrors [`MissionHost::with_backend`]'s
+    /// seam, for the gate suite instead of the agent backend.
+    pub fn with_gate_executor<F>(repo_root: PathBuf, gate_executor: F) -> Self
+    where
+        F: Fn(&str, &Path) -> (bool, String) + Send + Sync + 'static,
+    {
+        MissionHost {
+            repo_root,
+            backend: tokio::sync::OnceCell::new(),
+            missions: Arc::new(Mutex::new(HashMap::new())),
+            sweeper: Mutex::new(None),
+            drain: Mutex::new(DrainSlot::Idle),
+            auto_work: Mutex::new(None),
+            gate_executor: Arc::new(gate_executor),
         }
     }
 
@@ -498,6 +561,58 @@ impl MissionHost {
             map.insert(id.to_string(), HostedMission::Running(handle));
         }
         Ok(())
+    }
+
+    /// `POST /api/missions/:id/merge`: the human-triggered gated Merge
+    /// action (roadmap M6). Loads the mission's `base_branch`/`base_sha`/
+    /// `mission_branch` from its event log (no engine needs to be hosted —
+    /// merge is independent of the planning/run-loop registry) and runs
+    /// [`kranz_engine::merge::merge_mission`] under `spawn_blocking` (git and
+    /// the gate suite are both blocking work). Never pushes.
+    pub async fn merge(&self, id: &str) -> Result<Value, ApiError> {
+        let paths = MissionPaths::new(&self.repo_root, id);
+        if !paths.events_file().is_file() {
+            return Err(ApiError::not_found(format!("unknown mission '{id}'")));
+        }
+        let events = EventLog::read_events(&paths.events_file())?;
+        let state = kranz_engine::reducer::fold(&events).map_err(ApiError::from)?;
+        let base_branch = state.mission.base_branch.clone();
+        let base_sha = state.mission.base_sha.clone().ok_or_else(|| {
+            ApiError::conflict(format!(
+                "mission '{id}' has no pinned base sha — approve a plan first"
+            ))
+        })?;
+        let mission_branch = state.mission.mission_branch.clone();
+
+        let repo_root = self.repo_root.clone();
+        let gate_executor = Arc::clone(&self.gate_executor);
+        let report = tokio::task::spawn_blocking(move || {
+            let repo = GitRepo::open(&repo_root)?;
+            merge_mission(
+                &repo,
+                &base_branch,
+                &base_sha,
+                &mission_branch,
+                |cmd, cwd| gate_executor(cmd, cwd),
+            )
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("merge task panicked: {e}")))?
+        .map_err(ApiError::from)?;
+
+        match report {
+            MergeReport::Merged { commit } => Ok(json!({ "merged": true, "commit": commit })),
+            MergeReport::RefusedDirtyTree => Err(ApiError::conflict(
+                "refusing to merge: tracked working tree is dirty",
+            )),
+            MergeReport::GateFailed { gate, output } => {
+                Err(ApiError::unprocessable(format!("{gate} failed:\n{output}")))
+            }
+            MergeReport::Conflict { files } => Err(ApiError::conflict(format!(
+                "merge conflicted in: {}",
+                files.join(", ")
+            ))),
+        }
     }
 
     /// Release a hosted idle engine: drop it from the registry (flushing its
@@ -1352,6 +1467,17 @@ pub(crate) async fn start_mission(
     let id = valid_id(&server, &id)?;
     server.host.start(&id).await?;
     Ok((StatusCode::ACCEPTED, Json(json!({ "running": true }))))
+}
+
+/// `POST /api/missions/:id/merge` → `200 {"merged":true,"commit":"..."}` on
+/// success. See [`MissionHost::merge`] for the non-2xx shapes (dirty tree /
+/// gate failure / conflict).
+pub(crate) async fn merge_mission_route(
+    State(server): State<Arc<ServerState>>,
+    UrlPath(id): UrlPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let id = valid_id(&server, &id)?;
+    Ok(Json(server.host.merge(&id).await?))
 }
 
 /// `POST /api/queue/drain` — no required body → `200 <drain-state JSON>`.
