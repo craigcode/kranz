@@ -37,3 +37,4 @@ Approved plans, newest last.
 - 2026-07-07 · [m-a11f17](m-a11f17/plan.md) — Add a lens filter bar (Actionable | Backlog | Missions | All) to the pipeline view so operators see actionable work by d… [truncated] · [report](m-a11f17/report.md)
 - 2026-07-07 · [m-f1c684](m-f1c684/plan.md) — Detect a stalled or dropped Slack Socket Mode connection in the kranz serve --slack bridge, reconnect automatically with… [truncated] · [report](m-f1c684/report.md)
 - 2026-07-07 · [m-5224ee](m-5224ee/plan.md) — Ticket surfaces (REST /api/tickets projection, CLI ticket list/show, Slack, and the dashboard BacklogPanel) distinguish … [truncated] · [report](m-5224ee/report.md)
+- 2026-07-07 · [m-bf1264](m-bf1264/plan.md) — A mission whose deliverable diff against the pinned base SHA is empty (no non-meta feature commits on the mission branch… [truncated]
