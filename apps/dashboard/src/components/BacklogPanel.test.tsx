@@ -111,4 +111,53 @@ describe('BacklogPanel', () => {
     const chip = await screen.findByText('was blocked by dep-a');
     expect(chip.className).toContain('ticket-blocker-badge--satisfied');
   });
+
+  it('renders delivered + UNMERGED for a done ticket with merged:false', async () => {
+    vi.mocked(api.tickets).mockResolvedValueOnce([
+      makeSummary({ slug: 'done-delivered', state: 'done', merged: false }),
+    ]);
+
+    render(<BacklogPanel />);
+
+    const pill = await screen.findByText('delivered');
+    expect(pill.className).toContain('pill-delivered');
+    expect(screen.getByText('UNMERGED')).toBeTruthy();
+    expect(screen.queryByText('done')).toBeFalsy();
+  });
+
+  it('renders landed with no UNMERGED badge for a done ticket with merged:true', async () => {
+    vi.mocked(api.tickets).mockResolvedValueOnce([
+      makeSummary({ slug: 'done-landed', state: 'done', merged: true }),
+    ]);
+
+    render(<BacklogPanel />);
+
+    const pill = await screen.findByText('landed');
+    expect(pill.className).toContain('pill-landed');
+    expect(screen.queryByText('UNMERGED')).toBeFalsy();
+    expect(screen.queryByText('done')).toBeFalsy();
+  });
+
+  it('renders landed for a done ticket with merged:null', async () => {
+    vi.mocked(api.tickets).mockResolvedValueOnce([
+      makeSummary({ slug: 'done-null', state: 'done', merged: null }),
+    ]);
+
+    render(<BacklogPanel />);
+
+    const pill = await screen.findByText('landed');
+    expect(pill.className).toContain('pill-landed');
+    expect(screen.queryByText('UNMERGED')).toBeFalsy();
+  });
+
+  it('renders the raw state pill for a non-done ticket', async () => {
+    vi.mocked(api.tickets).mockResolvedValueOnce([
+      makeSummary({ slug: 'in-review', state: 'review' }),
+    ]);
+
+    render(<BacklogPanel />);
+
+    const pill = await screen.findByText('review');
+    expect(pill.className).toContain('pill-review');
+  });
 });

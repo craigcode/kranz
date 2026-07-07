@@ -5,8 +5,6 @@
 import { useEffect } from 'react';
 import { useKranzStore } from '../lib/store';
 import { RunQueueButton } from './RunQueueButton';
-import { pipelineStage } from '../lib/pipelineStage';
-import type { TicketWorkItem } from '../lib/pipelineStage';
 import type { TicketSummary } from '../lib/types';
 
 export function BacklogPanel() {
@@ -19,12 +17,10 @@ export function BacklogPanel() {
   }, [loadTickets]);
 
   const row = (t: TicketSummary) => {
-    const item: TicketWorkItem = {
-      kind: 'ticket',
-      ticket: { slug: t.slug, state: t.state },
-      mission: { status: 'complete', merged: t.merged ?? null },
-    };
-    const stage = t.state === 'done' ? pipelineStage(item) : t.state;
+    // Mirrors the CLI/Slack ticket surfaces: only merged===false is
+    // Delivered; merged===true or merged===null (no mission / unprobable) is
+    // Landed — matches pipelineStage.ts's done-state semantics.
+    const stage = t.state === 'done' ? (t.merged === false ? 'delivered' : 'landed') : t.state;
 
     return (
     <li key={t.slug} className="picker-item">
