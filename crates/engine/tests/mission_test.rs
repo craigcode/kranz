@@ -200,6 +200,12 @@ fn orch_script(replies: Vec<String>) -> MockScript {
     )
 }
 
+/// Dirty-tree-turn reply (§4.4): the worker left uncommitted changes; commit
+/// them as-is so they land on the mission branch.
+fn dirty_tree_commit_as_is() -> String {
+    json!({ "action": "commit-as-is", "note": "worker delivered files" }).to_string()
+}
+
 /// Judgement-turn reply (§4.5 f).
 fn judgement(decision: &str, guidance: &str) -> String {
     json!({ "decision": decision, "guidance": guidance, "summary": format!("worker judged: {decision}") })
@@ -1940,6 +1946,80 @@ async fn base_sha_reaches_worker_and_validator_env() {
         Some(base_tip_before.as_str()),
         "validator env carries the recorded base sha"
     );
+}
+
+/// A mock worker that writes a file into its session cwd leaves a dirty tree
+/// behind, which the engine's §4.4 discipline checkpoints as a real,
+/// non-meta commit on the mission branch — proving mock missions can deliver
+/// actual commits (not just an empty diff).
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_file_write_lands_a_non_meta_commit_and_mission_completes() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let base_tip_before = raw_git(&root, &["rev-parse", "main"]).trim().to_string();
+
+    let worker_writes = MockScript::single_shot_json(&json!({
+        "result": "pass",
+        "summary": "implemented and tested",
+        "filesTouched": ["feature.txt"],
+        "testsAdded": [],
+        "testEvidence": "all green",
+        "commits": []
+    }))
+    .writes_file("feature.txt", "delivered by the mock worker\n");
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_writes,
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            verdicts_pass(&["a-2"]),
+            no_lesson(),
+        ]),
+        validator_with(json!([])),
+    ]));
+
+    let contract = vec![assertion("a-2", "error messages are actionable", None)];
+    let cfg = MissionConfig {
+        skip_scrutiny: false,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, contract)).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+
+    let mission_branch = engine.state().mission.mission_branch.clone();
+    let log = raw_git(
+        &root,
+        &[
+            "log",
+            &format!("{base_tip_before}..{mission_branch}"),
+            "--format=%s",
+        ],
+    );
+    let subjects: Vec<&str> = log.lines().collect();
+    assert!(
+        subjects
+            .iter()
+            .any(|s| !kranz_engine::contract_sweep::is_meta_commit(s)),
+        "expected at least one non-meta commit on the mission branch, got: {subjects:?}"
+    );
+    assert!(
+        subjects
+            .iter()
+            .any(|s| s.contains("feature.txt") || s.contains("checkpoint") || s.contains("f-1-1")),
+        "the worker's dirty tree should have produced the feature checkpoint commit: {subjects:?}"
+    );
+    let feature_file = std::fs::read_to_string(root.join("feature.txt"))
+        .expect("the mock worker's write should survive on the mission branch");
+    assert_eq!(feature_file, "delivered by the mock worker\n");
 }
 
 /// The missions catalog upserts by mission id: appends new entries newest

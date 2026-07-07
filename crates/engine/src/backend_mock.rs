@@ -53,6 +53,13 @@ pub struct MockScript {
     /// test's timeout instead of flaky-passing. Meaningful for single-shot
     /// scripts (streaming sessions end via `abort`, not a final event).
     pub hold_result_until_started: Option<usize>,
+    /// Files to write into the session's working directory (`spec.cwd`) when
+    /// the session starts — the seam that lets a mock session leave a dirty
+    /// tree for the engine's §4.4 checkpoint to commit. Each entry is a path
+    /// relative to the session cwd and its contents; parent directories are
+    /// created as needed. Empty by default (byte-for-byte unchanged
+    /// behaviour).
+    pub writes: Vec<(String, String)>,
 }
 
 impl Default for MockScript {
@@ -64,6 +71,7 @@ impl Default for MockScript {
             streaming: false,
             session_id: None,
             hold_result_until_started: None,
+            writes: Vec::new(),
         }
     }
 }
@@ -131,6 +139,14 @@ impl MockScript {
     /// the final scripted event until `n` sessions have started.
     pub fn rendezvous(mut self, n: usize) -> Self {
         self.hold_result_until_started = Some(n);
+        self
+    }
+
+    /// Write `contents` to `path` (relative to the session's working
+    /// directory) when the session starts — lets a scripted worker session
+    /// leave a dirty tree for the engine's §4.4 checkpoint to commit.
+    pub fn writes_file(mut self, path: impl Into<String>, contents: impl Into<String>) -> Self {
+        self.writes.push((path.into(), contents.into()));
         self
     }
 }
@@ -400,6 +416,21 @@ impl AgentBackend for MockBackend {
             injected.push(Vec::new());
             injected.len() - 1
         };
+
+        for (rel_path, contents) in &script.writes {
+            let target = spec.cwd.join(rel_path);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    EngineError::Backend(format!(
+                        "mock: failed to create parent dirs for {}: {e}",
+                        target.display()
+                    ))
+                })?;
+            }
+            std::fs::write(&target, contents).map_err(|e| {
+                EngineError::Backend(format!("mock: failed to write {}: {e}", target.display()))
+            })?;
+        }
 
         let session_id = script
             .session_id
