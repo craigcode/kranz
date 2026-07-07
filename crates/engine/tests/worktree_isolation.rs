@@ -6,6 +6,7 @@
 //! re-route mission-branch mutations through a dedicated worktree. Nothing
 //! consumes either yet.
 
+use kranz_engine::auth_verify::AuthVerdict;
 use kranz_engine::backend::{AgentBackend, PromptMode};
 use kranz_engine::backend_mock::{
     mock_init, mock_result_error, mock_result_text, mock_text, MockBackend, MockScript,

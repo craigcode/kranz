@@ -844,6 +844,19 @@ impl MissionEngine {
         verdict
     }
 
+    /// Test-only seam (mission m-165b6f, f-2-2): pre-seeds the cached
+    /// worker-auth verdict so `MockBackend`-driven mission-flow tests don't
+    /// have the live preflight (see [`Self::worker_auth_verdict`]) consume a
+    /// `MockScript` meant for a real worker/validator session — the
+    /// preflight and its verdict handling are covered directly by
+    /// `auth_verify`'s own unit tests instead. Never call this outside
+    /// tests: it bypasses the real auth-verification guarantee the
+    /// preflight exists to provide.
+    #[doc(hidden)]
+    pub fn seed_worker_auth_verdict_for_test(&mut self, verdict: AuthVerdict) {
+        self.worker_auth_verdict = Some(verdict);
+    }
+
     /// Fold events appended by `runner::run_*` (which writes to the log
     /// directly) into engine state. Must be called immediately after every
     /// runner invocation, before any further `emit`.

@@ -1316,6 +1316,50 @@ fn seed_worker_scratch_home_worker_env_hygiene_copies_only_allowlisted_entries()
     );
 }
 
+/// Confinement proof: an operator dotfile sitting right next to the
+/// allowlisted credentials entry in the source config dir must never leak
+/// into the scratch `CLAUDE_CONFIG_DIR`. The scratch dir's *entire* contents
+/// must equal the allowlist — not "the allowlist plus whatever else was
+/// there" — so this asserts the full directory listing, not just presence.
+#[test]
+fn seed_worker_scratch_home_confines_scratch_config_dir_to_allowlist_only() {
+    let source = tempfile::tempdir().unwrap();
+    let source_config = source.path().join(".claude");
+    std::fs::create_dir_all(&source_config).unwrap();
+    std::fs::write(
+        source_config.join(CLAUDE_CREDENTIALS_ENTRY),
+        r#"{"claudeAiOauth":{"accessToken":"fixture-token"}}"#,
+    )
+    .unwrap();
+    // An arbitrary operator file placed alongside the allowlist entry: not on
+    // the allowlist, must not be copied into the scratch config dir.
+    std::fs::write(source_config.join("operator-notes.txt"), "do not leak me").unwrap();
+
+    let scratch = tempfile::tempdir().unwrap();
+    let (_home, config_dir) = seed_worker_scratch_home(scratch.path(), Some(source.path()), None)
+        .expect("seeding must succeed");
+
+    assert!(
+        !config_dir.join("operator-notes.txt").exists(),
+        "non-allowlisted operator file must not be copied into the scratch config dir"
+    );
+
+    let mut entries: Vec<String> = std::fs::read_dir(&config_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    entries.sort();
+    let mut expected: Vec<String> = claude_min_config_entries()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    expected.sort();
+    assert_eq!(
+        entries, expected,
+        "scratch config dir must contain exactly claude_min_config_entries() and nothing else: {entries:?}"
+    );
+}
+
 #[test]
 fn seed_worker_scratch_home_worker_env_hygiene_tolerates_missing_source_home() {
     let source = tempfile::tempdir().unwrap(); // no .claude dir under here at all
