@@ -36,6 +36,7 @@ pub mod bridge;
 pub mod client;
 pub mod config;
 pub mod format;
+pub mod health;
 pub mod host;
 pub mod inbound;
 pub mod outbound;
