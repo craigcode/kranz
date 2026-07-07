@@ -47,6 +47,13 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const BACKOFF_MIN: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
+/// How long to wait for the next frame (of any kind, including Slack's
+/// periodic pings) before treating the socket as stalled. A TCP connection
+/// that dies silently (no FIN/RST, e.g. after a long idle period following a
+/// sibling drain) otherwise parks `read.next()` forever and the reconnect
+/// machinery is never reached.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(45);
+
 /// Shared, thread-safe view of the mission↔thread map plus its repo root, so
 /// both the outbound loop (which appends threads) and the inbound router (which
 /// reads them) see a single consistent map, persisted on every change.
@@ -338,15 +345,77 @@ async fn connect_once(
     // re-dispatched. Bounded so a long-lived connection can't grow it forever.
     let mut seen = SeenEnvelopes::default();
 
+    pump_connection(
+        &mut read, &mut write, cfg, client, repo_root, threads, host, stop, &mut seen,
+    )
+    .await
+}
+
+/// Does `text` parse to a Socket Mode `{"type":"disconnect", ...}` frame?
+/// Slack sends this shortly before tearing a socket down (e.g.
+/// `reason: "warning"` or `"refresh_requested"`); it carries no
+/// `envelope_id`, so it must be caught before routing rather than dispatched
+/// as an (ignored) action.
+fn is_disconnect_frame(text: &str) -> bool {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|v| {
+            v.get("type")
+                .and_then(Value::as_str)
+                .map(|t| t == "disconnect")
+        })
+        .unwrap_or(false)
+}
+
+/// Pump one already-open connection's read/write halves until it closes,
+/// `stop` fires, or the connection stalls. Extracted out of [`connect_once`]
+/// so it is generic over the stream/sink and can be driven by an in-memory
+/// stream in tests instead of a live websocket.
+///
+/// Returns the same contract as [`connect_once`]: `Ok(true)` on `stop`,
+/// `Ok(false)` on a clean close, a write-send failure, a disconnect frame, or
+/// an idle stall (all reconnect promptly); `Err(_)` on a stream error (grows
+/// the backoff).
+#[allow(clippy::too_many_arguments)]
+async fn pump_connection<R, E, W>(
+    read: &mut R,
+    write: &mut W,
+    cfg: &SlackConfig,
+    client: &SlackClient,
+    repo_root: &Path,
+    threads: &SharedThreads,
+    host: &Option<SharedHost>,
+    stop: &Arc<Notify>,
+    seen: &mut SeenEnvelopes,
+) -> Result<bool>
+where
+    R: futures_util::Stream<Item = std::result::Result<Message, E>> + Unpin,
+    W: futures_util::Sink<Message> + Unpin,
+    E: std::fmt::Display,
+{
     loop {
         tokio::select! {
             _ = stop.notified() => {
                 let _ = write.send(Message::Close(None)).await;
                 return Ok(true);
             }
-            msg = read.next() => {
+            timed = tokio::time::timeout(IDLE_TIMEOUT, read.next()) => {
+                let msg = match timed {
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            idle_secs = IDLE_TIMEOUT.as_secs(),
+                            "slack socket idle; treating as stalled, reconnecting"
+                        );
+                        return Ok(false);
+                    }
+                    Ok(msg) => msg,
+                };
                 match msg {
                     Some(Ok(Message::Text(text))) => {
+                        if is_disconnect_frame(&text) {
+                            tracing::warn!("slack sent a disconnect frame; reconnecting");
+                            return Ok(false);
+                        }
                         let Some(routed) = parse_envelope(&text, threads) else { continue };
                         // Ack FIRST (within Slack's 3 s budget), before any slow
                         // work — otherwise a claude turn would delay the ack and
@@ -399,7 +468,7 @@ async fn connect_once(
                     }
                     Some(Ok(Message::Close(_))) | None => return Ok(false),
                     Some(Ok(_)) => {} // pong / binary: ignore
-                    Some(Err(e)) => return Err(e.into()),
+                    Some(Err(e)) => return Err(anyhow::anyhow!("{e}")),
                 }
             }
         }
@@ -3716,5 +3785,100 @@ mod tests {
         }
         assert!(seen.insert("env-a"), "evicted id counts as new again");
         assert!(seen.set.len() <= SeenEnvelopes::CAP + 1);
+    }
+
+    #[test]
+    fn is_disconnect_frame_true_for_disconnect_false_for_action_envelope() {
+        assert!(is_disconnect_frame(
+            r#"{"type":"disconnect","reason":"refresh_requested"}"#
+        ));
+        assert!(is_disconnect_frame(
+            r#"{"type":"disconnect","reason":"warning"}"#
+        ));
+        // A real Socket Mode envelope, e.g. a slash_commands frame — must NOT
+        // be misclassified as a disconnect.
+        assert!(!is_disconnect_frame(
+            r#"{"envelope_id":"1","type":"slash_commands","payload":{}}"#
+        ));
+        assert!(!is_disconnect_frame("not json at all"));
+    }
+
+    /// No frames ever arrive: `pump_connection` must not park forever on a
+    /// silently-dead TCP connection. Advancing virtual time past
+    /// `IDLE_TIMEOUT` must make it return `Ok(false)` so the caller reconnects.
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_triggers_reconnect() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_cfg();
+        let client = SlackClient::new(&cfg).unwrap();
+        let threads = SharedThreads::load(tmp.path()).unwrap();
+        let stop = Arc::new(Notify::new());
+        let mut seen = SeenEnvelopes::default();
+
+        let mut read = futures_util::stream::pending::<
+            std::result::Result<Message, std::convert::Infallible>,
+        >();
+        let mut write = futures_util::sink::drain::<Message>();
+
+        let handle = tokio::spawn(async move {
+            pump_connection(
+                &mut read,
+                &mut write,
+                &cfg,
+                &client,
+                tmp.path(),
+                &threads,
+                &None,
+                &stop,
+                &mut seen,
+            )
+            .await
+        });
+
+        tokio::time::advance(IDLE_TIMEOUT + Duration::from_secs(1)).await;
+        let result = handle.await.unwrap();
+        assert!(
+            matches!(result, Ok(false)),
+            "expected Ok(false), got {result:?}"
+        );
+    }
+
+    /// A `{"type":"disconnect"}` frame must short-circuit the loop with
+    /// `Ok(false)` (reconnect) WITHOUT being routed/dispatched as an action —
+    /// it carries no `envelope_id` and today's `route()` would otherwise
+    /// silently classify it `Action::Ignore` and keep pumping a doomed socket.
+    #[tokio::test]
+    async fn disconnect_frame_triggers_reconnect() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_cfg();
+        let client = SlackClient::new(&cfg).unwrap();
+        let threads = SharedThreads::load(tmp.path()).unwrap();
+        let stop = Arc::new(Notify::new());
+        let mut seen = SeenEnvelopes::default();
+
+        let frame = Message::Text(r#"{"type":"disconnect","reason":"refresh_requested"}"#.into());
+        let mut read =
+            futures_util::stream::iter(vec![Ok::<Message, std::convert::Infallible>(frame)]);
+        let mut write = futures_util::sink::drain::<Message>();
+
+        let result = pump_connection(
+            &mut read,
+            &mut write,
+            &cfg,
+            &client,
+            tmp.path(),
+            &threads,
+            &None,
+            &stop,
+            &mut seen,
+        )
+        .await;
+        assert!(
+            matches!(result, Ok(false)),
+            "expected Ok(false), got {result:?}"
+        );
+        // Nothing was acked or dedup-recorded: the disconnect frame carries no
+        // envelope_id, and it must never reach `parse_envelope`/dispatch.
+        assert!(seen.set.is_empty());
     }
 }
