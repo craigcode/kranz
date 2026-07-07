@@ -597,6 +597,86 @@ impl MissionEngine {
             }
         }
 
+        // Sandbox preflight (f-2-3): when the worker role opts into fs
+        // enforcement and we're on macOS, actually run each distinct contract
+        // `command` assertion under the generated worker Seatbelt profile and
+        // surface a `warn` for any that fail under it — a profile/contract
+        // mismatch (e.g. the command writes outside the allowlist) is exactly
+        // the kind of thing an operator wants flagged before the mission runs
+        // workers for real. Best-effort and advisory only: never an `error`,
+        // never a block. `session_cwd` uses `self.paths.repo_root` (the
+        // primary checkout) as a cheap stand-in for the actual per-session
+        // worktree root, which does not exist yet at preflight time.
+        if self.state.config.worker.sandbox.enforce == crate::types::SandboxEnforce::Fs
+            && cfg!(target_os = "macos")
+        {
+            issues.extend(self.sandbox_command_preflight());
+        }
+
+        issues
+    }
+
+    /// Run each distinct contract `command` assertion under the worker's
+    /// generated Seatbelt profile; a non-zero exit under the sandbox becomes a
+    /// `warn` `PreflightIssue` naming the assertion. Best-effort: any failure
+    /// to resolve the sandbox or write the profile file is silently skipped
+    /// (never escalated) rather than reported, since this probe must never
+    /// block or mislabel an environment problem as a sandbox problem.
+    fn sandbox_command_preflight(&self) -> Vec<PreflightIssue> {
+        let mission_dir = self.paths.mission_dir();
+        let (resolved, _warn) = crate::sandbox::resolve_for_session(
+            &self.state.config.worker.sandbox,
+            self.paths.repo_root.as_path(),
+            &mission_dir,
+        );
+        let Some(resolved) = resolved else {
+            return Vec::new();
+        };
+        let profile = crate::sandbox::generate_profile(&resolved.inputs);
+        let profile_path = match crate::sandbox::write_profile_file(&mission_dir, &profile)
+            .or_else(|_| crate::sandbox::write_profile_file(&resolved.inputs.tmpdir, &profile))
+        {
+            Ok(path) => path,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut issues = Vec::new();
+        let mut probed: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        const MAX_PROBES: usize = 20;
+        const TIMEOUT: Duration = Duration::from_secs(5);
+        for assertion in &self.state.mission.validation_contract {
+            if issues.len() >= MAX_PROBES || probed.len() >= MAX_PROBES {
+                break;
+            }
+            if assertion.check != AssertionCheck::Command {
+                continue;
+            }
+            let Some(command) = assertion.command.as_deref() else {
+                continue;
+            };
+            if !probed.insert(command) {
+                continue; // already probed this exact command
+            }
+            let (program, args) = crate::backend_claude::sandbox_command(
+                &profile_path,
+                std::path::Path::new("/bin/sh"),
+                &["-c".to_string(), command.to_string()],
+            );
+            match run_with_timeout(&program, &args, TIMEOUT) {
+                Some(output) if !output.status.success() => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let tail = last_chars_local(&stderr, 200);
+                    issues.push(PreflightIssue {
+                        severity: "warn",
+                        message: format!(
+                            "command assertion [{}] fails under the fs sandbox profile: {tail}",
+                            assertion.id
+                        ),
+                    });
+                }
+                _ => {}
+            }
+        }
         issues
     }
 
@@ -3308,6 +3388,7 @@ impl MissionEngine {
             max_budget_usd: role_cfg.max_budget_usd,
             max_turns: role_cfg.max_turns,
             env: HashMap::new(),
+            sandbox: None,
         };
         permissions::apply(
             permissions::for_role(Role::Orchestrator, &cfg, &[], &[]),
@@ -4625,6 +4706,47 @@ fn path_is_executable(path: &std::path::Path) -> bool {
     {
         true
     }
+}
+
+/// Run `program args` to completion, polling with a bounded wall-clock
+/// (`timeout`) rather than blocking forever — the sandbox preflight probe
+/// runs operator-authored contract commands and must never hang a mission
+/// start. Returns `None` on spawn failure or on timeout (the child is killed).
+fn run_with_timeout(
+    program: &std::path::Path,
+    args: &[String],
+    timeout: Duration,
+) -> Option<std::process::Output> {
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Last `max` characters of `text` (for stderr tails in sandbox preflight
+/// messages — never splits a code point).
+fn last_chars_local(text: &str, max: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let start = chars.len().saturating_sub(max);
+    chars[start..].iter().collect()
 }
 
 /// Whether `root` looks like a git repository — a `.git` entry exists (a dir

@@ -39,6 +39,7 @@ fn spec(session_id: &str, prompt: PromptMode) -> SessionSpec {
         max_budget_usd: Some(1.0),
         max_turns: Some(10),
         env: HashMap::new(),
+        sandbox: None,
     }
 }
 

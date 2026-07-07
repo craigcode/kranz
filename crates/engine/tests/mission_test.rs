@@ -2375,6 +2375,133 @@ async fn run_emits_preflight_decision_when_issues_exist() {
     )));
 }
 
+/// The sandbox preflight probe (f-2-3) is inert when the worker role has
+/// `sandbox.enforce == off`: zero sandbox-related issues, regardless of
+/// platform.
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_preflight_inert_when_enforce_off() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let backend = Arc::new(MockBackend::new());
+
+    let contract = vec![assertion(
+        "a-1",
+        "writes outside the allowlist",
+        Some("sh -c 'echo x > $HOME/kranz_pf_should_not_run'"),
+    )];
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(simple_plan(1, contract)).unwrap();
+
+    let issues = engine.preflight();
+    assert!(
+        !issues
+            .iter()
+            .any(|i| i.message.contains("fs sandbox profile")),
+        "enforce:off must add zero sandbox preflight issues: {issues:?}"
+    );
+}
+
+/// On a non-macOS build, the sandbox preflight probe is inert even when
+/// `enforce == fs` is configured (macOS is the only supported platform for
+/// this tier).
+#[cfg(not(target_os = "macos"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_preflight_inert_on_non_macos() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let backend = Arc::new(MockBackend::new());
+
+    let mut cfg = test_cfg();
+    cfg.worker.sandbox.enforce = kranz_engine::types::SandboxEnforce::Fs;
+
+    let contract = vec![assertion(
+        "a-1",
+        "writes outside the allowlist",
+        Some("sh -c 'echo x > $HOME/kranz_pf_should_not_run'"),
+    )];
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, contract)).unwrap();
+
+    let issues = engine.preflight();
+    assert!(
+        !issues
+            .iter()
+            .any(|i| i.message.contains("fs sandbox profile")),
+        "non-macos builds must add zero sandbox preflight issues: {issues:?}"
+    );
+}
+
+/// On macOS with the worker role opted into `enforce: fs`, a contract command
+/// that writes outside the generated allowlist (session cwd / mission dir /
+/// tmpdir / extraWrite) fails under the sandbox and surfaces as a `warn`
+/// PreflightIssue naming that assertion id; a benign command yields no
+/// sandbox issue; and the probe never returns an `error` nor blocks the run.
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_preflight_flags_command_that_writes_outside_allowlist() {
+    if !setup() {
+        return;
+    }
+    if std::process::Command::new("which")
+        .arg("sandbox-exec")
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
+        eprintln!("sandbox-exec not found on this host; skipping");
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let backend = Arc::new(MockBackend::new());
+
+    let mut cfg = test_cfg();
+    cfg.worker.sandbox.enforce = kranz_engine::types::SandboxEnforce::Fs;
+
+    let marker = format!("kranz_pf_{}", uuid::Uuid::new_v4());
+    let contract = vec![
+        assertion(
+            "a-outside",
+            "writes outside the allowlist",
+            Some(&format!("echo x > $HOME/{marker}")),
+        ),
+        assertion("a-benign", "trivially true", Some("true")),
+    ];
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, contract)).unwrap();
+
+    let issues = engine.preflight();
+
+    assert!(
+        !issues.iter().any(|i| i.severity == "error"),
+        "sandbox preflight must never escalate to error: {issues:?}"
+    );
+
+    let outside_issue = issues
+        .iter()
+        .find(|i| i.message.contains("[a-outside]") && i.message.contains("fs sandbox profile"));
+    assert!(
+        outside_issue.is_some(),
+        "expected a sandbox warn for the out-of-allowlist command: {issues:?}"
+    );
+    assert_eq!(outside_issue.unwrap().severity, "warn");
+
+    assert!(
+        !issues
+            .iter()
+            .any(|i| i.message.contains("[a-benign]") && i.message.contains("fs sandbox profile")),
+        "benign command must not produce a sandbox issue: {issues:?}"
+    );
+
+    // Clean up in case the sandbox somehow did not block the write.
+    if let Ok(home) = std::env::var("HOME") {
+        let _ = std::fs::remove_file(std::path::Path::new(&home).join(&marker));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 11. Mid-mission re-planning (roadmap M2)
 // ---------------------------------------------------------------------------

@@ -1,0 +1,137 @@
+# Mission plan — m-bbe805
+
+**Goal:** Add a DroidBackend (AgentBackend over `droid exec -o json`) selectable only for the scrutiny validator, mirroring the CodexBackend posture: cross-vendor read-only audit, never building, with config-enforced role restriction and the same loud-fallback selection seam.
+
+Branch `kranz/mission-m-bbe805` (from `main`). Approved plan of record; the machine-readable twin is [plan.json](plan.json). Live status: `kranz status` or the dashboard.
+
+## Cost estimate
+
+Estimated **$8.59 – $42.93** (expected ~$17.17). Rough estimate — live usage is authoritative; based on 27 completed mission(s).
+
+## Validation contract
+
+Defined before any feature; gates mission completion.
+
+- **[d1]** The DroidBackend translates a `droid exec -o json` result object into a terminal Result event whose text is the `result` field and parses as a non-empty ValidatorReport (guards the m-5d2c79 empty-terminal-text trap). 
+  `cargo test --workspace backend_droid_terminal_text_parses_report 2>&1 | grep -qE 'result: ok\. [1-9]'`
+- **[d2]** The droid argv is exactly the read-only single-shot form `exec -o json --auto low -m <model> <prompt>`, with all claude-only SessionSpec fields (json_schema, max_budget_usd, resume, permission_mode, allowed/disallowed_tools, tools, settings_json, effort) ignored. 
+  `cargo test --workspace build_args_droid_read_only 2>&1 | grep -qE 'result: ok\. [1-9]'`
+- **[d3]** config::validate accepts `validatorScrutiny.backend = "droid"`. 
+  `cargo test --workspace validate_accepts_droid_scrutiny_backend 2>&1 | grep -qE 'result: ok\. [1-9]'`
+- **[d4]** config::validate rejects `backend = "droid"` on the worker, functional-validator, and orchestrator roles. 
+  `cargo test --workspace validate_rejects_droid_on_non_scrutiny_roles 2>&1 | grep -qE 'result: ok\. [1-9]'`
+- **[d5]** GLM 5.2 (accounts/fireworks/models/glm-5p2) is priced by a dedicated Fireworks pricing branch — distinct from opus and codex tiers — and is DEFAULT_DROID_MODEL; claude-fable-5 still resolves to fable pricing. 
+  `cargo test --workspace droid_pricing_applied 2>&1 | grep -qE 'result: ok\. [1-9]'`
+- **[d6]** When backend=droid but no droid binary is reachable, selection falls back to the claude scrutiny validator with a loud recorded OrchestratorDecision, and the scrutiny validator still runs exactly once through the injected backend. 
+  `cargo test --workspace droid_absent_loud_fallback 2>&1 | grep -qE 'result: ok\. [1-9]'`
+- **[d7]** preflight emits a warn-severity issue when backend=droid but no droid binary is found. 
+  `cargo test --workspace droid_preflight_warns 2>&1 | grep -qE 'result: ok\. [1-9]'`
+- **[d8]** A stub droid binary emitting the committed fixture drives real ValidatorReport findings through the fix-cycle machinery (validation.finding + fixfeature.created), the scrutiny spawn event carries glm-5p2, the run is priced with the droid table, and no fallback decision is emitted. 
+  `cargo test --workspace droid_scrutiny_findings_flow 2>&1 | grep -qE 'result: ok\. [1-9]'`
+- **[d9]** A droid scrutiny run that completes without a parseable report triggers exactly one bounded retry on the claude backend, loudly recorded. 
+  `cargo test --workspace droid_runtime_retry_falls_back_to_claude 2>&1 | grep -qE 'result: ok\. [1-9]'`
+- **[d10]** The entire workspace test suite passes. 
+  `cargo test --workspace 2>&1 | grep -qE 'result: ok\.'`
+- **[d11]** Formatting is clean across the workspace. 
+  `cargo fmt --all -- --check`
+- **[d12]** Clippy is clean across all targets with warnings denied. 
+  `cargo clippy --workspace --all-targets -- -D warnings`
+
+## Milestone 1 — Droid exec translation grounded in a committed fixture
+
+### 1.1 Committed droid `-o json` fixtures + fixture-validation test crate
+
+Create two fixtures under crates/engine/tests/fixtures/, each a SINGLE-LINE JSON object matching exactly the shape `droid exec -m <model> -o json --auto low` emits (see mission probe): keys type, subtype, is_error, duration_ms, num_turns, result, session_id, and usage{input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens}.
+
+- `droid_exec_scrutiny.json`: type="result", subtype="success", is_error=false; the `result` field is a STRING containing a JSON ValidatorReport (the shape kranz_engine::runner::parse_validator_report accepts — study crates/engine/src/runner.rs parse_validator_report and the final agent_message text in crates/engine/tests/fixtures/codex_exec_scrutiny.jsonl) with >=1 finding and a non-empty summary; each finding has a non-empty `subject`, a `severity` in {critical, major, minor}, and non-empty `evidence`. Set usage.input_tokens to ~14631 and output_tokens > 0.
+- `droid_exec_scrutiny_no_report.json`: is_error=false, usage present, but `result` is an EMPTY string (models a completed droid turn that produced no parseable report — consumed later by the runtime bounded-retry test).
+
+Add crates/engine/tests/droid_fixture_test.rs, mirroring crates/engine/tests/codex_fixture_test.rs: assert the fixture is valid JSON with type=="result" and a string session_id; usage has the three token fields as numbers; and the `result` string parses via kranz_engine::runner::parse_validator_report into a report with non-empty findings and summary, with per-finding subject/severity/evidence assertions. Name that last test `droid_fixture_result_is_a_valid_validator_report`. Also assert the no_report fixture's `result` string does NOT parse into a report.
+
+This feature adds NO engine source — fixtures + one integration test file only. Do not touch backend_droid or config yet.
+
+Done when:
+- droid_exec_scrutiny.json deserializes as the documented result-object shape and its `result` string parses to a ValidatorReport with >=1 finding and a non-empty summary.
+- droid_exec_scrutiny_no_report.json's `result` string does NOT parse into a ValidatorReport.
+- crates/engine/tests/droid_fixture_test.rs compiles and all its tests pass under `cargo test --workspace`.
+
+### 1.2 backend_droid module: exec translation + single-shot session
+
+Add crates/engine/src/backend_droid.rs, closely mirroring crates/engine/src/backend_codex.rs (READ that file first — copy its structure, kill/process-group handling, stderr-tail capture, and single-shot posture). Register `pub mod backend_droid;` in crates/engine/src/lib.rs next to backend_codex.
+
+- `discover_droid_binary(configured: Option<&str>) -> Result<PathBuf>`: identical strategy to discover_codex_binary but env var is KRANZ_DROID_BIN (exclusive override when set non-empty), binary name is `droid`, and fallback_candidates() covers ~/.factory/bin/droid, ~/.local/bin/droid, /opt/homebrew/bin/droid, /usr/local/bin/droid, ~/.npm-global/bin/droid (plus the windows .cmd/.exe variants under the same dirs). Validate each candidate via `<bin> --version`. The not-found error tells the user to install Factory droid or point kranz at it via the validatorScrutiny.droidBinary config field or KRANZ_DROID_BIN.
+- `build_args(spec) -> Vec<String>`: EXACTLY ["exec", "-o", "json", "--auto", "low", "-m", spec.model, effective_prompt]. Read-only single-shot posture: NO write/edit flags, NO --mission/--worker-model. effective_prompt folds append_system_prompt ahead of the prompt text (same helper as codex). Ignore every claude-only SessionSpec field exactly as codex does. Provide unit test `build_args_droid_read_only` asserting the exact argv for a spec with claude-only fields populated, plus a test that append_system_prompt is folded into the positional prompt.
+- `parse_droid_result(line, model) -> Vec<AgentEvent>`: droid `-o json` emits a SINGLE result object (not a stream). Map a parsed object with type=="result" to an AgentEvent::Init (session_id from `session_id`, model = the passed `model`) FOLLOWED BY a terminal AgentEvent::Result where text = the FULL `result` string (this is the m-5d2c79 invariant: runner::run_session derives final_text solely from the Result event's text — the report must ride there, non-empty when `result` is non-empty), is_error from `is_error`, usage = {input: input_tokens, output: output_tokens, cache_read: cache_read_input_tokens, cache_write: cache_creation_input_tokens}, num_turns from `num_turns`, and cost_usd = Some(cost::usage_cost_usd(&usage, model)) unless the object reports its own cost. Unparseable lines become AgentEvent::Other{ raw: {"unparsed": line} }. No stitching is required (single object), but assert Result.text is non-empty for the success fixture. Tests: `backend_droid_parse_fixture` (feed the committed droid_exec_scrutiny.json → get an Init with non-empty session_id, a terminal Result with non-zero usage, cost_usd Some, num_turns Some) and `backend_droid_terminal_text_parses_report` (the terminal Result.text parses via crate::runner::parse_validator_report into a report with non-empty findings). In THIS feature use the literal model id "accounts/fireworks/models/glm-5p2" in tests (DEFAULT_DROID_MODEL is added in a later milestone; keep M1 independent).
+- `DroidBackend { binary }` and `DroidSession`: mirror CodexBackend/CodexSession exactly — single-shot only (reject spec.resume in start(); send_user_message always errors), stdout line reader, stderr-tail capture, unix process-group SIGKILL + windows kill-on-close Job Object via the shared helpers in backend_claude (kill_group, win_job), and finish_at_eof/exit_status semantics. Keep the read loop even though only one JSON line is expected.
+
+Do not modify types.rs, config.rs, cost.rs, or orchestrator.rs in this feature.
+
+Done when:
+- `cargo test --workspace backend_droid` runs >=1 test and passes.
+- build_args produces exactly `exec -o json --auto low -m <model> <prompt>` and ignores all claude-only SessionSpec fields; append_system_prompt is folded into the positional prompt.
+- Feeding droid_exec_scrutiny.json to parse_droid_result yields an Init with a non-empty session_id and a terminal Result whose text parses via runner::parse_validator_report into a non-empty ValidatorReport, with non-zero usage and cost_usd Some.
+- DroidBackend rejects a resumed SessionSpec and DroidSession::send_user_message always errors.
+- backend_droid compiles clean under `cargo clippy --workspace --all-targets -- -D warnings`.
+
+
+## Milestone 2 — Droid selectable as the scrutiny backend, end-to-end
+
+### 2.1 Types, config validation, and Fireworks GLM pricing for the droid backend
+
+Three engine files.
+
+1) crates/engine/src/types.rs: add `Droid` to enum BackendKind; in MissionConfig::scrutiny_backend_kind() map Some("droid") => BackendKind::Droid; update the RoleConfig.backend doc comment to mention "droid" selects DroidBackend.
+
+2) crates/engine/src/config.rs validate(): in the validator_scrutiny.backend match, accept Some("droid") alongside None/"claude"/"codex", and update the error message to read `must be one of None, "claude", "codex", "droid"`. The existing non-scrutiny-role loop already rejects any Some(..) backend on orchestrator/worker/validatorFunctional — confirm a droid value there is rejected. Update tests: extend `validate_accepts_known_scrutiny_backends` to include Some("droid"); add `validate_accepts_droid_scrutiny_backend` and `validate_rejects_droid_on_non_scrutiny_roles` (mirror the codex-named versions); keep `validate_rejects_unknown_scrutiny_backend` (e.g. "gemini") green.
+
+3) crates/engine/src/cost.rs: add `pub const DEFAULT_DROID_MODEL: &str = "accounts/fireworks/models/glm-5p2";`. Add `pub fn is_droid_model(model: &str) -> bool` returning true when the lowercased model contains "glm" or "fireworks". In pricing_for_model, add a branch — placed BEFORE the opus fallback and NOT before the fable branch (claude-fable-5 must still resolve to fable) — matching "glm" or "fireworks" and returning the Fireworks GLM 5.2 rate: input_per_mtok = 0.55, output_per_mtok = 2.19, with a `// TODO(pricing): confirm Fireworks GLM 5.2 $/Mtok before ship` comment (PLACEHOLDER — operator confirms real numbers at the gate). Add test `droid_pricing_applied`: pricing_for_model(DEFAULT_DROID_MODEL) returns the glm rate and is distinct from both opus and codex; usage_cost_usd on a known TokenUsage under DEFAULT_DROID_MODEL equals the hand-computed value; and pricing_for_model("claude-fable-5") still returns the fable rate.
+
+Do not touch orchestrator.rs or backend_droid.rs in this feature.
+
+Done when:
+- config::validate accepts backend="droid" on validatorScrutiny and rejects it on worker, validatorFunctional, and orchestrator; an unknown backend (e.g. "gemini") is still rejected.
+- DEFAULT_DROID_MODEL == "accounts/fireworks/models/glm-5p2" and pricing_for_model routes it through the glm/fireworks branch, distinct from opus and codex tiers.
+- pricing_for_model("claude-fable-5") still resolves to fable pricing (the glm/fireworks branch does not shadow it).
+- `cargo test --workspace` green, including droid_pricing_applied and the updated config tests.
+
+### 2.2 Wire droid into select_scrutiny_backend, preflight, and the run-loop fallback
+
+Mirror the codex wiring in crates/engine/src/orchestrator.rs (study the codex_backend field, select_scrutiny_backend, preflight codex arm, and the validation_round scrutiny branch first).
+
+1) Add a lazily-built cache field `droid_backend: Option<Arc<dyn AgentBackend>>` to MissionEngine, initialised None in both create() and resume() (exactly where codex_backend is).
+2) select_scrutiny_backend(): when scrutiny_backend_kind() == BackendKind::Droid, return the cached droid_backend if present; otherwise discover_droid_binary(None) — on Ok, build DroidBackend::new(binary), cache it, return (backend, None); on Err, return (Arc::clone(&self.backend), Some(reason)) where reason mirrors the codex string: "droid backend requested but not available ({err}); falling back to the claude scrutiny validator". Leave the existing codex arm unchanged (you may branch on BackendKind, but do not alter codex behaviour).
+3) In the validation_round scrutiny branch (~line 2397), add `used_droid` beside `used_codex`: set it true when scrutiny_backend_kind() == Droid and no fallback reason was returned. When used_droid && !cost::is_droid_model(&cfg.validator_scrutiny.model), swap cfg.validator_scrutiny.model = cost::DEFAULT_DROID_MODEL (mirrors the codex model swap). Add the bounded one-retry fallback: if used_droid && outcome.validator_report.is_none(), emit_decision("droid scrutiny run failed with no validator report; retrying once with the claude scrutiny validator", None) and re-run the validator once on self.backend — mirror the codex retry block exactly.
+4) preflight(): when validator_scrutiny.backend == Some("droid") and discover_droid_binary(None) is Err, push a warn issue: "validatorScrutiny.backend is \"droid\" but no droid binary was found ({err}); the scrutiny validator will fall back to the claude backend".
+
+Tests (unix-gate the ones using an env guard, mirroring the codex CodexEnvGuard pattern; add a DroidEnvGuard around KRANZ_DROID_BIN serialized on its own dedicated mutex, restoring the prior value on drop):
+- `droid_preflight_warns_when_binary_absent`: backend=droid with KRANZ_DROID_BIN pointed at a nonexistent path; preflight yields a warn mentioning "droid".
+- `droid_absent_loud_fallback`: backend=droid, no droid binary, skip_functional=true, a mock backend returning a clean scrutiny report; run validation_round(0); assert a preflight warn, an OrchestratorDecision whose summary contains "droid" and "not available", and that the scrutiny validator still ran exactly once through the injected mock backend.
+- Extend the existing default_scrutiny_backend_is_claude guard (or add a sibling) so the droid arm does not regress the claude-default path (no fallback, no event emitted).
+
+End-to-end stub-binary tests are a separate feature; do not add them here.
+
+Done when:
+- select_scrutiny_backend returns a DroidBackend when a droid binary is discoverable and returns (injected backend, Some(reason)) with the loud fallback string when it is not.
+- The claude-default path still returns the injected backend with no fallback reason and emits no event.
+- preflight warns (severity "warn", message mentions "droid") when backend=droid and no droid binary is found.
+- In the run loop, used_droid swaps validator_scrutiny.model to DEFAULT_DROID_MODEL when it isn't already a glm/fireworks model, and a droid run with no report triggers exactly one loud claude retry.
+- `cargo test --workspace` green, including droid_absent_loud_fallback and droid_preflight_warns_when_binary_absent.
+
+### 2.3 End-to-end stub-droid-binary round drives findings through the fix-cycle machinery
+
+Add unix-gated orchestrator tests mirroring the codex `codex_scrutiny_findings_flow` suite (READ that region of crates/engine/src/orchestrator.rs and its write_codex_stub / CodexStubEnvGuard helpers first). These drive the REAL DroidBackend via a POSIX shell stub that emits the committed fixture — NO real droid binary, NO API spend.
+
+- `write_droid_stub()`: writes a /bin/sh stub where `--version` prints a plausible version string and any `exec ...` invocation `cat`s crates/engine/tests/fixtures/droid_exec_scrutiny.json to stdout and exits 0; chmod 0755. `write_droid_stub_no_report()`: same but cats droid_exec_scrutiny_no_report.json.
+- `DroidStubEnvGuard`: sets KRANZ_DROID_BIN to the stub path (exclusive override so discover_droid_binary resolves it first), serialized on a dedicated mutex, restoring the prior value on drop (mirror CodexStubEnvGuard).
+- `droid_scrutiny_findings_flow`: backend=droid, skip_functional=true, stub present; a mock ORCHESTRATOR backend returning a fixFeatures conversion reply; push an active milestone and run a validation round; assert the fixture's ValidatorReport findings fold through the normal machinery (validation.finding events and a fixfeature.created landing in state), the scrutiny spawn event carries DEFAULT_DROID_MODEL, and NO fallback OrchestratorDecision was emitted (it genuinely ran through droid).
+- `droid_scrutiny_run_priced_with_droid_table`: assert the recorded scrutiny run's cost equals cost::usage_cost_usd(fixture_usage, cost::DEFAULT_DROID_MODEL) for the fixture's usage numbers.
+- `droid_runtime_retry_falls_back_to_claude`: with write_droid_stub_no_report() (droid exits 0 but yields no parseable report), assert exactly one bounded retry — an OrchestratorDecision whose summary contains "droid" and "retrying once", and that the retry ran on the injected claude/mock backend (mock started exactly once for the retry).
+
+Reuse the existing codex test scaffolding (lessons_test_repo, mock orchestrator script helpers, milestone builders) rather than reinventing it.
+
+Done when:
+- A stub droid binary emitting droid_exec_scrutiny.json drives ValidatorReport findings through the fix-cycle path (validation.finding + fixfeature.created in state) with no fallback decision emitted.
+- The scrutiny spawn event carries DEFAULT_DROID_MODEL (glm-5p2) and the run's cost matches usage_cost_usd(fixture_usage, DEFAULT_DROID_MODEL).
+- A no-report droid run (write_droid_stub_no_report) triggers exactly one loud claude retry, recorded as an OrchestratorDecision mentioning "droid" and "retrying once".
+- All new tests pass under `cargo test --workspace` on unix.
+

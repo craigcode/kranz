@@ -29,3 +29,4 @@ Approved plans, newest last.
 - 2026-07-06 · [m-ba8d58](m-ba8d58/plan.md) — Fix five render bugs in the dashboard pipeline view (apps/dashboard): honest inert stages for abandoned/deleted missions… [truncated] · [report](m-ba8d58/report.md)
 - 2026-07-06 · [m-079c36](m-079c36/plan.md) — M7 tier 1: when workerIsolation=worktree, every worker and validator session runs in a dedicated git worktree and all mi… [truncated] · [report](m-079c36/report.md)
 - 2026-07-06 · [m-671b04](m-671b04/plan.md) — Close M7 tier-1's visibility gap: add an engine-computed out-of-contract-write sweep (worker worktree diffs vs a plan-de… [truncated] · [report](m-671b04/report.md)
+- 2026-07-06 · [m-acb3a0](m-acb3a0/plan.md) — Add a config-gated macOS Seatbelt (sandbox-exec) filesystem sandbox per session: generate a write-allowlist profile (ses… [truncated] · [report](m-acb3a0/report.md)
