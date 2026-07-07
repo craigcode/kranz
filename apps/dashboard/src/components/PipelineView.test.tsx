@@ -17,6 +17,7 @@ vi.mock('../lib/api', async () => {
       reportMd: vi.fn(),
       diffStat: vi.fn(),
       createTicket: vi.fn(),
+      deleteMission: vi.fn(),
     },
   };
 });
@@ -55,6 +56,7 @@ beforeEach(() => {
   vi.mocked(api.reportMd).mockReset();
   vi.mocked(api.diffStat).mockReset();
   vi.mocked(api.createTicket).mockReset();
+  vi.mocked(api.deleteMission).mockReset();
   useKranzStore.setState(
     { ...INITIAL_STORE_STATE, tickets: [], ticketsError: null, missions: [], missionsError: null },
     true,
@@ -194,11 +196,14 @@ describe('PipelineView', () => {
     expect(landedRow?.querySelector('.unmerged-badge')).toBeNull();
   });
 
-  it('renders an abandoned mission row as inert: no actions, abandoned pill, no old Redraft affordance', async () => {
+  it('renders an abandoned mission row with review and delete, but no work actions', async () => {
     vi.mocked(api.tickets).mockResolvedValueOnce([]);
-    vi.mocked(api.missions).mockResolvedValueOnce([
-      makeMission({ id: 'm-dead', goal: 'Abandoned mission work', status: 'abandoned' }),
-    ]);
+    vi.mocked(api.missions)
+      .mockResolvedValueOnce([
+        makeMission({ id: 'm-dead', goal: 'Abandoned mission work', status: 'abandoned' }),
+      ])
+      .mockResolvedValueOnce([]);
+    vi.mocked(api.deleteMission).mockResolvedValueOnce({ deleted: true });
 
     render(<PipelineView />);
 
@@ -206,6 +211,9 @@ describe('PipelineView', () => {
     fireEvent.click(screen.getByText('All'));
 
     const row = (await screen.findByText('Abandoned mission work')).closest('li') as HTMLElement;
+    const detailLink = row.querySelector('a.picker-id[href="#/m/m-dead"]');
+    expect(detailLink?.textContent).toBe('m-dead');
+    expect(row.querySelector('.pipeline-delete-action')?.textContent).toBe('Delete');
     expect(row.querySelectorAll('.pipeline-primary-action').length).toBe(0);
     expect(row.querySelectorAll('.pipeline-secondary-action').length).toBe(0);
     expect(row.querySelector('.pill-abandoned')?.textContent).toContain('abandoned');
@@ -213,6 +221,14 @@ describe('PipelineView', () => {
     expect(row.textContent).not.toContain('Redraft');
     expect(row.textContent).not.toContain('Merge');
     expect(row.textContent).not.toContain('Iterate');
+
+    fireEvent.click(row.querySelector('.pipeline-delete-action') as HTMLButtonElement);
+    expect(row.querySelector('.pipeline-delete-action')?.textContent).toBe('confirm delete');
+    expect(api.deleteMission).not.toHaveBeenCalled();
+
+    fireEvent.click(row.querySelector('.pipeline-delete-action') as HTMLButtonElement);
+    await waitFor(() => expect(api.deleteMission).toHaveBeenCalledWith('m-dead', false));
+    await waitFor(() => expect(screen.queryByText('Abandoned mission work')).toBeNull());
   });
 
   it('renders a direct-fixed done ticket (no mission) as landed, not delivered', async () => {
