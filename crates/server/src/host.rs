@@ -617,6 +617,9 @@ impl MissionHost {
                 "merge conflicted in: {}",
                 files.join(", ")
             ))),
+            MergeReport::RefusedPreMerge { detail } => Err(ApiError::conflict(format!(
+                "merge refused before it started: {detail}"
+            ))),
         }
     }
 

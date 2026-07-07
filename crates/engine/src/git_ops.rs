@@ -26,7 +26,9 @@ pub struct CommitInfo {
 ///
 /// A `Conflict` merge is always rolled back with `git merge --abort` before it
 /// is returned, so the working tree is left clean either way — the caller never
-/// has to clean up a half-merged tree.
+/// has to clean up a half-merged tree. A `RefusedPreMerge` failure never had a
+/// merge in progress (no `MERGE_HEAD`), so no abort is attempted — there is
+/// nothing to roll back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeOutcome {
     /// The branch merged cleanly; the merge commit is on the current branch.
@@ -34,6 +36,12 @@ pub enum MergeOutcome {
     /// The merge hit conflicts and was aborted. `files` lists the conflicting
     /// paths git reported (best-effort; empty when git named none).
     Conflict { files: Vec<String> },
+    /// Git refused the merge before it started (no `MERGE_HEAD` was ever
+    /// created) — e.g. an untracked file at a path the merge would bring in.
+    /// `detail` is git's verbatim stderr/stdout for the failed merge command.
+    /// No `git merge --abort` is attempted, since there is no merge in
+    /// progress to abort.
+    RefusedPreMerge { detail: String },
 }
 
 /// Handle to a local git repository rooted at a working-tree directory.
@@ -377,20 +385,34 @@ impl GitRepo {
     /// the current branch. On conflict the merge is rolled back with
     /// `git merge --abort` (so the working tree is left CLEAN — the porcelain
     /// status is empty afterwards) and [`MergeOutcome::Conflict`] is returned,
-    /// carrying the conflicting paths git named. Only a genuine git failure
-    /// (git could not be spawned, or the abort itself failed) is an `Err`.
+    /// carrying the conflicting paths git named. When git refuses the merge
+    /// before it ever starts (no `MERGE_HEAD`, e.g. an untracked file in the
+    /// way) [`MergeOutcome::RefusedPreMerge`] is returned instead, carrying
+    /// git's verbatim refusal — no abort is attempted, since there is nothing
+    /// to abort. Only a genuine git failure (git could not be spawned, or the
+    /// abort itself failed on a real conflict) is an `Err`.
     pub fn merge_no_ff(&self, branch: &str) -> Result<MergeOutcome> {
         if branch.starts_with('-') {
             return Err(EngineError::Git(format!(
                 "refusing to merge flag-shaped ref {branch:?}"
             )));
         }
-        if self
-            .probe(&["merge", "--no-ff", "--no-edit", branch])?
-            .status
-            .success()
-        {
+        let out = self.probe(&["merge", "--no-ff", "--no-edit", branch])?;
+        if out.status.success() {
             return Ok(MergeOutcome::Clean);
+        }
+        // Distinguish a genuine content conflict (MERGE_HEAD exists — a merge
+        // is actually in progress) from a pre-merge refusal (e.g. an
+        // untracked file the merge would overwrite), which never creates
+        // MERGE_HEAD and so has nothing for `git merge --abort` to roll back.
+        let merge_in_progress = self
+            .probe(&["rev-parse", "-q", "--verify", "MERGE_HEAD"])?
+            .status
+            .success();
+        if !merge_in_progress {
+            return Ok(MergeOutcome::RefusedPreMerge {
+                detail: failure_detail(&out),
+            });
         }
         // A conflicting merge leaves the tree mid-merge; collect the unmerged
         // paths (best-effort) BEFORE aborting, then abort to restore a clean
@@ -404,6 +426,42 @@ impl GitRepo {
             ))
         })?;
         Ok(MergeOutcome::Conflict { files })
+    }
+
+    /// Bytes of `path` as it exists on `branch` (`git show <branch>:<path>`),
+    /// or `None` when the path does not exist on that branch. Used to compare
+    /// an untracked working-tree file byte-for-byte against the version a
+    /// merge would bring in, so it can be safely removed when identical.
+    pub fn show_file(&self, branch: &str, path: &str) -> Result<Option<Vec<u8>>> {
+        if branch.starts_with('-') {
+            return Err(EngineError::Git(format!(
+                "refusing show_file with flag-shaped ref {branch:?}"
+            )));
+        }
+        let spec = format!("{branch}:{path}");
+        let out = self.probe(&["show", &spec])?;
+        if out.status.success() {
+            Ok(Some(out.stdout))
+        } else {
+            let detail = failure_detail(&out).to_lowercase();
+            if detail.contains("does not exist") || detail.contains("exists on disk, but not") {
+                Ok(None)
+            } else {
+                Err(EngineError::Git(format!(
+                    "git show {spec} failed ({}): {}",
+                    out.status,
+                    failure_detail(&out)
+                )))
+            }
+        }
+    }
+
+    /// Whether `path` is currently untracked in the working tree
+    /// (`git status --porcelain -- <path>` reports a `??` entry). `false`
+    /// when the path is tracked, ignored-and-absent, or simply not present.
+    pub fn is_untracked(&self, path: &str) -> Result<bool> {
+        let out = self.run(&["status", "--porcelain", "--", path])?;
+        Ok(out.lines().any(|l| l.starts_with("??")))
     }
 
     /// Paths with unmerged (conflicted) entries in the index

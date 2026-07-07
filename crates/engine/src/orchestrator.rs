@@ -2372,6 +2372,21 @@ impl MissionEngine {
                         }
                     }
                 }
+                crate::git_ops::MergeOutcome::RefusedPreMerge { detail } => {
+                    conflicts += 1;
+                    // A pre-MERGE_HEAD refusal (e.g. an untracked file in the
+                    // way) is not a content conflict, so there is nothing for
+                    // a resolution feature to re-implement — just fail the
+                    // feature with git's verbatim detail.
+                    self.emit(EventKind::FeatureFailed {
+                        feature_id: feature_id.clone(),
+                        reason: format!(
+                            "parallel merge of {} into {mission_branch} was refused by git \
+                             before it started: {detail}",
+                            ws.branch
+                        ),
+                    })?;
+                }
             }
         }
 
