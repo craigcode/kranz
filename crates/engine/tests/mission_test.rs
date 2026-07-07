@@ -163,16 +163,22 @@ fn simple_plan(features: usize, contract: Vec<Assertion>) -> Plan {
 }
 
 /// Worker script: completed single-shot run whose final text is a passing
-/// WorkerReport (no commits made — the mock cannot touch the repo).
+/// WorkerReport. Writes a unique file into the session cwd so the worker
+/// leaves a dirty tree behind (§4.4), which the engine checkpoints as a
+/// real, non-meta commit on the mission branch.
 fn worker_pass() -> MockScript {
+    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = format!("delivered-{n}.txt");
     MockScript::single_shot_json(&json!({
         "result": "pass",
         "summary": "implemented and tested",
-        "filesTouched": [],
+        "filesTouched": [path],
         "testsAdded": [],
         "testEvidence": "all green",
         "commits": []
     }))
+    .writes_file(&path, "delivered by the mock worker\n")
 }
 
 /// Worker script: completed run whose report says result "fail".
@@ -326,7 +332,9 @@ async fn happy_path_completes_mission_with_tag_and_contract_gate() {
     let backend = Arc::new(MockBackend::with_scripts(vec![
         worker_pass(),
         orch_script(vec![
+            dirty_tree_commit_as_is(),
             judgement("complete", ""),
+            dirty_tree_commit_as_is(),
             judgement("complete", ""),
             verdicts_pass(&["a-2"]),
             "Always add a regression test alongside the fix it covers.".to_string(),
@@ -386,10 +394,11 @@ async fn happy_path_completes_mission_with_tag_and_contract_gate() {
         EventKind::MilestoneCompleted { tag: Some(t), .. } if *t == tag_name
     )));
 
-    // Both features completed with no commits (mock workers touch nothing).
+    // Both features completed, each with a real checkpoint commit (the mock
+    // workers write a file and the §4.4 discipline commits it as-is).
     assert!(events.iter().any(|e| matches!(
         &e.kind,
-        EventKind::FeatureCompleted { feature_id, commits } if feature_id == "f-1-2" && commits.is_empty()
+        EventKind::FeatureCompleted { feature_id, commits } if feature_id == "f-1-2" && !commits.is_empty()
     )));
 
     // Final state folds to Complete with both features Complete.
@@ -499,8 +508,10 @@ async fn validation_round_creates_fix_feature_then_completes() {
     let backend = Arc::new(MockBackend::with_scripts(vec![
         worker_pass(),
         orch_script(vec![
+            dirty_tree_commit_as_is(),
             judgement("complete", ""),
             fix_features(1),
+            dirty_tree_commit_as_is(),
             judgement("complete", ""),
             no_lesson(),
         ]),
@@ -582,8 +593,10 @@ async fn loop_guard_blocks_milestone_after_max_fix_cycles() {
     let backend = Arc::new(MockBackend::with_scripts(vec![
         worker_pass(),
         orch_script(vec![
+            dirty_tree_commit_as_is(),
             judgement("complete", ""),
             fix_features(1),
+            dirty_tree_commit_as_is(),
             judgement("complete", ""),
             fix_features(1), // round 2 conversion: fixes wanted at the cap
         ]),
@@ -655,6 +668,7 @@ async fn waive_completes_milestone() {
     let backend = Arc::new(MockBackend::with_scripts(vec![
         worker_pass(),
         orch_script(vec![
+            dirty_tree_commit_as_is(),
             judgement("complete", ""),
             waive_reply("part 1 works", "docstring nitpick"),
             no_lesson(),
@@ -789,8 +803,10 @@ async fn waive_at_cap_completes_instead_of_blocking() {
     let backend = Arc::new(MockBackend::with_scripts(vec![
         worker_pass(),
         orch_script(vec![
+            dirty_tree_commit_as_is(),
             judgement("complete", ""),
             fix_features(1),
+            dirty_tree_commit_as_is(),
             judgement("complete", ""),
             waive_reply("helper docs", "cosmetic; outside the contract"),
             no_lesson(),
@@ -859,6 +875,7 @@ async fn waive_at_final_gate_completes_mission() {
     let backend = Arc::new(MockBackend::with_scripts(vec![
         worker_pass(),
         orch_script(vec![
+            dirty_tree_commit_as_is(),
             judgement("complete", ""),
             waive_reply("a-1", "command not runnable in this environment"),
             "Always check that build commands are portable across shells.".to_string(),
@@ -962,6 +979,10 @@ async fn capture_turn_error_still_completes_mission() {
         MockScript::streaming(vec![mock_init("orch-session"), mock_result_text("ready")])
             .responding(vec![
                 vec![
+                    mock_text(&dirty_tree_commit_as_is()),
+                    mock_result_text(&dirty_tree_commit_as_is()),
+                ],
+                vec![
                     mock_text(&judgement("complete", "")),
                     mock_result_text(&judgement("complete", "")),
                 ],
@@ -1035,7 +1056,8 @@ async fn respawn_bounded_fails_feature_then_mission_continues() {
         orch_script(vec![
             judgement("respawn", "add the missing test double"),
             judgement("respawn", "try harder"), // denied: budget exhausted
-            judgement("complete", ""),          // f-1-2
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""), // f-1-2
             no_lesson(),
         ]),
         worker_fail(), // f-1-1 attempt 2 (the one allowed respawn)
@@ -1101,6 +1123,7 @@ async fn pause_resume_and_user_message_flow() {
     let backend = Arc::new(MockBackend::with_scripts(vec![
         orch_script(vec![
             "Acknowledged — I'll fold the request into the remaining feature.".to_string(),
+            dirty_tree_commit_as_is(),
             judgement("complete", ""),
             no_lesson(),
         ]),
@@ -1234,7 +1257,7 @@ async fn orchestrator_decision_detail_is_scrubbed() {
     // seed, then the leaky judgement.
     let backend = Arc::new(MockBackend::with_scripts(vec![
         worker_pass(),
-        orch_script(vec![leaky_judgement, no_lesson()]),
+        orch_script(vec![dirty_tree_commit_as_is(), leaky_judgement, no_lesson()]),
     ]));
 
     let mut engine = make_engine(&backend, &root, test_cfg());
@@ -1339,7 +1362,9 @@ async fn kill_and_resume_completes_on_single_log() {
     let backend2 = Arc::new(MockBackend::with_scripts(vec![
         worker_pass(), // f-1-1 rerun
         orch_script(vec![
+            dirty_tree_commit_as_is(),
             judgement("complete", ""),
+            dirty_tree_commit_as_is(),
             judgement("complete", ""),
             no_lesson(),
         ]),
@@ -1411,7 +1436,9 @@ async fn force_reseed_reseeds_with_digest_and_plan() {
         ]),
         worker_pass(),
         orch_script(vec![
+            dirty_tree_commit_as_is(),
             judgement("complete", ""),
+            dirty_tree_commit_as_is(),
             judgement("complete", ""),
             no_lesson(),
         ]),
@@ -1799,7 +1826,11 @@ async fn plan_md_cost_estimate_uses_calibration_once_a_mission_completes() {
     // -> capture-lesson turn, per the happy-path helpers above).
     let backend = Arc::new(MockBackend::with_scripts(vec![
         worker_pass(),
-        orch_script(vec![judgement("complete", ""), no_lesson()]),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
     ]));
     let mut first = make_engine(&backend, &root, test_cfg());
     first.approve_plan(simple_plan(1, vec![])).unwrap();
