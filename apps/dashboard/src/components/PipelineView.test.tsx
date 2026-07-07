@@ -444,6 +444,30 @@ describe('PipelineView', () => {
     expect(backlogLink?.getAttribute('href')).toBe('#/backlog');
   });
 
+  it('shows a Landed count hint that switches to the All lens', async () => {
+    vi.mocked(api.tickets).mockResolvedValueOnce([
+      makeTicket({ slug: 'fix-a', title: 'Fix A', state: 'new' }),
+    ]);
+    vi.mocked(api.missions).mockResolvedValueOnce([
+      makeMission({ id: 'm-landed', goal: 'Landed work', status: 'complete', merged: true }),
+    ]);
+    vi.mocked(api.reportMd).mockResolvedValue({ markdown: 'Report body.' });
+    vi.mocked(api.diffStat).mockResolvedValue({ diffStat: '1 file changed', baseSha: 'a', tip: 'b' });
+
+    render(<PipelineView />);
+
+    expect(await screen.findByText('fix-a')).toBeTruthy();
+    expect(screen.queryByText('m-landed')).toBeNull();
+
+    const hint = document.querySelector('.lens-landed-hint') as HTMLElement;
+    expect(hint).toBeTruthy();
+    expect(hint.textContent).toContain('Landed (1)');
+
+    fireEvent.click(hint);
+
+    expect(await screen.findByText('m-landed')).toBeTruthy();
+  });
+
   it('Backlog lens shows only ticket rows', async () => {
     vi.mocked(api.tickets).mockResolvedValueOnce([
       makeTicket({ slug: 'fix-a', title: 'Fix A', state: 'new' }),
