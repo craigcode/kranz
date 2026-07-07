@@ -73,6 +73,9 @@ describe('PipelineView', () => {
 
     render(<PipelineView />);
 
+    await screen.findByText('fix-a');
+    fireEvent.click(screen.getByText('All'));
+
     expect(await screen.findByText('fix-a')).toBeTruthy();
     expect(screen.getByText('Fix A')).toBeTruthy();
     expect(screen.getByText('fix-b')).toBeTruthy();
@@ -93,6 +96,9 @@ describe('PipelineView', () => {
     vi.mocked(api.missions).mockResolvedValueOnce([]);
 
     render(<PipelineView />);
+
+    await screen.findByText('fix-a');
+    fireEvent.click(screen.getByText('All'));
 
     const rowA = (await screen.findByText('fix-a')).closest('li');
     const rowB = (await screen.findByText('fix-b')).closest('li');
@@ -178,6 +184,9 @@ describe('PipelineView', () => {
 
     render(<PipelineView />);
 
+    await screen.findByText('m-unmerged');
+    fireEvent.click(screen.getByText('All'));
+
     const unmergedRow = (await screen.findByText('m-unmerged')).closest('li');
     expect(unmergedRow?.querySelector('.unmerged-badge')?.textContent).toBe('UNMERGED');
 
@@ -192,6 +201,9 @@ describe('PipelineView', () => {
     ]);
 
     render(<PipelineView />);
+
+    await screen.findByText('Pipeline');
+    fireEvent.click(screen.getByText('All'));
 
     const row = (await screen.findByText('Abandoned mission work')).closest('li') as HTMLElement;
     expect(row.querySelectorAll('.pipeline-primary-action').length).toBe(0);
@@ -210,6 +222,9 @@ describe('PipelineView', () => {
     vi.mocked(api.missions).mockResolvedValueOnce([]);
 
     render(<PipelineView />);
+
+    await screen.findByText('Pipeline');
+    fireEvent.click(screen.getByText('All'));
 
     const row = (await screen.findByText('fix-work-branch-isolation')).closest('li') as HTMLElement;
     expect(row.querySelector('.pill-landed')?.textContent).toContain('landed');
@@ -297,6 +312,9 @@ describe('PipelineView', () => {
 
     render(<PipelineView />);
 
+    await screen.findByText('Pipeline');
+    fireEvent.click(screen.getByText('All'));
+
     const row = (await screen.findByText('m-landed')).closest('li') as HTMLElement;
     fireEvent.click(row.querySelector('.pipeline-primary-action') as HTMLButtonElement);
 
@@ -346,9 +364,101 @@ describe('PipelineView', () => {
 
     render(<PipelineView />);
 
+    await screen.findByText('Pipeline');
+    fireEvent.click(screen.getByText('All'));
+
     const idEl = await screen.findByText(longId);
     expect(idEl.className).toContain('picker-id');
     expect(idEl.textContent).toBe(longId);
+  });
+
+  it('default lens is Actionable', async () => {
+    vi.mocked(api.tickets).mockResolvedValueOnce([
+      makeTicket({ slug: 'fix-a', title: 'Fix A', state: 'new' }),
+    ]);
+    vi.mocked(api.missions).mockResolvedValueOnce([
+      makeMission({ id: 'm-landed', goal: 'Landed work', status: 'complete', merged: true }),
+      makeMission({ id: 'm-dead', goal: 'Abandoned mission work', status: 'abandoned' }),
+    ]);
+    vi.mocked(api.reportMd).mockResolvedValue({ markdown: 'Report body.' });
+    vi.mocked(api.diffStat).mockResolvedValue({ diffStat: '1 file changed', baseSha: 'a', tip: 'b' });
+
+    render(<PipelineView />);
+
+    expect(await screen.findByText('fix-a')).toBeTruthy();
+    expect(screen.queryByText('m-landed')).toBeNull();
+    expect(screen.queryByText('Abandoned mission work')).toBeNull();
+  });
+
+  it('All lens shows every row', async () => {
+    vi.mocked(api.tickets).mockResolvedValueOnce([
+      makeTicket({ slug: 'fix-a', title: 'Fix A', state: 'new' }),
+    ]);
+    vi.mocked(api.missions).mockResolvedValueOnce([
+      makeMission({ id: 'm-landed', goal: 'Landed work', status: 'complete', merged: true }),
+      makeMission({ id: 'm-dead', goal: 'Abandoned mission work', status: 'abandoned' }),
+    ]);
+    vi.mocked(api.reportMd).mockResolvedValue({ markdown: 'Report body.' });
+    vi.mocked(api.diffStat).mockResolvedValue({ diffStat: '1 file changed', baseSha: 'a', tip: 'b' });
+
+    render(<PipelineView />);
+
+    await screen.findByText('fix-a');
+    fireEvent.click(screen.getByText('All'));
+
+    expect(await screen.findByText('m-landed')).toBeTruthy();
+    expect(screen.getByText('Abandoned mission work')).toBeTruthy();
+  });
+
+  it('Missions lens row links to mission detail', async () => {
+    vi.mocked(api.tickets).mockResolvedValueOnce([]);
+    vi.mocked(api.missions).mockResolvedValueOnce([
+      makeMission({ id: 'm-delivered', goal: 'Done, unmerged', status: 'complete', merged: false }),
+    ]);
+    vi.mocked(api.reportMd).mockResolvedValueOnce({ markdown: 'Shipped the widget.' });
+    vi.mocked(api.diffStat).mockResolvedValueOnce({
+      diffStat: '2 files changed, 10 insertions(+)',
+      baseSha: 'a',
+      tip: 'b',
+    });
+
+    render(<PipelineView />);
+
+    await screen.findByText('m-delivered');
+    fireEvent.click(screen.getByText('Missions'));
+
+    const row = (await screen.findByText('m-delivered')).closest('li') as HTMLElement;
+    const link = row.querySelector('a[href="#/m/m-delivered"]');
+    expect(link).toBeTruthy();
+  });
+
+  it('links to #/backlog', async () => {
+    vi.mocked(api.tickets).mockResolvedValueOnce([]);
+    vi.mocked(api.missions).mockResolvedValueOnce([]);
+
+    render(<PipelineView />);
+
+    await screen.findByText('Pipeline');
+    const backlogLink = document.querySelector('a[href="#/backlog"]');
+    expect(backlogLink).toBeTruthy();
+    expect(backlogLink?.getAttribute('href')).toBe('#/backlog');
+  });
+
+  it('Backlog lens shows only ticket rows', async () => {
+    vi.mocked(api.tickets).mockResolvedValueOnce([
+      makeTicket({ slug: 'fix-a', title: 'Fix A', state: 'new' }),
+    ]);
+    vi.mocked(api.missions).mockResolvedValueOnce([
+      makeMission({ id: 'm-orphan', goal: 'Ticketless mission work', status: 'running' }),
+    ]);
+
+    render(<PipelineView />);
+
+    await screen.findByText('fix-a');
+    fireEvent.click(screen.getByText('Backlog'));
+
+    expect(await screen.findByText('fix-a')).toBeTruthy();
+    expect(screen.queryByText('Ticketless mission work')).toBeNull();
   });
 });
 
@@ -362,7 +472,10 @@ describe('App default route', () => {
     render(<App />);
 
     expect(await screen.findByText('Pipeline')).toBeTruthy();
-    expect(screen.queryByText('Missions')).toBeNull();
+    const missionsTab = Array.from(document.querySelectorAll('.lens-tab')).find(
+      (el) => el.textContent === 'Missions',
+    );
+    expect(missionsTab).toBeTruthy();
     expect(screen.queryByText('+ new mission')).toBeTruthy();
   });
 });
