@@ -958,11 +958,15 @@ impl MissionHost {
         // can ever land on a mission branch. See `drain_task` for the
         // restore-on-exit half of this contract.
         let task_state = Arc::clone(&state);
-        let join = tokio::spawn(drain_task(repo_root.clone(), task_state, move |mission_id| {
-            let backend = Arc::clone(&backend);
-            let repo_root = repo_root.clone();
-            async move { run_mission_headless(backend, repo_root, mission_id).await }
-        }));
+        let join = tokio::spawn(drain_task(
+            repo_root.clone(),
+            task_state,
+            move |mission_id| {
+                let backend = Arc::clone(&backend);
+                let repo_root = repo_root.clone();
+                async move { run_mission_headless(backend, repo_root, mission_id).await }
+            },
+        ));
 
         let initial = drain_state_json(&state.lock().expect("drain state lock"));
         *self.drain.lock().expect("drain tracker lock") =
@@ -1175,19 +1179,25 @@ fn restore_drain_checkout(repo_root: &Path, original: Option<&str>) {
     if original.starts_with("kranz/mission-") {
         return;
     }
-    let Ok(git) = GitRepo::open(repo_root) else { return };
+    let Ok(git) = GitRepo::open(repo_root) else {
+        return;
+    };
     if git.current_branch().ok().as_deref() == Some(original) {
         return;
     }
     match git.is_clean_tracked() {
         Ok(true) => match git.checkout(original) {
             Ok(()) => tracing::info!(branch = %original, "hosted drain restored operator checkout"),
-            Err(e) => tracing::warn!(branch = %original, error = %e, "hosted drain could not restore checkout"),
+            Err(e) => {
+                tracing::warn!(branch = %original, error = %e, "hosted drain could not restore checkout")
+            }
         },
         Ok(false) => tracing::warn!(
             "hosted drain leaving checkout in place: tracked files have uncommitted changes"
         ),
-        Err(e) => tracing::warn!(error = %e, "hosted drain could not probe the working tree; checkout left in place"),
+        Err(e) => {
+            tracing::warn!(error = %e, "hosted drain could not probe the working tree; checkout left in place")
+        }
     }
 }
 
