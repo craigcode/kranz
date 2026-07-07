@@ -1,6 +1,7 @@
 //! Integration tests for permission profiles (plan §4.7) and the session
 //! runner (plan §4.6), driven entirely through the mock backend.
 
+use kranz_engine::auth_verify::AuthVerdict;
 use kranz_engine::backend::{PromptMode, SessionExit, SessionSpec};
 use kranz_engine::backend_mock::{
     mock_denied, mock_init, mock_result_text, mock_text, mock_tool_use, MockBackend, MockScript,
@@ -849,6 +850,7 @@ async fn run_worker_builds_spec_and_uses_report_result() {
         None,
         None,
         &[],
+        AuthVerdict::Inconclusive,
     )
     .await
     .unwrap();
@@ -937,6 +939,7 @@ async fn run_worker_seeds_scratch_home_and_config_dir_worker_env_hygiene() {
         None,
         Some(base_sha),
         &[],
+        AuthVerdict::Authenticated,
     )
     .await
     .unwrap();
@@ -950,19 +953,25 @@ async fn run_worker_seeds_scratch_home_and_config_dir_worker_env_hygiene() {
         Some(base_sha)
     );
 
-    // seed_worker_env no longer relocates HOME / CLAUDE_CONFIG_DIR: the
-    // scratch HOME cut the worker off from the live macOS-Keychain OAuth token,
-    // so `claude` launched unauthenticated and produced nothing (silent
-    // work-loss, m-66aff8). Until env hygiene can prove the scratch HOME
-    // authenticates, the worker inherits the real HOME.
-    // See fix-worker-env-hygiene-starves-auth.
+    // seed_worker_env relocates HOME / CLAUDE_CONFIG_DIR only once the
+    // preflight has proven the scratch env authenticates (mission m-165b6f,
+    // f-1-2). With an Authenticated verdict, the worker spec is relocated to
+    // the scratch home under `scratch_home_root(session_id)`.
+    let scratch_root = kranz_engine::backend_claude::scratch_home_root(&spec.session_id);
+    let home = spec.env.get("HOME").expect("HOME relocated to scratch dir");
     assert!(
-        !spec.env.contains_key("HOME"),
-        "worker spec.env must NOT relocate HOME (auth-starvation regression)"
+        std::path::Path::new(home).starts_with(&scratch_root),
+        "HOME {home} must be under scratch root {}",
+        scratch_root.display()
     );
+    let config_dir = spec
+        .env
+        .get("CLAUDE_CONFIG_DIR")
+        .expect("CLAUDE_CONFIG_DIR relocated to scratch dir");
     assert!(
-        !spec.env.contains_key("CLAUDE_CONFIG_DIR"),
-        "worker spec.env must NOT relocate CLAUDE_CONFIG_DIR"
+        std::path::Path::new(config_dir).starts_with(&scratch_root),
+        "CLAUDE_CONFIG_DIR {config_dir} must be under scratch root {}",
+        scratch_root.display()
     );
 }
 
@@ -1173,6 +1182,7 @@ async fn run_worker_in_buffered_collects_kinds_without_touching_the_log() {
         &cwd,
         None,
         &[],
+        AuthVerdict::Inconclusive,
     )
     .await
     .unwrap();

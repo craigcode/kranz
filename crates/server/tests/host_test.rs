@@ -797,9 +797,14 @@ async fn hosted_lifecycle_reaches_complete_without_a_terminal() {
             // records nothing and lets the mission close.
             turn("NONE"),
         ]);
-    // Session-start order: the orchestrator starts during planning, the
-    // worker at run time.
-    let backend = Arc::new(MockBackend::with_scripts(vec![orch, worker_pass()]));
+    // Session-start order: the orchestrator starts during planning, then the
+    // one-per-mission auth preflight probe (mission m-165b6f, f-2-1/f-2-2)
+    // right before the first worker spawn, then the worker at run time.
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        orch,
+        MockScript::single_shot("ack"),
+        worker_pass(),
+    ]));
     let app = hosted_app(&root, backend);
 
     // Create — with a config patch (both validators off keeps the run to a
@@ -1160,6 +1165,11 @@ async fn queue_drain_route_runs_a_queued_mission_to_complete() {
     ]);
     let backend = Arc::new(MockBackend::with_scripts(vec![
         orch,
+        // `/release` drops the planning-phase engine; the drain's headless
+        // resume builds a brand new engine whose cached auth verdict starts
+        // unset, so it drives its own one-per-mission preflight probe right
+        // before the resumed run's first worker spawn.
+        MockScript::single_shot("ack"),
         worker_pass(),
         orch_run,
     ]));

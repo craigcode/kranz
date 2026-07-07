@@ -18,6 +18,7 @@
 //!
 //! All tests skip cleanly when `git` is not on PATH.
 
+use kranz_engine::auth_verify::AuthVerdict;
 use kranz_engine::backend::{AgentBackend, PromptMode, SessionExit};
 use kranz_engine::backend_mock::{
     mock_init, mock_result_error, mock_result_text, mock_text, MockBackend, MockScript,
@@ -139,7 +140,17 @@ fn test_cfg() -> MissionConfig {
 
 fn make_engine(backend: &Arc<MockBackend>, root: &Path, cfg: MissionConfig) -> MissionEngine {
     let backend: Arc<dyn AgentBackend> = Arc::clone(backend) as Arc<dyn AgentBackend>;
-    MissionEngine::create(backend, root, GOAL, cfg).expect("create mission engine")
+    let mut engine =
+        MissionEngine::create(backend, root, GOAL, cfg).expect("create mission engine");
+    // Pre-seed the worker-auth verdict (mission m-165b6f, f-2-2): otherwise
+    // the live preflight (orchestrator.rs `worker_auth_verdict`) would
+    // consume the first queued `MockScript` meant for a real worker or
+    // validator session, desyncing every test's FIFO script order. Matches
+    // the fail-safe `Inconclusive` these tests hardcoded before the
+    // preflight was wired in, so mission-flow behaviour here is unchanged;
+    // the preflight itself is exercised by `auth_verify`'s own unit tests.
+    engine.seed_worker_auth_verdict_for_test(AuthVerdict::Inconclusive);
+    engine
 }
 
 /// A plan with one milestone ("M1") of `features` features.
@@ -1392,6 +1403,7 @@ async fn kill_and_resume_completes_on_single_log() {
     let backend2_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend2) as Arc<dyn AgentBackend>;
     let mut engine = MissionEngine::resume(backend2_dyn, &root, &mission_id, LockForce::No)
         .expect("resume mission");
+    engine.seed_worker_auth_verdict_for_test(AuthVerdict::Inconclusive);
 
     let status = timeout(TEST_TIMEOUT, engine.run())
         .await
@@ -3313,6 +3325,7 @@ async fn crash_mid_parallel_batch_resumes_cleanly() {
     let backend2_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend2) as Arc<dyn AgentBackend>;
     let mut engine = MissionEngine::resume(backend2_dyn, &root, &mission_id, LockForce::No)
         .expect("resume mission");
+    engine.seed_worker_auth_verdict_for_test(AuthVerdict::Inconclusive);
 
     let status = timeout(TEST_TIMEOUT, engine.run())
         .await

@@ -36,6 +36,7 @@
 //! branch at approval (plan §4.4). This keeps the §4.4 dirty-tree discipline
 //! meaningful: a dirty tree after a worker run is *worker* dirt.
 
+use crate::auth_verify::AuthVerdict;
 use crate::backend::{AgentBackend, AgentEvent, AgentSession, PromptMode, SessionSpec};
 use crate::config;
 use crate::contract_sweep;
@@ -290,6 +291,13 @@ pub struct MissionEngine {
     /// primary-checkout cleanliness check: the primary must never move once
     /// mission-branch work is routed to the integration worktree.
     primary_branch_at_start: Option<String>,
+    /// Once-per-mission cache of the worker HOME relocate-vs-inherit decision
+    /// (mission m-165b6f, f-2-1): computed on the first worker spawn by
+    /// driving [`crate::auth_verify::verify_worker_auth`] against `self.backend`,
+    /// then reused for every subsequent worker in this mission so the trivial
+    /// preflight session is spawned exactly once, not once per worker. `None`
+    /// until the first call to [`Self::worker_auth_verdict`].
+    worker_auth_verdict: Option<AuthVerdict>,
 }
 
 impl MissionEngine {
@@ -362,6 +370,7 @@ impl MissionEngine {
             droid_backend: None,
             active_tree: None,
             primary_branch_at_start: None,
+            worker_auth_verdict: None,
         })
     }
 
@@ -460,6 +469,7 @@ impl MissionEngine {
             droid_backend: None,
             active_tree: None,
             primary_branch_at_start: None,
+            worker_auth_verdict: None,
         })
     }
 
@@ -790,6 +800,61 @@ impl MissionEngine {
             }
             BackendKind::Claude => (Arc::clone(&self.backend), None),
         }
+    }
+
+    /// The worker HOME relocate-vs-inherit decision for this mission (mission
+    /// m-165b6f, f-2-1), computed ONCE and cached in `self.worker_auth_verdict`.
+    ///
+    /// On the first call this drives a real trivial session via
+    /// [`crate::auth_verify::verify_worker_auth`] against `self.backend` under a
+    /// scratch candidate `HOME`/`CLAUDE_CONFIG_DIR` (seeded the same way a
+    /// relocated worker's env would be); every subsequent call — across every
+    /// worker this mission spawns, sequential or concurrent — returns the
+    /// cached verdict without spawning another preflight session. If seeding
+    /// the scratch candidate env fails (e.g. an unwritable temp dir), that is
+    /// [`AuthVerdict::Inconclusive`] (fail-safe), same as the runner does for
+    /// scratch-home seeding elsewhere.
+    async fn worker_auth_verdict(&mut self) -> AuthVerdict {
+        if let Some(verdict) = self.worker_auth_verdict {
+            return verdict;
+        }
+        let real_home = std::env::var_os("HOME").map(PathBuf::from);
+        let real_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from);
+        let scratch_root = crate::backend_claude::scratch_home_root(&format!(
+            "preflight-{}",
+            self.state.mission.id
+        ));
+        let verdict = match crate::backend_claude::seed_worker_scratch_home(
+            &scratch_root,
+            real_home.as_deref(),
+            real_config_dir.as_deref(),
+        ) {
+            Ok((home, config_dir)) => {
+                let mut candidate_env = HashMap::new();
+                candidate_env.insert("HOME".to_string(), home.display().to_string());
+                candidate_env.insert(
+                    "CLAUDE_CONFIG_DIR".to_string(),
+                    config_dir.display().to_string(),
+                );
+                crate::auth_verify::verify_worker_auth(self.backend.as_ref(), &candidate_env).await
+            }
+            Err(_) => AuthVerdict::Inconclusive,
+        };
+        self.worker_auth_verdict = Some(verdict);
+        verdict
+    }
+
+    /// Test-only seam (mission m-165b6f, f-2-2): pre-seeds the cached
+    /// worker-auth verdict so `MockBackend`-driven mission-flow tests don't
+    /// have the live preflight (see [`Self::worker_auth_verdict`]) consume a
+    /// `MockScript` meant for a real worker/validator session — the
+    /// preflight and its verdict handling are covered directly by
+    /// `auth_verify`'s own unit tests instead. Never call this outside
+    /// tests: it bypasses the real auth-verification guarantee the
+    /// preflight exists to provide.
+    #[doc(hidden)]
+    pub fn seed_worker_auth_verdict_for_test(&mut self, verdict: AuthVerdict) {
+        self.worker_auth_verdict = Some(verdict);
     }
 
     /// Fold events appended by `runner::run_*` (which writes to the log
@@ -1670,6 +1735,10 @@ impl MissionEngine {
                 Arc::clone(&cancel),
             ));
             let backend = Arc::clone(&self.backend);
+            // Once-per-mission cached decision (mission m-165b6f, f-2-1): the
+            // preflight session is driven at most once per mission, not once
+            // per worker spawn.
+            let auth_verdict = self.worker_auth_verdict().await;
             // Worktree mode (M7 tier 1): the worker session's cwd is the
             // mission integration worktree, never the primary repo root.
             // Checkout mode keeps the exact `run_worker` call it always had.
@@ -1688,6 +1757,7 @@ impl MissionEngine {
                     &session_cwd,
                     base_sha.as_deref(),
                     &grants,
+                    auth_verdict,
                 )
                 .await
             } else {
@@ -1703,6 +1773,7 @@ impl MissionEngine {
                     Some(cancel),
                     base_sha.as_deref(),
                     &grants,
+                    auth_verdict,
                 )
                 .await
             };
@@ -2202,6 +2273,11 @@ impl MissionEngine {
         let base_sha = self.state.mission.base_sha.clone();
         let grants = self.state.mission.command_grants.clone();
         let tracker = ConcurrencyTracker::new();
+        // Once-per-mission cached decision (mission m-165b6f, f-2-1): computed
+        // here, BEFORE any concurrent worker task is spawned, so every worker
+        // in this batch shares the exact same decision and the preflight
+        // session never races itself.
+        let auth_verdict = self.worker_auth_verdict().await;
 
         let mut set: tokio::task::JoinSet<(usize, BufferedRunResult)> = tokio::task::JoinSet::new();
         for (idx, ws) in workspaces.iter().enumerate() {
@@ -2229,6 +2305,7 @@ impl MissionEngine {
                     &ws_path,
                     base_sha.as_deref(),
                     &grants,
+                    auth_verdict,
                 )
                 .await;
                 (idx, result)

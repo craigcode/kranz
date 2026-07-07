@@ -1,0 +1,124 @@
+# Mission plan — m-165b6f
+
+**Goal:** Re-enable worker HOME/CLAUDE_CONFIG_DIR relocation hygiene safely by relocating only when the worker is verified able to authenticate under the scratch env, and otherwise inheriting the real HOME with a loud recorded decision — never silently launching an unauthenticated worker.
+
+Branch `kranz/mission-m-165b6f` (from `main`). Approved plan of record; the machine-readable twin is [plan.json](plan.json). Live status: `kranz status` or the dashboard.
+
+## Cost estimate
+
+Estimated **$8.87 – $44.33** (expected ~$17.73). Rough estimate — live usage is authoritative; based on 38 completed mission(s).
+
+## Validation contract
+
+Defined before any feature; gates mission completion.
+
+- **[a1]** When the auth preflight succeeds, the constructed worker spec relocates HOME and CLAUDE_CONFIG_DIR to a scratch dir that contains only the allowlisted config entries (hygiene ON). 
+  `cargo test -p kranz-engine worker_auth_preflight_success_relocates 2>&1 | grep -qE 'test result: ok\. [1-9][0-9]* passed'`
+- **[a2]** When the auth preflight fails, errors, or is inconclusive, the worker spec inherits the real HOME (carries no HOME/CLAUDE_CONFIG_DIR keys) — it never launches into the unverified scratch env. 
+  `cargo test -p kranz-engine worker_auth_preflight_failure_inherits_home 2>&1 | grep -qE 'test result: ok\. [1-9][0-9]* passed'`
+- **[a3]** The relocate-vs-inherit decision is recorded as an observable event/log entry for both outcomes, so a fallback to the real HOME is loud, never silent. 
+  `cargo test -p kranz-engine worker_auth_decision_is_recorded 2>&1 | grep -qE 'test result: ok\. [1-9][0-9]* passed'`
+- **[a4]** Both worker-spawn paths route HOME relocation through the gated preflight — there is no code path that relocates HOME without a successful auth verification. 
+  `cargo test -p kranz-engine worker_auth_both_spawn_paths_gated 2>&1 | grep -qE 'test result: ok\. [1-9][0-9]* passed'`
+- **[a5]** The auth preflight decision is computed once per mission and reused for every worker in that mission rather than re-run per worker. 
+  `cargo test -p kranz-engine worker_auth_preflight_cached_once_per_mission 2>&1 | grep -qE 'test result: ok\. [1-9][0-9]* passed'`
+- **[a6]** The entire workspace test suite passes. 
+  `cargo test --workspace 2>&1 | grep -qE 'test result: ok\.'`
+- **[a7]** The workspace is formatted and lint-clean. 
+  `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings`
+- **[a8]** The disabled HOTFIX in seed_worker_env is replaced by the auth-gated safe path (no unconditional no-relocation block remains) and the stale no-relocation assertions in the runner tests are updated to the new gated contract. *(agent judgement)*
+- **[a9]** Under the hygiene env on macOS (Keychain auth), a worker authenticates and produces real output, evidenced by an operator-run live mission that lands actual commits. *(agent judgement)*
+
+## Milestone 1 — Auth-verified HOME decision (offline-proven)
+
+### 1.1 verify_worker_auth seam + auth-failure detector
+
+Add a mockable authentication-preflight seam to crates/engine so the engine can decide, before spawning a worker, whether the worker's `claude` CLI can authenticate under a CANDIDATE scratch HOME/CLAUDE_CONFIG_DIR environment.
+
+Context: today `seed_worker_env` (crates/engine/src/runner.rs ~line 657) has its HOME/CLAUDE_CONFIG_DIR relocation DISABLED by a HOTFIX because relocating HOME cut workers off from live macOS-Keychain auth (mission m-66aff8: workers died at turn 1 with 'Not logged in', $0 cost, zero tool-use, producing empty diffs while the mission falsely completed). The scratch-seeding helper `seed_worker_scratch_home` (crates/engine/src/backend_claude.rs ~line 331) and the allowlist `claude_min_config_entries` still exist and work but are dormant. Read docs/scoping/claude-cli-min-env.md for the auth model — note its claim that Keychain auth is HOME-independent is CONTRADICTED by the m-66aff8 observation, which is exactly why this seam verifies actual behavior rather than trusting a detection heuristic.
+
+Implement a function, roughly `async fn verify_worker_auth(backend: &dyn AgentBackend, candidate_env: &HashMap<String,String>) -> AuthVerdict` (choose an idiomatic signature/return enum; e.g. Authenticated / Unauthenticated / Inconclusive). It must:
+- Build a minimal trivial SessionSpec (tiny prompt such as asking the model to reply with a single token) whose `env` is the provided candidate_env, and start it via the injected `AgentBackend` (the mockable seam is `AgentBackend::start` in crates/engine/src/backend.rs).
+- Drive the session to completion and classify the outcome using a robust auth-failure signature: treat the run as UNAUTHENTICATED when it exhibits a known auth-error signature (e.g. a 'Not logged in' / not-authenticated message) OR ends with zero assistant activity at zero cost / a non-success exit; treat it as AUTHENTICATED when the model actually produced a normal reply. Any spawn/IO error or ambiguous result is INCONCLUSIVE.
+- Never panic; return a verdict.
+
+Do NOT wire this into the spawn path yet (that is a later feature) and do NOT call the real backend at runtime here. Keep it a pure seam consuming `&dyn AgentBackend`.
+
+Tests: use the existing MockBackend/MockScript (crates/engine/src/backend_mock.rs) to script (a) a normal single-shot reply -> Authenticated, (b) a 'Not logged in' / zero-activity-zero-cost run -> Unauthenticated, (c) a backend/start error -> Inconclusive. Name the primary passing test(s) so they include a stable, new identifier. cargo fmt and clippy must stay clean.
+
+Done when:
+- A unit test drives verify_worker_auth with a MockScript scripting a normal reply and asserts the verdict is Authenticated
+- A unit test drives verify_worker_auth with a MockScript scripting a 'Not logged in' / zero-activity, zero-cost run and asserts the verdict is Unauthenticated
+- A unit test drives verify_worker_auth against a backend that errors on start and asserts the verdict is Inconclusive (fail-safe, not a panic)
+- verify_worker_auth takes a &dyn AgentBackend (or equivalent injected seam) so it is exercised entirely offline via MockBackend, spawning no real claude process
+
+### 1.2 Gate HOME relocation on the preflight verdict; remove the HOTFIX
+
+Rewire worker spec construction so HOME/CLAUDE_CONFIG_DIR relocation is CONDITIONAL on a successful auth preflight, replacing the disabled HOTFIX in `seed_worker_env` (crates/engine/src/runner.rs ~line 657).
+
+Use the `verify_worker_auth` seam added in the prior feature (AuthVerdict enum). Decision rule:
+- If the candidate scratch env (built via `seed_worker_scratch_home` in crates/engine/src/backend_claude.rs using the `claude_min_config_entries` allowlist) verifies AUTHENTICATED, relocate: set HOME to the scratch home and CLAUDE_CONFIG_DIR to its `.claude` dir on the worker spec, keeping the existing GIT_AUTHOR_*/GIT_COMMITTER_* identity injection.
+- If the verdict is UNAUTHENTICATED, INCONCLUSIVE, or errored, FAIL SAFE: do not set HOME/CLAUDE_CONFIG_DIR at all (worker inherits the real HOME), keeping the git identity injection. This is the loud-fallback default; never launch a worker into a scratch env that did not verify.
+
+Plumb whatever `&dyn AgentBackend` / decision input is needed into the worker-spec build path so this is testable with MockBackend; keep production wiring (real backend + caching) for the next milestone — here it is acceptable for the decision input to be injected so both branches are unit-testable.
+
+Delete the HOTFIX comment block and its unconditional no-relocation behavior. Update the now-stale assertions that require NO relocation: in crates/engine/src/runner.rs the test `worker_env_hygiene_scratch_home_worker_can_commit` (asserts `!spec.env.contains_key("HOME")`) and in crates/engine/tests/runner_test.rs the test `run_worker_seeds_scratch_home_and_config_dir_worker_env_hygiene` (asserts HOME/CLAUDE_CONFIG_DIR absent). Rewrite them to assert the new gated contract: with a preflight that verifies Authenticated, HOME+CLAUDE_CONFIG_DIR ARE set to the scratch dir; with a preflight that verifies Unauthenticated/Inconclusive, they are ABSENT. Preserve the git-identity commit test (identity injection still applies in both branches).
+
+Name the new decision tests with stable, unique identifiers including `worker_auth_preflight_success_relocates` and `worker_auth_preflight_failure_inherits_home`. Keep cargo fmt and clippy clean.
+
+Done when:
+- A test named worker_auth_preflight_success_relocates asserts that when the preflight verdict is Authenticated the worker spec sets HOME and CLAUDE_CONFIG_DIR to the scratch dir containing only the allowlisted entries
+- A test named worker_auth_preflight_failure_inherits_home asserts that when the preflight verdict is Unauthenticated or Inconclusive the worker spec contains no HOME and no CLAUDE_CONFIG_DIR key
+- The GIT_AUTHOR_*/GIT_COMMITTER_* identity env is still injected in both the relocate and the inherit branch
+- The HOTFIX block is removed from seed_worker_env and the previously passing no-relocation assertions are rewritten to the new gated contract, with cargo fmt --all -- --check and cargo clippy clean
+
+### 1.3 Record the relocate-vs-inherit decision loudly
+
+Make the HOME relocate-vs-inherit decision from the previous feature observable, so a fallback to the real HOME is never silent (acceptance requirement: 'loud decision, not silent').
+
+At the decision site in the worker-spec build path (crates/engine/src/runner.rs), emit a durable, observable record of the decision for BOTH outcomes: which branch was taken (relocated to scratch HOME vs inherited real HOME) and the verdict/reason that drove it (Authenticated vs Unauthenticated/Inconclusive/errored). Use the engine's existing observability mechanism consistent with how other worker decisions are surfaced — prefer an event on the mission event log (see EventKind in the engine, and how worker.spawned / other worker events are emitted) if one fits; otherwise a structured tracing log at info level. Do not log any secret values or credential contents — only the decision and a non-sensitive reason.
+
+Add a test named with a stable unique identifier `worker_auth_decision_is_recorded` proving that after building a worker spec, the decision record is present for both the relocate branch (Authenticated) and the inherit branch (Unauthenticated), asserting the recorded outcome matches the branch taken. If using the event log, assert the event appears in the read-back log; if using tracing, capture and assert the emitted record. Keep cargo fmt and clippy clean.
+
+Done when:
+- A test named worker_auth_decision_is_recorded asserts that when the preflight yields Authenticated the recorded decision states the worker relocated to the scratch HOME
+- The same test asserts that when the preflight yields Unauthenticated/Inconclusive the recorded decision states the worker inherited the real HOME and carries a non-sensitive reason
+- The recorded decision contains no secret or credential values
+- cargo fmt --all -- --check and cargo clippy are clean
+
+
+## Milestone 2 — Production integration and live continuity
+
+### 2.1 Wire the real preflight into both spawn paths, cached once per mission
+
+Wire the auth preflight into real worker spawning so production missions use it, computing it ONCE per mission and reusing the decision for every worker.
+
+Both worker-spawn paths in crates/engine/src/runner.rs (the live `run_worker`/`run_worker_in` path and the buffered `run_worker_in_buffered` path, both routing through `build_worker_spec` ~line 686) must obtain their HOME relocate-vs-inherit decision from the gated preflight added in milestone 1, driven by the real ClaudeBackend in production. Introduce a once-per-mission cache/memo of the auth decision (e.g. computed on first worker spawn and reused, or computed at mission start and threaded through) so the trivial preflight session is not re-spawned for every worker. The cache key/scope is the mission; concurrent workers within a mission must share the single decision.
+
+Keep the seam injectable so tests use MockBackend: assert that across a mission spawning multiple workers, `verify_worker_auth` (i.e. the backend `start` for the preflight) is invoked exactly once and all workers receive the same relocate/inherit decision. Ensure that if the preflight is Unauthenticated/Inconclusive, every worker in the mission inherits the real HOME (fail-safe), and if Authenticated, every worker relocates.
+
+Name the caching test with a stable unique identifier `worker_auth_preflight_cached_once_per_mission` and the both-paths-gated coverage `worker_auth_both_spawn_paths_gated` (a test asserting neither spawn path relocates HOME without a successful verify). Keep cargo fmt and clippy clean.
+
+Done when:
+- A test named worker_auth_preflight_cached_once_per_mission spawns multiple workers in one mission via MockBackend and asserts the preflight session is started exactly once and all workers share the same decision
+- A test named worker_auth_both_spawn_paths_gated asserts that both the live and buffered worker-spawn paths only relocate HOME when the cached verdict is Authenticated, and inherit the real HOME otherwise
+- With an Unauthenticated/Inconclusive cached verdict, every worker spec in the mission omits HOME/CLAUDE_CONFIG_DIR (fail-safe applies uniformly)
+
+### 2.2 Confinement proof, green sweep, and live-auth runbook
+
+Finalize the mission: prove scratch-env confinement, get the tree fully green, and document how to obtain the live-auth proof.
+
+1. Confinement test: add/verify a test proving that when relocation is engaged, the scratch CLAUDE_CONFIG_DIR contains ONLY the allowlisted entries from `claude_min_config_entries` (crates/engine/src/backend_claude.rs) and no arbitrary operator dotfiles leak in. Build on the existing `seed_worker_scratch_home` tests in crates/engine/tests/backend_claude_test.rs; assert an operator file placed alongside the allowlist in a fake source config dir is NOT copied into the scratch dir.
+
+2. Green sweep: ensure `cargo test --workspace` passes and `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings` are clean across the whole change set. Fix any formatting/lint fallout from the mission (repo history shows fmt cleanliness regressions have cost prior missions a full respawn — run cargo fmt before finishing).
+
+3. Live-auth runbook: author a short doc under docs/ (e.g. docs/scoping/worker-auth-preflight.md) describing how an operator obtains the live-auth proof required by contract assertion a9 — i.e. run a real Kranz mission on this macOS host and confirm a worker authenticates under the hygiene env and lands actual commits (non-empty diff, real WorkerReport). The doc should state the expected observable signals of success (worker produced commits, non-zero cost, tools used) versus the m-66aff8 failure signature ('Not logged in', $0, zero tools, empty diff), and how the loud decision record (from milestone 1) tells the operator whether hygiene actually engaged or the fail-safe inherited HOME.
+
+Do not run or fake a live claude mission from within a worker session; the live run is performed out-of-band by the operator. Keep cargo fmt and clippy clean.
+
+Done when:
+- A test asserts the scratch CLAUDE_CONFIG_DIR receives only the allowlisted entries and that a non-allowlisted operator file in the source config dir is not copied in
+- cargo test --workspace passes
+- cargo fmt --all -- --check succeeds and cargo clippy --workspace --all-targets -- -D warnings is clean
+- A docs/ runbook describes how to obtain the a9 live-auth proof, including the success vs m-66aff8 failure signatures and how the loud decision record reveals whether hygiene engaged
+

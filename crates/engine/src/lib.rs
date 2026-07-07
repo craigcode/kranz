@@ -18,6 +18,7 @@ pub mod events;
 pub mod paths;
 pub mod types;
 
+pub mod auth_verify;
 pub mod config;
 pub mod contract_sweep;
 pub mod cost;
