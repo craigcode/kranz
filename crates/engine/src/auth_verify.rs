@@ -64,6 +64,7 @@ fn probe_spec(candidate_env: &HashMap<String, String>) -> SessionSpec {
         allowed_tools: Vec::new(),
         disallowed_tools: Vec::new(),
         tools: Vec::new(),
+        writable: false,
         settings_json: None,
         json_schema: None,
         max_budget_usd: None,

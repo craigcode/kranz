@@ -117,6 +117,7 @@ fn session_spec(prompt: PromptMode) -> SessionSpec {
         allowed_tools: vec!["Bash".to_string()],
         disallowed_tools: vec!["Bash(git push*)".to_string()],
         tools: vec![],
+        writable: true,
         settings_json: None,
         json_schema: None,
         max_budget_usd: Some(1.0),
@@ -870,6 +871,10 @@ async fn run_worker_builds_spec_and_uses_report_result() {
     assert_eq!(spec.effort, cfg.worker.reasoning_effort);
     assert_eq!(spec.max_turns, cfg.worker.max_turns);
     assert_eq!(spec.max_budget_usd, cfg.worker.max_budget_usd);
+    assert!(
+        spec.writable,
+        "worker sessions must get write-capable backends"
+    );
     assert_eq!(spec.permission_mode.as_deref(), Some("acceptEdits"));
     assert_eq!(spec.allowed_tools, vec!["Bash".to_string()]);
     assert!(spec.disallowed_tools.iter().any(|d| d == "Bash(git push*)"));
@@ -1015,6 +1020,10 @@ async fn run_validator_builds_spec_permissions_and_parses_report() {
 
     let specs = backend.started_specs();
     let spec = &specs[0];
+    assert!(
+        !spec.writable,
+        "validator sessions must keep read-only backend mode"
+    );
     assert!(
         !spec.env.contains_key("KRANZ_BASE_SHA"),
         "no base sha means no env var"

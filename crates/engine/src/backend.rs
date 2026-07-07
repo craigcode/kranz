@@ -74,6 +74,12 @@ pub struct SessionSpec {
     /// Claude-CLI-ism: `--tools` is a Claude Code flag; a non-claude backend
     /// may ignore this field.
     pub tools: Vec<String>,
+    /// Whether this session's role is expected to edit the working tree.
+    ///
+    /// Non-Claude backends use this to select a write-capable local workspace
+    /// mode for workers while keeping validators and orchestrators read-only.
+    /// Claude continues to use `permission_mode`/tool rules and ignores this.
+    pub writable: bool,
     /// Extra settings JSON (hooks etc.) passed via --settings.
     ///
     /// Claude-CLI-ism: `--settings` (hooks, etc.) is a Claude Code concept; a
