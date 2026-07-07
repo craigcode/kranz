@@ -12,6 +12,7 @@ import { renderMarkdown } from '../lib/markdown';
 import { pipelineStage, primaryAction, parseEstimateFromPlanMd } from '../lib/pipelineStage';
 import type { WorkItem, WorkItemMission } from '../lib/pipelineStage';
 import type { MissionSummary, TicketSummary } from '../lib/types';
+import { LENSES, filterLensRows, landedCount, type Lens } from '../lib/lensFilter';
 
 interface Row {
   key: string;
@@ -22,6 +23,7 @@ interface Row {
   blockedBy: string[];
   missionId?: string;
   slug?: string;
+  missionCreatedAt?: string;
 }
 
 function toWorkItemMission(m: MissionSummary): WorkItemMission {
@@ -48,6 +50,7 @@ function buildRows(tickets: TicketSummary[], missions: MissionSummary[]): Row[] 
       blockedBy: t.blockedBy,
       missionId: t.missionId,
       slug: t.slug,
+      missionCreatedAt: mission?.createdAt,
     };
   });
 
@@ -61,6 +64,7 @@ function buildRows(tickets: TicketSummary[], missions: MissionSummary[]): Row[] 
       isBlocked: false,
       blockedBy: [],
       missionId: m.id,
+      missionCreatedAt: m.createdAt,
     }));
 
   return [...ticketRows, ...missionRows];
@@ -230,6 +234,7 @@ export function PipelineView() {
   const loadMissions = useKranzStore((s) => s.loadMissions);
   const draftTicket = useKranzStore((s) => s.draftTicket);
   const approveTicket = useKranzStore((s) => s.approveTicket);
+  const [lens, setLens] = useState<Lens>('actionable');
 
   useEffect(() => {
     void loadTickets();
@@ -237,6 +242,7 @@ export function PipelineView() {
   }, [loadTickets, loadMissions]);
 
   const rows = buildRows(tickets, missions);
+  const visibleRows = filterLensRows(rows, lens);
 
   const renderPrimary = (row: Row, stage: ReturnType<typeof pipelineStage>) => {
     const action = primaryAction(stage);
@@ -409,6 +415,9 @@ export function PipelineView() {
           >
             + new mission
           </button>
+          <a className="btn-small pipeline-backlog-link" href="#/backlog">
+            Backlog ↗
+          </a>
         </div>
         {ticketsError !== null && (
           <div className="picker-error" role="alert">
@@ -426,13 +435,35 @@ export function PipelineView() {
             </button>
           </div>
         )}
+        <div className="lens-bar" role="tablist">
+          {LENSES.map((l) => (
+            <button
+              key={l.id}
+              type="button"
+              className={'lens-tab' + (lens === l.id ? ' lens-tab--active' : '')}
+              aria-pressed={lens === l.id}
+              onClick={() => setLens(l.id)}
+            >
+              {l.label}
+            </button>
+          ))}
+        </div>
         <RunQueueButton />
+        {lens === 'actionable' && landedCount(rows) > 0 && (
+          <button
+            type="button"
+            className="lens-landed-hint"
+            onClick={() => setLens('all')}
+          >
+            Landed ({landedCount(rows)}) — view all
+          </button>
+        )}
         {ticketsError === null && missionsError === null && rows.length === 0 && (
           <div className="dim picker-empty" role="status">
             No work items found. Create one with <code>kranz ticket new</code>.
           </div>
         )}
-        <ul className="picker-list">{rows.map(row)}</ul>
+        <ul className="picker-list">{visibleRows.map(row)}</ul>
       </div>
     </div>
   );

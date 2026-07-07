@@ -1392,6 +1392,48 @@ button {
   margin: 8px 0;
 }
 
+.lens-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px 0;
+  margin-bottom: 2px;
+}
+
+.lens-tab {
+  height: 22px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel);
+  color: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.lens-tab--active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+
+.lens-landed-hint {
+  display: block;
+  margin: 4px 14px 0;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--dim);
+  font-size: 11px;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.pipeline-backlog-link {
+  margin-left: auto;
+}
+
 .picker-empty {
   padding: 12px 14px;
 }
