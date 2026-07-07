@@ -14,14 +14,29 @@ BacklogPanel) — it is reachable only by typing the hash or via a single
 ticket's back-link. Fix both so an operator opening the dashboard
 immediately sees what needs doing and can reach the full backlog.
 
-Two changes:
-1. **Signal over history.** Default the pipeline view to actionable
-   stages; collapse terminal `landed` rows under a "Landed (N) ▸"
-   expander (or a filter/toggle), so captured/reviewable/delivered/
-   failed are what shows first. Preserve the ability to see everything.
-2. **A front door to the backlog.** Add a visible nav link/tab from the
-   pipeline header to #/backlog (and ideally a reciprocal link back), so
-   the ticket backlog list is discoverable, not orphaned.
+The fix is a **lens filter bar** on the pipeline view — one data source,
+several filtered views — NOT new standalone list components (those drift
+and rot: MissionPicker was exactly that and became unrouted dead code we
+deleted 2026-07-06). Lenses:
+
+| Lens | Shows | Answers |
+|------|-------|---------|
+| Actionable (default) | captured/reviewable/delivered/failed | "what needs me" |
+| Backlog | tickets only | "what could I work" |
+| Missions | running + recent missions | "what's executing" (the current-missions selector) |
+| All | everything (today's behavior) | "full history" |
+
+Concretely:
+1. **Signal over history.** Default to the Actionable lens; terminal
+   `landed`/`abandoned` rows are hidden there and visible under All (or a
+   collapsed "Landed (N) ▸" group). The operator sees what needs doing on
+   open.
+2. **A Missions lens** = the "current missions button" — a filter to
+   running + recent missions, one tap; clicking a row still opens the
+   existing mission detail (#/m/<id>) for live monitoring/steering. No
+   separate MissionPicker-style component.
+3. **Reach the backlog.** A Backlog lens (tickets) plus a visible link to
+   the full BacklogPanel (#/backlog), so it is discoverable, not orphaned.
 
 ## Context
 
@@ -34,15 +49,21 @@ list landing (MissionPicker + BacklogPanel) dropped the backlog's nav
 entry point. This directly undermines the pipeline-view scoping's
 "done when": "the pipeline view answers where is it, what's next, whose
 move is it without a second question" (docs/scoping/pipeline-view.md).
-Landed-row collapse and a backlog link restore that promise. Pure
-dashboard work (apps/dashboard): PipelineView.tsx, App.tsx nav, styles.
+Landed-row collapse and a backlog link restore that promise. Operator
+follow-up 2026-07-06: "if pipeline is everything, do we also need a
+current-missions selector?" — answer: yes, but as a Missions LENS on the
+same data, not a separate component (MissionPicker's rot is the receipt).
+Pure dashboard work (apps/dashboard): PipelineView.tsx, App.tsx nav,
+styles.
 
 ## Acceptance hints
 
-- Opening #/ shows actionable stages first; terminal landed rows are
-  collapsed/filtered by default with a way to expand them.
-- A visible, discoverable navigation affordance reaches #/backlog from
-  the pipeline view.
+- A lens filter bar (Actionable | Backlog | Missions | All) filters the
+  single pipeline data source; the default lens hides terminal rows so
+  actionable work shows on open.
+- The Missions lens shows running + recent missions and rows still open
+  the existing #/m/<id> detail — no new standalone list component.
+- A visible, discoverable affordance reaches the full backlog (#/backlog).
 - cd apps/dashboard && npx tsc --noEmit && npm run test && npm run build
-  all pass; a component test asserts landed rows are collapsed by
-  default and the backlog nav link is present.
+  all pass; component tests assert the default lens excludes landed rows,
+  the Missions lens filters to missions, and the backlog link is present.
