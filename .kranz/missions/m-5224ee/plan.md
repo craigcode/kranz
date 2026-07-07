@@ -1,0 +1,118 @@
+# Mission plan — m-5224ee
+
+**Goal:** Ticket surfaces (REST /api/tickets projection, CLI ticket list/show, Slack, and the dashboard BacklogPanel) distinguish Delivered (mission complete-but-unmerged) from Landed (mission branch merged into base) by reusing the existing merged-ancestor probe, instead of collapsing both into `done`.
+
+Branch `kranz/mission-m-5224ee` (from `main`). Approved plan of record; the machine-readable twin is [plan.json](plan.json). Live status: `kranz status` or the dashboard.
+
+## Cost estimate
+
+Estimated **$8.87 – $44.35** (expected ~$17.74). Rough estimate — live usage is authoritative; based on 36 completed mission(s).
+
+## Validation contract
+
+Defined before any feature; gates mission completion.
+
+- **[a1]** The ticket projection reports a completed-but-UNMERGED mission's ticket as Delivered (merged=false) and a completed-and-MERGED mission's ticket as Landed (merged=true), at both the engine helper and the /api/tickets (list and show) REST layer. 
+  `cargo test --workspace ticket_projection_merged 2>&1 | grep -qE 'result: ok\. [1-9][0-9]* passed'`
+- **[a2]** CLI `kranz ticket list`/`show` render DELIVERED for a Done ticket whose mission is unmerged and LANDED when merged (or when there is no linked mission), instead of a single DONE label. 
+  `cargo test --workspace cli_ticket_delivered_landed 2>&1 | grep -qE 'result: ok\. [1-9][0-9]* passed'`
+- **[a3]** The Slack ticket surfaces (`/kranz ticket list` and `show`) render Delivered vs Landed for a completed ticket based on merge status, instead of the collapsed `Done`. 
+  `cargo test --workspace slack_ticket_delivered_landed 2>&1 | grep -qE 'result: ok\. [1-9][0-9]* passed'`
+- **[a4]** The dashboard BacklogPanel renders a done-but-unmerged ticket with a delivered/UNMERGED indicator distinct from a landed ticket, rather than a bare `done` pill. 
+  `npm --prefix apps/dashboard test -- BacklogPanel 2>&1 | grep -qE '[1-9][0-9]* passed'`
+- **[a5]** The full Rust workspace still builds and all tests pass (no regression to mission-row merged detection or existing ticket behavior). 
+  `cargo test --workspace`
+- **[a6]** The dashboard test suite still passes as a whole (no regression to PipelineView or other components). 
+  `npm --prefix apps/dashboard test`
+- **[a7]** The Delivered/Landed derivation reuses the existing git_ops::is_ancestor / merged_bit probe and introduces no new git-subprocess or ancestry logic; the probe exists as a single shared engine function used by both mission rows and tickets. *(agent judgement)*
+
+## Milestone 1 — Ticket projection carries the live merged bit
+
+### 1.1 Shared engine merge-ancestry derivation for tickets
+
+Add the shared merge-ancestry derivation to the kranz-engine crate so both mission rows and tickets reuse ONE probe (no new git logic).
+
+1) Lift `merged_bit` out of `crates/server/src/rest.rs:79-89` into kranz-engine as a public function — e.g. a new module `crates/engine/src/merged.rs` (add `pub mod merged;` to `crates/engine/src/lib.rs`): `pub fn merged_bit(repo: &GitRepo, mission: &Mission) -> Option<bool>`. Keep the logic VERBATIM: return None if `!repo.branch_exists(&mission.mission_branch)?`; else `repo.is_ancestor(&repo.rev_parse(&mission.mission_branch)?, &repo.rev_parse(&mission.base_branch)?).ok()`. It reuses the existing git_ops primitives (`branch_exists`, `rev_parse`, `is_ancestor` at crates/engine/src/git_ops.rs:97/113/134). Do not change its behavior.
+
+2) Add `pub fn ticket_merged(repo_root: &Path, slug: &str) -> Option<bool>` that returns the merge status ONLY when the Delivered/Landed split applies: read `Ticket::read_state(repo_root, slug)`; if it is not `TicketState::Done`, return None. Resolve the linked mission via `Ticket::mission_for(repo_root, slug)`; if None, return None. Load the mission state: `let paths = MissionPaths::new(repo_root, &mission_id);` if `!paths.events_file().is_file()` return None, then `reducer::fold(&EventLog::read_events(&paths.events_file())?)` — on any read/fold error return None. If `state.mission.status != MissionStatus::Complete` (e.g. Abandoned/Failed) return None. Then `let repo = GitRepo::open(repo_root).ok()?;` and return `merged_bit(&repo, &state.mission)`.
+
+Caller semantics (document in the fn): `Some(false)` => Delivered (complete-but-unmerged); `Some(true)` => Landed (merged); `None` => split not applicable — callers treat a Done ticket with None as Landed (direct-fixed / dead or unloadable mission). This mirrors `apps/dashboard/src/lib/pipelineStage.ts:87-96` exactly.
+
+Tests: name each so it contains the substring `ticket_projection_merged` (a mission-wide contract command greps for it). Use a tempdir git repo and reuse the existing helpers/fixtures in `crates/engine/tests/git_ops_test.rs:873+` and `crates/engine/tests/merge_test.rs` for building commits/branches and folding a mission event log — do NOT hand-roll git. Cover: (a) Done ticket whose linked Complete mission branch is NOT an ancestor of base => Some(false); (b) same but branch merged (is an ancestor of base) => Some(true); (c) Done ticket with no linked mission => None; (d) Done ticket whose mission is Abandoned => None; (e) a non-Done ticket (e.g. Queued) => None.
+
+Run `cargo fmt` and `cargo clippy` before finishing — CI gates fmt and a prior mission lost a full respawn for skipping it.
+
+Done when:
+- `cargo test --workspace ticket_projection_merged` passes with engine unit tests covering: Done+unmerged→Some(false), Done+merged→Some(true), Done+no-mission→None, Done+abandoned-mission→None, non-Done→None.
+- The derivation calls git_ops::is_ancestor via the lifted merged_bit; no new `git` subprocess or ancestry logic is introduced.
+- `cargo fmt --check` and `cargo clippy` are clean.
+
+### 1.2 Surface the merged bit on /api/tickets and de-duplicate the probe
+
+Wire the engine derivation into the server so the ticket PROJECTION carries the live merged bit, and remove the duplicate probe.
+
+1) In `crates/server/src/rest.rs`: delete the private `merged_bit` (rest.rs:79-89) and call the engine's lifted function (from the module F1.1 created) inside `list_missions` (rest.rs:56-58). Behavior must remain byte-identical — the existing `/api/missions` `merged` tests must still pass unchanged.
+
+2) In `crates/server/src/tickets.rs`: extend BOTH `ticket_summary_json` (tickets.rs:132) and `ticket_full_json` (tickets.rs:147) to add a `"merged"` field: `"merged": kranz_engine::ticket::ticket_merged(repo_root, &ticket.slug)`. serde renders `Option<bool>` as `true`/`false`/`null`, exactly mirroring `/api/missions`'s `merged`. Leave the existing `"state"` field unchanged and unrenamed — the dashboard PipelineView still derives from raw `state`; do not repurpose it.
+
+Tests: name them to contain the substring `ticket_projection_merged`, in the `#[cfg(test)]` module of tickets.rs (follow the existing tempdir + `oneshot` request patterns there). Build a ticket in `Done` state (`Ticket::write_state(.., TicketState::Done, None)`) linked to a mission (`Ticket::record_mission`) whose event log folds to a Complete mission with an UNMERGED branch, and assert both `GET /api/tickets` (the matching list row) and `GET /api/tickets/:slug` report `merged == false`; with a merged mission → `merged == true`; a `New`/unlinked ticket → `merged == null`. Reuse the mission-event-log/git fixtures the existing `/api/missions` merged tests use so you don't hand-roll git.
+
+Run `cargo fmt` and `cargo clippy` before finishing.
+
+Done when:
+- `cargo test --workspace ticket_projection_merged` passes, including server REST tests asserting `/api/tickets` list AND show report merged=false for a Done ticket on an unmerged mission, merged=true when merged, and merged=null for a new/unlinked ticket.
+- Existing `/api/missions` merged tests still pass (list_missions now uses the engine merged_bit; behavior unchanged).
+- The server crate no longer defines its own merged_bit — the ancestry probe is the single shared engine function.
+
+
+## Milestone 2 — Every ticket surface renders Delivered vs Landed
+
+### 2.1 CLI ticket list/show render Delivered vs Landed
+
+Make `kranz ticket list` and `kranz ticket show` render Delivered vs Landed for completed tickets, reusing the engine derivation.
+
+In `crates/cli/src/backlog.rs`: when a ticket row's read state is `TicketState::Done`, consult `kranz_engine::ticket::ticket_merged(repo, slug)` and render `DELIVERED` when it is `Some(false)` and `LANDED` when `Some(true)` or `None`. Keep every non-Done label exactly as today (`ticket_state_label`, backlog.rs:63-74). The row builder at backlog.rs:245-258 already has the repo path + slug; compute the resolved terminal label there (or thread repo/slug into the renderer) so `render_ticket_list` shows the split.
+
+Also address the duplicated label map at `crates/engine/src/deps.rs:189-200` (a second `ticket_state_label` copy mapping `Done => "DONE"`): if that copy feeds any user-facing terminal label, apply the same Delivered/Landed split or route both through one shared helper so they cannot diverge; if it is only used for internal/non-terminal messaging, leave it but add a one-line comment noting the CLI terminal split lives in backlog.rs.
+
+Tests: name them to contain the substring `cli_ticket_delivered_landed`, in the crate's test module using a tempdir repo and the engine test fixtures for building the mission/branches. Cover: Done+unmerged→`DELIVERED`, Done+merged→`LANDED`, Done+no-mission→`LANDED`, and that a non-terminal state (e.g. Queued) label is unchanged.
+
+Run `cargo fmt` and `cargo clippy` before finishing.
+
+Done when:
+- `cargo test --workspace cli_ticket_delivered_landed` passes: Done+unmerged → DELIVERED, Done+merged → LANDED, Done+no-mission → LANDED in the ticket list/show rendering.
+- Non-terminal state labels (NEW/DRAFTING/NEEDS-CONTEXT/REVIEW/QUEUED/RUNNING/FAILED) are unchanged.
+- `cargo fmt --check` and `cargo clippy` are clean.
+
+### 2.2 Slack ticket list/show render Delivered vs Landed
+
+Make the Slack ticket surfaces render Delivered vs Landed for completed tickets.
+
+In `crates/slack/src/bridge.rs`: `build_ticket_list_reply` (bridge.rs:2271-2286, state built ~2277-2280) and `build_ticket_show_reply` (bridge.rs:2293-2317, state ~2307) currently set the display state to `format!("{:?}", Ticket::read_state(..))`. For a `Done` ticket, replace the display state with `Delivered` when `kranz_engine::ticket::ticket_merged(repo_root, slug)` is `Some(false)` and `Landed` when `Some(true)` or `None`; render all non-Done states as today. The resulting strings flow into `crates/slack/src/format.rs` (`build_ticket_list` ~645-668, `build_ticket_show` ~672-673) — pass the resolved label through; no other format-layer change is required.
+
+Do NOT change the App Home `ticket_is_open` filter (bridge.rs:2646) or any ticket visibility/filtering — visibility is explicitly out of scope for this mission. This feature only relabels the surfaces that already display completed tickets.
+
+Tests: name them to contain the substring `slack_ticket_delivered_landed`, tempdir repo + engine fixtures. Cover: build_ticket_list_reply and build_ticket_show_reply for a Done ticket on an unmerged mission yield `Delivered`; merged → `Landed`; no linked mission → `Landed`.
+
+Run `cargo fmt` and `cargo clippy` before finishing.
+
+Done when:
+- `cargo test --workspace slack_ticket_delivered_landed` passes: `/kranz ticket list` and `show` render Delivered for a Done+unmerged ticket and Landed for Done+merged and Done+no-mission.
+- App Home ticket filtering (`ticket_is_open`) and all other visibility logic are unchanged.
+- `cargo fmt --check` and `cargo clippy` are clean.
+
+### 2.3 Dashboard BacklogPanel renders Delivered vs Landed
+
+Make the dashboard BacklogPanel distinguish Delivered from Landed for completed tickets. Today it renders a raw `pill-${t.state}` with the collapsed `done` (apps/dashboard/src/components/BacklogPanel.tsx:28-31).
+
+`GET /api/tickets` now returns a `merged: boolean | null` field per ticket row (added in the M1 server feature). Add `merged` to the Ticket type in `apps/dashboard/src/lib/types.ts` (and wherever the ticket row is typed in `api.ts`/`store.ts`). For a ticket whose `state === 'done'`, render a distinct label/pill: `delivered` (with the existing UNMERGED badge convention used in PipelineView) when `merged === false`, and `landed` when `merged === true` or `merged === null`. Prefer reusing the existing derivation in `apps/dashboard/src/lib/pipelineStage.ts` (construct a TicketWorkItem and call `pipelineStage`, as PipelineView does) OR derive directly from the `merged` bit — either way the split must match pipelineStage semantics (pipelineStage.ts:87-96: merged true→landed, false→delivered, null→landed). Reuse the existing `.pill-delivered`/`.pill-landed` styles (styles.css:367-372).
+
+Tests: add them to `apps/dashboard/src/components/BacklogPanel.test.tsx` (so the `BacklogPanel` file filter runs them). Assert on rendered text/class (DOM presence — jsdom does no layout): a done ticket row with `merged:false` shows the delivered/UNMERGED indicator and NOT a bare `done` pill; with `merged:true` shows landed; with `merged:null` shows landed.
+
+Run `npm --prefix apps/dashboard test` and the type-check/build before finishing.
+
+Done when:
+- `npm --prefix apps/dashboard test -- BacklogPanel` passes: a done+unmerged (merged:false) ticket renders a delivered/UNMERGED indicator distinct from a landed (merged:true) one, and neither renders the bare `done` pill.
+- The delivered/landed split matches pipelineStage semantics (merged true→landed, false→delivered, null→landed).
+- `tsc` build passes with the Ticket type extended to include the new `merged` field.
+

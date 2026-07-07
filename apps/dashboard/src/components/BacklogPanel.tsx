@@ -16,7 +16,13 @@ export function BacklogPanel() {
     void loadTickets();
   }, [loadTickets]);
 
-  const row = (t: TicketSummary) => (
+  const row = (t: TicketSummary) => {
+    // Mirrors the CLI/Slack ticket surfaces: only merged===false is
+    // Delivered; merged===true or merged===null (no mission / unprobable) is
+    // Landed — matches pipelineStage.ts's done-state semantics.
+    const stage = t.state === 'done' ? (t.merged === false ? 'delivered' : 'landed') : t.state;
+
+    return (
     <li key={t.slug} className="picker-item">
       <button
         type="button"
@@ -25,10 +31,15 @@ export function BacklogPanel() {
           window.location.hash = `#/backlog/${encodeURIComponent(t.slug)}`;
         }}
       >
-        <span className={`status-pill pill-${t.state}`}>
+        <span className={`status-pill pill-${stage}`}>
           <span className="status-dot" aria-hidden="true" />
-          {t.state}
+          {stage}
         </span>
+        {stage === 'delivered' && (
+          <span className="unmerged-badge" title="mission complete, not yet merged">
+            UNMERGED
+          </span>
+        )}
         <span className="mono picker-id">{t.slug}</span>
         <span className="dim">p{t.priority}</span>
         <span className="picker-goal">{t.title}</span>
@@ -49,7 +60,8 @@ export function BacklogPanel() {
           ))}
       </button>
     </li>
-  );
+    );
+  };
 
   return (
     <div className="picker">

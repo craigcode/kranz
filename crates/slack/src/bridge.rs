@@ -2274,15 +2274,30 @@ pub fn build_ticket_list_reply(repo_root: &Path) -> Vec<Value> {
         .map(|t| crate::format::TicketRow {
             slug: t.slug.clone(),
             priority: t.priority,
-            state: format!(
-                "{:?}",
-                kranz_engine::ticket::Ticket::read_state(repo_root, &t.slug)
-            ),
+            state: ticket_terminal_state_label(repo_root, &t.slug),
             title: t.title.clone(),
             blocked_by: t.blocked_by.clone(),
         })
         .collect();
     crate::format::build_ticket_list(&rows)
+}
+
+/// A ticket's display-state label, splitting `Done` into `Delivered`
+/// (mission complete but its branch is not yet merged into base) vs
+/// `Landed` (mission branch merged, or no mission-merge information to
+/// distinguish otherwise) — reusing the engine's merged-ancestor probe
+/// ([`kranz_engine::ticket::ticket_merged`]) so this can never drift from
+/// the REST `/api/tickets` projection or the CLI's `ticket_terminal_label`.
+/// Non-`Done` states render exactly as `{:?}` did before.
+fn ticket_terminal_state_label(repo_root: &Path, slug: &str) -> String {
+    let state = kranz_engine::ticket::Ticket::read_state(repo_root, slug);
+    if state != kranz_engine::ticket::TicketState::Done {
+        return format!("{state:?}");
+    }
+    match kranz_engine::merged::ticket_merged(repo_root, slug) {
+        Some(false) => "Delivered".to_string(),
+        Some(true) | None => "Landed".to_string(),
+    }
 }
 
 /// `/kranz ticket show <slug>` reply: the ticket's detail via
@@ -2304,7 +2319,7 @@ pub fn build_ticket_show_reply(repo_root: &Path, slug: &str) -> Vec<Value> {
         Ok(t) => t,
         Err(e) => return error_blocks(&format!("Couldn't read ticket `{slug}`: {e}")),
     };
-    let state = format!("{:?}", Ticket::read_state(repo_root, slug));
+    let state = ticket_terminal_state_label(repo_root, slug);
     let detail = crate::format::TicketDetail {
         slug: ticket.slug.clone(),
         title: ticket.title.clone(),
@@ -2835,6 +2850,7 @@ fn slugify(title: &str) -> String {
 mod tests {
     use super::*;
     use kranz_engine::queue;
+    use std::sync::Once;
     use tempfile::TempDir;
 
     #[test]
@@ -3936,5 +3952,223 @@ mod tests {
         // Nothing was acked or dedup-recorded: the disconnect frame carries no
         // envelope_id, and it must never reach `parse_envelope`/dispatch.
         assert!(seen.set.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // slack_ticket_delivered_landed — Delivered/Landed split on the Slack
+    // ticket list/show renderers, mirroring
+    // `kranz_cli::backlog`'s `cli_ticket_delivered_landed_*` tests so the
+    // Slack surface can never drift from the CLI/REST projection.
+    // -----------------------------------------------------------------
+
+    static GIT_ENV_ISOLATION: Once = Once::new();
+
+    /// Mask the host's global/system git config so identity, signing, and
+    /// hooks never leak into the throwaway repos (mirrors
+    /// `crates/engine/tests/merged_test.rs::isolate_git_env`).
+    fn isolate_git_env() {
+        GIT_ENV_ISOLATION.call_once(|| {
+            let missing = std::env::temp_dir().join(format!(
+                "kranz-slack-bridge-test-no-config-{}",
+                std::process::id()
+            ));
+            std::env::set_var("GIT_CONFIG_GLOBAL", &missing);
+            std::env::set_var("GIT_CONFIG_SYSTEM", &missing);
+            if let Ok(ceiling) = std::fs::canonicalize(std::env::temp_dir()) {
+                std::env::set_var("GIT_CEILING_DIRECTORIES", ceiling);
+            }
+        });
+    }
+
+    fn git_available() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn setup_git() -> bool {
+        isolate_git_env();
+        if git_available() {
+            true
+        } else {
+            eprintln!("skipping test: git is not on PATH");
+            false
+        }
+    }
+
+    fn raw_git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Fresh repo on branch `main` with one seed commit; returns
+    /// (tempdir, canonicalized root, seed commit sha).
+    fn init_git_repo() -> (TempDir, PathBuf, String) {
+        let dir = TempDir::new().unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(dir.path())
+            .output()
+            .expect("spawn git init");
+        if !init.status.success() {
+            raw_git(dir.path(), &["init"]);
+            raw_git(dir.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        }
+        raw_git(dir.path(), &["config", "user.name", "test"]);
+        raw_git(dir.path(), &["config", "user.email", "test@example.com"]);
+        std::fs::write(dir.path().join("README.md"), "seed\n").unwrap();
+        raw_git(dir.path(), &["add", "-A"]);
+        raw_git(dir.path(), &["commit", "-m", "seed"]);
+        let root = std::fs::canonicalize(dir.path()).expect("canonicalize repo root");
+        let sha = {
+            let out = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&root)
+                .output()
+                .expect("rev-parse HEAD");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        (dir, root, sha)
+    }
+
+    /// Create a Done ticket linked to `mission_id`, with the mission's branch
+    /// branched off `base_sha` and (optionally) merged back into `main`
+    /// before the mission's events are written as Complete.
+    fn scaffold_done_ticket_with_mission(
+        repo_root: &Path,
+        slug: &str,
+        mission_id: &str,
+        base_sha: &str,
+        merge_into_base: bool,
+    ) {
+        use kranz_engine::ticket::{Ticket, TicketState};
+        Ticket::scaffold(repo_root, slug, "fixture ticket", None, None).unwrap();
+        Ticket::write_state(repo_root, slug, TicketState::Done, None).unwrap();
+        Ticket::record_mission(repo_root, slug, mission_id).unwrap();
+
+        let branch = format!("kranz/mission-{mission_id}");
+        raw_git(repo_root, &["checkout", "-b", &branch, base_sha]);
+        std::fs::write(repo_root.join("feature.txt"), "new feature\n").unwrap();
+        raw_git(repo_root, &["add", "--", "feature.txt"]);
+        raw_git(repo_root, &["commit", "-m", "add feature"]);
+        raw_git(repo_root, &["checkout", "main"]);
+        if merge_into_base {
+            raw_git(repo_root, &["merge", "--no-ff", "--no-edit", &branch]);
+        }
+
+        seed_completed_mission_on_branch(repo_root, mission_id, &branch);
+    }
+
+    /// Like [`seed_completed_mission`], but with a caller-chosen mission
+    /// branch (so it lines up with the branch actually created in git).
+    fn seed_completed_mission_on_branch(repo_root: &Path, mission_id: &str, branch: &str) {
+        use kranz_engine::events::{Event, EventKind};
+        use kranz_engine::types::MissionConfig;
+        let paths = MissionPaths::new(repo_root, mission_id);
+        std::fs::create_dir_all(paths.mission_dir()).unwrap();
+        let created = Event {
+            seq: 1,
+            ts: chrono::Utc::now(),
+            mission_id: mission_id.to_string(),
+            kind: EventKind::MissionCreated {
+                goal: "goal".into(),
+                base_branch: "main".into(),
+                mission_branch: branch.to_string(),
+                config: MissionConfig::default(),
+            },
+        };
+        let completed = Event {
+            seq: 2,
+            ts: chrono::Utc::now(),
+            mission_id: mission_id.to_string(),
+            kind: EventKind::MissionCompleted {},
+        };
+        std::fs::write(
+            paths.events_file(),
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&created).unwrap(),
+                serde_json::to_string(&completed).unwrap()
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn slack_ticket_delivered_landed_when_done_and_unmerged() {
+        if !setup_git() {
+            return;
+        }
+        let (_dir, repo_root, base_sha) = init_git_repo();
+        scaffold_done_ticket_with_mission(&repo_root, "unmerged", "m-unmerged", &base_sha, false);
+
+        let list_text = serde_json::to_string(&build_ticket_list_reply(&repo_root)).unwrap();
+        assert!(
+            list_text.contains("Delivered"),
+            "ticket list should show Delivered for a Done+unmerged ticket: {list_text}"
+        );
+
+        let show_text =
+            serde_json::to_string(&build_ticket_show_reply(&repo_root, "unmerged")).unwrap();
+        assert!(
+            show_text.contains("Delivered"),
+            "ticket show should show Delivered for a Done+unmerged ticket: {show_text}"
+        );
+    }
+
+    #[test]
+    fn slack_ticket_delivered_landed_when_done_and_merged() {
+        if !setup_git() {
+            return;
+        }
+        let (_dir, repo_root, base_sha) = init_git_repo();
+        scaffold_done_ticket_with_mission(&repo_root, "merged", "m-merged", &base_sha, true);
+
+        let list_text = serde_json::to_string(&build_ticket_list_reply(&repo_root)).unwrap();
+        assert!(
+            list_text.contains("Landed"),
+            "ticket list should show Landed for a Done+merged ticket: {list_text}"
+        );
+
+        let show_text =
+            serde_json::to_string(&build_ticket_show_reply(&repo_root, "merged")).unwrap();
+        assert!(
+            show_text.contains("Landed"),
+            "ticket show should show Landed for a Done+merged ticket: {show_text}"
+        );
+    }
+
+    #[test]
+    fn slack_ticket_delivered_landed_when_done_and_no_mission() {
+        if !setup_git() {
+            return;
+        }
+        let (_dir, repo_root, _base_sha) = init_git_repo();
+        use kranz_engine::ticket::{Ticket, TicketState};
+        Ticket::scaffold(&repo_root, "no-mission", "fixture ticket", None, None).unwrap();
+        Ticket::write_state(&repo_root, "no-mission", TicketState::Done, None).unwrap();
+
+        let list_text = serde_json::to_string(&build_ticket_list_reply(&repo_root)).unwrap();
+        assert!(
+            list_text.contains("Landed"),
+            "ticket list should show Landed for a Done ticket with no linked mission: {list_text}"
+        );
+
+        let show_text =
+            serde_json::to_string(&build_ticket_show_reply(&repo_root, "no-mission")).unwrap();
+        assert!(
+            show_text.contains("Landed"),
+            "ticket show should show Landed for a Done ticket with no linked mission: {show_text}"
+        );
     }
 }

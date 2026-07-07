@@ -75,6 +75,10 @@ export interface TicketSummary {
   blockedBy: string[];
   isBlocked: boolean;
   missionId?: string;
+  /** Ancestry-probe bit: joined mission's branch tip is an ancestor of the
+   *  live base branch tip. `null`/absent when there's no joined mission or
+   *  the probe found nothing to merge yet. */
+  merged?: boolean | null;
 }
 
 /** Full ticket shape from `GET /api/tickets/:slug`. */
@@ -92,6 +96,7 @@ export interface Ticket {
   state: TicketState;
   needsContext: string[];
   missionId?: string;
+  merged?: boolean | null;
 }
 
 // ---------------------------------------------------------------------------

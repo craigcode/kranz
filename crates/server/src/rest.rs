@@ -11,6 +11,7 @@ use axum::Json;
 use kranz_engine::control;
 use kranz_engine::event_log::EventLog;
 use kranz_engine::events::Event;
+use kranz_engine::merged::merged_bit;
 use kranz_engine::paths::MissionPaths;
 use kranz_engine::reducer;
 use kranz_engine::types::{ControlCommand, MissionState};
@@ -69,23 +70,6 @@ pub(crate) async fn list_missions(State(server): State<Arc<ServerState>>) -> Jso
         rows.push(row);
     }
     Json(Value::Array(rows))
-}
-
-/// Whether `mission`'s branch tip is an ancestor of the LIVE base branch tip
-/// (not the pinned `base_sha` — merged-detection tracks whatever the base
-/// branch has absorbed as of now). `None` when there is no mission branch, or
-/// when any ref fails to resolve; a per-mission git failure here must not
-/// fail the whole list.
-fn merged_bit(
-    repo: &kranz_engine::git_ops::GitRepo,
-    mission: &kranz_engine::types::Mission,
-) -> Option<bool> {
-    if !repo.branch_exists(&mission.mission_branch).ok()? {
-        return None;
-    }
-    let mission_tip = repo.rev_parse(&mission.mission_branch).ok()?;
-    let base_tip = repo.rev_parse(&mission.base_branch).ok()?;
-    repo.is_ancestor(&mission_tip, &base_tip).ok()
 }
 
 /// `<repo>/.kranz/missions/index.md` contents, or `""` if the file is absent

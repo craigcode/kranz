@@ -139,6 +139,7 @@ fn ticket_summary_json(repo_root: &std::path::Path, ticket: &Ticket) -> Value {
         "blockedBy": ticket.blocked_by,
         "isBlocked": kranz_engine::deps::is_blocked(repo_root, &ticket.slug).unwrap_or(false),
         "missionId": Ticket::mission_for(repo_root, &ticket.slug),
+        "merged": kranz_engine::merged::ticket_merged(repo_root, &ticket.slug),
     })
 }
 
@@ -160,6 +161,7 @@ fn ticket_full_json(repo_root: &std::path::Path, ticket: &Ticket) -> Value {
         "needsContext": needs_context_questions(&ticket.raw_body),
         "isBlocked": kranz_engine::deps::is_blocked(repo_root, &ticket.slug).unwrap_or(false),
         "missionId": Ticket::mission_for(repo_root, &ticket.slug),
+        "merged": kranz_engine::merged::ticket_merged(repo_root, &ticket.slug),
     })
 }
 
@@ -215,6 +217,15 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt;
+    use kranz_engine::event_log::{EventLog, LockForce};
+    use kranz_engine::events::EventKind;
+    use kranz_engine::paths::MissionPaths;
+    use kranz_engine::ticket::TicketState;
+    use kranz_engine::types::{
+        Assertion, AssertionCheck, MissionConfig, Plan, PlanFeature, PlanMilestone,
+    };
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
     use tempfile::TempDir;
     use tower::ServiceExt;
 
@@ -394,5 +405,280 @@ Ship the thing.
         let json = body_json(get_response).await;
         assert_eq!(json["goal"], "ship the thing");
         assert_eq!(json["context"], "some background");
+    }
+
+    // -----------------------------------------------------------------
+    // `merged` bit on the ticket projection (F1.2)
+    // -----------------------------------------------------------------
+
+    static ENV_ISOLATION: std::sync::Once = std::sync::Once::new();
+
+    /// Mask the host's global/system git config so identity, signing and
+    /// hooks never leak into the throwaway repos (mirrors
+    /// crates/server/tests/server_test.rs's isolate_git_env).
+    fn isolate_git_env() {
+        ENV_ISOLATION.call_once(|| {
+            let missing = std::env::temp_dir().join(format!(
+                "kranz-tickets-test-no-config-{}",
+                std::process::id()
+            ));
+            std::env::set_var("GIT_CONFIG_GLOBAL", &missing);
+            std::env::set_var("GIT_CONFIG_SYSTEM", &missing);
+            if let Ok(ceiling) = std::fs::canonicalize(std::env::temp_dir()) {
+                std::env::set_var("GIT_CEILING_DIRECTORIES", ceiling);
+            }
+        });
+    }
+
+    fn git_available() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn setup() -> bool {
+        isolate_git_env();
+        if git_available() {
+            true
+        } else {
+            eprintln!("skipping test: git is not on PATH");
+            false
+        }
+    }
+
+    fn raw_git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// Fresh repo on branch `main` with one seed commit; returns
+    /// (tempdir, canonicalized root, seed commit sha).
+    fn init_repo() -> (TempDir, PathBuf, String) {
+        let dir = TempDir::new().unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(dir.path())
+            .output()
+            .expect("spawn git init");
+        if !init.status.success() {
+            raw_git(dir.path(), &["init"]);
+            raw_git(dir.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        }
+        raw_git(dir.path(), &["config", "user.name", "test"]);
+        raw_git(dir.path(), &["config", "user.email", "test@example.com"]);
+        std::fs::write(dir.path().join("README.md"), "seed\n").unwrap();
+        raw_git(dir.path(), &["add", "-A"]);
+        raw_git(dir.path(), &["commit", "-m", "seed"]);
+        let root = std::fs::canonicalize(dir.path()).expect("canonicalize repo root");
+        let base_sha = raw_git(&root, &["rev-parse", "HEAD"]).trim().to_string();
+        (dir, root, base_sha)
+    }
+
+    fn sample_plan() -> Plan {
+        Plan {
+            goal: "Ship the demo".into(),
+            validation_contract: vec![Assertion {
+                id: "a-1".into(),
+                statement: "cargo test passes".into(),
+                check: AssertionCheck::Command,
+                command: Some("cargo test".into()),
+            }],
+            milestones: vec![PlanMilestone {
+                title: "M1".into(),
+                features: vec![PlanFeature {
+                    title: "F1".into(),
+                    spec: "build the thing".into(),
+                    validation_criteria: vec!["it works".into()],
+                }],
+            }],
+            command_grants: vec![],
+            touch_set: vec![],
+        }
+    }
+
+    /// Seed a mission whose plan is approved (base_sha pinned to the repo's
+    /// seed commit) and whose event log then folds to `MissionStatus::Complete`.
+    /// When `create_branch` and `merge_into_base` are both true, the mission
+    /// branch is merged into `main` before the events are appended.
+    fn seed_complete_mission(
+        repo_root: &Path,
+        id: &str,
+        base_sha: &str,
+        create_branch: bool,
+        merge_into_base: bool,
+    ) {
+        let paths = MissionPaths::new(repo_root, id);
+        let branch = format!("kranz/mission-{id}");
+        let mut log = EventLog::acquire(&paths, id, Duration::ZERO, LockForce::No).unwrap();
+        log.append(EventKind::MissionCreated {
+            goal: "Ship the demo".into(),
+            base_branch: "main".into(),
+            mission_branch: branch.clone(),
+            config: MissionConfig::default(),
+        })
+        .unwrap();
+        log.append(EventKind::PlanApproved {
+            plan: sample_plan(),
+            base_sha: Some(base_sha.to_string()),
+        })
+        .unwrap();
+        log.append(EventKind::MissionCompleted {}).unwrap();
+        drop(log);
+
+        if create_branch {
+            raw_git(repo_root, &["checkout", "-b", &branch, base_sha]);
+            std::fs::write(repo_root.join("feature.txt"), "new feature\n").unwrap();
+            raw_git(repo_root, &["add", "--", "feature.txt"]);
+            raw_git(repo_root, &["commit", "-m", "add feature"]);
+            raw_git(repo_root, &["checkout", "main"]);
+            if merge_into_base {
+                raw_git(repo_root, &["merge", "--no-ff", "--no-edit", &branch]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ticket_projection_merged_false_for_done_ticket_on_unmerged_mission() {
+        if !setup() {
+            return;
+        }
+        let (_dir, repo_root, base_sha) = init_repo();
+        write_ticket(&repo_root, "unmerged-work");
+        Ticket::record_mission(&repo_root, "unmerged-work", "m-unmerged").unwrap();
+        Ticket::write_state(&repo_root, "unmerged-work", TicketState::Done, None).unwrap();
+        seed_complete_mission(&repo_root, "m-unmerged", &base_sha, true, false);
+
+        let app = crate::router(repo_root.clone(), None);
+
+        let list_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tickets")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let rows = body_json(list_response).await;
+        let row = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["slug"] == "unmerged-work")
+            .expect("ticket present in list");
+        assert_eq!(row["merged"], false);
+
+        let show_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tickets/unmerged-work")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(show_response.status(), StatusCode::OK);
+        let json = body_json(show_response).await;
+        assert_eq!(json["merged"], false);
+    }
+
+    #[tokio::test]
+    async fn ticket_projection_merged_true_for_done_ticket_on_merged_mission() {
+        if !setup() {
+            return;
+        }
+        let (_dir, repo_root, base_sha) = init_repo();
+        write_ticket(&repo_root, "merged-work");
+        Ticket::record_mission(&repo_root, "merged-work", "m-merged").unwrap();
+        Ticket::write_state(&repo_root, "merged-work", TicketState::Done, None).unwrap();
+        seed_complete_mission(&repo_root, "m-merged", &base_sha, true, true);
+
+        let app = crate::router(repo_root.clone(), None);
+
+        let list_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tickets")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let rows = body_json(list_response).await;
+        let row = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["slug"] == "merged-work")
+            .expect("ticket present in list");
+        assert_eq!(row["merged"], true);
+
+        let show_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tickets/merged-work")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(show_response.status(), StatusCode::OK);
+        let json = body_json(show_response).await;
+        assert_eq!(json["merged"], true);
+    }
+
+    #[tokio::test]
+    async fn ticket_projection_merged_null_for_new_unlinked_ticket() {
+        let tmp = TempDir::new().unwrap();
+        write_ticket(tmp.path(), "fresh");
+        let app = crate::router(tmp.path().to_path_buf(), None);
+
+        let list_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tickets")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let rows = body_json(list_response).await;
+        let row = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["slug"] == "fresh")
+            .expect("ticket present in list");
+        assert!(row["merged"].is_null());
+
+        let show_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tickets/fresh")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(show_response.status(), StatusCode::OK);
+        let json = body_json(show_response).await;
+        assert!(json["merged"].is_null());
     }
 }

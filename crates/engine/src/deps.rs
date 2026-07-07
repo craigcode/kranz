@@ -186,6 +186,9 @@ pub fn approve_ticket(
 /// UPPERCASE label for a ticket pipeline state, matching
 /// `kranz_cli::backlog::ticket_state_label` — duplicated here (rather than
 /// depended on) since the CLI crate depends on this one, not the reverse.
+/// Only feeds internal error messaging (never a terminal/Done label surfaced
+/// to an operator); the CLI's Delivered/Landed split for `Done` lives
+/// entirely in `kranz_cli::backlog::ticket_terminal_label`.
 fn ticket_state_label(state: TicketState) -> &'static str {
     match state {
         TicketState::New => "NEW",

@@ -347,9 +347,12 @@ fn render_ticket_list_from_tempdir() {
     let tickets = Ticket::list(repo);
     let rows: Vec<TicketRow<'_>> = tickets
         .iter()
-        .map(|t| TicketRow {
-            ticket: t,
-            state: Ticket::read_state(repo, &t.slug),
+        .map(|t| {
+            let state = Ticket::read_state(repo, &t.slug);
+            TicketRow {
+                ticket: t,
+                label: backlog::ticket_terminal_label(repo, &t.slug, state),
+            }
         })
         .collect();
     let out = render_ticket_list(&rows);
@@ -377,7 +380,10 @@ fn render_ticket_show_includes_sections_and_needs_context() {
          ## Needs context (from orchestrator)\n- which module?\n",
     )
     .unwrap();
-    let out = render_ticket_show(&ticket, TicketState::NeedsContext);
+    let out = render_ticket_show(
+        &ticket,
+        backlog::ticket_state_label(TicketState::NeedsContext),
+    );
 
     assert!(out.contains("ticket demo [NEEDS-CONTEXT]"));
     assert!(out.contains("build it"));
@@ -575,7 +581,10 @@ fn state_transitions_needs_context_appends_and_flags() {
     let reloaded = Ticket::load(&Ticket::tickets_dir(repo).join("under.md")).unwrap();
     assert!(reloaded.raw_body.contains("what deps?"));
     // And `show` surfaces it.
-    let shown = render_ticket_show(&reloaded, TicketState::NeedsContext);
+    let shown = render_ticket_show(
+        &reloaded,
+        backlog::ticket_state_label(TicketState::NeedsContext),
+    );
     assert!(shown.contains("what deps?"));
 }
 
