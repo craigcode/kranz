@@ -64,3 +64,18 @@ validate.
   fallback decisions when a selected backend is unavailable at spawn.
 - cargo test --workspace green; stub-backend tests cover selection per
   role.
+
+## Resilience note (operator, 2026-07-06)
+
+Factory Max via DroidBackend is a SECOND independent auth+billing lane
+for Fable-class power (claude-fable-5) — decoupled from the Claude/Max
+credential path. Value beyond cost arbitrage: continuity when the Claude
+lane is rate-limited OR its auth breaks (see the 2026-07-06 auth-
+starvation incident, fix-worker-env-hygiene-starves-auth, where a single
+credential-path failure zeroed every mission). Design implication: any
+auto-fallback between lanes MUST be health-checked (verify the target
+lane authenticates and produces output before trusting it) and record
+the switch as a loud decision — never a silent backend swap, which would
+reproduce exactly the silent-failure mode that made tonight's outage
+invisible. Explicit per-role routing is the floor; health-checked
+fallback is the opt-in ceiling.
