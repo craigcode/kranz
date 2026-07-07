@@ -1,5 +1,6 @@
 //! Integration tests for the mock agent backend (plan §8 "the seam").
 
+use kranz_engine::auth_verify::AuthVerdict;
 use kranz_engine::backend::{
     AgentBackend, AgentEvent, AgentSession, PromptMode, SessionExit, SessionSpec,
 };
@@ -435,6 +436,7 @@ async fn worker_session_carries_configured_tools_onto_the_spec() {
         None,
         None,
         &[],
+        AuthVerdict::Inconclusive,
     )
     .await
     .unwrap();

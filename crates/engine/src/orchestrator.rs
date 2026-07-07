@@ -36,6 +36,7 @@
 //! branch at approval (plan §4.4). This keeps the §4.4 dirty-tree discipline
 //! meaningful: a dirty tree after a worker run is *worker* dirt.
 
+use crate::auth_verify::AuthVerdict;
 use crate::backend::{AgentBackend, AgentEvent, AgentSession, PromptMode, SessionSpec};
 use crate::config;
 use crate::contract_sweep;
@@ -1688,6 +1689,7 @@ impl MissionEngine {
                     &session_cwd,
                     base_sha.as_deref(),
                     &grants,
+                    AuthVerdict::Inconclusive,
                 )
                 .await
             } else {
@@ -1703,6 +1705,7 @@ impl MissionEngine {
                     Some(cancel),
                     base_sha.as_deref(),
                     &grants,
+                    AuthVerdict::Inconclusive,
                 )
                 .await
             };
