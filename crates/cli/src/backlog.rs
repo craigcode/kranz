@@ -73,10 +73,28 @@ pub fn ticket_state_label(state: TicketState) -> &'static str {
     }
 }
 
-/// One row of the `kranz ticket list` table: the ticket plus its read state.
+/// A ticket's terminal-state label, splitting `Done` into `DELIVERED`
+/// (mission complete but its branch is not yet merged into base) vs
+/// `LANDED` (mission branch merged, or no mission-merge information to
+/// distinguish otherwise) — reusing the engine's merged-ancestor probe
+/// ([`kranz_engine::merged::ticket_merged`]) so this can never drift from the
+/// REST `/api/tickets` projection. Non-`Done` states render exactly as
+/// [`ticket_state_label`].
+pub fn ticket_terminal_label(repo: &Path, slug: &str, state: TicketState) -> &'static str {
+    if state != TicketState::Done {
+        return ticket_state_label(state);
+    }
+    match kranz_engine::merged::ticket_merged(repo, slug) {
+        Some(false) => "DELIVERED",
+        Some(true) | None => "LANDED",
+    }
+}
+
+/// One row of the `kranz ticket list` table: the ticket plus its resolved
+/// terminal label (already split into DELIVERED/LANDED for a Done ticket).
 pub struct TicketRow<'a> {
     pub ticket: &'a Ticket,
-    pub state: TicketState,
+    pub label: &'static str,
 }
 
 /// Render the `kranz ticket list` table: slug, priority, state, title.
@@ -90,12 +108,7 @@ pub fn render_ticket_list(rows: &[TicketRow<'_>]) -> String {
         .max()
         .unwrap_or(4)
         .max(4);
-    let state_w = rows
-        .iter()
-        .map(|r| ticket_state_label(r.state).len())
-        .max()
-        .unwrap_or(5)
-        .max(5);
+    let state_w = rows.iter().map(|r| r.label.len()).max().unwrap_or(5).max(5);
     let mut out = String::new();
     out.push_str(&format!(
         "{:<slug_w$}  {:<3}  {:<state_w$}  {}\n",
@@ -106,22 +119,18 @@ pub fn render_ticket_list(rows: &[TicketRow<'_>]) -> String {
             "{:<slug_w$}  {:<3}  {:<state_w$}  {}\n",
             row.ticket.slug,
             row.ticket.priority,
-            ticket_state_label(row.state),
+            row.label,
             output::one_line(&row.ticket.title, 60),
         ));
     }
     out
 }
 
-/// Render `kranz ticket show <slug>`: the parsed ticket, its state, and any
-/// "needs context" block appended to the ticket body.
-pub fn render_ticket_show(ticket: &Ticket, state: TicketState) -> String {
+/// Render `kranz ticket show <slug>`: the parsed ticket, its resolved
+/// terminal label, and any "needs context" block appended to the ticket body.
+pub fn render_ticket_show(ticket: &Ticket, label: &str) -> String {
     let mut out = String::new();
-    out.push_str(&format!(
-        "ticket {} [{}]\n",
-        ticket.slug,
-        ticket_state_label(state)
-    ));
+    out.push_str(&format!("ticket {} [{}]\n", ticket.slug, label));
     out.push_str(&format!("  title:    {}\n", ticket.title));
     out.push_str(&format!("  priority: {}\n", ticket.priority));
     out.push_str(&format!("  schedule: {:?}\n", ticket.schedule));
@@ -240,9 +249,12 @@ pub fn cmd_ticket_list(repo: &Path) -> String {
     let tickets = Ticket::list(repo);
     let rows: Vec<TicketRow<'_>> = tickets
         .iter()
-        .map(|t| TicketRow {
-            ticket: t,
-            state: Ticket::read_state(repo, &t.slug),
+        .map(|t| {
+            let state = Ticket::read_state(repo, &t.slug);
+            TicketRow {
+                ticket: t,
+                label: ticket_terminal_label(repo, &t.slug, state),
+            }
         })
         .collect();
     render_ticket_list(&rows)
@@ -256,7 +268,8 @@ pub fn cmd_ticket_show(repo: &Path, slug: &str) -> Result<String> {
     }
     let ticket = Ticket::load(&path)?;
     let state = Ticket::read_state(repo, slug);
-    Ok(render_ticket_show(&ticket, state))
+    let label = ticket_terminal_label(repo, slug, state);
+    Ok(render_ticket_show(&ticket, label))
 }
 
 /// `kranz queue`.
@@ -549,4 +562,225 @@ async fn drive_mission(repo: PathBuf, mission_id: &str) -> Result<i32> {
         false,
     )
     .await
+}
+
+// ---------------------------------------------------------------------------
+// tests — Delivered/Landed split on the CLI ticket list/show renderer
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kranz_engine::events::{Event, EventKind};
+    use std::sync::Once;
+    use tempfile::TempDir;
+
+    static ENV_ISOLATION: Once = Once::new();
+
+    /// Mask the host's global/system git config (mirrors
+    /// `crates/engine/tests/merged_test.rs::isolate_git_env`) so identity,
+    /// signing, and hooks never leak into the throwaway repos.
+    fn isolate_git_env() {
+        ENV_ISOLATION.call_once(|| {
+            let missing = std::env::temp_dir().join(format!(
+                "kranz-cli-backlog-test-no-config-{}",
+                std::process::id()
+            ));
+            std::env::set_var("GIT_CONFIG_GLOBAL", &missing);
+            std::env::set_var("GIT_CONFIG_SYSTEM", &missing);
+            if let Ok(ceiling) = std::fs::canonicalize(std::env::temp_dir()) {
+                std::env::set_var("GIT_CEILING_DIRECTORIES", ceiling);
+            }
+        });
+    }
+
+    fn git_available() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn setup() -> bool {
+        isolate_git_env();
+        if git_available() {
+            true
+        } else {
+            eprintln!("skipping test: git is not on PATH");
+            false
+        }
+    }
+
+    fn raw_git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Fresh repo on branch `main` with one seed commit; returns
+    /// (tempdir, canonicalized root, seed commit sha).
+    fn init_repo() -> (TempDir, PathBuf, String) {
+        let dir = TempDir::new().unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(dir.path())
+            .output()
+            .expect("spawn git init");
+        if !init.status.success() {
+            raw_git(dir.path(), &["init"]);
+            raw_git(dir.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        }
+        raw_git(dir.path(), &["config", "user.name", "test"]);
+        raw_git(dir.path(), &["config", "user.email", "test@example.com"]);
+        std::fs::write(dir.path().join("README.md"), "seed\n").unwrap();
+        raw_git(dir.path(), &["add", "-A"]);
+        raw_git(dir.path(), &["commit", "-m", "seed"]);
+        let root = std::fs::canonicalize(dir.path()).expect("canonicalize repo root");
+        let sha = {
+            let out = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&root)
+                .output()
+                .expect("rev-parse HEAD");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        (dir, root, sha)
+    }
+
+    fn write_events(repo_root: &Path, mission_id: &str, kinds: Vec<EventKind>) {
+        let dir = repo_root.join(".kranz").join("missions").join(mission_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut lines = String::new();
+        for (i, kind) in kinds.into_iter().enumerate() {
+            let event = Event {
+                seq: (i + 1) as u64,
+                ts: chrono::Utc::now(),
+                mission_id: mission_id.to_string(),
+                kind,
+            };
+            lines.push_str(&serde_json::to_string(&event).unwrap());
+            lines.push('\n');
+        }
+        std::fs::write(dir.join("events.jsonl"), lines).unwrap();
+    }
+
+    fn created(mission_branch: &str) -> EventKind {
+        EventKind::MissionCreated {
+            goal: "fixture mission".to_string(),
+            base_branch: "main".to_string(),
+            mission_branch: mission_branch.to_string(),
+            config: kranz_engine::types::MissionConfig::default(),
+        }
+    }
+
+    /// Create a Done ticket linked to `mission_id`, with the mission's branch
+    /// branched off `base_sha` and (optionally) merged back into `main`
+    /// before the mission's events are written as Complete.
+    fn scaffold_done_ticket_with_mission(
+        repo_root: &Path,
+        slug: &str,
+        mission_id: &str,
+        base_sha: &str,
+        merge_into_base: bool,
+    ) {
+        Ticket::scaffold(repo_root, slug, "fixture ticket", None, None).unwrap();
+        Ticket::write_state(repo_root, slug, TicketState::Done, None).unwrap();
+        Ticket::record_mission(repo_root, slug, mission_id).unwrap();
+
+        let branch = format!("kranz/mission-{mission_id}");
+        raw_git(repo_root, &["checkout", "-b", &branch, base_sha]);
+        std::fs::write(repo_root.join("feature.txt"), "new feature\n").unwrap();
+        raw_git(repo_root, &["add", "--", "feature.txt"]);
+        raw_git(repo_root, &["commit", "-m", "add feature"]);
+        raw_git(repo_root, &["checkout", "main"]);
+        if merge_into_base {
+            raw_git(repo_root, &["merge", "--no-ff", "--no-edit", &branch]);
+        }
+
+        write_events(
+            repo_root,
+            mission_id,
+            vec![created(&branch), EventKind::MissionCompleted {}],
+        );
+    }
+
+    #[test]
+    fn cli_ticket_delivered_landed_when_done_and_unmerged() {
+        if !setup() {
+            return;
+        }
+        let (_dir, repo_root, base_sha) = init_repo();
+        scaffold_done_ticket_with_mission(&repo_root, "unmerged", "m-unmerged", &base_sha, false);
+
+        let label = ticket_terminal_label(&repo_root, "unmerged", TicketState::Done);
+        assert_eq!(label, "DELIVERED");
+
+        let ticket = load_ticket(&repo_root, "unmerged").unwrap();
+        assert!(render_ticket_show(&ticket, label).contains("[DELIVERED]"));
+    }
+
+    #[test]
+    fn cli_ticket_delivered_landed_when_done_and_merged() {
+        if !setup() {
+            return;
+        }
+        let (_dir, repo_root, base_sha) = init_repo();
+        scaffold_done_ticket_with_mission(&repo_root, "merged", "m-merged", &base_sha, true);
+
+        let label = ticket_terminal_label(&repo_root, "merged", TicketState::Done);
+        assert_eq!(label, "LANDED");
+
+        let ticket = load_ticket(&repo_root, "merged").unwrap();
+        assert!(render_ticket_show(&ticket, label).contains("[LANDED]"));
+    }
+
+    #[test]
+    fn cli_ticket_delivered_landed_when_done_and_no_mission() {
+        if !setup() {
+            return;
+        }
+        let (_dir, repo_root, _base_sha) = init_repo();
+        Ticket::scaffold(&repo_root, "no-mission", "fixture ticket", None, None).unwrap();
+        Ticket::write_state(&repo_root, "no-mission", TicketState::Done, None).unwrap();
+
+        let label = ticket_terminal_label(&repo_root, "no-mission", TicketState::Done);
+        assert_eq!(label, "LANDED", "Done with no linked mission => Landed");
+    }
+
+    #[test]
+    fn cli_ticket_delivered_landed_leaves_non_terminal_states_unchanged() {
+        if !setup() {
+            return;
+        }
+        let (_dir, repo_root, _base_sha) = init_repo();
+        Ticket::scaffold(&repo_root, "queued", "fixture ticket", None, None).unwrap();
+        Ticket::write_state(&repo_root, "queued", TicketState::Queued, None).unwrap();
+
+        let label = ticket_terminal_label(&repo_root, "queued", TicketState::Queued);
+        assert_eq!(label, "QUEUED");
+        assert_eq!(label, ticket_state_label(TicketState::Queued));
+
+        for state in [
+            TicketState::New,
+            TicketState::Drafting,
+            TicketState::NeedsContext,
+            TicketState::Review,
+            TicketState::Running,
+            TicketState::Failed,
+        ] {
+            assert_eq!(
+                ticket_terminal_label(&repo_root, "queued", state),
+                ticket_state_label(state),
+                "non-Done state {state:?} must render exactly as ticket_state_label"
+            );
+        }
+    }
 }
