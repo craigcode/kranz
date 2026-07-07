@@ -243,3 +243,111 @@ fn no_merge_mission_outcome_ever_pushes() {
         "still no remote after a merge"
     );
 }
+
+/// Commits `plan.md` and `report.md` under `.kranz/missions/<id>/` on a new
+/// mission branch off `seed`, mirroring the canonical tracked paths the
+/// engine writes on the mission branch. Leaves `main` checked out.
+fn seed_mission_branch_with_twins(
+    dir: &TempDir,
+    repo: &GitRepo,
+    seed: &str,
+    plan: &str,
+    report: &str,
+) -> (String, String) {
+    let plan_path = ".kranz/missions/m-x/plan.md".to_string();
+    let report_path = ".kranz/missions/m-x/report.md".to_string();
+    repo.create_branch("kranz/mission-x", Some(seed)).unwrap();
+    repo.checkout("kranz/mission-x").unwrap();
+    for (path, content) in [(&plan_path, plan), (&report_path, report)] {
+        let full = dir.path().join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(&full, content).unwrap();
+    }
+    repo.add_all_and_commit("mission deliverables").unwrap();
+    repo.checkout("main").unwrap();
+    (plan_path, report_path)
+}
+
+#[test]
+fn preview_twin_byte_identical_untracked_files_let_merge_land_cleanly() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, seed) = seeded_repo();
+    let plan_content = "# Plan\ncanonical\n";
+    let report_content = "# Report\ncanonical\n";
+    let (plan_path, report_path) =
+        seed_mission_branch_with_twins(&dir, &repo, &seed, plan_content, report_content);
+
+    // Untracked human-readable twins in the primary tree, byte-identical to
+    // what the mission branch will bring in.
+    for (path, content) in [(&plan_path, plan_content), (&report_path, report_content)] {
+        let full = dir.path().join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(&full, content).unwrap();
+    }
+    // Confirm they really are untracked before the merge.
+    assert!(repo.is_untracked(&plan_path).unwrap());
+    assert!(repo.is_untracked(&report_path).unwrap());
+
+    let report = merge_mission(&repo, "main", &seed, "kranz/mission-x", passing_executor).unwrap();
+    assert!(
+        matches!(report, MergeReport::Merged { .. }),
+        "expected Merged, got {report:?}"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(&plan_path)).unwrap(),
+        plan_content
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(&report_path)).unwrap(),
+        report_content
+    );
+}
+
+#[test]
+fn preview_twin_divergent_untracked_file_blocks_merge_without_abort_wrapper() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, seed) = seeded_repo();
+    let plan_content = "# Plan\ncanonical\n";
+    let report_content = "# Report\ncanonical\n";
+    let (plan_path, report_path) =
+        seed_mission_branch_with_twins(&dir, &repo, &seed, plan_content, report_content);
+
+    // plan.md twin is identical, but report.md twin DIVERGES from the
+    // incoming canonical content — must NOT be silently removed.
+    let divergent_report = "# Report\nSTALE OPERATOR-VISIBLE COPY\n";
+    let full_plan = dir.path().join(&plan_path);
+    std::fs::create_dir_all(full_plan.parent().unwrap()).unwrap();
+    std::fs::write(&full_plan, plan_content).unwrap();
+    let full_report = dir.path().join(&report_path);
+    std::fs::create_dir_all(full_report.parent().unwrap()).unwrap();
+    std::fs::write(&full_report, divergent_report).unwrap();
+
+    let report = merge_mission(&repo, "main", &seed, "kranz/mission-x", passing_executor).unwrap();
+
+    match &report {
+        MergeReport::Merged { .. } => panic!("must not merge over a divergent untracked file"),
+        MergeReport::RefusedPreMerge { detail } => {
+            assert!(
+                detail.contains("would be overwritten by merge"),
+                "detail must carry git's verbatim refusal: {detail}"
+            );
+            assert!(
+                !detail.contains("abort also failed"),
+                "pre-MERGE_HEAD refusal must never show the abort-wrapper text: {detail}"
+            );
+        }
+        other => panic!("expected RefusedPreMerge, got {other:?}"),
+    }
+
+    // The divergent file must be left in place, untouched.
+    assert_eq!(
+        std::fs::read_to_string(&full_report).unwrap(),
+        divergent_report
+    );
+    assert_eq!(repo.head_sha().unwrap(), seed, "base tip must be unchanged");
+}

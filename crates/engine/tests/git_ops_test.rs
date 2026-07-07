@@ -695,7 +695,7 @@ fn conflicting_merge_reports_conflict_and_leaves_tree_clean() {
                 "conflict must name shared.txt: {files:?}"
             );
         }
-        MergeOutcome::Clean => panic!("B must conflict against A's change"),
+        other => panic!("B must conflict against A's change, got {other:?}"),
     }
     // The crucial post-condition: the tree is CLEAN (aborted), not mid-merge.
     assert!(
@@ -951,4 +951,58 @@ fn is_ancestor_rejects_flag_shaped_refs() {
         .is_ancestor(&seed, "--force")
         .expect_err("flag-shaped descendant ref must be refused");
     assert!(matches!(err, EngineError::Git(_)));
+}
+
+/// merge_no_ff refuses BEFORE any merge starts (an untracked file at a path
+/// the branch would bring in, differing from the incoming content) — no
+/// MERGE_HEAD is ever created, so no `git merge --abort` is attempted, and
+/// the outcome carries git's verbatim refusal rather than the "abort also
+/// failed" wrapper.
+#[test]
+fn merge_no_ff_pre_merge_head_refusal_attempts_no_abort() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, seed) = seeded_repo();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    // Branch that commits tracked.txt.
+    let wt = worktree_dir(&wt_base, "twin");
+    repo.add_worktree(&wt, "kranz/wt/m/twin", &seed).unwrap();
+    let wt_repo = GitRepo::open(&wt).unwrap();
+    std::fs::write(wt.join("tracked.txt"), "incoming\n").unwrap();
+    wt_repo.add_all_and_commit("add tracked.txt").unwrap();
+
+    // In the primary tree, leave an UNTRACKED file at the same path that
+    // DIFFERS from the incoming content — git must refuse before starting.
+    write(&dir, "tracked.txt", "local divergent copy\n");
+
+    let outcome = repo.merge_no_ff("kranz/wt/m/twin").unwrap();
+    match outcome {
+        MergeOutcome::RefusedPreMerge { detail } => {
+            assert!(
+                detail.contains("would be overwritten by merge"),
+                "expected git's verbatim refusal, got: {detail}"
+            );
+            assert!(
+                !detail.contains("abort also failed"),
+                "pre-MERGE_HEAD refusal must not show the abort wrapper: {detail}"
+            );
+        }
+        other => panic!("expected RefusedPreMerge, got {other:?}"),
+    }
+    // No merge was ever started, so MERGE_HEAD must still be absent.
+    assert!(
+        !repo
+            .root()
+            .join(".git/MERGE_HEAD")
+            .try_exists()
+            .unwrap_or(false),
+        "MERGE_HEAD must not exist after a pre-merge refusal"
+    );
+    // The divergent untracked file must be untouched.
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("tracked.txt")).unwrap(),
+        "local divergent copy\n"
+    );
 }

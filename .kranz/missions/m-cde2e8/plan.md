@@ -1,0 +1,56 @@
+# Mission plan — m-cde2e8
+
+**Goal:** Make the worktree-mode gated merge land canonical plan.md/report.md deliverables cleanly despite the untracked operator-visibility twins at the same paths, and stop merge_no_ff from masking a pre-MERGE_HEAD refusal with a spurious 'abort also failed' error.
+
+Branch `kranz/mission-m-cde2e8` (from `main`). Approved plan of record; the machine-readable twin is [plan.json](plan.json). Live status: `kranz status` or the dashboard.
+
+## Cost estimate
+
+Estimated **$2.53 – $12.66** (expected ~$5.06). Rough estimate — live usage is authoritative; based on 33 completed mission(s).
+
+## Validation contract
+
+Defined before any feature; gates mission completion.
+
+- **[a1]** A worktree-mode gated merge whose primary tree holds untracked plan.md and report.md preview twins byte-identical to the incoming canonical versions succeeds (returns Merged), and the canonical files are present and readable at .kranz/missions/<id>/plan.md and report.md after the merge. 
+  `cargo test -p kranz-engine --test merge_test preview_twin 2>&1 | grep -qE 'test result: ok\. [1-9][0-9]* passed'`
+- **[a2]** merge_no_ff attempts NO 'git merge --abort' when the merge failed before MERGE_HEAD existed (e.g. the untracked-overwrite refusal), surfacing git's verbatim refusal instead of the 'abort also failed' wrapper; while a genuine content conflict (MERGE_HEAD present) still aborts to a clean tree and reports Conflict. 
+  `cargo test -p kranz-engine --test git_ops_test pre_merge_head 2>&1 | grep -qE 'test result: ok\. [1-9][0-9]* passed'`
+- **[a3]** On a pre-MERGE_HEAD merge failure the git refusal text is surfaced verbatim (git's own wording, e.g. 'would be overwritten by merge') and the 'abort also failed' wrapper string never appears; and the pre-merge cleanup only ever deletes untracked working-tree files whose bytes equal the incoming canonical blob (git show <mission_branch>:<path>), never a tracked or divergent file. *(agent judgement)*
+- **[a4]** The full workspace test suite passes with no regressions. 
+  `cargo test --workspace 2>&1 | grep -qE 'test result: ok\.'`
+
+## Milestone 1 — Worktree-mode gated merge lands canonical deliverables cleanly
+
+### 1.1 Strip byte-identical preview twins before merge; make merge_no_ff MERGE_HEAD-aware
+
+Fix the two coupled defects that break the worktree-mode gated merge. Both live in crates/engine. You have read nothing else about this mission — everything you need is here.
+
+BACKGROUND (why this is broken): In worktree mode the engine writes UNTRACKED human-readable twins into the PRIMARY working tree at the canonical mission paths so operators can read them without leaving the base checkout — plan.md (orchestrator.rs ~line 956), revised-plan.md (~line 1224), and report.md (~line 3227), all at .kranz/missions/<id>/. These are not gitignored. At gated merge time, merge_mission (crates/engine/src/merge.rs) checks out the base branch and calls GitRepo::merge_no_ff (crates/engine/src/git_ops.rs:382), which brings the TRACKED canonical files at the SAME paths from the mission branch. git refuses with 'untracked working tree files would be overwritten by merge' — and this happens BEFORE MERGE_HEAD is created (nothing to abort). merge_no_ff nevertheless runs 'git merge --abort' unconditionally (git_ops.rs:401), which fails ('no merge to abort'), and its error wrapper masks the real refusal with 'conflicted and `git merge --abort` also failed'.
+
+DO NOT relocate the twins to a preview/ subdir. The REST server serves them from the exact canonical paths (crates/server/src/rest.rs:160 reads paths.plan_md_file(); rest.rs:173 reads paths.report_file()), so relocating would 404 operator visibility pre-merge. Implement the removal approach instead.
+
+FIX 1 — merge_mission strips byte-identical untracked twins before merging (crates/engine/src/merge.rs). After the gate suite passes and the base branch is checked out, and immediately BEFORE calling repo.merge_no_ff(mission_branch), remove every untracked working-tree file that the merge would bring in AND whose current bytes are byte-identical to the incoming canonical version. Implement generically, NOT by hardcoding filenames, so it covers plan.md, report.md, and revised-plan.md alike:
+  - Enumerate the paths the merge touches via the existing repo.changed_paths(base_sha, mission_branch) (see its use in crates/engine/tests/merge_test.rs:212).
+  - For each path: only act if it currently exists in the primary working tree as an UNTRACKED file (e.g. `git status --porcelain -- <path>` yields a line starting with '??', or `git ls-files --error-unmatch <path>` fails). Skip tracked files (a dirty tracked tree was already refused earlier by is_clean_tracked at merge.rs:59).
+  - Read the incoming bytes from the mission branch (`git show <mission_branch>:<path>`) and compare RAW BYTES to the working-tree file. Remove the working-tree file ONLY when the bytes are exactly equal. This is provably lossless: the merge rewrites the identical bytes. Never remove a divergent file — leave it so git refuses loudly (that is the pre-MERGE_HEAD refusal case Fix 2 must surface cleanly).
+  - You will likely add a small read-only helper to GitRepo (e.g. show_file(branch, path) -> Result<Option<Vec<u8>>> returning None when the path is absent on the branch) and an is-untracked check. Follow the existing plumbing style: probe()/probe_os() return raw Output; run() demands success (git_ops.rs:585-619). failure_detail(out) (git_ops.rs:632) gives the best stderr/stdout detail.
+
+FIX 2 — merge_no_ff gates its abort on MERGE_HEAD existence (crates/engine/src/git_ops.rs:382-407). Currently: on a failed `git merge --no-ff --no-edit <branch>`, it collects unmerged_paths then unconditionally runs `git merge --abort`. Change it so that after a failed merge you check whether a merge is actually in progress via `git rev-parse -q --verify MERGE_HEAD` (probe; success => MERGE_HEAD exists). Then:
+  - MERGE_HEAD present (a genuine content conflict): behave EXACTLY as today — collect unmerged_paths, run `git merge --abort` (a failure here is still a real Err with the existing wrapper), return MergeOutcome::Conflict { files }. The existing test crates/engine/tests/git_ops_test.rs (the conflict-aborts-and-leaves-clean-tree test near line 656) MUST stay green unchanged.
+  - MERGE_HEAD absent (merge refused before it started, e.g. untracked-overwrite): do NOT run `git merge --abort`. Surface git's VERBATIM refusal text (capture it from the failed merge command's Output via failure_detail; the current code discards stderr because it uses probe().status only — you must capture the Output). Represent this as a distinct outcome carrying the verbatim detail string — add a new variant, e.g. MergeOutcome::RefusedPreMerge { detail: String }. Then map it in merge_mission (merge.rs) to a corresponding MergeReport variant, e.g. MergeReport::RefusedPreMerge { detail }, so the git refusal reaches the caller. The 'abort also failed' wrapper must NEVER appear on a pre-MERGE_HEAD failure. Update the MergeOutcome/MergeReport doc comments accordingly.
+
+TESTS (encode these BEFORE implementing; they are the acceptance criteria). Use the existing fixtures/harness style:
+  - In crates/engine/tests/merge_test.rs (reuse its helpers: seeded_repo(), seed_mission_branch(), passing_executor, raw_git, write): add a test whose NAME CONTAINS the substring `preview_twin`. Seed a mission branch that commits .kranz/missions/<id>/plan.md AND report.md (canonical content). In the primary tree, write byte-identical UNTRACKED twins at those same paths. Call merge_mission(&repo, "main", &seed, "kranz/mission-x", passing_executor) and assert it returns MergeReport::Merged, and that both files exist in the working tree afterward with the canonical bytes (readable post-merge). Add a second case (same substring family) where an untracked colliding file DIFFERS from the incoming version: assert merge_mission does NOT return Merged, that the surfaced report/detail contains git's verbatim wording (assert it contains 'would be overwritten by merge'), and that it does NOT contain 'abort also failed'; the divergent file must be left in place.
+  - In crates/engine/tests/git_ops_test.rs: add a test whose NAME CONTAINS the substring `pre_merge_head`. Construct a repo where merge_no_ff fails BEFORE MERGE_HEAD (commit a file tracked on the mission branch, leave a differing untracked file at that path in the primary tree, then merge_no_ff) and assert the returned outcome is the RefusedPreMerge variant carrying git's verbatim detail, and that no abort was attempted (the detail is git's refusal, not the 'abort also failed' wrapper). Keep the existing genuine-conflict test passing.
+
+CONSTRAINTS: This is read-only-git-plumbing plus in-memory logic; never push, never touch a remote. Run `cargo fmt --all` before finishing (unformatted code has cost this repo a respawn). Confirm `cargo test -p kranz-engine --test merge_test` and `--test git_ops_test` are green and paste that output as testEvidence. Do not add `set -o pipefail` anywhere.
+
+Done when:
+- crates/engine/tests/merge_test.rs contains a test named with the substring `preview_twin` proving that byte-identical untracked plan.md+report.md twins present in the primary tree let merge_mission return Merged, with both canonical files readable at their paths afterward.
+- A merge_test case proves a divergent untracked colliding file is left in place and merge_mission surfaces git's verbatim refusal (containing 'would be overwritten by merge') without the 'abort also failed' wrapper.
+- crates/engine/tests/git_ops_test.rs contains a test named with the substring `pre_merge_head` proving merge_no_ff returns the RefusedPreMerge outcome with git's verbatim detail and attempts no `git merge --abort` when MERGE_HEAD is absent.
+- The existing genuine-content-conflict test in git_ops_test.rs (MERGE_HEAD present) still aborts to a clean tree and reports Conflict — unchanged and green.
+- The pre-merge cleanup removes an untracked file only when its bytes equal `git show <mission_branch>:<path>`; tracked or divergent files are never removed.
+- cargo fmt --all --check is clean and cargo test --workspace passes.
+
