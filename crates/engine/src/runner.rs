@@ -687,6 +687,7 @@ fn seed_worker_env(
     real_home: Option<&std::path::Path>,
     real_config_dir: Option<&std::path::Path>,
 ) {
+    let mut relocated = false;
     if auth_verdict == AuthVerdict::Authenticated {
         let scratch_root = crate::backend_claude::scratch_home_root(&spec.session_id);
         if let Ok((home, config_dir)) = crate::backend_claude::seed_worker_scratch_home(
@@ -700,7 +701,34 @@ fn seed_worker_env(
                 "CLAUDE_CONFIG_DIR".to_string(),
                 config_dir.display().to_string(),
             );
+            relocated = true;
         }
+    }
+
+    // Loud decision record (mission m-165b6f, f-1-3): every worker spec build
+    // logs which HOME branch was taken and the non-sensitive reason, so a
+    // fallback to the real HOME is never silent. Never logs secret/credential
+    // values — only the verdict and the decision.
+    if relocated {
+        tracing::info!(
+            session_id = %spec.session_id,
+            decision = "relocated",
+            auth_verdict = ?auth_verdict,
+            "worker HOME relocated to verified scratch env"
+        );
+    } else {
+        let reason = if auth_verdict == AuthVerdict::Authenticated {
+            "scratch HOME seeding failed after a successful auth preflight"
+        } else {
+            "auth preflight did not confirm authentication in the scratch env"
+        };
+        tracing::info!(
+            session_id = %spec.session_id,
+            decision = "inherited",
+            auth_verdict = ?auth_verdict,
+            reason,
+            "worker HOME inherited from the real environment (loud fail-safe)"
+        );
     }
 
     if let Ok(repo) = crate::git_ops::GitRepo::open(&spec.cwd) {
@@ -1228,6 +1256,137 @@ mod tests {
             ] {
                 assert!(spec.env.contains_key(key), "{verdict:?} missing {key}");
             }
+        }
+    }
+
+    /// A no-dependency [`tracing::Subscriber`] that records every event's
+    /// fields (debug-formatted) as one string per event, for tests that need
+    /// to assert on emitted `tracing::info!` records without pulling in
+    /// `tracing-subscriber`.
+    struct CapturingSubscriber {
+        events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl tracing::Subscriber for CapturingSubscriber {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Visitor(String);
+            impl tracing::field::Visit for Visitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write;
+                    let _ = write!(self.0, " {}={:?}", field.name(), value);
+                }
+            }
+            let mut visitor = Visitor(String::new());
+            event.record(&mut visitor);
+            self.events.lock().unwrap().push(visitor.0);
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// mission m-165b6f, f-1-3: the relocate-vs-inherit decision must be
+    /// recorded loudly for BOTH branches — never a silent fallback. This
+    /// captures the `tracing::info!` records `seed_worker_env` emits and
+    /// asserts the recorded decision matches the branch actually taken, that
+    /// the `Unauthenticated`/`Inconclusive` branch carries a non-sensitive
+    /// reason, and that no secret/credential value is ever logged.
+    #[test]
+    fn worker_auth_decision_is_recorded() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        assert!(git(repo_dir.path(), &["init", "-q"]).status.success());
+        let real_home = tempfile::tempdir().unwrap();
+        let real_config = real_home.path().join(".claude");
+        std::fs::create_dir_all(&real_config).unwrap();
+        let secret = "sk-super-secret-credential-value";
+        std::fs::write(
+            real_config.join(".credentials.json"),
+            format!("{{\"token\":\"{secret}\"}}"),
+        )
+        .unwrap();
+
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = CapturingSubscriber {
+            events: events.clone(),
+        };
+
+        // Authenticated branch: must record "relocated".
+        let guard = tracing::subscriber::set_default(subscriber);
+        let mut spec = minimal_worker_spec(repo_dir.path().to_path_buf());
+        seed_worker_env(
+            &mut spec,
+            AuthVerdict::Authenticated,
+            Some(real_home.path()),
+            None,
+        );
+        assert!(
+            spec.env.contains_key("HOME"),
+            "sanity: Authenticated verdict should have relocated HOME"
+        );
+        drop(guard);
+
+        {
+            let recorded = events.lock().unwrap();
+            assert!(
+                !recorded.is_empty(),
+                "the Authenticated decision must be recorded"
+            );
+            let record = recorded.last().unwrap();
+            assert!(
+                record.contains("decision=\"relocated\""),
+                "expected a relocated decision record, got: {record}"
+            );
+            assert!(
+                record.contains("Authenticated"),
+                "record must carry the verdict that drove it: {record}"
+            );
+        }
+
+        // Unauthenticated/Inconclusive branch: must record "inherited" with a
+        // non-sensitive reason.
+        for verdict in [AuthVerdict::Unauthenticated, AuthVerdict::Inconclusive] {
+            events.lock().unwrap().clear();
+            let subscriber = CapturingSubscriber {
+                events: events.clone(),
+            };
+            let guard = tracing::subscriber::set_default(subscriber);
+            let mut spec = minimal_worker_spec(repo_dir.path().to_path_buf());
+            seed_worker_env(&mut spec, verdict, Some(real_home.path()), None);
+            assert!(
+                !spec.env.contains_key("HOME"),
+                "sanity: {verdict:?} must not relocate HOME"
+            );
+            drop(guard);
+
+            let recorded = events.lock().unwrap();
+            assert!(
+                !recorded.is_empty(),
+                "{verdict:?} decision must be recorded"
+            );
+            let record = recorded.last().unwrap();
+            assert!(
+                record.contains("decision=\"inherited\""),
+                "expected an inherited decision record for {verdict:?}, got: {record}"
+            );
+            assert!(
+                record.contains("reason="),
+                "record must carry a non-sensitive reason for {verdict:?}: {record}"
+            );
+            assert!(
+                !record.contains(secret),
+                "decision record must never contain a secret/credential value: {record}"
+            );
         }
     }
 
