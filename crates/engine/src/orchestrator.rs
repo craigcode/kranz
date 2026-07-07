@@ -3237,7 +3237,15 @@ impl MissionEngine {
             .map(|a| format!("- [{}] {}", a.id, a.statement))
             .collect::<Vec<_>>()
             .join("\n");
-        let base = self.state.mission.base_branch.clone();
+        // Diff against the base pinned at approval, never the live base branch:
+        // a base branch that advanced mid-mission would silently change the
+        // final judgement's diff (same never-re-resolve rule as the command
+        // env's KRANZ_BASE_SHA). Fall back to base_branch only for legacy
+        // missions with no pinned base_sha.
+        let base = match self.state.mission.base_sha.as_deref() {
+            Some(sha) if !sha.is_empty() => sha.to_string(),
+            _ => self.state.mission.base_branch.clone(),
+        };
         let diff_stat = self
             .active_repo()
             .diff_stat(&base, "HEAD")
