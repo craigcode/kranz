@@ -38,4 +38,4 @@ Approved plans, newest last.
 - 2026-07-07 · [m-f1c684](m-f1c684/plan.md) — Detect a stalled or dropped Slack Socket Mode connection in the kranz serve --slack bridge, reconnect automatically with… [truncated] · [report](m-f1c684/report.md)
 - 2026-07-07 · [m-5224ee](m-5224ee/plan.md) — Ticket surfaces (REST /api/tickets projection, CLI ticket list/show, Slack, and the dashboard BacklogPanel) distinguish … [truncated] · [report](m-5224ee/report.md)
 - 2026-07-07 · [m-bf1264](m-bf1264/plan.md) — A mission whose deliverable diff against the pinned base SHA is empty (no non-meta feature commits on the mission branch… [truncated] · [report](m-bf1264/report.md)
-- 2026-07-07 · [m-165b6f](m-165b6f/plan.md) — Re-enable worker HOME/CLAUDE_CONFIG_DIR relocation hygiene safely by relocating only when the worker is verified able to… [truncated]
+- 2026-07-07 · [m-165b6f](m-165b6f/plan.md) — Re-enable worker HOME/CLAUDE_CONFIG_DIR relocation hygiene safely by relocating only when the worker is verified able to… [truncated] · [report](m-165b6f/report.md)
