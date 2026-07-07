@@ -1932,6 +1932,7 @@ async fn base_sha_reaches_worker_and_validator_env() {
     let backend = Arc::new(MockBackend::with_scripts(vec![
         worker_pass(),
         orch_script(vec![
+            dirty_tree_commit_as_is(),
             judgement("complete", ""),
             verdicts_pass(&["a-2"]),
             no_lesson(),
@@ -2435,6 +2436,7 @@ async fn run_emits_preflight_decision_when_issues_exist() {
     let backend = Arc::new(MockBackend::with_scripts(vec![
         worker_pass(),
         orch_script(vec![
+            dirty_tree_commit_as_is(),
             judgement("complete", ""),
             waive_reply("a-1", "command program unavailable in this environment"),
             no_lesson(),
@@ -2788,9 +2790,12 @@ async fn approve_revised_plan_rejects_dropping_a_completed_milestone() {
         // fix worker M2, functional validator M2 round 2 (finding again).
         worker_pass(),
         orch_script(vec![
+            dirty_tree_commit_as_is(),
             judgement("complete", ""), // M1 f-1-1
+            dirty_tree_commit_as_is(),
             judgement("complete", ""), // M2 f-2-1
             fix_features(1),           // M2 round 1 conversion → one fix
+            dirty_tree_commit_as_is(),
             judgement("complete", ""), // M2 fix worker
             fix_features(1),           // M2 round 2 conversion at the cap → wants another
         ]),
@@ -3278,7 +3283,9 @@ async fn crash_mid_parallel_batch_resumes_cleanly() {
     let backend2 = Arc::new(MockBackend::with_scripts(vec![
         worker_pass(), // f-1-1 rerun (sequential)
         orch_script(vec![
+            dirty_tree_commit_as_is(),
             judgement("complete", ""),
+            dirty_tree_commit_as_is(),
             judgement("complete", ""),
             no_lesson(),
         ]),
@@ -3398,7 +3405,9 @@ async fn max_parallel_one_is_the_unchanged_sequential_path() {
     let backend = Arc::new(MockBackend::with_scripts(vec![
         worker_pass(),
         orch_script(vec![
+            dirty_tree_commit_as_is(),
             judgement("complete", ""),
+            dirty_tree_commit_as_is(),
             judgement("complete", ""),
             no_lesson(),
         ]),
@@ -3632,7 +3641,11 @@ async fn run_reasserts_mission_branch_and_restores_base() {
     let (_dir, root) = init_repo();
     let backend = Arc::new(MockBackend::with_scripts(vec![
         worker_pass(),
-        orch_script(vec![judgement("complete", ""), "NONE".to_string()]),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            "NONE".to_string(),
+        ]),
     ]));
     let mut engine = make_engine(&backend, &root, test_cfg());
     engine
