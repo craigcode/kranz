@@ -31,6 +31,7 @@
 //! separate files, not the single-writer log, so they are written live in both
 //! modes.
 
+use crate::auth_verify::AuthVerdict;
 use crate::backend::{AgentBackend, AgentEvent, PromptMode, SessionExit, SessionSpec};
 use crate::error::{EngineError, Result};
 use crate::event_log::EventLog;
@@ -511,6 +512,14 @@ pub fn contract_env(base_sha: Option<&str>) -> HashMap<String, String> {
 /// For M3 parallel-within-milestone execution — where each worker runs in its
 /// own git worktree — use [`run_worker_in`] to override just the session cwd
 /// while the run's transcript and events stay under the real mission dir.
+///
+/// `auth_verdict` is the worker-HOME auth-preflight decision input (mission
+/// m-165b6f, f-1-2): [`AuthVerdict::Authenticated`] relocates HOME/
+/// CLAUDE_CONFIG_DIR to a verified scratch env, anything else is a loud
+/// fail-safe that inherits the real HOME. Real per-spawn preflight + caching
+/// (computing this via [`crate::auth_verify::verify_worker_auth`] against
+/// `backend`) is not yet wired here — that is the next milestone; today
+/// callers pass the decision they already have.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_worker(
     backend: &dyn AgentBackend,
@@ -524,6 +533,7 @@ pub async fn run_worker(
     cancel: Option<Arc<Notify>>,
     base_sha: Option<&str>,
     grants: &[String],
+    auth_verdict: AuthVerdict,
 ) -> Result<RunOutcome> {
     let cwd = paths.repo_root.clone();
     run_worker_in(
@@ -539,6 +549,7 @@ pub async fn run_worker(
         &cwd,
         base_sha,
         grants,
+        auth_verdict,
     )
     .await
 }
@@ -565,6 +576,7 @@ pub async fn run_worker_in(
     session_cwd: &std::path::Path,
     base_sha: Option<&str>,
     grants: &[String],
+    auth_verdict: AuthVerdict,
 ) -> Result<RunOutcome> {
     let (spec, run_meta) = build_worker_spec(
         cfg,
@@ -576,6 +588,7 @@ pub async fn run_worker_in(
         base_sha,
         grants,
         paths.mission_dir(),
+        auth_verdict,
     );
     let mut target = LogTarget::Live(log);
     run_session_to(backend, spec, &mut target, paths, run_meta, cancel).await
@@ -610,6 +623,7 @@ pub async fn run_worker_in_buffered(
     session_cwd: &std::path::Path,
     base_sha: Option<&str>,
     grants: &[String],
+    auth_verdict: AuthVerdict,
 ) -> Result<(Vec<EventKind>, RunOutcome)> {
     let (spec, run_meta) = build_worker_spec(
         cfg,
@@ -621,6 +635,7 @@ pub async fn run_worker_in_buffered(
         base_sha,
         grants,
         paths.mission_dir(),
+        auth_verdict,
     );
     let mut target = LogTarget::Buffer(Vec::new());
     let outcome = run_session_to(backend, spec, &mut target, paths, run_meta, None).await?;
@@ -654,17 +669,39 @@ pub async fn run_worker_in_buffered(
 /// dir), the worker falls back to inheriting the real `HOME`/`CLAUDE_CONFIG_DIR`
 /// (i.e. the scratch-HOME half of this function is a no-op) rather than
 /// failing spec construction.
-fn seed_worker_env(spec: &mut SessionSpec) {
-    // CRITICAL (fix-worker-env-hygiene-starves-auth): the scratch HOME /
-    // CLAUDE_CONFIG_DIR relocation is DISABLED. On macOS the live OAuth token
-    // lives in the login Keychain, not ~/.claude/.credentials.json (which may
-    // be absent or stale). Relocating HOME cuts the worker off from the live
-    // credential, so `claude` launches unauthenticated and silently produces
-    // no output — the mission then falsely COMPLETEs with zero deliverables
-    // (observed 2026-07-06, m-66aff8: "no report, no commits, empty diff").
-    // Until env hygiene can PROVE the scratch HOME authenticates before
-    // trusting it, workers inherit the real HOME. Git identity below is
-    // independent and stays.
+///
+/// Relocation is GATED on `auth_verdict` (mission m-165b6f, f-1-2): a worker
+/// only launches into the scratch HOME when it has been proven — via
+/// [`crate::auth_verify::verify_worker_auth`] driving a real trivial session
+/// under the candidate scratch env — able to authenticate there
+/// ([`AuthVerdict::Authenticated`]). Any other verdict
+/// ([`AuthVerdict::Unauthenticated`] or [`AuthVerdict::Inconclusive`]) is a
+/// loud fail-safe: the worker inherits the real `HOME`/`CLAUDE_CONFIG_DIR`
+/// rather than risk launching unauthenticated and silently producing no
+/// output (observed 2026-07-06, m-66aff8: "no report, no commits, empty
+/// diff" — see fix-worker-env-hygiene-starves-auth). Git identity injection
+/// below is independent of this gate and always applies.
+fn seed_worker_env(
+    spec: &mut SessionSpec,
+    auth_verdict: AuthVerdict,
+    real_home: Option<&std::path::Path>,
+    real_config_dir: Option<&std::path::Path>,
+) {
+    if auth_verdict == AuthVerdict::Authenticated {
+        let scratch_root = crate::backend_claude::scratch_home_root(&spec.session_id);
+        if let Ok((home, config_dir)) = crate::backend_claude::seed_worker_scratch_home(
+            &scratch_root,
+            real_home,
+            real_config_dir,
+        ) {
+            spec.env
+                .insert("HOME".to_string(), home.display().to_string());
+            spec.env.insert(
+                "CLAUDE_CONFIG_DIR".to_string(),
+                config_dir.display().to_string(),
+            );
+        }
+    }
 
     if let Ok(repo) = crate::git_ops::GitRepo::open(&spec.cwd) {
         if let Ok((name, email)) = repo.resolved_identity() {
@@ -693,6 +730,7 @@ fn build_worker_spec(
     base_sha: Option<&str>,
     grants: &[String],
     mission_dir: std::path::PathBuf,
+    auth_verdict: AuthVerdict,
 ) -> (SessionSpec, RunMeta) {
     let role = Role::Worker;
     let role_cfg = cfg.role(role);
@@ -752,7 +790,14 @@ fn build_worker_spec(
         sandbox: None,
     };
     spec.env = contract_env(base_sha);
-    seed_worker_env(&mut spec);
+    let real_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let real_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(std::path::PathBuf::from);
+    seed_worker_env(
+        &mut spec,
+        auth_verdict,
+        real_home.as_deref(),
+        real_config_dir.as_deref(),
+    );
     let (sandbox, warn) =
         crate::sandbox::resolve_for_session(&role_cfg.sandbox, session_cwd, &mission_dir);
     if let Some(warn) = warn {
@@ -1035,16 +1080,17 @@ mod tests {
     /// Finding 1: a worker in a HOME with no `.gitconfig` must still be able
     /// to `git commit` — proving the injected `GIT_AUTHOR_*` / `GIT_COMMITTER_*`
     /// env vars actually carry the identity through, not merely that the keys
-    /// are present. (The scratch-HOME relocation `seed_worker_env` once did is
-    /// DISABLED — see fix-worker-env-hygiene-starves-auth — so this proves the
-    /// identity injection alone suffices, with HOME pointed at an empty dir.)
+    /// are present. Uses an `Unauthenticated` preflight verdict (the fail-safe
+    /// inherit branch — see [`worker_auth_preflight_failure_inherits_home`]),
+    /// with HOME pointed at an empty dir, to prove the identity injection
+    /// alone suffices when relocation does not happen.
     #[test]
     fn worker_env_hygiene_scratch_home_worker_can_commit() {
         let repo_dir = tempfile::tempdir().unwrap();
         assert!(git(repo_dir.path(), &["init", "-q"]).status.success());
 
         let mut spec = minimal_worker_spec(repo_dir.path().to_path_buf());
-        seed_worker_env(&mut spec);
+        seed_worker_env(&mut spec, AuthVerdict::Unauthenticated, None, None);
 
         // Existing contract env survives the env layering.
         assert_eq!(
@@ -1052,11 +1098,11 @@ mod tests {
             Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
         );
 
-        // seed_worker_env no longer relocates HOME (the relocation starved the
-        // worker of live macOS-Keychain auth); it must NOT set a scratch HOME.
+        // An Unauthenticated preflight verdict is the fail-safe inherit
+        // branch: seed_worker_env must NOT relocate HOME.
         assert!(
             !spec.env.contains_key("HOME"),
-            "seed_worker_env must not relocate HOME (auth-starvation regression)"
+            "an Unauthenticated preflight verdict must not relocate HOME"
         );
 
         for key in [
@@ -1093,6 +1139,96 @@ mod tests {
             spec.env["GIT_AUTHOR_NAME"], spec.env["GIT_AUTHOR_EMAIL"]
         );
         assert_eq!(logged, expected);
+    }
+
+    /// mission m-165b6f, f-1-2: an `Authenticated` preflight verdict gates
+    /// HOME relocation ON. `spec.env` must carry a scratch HOME/
+    /// CLAUDE_CONFIG_DIR pair, and the scratch config dir must contain only
+    /// the [`crate::backend_claude::claude_min_config_entries`] allowlist —
+    /// not arbitrary operator dotfiles that happened to sit alongside it.
+    #[test]
+    fn worker_auth_preflight_success_relocates() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        assert!(git(repo_dir.path(), &["init", "-q"]).status.success());
+
+        let real_home = tempfile::tempdir().unwrap();
+        let real_config = real_home.path().join(".claude");
+        std::fs::create_dir_all(&real_config).unwrap();
+        std::fs::write(real_config.join(".credentials.json"), "{\"secret\":true}").unwrap();
+        // Not on the allowlist — must never be copied into the scratch dir.
+        std::fs::write(real_config.join("settings.json"), "{\"other\":true}").unwrap();
+
+        let mut spec = minimal_worker_spec(repo_dir.path().to_path_buf());
+        seed_worker_env(
+            &mut spec,
+            AuthVerdict::Authenticated,
+            Some(real_home.path()),
+            None,
+        );
+
+        let home = spec.env.get("HOME").expect("HOME must be relocated");
+        let config_dir = spec
+            .env
+            .get("CLAUDE_CONFIG_DIR")
+            .expect("CLAUDE_CONFIG_DIR must be relocated");
+        let scratch_root = crate::backend_claude::scratch_home_root(&spec.session_id);
+        assert!(std::path::Path::new(home).starts_with(&scratch_root));
+        assert_eq!(
+            std::path::Path::new(config_dir),
+            std::path::Path::new(home).join(".claude")
+        );
+
+        let entries: Vec<_> = std::fs::read_dir(config_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![".credentials.json".to_string()],
+            "scratch config dir must contain only the allowlisted entries: {entries:?}"
+        );
+
+        for key in [
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "GIT_COMMITTER_NAME",
+            "GIT_COMMITTER_EMAIL",
+        ] {
+            assert!(spec.env.contains_key(key), "missing {key}");
+        }
+    }
+
+    /// mission m-165b6f, f-1-2: an unproven preflight verdict
+    /// (`Unauthenticated` or `Inconclusive`) is the loud fail-safe — no HOME/
+    /// CLAUDE_CONFIG_DIR key at all, so the worker inherits the real HOME,
+    /// while git identity injection still applies.
+    #[test]
+    fn worker_auth_preflight_failure_inherits_home() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        assert!(git(repo_dir.path(), &["init", "-q"]).status.success());
+        let real_home = tempfile::tempdir().unwrap();
+
+        for verdict in [AuthVerdict::Unauthenticated, AuthVerdict::Inconclusive] {
+            let mut spec = minimal_worker_spec(repo_dir.path().to_path_buf());
+            seed_worker_env(&mut spec, verdict, Some(real_home.path()), None);
+
+            assert!(
+                !spec.env.contains_key("HOME"),
+                "{verdict:?} must not set HOME"
+            );
+            assert!(
+                !spec.env.contains_key("CLAUDE_CONFIG_DIR"),
+                "{verdict:?} must not set CLAUDE_CONFIG_DIR"
+            );
+            for key in [
+                "GIT_AUTHOR_NAME",
+                "GIT_AUTHOR_EMAIL",
+                "GIT_COMMITTER_NAME",
+                "GIT_COMMITTER_EMAIL",
+            ] {
+                assert!(spec.env.contains_key(key), "{verdict:?} missing {key}");
+            }
+        }
     }
 
     /// Finding 2: the credential-copy SOURCE dir honors an operator

@@ -2229,6 +2229,10 @@ impl MissionEngine {
                     &ws_path,
                     base_sha.as_deref(),
                     &grants,
+                    // Real per-spawn preflight + caching lands next milestone
+                    // (mission m-165b6f); today the fail-safe default keeps
+                    // workers on the real HOME.
+                    crate::auth_verify::AuthVerdict::Inconclusive,
                 )
                 .await;
                 (idx, result)
