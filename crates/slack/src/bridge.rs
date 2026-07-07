@@ -21,6 +21,7 @@
 
 use crate::client::SlackClient;
 use crate::config::{NotifyFlags, SlackConfig};
+use crate::health::BridgeHealth;
 use crate::host::{PlanOutcome, SharedHost};
 use crate::inbound::{route, Action, ThreadLookup};
 use crate::outbound::{classify, NotifyClass, Outbound};
@@ -36,7 +37,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -53,6 +54,10 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// sibling drain) otherwise parks `read.next()` forever and the reconnect
 /// machinery is never reached.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// How often the periodic health-log task in [`run_socket`] emits a liveness
+/// line (info when healthy, warn when disconnected or stale).
+const HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Shared, thread-safe view of the mission↔thread map plus its repo root, so
 /// both the outbound loop (which appends threads) and the inbound router (which
@@ -272,24 +277,58 @@ pub async fn run_socket(
     let stop_setter = stop.clone();
     tokio::pin!(shutdown);
 
+    // Shared liveness handle: connect/frame/disconnect events feed it from
+    // `connect_once`/`pump_connection`, and the periodic task below logs its
+    // snapshot so a stalled or dead bridge is loud rather than silent.
+    let health = BridgeHealth::new();
+    let health_log_stop = stop.clone();
+    let health_log = health.clone();
+    let health_task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(HEALTH_LOG_INTERVAL);
+        ticker.tick().await; // first tick fires immediately; skip it
+        loop {
+            tokio::select! {
+                _ = health_log_stop.notified() => return,
+                _ = ticker.tick() => {
+                    let snapshot = health_log.snapshot(Instant::now());
+                    let secs = snapshot.secs_since_frame.unwrap_or(u64::MAX);
+                    if snapshot.connected && !snapshot.stale {
+                        tracing::info!(secs_since_frame = secs, "slack bridge healthy: connected, last frame {secs}s ago");
+                    } else {
+                        tracing::warn!(
+                            connected = snapshot.connected,
+                            secs_since_frame = secs,
+                            "slack bridge UNHEALTHY: no frame in {secs}s"
+                        );
+                    }
+                }
+            }
+        }
+    });
+
     let mut backoff = BACKOFF_MIN;
     loop {
         tokio::select! {
             _ = &mut shutdown => {
                 stop_setter.notify_waiters();
+                health_task.abort();
                 tracing::info!("slack inbound loop shutting down");
                 return;
             }
-            result = connect_once(&cfg, &client, &repo_root, &threads, &host, &stop) => {
+            result = connect_once(&cfg, &client, &repo_root, &threads, &host, &stop, &health) => {
+                health.record_disconnected();
                 match result {
                     // Clean close requested by shutdown: exit.
-                    Ok(true) => return,
+                    Ok(true) => {
+                        health_task.abort();
+                        return;
+                    }
                     // Socket connected then closed on its own (Slack rotates the
                     // wss URL, or a network blip): a healthy session, so RESET
                     // the backoff — the drop isn't a failure to reach Slack.
                     Ok(false) => {
                         backoff = BACKOFF_MIN;
-                        tracing::info!("slack socket closed; reconnecting");
+                        tracing::warn!("slack socket closed; reconnecting");
                     }
                     // Never even connected (open_connection / dial failed): grow
                     // the backoff so we don't hammer Slack while it's unreachable.
@@ -304,6 +343,7 @@ pub async fn run_socket(
         tokio::select! {
             _ = &mut shutdown => {
                 stop_setter.notify_waiters();
+                health_task.abort();
                 return;
             }
             _ = tokio::time::sleep(backoff) => {}
@@ -329,6 +369,7 @@ async fn connect_once(
     threads: &SharedThreads,
     host: &Option<SharedHost>,
     stop: &Arc<Notify>,
+    health: &BridgeHealth,
 ) -> Result<bool> {
     let url = client
         .open_connection()
@@ -337,7 +378,11 @@ async fn connect_once(
     let (ws_stream, _resp) = tokio_tungstenite::connect_async(&url)
         .await
         .context("dialing Socket Mode websocket")?;
-    tracing::info!("slack Socket Mode connected");
+    health.record_connected();
+    tracing::info!(
+        connect_count = health.connect_count(),
+        "slack Socket Mode connected"
+    );
     let (mut write, mut read) = ws_stream.split();
     // Bounded dedup of processed envelope ids: Slack redelivers an envelope if
     // the ack is late, which for a claude-spawning action (NewMission) would
@@ -346,7 +391,7 @@ async fn connect_once(
     let mut seen = SeenEnvelopes::default();
 
     pump_connection(
-        &mut read, &mut write, cfg, client, repo_root, threads, host, stop, &mut seen,
+        &mut read, &mut write, cfg, client, repo_root, threads, host, stop, &mut seen, health,
     )
     .await
 }
@@ -387,6 +432,7 @@ async fn pump_connection<R, E, W>(
     host: &Option<SharedHost>,
     stop: &Arc<Notify>,
     seen: &mut SeenEnvelopes,
+    health: &BridgeHealth,
 ) -> Result<bool>
 where
     R: futures_util::Stream<Item = std::result::Result<Message, E>> + Unpin,
@@ -410,6 +456,12 @@ where
                     }
                     Ok(msg) => msg,
                 };
+                // A frame of any kind (text, ping, pong, error) proves the
+                // socket is still alive; stamp it before dispatching. `None`
+                // is a stream end, not a frame, so it's excluded below.
+                if msg.is_some() {
+                    health.record_frame();
+                }
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         if is_disconnect_frame(&text) {
@@ -3814,6 +3866,7 @@ mod tests {
         let threads = SharedThreads::load(tmp.path()).unwrap();
         let stop = Arc::new(Notify::new());
         let mut seen = SeenEnvelopes::default();
+        let health = BridgeHealth::new();
 
         let mut read = futures_util::stream::pending::<
             std::result::Result<Message, std::convert::Infallible>,
@@ -3831,6 +3884,7 @@ mod tests {
                 &None,
                 &stop,
                 &mut seen,
+                &health,
             )
             .await
         });
@@ -3855,6 +3909,7 @@ mod tests {
         let threads = SharedThreads::load(tmp.path()).unwrap();
         let stop = Arc::new(Notify::new());
         let mut seen = SeenEnvelopes::default();
+        let health = BridgeHealth::new();
 
         let frame = Message::Text(r#"{"type":"disconnect","reason":"refresh_requested"}"#.into());
         let mut read =
@@ -3871,6 +3926,7 @@ mod tests {
             &None,
             &stop,
             &mut seen,
+            &health,
         )
         .await;
         assert!(
