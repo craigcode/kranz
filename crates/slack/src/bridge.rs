@@ -1795,8 +1795,23 @@ async fn dispatch_action(
                     }
                 }
                 // Running / paused / blocked (and, unchanged from before,
-                // terminal): the control-inbox guidance write.
+                // terminal): the control-inbox guidance write. Steering a live
+                // mission is spend-adjacent — strictly more powerful than the
+                // allowlist-gated pause/resume — so gate it on the same
+                // allowlist as planning and pause/resume.
                 Ok(_) => {
+                    if !cfg.is_authorized(user_id.as_deref()) {
+                        post_thread_note(
+                            cfg,
+                            client,
+                            threads,
+                            mission_id,
+                            "Steering a running mission spends money and is limited to the \
+                             `slack.allowUsers` allowlist — ask an admin to add you.",
+                        )
+                        .await;
+                        return;
+                    }
                     if let Err(e) = guidance(repo_root, mission_id, text) {
                         tracing::warn!(error = %e, "failed to enqueue Slack guidance");
                     }
