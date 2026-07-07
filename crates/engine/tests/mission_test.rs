@@ -140,7 +140,8 @@ fn test_cfg() -> MissionConfig {
 
 fn make_engine(backend: &Arc<MockBackend>, root: &Path, cfg: MissionConfig) -> MissionEngine {
     let backend: Arc<dyn AgentBackend> = Arc::clone(backend) as Arc<dyn AgentBackend>;
-    let mut engine = MissionEngine::create(backend, root, GOAL, cfg).expect("create mission engine");
+    let mut engine =
+        MissionEngine::create(backend, root, GOAL, cfg).expect("create mission engine");
     // Pre-seed the worker-auth verdict (mission m-165b6f, f-2-2): otherwise
     // the live preflight (orchestrator.rs `worker_auth_verdict`) would
     // consume the first queued `MockScript` meant for a real worker or
