@@ -188,15 +188,25 @@ fn one_feature_plan() -> Plan {
     }
 }
 
+/// Worker script: completed single-shot run whose final text is a passing
+/// WorkerReport. Writes a unique file into the session cwd so the worker
+/// leaves a dirty tree behind (§4.4), which the engine checkpoints as a
+/// real, non-meta commit on the mission branch. The path is unique per
+/// worker (atomic counter) so worktree-mode's per-feature branch merges
+/// never collide on the same path.
 fn worker_pass() -> MockScript {
+    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = format!("delivered-{n}.txt");
     MockScript::single_shot_json(&json!({
         "result": "pass",
         "summary": "implemented and tested",
-        "filesTouched": [],
+        "filesTouched": [path],
         "testsAdded": [],
         "testEvidence": "all green",
         "commits": []
     }))
+    .writes_file(&path, "delivered by the mock worker\n")
 }
 
 fn judgement_complete() -> String {
@@ -204,11 +214,22 @@ fn judgement_complete() -> String {
         .to_string()
 }
 
-/// Orchestrator streaming script: seed, then one judgement turn, then the
+/// Dirty-tree-turn reply (§4.4): the worker left uncommitted changes; commit
+/// them as-is so they land on the mission branch.
+fn dirty_tree_commit_as_is() -> String {
+    json!({ "action": "commit-as-is", "note": "worker delivered files" }).to_string()
+}
+
+/// Orchestrator streaming script: seed, then the dirty-tree turn (the
+/// sequential worker's file write), then one judgement turn, then the
 /// (empty-contract) capture turn replying NONE.
 fn orch_script_complete_no_lesson() -> MockScript {
     MockScript::streaming(vec![mock_init("orch-session"), mock_result_text("ready")]).responding(
         vec![
+            vec![
+                mock_text(&dirty_tree_commit_as_is()),
+                mock_result_text(&dirty_tree_commit_as_is()),
+            ],
             vec![
                 mock_text(&judgement_complete()),
                 mock_result_text(&judgement_complete()),
@@ -735,6 +756,7 @@ fn two_milestone_scripts() -> Vec<MockScript> {
             parallel_plan(&["f-1-1", "f-1-2"]),
             judgement_complete(),
             judgement_complete(),
+            dirty_tree_commit_as_is(),
             judgement_complete(),
             "NONE".to_string(),
         ]),

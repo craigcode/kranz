@@ -2966,6 +2966,33 @@ impl MissionEngine {
             self.emit(EventKind::MissionValidating {})?;
         }
 
+        // Deterministic non-emptiness safety net (feature f-2-2): a mission
+        // whose deliverable diff against the pinned base is empty (no
+        // non-meta feature commits on the mission branch) must terminate
+        // Failed, independent of and BEFORE any contract assertion — a green
+        // contract can never override an empty deliverable. This runs
+        // first, ahead of the command/agent-judgement assertions below.
+        let base = match self.state.mission.base_sha.as_deref() {
+            Some(sha) if !sha.is_empty() => sha.to_string(),
+            _ => self.state.mission.base_branch.clone(),
+        };
+        let non_meta_commit_count = self
+            .active_repo()
+            .commits_between(&base, "HEAD")?
+            .iter()
+            .filter(|commit| !contract_sweep::is_meta_commit(&commit.subject))
+            .count();
+        if non_meta_commit_count == 0 {
+            self.emit(EventKind::MissionFailed {
+                reason: format!(
+                    "no deliverable commits landed on the mission branch: \
+                     {base}..HEAD contains 0 feature commits (only engine/meta \
+                     commits). Refusing to COMPLETE on an empty deliverable diff."
+                ),
+            })?;
+            return Ok(Some(MissionStatus::Failed));
+        }
+
         let contract = self.state.mission.validation_contract.clone();
         let mut findings: Vec<Finding> = Vec::new();
         let env = runner::contract_env(self.state.mission.base_sha.as_deref());

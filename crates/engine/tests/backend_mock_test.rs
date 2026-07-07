@@ -544,3 +544,54 @@ async fn scrutiny_validator_does_not_get_extra_tools_folded_into_allowed() {
         .allowed_tools
         .contains(&"FakeBrowserTool".to_string()));
 }
+
+// ---------------------------------------------------------------------------
+// MockScript file-write seam (mock workers can deliver real commits)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn writes_file_creates_the_file_in_the_session_cwd() {
+    let cwd = tempfile::tempdir().unwrap();
+    let backend = MockBackend::with_scripts(vec![MockScript::single_shot("done")
+        .writes_file("nested/dir/output.txt", "hello from the mock worker\n")]);
+
+    let mut session = backend
+        .start(SessionSpec {
+            cwd: cwd.path().to_path_buf(),
+            ..single_shot_spec("write-session")
+        })
+        .await
+        .expect("start session");
+
+    // Drain the scripted stream — the write happens at start(), before any
+    // event is pumped, but draining proves the write doesn't interfere with
+    // ordinary scripted-event behaviour.
+    final_result_text(&mut session).await;
+
+    let written = std::fs::read_to_string(cwd.path().join("nested/dir/output.txt"))
+        .expect("mock write should have created the file");
+    assert_eq!(written, "hello from the mock worker\n");
+}
+
+#[tokio::test]
+async fn default_script_writes_nothing() {
+    let cwd = tempfile::tempdir().unwrap();
+    let backend = MockBackend::with_scripts(vec![MockScript::single_shot("done")]);
+
+    backend
+        .start(SessionSpec {
+            cwd: cwd.path().to_path_buf(),
+            ..single_shot_spec("no-write-session")
+        })
+        .await
+        .expect("start session");
+
+    let entries: Vec<_> = std::fs::read_dir(cwd.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert!(
+        entries.is_empty(),
+        "no script writes means no files should appear: {entries:?}"
+    );
+}

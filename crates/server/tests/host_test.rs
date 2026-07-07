@@ -126,16 +126,26 @@ fn turn(reply: &str) -> Vec<kranz_engine::backend::AgentEvent> {
     vec![mock_text(reply), mock_result_text(reply)]
 }
 
+/// Dirty-tree-turn reply (§4.4): the worker left uncommitted changes; commit
+/// them as-is so they land on the mission branch.
+fn dirty_tree_commit_as_is() -> String {
+    json!({ "action": "commit-as-is", "note": "worker delivered files" }).to_string()
+}
+
 /// Worker script: completed single-shot run with a passing WorkerReport.
 fn worker_pass() -> MockScript {
+    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = format!("delivered-{n}.txt");
     MockScript::single_shot_json(&json!({
         "result": "pass",
         "summary": "implemented and tested",
-        "filesTouched": [],
+        "filesTouched": [path],
         "testsAdded": [],
         "testEvidence": "all green",
         "commits": []
     }))
+    .writes_file(&path, "delivered by the mock worker\n")
 }
 
 /// A minimal one-milestone/one-feature plan in wire (camelCase) shape.
@@ -781,6 +791,7 @@ async fn hosted_lifecycle_reaches_complete_without_a_terminal() {
             turn("what platforms must this support?"),
             turn("really, tell me about platforms first"),
             turn(&plan_json().to_string()),
+            turn(&dirty_tree_commit_as_is()),
             turn(&judgement.to_string()),
             // Mission-5 era: completion runs a lesson-capture turn; NONE
             // records nothing and lets the mission close.
@@ -1142,7 +1153,11 @@ async fn queue_drain_route_runs_a_queued_mission_to_complete() {
         mock_init("orch-drain-run"),
         mock_result_text("resumed"),
     ])
-    .responding(vec![turn(&judgement.to_string()), turn("NONE")]);
+    .responding(vec![
+        turn(&dirty_tree_commit_as_is()),
+        turn(&judgement.to_string()),
+        turn("NONE"),
+    ]);
     let backend = Arc::new(MockBackend::with_scripts(vec![
         orch,
         worker_pass(),

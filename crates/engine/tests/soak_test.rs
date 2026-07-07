@@ -139,15 +139,23 @@ fn make_engine(backend: Arc<dyn AgentBackend>, root: &Path, cfg: MissionConfig) 
 }
 
 /// Worker script: completed single-shot run with a passing WorkerReport.
+/// Writes a unique file into the session cwd so the worker leaves a dirty
+/// tree behind (§4.4), which the engine checkpoints as a real, non-meta
+/// commit on the mission branch. The path is unique per worker (atomic
+/// counter) so parallel-batch merges never collide on the same path.
 fn worker_pass() -> MockScript {
+    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = format!("delivered-{n}.txt");
     MockScript::single_shot_json(&json!({
         "result": "pass",
         "summary": "implemented and tested",
-        "filesTouched": [],
+        "filesTouched": [path],
         "testsAdded": [],
         "testEvidence": "all green",
         "commits": []
     }))
+    .writes_file(&path, "delivered by the mock worker\n")
 }
 
 /// Orchestrator streaming script: seed turn, then one batch per engine turn.
@@ -163,6 +171,15 @@ fn orch_script(replies: Vec<String>) -> MockScript {
 fn judgement(decision: &str, guidance: &str) -> String {
     json!({ "decision": decision, "guidance": guidance, "summary": format!("worker judged: {decision}") })
         .to_string()
+}
+
+/// Dirty-tree-turn reply (§4.4): the worker left uncommitted changes; commit
+/// them as-is so they land on the mission branch. Only sequential-path
+/// workers need this turn — parallel-batch workers' dirty trees are
+/// checkpoint-committed onto their per-feature branch during the merge, with
+/// no explicit orchestrator turn.
+fn dirty_tree_commit_as_is() -> String {
+    json!({ "action": "commit-as-is", "note": "worker delivered files" }).to_string()
 }
 
 fn parallel_plan(ids: &[&str]) -> String {
@@ -556,7 +573,12 @@ async fn run_crash_resume_iteration(iter: usize) {
     // candidates → the sequential path finishes them (worker → judgement ×2).
     let backend2: Arc<dyn AgentBackend> = Arc::new(MockBackend::with_scripts(vec![
         worker_pass(), // f-1-1 rerun (sequential)
-        orch_script(vec![judgement("complete", ""), judgement("complete", "")]),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+        ]),
         worker_pass(), // f-1-2 rerun (sequential)
     ]));
     let mut engine = match MissionEngine::resume(backend2, &root, &mission_id, LockForce::No) {
@@ -592,6 +614,7 @@ async fn run_conflict_iteration(iter: usize) {
             parallel_plan(&["f-1-1", "f-1-2"]),
             judgement("complete", ""),
             judgement("complete", ""),
+            dirty_tree_commit_as_is(),
             judgement("complete", ""),
         ]),
         worker_pass(), // f-1-1 (parallel worktree)
