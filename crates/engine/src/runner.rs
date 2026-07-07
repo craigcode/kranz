@@ -1025,6 +1025,7 @@ mod tests {
             max_budget_usd: None,
             max_turns: None,
             env: contract_env(Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")),
+            sandbox: None,
         }
     }
 
