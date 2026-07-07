@@ -32,3 +32,4 @@ Approved plans, newest last.
 - 2026-07-06 · [m-acb3a0](m-acb3a0/plan.md) — Add a config-gated macOS Seatbelt (sandbox-exec) filesystem sandbox per session: generate a write-allowlist profile (ses… [truncated] · [report](m-acb3a0/report.md)
 - 2026-07-06 · [m-bbe805](m-bbe805/plan.md) — Add a DroidBackend (AgentBackend over `droid exec -o json`) selectable only for the scrutiny validator, mirroring the Co… [truncated] · [report](m-bbe805/report.md)
 - 2026-07-06 · [m-9d4193](m-9d4193/plan.md) — Make the serve-hosted queue drain (POST /api/queue/drain) restore the operator's dispatch-time checkout when the drain f… [truncated] · [report](m-9d4193/report.md)
+- 2026-07-06 · [m-836e99](m-836e99/plan.md) — Delete the unrouted dead MissionPicker component and its now-orphaned helper/tests, and scrub every remaining source ref… [truncated] · [report](m-836e99/report.md)

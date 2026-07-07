@@ -1,6 +1,6 @@
 // #/backlog — the dashboard's browsable ticket backlog (docs/tickets.md
-// "The backlog over REST"). Mirrors MissionPicker's list styling: rows use
-// .picker-item / .picker-row, clicking one navigates to #/backlog/<slug>.
+// "The backlog over REST"). Rows use the shared .picker-item / .picker-row
+// list styling; clicking one navigates to #/backlog/<slug>.
 
 import { useEffect } from 'react';
 import { useKranzStore } from '../lib/store';
