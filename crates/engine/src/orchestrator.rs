@@ -171,6 +171,13 @@ pub enum PlanRequest {
     NotReady(String),
 }
 
+struct SelectedBackend {
+    backend: Arc<dyn AgentBackend>,
+    kind: BackendKind,
+    cfg: MissionConfig,
+    fallback_reason: Option<String>,
+}
+
 /// What the findings-conversion turn decided (see [`MissionEngine::convert_findings`]).
 enum FindingsConversion {
     /// Convert into fix features. Unparseable answers and answers that
@@ -269,14 +276,14 @@ pub struct MissionEngine {
     /// planning seed's reply routinely ends with scoping questions the user
     /// must see. Drained by [`MissionEngine::take_seed_reply`].
     pending_seed_reply: Option<String>,
-    /// Lazily-built [`crate::backend_codex::CodexBackend`] cache for
-    /// `validatorScrutiny.backend = "codex"`. `None` until the first
-    /// successful probe; a failed probe is never cached (so a codex install
-    /// that appears mid-mission is picked up on the next scrutiny round).
+    /// Lazily-built [`crate::backend_codex::CodexBackend`] cache for roles
+    /// whose `backend = "codex"`. `None` until the first successful probe; a
+    /// failed probe is never cached (so a codex install that appears
+    /// mid-mission is picked up on the next role spawn).
     codex_backend: Option<Arc<dyn AgentBackend>>,
-    /// Lazily-built [`crate::backend_droid::DroidBackend`] cache for
-    /// `validatorScrutiny.backend = "droid"`. Mirrors `codex_backend`: `None`
-    /// until the first successful probe; a failed probe is never cached.
+    /// Lazily-built [`crate::backend_droid::DroidBackend`] cache for roles
+    /// whose `backend = "droid"`. Mirrors `codex_backend`: `None` until the
+    /// first successful probe; a failed probe is never cached.
     droid_backend: Option<Arc<dyn AgentBackend>>,
     /// The tree mission-branch work runs in for the current `run()` call
     /// (M7 tier 1). `None` in checkout mode (and before the first `run()`),
@@ -574,27 +581,37 @@ impl MissionEngine {
             });
         }
 
-        if self.state.config.validator_scrutiny.backend.as_deref() == Some("codex") {
-            if let Err(err) = crate::backend_codex::discover_codex_binary(None) {
-                issues.push(PreflightIssue {
-                    severity: "warn",
-                    message: format!(
-                        "validatorScrutiny.backend is \"codex\" but no codex binary was found \
-                         ({err}); the scrutiny validator will fall back to the claude backend"
-                    ),
-                });
-            }
-        }
-
-        if self.state.config.validator_scrutiny.backend.as_deref() == Some("droid") {
-            if let Err(err) = crate::backend_droid::discover_droid_binary(None) {
-                issues.push(PreflightIssue {
-                    severity: "warn",
-                    message: format!(
-                        "validatorScrutiny.backend is \"droid\" but no droid binary was found \
-                         ({err}); the scrutiny validator will fall back to the claude backend"
-                    ),
-                });
+        for role in [
+            Role::Orchestrator,
+            Role::Worker,
+            Role::ValidatorScrutiny,
+            Role::ValidatorFunctional,
+        ] {
+            let role_key = role_config_key(role);
+            match self.state.config.backend_kind(role) {
+                BackendKind::Codex => {
+                    if let Err(err) = crate::backend_codex::discover_codex_binary(None) {
+                        issues.push(PreflightIssue {
+                            severity: "warn",
+                            message: format!(
+                                "{role_key}.backend is \"codex\" but no codex binary was found \
+                                 ({err}); that role will fall back to the claude backend"
+                            ),
+                        });
+                    }
+                }
+                BackendKind::Droid => {
+                    if let Err(err) = crate::backend_droid::discover_droid_binary(None) {
+                        issues.push(PreflightIssue {
+                            severity: "warn",
+                            message: format!(
+                                "{role_key}.backend is \"droid\" but no droid binary was found \
+                                 ({err}); that role will fall back to the claude backend"
+                            ),
+                        });
+                    }
+                }
+                BackendKind::Claude => {}
             }
         }
 
@@ -743,63 +760,129 @@ impl MissionEngine {
         Ok(())
     }
 
-    /// Choose the backend for a `ValidatorScrutiny` run.
+    /// Choose the backend for a role and return a config clone whose role
+    /// model has been normalized for the backend actually used.
     ///
-    /// `validatorScrutiny.backend == Some("codex")` selects
-    /// [`crate::backend_codex::CodexBackend`], probing availability via
-    /// [`crate::backend_codex::discover_codex_binary`] and lazily caching the
-    /// constructed backend in `self.codex_backend` on success. Any other
-    /// config value (including the default `None`) keeps the injected
-    /// `self.backend`.
-    ///
-    /// On probe failure this falls back to `self.backend` and returns
-    /// `Some(reason)` describing the fallback — the caller MUST surface that
-    /// reason via [`Self::emit_decision`] before spawning, so a codex
-    /// unavailability never silently swaps in a different validator.
-    fn select_scrutiny_backend(&mut self) -> (Arc<dyn AgentBackend>, Option<String>) {
-        match self.state.config.scrutiny_backend_kind() {
+    /// `*.backend == "codex"` / `"droid"` probes the corresponding CLI and
+    /// lazily caches the constructed backend on success. Probe failure falls
+    /// back to the injected Claude backend and returns a loud
+    /// `fallback_reason`; callers MUST record it before spawning.
+    fn select_backend(&mut self, role: Role) -> SelectedBackend {
+        let requested = self.state.config.backend_kind(role);
+        let role_name = role_label(role);
+        let mut cfg = self.state.config.clone();
+        let set_effective_model = |cfg: &mut MissionConfig, kind: BackendKind| {
+            let role_cfg = match role {
+                Role::Orchestrator => &mut cfg.orchestrator,
+                Role::Worker => &mut cfg.worker,
+                Role::ValidatorScrutiny => &mut cfg.validator_scrutiny,
+                Role::ValidatorFunctional => &mut cfg.validator_functional,
+            };
+            role_cfg.model = config::effective_model(role, kind, &role_cfg.model);
+        };
+
+        match requested {
             BackendKind::Codex => {
                 if let Some(cached) = &self.codex_backend {
-                    return (Arc::clone(cached), None);
+                    set_effective_model(&mut cfg, BackendKind::Codex);
+                    return SelectedBackend {
+                        backend: Arc::clone(cached),
+                        kind: BackendKind::Codex,
+                        cfg,
+                        fallback_reason: None,
+                    };
                 }
                 match crate::backend_codex::discover_codex_binary(None) {
                     Ok(binary) => {
                         let backend: Arc<dyn AgentBackend> =
                             Arc::new(crate::backend_codex::CodexBackend::new(binary));
                         self.codex_backend = Some(Arc::clone(&backend));
-                        (backend, None)
+                        set_effective_model(&mut cfg, BackendKind::Codex);
+                        SelectedBackend {
+                            backend,
+                            kind: BackendKind::Codex,
+                            cfg,
+                            fallback_reason: None,
+                        }
                     }
-                    Err(err) => (
-                        Arc::clone(&self.backend),
-                        Some(format!(
-                            "codex backend requested but not available ({err}); falling back to \
-                             the claude scrutiny validator"
-                        )),
-                    ),
+                    Err(err) => {
+                        set_effective_model(&mut cfg, BackendKind::Claude);
+                        SelectedBackend {
+                            backend: Arc::clone(&self.backend),
+                            kind: BackendKind::Claude,
+                            cfg,
+                            fallback_reason: Some(format!(
+                                "codex backend requested for the {role_name} but not available \
+                                 ({err}); falling back to the claude {role_name}"
+                            )),
+                        }
+                    }
                 }
             }
             BackendKind::Droid => {
                 if let Some(cached) = &self.droid_backend {
-                    return (Arc::clone(cached), None);
+                    set_effective_model(&mut cfg, BackendKind::Droid);
+                    return SelectedBackend {
+                        backend: Arc::clone(cached),
+                        kind: BackendKind::Droid,
+                        cfg,
+                        fallback_reason: None,
+                    };
                 }
                 match crate::backend_droid::discover_droid_binary(None) {
                     Ok(binary) => {
                         let backend: Arc<dyn AgentBackend> =
                             Arc::new(crate::backend_droid::DroidBackend::new(binary));
                         self.droid_backend = Some(Arc::clone(&backend));
-                        (backend, None)
+                        set_effective_model(&mut cfg, BackendKind::Droid);
+                        SelectedBackend {
+                            backend,
+                            kind: BackendKind::Droid,
+                            cfg,
+                            fallback_reason: None,
+                        }
                     }
-                    Err(err) => (
-                        Arc::clone(&self.backend),
-                        Some(format!(
-                            "droid backend requested but not available ({err}); falling back to \
-                             the claude scrutiny validator"
-                        )),
-                    ),
+                    Err(err) => {
+                        set_effective_model(&mut cfg, BackendKind::Claude);
+                        SelectedBackend {
+                            backend: Arc::clone(&self.backend),
+                            kind: BackendKind::Claude,
+                            cfg,
+                            fallback_reason: Some(format!(
+                                "droid backend requested for the {role_name} but not available \
+                                 ({err}); falling back to the claude {role_name}"
+                            )),
+                        }
+                    }
                 }
             }
-            BackendKind::Claude => (Arc::clone(&self.backend), None),
+            BackendKind::Claude => {
+                set_effective_model(&mut cfg, BackendKind::Claude);
+                SelectedBackend {
+                    backend: Arc::clone(&self.backend),
+                    kind: BackendKind::Claude,
+                    cfg,
+                    fallback_reason: None,
+                }
+            }
         }
+    }
+
+    fn claude_fallback_cfg_for_role(&self, role: Role) -> MissionConfig {
+        let mut cfg = self.state.config.clone();
+        let fallback_model = match role {
+            Role::Orchestrator | Role::ValidatorScrutiny => "opus",
+            Role::Worker | Role::ValidatorFunctional => "sonnet",
+        };
+        match role {
+            Role::Orchestrator => cfg.orchestrator.model = fallback_model.to_string(),
+            Role::Worker => cfg.worker.model = fallback_model.to_string(),
+            Role::ValidatorScrutiny => cfg.validator_scrutiny.model = fallback_model.to_string(),
+            Role::ValidatorFunctional => {
+                cfg.validator_functional.model = fallback_model.to_string()
+            }
+        }
+        cfg
     }
 
     /// The worker HOME relocate-vs-inherit decision for this mission (mission
@@ -1720,7 +1803,6 @@ impl MissionEngine {
             let feature = self.state.mission.milestones[mi].features[fi].clone();
             let goal = self.state.mission.goal.clone();
             let milestone_title = self.state.mission.milestones[mi].title.clone();
-            let cfg = self.state.config.clone();
             let base_sha = self.state.mission.base_sha.clone();
             let grants = self.state.mission.command_grants.clone();
             let pre_run_sha = self.active_repo().head_sha()?;
@@ -1734,11 +1816,22 @@ impl MissionEngine {
                 INTERRUPT_POLL,
                 Arc::clone(&cancel),
             ));
-            let backend = Arc::clone(&self.backend);
+            let selected = self.select_backend(Role::Worker);
+            if let Some(reason) = selected.fallback_reason.as_deref() {
+                self.emit_decision(reason, None)?;
+            }
+            let selected_kind = selected.kind;
+            let backend = Arc::clone(&selected.backend);
+            let cfg = selected.cfg;
             // Once-per-mission cached decision (mission m-165b6f, f-2-1): the
             // preflight session is driven at most once per mission, not once
-            // per worker spawn.
-            let auth_verdict = self.worker_auth_verdict().await;
+            // per worker spawn. It is Claude-specific; non-Claude workers do
+            // not need a Claude auth probe before launch.
+            let auth_verdict = if selected_kind == BackendKind::Claude {
+                self.worker_auth_verdict().await
+            } else {
+                AuthVerdict::Inconclusive
+            };
             // Worktree mode (M7 tier 1): the worker session's cwd is the
             // mission integration worktree, never the primary repo root.
             // Checkout mode keeps the exact `run_worker` call it always had.
@@ -2269,21 +2362,31 @@ impl MissionEngine {
         // overlap (and tests can assert it).
         let goal = self.state.mission.goal.clone();
         let milestone_title = self.state.mission.milestones[mi].title.clone();
-        let cfg = self.state.config.clone();
         let base_sha = self.state.mission.base_sha.clone();
         let grants = self.state.mission.command_grants.clone();
         let tracker = ConcurrencyTracker::new();
+        let selected = self.select_backend(Role::Worker);
+        if let Some(reason) = selected.fallback_reason.as_deref() {
+            self.emit_decision(reason, None)?;
+        }
+        let selected_kind = selected.kind;
+        let worker_backend = Arc::clone(&selected.backend);
+        let cfg = selected.cfg;
         // Once-per-mission cached decision (mission m-165b6f, f-2-1): computed
         // here, BEFORE any concurrent worker task is spawned, so every worker
         // in this batch shares the exact same decision and the preflight
         // session never races itself.
-        let auth_verdict = self.worker_auth_verdict().await;
+        let auth_verdict = if selected_kind == BackendKind::Claude {
+            self.worker_auth_verdict().await
+        } else {
+            AuthVerdict::Inconclusive
+        };
 
         let mut set: tokio::task::JoinSet<(usize, BufferedRunResult)> = tokio::task::JoinSet::new();
         for (idx, ws) in workspaces.iter().enumerate() {
             let (mwi, fwi) = self.locate_feature(&ws.feature_id)?;
             let feature = self.state.mission.milestones[mwi].features[fwi].clone();
-            let backend = Arc::clone(&self.backend);
+            let backend = Arc::clone(&worker_backend);
             let paths = self.paths.clone();
             let cfg = cfg.clone();
             let goal = goal.clone();
@@ -2608,44 +2711,17 @@ impl MissionEngine {
         for role in roles {
             let milestone = self.state.mission.milestones[mi].clone();
             let contract = self.state.mission.validation_contract.clone();
-            let mut cfg = self.state.config.clone();
             let base_sha = self.state.mission.base_sha.clone();
             let grants = self.state.mission.command_grants.clone();
             let worker_commands = worker_commands_for_milestone(&self.state, &milestone);
 
-            // Only `ValidatorScrutiny` may run on a non-claude backend
-            // (config::validate enforces this); `ValidatorFunctional` always
-            // uses the injected backend.
-            let mut used_codex = false;
-            let mut used_droid = false;
-            let backend = if role == Role::ValidatorScrutiny {
-                let (backend, fallback_reason) = self.select_scrutiny_backend();
-                if let Some(reason) = fallback_reason {
-                    // Loud, recorded — a codex/droid probe failure never
-                    // silently swaps the validator backend.
-                    self.emit_decision(&reason, None)?;
-                } else {
-                    match self.state.config.scrutiny_backend_kind() {
-                        BackendKind::Codex => used_codex = true,
-                        BackendKind::Droid => used_droid = true,
-                        BackendKind::Claude => {}
-                    }
-                }
-                backend
-            } else {
-                Arc::clone(&self.backend)
-            };
-
-            // Codex pricing/totals only apply to codex-family models: swap in
-            // DEFAULT_CODEX_MODEL for both the dispatch spec and RunMeta when
-            // validatorScrutiny.model isn't already one.
-            if used_codex && !cost::is_codex_model(&cfg.validator_scrutiny.model) {
-                cfg.validator_scrutiny.model = cost::DEFAULT_CODEX_MODEL.to_string();
+            let selected = self.select_backend(role);
+            if let Some(reason) = selected.fallback_reason.as_deref() {
+                self.emit_decision(reason, None)?;
             }
-            // Same swap for droid-family (glm/fireworks) models.
-            if used_droid && !cost::is_droid_model(&cfg.validator_scrutiny.model) {
-                cfg.validator_scrutiny.model = cost::DEFAULT_DROID_MODEL.to_string();
-            }
+            let selected_kind = selected.kind;
+            let backend = Arc::clone(&selected.backend);
+            let cfg = selected.cfg;
 
             let session_cwd = self.active_root().to_path_buf();
             let outcome = runner::run_validator_in(
@@ -2668,49 +2744,24 @@ impl MissionEngine {
             let mut outcome = outcome?;
             caught?;
 
-            // Bounded (exactly one retry) runtime fallback: a codex scrutiny
-            // run that errored out with no report (auth/network failure)
-            // falls back to the claude backend so a persistently broken
-            // codex install can't loop.
-            if used_codex && outcome.validator_report.is_none() {
+            // Bounded (exactly one retry) runtime fallback: a non-Claude
+            // validator run that produced no parseable report falls back to
+            // the injected Claude backend so a persistently broken external
+            // lane cannot loop or silently skip validation.
+            if matches!(selected_kind, BackendKind::Codex | BackendKind::Droid)
+                && outcome.validator_report.is_none()
+            {
                 self.emit_decision(
-                    "codex scrutiny run failed with no validator report; retrying once with \
-                     the claude scrutiny validator",
+                    &format!(
+                        "{} {} run failed with no validator report; retrying once with \
+                         the claude {}",
+                        selected_kind.as_str(),
+                        role_label(role),
+                        role_label(role)
+                    ),
                     None,
                 )?;
-                let retry_cfg = self.state.config.clone();
-                let retry_backend = Arc::clone(&self.backend);
-                let retry_session_cwd = self.active_root().to_path_buf();
-                let retry_outcome = runner::run_validator_in(
-                    retry_backend.as_ref(),
-                    &mut self.log,
-                    &self.paths,
-                    &retry_cfg,
-                    role,
-                    &milestone,
-                    &contract,
-                    &start_sha,
-                    None,
-                    &retry_session_cwd,
-                    base_sha.as_deref(),
-                    &grants,
-                    &worker_commands,
-                )
-                .await;
-                let caught = self.catch_up();
-                outcome = retry_outcome?;
-                caught?;
-            }
-
-            // Bounded (exactly one retry) runtime fallback for droid,
-            // mirroring the codex case above.
-            if used_droid && outcome.validator_report.is_none() {
-                self.emit_decision(
-                    "droid scrutiny run failed with no validator report; retrying once with \
-                     the claude scrutiny validator",
-                    None,
-                )?;
-                let retry_cfg = self.state.config.clone();
+                let retry_cfg = self.claude_fallback_cfg_for_role(role);
                 let retry_backend = Arc::clone(&self.backend);
                 let retry_session_cwd = self.active_root().to_path_buf();
                 let retry_outcome = runner::run_validator_in(
@@ -3427,6 +3478,10 @@ impl MissionEngine {
     /// session dies mid-turn, re-seed once and retry; two consecutive
     /// failures → [`EngineError::Backend`].
     async fn orch_turn(&mut self, message: &str) -> Result<String> {
+        if self.state.config.backend_kind(Role::Orchestrator) != BackendKind::Claude {
+            return self.orch_single_shot_turn(message).await;
+        }
+
         let mut last_err: Option<EngineError> = None;
         for attempt in 0..2u8 {
             self.ensure_orchestrator().await?;
@@ -3461,6 +3516,108 @@ impl MissionEngine {
             "orchestrator turn failed twice (re-seed did not recover): {}",
             last_err.expect("two failures recorded")
         )))
+    }
+
+    /// One orchestrator turn through a single-shot backend (Codex/Droid).
+    ///
+    /// The default Claude path remains the long-lived streaming session above.
+    /// Non-Claude backends do not support `send_user_message`, so each
+    /// orchestrator turn is a fresh single-shot session grounded by the same
+    /// digest the streaming path prepends to every turn.
+    async fn orch_single_shot_turn(&mut self, message: &str) -> Result<String> {
+        let selected = self.select_backend(Role::Orchestrator);
+        if let Some(reason) = selected.fallback_reason.as_deref() {
+            self.emit_decision(reason, None)?;
+        }
+        let backend = Arc::clone(&selected.backend);
+        let cfg = selected.cfg;
+        let role_cfg = cfg.role(Role::Orchestrator).clone();
+
+        let mut vars: HashMap<&str, String> = HashMap::new();
+        vars.insert(
+            "turnBudget",
+            cfg.worker
+                .max_turns
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "a reasonable number of".to_string()),
+        );
+        let system_prompt = prompts::render(prompts::text(Role::Orchestrator), &vars);
+
+        let prompt = if self.state.mission.status == MissionStatus::Planning {
+            let mut seed = format!(
+                "MISSION GOAL:\n{}\n\nYou are in the planning phase. Interrogate the \
+                 goal and the repository (read-only), ask the user sharp questions if \
+                 anything material is ambiguous, then propose the validation contract, \
+                 milestones and features. Do not emit the plan JSON until asked.",
+                self.state.mission.goal
+            );
+            if let Some(index) = lessons::render_lessons_index(&self.paths.repo_root) {
+                seed.push_str("\n\n");
+                seed.push_str(&index);
+            }
+            format!("{seed}\n\nUSER TURN:\n{message}")
+        } else {
+            format!("{}\n\n{}", digest::render(&self.state), message)
+        };
+
+        let mut spec = SessionSpec {
+            cwd: self.paths.repo_root.clone(),
+            prompt: PromptMode::SingleShot(prompt),
+            append_system_prompt: Some(system_prompt),
+            model: role_cfg.model.clone(),
+            effort: role_cfg.reasoning_effort.clone(),
+            session_id: uuid::Uuid::new_v4().to_string(),
+            resume: None,
+            permission_mode: None,
+            allowed_tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+            tools: cfg.role(Role::Orchestrator).tools.clone(),
+            settings_json: None,
+            json_schema: None,
+            max_budget_usd: role_cfg.max_budget_usd,
+            max_turns: role_cfg.max_turns,
+            env: HashMap::new(),
+            sandbox: None,
+        };
+        permissions::apply(
+            permissions::for_role(Role::Orchestrator, &cfg, &[], &[]),
+            &mut spec,
+        );
+
+        let orch_count = self
+            .state
+            .runs
+            .values()
+            .filter(|r| r.role == Role::Orchestrator)
+            .count();
+        let run_id = format!("orch-{}", orch_count + 1);
+        let run_meta = runner::RunMeta {
+            run_id,
+            role: Role::Orchestrator,
+            feature_id: None,
+            milestone_id: None,
+            model: role_cfg.model,
+            prompt_hash: prompts::hash(Role::Orchestrator),
+        };
+        let outcome = runner::run_session(
+            backend.as_ref(),
+            spec,
+            &mut self.log,
+            &self.paths,
+            run_meta,
+            None,
+        )
+        .await;
+        let caught = self.catch_up();
+        let outcome = outcome?;
+        caught?;
+        if outcome.result == RunResult::Fail {
+            return Err(EngineError::Backend(format!(
+                "orchestrator single-shot turn failed: {}",
+                outcome.final_text
+            )));
+        }
+        Ok(outcome.final_text)
     }
 
     /// Ensure the long-lived streaming orchestrator session exists.
@@ -4018,6 +4175,24 @@ fn mission_worktree_path(mission_id: &str) -> PathBuf {
 // ---------------------------------------------------------------------------
 // Pure helpers
 // ---------------------------------------------------------------------------
+
+fn role_config_key(role: Role) -> &'static str {
+    match role {
+        Role::Orchestrator => "orchestrator",
+        Role::Worker => "worker",
+        Role::ValidatorScrutiny => "validatorScrutiny",
+        Role::ValidatorFunctional => "validatorFunctional",
+    }
+}
+
+fn role_label(role: Role) -> &'static str {
+    match role {
+        Role::Orchestrator => "orchestrator",
+        Role::Worker => "worker",
+        Role::ValidatorScrutiny => "scrutiny validator",
+        Role::ValidatorFunctional => "functional validator",
+    }
+}
 
 /// Index of the first milestone (in plan order) that is not Complete.
 fn first_incomplete(state: &MissionState) -> Option<usize> {
@@ -5630,11 +5805,11 @@ mod tests {
         }
     }
 
-    /// Default config never selects codex: `select_scrutiny_backend` must
-    /// hand back the injected backend untouched and never emit a fallback
-    /// decision (there is nothing to fall back from).
+    /// Default config never selects a non-Claude backend: `select_backend`
+    /// must hand back the injected backend untouched for every role and never
+    /// emit a fallback decision (there is nothing to fall back from).
     #[test]
-    fn default_scrutiny_backend_is_claude() {
+    fn default_role_backends_are_claude() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = std::fs::canonicalize(dir.path()).unwrap_or_else(|_| dir.path().to_path_buf());
         let _ = std::process::Command::new("git")
@@ -5666,18 +5841,33 @@ mod tests {
 
         let before = EventLog::read_events(&engine.paths.events_file()).expect("read events");
 
-        let (selected, reason) = engine.select_scrutiny_backend();
-        assert!(reason.is_none(), "default config must not fall back");
-        assert!(
-            Arc::ptr_eq(&selected, &backend),
-            "default config must select the injected backend"
-        );
+        for role in [
+            Role::Orchestrator,
+            Role::Worker,
+            Role::ValidatorScrutiny,
+            Role::ValidatorFunctional,
+        ] {
+            let selected = engine.select_backend(role);
+            assert!(
+                selected.fallback_reason.is_none(),
+                "default config must not fall back for {role:?}"
+            );
+            assert_eq!(selected.kind, BackendKind::Claude);
+            assert!(
+                Arc::ptr_eq(&selected.backend, &backend),
+                "default config must select the injected backend for {role:?}"
+            );
+            assert_eq!(
+                selected.cfg.role(role).model,
+                MissionConfig::default().role(role).model
+            );
+        }
 
         let after = EventLog::read_events(&engine.paths.events_file()).expect("read events");
         assert_eq!(
             before.len(),
             after.len(),
-            "select_scrutiny_backend must not emit any event on the claude-default path"
+            "select_backend must not emit any event on the claude-default path"
         );
     }
 
@@ -6060,7 +6250,12 @@ mod tests {
         // 9 is out of the 1..=8 range M3 allows, so the patch must be rejected.
         let bad = serde_json::json!({ "maxParallelWorkers": 9 });
         assert!(preview_config_patch(&cfg, &bad).is_err());
-        let good = serde_json::json!({ "worker": { "model": "haiku" } });
+        let below_floor = serde_json::json!({ "worker": { "model": "haiku" } });
+        assert!(preview_config_patch(&cfg, &below_floor).is_err());
+        let good = serde_json::json!({
+            "worker": { "model": "haiku" },
+            "allowBelowDefaultWorkerModel": true
+        });
         assert!(preview_config_patch(&cfg, &good).is_ok());
     }
 
@@ -7070,6 +7265,57 @@ mod tests {
         cfg.validator_scrutiny.backend = Some("droid".to_string());
         cfg.skip_functional = true;
         cfg
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn select_backend_routes_each_role_and_normalizes_default_models() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let (_codex_stub_dir, codex_stub) = write_codex_stub();
+        let (_droid_stub_dir, droid_stub) = write_droid_stub();
+
+        let mut cfg = MissionConfig::default();
+        cfg.orchestrator.backend = Some("droid".to_string());
+        cfg.orchestrator.model = "claude-fable-5".to_string();
+        cfg.worker.backend = Some("codex".to_string());
+        cfg.validator_scrutiny.backend = Some("codex".to_string());
+        cfg.validator_functional.backend = Some("droid".to_string());
+        cfg.validator_functional.model = "claude-fable-5".to_string();
+
+        let mock: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
+        let mut engine =
+            MissionEngine::create(mock.clone(), &root, "goal", cfg).expect("create engine");
+
+        let codex_guard = CodexStubEnvGuard::engage(&codex_stub);
+        let droid_guard = DroidStubEnvGuard::engage(&droid_stub);
+
+        let worker = engine.select_backend(Role::Worker);
+        assert_eq!(worker.kind, BackendKind::Codex);
+        assert_eq!(worker.cfg.worker.model, cost::DEFAULT_CODEX_MODEL);
+        assert!(
+            !Arc::ptr_eq(&worker.backend, &mock),
+            "worker should route to the codex backend"
+        );
+
+        let scrutiny = engine.select_backend(Role::ValidatorScrutiny);
+        assert_eq!(scrutiny.kind, BackendKind::Codex);
+        assert_eq!(
+            scrutiny.cfg.validator_scrutiny.model,
+            cost::DEFAULT_CODEX_MODEL
+        );
+
+        let functional = engine.select_backend(Role::ValidatorFunctional);
+        assert_eq!(functional.kind, BackendKind::Droid);
+        assert_eq!(functional.cfg.validator_functional.model, "claude-fable-5");
+
+        let orchestrator = engine.select_backend(Role::Orchestrator);
+        assert_eq!(orchestrator.kind, BackendKind::Droid);
+        assert_eq!(orchestrator.cfg.orchestrator.model, "claude-fable-5");
+
+        drop(droid_guard);
+        drop(codex_guard);
     }
 
     /// The stub droid's ValidatorReport findings (>=1, per the fixture) fold
