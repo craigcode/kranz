@@ -16,6 +16,7 @@ use crate::rest::mission_paths;
 use crate::ServerState;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as UrlPath, Query, State};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use kranz_engine::event_log::EventLog;
 use kranz_engine::events::{Event, EventKind};
@@ -40,8 +41,19 @@ pub(crate) async fn ws_handler(
     State(server): State<Arc<ServerState>>,
     UrlPath(id): UrlPath<String>,
     Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
+    let Some(origin) = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    if !crate::origin_allowed(origin) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
     let paths = match mission_paths(&server, &id) {
         Ok(paths) => paths,
         Err(e) => return e.into_response(),

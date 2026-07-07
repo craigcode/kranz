@@ -193,14 +193,16 @@ pub fn router_with_shared_host(
         None => app.route("/", get(root_info)),
     };
 
-    // Layer order (outermost last): the CORS layer wraps the JSON gate wraps
-    // the token gate, so even rejections carry CORS headers for approved
-    // origins and a non-JSON POST is rejected before the token is examined.
+    // Layer order (outermost last): the CORS layer wraps the Host gate wraps
+    // the JSON gate wraps the token gate, so even rejections carry CORS
+    // headers for approved origins and a non-JSON POST is rejected before the
+    // token is examined.
     app.layer(middleware::from_fn_with_state(
         token,
         require_mutation_token,
     ))
     .layer(middleware::from_fn(require_json_api_posts))
+    .layer(middleware::from_fn(require_local_host))
     .layer(cors_layer())
 }
 
@@ -273,6 +275,38 @@ fn origin_allowed(origin: &str) -> bool {
                     .strip_prefix(':')
                     .is_some_and(|port| port.parse::<u16>().is_ok())
         })
+    })
+}
+
+/// Local-service Host guard for every route. Browsers always send `Host`, so
+/// DNS rebinding attempts arrive as the attacker-controlled hostname and are
+/// rejected before tokenless reads can return mission state or transcripts.
+///
+/// Path-only in-process requests used by `tower::ServiceExt::oneshot` carry no
+/// Host header and are allowed; real network HTTP/1.1 requests present Host.
+async fn require_local_host(request: Request, next: Next) -> Response {
+    if let Some(host) = request.headers().get(header::HOST) {
+        if !host.to_str().is_ok_and(host_allowed) {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "error": "invalid host" })),
+            )
+                .into_response();
+        }
+    }
+    next.run(request).await
+}
+
+/// Trusted HTTP Host values: `localhost` or `127.0.0.1`, each with an
+/// optional `:<u16>` port. This deliberately mirrors the browser origins the
+/// dashboard may use, without substring matching.
+fn host_allowed(host: &str) -> bool {
+    let host = host.trim().to_ascii_lowercase();
+    ["localhost", "127.0.0.1"].iter().any(|base| {
+        host == *base
+            || host
+                .strip_prefix(&format!("{base}:"))
+                .is_some_and(|port| port.parse::<u16>().is_ok())
     })
 }
 
@@ -430,7 +464,7 @@ pub async fn serve_with_shutdown(
 
 #[cfg(test)]
 mod tests {
-    use super::origin_allowed;
+    use super::{host_allowed, origin_allowed};
 
     #[test]
     fn origin_allowlist_accepts_only_local_dev_and_tauri() {
@@ -466,6 +500,32 @@ mod tests {
             "",
         ] {
             assert!(!origin_allowed(denied), "should deny {denied}");
+        }
+    }
+
+    #[test]
+    fn host_allowlist_accepts_only_localhost_hosts() {
+        for allowed in [
+            "localhost",
+            "localhost:4560",
+            "LOCALHOST:5173",
+            "127.0.0.1",
+            "127.0.0.1:65535",
+        ] {
+            assert!(host_allowed(allowed), "should allow {allowed}");
+        }
+        for denied in [
+            "evil.example",
+            "evil.example:4560",
+            "localhost.evil.example",
+            "127.0.0.1.evil.example",
+            "127.0.0.10",
+            "127.0.0.1:99999",
+            "localhost:4560.evil.example",
+            "[::1]:4560",
+            "",
+        ] {
+            assert!(!host_allowed(denied), "should deny {denied}");
         }
     }
 }

@@ -19,7 +19,7 @@
 //! All tests skip cleanly when `git` is not on PATH.
 
 use kranz_engine::auth_verify::AuthVerdict;
-use kranz_engine::backend::{AgentBackend, PromptMode, SessionExit};
+use kranz_engine::backend::{AgentBackend, PromptMode};
 use kranz_engine::backend_mock::{
     mock_init, mock_result_error, mock_result_text, mock_text, MockBackend, MockScript,
 };
@@ -1072,22 +1072,21 @@ async fn respawn_bounded_fails_feature_then_mission_continues() {
     }
     let (_dir, root) = init_repo();
 
-    // f-1-1: two failing worker runs. Judgement says "respawn" both times;
-    // the first respawn is within budget (max_respawns = 1), the second
-    // request exceeds it → the ENGINE fails the feature without consulting
-    // further. f-1-2 then succeeds; validators are skipped, contract empty,
-    // so the mission completes around the failed feature.
+    // f-1-1: two failing worker runs. The trusted runner verdict now respawns
+    // non-pass workers before any orchestrator judgement; the first respawn
+    // is within budget (max_respawns = 1), the second request exceeds it →
+    // the ENGINE fails the feature. f-1-2 then succeeds; validators are
+    // skipped, contract empty, so the mission completes around the failed
+    // feature.
     let backend = Arc::new(MockBackend::with_scripts(vec![
         worker_fail(), // f-1-1 attempt 1
+        worker_fail(), // f-1-1 attempt 2 (the one allowed respawn)
+        worker_pass(), // f-1-2
         orch_script(vec![
-            judgement("respawn", "add the missing test double"),
-            judgement("respawn", "try harder"), // denied: budget exhausted
             dirty_tree_commit_as_is(),
             judgement("complete", ""), // f-1-2
             no_lesson(),
         ]),
-        worker_fail(), // f-1-1 attempt 2 (the one allowed respawn)
-        worker_pass(), // f-1-2
     ]));
 
     let cfg = MissionConfig {
@@ -1109,14 +1108,14 @@ async fn respawn_bounded_fails_feature_then_mission_continues() {
     assert_eq!(ms.features[0].worker_runs.len(), 2, "two worker runs total");
     assert_eq!(ms.features[1].status, FeatureStatus::Complete);
 
-    // The respawned worker received the judgement guidance in its task.
+    // The respawned worker received the runner-failure guidance in its task.
     let specs = backend.started_specs();
-    // start order: worker, orch, worker(respawn), worker(f-1-2)
-    match &specs[2].prompt {
+    // start order: worker, worker(respawn), worker(f-1-2), orch
+    match &specs[1].prompt {
         PromptMode::SingleShot(task) => {
             assert!(
-                task.contains("add the missing test double"),
-                "guidance passed: {task}"
+                task.contains("worker run not trusted"),
+                "runner failure guidance passed: {task}"
             )
         }
         other => panic!("respawned worker must be single-shot, got {other:?}"),
@@ -1335,18 +1334,13 @@ async fn kill_and_resume_completes_on_single_log() {
     let (_dir, root) = init_repo();
 
     // --- Phase 1: the "crash" -------------------------------------------
-    // The first worker's session dies (exit Failed, no result). The engine
-    // then tries a judgement turn, but the orchestrator script has NO
-    // on_message batches: the session parks, the (shortened) stall timeout
-    // declares it dead, the retry re-seeds — and the backend has no script
-    // left, so run() errors out mid-feature. That is our in-process kill.
-    let crash_worker = MockScript {
-        events: vec![mock_init("w-crash"), mock_text("working on it…")],
-        exit: SessionExit::Failed("simulated process crash".to_string()),
-        ..Default::default()
-    };
+    // The first worker reaches a trusted pass, then the judgement turn stalls:
+    // the orchestrator script has NO on_message batches, so the session parks,
+    // the (shortened) stall timeout declares it dead, the retry re-seeds — and
+    // the backend has no script left, so run() errors out mid-feature. That is
+    // our in-process kill.
     let backend1 = Arc::new(MockBackend::with_scripts(vec![
-        crash_worker,
+        worker_pass_no_write(),
         orch_script(vec![]), // seed only; the judgement turn starves
     ]));
 

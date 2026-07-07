@@ -20,6 +20,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tower::ServiceExt;
@@ -839,6 +840,48 @@ async fn control_post_without_origin_is_unaffected_by_cors() {
 }
 
 #[tokio::test]
+async fn host_header_rejects_dns_rebinding_hosts() {
+    let (_tmp, _repo_root, _paths, app) = fixture();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/missions/{MISSION_ID}/state"))
+                .header(header::HOST, "localhost:4560")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    for host in [
+        "evil.example",
+        "evil.example:4560",
+        "localhost.evil.example",
+        "127.0.0.1.evil.example:4560",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/missions/{MISSION_ID}/state"))
+                    .header(header::HOST, host)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "Host {host} must be rejected"
+        );
+    }
+}
+
+#[tokio::test]
 async fn control_post_rejects_non_json_content_types() {
     // A drive-by page can send text/plain or form-encoded POSTs WITHOUT a
     // CORS preflight ("simple" requests). The JSON gate rejects them before
@@ -1029,6 +1072,28 @@ async fn next_frame(ws: &mut WsStream) -> Value {
     }
 }
 
+fn ws_request(
+    url: &str,
+    origin: Option<&str>,
+) -> tokio_tungstenite::tungstenite::handshake::client::Request {
+    let mut request = url.into_client_request().unwrap();
+    if let Some(origin) = origin {
+        request
+            .headers_mut()
+            .insert("origin", origin.parse().unwrap());
+    }
+    request
+}
+
+async fn connect_allowed_ws(url: &str) -> WsStream {
+    let request = ws_request(url, Some("http://localhost:5173"));
+    let (ws, _) = tokio::time::timeout(WAIT, connect_async(request))
+        .await
+        .unwrap()
+        .unwrap();
+    ws
+}
+
 async fn spawn_server(app: axum::Router) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1057,10 +1122,7 @@ async fn ws_snapshot_tail_state_ping_and_since_replay() {
     assert_eq!(health["ok"], true);
 
     let url = format!("ws://{addr}/api/missions/{MISSION_ID}/ws");
-    let (mut ws, _) = tokio::time::timeout(WAIT, connect_async(&url))
-        .await
-        .unwrap()
-        .unwrap();
+    let mut ws = connect_allowed_ws(&url).await;
 
     // First frame: a snapshot carrying the fold and its seq.
     let frame = next_frame(&mut ws).await;
@@ -1114,10 +1176,7 @@ async fn ws_snapshot_tail_state_ping_and_since_replay() {
     assert_eq!(frame["type"], "pong");
 
     // Reconnect with ?since=7: replay starts at seq 8, no snapshot.
-    let (mut ws2, _) = tokio::time::timeout(WAIT, connect_async(format!("{url}?since=7")))
-        .await
-        .unwrap()
-        .unwrap();
+    let mut ws2 = connect_allowed_ws(&format!("{url}?since=7")).await;
     let frame = next_frame(&mut ws2).await;
     assert_eq!(frame["type"], "event");
     assert_eq!(frame["seq"], 8);
@@ -1132,13 +1191,30 @@ async fn ws_since_ahead_of_head_gets_fresh_snapshot() {
     let addr = spawn_server(app).await;
 
     let url = format!("ws://{addr}/api/missions/{MISSION_ID}/ws?since=999");
-    let (mut ws, _) = tokio::time::timeout(WAIT, connect_async(url))
-        .await
-        .unwrap()
-        .unwrap();
+    let mut ws = connect_allowed_ws(&url).await;
     let frame = next_frame(&mut ws).await;
     assert_eq!(frame["type"], "snapshot");
     assert_eq!(frame["seq"], 7);
+}
+
+#[tokio::test]
+async fn ws_rejects_missing_or_foreign_origin() {
+    let (_tmp, _repo_root, _paths, app) = fixture();
+    let addr = spawn_server(app).await;
+    let url = format!("ws://{addr}/api/missions/{MISSION_ID}/ws");
+
+    let missing = tokio::time::timeout(WAIT, connect_async(&url))
+        .await
+        .unwrap();
+    assert!(missing.is_err(), "missing Origin must be rejected");
+
+    let foreign = tokio::time::timeout(
+        WAIT,
+        connect_async(ws_request(&url, Some("https://evil.example"))),
+    )
+    .await
+    .unwrap();
+    assert!(foreign.is_err(), "foreign Origin must be rejected");
 }
 
 #[tokio::test]
@@ -1147,9 +1223,12 @@ async fn ws_unknown_mission_is_rejected() {
     let addr = spawn_server(app).await;
 
     let url = format!("ws://{addr}/api/missions/nope/ws");
-    let result = tokio::time::timeout(WAIT, connect_async(url))
-        .await
-        .unwrap();
+    let result = tokio::time::timeout(
+        WAIT,
+        connect_async(ws_request(&url, Some("http://localhost:5173"))),
+    )
+    .await
+    .unwrap();
     assert!(result.is_err(), "handshake to an unknown mission must fail");
 }
 

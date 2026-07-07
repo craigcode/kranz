@@ -37,7 +37,9 @@
 //! meaningful: a dirty tree after a worker run is *worker* dirt.
 
 use crate::auth_verify::AuthVerdict;
-use crate::backend::{AgentBackend, AgentEvent, AgentSession, PromptMode, SessionSpec};
+use crate::backend::{
+    AgentBackend, AgentEvent, AgentSession, PromptMode, SessionExit, SessionSpec,
+};
 use crate::config;
 use crate::contract_sweep;
 use crate::control;
@@ -1897,7 +1899,7 @@ impl MissionEngine {
                 .unwrap_or_default();
 
             match self
-                .judge_worker_run(&feature.id, outcome.report.as_ref(), &commits, &diff_stat)
+                .judge_worker_run(&feature.id, &outcome, &commits, &diff_stat)
                 .await?
             {
                 JudgementOutcome::Complete => {
@@ -1976,11 +1978,20 @@ impl MissionEngine {
     async fn judge_worker_run(
         &mut self,
         feature_id: &str,
-        report: Option<&WorkerReport>,
+        outcome: &runner::RunOutcome,
         commits: &[String],
         diff_stat: &str,
     ) -> Result<JudgementOutcome> {
-        let report_text = match report {
+        let runner_summary = run_outcome_summary(outcome);
+        if outcome.result != RunResult::Pass {
+            let summary = format!("worker run not trusted: {runner_summary}");
+            self.emit_decision(&format!("judgement for {feature_id}: {summary}"), None)?;
+            return Ok(JudgementOutcome::Respawn(format!(
+                "{summary}. Re-run the feature; do not rely on the previous worker report."
+            )));
+        }
+
+        let report_text = match outcome.report.as_ref() {
             Some(r) => serde_json::to_string_pretty(r)?,
             None => "NO REPORT — treat sceptically".to_string(),
         };
@@ -1995,6 +2006,7 @@ impl MissionEngine {
         };
         let message = format!(
             "A worker run for feature {feature_id} just finished. Judge it.\n\n\
+             RUNNER VERDICT:\n{runner_summary}\n\n\
              WORKER REPORT:\n{report_text}\n\n\
              COMMITS THIS RUN:\n{commits_text}\n\n\
              DIFF STAT:\n{diff_stat}\n\n\
@@ -2649,12 +2661,7 @@ impl MissionEngine {
             .collect();
         let diff_stat = wt_repo.diff_stat(start_sha, "HEAD").unwrap_or_default();
         match self
-            .judge_worker_run(
-                &ws.feature_id,
-                outcome.report.as_ref(),
-                &commits,
-                &diff_stat,
-            )
+            .judge_worker_run(&ws.feature_id, outcome, &commits, &diff_stat)
             .await?
         {
             JudgementOutcome::Complete => Ok(true),
@@ -2744,19 +2751,18 @@ impl MissionEngine {
             let mut outcome = outcome?;
             caught?;
 
-            // Bounded (exactly one retry) runtime fallback: a non-Claude
-            // validator run that produced no parseable report falls back to
-            // the injected Claude backend so a persistently broken external
-            // lane cannot loop or silently skip validation.
-            if matches!(selected_kind, BackendKind::Codex | BackendKind::Droid)
-                && outcome.validator_report.is_none()
-            {
+            // Bounded (exactly one retry) runtime fallback: a validator run
+            // that did not produce a trusted pass is retried once with the
+            // injected Claude backend. A crashed/aborted validator must never
+            // collapse into "no findings" and green-light validation.
+            if !validator_outcome_trusted(&outcome) {
                 self.emit_decision(
                     &format!(
-                        "{} {} run failed with no validator report; retrying once with \
+                        "{} {} run did not produce a trusted validator report ({}); retrying once with \
                          the claude {}",
                         selected_kind.as_str(),
                         role_label(role),
+                        run_outcome_summary(&outcome),
                         role_label(role)
                     ),
                     None,
@@ -2785,10 +2791,25 @@ impl MissionEngine {
                 caught?;
             }
 
-            if let Some(report) = outcome.validator_report {
-                for finding in report.findings {
-                    findings.push((outcome.run_id.clone(), finding));
-                }
+            if !validator_outcome_trusted(&outcome) {
+                let reason = format!(
+                    "{} validation did not produce a trusted report after retry: {}",
+                    role_label(role),
+                    run_outcome_summary(&outcome)
+                );
+                self.emit_decision(&reason, None)?;
+                self.emit(EventKind::MilestoneBlocked {
+                    milestone_id,
+                    reason,
+                })?;
+                return Ok(());
+            }
+
+            let report = outcome
+                .validator_report
+                .expect("trusted validator outcome must carry a report");
+            for finding in report.findings {
+                findings.push((outcome.run_id.clone(), finding));
             }
         }
 
@@ -2982,24 +3003,17 @@ impl MissionEngine {
                 "unparseable fix-features decision; synthesized from findings".to_string(),
             ),
         };
-        if specs.is_empty() && !waived.is_empty() {
+        let waived_subjects: std::collections::HashSet<&str> =
+            waived.iter().map(|w| w.subject.as_str()).collect();
+        let unwaived_findings: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| !waived_subjects.contains(f.subject.as_str()))
+            .collect();
+        if specs.is_empty() && !waived.is_empty() && unwaived_findings.is_empty() {
             return Ok(FindingsConversion::Waive { waived });
         }
         let specs = if specs.is_empty() {
-            findings
-                .iter()
-                .map(|f| FixFeatureSpec {
-                    title: format!("Fix finding: {}", f.subject),
-                    spec: format!(
-                        "Address this validation finding.\nEvidence: {}\nSuggested fix: {}",
-                        f.evidence, f.suggested_fix
-                    ),
-                    validation_criteria: vec![format!(
-                        "finding '{}' no longer reproduces",
-                        f.subject
-                    )],
-                })
-                .collect()
+            synthesize_fix_specs(unwaived_findings)
         } else {
             specs
         };
@@ -4008,6 +4022,41 @@ impl MissionEngine {
             }
         }
     }
+}
+
+fn validator_outcome_trusted(outcome: &runner::RunOutcome) -> bool {
+    outcome.result == RunResult::Pass && outcome.validator_report.is_some()
+}
+
+fn run_outcome_summary(outcome: &runner::RunOutcome) -> String {
+    format!(
+        "result={:?}, exit={}, deniedToolResults={}",
+        outcome.result,
+        session_exit_summary(&outcome.exit),
+        outcome.denied_count
+    )
+}
+
+fn session_exit_summary(exit: &SessionExit) -> String {
+    match exit {
+        SessionExit::Completed => "completed".to_string(),
+        SessionExit::Aborted => "aborted".to_string(),
+        SessionExit::Failed(message) => format!("failed: {}", tail_chars(message, 240)),
+    }
+}
+
+fn synthesize_fix_specs(findings: Vec<&Finding>) -> Vec<FixFeatureSpec> {
+    findings
+        .into_iter()
+        .map(|f| FixFeatureSpec {
+            title: format!("Fix finding: {}", f.subject),
+            spec: format!(
+                "Address this validation finding.\nEvidence: {}\nSuggested fix: {}",
+                f.evidence, f.suggested_fix
+            ),
+            validation_criteria: vec![format!("finding '{}' no longer reproduces", f.subject)],
+        })
+        .collect()
 }
 
 /// What the judgement turn decided for a worker run.
@@ -6529,6 +6578,209 @@ mod tests {
             mock_result_text("ready"),
         ])
         .responding(vec![vec![mock_text(reply), mock_result_text(reply)]])
+    }
+
+    fn finding(subject: &str) -> Finding {
+        Finding {
+            subject: subject.to_string(),
+            severity: "major".to_string(),
+            evidence: format!("{subject} evidence"),
+            suggested_fix: format!("fix {subject}"),
+            class: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_waiver_synthesizes_unwaived_findings() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let reply = serde_json::json!({
+            "fixFeatures": [],
+            "waived": [{ "subject": "covered", "reason": "not contract relevant" }],
+            "summary": "waive one"
+        })
+        .to_string();
+        let backend: Arc<dyn AgentBackend> =
+            Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+                lesson_orch_script(&reply),
+            ]));
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+
+        let conversion = engine
+            .convert_findings("ms-1", &[finding("covered"), finding("uncovered")])
+            .await
+            .unwrap();
+
+        match conversion {
+            FindingsConversion::Fix { specs, .. } => {
+                assert_eq!(specs.len(), 1, "only the unwaived finding needs a fix");
+                assert!(
+                    specs[0].title.contains("uncovered"),
+                    "expected synthesized fix for the uncovered finding: {}",
+                    specs[0].title
+                );
+            }
+            FindingsConversion::Waive { .. } => {
+                panic!("a partial waiver must not waive the whole finding set")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn all_waived_findings_still_waive() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let reply = serde_json::json!({
+            "fixFeatures": [],
+            "waived": [
+                { "subject": "one", "reason": "not contract relevant" },
+                { "subject": "two", "reason": "duplicate of one" }
+            ],
+            "summary": "waive all"
+        })
+        .to_string();
+        let backend: Arc<dyn AgentBackend> =
+            Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+                lesson_orch_script(&reply),
+            ]));
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+
+        let conversion = engine
+            .convert_findings("ms-1", &[finding("one"), finding("two")])
+            .await
+            .unwrap();
+
+        match conversion {
+            FindingsConversion::Waive { waived } => assert_eq!(waived.len(), 2),
+            FindingsConversion::Fix { .. } => panic!("a full waiver should still waive"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_pass_worker_outcome_cannot_complete_from_pass_report() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let report = serde_json::json!({
+            "result": "pass",
+            "summary": "I passed before the process died",
+            "filesTouched": [],
+            "testsAdded": [],
+            "testEvidence": "",
+            "dependenciesAdded": [],
+            "knownGaps": [],
+            "commits": [],
+            "commandsRun": []
+        });
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            crate::backend_mock::MockScript::single_shot("auth ok"),
+            crate::backend_mock::MockScript::single_shot_json(&report)
+                .with_exit(SessionExit::Aborted),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock.clone();
+        let cfg = MissionConfig {
+            max_respawns: 0,
+            ..MissionConfig::default()
+        };
+        let mut engine = MissionEngine::create(backend, &root, "goal", cfg).unwrap();
+        engine.state.mission.milestones.push(Milestone {
+            id: "ms-1".to_string(),
+            title: "m".to_string(),
+            features: vec![Feature {
+                id: "f-1-1".to_string(),
+                title: "f".to_string(),
+                spec: "s".to_string(),
+                validation_criteria: vec![],
+                origin: FeatureOrigin::Plan,
+                status: FeatureStatus::Pending,
+                worker_runs: vec![],
+                commits: vec![],
+                respawns: 0,
+            }],
+            status: MilestoneStatus::Active,
+            fix_cycles: 0,
+            start_sha: Some(engine.repo.head_sha().unwrap()),
+        });
+
+        engine.run_feature(0, 0).await.unwrap();
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::FeatureFailed { feature_id, .. } if feature_id == "f-1-1")),
+            "non-pass runner outcome must fail/respawn, not complete: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::FeatureCompleted { feature_id, .. } if feature_id == "f-1-1")),
+            "stale pass report must not complete the feature"
+        );
+        assert_eq!(
+            mock.started_specs().len(),
+            2,
+            "only the auth preflight and worker should run; no orchestrator judgement turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_validator_without_report_blocks_validation() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            crate::backend_mock::MockScript::single_shot("not json")
+                .with_exit(SessionExit::Failed("validator crashed".to_string())),
+            crate::backend_mock::MockScript::single_shot("still not json")
+                .with_exit(SessionExit::Failed("validator crashed again".to_string())),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock;
+        let cfg = MissionConfig {
+            skip_functional: true,
+            ..MissionConfig::default()
+        };
+        let mut engine = MissionEngine::create(backend, &root, "goal", cfg).unwrap();
+        engine.state.mission.milestones.push(Milestone {
+            id: "ms-1".to_string(),
+            title: "m".to_string(),
+            features: vec![],
+            status: MilestoneStatus::Active,
+            fix_cycles: 0,
+            start_sha: Some(engine.repo.head_sha().unwrap()),
+        });
+
+        engine.validation_round(0).await.unwrap();
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        let validator_spawns = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.kind,
+                    EventKind::WorkerSpawned { role, .. } if *role == Role::ValidatorScrutiny
+                )
+            })
+            .count();
+        assert_eq!(validator_spawns, 2, "validator must be retried once");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::MilestoneBlocked { milestone_id, reason } if milestone_id == "ms-1" && reason.contains("trusted report"))),
+            "failed validator must block validation, not count as clean: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::MilestoneCompleted { milestone_id, .. } if milestone_id == "ms-1")),
+            "failed validator with no report must not complete the milestone"
+        );
     }
 
     #[tokio::test]
