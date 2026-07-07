@@ -158,6 +158,46 @@ function DeliveredReport({ missionId }: { missionId: string }) {
   );
 }
 
+/** Abandoned rows are inert for work actions, but still need cleanup. This is
+ *  the same two-step affordance as StatusStrip's abandon control, routed
+ *  through the existing `kranz clean` web twin. */
+function DeleteMissionControl({ missionId }: { missionId: string }) {
+  const deleteMission = useKranzStore((s) => s.deleteMission);
+  const [armedDelete, setArmedDelete] = useState(false);
+
+  useEffect(() => {
+    if (!armedDelete) return;
+    const t = window.setTimeout(() => setArmedDelete(false), 5000);
+    return () => window.clearTimeout(t);
+  }, [armedDelete]);
+
+  if (armedDelete) {
+    return (
+      <button
+        type="button"
+        className="btn-small picker-action-danger pipeline-delete-action"
+        title="permanently removes this abandoned mission and prunes it from the index"
+        onClick={() => {
+          setArmedDelete(false);
+          void deleteMission(missionId, false);
+        }}
+      >
+        confirm delete
+      </button>
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      className="btn-small pipeline-delete-action"
+      onClick={() => setArmedDelete(true)}
+    >
+      Delete
+    </button>
+  );
+}
+
 /** Iterate (Delivered + Landed): one tap opens an inline one-line-direction
  *  box; submitting creates a follow-up ticket via `POST /api/tickets`,
  *  seeded with the finished mission's report as context, then routes to the
@@ -352,6 +392,30 @@ export function PipelineView() {
     return null;
   };
 
+  const renderCleanup = (row: Row, stage: ReturnType<typeof pipelineStage>) => {
+    if (stage === 'abandoned' && row.missionId !== undefined) {
+      return <DeleteMissionControl missionId={row.missionId} />;
+    }
+
+    return null;
+  };
+
+  const linkedMissionId = (row: Row) =>
+    row.item.kind === 'mission' || row.item.mission !== undefined ? row.missionId : undefined;
+
+  const renderRowId = (row: Row) => {
+    const missionId = linkedMissionId(row);
+    if (missionId !== undefined) {
+      return (
+        <a className="mono picker-id" href={`#/m/${encodeURIComponent(missionId)}`}>
+          {row.id}
+        </a>
+      );
+    }
+
+    return <span className="mono picker-id">{row.id}</span>;
+  };
+
   const row = (r: Row) => {
     const stage = pipelineStage(r.item);
     const showBlockedBadge =
@@ -365,7 +429,7 @@ export function PipelineView() {
               <span className="status-dot" aria-hidden="true" />
               {stage}
             </span>
-            <span className="mono picker-id">{r.id}</span>
+            {renderRowId(r)}
             <span className="picker-goal">{r.title}</span>
             {showBlockedBadge && (
               <span className="ticket-blocker-badge" title={`blocked by ${r.blockedBy.join(', ')}`}>
@@ -380,6 +444,7 @@ export function PipelineView() {
           </div>
           {renderPrimary(r, stage)}
           {renderSecondary(r, stage)}
+          {renderCleanup(r, stage)}
         </div>
         {stage === 'reviewable' && r.missionId !== undefined && (
           <ReviewablePlan missionId={r.missionId} />
