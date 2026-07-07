@@ -36,3 +36,4 @@ Approved plans, newest last.
 - 2026-07-07 · [m-cde2e8](m-cde2e8/plan.md) — Make the worktree-mode gated merge land canonical plan.md/report.md deliverables cleanly despite the untracked operator-… [truncated] · [report](m-cde2e8/report.md)
 - 2026-07-07 · [m-a11f17](m-a11f17/plan.md) — Add a lens filter bar (Actionable | Backlog | Missions | All) to the pipeline view so operators see actionable work by d… [truncated] · [report](m-a11f17/report.md)
 - 2026-07-07 · [m-f1c684](m-f1c684/plan.md) — Detect a stalled or dropped Slack Socket Mode connection in the kranz serve --slack bridge, reconnect automatically with… [truncated] · [report](m-f1c684/report.md)
+- 2026-07-07 · [m-5224ee](m-5224ee/plan.md) — Ticket surfaces (REST /api/tickets projection, CLI ticket list/show, Slack, and the dashboard BacklogPanel) distinguish … [truncated]
