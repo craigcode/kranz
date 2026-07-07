@@ -181,6 +181,21 @@ fn worker_pass() -> MockScript {
     .writes_file(&path, "delivered by the mock worker\n")
 }
 
+/// Worker script: completed single-shot run whose final text is a passing
+/// WorkerReport, but which writes NOTHING to the session cwd — the tree
+/// stays clean, no checkpoint commit lands, and the feature's commit list is
+/// empty. Used to construct an empty-deliverable mission (feature f-2-2).
+fn worker_pass_no_write() -> MockScript {
+    MockScript::single_shot_json(&json!({
+        "result": "pass",
+        "summary": "implemented and tested",
+        "filesTouched": [],
+        "testsAdded": [],
+        "testEvidence": "all green",
+        "commits": []
+    }))
+}
+
 /// Worker script: completed run whose report says result "fail".
 fn worker_fail() -> MockScript {
     MockScript::single_shot_json(&json!({
@@ -3706,5 +3721,98 @@ async fn create_refuses_another_missions_branch_as_base() {
     assert!(
         msg.contains("another mission's branch"),
         "refusal must explain the stacking hazard, got: {msg}"
+    );
+}
+
+/// Feature f-2-2: the final gate's deterministic non-emptiness safety net.
+/// A mock mission whose sole worker delivers nothing (no file writes → no
+/// checkpoint commit) must terminate Failed with an honest, non-empty
+/// reason, and must never emit `mission.completed` — regardless of the
+/// (empty, therefore vacuously green) contract.
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_deliverable_mission_terminates_failed() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass_no_write(),
+        orch_script(vec![judgement("complete", "")]),
+    ]));
+
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Failed);
+
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    let types = event_types(&events);
+    assert!(
+        types.contains(&"mission.failed"),
+        "expected mission.failed: {types:?}"
+    );
+    assert!(
+        !types.contains(&"mission.completed"),
+        "must never complete on an empty deliverable diff: {types:?}"
+    );
+    let reason = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::MissionFailed { reason } => Some(reason.clone()),
+            _ => None,
+        })
+        .expect("mission.failed event carries a reason");
+    assert!(!reason.trim().is_empty(), "reason must be non-empty");
+}
+
+/// Regression guard: a genuine mission whose worker actually delivers a file
+/// (a real, non-meta commit lands on the mission branch) is inert to the
+/// f-2-2 safety net — it still completes normally and never emits
+/// `mission.failed`.
+#[tokio::test(flavor = "multi_thread")]
+async fn delivering_mission_still_completes() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+    ]));
+
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    let types = event_types(&events);
+    assert!(
+        types.contains(&"mission.completed"),
+        "expected mission.completed: {types:?}"
+    );
+    assert!(
+        !types.contains(&"mission.failed"),
+        "delivering mission must not trip the empty-deliverable safety net: {types:?}"
     );
 }
