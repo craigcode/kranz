@@ -31,3 +31,4 @@ Approved plans, newest last.
 - 2026-07-06 · [m-671b04](m-671b04/plan.md) — Close M7 tier-1's visibility gap: add an engine-computed out-of-contract-write sweep (worker worktree diffs vs a plan-de… [truncated] · [report](m-671b04/report.md)
 - 2026-07-06 · [m-acb3a0](m-acb3a0/plan.md) — Add a config-gated macOS Seatbelt (sandbox-exec) filesystem sandbox per session: generate a write-allowlist profile (ses… [truncated] · [report](m-acb3a0/report.md)
 - 2026-07-06 · [m-bbe805](m-bbe805/plan.md) — Add a DroidBackend (AgentBackend over `droid exec -o json`) selectable only for the scrutiny validator, mirroring the Co… [truncated] · [report](m-bbe805/report.md)
+- 2026-07-06 · [m-9d4193](m-9d4193/plan.md) — Make the serve-hosted queue drain (POST /api/queue/drain) restore the operator's dispatch-time checkout when the drain f… [truncated] · [report](m-9d4193/report.md)
