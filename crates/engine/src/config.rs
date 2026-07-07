@@ -160,10 +160,10 @@ pub fn validate(cfg: &MissionConfig) -> Result<()> {
         }
     }
     match cfg.validator_scrutiny.backend.as_deref() {
-        None | Some("claude") | Some("codex") => {}
+        None | Some("claude") | Some("codex") | Some("droid") => {}
         Some(other) => {
             return Err(EngineError::Config(format!(
-                "validatorScrutiny.backend must be one of None, \"claude\", \"codex\", got {other:?}"
+                "validatorScrutiny.backend must be one of None, \"claude\", \"codex\", \"droid\", got {other:?}"
             )));
         }
     }
@@ -256,7 +256,7 @@ mod tests {
 
     #[test]
     fn validate_accepts_known_scrutiny_backends() {
-        for backend in [None, Some("claude"), Some("codex")] {
+        for backend in [None, Some("claude"), Some("codex"), Some("droid")] {
             let mut cfg = MissionConfig::default();
             cfg.validator_scrutiny.backend = backend.map(|s| s.to_string());
             assert!(
@@ -264,6 +264,13 @@ mod tests {
                 "backend {backend:?} should be accepted"
             );
         }
+    }
+
+    #[test]
+    fn validate_accepts_droid_scrutiny_backend() {
+        let mut cfg = MissionConfig::default();
+        cfg.validator_scrutiny.backend = Some("droid".into());
+        assert!(validate(&cfg).is_ok());
     }
 
     #[test]
@@ -356,5 +363,20 @@ mod tests {
             message.contains("fs+net") || message.contains("enforce"),
             "error should name the offending value or field, got: {message}"
         );
+    }
+
+    #[test]
+    fn validate_rejects_droid_on_non_scrutiny_roles() {
+        let mut cfg = MissionConfig::default();
+        cfg.worker.backend = Some("droid".into());
+        assert!(validate(&cfg).is_err());
+
+        let mut cfg = MissionConfig::default();
+        cfg.validator_functional.backend = Some("droid".into());
+        assert!(validate(&cfg).is_err());
+
+        let mut cfg = MissionConfig::default();
+        cfg.orchestrator.backend = Some("droid".into());
+        assert!(validate(&cfg).is_err());
     }
 }

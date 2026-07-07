@@ -26,6 +26,17 @@ pub fn is_codex_model(model: &str) -> bool {
     m.contains("codex") || m.contains("gpt")
 }
 
+/// Default model id for the Droid backend (Fireworks-hosted GLM 5.2),
+/// importable engine-wide.
+pub const DEFAULT_DROID_MODEL: &str = "accounts/fireworks/models/glm-5p2";
+
+/// Whether `model` names a droid-family (Fireworks GLM) model (same
+/// substring match [`pricing_for_model`] uses to select droid pricing).
+pub fn is_droid_model(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    m.contains("glm") || m.contains("fireworks")
+}
+
 /// Per-model token pricing in USD per million tokens.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Pricing {
@@ -59,6 +70,12 @@ pub fn pricing_for_model(model: &str) -> Pricing {
         Pricing {
             input_per_mtok: 1.25,
             output_per_mtok: 10.0,
+        }
+    } else if m.contains("glm") || m.contains("fireworks") {
+        // TODO(pricing): confirm Fireworks GLM 5.2 $/Mtok before ship
+        Pricing {
+            input_per_mtok: 0.55,
+            output_per_mtok: 2.19,
         }
     } else if m.contains("opus") {
         Pricing {
@@ -517,5 +534,34 @@ mod tests {
         let unknown = pricing_for_model("some-unknown-model-xyz");
         let opus = pricing_for_model("opus");
         assert_eq!(unknown, opus);
+    }
+
+    #[test]
+    fn droid_pricing_applied() {
+        let glm = pricing_for_model(DEFAULT_DROID_MODEL);
+        assert_eq!(glm.input_per_mtok, 0.55);
+        assert_eq!(glm.output_per_mtok, 2.19);
+
+        let opus = pricing_for_model("opus");
+        let codex = pricing_for_model(DEFAULT_CODEX_MODEL);
+        assert_ne!(glm, opus);
+        assert_ne!(glm, codex);
+
+        let usage = TokenUsage {
+            input: 2_000_000,
+            output: 1_000_000,
+            cache_read: 500_000,
+            cache_write: 200_000,
+        };
+        let expected = 2.0 * 0.55 + 1.0 * 2.19 + 0.5 * (0.1 * 0.55) + 0.2 * (1.25 * 0.55);
+        let got = usage_cost_usd(&usage, DEFAULT_DROID_MODEL);
+        assert!(
+            (got - expected).abs() < 1e-9,
+            "got {got}, expected {expected}"
+        );
+
+        let fable = pricing_for_model("claude-fable-5");
+        assert_eq!(fable.input_per_mtok, 10.0);
+        assert_eq!(fable.output_per_mtok, 50.0);
     }
 }
