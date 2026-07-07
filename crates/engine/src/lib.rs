@@ -26,6 +26,7 @@ pub mod event_log;
 pub mod git_ops;
 pub mod lessons;
 pub mod merge;
+pub mod merged;
 pub mod prompts;
 pub mod queue;
 pub mod reducer;
