@@ -655,21 +655,16 @@ pub async fn run_worker_in_buffered(
 /// (i.e. the scratch-HOME half of this function is a no-op) rather than
 /// failing spec construction.
 fn seed_worker_env(spec: &mut SessionSpec) {
-    let scratch_root = crate::backend_claude::scratch_home_root(&spec.session_id);
-    let real_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    let real_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(std::path::PathBuf::from);
-    if let Ok((home, config_dir)) = crate::backend_claude::seed_worker_scratch_home(
-        &scratch_root,
-        real_home.as_deref(),
-        real_config_dir.as_deref(),
-    ) {
-        spec.env
-            .insert("HOME".to_string(), home.display().to_string());
-        spec.env.insert(
-            "CLAUDE_CONFIG_DIR".to_string(),
-            config_dir.display().to_string(),
-        );
-    }
+    // CRITICAL (fix-worker-env-hygiene-starves-auth): the scratch HOME /
+    // CLAUDE_CONFIG_DIR relocation is DISABLED. On macOS the live OAuth token
+    // lives in the login Keychain, not ~/.claude/.credentials.json (which may
+    // be absent or stale). Relocating HOME cuts the worker off from the live
+    // credential, so `claude` launches unauthenticated and silently produces
+    // no output — the mission then falsely COMPLETEs with zero deliverables
+    // (observed 2026-07-06, m-66aff8: "no report, no commits, empty diff").
+    // Until env hygiene can PROVE the scratch HOME authenticates before
+    // trusting it, workers inherit the real HOME. Git identity below is
+    // independent and stays.
 
     if let Ok(repo) = crate::git_ops::GitRepo::open(&spec.cwd) {
         if let Ok((name, email)) = repo.resolved_identity() {
@@ -1037,10 +1032,12 @@ mod tests {
             .expect("git spawns")
     }
 
-    /// Finding 1: a worker whose scratch HOME has no `.gitconfig` must still
-    /// be able to `git commit` — proving the injected `GIT_AUTHOR_*` /
-    /// `GIT_COMMITTER_*` env vars actually carry the identity through, not
-    /// merely that the keys are present.
+    /// Finding 1: a worker in a HOME with no `.gitconfig` must still be able
+    /// to `git commit` — proving the injected `GIT_AUTHOR_*` / `GIT_COMMITTER_*`
+    /// env vars actually carry the identity through, not merely that the keys
+    /// are present. (The scratch-HOME relocation `seed_worker_env` once did is
+    /// DISABLED — see fix-worker-env-hygiene-starves-auth — so this proves the
+    /// identity injection alone suffices, with HOME pointed at an empty dir.)
     #[test]
     fn worker_env_hygiene_scratch_home_worker_can_commit() {
         let repo_dir = tempfile::tempdir().unwrap();
@@ -1049,16 +1046,17 @@ mod tests {
         let mut spec = minimal_worker_spec(repo_dir.path().to_path_buf());
         seed_worker_env(&mut spec);
 
-        // Existing contract env survives the scratch-env layering.
+        // Existing contract env survives the env layering.
         assert_eq!(
             spec.env.get("KRANZ_BASE_SHA").map(String::as_str),
             Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
         );
 
-        let home = spec.env.get("HOME").expect("scratch HOME set").clone();
+        // seed_worker_env no longer relocates HOME (the relocation starved the
+        // worker of live macOS-Keychain auth); it must NOT set a scratch HOME.
         assert!(
-            !std::path::Path::new(&home).join(".gitconfig").exists(),
-            "scratch HOME must carry no .gitconfig — that's the gap this test proves around"
+            !spec.env.contains_key("HOME"),
+            "seed_worker_env must not relocate HOME (auth-starvation regression)"
         );
 
         for key in [
@@ -1070,18 +1068,22 @@ mod tests {
             assert!(spec.env.contains_key(key), "missing {key}");
         }
 
+        // Point HOME at an empty dir (no ambient .gitconfig) to prove the
+        // injected GIT_* identity alone carries a commit through.
+        let empty_home = tempfile::tempdir().unwrap();
         std::fs::write(repo_dir.path().join("file.txt"), "content").unwrap();
         assert!(git(repo_dir.path(), &["add", "."]).status.success());
 
         let commit_status = std::process::Command::new("git")
-            .args(["commit", "-m", "worker commit under scratch HOME"])
+            .args(["commit", "-m", "worker commit via injected identity"])
             .current_dir(repo_dir.path())
+            .env("HOME", empty_home.path())
             .envs(&spec.env)
             .status()
             .expect("git commit spawns");
         assert!(
             commit_status.success(),
-            "worker must be able to commit with the scratch HOME + injected git identity env"
+            "worker must be able to commit with the injected git identity env"
         );
 
         let log = git(repo_dir.path(), &["log", "-1", "--format=%an <%ae>"]);

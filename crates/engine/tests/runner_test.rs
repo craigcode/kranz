@@ -944,29 +944,26 @@ async fn run_worker_seeds_scratch_home_and_config_dir_worker_env_hygiene() {
     let specs = backend.started_specs();
     let spec = &specs[0];
 
-    // Contract env is preserved alongside the scratch env.
+    // Contract env is preserved.
     assert_eq!(
         spec.env.get("KRANZ_BASE_SHA").map(String::as_str),
         Some(base_sha)
     );
 
-    let home = spec
-        .env
-        .get("HOME")
-        .expect("worker spec.env must set a scratch HOME");
-    let config_dir = spec
-        .env
-        .get("CLAUDE_CONFIG_DIR")
-        .expect("worker spec.env must set a scratch CLAUDE_CONFIG_DIR");
+    // seed_worker_env no longer relocates HOME / CLAUDE_CONFIG_DIR: the
+    // scratch HOME cut the worker off from the live macOS-Keychain OAuth token,
+    // so `claude` launched unauthenticated and produced nothing (silent
+    // work-loss, m-66aff8). Until env hygiene can prove the scratch HOME
+    // authenticates, the worker inherits the real HOME.
+    // See fix-worker-env-hygiene-starves-auth.
     assert!(
-        home.contains(&spec.session_id),
-        "scratch HOME must be unique per session id: {home}"
+        !spec.env.contains_key("HOME"),
+        "worker spec.env must NOT relocate HOME (auth-starvation regression)"
     );
     assert!(
-        config_dir.starts_with(home.as_str()),
-        "CLAUDE_CONFIG_DIR must live under the scratch HOME: {config_dir}"
+        !spec.env.contains_key("CLAUDE_CONFIG_DIR"),
+        "worker spec.env must NOT relocate CLAUDE_CONFIG_DIR"
     );
-    assert!(config_dir.ends_with(".claude"));
 }
 
 #[tokio::test]
