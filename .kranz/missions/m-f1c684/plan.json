@@ -1,0 +1,74 @@
+{
+  "goal": "Detect a stalled or dropped Slack Socket Mode connection in the kranz serve --slack bridge, reconnect automatically with backoff, and expose an observable liveness signal so a dead bridge is loud rather than silent.",
+  "validationContract": [
+    {
+      "id": "a1",
+      "statement": "When the Socket Mode connection receives no frames for the idle-timeout window, the pump loop ends the connection with the reconnect outcome instead of blocking forever.",
+      "check": "command",
+      "command": "cargo test -p kranz-slack idle_timeout 2>&1 | grep -qE 'idle_timeout_triggers_reconnect \\.\\.\\. ok'"
+    },
+    {
+      "id": "a2",
+      "statement": "A Slack 'disconnect' frame ends the current connection with the reconnect outcome (the bridge pre-empts Slack's teardown rather than ignoring the warning).",
+      "check": "command",
+      "command": "cargo test -p kranz-slack disconnect_frame 2>&1 | grep -qE 'disconnect_frame_triggers_reconnect \\.\\.\\. ok'"
+    },
+    {
+      "id": "a3",
+      "statement": "The bridge liveness snapshot reports 'stale' once the time since the last received frame exceeds the staleness threshold.",
+      "check": "command",
+      "command": "cargo test -p kranz-slack health_reports_stale 2>&1 | grep -qE 'health_reports_stale_after_threshold \\.\\.\\. ok'"
+    },
+    {
+      "id": "a4",
+      "statement": "The bridge liveness snapshot reports 'live' when a frame was received within the staleness threshold.",
+      "check": "command",
+      "command": "cargo test -p kranz-slack health_reports_live 2>&1 | grep -qE 'health_reports_live_within_threshold \\.\\.\\. ok'"
+    },
+    {
+      "id": "a5",
+      "statement": "The full kranz-slack test suite (existing inbound/outbound/ack/dedup behavior plus the new tests) compiles and passes — no regression in the socket loop's production behavior.",
+      "check": "command",
+      "command": "cargo test -p kranz-slack 2>&1 | grep -qE 'result: ok'"
+    },
+    {
+      "id": "a6",
+      "statement": "While running, the bridge emits a periodic health log line reflecting connection state and time-since-last-frame, and logs a distinct loud (warn-level) line when a stall is detected or a reconnect occurs — so an operator watching logs sees a dead bridge.",
+      "check": "agent-judgement"
+    }
+  ],
+  "milestones": [
+    {
+      "title": "A stalled or Slack-warned socket auto-reconnects",
+      "features": [
+        {
+          "title": "Harden the Socket Mode pump loop: injectable test seam, idle-timeout stall detection, and disconnect-frame reconnect",
+          "spec": "CONTEXT: In crates/slack/src/bridge.rs, `run_socket` reconnects with capped exponential backoff (BACKOFF_MIN/BACKOFF_MAX), but only when `connect_once` RETURNS. `connect_once` runs an inner `loop { tokio::select! { _ = stop.notified() => ...; msg = read.next() => match msg { ... } } }` over a split tokio-tungstenite websocket. It returns Ok(true) on shutdown, Ok(false) on a clean Close/None or write-send failure (caller reconnects, resetting backoff), and Err on a stream error (caller reconnects, growing backoff). TWO real bugs: (1) `read.next()` has NO timeout — if the TCP connection dies silently (no FIN/RST, as happens after a long idle period following a sibling drain) the select parks forever, `connect_once` never returns, and the existing reconnect machinery is never reached — this is the live silent-failure symptom. (2) Slack sends a `{\"type\":\"disconnect\", \"reason\":\"warning\"|\"refresh_requested\"}` frame before tearing a socket down; today `route()` classifies it as Action::Ignore (see crates/slack/src/inbound.rs around line 308 and the test at ~2136) and it carries no envelope_id, so the loop silently drops it and keeps pumping a doomed socket.\n\nTASK:\n1. Refactor the inner read/select loop OUT of `connect_once` into a separate async function (e.g. `pump_connection`) that is generic over the read stream and write sink so it can be driven by an in-memory stream in tests instead of a live websocket. Suggested signature shape: generic `R: futures_util::Stream<Item = Result<tokio_tungstenite::tungstenite::Message, E>> + Unpin` and `W: futures_util::Sink<tokio_tungstenite::tungstenite::Message> + Unpin`, plus the same `stop: &Arc<Notify>`, `SeenEnvelopes`, and dispatch dependencies it uses today. `connect_once` keeps opening the wss URL (client.open_connection + connect_async) and calls the new function with the real split halves. PRESERVE production behavior EXACTLY: ack-first (send `{\"envelope_id\":id}` before slow work), SeenEnvelopes dedup, `is_slow_action` spawn-off-the-read-loop, Ping->Pong, and the same Ok(true)/Ok(false)/Err return contract.\n2. Add an idle timeout. Introduce `const IDLE_TIMEOUT: Duration = Duration::from_secs(45);`. Wrap the `read.next()` await in `tokio::time::timeout(IDLE_TIMEOUT, ...)`; when it elapses, log a loud `tracing::warn!` (e.g. \"slack socket idle N s; treating as stalled, reconnecting\") and return `Ok(false)` so the existing caller reconnects. Normal Slack traffic (pings every few seconds) keeps this from firing in a healthy session.\n3. Handle the disconnect frame. Add a small pure helper `fn is_disconnect_frame(text: &str) -> bool` that returns true when the frame parses to JSON with top-level `type == \"disconnect\"`. In the pump loop, on a Text frame, check this FIRST; if true, log at info/warn and return `Ok(false)` (reconnect) — do not route it. Unit-test the helper directly too.\n4. TESTS (in #[cfg(test)] within bridge.rs or a tests/ file). Use `tokio::time::pause()` + `tokio::time::advance()` and an in-memory stream (e.g. a `futures_util` stream built from a channel or `stream::pending()`/`stream::iter`) plus a sink that collects sent messages (e.g. `Vec`-backed or `futures_util::sink::drain()`), so no live Slack is needed. Required test names (the mission contract greps for these EXACT names):\n   - `idle_timeout_triggers_reconnect`: drive `pump_connection` with a read stream that never yields another frame; advance virtual time past IDLE_TIMEOUT; assert the function returns `Ok(false)`.\n   - `disconnect_frame_triggers_reconnect`: feed a single `{\"type\":\"disconnect\",\"reason\":\"refresh_requested\"}` Text frame; assert the function returns `Ok(false)` and did NOT dispatch it as an action.\n   Keep/adjust any existing tests that referenced the old inline loop shape.\n5. Run `cargo fmt` before finishing (this repo has previously lost a full respawn to an unformatted worker diff), then `cargo clippy -p kranz-slack` and `cargo test -p kranz-slack` and confirm green.\n\nCONSTRAINTS: Do not touch crates/server or crates/cli. Do not change the outbound loop (`run_bridge`). Keep the tungstenite Message import path stable. The idle timeout must be a named constant, not a magic literal.",
+          "validationCriteria": [
+            "A test named `idle_timeout_triggers_reconnect` drives the extracted pump function with a stream that yields no frames, advances virtual time past IDLE_TIMEOUT via tokio::time, and asserts the function returns Ok(false); the per-test line `idle_timeout_triggers_reconnect ... ok` appears in `cargo test -p kranz-slack` output.",
+            "A test named `disconnect_frame_triggers_reconnect` feeds a {\"type\":\"disconnect\"} Text frame and asserts the pump function returns Ok(false) without dispatching it; the per-test line `disconnect_frame_triggers_reconnect ... ok` appears.",
+            "`is_disconnect_frame` is a pure helper unit-tested for a disconnect frame (true) and a non-disconnect frame such as a slash_commands envelope (false).",
+            "`cargo test -p kranz-slack` prints `result: ok` (full suite, including all pre-existing inbound/outbound/ack/dedup tests, still passes) and the diff is `cargo fmt`-clean.",
+            "Production ack-first ordering, SeenEnvelopes dedup, is_slow_action spawn behavior, and Ping->Pong handling are preserved (unchanged externally observable behavior)."
+          ]
+        }
+      ]
+    },
+    {
+      "title": "A dead bridge is observable",
+      "features": [
+        {
+          "title": "Shared bridge liveness state with periodic health log and loud stall/reconnect logging",
+          "spec": "CONTEXT: This builds directly on Milestone 1's refactored pump loop in crates/slack/src/bridge.rs (the `pump_connection` function and `run_socket`/`connect_once`). Milestone 1 is complete and validated before this feature runs. Goal: make a stalled/dead bridge observable through logs, since today there is no liveness signal anywhere (the server's /api/health knows nothing about the bridge, and there is no last-frame timestamp or periodic log).\n\nTASK:\n1. Add a shared liveness handle, e.g. `#[derive(Clone)] struct BridgeHealth(Arc<Mutex<HealthState>>)` (or an atomics-based equivalent) holding at least: `connected: bool`, `last_frame_at: Option<Instant>`, and a monotonically increasing `connect_count`. Consider a small `health` module or keep it in bridge.rs.\n2. Provide mutation methods used by the loop: `record_connected()` (set connected=true, bump connect_count, stamp last_frame_at=now), `record_frame()` (stamp last_frame_at=now), `record_disconnected()` (connected=false). Wire these into the code paths from Milestone 1: call record_connected when connect_once establishes the socket, record_frame on EVERY received frame inside pump_connection, and record_disconnected when a connection ends (stall, disconnect frame, close, or error).\n3. Make the staleness decision PURE and testable independent of the wall clock: e.g. `fn snapshot(&self, now: Instant) -> HealthSnapshot` returning `{ connected: bool, secs_since_frame: Option<u64>, stale: bool }`, where `stale` is true iff `now - last_frame_at > STALENESS_THRESHOLD` (`const STALENESS_THRESHOLD: Duration`; pick a value >= the M1 idle timeout, e.g. 60s). The threshold comparison must be computed from the two Instants/Durations passed in — do NOT call Instant::now() inside the pure computation, so tests pass explicit values.\n4. Add a periodic health-log task in `run_socket`: a `tokio::time::interval` (e.g. `const HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(60);`) that, each tick, reads the snapshot and logs it — `tracing::info!` when connected and not stale (e.g. \"slack bridge healthy: connected, last frame Ns ago\"), and `tracing::warn!` when disconnected OR stale (e.g. \"slack bridge UNHEALTHY: no frame in Ns\"). This task must also stop on the shared shutdown notify, like the other loops.\n5. Ensure loud logging on the transition events: a `tracing::info!` on (re)connect and a `tracing::warn!` on stall-detected and on reconnect-after-drop (some of this may already exist from M1 — make sure the stall and reconnect cases are warn-level and clearly worded).\n6. TESTS over the pure snapshot logic (contract greps for these EXACT names):\n   - `health_reports_stale_after_threshold`: build a HealthState whose last_frame_at is `now - (STALENESS_THRESHOLD + 1s)`; assert `snapshot(now).stale == true`.\n   - `health_reports_live_within_threshold`: last_frame_at is `now - (STALENESS_THRESHOLD / 2)`; assert `snapshot(now).stale == false` and `connected == true`.\n   Construct the Instants in-test via `Instant::now()` +/- Duration arithmetic passed into the pure fn (no reliance on real elapsed time / no sleeps).\n7. Run `cargo fmt`, then `cargo clippy -p kranz-slack` and `cargo test -p kranz-slack`; confirm green.\n\nCONSTRAINTS: Stay entirely within crates/slack — do NOT add a server route or touch crates/server or crates/cli (the HTTP /api/slack/health endpoint is explicitly out of scope for this mission). Do not spam the Slack channel; the health signal is log-based only. All thresholds/intervals are named constants.",
+          "validationCriteria": [
+            "A `BridgeHealth` shared handle records last-frame time on every received frame, connected on socket establishment, and disconnected when a connection ends, and these calls are wired into the Milestone 1 pump loop / connect paths.",
+            "A test named `health_reports_stale_after_threshold` asserts the pure snapshot reports stale==true when the last frame is older than STALENESS_THRESHOLD; the per-test line `health_reports_stale_after_threshold ... ok` appears in `cargo test -p kranz-slack`.",
+            "A test named `health_reports_live_within_threshold` asserts the pure snapshot reports stale==false and connected==true when a frame arrived within the threshold; the per-test line `health_reports_live_within_threshold ... ok` appears.",
+            "`run_socket` spawns a periodic (interval-based) task that logs the health snapshot at info when healthy and at warn when disconnected or stale, and stops on the shared shutdown notify.",
+            "Stall detection and reconnect events are logged at warn level with clear wording; a (re)connect logs at info; the change is `cargo fmt`-clean and `cargo test -p kranz-slack` prints `result: ok`."
+          ]
+        }
+      ]
+    }
+  ]
+}
