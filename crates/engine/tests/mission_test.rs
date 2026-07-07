@@ -1272,7 +1272,11 @@ async fn orchestrator_decision_detail_is_scrubbed() {
     // seed, then the leaky judgement.
     let backend = Arc::new(MockBackend::with_scripts(vec![
         worker_pass(),
-        orch_script(vec![dirty_tree_commit_as_is(), leaky_judgement, no_lesson()]),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            leaky_judgement,
+            no_lesson(),
+        ]),
     ]));
 
     let mut engine = make_engine(&backend, &root, test_cfg());
