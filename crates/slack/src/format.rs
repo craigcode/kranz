@@ -30,6 +30,12 @@ pub const START_ACTION_ID: &str = "kranz_start";
 /// crate only renders the button.
 pub const MERGE_ACTION_ID: &str = "kranz_merge";
 
+/// `action_id` of the "Queue" button on a `/kranz todo` Reviewable-ticket row.
+/// The button value carries the ticket slug and routes through the same
+/// allowlist-gated [`crate::inbound::Action::QueueTicket`] path as
+/// `/kranz queue <slug>`; rendering the todo list itself remains read-only.
+pub const QUEUE_TICKET_ACTION_ID: &str = "kranz_queue_ticket";
+
 /// `callback_id` of the new-mission modal ([`build_new_mission_modal`]); its
 /// `view_submission` routes to [`crate::inbound::Action::NewMission`].
 pub const NEW_MISSION_CALLBACK_ID: &str = "kranz_new_mission";
@@ -160,6 +166,138 @@ pub struct TicketDetail {
     pub blocked_by: Vec<String>,
     /// Clarifying questions the orchestrator appended (empty when none).
     pub needs_context: Vec<String>,
+}
+
+/// Canonical pipeline stages, mirrored from
+/// `apps/dashboard/src/lib/pipelineStage.ts`. Keep this enum in that order so
+/// Slack status counts render exactly like the dashboard columns/lenses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum PipelineStage {
+    Captured,
+    Drafting,
+    NeedsYou,
+    Reviewable,
+    Queued,
+    Running,
+    Delivered,
+    Landed,
+    Failed,
+    Abandoned,
+}
+
+impl PipelineStage {
+    pub const ALL: [PipelineStage; 10] = [
+        PipelineStage::Captured,
+        PipelineStage::Drafting,
+        PipelineStage::NeedsYou,
+        PipelineStage::Reviewable,
+        PipelineStage::Queued,
+        PipelineStage::Running,
+        PipelineStage::Delivered,
+        PipelineStage::Landed,
+        PipelineStage::Failed,
+        PipelineStage::Abandoned,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PipelineStage::Captured => "captured",
+            PipelineStage::Drafting => "drafting",
+            PipelineStage::NeedsYou => "needs-you",
+            PipelineStage::Reviewable => "reviewable",
+            PipelineStage::Queued => "queued",
+            PipelineStage::Running => "running",
+            PipelineStage::Delivered => "delivered",
+            PipelineStage::Landed => "landed",
+            PipelineStage::Failed => "failed",
+            PipelineStage::Abandoned => "abandoned",
+        }
+    }
+}
+
+/// Count of work items at one canonical pipeline stage.
+#[derive(Debug, Clone)]
+pub struct StageCount {
+    pub stage: PipelineStage,
+    pub count: usize,
+}
+
+/// The currently-running mission line in `/kranz status`, if one can be
+/// determined from the queue busy lock or the folded pipeline rows.
+#[derive(Debug, Clone)]
+pub struct RunningMissionSnapshot {
+    pub mission_id: String,
+    pub title: String,
+    pub status: String,
+    pub cost_usd: Option<f64>,
+}
+
+/// A Delivered row whose mission branch has not landed yet.
+#[derive(Debug, Clone)]
+pub struct UnmergedMission {
+    pub mission_id: String,
+    pub title: String,
+    pub ticket_slug: Option<String>,
+}
+
+/// Fixed, already-derived state for `/kranz status`. The bridge owns all repo
+/// reads and pipeline derivation; this formatter only renders the snapshot.
+#[derive(Debug, Clone)]
+pub struct PipelineStatusSnapshot {
+    pub running: Option<RunningMissionSnapshot>,
+    pub queue_depth: usize,
+    pub stage_counts: Vec<StageCount>,
+    pub unmerged: Vec<UnmergedMission>,
+}
+
+/// The three human-awaiting pipeline action classes surfaced by `/kranz todo`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TodoActionKind {
+    Reviewable,
+    Delivered,
+    NeedsYou,
+}
+
+impl TodoActionKind {
+    fn label(self) -> &'static str {
+        match self {
+            TodoActionKind::Reviewable => "REVIEWABLE",
+            TodoActionKind::Delivered => "DELIVERED",
+            TodoActionKind::NeedsYou => "NEEDS-YOU",
+        }
+    }
+}
+
+/// Optional one-tap affordance for a todo row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TodoTarget {
+    QueueTicket { slug: String },
+    MergeMission { mission_id: String },
+    OpenUrl { label: String, url: String },
+    None,
+}
+
+/// One operator-facing pipeline action row for `/kranz todo`.
+#[derive(Debug, Clone)]
+pub struct TodoAction {
+    pub kind: TodoActionKind,
+    pub id: String,
+    pub title: String,
+    pub note: Option<String>,
+    pub target: TodoTarget,
+}
+
+/// A human-only gate from `docs/operator-gates.md`.
+#[derive(Debug, Clone)]
+pub struct GateItem {
+    pub title: String,
+}
+
+/// Fixed, already-derived state for `/kranz todo`.
+#[derive(Debug, Clone)]
+pub struct OperatorTodo {
+    pub pipeline_actions: Vec<TodoAction>,
+    pub gated_items: Vec<GateItem>,
 }
 
 /// A plan awaiting review, with the pieces a reviewer needs before spending:
@@ -642,6 +780,60 @@ pub fn build_status(s: &StatusSummary) -> Vec<Value> {
     ]
 }
 
+/// `/kranz status` global snapshot: running mission, queue depth, canonical
+/// stage counts, and the Delivered-but-unmerged set.
+pub fn build_pipeline_status(s: &PipelineStatusSnapshot) -> Vec<Value> {
+    let running = match &s.running {
+        Some(r) => {
+            let mut line = format!(
+                "`{}` · *{}* · {}",
+                escape_mrkdwn(&r.mission_id),
+                escape_mrkdwn(&r.status),
+                escape_mrkdwn(r.title.trim())
+            );
+            if let Some(cost) = r.cost_usd {
+                line.push_str(&format!(" · cost ${cost:.2}"));
+            }
+            line
+        }
+        None => "_No mission is running._".to_string(),
+    };
+
+    let stages = s
+        .stage_counts
+        .iter()
+        .map(|c| format!("{} {}", c.stage.label(), c.count))
+        .collect::<Vec<_>>()
+        .join(" · ");
+
+    let mut blocks = vec![
+        header(":bar_chart: Kranz status"),
+        section(&format!(
+            "*Running*\n{}\n\n*Queue*\n{} waiting\n\n*Stages*\n{}",
+            running, s.queue_depth, stages
+        )),
+    ];
+
+    if s.unmerged.is_empty() {
+        blocks.push(context("*UNMERGED* none"));
+    } else {
+        let mut body = String::new();
+        for item in &s.unmerged {
+            body.push_str(&format!(
+                "• `{}` — {}",
+                escape_mrkdwn(&item.mission_id),
+                escape_mrkdwn(item.title.trim())
+            ));
+            if let Some(slug) = &item.ticket_slug {
+                body.push_str(&format!(" _(ticket `{}`)_", escape_mrkdwn(slug)));
+            }
+            body.push('\n');
+        }
+        blocks.push(section(&format!("*UNMERGED*\n{}", clip(body.trim_end()))));
+    }
+    blocks
+}
+
 /// `/kranz ticket list` reply: one compact line per ticket (slug, priority,
 /// state, title, blocked-by note), or a friendly empty-backlog line.
 pub fn build_ticket_list(rows: &[TicketRow]) -> Vec<Value> {
@@ -692,6 +884,89 @@ pub fn build_ticket_show(t: &TicketDetail) -> Vec<Value> {
         blocks.push(section(&clip(q.trim_end())));
     }
     blocks
+}
+
+/// `/kranz todo`: operator worklist in two sections. The inputs are fixed
+/// state: no repo reads, no clock, no model/engine calls.
+pub fn build_operator_todo(todo: &OperatorTodo) -> Vec<Value> {
+    let mut blocks = vec![header(":white_check_mark: Kranz todo")];
+
+    blocks.push(section("*PIPELINE ACTIONS*"));
+    if todo.pipeline_actions.is_empty() {
+        blocks.push(context("_No pipeline actions are waiting on you._"));
+    } else {
+        for action in &todo.pipeline_actions {
+            blocks.push(section(&todo_action_text(action)));
+            if let Some(button) = todo_button(&action.target) {
+                blocks.push(json!({ "type": "actions", "elements": [button] }));
+            }
+        }
+    }
+
+    blocks.push(json!({ "type": "divider" }));
+    blocks.push(section("*GATED ITEMS*"));
+    if todo.gated_items.is_empty() {
+        blocks.push(context(
+            "_No gated items listed in_ `docs/operator-gates.md`.",
+        ));
+    } else {
+        let mut body = String::new();
+        for item in &todo.gated_items {
+            body.push_str("• ");
+            body.push_str(&escape_mrkdwn(item.title.trim()));
+            body.push('\n');
+        }
+        blocks.push(section(&clip(body.trim_end())));
+    }
+
+    blocks
+}
+
+fn todo_action_text(action: &TodoAction) -> String {
+    let mut text = format!(
+        "*{}* `{}` — {}",
+        action.kind.label(),
+        escape_mrkdwn(&action.id),
+        escape_mrkdwn(action.title.trim())
+    );
+    if let Some(note) = action
+        .note
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    {
+        text.push('\n');
+        text.push('_');
+        text.push_str(&escape_mrkdwn(note));
+        text.push('_');
+    }
+    clip(&text)
+}
+
+fn todo_button(target: &TodoTarget) -> Option<Value> {
+    match target {
+        TodoTarget::QueueTicket { slug } => Some(json!({
+            "type": "button",
+            "style": "primary",
+            "text": { "type": "plain_text", "text": "Queue" },
+            "action_id": QUEUE_TICKET_ACTION_ID,
+            "value": slug,
+        })),
+        TodoTarget::MergeMission { mission_id } => Some(json!({
+            "type": "button",
+            "style": "primary",
+            "text": { "type": "plain_text", "text": "Merge" },
+            "action_id": MERGE_ACTION_ID,
+            "value": mission_id,
+        })),
+        TodoTarget::OpenUrl { label, url } => Some(json!({
+            "type": "button",
+            "text": { "type": "plain_text", "text": label },
+            "url": url,
+            "action_id": "kranz_todo_open",
+        })),
+        TodoTarget::None => None,
+    }
 }
 
 /// Plan-review message: goal + milestones + assertion count + optional
@@ -769,7 +1044,8 @@ pub fn build_help() -> Vec<Value> {
              • `/kranz resume [<id>]` — resume a paused mission\n\
              • `/kranz work` — show the execution queue (drain it with the `kranz work` dispatcher)\n\
              • `/kranz work run` — trigger the queue drain through the host (progress posts per mission)\n\
-             • `/kranz status [<id>]` — show a mission's status\n\
+             • `/kranz status` — show the pipeline snapshot; `/kranz status <id>` shows one mission\n\
+             • `/kranz todo` — show operator pipeline actions and human-only gates\n\
              • `/kranz ticket <title>` — file a new backlog ticket\n\
              • `/kranz ticket list` — list backlog tickets\n\
              • `/kranz ticket show <slug>` — show a ticket's detail\n\
@@ -1258,6 +1534,114 @@ mod tests {
             "summary body present"
         );
         assert!(text.contains("cost $1.20"));
+    }
+
+    #[test]
+    fn pipeline_status_renders_fixed_snapshot_counts_and_unmerged() {
+        let blocks = build_pipeline_status(&PipelineStatusSnapshot {
+            running: Some(RunningMissionSnapshot {
+                mission_id: "m-run".into(),
+                title: "Ship the Slack bridge".into(),
+                status: "Running".into(),
+                cost_usd: Some(1.25),
+            }),
+            queue_depth: 2,
+            stage_counts: PipelineStage::ALL
+                .iter()
+                .map(|stage| StageCount {
+                    stage: *stage,
+                    count: match stage {
+                        PipelineStage::Captured => 1,
+                        PipelineStage::NeedsYou => 1,
+                        PipelineStage::Reviewable => 2,
+                        PipelineStage::Running => 1,
+                        PipelineStage::Delivered => 1,
+                        _ => 0,
+                    },
+                })
+                .collect(),
+            unmerged: vec![UnmergedMission {
+                mission_id: "m-delivered".into(),
+                title: "Ready to land".into(),
+                ticket_slug: Some("ready-ticket".into()),
+            }],
+        });
+
+        let text = all_text(&blocks);
+        assert!(text.contains("Kranz status"));
+        assert!(text.contains("m-run"));
+        assert!(text.contains("cost $1.25"));
+        assert!(text.contains("2 waiting"));
+        assert!(text.contains("captured 1"));
+        assert!(text.contains("needs-you 1"));
+        assert!(text.contains("reviewable 2"));
+        assert!(text.contains("delivered 1"));
+        assert!(text.contains("m-delivered"));
+        assert!(text.contains("ready-ticket"));
+    }
+
+    #[test]
+    fn operator_todo_renders_fixed_pipeline_actions_gates_and_buttons() {
+        let blocks = build_operator_todo(&OperatorTodo {
+            pipeline_actions: vec![
+                TodoAction {
+                    kind: TodoActionKind::Reviewable,
+                    id: "review-ticket".into(),
+                    title: "Approve this plan".into(),
+                    note: Some("Queue reviewed plan for run.".into()),
+                    target: TodoTarget::QueueTicket {
+                        slug: "review-ticket".into(),
+                    },
+                },
+                TodoAction {
+                    kind: TodoActionKind::Delivered,
+                    id: "m-delivered".into(),
+                    title: "Merge this report".into(),
+                    note: None,
+                    target: TodoTarget::MergeMission {
+                        mission_id: "m-delivered".into(),
+                    },
+                },
+                TodoAction {
+                    kind: TodoActionKind::NeedsYou,
+                    id: "needs-context".into(),
+                    title: "Answer drafter questions".into(),
+                    note: Some("Answer questions, then redraft.".into()),
+                    target: TodoTarget::OpenUrl {
+                        label: "Open ticket".into(),
+                        url: "http://dash/#/backlog/needs-context".into(),
+                    },
+                },
+            ],
+            gated_items: vec![
+                GateItem {
+                    title: "repo public + history scrub".into(),
+                },
+                GateItem {
+                    title: "M6 live deploy".into(),
+                },
+            ],
+        });
+
+        let text = all_text(&blocks);
+        assert!(text.contains("PIPELINE ACTIONS"));
+        assert!(text.contains("REVIEWABLE"));
+        assert!(text.contains("DELIVERED"));
+        assert!(text.contains("NEEDS-YOU"));
+        assert!(text.contains("GATED ITEMS"));
+        assert!(text.contains("repo public + history scrub"));
+
+        let buttons = all_buttons(&blocks);
+        assert_eq!(buttons.len(), 3);
+        assert!(buttons
+            .iter()
+            .any(|b| b["action_id"] == QUEUE_TICKET_ACTION_ID && b["value"] == "review-ticket"));
+        assert!(buttons
+            .iter()
+            .any(|b| b["action_id"] == MERGE_ACTION_ID && b["value"] == "m-delivered"));
+        assert!(buttons
+            .iter()
+            .any(|b| b["url"] == "http://dash/#/backlog/needs-context"));
     }
 
     #[test]

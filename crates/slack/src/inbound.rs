@@ -24,7 +24,8 @@
 //! - `events_api` `message` in a thread we know (its `thread_ts` maps to a
 //!   mission) → [`Action::Guidance`]. Bot's own messages, thread roots, and
 //!   messages in unknown threads are ignored (else the bridge echoes itself).
-//! - `slash_commands` `/kranz ticket <title>` → [`Action::NewTicket`];
+//! - `slash_commands` `/kranz todo` → [`Action::Todo`];
+//!   `/kranz ticket <title>` → [`Action::NewTicket`];
 //!   `/kranz ticket new <slug> <title...>` → [`Action::NewTicketModal`] (a
 //!   multiline goal/context modal, carrying the slug/title through);
 //!   `/kranz help`, bare `/kranz`, or any unrecognized subcommand →
@@ -37,7 +38,7 @@ use crate::format::{
     CONFIG_ROLE_ACTION, CONFIG_ROLE_BLOCK, MERGE_ACTION_ID, NEW_MISSION_CALLBACK_ID,
     NEW_MISSION_GOAL_ACTION, NEW_MISSION_GOAL_BLOCK, NEW_TICKET_CALLBACK_ID,
     NEW_TICKET_CONTEXT_ACTION, NEW_TICKET_CONTEXT_BLOCK, NEW_TICKET_GOAL_ACTION,
-    NEW_TICKET_GOAL_BLOCK, START_ACTION_ID,
+    NEW_TICKET_GOAL_BLOCK, QUEUE_TICKET_ACTION_ID, START_ACTION_ID,
 };
 use serde_json::Value;
 
@@ -142,12 +143,16 @@ pub enum Action {
         response_url: Option<String>,
         channel: String,
     },
-    /// `/kranz status [<id>]` → post a folded status summary. `mission_id`
-    /// absent = "the most recent mission". Read-only, so not spend-gated.
+    /// `/kranz status` → post the deterministic pipeline snapshot; `/kranz
+    /// status <id>` keeps the folded one-mission detail. Read-only, so not
+    /// spend-gated.
     Status {
         mission_id: Option<String>,
         response_url: Option<String>,
     },
+    /// `/kranz todo` → post the deterministic operator worklist. Read-only, so
+    /// not spend-gated.
+    Todo { response_url: Option<String> },
     /// `/kranz plan <id>` → demand the plan for a mission (request-plan turn).
     /// A money-spending action (it runs an orchestrator turn): spend-gated.
     RequestPlan {
@@ -338,18 +343,20 @@ fn route_interactive(payload: &Value) -> Action {
         Approve,
         Start,
         Merge,
+        QueueTicket,
     }
     for action in actions {
         let kind = match action.get("action_id").and_then(Value::as_str) {
             Some(id) if id == APPROVE_ACTION_ID => ButtonKind::Approve,
             Some(id) if id == START_ACTION_ID => ButtonKind::Start,
             Some(id) if id == MERGE_ACTION_ID => ButtonKind::Merge,
+            Some(id) if id == QUEUE_TICKET_ACTION_ID => ButtonKind::QueueTicket,
             _ => continue,
         };
-        // The mission id rides in the button `value`.
-        if let Some(mission_id) = action.get("value").and_then(Value::as_str) {
-            let mission_id = mission_id.trim();
-            if !mission_id.is_empty() {
+        // The mission id or ticket slug rides in the button `value`.
+        if let Some(value) = action.get("value").and_then(Value::as_str) {
+            let value = value.trim();
+            if !value.is_empty() {
                 // Capture the clicker + response_url so the bridge can gate
                 // the button on the spend allowlist (block_actions carries
                 // `user.id` and `response_url`, same as a slash command).
@@ -362,20 +369,25 @@ fn route_interactive(payload: &Value) -> Action {
                     .get("response_url")
                     .and_then(Value::as_str)
                     .map(str::to_string);
-                let mission_id = mission_id.to_string();
+                let value = value.to_string();
                 return match kind {
                     ButtonKind::Start => Action::ApproveStart {
-                        mission_id,
+                        mission_id: value,
                         user_id,
                         response_url,
                     },
                     ButtonKind::Approve => Action::Approve {
-                        mission_id,
+                        mission_id: value,
                         user_id,
                         response_url,
                     },
                     ButtonKind::Merge => Action::Merge {
-                        mission_id,
+                        mission_id: value,
+                        user_id,
+                        response_url,
+                    },
+                    ButtonKind::QueueTicket => Action::QueueTicket {
+                        slug: value,
                         user_id,
                         response_url,
                     },
@@ -607,7 +619,7 @@ fn route_event(payload: &Value, lookup: &impl ThreadLookup) -> Action {
 
 /// `slash_commands` → the `/kranz` subcommand router. Recognized subcommands:
 /// `ticket <title>`, `ticket list`, `ticket show <slug>`, `new <goal>`,
-/// `status [<id>]`, `plan <id>`, `approve <id>`, `draft <slug>`,
+/// `status [<id>]`, `todo`, `plan <id>`, `approve <id>`, `draft <slug>`,
 /// `config [<id>] <role> <model> [effort]`, `pause [<id>]`, `resume [<id>]`,
 /// `work`. A bare `/kranz`, `help`, or an unrecognized/incomplete subcommand
 /// shows the command list — a typo lands on help rather than silently doing
@@ -746,6 +758,15 @@ fn route_slash(payload: &Value) -> Action {
             mission_id,
             response_url,
         };
+    }
+
+    // `todo` → deterministic operator worklist. Extra tokens are typos and
+    // fall through to help.
+    if let Some(rest) = strip_ci_prefix(text, "todo") {
+        if rest.trim().is_empty() {
+            return Action::Todo { response_url };
+        }
+        // `todo <anything>` → help.
     }
 
     // `plan <id>` → demand the plan (spend-gated: runs an orchestrator turn).
@@ -1119,6 +1140,32 @@ mod tests {
                 mission_id: "m-42".into(),
                 user_id: Some("Uclicker".into()),
                 response_url: Some("https://hooks.slack/s".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn block_actions_todo_queue_button_routes_to_queue_ticket() {
+        let env = json!({
+            "type": "interactive",
+            "envelope_id": "env-q",
+            "payload": {
+                "type": "block_actions",
+                "user": { "id": "Uqueue" },
+                "response_url": "https://hooks.slack/q",
+                "actions": [
+                    { "action_id": QUEUE_TICKET_ACTION_ID, "value": "reviewable-ticket", "type": "button" }
+                ]
+            }
+        });
+        let routed = route(&env, &lookup_none());
+        assert_eq!(routed.envelope_id.as_deref(), Some("env-q"));
+        assert_eq!(
+            routed.action,
+            Action::QueueTicket {
+                slug: "reviewable-ticket".into(),
+                user_id: Some("Uqueue".into()),
+                response_url: Some("https://hooks.slack/q".into()),
             }
         );
     }
@@ -1635,6 +1682,36 @@ mod tests {
             Action::Status {
                 mission_id: None,
                 response_url: Some("https://hooks.slack/s".into())
+            }
+        );
+    }
+
+    #[test]
+    fn slash_todo_routes_to_todo() {
+        let env = json!({
+            "type": "slash_commands",
+            "payload": { "command": "/kranz", "text": "todo",
+                         "response_url": "https://hooks.slack/t" }
+        });
+        assert_eq!(
+            route(&env, &lookup_none()).action,
+            Action::Todo {
+                response_url: Some("https://hooks.slack/t".into())
+            }
+        );
+    }
+
+    #[test]
+    fn slash_todo_with_extra_tokens_falls_through_to_help() {
+        let env = json!({
+            "type": "slash_commands",
+            "payload": { "command": "/kranz", "text": "todo now",
+                         "response_url": "https://hooks.slack/t" }
+        });
+        assert_eq!(
+            route(&env, &lookup_none()).action,
+            Action::Help {
+                response_url: Some("https://hooks.slack/t".into())
             }
         );
     }

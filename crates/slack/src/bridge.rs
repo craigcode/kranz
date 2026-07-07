@@ -34,7 +34,7 @@ use kranz_engine::paths::MissionPaths;
 use kranz_engine::reducer;
 use kranz_engine::types::{ControlCommand, MissionState, MissionStatus};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -1024,19 +1024,43 @@ async fn dispatch_action(
         Action::Status {
             mission_id,
             response_url,
-        } => match build_status_reply(repo_root, mission_id.as_deref()) {
-            Ok(blocks) => reply_ephemeral(cfg, client, response_url.as_deref(), &blocks).await,
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to build Slack status reply");
+        } => {
+            if mission_id.is_none() {
                 reply_ephemeral(
                     cfg,
                     client,
                     response_url.as_deref(),
-                    &error_blocks(&format!("Couldn't read that mission: {e}")),
+                    &build_pipeline_status_reply(repo_root),
                 )
                 .await;
+            } else {
+                match build_status_reply(repo_root, mission_id.as_deref()) {
+                    Ok(blocks) => {
+                        reply_ephemeral(cfg, client, response_url.as_deref(), &blocks).await
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to build Slack status reply");
+                        reply_ephemeral(
+                            cfg,
+                            client,
+                            response_url.as_deref(),
+                            &error_blocks(&format!("Couldn't read that mission: {e}")),
+                        )
+                        .await;
+                    }
+                }
             }
-        },
+        }
+
+        Action::Todo { response_url } => {
+            reply_ephemeral(
+                cfg,
+                client,
+                response_url.as_deref(),
+                &build_todo_reply(repo_root, cfg.dashboard_url.as_deref()),
+            )
+            .await;
+        }
 
         // Read-only backlog verbs (no `user_id`, so structurally not
         // allowlist-gated — same shape as Status).
@@ -2214,6 +2238,7 @@ fn apply_action(repo_root: &Path, action: &Action) -> Result<()> {
         Action::NewTicket { title, .. } => scaffold_ticket(repo_root, title),
         Action::Help { .. }
         | Action::Status { .. }
+        | Action::Todo { .. }
         | Action::TicketList { .. }
         | Action::TicketShow { .. }
         | Action::NewMission { .. }
@@ -2261,6 +2286,380 @@ fn build_status_reply(repo_root: &Path, mission_id: Option<&str>) -> Result<Vec<
         summary: render_status_body(&state),
     };
     Ok(crate::format::build_status(&summary))
+}
+
+/// `/kranz status` reply: deterministic pipeline snapshot (no LLM/engine).
+fn build_pipeline_status_reply(repo_root: &Path) -> Vec<Value> {
+    use crate::format::{PipelineStage, PipelineStatusSnapshot, StageCount, UnmergedMission};
+
+    let rows = build_pipeline_rows(repo_root);
+    let mut counts: BTreeMap<PipelineStage, usize> =
+        PipelineStage::ALL.iter().map(|stage| (*stage, 0)).collect();
+    for row in &rows {
+        *counts.entry(row.stage).or_insert(0) += 1;
+    }
+
+    let running = running_mission_snapshot(repo_root, &rows);
+    let unmerged = rows
+        .iter()
+        .filter(|row| row.stage == PipelineStage::Delivered)
+        .filter_map(|row| {
+            let mission_id = row.mission_id.clone()?;
+            Some(UnmergedMission {
+                mission_id,
+                title: row.title.clone(),
+                ticket_slug: row.slug.clone(),
+            })
+        })
+        .collect();
+
+    let snapshot = PipelineStatusSnapshot {
+        running,
+        queue_depth: kranz_engine::queue::list(repo_root).len(),
+        stage_counts: PipelineStage::ALL
+            .iter()
+            .map(|stage| StageCount {
+                stage: *stage,
+                count: counts.get(stage).copied().unwrap_or(0),
+            })
+            .collect(),
+        unmerged,
+    };
+    crate::format::build_pipeline_status(&snapshot)
+}
+
+fn running_mission_snapshot(
+    repo_root: &Path,
+    rows: &[PipelineRow],
+) -> Option<crate::format::RunningMissionSnapshot> {
+    if let Some(busy_id) = kranz_engine::queue::is_repo_busy(repo_root) {
+        return rows
+            .iter()
+            .find(|row| row.mission_id.as_deref() == Some(busy_id.as_str()))
+            .map(row_to_running_snapshot)
+            .or_else(|| {
+                Some(crate::format::RunningMissionSnapshot {
+                    mission_id: busy_id,
+                    title: "mission holds the repo busy lock".to_string(),
+                    status: "Running".to_string(),
+                    cost_usd: None,
+                })
+            });
+    }
+
+    rows.iter()
+        .find(|row| row.stage == crate::format::PipelineStage::Running && row.mission_id.is_some())
+        .map(row_to_running_snapshot)
+}
+
+fn row_to_running_snapshot(row: &PipelineRow) -> crate::format::RunningMissionSnapshot {
+    crate::format::RunningMissionSnapshot {
+        mission_id: row.mission_id.clone().unwrap_or_else(|| row.id.clone()),
+        title: row.title.clone(),
+        status: row
+            .mission_status
+            .map(mission_stage_status_word)
+            .unwrap_or_else(|| "Running".to_string()),
+        cost_usd: row.cost_usd,
+    }
+}
+
+/// `/kranz todo` reply: deterministic operator worklist (no LLM/engine).
+fn build_todo_reply(repo_root: &Path, dashboard_url: Option<&str>) -> Vec<Value> {
+    let rows = build_pipeline_rows(repo_root);
+    let todo = crate::format::OperatorTodo {
+        pipeline_actions: pipeline_todo_actions(&rows, dashboard_url),
+        gated_items: read_operator_gates(repo_root),
+    };
+    crate::format::build_operator_todo(&todo)
+}
+
+fn pipeline_todo_actions(
+    rows: &[PipelineRow],
+    dashboard_url: Option<&str>,
+) -> Vec<crate::format::TodoAction> {
+    use crate::format::{PipelineStage, TodoAction, TodoActionKind, TodoTarget};
+
+    let mut actions = Vec::new();
+    for row in rows {
+        match row.stage {
+            PipelineStage::Reviewable if row.slug.is_some() => {
+                let slug = row.slug.clone().expect("checked above");
+                let (note, target) = if row.is_blocked {
+                    let note = if row.blocked_by.is_empty() {
+                        "Blocked by another ticket.".to_string()
+                    } else {
+                        format!("Blocked by {}.", row.blocked_by.join(", "))
+                    };
+                    (note, open_ticket_target(dashboard_url, &slug))
+                } else {
+                    (
+                        "Queue reviewed plan for run.".to_string(),
+                        TodoTarget::QueueTicket { slug: slug.clone() },
+                    )
+                };
+                actions.push(TodoAction {
+                    kind: TodoActionKind::Reviewable,
+                    id: slug,
+                    title: row.title.clone(),
+                    note: Some(note),
+                    target,
+                });
+            }
+            PipelineStage::Delivered if row.mission_id.is_some() => {
+                let mission_id = row.mission_id.clone().expect("checked above");
+                actions.push(TodoAction {
+                    kind: TodoActionKind::Delivered,
+                    id: mission_id.clone(),
+                    title: row.title.clone(),
+                    note: Some("Report is ready; merge the mission branch.".to_string()),
+                    target: TodoTarget::MergeMission { mission_id },
+                });
+            }
+            PipelineStage::NeedsYou if row.slug.is_some() => {
+                let slug = row.slug.clone().expect("checked above");
+                actions.push(TodoAction {
+                    kind: TodoActionKind::NeedsYou,
+                    id: slug.clone(),
+                    title: row.title.clone(),
+                    note: Some("Answer drafter questions, then redraft.".to_string()),
+                    target: open_ticket_target(dashboard_url, &slug),
+                });
+            }
+            _ => {}
+        }
+    }
+    actions
+}
+
+fn open_ticket_target(dashboard_url: Option<&str>, slug: &str) -> crate::format::TodoTarget {
+    match dashboard_url.map(str::trim).filter(|u| !u.is_empty()) {
+        Some(url) => crate::format::TodoTarget::OpenUrl {
+            label: "Open ticket".to_string(),
+            url: dashboard_backlog_deep_link(url, slug),
+        },
+        None => crate::format::TodoTarget::None,
+    }
+}
+
+fn dashboard_backlog_deep_link(dashboard_url: &str, slug: &str) -> String {
+    let base = dashboard_url.trim_end_matches('/');
+    format!("{base}/#/backlog/{slug}")
+}
+
+#[derive(Debug, Clone)]
+struct PipelineRow {
+    stage: crate::format::PipelineStage,
+    id: String,
+    title: String,
+    mission_id: Option<String>,
+    slug: Option<String>,
+    blocked_by: Vec<String>,
+    is_blocked: bool,
+    mission_status: Option<MissionStageStatus>,
+    cost_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+struct MissionProjection {
+    id: String,
+    status: MissionStageStatus,
+    merged: Option<bool>,
+    goal: String,
+    cost_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissionStageStatus {
+    Known(MissionStatus),
+    Deleted,
+}
+
+/// Build the same flat work-item rows as `PipelineView.tsx::buildRows`:
+/// every ticket is a row, and every mission not consumed by a ticket is a row.
+fn build_pipeline_rows(repo_root: &Path) -> Vec<PipelineRow> {
+    use kranz_engine::ticket::Ticket;
+
+    let missions = mission_projections(repo_root);
+    let missions_by_id: HashMap<String, MissionProjection> = missions
+        .iter()
+        .cloned()
+        .map(|mission| (mission.id.clone(), mission))
+        .collect();
+    let mut consumed_missions = std::collections::BTreeSet::new();
+    let mut rows = Vec::new();
+
+    for ticket in Ticket::list(repo_root) {
+        let state = Ticket::read_state(repo_root, &ticket.slug);
+        let mission_id = Ticket::mission_for(repo_root, &ticket.slug);
+        let mission = mission_id.as_deref().and_then(|id| missions_by_id.get(id));
+        if let Some(mission) = mission {
+            consumed_missions.insert(mission.id.clone());
+        }
+        rows.push(PipelineRow {
+            stage: pipeline_stage_for_ticket(state, mission),
+            id: ticket.slug.clone(),
+            title: ticket.title.clone(),
+            mission_id,
+            slug: Some(ticket.slug.clone()),
+            blocked_by: ticket.blocked_by.clone(),
+            is_blocked: kranz_engine::deps::is_blocked(repo_root, &ticket.slug).unwrap_or(false),
+            mission_status: mission.map(|m| m.status),
+            cost_usd: mission.and_then(|m| m.cost_usd),
+        });
+    }
+
+    for mission in missions {
+        if mission.status == MissionStageStatus::Deleted || consumed_missions.contains(&mission.id)
+        {
+            continue;
+        }
+        rows.push(PipelineRow {
+            stage: stage_from_mission(mission.status, mission.merged),
+            id: mission.id.clone(),
+            title: mission.goal.clone(),
+            mission_id: Some(mission.id),
+            slug: None,
+            blocked_by: vec![],
+            is_blocked: false,
+            mission_status: Some(mission.status),
+            cost_usd: mission.cost_usd,
+        });
+    }
+
+    rows
+}
+
+/// Fold missions into the subset of the REST `/api/missions` projection the
+/// dashboard stage model needs: status, merged bit, goal, and live cost.
+fn mission_projections(repo_root: &Path) -> Vec<MissionProjection> {
+    let mut ids = MissionPaths::list_missions(repo_root);
+    ids.sort();
+    let repo = kranz_engine::git_ops::GitRepo::open(repo_root).ok();
+    ids.into_iter()
+        .map(|id| {
+            let paths = MissionPaths::new(repo_root, &id);
+            if !paths.events_file().is_file() {
+                return MissionProjection {
+                    id,
+                    status: MissionStageStatus::Deleted,
+                    merged: None,
+                    goal: "deleted mission (no data recorded)".to_string(),
+                    cost_usd: None,
+                };
+            }
+            match EventLog::read_events(&paths.events_file()).and_then(|e| reducer::fold(&e)) {
+                Ok(state) => MissionProjection {
+                    id,
+                    status: MissionStageStatus::Known(state.mission.status),
+                    merged: repo
+                        .as_ref()
+                        .and_then(|repo| kranz_engine::merged::merged_bit(repo, &state.mission)),
+                    goal: state.mission.goal,
+                    cost_usd: (state.total_cost_usd > 0.0).then_some(state.total_cost_usd),
+                },
+                Err(e) => MissionProjection {
+                    id,
+                    status: MissionStageStatus::Known(MissionStatus::Failed),
+                    merged: None,
+                    goal: format!("unreadable mission ({e})"),
+                    cost_usd: None,
+                },
+            }
+        })
+        .collect()
+}
+
+/// Direct Rust mirror of `pipelineStage.ts::stageFromMission`.
+fn stage_from_mission(
+    status: MissionStageStatus,
+    merged: Option<bool>,
+) -> crate::format::PipelineStage {
+    use crate::format::PipelineStage;
+    match status {
+        MissionStageStatus::Known(MissionStatus::Failed) => PipelineStage::Failed,
+        MissionStageStatus::Known(MissionStatus::Complete) => {
+            if merged == Some(true) {
+                PipelineStage::Landed
+            } else {
+                PipelineStage::Delivered
+            }
+        }
+        MissionStageStatus::Known(
+            MissionStatus::Running
+            | MissionStatus::Paused
+            | MissionStatus::Blocked
+            | MissionStatus::Validating,
+        ) => PipelineStage::Running,
+        MissionStageStatus::Known(MissionStatus::Planning) => PipelineStage::Reviewable,
+        MissionStageStatus::Known(MissionStatus::Approved) => PipelineStage::Queued,
+        MissionStageStatus::Known(MissionStatus::Abandoned) | MissionStageStatus::Deleted => {
+            PipelineStage::Abandoned
+        }
+    }
+}
+
+/// Direct Rust mirror of `pipelineStage.ts::pipelineStage` for ticket rows.
+fn pipeline_stage_for_ticket(
+    state: kranz_engine::ticket::TicketState,
+    mission: Option<&MissionProjection>,
+) -> crate::format::PipelineStage {
+    use crate::format::PipelineStage;
+    use kranz_engine::ticket::TicketState;
+    match state {
+        TicketState::New => PipelineStage::Captured,
+        TicketState::Drafting => PipelineStage::Drafting,
+        TicketState::NeedsContext => PipelineStage::NeedsYou,
+        TicketState::Review => PipelineStage::Reviewable,
+        TicketState::Queued => PipelineStage::Queued,
+        TicketState::Running => PipelineStage::Running,
+        TicketState::Done => match mission.map(|m| m.status) {
+            None
+            | Some(MissionStageStatus::Known(MissionStatus::Abandoned))
+            | Some(MissionStageStatus::Deleted) => PipelineStage::Landed,
+            Some(_) => {
+                if mission.and_then(|m| m.merged) == Some(true) {
+                    PipelineStage::Landed
+                } else {
+                    PipelineStage::Delivered
+                }
+            }
+        },
+        TicketState::Failed => PipelineStage::Failed,
+    }
+}
+
+fn mission_stage_status_word(status: MissionStageStatus) -> String {
+    match status {
+        MissionStageStatus::Known(status) => status_word(status),
+        MissionStageStatus::Deleted => "Deleted".to_string(),
+    }
+}
+
+fn read_operator_gates(repo_root: &Path) -> Vec<crate::format::GateItem> {
+    let path = repo_root.join("docs").join("operator-gates.md");
+    let Ok(markdown) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    parse_operator_gates(&markdown)
+}
+
+fn parse_operator_gates(markdown: &str) -> Vec<crate::format::GateItem> {
+    markdown
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim_start();
+            let item = trimmed
+                .strip_prefix("- [ ] ")
+                .or_else(|| trimmed.strip_prefix("- [x] "))
+                .or_else(|| trimmed.strip_prefix("- [X] "))
+                .or_else(|| trimmed.strip_prefix("- "))?
+                .trim();
+            (!item.is_empty()).then(|| crate::format::GateItem {
+                title: item.to_string(),
+            })
+        })
+        .collect()
 }
 
 /// `/kranz ticket list` reply: one row per parseable ticket under
@@ -3220,6 +3619,54 @@ mod tests {
         std::fs::write(paths.events_file(), format!("{created}\n{completed}\n")).unwrap();
     }
 
+    fn basic_plan(goal: &str) -> kranz_engine::types::Plan {
+        use kranz_engine::types::{Plan, PlanFeature, PlanMilestone};
+        Plan {
+            goal: goal.to_string(),
+            validation_contract: vec![],
+            milestones: vec![PlanMilestone {
+                title: "M1".into(),
+                features: vec![PlanFeature {
+                    title: "F1".into(),
+                    spec: "s".into(),
+                    validation_criteria: vec!["c".into()],
+                }],
+            }],
+            command_grants: vec![],
+            touch_set: vec![],
+        }
+    }
+
+    fn seed_running_mission(repo_root: &Path, mission_id: &str, goal: &str) {
+        use kranz_engine::events::{Event, EventKind};
+        seed_mission(repo_root, mission_id, goal);
+        let paths = MissionPaths::new(repo_root, mission_id);
+        let approved = Event {
+            seq: 2,
+            ts: chrono::Utc::now(),
+            mission_id: mission_id.to_string(),
+            kind: EventKind::PlanApproved {
+                plan: basic_plan(goal),
+                base_sha: None,
+            },
+        };
+        let started = Event {
+            seq: 3,
+            ts: chrono::Utc::now(),
+            mission_id: mission_id.to_string(),
+            kind: EventKind::MilestoneStarted {
+                milestone_id: "ms-1".into(),
+                start_sha: "abc123".into(),
+            },
+        };
+        let mut existing = std::fs::read_to_string(paths.events_file()).unwrap();
+        existing.push_str(&serde_json::to_string(&approved).unwrap());
+        existing.push('\n');
+        existing.push_str(&serde_json::to_string(&started).unwrap());
+        existing.push('\n');
+        std::fs::write(paths.events_file(), existing).unwrap();
+    }
+
     #[test]
     fn build_status_reply_folds_the_log() {
         let tmp = TempDir::new().unwrap();
@@ -3282,6 +3729,180 @@ mod tests {
             status_word(MissionStatus::Approved),
             status_word(MissionStatus::Running)
         );
+    }
+
+    #[test]
+    fn pipeline_stage_derivation_mirrors_dashboard_reference_cases() {
+        use crate::format::PipelineStage;
+        use kranz_engine::ticket::TicketState;
+
+        assert_eq!(
+            pipeline_stage_for_ticket(TicketState::New, None),
+            PipelineStage::Captured
+        );
+        assert_eq!(
+            pipeline_stage_for_ticket(TicketState::NeedsContext, None),
+            PipelineStage::NeedsYou
+        );
+        assert_eq!(
+            pipeline_stage_for_ticket(TicketState::Review, None),
+            PipelineStage::Reviewable
+        );
+        assert_eq!(
+            pipeline_stage_for_ticket(TicketState::Queued, None),
+            PipelineStage::Queued
+        );
+        assert_eq!(
+            pipeline_stage_for_ticket(TicketState::Done, None),
+            PipelineStage::Landed
+        );
+
+        let complete_unmerged = MissionProjection {
+            id: "m-u".into(),
+            status: MissionStageStatus::Known(MissionStatus::Complete),
+            merged: Some(false),
+            goal: "g".into(),
+            cost_usd: None,
+        };
+        let complete_unknown = MissionProjection {
+            merged: None,
+            ..complete_unmerged.clone()
+        };
+        let complete_merged = MissionProjection {
+            merged: Some(true),
+            ..complete_unmerged.clone()
+        };
+        let abandoned = MissionProjection {
+            status: MissionStageStatus::Known(MissionStatus::Abandoned),
+            merged: None,
+            ..complete_unmerged.clone()
+        };
+
+        assert_eq!(
+            stage_from_mission(
+                MissionStageStatus::Known(MissionStatus::Complete),
+                Some(false)
+            ),
+            PipelineStage::Delivered
+        );
+        assert_eq!(
+            stage_from_mission(MissionStageStatus::Known(MissionStatus::Complete), None),
+            PipelineStage::Delivered
+        );
+        assert_eq!(
+            stage_from_mission(
+                MissionStageStatus::Known(MissionStatus::Complete),
+                Some(true)
+            ),
+            PipelineStage::Landed
+        );
+        assert_eq!(
+            stage_from_mission(MissionStageStatus::Known(MissionStatus::Planning), None),
+            PipelineStage::Reviewable
+        );
+        assert_eq!(
+            stage_from_mission(MissionStageStatus::Known(MissionStatus::Approved), None),
+            PipelineStage::Queued
+        );
+        assert_eq!(
+            stage_from_mission(MissionStageStatus::Deleted, None),
+            PipelineStage::Abandoned
+        );
+        assert_eq!(
+            pipeline_stage_for_ticket(TicketState::Done, Some(&complete_unmerged)),
+            PipelineStage::Delivered
+        );
+        assert_eq!(
+            pipeline_stage_for_ticket(TicketState::Done, Some(&complete_unknown)),
+            PipelineStage::Delivered
+        );
+        assert_eq!(
+            pipeline_stage_for_ticket(TicketState::Done, Some(&complete_merged)),
+            PipelineStage::Landed
+        );
+        assert_eq!(
+            pipeline_stage_for_ticket(TicketState::Done, Some(&abandoned)),
+            PipelineStage::Landed
+        );
+        assert_eq!(
+            pipeline_stage_for_ticket(TicketState::Review, Some(&complete_merged)),
+            PipelineStage::Reviewable,
+            "ticket head stages must ignore joined mission status"
+        );
+    }
+
+    #[test]
+    fn build_pipeline_status_reply_reports_counts_queue_running_and_unmerged() {
+        use kranz_engine::ticket::{Ticket, TicketState};
+
+        let tmp = TempDir::new().unwrap();
+        Ticket::scaffold(tmp.path(), "captured", "Captured ticket", None, None).unwrap();
+        Ticket::scaffold(tmp.path(), "reviewable", "Reviewable ticket", None, None).unwrap();
+        Ticket::write_state(tmp.path(), "reviewable", TicketState::Review, None).unwrap();
+        Ticket::scaffold(tmp.path(), "needs-you", "Needs context ticket", None, None).unwrap();
+        Ticket::write_state(tmp.path(), "needs-you", TicketState::NeedsContext, None).unwrap();
+
+        seed_running_mission(tmp.path(), "m-run", "Running mission");
+        seed_completed_mission(tmp.path(), "m-delivered");
+        queue::enqueue(
+            tmp.path(),
+            queue::QueueEntry {
+                mission_id: "m-queued".into(),
+                ticket_slug: None,
+                priority: 2,
+                seq: 0,
+            },
+        )
+        .unwrap();
+
+        let blocks = build_pipeline_status_reply(tmp.path());
+        let text = serde_json::to_string(&blocks).unwrap();
+        assert!(text.contains("m-run"), "running mission included");
+        assert!(text.contains("1 waiting"), "queue depth included");
+        assert!(text.contains("captured 1"), "captured count included");
+        assert!(text.contains("needs-you 1"), "needs-you count included");
+        assert!(
+            text.contains("reviewable 1"),
+            "reviewable ticket count included"
+        );
+        assert!(text.contains("running 1"), "running count included");
+        assert!(text.contains("delivered 1"), "delivered count included");
+        assert!(
+            text.contains("m-delivered"),
+            "delivered-but-unmerged set included"
+        );
+    }
+
+    #[test]
+    fn build_todo_reply_lists_pipeline_actions_and_tracked_gates() {
+        use kranz_engine::ticket::{Ticket, TicketState};
+
+        let tmp = TempDir::new().unwrap();
+        Ticket::scaffold(tmp.path(), "reviewable", "Approve plan", None, None).unwrap();
+        Ticket::write_state(tmp.path(), "reviewable", TicketState::Review, None).unwrap();
+        Ticket::scaffold(tmp.path(), "needs-you", "Answer questions", None, None).unwrap();
+        Ticket::write_state(tmp.path(), "needs-you", TicketState::NeedsContext, None).unwrap();
+        seed_completed_mission(tmp.path(), "m-delivered");
+
+        let docs = tmp.path().join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(
+            docs.join("operator-gates.md"),
+            "# Gates\n\n- [ ] repo public + history scrub\n- [ ] M6 live deploy\n",
+        )
+        .unwrap();
+
+        let blocks = build_todo_reply(tmp.path(), Some("http://127.0.0.1:4600"));
+        let text = serde_json::to_string(&blocks).unwrap();
+        assert!(text.contains("PIPELINE ACTIONS"));
+        assert!(text.contains("reviewable"));
+        assert!(text.contains("needs-you"));
+        assert!(text.contains("m-delivered"));
+        assert!(text.contains(crate::format::QUEUE_TICKET_ACTION_ID));
+        assert!(text.contains(crate::format::MERGE_ACTION_ID));
+        assert!(text.contains("http://127.0.0.1:4600/#/backlog/needs-you"));
+        assert!(text.contains("repo public + history scrub"));
+        assert!(text.contains("M6 live deploy"));
     }
 
     #[test]
