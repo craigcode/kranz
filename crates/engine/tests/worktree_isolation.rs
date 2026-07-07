@@ -7,7 +7,9 @@
 //! consumes either yet.
 
 use kranz_engine::backend::{AgentBackend, PromptMode};
-use kranz_engine::backend_mock::{mock_init, mock_result_text, mock_text, MockBackend, MockScript};
+use kranz_engine::backend_mock::{
+    mock_init, mock_result_error, mock_result_text, mock_text, MockBackend, MockScript,
+};
 use kranz_engine::config::load_layers;
 use kranz_engine::git_ops::GitRepo;
 use kranz_engine::orchestrator::MissionEngine;
@@ -1169,4 +1171,222 @@ async fn multi_milestone_worktree_mode_preserves_a1_a6_a7() {
         1,
         "only the primary worktree remains: {worktrees:?}"
     );
+}
+
+// -----------------------------------------------------------------------
+// f-2-1: wiring the real auth preflight into both spawn paths, cached once
+// per mission.
+// -----------------------------------------------------------------------
+
+/// A completed single-shot preflight probe session whose reply authenticates
+/// (mirrors [`crate::auth_verify`]'s own `verify_worker_auth_normal_reply_is_authenticated`
+/// fixture): init → assistant text "ack" → a non-error result.
+fn preflight_authenticated_script() -> MockScript {
+    MockScript::single_shot("ack")
+}
+
+/// A completed single-shot preflight probe session carrying the "Not logged
+/// in" auth-failure signature, which `verify_worker_auth` classifies as
+/// `Unauthenticated` regardless of cost/activity.
+fn preflight_unauthenticated_script() -> MockScript {
+    MockScript {
+        events: vec![
+            mock_init("preflight-session"),
+            mock_result_error("Not logged in"),
+        ],
+        ..Default::default()
+    }
+}
+
+/// Every `SessionSpec` in `specs` whose prompt is the auth-preflight probe
+/// (see `crate::auth_verify::probe_spec`): a single-shot "Reply with the
+/// single word: ack." prompt, distinguishable from every worker/orchestrator
+/// prompt in this test suite.
+fn preflight_probe_specs(
+    specs: &[kranz_engine::backend::SessionSpec],
+) -> Vec<&kranz_engine::backend::SessionSpec> {
+    specs
+        .iter()
+        .filter(|s| {
+            matches!(&s.prompt, PromptMode::SingleShot(t) if t.contains("Reply with the single word: ack"))
+        })
+        .collect()
+}
+
+fn worker_specs(
+    specs: &[kranz_engine::backend::SessionSpec],
+) -> Vec<&kranz_engine::backend::SessionSpec> {
+    specs
+        .iter()
+        .filter(
+            |s| matches!(&s.prompt, PromptMode::SingleShot(t) if t.contains("Implement feature")),
+        )
+        .collect()
+}
+
+/// `worker_auth_preflight_cached_once_per_mission`: a multi-feature,
+/// multi-milestone mission (M1 parallel-batch, two workers; M2 sequential,
+/// one worker — three workers total, exercising both spawn paths) drives the
+/// auth preflight exactly once, and every worker shares that one decision.
+/// An `Authenticated` preflight verdict means every one of the three worker
+/// specs relocates `HOME`/`CLAUDE_CONFIG_DIR` — proving the decision was
+/// reused, not recomputed (and silently flipping) per worker.
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_auth_preflight_cached_once_per_mission() {
+    let Some((_dir, root)) = mission_init_repo() else {
+        return;
+    };
+
+    let mut scripts = vec![
+        // orchestrator's own long-lived streaming session, exactly as
+        // `two_milestone_scripts()` builds it.
+        orch_multi_script(vec![
+            parallel_plan(&["f-1-1", "f-1-2"]),
+            judgement_complete(),
+            judgement_complete(),
+            dirty_tree_commit_as_is(),
+            judgement_complete(),
+            "NONE".to_string(),
+        ]),
+        // The ONE preflight probe: consumed by whichever spawn path runs
+        // first (M1's parallel batch), before any worker session starts.
+        preflight_authenticated_script(),
+    ];
+    scripts.extend((0..3).map(|_| worker_pass()));
+
+    let backend = Arc::new(MockBackend::with_scripts(scripts));
+    let backend_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend) as Arc<dyn AgentBackend>;
+    let mut cfg = worktree_cfg();
+    cfg.max_parallel_workers = 2;
+    let mut engine = MissionEngine::create(backend_dyn, &root, GOAL, cfg).expect("create engine");
+    engine.approve_plan(two_milestone_plan()).unwrap();
+
+    let status = timeout(TokioDuration::from_secs(90), engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+
+    let specs = backend.started_specs();
+
+    let probes = preflight_probe_specs(&specs);
+    assert_eq!(
+        probes.len(),
+        1,
+        "the auth preflight must be driven exactly once per mission, regardless of \
+         how many workers spawn: {:?}",
+        specs.iter().map(|s| &s.prompt).collect::<Vec<_>>()
+    );
+
+    let workers = worker_specs(&specs);
+    assert_eq!(
+        workers.len(),
+        3,
+        "expected three worker sessions (two parallel + one sequential)"
+    );
+    for spec in &workers {
+        assert!(
+            spec.env.contains_key("HOME") && spec.env.contains_key("CLAUDE_CONFIG_DIR"),
+            "every worker must share the single Authenticated decision and relocate HOME: {:?}",
+            spec.env
+        );
+    }
+}
+
+/// `worker_auth_both_spawn_paths_gated`: both the live sequential spawn path
+/// (`run_worker`/`run_worker_in`, M2's feature) and the buffered
+/// parallel-batch spawn path (`run_worker_in_buffered`, M1's two features)
+/// obtain their HOME relocate-vs-inherit decision from the SAME cached
+/// preflight verdict, and relocate only when that verdict is `Authenticated`.
+///
+/// Runs the same multi-feature, multi-milestone mission twice: once with a
+/// preflight that reports "Not logged in" (`Unauthenticated`) and once with a
+/// preflight that authenticates. In the failure case every worker spec — on
+/// both spawn paths — must omit `HOME`/`CLAUDE_CONFIG_DIR` entirely (the loud
+/// fail-safe applying uniformly, mission m-165b6f); in the success case every
+/// worker spec on both paths must carry the relocated pair.
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_auth_both_spawn_paths_gated() {
+    async fn run_mission_and_collect_worker_env_flags(preflight: MockScript) -> Vec<(bool, bool)> {
+        let Some((_dir, root)) = mission_init_repo() else {
+            return Vec::new();
+        };
+
+        let mut scripts = vec![
+            orch_multi_script(vec![
+                parallel_plan(&["f-1-1", "f-1-2"]),
+                judgement_complete(),
+                judgement_complete(),
+                dirty_tree_commit_as_is(),
+                judgement_complete(),
+                "NONE".to_string(),
+            ]),
+            preflight,
+        ];
+        scripts.extend((0..3).map(|_| worker_pass()));
+
+        let backend = Arc::new(MockBackend::with_scripts(scripts));
+        let backend_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend) as Arc<dyn AgentBackend>;
+        let mut cfg = worktree_cfg();
+        cfg.max_parallel_workers = 2;
+        let mut engine =
+            MissionEngine::create(backend_dyn, &root, GOAL, cfg).expect("create engine");
+        engine.approve_plan(two_milestone_plan()).unwrap();
+
+        let status = timeout(TokioDuration::from_secs(90), engine.run())
+            .await
+            .expect("run must not hang")
+            .unwrap();
+        assert_eq!(status, MissionStatus::Complete);
+
+        let specs = backend.started_specs();
+        assert_eq!(
+            preflight_probe_specs(&specs).len(),
+            1,
+            "exactly one preflight session per mission"
+        );
+        let workers = worker_specs(&specs);
+        assert_eq!(
+            workers.len(),
+            3,
+            "two parallel-batch + one sequential worker"
+        );
+        workers
+            .iter()
+            .map(|s| {
+                (
+                    s.env.contains_key("HOME"),
+                    s.env.contains_key("CLAUDE_CONFIG_DIR"),
+                )
+            })
+            .collect()
+    }
+
+    // Fail-safe: an Unauthenticated preflight means every worker on both
+    // spawn paths inherits the real HOME — no HOME/CLAUDE_CONFIG_DIR key at
+    // all, uniformly.
+    let unauthenticated_flags =
+        run_mission_and_collect_worker_env_flags(preflight_unauthenticated_script()).await;
+    if unauthenticated_flags.is_empty() {
+        return; // git unavailable; mission_init_repo already logged why.
+    }
+    for (has_home, has_config_dir) in &unauthenticated_flags {
+        assert!(
+            !has_home && !has_config_dir,
+            "an Unauthenticated cached verdict must gate OFF relocation on every spawn path: \
+             HOME present={has_home}, CLAUDE_CONFIG_DIR present={has_config_dir}"
+        );
+    }
+
+    // Success: an Authenticated preflight means every worker on both spawn
+    // paths relocates.
+    let authenticated_flags =
+        run_mission_and_collect_worker_env_flags(preflight_authenticated_script()).await;
+    for (has_home, has_config_dir) in &authenticated_flags {
+        assert!(
+            *has_home && *has_config_dir,
+            "an Authenticated cached verdict must gate ON relocation on every spawn path: \
+             HOME present={has_home}, CLAUDE_CONFIG_DIR present={has_config_dir}"
+        );
+    }
 }
