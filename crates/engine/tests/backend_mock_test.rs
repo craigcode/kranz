@@ -22,7 +22,7 @@ use tokio::time::timeout;
 /// How long a `next_event` call must stay pending to count as "blocked".
 const BLOCK_PROOF: Duration = Duration::from_millis(100);
 
-fn spec(session_id: &str, prompt: PromptMode) -> SessionSpec {
+fn spec(session_id: &str, prompt: PromptMode, writable: bool) -> SessionSpec {
     SessionSpec {
         cwd: std::env::temp_dir(),
         prompt,
@@ -35,6 +35,7 @@ fn spec(session_id: &str, prompt: PromptMode) -> SessionSpec {
         allowed_tools: vec!["Bash(cargo test*)".to_string()],
         disallowed_tools: vec!["Bash(git push*)".to_string()],
         tools: vec![],
+        writable,
         settings_json: None,
         json_schema: None,
         max_budget_usd: Some(1.0),
@@ -48,11 +49,16 @@ fn single_shot_spec(session_id: &str) -> SessionSpec {
     spec(
         session_id,
         PromptMode::SingleShot("do the thing".to_string()),
+        true,
     )
 }
 
 fn streaming_spec(session_id: &str) -> SessionSpec {
-    spec(session_id, PromptMode::Streaming("orchestrate".to_string()))
+    spec(
+        session_id,
+        PromptMode::Streaming("orchestrate".to_string()),
+        false,
+    )
 }
 
 async fn next(session: &mut Box<dyn AgentSession>) -> Option<AgentEvent> {

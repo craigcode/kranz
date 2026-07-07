@@ -1,9 +1,9 @@
 //! Codex agent backend: drives `codex exec --json` headless.
 //!
 //! Ground truth is `crates/engine/tests/fixtures/codex_exec_scrutiny.jsonl`,
-//! a recorded `codex exec --json` transcript. This module is validator-scoped
-//! and single-shot only: unlike `backend_claude`, there is no `--resume` and
-//! no streaming-input mode, so [`CodexSession::send_user_message`] and a
+//! a recorded `codex exec --json` transcript. This module is single-shot
+//! only: unlike `backend_claude`, there is no `--resume` and no
+//! streaming-input mode, so [`CodexSession::send_user_message`] and a
 //! `resume`d [`SessionSpec`] are both rejected at the seam rather than
 //! translated into codex flags.
 //!
@@ -178,11 +178,16 @@ fn effective_prompt(spec: &SessionSpec) -> String {
 /// `max_budget_usd`, `resume`, `permission_mode`, `allowed_tools` /
 /// `disallowed_tools`, `tools`, `settings_json`, `effort`.
 pub fn build_args(spec: &SessionSpec) -> Vec<String> {
+    let sandbox = if spec.writable {
+        "workspace-write"
+    } else {
+        "read-only"
+    };
     vec![
         "exec".into(),
         "--json".into(),
         "--sandbox".into(),
-        "read-only".into(),
+        sandbox.into(),
         "--model".into(),
         spec.model.clone(),
         effective_prompt(spec),
@@ -404,8 +409,8 @@ fn last_chars(text: &str, max: usize) -> String {
 // Backend
 // ---------------------------------------------------------------------------
 
-/// The [`AgentBackend`] for `codex exec --json`: single-shot, read-only
-/// sandbox, validator-scoped only.
+/// The [`AgentBackend`] for `codex exec --json`: single-shot with sandbox
+/// mode selected from the session role.
 #[derive(Debug, Clone)]
 pub struct CodexBackend {
     binary: PathBuf,
@@ -857,6 +862,7 @@ mod tests {
             allowed_tools: vec!["Bash(npm test*)".to_string()],
             disallowed_tools: vec!["Bash(git push*)".to_string()],
             tools: vec!["Bash".to_string()],
+            writable: false,
             settings_json: Some(json!({"hooks": {}})),
             json_schema: Some(json!({"type": "object"})),
             max_budget_usd: Some(5.0),
@@ -875,6 +881,43 @@ mod tests {
                 "--model".to_string(),
                 "gpt-5-codex".to_string(),
                 "be terse\n\ndo the thing".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_args_uses_workspace_write_for_writable_sessions() {
+        let spec = SessionSpec {
+            cwd: PathBuf::from("."),
+            prompt: PromptMode::SingleShot("do the thing".to_string()),
+            append_system_prompt: None,
+            model: "gpt-5-codex".to_string(),
+            effort: "high".to_string(),
+            session_id: "sess-1".to_string(),
+            resume: None,
+            permission_mode: None,
+            allowed_tools: vec![],
+            disallowed_tools: vec![],
+            tools: vec![],
+            writable: true,
+            settings_json: None,
+            json_schema: None,
+            max_budget_usd: None,
+            max_turns: None,
+            env: Default::default(),
+            sandbox: None,
+        };
+        let args = build_args(&spec);
+        assert_eq!(
+            args,
+            vec![
+                "exec".to_string(),
+                "--json".to_string(),
+                "--sandbox".to_string(),
+                "workspace-write".to_string(),
+                "--model".to_string(),
+                "gpt-5-codex".to_string(),
+                "do the thing".to_string(),
             ]
         );
     }
