@@ -34,3 +34,4 @@ Approved plans, newest last.
 - 2026-07-06 · [m-9d4193](m-9d4193/plan.md) — Make the serve-hosted queue drain (POST /api/queue/drain) restore the operator's dispatch-time checkout when the drain f… [truncated] · [report](m-9d4193/report.md)
 - 2026-07-06 · [m-836e99](m-836e99/plan.md) — Delete the unrouted dead MissionPicker component and its now-orphaned helper/tests, and scrub every remaining source ref… [truncated] · [report](m-836e99/report.md)
 - 2026-07-07 · [m-cde2e8](m-cde2e8/plan.md) — Make the worktree-mode gated merge land canonical plan.md/report.md deliverables cleanly despite the untracked operator-… [truncated] · [report](m-cde2e8/report.md)
+- 2026-07-07 · [m-a11f17](m-a11f17/plan.md) — Add a lens filter bar (Actionable | Backlog | Missions | All) to the pipeline view so operators see actionable work by d… [truncated]
