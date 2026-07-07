@@ -301,6 +301,7 @@ async fn worker_session_cwd_is_worktree() {
     let backend_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend) as Arc<dyn AgentBackend>;
     let mut engine =
         MissionEngine::create(backend_dyn, &root, GOAL, worktree_cfg()).expect("create engine");
+    engine.seed_worker_auth_verdict_for_test(AuthVerdict::Inconclusive);
     engine.approve_plan(one_feature_plan()).unwrap();
     // `approve_plan` (f-2-3) never checks out the mission branch in the
     // primary tree in worktree mode, so the primary is already on `main`
@@ -369,6 +370,7 @@ async fn checkout_mode_runs_worker_in_primary_root() {
     let backend_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend) as Arc<dyn AgentBackend>;
     let mut engine =
         MissionEngine::create(backend_dyn, &root, GOAL, checkout_cfg()).expect("create engine");
+    engine.seed_worker_auth_verdict_for_test(AuthVerdict::Inconclusive);
     let mission_branch = engine.state().mission.mission_branch.clone();
     engine.approve_plan(one_feature_plan()).unwrap();
 
@@ -428,6 +430,7 @@ async fn validator_session_cwd_is_worktree() {
     ]));
     let backend_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend) as Arc<dyn AgentBackend>;
     let mut engine = MissionEngine::create(backend_dyn, &root, GOAL, cfg).expect("create engine");
+    engine.seed_worker_auth_verdict_for_test(AuthVerdict::Inconclusive);
     engine.approve_plan(one_feature_plan()).unwrap();
     raw_git(&root, &["checkout", "main"]);
 
@@ -489,6 +492,7 @@ async fn base_sha_reaches_sessions_in_worktree_mode() {
     ]));
     let backend_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend) as Arc<dyn AgentBackend>;
     let mut engine = MissionEngine::create(backend_dyn, &root, GOAL, cfg).expect("create engine");
+    engine.seed_worker_auth_verdict_for_test(AuthVerdict::Inconclusive);
 
     let mut plan = one_feature_plan();
     plan.validation_contract.push(Assertion {
@@ -573,6 +577,7 @@ async fn primary_checkout_untouched_in_worktree_mode() {
     let backend_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend) as Arc<dyn AgentBackend>;
     let mut engine =
         MissionEngine::create(backend_dyn, &root, GOAL, worktree_cfg()).expect("create engine");
+    engine.seed_worker_auth_verdict_for_test(AuthVerdict::Inconclusive);
     engine.approve_plan(one_feature_plan()).unwrap();
 
     let status = timeout(TokioDuration::from_secs(60), engine.run())
@@ -618,6 +623,7 @@ async fn mission_branch_carries_deliverables_in_worktree_mode() {
     let backend_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend) as Arc<dyn AgentBackend>;
     let mut engine =
         MissionEngine::create(backend_dyn, &root, GOAL, worktree_cfg()).expect("create engine");
+    engine.seed_worker_auth_verdict_for_test(AuthVerdict::Inconclusive);
     let mission_branch = engine.state().mission.mission_branch.clone();
     let mission_id = engine.mission_id().to_string();
     engine.approve_plan(one_feature_plan()).unwrap();
@@ -788,6 +794,7 @@ async fn worktrees_removed_at_mission_end_in_worktree_mode() {
     let mut cfg = worktree_cfg();
     cfg.max_parallel_workers = 2;
     let mut engine = MissionEngine::create(backend_dyn, &root, GOAL, cfg).expect("create engine");
+    engine.seed_worker_auth_verdict_for_test(AuthVerdict::Inconclusive);
     let mission_id = engine.mission_id().to_string();
     engine.approve_plan(two_milestone_plan()).unwrap();
 
@@ -886,6 +893,7 @@ async fn checkout_mode_matches_legacy_sequential() {
     let backend = Arc::new(MockBackend::with_scripts(two_milestone_scripts()));
     let backend_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend) as Arc<dyn AgentBackend>;
     let mut engine = MissionEngine::create(backend_dyn, &root, GOAL, cfg).expect("create engine");
+    engine.seed_worker_auth_verdict_for_test(AuthVerdict::Inconclusive);
     let mission_branch = engine.state().mission.mission_branch.clone();
     engine.approve_plan(two_milestone_plan()).unwrap();
 
@@ -964,6 +972,7 @@ async fn approve_revised_plan_untouched_primary_in_worktree_mode() {
     let backend_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend) as Arc<dyn AgentBackend>;
     let mut engine =
         MissionEngine::create(backend_dyn, &root, GOAL, worktree_cfg()).expect("create engine");
+    engine.seed_worker_auth_verdict_for_test(AuthVerdict::Inconclusive);
     let mission_branch = engine.state().mission.mission_branch.clone();
     let mission_id = engine.mission_id().to_string();
     engine.approve_plan(one_feature_plan()).unwrap();
@@ -1076,6 +1085,7 @@ async fn multi_milestone_worktree_mode_preserves_a1_a6_a7() {
     let backend = Arc::new(MockBackend::with_scripts(two_milestone_scripts()));
     let backend_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend) as Arc<dyn AgentBackend>;
     let mut engine = MissionEngine::create(backend_dyn, &root, GOAL, cfg).expect("create engine");
+    engine.seed_worker_auth_verdict_for_test(AuthVerdict::Inconclusive);
     let mission_branch = engine.state().mission.mission_branch.clone();
     let mission_id = engine.mission_id().to_string();
 

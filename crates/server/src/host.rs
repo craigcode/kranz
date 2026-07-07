@@ -2368,6 +2368,13 @@ mod tests {
         ]
     }
 
+    /// A completed single-shot preflight probe session whose reply
+    /// authenticates, consumed once by `MissionEngine::worker_auth_verdict`
+    /// before the first worker/validator session of the mission spawns.
+    fn preflight_authenticated_script() -> MockScript {
+        MockScript::single_shot("ack")
+    }
+
     /// Worker script: completed single-shot run with a passing WorkerReport.
     fn worker_pass() -> MockScript {
         MockScript::single_shot_json(&json!({
@@ -2417,6 +2424,7 @@ mod tests {
         .responding(vec![turn(&judgement.to_string()), turn("NONE")]);
         let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::with_scripts(vec![
             orch,
+            preflight_authenticated_script(),
             worker_pass(),
             orch_run,
         ]));
