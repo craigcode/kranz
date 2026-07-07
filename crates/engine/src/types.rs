@@ -348,10 +348,11 @@ pub struct RoleConfig {
     pub max_budget_usd: Option<f64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<String>,
-    /// Backend override: only meaningful (and only accepted by
-    /// `config::validate`) on `validatorScrutiny`; `None` or `"claude"` keeps
-    /// the default Claude Code backend, `"codex"` selects [`crate::backend_codex::CodexBackend`],
-    /// `"droid"` selects [`crate::backend_droid::DroidBackend`].
+    /// Backend override for this role. `None` or `"claude"` keeps the default
+    /// Claude Code backend, `"codex"` selects
+    /// [`crate::backend_codex::CodexBackend`], and `"droid"` selects
+    /// [`crate::backend_droid::DroidBackend`]. `config::validate` checks that
+    /// the selected backend/model pair is supported for the role.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
     /// Per-role macOS Seatbelt filesystem sandbox opt-in.
@@ -389,6 +390,16 @@ pub enum BackendKind {
     Droid,
 }
 
+impl BackendKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BackendKind::Claude => "claude",
+            BackendKind::Codex => "codex",
+            BackendKind::Droid => "droid",
+        }
+    }
+}
+
 /// How worker/validator sessions are isolated from the primary checkout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -423,6 +434,11 @@ pub struct MissionConfig {
     pub allow_validator_commands: Vec<String>,
     /// Loud, never-default escape hatch.
     pub dangerously_allow_all: bool,
+    /// Explicit mission opt-in for worker models below the default worker tier.
+    ///
+    /// Default false: cheap/lower-tier workers must be chosen deliberately on
+    /// the mission config rather than becoming a silent global default.
+    pub allow_below_default_worker_model: bool,
     /// Path to the claude binary (auto-discovered when None).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claude_binary: Option<String>,
@@ -480,6 +496,7 @@ impl Default for MissionConfig {
             deny_patterns: vec![],
             allow_validator_commands: vec![],
             dangerously_allow_all: false,
+            allow_below_default_worker_model: false,
             claude_binary: None,
             worker_isolation: WorkerIsolation::Checkout,
         }
@@ -500,10 +517,12 @@ impl MissionConfig {
         }
     }
 
-    /// Which backend drives `validatorScrutiny` sessions. Only this role may
-    /// set `backend`; `config::validate` rejects it elsewhere.
-    pub fn scrutiny_backend_kind(&self) -> BackendKind {
-        match self.validator_scrutiny.backend.as_deref() {
+    /// Which backend drives a role's sessions. `config::validate` rejects
+    /// unknown backend strings before runtime; this accessor treats any
+    /// unexpected value as Claude as a conservative fallback for callers that
+    /// operate on already-validated config.
+    pub fn backend_kind(&self, role: Role) -> BackendKind {
+        match self.role(role).backend.as_deref() {
             Some("codex") => BackendKind::Codex,
             Some("droid") => BackendKind::Droid,
             _ => BackendKind::Claude,
