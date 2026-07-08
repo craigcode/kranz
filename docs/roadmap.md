@@ -135,7 +135,7 @@ and the project has no distribution story.
 Done when: CI is green on both platforms including the kill/resume test, and
 a new machine goes from nothing to `kranz plan` without cloning the repo.
 
-## M5 — Deeper validation & automation ◑ (kranz exec + scrub shipped; QA/skill-capture/OTEL deferred)
+## M5 — Deeper validation & automation ◑ (kranz exec + secret scanning shipped; QA/skill-capture/OTEL deferred)
 
 - Functional QA via browser/computer-use driven by the validator, for target
   repos with a scriptable run harness (same prerequisite Factory imposes).
@@ -143,7 +143,13 @@ a new machine goes from nothing to `kranz plan` without cloning the repo.
   exit code out; no interactive approval, contract gates only).
 - Skill capture: orchestrator proposes `.claude/skills` entries from repeated
   worker patterns; human approves before write.
-- OTEL export of engine events; real secret scanning replacing the regex scrub.
+- OTEL export of engine events (opt-in `kranz otel` sidecar shipped).
+- [x] Real secret scanning replacing the regex scrub — shipped 2026-07-07
+  (`0b731d0`): curated + entropy detectors, redact-at-write ingest gate with
+  `secret.redacted` audit events, merge pre-gate + CI job + `kranz scan`,
+  fingerprint waivers via `.kranz/secret-allowlist`. Design of record:
+  docs/scoping/secret-scanning.md (all D-A..D-D decided). Follow-up: verify
+  the always-on entropy detector's false-positive rate on real logs.
 
 ## M6 — Cloud missions ◑ (scoped push, Dockerfile, deploy docs, exec --push shipped; live deploy user-gated)
 
