@@ -3,7 +3,7 @@
 use chrono::{DateTime, TimeZone, Utc};
 use kranz_engine::error::EngineError;
 use kranz_engine::events::{Event, EventKind};
-use kranz_engine::reducer::{apply, fold, read_snapshot, write_snapshot};
+use kranz_engine::reducer::{apply, dry_run_revised_plan, fold, read_snapshot, write_snapshot};
 use kranz_engine::types::*;
 use proptest::prelude::*;
 use serde_json::json;
@@ -1089,6 +1089,177 @@ fn plan_revision_cannot_change_completed_milestones() {
     assert!(err
         .to_string()
         .contains("alters completed milestone 'milestone one'"));
+}
+
+#[test]
+fn plan_revision_tolerates_completed_milestone_whitespace() {
+    // A revision that reproduces a completed milestone's feature with ONLY
+    // whitespace differences (the orchestrator LLM will not echo it back
+    // byte-for-byte) must fold cleanly — the pre-emit gate tolerates this, so
+    // the reducer must too. Before the fix, the reducer compared these fields
+    // exactly, so an accepted PlanRevised became unfoldable and bricked the
+    // mission. Regression guard for the gate/reducer trim split.
+    let mut revised = plan();
+    let spec = revised.milestones[0].features[0].spec.clone();
+    let title = revised.milestones[0].features[0].title.clone();
+    revised.milestones[0].features[0].spec = format!("  {spec}\n");
+    revised.milestones[0].features[0].title = format!("{title}\t");
+    revised.goal = "build the revised thing".into();
+
+    let events: Vec<Event> = vec![
+        created(),
+        EventKind::PlanApproved {
+            plan: plan(),
+            base_sha: None,
+        },
+        EventKind::MilestoneCompleted {
+            milestone_id: "ms-1".into(),
+            tag: None,
+        },
+        EventKind::PlanRevisionProposed {
+            revision: 1,
+            plan: revised.clone(),
+            instructions: "reword".into(),
+        },
+        EventKind::PlanRevised {
+            revision: 1,
+            plan: revised,
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, kind)| ev(i as u64 + 1, kind))
+    .collect();
+
+    let state = fold(&events).expect("whitespace-only completed-milestone diff must fold cleanly");
+    assert_eq!(state.mission.goal, "build the revised thing");
+    // Completed work is frozen: the ORIGINAL stored feature text is kept, not
+    // the reformatted variant.
+    assert_eq!(
+        feature(&state, "f-1-1").spec,
+        plan().milestones[0].features[0].spec
+    );
+}
+
+#[test]
+fn plan_revision_proposed_revision_zero_is_rejected() {
+    let events: Vec<Event> = vec![
+        created(),
+        EventKind::PlanApproved {
+            plan: plan(),
+            base_sha: None,
+        },
+        EventKind::PlanRevisionProposed {
+            revision: 0,
+            plan: plan(),
+            instructions: "x".into(),
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, kind)| ev(i as u64 + 1, kind))
+    .collect();
+    let err = fold(&events).unwrap_err();
+    assert!(matches!(err, EngineError::InvalidState(_)));
+    assert!(err.to_string().contains("must be >= 1"));
+}
+
+#[test]
+fn plan_revised_mismatched_revision_is_rejected() {
+    let mut state = fold_kinds(vec![
+        created(),
+        EventKind::PlanApproved {
+            plan: plan(),
+            base_sha: None,
+        },
+        EventKind::PlanRevisionProposed {
+            revision: 1,
+            plan: plan(),
+            instructions: "x".into(),
+        },
+    ]);
+    let next = state.last_seq + 1;
+    let err = apply(
+        &mut state,
+        &ev(
+            next,
+            EventKind::PlanRevised {
+                revision: 2,
+                plan: plan(),
+            },
+        ),
+    )
+    .unwrap_err();
+    assert!(matches!(err, EngineError::InvalidState(_)));
+    assert!(err
+        .to_string()
+        .contains("does not match pending revision 1"));
+}
+
+#[test]
+fn plan_revision_rejected_mismatched_revision_is_rejected() {
+    let mut state = fold_kinds(vec![
+        created(),
+        EventKind::PlanApproved {
+            plan: plan(),
+            base_sha: None,
+        },
+        EventKind::PlanRevisionProposed {
+            revision: 1,
+            plan: plan(),
+            instructions: "x".into(),
+        },
+    ]);
+    let next = state.last_seq + 1;
+    let err = apply(
+        &mut state,
+        &ev(
+            next,
+            EventKind::PlanRevisionRejected {
+                revision: 2,
+                reason: "x".into(),
+            },
+        ),
+    )
+    .unwrap_err();
+    assert!(matches!(err, EngineError::InvalidState(_)));
+    assert!(err
+        .to_string()
+        .contains("does not match pending revision 1"));
+}
+
+#[test]
+fn dry_run_revised_plan_refuses_completed_milestone_rewrite() {
+    // The orchestrator dry-runs the fold before it durably appends PlanRevised.
+    // A revision that genuinely rewrites completed work is refused here, so the
+    // unappliable event never reaches the append-only log; a whitespace-only
+    // variant, by contrast, dry-runs clean.
+    let state = fold_kinds(vec![
+        created(),
+        EventKind::PlanApproved {
+            plan: plan(),
+            base_sha: None,
+        },
+        EventKind::MilestoneCompleted {
+            milestone_id: "ms-1".into(),
+            tag: None,
+        },
+        EventKind::PlanRevisionProposed {
+            revision: 1,
+            plan: plan(),
+            instructions: "seed".into(),
+        },
+    ]);
+
+    let mut bad = plan();
+    bad.milestones[0].features[0].spec = "genuinely different work".into();
+    let err = dry_run_revised_plan(&state, &bad, 1).unwrap_err();
+    assert!(matches!(err, EngineError::InvalidState(_)));
+
+    let mut ok = plan();
+    let spec = ok.milestones[0].features[0].spec.clone();
+    ok.milestones[0].features[0].spec = format!("{spec}\n");
+    dry_run_revised_plan(&state, &ok, 1).expect("whitespace-only revision dry-runs clean");
 }
 
 #[test]

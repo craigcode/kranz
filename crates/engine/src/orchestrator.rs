@@ -1313,6 +1313,11 @@ impl MissionEngine {
             )));
         }
         validate_revised_plan_for_gate(&self.state.mission, &pending.plan)?;
+        // Belt-and-suspenders: the reducer — not merely the gate — must accept
+        // this revision. Dry-run the exact fold before any durable side effect,
+        // so an unappliable PlanRevised can never be appended to the log (emit
+        // appends before it folds; a failed fold on replay bricks the mission).
+        reducer::dry_run_revised_plan(&self.state, &pending.plan, revision)?;
         self.commit_revised_plan_record(&pending.plan, revision)?;
         if self.state.mission.status == MissionStatus::Blocked {
             if let Some(mi) = first_incomplete(&self.state) {
@@ -4851,23 +4856,13 @@ fn validate_vec_extends(label: &str, existing: &[String], revised: &[String]) ->
 }
 
 /// Whether a completed milestone's feature set is reproduced UNCHANGED in the
-/// revised plan milestone (roadmap M2 re-planning guard): same feature count,
-/// same titles/specs/validation-criteria in the same order. Titles/specs are
-/// compared trimmed; criteria compared exactly-trimmed element-wise. A
-/// completed milestone whose work is done must not be silently rewritten.
+/// revised plan milestone (roadmap M2 re-planning guard). Delegates to the
+/// reducer's canonical [`reducer::completed_features_match`] so this pre-emit
+/// gate and the reducer's fold can never disagree: if they did, the gate could
+/// accept a revision the reducer rejects, and `emit` (which appends before it
+/// folds) would leave an unfoldable event in the append-only log.
 fn completed_features_unchanged(done: &Milestone, revised: &PlanMilestone) -> bool {
-    if done.features.len() != revised.features.len() {
-        return false;
-    }
-    done.features.iter().zip(&revised.features).all(|(a, b)| {
-        a.title.trim() == b.title.trim()
-            && a.spec.trim() == b.spec.trim()
-            && a.validation_criteria.len() == b.validation_criteria.len()
-            && a.validation_criteria
-                .iter()
-                .zip(&b.validation_criteria)
-                .all(|(x, y)| x.trim() == y.trim())
-    })
+    reducer::completed_features_match(&done.features, &revised.features)
 }
 
 /// Normalize a feature title for matching across a re-plan (trim + lowercase):

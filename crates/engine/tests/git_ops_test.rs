@@ -303,6 +303,25 @@ fn commit_paths_commits_only_named_paths() {
 }
 
 #[test]
+fn commit_paths_is_idempotent_when_nothing_staged() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, _base) = seeded_repo();
+    write(&dir, "a.txt", "aaa\n");
+    let first = repo.commit_paths(&[Path::new("a.txt")], "add a").unwrap();
+
+    // Re-committing byte-identical content (a crash-replayed re-approval) must
+    // be a no-op that returns the unchanged head, not an empty-commit error
+    // that would wedge the caller.
+    write(&dir, "a.txt", "aaa\n");
+    let second = repo
+        .commit_paths(&[Path::new("a.txt")], "add a (replay)")
+        .expect("re-committing identical content must not error");
+    assert_eq!(first, second, "head must not advance on a no-op re-commit");
+}
+
+#[test]
 fn commit_paths_blocks_unwaived_secret_findings_before_staging() {
     if !setup() {
         return;

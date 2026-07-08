@@ -454,6 +454,16 @@ fn apply_revised_plan(state: &mut MissionState, plan: &Plan, revision: u32) -> R
     Ok(())
 }
 
+/// Validate that a `PlanRevised { revision, plan }` event would fold cleanly
+/// onto `state`, WITHOUT mutating it. The orchestrator calls this before it
+/// durably appends the event — `emit` appends before it folds — so a revision
+/// the reducer would reject is refused up front instead of poisoning the
+/// append-only log. A failed fold on replay would otherwise error on every
+/// subsequent load and permanently brick the mission.
+pub fn dry_run_revised_plan(state: &MissionState, plan: &Plan, revision: u32) -> Result<()> {
+    apply_revised_plan(&mut state.clone(), plan, revision)
+}
+
 fn ensure_contract_extends(existing: &[Assertion], revised: &[Assertion]) -> Result<()> {
     for old in existing {
         let Some(new) = revised.iter().find(|a| a.id == old.id) else {
@@ -485,16 +495,30 @@ fn ensure_strings_extend(label: &str, existing: &[String], revised: &[String]) -
 
 fn completed_milestone_matches(existing: &Milestone, revised: &PlanMilestone) -> bool {
     existing.title.trim() == revised.title.trim()
-        && existing.features.len() == revised.features.len()
-        && existing
-            .features
-            .iter()
-            .zip(&revised.features)
-            .all(|(feature, plan_feature)| {
-                feature.title == plan_feature.title
-                    && feature.spec == plan_feature.spec
-                    && feature.validation_criteria == plan_feature.validation_criteria
-            })
+        && completed_features_match(&existing.features, &revised.features)
+}
+
+/// Whether a completed milestone's features are reproduced UNCHANGED in a
+/// revised plan: same count, and same title/spec/validation-criteria in order,
+/// compared TRIMMED. This is the single source of truth for the "completed
+/// work is frozen" rule — the orchestrator's pre-emit gate
+/// (`completed_features_unchanged`) delegates here so the gate and the reducer
+/// can never diverge. The leniency is deliberate: a regenerated plan will not
+/// echo incidental whitespace back byte-for-byte, and whitespace is not a
+/// content change. An exact compare here would let the gate accept a revision
+/// the reducer then rejects, and because `emit` appends before it folds, that
+/// leaves an unfoldable event in the append-only log and bricks the mission.
+pub(crate) fn completed_features_match(existing: &[Feature], revised: &[PlanFeature]) -> bool {
+    existing.len() == revised.len()
+        && existing.iter().zip(revised).all(|(a, b)| {
+            a.title.trim() == b.title.trim()
+                && a.spec.trim() == b.spec.trim()
+                && a.validation_criteria.len() == b.validation_criteria.len()
+                && a.validation_criteria
+                    .iter()
+                    .zip(&b.validation_criteria)
+                    .all(|(x, y)| x.trim() == y.trim())
+        })
 }
 
 fn merge_revised_milestone(

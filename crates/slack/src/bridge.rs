@@ -4648,6 +4648,109 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn revision_denies_an_unlisted_user_and_enqueues_nothing() {
+        // The M2 revision arms are gated exactly like steer: a non-empty
+        // allowlist refuses an unlisted user on all three revision commands and
+        // enqueues NOTHING. Anti-vacuity guard — dropping the is_authorized
+        // check on revision_control (the ungated-mutation-arm class of bug) must
+        // fail a test, not slip through green.
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-gated", "goal");
+        let cfg = SlackConfig {
+            bot_token: "xoxb".into(),
+            app_token: "xapp".into(),
+            channel: "C1".into(),
+            notify: NotifyFlags::default(),
+            allow_users: vec!["U-allowed".into()],
+            dashboard_url: None,
+            instance_name: None,
+        };
+        let client = SlackClient::new(&cfg).unwrap();
+        for cmd in [
+            ControlCommand::RequestRevision {
+                instructions: "do it".into(),
+            },
+            ControlCommand::ApproveRevision { revision: 1 },
+            ControlCommand::RejectRevision { revision: 1 },
+        ] {
+            revision_control(
+                &cfg,
+                &client,
+                tmp.path(),
+                "m-gated",
+                Some("U-outsider"),
+                None,
+                cmd,
+                "queued",
+            )
+            .await;
+        }
+        assert!(
+            kranz_engine::control::drain(&MissionPaths::new(tmp.path(), "m-gated"))
+                .unwrap()
+                .is_empty(),
+            "an unlisted user's revision commands enqueue nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn revision_allows_a_listed_user_and_enqueues_the_command() {
+        // The gate's positive half: a listed user's revision request enqueues.
+        // A mission is only revisable once it has an approved plan (past
+        // Planning), so seed MissionCreated + PlanApproved.
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-ok", "goal");
+        let paths = MissionPaths::new(tmp.path(), "m-ok");
+        let approved = kranz_engine::events::Event {
+            seq: 2,
+            ts: chrono::Utc::now(),
+            mission_id: "m-ok".into(),
+            kind: kranz_engine::events::EventKind::PlanApproved {
+                plan: sample_plan("goal"),
+                base_sha: None,
+            },
+        };
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(paths.events_file())
+                .unwrap();
+            writeln!(f, "{}", serde_json::to_string(&approved).unwrap()).unwrap();
+        }
+        let cfg = SlackConfig {
+            bot_token: "xoxb".into(),
+            app_token: "xapp".into(),
+            channel: "C1".into(),
+            notify: NotifyFlags::default(),
+            allow_users: vec!["U-allowed".into()],
+            dashboard_url: None,
+            instance_name: None,
+        };
+        let client = SlackClient::new(&cfg).unwrap();
+        revision_control(
+            &cfg,
+            &client,
+            tmp.path(),
+            "m-ok",
+            Some("U-allowed"),
+            None,
+            ControlCommand::RequestRevision {
+                instructions: "tighten scope".into(),
+            },
+            "revision requested",
+        )
+        .await;
+        let drained = kranz_engine::control::drain(&MissionPaths::new(tmp.path(), "m-ok")).unwrap();
+        assert_eq!(drained.len(), 1, "listed user's revision is enqueued");
+        assert!(
+            matches!(drained[0].1, ControlCommand::RequestRevision { .. }),
+            "got {:?}",
+            drained[0].1
+        );
+    }
+
     #[test]
     fn pause_resume_work_are_noops_in_apply_action() {
         // These reply over the network in dispatch_action; apply_action must not

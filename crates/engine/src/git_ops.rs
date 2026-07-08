@@ -214,6 +214,11 @@ impl GitRepo {
     /// Paths may be absolute or relative to the repo root. Content staged
     /// for *other* paths is left staged and untouched (`git commit -- <paths>`
     /// commits just the named pathspecs).
+    ///
+    /// Idempotent: if staging the named paths yields no change (e.g. a
+    /// crash-replayed re-commit of byte-identical files), this is a no-op that
+    /// returns the current head rather than an empty-commit error. An empty
+    /// `paths` slice is still rejected up front.
     pub fn commit_paths(&self, paths: &[&Path], message: &str) -> Result<String> {
         if paths.is_empty() {
             return Err(EngineError::Git("commit_paths: no paths given".into()));
@@ -235,6 +240,21 @@ impl GitRepo {
         let mut add: Vec<OsString> = vec!["add".into(), "--".into()];
         add.extend(path_args.clone());
         self.run_os(&add)?;
+
+        // Idempotent: if staging these pathspecs produced nothing (e.g. a
+        // crash-replayed re-approval that rewrites byte-identical files), skip
+        // the commit and return the unchanged head. `git commit` errors on an
+        // empty commit, which would otherwise wedge the caller on replay.
+        let mut staged: Vec<OsString> = vec![
+            "diff".into(),
+            "--cached".into(),
+            "--name-only".into(),
+            "--".into(),
+        ];
+        staged.extend(path_args.clone());
+        if self.run_os(&staged)?.trim().is_empty() {
+            return self.head_sha();
+        }
 
         let mut commit: Vec<OsString> =
             vec!["commit".into(), "-m".into(), message.into(), "--".into()];
