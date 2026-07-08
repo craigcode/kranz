@@ -13,7 +13,8 @@
 //!   `apps.connections.open`), acks every envelope within Slack's 3 s budget,
 //!   routes it with the pure [`crate::inbound::route`], and applies the
 //!   resulting [`Action`] (approve→queue, guidance→control inbox,
-//!   ticket→scaffold). Reconnects with capped exponential backoff on any close
+//!   ticket→scaffold). Reconnects promptly after an established socket ends,
+//!   and uses capped exponential backoff only while Slack is unreachable
 //!   (Slack rotates the wss URL, so each reconnect re-opens it).
 //!
 //! Shutdown is any `Future` that resolves when the host wants the bridge to
@@ -322,8 +323,9 @@ async fn post_outbound(
 // ---------------------------------------------------------------------------
 
 /// Inbound loop: connect the Socket Mode websocket, handle envelopes, and
-/// reconnect with backoff until `shutdown`. Each connect re-opens a fresh wss
-/// URL (Slack rotates them).
+/// reconnect until `shutdown`. Each connect re-opens a fresh wss URL (Slack
+/// rotates them). Dial/open failures use backoff; established sockets that
+/// end or reset reconnect promptly.
 pub async fn run_socket(
     cfg: SlackConfig,
     client: SlackClient,
@@ -373,7 +375,7 @@ pub async fn run_socket(
     // it on the next socket; re-ack those ids without re-running side effects.
     let mut seen = SeenEnvelopes::default();
     loop {
-        tokio::select! {
+        let grow_backoff = tokio::select! {
             _ = &mut shutdown => {
                 stop_setter.notify_waiters();
                 health_task.abort();
@@ -393,16 +395,18 @@ pub async fn run_socket(
                     // the backoff — the drop isn't a failure to reach Slack.
                     Ok(false) => {
                         backoff = BACKOFF_MIN;
-                        tracing::warn!("slack socket closed; reconnecting");
+                        tracing::info!("slack socket ended; reconnecting");
+                        false
                     }
                     // Never even connected (open_connection / dial failed): grow
                     // the backoff so we don't hammer Slack while it's unreachable.
                     Err(e) => {
                         tracing::warn!(error = %e, backoff_ms = backoff.as_millis() as u64, "slack connect failed; backing off");
+                        true
                     }
                 }
             }
-        }
+        };
 
         // Backoff before reconnect, but wake immediately on shutdown.
         tokio::select! {
@@ -413,8 +417,9 @@ pub async fn run_socket(
             }
             _ = tokio::time::sleep(backoff) => {}
         }
-        // Only failures grow the backoff; a clean reset above starts fresh.
-        backoff = (backoff * 2).min(BACKOFF_MAX);
+        if grow_backoff {
+            backoff = (backoff * 2).min(BACKOFF_MAX);
+        }
     }
 }
 
@@ -423,10 +428,11 @@ pub async fn run_socket(
 ///
 /// Returns:
 /// - `Ok(true)`  — `stop` ended it (clean shutdown); the caller exits.
-/// - `Ok(false)` — the socket connected and then closed on its own; the caller
-///   reconnects promptly (a rotated URL / blip is not a failure to reach Slack).
-/// - `Err(_)`    — never connected, or a protocol error mid-stream; the caller
-///   reconnects after a growing backoff.
+/// - `Ok(false)` — the socket connected and then ended/errored on its own; the
+///   caller reconnects promptly (a rotated URL / blip is not a failure to reach
+///   Slack).
+/// - `Err(_)`    — never connected; the caller reconnects after a growing
+///   backoff.
 #[allow(clippy::too_many_arguments)]
 async fn connect_once(
     cfg: &SlackConfig,
@@ -480,9 +486,8 @@ fn is_disconnect_frame(text: &str) -> bool {
 /// stream in tests instead of a live websocket.
 ///
 /// Returns the same contract as [`connect_once`]: `Ok(true)` on `stop`,
-/// `Ok(false)` on a clean close, a write-send failure, a disconnect frame, or
-/// an idle stall (all reconnect promptly); `Err(_)` on a stream error (grows
-/// the backoff).
+/// `Ok(false)` on a clean close, a write-send failure, a disconnect frame, an
+/// idle stall, or a stream error (all reconnect promptly).
 #[allow(clippy::too_many_arguments)]
 async fn pump_connection<R, E, W>(
     read: &mut R,
@@ -582,7 +587,10 @@ where
                     }
                     Some(Ok(Message::Close(_))) | None => return Ok(false),
                     Some(Ok(_)) => {} // pong / binary: ignore
-                    Some(Err(e)) => return Err(anyhow::anyhow!("{e}")),
+                    Some(Err(e)) => {
+                        tracing::warn!(error = %e, "slack socket stream error; reconnecting");
+                        return Ok(false);
+                    }
                 }
             }
         }
@@ -5463,6 +5471,43 @@ mod tests {
 
         tokio::time::advance(IDLE_TIMEOUT + Duration::from_secs(1)).await;
         let result = handle.await.unwrap();
+        assert!(
+            matches!(result, Ok(false)),
+            "expected Ok(false), got {result:?}"
+        );
+    }
+
+    /// A read-side stream error means the already-open socket died; it must
+    /// reconnect promptly instead of escalating the dial/open backoff across
+    /// otherwise healthy long-lived sessions.
+    #[tokio::test]
+    async fn stream_error_triggers_prompt_reconnect() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_cfg();
+        let client = SlackClient::new(&cfg).unwrap();
+        let threads = SharedThreads::load(tmp.path()).unwrap();
+        let stop = Arc::new(Notify::new());
+        let mut seen = SeenEnvelopes::default();
+        let health = BridgeHealth::new();
+
+        let mut read = futures_util::stream::iter(vec![Err::<Message, _>(
+            "Connection reset without closing handshake",
+        )]);
+        let mut write = futures_util::sink::drain::<Message>();
+
+        let result = pump_connection(
+            &mut read,
+            &mut write,
+            &cfg,
+            &client,
+            tmp.path(),
+            &threads,
+            &None,
+            &stop,
+            &mut seen,
+            &health,
+        )
+        .await;
         assert!(
             matches!(result, Ok(false)),
             "expected Ok(false), got {result:?}"
