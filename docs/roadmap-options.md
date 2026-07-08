@@ -1,0 +1,73 @@
+# Roadmap Options
+
+This is the deterministic source for `/kranz roadmap`: strategic options that
+are worth remembering but are not always immediate backlog tickets. Keep each
+option under one of the category headings below.
+
+Format:
+
+```text
+- **Title** - one-line summary.
+  Why: why this option matters.
+  Trigger: what makes it next.
+  Source: docs/path.md; .kranz/tickets/slug.md
+  Ticket: slug or none
+```
+
+## Now
+
+- **Core safety and reliability polish** - finish the cleanup train before more demo-shaped work.
+  Why: These items protect the mission/audit promise and keep later work from landing on shaky operator surfaces.
+  Trigger: Pick whenever no human-gated ecosystem step is unblocked.
+  Source: .kranz/tickets/fix-slack-mission-id-path-traversal.md; .kranz/tickets/stale-base-merge-warning.md; .kranz/tickets/mission-cost-trailers.md
+  Ticket: multiple
+
+- **Roadmap surface v1** - keep `/kranz roadmap` backed by this tracked file so strategic options remain visible from Slack.
+  Why: The backlog shows captured work, and `/kranz todo` shows immediate human actions; this file keeps conditional futures from collapsing into either.
+  Trigger: Maintain whenever roadmap/scoping docs add or retire a strategic option.
+  Source: docs/roadmap.md; docs/operator-gates.md; docs/roadmap-options.md
+  Ticket: none
+
+## Human-gated
+
+- **Gas City Stage 1 live-city validation** - validate the existing pack against a disposable live City before building more integration polish.
+  Why: The pack is stub/live-spike proven, but agent registration, supervisor behavior, and event-trigger reality still need one careful human-run pass.
+  Trigger: A live `gc` city is available and the operator is willing to spend setup/teardown time plus any live mayor-session cost.
+  Source: docs/gascity-citizenship.md
+  Ticket: none
+
+- **M6 live cloud deploy** - prove hosted kranz end-to-end after scoped push and deploy docs.
+  Why: Cloud missions are scoped but still need a deliberately gated live run before claiming the milestone is operational.
+  Trigger: Operator chooses a host and accepts the live deploy/network surface.
+  Source: docs/roadmap.md; docs/deploy.md
+  Ticket: none
+
+## Scoping-ready
+
+- **Repo knowledge store slice 1** - add `docs/knowledge/` conventions and `research.md` planning artifacts.
+  Why: It is the clean continuation from Factory AutoWiki research without outsourcing kranz's canonical knowledge layer.
+  Trigger: Start when the next capability lane beats cleanup on leverage.
+  Source: docs/scoping/repo-knowledge-store.md; .kranz/tickets/repo-knowledge-store-research.md
+  Ticket: repo-knowledge-store-research
+
+- **Gas City event dispatch and mission events** - after Stage 1, build the two stub-verifiable pack improvements.
+  Why: Event dispatch lowers bead latency, and `kranz.mission.*` events make kranz a better City citizen without adopting beads as the core work model.
+  Trigger: Stage 1 live-city validation has run at least once.
+  Source: docs/gascity-citizenship.md
+  Ticket: docs briefs 1 and 3
+
+## Parked/demo
+
+- **Even Realities demo feature** - keep as a high-delight demo lane, not the next strategic foundation.
+  Why: It will be fun to show, but Gas City citizenship and ecosystem fit are higher-leverage right now.
+  Trigger: Revisit when core reliability and ecosystem work are calmer.
+  Source: docs/roadmap.md
+  Ticket: none
+
+## Out of kranz lane
+
+- **Agentic IDE / desktop coding environment** - belongs to sgian, not kranz.
+  Why: Kranz should stay a mission/audit/gate harness; terminal/editor/voice surfaces would blur the product boundary.
+  Trigger: Track in sgian's roadmap, not here.
+  Source: docs/roadmap.md; docs/scoping/repo-knowledge-store.md
+  Ticket: none

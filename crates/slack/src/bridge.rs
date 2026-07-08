@@ -1132,6 +1132,16 @@ async fn dispatch_action(
             .await;
         }
 
+        Action::Roadmap { response_url } => {
+            reply_ephemeral(
+                cfg,
+                client,
+                response_url.as_deref(),
+                &build_roadmap_reply(repo_root),
+            )
+            .await;
+        }
+
         Action::Ask {
             question,
             user_id,
@@ -2493,6 +2503,7 @@ fn apply_action(repo_root: &Path, action: &Action) -> Result<()> {
         Action::Help { .. }
         | Action::Status { .. }
         | Action::Todo { .. }
+        | Action::Roadmap { .. }
         | Action::TicketList { .. }
         | Action::TicketShow { .. }
         | Action::NewMission { .. }
@@ -2631,6 +2642,14 @@ fn build_todo_reply(repo_root: &Path, dashboard_url: Option<&str>) -> Vec<Value>
         gated_items: read_operator_gates(repo_root),
     };
     crate::format::build_operator_todo(&todo)
+}
+
+/// `/kranz roadmap` reply: deterministic strategic option map (no LLM/engine).
+fn build_roadmap_reply(repo_root: &Path) -> Vec<Value> {
+    let snapshot = crate::format::RoadmapSnapshot {
+        sections: read_roadmap_options(repo_root),
+    };
+    crate::format::build_roadmap(&snapshot)
 }
 
 fn pipeline_todo_actions(
@@ -2919,6 +2938,115 @@ fn parse_operator_gates(markdown: &str) -> Vec<crate::format::GateItem> {
             })
         })
         .collect()
+}
+
+fn read_roadmap_options(repo_root: &Path) -> Vec<crate::format::RoadmapSection> {
+    let path = repo_root.join("docs").join("roadmap-options.md");
+    let Ok(markdown) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    parse_roadmap_options(&markdown)
+}
+
+fn parse_roadmap_options(markdown: &str) -> Vec<crate::format::RoadmapSection> {
+    let mut sections = Vec::new();
+    let mut current_section: Option<crate::format::RoadmapSection> = None;
+    let mut current_option: Option<crate::format::RoadmapOption> = None;
+
+    for line in markdown.lines() {
+        let trimmed = line.trim();
+        if let Some(name) = trimmed.strip_prefix("## ") {
+            push_roadmap_option(&mut current_section, &mut current_option);
+            if let Some(section) = current_section.take() {
+                if !section.options.is_empty() {
+                    sections.push(section);
+                }
+            }
+            current_section = Some(crate::format::RoadmapSection {
+                name: name.trim().to_string(),
+                options: Vec::new(),
+            });
+            continue;
+        }
+
+        if trimmed.starts_with("- **") {
+            push_roadmap_option(&mut current_section, &mut current_option);
+            current_option = parse_roadmap_option_line(trimmed);
+            continue;
+        }
+
+        if let Some(option) = current_option.as_mut() {
+            if let Some((key, value)) = parse_roadmap_field(trimmed) {
+                match key {
+                    "why" => option.why = Some(value.to_string()),
+                    "trigger" => option.trigger = Some(value.to_string()),
+                    "source" => option.source = Some(value.to_string()),
+                    "ticket" => option.ticket = Some(value.to_string()),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    push_roadmap_option(&mut current_section, &mut current_option);
+    if let Some(section) = current_section {
+        if !section.options.is_empty() {
+            sections.push(section);
+        }
+    }
+
+    sections
+}
+
+fn push_roadmap_option(
+    current_section: &mut Option<crate::format::RoadmapSection>,
+    current_option: &mut Option<crate::format::RoadmapOption>,
+) {
+    if let (Some(section), Some(option)) = (current_section.as_mut(), current_option.take()) {
+        if !option.title.trim().is_empty() {
+            section.options.push(option);
+        }
+    }
+}
+
+fn parse_roadmap_option_line(line: &str) -> Option<crate::format::RoadmapOption> {
+    let rest = line.strip_prefix("- **")?;
+    let (title, after_title) = rest.split_once("**")?;
+    let title = title.trim();
+    if title.is_empty() {
+        return None;
+    }
+    let summary = after_title
+        .trim()
+        .strip_prefix('-')
+        .or_else(|| after_title.trim().strip_prefix('—'))
+        .or_else(|| after_title.trim().strip_prefix(':'))
+        .unwrap_or(after_title.trim())
+        .trim();
+    Some(crate::format::RoadmapOption {
+        title: title.to_string(),
+        summary: summary.to_string(),
+        why: None,
+        trigger: None,
+        source: None,
+        ticket: None,
+    })
+}
+
+fn parse_roadmap_field(line: &str) -> Option<(&str, &str)> {
+    let (key, value) = line.split_once(':')?;
+    let key = key.trim();
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    match key.to_ascii_lowercase().as_str() {
+        "why" => Some(("why", value)),
+        "trigger" => Some(("trigger", value)),
+        "source" => Some(("source", value)),
+        "ticket" => Some(("ticket", value)),
+        _ => None,
+    }
 }
 
 /// `/kranz ticket list` reply: one row per parseable ticket under
@@ -4392,6 +4520,69 @@ mod tests {
         assert!(text.contains("http://127.0.0.1:4600/#/backlog/needs-you"));
         assert!(text.contains("repo public + history scrub"));
         assert!(text.contains("M6 live deploy"));
+    }
+
+    #[test]
+    fn parse_roadmap_options_groups_fields_by_section() {
+        let sections = parse_roadmap_options(
+            r#"# Roadmap Options
+
+## Now
+
+- **Core safety** - finish the cleanup train.
+  Why: Protect the mission gate.
+  Trigger: Before demos.
+  Source: docs/roadmap.md
+  Ticket: stale-base-merge-warning
+
+## Parked/demo
+
+- **Even Realities** - demo lane.
+  Trigger: Later.
+"#,
+        );
+
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].name, "Now");
+        assert_eq!(sections[0].options.len(), 1);
+        let option = &sections[0].options[0];
+        assert_eq!(option.title, "Core safety");
+        assert_eq!(option.summary, "finish the cleanup train.");
+        assert_eq!(option.why.as_deref(), Some("Protect the mission gate."));
+        assert_eq!(option.trigger.as_deref(), Some("Before demos."));
+        assert_eq!(option.source.as_deref(), Some("docs/roadmap.md"));
+        assert_eq!(option.ticket.as_deref(), Some("stale-base-merge-warning"));
+        assert_eq!(sections[1].name, "Parked/demo");
+        assert_eq!(sections[1].options[0].title, "Even Realities");
+    }
+
+    #[test]
+    fn build_roadmap_reply_reads_tracked_options_file() {
+        let tmp = TempDir::new().unwrap();
+        let docs = tmp.path().join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(
+            docs.join("roadmap-options.md"),
+            r#"# Roadmap Options
+
+## Human-gated
+
+- **Gas City Stage 1** - live-city validation.
+  Why: Validate supervisor reality.
+  Trigger: A disposable city is available.
+  Source: docs/gascity-citizenship.md
+  Ticket: none
+"#,
+        )
+        .unwrap();
+
+        let blocks = build_roadmap_reply(tmp.path());
+        let text = serde_json::to_string(&blocks).unwrap();
+        assert!(text.contains("Kranz roadmap"));
+        assert!(text.contains("HUMAN-GATED"));
+        assert!(text.contains("Gas City Stage 1"));
+        assert!(text.contains("live-city validation"));
+        assert!(text.contains("docs/gascity-citizenship.md"));
     }
 
     #[test]

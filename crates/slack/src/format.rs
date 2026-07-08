@@ -318,6 +318,30 @@ pub struct OperatorTodo {
     pub gated_items: Vec<GateItem>,
 }
 
+/// One strategic roadmap option from `docs/roadmap-options.md`.
+#[derive(Debug, Clone)]
+pub struct RoadmapOption {
+    pub title: String,
+    pub summary: String,
+    pub why: Option<String>,
+    pub trigger: Option<String>,
+    pub source: Option<String>,
+    pub ticket: Option<String>,
+}
+
+/// A grouped roadmap section, preserving the order from the tracked source.
+#[derive(Debug, Clone)]
+pub struct RoadmapSection {
+    pub name: String,
+    pub options: Vec<RoadmapOption>,
+}
+
+/// Fixed, already-derived state for `/kranz roadmap`.
+#[derive(Debug, Clone)]
+pub struct RoadmapSnapshot {
+    pub sections: Vec<RoadmapSection>,
+}
+
 /// A plan awaiting review, with the pieces a reviewer needs before spending:
 /// the goal, milestone list, and validation-assertion count. Renders with
 /// **Approve & start** / **Approve & queue** buttons carrying the mission id.
@@ -1013,6 +1037,99 @@ pub fn build_operator_todo(todo: &OperatorTodo) -> Vec<Value> {
     blocks
 }
 
+/// `/kranz roadmap`: strategic options grouped by immediacy/trigger. Inputs
+/// are fixed state from `docs/roadmap-options.md`; no repo reads here.
+pub fn build_roadmap(snapshot: &RoadmapSnapshot) -> Vec<Value> {
+    let mut blocks = vec![header(":map: Kranz roadmap")];
+    let sections: Vec<&RoadmapSection> = snapshot
+        .sections
+        .iter()
+        .filter(|section| !section.options.is_empty())
+        .collect();
+    if sections.is_empty() {
+        blocks.push(context(
+            "_No roadmap options listed in_ `docs/roadmap-options.md`.",
+        ));
+        return blocks;
+    }
+
+    for roadmap_section in sections {
+        blocks.push(section(&format!(
+            "*{}*",
+            escape_mrkdwn(&roadmap_section.name.to_ascii_uppercase())
+        )));
+        let mut body = String::new();
+        for option in &roadmap_section.options {
+            body.push_str(&roadmap_option_text(option));
+            body.push('\n');
+        }
+        blocks.push(section(&clip(body.trim_end())));
+    }
+    blocks
+}
+
+fn roadmap_option_text(option: &RoadmapOption) -> String {
+    let mut text = format!("• *{}*", escape_mrkdwn(option.title.trim()));
+    let summary = option.summary.trim();
+    if !summary.is_empty() {
+        text.push_str(" - ");
+        text.push_str(&escape_mrkdwn(summary));
+    }
+    let why = option
+        .why
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let trigger = option
+        .trigger
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if why.is_some() || trigger.is_some() {
+        text.push('\n');
+        if let Some(why) = why {
+            text.push_str("_Why:_ ");
+            text.push_str(&escape_mrkdwn(why));
+        }
+        if let Some(trigger) = trigger {
+            if why.is_some() {
+                text.push(' ');
+            }
+            text.push_str("_Trigger:_ ");
+            text.push_str(&escape_mrkdwn(trigger));
+        }
+    }
+
+    let source = option
+        .source
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let ticket = option
+        .ticket
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if source.is_some() || ticket.is_some() {
+        text.push('\n');
+        if let Some(source) = source {
+            text.push_str("_Source:_ `");
+            text.push_str(&escape_mrkdwn(source));
+            text.push('`');
+        }
+        if let Some(ticket) = ticket {
+            if source.is_some() {
+                text.push(' ');
+            }
+            text.push_str("_Ticket:_ `");
+            text.push_str(&escape_mrkdwn(ticket));
+            text.push('`');
+        }
+    }
+
+    text
+}
+
 fn todo_action_text(action: &TodoAction) -> String {
     let mut text = format!(
         "*{}* `{}` — {}",
@@ -1156,6 +1273,7 @@ pub fn build_help() -> Vec<Value> {
              • `/kranz work run` — trigger the queue drain through the host (progress posts per mission)\n\
              • `/kranz status` — show the pipeline snapshot; `/kranz status <id>` shows one mission\n\
              • `/kranz todo` — show operator pipeline actions and human-only gates\n\
+             • `/kranz roadmap` — show strategic options grouped by trigger/status\n\
              • `/kranz ask <question>` — ask a grounded, read-only question about mission/ticket state\n\
              • `/kranz ticket <title>` — file a new backlog ticket\n\
              • `/kranz ticket list` — list backlog tickets\n\
@@ -1754,6 +1872,48 @@ mod tests {
         assert!(buttons
             .iter()
             .any(|b| b["url"] == "http://dash/#/backlog/needs-context"));
+    }
+
+    #[test]
+    fn roadmap_renders_sections_options_and_metadata() {
+        let blocks = build_roadmap(&RoadmapSnapshot {
+            sections: vec![
+                RoadmapSection {
+                    name: "Now".into(),
+                    options: vec![RoadmapOption {
+                        title: "Core safety".into(),
+                        summary: "finish reliability polish".into(),
+                        why: Some("protects mission trust".into()),
+                        trigger: Some("pick before demos".into()),
+                        source: Some("docs/roadmap.md".into()),
+                        ticket: Some("stale-base-merge-warning".into()),
+                    }],
+                },
+                RoadmapSection {
+                    name: "Parked/demo".into(),
+                    options: vec![RoadmapOption {
+                        title: "Even Realities".into(),
+                        summary: "demo lane".into(),
+                        why: None,
+                        trigger: Some("after ecosystem work".into()),
+                        source: None,
+                        ticket: Some("none".into()),
+                    }],
+                },
+            ],
+        });
+
+        let text = all_text(&blocks);
+        assert!(text.contains("Kranz roadmap"));
+        assert!(text.contains("NOW"));
+        assert!(text.contains("Core safety"));
+        assert!(text.contains("finish reliability polish"));
+        assert!(text.contains("protects mission trust"));
+        assert!(text.contains("pick before demos"));
+        assert!(text.contains("docs/roadmap.md"));
+        assert!(text.contains("stale-base-merge-warning"));
+        assert!(text.contains("PARKED/DEMO"));
+        assert!(text.contains("Even Realities"));
     }
 
     #[test]

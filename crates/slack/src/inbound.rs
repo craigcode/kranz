@@ -25,6 +25,7 @@
 //!   mission) → [`Action::Guidance`]. Bot's own messages, thread roots, and
 //!   messages in unknown threads are ignored (else the bridge echoes itself).
 //! - `slash_commands` `/kranz todo` → [`Action::Todo`];
+//!   `/kranz roadmap` → [`Action::Roadmap`];
 //!   `/kranz ticket <title>` → [`Action::NewTicket`];
 //!   `/kranz ticket new <slug> <title...>` → [`Action::NewTicketModal`] (a
 //!   multiline goal/context modal, carrying the slug/title through);
@@ -154,6 +155,9 @@ pub enum Action {
     /// `/kranz todo` → post the deterministic operator worklist. Read-only, so
     /// not spend-gated.
     Todo { response_url: Option<String> },
+    /// `/kranz roadmap` → post the deterministic strategic option map from
+    /// `docs/roadmap-options.md`. Read-only, so not spend-gated.
+    Roadmap { response_url: Option<String> },
     /// `/kranz ask <question>` → read-only LLM-backed Q&A grounded in mission,
     /// ticket, queue, report, and event state. It spends tokens, so it is
     /// allowlist-gated like other spend actions.
@@ -693,9 +697,10 @@ fn route_event(payload: &Value, lookup: &impl ThreadLookup) -> Action {
 
 /// `slash_commands` → the `/kranz` subcommand router. Recognized subcommands:
 /// `ticket <title>`, `ticket list`, `ticket show <slug>`, `new <goal>`,
-/// `status [<id>]`, `todo`, `ask <question>`, `plan <id>`, `approve <id>`, `draft <slug>`,
-/// `config [<id>] <role> <model> [effort]`, `pause [<id>]`, `resume [<id>]`,
-/// `work`. A bare `/kranz`, `help`, or an unrecognized/incomplete subcommand
+/// `status [<id>]`, `todo`, `roadmap`, `ask <question>`, `plan <id>`,
+/// `approve <id>`, `draft <slug>`, `config [<id>] <role> <model> [effort]`,
+/// `pause [<id>]`, `resume [<id>]`, `work`. A bare `/kranz`, `help`, or an
+/// unrecognized/incomplete subcommand
 /// shows the command list — a typo lands on help rather than silently doing
 /// something surprising, which is what keeps the surface discoverable.
 ///
@@ -841,6 +846,15 @@ fn route_slash(payload: &Value) -> Action {
             return Action::Todo { response_url };
         }
         // `todo <anything>` → help.
+    }
+
+    // `roadmap` → deterministic strategic option map. Extra tokens are typos
+    // and fall through to help.
+    if let Some(rest) = strip_ci_prefix(text, "roadmap") {
+        if rest.trim().is_empty() {
+            return Action::Roadmap { response_url };
+        }
+        // `roadmap <anything>` → help.
     }
 
     // `ask <question>` → read-only, LLM-backed Q&A. It still spends tokens,
@@ -1891,6 +1905,48 @@ mod tests {
             route(&env, &lookup_none()).action,
             Action::Todo {
                 response_url: Some("https://hooks.slack/t".into())
+            }
+        );
+    }
+
+    #[test]
+    fn slash_roadmap_routes_to_roadmap() {
+        let env = json!({
+            "type": "slash_commands",
+            "payload": { "command": "/kranz", "text": "roadmap",
+                         "response_url": "https://hooks.slack/r" }
+        });
+        assert_eq!(
+            route(&env, &lookup_none()).action,
+            Action::Roadmap {
+                response_url: Some("https://hooks.slack/r".into())
+            }
+        );
+
+        let env = json!({
+            "type": "slash_commands",
+            "payload": { "command": "/kranz", "text": "ROADMAP  ",
+                         "response_url": "https://hooks.slack/r" }
+        });
+        assert_eq!(
+            route(&env, &lookup_none()).action,
+            Action::Roadmap {
+                response_url: Some("https://hooks.slack/r".into())
+            }
+        );
+    }
+
+    #[test]
+    fn slash_roadmap_with_extra_tokens_falls_through_to_help() {
+        let env = json!({
+            "type": "slash_commands",
+            "payload": { "command": "/kranz", "text": "roadmap now",
+                         "response_url": "https://hooks.slack/r" }
+        });
+        assert_eq!(
+            route(&env, &lookup_none()).action,
+            Action::Help {
+                response_url: Some("https://hooks.slack/r".into())
             }
         );
     }
