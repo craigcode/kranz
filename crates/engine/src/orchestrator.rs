@@ -3583,15 +3583,13 @@ impl MissionEngine {
             .map(|a| format!("- [{}] {}", a.id, a.statement))
             .collect::<Vec<_>>()
             .join("\n");
-        // Diff against the base pinned at approval, never the live base branch:
-        // a base branch that advanced mid-mission would silently change the
-        // final judgement's diff (same never-re-resolve rule as the command
-        // env's KRANZ_BASE_SHA). Fall back to base_branch only for legacy
-        // missions with no pinned base_sha.
-        let base = match self.state.mission.base_sha.as_deref() {
-            Some(sha) if !sha.is_empty() => sha.to_string(),
-            _ => self.state.mission.base_branch.clone(),
-        };
+        // Diff against the base pinned at approval, never the live base branch
+        // (a base that advanced mid-mission would silently change the final
+        // judgement's diff). See judge_diff_base / judge_gate_diff_uses_pinned_base_sha.
+        let base = judge_diff_base(
+            self.state.mission.base_sha.as_deref(),
+            &self.state.mission.base_branch,
+        );
         let diff_stat = self
             .active_repo()
             .diff_stat(&base, "HEAD")
@@ -4873,6 +4871,18 @@ fn render_research_markdown(research: &Research, mission_id: &str) -> String {
         &research.candidate_knowledge_updates,
     );
     md
+}
+
+/// Which base ref the final gate's agent-judgement turn diffs against: the base
+/// pinned at approval (`base_sha`), never the moving base branch — a base that
+/// advanced mid-mission would silently change the judge's diff (same
+/// never-re-resolve rule as the command env's `KRANZ_BASE_SHA`). Falls back to
+/// `base_branch` only for legacy missions with no pinned sha.
+fn judge_diff_base(base_sha: Option<&str>, base_branch: &str) -> String {
+    match base_sha {
+        Some(sha) if !sha.is_empty() => sha.to_string(),
+        _ => base_branch.to_string(),
+    }
 }
 
 /// Prompt policy asking the orchestrator to document its research for
@@ -7225,6 +7235,85 @@ mod tests {
         // Empty sources section is omitted; the blank fact is skipped.
         assert!(!md.contains("## External sources"));
         assert!(!md.contains("-  \n"));
+    }
+
+    #[test]
+    fn judge_gate_diff_uses_pinned_base_sha() {
+        // The final gate's judge diffs against the base pinned at approval,
+        // never the moving base branch. Selection: pinned sha wins; None/empty
+        // falls back to base_branch (legacy missions).
+        assert_eq!(judge_diff_base(Some("abc123"), "main"), "abc123");
+        assert_eq!(judge_diff_base(None, "main"), "main");
+        assert_eq!(judge_diff_base(Some(""), "main"), "main");
+
+        // Non-vacuity, in a real repo: when the base branch MOVES after the
+        // mission forks, the pinned-sha diff stays put while the moved-branch
+        // diff changes — diffing the wrong base would silently alter the judge's
+        // view of the mission's work. Skip when git is unavailable.
+        let git_ok = std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !git_ok {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(dir.path())
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        if !std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(dir.path())
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            git(&["init"]);
+            git(&["symbolic-ref", "HEAD", "refs/heads/main"]);
+        }
+        git(&["config", "user.name", "t"]);
+        git(&["config", "user.email", "t@e"]);
+        std::fs::write(dir.path().join("base.txt"), "base\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-m", "base"]);
+
+        let repo = GitRepo::open(dir.path()).unwrap();
+        let pinned = repo.rev_parse("main").unwrap(); // base tip pinned at approval
+
+        // Mission forks and adds its own feature commit.
+        git(&["checkout", "-b", "kranz/mission-x"]);
+        std::fs::write(dir.path().join("feature.txt"), "feature\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-m", "feature"]);
+
+        // The base branch MOVES after the fork.
+        git(&["checkout", "main"]);
+        std::fs::write(dir.path().join("unrelated.txt"), "moved\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-m", "base moved"]);
+        git(&["checkout", "kranz/mission-x"]);
+
+        let diff_pinned = repo.diff_stat(&pinned, "HEAD").unwrap();
+        let diff_moved = repo.diff_stat("main", "HEAD").unwrap();
+        assert!(
+            diff_pinned.contains("feature.txt"),
+            "pinned diff should be the mission's own work: {diff_pinned}"
+        );
+        assert_ne!(
+            diff_pinned, diff_moved,
+            "a moved base must change the diff (else the guard is vacuous): \
+             pinned={diff_pinned:?} moved={diff_moved:?}"
+        );
     }
 
     /// F2: while `run()` idles in the `MissionStatus::Paused` poll branch, a
