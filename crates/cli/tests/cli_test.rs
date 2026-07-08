@@ -203,6 +203,36 @@ fn parses_missions() {
 }
 
 #[test]
+fn parses_scan_modes() {
+    assert!(matches!(
+        Cli::try_parse_from(["kranz", "scan"]).unwrap().command,
+        Command::Scan {
+            staged: false,
+            range: None
+        }
+    ));
+
+    assert!(matches!(
+        Cli::try_parse_from(["kranz", "scan", "--staged"])
+            .unwrap()
+            .command,
+        Command::Scan {
+            staged: true,
+            range: None
+        }
+    ));
+
+    let cli = Cli::try_parse_from(["kranz", "scan", "--range", "main..HEAD"]).unwrap();
+    match cli.command {
+        Command::Scan { staged, range } => {
+            assert!(!staged);
+            assert_eq!(range.as_deref(), Some("main..HEAD"));
+        }
+        other => panic!("expected Scan, got {other:?}"),
+    }
+}
+
+#[test]
 fn parses_serve() {
     let cli = Cli::try_parse_from(["kranz", "serve"]).unwrap();
     match cli.command {
@@ -894,8 +924,22 @@ fn renderer_tags_worker_lines_and_truncates() {
     let paused = event(5, "m-1", EventKind::MissionPaused {});
     assert_eq!(renderer.render(&paused), "[mission] paused");
 
-    let validating = event(
+    let redacted = event(
         6,
+        "m-1",
+        EventKind::SecretRedacted {
+            rule_id: "openai-api-key".to_string(),
+            fingerprint: "abc123def456".to_string(),
+            location: "event/payload/text".to_string(),
+        },
+    );
+    assert_eq!(
+        renderer.render(&redacted),
+        "[secret] redacted openai-api-key abc123def456 at event/payload/text"
+    );
+
+    let validating = event(
+        7,
         "m-1",
         EventKind::MilestoneValidating {
             milestone_id: "ms-1".to_string(),
@@ -905,7 +949,7 @@ fn renderer_tags_worker_lines_and_truncates() {
 
     // Long, multi-line content collapses to one line capped at 160 chars.
     let long = event(
-        7,
+        8,
         "m-1",
         EventKind::WorkerMessage {
             run_id: "w-1".to_string(),

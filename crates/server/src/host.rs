@@ -610,9 +610,14 @@ impl MissionHost {
             MergeReport::RefusedDirtyTree => Err(ApiError::conflict(
                 "refusing to merge: tracked working tree is dirty",
             )),
-            MergeReport::GateFailed { gate, output } => {
-                Err(ApiError::unprocessable(format!("{gate} failed:\n{output}")))
-            }
+            MergeReport::GateFailed { gate, output } => Err(ApiError::unprocessable(
+                kranz_engine::scrub::scrub(&format!("{gate} failed:\n{output}")),
+            )),
+            MergeReport::SecretScanFailed { findings } => Err(ApiError::unprocessable(format!(
+                "secret scan failed; add a fingerprint to {} only for a reviewed false positive:\n{}",
+                kranz_engine::scrub::SECRET_ALLOWLIST_PATH,
+                kranz_engine::scrub::format_findings(&findings)
+            ))),
             MergeReport::Conflict { files } => Err(ApiError::conflict(format!(
                 "merge conflicted in: {}",
                 files.join(", ")

@@ -9,6 +9,7 @@
 //! whatever git printed, so mission logs show *why* a git step failed.
 
 use crate::error::{EngineError, Result};
+use crate::scrub;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -190,6 +191,18 @@ impl GitRepo {
         if paths.is_empty() {
             return Err(EngineError::Git("commit_paths: no paths given".into()));
         }
+        let allowed = std::fs::read_to_string(self.root.join(scrub::SECRET_ALLOWLIST_PATH))
+            .ok()
+            .map(|text| scrub::read_allowlist_text(&text))
+            .unwrap_or_default();
+        let findings = scrub::filter_allowed(scrub::scan_paths(&self.root, paths), &allowed);
+        if !findings.is_empty() {
+            return Err(EngineError::Git(format!(
+                "secret scan blocked engine commit; add a fingerprint to {} only for a reviewed false positive:\n{}",
+                scrub::SECRET_ALLOWLIST_PATH,
+                scrub::format_findings(&findings)
+            )));
+        }
         let path_args = paths.iter().map(|p| p.as_os_str().to_os_string());
 
         let mut add: Vec<OsString> = vec!["add".into(), "--".into()];
@@ -235,6 +248,21 @@ impl GitRepo {
     pub fn diff_full(&self, from: &str, to: &str) -> Result<String> {
         let range = format!("{from}..{to}");
         self.run(&["diff", &range])
+    }
+
+    /// Full `git diff <range>` output for a caller-supplied range.
+    pub fn diff_range(&self, range: &str) -> Result<String> {
+        if range.starts_with('-') || range.chars().any(char::is_whitespace) {
+            return Err(EngineError::Git(format!(
+                "refusing diff of malformed range {range:?}"
+            )));
+        }
+        self.run(&["diff", range])
+    }
+
+    /// Full staged diff (`git diff --cached`) output.
+    pub fn diff_staged(&self) -> Result<String> {
+        self.run(&["diff", "--cached"])
     }
 
     /// Paths changed in `from..to` (`git diff --name-only <from>..<to>`),

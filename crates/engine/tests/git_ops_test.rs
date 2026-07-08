@@ -303,6 +303,45 @@ fn commit_paths_commits_only_named_paths() {
 }
 
 #[test]
+fn commit_paths_blocks_unwaived_secret_findings_before_staging() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, base) = seeded_repo();
+    let secret = "sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    write(&dir, "leak.txt", &format!("ANTHROPIC_API_KEY={secret}\n"));
+
+    let err = repo
+        .commit_paths(&[Path::new("leak.txt")], "leak")
+        .expect_err("secret finding must block the engine commit");
+    match err {
+        EngineError::Git(msg) => {
+            assert!(
+                msg.contains("secret scan blocked engine commit"),
+                "missing scan context: {msg}"
+            );
+            assert!(
+                msg.contains(".kranz/secret-allowlist"),
+                "missing waiver guidance: {msg}"
+            );
+            assert!(msg.contains("anthropic-api-key"), "missing rule id: {msg}");
+            assert!(
+                !msg.contains(secret),
+                "secret value leaked through error: {msg}"
+            );
+        }
+        other => panic!("expected EngineError::Git, got: {other:?}"),
+    }
+    assert_eq!(repo.head_sha().unwrap(), base, "commit must not advance");
+    assert!(
+        raw_git(dir.path(), &["diff", "--cached", "--name-only"])
+            .trim()
+            .is_empty(),
+        "blocked commit must not stage the secret file"
+    );
+}
+
+#[test]
 fn commits_between_is_oldest_first() {
     if !setup() {
         return;

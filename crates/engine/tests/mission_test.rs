@@ -1259,6 +1259,39 @@ async fn pause_resume_and_user_message_flow() {
 // 5b. Scrubbing: orchestrator decision detail (structured-field leak)
 // ---------------------------------------------------------------------------
 
+#[test]
+fn mission_created_secret_redacts_and_audits() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let secret = "sk-ant-api03-AbCdEf_123-xyz";
+    let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::with_scripts(vec![]));
+
+    let engine = MissionEngine::create(backend, &root, &format!("ship with {secret}"), test_cfg())
+        .expect("create mission");
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let raw_log = std::fs::read_to_string(paths.events_file()).unwrap();
+    assert!(
+        !raw_log.contains(secret),
+        "events.jsonl leaked secret: {raw_log}"
+    );
+    assert!(raw_log.contains("[REDACTED]"));
+    let events = read_log(&paths);
+    assert!(events.iter().any(|event| {
+        matches!(
+            &event.kind,
+            EventKind::SecretRedacted {
+                rule_id,
+                location,
+                ..
+            } if rule_id == "anthropic-api-key" && location.contains("/payload/goal")
+        )
+    }));
+}
+
 /// Regression: the orchestrator's raw turn text becomes the
 /// `orchestrator.decision` detail (and its summary feeds the decision
 /// summary). A credential in that model-authored text must be redacted

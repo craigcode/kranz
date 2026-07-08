@@ -4,7 +4,10 @@
 //! present, surrounding text intact), false-positive guards, and
 //! char-boundary-safe truncation with multibyte input.
 
-use kranz_engine::scrub::{scrub, scrub_and_truncate, truncate_chars};
+use kranz_engine::scrub::{
+    filter_allowed, read_allowlist_text, scan_text, scan_unified_diff, scrub, scrub_and_truncate,
+    scrub_with_findings, truncate_chars,
+};
 
 const MARKER: &str = "[REDACTED]";
 const TRUNCATED: &str = "… [truncated]";
@@ -13,6 +16,58 @@ const TRUNCATED: &str = "… [truncated]";
 fn anthropic_key_redacted() {
     let out = scrub("using key sk-ant-api03-AbCdEf_123-xyz for auth");
     assert_eq!(out, "using key [REDACTED] for auth");
+}
+
+#[test]
+fn scanner_reports_rule_id_fingerprint_and_no_secret_value() {
+    let secret = "sk-ant-api03-AbCdEf_123-xyz";
+    let scan = scrub_with_findings(&format!("using key {secret}"), "unit");
+
+    assert_eq!(scan.redacted, "using key [REDACTED]");
+    assert_eq!(scan.findings.len(), 1);
+    let finding = &scan.findings[0];
+    assert_eq!(finding.rule_id, "anthropic-api-key");
+    assert_eq!(finding.location, "unit");
+    assert!(!finding.fingerprint.contains(secret));
+    assert_eq!(finding.fingerprint.len(), 24);
+}
+
+#[test]
+fn scanner_context_rules_point_at_secret_span_only() {
+    let token = "abcdEFGHijklMNOPqrstUVWX1234";
+    let text = format!("Authorization: Bearer {token}");
+    let scan = scrub_with_findings(&text, "headers");
+
+    assert_eq!(scan.redacted, "Authorization: Bearer [REDACTED]");
+    assert_eq!(scan.findings.len(), 1);
+    let finding = &scan.findings[0];
+    assert_eq!(finding.rule_id, "authorization-bearer");
+    assert_eq!(&text[finding.start..finding.end], token);
+}
+
+#[test]
+fn scanner_allowlist_filters_by_fingerprint() {
+    let finding = scan_text("token = sk-AbCdEfGhIjKlMnOpQrStUvWx0123")
+        .into_iter()
+        .next()
+        .expect("secret finding");
+    let allowed = read_allowlist_text(&format!("# reviewed\n{}\n", finding.fingerprint));
+    assert!(filter_allowed(vec![finding], &allowed).is_empty());
+}
+
+#[test]
+fn unified_diff_scan_only_checks_added_lines() {
+    let old_secret = "sk-ant-api03-OldSecret_123456";
+    let new_secret = "sk-ant-api03-NewSecret_123456";
+    let diff = format!(
+        "diff --git a/.env b/.env\n--- a/.env\n+++ b/.env\n@@ -1,2 +1,2 @@\n-{old_secret}\n context\n+{new_secret}\n"
+    );
+
+    let findings = scan_unified_diff(&diff);
+
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].rule_id, "anthropic-api-key");
+    assert_eq!(findings[0].location, ".env:2");
 }
 
 #[test]

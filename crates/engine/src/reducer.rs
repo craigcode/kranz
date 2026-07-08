@@ -272,6 +272,11 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             state.pending_user_messages.clear();
         }
 
+        EventKind::SecretRedacted { .. } => {
+            // Audit-only: the write boundary already redacted the event that
+            // preceded this marker. State shape intentionally does not grow.
+        }
+
         EventKind::ConfigChanged { patch } => {
             let mut value = serde_json::to_value(&state.config)?;
             deep_merge(&mut value, patch);

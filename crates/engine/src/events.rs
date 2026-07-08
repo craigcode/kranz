@@ -196,6 +196,14 @@ pub enum EventKind {
         detail: Option<String>,
     },
 
+    #[serde(rename = "secret.redacted")]
+    SecretRedacted {
+        #[serde(rename = "ruleId")]
+        rule_id: String,
+        fingerprint: String,
+        location: String,
+    },
+
     #[serde(rename = "config.changed")]
     ConfigChanged { patch: serde_json::Value },
 
@@ -235,6 +243,7 @@ impl EventKind {
             EventKind::MissionResumed {} => "mission.resumed",
             EventKind::UserMessage { .. } => "user.message",
             EventKind::OrchestratorDecision { .. } => "orchestrator.decision",
+            EventKind::SecretRedacted { .. } => "secret.redacted",
             EventKind::ConfigChanged { .. } => "config.changed",
             EventKind::MissionCompleted {} => "mission.completed",
             EventKind::MissionFailed { .. } => "mission.failed",

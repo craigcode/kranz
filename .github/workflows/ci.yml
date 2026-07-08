@@ -6,6 +6,26 @@ on:
   pull_request:
 
 jobs:
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Determine scan range
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "SCAN_RANGE=${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}" >> "$GITHUB_ENV"
+          elif [[ "${{ github.event.before }}" =~ ^0+$ ]]; then
+            echo "SCAN_RANGE=HEAD" >> "$GITHUB_ENV"
+          else
+            echo "SCAN_RANGE=${{ github.event.before }}..${{ github.sha }}" >> "$GITHUB_ENV"
+          fi
+      - run: cargo run --package kranz -- scan --range "$SCAN_RANGE"
+
   rust:
     strategy:
       fail-fast: false

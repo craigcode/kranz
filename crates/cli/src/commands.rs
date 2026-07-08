@@ -139,6 +139,7 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             print!("{}", backlog::cmd_queue(&repo));
             Ok(0)
         }
+        Command::Scan { staged, range } => cmd_scan(&repo, staged, range.as_deref()),
         Command::Work { once } => backlog::cmd_work(repo, once)
             .await
             .map_err(augment_limit_hint),
@@ -870,6 +871,39 @@ pub fn cmd_msg(repo: &Path, mission_id: &str, text: &str, interrupt: bool) -> Re
         interrupt,
     };
     Ok(control::enqueue(&paths, &cmd)?)
+}
+
+pub fn cmd_scan(repo: &Path, staged: bool, range: Option<&str>) -> Result<i32> {
+    if staged && range.is_some() {
+        bail!("choose either --staged or --range, not both");
+    }
+    let git = kranz_engine::git_ops::GitRepo::open(repo)?;
+    let diff = if staged {
+        git.diff_staged()?
+    } else if let Some(range) = range {
+        git.diff_range(range)?
+    } else {
+        git.diff_range("HEAD")?
+    };
+    let allowed = std::fs::read_to_string(repo.join(kranz_engine::scrub::SECRET_ALLOWLIST_PATH))
+        .ok()
+        .map(|text| kranz_engine::scrub::read_allowlist_text(&text))
+        .unwrap_or_default();
+    let findings = kranz_engine::scrub::filter_allowed(
+        kranz_engine::scrub::scan_unified_diff(&diff),
+        &allowed,
+    );
+    if findings.is_empty() {
+        println!("secret scan passed");
+        Ok(0)
+    } else {
+        println!(
+            "secret scan failed; add a fingerprint to {} only for a reviewed false positive:\n{}",
+            kranz_engine::scrub::SECRET_ALLOWLIST_PATH,
+            kranz_engine::scrub::format_findings(&findings)
+        );
+        Ok(2)
+    }
 }
 
 // ---------------------------------------------------------------------------

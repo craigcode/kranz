@@ -274,6 +274,15 @@ impl EventRenderer {
                 ansi::CYAN,
                 format!("decision: {summary}"),
             ),
+            EventKind::SecretRedacted {
+                rule_id,
+                fingerprint,
+                location,
+            } => (
+                "secret".to_string(),
+                ansi::YELLOW,
+                format!("redacted {rule_id} {fingerprint} at {location}"),
+            ),
             EventKind::ConfigChanged { .. } => (
                 "mission".to_string(),
                 ansi::YELLOW,

@@ -354,13 +354,15 @@ impl MissionEngine {
         )?;
 
         let mission_branch = format!("kranz/mission-{mission_id}");
-        let created = log.append(EventKind::MissionCreated {
+        let (created, audits) = log.append_with_redaction_audits(EventKind::MissionCreated {
             goal: goal.to_string(),
             base_branch,
             mission_branch,
             config: cfg,
         })?;
-        let state = reducer::fold(std::slice::from_ref(&created))?;
+        let mut events = vec![created];
+        events.extend(audits);
+        let state = reducer::fold(&events)?;
         reducer::write_snapshot(&state, &paths.state_file())?;
 
         Ok(MissionEngine {
@@ -752,10 +754,14 @@ impl MissionEngine {
     /// The snapshot write is mandatory for lifecycle events and best-effort
     /// for `worker.message` stream deltas (recoverable by refolding the log).
     fn emit(&mut self, kind: EventKind) -> Result<Event> {
-        let event = self.log.append(kind)?;
+        let (event, audits) = self.log.append_with_redaction_audits(kind)?;
+        let stream_delta = event.kind.is_stream_delta();
         reducer::apply(&mut self.state, &event)?;
+        for audit in &audits {
+            reducer::apply(&mut self.state, audit)?;
+        }
         let snapshot = reducer::write_snapshot(&self.state, &self.paths.state_file());
-        if event.kind.is_stream_delta() {
+        if stream_delta && audits.is_empty() {
             if let Err(e) = snapshot {
                 tracing::debug!(error = %e, "best-effort snapshot write failed on stream delta");
             }
@@ -3175,7 +3181,7 @@ impl MissionEngine {
                 findings.push(Finding {
                     subject: assertion.id.clone(),
                     severity: "critical".to_string(),
-                    evidence: format!("command failed: {command}\n{output}"),
+                    evidence: scrub::scrub(&format!("command failed: {command}\n{output}")),
                     suggested_fix: String::new(),
                     class: String::new(),
                 });
@@ -4742,7 +4748,7 @@ pub fn render_mission_report(
             } else {
                 ""
             };
-            let evidence = scrub::truncate_chars(
+            let evidence = scrub::scrub_and_truncate(
                 &finding
                     .evidence
                     .split_whitespace()
@@ -5298,13 +5304,17 @@ pub fn abandon_mission(
         Duration::from_millis(state.config.event_stream_throttle_ms),
         force,
     )?;
-    let event = log.append(EventKind::MissionAbandoned {
+    let (event, audits) = log.append_with_redaction_audits(EventKind::MissionAbandoned {
         reason: reason.to_string(),
     })?;
-    // Fold the one new event on top of the state we already have and snapshot,
-    // so state.json matches the log without a full re-fold.
+    // Fold the new event plus any redaction audits on top of the state we
+    // already have and snapshot, so state.json matches the log without a full
+    // re-fold.
     let mut state = state;
     reducer::apply(&mut state, &event)?;
+    for audit in &audits {
+        reducer::apply(&mut state, audit)?;
+    }
     reducer::write_snapshot(&state, &paths.state_file())?;
     // `log` drops here: buffer flushed, lock released.
     Ok(())

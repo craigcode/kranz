@@ -58,6 +58,62 @@ fn now_epoch_secs() -> u64 {
         .as_secs()
 }
 
+#[test]
+fn append_redacting_scrubs_secret_before_persisting_event() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = paths(tmp.path());
+    let mut log = EventLog::acquire(&paths, MISSION, NEVER, LockForce::No).unwrap();
+    let secret = "sk-ant-api03-AbCdEf_123-xyz";
+
+    let (event, findings) = log
+        .append_redacting(EventKind::UserMessage {
+            text: format!("use {secret}"),
+            interrupt: false,
+        })
+        .unwrap();
+    drop(log);
+
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].rule_id, "anthropic-api-key");
+    match event.kind {
+        EventKind::UserMessage { text, .. } => assert_eq!(text, "use [REDACTED]"),
+        other => panic!("wrong event: {other:?}"),
+    }
+    let raw = std::fs::read_to_string(paths.events_file()).unwrap();
+    assert!(!raw.contains(secret), "event log leaked secret: {raw}");
+    assert!(raw.contains("[REDACTED]"));
+}
+
+#[test]
+fn append_emits_secret_redacted_audit_event() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = paths(tmp.path());
+    let mut log = EventLog::acquire(&paths, MISSION, NEVER, LockForce::No).unwrap();
+    let secret = "sk-ant-api03-AbCdEf_123-xyz";
+
+    log.append(EventKind::UserMessage {
+        text: format!("use {secret}"),
+        interrupt: false,
+    })
+    .unwrap();
+    drop(log);
+
+    let events = EventLog::read_events(&paths.events_file()).unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(matches!(
+        &events[0].kind,
+        EventKind::UserMessage { text, .. } if text == "use [REDACTED]"
+    ));
+    assert!(matches!(
+        &events[1].kind,
+        EventKind::SecretRedacted {
+            rule_id,
+            location,
+            ..
+        } if rule_id == "anthropic-api-key" && location.contains("/payload/text")
+    ));
+}
+
 /// Independent computation of the process identity token the engine records
 /// as lock line 3, using the same platform recipe. Duplicated here on purpose:
 /// it pins the on-disk token FORMAT, so an accidental format change (which

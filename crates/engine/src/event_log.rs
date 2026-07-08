@@ -12,6 +12,7 @@
 use crate::error::{EngineError, Result};
 use crate::events::{Event, EventKind};
 use crate::paths::MissionPaths;
+use crate::scrub::SecretFinding;
 use chrono::Utc;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Write};
@@ -232,7 +233,9 @@ impl EventLog {
 
     /// Append one event: assigns the next seq and the current timestamp,
     /// serializes to a single JSON line, and returns a clone of the stored
-    /// event so the caller can broadcast it.
+    /// event so the caller can broadcast it. If this boundary redacts any
+    /// string payload, `secret.redacted` audit events are appended immediately
+    /// after the sanitized event.
     ///
     /// Durability: lifecycle events drain any buffered deltas first (file
     /// order == append order), then write + flush + fsync. Stream deltas are
@@ -240,12 +243,38 @@ impl EventLog {
     /// throttle age — checked here on each append, or on demand (without
     /// waiting for another append) via [`EventLog::flush_if_due`].
     pub fn append(&mut self, kind: EventKind) -> Result<Event> {
+        Ok(self.append_with_redaction_audits(kind)?.0)
+    }
+
+    /// Append one event and any required `secret.redacted` audit events.
+    /// Returns the sanitized primary event plus the audit events that followed
+    /// it, so callers that maintain snapshots can fold the same sequence.
+    pub fn append_with_redaction_audits(&mut self, kind: EventKind) -> Result<(Event, Vec<Event>)> {
+        let (event, redactions) = self.append_redacting(kind)?;
+        let mut audits = Vec::new();
+        for finding in redactions {
+            let (audit, _) = self.append_redacting(EventKind::SecretRedacted {
+                rule_id: finding.rule_id,
+                fingerprint: finding.fingerprint,
+                location: finding.location,
+            })?;
+            audits.push(audit);
+        }
+        Ok((event, audits))
+    }
+
+    /// Append one event after scanning/redacting string payloads. Returns the
+    /// sanitized event plus secret findings (fingerprints only, never values).
+    pub fn append_redacting(&mut self, kind: EventKind) -> Result<(Event, Vec<SecretFinding>)> {
         let event = Event {
             seq: self.next_seq,
             ts: Utc::now(),
             mission_id: self.mission_id.clone(),
             kind,
         };
+        let mut value = serde_json::to_value(&event)?;
+        let findings = crate::scrub::scrub_json_value(&mut value, "event");
+        let event: Event = serde_json::from_value(value)?;
         let mut line = serde_json::to_string(&event)?;
         line.push('\n');
 
@@ -266,7 +295,7 @@ impl EventLog {
         }
 
         self.next_seq += 1;
-        Ok(event)
+        Ok((event, findings))
     }
 
     /// Write any buffered deltas out to the file (no fsync — deltas are

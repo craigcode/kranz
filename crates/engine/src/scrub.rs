@@ -47,8 +47,12 @@
 //! text can never panic the engine or produce invalid UTF-8.
 
 use regex::Regex;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::ops::Range;
+use std::path::Path;
 use std::sync::OnceLock;
 
 /// Marker appended by [`truncate_chars`] when content was cut.
@@ -57,12 +61,58 @@ const TRUNCATION_MARKER: &str = "… [truncated]";
 /// Replacement marker written in place of a redacted secret.
 const REDACTED: &str = "[REDACTED]";
 
+/// Tracked repository file containing one waived secret fingerprint per line.
+pub const SECRET_ALLOWLIST_PATH: &str = ".kranz/secret-allowlist";
+
+/// A secret detector hit. Never carries the secret value itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecretFinding {
+    pub rule_id: String,
+    pub fingerprint: String,
+    pub location: String,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Result of scanning and redacting a text payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretScan {
+    pub redacted: String,
+    pub findings: Vec<SecretFinding>,
+}
+
 /// One scrub pattern plus its replacement template. Replacements may use
 /// `${1}` (and `${2}`) to preserve captured context (e.g. the key name of an
 /// assignment, or the `user:`/`@host` framing of a connection string).
 struct Rule {
+    id: &'static str,
     re: Regex,
     replacement: &'static str,
+    secret_group: Option<usize>,
+}
+
+fn rule(id: &'static str, pattern: &str, replacement: &'static str) -> Rule {
+    Rule {
+        id,
+        re: Regex::new(pattern).expect("static scrub regex must compile"),
+        replacement,
+        secret_group: None,
+    }
+}
+
+fn grouped_rule(
+    id: &'static str,
+    pattern: &str,
+    replacement: &'static str,
+    secret_group: usize,
+) -> Rule {
+    Rule {
+        id,
+        re: Regex::new(pattern).expect("static scrub regex must compile"),
+        replacement,
+        secret_group: Some(secret_group),
+    }
 }
 
 /// The scrub rules, compiled once on first use. See the module docs for the
@@ -73,63 +123,92 @@ struct Rule {
 fn rules() -> &'static [Rule] {
     static RULES: OnceLock<Vec<Rule>> = OnceLock::new();
     RULES.get_or_init(|| {
-        let rule = |pattern: &str, replacement: &'static str| Rule {
-            re: Regex::new(pattern).expect("static scrub regex must compile"),
-            replacement,
-        };
         vec![
             // 1. PEM private key blocks — the whole block, or just the BEGIN
             //    line when the END marker never arrives (partial output).
             rule(
+                "pem-private-key",
                 r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----|-----BEGIN [A-Z ]*PRIVATE KEY-----[^\r\n]*",
                 REDACTED,
             ),
             // 2. GCP service-account JSON `"private_key": "-----BEGIN...\n..."`.
             //    The PEM body is escaped onto one line, so the multi-line rule
             //    above misses it. Keep the field name, redact the value.
-            rule(
-                r#"(?i)("private_key"\s*:\s*")-----BEGIN[^"]*"#,
+            grouped_rule(
+                "gcp-private-key-json",
+                r#"(?i)("private_key"\s*:\s*")(-----BEGIN[^"]*)"#,
                 "${1}[REDACTED]",
+                2,
             ),
             // 3a. Anthropic API keys (before the generic sk- rule).
-            rule(r"\bsk-ant-[A-Za-z0-9_-]{8,}", REDACTED),
+            rule("anthropic-api-key", r"\bsk-ant-[A-Za-z0-9_-]{8,}", REDACTED),
             // 3b. OpenAI project keys: sk-proj-<body>. Listed before the plain
             //     sk- rule because the body contains `-`/`_` which the plain
             //     rule would stop at, leaving a tail behind.
-            rule(r"\bsk-proj-[A-Za-z0-9_-]{20,}", REDACTED),
+            rule(
+                "openai-project-key",
+                r"\bsk-proj-[A-Za-z0-9_-]{20,}",
+                REDACTED,
+            ),
             // 3c. OpenAI-style keys (plain sk-...).
-            rule(r"\bsk-[A-Za-z0-9]{20,}", REDACTED),
+            rule("openai-api-key", r"\bsk-[A-Za-z0-9]{20,}", REDACTED),
             // 3d. Google API keys (AIza + 35 chars).
-            rule(r"\bAIza[0-9A-Za-z_-]{35}\b", REDACTED),
+            rule("google-api-key", r"\bAIza[0-9A-Za-z_-]{35}\b", REDACTED),
             // 3e. Stripe live/restricted/publishable keys.
-            rule(r"\b(?:sk|rk|pk)_live_[0-9A-Za-z]{16,}", REDACTED),
+            rule(
+                "stripe-live-key",
+                r"\b(?:sk|rk|pk)_live_[0-9A-Za-z]{16,}",
+                REDACTED,
+            ),
             // 3f. npm access tokens (npm_ + 36 chars).
-            rule(r"\bnpm_[0-9A-Za-z]{36}\b", REDACTED),
+            rule("npm-token", r"\bnpm_[0-9A-Za-z]{36}\b", REDACTED),
             // 3g. GitHub tokens: classic (ghp_), OAuth (gho_), server (ghs_).
-            rule(r"\bgh[pos]_[A-Za-z0-9]{20,}", REDACTED),
+            rule("github-token", r"\bgh[pos]_[A-Za-z0-9]{20,}", REDACTED),
             // 3h. GitHub fine-grained PATs.
-            rule(r"\bgithub_pat_[A-Za-z0-9_]{20,}", REDACTED),
+            rule(
+                "github-fine-grained-token",
+                r"\bgithub_pat_[A-Za-z0-9_]{20,}",
+                REDACTED,
+            ),
             // 3i. AWS access key ids (exactly 16 chars after AKIA).
-            rule(r"\bAKIA[0-9A-Z]{16}\b", REDACTED),
+            rule("aws-access-key-id", r"\bAKIA[0-9A-Z]{16}\b", REDACTED),
             // 3j. AWS secret keys in config/env form; the key name is kept.
-            rule(r"(?i)\b(aws_secret_access_key\s*[=:]\s*)\S+", "${1}[REDACTED]"),
+            grouped_rule(
+                "aws-secret-access-key",
+                r"(?i)\b(aws_secret_access_key\s*[=:]\s*)(\S+)",
+                "${1}[REDACTED]",
+                2,
+            ),
             // 3k. Slack tokens.
-            rule(r"\bxox[baprs]-[A-Za-z0-9-]{10,}", REDACTED),
+            rule("slack-token", r"\bxox[baprs]-[A-Za-z0-9-]{10,}", REDACTED),
             // 3l. JWTs (three base64url segments).
             rule(
+                "jwt",
                 r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}",
                 REDACTED,
             ),
             // 4a. Authorization: Bearer <token> — keep the scheme word.
-            rule(r"(?i)\b(bearer\s+)[a-z0-9._~+/=-]{16,}", "${1}[REDACTED]"),
+            grouped_rule(
+                "authorization-bearer",
+                r"(?i)\b(bearer\s+)([a-z0-9._~+/=-]{16,})",
+                "${1}[REDACTED]",
+                2,
+            ),
             // 4b. Authorization: Basic <base64> — keep the scheme word.
-            rule(r"(?i)\b(basic\s+)[a-z0-9+/]{16,}={0,2}", "${1}[REDACTED]"),
+            grouped_rule(
+                "authorization-basic",
+                r"(?i)\b(basic\s+)([a-z0-9+/]{16,}={0,2})",
+                "${1}[REDACTED]",
+                2,
+            ),
             // 5. Connection strings with an embedded password:
             //    scheme://user:PASSWORD@host. Redact only the password segment;
             //    the `user:` prefix and `@host` remainder are preserved.
-            rule(
-                r"([a-zA-Z][a-zA-Z0-9+.-]*://[^\s:/@]+:)[^\s:/@]+(@)",
-                "${1}[REDACTED]${2}",
+            grouped_rule(
+                "connection-string-password",
+                r"([a-zA-Z][a-zA-Z0-9+.-]*://[^\s:/@]+:)([^\s:/@]+)(@)",
+                "${1}[REDACTED]${3}",
+                2,
             ),
         ]
     })
@@ -266,6 +345,100 @@ fn is_high_entropy_secret(value: &str) -> bool {
         && shannon_entropy(value) >= 4.0
 }
 
+fn secret_fingerprint(rule_id: &str, value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(rule_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(value.as_bytes());
+    let digest = hasher.finalize();
+    digest[..12].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn push_finding(
+    out: &mut Vec<SecretFinding>,
+    occupied: &mut Vec<Range<usize>>,
+    rule_id: &str,
+    location: &str,
+    range: Range<usize>,
+    value: &str,
+) {
+    if is_allowlisted(value) {
+        return;
+    }
+    if occupied
+        .iter()
+        .any(|existing| existing.start < range.end && range.start < existing.end)
+    {
+        return;
+    }
+    occupied.push(range.clone());
+    out.push(SecretFinding {
+        rule_id: rule_id.to_string(),
+        fingerprint: secret_fingerprint(rule_id, value),
+        location: location.to_string(),
+        start: range.start,
+        end: range.end,
+    });
+}
+
+/// Find secrets in `text`, using `location` only for diagnostics.
+pub fn scan_text_at(text: &str, location: &str) -> Vec<SecretFinding> {
+    let mut out = Vec::new();
+    let mut occupied: Vec<Range<usize>> = Vec::new();
+    for rule in rules() {
+        for caps in rule.re.captures_iter(text) {
+            let m = rule
+                .secret_group
+                .and_then(|idx| caps.get(idx))
+                .or_else(|| caps.get(0));
+            if let Some(m) = m {
+                push_finding(
+                    &mut out,
+                    &mut occupied,
+                    rule.id,
+                    location,
+                    m.start()..m.end(),
+                    m.as_str(),
+                );
+            }
+        }
+    }
+
+    for caps in generic_assignment_re().captures_iter(text) {
+        if let Some(value) = caps.get(2) {
+            push_finding(
+                &mut out,
+                &mut occupied,
+                "generic-secret-assignment",
+                location,
+                value.start()..value.end(),
+                value.as_str(),
+            );
+        }
+    }
+
+    for caps in entropy_assignment_re().captures_iter(text) {
+        if let Some(value) = caps.get(2) {
+            if is_high_entropy_secret(value.as_str()) {
+                push_finding(
+                    &mut out,
+                    &mut occupied,
+                    "high-entropy-secret-assignment",
+                    location,
+                    value.start()..value.end(),
+                    value.as_str(),
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Find secrets in `text`.
+pub fn scan_text(text: &str) -> Vec<SecretFinding> {
+    scan_text_at(text, "text")
+}
+
 /// Generic assignment pass: redact the value of a `key/secret/token/password`
 /// assignment unless it is allowlisted. Runs as a closure (not a static regex
 /// replacement) so placeholders (`REPLACE_ME`), UUIDs, git SHAs, and
@@ -307,7 +480,7 @@ fn scrub_entropy(text: &str) -> Cow<'_, str> {
 /// segment only, keeping `user:` and `@host`. The final entropy pass catches
 /// unprefixed high-entropy blobs assigned to secret-ish names, gated so prose,
 /// git SHAs, and UUIDs survive.
-pub fn scrub(text: &str) -> String {
+fn scrub_impl(text: &str) -> String {
     let mut out = text.to_owned();
     for rule in rules() {
         if let Cow::Owned(replaced) = rule.re.replace_all(&out, rule.replacement) {
@@ -327,6 +500,154 @@ pub fn scrub(text: &str) -> String {
         out = replaced;
     }
     out
+}
+
+/// Scan and redact anything that looks like a credential.
+pub fn scrub_with_findings(text: &str, location: &str) -> SecretScan {
+    SecretScan {
+        redacted: scrub_impl(text),
+        findings: scan_text_at(text, location),
+    }
+}
+
+pub fn scrub(text: &str) -> String {
+    scrub_impl(text)
+}
+
+/// Redact every string leaf in a JSON value. Findings carry JSON-pointer-ish
+/// locations rooted at `location`.
+pub fn scrub_json_value(value: &mut serde_json::Value, location: &str) -> Vec<SecretFinding> {
+    fn walk(value: &mut serde_json::Value, path: String, findings: &mut Vec<SecretFinding>) {
+        match value {
+            serde_json::Value::String(s) => {
+                let scan = scrub_with_findings(s, &path);
+                if !scan.findings.is_empty() {
+                    *s = scan.redacted;
+                    findings.extend(scan.findings);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (idx, item) in items.iter_mut().enumerate() {
+                    walk(item, format!("{path}/{idx}"), findings);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for (key, item) in map.iter_mut() {
+                    walk(item, format!("{path}/{key}"), findings);
+                }
+            }
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            }
+        }
+    }
+
+    let mut findings = Vec::new();
+    walk(value, location.to_string(), &mut findings);
+    findings
+}
+
+/// Scan only added lines in a unified git diff.
+pub fn scan_unified_diff(diff: &str) -> Vec<SecretFinding> {
+    let mut findings = Vec::new();
+    let mut path = "<diff>".to_string();
+    let mut new_line: Option<usize> = None;
+
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("+++ b/") {
+            path = rest.to_string();
+            continue;
+        }
+        if line.starts_with("@@ ") {
+            new_line = parse_new_hunk_start(line);
+            continue;
+        }
+        if line.starts_with("+++") {
+            continue;
+        }
+        if let Some(added) = line.strip_prefix('+') {
+            let line_no = new_line.unwrap_or(0);
+            let location = if line_no == 0 {
+                path.clone()
+            } else {
+                format!("{path}:{line_no}")
+            };
+            findings.extend(scan_text_at(added, &location));
+            if let Some(n) = &mut new_line {
+                *n += 1;
+            }
+        } else if !line.starts_with('-') {
+            if let Some(n) = &mut new_line {
+                *n += 1;
+            }
+        }
+    }
+
+    findings
+}
+
+fn parse_new_hunk_start(line: &str) -> Option<usize> {
+    let plus = line.split_whitespace().find(|part| part.starts_with('+'))?;
+    let number = plus
+        .trim_start_matches('+')
+        .split(',')
+        .next()
+        .filter(|s| !s.is_empty())?;
+    number.parse().ok()
+}
+
+pub fn read_allowlist_text(text: &str) -> std::collections::BTreeSet<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| line.split_whitespace().next())
+        .map(str::to_string)
+        .collect()
+}
+
+pub fn filter_allowed(
+    findings: Vec<SecretFinding>,
+    allowed: &std::collections::BTreeSet<String>,
+) -> Vec<SecretFinding> {
+    findings
+        .into_iter()
+        .filter(|f| !allowed.contains(&f.fingerprint))
+        .collect()
+}
+
+pub fn format_findings(findings: &[SecretFinding]) -> String {
+    findings
+        .iter()
+        .map(|finding| {
+            format!(
+                "{} {} {} bytes {}..{}",
+                finding.fingerprint, finding.rule_id, finding.location, finding.start, finding.end
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Scan file contents about to be committed by the engine.
+pub fn scan_paths(repo_root: &Path, paths: &[&Path]) -> Vec<SecretFinding> {
+    let mut findings = Vec::new();
+    for path in paths {
+        let full = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            repo_root.join(path)
+        };
+        let Ok(bytes) = std::fs::read(&full) else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        let location = full
+            .strip_prefix(repo_root)
+            .ok()
+            .and_then(|p| p.to_str())
+            .unwrap_or_else(|| full.to_str().unwrap_or("<path>"));
+        findings.extend(scan_text_at(&text, location));
+    }
+    findings
 }
 
 /// Truncate to at most `max` characters (not bytes), appending

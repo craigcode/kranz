@@ -131,11 +131,17 @@ impl Ticket {
     /// with the goal/context when supplied. The result parses back cleanly
     /// through [`Ticket::parse`].
     pub fn ticket_template(title: &str, goal: Option<&str>, context: Option<&str>) -> String {
-        let goal_body = goal.map(str::trim).filter(|g| !g.is_empty()).unwrap_or("");
+        let title = crate::scrub::scrub(title.trim());
+        let goal_body = goal
+            .map(str::trim)
+            .filter(|g| !g.is_empty())
+            .map(crate::scrub::scrub)
+            .unwrap_or_default();
         let context_body = context
             .map(str::trim)
             .filter(|c| !c.is_empty())
-            .unwrap_or("");
+            .map(crate::scrub::scrub)
+            .unwrap_or_default();
         format!(
             "---\n\
              title: {title}\n\
@@ -436,7 +442,7 @@ impl Ticket {
         text.push_str("\n## Needs context (from orchestrator)\n");
         for q in bound_questions(questions) {
             text.push_str("- ");
-            text.push_str(&q);
+            text.push_str(&crate::scrub::scrub(&q));
             text.push('\n');
         }
         atomic_write(&md, text.as_bytes())?;

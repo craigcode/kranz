@@ -1355,15 +1355,19 @@ async fn merge_route_refuses_a_dirty_tracked_tree_and_leaves_base_unchanged() {
 }
 
 #[tokio::test]
-async fn merge_route_surfaces_a_failing_gates_verbatim_output_and_leaves_base_unchanged() {
+async fn merge_route_surfaces_redacted_failing_gate_output_and_leaves_base_unchanged() {
     if !setup() {
         return;
     }
     let (_dir, repo_root, base_sha) = init_repo();
     seed_diffable_mission(&repo_root, "m-red", &base_sha, true);
+    const SECRET: &str = "sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let app = merge_app(&repo_root, |cmd, _cwd| {
         if cmd == "cargo test --workspace" {
-            (false, "FAILED: it_broke\nassertion failed".to_string())
+            (
+                false,
+                format!("FAILED: it_broke\nassertion failed with {SECRET}"),
+            )
         } else {
             (true, String::new())
         }
@@ -1384,6 +1388,8 @@ async fn merge_route_surfaces_a_failing_gates_verbatim_output_and_leaves_base_un
     assert!(error.contains("cargo test --workspace"), "{body}");
     assert!(error.contains("FAILED: it_broke"), "{body}");
     assert!(error.contains("assertion failed"), "{body}");
+    assert!(error.contains("[REDACTED]"), "{body}");
+    assert!(!error.contains(SECRET), "{body}");
     let base_after = raw_git(&repo_root, &["rev-parse", "main"])
         .trim()
         .to_string();

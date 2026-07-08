@@ -12,6 +12,7 @@
 use crate::error::Result;
 use crate::git_ops::{GitRepo, MergeOutcome};
 use crate::merge_gate::{run_gate_suite, GateSuiteResult};
+use crate::scrub::{self, SecretFinding};
 use std::path::Path;
 
 /// Outcome of a gated merge attempt.
@@ -27,6 +28,9 @@ pub enum MergeReport {
         /// That gate's verbatim captured output.
         output: String,
     },
+    /// The mission branch diff contains an unwaived secret finding. Base is
+    /// untouched and no other gates ran.
+    SecretScanFailed { findings: Vec<SecretFinding> },
     /// The merge conflicted and was rolled back (working tree left clean).
     Conflict {
         /// Conflicting paths git named (best-effort; may be empty).
@@ -65,6 +69,16 @@ where
 {
     if !repo.is_clean_tracked()? {
         return Ok(MergeReport::RefusedDirtyTree);
+    }
+
+    let diff = repo.diff_full(base_sha, mission_branch)?;
+    let allowlist = repo
+        .show_file(mission_branch, scrub::SECRET_ALLOWLIST_PATH)?
+        .map(|bytes| scrub::read_allowlist_text(&String::from_utf8_lossy(&bytes)))
+        .unwrap_or_default();
+    let findings = scrub::filter_allowed(scrub::scan_unified_diff(&diff), &allowlist);
+    if !findings.is_empty() {
+        return Ok(MergeReport::SecretScanFailed { findings });
     }
 
     let dashboard_touched = repo.dashboard_touched(base_sha, mission_branch)?;

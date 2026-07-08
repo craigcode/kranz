@@ -5,6 +5,7 @@
 
 use kranz_engine::git_ops::GitRepo;
 use kranz_engine::merge::{merge_mission, MergeReport};
+use kranz_engine::scrub;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Once;
@@ -104,6 +105,25 @@ fn seed_mission_branch(dir: &TempDir, repo: &GitRepo, seed: &str, path: &str, co
     repo.checkout("main").unwrap();
 }
 
+fn seed_mission_branch_with_files(
+    dir: &TempDir,
+    repo: &GitRepo,
+    seed: &str,
+    files: &[(&str, &str)],
+) {
+    repo.create_branch("kranz/mission-x", Some(seed)).unwrap();
+    repo.checkout("kranz/mission-x").unwrap();
+    for (path, content) in files {
+        let full = dir.path().join(path);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&full, content).unwrap();
+    }
+    repo.add_all_and_commit("mission work").unwrap();
+    repo.checkout("main").unwrap();
+}
+
 fn passing_executor(_cmd: &str, _cwd: &Path) -> (bool, String) {
     (true, String::new())
 }
@@ -193,6 +213,69 @@ fn a_failing_gate_stops_before_the_merge_and_leaves_base_unchanged() {
     assert_eq!(repo.head_sha().unwrap(), seed, "base tip must be unchanged");
     assert_eq!(repo.current_branch().unwrap(), "main");
     let _ = dir;
+}
+
+#[test]
+fn secret_scan_failure_stops_before_gates_and_leaves_base_unchanged() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, seed) = seeded_repo();
+    let secret = "sk-ant-api03-AbCdEf_123-xyz";
+    seed_mission_branch(&dir, &repo, &seed, ".env", &format!("KEY={secret}\n"));
+
+    let gate_calls = std::cell::RefCell::new(Vec::<String>::new());
+    let report = merge_mission(&repo, "main", &seed, "kranz/mission-x", |cmd, _cwd| {
+        gate_calls.borrow_mut().push(cmd.to_string());
+        (true, String::new())
+    })
+    .unwrap();
+
+    match report {
+        MergeReport::SecretScanFailed { findings } => {
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].rule_id, "anthropic-api-key");
+            assert_eq!(findings[0].location, ".env:1");
+            assert!(!findings[0].fingerprint.contains(secret));
+        }
+        other => panic!("expected SecretScanFailed, got {other:?}"),
+    }
+    assert!(
+        gate_calls.borrow().is_empty(),
+        "secret pre-gate should stop before CI gates"
+    );
+    assert_eq!(repo.head_sha().unwrap(), seed, "base tip must be unchanged");
+}
+
+#[test]
+fn committed_secret_fingerprint_waiver_allows_merge() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, seed) = seeded_repo();
+    let secret = "sk-ant-api03-AbCdEf_123-xyz";
+    let fingerprint = scrub::scan_text(secret)
+        .into_iter()
+        .next()
+        .expect("secret finding")
+        .fingerprint;
+    let allowlist = format!("# reviewed test fixture\n{fingerprint}\n");
+    seed_mission_branch_with_files(
+        &dir,
+        &repo,
+        &seed,
+        &[
+            (".env", &format!("KEY={secret}\n")),
+            (scrub::SECRET_ALLOWLIST_PATH, &allowlist),
+        ],
+    );
+
+    let report = merge_mission(&repo, "main", &seed, "kranz/mission-x", passing_executor).unwrap();
+
+    assert!(
+        matches!(report, MergeReport::Merged { .. }),
+        "expected waived secret finding to merge, got {report:?}"
+    );
 }
 
 #[test]

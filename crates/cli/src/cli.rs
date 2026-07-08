@@ -207,6 +207,17 @@ pub enum Command {
     /// Show the per-repo execution queue
     Queue,
 
+    /// Scan a git diff for unwaived secret findings.
+    Scan {
+        /// Scan staged changes (`git diff --cached`)
+        #[arg(long)]
+        staged: bool,
+
+        /// Scan a git range such as `main..HEAD`
+        #[arg(long, value_name = "A..B")]
+        range: Option<String>,
+    },
+
     /// Drain the execution queue: run queued missions one at a time per repo
     Work {
         /// Process exactly one front entry (exit 0 if the repo is busy)
