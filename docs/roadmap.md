@@ -239,6 +239,44 @@ repos operate from one Slack workspace with unambiguous routing; and a
 brand-new repo's first mission runs with no hand-editing beyond
 `kranz init` answers.
 
+## Product pattern notes from Warp/Oz/Factory scan (2026-07-08)
+
+External scan: Warp Agent/Oz and Factory's Droid/AutoWiki surfaces are useful
+as UX/product benchmarks, not architecture targets. The broad "agentic IDE"
+lane (terminal replacement, built-in editor/LSP, voice, general local coding
+environment) belongs to the sgian side product, not kranz. The
+kranz-compatible lessons are narrower and should reinforce the
+mission/audit/gate model:
+
+- **Plan UX as an audited artifact.** Keep `plan.json`/`plan.md` as the source
+  of truth, but make the dashboard feel more like a plan workspace: revision
+  timeline, compare/restore prior revisions, clearer mid-mission plan diffs,
+  and "execute this milestone/section" controls that still go through normal
+  mission events and approval gates.
+- **Human diff review loop.** Add an interactive review surface for delivered
+  mission diffs: inline comments anchored to files/lines, batch submit feedback,
+  side-by-side previews for mission artifacts, and route the batch into a
+  fix-feature, revision, or validation pass. This is a better fit for kranz
+  than agent-on-agent code review because the human stays the consent boundary.
+- **Repo knowledge with freshness.** Advance the repo-knowledge-store lane:
+  committed `docs/knowledge/` notes, generated `.kranz/knowledge/` cache,
+  visible indexing/freshness status, worktree-aware selection, and injection
+  into initial planning plus M2 revised-planning. Prefer reviewable Markdown
+  over opaque embeddings as the durable layer. Borrow Factory AutoWiki's
+  two-pass repo survey, incremental refresh by source commit, and multi-surface
+  presentation, but keep third-party wiki output as seed/benchmark material
+  rather than trusted mission input.
+- **Mission profiles and permissions.** Package backend choice, model/effort,
+  sandbox policy, command grants, MCP/tools, ask-question behavior, and autonomy
+  floors into named profiles (`Safe`, `Autonomous`, `Cloud`, `Local review`).
+  Profiles should render as a consent diff before plan approval and live in repo
+  config when project-specific.
+- **Run record completeness.** Treat every mission, local or cloud, as a
+  shareable audit record: trigger/source, owner, profile, model/backend,
+  estimate, approvals, plan revisions, commands/logs/transcripts, findings,
+  costs, artifacts, and "whose move is it". This strengthens M6/M8 without
+  turning kranz into an IDE.
+
 ## Continuous UX backlog (no milestone, picked up opportunistically)
 
 - `kranz run` status header / richer TUI (dashboard remains the primary
@@ -254,3 +292,6 @@ brand-new repo's first mission runs with no hand-editing beyond
 
 Cloud/remote execution, multi-user/RBAC, and org policy remain non-goals
 (plan §3); the architecture continues to not preclude them.
+Also out of scope for kranz: terminal replacement, a general-purpose code
+editor/LSP shell, voice-first coding, and the broader agentic-IDE product shape
+now parked for sgian.

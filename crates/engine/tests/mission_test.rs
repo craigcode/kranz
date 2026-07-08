@@ -503,6 +503,20 @@ async fn happy_path_completes_mission_with_tag_and_contract_gate() {
         "both assertions listed: {report}"
     );
 
+    // The completion report reuses the estimate persisted at approval (M1
+    // review P2), not one recomputed against a since-changed corpus/config:
+    // estimate.json exists and the report cites its exact expected figure.
+    let approved: kranz_engine::cost::CostEstimate = serde_json::from_str(
+        &std::fs::read_to_string(paths.estimate_file())
+            .expect("estimate.json persisted at approval"),
+    )
+    .unwrap();
+    assert!(
+        report.contains(&format!("(expected ${:.2})", approved.expected_usd)),
+        "report must cite the approved estimate (expected ${:.2}): {report}",
+        approved.expected_usd
+    );
+
     let subject = raw_git(&root, &["log", "-1", "--format=%s"]);
     assert_eq!(
         subject.trim(),

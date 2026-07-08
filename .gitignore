@@ -11,6 +11,7 @@ dist/
 .kranz/missions/*/events.jsonl
 .kranz/missions/*/events.jsonl.lock
 .kranz/missions/*/state.json
+.kranz/missions/*/estimate.json
 .kranz/missions/*/runs/
 .kranz/missions/*/control/
 /notes.txt

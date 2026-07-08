@@ -1155,6 +1155,11 @@ impl MissionEngine {
             )?;
         }
 
+        // Persist the approval-time estimate so the completion report reuses
+        // this exact number (M1): recomputing it later would compare actual
+        // cost against a value recalibrated on a since-changed corpus/config.
+        self.persist_approved_estimate(&estimate)?;
+
         self.emit(EventKind::PlanApproved {
             plan,
             base_sha: Some(base_sha),
@@ -1360,10 +1365,24 @@ impl MissionEngine {
         Ok(())
     }
 
+    /// Persist the approval-time cost estimate to the primary mission dir as
+    /// gitignored runtime bookkeeping (see [`MissionPaths::estimate_file`]). The
+    /// completion report reads it back so "estimated vs actual" reflects the
+    /// number the operator actually approved, not one recomputed later.
+    fn persist_approved_estimate(&self, estimate: &cost::CostEstimate) -> Result<()> {
+        let path = self.paths.estimate_file();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, serde_json::to_string_pretty(estimate)?)?;
+        Ok(())
+    }
+
     fn commit_revised_plan_record(&mut self, plan: &Plan, revision: u32) -> Result<()> {
         let calibration = cost::calibrate(&self.paths.repo_root);
         let estimate = cost::estimate(plan, &self.state.config, &calibration.params);
         let estimate = cost::apply_shape(estimate, plan, &calibration);
+        self.persist_approved_estimate(&estimate)?;
         let plan_md_body = render_plan_markdown(
             plan,
             &self.state.mission,
@@ -3612,16 +3631,21 @@ impl MissionEngine {
         self.log.flush()?;
         let events = EventLog::read_events(&self.paths.events_file())?;
         let plan: Plan = serde_json::from_str(&self.plan_json()?)?;
-        // Use the calibrated estimate the operator actually saw at approval,
-        // not the built-in defaults — otherwise the report's "estimated vs
-        // actual" compares the actual against a naive number nobody was shown,
-        // which is what made estimates look wildly off in old reports (M1).
-        let calibration = cost::calibrate(&self.paths.repo_root);
-        let estimate = cost::apply_shape(
-            cost::estimate(&plan, &self.state.config, &calibration.params),
-            &plan,
-            &calibration,
-        );
+        // Prefer the estimate persisted at approval so "estimated vs actual"
+        // compares against the exact number the operator approved (M1). Missions
+        // approved before estimate.json existed fall back to a calibrated
+        // recompute (still better than the old default-params number).
+        let estimate = std::fs::read_to_string(self.paths.estimate_file())
+            .ok()
+            .and_then(|s| serde_json::from_str::<cost::CostEstimate>(&s).ok())
+            .unwrap_or_else(|| {
+                let calibration = cost::calibrate(&self.paths.repo_root);
+                cost::apply_shape(
+                    cost::estimate(&plan, &self.state.config, &calibration.params),
+                    &plan,
+                    &calibration,
+                )
+            });
         let report = render_mission_report(&self.state, &events, &plan, &estimate);
 
         let active_paths = self.active_paths();
@@ -5662,6 +5686,7 @@ fn write_kranz_gitignore(paths: &MissionPaths) -> Result<()> {
              missions/*/events.jsonl.lock\n\
              missions/*/state.json\n\
              missions/*/state.json.tmp\n\
+             missions/*/estimate.json\n\
              missions/*/control/\n\
              missions/*/runs/\n\
              slack-threads.json\n\

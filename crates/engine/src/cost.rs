@@ -12,6 +12,7 @@ use crate::types::{
     AssertionCheck, FeatureOrigin, MissionConfig, MissionState, MissionStatus, Plan, PlanFeature,
     PlanMilestone, Role, TokenUsage, WorkerRun,
 };
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 const TOKENS_PER_MTOK: f64 = 1_000_000.0;
@@ -141,7 +142,7 @@ impl Default for EstimateParams {
 /// A pre-mission cost estimate range. `expected_usd` is the central guess;
 /// `low_usd`/`high_usd` bound it at 0.5x and 2.5x — real missions vary that
 /// much. Live usage remains authoritative.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct CostEstimate {
     /// Expected worker session count (fractional — it is a rate, not a plan).
     pub worker_runs: f64,
@@ -159,7 +160,7 @@ pub struct CostEstimate {
 }
 
 /// How much the calibration corpus backs a [`CostEstimate`]'s range.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Confidence {
     /// The calibration corpus has (or is assumed to have) comparable
     /// missions.
@@ -222,7 +223,7 @@ pub fn estimate(plan: &Plan, cfg: &MissionConfig, p: &EstimateParams) -> CostEst
 /// The plan-observable shape of a mission, used to flag validation contracts
 /// [`estimate`]'s calibration corpus doesn't cover (later features will widen
 /// ranges / lower confidence for these; this type is inert on its own).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MissionShape {
     /// Contract gates on a build/test/lint command — the calibration corpus's
     /// typical shape.

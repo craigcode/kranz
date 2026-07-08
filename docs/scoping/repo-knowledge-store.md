@@ -65,6 +65,30 @@ but not as a trusted runtime dependency. Its output shape is an app/wiki
 experience, while kranz needs reviewable, committed, source-linked Markdown
 that can be diffed in the same approval flow as plans and reports.
 
+### Factory AutoWiki and Droid desktop
+
+[Factory AutoWiki](https://www.factory.ai/news/wiki) is strong product
+validation for a repo-local knowledge lane. The useful pattern is not "use a
+third-party wiki as truth"; it is the build shape: survey the repository in a
+structural pass and a semantic pass, generate a browsable wiki from source,
+carry unchanged pages forward on incremental refresh, attach output to a
+specific commit/version, and expose the same knowledge to humans and agents.
+Its reference taxonomy also maps well to kranz: overview, architecture, tech
+stack, project structure, entry points, systems/features, contribution notes,
+lore/decisions, reference, and maintainers.
+
+Factory's Droid desktop post
+([working with Droid in the desktop app](https://www.factory.ai/news/working-with-droid-in-the-desktop-app))
+points to a separate but related UX lesson: review should happen beside the
+artifact being judged. For kranz, that means plan/report/diff/wiki previews
+with anchored feedback into mission events; broader agentic desktop and live
+artifact editing belongs to the sgian product lane.
+
+Fit for kranz: use AutoWiki as a benchmark and possible one-shot import source,
+but keep canonical knowledge in reviewed Markdown with provenance and freshness
+metadata. A third-party wiki can seed or compare candidate notes; it must not
+be the durable authority that planning, validation, or merge gates trust.
+
 ### Obsidian-compatible vaults
 
 Obsidian defines a vault as a filesystem folder containing notes, attachments,
@@ -172,19 +196,24 @@ review and hard to audit in plan approval.
 ## D-B - generation model
 
 **Proposal: build the first generator inside kranz, using existing backend
-sessions and deterministic file discovery; treat OpenWiki/RepoAgent as design
-references, not dependencies.**
+sessions and deterministic file discovery; treat Factory AutoWiki,
+OpenWiki/DeepWiki-Open, and RepoAgent as design references, not dependencies.**
 
 The first version should be a kranz mission/command that:
 
-1. Reads `docs/knowledge/index.md` and the changed files since a chosen base.
-2. Produces a proposed note patch and a `research.md` evidence artifact.
-3. Runs drift checks named in each touched note's front matter.
-4. Leaves normal git review to the operator; no auto-commit outside a mission.
+1. Reads `docs/knowledge/index.md`, the changed files since a chosen base, and
+   a deterministic structural repo map.
+2. Performs a semantic pass over likely entry points, APIs, tests, config,
+   validation gates, and feature boundaries.
+3. Produces a proposed note patch, commit/base metadata, and a `research.md`
+   evidence artifact.
+4. Runs drift checks named in each touched note's front matter.
+5. Leaves normal git review to the operator; no auto-commit outside a mission.
 
-OpenWiki/DeepWiki-Open can be evaluated in an optional spike to seed an initial
-vault, but generated output must pass through the same Markdown/provenance
-contract before becoming canonical.
+Factory AutoWiki, OpenWiki/DeepWiki-Open, or a similar external generator can
+be evaluated in an optional spike to seed an initial vault, but generated
+output must pass through the same Markdown/provenance contract before becoming
+canonical.
 
 ## D-C - prompt consumption
 
@@ -263,8 +292,10 @@ accepted into standing docs.
    reads the vault, applies freshness and relevance filters, enforces the byte
    cap, and injects the result into planning and M2 revised-planning seeds.
 3. **Refresh/drift command.** Add `kranz knowledge refresh` / server endpoint
-   as a reviewable mission path: detect changed verified paths, run note drift
-   checks, propose Markdown edits, and surface stale notes in dashboard/Slack.
+   as a reviewable mission path: detect changed verified paths, compare against
+   the last recorded source commit, run note drift checks, propose incremental
+   Markdown edits, carry unchanged pages forward, and surface stale notes in
+   dashboard/Slack.
 
 Each slice should carry focused tests plus the full workspace gate. Dashboard
 work begins only in slice 3, when there is a user-facing stale-note surface.
@@ -276,8 +307,8 @@ work begins only in slice 3, when there is a user-facing stale-note surface.
 - Serving a full wiki UI in the first two slices.
 - Replacing `.kranz/lessons/`.
 - Sending the full vault to every model turn.
-- Trying to make OpenWiki/RepoAgent output trusted without kranz review and
-  provenance metadata.
+- Trying to make Factory AutoWiki/OpenWiki/RepoAgent output trusted without
+  kranz review and provenance metadata.
 - Cross-repo/fleet memory; this document is repo-local only.
 
 ## Done when

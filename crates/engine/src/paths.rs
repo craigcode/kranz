@@ -63,6 +63,14 @@ impl MissionPaths {
         self.mission_dir().join("report.md")
     }
 
+    /// Approval-time cost estimate (gitignored runtime bookkeeping, like
+    /// `state.json`): persisted at plan approval / revision so the completion
+    /// report can compare actual cost against the exact estimate the operator
+    /// approved, rather than one recomputed against a later corpus or config.
+    pub fn estimate_file(&self) -> PathBuf {
+        self.mission_dir().join("estimate.json")
+    }
+
     pub fn events_file(&self) -> PathBuf {
         self.mission_dir().join("events.jsonl")
     }

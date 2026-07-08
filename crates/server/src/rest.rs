@@ -169,12 +169,20 @@ pub(crate) async fn mission_revision_diff(
     let current = read_file_or_404(&paths.plan_md_file(), || {
         format!("mission '{id}' has no approved plan yet")
     })?;
-    let estimate = cost::estimate(
+    // Preview the same calibrated estimate approval will commit, so the
+    // dashboard's revision diff shows the range that actually lands (M1).
+    let calibration = cost::calibrate(&paths.repo_root);
+    let estimate = cost::apply_shape(
+        cost::estimate(&pending.plan, &state.config, &calibration.params),
         &pending.plan,
-        &state.config,
-        &cost::EstimateParams::default(),
+        &calibration,
     );
-    let revised = render_plan_markdown(&pending.plan, &state.mission, &estimate, 0);
+    let revised = render_plan_markdown(
+        &pending.plan,
+        &state.mission,
+        &estimate,
+        calibration.missions_used,
+    );
     Ok(Json(json!({
         "revision": pending.revision,
         "instructions": pending.instructions,
