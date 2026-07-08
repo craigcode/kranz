@@ -2952,9 +2952,19 @@ fn parse_roadmap_options(markdown: &str) -> Vec<crate::format::RoadmapSection> {
     let mut sections = Vec::new();
     let mut current_section: Option<crate::format::RoadmapSection> = None;
     let mut current_option: Option<crate::format::RoadmapOption> = None;
+    let mut in_code_fence = false;
 
     for line in markdown.lines() {
         let trimmed = line.trim();
+        // Skip fenced code blocks: the file documents its own format inside a
+        // ``` block, and that example must never be parsed as a real option.
+        if trimmed.starts_with("```") {
+            in_code_fence = !in_code_fence;
+            continue;
+        }
+        if in_code_fence {
+            continue;
+        }
         if let Some(name) = trimmed.strip_prefix("## ") {
             push_roadmap_option(&mut current_section, &mut current_option);
             if let Some(section) = current_section.take() {
@@ -4554,6 +4564,33 @@ mod tests {
         assert_eq!(option.ticket.as_deref(), Some("stale-base-merge-warning"));
         assert_eq!(sections[1].name, "Parked/demo");
         assert_eq!(sections[1].options[0].title, "Even Realities");
+    }
+
+    #[test]
+    fn parse_roadmap_options_ignores_fenced_code_blocks() {
+        // A fenced block after a heading (e.g. a format example) must not be
+        // ingested as real options — only the genuine entries around it count.
+        let sections = parse_roadmap_options(
+            "## Now\n\
+             \n\
+             - **Real option** - a genuine entry.\n\
+             \x20 Why: it counts.\n\
+             \n\
+             ```text\n\
+             - **Example title** - not a real option.\n\
+             \x20 Why: this is only documentation.\n\
+             ```\n\
+             \n\
+             - **Second real** - after the fence.\n",
+        );
+
+        assert_eq!(sections.len(), 1);
+        let titles: Vec<&str> = sections[0]
+            .options
+            .iter()
+            .map(|o| o.title.as_str())
+            .collect();
+        assert_eq!(titles, vec!["Real option", "Second real"]);
     }
 
     #[test]
