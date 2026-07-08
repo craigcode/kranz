@@ -423,6 +423,7 @@ fn plan() -> Plan {
                 features: vec![feature("Gamma")],
             },
         ],
+        considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
     }

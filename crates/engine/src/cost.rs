@@ -369,6 +369,7 @@ pub fn calibrate(repo_root: &Path) -> Calibration {
 fn mission_plan(state: &MissionState) -> Plan {
     Plan {
         goal: state.mission.goal.clone(),
+        considered_alternatives: None,
         command_grants: state.mission.command_grants.clone(),
         touch_set: state.mission.touch_set.clone(),
         validation_contract: state.mission.validation_contract.clone(),

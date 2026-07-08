@@ -227,6 +227,14 @@ pub fn validate(cfg: &MissionConfig) -> Result<()> {
             cfg.event_stream_throttle_ms
         )));
     }
+    if !cfg.considered_alternatives_high_usd_threshold.is_finite()
+        || cfg.considered_alternatives_high_usd_threshold < 0.0
+    {
+        return Err(EngineError::Config(format!(
+            "consideredAlternativesHighUsdThreshold must be finite and non-negative, got {}",
+            cfg.considered_alternatives_high_usd_threshold
+        )));
+    }
 
     // Parallel workers (roadmap M3): `1` (the default) keeps the sequential
     // run loop byte-for-byte; `2..=8` opts into parallel-within-milestone
@@ -331,6 +339,34 @@ mod tests {
     fn default_serializes_camel_case_auto_work() {
         let value = serde_json::to_value(MissionConfig::default()).unwrap();
         assert_eq!(value["autoWork"], false);
+    }
+
+    #[test]
+    fn default_serializes_camel_case_considered_alternatives_thresholds() {
+        let value = serde_json::to_value(MissionConfig::default()).unwrap();
+        assert_eq!(value["consideredAlternativesFeatureThreshold"], 4);
+        assert_eq!(value["consideredAlternativesTouchSetThreshold"], 4);
+        assert_eq!(value["consideredAlternativesHighUsdThreshold"], 0.0);
+    }
+
+    #[test]
+    fn layer_overrides_considered_alternatives_thresholds() {
+        let dir = tempfile::tempdir().unwrap();
+        let layer_path = dir.path().join("config.json");
+        std::fs::write(
+            &layer_path,
+            r#"{
+                "consideredAlternativesFeatureThreshold": 2,
+                "consideredAlternativesTouchSetThreshold": 3,
+                "consideredAlternativesHighUsdThreshold": 9.5
+            }"#,
+        )
+        .unwrap();
+
+        let cfg = load_layers(&[layer_path]).unwrap();
+        assert_eq!(cfg.considered_alternatives_feature_threshold, 2);
+        assert_eq!(cfg.considered_alternatives_touch_set_threshold, 3);
+        assert_eq!(cfg.considered_alternatives_high_usd_threshold, 9.5);
     }
 
     #[test]

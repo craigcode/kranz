@@ -6,8 +6,8 @@ use kranz_slack::format::{
     build_blocked, build_complete, build_help, build_home_view, build_needs_context,
     build_new_mission_ack, build_plan_ready, build_plan_review, build_status, dashboard_button,
     dashboard_deep_link, Blocked, Complete, HomeMission, HomeQueueItem, HomeTicket, NeedsContext,
-    NewMissionAck, Outcome, PlanReady, PlanReview, StatusSummary, APPROVE_ACTION_ID,
-    START_ACTION_ID,
+    NewMissionAck, Outcome, PlanAlternativesReview, PlanReady, PlanReview,
+    RejectedAlternativeReview, StatusSummary, APPROVE_ACTION_ID, START_ACTION_ID,
 };
 use serde_json::Value;
 
@@ -236,6 +236,19 @@ fn plan_review_block_kit_has_start_and_queue_buttons() {
         goal: "Rate-limit the notes API".into(),
         milestone_titles: vec!["Token bucket".into(), "429 responses".into()],
         assertion_count: 2,
+        considered_alternatives: Some(PlanAlternativesReview {
+            chosen: "small vertical slice".into(),
+            rejected: vec![
+                RejectedAlternativeReview {
+                    approach: "rewrite all handlers".into(),
+                    trade_off: "too much blast radius".into(),
+                },
+                RejectedAlternativeReview {
+                    approach: "docs only".into(),
+                    trade_off: "does not enforce the limit".into(),
+                },
+            ],
+        }),
         estimate: Some("~$3.10 · ~9 min".into()),
     });
     assert_valid_blocks(&blocks);
@@ -243,6 +256,8 @@ fn plan_review_block_kit_has_start_and_queue_buttons() {
     assert!(text.contains("m-42"));
     assert!(text.contains("Rate-limit the notes API"));
     assert!(text.contains("Token bucket") && text.contains("429 responses"));
+    assert!(text.contains("small vertical slice"));
+    assert!(text.contains("rewrite all handlers"));
     assert!(text.contains("2 validation assertions"));
     assert!(text.contains("~$3.10 · ~9 min"), "estimate rendered");
 

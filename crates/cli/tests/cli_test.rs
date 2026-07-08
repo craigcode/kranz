@@ -62,6 +62,7 @@ fn sample_plan() -> Plan {
                 },
             ],
         }],
+        considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
     }
@@ -230,6 +231,20 @@ fn parses_scan_modes() {
         }
         other => panic!("expected Scan, got {other:?}"),
     }
+}
+
+#[test]
+fn parses_ready() {
+    assert!(matches!(
+        Cli::try_parse_from(["kranz", "ready"]).unwrap().command,
+        Command::Ready { json: false }
+    ));
+    assert!(matches!(
+        Cli::try_parse_from(["kranz", "ready", "--json"])
+            .unwrap()
+            .command,
+        Command::Ready { json: true }
+    ));
 }
 
 #[test]

@@ -218,6 +218,13 @@ pub enum Command {
         range: Option<String>,
     },
 
+    /// Score how ready this repo is for autonomous kranz missions.
+    Ready {
+        /// Print the serializable scorecard JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Drain the execution queue: run queued missions one at a time per repo
     Work {
         /// Process exactly one front entry (exit 0 if the repo is busy)

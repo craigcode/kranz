@@ -13,6 +13,7 @@
 //! - [`exec`] — `kranz exec -f mission.md`, fully headless missions for CI
 //! - [`otel`] — event-log-to-span mapping for the `kranz otel` sidecar
 //! - [`output`] — pure rendering (status tree, plan review, cost estimate)
+//! - [`ready`] — repo-readiness scorecard for onboarding
 //! - [`tail`] — the live event printer used by `kranz run`
 //! - [`planning_tui`] — the full-screen interactive planning UI
 
@@ -29,4 +30,5 @@ pub mod host_bridge;
 pub mod otel;
 pub mod output;
 pub mod planning_tui;
+pub mod ready;
 pub mod tail;

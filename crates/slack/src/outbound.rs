@@ -206,6 +206,7 @@ mod tests {
                 title: "Token bucket".into(),
                 features: vec![],
             }],
+            considered_alternatives: None,
             command_grants: vec![],
             touch_set: vec![],
         };

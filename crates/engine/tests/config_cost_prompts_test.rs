@@ -260,6 +260,7 @@ fn plan_with(features_per_milestone: &[usize]) -> Plan {
                     .collect(),
             })
             .collect(),
+        considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
     }

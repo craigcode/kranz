@@ -165,6 +165,18 @@ pub fn render_plan(plan: &Plan) -> String {
         }
     }
 
+    if let Some(alternatives) = &plan.considered_alternatives {
+        out.push_str("considered alternatives:\n");
+        out.push_str(&format!("  chosen: {}\n", alternatives.chosen.trim()));
+        for rejected in &alternatives.rejected {
+            out.push_str(&format!(
+                "  rejected: {} — {}\n",
+                rejected.approach.trim(),
+                rejected.trade_off.trim()
+            ));
+        }
+    }
+
     out.push_str("milestones:\n");
     for (mi, milestone) in plan.milestones.iter().enumerate() {
         out.push_str(&format!("  {}. {}\n", mi + 1, milestone.title));
@@ -256,6 +268,7 @@ mod tests {
                     validation_criteria: vec!["alpha works".to_string()],
                 }],
             }],
+            considered_alternatives: None,
             command_grants: vec![],
             touch_set: vec![],
         };

@@ -140,6 +140,15 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             Ok(0)
         }
         Command::Scan { staged, range } => cmd_scan(&repo, staged, range.as_deref()),
+        Command::Ready { json } => {
+            let report = crate::ready::assess(&repo);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", crate::ready::render(&report));
+            }
+            Ok(0)
+        }
         Command::Work { once } => backlog::cmd_work(repo, once)
             .await
             .map_err(augment_limit_hint),

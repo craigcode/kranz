@@ -5,9 +5,9 @@
 //! `kranz_server` stays Slack-free.
 
 use kranz_engine::draft::DraftOutcome;
-use kranz_engine::types::Plan;
+use kranz_engine::types::{Plan, TokenUsage};
 use kranz_server::{ApiError, MissionHost};
-use kranz_slack::host::{BoxFuture, PlanOutcome, PlanningHost};
+use kranz_slack::host::{AskOutcome, BoxFuture, PlanOutcome, PlanningHost};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -91,6 +91,26 @@ impl PlanningHost for HostedPlanning {
         // already carries a user-presentable refusal (dirty tree / failing
         // gate with its verbatim output / conflict) in `ApiError::message`.
         Box::pin(async move { self.0.merge(id).await.map_err(plain) })
+    }
+
+    fn ask<'a>(&'a self, question: &'a str) -> BoxFuture<'a, anyhow::Result<AskOutcome>> {
+        Box::pin(async move {
+            let value = self.0.ask(question).await.map_err(plain)?;
+            let answer = value
+                .get("answer")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let cost_usd = value.get("costUsd").and_then(Value::as_f64).unwrap_or(0.0);
+            let tokens: TokenUsage =
+                serde_json::from_value(value.get("tokens").cloned().unwrap_or(Value::Null))
+                    .unwrap_or_default();
+            Ok(AskOutcome {
+                answer,
+                cost_usd,
+                tokens,
+            })
+        })
     }
 }
 

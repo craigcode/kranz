@@ -78,11 +78,29 @@ Approval never happens inside this conversation: the human triggers a FORMAL pla
       ]
     }
   ],
+  "consideredAlternatives": {
+    "chosen": "why this plan shape is the best fit",
+    "rejected": [
+      {
+        "approach": "one rejected plan shape",
+        "tradeOff": "why it was rejected"
+      },
+      {
+        "approach": "another rejected plan shape",
+        "tradeOff": "why it was rejected"
+      }
+    ]
+  },
   "commandGrants": [
     "gc lint"
   ]
 }
 ```
+
+`consideredAlternatives` is optional for small plans, but required when the
+engine's large-scope policy says the plan is broad or likely expensive. Include
+a concise chosen approach and at least two rejected shapes with one-line
+trade-offs so the human approval gate can see what was weighed.
 
 `commandGrants` is an optional, top-level array of read-only shell commands granted mission-wide: every worker AND validator session may run them (and their `--help` forms), regardless of which feature or milestone they're working. It is the single source of truth shared by both surfaces, so use it for brief-granted command exceptions — e.g. a project CLI like `gc lint` — that validators must be able to re-run to independently verify a worker's claim rather than trusting it blind.
 

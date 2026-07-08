@@ -74,6 +74,10 @@ pub struct Plan {
     pub goal: String,
     pub validation_contract: Vec<Assertion>,
     pub milestones: Vec<PlanMilestone>,
+    /// Review material required for broad/expensive plans: the approach the
+    /// planner chose and at least two rejected shapes with their trade-offs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub considered_alternatives: Option<ConsideredAlternatives>,
     /// Read-only shell commands the plan declares as runnable by BOTH worker
     /// and validator sessions.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -82,6 +86,20 @@ pub struct Plan {
     /// allowed to touch.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub touch_set: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConsideredAlternatives {
+    pub chosen: String,
+    pub rejected: Vec<RejectedAlternative>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RejectedAlternative {
+    pub approach: String,
+    pub trade_off: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -430,6 +448,15 @@ pub struct MissionConfig {
     /// When true, the serve process drains the queue automatically whenever
     /// entries are waiting. Default off.
     pub auto_work: bool,
+    /// Require `Plan.consideredAlternatives` when feature count reaches this
+    /// threshold. `0` disables this trigger.
+    pub considered_alternatives_feature_threshold: usize,
+    /// Require `Plan.consideredAlternatives` when `touchSet` breadth reaches
+    /// this threshold. `0` disables this trigger.
+    pub considered_alternatives_touch_set_threshold: usize,
+    /// Require `Plan.consideredAlternatives` when the estimated high cost
+    /// reaches this threshold. `0.0` disables this trigger.
+    pub considered_alternatives_high_usd_threshold: f64,
     /// Extra Bash deny patterns beyond the built-in list (§4.7).
     pub deny_patterns: Vec<String>,
     /// Commands validators may run, in addition to contract `command`s.
@@ -495,6 +522,9 @@ impl Default for MissionConfig {
             event_stream_throttle_ms: 250,
             planning_idle_release_minutes: 30,
             auto_work: false,
+            considered_alternatives_feature_threshold: 4,
+            considered_alternatives_touch_set_threshold: 4,
+            considered_alternatives_high_usd_threshold: 0.0,
             deny_patterns: vec![],
             allow_validator_commands: vec![],
             dangerously_allow_all: false,

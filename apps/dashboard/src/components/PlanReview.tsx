@@ -42,6 +42,28 @@ export function PlanReview() {
 
         <p className="plan-review-goal">{plan.goal}</p>
 
+        {plan.consideredAlternatives !== undefined && (
+          <section aria-label="Considered alternatives">
+            <div className="section-label">Considered alternatives</div>
+            <div className="plan-alternatives">
+              <p>
+                <span className="dim">Chosen:</span> {plan.consideredAlternatives.chosen}
+              </p>
+              {plan.consideredAlternatives.rejected.length > 0 && (
+                <ul>
+                  {plan.consideredAlternatives.rejected.map((rejected, i) => (
+                    <li key={i}>
+                      <strong>{rejected.approach}</strong>
+                      {' — '}
+                      {rejected.tradeOff}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </section>
+        )}
+
         <section aria-label="Validation contract">
           <div className="section-label">Validation contract</div>
           <ul className="contract-list">

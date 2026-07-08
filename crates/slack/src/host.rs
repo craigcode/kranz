@@ -12,7 +12,7 @@
 //! object-safe without an `async-trait` dependency.
 
 use kranz_engine::draft::DraftOutcome;
-use kranz_engine::types::Plan;
+use kranz_engine::types::{Plan, TokenUsage};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -32,6 +32,13 @@ pub enum PlanOutcome {
         estimate: Option<String>,
     },
     NotReady(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct AskOutcome {
+    pub answer: String,
+    pub cost_usd: f64,
+    pub tokens: TokenUsage,
 }
 
 /// The hosted-engine operations the bridge drives. Implemented over
@@ -109,6 +116,11 @@ pub trait PlanningHost: Send + Sync + 'static {
     /// carries the refusal VERBATIM (dirty tree / failing gate with its
     /// captured output / merge conflict) for the bridge to forward unchanged.
     fn merge<'a>(&'a self, id: &'a str) -> BoxFuture<'a, anyhow::Result<Value>>;
+
+    /// `/kranz ask <question>` → answer a read-only question grounded in
+    /// mission/ticket/repo state. The implementation must not create, enqueue,
+    /// approve, start, merge, or write mission state.
+    fn ask<'a>(&'a self, question: &'a str) -> BoxFuture<'a, anyhow::Result<AskOutcome>>;
 }
 
 /// How the bridge holds the host: shared, optional (a bridge without a host —

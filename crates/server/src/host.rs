@@ -31,7 +31,7 @@ use axum::extract::{Path as UrlPath, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
-use kranz_engine::backend::AgentBackend;
+use kranz_engine::backend::{AgentBackend, AgentEvent, PromptMode, SessionExit, SessionSpec};
 use kranz_engine::backend_claude::ClaudeBackend;
 use kranz_engine::config;
 use kranz_engine::cost::{self, CostEstimate};
@@ -44,8 +44,9 @@ use kranz_engine::git_ops::KranzCommitMetadata;
 use kranz_engine::merge::{merge_mission, MergeReport};
 use kranz_engine::orchestrator::{MissionEngine, PlanRequest};
 use kranz_engine::paths::MissionPaths;
+use kranz_engine::queue;
 use kranz_engine::ticket::Ticket;
-use kranz_engine::types::{MissionConfig, MissionStatus, Plan};
+use kranz_engine::types::{MissionConfig, MissionStatus, Plan, TokenUsage};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -648,6 +649,63 @@ impl MissionHost {
         }
     }
 
+    /// Read-only, LLM-backed Q&A for `/kranz ask`: ground the model in current
+    /// mission/ticket state and return one answer plus usage. This deliberately
+    /// bypasses the hosted mission registry: it must never create a mission,
+    /// append mission events, enqueue work, approve, start, or merge.
+    pub async fn ask(&self, question: &str) -> Result<Value, ApiError> {
+        let question = question.trim();
+        if question.is_empty() {
+            return Err(ApiError::bad_request("ask requires a question"));
+        }
+        let cfg = config::load(&self.repo_root)?;
+        config::validate(&cfg)?;
+        let role = cfg.validator_scrutiny.clone();
+        let backend = self.backend(cfg.claude_binary.as_deref()).await?;
+        let prompt = ask_prompt(question, &ask_context(&self.repo_root));
+        let spec = SessionSpec {
+            cwd: self.repo_root.clone(),
+            prompt: PromptMode::SingleShot(prompt),
+            append_system_prompt: Some(
+                "You answer read-only questions about this Kranz repository. \
+                 Use only the supplied context; if it is insufficient, say what is missing. \
+                 Do not modify files, run commands, create missions, enqueue work, approve, \
+                 start, or merge anything."
+                    .to_string(),
+            ),
+            model: role.model,
+            effort: role.reasoning_effort,
+            session_id: format!("ask-{}", uuid::Uuid::new_v4()),
+            resume: None,
+            permission_mode: Some("plan".to_string()),
+            allowed_tools: vec![],
+            disallowed_tools: vec![
+                "Bash(*)".to_string(),
+                "Edit(*)".to_string(),
+                "Write(*)".to_string(),
+            ],
+            tools: vec![
+                "Read".to_string(),
+                "Grep".to_string(),
+                "Glob".to_string(),
+                "LS".to_string(),
+            ],
+            writable: false,
+            settings_json: None,
+            json_schema: None,
+            max_budget_usd: role.max_budget_usd,
+            max_turns: role.max_turns,
+            env: HashMap::new(),
+            sandbox: None,
+        };
+        let outcome = run_ask_session(backend, spec).await?;
+        Ok(json!({
+            "answer": outcome.answer,
+            "costUsd": outcome.cost_usd,
+            "tokens": outcome.tokens,
+        }))
+    }
+
     /// Release a hosted idle engine: drop it from the registry (flushing its
     /// log and freeing the single-writer lock) so an EXTERNAL runner — the
     /// `kranz work` dispatcher, a terminal `kranz plan/run` — can take the
@@ -1140,6 +1198,166 @@ async fn run_to_end(
         .lock()
         .expect("missions registry lock")
         .remove(&mission_id);
+}
+
+struct AskRunOutcome {
+    answer: String,
+    cost_usd: f64,
+    tokens: TokenUsage,
+}
+
+async fn run_ask_session(
+    backend: Arc<dyn AgentBackend>,
+    spec: SessionSpec,
+) -> Result<AskRunOutcome, ApiError> {
+    let mut session = backend.start(spec).await.map_err(ApiError::from)?;
+    let mut streamed_text = String::new();
+    let mut result_text = None;
+    let mut tokens = TokenUsage::default();
+    let mut cost_usd = 0.0;
+    let mut result_error = false;
+    while let Some(event) = session.next_event().await.map_err(ApiError::from)? {
+        match event {
+            AgentEvent::Text { text, .. } => streamed_text.push_str(&text),
+            AgentEvent::Result {
+                text,
+                is_error,
+                usage,
+                cost_usd: cost,
+                ..
+            } => {
+                result_error |= is_error;
+                tokens.add(&usage);
+                cost_usd += cost.unwrap_or(0.0);
+                if !text.trim().is_empty() {
+                    result_text = Some(text);
+                }
+            }
+            _ => {}
+        }
+    }
+    match session.exit_status() {
+        Some(SessionExit::Completed) if !result_error => {
+            let answer = result_text.unwrap_or(streamed_text).trim().to_string();
+            if answer.is_empty() {
+                return Err(ApiError::internal("ask turn produced an empty answer"));
+            }
+            Ok(AskRunOutcome {
+                answer,
+                cost_usd,
+                tokens,
+            })
+        }
+        Some(SessionExit::Completed) => Err(ApiError::internal("ask turn failed")),
+        Some(SessionExit::Failed(reason)) => {
+            Err(ApiError::internal(format!("ask turn failed: {reason}")))
+        }
+        Some(SessionExit::Aborted) => Err(ApiError::internal("ask turn aborted")),
+        None => Err(ApiError::internal("ask turn ended without an exit status")),
+    }
+}
+
+fn ask_prompt(question: &str, context: &str) -> String {
+    format!(
+        "Answer this operator question about the Kranz repository.\n\n\
+         Rules:\n\
+         - Ground the answer only in the context below.\n\
+         - If the context is insufficient, say what is missing.\n\
+         - Keep the answer concise but specific, citing mission ids or ticket slugs when relevant.\n\
+         - This is read-only: do not propose that you have changed state.\n\n\
+         Question:\n{question}\n\nContext:\n{context}"
+    )
+}
+
+fn ask_context(repo_root: &Path) -> String {
+    let mut out = String::new();
+    out.push_str("## Missions\n");
+    let mut ids = MissionPaths::list_missions(repo_root);
+    ids.sort();
+    ids.reverse();
+    if ids.is_empty() {
+        out.push_str("(none)\n");
+    }
+    for id in ids.into_iter().take(20) {
+        let paths = MissionPaths::new(repo_root, &id);
+        let Ok(events) = EventLog::read_events(&paths.events_file()) else {
+            continue;
+        };
+        let Ok(state) = kranz_engine::reducer::fold(&events) else {
+            continue;
+        };
+        out.push_str(&format!(
+            "- {}: {:?}; goal: {}; branch: {}; cost: ${:.4}; tokens in/out/cacheRead/cacheWrite: {}/{}/{}/{}\n",
+            state.mission.id,
+            state.mission.status,
+            one_line(&state.mission.goal),
+            state.mission.mission_branch,
+            state.total_cost_usd,
+            state.totals.input,
+            state.totals.output,
+            state.totals.cache_read,
+            state.totals.cache_write,
+        ));
+        for decision in state.recent_decisions.iter().rev().take(3) {
+            out.push_str(&format!("  decision: {}\n", one_line(decision)));
+        }
+        let report = paths.report_file();
+        if let Ok(text) = std::fs::read_to_string(report) {
+            out.push_str(&format!(
+                "  report excerpt: {}\n",
+                truncate(&one_line(&text), 500)
+            ));
+        }
+    }
+
+    out.push_str("\n## Tickets\n");
+    let tickets = Ticket::list(repo_root);
+    if tickets.is_empty() {
+        out.push_str("(none)\n");
+    }
+    for ticket in tickets.iter().take(40) {
+        let state = Ticket::read_state(repo_root, &ticket.slug);
+        out.push_str(&format!(
+            "- {} [{:?}, p{}]: {}; blocked-by: {}\n",
+            ticket.slug,
+            state,
+            ticket.priority,
+            one_line(&ticket.title),
+            if ticket.blocked_by.is_empty() {
+                "none".to_string()
+            } else {
+                ticket.blocked_by.join(", ")
+            }
+        ));
+    }
+
+    out.push_str("\n## Queue\n");
+    let entries = queue::list(repo_root);
+    if entries.is_empty() {
+        out.push_str("(empty)\n");
+    }
+    for entry in entries.iter().take(20) {
+        out.push_str(&format!(
+            "- {} priority={} ticket={}\n",
+            entry.mission_id,
+            entry.priority,
+            entry.ticket_slug.as_deref().unwrap_or("-")
+        ));
+    }
+    out
+}
+
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn truncate(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 /// The spawned-task body behind [`MissionHost::drain`], factored out so a
@@ -1712,6 +1930,37 @@ mod tests {
         git(dir.path(), &["commit", "-m", "seed"]);
         let root = std::fs::canonicalize(dir.path()).expect("canonicalize");
         Some((dir, root))
+    }
+
+    #[tokio::test]
+    async fn ask_runs_read_only_one_shot_without_creating_mission_state() {
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
+        let backend = Arc::new(MockBackend::with_scripts(vec![MockScript::single_shot(
+            "Nothing is currently blocked.",
+        )]));
+        let host = MissionHost::with_backend(root.clone(), backend.clone());
+
+        let before = MissionPaths::list_missions(&root);
+        let value = host.ask("what is blocked?").await.unwrap();
+
+        assert_eq!(value["answer"], "Nothing is currently blocked.");
+        assert_eq!(
+            MissionPaths::list_missions(&root),
+            before,
+            "ask must not create or mutate mission directories"
+        );
+        let specs = backend.started_specs();
+        assert_eq!(specs.len(), 1);
+        assert!(!specs[0].writable, "ask session is read-only");
+        assert_eq!(specs[0].permission_mode.as_deref(), Some("plan"));
+        let prompt = match &specs[0].prompt {
+            PromptMode::SingleShot(prompt) => prompt,
+            other => panic!("ask must be one-shot, got {other:?}"),
+        };
+        assert!(prompt.contains("what is blocked?"));
+        assert!(prompt.contains("## Missions"));
     }
 
     #[tokio::test]

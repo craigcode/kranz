@@ -153,6 +153,16 @@ pub enum Action {
     /// `/kranz todo` → post the deterministic operator worklist. Read-only, so
     /// not spend-gated.
     Todo { response_url: Option<String> },
+    /// `/kranz ask <question>` → read-only LLM-backed Q&A grounded in mission,
+    /// ticket, queue, report, and event state. It spends tokens, so it is
+    /// allowlist-gated like other spend actions.
+    Ask {
+        question: String,
+        user_id: Option<String>,
+        response_url: Option<String>,
+        channel: String,
+        thread_ts: Option<String>,
+    },
     /// `/kranz plan <id>` → demand the plan for a mission (request-plan turn).
     /// A money-spending action (it runs an orchestrator turn): spend-gated.
     RequestPlan {
@@ -619,13 +629,13 @@ fn route_event(payload: &Value, lookup: &impl ThreadLookup) -> Action {
 
 /// `slash_commands` → the `/kranz` subcommand router. Recognized subcommands:
 /// `ticket <title>`, `ticket list`, `ticket show <slug>`, `new <goal>`,
-/// `status [<id>]`, `todo`, `plan <id>`, `approve <id>`, `draft <slug>`,
+/// `status [<id>]`, `todo`, `ask <question>`, `plan <id>`, `approve <id>`, `draft <slug>`,
 /// `config [<id>] <role> <model> [effort]`, `pause [<id>]`, `resume [<id>]`,
 /// `work`. A bare `/kranz`, `help`, or an unrecognized/incomplete subcommand
 /// shows the command list — a typo lands on help rather than silently doing
 /// something surprising, which is what keeps the surface discoverable.
 ///
-/// The spend-gated subcommands (`new`, `plan`, `approve`, `draft`) carry the invoking
+/// The spend-gated subcommands (`new`, `plan`, `approve`, `draft`, `ask`) carry the invoking
 /// `user_id` so [`crate::bridge`] can consult the allowlist before acting; the
 /// gate itself lives in [`crate::config::SlackConfig::is_authorized`], not here
 /// (routing stays pure and config-free).
@@ -767,6 +777,26 @@ fn route_slash(payload: &Value) -> Action {
             return Action::Todo { response_url };
         }
         // `todo <anything>` → help.
+    }
+
+    // `ask <question>` → read-only, LLM-backed Q&A. It still spends tokens,
+    // so the bridge gates it on the same allowlist as plan/draft/work run.
+    if let Some(rest) = strip_ci_prefix(text, "ask") {
+        let question = rest.trim();
+        if !question.is_empty() {
+            let thread_ts = payload
+                .get("thread_ts")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            return Action::Ask {
+                question: question.to_string(),
+                user_id,
+                response_url,
+                channel,
+                thread_ts,
+            };
+        }
+        // `ask` with no question → help.
     }
 
     // `plan <id>` → demand the plan (spend-gated: runs an orchestrator turn).
@@ -1697,6 +1727,31 @@ mod tests {
             route(&env, &lookup_none()).action,
             Action::Todo {
                 response_url: Some("https://hooks.slack/t".into())
+            }
+        );
+    }
+
+    #[test]
+    fn slash_ask_routes_to_ask_with_question() {
+        let env = json!({
+            "type": "slash_commands",
+            "payload": {
+                "command": "/kranz",
+                "text": "ask why did m-1 cost so much?",
+                "user_id": "U9",
+                "response_url": "https://hooks.slack/a",
+                "channel_id": "C1",
+                "thread_ts": "111.222"
+            }
+        });
+        assert_eq!(
+            route(&env, &lookup_none()).action,
+            Action::Ask {
+                question: "why did m-1 cost so much?".into(),
+                user_id: Some("U9".into()),
+                response_url: Some("https://hooks.slack/a".into()),
+                channel: "C1".into(),
+                thread_ts: Some("111.222".into()),
             }
         );
     }

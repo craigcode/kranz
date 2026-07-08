@@ -53,6 +53,7 @@ fn sample_plan() -> Plan {
                 validation_criteria: vec!["it works".into()],
             }],
         }],
+        considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
     }

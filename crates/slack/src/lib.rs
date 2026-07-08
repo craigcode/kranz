@@ -44,7 +44,7 @@ pub mod threads;
 
 pub use client::SlackClient;
 pub use config::{NotifyFlags, SlackConfig};
-pub use host::{PlanOutcome, PlanningHost, SharedHost};
+pub use host::{AskOutcome, PlanOutcome, PlanningHost, SharedHost};
 
 use anyhow::Result;
 use std::path::Path;

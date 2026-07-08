@@ -1004,8 +1004,9 @@ impl MissionEngine {
     pub async fn request_plan(&mut self) -> Result<PlanRequest> {
         let message = format!(
             "Emit the plan now. Output ONLY a JSON object conforming exactly to this JSON \
-             Schema — no prose before or after:\n{}\n",
-            plan_schema()
+             Schema — no prose before or after:\n{}\n\n{}",
+            plan_schema(),
+            considered_alternatives_prompt_policy(&self.state.config)
         );
         let text = self.orch_turn(&message).await?;
         if let Some(plan) = runner::parse_report::<Plan>(&text) {
@@ -1055,6 +1056,11 @@ impl MissionEngine {
         }
         assign_assertion_ids(&mut plan.validation_contract);
 
+        let calibration = cost::calibrate(&self.paths.repo_root);
+        let estimate = cost::estimate(&plan, &self.state.config, &calibration.params);
+        let estimate = cost::apply_shape(estimate, &plan, &calibration);
+        validate_considered_alternatives(&plan, &estimate, &self.state.config)?;
+
         // Git first: if anything fails here, no event was emitted and
         // approve_plan can simply be retried.
         let base = self.state.mission.base_branch.clone();
@@ -1080,9 +1086,6 @@ impl MissionEngine {
         // The calibrated cost estimate is baked in here so the Reviewable
         // human queue gate (and any future surface reading plan.md) sees it
         // without recomputing it — `calibrate` never fails.
-        let calibration = cost::calibrate(&self.paths.repo_root);
-        let estimate = cost::estimate(&plan, &self.state.config, &calibration.params);
-        let estimate = cost::apply_shape(estimate, &plan, &calibration);
         let plan_md_body = render_plan_markdown(
             &plan,
             &self.state.mission,
@@ -4043,6 +4046,7 @@ impl MissionEngine {
                                 .collect(),
                         })
                         .collect(),
+                    considered_alternatives: None,
                     command_grants: mission.command_grants.clone(),
                     touch_set: mission.touch_set.clone(),
                 };
@@ -4410,6 +4414,23 @@ pub fn render_plan_markdown(
         }
     }
 
+    if let Some(alternatives) = &plan.considered_alternatives {
+        let _ = writeln!(md, "## Considered alternatives\n");
+        let _ = writeln!(md, "**Chosen approach:** {}\n", alternatives.chosen.trim());
+        if !alternatives.rejected.is_empty() {
+            let _ = writeln!(md, "Rejected shapes:");
+            for rejected in &alternatives.rejected {
+                let _ = writeln!(
+                    md,
+                    "- **{}** — {}",
+                    rejected.approach.trim(),
+                    rejected.trade_off.trim()
+                );
+            }
+            let _ = writeln!(md);
+        }
+    }
+
     let _ = writeln!(md, "## Validation contract\n");
     let _ = writeln!(
         md,
@@ -4441,6 +4462,108 @@ pub fn render_plan_markdown(
         }
     }
     md
+}
+
+fn considered_alternatives_prompt_policy(cfg: &MissionConfig) -> String {
+    let feature_threshold = cfg.considered_alternatives_feature_threshold;
+    let touch_threshold = cfg.considered_alternatives_touch_set_threshold;
+    let cost_threshold = cfg.considered_alternatives_high_usd_threshold;
+    let mut triggers = Vec::new();
+    if feature_threshold > 0 {
+        triggers.push(format!("{feature_threshold}+ features"));
+    }
+    if touch_threshold > 0 {
+        triggers.push(format!("{touch_threshold}+ touchSet patterns"));
+    }
+    if cost_threshold > 0.0 {
+        triggers.push(format!(
+            "likely high estimate at or above ${cost_threshold:.2}"
+        ));
+    }
+    if triggers.is_empty() {
+        return "The optional consideredAlternatives field may be omitted.".to_string();
+    }
+    format!(
+        "Policy: if this plan crosses any large-scope trigger ({}) include \
+         consideredAlternatives with a non-empty chosen approach and at least two rejected \
+         approaches, each with a one-line tradeOff. Small plans may omit it.",
+        triggers.join(", ")
+    )
+}
+
+fn validate_considered_alternatives(
+    plan: &Plan,
+    estimate: &cost::CostEstimate,
+    cfg: &MissionConfig,
+) -> Result<()> {
+    let required = considered_alternatives_requirement(plan, estimate, cfg);
+    match (&plan.considered_alternatives, required) {
+        (None, Some(reason)) => Err(EngineError::InvalidState(format!(
+            "considered alternatives required: {reason}. Add consideredAlternatives with a \
+             chosen approach and at least two rejected approaches with tradeOff."
+        ))),
+        (Some(alternatives), _) => validate_considered_alternatives_body(alternatives),
+        (None, None) => Ok(()),
+    }
+}
+
+fn considered_alternatives_requirement(
+    plan: &Plan,
+    estimate: &cost::CostEstimate,
+    cfg: &MissionConfig,
+) -> Option<String> {
+    let features = plan_feature_count(plan);
+    if cfg.considered_alternatives_feature_threshold > 0
+        && features >= cfg.considered_alternatives_feature_threshold
+    {
+        return Some(format!(
+            "{features} feature(s) >= feature threshold {}",
+            cfg.considered_alternatives_feature_threshold
+        ));
+    }
+    let touch_set = plan.touch_set.len();
+    if cfg.considered_alternatives_touch_set_threshold > 0
+        && touch_set >= cfg.considered_alternatives_touch_set_threshold
+    {
+        return Some(format!(
+            "{touch_set} touchSet pattern(s) >= touchSet threshold {}",
+            cfg.considered_alternatives_touch_set_threshold
+        ));
+    }
+    if cfg.considered_alternatives_high_usd_threshold > 0.0
+        && estimate.high_usd >= cfg.considered_alternatives_high_usd_threshold
+    {
+        return Some(format!(
+            "estimated high cost ${:.2} >= cost threshold ${:.2}",
+            estimate.high_usd, cfg.considered_alternatives_high_usd_threshold
+        ));
+    }
+    None
+}
+
+fn validate_considered_alternatives_body(alternatives: &ConsideredAlternatives) -> Result<()> {
+    if alternatives.chosen.trim().is_empty() {
+        return Err(EngineError::InvalidState(
+            "consideredAlternatives.chosen must not be empty".to_string(),
+        ));
+    }
+    let valid_rejected = alternatives
+        .rejected
+        .iter()
+        .filter(|r| !r.approach.trim().is_empty() && !r.trade_off.trim().is_empty())
+        .count();
+    if valid_rejected < 2 {
+        return Err(EngineError::InvalidState(
+            "consideredAlternatives.rejected must include at least two entries with approach \
+             and tradeOff"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn plan_feature_count(plan: &Plan) -> usize {
+    plan.milestones.iter().map(|m| m.features.len()).sum()
 }
 
 /// Whether a completed milestone's feature set is reproduced UNCHANGED in the
@@ -5538,6 +5661,27 @@ fn plan_schema() -> serde_json::Value {
         "required": ["goal", "validationContract", "milestones"],
         "properties": {
             "goal": { "type": "string" },
+            "consideredAlternatives": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["chosen", "rejected"],
+                "properties": {
+                    "chosen": { "type": "string" },
+                    "rejected": {
+                        "type": "array",
+                        "minItems": 2,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["approach", "tradeOff"],
+                            "properties": {
+                                "approach": { "type": "string" },
+                                "tradeOff": { "type": "string" }
+                            }
+                        }
+                    }
+                }
+            },
             "validationContract": {
                 "type": "array",
                 "items": {
@@ -6453,6 +6597,19 @@ mod tests {
                     validation_criteria: vec!["c".into()],
                 }],
             }],
+            considered_alternatives: Some(ConsideredAlternatives {
+                chosen: "single safe slice".into(),
+                rejected: vec![
+                    RejectedAlternative {
+                        approach: "big bang".into(),
+                        trade_off: "too broad".into(),
+                    },
+                    RejectedAlternative {
+                        approach: "docs only".into(),
+                        trade_off: "does not deliver behavior".into(),
+                    },
+                ],
+            }),
             command_grants: vec!["gc lint".into()],
             touch_set: vec!["src/**".into()],
         };

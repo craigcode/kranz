@@ -22,7 +22,7 @@
 use crate::client::SlackClient;
 use crate::config::{NotifyFlags, SlackConfig};
 use crate::health::BridgeHealth;
-use crate::host::{PlanOutcome, SharedHost};
+use crate::host::{AskOutcome, PlanOutcome, SharedHost};
 use crate::inbound::{route, Action, ThreadLookup};
 use crate::outbound::{classify, NotifyClass, Outbound};
 use crate::threads::ThreadMap;
@@ -618,6 +618,7 @@ fn is_slow_action(action: &Action) -> bool {
             | Action::ApproveMission { .. }
             | Action::QueueTicket { .. }
             | Action::Draft { .. }
+            | Action::Ask { .. }
             | Action::WorkRun { .. }
             | Action::CreateTicket { .. }
             | Action::Merge { .. }
@@ -1130,6 +1131,69 @@ async fn dispatch_action(
             .await;
         }
 
+        Action::Ask {
+            question,
+            user_id,
+            response_url,
+            channel,
+            thread_ts,
+        } => {
+            if !cfg.is_authorized(user_id.as_deref()) {
+                reply_ephemeral(
+                    cfg,
+                    client,
+                    response_url.as_deref(),
+                    &not_authorized_blocks(),
+                )
+                .await;
+                return;
+            }
+            let Some(host) = host else {
+                reply_ephemeral(
+                    cfg,
+                    client,
+                    response_url.as_deref(),
+                    &error_blocks("No hosted engine is attached, so `/kranz ask` cannot run here."),
+                )
+                .await;
+                return;
+            };
+            reply_ephemeral(
+                cfg,
+                client,
+                response_url.as_deref(),
+                &error_blocks(":hourglass_flowing_sand: Asking Kranz — the grounded answer will post back here."),
+            )
+            .await;
+            match host.ask(question).await {
+                Ok(outcome) => {
+                    let blocks = ask_answer_blocks(question, &outcome);
+                    let blocks = crate::format::label_blocks(blocks, cfg.instance_name.as_deref());
+                    if channel.trim().is_empty() {
+                        if let Some(url) = response_url.as_deref() {
+                            if let Err(e) = client.post_response(url, &blocks, false).await {
+                                tracing::warn!(error = %e, "failed to post Slack ask answer");
+                            }
+                        }
+                    } else if let Err(e) = client
+                        .post_message(channel, &blocks, thread_ts.as_deref())
+                        .await
+                    {
+                        tracing::warn!(error = %e, "failed to post Slack ask answer");
+                    }
+                }
+                Err(e) => {
+                    reply_ephemeral(
+                        cfg,
+                        client,
+                        response_url.as_deref(),
+                        &error_blocks(&format!("Couldn't answer that yet: {e}")),
+                    )
+                    .await;
+                }
+            }
+        }
+
         // Read-only backlog verbs (no `user_id`, so structurally not
         // allowlist-gated — same shape as Status).
         Action::TicketList { response_url } => {
@@ -1410,6 +1474,19 @@ async fn dispatch_action(
                         goal: plan.goal.clone(),
                         milestone_titles: plan.milestones.iter().map(|m| m.title.clone()).collect(),
                         assertion_count: plan.validation_contract.len(),
+                        considered_alternatives: plan.considered_alternatives.as_ref().map(|a| {
+                            crate::format::PlanAlternativesReview {
+                                chosen: a.chosen.clone(),
+                                rejected: a
+                                    .rejected
+                                    .iter()
+                                    .map(|r| crate::format::RejectedAlternativeReview {
+                                        approach: r.approach.clone(),
+                                        trade_off: r.trade_off.clone(),
+                                    })
+                                    .collect(),
+                            }
+                        }),
                         estimate,
                     });
                     // No caching here: the host parked the reviewed plan
@@ -2195,6 +2272,36 @@ fn error_blocks(msg: &str) -> Vec<Value> {
     vec![json!({ "type": "section", "text": { "type": "mrkdwn", "text": msg } })]
 }
 
+fn ask_answer_blocks(question: &str, outcome: &AskOutcome) -> Vec<Value> {
+    vec![
+        json!({
+            "type": "header",
+            "text": { "type": "plain_text", "text": "Kranz ask" }
+        }),
+        json!({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": format!("*Q:* {}\n\n{}", crate::format::escape_mrkdwn(question), crate::format::escape_mrkdwn(&outcome.answer))
+            }
+        }),
+        json!({
+            "type": "context",
+            "elements": [{
+                "type": "mrkdwn",
+                "text": format!(
+                    "cost ${:.4} · tokens in/out/cacheRead/cacheWrite {}/{}/{}/{}",
+                    outcome.cost_usd,
+                    outcome.tokens.input,
+                    outcome.tokens.output,
+                    outcome.tokens.cache_read,
+                    outcome.tokens.cache_write,
+                )
+            }]
+        }),
+    ]
+}
+
 /// The honest refusal for hosted-engine operations when the bridge was started
 /// without a host (tests, or embedding `serve_slack` outside `kranz serve`).
 fn no_host_blocks(mission_id: &str) -> Vec<Value> {
@@ -2337,6 +2444,7 @@ fn apply_action(repo_root: &Path, action: &Action) -> Result<()> {
         | Action::QueueTicket { .. }
         | Action::ApproveStart { .. }
         | Action::Draft { .. }
+        | Action::Ask { .. }
         | Action::Config { .. }
         | Action::Pause { .. }
         | Action::Resume { .. }
@@ -3610,6 +3718,7 @@ mod tests {
                             validation_criteria: vec!["c".into()],
                         }],
                     }],
+                    considered_alternatives: None,
                     command_grants: vec![],
                     touch_set: vec![],
                 },
@@ -3735,6 +3844,7 @@ mod tests {
                             validation_criteria: vec!["c".into()],
                         }],
                     }],
+                    considered_alternatives: None,
                     command_grants: vec![],
                     touch_set: vec![],
                 },
@@ -3790,6 +3900,7 @@ mod tests {
                     validation_criteria: vec!["works".into()],
                 }],
             }],
+            considered_alternatives: None,
             command_grants: vec![],
             touch_set: vec![],
         }
@@ -3856,6 +3967,7 @@ mod tests {
                     validation_criteria: vec!["c".into()],
                 }],
             }],
+            considered_alternatives: None,
             command_grants: vec![],
             touch_set: vec![],
         }
@@ -4688,6 +4800,13 @@ mod tests {
             slug: "s-1".into(),
             user_id: None,
             response_url: None,
+        }));
+        assert!(is_slow_action(&Action::Ask {
+            question: "what is blocked?".into(),
+            user_id: None,
+            response_url: None,
+            channel: "C1".into(),
+            thread_ts: None,
         }));
         // WorkRun triggers a live-host drain (spawns work) → must run off the
         // read loop, same as Draft.

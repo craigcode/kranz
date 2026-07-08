@@ -146,7 +146,18 @@ export interface Plan {
   goal: string;
   validationContract: Assertion[];
   milestones: PlanMilestone[];
+  consideredAlternatives?: ConsideredAlternatives;
   touchSet?: string[];
+}
+
+export interface ConsideredAlternatives {
+  chosen: string;
+  rejected: RejectedAlternative[];
+}
+
+export interface RejectedAlternative {
+  approach: string;
+  tradeOff: string;
 }
 
 export interface PlanMilestone {

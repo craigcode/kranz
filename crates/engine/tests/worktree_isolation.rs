@@ -186,6 +186,7 @@ fn one_feature_plan() -> Plan {
                 validation_criteria: vec!["part 1 works".to_string()],
             }],
         }],
+        considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
     }
@@ -726,6 +727,7 @@ fn two_milestone_plan() -> Plan {
                 }],
             },
         ],
+        considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
     }

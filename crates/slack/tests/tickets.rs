@@ -15,7 +15,7 @@ use kranz_slack::bridge::{
 };
 use kranz_slack::host::BoxFuture;
 use kranz_slack::inbound::{route, Action, ThreadLookup};
-use kranz_slack::{NotifyFlags, PlanOutcome, PlanningHost, SharedHost, SlackConfig};
+use kranz_slack::{AskOutcome, NotifyFlags, PlanOutcome, PlanningHost, SharedHost, SlackConfig};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -394,6 +394,10 @@ impl PlanningHost for FakeHost {
     fn merge<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, anyhow::Result<Value>> {
         self.merge_calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { Ok(json!({ "merged": true, "commit": "abc123" })) })
+    }
+
+    fn ask<'a>(&'a self, _question: &'a str) -> BoxFuture<'a, anyhow::Result<AskOutcome>> {
+        Box::pin(async { unreachable!("ticket tests never call ask") })
     }
 }
 

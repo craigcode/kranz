@@ -268,6 +268,7 @@ mod tests {
             goal: "g".into(),
             validation_contract: vec![],
             milestones: vec![],
+            considered_alternatives: None,
             command_grants: vec![],
             touch_set: vec![],
         }

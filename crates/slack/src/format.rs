@@ -309,9 +309,22 @@ pub struct PlanReview {
     pub goal: String,
     pub milestone_titles: Vec<String>,
     pub assertion_count: usize,
+    pub considered_alternatives: Option<PlanAlternativesReview>,
     /// Optional one-line calibrated cost/time estimate string (rendered as
     /// context when present).
     pub estimate: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlanAlternativesReview {
+    pub chosen: String,
+    pub rejected: Vec<RejectedAlternativeReview>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RejectedAlternativeReview {
+    pub approach: String,
+    pub trade_off: String,
 }
 
 /// Slack truncates and mis-renders very long single strings; keep any one field
@@ -989,6 +1002,23 @@ pub fn build_plan_review(p: &PlanReview) -> Vec<Value> {
         section(&format!("*Goal*\n{}", clip(p.goal.trim()))),
         section(&format!("*Milestones*\n{}", clip(milestones.trim_end()))),
     ];
+    if let Some(alternatives) = &p.considered_alternatives {
+        let mut body = format!("*Chosen:* {}", alternatives.chosen.trim());
+        if !alternatives.rejected.is_empty() {
+            body.push_str("\n*Rejected:*");
+            for rejected in &alternatives.rejected {
+                body.push_str(&format!(
+                    "\n• {} — {}",
+                    rejected.approach.trim(),
+                    rejected.trade_off.trim()
+                ));
+            }
+        }
+        blocks.push(section(&format!(
+            "*Considered alternatives*\n{}",
+            clip(&body)
+        )));
+    }
     let mut meta = format!(
         "{} validation assertion{} · mission `{}`",
         p.assertion_count,
@@ -1046,6 +1076,7 @@ pub fn build_help() -> Vec<Value> {
              • `/kranz work run` — trigger the queue drain through the host (progress posts per mission)\n\
              • `/kranz status` — show the pipeline snapshot; `/kranz status <id>` shows one mission\n\
              • `/kranz todo` — show operator pipeline actions and human-only gates\n\
+             • `/kranz ask <question>` — ask a grounded, read-only question about mission/ticket state\n\
              • `/kranz ticket <title>` — file a new backlog ticket\n\
              • `/kranz ticket list` — list backlog tickets\n\
              • `/kranz ticket show <slug>` — show a ticket's detail\n\
@@ -1669,6 +1700,7 @@ mod tests {
             goal: "Rate-limit the notes API".into(),
             milestone_titles: vec!["Token bucket".into(), "429 responses".into()],
             assertion_count: 3,
+            considered_alternatives: None,
             estimate: Some("~$4.50 · ~12 min".into()),
         });
         let text = all_text(&blocks);
@@ -1702,6 +1734,7 @@ mod tests {
             goal: "g".into(),
             milestone_titles: vec![],
             assertion_count: 1,
+            considered_alternatives: None,
             estimate: None,
         });
         let text = all_text(&blocks);

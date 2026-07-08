@@ -194,8 +194,25 @@ fn simple_plan(features: usize, contract: Vec<Assertion>) -> Plan {
                 })
                 .collect(),
         }],
+        considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
+    }
+}
+
+fn considered_alternatives() -> ConsideredAlternatives {
+    ConsideredAlternatives {
+        chosen: "single integrated slice with tests at the acceptance boundary".to_string(),
+        rejected: vec![
+            RejectedAlternative {
+                approach: "big-bang rewrite".to_string(),
+                trade_off: "too much review surface for one approval".to_string(),
+            },
+            RejectedAlternative {
+                approach: "docs-only spike".to_string(),
+                trade_off: "would not deliver the requested behavior".to_string(),
+            },
+        ],
     }
 }
 
@@ -1917,6 +1934,60 @@ async fn plan_approval_writes_plan_branch_and_commit() {
     assert!(err.to_string().contains("Planning"), "got: {err}");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn approve_plan_requires_considered_alternatives_for_large_scope() {
+    let (_dir, root) = init_repo();
+    let backend = Arc::new(MockBackend::new());
+    let cfg = MissionConfig {
+        considered_alternatives_feature_threshold: 2,
+        considered_alternatives_touch_set_threshold: 0,
+        considered_alternatives_high_usd_threshold: 0.0,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+
+    let err = engine.approve_plan(simple_plan(2, vec![])).unwrap_err();
+    assert!(
+        err.to_string().contains("considered alternatives required"),
+        "large-scope refusal names the missing review material: {err}"
+    );
+    assert_eq!(engine.state().mission.status, MissionStatus::Planning);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn approve_plan_persists_considered_alternatives_when_required() {
+    let (_dir, root) = init_repo();
+    let backend = Arc::new(MockBackend::new());
+    let cfg = MissionConfig {
+        considered_alternatives_feature_threshold: 2,
+        considered_alternatives_touch_set_threshold: 0,
+        considered_alternatives_high_usd_threshold: 0.0,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    let mission_id = engine.mission_id().to_string();
+    let mut plan = simple_plan(2, vec![]);
+    plan.considered_alternatives = Some(considered_alternatives());
+
+    engine.approve_plan(plan).unwrap();
+
+    let plan_text = std::fs::read_to_string(engine.paths().plan_file()).unwrap();
+    let written: Plan = serde_json::from_str(&plan_text).unwrap();
+    assert!(
+        written.considered_alternatives.is_some(),
+        "plan.json carries the review section"
+    );
+    let md = std::fs::read_to_string(
+        root.join(".kranz")
+            .join("missions")
+            .join(&mission_id)
+            .join("plan.md"),
+    )
+    .unwrap();
+    assert!(md.contains("## Considered alternatives"), "{md}");
+    assert!(md.contains("big-bang rewrite"), "{md}");
+}
+
 /// Once a prior mission has COMPLETED in the repo, a later `approve_plan`'s
 /// plan.md cites calibrated params (not the built-in defaults) and the
 /// "based on N completed mission(s)" provenance wording.
@@ -2940,6 +3011,7 @@ async fn approve_revised_plan_rejects_dropping_a_completed_milestone() {
                 }],
             },
         ],
+        considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
     };
@@ -2973,6 +3045,7 @@ async fn approve_revised_plan_rejects_dropping_a_completed_milestone() {
                 validation_criteria: vec!["part 2 works".to_string()],
             }],
         }],
+        considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
     };
@@ -3010,6 +3083,7 @@ async fn approve_revised_plan_rejects_dropping_a_completed_milestone() {
                 }],
             },
         ],
+        considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
     };

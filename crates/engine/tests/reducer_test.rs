@@ -58,6 +58,7 @@ fn plan() -> Plan {
                 features: vec![feature("gamma")],
             },
         ],
+        considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
     }
@@ -1307,6 +1308,7 @@ fn prop_plan() -> Plan {
                 features: vec![feature("c"), feature("d")],
             },
         ],
+        considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
     }
