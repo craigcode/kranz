@@ -518,7 +518,13 @@ pub fn build_revision_ready(r: &RevisionReady, dashboard_url: Option<&str>) -> V
             "Revision {} proposed — {}",
             r.revision, r.mission_id
         )),
-        section(&format!("*Instructions*\n{}", clip(r.instructions.trim()))),
+        // Instructions are untrusted operator input: escape Slack control
+        // sequences (<!channel>, <@Uxxx>, <url|label>) so a revision request
+        // can't inject broadcast pings or misleading links into the card.
+        section(&format!(
+            "*Instructions*\n{}",
+            clip(&escape_mrkdwn(r.instructions.trim()))
+        )),
         section(&format!(
             "*Revised milestones*\n{}",
             clip(milestones.trim_end())

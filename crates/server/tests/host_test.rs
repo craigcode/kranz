@@ -839,6 +839,29 @@ async fn revision_routes_expose_diff_and_enqueue_decisions() {
         kranz_engine::types::ControlCommand::ApproveRevision { revision: 1 }
     ));
 
+    // `drain` is non-destructive, so the approve command above is still queued;
+    // clear the inbox so the reject assertion sees only its own command. The
+    // pending revision lives in the event log, so the mission is still
+    // revisable and the reject route mirrors approve but selects RejectRevision.
+    for (path, _) in kranz_engine::control::drain(&MissionPaths::new(&root, "m-rev")).unwrap() {
+        std::fs::remove_file(path).unwrap();
+    }
+    let (status, body) = post_json(
+        &app,
+        "/api/missions/m-rev/revision/reject",
+        Some(TOKEN),
+        json!({ "revision": 1 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(body["queued"], true);
+    let drained = kranz_engine::control::drain(&MissionPaths::new(&root, "m-rev")).unwrap();
+    assert_eq!(drained.len(), 1);
+    assert!(matches!(
+        drained[0].1,
+        kranz_engine::types::ControlCommand::RejectRevision { revision: 1 }
+    ));
+
     let (status, body) = post_json(
         &app,
         "/api/missions/m-rev/revise",

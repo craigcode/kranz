@@ -688,6 +688,136 @@ fn msg_rejects_unknown_mission() {
     assert!(commands::cmd_msg(tmp.path(), "m-none", "x", false).is_err());
 }
 
+#[test]
+fn revision_commands_enqueue_for_a_revisable_mission() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+
+    // An approved mission (past Planning) accepts a revision request.
+    write_events(
+        repo,
+        "m-1",
+        vec![
+            created_kind("goal", "m-1"),
+            EventKind::PlanApproved {
+                plan: sample_plan(),
+                base_sha: None,
+            },
+        ],
+    );
+    commands::cmd_request_revision(repo, "m-1", "drop feature two").unwrap();
+    let files = queued_json_files(repo, "m-1");
+    assert_eq!(files.len(), 1);
+    let value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&files[0]).unwrap()).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({ "kind": "request-revision", "instructions": "drop feature two" })
+    );
+
+    // A mission with a pending revision 1 accepts approve and reject at that
+    // number (separate missions so each control inbox holds exactly one).
+    for (mission, cmd, expected) in [
+        (
+            "m-2",
+            "approve",
+            serde_json::json!({ "kind": "approve-revision", "revision": 1 }),
+        ),
+        (
+            "m-3",
+            "reject",
+            serde_json::json!({ "kind": "reject-revision", "revision": 1 }),
+        ),
+    ] {
+        write_events(
+            repo,
+            mission,
+            vec![
+                created_kind("goal", mission),
+                EventKind::PlanApproved {
+                    plan: sample_plan(),
+                    base_sha: None,
+                },
+                EventKind::PlanRevisionProposed {
+                    revision: 1,
+                    plan: sample_plan(),
+                    instructions: "seed".into(),
+                },
+            ],
+        );
+        if cmd == "approve" {
+            commands::cmd_approve_revision(repo, mission, 1).unwrap();
+        } else {
+            commands::cmd_reject_revision(repo, mission, 1).unwrap();
+        }
+        let files = queued_json_files(repo, mission);
+        assert_eq!(files.len(), 1, "{mission}");
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&files[0]).unwrap()).unwrap();
+        assert_eq!(value, expected, "{mission}");
+    }
+}
+
+#[test]
+fn revision_commands_reject_bad_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+
+    // Planning-only mission: no approved plan to revise yet.
+    write_events(repo, "m-plan", vec![created_kind("goal", "m-plan")]);
+    assert!(commands::cmd_request_revision(repo, "m-plan", "x").is_err());
+
+    // Approved mission with no pending revision.
+    write_events(
+        repo,
+        "m-1",
+        vec![
+            created_kind("goal", "m-1"),
+            EventKind::PlanApproved {
+                plan: sample_plan(),
+                base_sha: None,
+            },
+        ],
+    );
+    assert!(
+        commands::cmd_request_revision(repo, "m-1", "   ").is_err(),
+        "empty instructions are refused"
+    );
+    assert!(
+        commands::cmd_approve_revision(repo, "m-1", 1).is_err(),
+        "no pending revision to approve"
+    );
+    assert!(
+        commands::cmd_reject_revision(repo, "m-1", 1).is_err(),
+        "no pending revision to reject"
+    );
+
+    // Pending revision 1, but the operator names the wrong number.
+    write_events(
+        repo,
+        "m-2",
+        vec![
+            created_kind("goal", "m-2"),
+            EventKind::PlanApproved {
+                plan: sample_plan(),
+                base_sha: None,
+            },
+            EventKind::PlanRevisionProposed {
+                revision: 1,
+                plan: sample_plan(),
+                instructions: "seed".into(),
+            },
+        ],
+    );
+    assert!(
+        commands::cmd_approve_revision(repo, "m-2", 2).is_err(),
+        "revision number must match the pending one"
+    );
+
+    // Unknown mission.
+    assert!(commands::cmd_request_revision(repo, "m-none", "x").is_err());
+}
+
 // ---------------------------------------------------------------------------
 // Control-command targeting (pause/resume/msg refuse terminal missions —
 // their inbox is never drained, so "success" there would be a silent no-op)
