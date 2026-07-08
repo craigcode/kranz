@@ -1073,6 +1073,19 @@ impl MissionEngine {
         let estimate = cost::estimate(&plan, &self.state.config, &calibration.params);
         let estimate = cost::apply_shape(estimate, &plan, &calibration);
         validate_considered_alternatives(&plan, &estimate, &self.state.config)?;
+        // repo-knowledge-store slice 1: research.md is soft-prompted over the
+        // considered-alternatives threshold, not gated. Surface the gap in
+        // telemetry so we can see (before hardening) how often over-threshold
+        // drafts arrive without a research artifact.
+        if self.pending_research.is_none()
+            && considered_alternatives_requirement(&plan, &estimate, &self.state.config).is_some()
+        {
+            tracing::warn!(
+                mission = %self.state.mission.id,
+                "approving an over-threshold plan with no research.md (research is \
+                 soft-prompted, not gated)"
+            );
+        }
 
         // Git first: if anything fails here, no event was emitted and
         // approve_plan can simply be retried.
@@ -1321,6 +1334,16 @@ impl MissionEngine {
                 let estimate = cost::estimate(&plan, &self.state.config, &calibration.params);
                 let estimate = cost::apply_shape(estimate, &plan, &calibration);
                 validate_considered_alternatives(&plan, &estimate, &self.state.config)?;
+                if self.pending_research.is_none()
+                    && considered_alternatives_requirement(&plan, &estimate, &self.state.config)
+                        .is_some()
+                {
+                    tracing::warn!(
+                        mission = %self.state.mission.id,
+                        "revising to an over-threshold plan with no research.md (research is \
+                         soft-prompted, not gated)"
+                    );
+                }
                 validate_revised_plan_for_gate(&self.state.mission, &plan)?;
                 let revision = self.state.latest_plan_revision + 1;
                 self.emit(EventKind::PlanRevisionProposed {
