@@ -26,3 +26,18 @@ kranz-engine (repo meta-lesson).
 ## Scoping answers
 
 ## Acceptance hints
+
+## Outcome
+
+Seatbelt cannot enforce the requested hostname egress allowlist. Live
+`sandbox-exec` verification rejects rules like
+`(remote tcp "api.anthropic.com:443")` before the sandboxed command starts,
+requiring `*` or `localhost` hosts instead. A `*:443` rule would be a broad
+network permission, not the containment boundary this ticket asked for.
+
+Current implementation therefore fails closed: macOS `enforce: "fs+net"` is
+unsupported, the resolver returns no sandbox with a refusal warning, and
+worker/validator runner construction errors before launching a backend
+session. Future macOS egress containment should move to a different mechanism
+(container backend, app-layer proxy, or packet-filter integration) rather than
+claiming Seatbelt hostname allowlisting works.

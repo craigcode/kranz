@@ -980,6 +980,44 @@ async fn run_worker_seeds_scratch_home_and_config_dir_worker_env_hygiene() {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn run_worker_refuses_unsupported_macos_fs_net_sandbox() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    let mut log = seeded_log(&p);
+    let mut cfg = MissionConfig::default();
+    cfg.worker.sandbox.enforce = kranz_engine::types::SandboxEnforce::FsNet;
+
+    let backend =
+        MockBackend::with_scripts(vec![MockScript::single_shot_json(&worker_report_json())]);
+    let err = run_worker(
+        &backend,
+        &mut log,
+        &p,
+        &cfg,
+        &feature(),
+        "ship the auth system",
+        "Auth",
+        None,
+        None,
+        None,
+        &[],
+        AuthVerdict::Inconclusive,
+    )
+    .await
+    .unwrap_err();
+
+    let message = err.to_string();
+    assert!(message.contains("fs+net"), "{message}");
+    assert!(message.contains("unsupported"), "{message}");
+    assert!(message.contains("refusing"), "{message}");
+    assert!(
+        backend.started_specs().is_empty(),
+        "unsupported sandbox enforcement must fail before launching a backend session"
+    );
+}
+
 #[tokio::test]
 async fn run_validator_builds_spec_permissions_and_parses_report() {
     let dir = tempfile::tempdir().unwrap();
@@ -1099,6 +1137,45 @@ async fn run_validator_rejects_non_validator_roles() {
     .await
     .unwrap_err();
     assert!(err.to_string().contains("validator role"), "got: {err}");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn run_validator_refuses_unsupported_macos_fs_net_sandbox() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    let mut log = seeded_log(&p);
+    let mut cfg = MissionConfig::default();
+    cfg.validator_scrutiny.sandbox.enforce = kranz_engine::types::SandboxEnforce::FsNet;
+    let backend = MockBackend::with_scripts(vec![MockScript::single_shot_json(
+        &json!({ "findings": [], "summary": "not reached" }),
+    )]);
+
+    let err = run_validator(
+        &backend,
+        &mut log,
+        &p,
+        &cfg,
+        Role::ValidatorScrutiny,
+        &milestone(),
+        &[],
+        "abc123",
+        None,
+        None,
+        &[],
+        &[],
+    )
+    .await
+    .unwrap_err();
+
+    let message = err.to_string();
+    assert!(message.contains("fs+net"), "{message}");
+    assert!(message.contains("unsupported"), "{message}");
+    assert!(message.contains("refusing"), "{message}");
+    assert!(
+        backend.started_specs().is_empty(),
+        "unsupported sandbox enforcement must fail before launching a validator session"
+    );
 }
 
 /// Contract commands must admit their natural reinvocations (observed live:

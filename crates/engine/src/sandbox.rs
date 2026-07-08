@@ -1,9 +1,12 @@
 //! OS sandbox profile/argv generation — Tier 2 filesystem/network containment.
 //! See docs/scoping/worker-sandboxing.md tier 2.
 //!
-//! macOS uses Seatbelt (`sandbox-exec`). Linux uses bubblewrap for filesystem
-//! isolation; `fs+net` fails closed with `--unshare-net` because bwrap alone
-//! cannot express a hostname egress allowlist.
+//! macOS uses Seatbelt (`sandbox-exec`) for filesystem isolation. Seatbelt
+//! cannot express hostname egress allowlists (it accepts only `*`/`localhost`
+//! network hosts), so `fs+net` is refused on macOS rather than pretending to
+//! contain network access. Linux uses bubblewrap for filesystem isolation;
+//! `fs+net` fails closed with `--unshare-net` because bwrap alone cannot
+//! express a hostname egress allowlist.
 
 use std::path::{Path, PathBuf};
 
@@ -35,8 +38,8 @@ pub enum SandboxDecision {
     Off,
     /// Enforcement is requested and the platform supports it.
     Enforce(SandboxBackend),
-    /// Enforcement is requested but the platform can't honor it; the caller
-    /// should warn once and proceed unsandboxed.
+    /// Enforcement is requested but the platform can't honor it; run-level
+    /// callers must refuse rather than proceed unsandboxed.
     UnsupportedWarn,
 }
 
@@ -55,10 +58,11 @@ fn enforce_label(enforce: crate::types::SandboxEnforce) -> &'static str {
 pub fn platform_support(enforce: crate::types::SandboxEnforce, target_os: &str) -> SandboxDecision {
     match enforce {
         crate::types::SandboxEnforce::Off => SandboxDecision::Off,
-        crate::types::SandboxEnforce::Fs | crate::types::SandboxEnforce::FsNet
-            if target_os == "macos" =>
-        {
+        crate::types::SandboxEnforce::Fs if target_os == "macos" => {
             SandboxDecision::Enforce(SandboxBackend::Seatbelt)
+        }
+        crate::types::SandboxEnforce::FsNet if target_os == "macos" => {
+            SandboxDecision::UnsupportedWarn
         }
         crate::types::SandboxEnforce::Fs | crate::types::SandboxEnforce::FsNet
             if target_os == "linux" =>
@@ -93,7 +97,7 @@ fn expand_tilde(raw: &str) -> PathBuf {
 /// one session, plus an optional one-time warning string.
 ///
 /// Returns `(Some(ResolvedSandbox), None)` when enforcement is requested and
-/// supported (macOS), `(None, None)` when enforcement is off, and
+/// supported, `(None, None)` when enforcement is off, and
 /// `(None, Some(warning))` when enforcement is requested but unsupported on
 /// this platform.
 pub fn resolve_for_session(
@@ -122,14 +126,14 @@ fn resolve_for_session_target(
         SandboxDecision::UnsupportedWarn => (
             None,
             Some(format!(
-                "sandbox enforce:{} requested but unsupported on target_os={target_os}; running unsandboxed",
+                "sandbox enforce:{} requested but unsupported on target_os={target_os}; refusing to run unsandboxed",
                 enforce_label(role_sandbox.enforce)
             )),
         ),
         SandboxDecision::Enforce(SandboxBackend::Bubblewrap) if !bwrap_available => (
             None,
             Some(format!(
-                "sandbox enforce:{} requested on linux but `bwrap` was not found; running unsandboxed",
+                "sandbox enforce:{} requested on linux but `bwrap` was not found; refusing to run unsandboxed",
                 enforce_label(role_sandbox.enforce)
             )),
         ),
@@ -219,7 +223,10 @@ pub fn effective_egress(configured: &[String]) -> Vec<String> {
 /// Generate an SBPL profile: deny-by-default, broad read, write limited to
 /// subpaths of `session_cwd`, `mission_dir`, `tmpdir`, and each `extra_write`
 /// entry. `fs` allows network; `fs+net` restricts outbound TCP to the
-/// configured egress list plus the default Anthropic endpoints.
+/// configured egress list plus the default Anthropic endpoints. macOS no
+/// longer resolves `fs+net` to Seatbelt because `sandbox-exec` rejects those
+/// hostname rules; this generator remains covered so the fail-closed proof can
+/// exercise the rejected profile shape.
 pub fn generate_profile(inputs: &SandboxInputs) -> String {
     let write_paths = write_allowlist(inputs);
 
@@ -302,6 +309,82 @@ pub fn write_profile_file(dir: &Path, profile: &str) -> std::io::Result<PathBuf>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    use std::sync::Mutex;
+
+    #[cfg(target_os = "macos")]
+    static SANDBOX_EXEC_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(target_os = "macos")]
+    fn sandbox_exec_can_apply() -> bool {
+        let found = std::process::Command::new("which")
+            .arg("sandbox-exec")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !found {
+            eprintln!("sandbox-exec not found on this host; skipping");
+            return false;
+        }
+
+        let smoke = std::process::Command::new("sandbox-exec")
+            .arg("-p")
+            .arg("(version 1)\n(allow default)\n")
+            .arg("/usr/bin/true")
+            .output();
+        match smoke {
+            Ok(output) if output.status.success() => true,
+            Ok(output) => {
+                eprintln!(
+                    "sandbox-exec cannot apply a smoke profile on this host; skipping: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                false
+            }
+            Err(e) => {
+                eprintln!("sandbox-exec smoke probe failed; skipping: {e}");
+                false
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn bwrap_can_apply() -> bool {
+        if !command_available("bwrap") {
+            eprintln!("bwrap not found on this host; skipping");
+            return false;
+        }
+
+        let smoke = std::process::Command::new("bwrap")
+            .args([
+                "--die-with-parent",
+                "--ro-bind",
+                "/",
+                "/",
+                "--dev",
+                "/dev",
+                "--proc",
+                "/proc",
+                "--",
+                "/bin/true",
+            ])
+            .output();
+        match smoke {
+            Ok(output) if output.status.success() => true,
+            Ok(output) => {
+                eprintln!(
+                    "bwrap cannot apply a smoke sandbox on this host; skipping: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                false
+            }
+            Err(e) => {
+                eprintln!("bwrap smoke probe failed; skipping: {e}");
+                false
+            }
+        }
+    }
 
     fn inputs(
         session_cwd: &Path,
@@ -455,7 +538,7 @@ mod tests {
         );
         assert_eq!(
             platform_support(SandboxEnforce::FsNet, "macos"),
-            SandboxDecision::Enforce(SandboxBackend::Seatbelt)
+            SandboxDecision::UnsupportedWarn
         );
         assert_eq!(
             platform_support(SandboxEnforce::FsNet, "linux"),
@@ -551,16 +634,32 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn sandbox_resolve_fs_net_on_macos_refuses_hostname_egress() {
+        let cfg = crate::types::SandboxConfig {
+            enforce: crate::types::SandboxEnforce::FsNet,
+            extra_write: vec![],
+            egress: vec![],
+        };
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+
+        let (resolved, warn) = resolve_for_session(&cfg, session.path(), mission.path());
+
+        assert!(resolved.is_none());
+        let warn = warn.expect("fs+net on macOS should produce a warning");
+        assert!(warn.contains("fs+net"), "{warn}");
+        assert!(warn.contains("unsupported"), "{warn}");
+        assert!(warn.contains("refusing"), "{warn}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn sandbox_enforcement_macos_allows_inside_denies_outside() {
         use std::process::Command;
 
-        if Command::new("which")
-            .arg("sandbox-exec")
-            .output()
-            .map(|o| !o.status.success())
-            .unwrap_or(true)
-        {
-            eprintln!("sandbox-exec not found on this host; skipping");
+        let _guard = SANDBOX_EXEC_TEST_LOCK.lock().unwrap();
+
+        if !sandbox_exec_can_apply() {
             return;
         }
 
@@ -600,6 +699,98 @@ mod tests {
             .arg(format!("echo hi > {}", outside_file.display()))
             .status()
             .expect("failed to run sandbox-exec");
+        assert!(
+            !outside_status.success(),
+            "expected write outside allowlist to be denied"
+        );
+        assert!(
+            !outside_file.exists(),
+            "denied write must not have created the file"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "run alone: an invalid hostname profile can poison later sandbox-exec calls in this test binary"]
+    fn sandbox_enforcement_macos_fs_net_hostname_profile_fails_closed() {
+        use std::process::Command;
+
+        let _guard = SANDBOX_EXEC_TEST_LOCK.lock().unwrap();
+
+        if !sandbox_exec_can_apply() {
+            return;
+        }
+
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut inputs = inputs(session.path(), mission.path(), tmp.path(), vec![]);
+        inputs.enforce = crate::types::SandboxEnforce::FsNet;
+
+        let profile = generate_profile(&inputs);
+        let profile_dir = tempfile::tempdir().unwrap();
+        let profile_path = write_profile_file(profile_dir.path(), &profile).unwrap();
+
+        let denied = Command::new("sandbox-exec")
+            .arg("-f")
+            .arg(&profile_path)
+            .arg("/usr/bin/true")
+            .output()
+            .expect("failed to run sandbox-exec");
+        assert!(
+            !denied.status.success(),
+            "hostname-based fs+net profile must fail closed on macOS rather than run with invalid egress rules"
+        );
+        let stderr = String::from_utf8_lossy(&denied.stderr);
+        assert!(
+            stderr.contains("host must be * or localhost"),
+            "unexpected sandbox-exec error for hostname egress limitation: {stderr}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandbox_enforcement_linux_bwrap_allows_inside_denies_outside() {
+        use std::process::Command;
+
+        if !bwrap_can_apply() {
+            return;
+        }
+
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let inputs = inputs(session.path(), mission.path(), tmp.path(), vec![]);
+
+        let inside_file = session.path().join("inside.txt");
+        let inside_args = bubblewrap_args(
+            &inputs,
+            Path::new("/bin/sh"),
+            &["-c".into(), format!("echo hi > {}", inside_file.display())],
+        );
+        let inside_status = Command::new("bwrap")
+            .args(inside_args)
+            .status()
+            .expect("failed to run bwrap");
+        assert!(
+            inside_status.success(),
+            "expected write inside session_cwd to succeed"
+        );
+        assert!(inside_file.exists(), "expected inside file to be created");
+
+        let outside_file = outside
+            .path()
+            .join(format!("kranz_bwrap_should_fail_{}", uuid::Uuid::new_v4()));
+        let outside_args = bubblewrap_args(
+            &inputs,
+            Path::new("/bin/sh"),
+            &["-c".into(), format!("echo hi > {}", outside_file.display())],
+        );
+        let outside_status = Command::new("bwrap")
+            .args(outside_args)
+            .status()
+            .expect("failed to run bwrap");
         assert!(
             !outside_status.success(),
             "expected write outside allowlist to be denied"

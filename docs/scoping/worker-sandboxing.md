@@ -65,11 +65,17 @@ All of it asks the agent nicely. None of it constrains the process.
 
 - **macOS**: generate a Seatbelt profile per session (`sandbox-exec`):
   write allowlist = worktree + mission control dir + `TMPDIR` (+ opt-in
-  toolchain caches: `~/.cargo`, npm cache); network limited to the Anthropic
-  API plus a mission-config egress allowlist (package registries when the
-  contract needs builds).
-- **Linux**: bubblewrap equivalent (same allowlists; landlock considered if
-  bwrap is unavailable).
+  toolchain caches: `~/.cargo`, npm cache). `enforce: "fs"` is supported.
+  `enforce: "fs+net"` is now explicitly refused: live verification showed
+  Seatbelt rejects hostname egress rules such as
+  `(remote tcp "api.anthropic.com:443")` with `host must be * or localhost`.
+  A broad `*:443` rule is not a useful containment boundary, so macOS network
+  allowlisting needs a different backend (container/proxy/pf) before it can be
+  claimed.
+- **Linux**: bubblewrap equivalent for the same filesystem allowlists.
+  `enforce: "fs+net"` fails closed with `--unshare-net` because bwrap alone
+  cannot express a hostname allowlist; if `bwrap` is missing, kranz refuses
+  requested enforcement rather than falling back to unsandboxed execution.
 - **Windows**: explicitly out of scope for the first pass (restricted
   tokens/AppContainer are a different project); documented, not silent.
 - Config per role:
@@ -82,15 +88,16 @@ All of it asks the agent nicely. None of it constrains the process.
   global config, npm). Mitigation: detected-toolchain allowlist defaults +
   a preflight probe that runs the contract's validation commands under the
   profile and reports failures as preflight issues, not mid-run mysteries.
-- **Shipped (macOS, `enforce: "fs"`)**: Seatbelt profile generation
-  (`crate::sandbox::generate_profile`), the per-role `sandbox` config surface,
-  the enforced `claude` spawn wrap (`backend_claude` shells out via
-  `sandbox-exec -f <profile>` when a role opts in), and the mission preflight
-  probe described above (`MissionEngine::preflight` runs each distinct
-  contract `command` assertion under the generated worker profile and
-  surfaces a `warn` `PreflightIssue` for any that fail under it — advisory
-  only, never blocking). `fs+net` egress allowlisting, Linux bwrap parity, and
-  Windows support remain open (see Sequencing below).
+- **Shipped**: Seatbelt profile generation for macOS `enforce: "fs"`
+  (`crate::sandbox::generate_profile`), bubblewrap wrapping for Linux
+  `enforce: "fs"` / `"fs+net"`, the per-role `sandbox` config surface, the
+  enforced `claude` spawn wrap, and the mission preflight probe described
+  above (`MissionEngine::preflight` runs each distinct contract `command`
+  assertion under the generated worker profile and surfaces a `warn`
+  `PreflightIssue` for any that fail under it — advisory only, never
+  blocking). Requested enforcement that cannot resolve to an OS sandbox now
+  fails closed before launching a worker or validator. macOS `fs+net` hostname
+  egress allowlisting and Windows support remain open (see Sequencing below).
 
 ### Tier 3 — container backend (the Gas City / fleet stepping stone)
 
@@ -106,8 +113,12 @@ All of it asks the agent nicely. None of it constrains the process.
 2. Out-of-contract write audit + finding class (Tier 1).
 3. Seatbelt profile generation + `sandbox` config surface, `enforce: "fs"`
    (Tier 2, macOS).
-4. Egress allowlist → `enforce: "fs+net"` (Tier 2, macOS).
-5. Linux bwrap parity (Tier 2).
+4. Egress allowlist → `enforce: "fs+net"` (Tier 2, macOS): blocked for the
+   Seatbelt backend by the hostname-egress limitation above; current behavior
+   is fail-closed refusal, not partial enforcement.
+5. Linux bwrap parity (Tier 2): implemented as filesystem allowlists plus
+   `--unshare-net` for `fs+net`; a live ubuntu runner remains the preferred
+   external proof.
 6. Container backend (Tier 3) — may defer into a City-driven milestone.
 
 Briefs 1–2 are pure-Rust engine work (gate `--workspace`, per the M5
@@ -116,12 +127,13 @@ meta-lesson). Briefs 3–5 need macOS/Linux runners to validate for real.
 ## Done when
 
 A deliberately hostile brief (instructed to write outside its scope and to
-call out to the network) run under `enforce: "fs+net"` leaves **zero writes
-outside its worktree + mission dir**, its blocked attempts surface as
-`out-of-contract-write` / preflight findings; a normal mission's contract
-commands (cargo test, npm build) still pass under the sandbox at under ~10%
-wall-clock overhead; and the primary checkout never changes branch during any
-mission, sequential included.
+call out to the network) run under a supported `enforce: "fs+net"` backend
+leaves **zero writes outside its worktree + mission dir**, its blocked attempts
+surface as `out-of-contract-write` / preflight findings; a normal mission's
+contract commands (cargo test, npm build) still pass under the sandbox at
+under ~10% wall-clock overhead; and the primary checkout never changes branch
+during any mission, sequential included. On macOS, `fs+net` does not satisfy
+this until a non-Seatbelt network backend exists.
 
 ## Open questions
 

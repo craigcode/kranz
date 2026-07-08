@@ -32,3 +32,14 @@ Also note: ingest scanning adds per-event regex+entropy cost on the write path
   asserts a SHA/base64/diff-hunk sample is NOT redacted.
 - Note write-path latency of the ingest scan at realistic event volume.
 - cargo test --workspace green.
+
+## Verification
+
+- Added fixture coverage for legitimate high-entropy operational text: commit
+  SHAs, SHA256 artifacts, base64 fixture prose, diff hunks, and structured
+  sandbox config.
+- Added committed-report sweep: `.kranz/missions/**/report.md` scanned with
+  zero findings. Local run audited 39 reports in ~60 ms.
+- Added an ignored lived-in checkout audit for gitignored runtime artifacts
+  (`report.md` + `events.jsonl`). Local run audited 77 artifacts / 13.7 MB in
+  ~1.7 s with zero findings.

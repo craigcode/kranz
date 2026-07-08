@@ -29,3 +29,20 @@ anyone relies on fs+net on macOS. Linux (`--unshare-net`) already fails closed.
   destination connects and a non-allowlisted one is refused; OR the profile is
   proven to fail closed and the hostname-egress limitation is documented.
 - cargo test --workspace green.
+
+## Verification
+
+Live macOS verification proved the second acceptance path: Seatbelt rejects
+the generated hostname egress profile at load time with `host must be * or
+localhost`. kranz now treats macOS `enforce: "fs+net"` as unsupported and
+refuses to launch workers or validators unsandboxed when that mode is
+requested.
+
+Regression coverage:
+- `sandbox_enforcement_macos_fs_net_hostname_profile_fails_closed` exercises
+  the rejected profile shape directly via `sandbox-exec`.
+- `sandbox_resolve_fs_net_on_macos_refuses_hostname_egress` locks the resolver
+  decision.
+- `run_worker_refuses_unsupported_macos_fs_net_sandbox` and
+  `run_validator_refuses_unsupported_macos_fs_net_sandbox` prove caller-level
+  fail-closed behavior before backend launch.

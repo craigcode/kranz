@@ -5,9 +5,11 @@
 //! char-boundary-safe truncation with multibyte input.
 
 use kranz_engine::scrub::{
-    filter_allowed, read_allowlist_text, scan_text, scan_unified_diff, scrub, scrub_and_truncate,
-    scrub_with_findings, truncate_chars,
+    filter_allowed, read_allowlist_text, scan_text, scan_text_at, scan_unified_diff, scrub,
+    scrub_and_truncate, scrub_with_findings, truncate_chars,
 };
+use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 const MARKER: &str = "[REDACTED]";
 const TRUNCATED: &str = "… [truncated]";
@@ -68,6 +70,86 @@ fn unified_diff_scan_only_checks_added_lines() {
     assert_eq!(findings.len(), 1);
     assert_eq!(findings[0].rule_id, "anthropic-api-key");
     assert_eq!(findings[0].location, ".env:2");
+}
+
+#[test]
+fn ingest_scanner_leaves_legitimate_high_entropy_operational_text() {
+    let text = "\
+commit 4b825dc642cb6eb9a060e54bf8d69288fbee4904
+artifact_sha256 = 04f8996da763b7a969b1028ee3007569eaf89c5b7cf7f9633d368973b66a5058
+base64 fixture: VGhpcyBpcyBhIG5vbi1zZWNyZXQgdGVzdCBmaXh0dXJlIHBheWxvYWQ=
+diff --git a/src/lib.rs b/src/lib.rs
+@@ -1,2 +1,2 @@
+-let old_revision = \"f572d396fae9206628714fb2ce00f72e94f2258f\";
++let new_revision = \"3b18e3e9c4d90f19aa6e7e64bb9d5a9f5ce7b443\";
+config = {\"backend\":\"codex\",\"model\":\"gpt-5-codex\",\"sandbox\":{\"enforce\":\"fs+net\"}}
+";
+
+    let scan = scrub_with_findings(text, "fixture");
+
+    assert_eq!(scan.redacted, text);
+    assert!(scan.findings.is_empty(), "{:?}", scan.findings);
+}
+
+#[test]
+fn ingest_scanner_leaves_committed_mission_reports_unchanged() {
+    let started = Instant::now();
+    let repo = workspace_root();
+    let reports = collect_named_files(&repo.join(".kranz").join("missions"), "report.md");
+
+    assert!(
+        reports.len() >= 5,
+        "expected committed mission reports to audit; found {}",
+        reports.len()
+    );
+    for report in &reports {
+        let text = std::fs::read_to_string(report).expect("read committed report");
+        let location = rel_path(&repo, report);
+        let findings = scan_text_at(&text, &location);
+        assert!(
+            findings.is_empty(),
+            "ingest scanner would redact legitimate committed report content in {location}: {findings:?}"
+        );
+    }
+    eprintln!(
+        "audited {} committed mission reports in {:?}",
+        reports.len(),
+        started.elapsed()
+    );
+}
+
+#[test]
+#[ignore = "audits gitignored local runtime events.jsonl logs from a lived-in checkout"]
+fn ingest_scanner_audits_local_runtime_artifacts() {
+    let started = Instant::now();
+    let repo = workspace_root();
+    let missions = repo.join(".kranz").join("missions");
+    let mut artifacts = collect_named_files(&missions, "report.md");
+    artifacts.extend(collect_named_files(&missions, "events.jsonl"));
+    artifacts.sort();
+
+    assert!(
+        !artifacts.is_empty(),
+        "expected at least one local mission artifact under {}",
+        missions.display()
+    );
+    let mut bytes = 0usize;
+    for path in &artifacts {
+        let text = std::fs::read_to_string(path).expect("read local mission artifact");
+        bytes += text.len();
+        let location = rel_path(&repo, path);
+        let findings = scan_text_at(&text, &location);
+        assert!(
+            findings.is_empty(),
+            "ingest scanner would redact local mission artifact content in {location}: {findings:?}"
+        );
+    }
+    eprintln!(
+        "audited {} local mission artifacts ({} bytes) in {:?}",
+        artifacts.len(),
+        bytes,
+        started.elapsed()
+    );
 }
 
 #[test]
@@ -419,4 +501,40 @@ fn scrub_and_truncate_scrubs_before_cutting() {
     );
     assert!(!out.contains("sk-ant-"), "{out}");
     assert!(out.ends_with(TRUNCATED), "{out}");
+}
+
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("engine crate lives under crates/engine")
+        .to_path_buf()
+}
+
+fn collect_named_files(root: &Path, name: &str) -> Vec<PathBuf> {
+    fn walk(dir: &Path, name: &str, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, name, out);
+            } else if path.file_name().and_then(|s| s.to_str()) == Some(name) {
+                out.push(path);
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    walk(root, name, &mut out);
+    out.sort();
+    out
+}
+
+fn rel_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned()
 }

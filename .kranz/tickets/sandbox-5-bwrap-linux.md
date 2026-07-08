@@ -26,3 +26,17 @@ kranz-engine (repo meta-lesson).
 ## Scoping answers
 
 ## Acceptance hints
+
+## Implementation notes
+
+The Linux path resolves `enforce: "fs"` and `"fs+net"` to bubblewrap when
+`bwrap` is available, shares the same filesystem write allowlist construction
+as Seatbelt, and adds `--unshare-net` for `fs+net` so network access fails
+closed instead of pretending to offer hostname egress. If `bwrap` is missing,
+requested enforcement now refuses before launch rather than running
+unsandboxed.
+
+Regression coverage locks the generated argv (`--ro-bind / /`, allowlisted
+`--bind` write roots, `--chdir`, and `--unshare-net`) and the missing-bwrap
+resolution path. A live ubuntu runner remains the external proof to add once
+CI has bubblewrap/user namespaces available.

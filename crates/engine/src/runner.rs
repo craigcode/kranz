@@ -41,8 +41,8 @@ use crate::permissions;
 use crate::prompts;
 use crate::scrub;
 use crate::types::{
-    Assertion, AssertionCheck, Feature, Milestone, MissionConfig, Role, RunResult, TokenUsage,
-    ValidatorReport, WorkerReport,
+    Assertion, AssertionCheck, Feature, Milestone, MissionConfig, Role, RoleConfig, RunResult,
+    SandboxEnforce, TokenUsage, ValidatorReport, WorkerReport,
 };
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
@@ -589,7 +589,7 @@ pub async fn run_worker_in(
         grants,
         paths.mission_dir(),
         auth_verdict,
-    );
+    )?;
     let mut target = LogTarget::Live(log);
     run_session_to(backend, spec, &mut target, paths, run_meta, cancel).await
 }
@@ -636,7 +636,7 @@ pub async fn run_worker_in_buffered(
         grants,
         paths.mission_dir(),
         auth_verdict,
-    );
+    )?;
     let mut target = LogTarget::Buffer(Vec::new());
     let outcome = run_session_to(backend, spec, &mut target, paths, run_meta, None).await?;
     let buffered = match target {
@@ -759,7 +759,7 @@ fn build_worker_spec(
     grants: &[String],
     mission_dir: std::path::PathBuf,
     auth_verdict: AuthVerdict,
-) -> (SessionSpec, RunMeta) {
+) -> Result<(SessionSpec, RunMeta)> {
     let role = Role::Worker;
     let role_cfg = cfg.role(role);
 
@@ -827,12 +827,7 @@ fn build_worker_spec(
         real_home.as_deref(),
         real_config_dir.as_deref(),
     );
-    let (sandbox, warn) =
-        crate::sandbox::resolve_for_session(&role_cfg.sandbox, session_cwd, &mission_dir);
-    if let Some(warn) = warn {
-        tracing::warn!("{warn}");
-    }
-    spec.sandbox = sandbox;
+    spec.sandbox = resolve_sandbox_or_refuse(role_cfg, session_cwd, &mission_dir)?;
     permissions::apply(permissions::for_role(role, cfg, &[], grants), &mut spec);
 
     let run_meta = RunMeta {
@@ -843,7 +838,7 @@ fn build_worker_spec(
         model: role_cfg.model.clone(),
         prompt_hash: prompts::hash(role),
     };
-    (spec, run_meta)
+    Ok((spec, run_meta))
 }
 
 /// Run one validator session for a milestone (plan §4.4/§4.6).
@@ -1000,12 +995,7 @@ pub async fn run_validator_in(
         sandbox: None,
     };
     spec.env = contract_env(base_sha);
-    let (sandbox, warn) =
-        crate::sandbox::resolve_for_session(&role_cfg.sandbox, session_cwd, &paths.mission_dir());
-    if let Some(warn) = warn {
-        tracing::warn!("{warn}");
-    }
-    spec.sandbox = sandbox;
+    spec.sandbox = resolve_sandbox_or_refuse(role_cfg, session_cwd, &paths.mission_dir())?;
     permissions::apply(
         permissions::for_role(kind, cfg, &combined_commands, grants),
         &mut spec,
@@ -1032,6 +1022,27 @@ fn bullet_list(items: &[String]) -> String {
         .map(|item| format!("- {item}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn resolve_sandbox_or_refuse(
+    role_cfg: &RoleConfig,
+    session_cwd: &std::path::Path,
+    mission_dir: &std::path::Path,
+) -> Result<Option<crate::sandbox::ResolvedSandbox>> {
+    let (sandbox, warn) =
+        crate::sandbox::resolve_for_session(&role_cfg.sandbox, session_cwd, mission_dir);
+    if let Some(warn) = warn.as_deref() {
+        tracing::warn!("{warn}");
+    }
+    if sandbox.is_none() && role_cfg.sandbox.enforce != SandboxEnforce::Off {
+        return Err(EngineError::Backend(warn.unwrap_or_else(|| {
+            format!(
+                "sandbox enforce:{:?} requested but no sandbox could be resolved; refusing to run unsandboxed",
+                role_cfg.sandbox.enforce
+            )
+        })));
+    }
+    Ok(sandbox)
 }
 
 #[cfg(test)]
