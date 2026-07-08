@@ -26,7 +26,7 @@ Done when: the acceptance mission completes unattended with every §5 criterion
 checked off; a fresh mission's estimate lands within 2× of its actual; every
 completed mission ends with a committed report.md.
 
-## M2 — Mission lifecycle completeness ◑ (hygiene+preflight shipped; re-planning = safe subset)
+## M2 — Mission lifecycle completeness ✅ (shipped 2026-07-08: mid-mission re-planning + hygiene + preflight)
 
 Live use exposed the lifecycle edges v1 cut.
 
