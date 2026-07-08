@@ -44,11 +44,11 @@ Format:
 
 ## Scoping-ready
 
-- **Repo knowledge store slice 1** - add `docs/knowledge/` conventions and `research.md` planning artifacts.
-  Why: It is the clean continuation from Factory AutoWiki research without outsourcing kranz's canonical knowledge layer.
-  Trigger: Start when the next capability lane beats cleanup on leverage.
-  Source: docs/scoping/repo-knowledge-store.md; .kranz/tickets/repo-knowledge-store-research.md
-  Ticket: repo-knowledge-store-research
+- **Repo knowledge store slices 2-3** - slice 1 (the `docs/knowledge/` vault + `research.md` artifacts) shipped 2026-07-08; next is slice 2 (ranked/capped knowledge injection into planning and M2 revision) then slice 3 (`kranz knowledge refresh` drift checks).
+  Why: Slice 1 made the knowledge browsable and captured; slice 2 is where it starts paying off — the planner stops rediscovering the repo every draft.
+  Trigger: Start when the next capability lane beats cleanup on leverage; slice 3 waits until enough notes exist to drift.
+  Source: docs/scoping/repo-knowledge-store.md
+  Ticket: none
 
 - **Gas City event dispatch and mission events** - after Stage 1, build the two stub-verifiable pack improvements.
   Why: Event dispatch lowers bead latency, and `kranz.mission.*` events make kranz a better City citizen without adopting beads as the core work model.

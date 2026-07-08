@@ -1,8 +1,13 @@
 # Persistent repo knowledge store for agents and humans
 
-Status: researched 2026-07-08. Decisions D-A through D-F are recommendations,
-not yet accepted operator decisions. Buildable as three slices after the cleanup
-tier; no code has shipped from this document.
+Status: **slice 1 shipped 2026-07-08** (commits `ae9084e` vault + `0cfb564`
+research.md). D-A (canonical `docs/knowledge/` shape), D-D (`research.md` beside
+plan artifacts), and D-E's freshness/provenance metadata are accepted and built;
+D-B/D-C/D-F remain recommendations for later slices. Remaining: slice 2
+(ranked/capped knowledge injection into planning + M2 revision) and slice 3
+(`kranz knowledge refresh` drift checks). One slice-1 simplification carried
+forward: `research.md` is soft-prompted over the considered-alternatives
+threshold, not hard-gated at approval — see "Open questions" #1.
 
 ## Why
 
