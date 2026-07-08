@@ -71,6 +71,12 @@ impl MissionPaths {
         self.mission_dir().join("estimate.json")
     }
 
+    /// Per-mission research evidence artifact (repo-knowledge-store slice 1),
+    /// committed beside `plan.md` on the mission branch when a plan is approved.
+    pub fn research_file(&self) -> PathBuf {
+        self.mission_dir().join("research.md")
+    }
+
     pub fn events_file(&self) -> PathBuf {
         self.mission_dir().join("events.jsonl")
     }

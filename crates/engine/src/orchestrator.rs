@@ -278,6 +278,12 @@ pub struct MissionEngine {
     /// planning seed's reply routinely ends with scoping questions the user
     /// must see. Drained by [`MissionEngine::take_seed_reply`].
     pending_seed_reply: Option<String>,
+    /// Research evidence extracted from the most recent Ready plan JSON, held
+    /// in memory until approval renders and commits `research.md` beside
+    /// `plan.md` (repo-knowledge-store slice 1). Not runtime-durable: it spans
+    /// the draft→approve window within one engine instance, which both the CLI
+    /// draft flow and the registry-held hosted flow keep alive.
+    pending_research: Option<Research>,
     /// Lazily-built [`crate::backend_codex::CodexBackend`] cache for roles
     /// whose `backend = "codex"`. `None` until the first successful probe; a
     /// failed probe is never cached (so a codex install that appears
@@ -377,6 +383,7 @@ impl MissionEngine {
             orch_transcript: None,
             orch_stall_timeout: DEFAULT_ORCH_STALL_TIMEOUT,
             pending_seed_reply: None,
+            pending_research: None,
             codex_backend: None,
             droid_backend: None,
             active_tree: None,
@@ -476,6 +483,7 @@ impl MissionEngine {
             orch_transcript: None,
             orch_stall_timeout: DEFAULT_ORCH_STALL_TIMEOUT,
             pending_seed_reply: None,
+            pending_research: None,
             codex_backend: None,
             droid_backend: None,
             active_tree: None,
@@ -1004,17 +1012,22 @@ impl MissionEngine {
     pub async fn request_plan(&mut self) -> Result<PlanRequest> {
         let message = format!(
             "Emit the plan now. Output ONLY a JSON object conforming exactly to this JSON \
-             Schema — no prose before or after:\n{}\n\n{}",
+             Schema — no prose before or after:\n{}\n\n{}\n\n{}",
             plan_schema(),
-            considered_alternatives_prompt_policy(&self.state.config)
+            considered_alternatives_prompt_policy(&self.state.config),
+            research_prompt_policy(&self.state.config)
         );
         let text = self.orch_turn(&message).await?;
         if let Some(plan) = runner::parse_report::<Plan>(&text) {
+            self.pending_research = extract_research(&text);
             return Ok(PlanRequest::Ready(plan));
         }
         let retry = self.orch_turn(JSON_RETRY_MSG).await?;
         match runner::parse_report::<Plan>(&retry) {
-            Some(plan) => Ok(PlanRequest::Ready(plan)),
+            Some(plan) => {
+                self.pending_research = extract_research(&retry);
+                Ok(PlanRequest::Ready(plan))
+            }
             // Prefer the retry's text (the model's latest word); fall back to
             // the first turn's when the retry came back empty. Both are
             // already scrubbed by pump_turn.
@@ -1092,6 +1105,12 @@ impl MissionEngine {
             &estimate,
             calibration.missions_used,
         );
+        // research.md (repo-knowledge-store slice 1): the evidence the
+        // orchestrator emitted with the plan, committed beside plan.md.
+        let research_md = self
+            .pending_research
+            .as_ref()
+            .map(|r| render_research_markdown(r, &self.state.mission.id));
 
         if worktree_mode {
             let (wt_path, wt_repo) = self.setup_mission_worktree()?;
@@ -1114,8 +1133,15 @@ impl MissionEngine {
                     chrono::Utc::now().date_naive(),
                 );
                 std::fs::write(&index, index_body)?;
+                let research_file = wt_paths.research_file();
+                let mut to_commit: Vec<&Path> =
+                    vec![plan_file.as_path(), plan_md.as_path(), index.as_path()];
+                if let Some(body) = &research_md {
+                    std::fs::write(&research_file, body)?;
+                    to_commit.push(research_file.as_path());
+                }
                 wt_repo.commit_paths(
-                    &[plan_file.as_path(), plan_md.as_path(), index.as_path()],
+                    &to_commit,
                     &format!("[kranz] approved plan for {}", self.state.mission.id),
                 )?;
                 Ok(())
@@ -1133,6 +1159,9 @@ impl MissionEngine {
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::write(&primary_plan_md, &plan_md_body)?;
+            if let Some(body) = &research_md {
+                std::fs::write(self.paths.research_file(), body)?;
+            }
         } else {
             let plan_file = self.paths.plan_file();
             if let Some(parent) = plan_file.parent() {
@@ -1149,11 +1178,19 @@ impl MissionEngine {
                 chrono::Utc::now().date_naive(),
             );
             std::fs::write(&index, index_body)?;
+            let research_file = self.paths.research_file();
+            let mut to_commit: Vec<&Path> =
+                vec![plan_file.as_path(), plan_md.as_path(), index.as_path()];
+            if let Some(body) = &research_md {
+                std::fs::write(&research_file, body)?;
+                to_commit.push(research_file.as_path());
+            }
             self.repo.commit_paths(
-                &[plan_file.as_path(), plan_md.as_path(), index.as_path()],
+                &to_commit,
                 &format!("[kranz] approved plan for {}", self.state.mission.id),
             )?;
         }
+        self.pending_research = None;
 
         // Persist the approval-time estimate so the completion report reuses
         // this exact number (M1): recomputing it later would compare actual
@@ -1241,18 +1278,23 @@ impl MissionEngine {
              features, same order); then revise the remaining milestones' features as the \
              current situation warrants (drop features no longer needed, add features now \
              required). Output ONLY a JSON object conforming exactly to this JSON Schema — \
-             no prose before or after:\n{}\n\n{}\n\n{}",
+             no prose before or after:\n{}\n\n{}\n\n{}\n\n{}",
             plan_schema(),
             considered_alternatives_prompt_policy(&self.state.config),
+            research_prompt_policy(&self.state.config),
             instructions_block
         );
         let text = self.orch_turn(&message).await?;
         if let Some(plan) = runner::parse_report::<Plan>(&text) {
+            self.pending_research = extract_research(&text);
             return Ok(PlanRequest::Ready(plan));
         }
         let retry = self.orch_turn(JSON_RETRY_MSG).await?;
         match runner::parse_report::<Plan>(&retry) {
-            Some(plan) => Ok(PlanRequest::Ready(plan)),
+            Some(plan) => {
+                self.pending_research = extract_research(&retry);
+                Ok(PlanRequest::Ready(plan))
+            }
             None => Ok(PlanRequest::NotReady(if retry.trim().is_empty() {
                 text
             } else {
@@ -1390,6 +1432,10 @@ impl MissionEngine {
             calibration.missions_used,
         );
         let revised_md_body = render_revised_plan_markdown(plan, &self.state.mission, &[], &[]);
+        let research_md = self
+            .pending_research
+            .as_ref()
+            .map(|r| render_research_markdown(r, &self.state.mission.id));
         let active_paths = self.active_paths();
         let plan_file = active_paths.plan_file();
         let plan_md = active_paths.plan_md_file();
@@ -1408,13 +1454,19 @@ impl MissionEngine {
             chrono::Utc::now().date_naive(),
         );
         std::fs::write(&index, index_body)?;
+        let research_file = active_paths.research_file();
+        let mut to_commit: Vec<&Path> = vec![
+            plan_file.as_path(),
+            plan_md.as_path(),
+            revised_md.as_path(),
+            index.as_path(),
+        ];
+        if let Some(body) = &research_md {
+            std::fs::write(&research_file, body)?;
+            to_commit.push(research_file.as_path());
+        }
         self.active_repo().commit_paths(
-            &[
-                plan_file.as_path(),
-                plan_md.as_path(),
-                revised_md.as_path(),
-                index.as_path(),
-            ],
+            &to_commit,
             &format!(
                 "[kranz] revised plan for {} (rev {revision})",
                 self.state.mission.id
@@ -1432,7 +1484,11 @@ impl MissionEngine {
                 self.paths.mission_dir().join("revised-plan.md"),
                 revised_md_body,
             )?;
+            if let Some(body) = &research_md {
+                std::fs::write(self.paths.research_file(), body)?;
+            }
         }
+        self.pending_research = None;
         Ok(())
     }
 
@@ -4706,6 +4762,131 @@ pub fn render_plan_markdown(
     md
 }
 
+/// The `research` evidence object the orchestrator may emit alongside the plan
+/// JSON (repo-knowledge-store slice 1). The [`Plan`] struct ignores it (no
+/// `deny_unknown_fields`); [`extract_research`] pulls it from the raw JSON so it
+/// can be rendered to `research.md` without adding a field to every `Plan`
+/// literal. All fields optional so a partial object still parses.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct Research {
+    files_read: Vec<String>,
+    sources: Vec<String>,
+    facts: Vec<ResearchFact>,
+    ambiguities: Vec<String>,
+    candidate_knowledge_updates: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct ResearchFact {
+    fact: String,
+    evidence: String,
+}
+
+impl Research {
+    fn is_empty(&self) -> bool {
+        self.files_read.is_empty()
+            && self.sources.is_empty()
+            && self.facts.is_empty()
+            && self.ambiguities.is_empty()
+            && self.candidate_knowledge_updates.is_empty()
+    }
+}
+
+/// Pull the optional `research` object out of the orchestrator's plan JSON.
+/// Returns `None` when absent, unparseable, or empty.
+fn extract_research(plan_text: &str) -> Option<Research> {
+    let value: serde_json::Value = runner::parse_report(plan_text)?;
+    let research: Research = serde_json::from_value(value.get("research")?.clone()).ok()?;
+    (!research.is_empty()).then_some(research)
+}
+
+/// Render a `research.md` audit artifact from the extracted evidence.
+fn render_research_markdown(research: &Research, mission_id: &str) -> String {
+    use std::fmt::Write as _;
+    let mut md = format!(
+        "# Research — {mission_id}\n\nEvidence behind the approved plan \
+         (roadmap M1 / repo-knowledge-store slice 1). Candidate knowledge updates \
+         feed `docs/knowledge/`.\n"
+    );
+    let list = |md: &mut String, title: &str, items: &[String]| {
+        let items: Vec<&str> = items
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if items.is_empty() {
+            return;
+        }
+        let _ = write!(md, "\n## {title}\n\n");
+        for it in items {
+            let _ = writeln!(md, "- {it}");
+        }
+    };
+    list(&mut md, "Files & docs read", &research.files_read);
+    list(&mut md, "External sources", &research.sources);
+    let facts: Vec<&ResearchFact> = research
+        .facts
+        .iter()
+        .filter(|f| !f.fact.trim().is_empty())
+        .collect();
+    if !facts.is_empty() {
+        let _ = write!(md, "\n## Facts\n\n");
+        for f in facts {
+            let fact = f.fact.trim();
+            let ev = f.evidence.trim();
+            if ev.is_empty() {
+                let _ = writeln!(md, "- {fact}");
+            } else {
+                let _ = writeln!(md, "- {fact} — `{ev}`");
+            }
+        }
+    }
+    list(&mut md, "Ambiguities & stale docs", &research.ambiguities);
+    list(
+        &mut md,
+        "Candidate knowledge updates",
+        &research.candidate_knowledge_updates,
+    );
+    md
+}
+
+/// Prompt policy asking the orchestrator to document its research for
+/// broad/expensive plans (mirrors [`considered_alternatives_prompt_policy`]'s
+/// triggers). The evidence lands in `research.md` beside `plan.md`.
+fn research_prompt_policy(cfg: &MissionConfig) -> String {
+    let mut triggers = Vec::new();
+    if cfg.considered_alternatives_feature_threshold > 0 {
+        triggers.push(format!(
+            "{}+ features",
+            cfg.considered_alternatives_feature_threshold
+        ));
+    }
+    if cfg.considered_alternatives_touch_set_threshold > 0 {
+        triggers.push(format!(
+            "{}+ touchSet patterns",
+            cfg.considered_alternatives_touch_set_threshold
+        ));
+    }
+    if cfg.considered_alternatives_high_usd_threshold > 0.0 {
+        triggers.push(format!(
+            "likely high estimate at or above ${:.2}",
+            cfg.considered_alternatives_high_usd_threshold
+        ));
+    }
+    if triggers.is_empty() {
+        return "The optional research object may be omitted.".to_string();
+    }
+    format!(
+        "Policy: if this plan crosses any large-scope trigger ({}) include a research object \
+         documenting filesRead, sources, facts (each with concise evidence: a path, command, or \
+         URL), ambiguities/stale docs found, and candidateKnowledgeUpdates (proposed docs/knowledge/ \
+         notes). Small plans may omit it.",
+        triggers.join(", ")
+    )
+}
+
 fn considered_alternatives_prompt_policy(cfg: &MissionConfig) -> String {
     let feature_threshold = cfg.considered_alternatives_feature_threshold;
     let touch_threshold = cfg.considered_alternatives_touch_set_threshold;
@@ -5999,6 +6180,27 @@ fn plan_schema() -> serde_json::Value {
                     }
                 }
             },
+            "research": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "filesRead": { "type": "array", "items": { "type": "string" } },
+                    "sources": { "type": "array", "items": { "type": "string" } },
+                    "facts": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "fact": { "type": "string" },
+                                "evidence": { "type": "string" }
+                            }
+                        }
+                    },
+                    "ambiguities": { "type": "array", "items": { "type": "string" } },
+                    "candidateKnowledgeUpdates": { "type": "array", "items": { "type": "string" } }
+                }
+            },
             "validationContract": {
                 "type": "array",
                 "items": {
@@ -6941,6 +7143,65 @@ mod tests {
                 "schema missing top-level key {key}"
             );
         }
+    }
+
+    #[test]
+    fn extract_research_pulls_the_optional_object() {
+        let text = r#"{
+            "goal": "g",
+            "milestones": [{"title":"m","features":[{"title":"f","spec":"s","validationCriteria":["c"]}]}],
+            "validationContract": [],
+            "research": {
+                "filesRead": ["crates/engine/src/orchestrator.rs"],
+                "sources": ["https://example.com"],
+                "facts": [{"fact":"the run loop folds events","evidence":"reducer.rs"}],
+                "ambiguities": ["stale doc X"],
+                "candidateKnowledgeUpdates": ["add architecture/run-loop.md"]
+            }
+        }"#;
+        let r = extract_research(text).expect("research present");
+        assert_eq!(r.files_read, vec!["crates/engine/src/orchestrator.rs"]);
+        assert_eq!(r.facts.len(), 1);
+        assert_eq!(r.facts[0].evidence, "reducer.rs");
+        assert_eq!(r.candidate_knowledge_updates.len(), 1);
+
+        // Absent research -> None.
+        let none = r#"{"goal":"g","milestones":[{"title":"m","features":[{"title":"f","spec":"s","validationCriteria":["c"]}]}],"validationContract":[]}"#;
+        assert!(extract_research(none).is_none());
+        // Empty research object -> None (nothing to render).
+        let empty = r#"{"goal":"g","milestones":[],"validationContract":[],"research":{}}"#;
+        assert!(extract_research(empty).is_none());
+    }
+
+    #[test]
+    fn render_research_markdown_lays_out_sections() {
+        let r = Research {
+            files_read: vec!["a.rs".into(), "  ".into()],
+            sources: vec![],
+            facts: vec![
+                ResearchFact {
+                    fact: "x holds".into(),
+                    evidence: "a.rs:10".into(),
+                },
+                ResearchFact {
+                    fact: "  ".into(),
+                    evidence: "".into(),
+                },
+            ],
+            ambiguities: vec!["doc drift".into()],
+            candidate_knowledge_updates: vec!["note Y".into()],
+        };
+        let md = render_research_markdown(&r, "m-1");
+        assert!(md.contains("# Research — m-1"), "{md}");
+        assert!(md.contains("## Files & docs read"));
+        assert!(md.contains("- a.rs"));
+        assert!(md.contains("## Facts"));
+        assert!(md.contains("- x holds — `a.rs:10`"), "{md}");
+        assert!(md.contains("## Ambiguities & stale docs"));
+        assert!(md.contains("- note Y"));
+        // Empty sources section is omitted; the blank fact is skipped.
+        assert!(!md.contains("## External sources"));
+        assert!(!md.contains("-  \n"));
     }
 
     /// F2: while `run()` idles in the `MissionStatus::Paused` poll branch, a
