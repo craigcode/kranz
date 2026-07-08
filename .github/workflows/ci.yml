@@ -39,6 +39,10 @@ jobs:
         working-directory: apps/dashboard
       - run: npm run build
         working-directory: apps/dashboard
+      - run: npm run test
+        working-directory: apps/dashboard
+      - run: npm run lint
+        working-directory: apps/dashboard
 
   # One real-model smoke mission, manual trigger only (costs tokens).
   smoke:

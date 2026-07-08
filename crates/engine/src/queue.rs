@@ -7,12 +7,11 @@
 //! (`.seq`) assigns the sequence number.
 //!
 //! Per-repo serialization is mandatory: missions share the working tree, so at
-//! most one may run at a time in a repo. [`is_repo_busy`] detects the currently
-//! RUNNING mission by finding any live `events.jsonl.lock` (a lock held by a
-//! process that is still alive), delegating to the event-log module's
-//! canonical liveness probe.
+//! most one may run at a time in a repo. Queue dispatchers acquire a repo-wide
+//! busy guard as part of claiming work, and [`is_repo_busy`] reports that guard
+//! (falling back to legacy live `events.jsonl.lock` detection).
 
-use crate::error::Result;
+use crate::error::{EngineError, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -254,6 +253,89 @@ pub fn contains(repo_root: &Path, mission_id: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Repo busy guard: one RUNNING mission per working tree
+// ---------------------------------------------------------------------------
+
+fn repo_busy_lock(repo_root: &Path) -> PathBuf {
+    queue_dir(repo_root).join(".repo.busy.lock")
+}
+
+fn repo_busy_mission_file(repo_root: &Path) -> PathBuf {
+    queue_dir(repo_root).join(".repo.busy.mission")
+}
+
+fn repo_busy_mission(repo_root: &Path) -> Option<String> {
+    std::fs::read_to_string(repo_busy_mission_file(repo_root))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn lock_held_for_repo(repo_root: &Path) -> EngineError {
+    let holder = is_repo_busy(repo_root).unwrap_or_else(|| "unknown".to_string());
+    EngineError::LockHeld(format!("repo is busy with mission {holder}"))
+}
+
+#[derive(Debug)]
+struct RepoBusyGuard {
+    lock_path: PathBuf,
+    mission_path: PathBuf,
+}
+
+impl RepoBusyGuard {
+    fn acquire(repo_root: &Path, mission_id: &str) -> Result<Self> {
+        std::fs::create_dir_all(queue_dir(repo_root))?;
+        let lock_path = repo_busy_lock(repo_root);
+        let mission_path = repo_busy_mission_file(repo_root);
+
+        for _ in 0..16 {
+            if legacy_mission_lock_busy(repo_root).is_some() {
+                return Err(lock_held_for_repo(repo_root));
+            }
+
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(mut file) => {
+                    use std::io::Write as _;
+                    write!(file, "{}", crate::event_log::current_lock_holder_record())?;
+                    file.sync_data()?;
+                    if let Err(e) = atomic_write(&mission_path, mission_id.as_bytes()) {
+                        let _ = std::fs::remove_file(&lock_path);
+                        return Err(e);
+                    }
+                    return Ok(Self {
+                        lock_path,
+                        mission_path,
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if lock_pid_is_alive(&lock_path) {
+                        return Err(lock_held_for_repo(repo_root));
+                    }
+                    let _ = std::fs::remove_file(&mission_path);
+                    let _ = std::fs::remove_file(&lock_path);
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        Err(EngineError::LockHeld(
+            "repo busy lock changed too often to acquire safely".to_string(),
+        ))
+    }
+}
+
+impl Drop for RepoBusyGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.mission_path);
+        let _ = std::fs::remove_file(&self.lock_path);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Claims: crash-safe hand-off from queue to dispatcher (review P1)
 // ---------------------------------------------------------------------------
 
@@ -267,6 +349,16 @@ pub struct Claim {
     pub entry: QueueEntry,
     claimed_path: PathBuf,
     original_path: PathBuf,
+    _repo_guard: Option<RepoBusyGuard>,
+}
+
+/// Result of atomically taking work with the repo-wide busy guard.
+#[derive(Debug)]
+pub enum ClaimFront {
+    Empty,
+    LostRace,
+    Busy { mission_id: String },
+    Claimed(Claim),
 }
 
 /// Atomically claim the front entry, if any. A lost rename race (a sibling
@@ -288,6 +380,7 @@ pub fn claim_front(repo_root: &Path) -> Option<Claim> {
                     entry,
                     claimed_path: claimed,
                     original_path: original,
+                    _repo_guard: None,
                 })
             }
             Err(_) => {
@@ -299,6 +392,37 @@ pub fn claim_front(repo_root: &Path) -> Option<Claim> {
     }
     tracing::warn!("claim_front: 16 consecutive claim failures; treating queue as unclaimable");
     None
+}
+
+/// Claim the front queue entry only if this repo is not already running a
+/// mission. The queue claim and repo busy guard travel together in [`Claim`],
+/// so the guard stays held until [`finish_claim`] or [`release_claim`] consumes
+/// it after the injected mission runner returns.
+pub fn claim_front_when_repo_free(repo_root: &Path) -> Result<ClaimFront> {
+    let had_front = peek(repo_root).is_some();
+    let Some(mut claim) = claim_front(repo_root) else {
+        return Ok(if had_front {
+            ClaimFront::LostRace
+        } else {
+            ClaimFront::Empty
+        });
+    };
+
+    match RepoBusyGuard::acquire(repo_root, &claim.entry.mission_id) {
+        Ok(guard) => {
+            claim._repo_guard = Some(guard);
+            Ok(ClaimFront::Claimed(claim))
+        }
+        Err(EngineError::LockHeld(_)) => {
+            let mission_id = is_repo_busy(repo_root).unwrap_or_else(|| "unknown".to_string());
+            release_claim(claim);
+            Ok(ClaimFront::Busy { mission_id })
+        }
+        Err(e) => {
+            release_claim(claim);
+            Err(e)
+        }
+    }
 }
 
 /// The mission ran to a terminal state (any outcome): retire the claim.
@@ -357,9 +481,21 @@ pub fn recover_dead_claims(repo_root: &Path) -> usize {
 }
 
 /// The mission id currently RUNNING in this repo, if any: detected by any
+/// repo-wide busy guard, falling back to any legacy
 /// `.kranz/missions/*/events.jsonl.lock` whose recorded pid is still alive.
-/// This enforces one-mission-at-a-time-per-repo.
 pub fn is_repo_busy(repo_root: &Path) -> Option<String> {
+    let repo_lock = repo_busy_lock(repo_root);
+    if repo_lock.exists() {
+        if lock_pid_is_alive(&repo_lock) {
+            return repo_busy_mission(repo_root).or_else(|| Some("unknown".to_string()));
+        }
+        let _ = std::fs::remove_file(repo_busy_mission_file(repo_root));
+        let _ = std::fs::remove_file(repo_lock);
+    }
+    legacy_mission_lock_busy(repo_root)
+}
+
+fn legacy_mission_lock_busy(repo_root: &Path) -> Option<String> {
     let missions = repo_root.join(".kranz").join("missions");
     let rd = std::fs::read_dir(&missions).ok()?;
     for entry in rd.flatten() {
@@ -420,5 +556,55 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
             let _ = std::fs::remove_file(&tmp);
             Err(e.into())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(mission_id: &str) -> QueueEntry {
+        QueueEntry {
+            mission_id: mission_id.to_string(),
+            ticket_slug: None,
+            priority: 2,
+            seq: 0,
+        }
+    }
+
+    #[test]
+    fn claim_front_when_repo_free_holds_repo_busy_until_claim_finishes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        enqueue(repo, entry("m-1")).unwrap();
+        enqueue(repo, entry("m-2")).unwrap();
+
+        let first = match claim_front_when_repo_free(repo).unwrap() {
+            ClaimFront::Claimed(claim) => claim,
+            other => panic!("expected first claim, got {other:?}"),
+        };
+        assert_eq!(first.entry.mission_id, "m-1");
+        assert_eq!(is_repo_busy(repo).as_deref(), Some("m-1"));
+
+        match claim_front_when_repo_free(repo).unwrap() {
+            ClaimFront::Busy { mission_id } => assert_eq!(mission_id, "m-1"),
+            other => panic!("expected repo-busy result, got {other:?}"),
+        }
+        assert!(
+            contains(repo, "m-2"),
+            "busy loser releases the queue claim instead of dropping work"
+        );
+
+        finish_claim(first);
+        assert_eq!(is_repo_busy(repo), None);
+
+        let second = match claim_front_when_repo_free(repo).unwrap() {
+            ClaimFront::Claimed(claim) => claim,
+            other => panic!("expected second claim after guard drop, got {other:?}"),
+        };
+        assert_eq!(second.entry.mission_id, "m-2");
+        finish_claim(second);
+        assert!(list(repo).is_empty());
+        assert_eq!(is_repo_busy(repo), None);
     }
 }

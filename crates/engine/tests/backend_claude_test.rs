@@ -985,7 +985,7 @@ mod sandbox_wrap {
     use super::*;
     use kranz_engine::backend_claude::sandbox_command;
     use kranz_engine::sandbox::{
-        generate_profile, write_profile_file, ResolvedSandbox, SandboxInputs,
+        generate_profile, write_profile_file, ResolvedSandbox, SandboxBackend, SandboxInputs,
     };
 
     #[test]
@@ -1072,12 +1072,17 @@ mod sandbox_wrap {
         let profile_dir = tempfile::tempdir().unwrap();
 
         let inputs = SandboxInputs {
+            enforce: kranz_engine::types::SandboxEnforce::Fs,
             session_cwd: session.path().to_path_buf(),
             mission_dir: mission.path().to_path_buf(),
             tmpdir: tmp.path().to_path_buf(),
             extra_write: vec![],
+            egress: vec![],
         };
-        let resolved = ResolvedSandbox { inputs };
+        let resolved = ResolvedSandbox {
+            backend: SandboxBackend::Seatbelt,
+            inputs,
+        };
 
         let profile = generate_profile(&resolved.inputs);
         let profile_path = write_profile_file(profile_dir.path(), &profile).unwrap();
@@ -1161,12 +1166,17 @@ mod sandbox_wrap {
         let script = write_script(script_dir.path(), "probe-claude.sh", &script_body);
 
         let inputs = SandboxInputs {
+            enforce: kranz_engine::types::SandboxEnforce::Fs,
             session_cwd: session.path().to_path_buf(),
             mission_dir: mission.path().to_path_buf(),
             tmpdir: tmp.path().to_path_buf(),
             extra_write: vec![],
+            egress: vec![],
         };
-        let resolved = ResolvedSandbox { inputs };
+        let resolved = ResolvedSandbox {
+            backend: SandboxBackend::Seatbelt,
+            inputs,
+        };
 
         let backend = ClaudeBackend::new(script);
         let mut spec = base_spec(PromptMode::SingleShot("hello".to_string()));

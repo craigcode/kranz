@@ -35,7 +35,9 @@ use kranz_engine::reducer;
 use kranz_engine::types::{ControlCommand, MissionState, MissionStatus};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
@@ -122,6 +124,34 @@ struct MissionCursor {
     last_seq: u64,
 }
 
+type PostFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+
+trait OutboundPoster {
+    fn post<'a>(
+        &'a mut self,
+        cfg: &'a SlackConfig,
+        client: &'a SlackClient,
+        threads: &'a SharedThreads,
+        mission_id: &'a str,
+        outbound: &'a Outbound,
+    ) -> PostFuture<'a>;
+}
+
+struct SlackPoster;
+
+impl OutboundPoster for SlackPoster {
+    fn post<'a>(
+        &'a mut self,
+        cfg: &'a SlackConfig,
+        client: &'a SlackClient,
+        threads: &'a SharedThreads,
+        mission_id: &'a str,
+        outbound: &'a Outbound,
+    ) -> PostFuture<'a> {
+        Box::pin(post_outbound(cfg, client, threads, mission_id, outbound))
+    }
+}
+
 /// Outbound loop: tail every mission under `repo_root`, posting classified
 /// notifications to Slack. Runs until `shutdown` resolves.
 ///
@@ -171,6 +201,30 @@ async fn poll_mission(
     mission_id: &str,
     cursors: &mut HashMap<String, MissionCursor>,
 ) -> Result<()> {
+    let mut poster = SlackPoster;
+    poll_mission_with_poster(
+        cfg,
+        client,
+        repo_root,
+        threads,
+        mission_id,
+        cursors,
+        &mut poster,
+    )
+    .await
+}
+
+/// Testable implementation of [`poll_mission`], with Slack posting injected so
+/// cursor retry semantics can be exercised without a live Slack endpoint.
+async fn poll_mission_with_poster(
+    cfg: &SlackConfig,
+    client: &SlackClient,
+    repo_root: &Path,
+    threads: &SharedThreads,
+    mission_id: &str,
+    cursors: &mut HashMap<String, MissionCursor>,
+    poster: &mut impl OutboundPoster,
+) -> Result<()> {
     let paths = MissionPaths::new(repo_root, mission_id);
     let events_path = paths.events_file();
     if !events_path.is_file() {
@@ -192,6 +246,7 @@ async fn poll_mission(
     let new_events = EventLog::read_events_after(&events_path, cursor.last_seq)?;
     for event in &new_events {
         // Advance the fold first so `classify` sees post-apply state.
+        let state_before_event = cursor.state.clone();
         if reducer::apply(&mut cursor.state, event).is_err() {
             // Re-fold up to this event and retry once; on failure, resync the
             // cursor to head and skip (never wedge the loop).
@@ -207,15 +262,20 @@ async fn poll_mission(
                 }
             }
         }
-        cursor.last_seq = event.seq;
 
         if let Some(outbound) = classify(event, &cursor.state, repo_root) {
             if class_enabled(&cfg.notify, outbound.class()) {
-                if let Err(e) = post_outbound(cfg, client, threads, mission_id, &outbound).await {
-                    tracing::warn!(mission = %mission_id, error = %e, "slack post failed");
+                if let Err(e) = poster
+                    .post(cfg, client, threads, mission_id, &outbound)
+                    .await
+                {
+                    cursor.state = state_before_event;
+                    tracing::warn!(mission = %mission_id, seq = event.seq, error = %e, "slack post failed; will retry");
+                    return Ok(());
                 }
             }
         }
+        cursor.last_seq = event.seq;
     }
     Ok(())
 }
@@ -307,6 +367,10 @@ pub async fn run_socket(
     });
 
     let mut backoff = BACKOFF_MIN;
+    // Bounded dedup of processed envelope ids persists across reconnects in
+    // this process. Slack may ack-timeout an envelope, reconnect, and redeliver
+    // it on the next socket; re-ack those ids without re-running side effects.
+    let mut seen = SeenEnvelopes::default();
     loop {
         tokio::select! {
             _ = &mut shutdown => {
@@ -315,7 +379,7 @@ pub async fn run_socket(
                 tracing::info!("slack inbound loop shutting down");
                 return;
             }
-            result = connect_once(&cfg, &client, &repo_root, &threads, &host, &stop, &health) => {
+            result = connect_once(&cfg, &client, &repo_root, &threads, &host, &stop, &mut seen, &health) => {
                 health.record_disconnected();
                 match result {
                     // Clean close requested by shutdown: exit.
@@ -362,6 +426,7 @@ pub async fn run_socket(
 ///   reconnects promptly (a rotated URL / blip is not a failure to reach Slack).
 /// - `Err(_)`    — never connected, or a protocol error mid-stream; the caller
 ///   reconnects after a growing backoff.
+#[allow(clippy::too_many_arguments)]
 async fn connect_once(
     cfg: &SlackConfig,
     client: &SlackClient,
@@ -369,6 +434,7 @@ async fn connect_once(
     threads: &SharedThreads,
     host: &Option<SharedHost>,
     stop: &Arc<Notify>,
+    seen: &mut SeenEnvelopes,
     health: &BridgeHealth,
 ) -> Result<bool> {
     let url = client
@@ -384,14 +450,9 @@ async fn connect_once(
         "slack Socket Mode connected"
     );
     let (mut write, mut read) = ws_stream.split();
-    // Bounded dedup of processed envelope ids: Slack redelivers an envelope if
-    // the ack is late, which for a claude-spawning action (NewMission) would
-    // otherwise create a DUPLICATE mission. Seen ids are re-acked but not
-    // re-dispatched. Bounded so a long-lived connection can't grow it forever.
-    let mut seen = SeenEnvelopes::default();
 
     pump_connection(
-        &mut read, &mut write, cfg, client, repo_root, threads, host, stop, &mut seen, health,
+        &mut read, &mut write, cfg, client, repo_root, threads, host, stop, seen, health,
     )
     .await
 }
@@ -3394,6 +3455,111 @@ mod tests {
         }
     }
 
+    struct FailOncePoster {
+        attempts: usize,
+        classes: Vec<NotifyClass>,
+    }
+
+    impl FailOncePoster {
+        fn new() -> Self {
+            Self {
+                attempts: 0,
+                classes: Vec::new(),
+            }
+        }
+    }
+
+    impl OutboundPoster for FailOncePoster {
+        fn post<'a>(
+            &'a mut self,
+            _cfg: &'a SlackConfig,
+            _client: &'a SlackClient,
+            _threads: &'a SharedThreads,
+            _mission_id: &'a str,
+            outbound: &'a Outbound,
+        ) -> PostFuture<'a> {
+            self.attempts += 1;
+            self.classes.push(outbound.class());
+            let fail = self.attempts == 1;
+            Box::pin(async move {
+                if fail {
+                    Err(anyhow::anyhow!("temporary Slack failure"))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn outbound_cursor_retries_failed_post_before_advancing() {
+        let tmp = TempDir::new().unwrap();
+        let mission_id = "m-retry";
+        seed_mission(tmp.path(), mission_id, "notify me");
+
+        let cfg = test_cfg();
+        let client = SlackClient::new(&cfg).unwrap();
+        let threads = SharedThreads::load(tmp.path()).unwrap();
+        let mut cursors = HashMap::new();
+        let mut poster = FailOncePoster::new();
+
+        poll_mission_with_poster(
+            &cfg,
+            &client,
+            tmp.path(),
+            &threads,
+            mission_id,
+            &mut cursors,
+            &mut poster,
+        )
+        .await
+        .unwrap();
+        assert_eq!(poster.attempts, 0, "initial seed does not replay history");
+        assert_eq!(cursors.get(mission_id).unwrap().last_seq, 1);
+
+        append_plan_approved(tmp.path(), mission_id, "notify me");
+
+        poll_mission_with_poster(
+            &cfg,
+            &client,
+            tmp.path(),
+            &threads,
+            mission_id,
+            &mut cursors,
+            &mut poster,
+        )
+        .await
+        .unwrap();
+        let cursor = cursors.get(mission_id).unwrap();
+        assert_eq!(poster.attempts, 1);
+        assert_eq!(poster.classes, vec![NotifyClass::PlanReady]);
+        assert_eq!(cursor.last_seq, 1, "failed post leaves cursor retryable");
+        assert_eq!(
+            cursor.state.last_seq, 1,
+            "failed post rolls folded state back with the cursor"
+        );
+
+        poll_mission_with_poster(
+            &cfg,
+            &client,
+            tmp.path(),
+            &threads,
+            mission_id,
+            &mut cursors,
+            &mut poster,
+        )
+        .await
+        .unwrap();
+        let cursor = cursors.get(mission_id).unwrap();
+        assert_eq!(poster.attempts, 2);
+        assert_eq!(
+            poster.classes,
+            vec![NotifyClass::PlanReady, NotifyClass::PlanReady]
+        );
+        assert_eq!(cursor.last_seq, 2);
+        assert_eq!(cursor.state.last_seq, 2);
+    }
+
     /// D-A: `is_ticket_slug` is the gate `Action::QueueTicket` uses to decide
     /// whether an arg is a backlog ticket at all.
     #[test]
@@ -3598,6 +3764,38 @@ mod tests {
         };
         let line = serde_json::to_string(&event).unwrap();
         std::fs::write(paths.events_file(), format!("{line}\n")).unwrap();
+    }
+
+    fn sample_plan(goal: &str) -> kranz_engine::types::Plan {
+        use kranz_engine::types::{Plan, PlanFeature, PlanMilestone};
+        Plan {
+            goal: goal.to_string(),
+            validation_contract: vec![],
+            milestones: vec![PlanMilestone {
+                title: "M1".into(),
+                features: vec![PlanFeature {
+                    title: "F1".into(),
+                    spec: "build it".into(),
+                    validation_criteria: vec!["works".into()],
+                }],
+            }],
+            command_grants: vec![],
+            touch_set: vec![],
+        }
+    }
+
+    fn append_plan_approved(repo_root: &Path, mission_id: &str, goal: &str) {
+        use kranz_engine::event_log::LockForce;
+        use kranz_engine::events::EventKind;
+
+        let paths = MissionPaths::new(repo_root, mission_id);
+        let mut log =
+            EventLog::acquire(&paths, mission_id, Duration::from_millis(0), LockForce::No).unwrap();
+        log.append(EventKind::PlanApproved {
+            plan: sample_plan(goal),
+            base_sha: None,
+        })
+        .unwrap();
     }
 
     /// Seed a mission that folds to [`MissionStatus::Complete`] — a `created`
@@ -4489,6 +4687,114 @@ mod tests {
         }
         assert!(seen.insert("env-a"), "evicted id counts as new again");
         assert!(seen.set.len() <= SeenEnvelopes::CAP + 1);
+    }
+
+    async fn pump_one_frame(
+        cfg: &SlackConfig,
+        client: &SlackClient,
+        repo_root: &Path,
+        threads: &SharedThreads,
+        seen: &mut SeenEnvelopes,
+        frame: Value,
+    ) {
+        let stop = Arc::new(Notify::new());
+        let health = BridgeHealth::new();
+        let mut read = futures_util::stream::iter(vec![Ok::<Message, std::convert::Infallible>(
+            Message::Text(frame.to_string()),
+        )]);
+        let mut write = futures_util::sink::drain::<Message>();
+
+        let result = pump_connection(
+            &mut read, &mut write, cfg, client, repo_root, threads, &None, &stop, seen, &health,
+        )
+        .await;
+        assert!(
+            matches!(result, Ok(false)),
+            "expected stream close after one frame, got {result:?}"
+        );
+    }
+
+    fn guidance_envelope(envelope_id: &str) -> Value {
+        json!({
+            "type": "events_api",
+            "envelope_id": envelope_id,
+            "payload": {
+                "event": {
+                    "type": "message",
+                    "channel": "C1",
+                    "user": "U1",
+                    "text": "please adjust",
+                    "thread_ts": "111.111",
+                    "ts": "111.222"
+                }
+            }
+        })
+    }
+
+    async fn drain_control_after_spawn(
+        repo_root: &Path,
+        mission_id: &str,
+    ) -> Vec<(PathBuf, ControlCommand)> {
+        let paths = MissionPaths::new(repo_root, mission_id);
+        for _ in 0..50 {
+            let drained = kranz_engine::control::drain(&paths).unwrap();
+            if !drained.is_empty() {
+                return drained;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Vec::new()
+    }
+
+    #[tokio::test]
+    async fn pump_connection_dedups_envelopes_across_reconnects() {
+        let tmp = TempDir::new().unwrap();
+        let mission_id = "m-reconnect";
+        seed_mission(tmp.path(), mission_id, "steer me");
+        append_plan_approved(tmp.path(), mission_id, "steer me");
+
+        let cfg = test_cfg();
+        let client = SlackClient::new(&cfg).unwrap();
+        let threads = SharedThreads::load(tmp.path()).unwrap();
+        threads.set(mission_id, "111.111");
+        let mut seen = SeenEnvelopes::default();
+
+        pump_one_frame(
+            &cfg,
+            &client,
+            tmp.path(),
+            &threads,
+            &mut seen,
+            guidance_envelope("env-redeliver"),
+        )
+        .await;
+        let drained = drain_control_after_spawn(tmp.path(), mission_id).await;
+        assert_eq!(drained.len(), 1, "first delivery enqueues guidance");
+        match &drained[0].1 {
+            ControlCommand::Msg { text, .. } => assert_eq!(text, "please adjust"),
+            other => panic!("expected guidance message, got {other:?}"),
+        }
+        assert!(seen.set.contains("env-redeliver"));
+        for (path, _) in drained {
+            std::fs::remove_file(path).unwrap();
+        }
+
+        pump_one_frame(
+            &cfg,
+            &client,
+            tmp.path(),
+            &threads,
+            &mut seen,
+            guidance_envelope("env-redeliver"),
+        )
+        .await;
+        tokio::task::yield_now().await;
+        let drained =
+            kranz_engine::control::drain(&MissionPaths::new(tmp.path(), mission_id)).unwrap();
+        assert!(
+            drained.is_empty(),
+            "redelivery after reconnect must be acked but not dispatched"
+        );
     }
 
     #[test]

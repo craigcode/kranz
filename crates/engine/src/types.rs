@@ -355,24 +355,23 @@ pub struct RoleConfig {
     /// the selected backend/model pair is supported for the role.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
-    /// Per-role macOS Seatbelt filesystem sandbox opt-in.
+    /// Per-role OS sandbox opt-in.
     #[serde(default)]
     pub sandbox: SandboxConfig,
 }
 
-/// Filesystem sandbox enforcement level for a role's sessions.
-///
-/// Only `Fs` is implemented by this ticket; a future `fs+net` variant is
-/// intentionally not yet a valid value (see `config::validate` tests).
+/// OS sandbox enforcement level for a role's sessions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum SandboxEnforce {
     #[default]
     Off,
     Fs,
+    #[serde(rename = "fs+net")]
+    FsNet,
 }
 
-/// Per-role macOS Seatbelt (`sandbox-exec`) filesystem sandbox config.
+/// Per-role OS sandbox config.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct SandboxConfig {
@@ -380,6 +379,9 @@ pub struct SandboxConfig {
     /// Extra paths the operator opts into as writable (e.g. "~/.cargo").
     /// Stored as raw strings; not expanded or canonicalized here.
     pub extra_write: Vec<String>,
+    /// Extra network destinations allowed under `enforce = "fs+net"` (for
+    /// example package registries). Stored as `host:port` strings.
+    pub egress: Vec<String>,
 }
 
 /// Which [`AgentBackend`](crate::backend::AgentBackend) drives a role's sessions.

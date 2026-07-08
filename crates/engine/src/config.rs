@@ -509,6 +509,7 @@ mod tests {
         ] {
             assert_eq!(role.sandbox.enforce, crate::types::SandboxEnforce::Off);
             assert!(role.sandbox.extra_write.is_empty());
+            assert!(role.sandbox.egress.is_empty());
         }
         assert!(validate(&cfg).is_ok());
     }
@@ -536,14 +537,19 @@ mod tests {
     #[test]
     fn sandbox_config_extra_write_roundtrips() {
         let mut cfg = MissionConfig::default();
-        cfg.worker.sandbox.enforce = crate::types::SandboxEnforce::Fs;
+        cfg.worker.sandbox.enforce = crate::types::SandboxEnforce::FsNet;
         cfg.worker.sandbox.extra_write = vec!["~/.cargo".into(), "~/.npm".into()];
+        cfg.worker.sandbox.egress = vec!["registry.npmjs.org:443".into()];
 
         let value = serde_json::to_value(&cfg).unwrap();
-        assert_eq!(value["worker"]["sandbox"]["enforce"], "fs");
+        assert_eq!(value["worker"]["sandbox"]["enforce"], "fs+net");
         assert_eq!(
             value["worker"]["sandbox"]["extraWrite"],
             serde_json::json!(["~/.cargo", "~/.npm"])
+        );
+        assert_eq!(
+            value["worker"]["sandbox"]["egress"],
+            serde_json::json!(["registry.npmjs.org:443"])
         );
 
         let roundtripped: MissionConfig = serde_json::from_value(value).unwrap();
@@ -551,21 +557,21 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_config_rejects_fs_plus_net() {
+    fn sandbox_config_parses_fs_plus_net() {
         let dir = tempfile::tempdir().unwrap();
         let layer_path = dir.path().join("config.json");
         std::fs::write(
             &layer_path,
-            r#"{"worker":{"sandbox":{"enforce":"fs+net"}}}"#,
+            r#"{"worker":{"sandbox":{"enforce":"fs+net","egress":["crates.io:443"]}}}"#,
         )
         .unwrap();
 
-        let err = load_layers(&[layer_path]).unwrap_err();
-        let message = err.to_string();
-        assert!(
-            message.contains("fs+net") || message.contains("enforce"),
-            "error should name the offending value or field, got: {message}"
+        let cfg = load_layers(&[layer_path]).unwrap();
+        assert_eq!(
+            cfg.worker.sandbox.enforce,
+            crate::types::SandboxEnforce::FsNet
         );
+        assert_eq!(cfg.worker.sandbox.egress, vec!["crates.io:443"]);
     }
 
     trait RoleConfigTestExt {

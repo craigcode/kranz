@@ -696,7 +696,10 @@ impl AgentBackend for ClaudeBackend {
         let args = build_args(&spec);
 
         let mut command = match &spec.sandbox {
-            Some(resolved) if cfg!(target_os = "macos") => {
+            Some(resolved)
+                if resolved.backend == crate::sandbox::SandboxBackend::Seatbelt
+                    && cfg!(target_os = "macos") =>
+            {
                 let profile = crate::sandbox::generate_profile(&resolved.inputs);
                 let profile_dir = resolved.inputs.mission_dir.clone();
                 let profile_path = crate::sandbox::write_profile_file(&profile_dir, &profile)
@@ -711,15 +714,24 @@ impl AgentBackend for ClaudeBackend {
                 command.args(&sandboxed_args);
                 command
             }
-            Some(_) => {
-                tracing::warn!(
-                    target_os = std::env::consts::OS,
-                    "sandbox enforce:fs requested but sandbox-exec wrapping is unavailable on \
-                     this platform; running unsandboxed"
-                );
-                let mut command = tokio::process::Command::new(&self.binary);
-                command.args(&args);
+            Some(resolved)
+                if resolved.backend == crate::sandbox::SandboxBackend::Bubblewrap
+                    && cfg!(target_os = "linux") =>
+            {
+                let mut command = tokio::process::Command::new("bwrap");
+                command.args(crate::sandbox::bubblewrap_args(
+                    &resolved.inputs,
+                    &self.binary,
+                    &args,
+                ));
                 command
+            }
+            Some(resolved) => {
+                return Err(EngineError::Backend(format!(
+                    "resolved sandbox backend {:?} is unavailable on target_os={}",
+                    resolved.backend,
+                    std::env::consts::OS
+                )));
             }
             None => {
                 let mut command = tokio::process::Command::new(&self.binary);

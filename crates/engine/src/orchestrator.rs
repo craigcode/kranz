@@ -644,18 +644,31 @@ impl MissionEngine {
             }
         }
 
-        // Sandbox preflight (f-2-3): when the worker role opts into fs
-        // enforcement and we're on macOS, actually run each distinct contract
-        // `command` assertion under the generated worker Seatbelt profile and
-        // surface a `warn` for any that fail under it — a profile/contract
-        // mismatch (e.g. the command writes outside the allowlist) is exactly
-        // the kind of thing an operator wants flagged before the mission runs
-        // workers for real. Best-effort and advisory only: never an `error`,
-        // never a block. `session_cwd` uses `self.paths.repo_root` (the
-        // primary checkout) as a cheap stand-in for the actual per-session
-        // worktree root, which does not exist yet at preflight time.
-        if self.state.config.worker.sandbox.enforce == crate::types::SandboxEnforce::Fs
-            && cfg!(target_os = "macos")
+        // Sandbox preflight (f-2-3/f-2-4): surface unsupported/missing
+        // sandbox tooling as a warning, and on macOS run each distinct
+        // contract `command` assertion under the generated worker Seatbelt
+        // profile. Best-effort and advisory only: never an `error`, never a
+        // block. `session_cwd` uses `self.paths.repo_root` (the primary
+        // checkout) as a cheap stand-in for the actual per-session worktree
+        // root, which does not exist yet at preflight time.
+        if self.state.config.worker.sandbox.enforce != crate::types::SandboxEnforce::Off {
+            let mission_dir = self.paths.mission_dir();
+            let (_resolved, warn) = crate::sandbox::resolve_for_session(
+                &self.state.config.worker.sandbox,
+                self.paths.repo_root.as_path(),
+                &mission_dir,
+            );
+            if let Some(warn) = warn {
+                issues.push(PreflightIssue {
+                    severity: "warn",
+                    message: warn,
+                });
+            }
+        }
+        if matches!(
+            self.state.config.worker.sandbox.enforce,
+            crate::types::SandboxEnforce::Fs | crate::types::SandboxEnforce::FsNet
+        ) && cfg!(target_os = "macos")
         {
             issues.extend(self.sandbox_command_preflight());
         }
@@ -679,6 +692,9 @@ impl MissionEngine {
         let Some(resolved) = resolved else {
             return Vec::new();
         };
+        if resolved.backend != crate::sandbox::SandboxBackend::Seatbelt {
+            return Vec::new();
+        }
         let profile = crate::sandbox::generate_profile(&resolved.inputs);
         let profile_path = match crate::sandbox::write_profile_file(&mission_dir, &profile)
             .or_else(|_| crate::sandbox::write_profile_file(&resolved.inputs.tmpdir, &profile))

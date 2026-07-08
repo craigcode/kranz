@@ -104,14 +104,12 @@ pub struct DrainReport {
     pub stopped_busy: bool,
 }
 
-/// Drain the per-repo queue one mission at a time. Reproduces the dispatch
-/// semantics of the pre-hoist `kranz work` CLI command exactly: recover dead
-/// claims once up front; then loop `queue::peek` + `queue::is_repo_busy` into
-/// [`next_work_action`]; on `Busy` either return (`once`) or sleep 5s and
-/// retry; on `Run`, claim the front atomically (retry after a brief sleep on
-/// a lost race), take the CLAIMED entry's mission id as authoritative, skip a
-/// ticket-born entry whose blocker failed (finish the claim + write ticket
-/// Failed), otherwise write ticket Running, invoke the injected
+/// Drain the per-repo queue one mission at a time. Recover dead claims once up
+/// front; then atomically claim the front entry with the repo-wide busy guard;
+/// on `Busy` either return (`once`) or sleep 5s and retry; on a lost claim race,
+/// retry after a brief sleep; on `Claimed`, take the CLAIMED entry's mission id
+/// as authoritative, skip a ticket-born entry whose blocker failed (finish the
+/// claim + write ticket Failed), otherwise write ticket Running, invoke the injected
 /// `run_mission`, then finish/release the claim (finish on success, finish on
 /// a ticket-born error so it doesn't re-claim forever, release on a bare-entry
 /// error so the work isn't lost), write the terminal ticket state, and honor
@@ -133,11 +131,13 @@ where
     let mut report = DrainReport::default();
     queue::recover_dead_claims(repo_root);
     loop {
-        let front = queue::peek(repo_root);
-        let busy = queue::is_repo_busy(repo_root);
-        match next_work_action(front.as_ref(), busy.as_deref()) {
-            WorkAction::Empty => return Ok(report),
-            WorkAction::Busy { .. } => {
+        match queue::claim_front_when_repo_free(repo_root)? {
+            queue::ClaimFront::Empty => return Ok(report),
+            queue::ClaimFront::LostRace => {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                continue;
+            }
+            queue::ClaimFront::Busy { .. } => {
                 if once {
                     report.stopped_busy = true;
                     return Ok(report);
@@ -145,17 +145,9 @@ where
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 continue;
             }
-            WorkAction::Run {
-                mission_id: _,
-                ticket_slug,
-            } => {
-                let Some(claim) = queue::claim_front(repo_root) else {
-                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                    continue;
-                };
-                // The front may have moved between peek and claim — the
-                // CLAIMED entry is authoritative, so run that one.
+            queue::ClaimFront::Claimed(claim) => {
                 let mission_id = claim.entry.mission_id.clone();
+                let ticket_slug = claim.entry.ticket_slug.clone();
                 if let Some(slug) = &ticket_slug {
                     if let Some(blocker) = work_skip_for_failed_blocker(repo_root, slug)? {
                         queue::finish_claim(claim);
@@ -415,6 +407,85 @@ mod tests {
         assert_eq!(report.ran.len(), 1);
         // One entry remains queued.
         assert_eq!(queue::list(repo).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_drain_queue_once_reports_busy_without_running_second_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        for i in 1..=2 {
+            queue::enqueue(
+                repo,
+                QueueEntry {
+                    mission_id: format!("mission-{i}"),
+                    ticket_slug: None,
+                    priority: 2,
+                    seq: 0,
+                },
+            )
+            .unwrap();
+        }
+
+        let first_runs = Arc::new(AtomicUsize::new(0));
+        let release_first = Arc::new(tokio::sync::Notify::new());
+        let first_repo = repo.to_path_buf();
+        let first = {
+            let first_runs = first_runs.clone();
+            let release_first = release_first.clone();
+            tokio::spawn(async move {
+                drain_queue(&first_repo, true, move |mission_id| {
+                    let first_runs = first_runs.clone();
+                    let release_first = release_first.clone();
+                    async move {
+                        assert_eq!(mission_id, "mission-1");
+                        first_runs.fetch_add(1, Ordering::SeqCst);
+                        release_first.notified().await;
+                        Ok(0)
+                    }
+                })
+                .await
+            })
+        };
+
+        for _ in 0..50 {
+            if first_runs.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            first_runs.load(Ordering::SeqCst),
+            1,
+            "first drainer should be holding the repo guard"
+        );
+
+        let second_runs = Arc::new(AtomicUsize::new(0));
+        let second_runs_clone = second_runs.clone();
+        let second = drain_queue(repo, true, move |_mission_id| {
+            let second_runs = second_runs_clone.clone();
+            async move {
+                second_runs.fetch_add(1, Ordering::SeqCst);
+                Ok(0)
+            }
+        })
+        .await
+        .unwrap();
+        assert!(second.stopped_busy);
+        assert!(second.ran.is_empty());
+        assert_eq!(
+            second_runs.load(Ordering::SeqCst),
+            0,
+            "busy loser must not run the next queued mission"
+        );
+        assert!(
+            queue::contains(repo, "mission-2"),
+            "busy loser releases its temporary claim"
+        );
+
+        release_first.notify_waiters();
+        let first = first.await.unwrap().unwrap();
+        assert_eq!(first.ran, vec!["mission-1".to_string()]);
+        assert!(queue::contains(repo, "mission-2"));
     }
 
     #[tokio::test]

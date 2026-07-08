@@ -46,7 +46,7 @@ const RUST_GATES: [Gate; 3] = [
     },
 ];
 
-const DASHBOARD_GATES: [Gate; 3] = [
+const DASHBOARD_GATES: [Gate; 5] = [
     Gate {
         command: "npm ci",
         cwd_suffix: "apps/dashboard",
@@ -59,13 +59,22 @@ const DASHBOARD_GATES: [Gate; 3] = [
         command: "npm run build",
         cwd_suffix: "apps/dashboard",
     },
+    Gate {
+        command: "npm run test",
+        cwd_suffix: "apps/dashboard",
+    },
+    Gate {
+        command: "npm run lint",
+        cwd_suffix: "apps/dashboard",
+    },
 ];
 
 /// Runs the Kranz CI gate suite, matching `.github/workflows/ci.yml` exactly
 /// and in order: `cargo fmt --all --check`, `cargo clippy --workspace
 /// --all-targets -- -D warnings`, `cargo test --workspace`, and — only when
-/// `dashboard_touched` — `npm ci` / `npx tsc --noEmit` / `npm run build` run
-/// with cwd `apps/dashboard`. Stops at the first failing gate.
+/// `dashboard_touched` — `npm ci` / `npx tsc --noEmit` / `npm run build` /
+/// `npm run test` / `npm run lint` run with cwd `apps/dashboard`. Stops at
+/// the first failing gate.
 ///
 /// `executor` is called as `executor(command, cwd)` and must return
 /// `(success, combined_stdout_stderr)`; production callers wrap
@@ -149,10 +158,16 @@ mod tests {
         "cargo test --workspace",
     ];
 
-    const DASHBOARD_GATE_COMMANDS: [&str; 3] = ["npm ci", "npx tsc --noEmit", "npm run build"];
+    const DASHBOARD_GATE_COMMANDS: [&str; 5] = [
+        "npm ci",
+        "npx tsc --noEmit",
+        "npm run build",
+        "npm run test",
+        "npm run lint",
+    ];
 
     #[test]
-    fn all_gates_green_yields_passed_and_issues_all_four_ci_commands_in_order() {
+    fn all_gates_green_yields_passed_and_issues_all_ci_commands_in_order() {
         let repo_root = PathBuf::from("/repo");
         let exec = FakeExecutor::all_pass();
 
@@ -204,7 +219,7 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_not_touched_omits_all_three_dashboard_commands() {
+    fn dashboard_not_touched_omits_all_dashboard_commands() {
         let repo_root = PathBuf::from("/repo");
         let exec = FakeExecutor::all_pass();
 
@@ -236,11 +251,13 @@ mod tests {
         assert_eq!(result, GateSuiteResult::Passed);
 
         let calls = exec.calls.borrow();
-        assert_eq!(calls.len(), 6);
+        assert_eq!(calls.len(), 8);
         // dashboard commands come after the three rust gates, in order.
         assert_eq!(calls[3].0, "npm ci");
         assert_eq!(calls[4].0, "npx tsc --noEmit");
         assert_eq!(calls[5].0, "npm run build");
+        assert_eq!(calls[6].0, "npm run test");
+        assert_eq!(calls[7].0, "npm run lint");
         for (_, cwd) in calls.iter().skip(3) {
             assert_eq!(cwd, &repo_root.join("apps/dashboard"));
         }
@@ -264,6 +281,8 @@ mod tests {
                 "npm ci",
                 "npx tsc --noEmit",
                 "npm run build",
+                "npm run test",
+                "npm run lint",
             ]
         );
     }

@@ -1,18 +1,31 @@
-//! macOS Seatbelt (SBPL) sandbox profile generation — Tier 2 filesystem
-//! containment primitive. See docs/scoping/worker-sandboxing.md tier 2.
+//! OS sandbox profile/argv generation — Tier 2 filesystem/network containment.
+//! See docs/scoping/worker-sandboxing.md tier 2.
 //!
-//! This module only builds the profile string (and optionally writes it to
-//! disk); wiring it into the `claude` spawn is a separate feature.
+//! macOS uses Seatbelt (`sandbox-exec`). Linux uses bubblewrap for filesystem
+//! isolation; `fs+net` fails closed with `--unshare-net` because bwrap alone
+//! cannot express a hostname egress allowlist.
 
 use std::path::{Path, PathBuf};
 
-/// Inputs used to build a session's write-allowlist.
+/// Default egress needed by Claude/Anthropic sessions under `fs+net`.
+pub const DEFAULT_EGRESS: &[&str] = &["api.anthropic.com:443", "*.anthropic.com:443"];
+
+/// Inputs used to build a session sandbox.
 #[derive(Debug, Clone)]
 pub struct SandboxInputs {
+    pub enforce: crate::types::SandboxEnforce,
     pub session_cwd: PathBuf,
     pub mission_dir: PathBuf,
     pub tmpdir: PathBuf,
     pub extra_write: Vec<PathBuf>,
+    pub egress: Vec<String>,
+}
+
+/// Concrete OS sandbox backend selected for this session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxBackend {
+    Seatbelt,
+    Bubblewrap,
 }
 
 /// How a role's `enforce` setting maps onto the current platform.
@@ -20,11 +33,19 @@ pub struct SandboxInputs {
 pub enum SandboxDecision {
     /// Enforcement is off; no sandbox is attached.
     Off,
-    /// Enforcement is requested and the platform supports it (macOS).
-    Enforce,
+    /// Enforcement is requested and the platform supports it.
+    Enforce(SandboxBackend),
     /// Enforcement is requested but the platform can't honor it; the caller
     /// should warn once and proceed unsandboxed.
     UnsupportedWarn,
+}
+
+fn enforce_label(enforce: crate::types::SandboxEnforce) -> &'static str {
+    match enforce {
+        crate::types::SandboxEnforce::Off => "off",
+        crate::types::SandboxEnforce::Fs => "fs",
+        crate::types::SandboxEnforce::FsNet => "fs+net",
+    }
 }
 
 /// Pure decision fn: given a role's `enforce` setting and the target OS
@@ -34,22 +55,26 @@ pub enum SandboxDecision {
 pub fn platform_support(enforce: crate::types::SandboxEnforce, target_os: &str) -> SandboxDecision {
     match enforce {
         crate::types::SandboxEnforce::Off => SandboxDecision::Off,
-        crate::types::SandboxEnforce::Fs => {
-            if target_os == "macos" {
-                SandboxDecision::Enforce
-            } else {
-                SandboxDecision::UnsupportedWarn
-            }
+        crate::types::SandboxEnforce::Fs | crate::types::SandboxEnforce::FsNet
+            if target_os == "macos" =>
+        {
+            SandboxDecision::Enforce(SandboxBackend::Seatbelt)
+        }
+        crate::types::SandboxEnforce::Fs | crate::types::SandboxEnforce::FsNet
+            if target_os == "linux" =>
+        {
+            SandboxDecision::Enforce(SandboxBackend::Bubblewrap)
+        }
+        crate::types::SandboxEnforce::Fs | crate::types::SandboxEnforce::FsNet => {
+            SandboxDecision::UnsupportedWarn
         }
     }
 }
 
-/// A resolved, enforced filesystem sandbox for one session. Only produced
-/// when [`platform_support`] decides `Enforce`; the profile itself is
-/// generated from `inputs` at spawn time (a separate feature wires it into
-/// the `claude` spawn).
+/// A resolved, enforced sandbox for one session.
 #[derive(Debug, Clone)]
 pub struct ResolvedSandbox {
+    pub backend: SandboxBackend,
     pub inputs: SandboxInputs,
 }
 
@@ -76,16 +101,39 @@ pub fn resolve_for_session(
     session_cwd: &Path,
     mission_dir: &Path,
 ) -> (Option<ResolvedSandbox>, Option<String>) {
-    match platform_support(role_sandbox.enforce, std::env::consts::OS) {
+    resolve_for_session_target(
+        role_sandbox,
+        session_cwd,
+        mission_dir,
+        std::env::consts::OS,
+        command_available("bwrap"),
+    )
+}
+
+fn resolve_for_session_target(
+    role_sandbox: &crate::types::SandboxConfig,
+    session_cwd: &Path,
+    mission_dir: &Path,
+    target_os: &str,
+    bwrap_available: bool,
+) -> (Option<ResolvedSandbox>, Option<String>) {
+    match platform_support(role_sandbox.enforce, target_os) {
         SandboxDecision::Off => (None, None),
         SandboxDecision::UnsupportedWarn => (
             None,
             Some(format!(
-                "sandbox enforce:fs requested but unsupported on target_os={}; running unsandboxed",
-                std::env::consts::OS
+                "sandbox enforce:{} requested but unsupported on target_os={target_os}; running unsandboxed",
+                enforce_label(role_sandbox.enforce)
             )),
         ),
-        SandboxDecision::Enforce => {
+        SandboxDecision::Enforce(SandboxBackend::Bubblewrap) if !bwrap_available => (
+            None,
+            Some(format!(
+                "sandbox enforce:{} requested on linux but `bwrap` was not found; running unsandboxed",
+                enforce_label(role_sandbox.enforce)
+            )),
+        ),
+        SandboxDecision::Enforce(backend) => {
             let tmpdir = std::env::var_os("TMPDIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(std::env::temp_dir);
@@ -96,17 +144,27 @@ pub fn resolve_for_session(
                 .collect();
             (
                 Some(ResolvedSandbox {
+                    backend,
                     inputs: SandboxInputs {
+                        enforce: role_sandbox.enforce,
                         session_cwd: session_cwd.to_path_buf(),
                         mission_dir: mission_dir.to_path_buf(),
                         tmpdir,
                         extra_write,
+                        egress: role_sandbox.egress.clone(),
                     },
                 }),
                 None,
             )
         }
     }
+}
+
+fn command_available(name: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| dir.join(name).is_file())
 }
 
 /// Absolutize a path without requiring it to exist: canonicalize if possible,
@@ -126,20 +184,44 @@ fn absolutize(path: &Path) -> PathBuf {
 
 /// Escape a path for embedding in an SBPL string literal.
 fn escape_sbpl_literal(path: &Path) -> String {
-    let s = path.to_string_lossy();
+    escape_sbpl_string(&path.to_string_lossy())
+}
+
+fn escape_sbpl_string(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// Generate an SBPL profile: deny-by-default, broad read, write limited to
-/// subpaths of `session_cwd`, `mission_dir`, `tmpdir`, and each `extra_write`
-/// entry. Network is explicitly allowed (this tier is filesystem-only).
-pub fn generate_profile(inputs: &SandboxInputs) -> String {
+fn write_allowlist(inputs: &SandboxInputs) -> Vec<PathBuf> {
     let mut write_paths: Vec<PathBuf> = vec![
         absolutize(&inputs.session_cwd),
         absolutize(&inputs.mission_dir),
         absolutize(&inputs.tmpdir),
     ];
     write_paths.extend(inputs.extra_write.iter().map(|p| absolutize(p)));
+    write_paths.sort();
+    write_paths.dedup();
+    write_paths
+}
+
+/// Default Anthropic egress plus mission-configured additions, trimmed and
+/// de-duplicated in stable order.
+pub fn effective_egress(configured: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = DEFAULT_EGRESS.iter().map(|s| (*s).to_string()).collect();
+    for item in configured {
+        let item = item.trim();
+        if !item.is_empty() && !out.iter().any(|existing| existing == item) {
+            out.push(item.to_string());
+        }
+    }
+    out
+}
+
+/// Generate an SBPL profile: deny-by-default, broad read, write limited to
+/// subpaths of `session_cwd`, `mission_dir`, `tmpdir`, and each `extra_write`
+/// entry. `fs` allows network; `fs+net` restricts outbound TCP to the
+/// configured egress list plus the default Anthropic endpoints.
+pub fn generate_profile(inputs: &SandboxInputs) -> String {
+    let write_paths = write_allowlist(inputs);
 
     let mut profile = String::new();
     profile.push_str("(version 1)\n");
@@ -154,7 +236,21 @@ pub fn generate_profile(inputs: &SandboxInputs) -> String {
     profile.push('\n');
     profile.push_str("(allow file-read*)\n");
     profile.push('\n');
-    profile.push_str("(allow network*)\n");
+    match inputs.enforce {
+        crate::types::SandboxEnforce::FsNet => {
+            profile.push_str("(allow network-outbound\n");
+            for dest in effective_egress(&inputs.egress) {
+                profile.push_str(&format!(
+                    "  (remote tcp \"{}\")\n",
+                    escape_sbpl_string(&dest)
+                ));
+            }
+            profile.push_str(")\n");
+        }
+        crate::types::SandboxEnforce::Off | crate::types::SandboxEnforce::Fs => {
+            profile.push_str("(allow network*)\n");
+        }
+    }
     profile.push('\n');
     profile.push_str("(allow file-write*\n");
     for p in &write_paths {
@@ -163,6 +259,36 @@ pub fn generate_profile(inputs: &SandboxInputs) -> String {
     profile.push_str(")\n");
 
     profile
+}
+
+/// Build the bubblewrap argv tail for running `binary args` under the resolved
+/// sandbox. The caller uses program `bwrap` and passes this vector as args.
+pub fn bubblewrap_args(inputs: &SandboxInputs, binary: &Path, args: &[String]) -> Vec<String> {
+    let mut out = vec![
+        "--die-with-parent".to_string(),
+        "--ro-bind".to_string(),
+        "/".to_string(),
+        "/".to_string(),
+        "--dev".to_string(),
+        "/dev".to_string(),
+        "--proc".to_string(),
+        "/proc".to_string(),
+    ];
+    if inputs.enforce == crate::types::SandboxEnforce::FsNet {
+        out.push("--unshare-net".to_string());
+    }
+    for path in write_allowlist(inputs) {
+        let path = path.display().to_string();
+        out.push("--bind".to_string());
+        out.push(path.clone());
+        out.push(path);
+    }
+    out.push("--chdir".to_string());
+    out.push(absolutize(&inputs.session_cwd).display().to_string());
+    out.push("--".to_string());
+    out.push(binary.display().to_string());
+    out.extend(args.iter().cloned());
+    out
 }
 
 /// Write the profile to a uniquely-named file under `dir`, returning its path.
@@ -184,10 +310,12 @@ mod tests {
         extra: Vec<PathBuf>,
     ) -> SandboxInputs {
         SandboxInputs {
+            enforce: crate::types::SandboxEnforce::Fs,
             session_cwd: session_cwd.to_path_buf(),
             mission_dir: mission_dir.to_path_buf(),
             tmpdir: tmpdir.to_path_buf(),
             extra_write: extra,
+            egress: Vec::new(),
         }
     }
 
@@ -244,6 +372,63 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_profile_fs_net_uses_egress_allowlist() {
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut inputs = inputs(session.path(), mission.path(), tmp.path(), vec![]);
+        inputs.enforce = crate::types::SandboxEnforce::FsNet;
+        inputs.egress = vec!["crates.io:443".into(), "api.anthropic.com:443".into()];
+
+        let profile = generate_profile(&inputs);
+
+        assert!(!profile.contains("(allow network*)"));
+        assert!(profile.contains("(allow network-outbound"));
+        assert!(profile.contains("(remote tcp \"api.anthropic.com:443\")"));
+        assert!(profile.contains("(remote tcp \"*.anthropic.com:443\")"));
+        assert!(profile.contains("(remote tcp \"crates.io:443\")"));
+        assert_eq!(
+            profile.matches("api.anthropic.com:443").count(),
+            1,
+            "configured egress must not duplicate the default"
+        );
+    }
+
+    #[test]
+    fn bubblewrap_args_bind_write_roots_and_unshare_network_for_fs_net() {
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        let mut inputs = inputs(
+            session.path(),
+            mission.path(),
+            tmp.path(),
+            vec![extra.path().to_path_buf()],
+        );
+        inputs.enforce = crate::types::SandboxEnforce::FsNet;
+
+        let args = bubblewrap_args(&inputs, Path::new("/usr/bin/claude"), &["--print".into()]);
+        let joined = args.join(" ");
+
+        assert!(args.contains(&"--unshare-net".to_string()));
+        for path in [
+            absolutize(session.path()),
+            absolutize(mission.path()),
+            absolutize(tmp.path()),
+            absolutize(extra.path()),
+        ] {
+            assert!(
+                joined.contains(&format!("--bind {0} {0}", path.display())),
+                "bubblewrap args missing bind for {}: {args:?}",
+                path.display()
+            );
+        }
+        assert!(joined.contains("--ro-bind / /"));
+        assert!(joined.ends_with("/usr/bin/claude --print"));
+    }
+
+    #[test]
     fn sandbox_profile_write_profile_file_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let profile = "(version 1)\n(deny default)\n";
@@ -262,11 +447,19 @@ mod tests {
         );
         assert_eq!(
             platform_support(SandboxEnforce::Fs, "macos"),
-            SandboxDecision::Enforce
+            SandboxDecision::Enforce(SandboxBackend::Seatbelt)
         );
         assert_eq!(
             platform_support(SandboxEnforce::Fs, "linux"),
-            SandboxDecision::UnsupportedWarn
+            SandboxDecision::Enforce(SandboxBackend::Bubblewrap)
+        );
+        assert_eq!(
+            platform_support(SandboxEnforce::FsNet, "macos"),
+            SandboxDecision::Enforce(SandboxBackend::Seatbelt)
+        );
+        assert_eq!(
+            platform_support(SandboxEnforce::FsNet, "linux"),
+            SandboxDecision::Enforce(SandboxBackend::Bubblewrap)
         );
         assert_eq!(
             platform_support(SandboxEnforce::Off, "linux"),
@@ -279,6 +472,7 @@ mod tests {
         let cfg = crate::types::SandboxConfig {
             enforce: crate::types::SandboxEnforce::Off,
             extra_write: vec![],
+            egress: vec![],
         };
         let session = tempfile::tempdir().unwrap();
         let mission = tempfile::tempdir().unwrap();
@@ -288,12 +482,40 @@ mod tests {
         assert!(warn.is_none());
     }
 
+    #[test]
+    fn sandbox_resolve_linux_requires_bwrap() {
+        let cfg = crate::types::SandboxConfig {
+            enforce: crate::types::SandboxEnforce::Fs,
+            extra_write: vec![],
+            egress: vec![],
+        };
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+
+        let (resolved, warn) =
+            resolve_for_session_target(&cfg, session.path(), mission.path(), "linux", false);
+        assert!(resolved.is_none());
+        assert!(
+            warn.unwrap().contains("bwrap"),
+            "missing-bwrap warning should name bwrap"
+        );
+
+        let (resolved, warn) =
+            resolve_for_session_target(&cfg, session.path(), mission.path(), "linux", true);
+        assert!(warn.is_none());
+        assert_eq!(
+            resolved.expect("bwrap present").backend,
+            SandboxBackend::Bubblewrap
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn sandbox_resolve_fs_on_macos_yields_resolved_sandbox() {
         let cfg = crate::types::SandboxConfig {
             enforce: crate::types::SandboxEnforce::Fs,
             extra_write: vec![],
+            egress: vec![],
         };
         let session = tempfile::tempdir().unwrap();
         let mission = tempfile::tempdir().unwrap();
@@ -301,6 +523,7 @@ mod tests {
         let (resolved, warn) = resolve_for_session(&cfg, session.path(), mission.path());
         assert!(warn.is_none());
         let resolved = resolved.expect("expected an enforced sandbox on macos");
+        assert_eq!(resolved.backend, SandboxBackend::Seatbelt);
         assert_eq!(resolved.inputs.session_cwd, session.path());
         assert_eq!(resolved.inputs.mission_dir, mission.path());
         assert!(!resolved.inputs.tmpdir.as_os_str().is_empty());
@@ -312,6 +535,7 @@ mod tests {
         let cfg = crate::types::SandboxConfig {
             enforce: crate::types::SandboxEnforce::Fs,
             extra_write: vec!["~/.cargo".to_string()],
+            egress: vec![],
         };
         let session = tempfile::tempdir().unwrap();
         let mission = tempfile::tempdir().unwrap();

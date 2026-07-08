@@ -148,20 +148,11 @@ impl EventLog {
         // From here on we hold the lock; release it if the rest of the
         // acquisition fails so a failed open doesn't strand the mission.
         let mut open = || -> Result<EventLog> {
-            let acquired_secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
             // Line 1: pid. Line 2: acquire time (diagnostics only — reuse
             // detection is the token's job). Line 3: our own identity token,
             // where this platform can produce one; a probe that finds it
             // missing degrades to plain pid liveness, never to Dead.
-            let mut lock_contents = format!("{}\n{}\n", std::process::id(), acquired_secs);
-            if let Some(token) = process_identity_token(std::process::id() as i32) {
-                lock_contents.push_str(&token);
-                lock_contents.push('\n');
-            }
-            lock_file.write_all(lock_contents.as_bytes())?;
+            lock_file.write_all(current_lock_holder_record().as_bytes())?;
             lock_file.flush()?;
 
             let events_path = paths.events_file();
@@ -641,6 +632,21 @@ pub fn lock_holder_is_alive(lock_path: &Path) -> bool {
         LockLiveness::Dead => false,
         LockLiveness::Alive | LockLiveness::Unknown => true,
     }
+}
+
+/// Lock-file contents for a lock held by the current process, in the same
+/// format parsed by [`lock_holder_is_alive`].
+pub fn current_lock_holder_record() -> String {
+    let acquired_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut contents = format!("{}\n{}\n", std::process::id(), acquired_secs);
+    if let Some(token) = process_identity_token(std::process::id() as i32) {
+        contents.push_str(&token);
+        contents.push('\n');
+    }
+    contents
 }
 
 /// Liveness verdict for the process recorded in a lock file.
