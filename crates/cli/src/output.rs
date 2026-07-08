@@ -2,7 +2,7 @@
 //! pre-mission cost estimate line. No I/O here — everything returns String
 //! so tests can assert on the exact output.
 
-use kranz_engine::cost::{Confidence, CostEstimate};
+use kranz_engine::cost::{Confidence, CostEstimate, MIN_CALIBRATION_MISSIONS};
 use kranz_engine::types::{
     AssertionCheck, FeatureStatus, MilestoneStatus, MissionState, MissionStatus, Plan,
 };
@@ -204,8 +204,13 @@ pub fn render_plan(plan: &Plan) -> String {
 pub fn render_cost_estimate(estimate: &CostEstimate, missions_used: usize) -> String {
     let provenance = if missions_used == 0 {
         "built-in defaults — no completed missions yet".to_string()
+    } else if missions_used < MIN_CALIBRATION_MISSIONS {
+        format!(
+            "per-run costs from {missions_used} completed mission(s), but too few to fit the range \
+             yet — treat the low end as a floor until {MIN_CALIBRATION_MISSIONS}+ complete"
+        )
     } else {
-        format!("based on {missions_used} completed mission(s)")
+        format!("range fit to {missions_used} completed missions")
     };
     match estimate.confidence {
         Confidence::High => format!(

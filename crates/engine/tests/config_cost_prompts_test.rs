@@ -612,6 +612,101 @@ fn calibrate_clamps_zero_costs_to_floor() {
     approx(p.fix_features_per_cycle, 0.0);
 }
 
+fn completed_mission_with_worker_cost(id: &str, worker_cost: f64) -> Vec<EventKind> {
+    vec![
+        created(id),
+        EventKind::PlanApproved {
+            plan: plan_with(&[1]),
+            base_sha: None,
+        },
+        EventKind::MilestoneStarted {
+            milestone_id: "ms-1".into(),
+            start_sha: "s".into(),
+        },
+        EventKind::FeatureStarted {
+            feature_id: "f-1-1".into(),
+        },
+        spawned("w-1", Role::Worker, Some("f-1-1"), None),
+        completed("w-1", Some(worker_cost), TokenUsage::default()),
+        EventKind::FeatureCompleted {
+            feature_id: "f-1-1".into(),
+            commits: vec![],
+        },
+        EventKind::MilestoneCompleted {
+            milestone_id: "ms-1".into(),
+            tag: None,
+        },
+        EventKind::MissionCompleted {},
+    ]
+}
+
+#[test]
+fn corpus_fit_is_off_below_the_minimum_mission_count() {
+    // Below MIN_CALIBRATION_MISSIONS the corpus can't be fit, so the built-in
+    // 1.0 / 0.5 / 2.5 band is kept and the estimate is unchanged from before
+    // the M1 refit.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+    for i in 0..(cost::MIN_CALIBRATION_MISSIONS - 1) {
+        write_events(
+            repo,
+            &format!("m-{i}"),
+            completed_mission_with_worker_cost(&format!("m-{i}"), 5.0),
+        );
+    }
+    let cal = cost::calibrate(repo);
+    assert_eq!(cal.missions_used, cost::MIN_CALIBRATION_MISSIONS - 1);
+    approx(cal.expected_mult, 1.0);
+    approx(cal.low_mult, 0.5);
+    approx(cal.high_mult, 2.5);
+}
+
+#[test]
+fn corpus_fit_engages_and_drives_apply_shape() {
+    // At/above the threshold the fit runs: the range becomes the empirical
+    // p10/p90 of actual÷predicted (not the fixed 0.5/2.5), and apply_shape
+    // multiplies the raw estimate by the fitted mults.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+    // Heterogeneous actuals so the fitted range is non-degenerate.
+    for (i, cost_usd) in [2.0, 4.0, 6.0, 8.0, 10.0, 30.0].iter().enumerate() {
+        write_events(
+            repo,
+            &format!("m-{i}"),
+            completed_mission_with_worker_cost(&format!("m-{i}"), *cost_usd),
+        );
+    }
+    let cal = cost::calibrate(repo);
+    assert_eq!(cal.missions_used, 6);
+
+    // The fit engaged: the band is no longer the built-in guess, and it is
+    // ordered around the center.
+    assert!(
+        (cal.low_mult, cal.high_mult) != (0.5, 2.5),
+        "expected an empirically fitted band, got ({}, {})",
+        cal.low_mult,
+        cal.high_mult
+    );
+    assert!(
+        cal.low_mult <= cal.expected_mult && cal.expected_mult <= cal.high_mult,
+        "band must bracket the center: {} <= {} <= {}",
+        cal.low_mult,
+        cal.expected_mult,
+        cal.high_mult
+    );
+
+    // apply_shape applies the fit to a code-shape plan (no doc-heavy widening).
+    let mut plan = plan_with(&[2, 1]);
+    plan.validation_contract = vec![command_assertion("a1", "cargo test --workspace")];
+    let cfg = MissionConfig::default();
+    let base = cost::estimate(&plan, &cfg, &cal.params);
+    let est = cost::apply_shape(base, &plan, &cal);
+    assert_eq!(est.shape, cost::MissionShape::CodeChange);
+    approx(est.expected_usd, base.expected_usd * cal.expected_mult);
+    approx(est.low_usd, base.expected_usd * cal.low_mult);
+    approx(est.high_usd, base.expected_usd * cal.high_mult);
+}
+
 // ---------------------------------------------------------------------------
 // prompts
 // ---------------------------------------------------------------------------

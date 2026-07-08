@@ -3612,7 +3612,16 @@ impl MissionEngine {
         self.log.flush()?;
         let events = EventLog::read_events(&self.paths.events_file())?;
         let plan: Plan = serde_json::from_str(&self.plan_json()?)?;
-        let estimate = cost::estimate(&plan, &self.state.config, &cost::EstimateParams::default());
+        // Use the calibrated estimate the operator actually saw at approval,
+        // not the built-in defaults — otherwise the report's "estimated vs
+        // actual" compares the actual against a naive number nobody was shown,
+        // which is what made estimates look wildly off in old reports (M1).
+        let calibration = cost::calibrate(&self.paths.repo_root);
+        let estimate = cost::apply_shape(
+            cost::estimate(&plan, &self.state.config, &calibration.params),
+            &plan,
+            &calibration,
+        );
         let report = render_mission_report(&self.state, &events, &plan, &estimate);
 
         let active_paths = self.active_paths();

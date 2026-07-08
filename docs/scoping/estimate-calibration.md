@@ -8,6 +8,24 @@ are now stale: the derivation already ships, and the bias runs the **opposite**
 direction. This doc measures the real gap across all 39 completed missions in
 this repo and scopes the refit.
 
+## Update — what the build measured (2026-07-08)
+
+Building slice 1 re-measured the gap using the **calibrated** params (what the
+live estimate actually uses), not the report's default params. Result: the
+live estimate was already well-centered — aggregate actual ÷ predicted =
+**1.08×**, not 3.78×. The "~3× low" analysis below is real, but it describes
+`report.md`'s "estimated" line, computed with `EstimateParams::default()`
+(`orchestrator.rs`), **not** the calibrated params the operator sees at
+approval. The misleading surface was the *report*, not the live estimate.
+
+Shipped in slice 1 (D-A, D-B, D-E): a corpus recenter (`expected_mult`, ≈1.08
+here); an empirical p10/p90 range **clamped to only widen** the built-in
+0.5×/2.5× band (in-sample quantiles from 38 points understate a fresh
+mission's uncertainty); honest provenance in the estimate line; and the
+completion `report.md` switched to the calibrated estimate so "estimated vs
+actual" is a fair comparison. Read the analysis below as *"why the report
+looked 3× off,"* not *"the live estimate is 3× off."*
+
 ## The finding: the estimate is systematically ~3× LOW, not high
 
 Every completed mission records `**Cost:** $actual vs $low–$high estimated

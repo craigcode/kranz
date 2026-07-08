@@ -551,7 +551,8 @@ fn cost_estimate_renders_range_and_calibration_provenance() {
         confidence: kranz_engine::cost::Confidence::High,
     };
 
-    // Calibrated from completed missions: says how many.
+    // A few completed missions but below the corpus-fit threshold: reports the
+    // count and flags that the range is not yet fitted.
     let rendered = output::render_cost_estimate(&estimate, 2);
     assert!(
         rendered.contains("estimated $9.18-$45.88"),
@@ -562,8 +563,16 @@ fn cost_estimate_renders_range_and_calibration_provenance() {
         "expected in: {rendered}"
     );
     assert!(
-        rendered.contains("based on 2 completed mission(s)"),
-        "provenance in: {rendered}"
+        rendered.contains("2 completed mission(s)")
+            && rendered.contains("too few to fit the range"),
+        "below-threshold provenance in: {rendered}"
+    );
+
+    // Enough completed missions to fit the range.
+    let rendered = output::render_cost_estimate(&estimate, 12);
+    assert!(
+        rendered.contains("range fit to 12 completed missions"),
+        "fitted provenance in: {rendered}"
     );
 
     // No completed missions yet: says the params are the built-in defaults.
@@ -573,8 +582,8 @@ fn cost_estimate_renders_range_and_calibration_provenance() {
         "default provenance in: {rendered}"
     );
     assert!(
-        !rendered.contains("based on"),
-        "no mission count without missions: {rendered}"
+        !rendered.contains("range fit") && !rendered.contains("too few"),
+        "no calibration provenance without missions: {rendered}"
     );
 }
 

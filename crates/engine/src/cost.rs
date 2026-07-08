@@ -301,7 +301,27 @@ pub struct Calibration {
     /// [`MissionShape::DocHeavy`] (from their recorded plan). Zero means the
     /// doc-heavy shape is uncovered by this corpus — see [`apply_shape`].
     pub doc_heavy_missions_used: usize,
+    /// Multiplier on the raw [`estimate`] `expected_usd` that recenters it onto
+    /// the corpus (aggregate actual ÷ predicted). The calibrated per-run
+    /// `params` already carry most of the correction, so this removes only the
+    /// residual aggregate bias left by the count formula (≈1.08 on this repo's
+    /// corpus). `1.0` below [`MIN_CALIBRATION_MISSIONS`].
+    pub expected_mult: f64,
+    /// Multipliers on the raw `expected_usd` for the low/high bounds: the
+    /// empirical p10 / p90 of actual ÷ predicted, but clamped so the band only
+    /// ever WIDENS the built-in `0.5` / `2.5` guess (in-sample quantiles from a
+    /// small corpus understate a fresh mission's uncertainty). `0.5` / `2.5`
+    /// below [`MIN_CALIBRATION_MISSIONS`].
+    pub low_mult: f64,
+    pub high_mult: f64,
 }
+
+/// Minimum completed missions before the corpus fit ([`expected_mult`] etc.)
+/// engages. Below this a repo keeps the built-in 1.0 / 0.5 / 2.5 band so cold
+/// and small repos behave exactly as before the M1 calibration refit.
+///
+/// [`expected_mult`]: Calibration::expected_mult
+pub const MIN_CALIBRATION_MISSIONS: usize = 5;
 
 /// Derive [`EstimateParams`] from the actuals recorded in this repo's
 /// COMPLETED missions (live estimates ran ~10x above actuals on the built-in
@@ -320,6 +340,10 @@ pub struct Calibration {
 pub fn calibrate(repo_root: &Path) -> Calibration {
     let mut per_mission: Vec<EstimateParams> = Vec::new();
     let mut doc_heavy_missions_used = 0usize;
+    // (milestones, planned features, config, actual total cost) per completed
+    // mission — the inputs needed to re-predict each mission and measure the
+    // estimate's bias (see `fit_estimate_to_corpus`).
+    let mut corpus: Vec<(usize, usize, MissionConfig, f64)> = Vec::new();
     for mission_id in MissionPaths::list_missions(repo_root) {
         let paths = MissionPaths::new(repo_root, &mission_id);
         let Ok(events) = EventLog::read_events(&paths.events_file()) else {
@@ -335,6 +359,20 @@ pub fn calibrate(repo_root: &Path) -> Calibration {
             doc_heavy_missions_used += 1;
         }
         per_mission.push(mission_actuals(&state));
+        let milestones = state.mission.milestones.len();
+        let planned_features = state
+            .mission
+            .milestones
+            .iter()
+            .flat_map(|m| m.features.iter())
+            .filter(|f| f.origin == FeatureOrigin::Plan)
+            .count();
+        corpus.push((
+            milestones,
+            planned_features,
+            state.config.clone(),
+            mission_total_cost(&state),
+        ));
     }
 
     if per_mission.is_empty() {
@@ -342,6 +380,9 @@ pub fn calibrate(repo_root: &Path) -> Calibration {
             params: EstimateParams::default(),
             missions_used: 0,
             doc_heavy_missions_used: 0,
+            expected_mult: 1.0,
+            low_mult: 0.5,
+            high_mult: 2.5,
         };
     }
 
@@ -356,11 +397,118 @@ pub fn calibrate(repo_root: &Path) -> Calibration {
         orchestrator_overhead_usd_per_feature: mean(|p| p.orchestrator_overhead_usd_per_feature)
             .max(0.01),
     };
+    let (expected_mult, low_mult, high_mult) = fit_estimate_to_corpus(&params, &corpus);
     Calibration {
         params,
         missions_used: per_mission.len(),
         doc_heavy_missions_used,
+        expected_mult,
+        low_mult,
+        high_mult,
     }
+}
+
+/// Total actual cost of a completed mission: the CLI-reported `cost_usd` per
+/// run, falling back to [`usage_cost_usd`], summed over every recorded run.
+fn mission_total_cost(state: &MissionState) -> f64 {
+    state
+        .runs
+        .values()
+        .map(|r| {
+            r.cost_usd
+                .unwrap_or_else(|| usage_cost_usd(&r.tokens, &r.model))
+        })
+        .sum()
+}
+
+/// Fit the count-based [`estimate`] to the corpus of completed missions
+/// (roadmap M1). Returns `(expected_mult, low_mult, high_mult)`, each a
+/// multiplier on the raw `estimate().expected_usd`:
+///
+/// - `expected_mult` = aggregate `Σ actual ÷ Σ predicted` — recenters the
+///   estimate onto reality, correcting the count formula's structural
+///   under-prediction (cost is driven by turns and diff size, not feature
+///   count);
+/// - `low_mult` / `high_mult` = the p10 / p90 of per-mission `actual ÷
+///   predicted` — the range that actually brackets past outcomes.
+///
+/// Below [`MIN_CALIBRATION_MISSIONS`] usable points the corpus can't be fit, so
+/// the built-in `1.0 / 0.5 / 2.5` is returned (an exact no-op in
+/// [`apply_shape`]). Values are clamped so one pathological mission can't blow
+/// the estimate up or collapse it.
+fn fit_estimate_to_corpus(
+    params: &EstimateParams,
+    corpus: &[(usize, usize, MissionConfig, f64)],
+) -> (f64, f64, f64) {
+    const DEFAULT: (f64, f64, f64) = (1.0, 0.5, 2.5);
+    if corpus.len() < MIN_CALIBRATION_MISSIONS {
+        return DEFAULT;
+    }
+    let mut sum_pred = 0.0;
+    let mut sum_actual = 0.0;
+    let mut ratios: Vec<f64> = Vec::new();
+    for (milestones, features, cfg, actual) in corpus {
+        let pred = estimate(&counts_plan(*milestones, *features), cfg, params).expected_usd;
+        if pred > 0.0 && *actual > 0.0 {
+            sum_pred += pred;
+            sum_actual += *actual;
+            ratios.push(*actual / pred);
+        }
+    }
+    if ratios.len() < MIN_CALIBRATION_MISSIONS || sum_pred <= 0.0 {
+        return DEFAULT;
+    }
+    ratios.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let center = (sum_actual / sum_pred).clamp(0.1, 20.0);
+    // The band only ever WIDENS the built-in 0.5×/2.5× guess, never narrows it:
+    // these are in-sample quantiles from a small corpus, and they understate a
+    // fresh mission's true uncertainty — a repo whose past missions happen to
+    // cluster tightly must not yield an overconfident range. It also stays
+    // ordered around the recentered middle.
+    let low = percentile(&ratios, 0.10).min(0.5).min(center).max(0.02);
+    let high = percentile(&ratios, 0.90)
+        .max(2.5)
+        .max(center)
+        .min(center.max(1.0) * 8.0);
+    (center, low, high)
+}
+
+/// A synthetic [`Plan`] carrying only the counts [`estimate`] reads (milestone
+/// count and total feature count); every other field is inert. Used to
+/// re-predict a completed mission from its recorded shape.
+fn counts_plan(milestones: usize, features: usize) -> Plan {
+    let milestones = milestones.max(1);
+    let mut ms = Vec::with_capacity(milestones);
+    for i in 0..milestones {
+        let n = if i == 0 { features } else { 0 };
+        ms.push(PlanMilestone {
+            title: String::new(),
+            features: (0..n)
+                .map(|_| PlanFeature {
+                    title: String::new(),
+                    spec: String::new(),
+                    validation_criteria: Vec::new(),
+                })
+                .collect(),
+        });
+    }
+    Plan {
+        goal: String::new(),
+        validation_contract: Vec::new(),
+        milestones: ms,
+        considered_alternatives: None,
+        command_grants: Vec::new(),
+        touch_set: Vec::new(),
+    }
+}
+
+/// Nearest-rank percentile of an already-sorted slice (`q` in `[0,1]`).
+fn percentile(sorted: &[f64], q: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let idx = (q * (sorted.len() as f64 - 1.0)).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
 }
 
 /// Reconstruct the [`Plan`] a completed mission's state was approved from —
@@ -417,9 +565,21 @@ pub fn apply_shape(base: CostEstimate, plan: &Plan, cal: &Calibration) -> CostEs
     let mut est = base;
     est.shape = shape;
 
+    // Recenter and empirically range the estimate onto the calibration corpus
+    // (roadmap M1). `raw` is the count formula's central guess; the corpus fit
+    // corrects its systematic under-prediction and replaces the fixed 0.5×/2.5×
+    // band with the observed p10/p90. Below MIN_CALIBRATION_MISSIONS the mults
+    // are 1.0 / 0.5 / 2.5, so this block is an exact no-op.
+    let raw = est.expected_usd;
+    est.expected_usd = raw * cal.expected_mult;
+    est.low_usd = raw * cal.low_mult;
+    est.high_usd = raw * cal.high_mult;
+
     if shape == MissionShape::DocHeavy && cal.doc_heavy_missions_used == 0 {
         est.confidence = Confidence::Low;
-        est.high_usd = est.expected_usd * LOW_CONFIDENCE_HIGH_MULT;
+        est.high_usd = est
+            .high_usd
+            .max(est.expected_usd * LOW_CONFIDENCE_HIGH_MULT);
     } else {
         est.confidence = Confidence::High;
     }
