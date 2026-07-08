@@ -10,10 +10,14 @@
 //! [`GitRepo::push_mission_branch`] or any other push.
 
 use crate::error::Result;
-use crate::git_ops::{GitRepo, MergeOutcome};
+use crate::git_ops::{with_kranz_trailers, GitRepo, KranzCommitMetadata, MergeOutcome};
 use crate::merge_gate::{run_gate_suite, GateSuiteResult};
 use crate::scrub::{self, SecretFinding};
 use std::path::Path;
+
+/// Number of merge commits on the live base after the mission's pinned base
+/// before the merge response flags likely sibling-merge semantic drift.
+pub const STALE_BASE_MERGE_THRESHOLD: usize = 1;
 
 /// Outcome of a gated merge attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,7 +51,18 @@ pub enum MergeReport {
     Merged {
         /// The new merge commit sha, now the tip of `base_branch`.
         commit: String,
+        /// Informational warning when the mission's pinned base trails merge
+        /// commits already landed on the live base branch.
+        stale_base: Option<StaleBaseWarning>,
     },
+}
+
+/// Non-blocking merge-time warning for missions drafted from a stale base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleBaseWarning {
+    pub base_sha: String,
+    pub live_base: String,
+    pub merge_commits_since_base: usize,
 }
 
 /// Runs the gated merge: refuse-if-dirty, then gates, then `--no-ff` merge.
@@ -62,6 +77,7 @@ pub fn merge_mission<F>(
     base_branch: &str,
     base_sha: &str,
     mission_branch: &str,
+    metadata: Option<KranzCommitMetadata>,
     executor: F,
 ) -> Result<MergeReport>
 where
@@ -90,16 +106,37 @@ where
         GateSuiteResult::Passed => {}
     }
 
+    let stale_base = stale_base_warning(repo, base_branch, base_sha)?;
+
     repo.checkout(base_branch)?;
     strip_identical_untracked_twins(repo, base_sha, mission_branch)?;
-    match repo.merge_no_ff(mission_branch)? {
+    let merge_message = metadata
+        .as_ref()
+        .map(|metadata| with_kranz_trailers(&format!("Merge {mission_branch}"), metadata));
+    match repo.merge_no_ff_with_message(mission_branch, merge_message.as_deref())? {
         MergeOutcome::Conflict { files } => Ok(MergeReport::Conflict { files }),
         MergeOutcome::RefusedPreMerge { detail } => Ok(MergeReport::RefusedPreMerge { detail }),
         MergeOutcome::Clean => {
             let commit = repo.head_sha()?;
-            Ok(MergeReport::Merged { commit })
+            Ok(MergeReport::Merged { commit, stale_base })
         }
     }
+}
+
+fn stale_base_warning(
+    repo: &GitRepo,
+    base_branch: &str,
+    base_sha: &str,
+) -> Result<Option<StaleBaseWarning>> {
+    let merge_commits_since_base = repo.merge_commit_count(base_sha, base_branch)?;
+    if merge_commits_since_base < STALE_BASE_MERGE_THRESHOLD {
+        return Ok(None);
+    }
+    Ok(Some(StaleBaseWarning {
+        base_sha: base_sha.to_string(),
+        live_base: base_branch.to_string(),
+        merge_commits_since_base,
+    }))
 }
 
 /// Removes untracked working-tree files the incoming merge would touch, but

@@ -3,11 +3,13 @@
 //! Mirrors the fixture style of `git_ops_test.rs`: throwaway temp repos with
 //! git's global/system config masked, skipping cleanly when git is missing.
 
-use kranz_engine::git_ops::GitRepo;
+use kranz_engine::git_ops::{GitRepo, KranzCommitMetadata};
 use kranz_engine::merge::{merge_mission, MergeReport};
 use kranz_engine::scrub;
+use kranz_engine::types::TokenUsage;
+use std::io::Write as _;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Once;
 use tempfile::TempDir;
 
@@ -55,6 +57,44 @@ fn raw_git(dir: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn interpret_head_trailers(dir: &Path) -> String {
+    let message = raw_git(dir, &["log", "-1", "--format=%B"]);
+    let mut child = Command::new("git")
+        .args(["interpret-trailers", "--parse"])
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn git interpret-trailers");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin piped")
+        .write_all(message.as_bytes())
+        .expect("write commit message");
+    let out = child.wait_with_output().expect("wait for trailers");
+    assert!(
+        out.status.success(),
+        "git interpret-trailers failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn trailer_metadata() -> KranzCommitMetadata {
+    KranzCommitMetadata {
+        mission_id: "m-x".to_string(),
+        cost_usd: 12.34567,
+        tokens: TokenUsage {
+            input: 100,
+            output: 20,
+            cache_read: 3,
+            cache_write: 4,
+        },
+    }
 }
 
 fn init_repo() -> (TempDir, GitRepo) {
@@ -140,10 +180,17 @@ fn dirty_tracked_tree_is_refused_without_running_gates_or_touching_base() {
     write(&dir, "README.md", "dirty\n");
 
     let gate_calls = std::cell::RefCell::new(Vec::<String>::new());
-    let report = merge_mission(&repo, "main", &seed, "kranz/mission-x", |cmd, _cwd| {
-        gate_calls.borrow_mut().push(cmd.to_string());
-        (true, String::new())
-    })
+    let report = merge_mission(
+        &repo,
+        "main",
+        &seed,
+        "kranz/mission-x",
+        None,
+        |cmd, _cwd| {
+            gate_calls.borrow_mut().push(cmd.to_string());
+            (true, String::new())
+        },
+    )
     .unwrap();
 
     assert_eq!(report, MergeReport::RefusedDirtyTree);
@@ -164,10 +211,22 @@ fn passing_gates_produce_a_no_ff_merge_commit_with_two_parents() {
     let (dir, repo, seed) = seeded_repo();
     seed_mission_branch(&dir, &repo, &seed, "src/lib.rs", "fn a() {}\n");
 
-    let report = merge_mission(&repo, "main", &seed, "kranz/mission-x", passing_executor).unwrap();
+    let report = merge_mission(
+        &repo,
+        "main",
+        &seed,
+        "kranz/mission-x",
+        None,
+        passing_executor,
+    )
+    .unwrap();
 
     match report {
-        MergeReport::Merged { commit } => {
+        MergeReport::Merged { commit, stale_base } => {
+            assert!(
+                stale_base.is_none(),
+                "fresh mission base should not warn: {stale_base:?}"
+            );
             let base_tip = repo.head_sha().unwrap();
             assert_eq!(commit, base_tip);
             assert_eq!(repo.current_branch().unwrap(), "main");
@@ -187,6 +246,82 @@ fn passing_gates_produce_a_no_ff_merge_commit_with_two_parents() {
 }
 
 #[test]
+fn merge_commit_carries_parseable_kranz_trailers() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, seed) = seeded_repo();
+    seed_mission_branch(&dir, &repo, &seed, "src/lib.rs", "fn a() {}\n");
+
+    let report = merge_mission(
+        &repo,
+        "main",
+        &seed,
+        "kranz/mission-x",
+        Some(trailer_metadata()),
+        passing_executor,
+    )
+    .unwrap();
+
+    assert!(matches!(report, MergeReport::Merged { .. }));
+    let trailers = interpret_head_trailers(dir.path());
+    for expected in [
+        "Kranz-Mission: m-x",
+        "Kranz-Cost-USD: 12.3457",
+        "Kranz-Tokens-Input: 100",
+        "Kranz-Tokens-Output: 20",
+        "Kranz-Tokens-Cache-Read: 3",
+        "Kranz-Tokens-Cache-Write: 4",
+    ] {
+        assert!(
+            trailers.contains(expected),
+            "missing trailer {expected:?} in:\n{trailers}"
+        );
+    }
+}
+
+#[test]
+fn stale_base_warning_counts_sibling_merges_since_mission_base() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, seed) = seeded_repo();
+    seed_mission_branch(&dir, &repo, &seed, "mission.txt", "mission change\n");
+
+    repo.create_branch("kranz/sibling", Some(&seed)).unwrap();
+    repo.checkout("kranz/sibling").unwrap();
+    write(&dir, "sibling.txt", "sibling change\n");
+    repo.add_all_and_commit("sibling change").unwrap();
+    repo.checkout("main").unwrap();
+    assert!(matches!(
+        repo.merge_no_ff("kranz/sibling").unwrap(),
+        kranz_engine::git_ops::MergeOutcome::Clean
+    ));
+
+    let report = merge_mission(
+        &repo,
+        "main",
+        &seed,
+        "kranz/mission-x",
+        None,
+        passing_executor,
+    )
+    .unwrap();
+
+    match report {
+        MergeReport::Merged {
+            stale_base: Some(warning),
+            ..
+        } => {
+            assert_eq!(warning.base_sha, seed);
+            assert_eq!(warning.live_base, "main");
+            assert_eq!(warning.merge_commits_since_base, 1);
+        }
+        other => panic!("expected stale-base warning, got {other:?}"),
+    }
+}
+
+#[test]
 fn a_failing_gate_stops_before_the_merge_and_leaves_base_unchanged() {
     if !setup() {
         return;
@@ -194,13 +329,20 @@ fn a_failing_gate_stops_before_the_merge_and_leaves_base_unchanged() {
     let (dir, repo, seed) = seeded_repo();
     seed_mission_branch(&dir, &repo, &seed, "src/lib.rs", "fn a() {}\n");
 
-    let report = merge_mission(&repo, "main", &seed, "kranz/mission-x", |cmd, _cwd| {
-        if cmd == "cargo fmt --all --check" {
-            (false, "diff detected: src/lib.rs".to_string())
-        } else {
-            (true, String::new())
-        }
-    })
+    let report = merge_mission(
+        &repo,
+        "main",
+        &seed,
+        "kranz/mission-x",
+        None,
+        |cmd, _cwd| {
+            if cmd == "cargo fmt --all --check" {
+                (false, "diff detected: src/lib.rs".to_string())
+            } else {
+                (true, String::new())
+            }
+        },
+    )
     .unwrap();
 
     match report {
@@ -225,10 +367,17 @@ fn secret_scan_failure_stops_before_gates_and_leaves_base_unchanged() {
     seed_mission_branch(&dir, &repo, &seed, ".env", &format!("KEY={secret}\n"));
 
     let gate_calls = std::cell::RefCell::new(Vec::<String>::new());
-    let report = merge_mission(&repo, "main", &seed, "kranz/mission-x", |cmd, _cwd| {
-        gate_calls.borrow_mut().push(cmd.to_string());
-        (true, String::new())
-    })
+    let report = merge_mission(
+        &repo,
+        "main",
+        &seed,
+        "kranz/mission-x",
+        None,
+        |cmd, _cwd| {
+            gate_calls.borrow_mut().push(cmd.to_string());
+            (true, String::new())
+        },
+    )
     .unwrap();
 
     match report {
@@ -270,7 +419,15 @@ fn committed_secret_fingerprint_waiver_allows_merge() {
         ],
     );
 
-    let report = merge_mission(&repo, "main", &seed, "kranz/mission-x", passing_executor).unwrap();
+    let report = merge_mission(
+        &repo,
+        "main",
+        &seed,
+        "kranz/mission-x",
+        None,
+        passing_executor,
+    )
+    .unwrap();
 
     assert!(
         matches!(report, MergeReport::Merged { .. }),
@@ -319,7 +476,15 @@ fn no_merge_mission_outcome_ever_pushes() {
     assert!(!repo.has_remote("origin").unwrap());
 
     seed_mission_branch(&dir, &repo, &seed, "src/lib.rs", "fn a() {}\n");
-    let merged = merge_mission(&repo, "main", &seed, "kranz/mission-x", passing_executor).unwrap();
+    let merged = merge_mission(
+        &repo,
+        "main",
+        &seed,
+        "kranz/mission-x",
+        None,
+        passing_executor,
+    )
+    .unwrap();
     assert!(matches!(merged, MergeReport::Merged { .. }));
     assert!(
         !repo.has_remote("origin").unwrap(),
@@ -373,7 +538,15 @@ fn preview_twin_byte_identical_untracked_files_let_merge_land_cleanly() {
     assert!(repo.is_untracked(&plan_path).unwrap());
     assert!(repo.is_untracked(&report_path).unwrap());
 
-    let report = merge_mission(&repo, "main", &seed, "kranz/mission-x", passing_executor).unwrap();
+    let report = merge_mission(
+        &repo,
+        "main",
+        &seed,
+        "kranz/mission-x",
+        None,
+        passing_executor,
+    )
+    .unwrap();
     assert!(
         matches!(report, MergeReport::Merged { .. }),
         "expected Merged, got {report:?}"
@@ -410,7 +583,15 @@ fn preview_twin_divergent_untracked_file_blocks_merge_without_abort_wrapper() {
     std::fs::create_dir_all(full_report.parent().unwrap()).unwrap();
     std::fs::write(&full_report, divergent_report).unwrap();
 
-    let report = merge_mission(&repo, "main", &seed, "kranz/mission-x", passing_executor).unwrap();
+    let report = merge_mission(
+        &repo,
+        "main",
+        &seed,
+        "kranz/mission-x",
+        None,
+        passing_executor,
+    )
+    .unwrap();
 
     match &report {
         MergeReport::Merged { .. } => panic!("must not merge over a divergent untracked file"),

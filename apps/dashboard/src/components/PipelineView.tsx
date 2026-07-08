@@ -1,8 +1,8 @@
 // #/ (default route) — the pipeline view: one flat list, one row per work
 // item, reduced through the nine-stage model (lib/pipelineStage.ts). The
-// browsable ticket backlog lives at #/backlog (BacklogPanel). Every ticket
-// is a row; every mission with no originating ticket ("kranz new") is also
-// a row, so nothing in progress is hidden.
+// #/backlog route is an alias for this same surface with the Backlog lens
+// selected. Every ticket is a row; every mission with no originating ticket
+// ("kranz new") is also a row, so nothing in progress is hidden.
 
 import { useEffect, useState } from 'react';
 import { useKranzStore } from '../lib/store';
@@ -265,7 +265,7 @@ function IterateControl({ missionId, className }: { missionId: string; className
   );
 }
 
-export function PipelineView() {
+export function PipelineView({ initialLens = 'actionable' }: { initialLens?: Lens }) {
   const tickets = useKranzStore((s) => s.tickets);
   const ticketsError = useKranzStore((s) => s.ticketsError);
   const loadTickets = useKranzStore((s) => s.loadTickets);
@@ -274,12 +274,16 @@ export function PipelineView() {
   const loadMissions = useKranzStore((s) => s.loadMissions);
   const draftTicket = useKranzStore((s) => s.draftTicket);
   const approveTicket = useKranzStore((s) => s.approveTicket);
-  const [lens, setLens] = useState<Lens>('actionable');
+  const [lens, setLens] = useState<Lens>(initialLens);
 
   useEffect(() => {
     void loadTickets();
     void loadMissions();
   }, [loadTickets, loadMissions]);
+
+  useEffect(() => {
+    setLens(initialLens);
+  }, [initialLens]);
 
   const rows = buildRows(tickets, missions);
   const visibleRows = filterLensRows(rows, lens);
@@ -480,9 +484,6 @@ export function PipelineView() {
           >
             + new mission
           </button>
-          <a className="btn-small pipeline-backlog-link" href="#/backlog">
-            Backlog ↗
-          </a>
         </div>
         {ticketsError !== null && (
           <div className="picker-error" role="alert">

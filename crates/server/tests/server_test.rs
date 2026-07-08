@@ -16,8 +16,10 @@ use kranz_engine::types::{
     Role, RunResult, TokenUsage,
 };
 use serde_json::{json, Value};
+use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -187,6 +189,31 @@ fn raw_git(dir: &Path, args: &[&str]) -> String {
     assert!(
         out.status.success(),
         "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn interpret_head_trailers(dir: &Path) -> String {
+    let message = raw_git(dir, &["log", "-1", "--format=%B"]);
+    let mut child = std::process::Command::new("git")
+        .args(["interpret-trailers", "--parse"])
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn git interpret-trailers");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin piped")
+        .write_all(message.as_bytes())
+        .expect("write commit message");
+    let out = child.wait_with_output().expect("wait for trailers");
+    assert!(
+        out.status.success(),
+        "git interpret-trailers failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8_lossy(&out.stdout).into_owned()
@@ -1317,12 +1344,62 @@ async fn merge_route_merges_on_green_gates_and_flips_the_merged_bit() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["merged"], true);
     assert!(body["commit"].is_string(), "{body}");
+    assert_eq!(body["staleBase"], Value::Null, "{body}");
+
+    let trailers = interpret_head_trailers(&repo_root);
+    assert!(trailers.contains("Kranz-Mission: m-green"), "{trailers}");
+    assert!(trailers.contains("Kranz-Cost-USD: 0.0000"), "{trailers}");
+    assert!(
+        trailers.contains("Kranz-Tokens-Input: 0") && trailers.contains("Kranz-Tokens-Output: 0"),
+        "{trailers}"
+    );
 
     let (status, body) = get_json(&app, "/api/missions").await;
     assert_eq!(status, StatusCode::OK);
     let rows = body.as_array().unwrap();
     let row = rows.iter().find(|r| r["id"] == "m-green").unwrap();
     assert_eq!(row["merged"], true, "{row}");
+}
+
+#[tokio::test]
+async fn merge_route_surfaces_stale_base_warning_without_blocking() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo_root, base_sha) = init_repo();
+    seed_diffable_mission(&repo_root, "m-stale", &base_sha, true);
+
+    raw_git(&repo_root, &["checkout", "-b", "kranz/sibling", &base_sha]);
+    std::fs::write(repo_root.join("sibling.txt"), "sibling change\n").unwrap();
+    raw_git(&repo_root, &["add", "--", "sibling.txt"]);
+    raw_git(&repo_root, &["commit", "-m", "sibling change"]);
+    raw_git(&repo_root, &["checkout", "main"]);
+    raw_git(
+        &repo_root,
+        &["merge", "--no-ff", "--no-edit", "kranz/sibling"],
+    );
+
+    let app = merge_app(&repo_root, |_cmd, _cwd| (true, String::new()));
+    let (status, body) = post_json(
+        &app,
+        "/api/missions/m-stale/merge",
+        Some(MERGE_TOKEN),
+        json!({}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["merged"], true, "{body}");
+    assert_eq!(body["staleBase"]["baseSha"], base_sha, "{body}");
+    assert_eq!(body["staleBase"]["liveBase"], "main", "{body}");
+    assert_eq!(body["staleBase"]["mergeCommitsSinceBase"], 1, "{body}");
+    assert!(
+        body["staleBase"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("stale base"),
+        "{body}"
+    );
 }
 
 #[tokio::test]

@@ -448,7 +448,7 @@ describe('PipelineView', () => {
     expect(link).toBeTruthy();
   });
 
-  it('links to #/backlog', async () => {
+  it('does not render a second Backlog nav link beside the Backlog lens', async () => {
     vi.mocked(api.tickets).mockResolvedValueOnce([]);
     vi.mocked(api.missions).mockResolvedValueOnce([]);
 
@@ -456,8 +456,7 @@ describe('PipelineView', () => {
 
     await screen.findByText('Pipeline');
     const backlogLink = document.querySelector('a[href="#/backlog"]');
-    expect(backlogLink).toBeTruthy();
-    expect(backlogLink?.getAttribute('href')).toBe('#/backlog');
+    expect(backlogLink).toBeNull();
   });
 
   it('shows a Landed count hint that switches to the All lens', async () => {
@@ -517,5 +516,26 @@ describe('App default route', () => {
     );
     expect(missionsTab).toBeTruthy();
     expect(screen.queryByText('+ new mission')).toBeTruthy();
+  });
+
+  it('routes #/backlog to the pipeline with the Backlog lens selected', async () => {
+    window.location.hash = '#/backlog';
+    vi.mocked(api.tickets).mockResolvedValueOnce([
+      makeTicket({ slug: 'fix-a', title: 'Fix A', state: 'new' }),
+    ]);
+    vi.mocked(api.missions).mockResolvedValueOnce([
+      makeMission({ id: 'm-orphan', goal: 'Ticketless mission work', status: 'running' }),
+    ]);
+
+    const { default: App } = await import('../App');
+    render(<App />);
+
+    expect(await screen.findByText('Pipeline')).toBeTruthy();
+    expect(await screen.findByText('fix-a')).toBeTruthy();
+    expect(screen.queryByText('Ticketless mission work')).toBeNull();
+    const backlogTab = Array.from(document.querySelectorAll('.lens-tab')).find(
+      (el) => el.textContent === 'Backlog',
+    );
+    expect(backlogTab?.getAttribute('aria-pressed')).toBe('true');
   });
 });

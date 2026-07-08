@@ -249,7 +249,7 @@ pub(crate) fn mission_paths(server: &ServerState, id: &str) -> Result<MissionPat
 /// and drive designators are rejected (axum percent-decodes path segments,
 /// so `%2e%2e%2f` would otherwise sneak through).
 fn safe_id(id: &str) -> bool {
-    !id.is_empty() && !id.contains(['/', '\\', ':']) && !id.contains("..")
+    MissionPaths::is_safe_id(id)
 }
 
 fn unknown_mission(id: &str) -> ApiError {

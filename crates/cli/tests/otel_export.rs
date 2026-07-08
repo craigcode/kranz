@@ -12,12 +12,13 @@ use chrono::{TimeZone, Utc};
 use kranz_cli::otel::map::{span_id, trace_id, AttrValue, MissionSpan, SpanStatus};
 use kranz_cli::otel::{build_exporter, export_spans};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Default)]
 struct Received {
     count: Arc<AtomicUsize>,
     non_empty: Arc<AtomicUsize>,
+    bodies: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 async fn handle_traces(
@@ -28,6 +29,7 @@ async fn handle_traces(
     if !body.is_empty() {
         state.non_empty.fetch_add(1, Ordering::SeqCst);
     }
+    state.bodies.lock().unwrap().push(body.to_vec());
     "ok"
 }
 
@@ -78,4 +80,19 @@ async fn from_start_exports_spans_to_endpoint() {
         received.non_empty.load(Ordering::SeqCst) >= 1,
         "expected at least one export request with a non-empty body"
     );
+    let bodies = received.bodies.lock().unwrap();
+    let body = bodies
+        .iter()
+        .find(|body| !body.is_empty())
+        .expect("non-empty body recorded");
+    assert!(
+        contains_bytes(body, b"service.name") && contains_bytes(body, b"kranz"),
+        "OTLP body should carry service.name=kranz resource metadata"
+    );
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }

@@ -990,9 +990,16 @@ pub async fn run_merge(host: &SharedHost, mission_id: &str) -> Vec<Value> {
     match host.merge(mission_id).await {
         Ok(value) => {
             let commit = value.get("commit").and_then(Value::as_str).unwrap_or("?");
-            error_blocks(&format!(
-                ":white_check_mark: Merged `{mission_id}` — commit `{commit}`."
-            ))
+            let mut message =
+                format!(":white_check_mark: Merged `{mission_id}` — commit `{commit}`.");
+            if let Some(warning) = value
+                .get("staleBase")
+                .and_then(|v| v.get("message"))
+                .and_then(Value::as_str)
+            {
+                message.push_str(&format!("\n:warning: {warning}"));
+            }
+            error_blocks(&message)
         }
         Err(e) => error_blocks(&format!("Couldn't merge `{mission_id}`: {e}")),
     }
@@ -2209,6 +2216,9 @@ fn looks_like_plan_json(reply: &str) -> bool {
 
 /// A mission's current status, folded read-only from its event log.
 fn mission_status(repo_root: &Path, mission_id: &str) -> Result<MissionStatus> {
+    if !MissionPaths::is_safe_id(mission_id) {
+        anyhow::bail!("unknown mission `{mission_id}`");
+    }
     let paths = MissionPaths::new(repo_root, mission_id);
     let events_path = paths.events_file();
     if !events_path.is_file() {
@@ -2344,7 +2354,8 @@ fn apply_action(repo_root: &Path, action: &Action) -> Result<()> {
 /// unknown/absent mission is a plain error the caller turns into an ephemeral.
 fn build_status_reply(repo_root: &Path, mission_id: Option<&str>) -> Result<Vec<Value>> {
     let mission_id = match mission_id {
-        Some(id) => id.to_string(),
+        Some(id) if MissionPaths::is_safe_id(id) => id.to_string(),
+        Some(id) => return Err(anyhow::anyhow!("unknown mission `{id}`")),
         None => most_recent_mission(repo_root).ok_or_else(|| {
             anyhow::anyhow!("no missions yet — create one with `/kranz new <goal>`")
         })?,
@@ -3905,6 +3916,23 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("m-nope"), "error names the unknown mission");
+    }
+
+    #[test]
+    fn build_status_reply_rejects_traversal_mission_id_before_paths() {
+        let tmp = TempDir::new().unwrap();
+        let victim = tmp.path().join("victim");
+        let sibling = tmp.path().join("sibling");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        seed_mission(&sibling, "m-secret", "do not disclose this mission");
+
+        let err = build_status_reply(&victim, Some("../../../sibling/.kranz/missions/m-secret"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("unknown mission"), "{err}");
+        assert!(!err.contains("do not disclose"), "{err}");
     }
 
     #[test]

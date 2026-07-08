@@ -205,7 +205,7 @@ export const api = {
     return postJson(`/api/missions/${encodeURIComponent(id)}/start`, {});
   },
 
-  // --- tickets (backlog panel) ----------------------------------------------
+  // --- tickets (Pipeline Backlog lens) ---------------------------------------
 
   tickets(): Promise<TicketSummary[]> {
     return getJson('/api/tickets');

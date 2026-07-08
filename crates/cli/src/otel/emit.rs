@@ -78,11 +78,12 @@ fn to_system_time(ts: DateTime<Utc>) -> std::time::SystemTime {
 /// Build an OTLP HTTP/protobuf span exporter pointed at `endpoint` (e.g.
 /// `http://localhost:4318/v1/traces` or a bare collector base URL).
 pub fn build_exporter(endpoint: &str) -> Result<OtlpSpanExporter> {
-    let exporter = OtlpSpanExporter::builder()
+    let mut exporter = OtlpSpanExporter::builder()
         .with_http()
         .with_endpoint(endpoint)
         .with_protocol(Protocol::HttpBinary)
         .build()?;
+    opentelemetry_sdk::trace::SpanExporter::set_resource(&mut exporter, &kranz_resource());
     Ok(exporter)
 }
 

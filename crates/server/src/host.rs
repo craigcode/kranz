@@ -40,6 +40,7 @@ use kranz_engine::draft::{drive_draft, DraftOutcome};
 use kranz_engine::error::EngineError;
 use kranz_engine::event_log::{EventLog, LockForce};
 use kranz_engine::git_ops::GitRepo;
+use kranz_engine::git_ops::KranzCommitMetadata;
 use kranz_engine::merge::{merge_mission, MergeReport};
 use kranz_engine::orchestrator::{MissionEngine, PlanRequest};
 use kranz_engine::paths::MissionPaths;
@@ -588,6 +589,11 @@ impl MissionHost {
             ))
         })?;
         let mission_branch = state.mission.mission_branch.clone();
+        let metadata = KranzCommitMetadata {
+            mission_id: state.mission.id.clone(),
+            cost_usd: state.total_cost_usd,
+            tokens: state.totals.clone(),
+        };
 
         let repo_root = self.repo_root.clone();
         let gate_executor = Arc::clone(&self.gate_executor);
@@ -598,6 +604,7 @@ impl MissionHost {
                 &base_branch,
                 &base_sha,
                 &mission_branch,
+                Some(metadata),
                 |cmd, cwd| gate_executor(cmd, cwd),
             )
         })
@@ -606,7 +613,20 @@ impl MissionHost {
         .map_err(ApiError::from)?;
 
         match report {
-            MergeReport::Merged { commit } => Ok(json!({ "merged": true, "commit": commit })),
+            MergeReport::Merged { commit, stale_base } => Ok(json!({
+                "merged": true,
+                "commit": commit,
+                "staleBase": stale_base.map(|warning| json!({
+                    "baseSha": warning.base_sha,
+                    "liveBase": warning.live_base,
+                    "mergeCommitsSinceBase": warning.merge_commits_since_base,
+                    "message": format!(
+                        "stale base: {} merge commit(s) landed on {} since the mission base; cross-branch semantic conflicts are more likely, and full gates have run",
+                        warning.merge_commits_since_base,
+                        warning.live_base,
+                    ),
+                })),
+            })),
             MergeReport::RefusedDirtyTree => Err(ApiError::conflict(
                 "refusing to merge: tracked working tree is dirty",
             )),

@@ -146,7 +146,7 @@ Slack; forensics one tap away in the browser.
   `/kranz approve <mission-id>`, same allowlist gate, running the identical
   `kranz_engine::deps::approve_ticket` gate the CLI/REST approve paths run so
   a blocked-by/cycle/not-REVIEW refusal is forwarded to the user verbatim).
-  The dashboard's backlog panel (`#/backlog`) rides the same REST surface, so
+  The dashboard's Pipeline Backlog lens (`#/backlog`) rides the same REST surface, so
   Slack and the web UI never drift on what "approvable" means.
 
 ## Slice 2 & 3 implementation notes

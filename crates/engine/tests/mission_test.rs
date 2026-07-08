@@ -33,8 +33,9 @@ use kranz_engine::paths::MissionPaths;
 use kranz_engine::reducer;
 use kranz_engine::types::*;
 use serde_json::json;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Once};
 use std::time::Duration;
 use tempfile::TempDir;
@@ -94,6 +95,31 @@ fn raw_git(dir: &Path, args: &[&str]) -> String {
     assert!(
         out.status.success(),
         "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn interpret_head_trailers(dir: &Path) -> String {
+    let message = raw_git(dir, &["log", "-1", "--format=%B"]);
+    let mut child = Command::new("git")
+        .args(["interpret-trailers", "--parse"])
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn git interpret-trailers");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin piped")
+        .write_all(message.as_bytes())
+        .expect("write commit message");
+    let out = child.wait_with_output().expect("wait for trailers");
+    assert!(
+        out.status.success(),
+        "git interpret-trailers failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8_lossy(&out.stdout).into_owned()
@@ -464,6 +490,28 @@ async fn happy_path_completes_mission_with_tag_and_contract_gate() {
     assert_eq!(
         subject.trim(),
         format!("[kranz] mission report for {mission_id}")
+    );
+    let trailers = interpret_head_trailers(&root);
+    assert!(
+        trailers.contains(&format!("Kranz-Mission: {mission_id}")),
+        "{trailers}"
+    );
+    assert!(
+        trailers.contains(&format!("Kranz-Cost-USD: {:.4}", state.total_cost_usd)),
+        "{trailers}"
+    );
+    assert!(
+        trailers.contains(&format!("Kranz-Tokens-Input: {}", state.totals.input))
+            && trailers.contains(&format!("Kranz-Tokens-Output: {}", state.totals.output))
+            && trailers.contains(&format!(
+                "Kranz-Tokens-Cache-Read: {}",
+                state.totals.cache_read
+            ))
+            && trailers.contains(&format!(
+                "Kranz-Tokens-Cache-Write: {}",
+                state.totals.cache_write
+            )),
+        "{trailers}"
     );
     let files = raw_git(&root, &["show", "--name-only", "--format=", "HEAD"]);
     let mut files: Vec<&str> = files.lines().filter(|l| !l.trim().is_empty()).collect();

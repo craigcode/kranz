@@ -30,6 +30,13 @@ impl MissionPaths {
         }
     }
 
+    /// Mission ids that come from untrusted user input are joined into
+    /// filesystem paths. Reject separators, `..`, and drive designators before
+    /// constructing paths from those ids.
+    pub fn is_safe_id(id: &str) -> bool {
+        !id.is_empty() && !id.contains(['/', '\\', ':']) && !id.contains("..")
+    }
+
     pub fn kranz_dir(&self) -> PathBuf {
         self.repo_root.join(".kranz")
     }
@@ -150,5 +157,15 @@ mod tests {
             paths.report_file(),
             PathBuf::from("/repo/.kranz/missions/m-abc123/report.md")
         );
+    }
+
+    #[test]
+    fn safe_id_rejects_path_traversal_shapes() {
+        for id in ["", "../m-x", "m-x/../../y", "m-x\\..\\y", "c:m-x", "m-.."] {
+            assert!(!MissionPaths::is_safe_id(id), "{id:?} should be unsafe");
+        }
+        for id in ["m-abc123", "m-2026-07-08", "m_ticket.linked"] {
+            assert!(MissionPaths::is_safe_id(id), "{id:?} should be safe");
+        }
     }
 }

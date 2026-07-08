@@ -48,7 +48,7 @@ use crate::digest;
 use crate::error::{EngineError, Result};
 use crate::event_log::{EventLog, LockForce};
 use crate::events::{Event, EventKind};
-use crate::git_ops::{CommitInfo, GitRepo};
+use crate::git_ops::{with_kranz_trailers, CommitInfo, GitRepo, KranzCommitMetadata};
 use crate::lessons;
 use crate::paths::MissionPaths;
 use crate::permissions;
@@ -3432,10 +3432,16 @@ impl MissionEngine {
         }
         let extra_paths = extra_paths.unwrap_or_default();
         commit.extend(extra_paths.iter().map(PathBuf::as_path));
-        self.active_repo().commit_paths(
-            &commit,
+        let metadata = KranzCommitMetadata {
+            mission_id: self.state.mission.id.clone(),
+            cost_usd: self.state.total_cost_usd,
+            tokens: self.state.totals.clone(),
+        };
+        let message = with_kranz_trailers(
             &format!("[kranz] mission report for {}", self.state.mission.id),
-        )?;
+            &metadata,
+        );
+        self.active_repo().commit_paths(&commit, &message)?;
 
         if self.state.config.isolation() == WorkerIsolation::Worktree {
             let primary_report = self.paths.mission_dir().join("report.md");

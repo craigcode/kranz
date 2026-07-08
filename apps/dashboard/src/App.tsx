@@ -26,19 +26,18 @@ import { ModelPanel } from './components/ModelPanel';
 import { FeaturesPanel } from './components/FeaturesPanel';
 import { ProgressLog } from './components/ProgressLog';
 import { TokenPrompt } from './components/TokenPrompt';
-import { BacklogPanel } from './components/BacklogPanel';
 import { TicketDetail } from './components/TicketDetail';
+import type { Lens } from './lib/lensFilter';
 
 // Capture a `#token=<t>` from `kranz serve --open` BEFORE the router reads
 // the hash (resolveToken strips it and persists to sessionStorage).
 resolveToken();
 
 type Route =
-  | { view: 'pipeline' }
+  | { view: 'pipeline'; lens?: Lens }
   | { view: 'new' }
   | { view: 'new-ticket' }
   | { view: 'mission'; id: string }
-  | { view: 'backlog' }
   | { view: 'ticket'; slug: string };
 
 function parseHash(): Route {
@@ -47,7 +46,7 @@ function parseHash(): Route {
   if (hash === '#/new-ticket') return { view: 'new-ticket' };
   const match = /^#\/m\/(.+)$/.exec(hash);
   if (match) return { view: 'mission', id: decodeURIComponent(match[1]) };
-  if (hash === '#/backlog') return { view: 'backlog' };
+  if (hash === '#/backlog') return { view: 'pipeline', lens: 'backlog' };
   const ticketMatch = /^#\/backlog\/(.+)$/.exec(hash);
   if (ticketMatch) return { view: 'ticket', slug: decodeURIComponent(ticketMatch[1]) };
   return { view: 'pipeline' };
@@ -83,7 +82,7 @@ export default function App() {
   if (route.view === 'pipeline') {
     return (
       <>
-        <PipelineView />
+        <PipelineView initialLens={route.lens} />
         <TokenPrompt />
       </>
     );
@@ -100,14 +99,6 @@ export default function App() {
     return (
       <>
         <NewTicket />
-        <TokenPrompt />
-      </>
-    );
-  }
-  if (route.view === 'backlog') {
-    return (
-      <>
-        <BacklogPanel />
         <TokenPrompt />
       </>
     );

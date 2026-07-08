@@ -10,6 +10,7 @@
 
 use crate::error::{EngineError, Result};
 use crate::scrub;
+use crate::types::TokenUsage;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -21,6 +22,32 @@ pub struct CommitInfo {
     pub sha: String,
     /// First line of the commit message.
     pub subject: String,
+}
+
+/// Mission facts attached to kranz-authored durable commits as git trailers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KranzCommitMetadata {
+    pub mission_id: String,
+    pub cost_usd: f64,
+    pub tokens: TokenUsage,
+}
+
+/// Append-only git trailers for mission attribution and actual cost.
+pub fn kranz_commit_trailers(metadata: &KranzCommitMetadata) -> String {
+    format!(
+        "Kranz-Mission: {}\nKranz-Cost-USD: {:.4}\nKranz-Tokens-Input: {}\nKranz-Tokens-Output: {}\nKranz-Tokens-Cache-Read: {}\nKranz-Tokens-Cache-Write: {}",
+        metadata.mission_id,
+        metadata.cost_usd,
+        metadata.tokens.input,
+        metadata.tokens.output,
+        metadata.tokens.cache_read,
+        metadata.tokens.cache_write,
+    )
+}
+
+/// Commit message with kranz trailers separated in the standard trailer block.
+pub fn with_kranz_trailers(subject: &str, metadata: &KranzCommitMetadata) -> String {
+    format!("{subject}\n\n{}", kranz_commit_trailers(metadata))
 }
 
 /// Outcome of a [`GitRepo::merge_no_ff`] into the current branch (roadmap M3).
@@ -238,6 +265,24 @@ impl GitRepo {
         Ok(commits)
     }
 
+    /// Count merge commits reachable from `to` but not `from`.
+    pub fn merge_commit_count(&self, from: &str, to: &str) -> Result<usize> {
+        for slot in [from, to] {
+            if slot.starts_with('-') {
+                return Err(EngineError::Git(format!(
+                    "refusing merge_commit_count with flag-shaped ref {slot:?}"
+                )));
+            }
+        }
+        let range = format!("{from}..{to}");
+        let out = self.run(&["rev-list", "--merges", "--count", &range])?;
+        out.trim().parse::<usize>().map_err(|e| {
+            EngineError::Git(format!(
+                "git rev-list --merges --count {range} returned non-numeric output {out:?}: {e}"
+            ))
+        })
+    }
+
     /// `git diff --stat <from>..<to>` output, verbatim.
     pub fn diff_stat(&self, from: &str, to: &str) -> Result<String> {
         let range = format!("{from}..{to}");
@@ -420,12 +465,25 @@ impl GitRepo {
     /// to abort. Only a genuine git failure (git could not be spawned, or the
     /// abort itself failed on a real conflict) is an `Err`.
     pub fn merge_no_ff(&self, branch: &str) -> Result<MergeOutcome> {
+        self.merge_no_ff_with_message(branch, None)
+    }
+
+    /// Like [`Self::merge_no_ff`] but supplies an explicit merge commit
+    /// message, used for kranz-authored trailer metadata.
+    pub fn merge_no_ff_with_message(
+        &self,
+        branch: &str,
+        message: Option<&str>,
+    ) -> Result<MergeOutcome> {
         if branch.starts_with('-') {
             return Err(EngineError::Git(format!(
                 "refusing to merge flag-shaped ref {branch:?}"
             )));
         }
-        let out = self.probe(&["merge", "--no-ff", "--no-edit", branch])?;
+        let out = match message {
+            Some(message) => self.probe(&["merge", "--no-ff", "-m", message, branch])?,
+            None => self.probe(&["merge", "--no-ff", "--no-edit", branch])?,
+        };
         if out.status.success() {
             return Ok(MergeOutcome::Clean);
         }
