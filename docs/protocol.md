@@ -16,10 +16,14 @@ the engine's serde shapes.
 | `GET /api/missions/:id/events?since=<seq>` | `[Event]` with `seq > since` (omit `since` → all) |
 | `GET /api/missions/:id/plan` | contents of plan.json (404 if not approved yet) |
 | `GET /api/missions/:id/plan.md` | `{"markdown": "<plan.md contents>"}` (404 if not approved yet) |
+| `GET /api/missions/:id/revision-diff` | pending revised-plan review artifact: `{"revision", "instructions", "markdown", "diff"}`. `markdown` is the proposed revised plan rendering; `diff` is a simple line diff from current plan.md to revised-plan.md. 404 if no revision is awaiting approval |
 | `GET /api/missions/:id/report.md` | `{"markdown": "<report.md contents>"}` (404 until the mission completes) |
 | `GET /api/missions/:id/diff-stat` | `{"diffStat", "baseSha", "tip"}` — `git diff --stat` of the pinned `base_sha` (set at plan approval) against the mission branch tip. 404 if the plan is not approved yet (no `base_sha`) or the mission branch does not exist yet |
 | `GET /api/missions/:id/runs/:runId/transcript` | JSONL parsed into a JSON array of raw stream values (404 if missing) |
-| `POST /api/missions/:id/control` | body = `ControlCommand` JSON (`{"kind":"msg","text":"...","interrupt":false}`, `{"kind":"pause"}`, `{"kind":"resume"}`, `{"kind":"config-change","patch":{...}}`) → `202 {"queued":true}` |
+| `POST /api/missions/:id/control` | body = `ControlCommand` JSON (`{"kind":"msg","text":"...","interrupt":false}`, `{"kind":"pause"}`, `{"kind":"resume"}`, `{"kind":"config-change","patch":{...}}`, `{"kind":"request-revision","instructions":"..."}`, `{"kind":"approve-revision","revision":1}`, `{"kind":"reject-revision","revision":1}`) → `202 {"queued":true}` |
+| `POST /api/missions/:id/revise` | body `{"instructions":"..."}` → queues `request-revision` for an active, approved-plan mission; `202 {"queued":true}`. Empty instructions are `400`; Planning/terminal missions are `409` |
+| `POST /api/missions/:id/revision/approve` | body `{"revision":1}` → queues `approve-revision` for the matching pending revision; `202 {"queued":true}`. Stale/missing revisions are `409` |
+| `POST /api/missions/:id/revision/reject` | body `{"revision":1}` → queues `reject-revision` for the matching pending revision; `202 {"queued":true}`. Stale/missing revisions are `409` |
 | `GET /api/health` | `{"ok":true,"version":"<crate version>"}` |
 
 Static dashboard files served from a configurable dir at `/` (SPA fallback to

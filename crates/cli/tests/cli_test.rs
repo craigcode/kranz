@@ -6,7 +6,7 @@
 
 use chrono::Utc;
 use clap::{CommandFactory, Parser};
-use kranz_cli::cli::{Cli, Command};
+use kranz_cli::cli::{Cli, Command, RevisionCommand};
 use kranz_cli::commands;
 use kranz_cli::output;
 use kranz_cli::tail::EventRenderer;
@@ -192,6 +192,40 @@ fn parses_msg() {
             assert!(interrupt);
         }
         other => panic!("expected Msg, got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_revision_commands() {
+    let cli = Cli::try_parse_from(["kranz", "revise", "m-1", "drop", "scope"]).unwrap();
+    match cli.command {
+        Command::Revise { id, instructions } => {
+            assert_eq!(id, "m-1");
+            assert_eq!(instructions, vec!["drop", "scope"]);
+        }
+        other => panic!("expected Revise, got {other:?}"),
+    }
+
+    let cli = Cli::try_parse_from(["kranz", "revision", "approve", "m-1", "2"]).unwrap();
+    match cli.command {
+        Command::Revision {
+            command: RevisionCommand::Approve { id, revision },
+        } => {
+            assert_eq!(id, "m-1");
+            assert_eq!(revision, 2);
+        }
+        other => panic!("expected Revision approve, got {other:?}"),
+    }
+
+    let cli = Cli::try_parse_from(["kranz", "revision", "reject", "m-1", "3"]).unwrap();
+    match cli.command {
+        Command::Revision {
+            command: RevisionCommand::Reject { id, revision },
+        } => {
+            assert_eq!(id, "m-1");
+            assert_eq!(revision, 3);
+        }
+        other => panic!("expected Revision reject, got {other:?}"),
     }
 }
 

@@ -23,6 +23,7 @@ import { OrchestratorView } from './components/OrchestratorView';
 import { PlanningView } from './components/PlanningView';
 import { TranscriptView } from './components/TranscriptView';
 import { ModelPanel } from './components/ModelPanel';
+import { RevisionPanel } from './components/RevisionPanel';
 import { FeaturesPanel } from './components/FeaturesPanel';
 import { ProgressLog } from './components/ProgressLog';
 import { TokenPrompt } from './components/TokenPrompt';
@@ -129,6 +130,7 @@ export default function App() {
           <main className="centre">{centre}</main>
           <aside className="right-col" aria-label="Mission panels">
             <ModelPanel />
+            <RevisionPanel />
             <FeaturesPanel />
             <ProgressLog />
           </aside>

@@ -1216,6 +1216,19 @@ impl MissionEngine {
     /// the subset the event vocabulary can express (see the contract note
     /// above).
     pub async fn request_revised_plan(&mut self) -> Result<PlanRequest> {
+        self.request_revised_plan_with_instructions("").await
+    }
+
+    async fn request_revised_plan_with_instructions(
+        &mut self,
+        instructions: &str,
+    ) -> Result<PlanRequest> {
+        let instructions = instructions.trim();
+        let instructions_block = if instructions.is_empty() {
+            "No extra operator instructions were supplied.".to_string()
+        } else {
+            format!("Operator revision request:\n{instructions}")
+        };
         let message = format!(
             "The mission is already underway. Propose a REVISED plan for the work that is \
              NOT yet complete. Rules: keep every already-COMPLETE milestone exactly as it is \
@@ -1223,8 +1236,10 @@ impl MissionEngine {
              features, same order); then revise the remaining milestones' features as the \
              current situation warrants (drop features no longer needed, add features now \
              required). Output ONLY a JSON object conforming exactly to this JSON Schema — \
-             no prose before or after:\n{}\n",
-            plan_schema()
+             no prose before or after:\n{}\n\n{}\n\n{}",
+            plan_schema(),
+            considered_alternatives_prompt_policy(&self.state.config),
+            instructions_block
         );
         let text = self.orch_turn(&message).await?;
         if let Some(plan) = runner::parse_report::<Plan>(&text) {
@@ -1239,6 +1254,162 @@ impl MissionEngine {
                 retry
             })),
         }
+    }
+
+    async fn propose_revision(&mut self, instructions: &str) -> Result<()> {
+        if self.state.pending_revision.is_some() {
+            self.emit_decision(
+                "revision request ignored: a revised plan is already awaiting approval",
+                Some(instructions.to_string()),
+            )?;
+            return Ok(());
+        }
+        let request = self
+            .request_revised_plan_with_instructions(instructions)
+            .await?;
+        match request {
+            PlanRequest::Ready(mut plan) => {
+                assign_assertion_ids(&mut plan.validation_contract);
+                let calibration = cost::calibrate(&self.paths.repo_root);
+                let estimate = cost::estimate(&plan, &self.state.config, &calibration.params);
+                let estimate = cost::apply_shape(estimate, &plan, &calibration);
+                validate_considered_alternatives(&plan, &estimate, &self.state.config)?;
+                validate_revised_plan_for_gate(&self.state.mission, &plan)?;
+                let revision = self.state.latest_plan_revision + 1;
+                self.emit(EventKind::PlanRevisionProposed {
+                    revision,
+                    plan,
+                    instructions: instructions.trim().to_string(),
+                })?;
+                self.emit_decision(
+                    &format!("revision {revision} proposed; awaiting approval"),
+                    Some(format!(
+                        "The run loop is parked until revision {revision} is approved or rejected."
+                    )),
+                )?;
+            }
+            PlanRequest::NotReady(reply) => {
+                self.emit_decision(
+                    "revision request needs more context",
+                    Some(if reply.trim().is_empty() {
+                        "orchestrator returned an empty not-ready reply".to_string()
+                    } else {
+                        reply
+                    }),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn approve_pending_revision(&mut self, revision: u32) -> Result<()> {
+        let pending = self.state.pending_revision.clone().ok_or_else(|| {
+            EngineError::InvalidState("no pending revised plan to approve".to_string())
+        })?;
+        if pending.revision != revision {
+            return Err(EngineError::InvalidState(format!(
+                "pending revision is {}, not {revision}",
+                pending.revision
+            )));
+        }
+        validate_revised_plan_for_gate(&self.state.mission, &pending.plan)?;
+        self.commit_revised_plan_record(&pending.plan, revision)?;
+        if self.state.mission.status == MissionStatus::Blocked {
+            if let Some(mi) = first_incomplete(&self.state) {
+                let milestone_id = self.state.mission.milestones[mi].id.clone();
+                self.emit(EventKind::MilestoneUnblocked {
+                    milestone_id,
+                    reason: format!("revision {revision} approved"),
+                })?;
+            }
+        }
+        self.emit(EventKind::PlanRevised {
+            revision,
+            plan: pending.plan,
+        })?;
+        self.emit_decision(
+            &format!("revision {revision} approved"),
+            Some("plan.json and plan.md were rewritten; completed work remains frozen".to_string()),
+        )?;
+        Ok(())
+    }
+
+    fn reject_pending_revision(&mut self, revision: u32) -> Result<()> {
+        let pending = self.state.pending_revision.as_ref().ok_or_else(|| {
+            EngineError::InvalidState("no pending revised plan to reject".to_string())
+        })?;
+        if pending.revision != revision {
+            return Err(EngineError::InvalidState(format!(
+                "pending revision is {}, not {revision}",
+                pending.revision
+            )));
+        }
+        self.emit(EventKind::PlanRevisionRejected {
+            revision,
+            reason: "rejected by operator".to_string(),
+        })?;
+        self.emit_decision(
+            &format!("revision {revision} rejected"),
+            Some("mission will continue with the existing plan of record".to_string()),
+        )?;
+        Ok(())
+    }
+
+    fn commit_revised_plan_record(&mut self, plan: &Plan, revision: u32) -> Result<()> {
+        let calibration = cost::calibrate(&self.paths.repo_root);
+        let estimate = cost::estimate(plan, &self.state.config, &calibration.params);
+        let estimate = cost::apply_shape(estimate, plan, &calibration);
+        let plan_md_body = render_plan_markdown(
+            plan,
+            &self.state.mission,
+            &estimate,
+            calibration.missions_used,
+        );
+        let revised_md_body = render_revised_plan_markdown(plan, &self.state.mission, &[], &[]);
+        let active_paths = self.active_paths();
+        let plan_file = active_paths.plan_file();
+        let plan_md = active_paths.plan_md_file();
+        let revised_md = active_paths.mission_dir().join("revised-plan.md");
+        if let Some(parent) = plan_file.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&plan_file, serde_json::to_string_pretty(plan)?)?;
+        std::fs::write(&plan_md, &plan_md_body)?;
+        std::fs::write(&revised_md, &revised_md_body)?;
+        let index = active_paths.missions_dir().join("index.md");
+        let index_body = upsert_mission_index(
+            &std::fs::read_to_string(&index).unwrap_or_default(),
+            &self.state.mission.id,
+            &plan.goal,
+            chrono::Utc::now().date_naive(),
+        );
+        std::fs::write(&index, index_body)?;
+        self.active_repo().commit_paths(
+            &[
+                plan_file.as_path(),
+                plan_md.as_path(),
+                revised_md.as_path(),
+                index.as_path(),
+            ],
+            &format!(
+                "[kranz] revised plan for {} (rev {revision})",
+                self.state.mission.id
+            ),
+        )?;
+
+        if self.active_tree.is_some() {
+            let primary_plan_file = self.paths.plan_file();
+            if let Some(parent) = primary_plan_file.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&primary_plan_file, serde_json::to_string_pretty(plan)?)?;
+            std::fs::write(self.paths.plan_md_file(), &plan_md_body)?;
+            std::fs::write(
+                self.paths.mission_dir().join("revised-plan.md"),
+                revised_md_body,
+            )?;
+        }
+        Ok(())
     }
 
     /// Apply a revised plan to a running or blocked mission (roadmap M2),
@@ -1602,7 +1773,7 @@ impl MissionEngine {
 
         loop {
             // (a) drain the control inbox.
-            self.drain_control()?;
+            self.drain_control().await?;
 
             match self.state.mission.status {
                 MissionStatus::Complete => return Ok(MissionStatus::Complete),
@@ -1616,6 +1787,12 @@ impl MissionEngine {
                     continue;
                 }
                 _ => {}
+            }
+
+            if self.state.pending_revision.is_some() {
+                self.log.flush_if_due()?;
+                tokio::time::sleep(PAUSE_POLL).await;
+                continue;
             }
 
             // (d) first incomplete milestone; none → final gate (h).
@@ -1686,7 +1863,7 @@ impl MissionEngine {
     /// Pause/Resume are idempotence-guarded above, and a repeated user
     /// message/config patch is benign, whereas deleting first would lose the
     /// command outright.
-    fn drain_control(&mut self) -> Result<()> {
+    async fn drain_control(&mut self) -> Result<()> {
         for (path, cmd) in control::drain(&self.paths)? {
             match cmd {
                 ControlCommand::Pause => {
@@ -1710,6 +1887,33 @@ impl MissionEngine {
                 }
                 ControlCommand::Msg { text, interrupt } => {
                     self.emit(EventKind::UserMessage { text, interrupt })?;
+                }
+                ControlCommand::RequestRevision { instructions } => {
+                    if let Err(e) = self.propose_revision(&instructions).await {
+                        tracing::warn!(error = %e, "revision request ignored");
+                        self.emit(EventKind::OrchestratorDecision {
+                            summary: format!("revision request ignored: {e}"),
+                            detail: None,
+                        })?;
+                    }
+                }
+                ControlCommand::ApproveRevision { revision } => {
+                    if let Err(e) = self.approve_pending_revision(revision) {
+                        tracing::warn!(error = %e, revision, "revision approval ignored");
+                        self.emit(EventKind::OrchestratorDecision {
+                            summary: format!("revision {revision} approval ignored: {e}"),
+                            detail: None,
+                        })?;
+                    }
+                }
+                ControlCommand::RejectRevision { revision } => {
+                    if let Err(e) = self.reject_pending_revision(revision) {
+                        tracing::warn!(error = %e, revision, "revision rejection ignored");
+                        self.emit(EventKind::OrchestratorDecision {
+                            summary: format!("revision {revision} rejection ignored: {e}"),
+                            detail: None,
+                        })?;
+                    }
                 }
             }
             std::fs::remove_file(&path)?;
@@ -1906,7 +2110,7 @@ impl MissionEngine {
 
             // Interrupt (or any queued command) → events now, so the
             // judgement digest reflects them.
-            self.drain_control()?;
+            self.drain_control().await?;
 
             // §4.4 dirty-tree discipline (applies to interrupted runs too).
             if !self.active_repo().is_clean()? && !self.resolve_dirty_tree(&feature.id).await? {
@@ -4566,6 +4770,86 @@ fn plan_feature_count(plan: &Plan) -> usize {
     plan.milestones.iter().map(|m| m.features.len()).sum()
 }
 
+fn validate_revised_plan_for_gate(mission: &Mission, plan: &Plan) -> Result<()> {
+    if plan.milestones.is_empty() {
+        return Err(EngineError::InvalidState(
+            "revised plan has no milestones".to_string(),
+        ));
+    }
+    if let Some(empty) = plan.milestones.iter().find(|m| m.features.is_empty()) {
+        return Err(EngineError::InvalidState(format!(
+            "revised plan milestone '{}' has no features",
+            empty.title
+        )));
+    }
+    validate_contract_extends(&mission.validation_contract, &plan.validation_contract)?;
+    validate_vec_extends(
+        "commandGrants",
+        &mission.command_grants,
+        &plan.command_grants,
+    )?;
+    validate_vec_extends("touchSet", &mission.touch_set, &plan.touch_set)?;
+
+    let completed: Vec<&Milestone> = mission
+        .milestones
+        .iter()
+        .filter(|m| m.status == MilestoneStatus::Complete)
+        .collect();
+    for (i, done) in completed.iter().enumerate() {
+        let revised = plan.milestones.get(i).ok_or_else(|| {
+            EngineError::InvalidState(format!(
+                "revised plan drops completed milestone '{}' (must appear first, unchanged)",
+                done.title
+            ))
+        })?;
+        if revised.title.trim() != done.title.trim() {
+            return Err(EngineError::InvalidState(format!(
+                "revised plan milestone {} is '{}' but completed milestone '{}' must appear \
+                 there unchanged",
+                i + 1,
+                revised.title,
+                done.title
+            )));
+        }
+        if !completed_features_unchanged(done, revised) {
+            return Err(EngineError::InvalidState(format!(
+                "revised plan alters the features of completed milestone '{}'",
+                done.title
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_contract_extends(existing: &[Assertion], revised: &[Assertion]) -> Result<()> {
+    for old in existing {
+        let Some(new) = revised.iter().find(|a| a.id == old.id) else {
+            return Err(EngineError::InvalidState(format!(
+                "revised plan removes validation assertion '{}'",
+                old.id
+            )));
+        };
+        if old.statement != new.statement || old.check != new.check || old.command != new.command {
+            return Err(EngineError::InvalidState(format!(
+                "revised plan changes validation assertion '{}'",
+                old.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_vec_extends(label: &str, existing: &[String], revised: &[String]) -> Result<()> {
+    for old in existing {
+        if !revised.iter().any(|new| new == old) {
+            return Err(EngineError::InvalidState(format!(
+                "revised plan removes {label} entry '{old}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Whether a completed milestone's feature set is reproduced UNCHANGED in the
 /// revised plan milestone (roadmap M2 re-planning guard): same feature count,
 /// same titles/specs/validation-criteria in the same order. Titles/specs are
@@ -4594,9 +4878,10 @@ fn norm_title(title: &str) -> String {
 
 /// Render the revised plan as human-readable markdown for review (roadmap M2),
 /// committed to the mission branch as `revised-plan.md`. Shows the full revised
-/// plan plus a "Re-plan changes" section spelling out exactly what the engine
-/// applied under the current event set (dropped/added features) and what it
-/// could not express — so a reviewer sees the honest scope of the revision.
+/// plan plus a "Re-plan changes" section describing the reducer's merge rules.
+/// Older single-milestone re-plan callers can still pass explicit dropped/added
+/// feature lists; the event-driven M2 path records the exact structural change
+/// in the `plan.revised` event and folded state.
 pub fn render_revised_plan_markdown(
     plan: &Plan,
     mission: &Mission,
@@ -4617,27 +4902,30 @@ pub fn render_revised_plan_markdown(
     let _ = writeln!(md, "## Re-plan changes applied\n");
     let _ = writeln!(
         md,
-        "Under the current event set a mid-mission re-plan can only DROP a still-pending \
-         planned feature and ADD a feature to the active milestone. Completed milestones, \
-         already-started features, and later milestones are not altered here.\n"
+        "Completed milestones are frozen unchanged. Remaining milestones are merged by \
+         position; existing pending features match by title, omitted pending features are \
+         skipped, and new feature titles are appended with revision-scoped ids. Review the \
+         resulting plan below and the `plan.revised` event for the exact machine state.\n"
     );
-    if dropped_feature_ids.is_empty() {
-        let _ = writeln!(md, "- Dropped features: none");
-    } else {
+    if !dropped_feature_ids.is_empty() {
         let _ = writeln!(
             md,
             "- Dropped (skipped) features: {}",
             dropped_feature_ids.join(", ")
         );
     }
-    if added_features.is_empty() {
-        let _ = writeln!(md, "- Added features: none");
-    } else {
+    if !added_features.is_empty() {
         let titles: Vec<String> = added_features
             .iter()
             .map(|f| f.title.trim().to_string())
             .collect();
         let _ = writeln!(md, "- Added features: {}", titles.join(", "));
+    }
+    if dropped_feature_ids.is_empty() && added_features.is_empty() {
+        let _ = writeln!(
+            md,
+            "- Per-feature legacy diff: not supplied for this revision path"
+        );
     }
     let _ = writeln!(md);
 
@@ -6457,6 +6745,8 @@ mod tests {
             pending_user_messages: vec![],
             recent_decisions: vec![],
             config: MissionConfig::default(),
+            latest_plan_revision: 0,
+            pending_revision: None,
             last_seq: 0,
         };
 

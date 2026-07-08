@@ -149,6 +149,15 @@ export const api = {
     return getJson(`/api/missions/${encodeURIComponent(id)}/diff-stat`);
   },
 
+  revisionDiff(id: string): Promise<{
+    revision: number;
+    instructions: string;
+    markdown: string;
+    diff: string;
+  }> {
+    return getJson(`/api/missions/${encodeURIComponent(id)}/revision-diff`);
+  },
+
   transcript(id: string, runId: string): Promise<TranscriptEntry[]> {
     return getJson(
       `/api/missions/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}/transcript`,
@@ -163,6 +172,27 @@ export const api = {
     await postJson<{ queued: boolean }>(
       `/api/missions/${encodeURIComponent(id)}/control`,
       command,
+    );
+  },
+
+  async requestRevision(id: string, instructions: string): Promise<void> {
+    await postJson<{ queued: boolean }>(
+      `/api/missions/${encodeURIComponent(id)}/revise`,
+      { instructions },
+    );
+  },
+
+  async approveRevision(id: string, revision: number): Promise<void> {
+    await postJson<{ queued: boolean }>(
+      `/api/missions/${encodeURIComponent(id)}/revision/approve`,
+      { revision },
+    );
+  },
+
+  async rejectRevision(id: string, revision: number): Promise<void> {
+    await postJson<{ queued: boolean }>(
+      `/api/missions/${encodeURIComponent(id)}/revision/reject`,
+      { revision },
     );
   },
 

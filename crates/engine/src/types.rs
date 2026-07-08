@@ -345,8 +345,25 @@ pub struct MissionState {
     pub recent_decisions: Vec<String>,
     /// Per-role config overrides applied mid-mission via config.changed.
     pub config: MissionConfig,
+    /// Latest revision number observed in the durable log. `0` means the
+    /// original approved plan is still the only plan of record.
+    #[serde(default)]
+    pub latest_plan_revision: u32,
+    /// A proposed revised plan awaiting human approve/reject. The mission
+    /// status does not change while this is set; the run loop parks on this
+    /// gate and the repo stays busy until consent arrives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_revision: Option<PendingRevision>,
     /// Seq of the last event folded in.
     pub last_seq: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingRevision {
+    pub revision: u32,
+    pub plan: Plan,
+    pub instructions: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -573,6 +590,9 @@ pub enum ControlCommand {
     Resume,
     Msg { text: String, interrupt: bool },
     ConfigChange { patch: serde_json::Value },
+    RequestRevision { instructions: String },
+    ApproveRevision { revision: u32 },
+    RejectRevision { revision: u32 },
 }
 
 #[cfg(test)]

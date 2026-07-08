@@ -1014,6 +1014,10 @@ button {
   min-height: 90px;
 }
 
+.panel-revision {
+  max-height: 34%;
+}
+
 .panel-log {
   flex: 1.4 1 auto;
   min-height: 120px;
@@ -1025,6 +1029,59 @@ button {
   overflow-y: auto;
   min-height: 0;
   padding-bottom: 6px;
+}
+
+.revision-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 0 8px 8px;
+  min-height: 0;
+}
+
+.revision-input {
+  width: 100%;
+  resize: vertical;
+  min-height: 66px;
+  max-height: 150px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px;
+  background: var(--panel);
+  color: var(--text);
+  font: inherit;
+}
+
+.revision-submit {
+  align-self: flex-start;
+}
+
+.revision-instructions {
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.revision-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.revision-diff {
+  margin: 0;
+  max-height: 220px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px;
+  background: var(--bg);
+  font: 11px/1.35 var(--mono);
+  white-space: pre;
+}
+
+.revision-error {
+  margin: 0 8px 8px;
 }
 
 /* model panel */

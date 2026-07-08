@@ -171,6 +171,12 @@ export interface PlanFeature {
   validationCriteria: string[];
 }
 
+export interface PendingRevision {
+  revision: number;
+  plan: Plan;
+  instructions: string;
+}
+
 export interface TokenUsage {
   input: number;
   output: number;
@@ -247,6 +253,8 @@ export interface MissionState {
   pendingUserMessages: string[];
   recentDecisions: string[];
   config: MissionConfig;
+  latestPlanRevision: number;
+  pendingRevision?: PendingRevision;
   lastSeq: number;
 }
 
@@ -287,6 +295,9 @@ export type PlanRequestResponse =
 export type EventKind =
   | { type: 'mission.created'; payload: { goal: string; baseBranch: string; missionBranch: string; config: MissionConfig } }
   | { type: 'plan.approved'; payload: { plan: Plan } }
+  | { type: 'plan.revision.proposed'; payload: { revision: number; plan: Plan; instructions: string } }
+  | { type: 'plan.revised'; payload: { revision: number; plan: Plan } }
+  | { type: 'plan.revision.rejected'; payload: { revision: number; reason: string } }
   | { type: 'milestone.started'; payload: { milestoneId: string; startSha: string } }
   | { type: 'feature.started'; payload: { featureId: string } }
   | { type: 'worker.spawned'; payload: { runId: string; role: Role; featureId?: string; milestoneId?: string; sdkSessionId: string; model: string; promptHash: string; transcriptPath: string } }
@@ -326,7 +337,10 @@ export type ControlCommand =
   | { kind: 'pause' }
   | { kind: 'resume' }
   | { kind: 'msg'; text: string; interrupt: boolean }
-  | { kind: 'config-change'; patch: Record<string, unknown> };
+  | { kind: 'config-change'; patch: Record<string, unknown> }
+  | { kind: 'request-revision'; instructions: string }
+  | { kind: 'approve-revision'; revision: number }
+  | { kind: 'reject-revision'; revision: number };
 
 // ---------------------------------------------------------------------------
 // WebSocket frames (GET /api/missions/:id/ws)

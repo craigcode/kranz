@@ -30,6 +30,14 @@ pub const START_ACTION_ID: &str = "kranz_start";
 /// crate only renders the button.
 pub const MERGE_ACTION_ID: &str = "kranz_merge";
 
+/// `action_id` of the "Approve revision" button on a proposed-revision card.
+/// The button value is `<mission-id>:<revision>`.
+pub const APPROVE_REVISION_ACTION_ID: &str = "kranz_approve_revision";
+
+/// `action_id` of the "Reject revision" button on a proposed-revision card.
+/// The button value is `<mission-id>:<revision>`.
+pub const REJECT_REVISION_ACTION_ID: &str = "kranz_reject_revision";
+
 /// `action_id` of the "Queue" button on a `/kranz todo` Reviewable-ticket row.
 /// The button value carries the ticket slug and routes through the same
 /// allowlist-gated [`crate::inbound::Action::QueueTicket`] path as
@@ -76,6 +84,16 @@ pub struct PlanReady {
     /// Milestone titles, in plan order (rendered as a compact bullet list).
     pub milestone_titles: Vec<String>,
     /// Number of validation-contract assertions (shown as a count, not dumped).
+    pub assertion_count: usize,
+}
+
+/// A proposed mid-mission plan revision awaiting human consent.
+#[derive(Debug, Clone)]
+pub struct RevisionReady {
+    pub mission_id: String,
+    pub revision: u32,
+    pub instructions: String,
+    pub milestone_titles: Vec<String>,
     pub assertion_count: usize,
 }
 
@@ -478,6 +496,60 @@ pub fn build_plan_ready(p: &PlanReady, dashboard_url: Option<&str>) -> Vec<Value
         )),
     ];
     push_dashboard_button(&mut blocks, dashboard_url, &p.mission_id);
+    blocks
+}
+
+/// Proposed-revision announcement: shows the operator instructions, revised
+/// milestone list, and explicit approve/reject buttons carrying the exact
+/// revision number.
+pub fn build_revision_ready(r: &RevisionReady, dashboard_url: Option<&str>) -> Vec<Value> {
+    let mut milestones = String::new();
+    for title in &r.milestone_titles {
+        milestones.push_str("• ");
+        milestones.push_str(title.trim());
+        milestones.push('\n');
+    }
+    if milestones.is_empty() {
+        milestones.push_str("_(no milestones listed)_");
+    }
+    let value = format!("{}:{}", r.mission_id, r.revision);
+    let mut blocks = vec![
+        header(&format!(
+            "Revision {} proposed — {}",
+            r.revision, r.mission_id
+        )),
+        section(&format!("*Instructions*\n{}", clip(r.instructions.trim()))),
+        section(&format!(
+            "*Revised milestones*\n{}",
+            clip(milestones.trim_end())
+        )),
+        context(&format!(
+            "{} validation assertion{} · mission `{}`",
+            r.assertion_count,
+            plural(r.assertion_count),
+            r.mission_id
+        )),
+        json!({
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "style": "primary",
+                    "text": { "type": "plain_text", "text": "Approve revision" },
+                    "action_id": APPROVE_REVISION_ACTION_ID,
+                    "value": value.clone(),
+                },
+                {
+                    "type": "button",
+                    "style": "danger",
+                    "text": { "type": "plain_text", "text": "Reject revision" },
+                    "action_id": REJECT_REVISION_ACTION_ID,
+                    "value": value,
+                }
+            ]
+        }),
+    ];
+    push_dashboard_button(&mut blocks, dashboard_url, &r.mission_id);
     blocks
 }
 
@@ -1067,6 +1139,8 @@ pub fn build_help() -> Vec<Value> {
              (bare `/kranz new` opens a form with a full multiline goal field)\n\
              • `/kranz plan <id>` — request the plan for review\n\
              • `/kranz approve <id>` — approve the plan and queue the mission\n\
+             • `/kranz revise <id> <instructions>` — request a mid-mission plan revision\n\
+             • `/kranz revision approve|reject <id> <rev>` — decide a proposed revision\n\
              • `/kranz queue <slug>` — queue a reviewed backlog ticket\n\
              • `/kranz config [<id>] <role> <model> [effort]` — change a role's model/effort \
              (roles: orchestrator·worker·scrutiny·functional; effort: low·medium·high·xhigh·max)\n\
@@ -1085,6 +1159,7 @@ pub fn build_help() -> Vec<Value> {
         section(
             "*In a mission thread*\n\
              • *Approve & start* / *Approve & queue* buttons on a plan-review message\n\
+             • *Approve revision* / *Reject revision* buttons on a revision message\n\
              • *Reply in the thread* — during planning your message is a planning turn; \
              on a running mission it becomes orchestrator guidance \
              (unblocks a blocked milestone, steers a running one)",

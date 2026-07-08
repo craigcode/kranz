@@ -132,6 +132,10 @@ pub fn router_with_shared_host(
         .route("/api/missions/{id}/events", get(rest::mission_events))
         .route("/api/missions/{id}/plan", get(rest::mission_plan))
         .route("/api/missions/{id}/plan.md", get(rest::mission_plan_md))
+        .route(
+            "/api/missions/{id}/revision-diff",
+            get(rest::mission_revision_diff),
+        )
         .route("/api/missions/{id}/report.md", get(rest::mission_report_md))
         .route("/api/missions/{id}/diff-stat", get(rest::mission_diff_stat))
         .route(
@@ -139,6 +143,15 @@ pub fn router_with_shared_host(
             get(rest::run_transcript),
         )
         .route("/api/missions/{id}/control", post(rest::post_control))
+        .route("/api/missions/{id}/revise", post(rest::post_revise))
+        .route(
+            "/api/missions/{id}/revision/approve",
+            post(rest::post_revision_approve),
+        )
+        .route(
+            "/api/missions/{id}/revision/reject",
+            post(rest::post_revision_reject),
+        )
         .route(
             "/api/missions/{id}/planning/turn",
             post(host::planning_turn),

@@ -53,6 +53,19 @@ pub enum EventKind {
         base_sha: Option<String>,
     },
 
+    #[serde(rename = "plan.revision.proposed")]
+    PlanRevisionProposed {
+        revision: u32,
+        plan: Plan,
+        instructions: String,
+    },
+
+    #[serde(rename = "plan.revised")]
+    PlanRevised { revision: u32, plan: Plan },
+
+    #[serde(rename = "plan.revision.rejected")]
+    PlanRevisionRejected { revision: u32, reason: String },
+
     #[serde(rename = "milestone.started")]
     MilestoneStarted {
         #[serde(rename = "milestoneId")]
@@ -224,6 +237,9 @@ impl EventKind {
         match self {
             EventKind::MissionCreated { .. } => "mission.created",
             EventKind::PlanApproved { .. } => "plan.approved",
+            EventKind::PlanRevisionProposed { .. } => "plan.revision.proposed",
+            EventKind::PlanRevised { .. } => "plan.revised",
+            EventKind::PlanRevisionRejected { .. } => "plan.revision.rejected",
             EventKind::MilestoneStarted { .. } => "milestone.started",
             EventKind::FeatureStarted { .. } => "feature.started",
             EventKind::WorkerSpawned { .. } => "worker.spawned",

@@ -21,7 +21,7 @@ use kranz_engine::backend_mock::{mock_init, mock_result_text, mock_text, MockBac
 use kranz_engine::event_log::{EventLog, LockForce};
 use kranz_engine::events::EventKind;
 use kranz_engine::paths::MissionPaths;
-use kranz_engine::types::MissionConfig;
+use kranz_engine::types::{MissionConfig, Plan};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -711,6 +711,35 @@ fn seed_mission_log(repo_root: &Path, id: &str) {
     .unwrap();
 }
 
+fn seed_pending_revision_log(repo_root: &Path, id: &str) {
+    let paths = MissionPaths::new(repo_root, id);
+    let plan: Plan = serde_json::from_value(plan_json()).unwrap();
+    let mut revised = plan.clone();
+    revised.goal = "ship the revised demo".into();
+    revised.milestones[0].features[0].spec = "build the safer thing".into();
+
+    let mut log = EventLog::acquire(&paths, id, Duration::ZERO, LockForce::No).unwrap();
+    log.append(EventKind::MissionCreated {
+        goal: "observe".into(),
+        base_branch: "main".into(),
+        mission_branch: format!("kranz/mission-{id}"),
+        config: MissionConfig::default(),
+    })
+    .unwrap();
+    log.append(EventKind::PlanApproved {
+        plan,
+        base_sha: Some("base-1".into()),
+    })
+    .unwrap();
+    log.append(EventKind::PlanRevisionProposed {
+        revision: 1,
+        plan: revised,
+        instructions: "make it safer".into(),
+    })
+    .unwrap();
+    std::fs::write(paths.plan_md_file(), "# Mission plan\n\nold plan\n").unwrap();
+}
+
 #[tokio::test]
 async fn mutation_token_gates_every_post_and_no_get() {
     let tmp = tempfile::tempdir().unwrap();
@@ -738,6 +767,9 @@ async fn mutation_token_gates_every_post_and_no_get() {
         "/api/missions/m-01/planning/request-plan",
         "/api/missions/m-01/approve",
         "/api/missions/m-01/start",
+        "/api/missions/m-01/revise",
+        "/api/missions/m-01/revision/approve",
+        "/api/missions/m-01/revision/reject",
         "/api/missions/m-01/release",
         "/api/queue/drain",
     ] {
@@ -763,6 +795,62 @@ async fn mutation_token_gates_every_post_and_no_get() {
     assert_eq!(status, StatusCode::OK);
     let (status, _) = get_json(&app, "/api/queue").await;
     assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn revision_routes_expose_diff_and_enqueue_decisions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    seed_pending_revision_log(&root, "m-rev");
+    let app = kranz_server::router_with_token(root.clone(), None, Some(TOKEN.to_string()));
+
+    let (status, body) = get_json(&app, "/api/missions/m-rev/revision-diff").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["revision"], 1);
+    assert_eq!(body["instructions"], "make it safer");
+    assert!(body["diff"].as_str().unwrap().contains("revised-plan.md"));
+
+    let (status, body) = post_json(
+        &app,
+        "/api/missions/m-rev/revision/approve",
+        Some(TOKEN),
+        json!({ "revision": 2 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("awaiting revision 1"));
+
+    let (status, body) = post_json(
+        &app,
+        "/api/missions/m-rev/revision/approve",
+        Some(TOKEN),
+        json!({ "revision": 1 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(body["queued"], true);
+    let drained = kranz_engine::control::drain(&MissionPaths::new(&root, "m-rev")).unwrap();
+    assert_eq!(drained.len(), 1);
+    assert!(matches!(
+        drained[0].1,
+        kranz_engine::types::ControlCommand::ApproveRevision { revision: 1 }
+    ));
+
+    let (status, body) = post_json(
+        &app,
+        "/api/missions/m-rev/revise",
+        Some(TOKEN),
+        json!({ "instructions": "  " }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("must not be empty"));
 }
 
 // ---------------------------------------------------------------------------

@@ -19,6 +19,15 @@ function describe(e: MissionEvent, state: MissionState | null): { text: string; 
         text: `Plan approved (${e.payload.plan.milestones.length} milestones)`,
         tone: 'ok',
       };
+    case 'plan.revision.proposed':
+      return {
+        text: `Revision ${e.payload.revision} proposed (${e.payload.plan.milestones.length} milestones)`,
+        tone: 'warn',
+      };
+    case 'plan.revised':
+      return { text: `Revision ${e.payload.revision} approved`, tone: 'ok' };
+    case 'plan.revision.rejected':
+      return { text: `Revision ${e.payload.revision} rejected`, tone: 'warn' };
     case 'milestone.started':
       return { text: `Milestone ${e.payload.milestoneId} started`, tone: 'info' };
     case 'feature.started':

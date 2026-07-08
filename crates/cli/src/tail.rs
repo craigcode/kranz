@@ -117,6 +117,21 @@ impl EventRenderer {
                     ),
                 )
             }
+            EventKind::PlanRevisionProposed { revision, .. } => (
+                "mission".to_string(),
+                ansi::YELLOW,
+                format!("revision {revision} proposed; awaiting approval"),
+            ),
+            EventKind::PlanRevised { revision, .. } => (
+                "mission".to_string(),
+                ansi::YELLOW,
+                format!("revision {revision} approved"),
+            ),
+            EventKind::PlanRevisionRejected { revision, .. } => (
+                "mission".to_string(),
+                ansi::YELLOW,
+                format!("revision {revision} rejected"),
+            ),
             EventKind::MilestoneStarted { milestone_id, .. } => (
                 format!("milestone {milestone_id}"),
                 ansi::YELLOW,

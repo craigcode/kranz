@@ -33,13 +33,16 @@ fn created() -> EventKind {
     }
 }
 
-/// Plan with 2 milestones / 3 features: ms-1 { f-1-1, f-1-2 }, ms-2 { f-2-1 }.
-fn plan() -> Plan {
-    let feature = |title: &str| PlanFeature {
+fn plan_feature(title: &str) -> PlanFeature {
+    PlanFeature {
         title: title.to_string(),
         spec: format!("spec for {title}"),
         validation_criteria: vec![format!("{title} works")],
-    };
+    }
+}
+
+/// Plan with 2 milestones / 3 features: ms-1 { f-1-1, f-1-2 }, ms-2 { f-2-1 }.
+fn plan() -> Plan {
     Plan {
         goal: "build the thing, planned".to_string(),
         validation_contract: vec![Assertion {
@@ -51,11 +54,11 @@ fn plan() -> Plan {
         milestones: vec![
             PlanMilestone {
                 title: "milestone one".to_string(),
-                features: vec![feature("alpha"), feature("beta")],
+                features: vec![plan_feature("alpha"), plan_feature("beta")],
             },
             PlanMilestone {
                 title: "milestone two".to_string(),
-                features: vec![feature("gamma")],
+                features: vec![plan_feature("gamma")],
             },
         ],
         considered_alternatives: None,
@@ -954,6 +957,138 @@ fn approved_status_full_lifecycle_still_folds_to_complete() {
         EventKind::MissionCompleted {},
     ]);
     assert_eq!(state.mission.status, MissionStatus::Complete);
+}
+
+#[test]
+fn plan_revision_approval_merges_remaining_work() {
+    let mut revised = plan();
+    revised.goal = "build the revised thing".into();
+    revised.milestones[0].features[1].spec = "tightened beta spec".into();
+    revised.milestones[0].features.push(plan_feature("delta"));
+    revised.milestones.push(PlanMilestone {
+        title: "milestone three".into(),
+        features: vec![plan_feature("omega")],
+    });
+
+    let mut state = fold_kinds(vec![
+        created(),
+        EventKind::PlanApproved {
+            plan: plan(),
+            base_sha: Some("base-1".into()),
+        },
+        EventKind::MilestoneStarted {
+            milestone_id: "ms-1".into(),
+            start_sha: "sha-1".into(),
+        },
+        EventKind::FeatureCompleted {
+            feature_id: "f-1-1".into(),
+            commits: vec!["c-alpha".into()],
+        },
+        EventKind::PlanRevisionProposed {
+            revision: 1,
+            plan: revised.clone(),
+            instructions: "add omega, tighten beta".into(),
+        },
+    ]);
+
+    assert_eq!(state.latest_plan_revision, 1);
+    assert_eq!(state.pending_revision.as_ref().map(|p| p.revision), Some(1));
+
+    apply(
+        &mut state,
+        &ev(
+            6,
+            EventKind::PlanRevised {
+                revision: 1,
+                plan: revised,
+            },
+        ),
+    )
+    .unwrap();
+
+    assert!(state.pending_revision.is_none());
+    assert_eq!(state.latest_plan_revision, 1);
+    assert_eq!(state.mission.goal, "build the revised thing");
+    assert_eq!(feature(&state, "f-1-1").status, FeatureStatus::Complete);
+    assert_eq!(feature(&state, "f-1-1").commits, vec!["c-alpha"]);
+    assert_eq!(feature(&state, "f-1-2").spec, "tightened beta spec");
+    assert_eq!(feature(&state, "ms-1-rev-1-1").title, "delta");
+    assert_eq!(milestone(&state, "ms-3").title, "milestone three");
+    assert_eq!(feature(&state, "f-3-1").title, "omega");
+}
+
+#[test]
+fn plan_revision_reject_clears_pending_without_changing_plan() {
+    let mut revised = plan();
+    revised.goal = "do something else".into();
+
+    let mut state = fold_kinds(vec![
+        created(),
+        EventKind::PlanApproved {
+            plan: plan(),
+            base_sha: None,
+        },
+        EventKind::PlanRevisionProposed {
+            revision: 2,
+            plan: revised,
+            instructions: "change direction".into(),
+        },
+    ]);
+
+    assert!(state.pending_revision.is_some());
+    apply(
+        &mut state,
+        &ev(
+            4,
+            EventKind::PlanRevisionRejected {
+                revision: 2,
+                reason: "operator rejected".into(),
+            },
+        ),
+    )
+    .unwrap();
+
+    assert!(state.pending_revision.is_none());
+    assert_eq!(state.latest_plan_revision, 2);
+    assert_eq!(state.mission.goal, "build the thing, planned");
+    assert_eq!(state.mission.milestones.len(), 2);
+}
+
+#[test]
+fn plan_revision_cannot_change_completed_milestones() {
+    let mut revised = plan();
+    revised.milestones[0].features[0].spec = "rewrite completed alpha".into();
+
+    let events: Vec<Event> = vec![
+        created(),
+        EventKind::PlanApproved {
+            plan: plan(),
+            base_sha: None,
+        },
+        EventKind::MilestoneCompleted {
+            milestone_id: "ms-1".into(),
+            tag: None,
+        },
+        EventKind::PlanRevisionProposed {
+            revision: 1,
+            plan: revised.clone(),
+            instructions: "bad".into(),
+        },
+        EventKind::PlanRevised {
+            revision: 1,
+            plan: revised,
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, kind)| ev(i as u64 + 1, kind))
+    .collect();
+    let err = fold(&events).unwrap_err();
+
+    assert!(matches!(err, EngineError::InvalidState(_)));
+    assert!(err
+        .to_string()
+        .contains("alters completed milestone 'milestone one'"));
 }
 
 #[test]

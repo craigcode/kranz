@@ -299,6 +299,7 @@ async fn post_outbound(
     let dash = cfg.dashboard_url.as_deref();
     let blocks = match outbound {
         Outbound::PlanReady(p) => crate::format::build_plan_ready(p, dash),
+        Outbound::RevisionReady(r) => crate::format::build_revision_ready(r, dash),
         Outbound::Blocked(b) => crate::format::build_blocked(b, dash),
         Outbound::Complete(c) => crate::format::build_complete(c, dash),
     };
@@ -1738,6 +1739,66 @@ async fn dispatch_action(
             )
             .await;
         }
+        Action::Revise {
+            mission_id,
+            instructions,
+            user_id,
+            response_url,
+        } => {
+            revision_control(
+                cfg,
+                client,
+                repo_root,
+                mission_id,
+                user_id.as_deref(),
+                response_url.as_deref(),
+                ControlCommand::RequestRevision {
+                    instructions: instructions.clone(),
+                },
+                "revision request queued",
+            )
+            .await;
+        }
+        Action::ApproveRevision {
+            mission_id,
+            revision,
+            user_id,
+            response_url,
+        } => {
+            revision_control(
+                cfg,
+                client,
+                repo_root,
+                mission_id,
+                user_id.as_deref(),
+                response_url.as_deref(),
+                ControlCommand::ApproveRevision {
+                    revision: *revision,
+                },
+                "revision approval queued",
+            )
+            .await;
+        }
+        Action::RejectRevision {
+            mission_id,
+            revision,
+            user_id,
+            response_url,
+        } => {
+            revision_control(
+                cfg,
+                client,
+                repo_root,
+                mission_id,
+                user_id.as_deref(),
+                response_url.as_deref(),
+                ControlCommand::RejectRevision {
+                    revision: *revision,
+                },
+                "revision rejection queued",
+            )
+            .await;
+        }
 
         // Queue report. READ-ONLY and REPORT-ONLY: the bridge never drains the
         // queue on the socket loop (that would spawn `claude`); it reads the
@@ -2448,6 +2509,9 @@ fn apply_action(repo_root: &Path, action: &Action) -> Result<()> {
         | Action::Config { .. }
         | Action::Pause { .. }
         | Action::Resume { .. }
+        | Action::Revise { .. }
+        | Action::ApproveRevision { .. }
+        | Action::RejectRevision { .. }
         | Action::Work { .. }
         | Action::WorkRun { .. }
         | Action::AppHome { .. }
@@ -3146,6 +3210,78 @@ fn enqueue_steer(
     kranz_engine::control::enqueue(&paths, &cmd).context("enqueue steering command")?;
     tracing::info!(mission = %mission_id, ?cmd, "steering command enqueued from Slack");
     Ok(mission_id)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn revision_control(
+    cfg: &SlackConfig,
+    client: &SlackClient,
+    repo_root: &Path,
+    mission_id: &str,
+    user_id: Option<&str>,
+    response_url: Option<&str>,
+    cmd: ControlCommand,
+    queued: &str,
+) {
+    if !cfg.is_authorized(user_id) {
+        reply_ephemeral(cfg, client, response_url, &not_authorized_blocks()).await;
+        return;
+    }
+    match enqueue_revision_control(repo_root, mission_id, cmd) {
+        Ok(applied_to) => {
+            reply_ephemeral(
+                cfg,
+                client,
+                response_url,
+                &error_blocks(&format!(":memo: {queued} for `{applied_to}`.")),
+            )
+            .await;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to enqueue revision control from Slack");
+            reply_ephemeral(
+                cfg,
+                client,
+                response_url,
+                &error_blocks(&format!("Couldn't queue revision command: {e}")),
+            )
+            .await;
+        }
+    }
+}
+
+fn enqueue_revision_control(
+    repo_root: &Path,
+    mission_id: &str,
+    cmd: ControlCommand,
+) -> Result<String> {
+    let mission_id = resolve_active_config_target(repo_root, Some(mission_id))?;
+    let paths = MissionPaths::new(repo_root, &mission_id);
+    let state = read_mission_state(&paths)?;
+    if state.mission.status == MissionStatus::Planning {
+        anyhow::bail!("mission `{mission_id}` has no approved plan to revise yet");
+    }
+    match &cmd {
+        ControlCommand::ApproveRevision { revision }
+        | ControlCommand::RejectRevision { revision } => match state.pending_revision {
+            Some(pending) if pending.revision == *revision => {}
+            Some(pending) => anyhow::bail!(
+                "mission `{mission_id}` is awaiting revision {}, not {revision}",
+                pending.revision
+            ),
+            None => anyhow::bail!("mission `{mission_id}` has no pending revision"),
+        },
+        ControlCommand::RequestRevision { .. } => {}
+        _ => anyhow::bail!("not a revision control command"),
+    }
+    kranz_engine::control::enqueue(&paths, &cmd).context("enqueue revision control")?;
+    tracing::info!(mission = %mission_id, ?cmd, "revision control enqueued from Slack");
+    Ok(mission_id)
+}
+
+fn read_mission_state(paths: &MissionPaths) -> Result<MissionState> {
+    let events = EventLog::read_events(&paths.events_file())?;
+    Ok(reducer::fold(&events)?)
 }
 
 /// `/kranz work` reply: report the per-repo execution queue (from

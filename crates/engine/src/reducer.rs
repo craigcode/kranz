@@ -82,6 +82,53 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             state.mission.command_grants = plan.command_grants.clone();
             state.mission.touch_set = plan.touch_set.clone();
             state.mission.status = MissionStatus::Approved;
+            state.latest_plan_revision = 0;
+            state.pending_revision = None;
+        }
+
+        EventKind::PlanRevisionProposed {
+            revision,
+            plan,
+            instructions,
+        } => {
+            if *revision == 0 {
+                return Err(EngineError::InvalidState(
+                    "plan.revision.proposed revision must be >= 1".to_string(),
+                ));
+            }
+            state.latest_plan_revision = state.latest_plan_revision.max(*revision);
+            state.pending_revision = Some(PendingRevision {
+                revision: *revision,
+                plan: plan.clone(),
+                instructions: instructions.clone(),
+            });
+        }
+
+        EventKind::PlanRevised { revision, plan } => {
+            if let Some(pending) = &state.pending_revision {
+                if pending.revision != *revision {
+                    return Err(EngineError::InvalidState(format!(
+                        "plan.revised revision {revision} does not match pending revision {}",
+                        pending.revision
+                    )));
+                }
+            }
+            apply_revised_plan(state, plan, *revision)?;
+            state.latest_plan_revision = state.latest_plan_revision.max(*revision);
+            state.pending_revision = None;
+        }
+
+        EventKind::PlanRevisionRejected { revision, .. } => {
+            if let Some(pending) = &state.pending_revision {
+                if pending.revision != *revision {
+                    return Err(EngineError::InvalidState(format!(
+                        "plan.revision.rejected revision {revision} does not match pending revision {}",
+                        pending.revision
+                    )));
+                }
+            }
+            state.latest_plan_revision = state.latest_plan_revision.max(*revision);
+            state.pending_revision = None;
         }
 
         EventKind::MilestoneStarted {
@@ -338,8 +385,206 @@ fn initial_state(event: &Event) -> Result<MissionState> {
         pending_user_messages: Vec::new(),
         recent_decisions: Vec::new(),
         config: config.clone(),
+        latest_plan_revision: 0,
+        pending_revision: None,
         last_seq: event.seq,
     })
+}
+
+fn apply_revised_plan(state: &mut MissionState, plan: &Plan, revision: u32) -> Result<()> {
+    ensure_contract_extends(
+        &state.mission.validation_contract,
+        &plan.validation_contract,
+    )?;
+    ensure_strings_extend(
+        "commandGrants",
+        &state.mission.command_grants,
+        &plan.command_grants,
+    )?;
+    ensure_strings_extend("touchSet", &state.mission.touch_set, &plan.touch_set)?;
+
+    let completed_prefix = state
+        .mission
+        .milestones
+        .iter()
+        .position(|m| m.status != MilestoneStatus::Complete)
+        .unwrap_or(state.mission.milestones.len());
+    if plan.milestones.len() < completed_prefix {
+        return Err(EngineError::InvalidState(
+            "plan.revised drops completed milestones".to_string(),
+        ));
+    }
+
+    let mut revised_milestones = Vec::new();
+    for (idx, existing) in state
+        .mission
+        .milestones
+        .iter()
+        .enumerate()
+        .take(completed_prefix)
+    {
+        let Some(plan_milestone) = plan.milestones.get(idx) else {
+            return Err(EngineError::InvalidState(format!(
+                "plan.revised drops completed milestone '{}'",
+                existing.title
+            )));
+        };
+        if !completed_milestone_matches(existing, plan_milestone) {
+            return Err(EngineError::InvalidState(format!(
+                "plan.revised alters completed milestone '{}'",
+                existing.title
+            )));
+        }
+        revised_milestones.push(existing.clone());
+    }
+
+    for (idx, plan_milestone) in plan.milestones.iter().enumerate().skip(completed_prefix) {
+        if let Some(existing) = state.mission.milestones.get(idx) {
+            revised_milestones.push(merge_revised_milestone(existing, plan_milestone, revision));
+        } else {
+            revised_milestones.push(new_plan_milestone(idx, plan_milestone));
+        }
+    }
+
+    state.mission.goal = plan.goal.clone();
+    state.mission.validation_contract = plan.validation_contract.clone();
+    state.mission.command_grants = plan.command_grants.clone();
+    state.mission.touch_set = plan.touch_set.clone();
+    state.mission.milestones = revised_milestones;
+    Ok(())
+}
+
+fn ensure_contract_extends(existing: &[Assertion], revised: &[Assertion]) -> Result<()> {
+    for old in existing {
+        let Some(new) = revised.iter().find(|a| a.id == old.id) else {
+            return Err(EngineError::InvalidState(format!(
+                "plan.revised removes validation assertion '{}'",
+                old.id
+            )));
+        };
+        if old.statement != new.statement || old.check != new.check || old.command != new.command {
+            return Err(EngineError::InvalidState(format!(
+                "plan.revised weakens or changes validation assertion '{}'",
+                old.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_strings_extend(label: &str, existing: &[String], revised: &[String]) -> Result<()> {
+    for old in existing {
+        if !revised.iter().any(|new| new == old) {
+            return Err(EngineError::InvalidState(format!(
+                "plan.revised removes {label} entry '{old}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn completed_milestone_matches(existing: &Milestone, revised: &PlanMilestone) -> bool {
+    existing.title.trim() == revised.title.trim()
+        && existing.features.len() == revised.features.len()
+        && existing
+            .features
+            .iter()
+            .zip(&revised.features)
+            .all(|(feature, plan_feature)| {
+                feature.title == plan_feature.title
+                    && feature.spec == plan_feature.spec
+                    && feature.validation_criteria == plan_feature.validation_criteria
+            })
+}
+
+fn merge_revised_milestone(
+    existing: &Milestone,
+    revised: &PlanMilestone,
+    revision: u32,
+) -> Milestone {
+    let mut features = Vec::new();
+    let mut new_count = 0usize;
+    for feature in &existing.features {
+        let matching = revised
+            .features
+            .iter()
+            .find(|candidate| norm_title(&candidate.title) == norm_title(&feature.title));
+        match (feature.status, matching) {
+            (FeatureStatus::Pending, Some(plan_feature)) => {
+                let mut updated = feature.clone();
+                updated.title = plan_feature.title.clone();
+                updated.spec = plan_feature.spec.clone();
+                updated.validation_criteria = plan_feature.validation_criteria.clone();
+                features.push(updated);
+            }
+            (FeatureStatus::Pending, None) => {
+                let mut skipped = feature.clone();
+                skipped.status = FeatureStatus::Skipped;
+                features.push(skipped);
+            }
+            _ => features.push(feature.clone()),
+        }
+    }
+
+    for plan_feature in &revised.features {
+        let already_present = existing
+            .features
+            .iter()
+            .any(|feature| norm_title(&feature.title) == norm_title(&plan_feature.title));
+        if !already_present {
+            new_count += 1;
+            features.push(Feature {
+                id: format!("{}-rev-{revision}-{new_count}", existing.id),
+                title: plan_feature.title.clone(),
+                spec: plan_feature.spec.clone(),
+                validation_criteria: plan_feature.validation_criteria.clone(),
+                origin: FeatureOrigin::Plan,
+                status: FeatureStatus::Pending,
+                worker_runs: Vec::new(),
+                commits: Vec::new(),
+                respawns: 0,
+            });
+        }
+    }
+
+    Milestone {
+        id: existing.id.clone(),
+        title: revised.title.clone(),
+        features,
+        status: existing.status,
+        fix_cycles: existing.fix_cycles,
+        start_sha: existing.start_sha.clone(),
+    }
+}
+
+fn new_plan_milestone(idx: usize, plan_milestone: &PlanMilestone) -> Milestone {
+    Milestone {
+        id: format!("ms-{}", idx + 1),
+        title: plan_milestone.title.clone(),
+        features: plan_milestone
+            .features
+            .iter()
+            .enumerate()
+            .map(|(fi, feature)| Feature {
+                id: format!("f-{}-{}", idx + 1, fi + 1),
+                title: feature.title.clone(),
+                spec: feature.spec.clone(),
+                validation_criteria: feature.validation_criteria.clone(),
+                origin: FeatureOrigin::Plan,
+                status: FeatureStatus::Pending,
+                worker_runs: Vec::new(),
+                commits: Vec::new(),
+                respawns: 0,
+            })
+            .collect(),
+        status: MilestoneStatus::Pending,
+        fix_cycles: 0,
+        start_sha: None,
+    }
+}
+
+fn norm_title(title: &str) -> String {
+    title.trim().to_ascii_lowercase()
 }
 
 fn milestone_mut<'a>(state: &'a mut MissionState, id: &str) -> Result<&'a mut Milestone> {

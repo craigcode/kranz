@@ -105,6 +105,22 @@ pub enum Command {
         interrupt: bool,
     },
 
+    /// Request a revised plan for an active mission
+    Revise {
+        /// Mission id to revise
+        id: String,
+
+        /// Operator instructions for the revision
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+        instructions: Vec<String>,
+    },
+
+    /// Approve or reject a pending plan revision
+    Revision {
+        #[command(subcommand)]
+        command: RevisionCommand,
+    },
+
     /// List this repo's missions
     Missions,
 
@@ -316,6 +332,27 @@ pub enum Command {
     Config {
         #[command(subcommand)]
         command: crate::config_cmd::ConfigCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RevisionCommand {
+    /// Approve a proposed plan revision
+    Approve {
+        /// Mission id whose pending revision should be approved
+        id: String,
+
+        /// Revision number to approve
+        revision: u32,
+    },
+
+    /// Reject a proposed plan revision
+    Reject {
+        /// Mission id whose pending revision should be rejected
+        id: String,
+
+        /// Revision number to reject
+        revision: u32,
     },
 }
 

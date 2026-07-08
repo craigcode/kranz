@@ -9,6 +9,7 @@
 //!
 //! Event → notification map (gated by [`crate::config::NotifyFlags`] in the bridge):
 //! - `plan.approved`      → plan ready for review (`build_plan_ready`)
+//! - `plan.revision.proposed` → revision ready for review (`build_revision_ready`)
 //! - `milestone.blocked`  → blocked (`build_blocked`)
 //! - `mission.completed`  → complete (`build_complete`, [`Outcome::Completed`])
 //! - `mission.failed`     → complete (`build_complete`, [`Outcome::Failed`])
@@ -17,7 +18,7 @@
 //! ticket file), so the bridge emits that one directly from the ticket layer;
 //! see [`crate::format::build_needs_context`]. It is intentionally absent here.
 
-use crate::format::{Blocked, Complete, Outcome, PlanReady};
+use crate::format::{Blocked, Complete, Outcome, PlanReady, RevisionReady};
 use kranz_engine::events::{Event, EventKind};
 use kranz_engine::types::MissionState;
 use std::path::Path;
@@ -27,6 +28,7 @@ use std::path::Path;
 #[derive(Debug, Clone)]
 pub enum Outbound {
     PlanReady(PlanReady),
+    RevisionReady(RevisionReady),
     Blocked(Blocked),
     Complete(Complete),
 }
@@ -37,6 +39,7 @@ impl Outbound {
     pub fn class(&self) -> NotifyClass {
         match self {
             Outbound::PlanReady(_) => NotifyClass::PlanReady,
+            Outbound::RevisionReady(_) => NotifyClass::PlanReady,
             Outbound::Blocked(_) => NotifyClass::Blocked,
             Outbound::Complete(_) => NotifyClass::Complete,
         }
@@ -66,6 +69,18 @@ pub fn classify(event: &Event, state: &MissionState, repo_root: &Path) -> Option
         EventKind::PlanApproved { plan, .. } => Some(Outbound::PlanReady(PlanReady {
             mission_id: state.mission.id.clone(),
             goal: plan.goal.clone(),
+            milestone_titles: plan.milestones.iter().map(|m| m.title.clone()).collect(),
+            assertion_count: plan.validation_contract.len(),
+        })),
+
+        EventKind::PlanRevisionProposed {
+            revision,
+            plan,
+            instructions,
+        } => Some(Outbound::RevisionReady(RevisionReady {
+            mission_id: state.mission.id.clone(),
+            revision: *revision,
+            instructions: instructions.clone(),
             milestone_titles: plan.milestones.iter().map(|m| m.title.clone()).collect(),
             assertion_count: plan.validation_contract.len(),
         })),
@@ -175,6 +190,8 @@ mod tests {
             pending_user_messages: vec![],
             recent_decisions: vec![],
             config: MissionConfig::default(),
+            latest_plan_revision: 0,
+            pending_revision: None,
             last_seq: 1,
         }
     }
@@ -226,6 +243,45 @@ mod tests {
         assert_eq!(p.mission_id, "m-1");
         assert_eq!(p.milestone_titles, vec!["Token bucket".to_string()]);
         assert_eq!(p.assertion_count, 1);
+    }
+
+    #[test]
+    fn plan_revision_proposed_classifies_revision_ready() {
+        let plan = Plan {
+            goal: "Rate-limit the notes API".into(),
+            validation_contract: vec![Assertion {
+                id: "a1".into(),
+                statement: "429 beyond N/min".into(),
+                check: AssertionCheck::Command,
+                command: Some("pytest".into()),
+            }],
+            milestones: vec![PlanMilestone {
+                title: "Safer bucket".into(),
+                features: vec![],
+            }],
+            considered_alternatives: None,
+            command_grants: vec![],
+            touch_set: vec![],
+        };
+        let out = classify(
+            &ev(EventKind::PlanRevisionProposed {
+                revision: 4,
+                plan,
+                instructions: "reduce scope".into(),
+            }),
+            &base_state(),
+            no_repo(),
+        )
+        .unwrap();
+        assert_eq!(out.class(), NotifyClass::PlanReady);
+        let Outbound::RevisionReady(r) = out else {
+            panic!("wrong variant")
+        };
+        assert_eq!(r.mission_id, "m-1");
+        assert_eq!(r.revision, 4);
+        assert_eq!(r.instructions, "reduce scope");
+        assert_eq!(r.milestone_titles, vec!["Safer bucket".to_string()]);
+        assert_eq!(r.assertion_count, 1);
     }
 
     #[test]

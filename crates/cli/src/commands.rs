@@ -6,7 +6,7 @@
 //! work on machines without a `claude` binary installed.
 
 use crate::backlog;
-use crate::cli::{Cli, Command, TicketCommand};
+use crate::cli::{Cli, Command, RevisionCommand, TicketCommand};
 use crate::output::{self, ansi};
 use crate::planning_tui::PlanningOutcome;
 use crate::tail::{self, EventRenderer};
@@ -95,6 +95,34 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             }
             if let Some(hint) = control_queue_hint(&repo, &mission) {
                 println!("{hint}");
+            }
+            Ok(0)
+        }
+        Command::Revise { id, instructions } => {
+            let instructions = instructions.join(" ");
+            cmd_request_revision(&repo, &id, &instructions)?;
+            println!("revision request queued for mission {id}");
+            if let Some(hint) = control_queue_hint(&repo, &id) {
+                println!("{hint}");
+            }
+            Ok(0)
+        }
+        Command::Revision { command } => {
+            match command {
+                RevisionCommand::Approve { id, revision } => {
+                    cmd_approve_revision(&repo, &id, revision)?;
+                    println!("revision {revision} approval queued for mission {id}");
+                    if let Some(hint) = control_queue_hint(&repo, &id) {
+                        println!("{hint}");
+                    }
+                }
+                RevisionCommand::Reject { id, revision } => {
+                    cmd_reject_revision(&repo, &id, revision)?;
+                    println!("revision {revision} rejection queued for mission {id}");
+                    if let Some(hint) = control_queue_hint(&repo, &id) {
+                        println!("{hint}");
+                    }
+                }
             }
             Ok(0)
         }
@@ -857,7 +885,7 @@ pub(crate) async fn run_mission_loop(
 }
 
 // ---------------------------------------------------------------------------
-// pause / resume / msg (control inbox writers; no lock, no backend)
+// pause / resume / msg / revision (control inbox writers; no lock, no backend)
 // ---------------------------------------------------------------------------
 
 /// Enqueue a Pause control command. Returns the queued file path.
@@ -880,6 +908,61 @@ pub fn cmd_msg(repo: &Path, mission_id: &str, text: &str, interrupt: bool) -> Re
         interrupt,
     };
     Ok(control::enqueue(&paths, &cmd)?)
+}
+
+/// Enqueue a RequestRevision control command. Returns the queued file path.
+pub fn cmd_request_revision(repo: &Path, mission_id: &str, instructions: &str) -> Result<PathBuf> {
+    let instructions = instructions.trim();
+    if instructions.is_empty() {
+        bail!("revision instructions must not be empty");
+    }
+    let paths = require_revisable_mission(repo, mission_id)?;
+    Ok(control::enqueue(
+        &paths,
+        &ControlCommand::RequestRevision {
+            instructions: instructions.to_string(),
+        },
+    )?)
+}
+
+/// Enqueue an ApproveRevision control command. Returns the queued file path.
+pub fn cmd_approve_revision(repo: &Path, mission_id: &str, revision: u32) -> Result<PathBuf> {
+    let paths = require_pending_revision(repo, mission_id, revision)?;
+    Ok(control::enqueue(
+        &paths,
+        &ControlCommand::ApproveRevision { revision },
+    )?)
+}
+
+/// Enqueue a RejectRevision control command. Returns the queued file path.
+pub fn cmd_reject_revision(repo: &Path, mission_id: &str, revision: u32) -> Result<PathBuf> {
+    let paths = require_pending_revision(repo, mission_id, revision)?;
+    Ok(control::enqueue(
+        &paths,
+        &ControlCommand::RejectRevision { revision },
+    )?)
+}
+
+fn require_revisable_mission(repo: &Path, mission_id: &str) -> Result<MissionPaths> {
+    let mission_id = control::resolve_active_mission(repo, Some(mission_id))?;
+    let state = load_state(repo, &mission_id)?;
+    if state.mission.status == MissionStatus::Planning {
+        bail!("mission {mission_id} has no approved plan to revise yet");
+    }
+    Ok(MissionPaths::new(repo, &mission_id))
+}
+
+fn require_pending_revision(repo: &Path, mission_id: &str, revision: u32) -> Result<MissionPaths> {
+    let paths = require_revisable_mission(repo, mission_id)?;
+    let state = load_state(repo, mission_id)?;
+    match state.pending_revision {
+        Some(pending) if pending.revision == revision => Ok(paths),
+        Some(pending) => bail!(
+            "mission {mission_id} is awaiting revision {}, not {revision}",
+            pending.revision
+        ),
+        None => bail!("mission {mission_id} has no pending revision"),
+    }
 }
 
 pub fn cmd_scan(repo: &Path, staged: bool, range: Option<&str>) -> Result<i32> {

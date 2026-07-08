@@ -81,6 +81,7 @@ function makeState(status: MissionStatus, runs: Record<string, WorkerRun>): Miss
     pendingUserMessages: [],
     recentDecisions: [],
     config: makeConfig(),
+    latestPlanRevision: 0,
     lastSeq: 0,
   };
 }

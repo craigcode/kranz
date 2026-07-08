@@ -33,12 +33,13 @@
 //! - anything else → [`Action::Ignore`].
 
 use crate::format::{
-    APPROVE_ACTION_ID, CONFIG_CALLBACK_ID, CONFIG_EFFORT_ACTION, CONFIG_EFFORT_BLOCK,
-    CONFIG_MISSION_ACTION, CONFIG_MISSION_BLOCK, CONFIG_MODEL_ACTION, CONFIG_MODEL_BLOCK,
-    CONFIG_ROLE_ACTION, CONFIG_ROLE_BLOCK, MERGE_ACTION_ID, NEW_MISSION_CALLBACK_ID,
-    NEW_MISSION_GOAL_ACTION, NEW_MISSION_GOAL_BLOCK, NEW_TICKET_CALLBACK_ID,
-    NEW_TICKET_CONTEXT_ACTION, NEW_TICKET_CONTEXT_BLOCK, NEW_TICKET_GOAL_ACTION,
-    NEW_TICKET_GOAL_BLOCK, QUEUE_TICKET_ACTION_ID, START_ACTION_ID,
+    APPROVE_ACTION_ID, APPROVE_REVISION_ACTION_ID, CONFIG_CALLBACK_ID, CONFIG_EFFORT_ACTION,
+    CONFIG_EFFORT_BLOCK, CONFIG_MISSION_ACTION, CONFIG_MISSION_BLOCK, CONFIG_MODEL_ACTION,
+    CONFIG_MODEL_BLOCK, CONFIG_ROLE_ACTION, CONFIG_ROLE_BLOCK, MERGE_ACTION_ID,
+    NEW_MISSION_CALLBACK_ID, NEW_MISSION_GOAL_ACTION, NEW_MISSION_GOAL_BLOCK,
+    NEW_TICKET_CALLBACK_ID, NEW_TICKET_CONTEXT_ACTION, NEW_TICKET_CONTEXT_BLOCK,
+    NEW_TICKET_GOAL_ACTION, NEW_TICKET_GOAL_BLOCK, QUEUE_TICKET_ACTION_ID,
+    REJECT_REVISION_ACTION_ID, START_ACTION_ID,
 };
 use serde_json::Value;
 
@@ -246,6 +247,31 @@ pub enum Action {
         user_id: Option<String>,
         response_url: Option<String>,
     },
+    /// `/kranz revise <id> <instructions>` → request a revised plan via the
+    /// mission's control inbox. This spends on the next engine drain, so it is
+    /// allowlist-gated.
+    Revise {
+        mission_id: String,
+        instructions: String,
+        user_id: Option<String>,
+        response_url: Option<String>,
+    },
+    /// Approve a pending revision from a button or
+    /// `/kranz revision approve <id> <rev>`.
+    ApproveRevision {
+        mission_id: String,
+        revision: u32,
+        user_id: Option<String>,
+        response_url: Option<String>,
+    },
+    /// Reject a pending revision from a button or
+    /// `/kranz revision reject <id> <rev>`.
+    RejectRevision {
+        mission_id: String,
+        revision: u32,
+        user_id: Option<String>,
+        response_url: Option<String>,
+    },
     /// `/kranz work` → report the queue state (entries + whether the repo is
     /// busy) as an ephemeral, and point at the `kranz work` dispatcher for
     /// actually draining it. REPORT-ONLY: the bridge must never spawn a mission
@@ -354,6 +380,8 @@ fn route_interactive(payload: &Value) -> Action {
         Start,
         Merge,
         QueueTicket,
+        ApproveRevision,
+        RejectRevision,
     }
     for action in actions {
         let kind = match action.get("action_id").and_then(Value::as_str) {
@@ -361,6 +389,8 @@ fn route_interactive(payload: &Value) -> Action {
             Some(id) if id == START_ACTION_ID => ButtonKind::Start,
             Some(id) if id == MERGE_ACTION_ID => ButtonKind::Merge,
             Some(id) if id == QUEUE_TICKET_ACTION_ID => ButtonKind::QueueTicket,
+            Some(id) if id == APPROVE_REVISION_ACTION_ID => ButtonKind::ApproveRevision,
+            Some(id) if id == REJECT_REVISION_ACTION_ID => ButtonKind::RejectRevision,
             _ => continue,
         };
         // The mission id or ticket slug rides in the button `value`.
@@ -381,6 +411,30 @@ fn route_interactive(payload: &Value) -> Action {
                     .map(str::to_string);
                 let value = value.to_string();
                 return match kind {
+                    ButtonKind::ApproveRevision => {
+                        let Some((mission_id, revision)) = parse_revision_button_value(&value)
+                        else {
+                            return Action::Ignore;
+                        };
+                        Action::ApproveRevision {
+                            mission_id,
+                            revision,
+                            user_id,
+                            response_url,
+                        }
+                    }
+                    ButtonKind::RejectRevision => {
+                        let Some((mission_id, revision)) = parse_revision_button_value(&value)
+                        else {
+                            return Action::Ignore;
+                        };
+                        Action::RejectRevision {
+                            mission_id,
+                            revision,
+                            user_id,
+                            response_url,
+                        }
+                    }
                     ButtonKind::Start => Action::ApproveStart {
                         mission_id: value,
                         user_id,
@@ -406,6 +460,16 @@ fn route_interactive(payload: &Value) -> Action {
         }
     }
     Action::Ignore
+}
+
+fn parse_revision_button_value(value: &str) -> Option<(String, u32)> {
+    let (mission_id, revision) = value.split_once(':')?;
+    let mission_id = mission_id.trim();
+    if mission_id.is_empty() {
+        return None;
+    }
+    let revision = revision.trim().parse::<u32>().ok()?;
+    Some((mission_id.to_string(), revision))
 }
 
 /// A modal `view_submission` → [`Action::NewMission`] when it is our
@@ -928,6 +992,51 @@ fn route_slash(payload: &Value) -> Action {
         // Too many tokens → help.
     }
 
+    // `revise <id> <instructions>` requests a mid-mission plan revision.
+    // Explicit id is required so free-form instructions are never confused
+    // with the target.
+    if let Some(rest) = strip_ci_prefix(text, "revise") {
+        let mut parts = rest.trim().splitn(2, char::is_whitespace);
+        let id = parts.next().unwrap_or("");
+        let instructions = parts.next().unwrap_or("").trim();
+        if !id.is_empty() && !instructions.is_empty() {
+            return Action::Revise {
+                mission_id: clean_id(id).to_string(),
+                instructions: instructions.to_string(),
+                user_id,
+                response_url,
+            };
+        }
+        // Missing id/instructions → help.
+    }
+
+    // `revision approve|reject <id> <rev>` is the slash twin of the revision
+    // card buttons.
+    if let Some(rest) = strip_ci_prefix(text, "revision") {
+        let rest = rest.trim();
+        if let Some(after_approve) = strip_ci_prefix(rest, "approve") {
+            if let Some((mission_id, revision)) = parse_revision_decision_args(after_approve) {
+                return Action::ApproveRevision {
+                    mission_id,
+                    revision,
+                    user_id,
+                    response_url,
+                };
+            }
+        }
+        if let Some(after_reject) = strip_ci_prefix(rest, "reject") {
+            if let Some((mission_id, revision)) = parse_revision_decision_args(after_reject) {
+                return Action::RejectRevision {
+                    mission_id,
+                    revision,
+                    user_id,
+                    response_url,
+                };
+            }
+        }
+        // Malformed revision command → help.
+    }
+
     // `work` → report the queue state and point at the `kranz work` dispatcher
     // (report-only); `work run` → actually trigger the drain THROUGH the host
     // (spend-gated in the bridge). Any other trailing text is a typo → help.
@@ -1048,6 +1157,16 @@ fn parse_optional_id(rest: &str) -> Option<Option<String>> {
         // A second token means the input isn't a clean `pause`/`resume [<id>]`.
         (Some(_), Some(_)) => None,
     }
+}
+
+fn parse_revision_decision_args(rest: &str) -> Option<(String, u32)> {
+    let mut tokens = rest.split_whitespace();
+    let id = tokens.next()?;
+    let revision = tokens.next()?.parse::<u32>().ok()?;
+    if tokens.next().is_some() {
+        return None;
+    }
+    Some((clean_id(id).to_string(), revision))
 }
 
 /// Strip the wrapper characters a Slack copy-paste smuggles in around an id:
@@ -1196,6 +1315,51 @@ mod tests {
                 slug: "reviewable-ticket".into(),
                 user_id: Some("Uqueue".into()),
                 response_url: Some("https://hooks.slack/q".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn block_actions_revision_buttons_route_to_revision_actions() {
+        let approve = json!({
+            "type": "interactive",
+            "payload": {
+                "type": "block_actions",
+                "user": { "id": "Urev" },
+                "response_url": "https://hooks.slack/rev",
+                "actions": [
+                    { "action_id": APPROVE_REVISION_ACTION_ID, "value": "m-42:3", "type": "button" }
+                ]
+            }
+        });
+        assert_eq!(
+            route(&approve, &lookup_none()).action,
+            Action::ApproveRevision {
+                mission_id: "m-42".into(),
+                revision: 3,
+                user_id: Some("Urev".into()),
+                response_url: Some("https://hooks.slack/rev".into()),
+            }
+        );
+
+        let reject = json!({
+            "type": "interactive",
+            "payload": {
+                "type": "block_actions",
+                "user": { "id": "Urev" },
+                "response_url": "https://hooks.slack/rev",
+                "actions": [
+                    { "action_id": REJECT_REVISION_ACTION_ID, "value": "m-42:3", "type": "button" }
+                ]
+            }
+        });
+        assert_eq!(
+            route(&reject, &lookup_none()).action,
+            Action::RejectRevision {
+                mission_id: "m-42".into(),
+                revision: 3,
+                user_id: Some("Urev".into()),
+                response_url: Some("https://hooks.slack/rev".into()),
             }
         );
     }
@@ -2168,6 +2332,41 @@ mod tests {
     }
 
     #[test]
+    fn slash_revision_commands_route_to_revision_actions() {
+        assert_eq!(
+            route(
+                &steer_env("revise m-9 drop the risky feature"),
+                &lookup_none()
+            )
+            .action,
+            Action::Revise {
+                mission_id: "m-9".into(),
+                instructions: "drop the risky feature".into(),
+                user_id: Some("Usteer".into()),
+                response_url: Some("https://hooks.slack/steer".into()),
+            }
+        );
+        assert_eq!(
+            route(&steer_env("revision approve m-9 2"), &lookup_none()).action,
+            Action::ApproveRevision {
+                mission_id: "m-9".into(),
+                revision: 2,
+                user_id: Some("Usteer".into()),
+                response_url: Some("https://hooks.slack/steer".into()),
+            }
+        );
+        assert_eq!(
+            route(&steer_env("revision reject m-9 2"), &lookup_none()).action,
+            Action::RejectRevision {
+                mission_id: "m-9".into(),
+                revision: 2,
+                user_id: Some("Usteer".into()),
+                response_url: Some("https://hooks.slack/steer".into()),
+            }
+        );
+    }
+
+    #[test]
     fn slash_work_routes_to_work() {
         assert_eq!(
             route(&steer_env("work"), &lookup_none()).action,
@@ -2187,7 +2386,15 @@ mod tests {
     #[test]
     fn slash_pause_resume_work_with_extra_tokens_fall_through_to_help() {
         // Two-token pause/resume, or work with an argument, are typos → help.
-        for text in ["pause m-1 extra", "resume a b", "work now", "work m-1"] {
+        for text in [
+            "pause m-1 extra",
+            "resume a b",
+            "work now",
+            "work m-1",
+            "revise m-1",
+            "revision approve m-1 nope",
+            "revision reject m-1 2 extra",
+        ] {
             assert_eq!(
                 route(&steer_env(text), &lookup_none()).action,
                 Action::Help {
