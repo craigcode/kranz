@@ -59,3 +59,8 @@ steps 2–5 and the acceptance bar.
   route and, if green, a scoped implementation brief mirroring the
   Codex/Droid path (single-shot, validator-first).
 - The mission must not modify anything under crates/.
+- Verified 2026-07-09: `agent` auth state lives under `$HOME/.cursor` and does
+  NOT survive a relocated HOME (`HOME=/tmp/x agent status` → "Not logged in").
+  The implementation brief must require either carrying `~/.cursor` into any
+  relocated worker HOME or a `CURSOR_API_KEY` session env — record this in the
+  permission/auth section of the decision.
