@@ -1,0 +1,38 @@
+{
+  "cli_version": "2026.04.13-a9d7fb5",
+  "flags": [
+    "--api-key",
+    "--header",
+    "--print",
+    "--output-format",
+    "--stream-partial-output",
+    "--cloud",
+    "--mode",
+    "--plan",
+    "--resume",
+    "--continue",
+    "--model",
+    "--list-models",
+    "--force",
+    "--yolo",
+    "--sandbox",
+    "--approve-mcps",
+    "--trust",
+    "--workspace",
+    "--worktree",
+    "--worktree-base",
+    "--skip-worktree-setup"
+  ],
+  "auth_usable": false,
+  "status_output": "Starting login process...\nChecking authentication status...\n✓ Login successful!\nLogged in (unable to fetch user details)\n(exit code 0)",
+  "models_output": "Loading models…\nNo models available for this account.\n(exit code 0)",
+  "model_matrix": {
+    "default": "`agent --list-models --model gpt-5` -> \"Loading models…\" then \"No models available for this account.\" exit 0. No arg-parse error; --model value accepted syntactically.",
+    "grok": "`agent --list-models --model grok-4.5` -> identical output to default case: \"No models available for this account.\" exit 0. No distinct error for this model id vs. the default; cannot confirm/deny grok-4.5 is a valid CLI model id at this layer.",
+    "invalid": "`agent --list-models --model definitely-not-a-real-model` -> identical output: \"No models available for this account.\" exit 0. No client-side validation of the --model value was observed; the CLI does not reject unknown model ids at the arg-parse layer, and the account-level \"no models available\" response masks whether server-side model-id validation would differ."
+  },
+  "fixture": null,
+  "blocker": "auth session is in an inconsistent state: `agent status` reports 'Login successful!' (exit 0) but cannot fetch user details, while `agent about` reports 'User Email: Not logged in'. `agent models` / `agent --list-models` report 'No models available for this account.' regardless of --model value. Headless model invocation cannot be exercised without spending money (agent --print was intentionally not run), and no model is currently available to this account, so the --model flag's server-side validation behavior is unverified.",
+  "recommendation": "defer",
+  "acceptance_bar": {}
+}
