@@ -91,11 +91,19 @@ an auth defer: `agent status` and `agent about` disagree with each other
 signal, `agent models` / `agent --list-models`, reports **zero models
 available for this account** regardless of `--model` value (default `gpt-5`,
 target `grok-4.5`, and a deliberately invalid id all return byte-identical
-output). `agent --print` was intentionally never invoked to avoid spending
-against an account with no confirmed model access, so `probe-result.json`
-carries `"fixture": null` — there is no captured `stream-json` output to
-build a parser against, and no evidence that terminal text, tool-use/result
-events, usage/cost, or permission-mode behavior are observable on the wire.
+output). `agent --print` is not un-invokable: `--output-format json` and the
+same command with `stream-json` were each run once during the probe and both
+failed free at the auth gate with `Authentication required`, before any
+billed turn could start — a deterministic, user-readable, post-arg-parse
+`--print` runtime rejection that *was* observed. Beyond that single free
+failure, `agent --print` was deliberately not invoked further; that
+abstention is clean-room read-only discipline (no billed turn was ever put
+at risk against an account with no confirmed model access), not evidence
+that `--print` produces nothing observable. `probe-result.json` still
+carries `"fixture": null` — there is no captured *successful* `stream-json`
+output to build a parser against, and no evidence that terminal text,
+tool-use/result events, usage/cost, or permission-mode behavior are
+observable on the wire for an authenticated turn.
 Per the acceptance bar, a route decision of `direct-parser` or `acp` requires
 evidence a fixture would provide; with `auth_usable: false` and no fixture,
 neither is supportable, so the honest recommendation is `defer`.
@@ -108,7 +116,7 @@ neither is supportable, so the honest recommendation is `defer`.
 | 2 | Tool-use/tool-results observable for transcripts & denial reporting | unresolved | No write-capable run (file edit, shell command) was exercised. |
 | 3 | Usage/cost on the wire or priceable from model ids | unresolved | No captured turn to inspect for usage/cost fields. |
 | 4 | `cwd`/`--workspace` honors kranz worktree isolation | unresolved | Flags exist (`--workspace`, `--worktree`, `--worktree-base`, `--skip-worktree-setup`) but were never exercised against a real run. |
-| 5 | Model-availability failures are deterministic and user-readable | unresolved | Response is deterministic ("No models available…", exit 0) but not diagnostic — it can't distinguish an invalid model id from a valid-but-unentitled one, and no `--print` run shows the runtime failure mode. |
+| 5 | Model-availability failures are deterministic and user-readable | unresolved | `agent --list-models` is deterministic ("No models available…", exit 0) but not diagnostic across model ids. Separately, `agent --print` (`json` and `stream-json`) failed free at the auth gate with a deterministic, user-readable `Authentication required` before any billed turn — so a post-arg-parse `--print` runtime failure mode *was* partially observed. What remains unresolved: distinguishing an invalid model id from a valid-but-unentitled one, and observing failure (or success) semantics of an actually-authenticated `--print` turn. |
 | 6 | Permission mapping preserves no-push/no-publish/no-main-write invariants | unresolved | `--mode ask\|plan`, `--force`/`--yolo`, `--sandbox`, `--trust` are documented in `--help` but none were exercised in a live run. |
 | 7 | Fixture test proves parser behavior offline | unresolved | `probe-result.json.fixture` is `null`; no captured output exists to derive a fixture from. |
 
