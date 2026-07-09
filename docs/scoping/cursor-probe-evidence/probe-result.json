@@ -1,12 +1,12 @@
 {
-  "cli_version": "2026.04.13-a9d7fb5",
+  "cli_version": "2026.07.08-0c04a8a",
+  "cli_version_prior": "2026.04.13-a9d7fb5",
   "flags": [
     "--api-key",
     "--header",
     "--print",
     "--output-format",
     "--stream-partial-output",
-    "--cloud",
     "--mode",
     "--plan",
     "--resume",
@@ -15,32 +15,46 @@
     "--list-models",
     "--force",
     "--yolo",
+    "--auto-review",
     "--sandbox",
     "--approve-mcps",
     "--trust",
     "--workspace",
+    "--add-dir",
+    "--plugin-dir",
     "--worktree",
     "--worktree-base",
     "--skip-worktree-setup"
   ],
-  "auth_usable": false,
-  "status_output": "Starting login process...\nChecking authentication status...\n✓ Login successful!\nLogged in (unable to fetch user details)\n(exit code 0)",
-  "models_output": "Loading models…\nNo models available for this account.\n(exit code 0)",
+  "flags_diff_vs_prior": {
+    "removed": ["--cloud"],
+    "added": ["--auto-review", "--add-dir", "--plugin-dir"],
+    "new_subcommand": "worker"
+  },
+  "auth_usable": true,
+  "auth_usable_prior": false,
+  "status_output": "✓ Logged in as <redacted>\n(exit code 0)",
+  "status_output_prior": "Starting login process...\nChecking authentication status...\n✓ Login successful!\nLogged in (unable to fetch user details)\n(exit code 0)",
+  "about_output": "About Cursor CLI\n\nCLI Version         2026.07.08-0c04a8a\nModel               Auto\nSubscription Tier   Ultra\nOS                  darwin (arm64)\nTerminal            unknown\nShell               zsh\nUser Email          <redacted>\n(exit code 0)",
+  "models_output": "Available models (~190 entries, populated catalog; see preflight.md 2026-07-09 section for full verbatim list)\n(exit code 0)",
+  "models_output_prior": "Loading models…\nNo models available for this account.\n(exit code 0)",
+  "grok_id_vs_display_name_off_by_one": "grok-4.5-medium displays as 'Cursor Grok 4.5 Low'; grok-4.5-high displays as 'Cursor Grok 4.5 Medium' -- the id's tier word is one step higher than the catalog's own display name for that same line. Always read the display name from the catalog; do not infer it from the id.",
   "model_matrix": {
-    "default": "`agent --list-models --model gpt-5` -> \"Loading models…\" then \"No models available for this account.\" exit 0. No arg-parse error; --model value accepted syntactically.",
-    "grok": "`agent --list-models --model grok-4.5` -> identical output to default case: \"No models available for this account.\" exit 0. No distinct error for this model id vs. the default; cannot confirm/deny grok-4.5 is a valid CLI model id at this layer.",
-    "invalid": "`agent --list-models --model definitely-not-a-real-model` -> identical output: \"No models available for this account.\" exit 0. No client-side validation of the --model value was observed; the CLI does not reject unknown model ids at the arg-parse layer, and the account-level \"no models available\" response masks whether server-side model-id validation would differ."
+    "default": "`agent --list-models --model gpt-5` -> \"Loading models…\" then \"No models available for this account.\" exit 0. No arg-parse error; --model value accepted syntactically. (2026-04-13 probe, prior binary; not re-run in the 2026-07-09 re-verification pass since auth is now usable and the full unfiltered catalog was captured instead.)",
+    "grok": "`agent --list-models --model grok-4.5` -> identical output to default case: \"No models available for this account.\" exit 0. No distinct error for this model id vs. the default; cannot confirm/deny grok-4.5 is a valid CLI model id at this layer. (2026-04-13 probe, prior binary.) Superseded by the 2026-07-09 catalog, which shows no bare `grok-4.5` id at all -- only tiered ids (`grok-4.5-medium`, `grok-4.5-high`, `grok-4.5-xhigh`, and `-fast-` variants); see grok_id_vs_display_name_off_by_one.",
+    "invalid": "`agent --list-models --model definitely-not-a-real-model` -> identical output: \"No models available for this account.\" exit 0. No client-side validation of the --model value was observed; the CLI does not reject unknown model ids at the arg-parse layer, and the account-level \"no models available\" response masks whether server-side model-id validation would differ. (2026-04-13 probe, prior binary; not re-run in the 2026-07-09 pass.)"
   },
   "fixture": null,
-  "blocker": "Exact commands attempted and their verbatim (redacted) output: (1) `agent status` -> \"Starting login process...\\nChecking authentication status...\\n✓ Login successful!\\nLogged in (unable to fetch user details)\\n(exit code 0)\"; (2) `agent about` -> \"User Email: Not logged in\" (exit code 0); (3) `agent models` / `agent --list-models` (default, and with `--model grok-4.5`, and with `--model definitely-not-a-real-model`) -> \"Loading models…\\nNo models available for this account.\\n(exit code 0)\" in all three cases. Net effect: the CLI self-reports a successful login but cannot resolve a user identity or any usable model for the account. `agent --print` (`--output-format json` and separately `stream-json`, both `--mode ask --trust`) was run twice and both failed free at the auth gate with \"Authentication required\" before any billed turn could start (see preflight.md's `agent --print` auth-gate check); beyond those two zero-cost calls, `--print` was intentionally not invoked further, to avoid risking a billed turn against an account with no confirmed model access. Concrete preconditions to unblock: (a) a reachable CURSOR_API_KEY (or equivalent bearer credential) must be present in the session env so headless auth does not depend on the interactive `agent login` browser flow, which a sandboxed headless worker cannot complete; (b) the Cursor account tied to that credential must have at least one model provisioned/entitled, since `agent models` currently returns zero models regardless of --model value and there is no local keychain/session-store access available to this sandboxed worker to inspect or repair the account's session state directly.",
+  "blocker": "2026-07-09 update: the prior blocker (no reachable auth credential, zero models provisioned) is RESOLVED in this worker's environment -- `agent status`/`agent about` now agree on a logged-in, identifiable account (Subscription Tier: Ultra) and `agent models`/`agent --list-models` return a populated ~190-entry catalog. auth_usable is now true (was false). This feature (f-1-1) is scoped to free/read-only re-verification only and intentionally did not run `agent --print`, so the --print output-shape/billed-turn questions below remain unresolved by this pass; they are now unblocked for a later, explicitly-billed feature to pursue since auth is confirmed usable. Original 2026-04-13 blocker text, kept for history: Exact commands attempted and their verbatim (redacted) output: (1) `agent status` -> \"Starting login process...\\nChecking authentication status...\\n✓ Login successful!\\nLogged in (unable to fetch user details)\\n(exit code 0)\"; (2) `agent about` -> \"User Email: Not logged in\" (exit code 0); (3) `agent models` / `agent --list-models` (default, and with `--model grok-4.5`, and with `--model definitely-not-a-real-model`) -> \"Loading models…\\nNo models available for this account.\\n(exit code 0)\" in all three cases. `agent --print` (`--output-format json` and separately `stream-json`, both `--mode ask --trust`) was run twice and both failed free at the auth gate with \"Authentication required\" before any billed turn could start (see preflight.md's `agent --print` auth-gate check).",
   "recommendation": "defer",
+  "recommendation_note": "Unchanged from the 2026-04-13 probe: this feature (f-1-1) is free/read-only re-verification only and does not make the final direct-parser vs. ACP vs. defer call. That call is explicitly deferred to a later feature, which can now also exercise `--print` since auth_usable=true in this environment.",
   "acceptance_bar": {
-    "terminal_text_stitching": "unresolved: agent --print was run twice (json and stream-json) but both failed free at the auth gate with \"Authentication required\" before any billed/authenticated turn (auth_usable=false, per model_matrix zero provisioned models); no authenticated stream-json/json/text output was captured to prove terminal assistant text can be stitched into Result.text.",
-    "tool_use_and_results_observable": "unresolved: no --print invocation was captured, write-capable behavior (file edit, shell command) was never exercised, so tool-use/tool-result event shape in stream-json is unknown.",
-    "usage_cost_on_wire_or_priceable": "unresolved: no --print output exists to inspect for usage/cost fields; cannot confirm usage is present on the wire or derivable from model ids without a captured turn.",
-    "cwd_workspace_worktree_isolation": "unresolved: --workspace, --worktree, --worktree-base, --skip-worktree-setup are present in --help (see flags/preflight.md) but were never exercised against a real run, so honoring kranz worktree isolation is unverified.",
-    "model_availability_failures_deterministic_readable": "unresolved: model_matrix shows agent --list-models returns byte-identical \"No models available for this account.\" (exit 0) for a plausible id (gpt-5), the target id (grok-4.5), and a deliberately invalid id (definitely-not-a-real-model) -- deterministic but not diagnostic across model ids. Separately, agent --print --output-format json and the same command with stream-json were each run once and both failed free at the auth gate with a deterministic, user-readable \"Authentication required\" before any billed turn, so a post-arg-parse --print runtime failure mode WAS partially observed. What remains unresolved: distinguishing an invalid model id from a valid-but-unentitled one, and observing failure (or success) semantics of an actually-authenticated --print turn.",
-    "permission_mapping_preserves_invariants": "unresolved: --mode ask|plan, --force/--yolo, --sandbox enabled|disabled, --trust are present in --help but no --print run exercised any of them, so no evidence yet that they map cleanly onto kranz's no-push/no-publish/no-main-write invariants.",
-    "fixture_offline_parser_test": "unresolved: probe-result.json.fixture is null; no captured stream-json (or json/text) output exists from which to build an offline fixture-driven parser test."
+    "terminal_text_stitching": "still unresolved by this feature: no --print call was made in the 2026-07-09 pass (out of scope). auth_usable is now true, so this is unblocked for a later billed feature to resolve; the 2026-04-13 probe's two free auth-gate `--print` calls (json/stream-json, both failing with \"Authentication required\" pre-billing) remain the only --print evidence on file.",
+    "tool_use_and_results_observable": "still unresolved: no --print invocation was captured in this feature, write-capable behavior (file edit, shell command) was never exercised, so tool-use/tool-result event shape in stream-json is unknown. Unblocked for a later billed feature now that auth_usable=true.",
+    "usage_cost_on_wire_or_priceable": "still unresolved: no --print output exists to inspect for usage/cost fields. Unblocked for a later billed feature now that auth_usable=true.",
+    "cwd_workspace_worktree_isolation": "still unresolved: --workspace, --worktree, --worktree-base, --skip-worktree-setup are present in --help (see flags/preflight.md) but were never exercised against a real run in this free/read-only feature.",
+    "model_availability_failures_deterministic_readable": "2026-04-13 model_matrix data (kept above) showed byte-identical \"No models available for this account.\" across a plausible/target/invalid model id -- deterministic but not diagnostic. As of 2026-07-09 the account now has a populated ~190-model catalog (auth_usable=true), so this specific no-models-available failure mode no longer reproduces in this environment; whether an actually-invalid model id now produces a distinct, diagnostic error remains unresolved because this feature did not run `--print` or otherwise probe an invalid id against the new populated catalog.",
+    "permission_mapping_preserves_invariants": "still unresolved: --mode ask|plan, --force/--yolo, --sandbox enabled|disabled, --trust are present in --help (surface unchanged from 2026-04-13 for these flags) but no --print run has ever exercised any of them.",
+    "fixture_offline_parser_test": "still unresolved: probe-result.json.fixture is null; no captured stream-json (or json/text) output exists from which to build an offline fixture-driven parser test."
   }
 }
