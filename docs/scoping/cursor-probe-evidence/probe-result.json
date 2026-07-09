@@ -44,7 +44,42 @@
     "grok": "`agent --list-models --model grok-4.5` -> identical output to default case: \"No models available for this account.\" exit 0. No distinct error for this model id vs. the default; cannot confirm/deny grok-4.5 is a valid CLI model id at this layer. (2026-04-13 probe, prior binary.) Superseded by the 2026-07-09 catalog, which shows no bare `grok-4.5` id at all -- only tiered ids (`grok-4.5-medium`, `grok-4.5-high`, `grok-4.5-xhigh`, and `-fast-` variants); see grok_id_vs_display_name_off_by_one.",
     "invalid": "`agent --list-models --model definitely-not-a-real-model` -> identical output: \"No models available for this account.\" exit 0. No client-side validation of the --model value was observed; the CLI does not reject unknown model ids at the arg-parse layer, and the account-level \"no models available\" response masks whether server-side model-id validation would differ. (2026-04-13 probe, prior binary; not re-run in the 2026-07-09 pass.)"
   },
-  "fixture": null,
+  "fixture": "docs/scoping/cursor-probe-evidence/fixture-stream-json.jsonl",
+  "fixture_capture": {
+    "date": "2026-07-09",
+    "auth_usable_at_capture": true,
+    "command": "agent --print --output-format stream-json --force --trust --workspace <tmpdir> --model gpt-5.6-luna-low \"Create hello.txt containing hi, then run cat hello.txt\"",
+    "workspace": "throwaway git repo under $TMPDIR (mktemp -d + git init), never this repo, never --worktree",
+    "event_types_observed": ["system/init", "user", "tool_call/started", "tool_call/completed", "assistant", "result/success"],
+    "criteria_met": {
+      "assistant_text": "present in the final 'assistant' event (message.content[0].text) and echoed into the terminal 'result' event's result field",
+      "tool_use_event": "three tool_call/started events present: a shellToolCall ('ls'), an editToolCall (write hello.txt), and a readToolCall (read hello.txt back) -- the model satisfied 'run a shell command' via its own verification 'ls' call rather than literally running 'cat', and read the file back via its Read tool instead of a shell 'cat'",
+      "tool_result_event": "three matching tool_call/completed events present, each carrying a 'result' object (shellToolCall.result.success, editToolCall.result.success, readToolCall.result.success)",
+      "terminal_usage_or_cost_event": "final 'result' event, subtype 'success', carries usage: {inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens} -- token usage present; no separate dollar-cost field was observed on the wire in this CLI version"
+    },
+    "redaction_applied": "session_id, call_id, toolCallId, request_id, model_call_id, conversationId string values replaced with <redacted>; $HOME path prefix and any email-shaped strings redacted; JSON structure, key names, and event 'type'/'subtype' values left untouched"
+  },
+  "prompt_shape_matrix": {
+    "file_edit_and_shell_command": {
+      "prompt": "Create hello.txt containing hi, then run cat hello.txt",
+      "stream_shape": "system/init -> user -> tool_call(shellToolCall 'ls', started+completed) -> tool_call(editToolCall write hello.txt, started+completed) -> tool_call(readToolCall read hello.txt, started+completed) -> assistant (text summarizing the file contents) -> result/success (usage tokens, no cost field)",
+      "temp_repo_git_diff_after": "git status: hello.txt untracked (new file, not staged/committed by the agent); git diff (tracked files): empty -- the agent wrote the file via its edit tool but did not stage or commit it; README.md (pre-existing tracked file) unchanged",
+      "note": "this is the committed fixture (docs/scoping/cursor-probe-evidence/fixture-stream-json.jsonl)"
+    },
+    "deliberately_failing_command": {
+      "prompt": "Run the shell command 'exit 1' and report what happened. Do not create or edit any files.",
+      "stream_shape": "system/init -> user -> ~78 thinking/delta events (reasoning stream, model gpt-5.6-luna-low is a reasoning model) -> thinking/completed -> tool_call(shellToolCall 'exit 1', started+completed) -> assistant (text: reports exit code 1, no output, no files changed) -> result/success (is_error:false at the top level -- the CLI run itself succeeded even though the shell command it ran failed)",
+      "tool_result_detail": "the shellToolCall's completed event nests the failure under result.failure (not result.success): {command:'exit 1', exitCode:1, signal:'', stdout:'', stderr:'', aborted:false} -- a distinct 'failure' variant of the tool-result payload, sibling to the 'success' variant seen in the write-capable run",
+      "temp_repo_git_diff_after": "no change: git status/diff identical to before this run (only the pre-existing untracked hello.txt from the prior run remains; no new files, no tracked-file changes)",
+      "not_committed": "raw output kept only as local evidence for this record, not committed as a separate fixture per spec (one write-capable fixture is committed; this run's shape is documented here instead)"
+    },
+    "no_op": {
+      "prompt": "Do nothing. Do not use any tools. Just reply with the single word: OK",
+      "stream_shape": "system/init -> user -> assistant (text: 'OK') -> result/success (usage tokens) -- no tool_call events at all",
+      "temp_repo_git_diff_after": "no change: git status/diff identical to before this run",
+      "not_committed": "raw output kept only as local evidence for this record, not committed as a separate fixture per spec"
+    }
+  },
   "blocker": "2026-07-09 update: the prior blocker (no reachable auth credential, zero models provisioned) is RESOLVED in this worker's environment -- `agent status`/`agent about` now agree on a logged-in, identifiable account (Subscription Tier: Ultra) and `agent models`/`agent --list-models` return a populated ~190-entry catalog. auth_usable is now true (was false). This feature (f-1-1) is scoped to free/read-only re-verification only and intentionally did not run `agent --print`, so the --print output-shape/billed-turn questions below remain unresolved by this pass; they are now unblocked for a later, explicitly-billed feature to pursue since auth is confirmed usable. Original 2026-04-13 blocker text, kept for history: Exact commands attempted and their verbatim (redacted) output: (1) `agent status` -> \"Starting login process...\\nChecking authentication status...\\n✓ Login successful!\\nLogged in (unable to fetch user details)\\n(exit code 0)\"; (2) `agent about` -> \"User Email: Not logged in\" (exit code 0); (3) `agent models` / `agent --list-models` (default, and with `--model grok-4.5`, and with `--model definitely-not-a-real-model`) -> \"Loading models…\\nNo models available for this account.\\n(exit code 0)\" in all three cases. `agent --print` (`--output-format json` and separately `stream-json`, both `--mode ask --trust`) was run twice and both failed free at the auth gate with \"Authentication required\" before any billed turn could start (see preflight.md's `agent --print` auth-gate check).",
   "recommendation": "defer",
   "recommendation_note": "Unchanged from the 2026-04-13 probe: this feature (f-1-1) is free/read-only re-verification only and does not make the final direct-parser vs. ACP vs. defer call. That call is explicitly deferred to a later feature, which can now also exercise `--print` since auth_usable=true in this environment.",

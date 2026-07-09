@@ -615,3 +615,95 @@ infer it from the id.
 - The grok id-vs-display-name off-by-one (documented above) is new,
   previously-unrecorded information relevant to any UI/backend that surfaces
   model display names.
+
+## 2026-07-09 write-capable capture (billed feature, binary `2026.07.08-0c04a8a`)
+
+Binary: `~/.local/bin/agent`. Gate check re-confirmed live before spending money:
+`agent status` -> `✓ Logged in as <redacted>` (exit 0) -- auth usable, matching
+this file's prior `auth_usable = true` determination. Proceeded to run
+`--print` for the first time in this probe's history.
+
+All work below ran against a **throwaway** git repo created with
+`mktemp -d` + `git init` under `$TMPDIR`, never against this repository, and
+`--worktree` was never passed.
+
+### Command
+
+```
+agent --print --output-format stream-json --force --trust \
+  --workspace <tmpdir> --model gpt-5.6-luna-low \
+  "Create hello.txt containing hi, then run cat hello.txt"
+```
+
+Exit code: `0`. Output captured as 10 newline-delimited JSON events, redacted
+(session/call/tool-call/request/model-call ids, `$HOME` path prefix, and any
+email-shaped strings replaced with `<redacted>`; JSON structure and event
+`type`/`subtype` values left intact) and committed verbatim as
+`docs/scoping/cursor-probe-evidence/fixture-stream-json.jsonl`.
+
+**Event sequence:** `system/init` -> `user` -> `tool_call` started/completed
+(`shellToolCall`, command `ls` -- the model's own workspace-verification step)
+-> `tool_call` started/completed (`editToolCall`, writes `hello.txt`) ->
+`tool_call` started/completed (`readToolCall`, reads `hello.txt` back --
+the model satisfied "run a command and show me the output" via its Read tool
+rather than literally shelling out to `cat`) -> `assistant` (text summarizing
+the created file) -> `result` (`subtype: success`, carries
+`usage: {inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens}`; no
+separate dollar-cost field was observed on the wire in this CLI version).
+
+This satisfies the fixture acceptance bar: assistant text present, at least
+one tool-use event present (three, in fact: shell/edit/read), at least one
+tool-result event present (three matching `completed` events, each carrying a
+`result.success` payload), and a terminal event carrying token usage.
+
+**Temp-repo `git diff` after this run:** `hello.txt` appears as an untracked
+file (`git status`); `git diff` against the tracked tree is empty -- the
+agent's edit tool wrote the file to disk but did not stage or commit it, and
+the pre-existing tracked `README.md` was untouched.
+
+### Deliberately-failing command
+
+Same workspace, same model, prompt: `"Run the shell command 'exit 1' and
+report what happened. Do not create or edit any files."` Exit code: `0` (the
+CLI invocation itself succeeds; only the shell command inside it fails).
+Stream shape: `system/init` -> `user` -> ~78 `thinking`/`delta` events (this
+model reasons before acting) -> `thinking/completed` -> `tool_call`
+started/completed (`shellToolCall`, command `exit 1`) -> `assistant` (text:
+reports exit code 1, no output, no files changed) -> `result/success`.
+Notably, the failing shell command's `tool_call/completed` event nests its
+outcome under `result.failure` (`{command:"exit 1", exitCode:1, stdout:"",
+stderr:"", aborted:false}`) rather than `result.success` -- a distinct,
+structurally-typed failure variant of the same tool-result event, not an
+error thrown up to the top level. The top-level `result` event still reports
+`is_error:false` and `subtype:"success"`, since the *agent run* succeeded
+even though the *shell command it ran* did not. Temp-repo `git diff` after:
+unchanged (only the untracked `hello.txt` from the previous run remains).
+Raw output was not committed as a separate fixture per spec; its shape is
+recorded here only.
+
+### No-op prompt
+
+Same workspace, same model, prompt: `"Do nothing. Do not use any tools. Just
+reply with the single word: OK"`. Exit code: `0`. Stream shape: `system/init`
+-> `user` -> `assistant` (text: `"OK"`) -> `result/success` (usage tokens) --
+no `tool_call` events at all, confirming the stream omits tool-use/tool-result
+events entirely when the model performs no tool calls. Temp-repo `git diff`
+after: unchanged. Raw output was not committed as a separate fixture per
+spec; its shape is recorded here only.
+
+### Summary
+
+- `probe-result.json.fixture` now points at
+  `docs/scoping/cursor-probe-evidence/fixture-stream-json.jsonl`, resolving
+  the `fixture_offline_parser_test` acceptance-bar item that was previously
+  unresolved (see `probe-result.json`'s `acceptance_bar` and new
+  `fixture_capture`/`prompt_shape_matrix` fields for full detail).
+  `tool_use_and_results_observable` and `usage_cost_on_wire_or_priceable` are
+  now resolved for the token-usage half (usage is present; no separate cost
+  field was seen on the wire in this CLI version). `cwd_workspace_worktree_isolation`
+  is now exercised: `--workspace <tmpdir>` correctly scoped all file/shell
+  activity to the throwaway repo.
+- Three billed `--print` calls were made in this feature (write-capable,
+  failing-command, no-op), each a single short turn against a throwaway
+  workspace -- no money was spent against this repository or any file outside
+  `$TMPDIR`.
