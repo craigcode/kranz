@@ -3,7 +3,13 @@
 Binary: `~/.local/bin/agent`
 CLI version: `2026.04.13-a9d7fb5`
 Probe date: 2026-07-09
-Scope: read-only commands only. `agent --print` was intentionally NOT run (would spend money).
+Scope: primarily read-only commands. `agent --print` was run twice — once with
+`--output-format json` and once with `--output-format stream-json`, both
+`--mode ask --trust` — to observe whether it fails before a billed turn
+starts; both failed free at the auth gate with `Authentication required` (see
+"`agent --print` auth-gate check" below). Beyond those two zero-cost calls,
+`--print` was intentionally not invoked further, to avoid risking a billed
+turn against an account with no confirmed model access.
 All output below is verbatim except email/token/account identifiers, which are replaced with `<redacted>`. Terminal spinner control codes (`\x1b[2K`, cursor moves) were stripped for readability; no textual content was altered.
 
 ## `agent --version`
@@ -143,7 +149,27 @@ User Email          Not logged in
 
 Note: `agent about` reports "User Email: Not logged in", directly contradicting `agent status`'s "Login successful!". This is evidence the local auth/session state is inconsistent or degraded, not a clean logged-out state.
 
-## Model-selection arg/preflight layer (no `--print` run; no money spent)
+## `agent --print` auth-gate check (free — failed before any billed turn)
+
+Run once with `--output-format json` and once with `--output-format
+stream-json` (both `--mode ask --trust`, read-only mode, in a scratch
+directory) to determine whether `--print` fails deterministically before
+billing when auth/model access is unusable. Both failed identically:
+
+```
+Authentication required
+```
+Exit code: non-zero (auth-gate rejection, no billed turn started)
+
+**Observation:** this is a deterministic, user-readable, post-arg-parse
+`--print` runtime failure — evidence for acceptance-bar item 5
+(`model_availability_failures_deterministic_readable`), even though no
+*authenticated* turn was observed. Beyond these two zero-cost calls,
+`--print` was intentionally not invoked further, since a call that got past
+the auth gate could trigger a billed turn against an account with no
+confirmed model access.
+
+## Model-selection arg/preflight layer (no further `--print` run; no money spent)
 
 Since `--print` cannot be run without cost, model selection was probed by combining `--model <id>` with the read-only `--list-models` flag, which exits before any billed agent turn.
 
@@ -184,4 +210,8 @@ Rationale: `agent status` claims "Login successful!" but cannot report user deta
 - Full flag surface confirmed, including `--print`, `--output-format stream-json`, `--model`, `--workspace`, `--sandbox`, `--trust`, `--worktree` — a direct-parser or ACP-backed backend both look structurally feasible from the flag surface alone.
 - Headless auth is currently unusable on this machine (no models available for this account), which blocks exercising `--print --output-format stream-json` output shape entirely.
 - `--model` argument is not client-side validated; real behavior (valid/invalid/unavailable model) can only be observed once auth is restored and at least one model is available.
-- No commands in this probe spent money; `agent --print` was never invoked.
+- No commands in this probe spent money. `agent --print` was invoked twice
+  (`json` and `stream-json`) and both failed free at the auth gate with
+  `Authentication required` before any billed turn could start; beyond that,
+  `--print` was intentionally not invoked further to avoid risking a billed
+  turn against an account with no confirmed model access.
