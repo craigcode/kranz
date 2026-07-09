@@ -1,0 +1,1 @@
+{"type":"result","subtype":"success","is_error":false,"duration_ms":2029,"duration_api_ms":2029,"result":"How can I help with the codebase?","session_id":"<redacted>","request_id":"<redacted>","usage":{"inputTokens":3,"outputTokens":13,"cacheReadTokens":31909,"cacheWriteTokens":0}}
