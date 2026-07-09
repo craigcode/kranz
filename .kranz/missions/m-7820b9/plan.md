@@ -1,0 +1,96 @@
+# Mission plan — m-7820b9
+
+**Goal:** Probe the Cursor CLI headless surface (agent 2026.04.13) and produce an evidence-backed decision: implement backend_cursor as a direct `agent --print --output-format stream-json` parser, an ACP-backed adapter, or defer until headless auth/model availability is usable — without building the backend.
+
+Branch `kranz/mission-m-7820b9` (from `main`). Approved plan of record; the machine-readable twin is [plan.json](plan.json). Live status: `kranz status` or the dashboard.
+
+## Cost estimate
+
+Estimated **$6.35 – $31.75** (expected ~$13.67). Rough estimate — live usage is authoritative; based on 38 completed mission(s).
+
+## Considered alternatives
+
+**Chosen approach:** A fixture-driven, offline-verifiable probe that mirrors backend_codex's evidence model and self-determines the auth branch at runtime: the worker attempts live capture when auth is reachable and otherwise records a reproducible blocker, while every validator assertion runs against committed artifacts with no network or paid calls.
+
+Rejected shapes:
+- **Build the backend_cursor parser now and validate it against a live prompt** — The design note forbids building the backend and headless auth is unproven; a live-dependent contract is non-deterministic, costs money per validation, and needs auth validators cannot obtain.
+- **One monolithic probe-and-decide feature** — Live capture plus write-behavior probing plus synthesis exceeds a fresh session's ~50-turn budget and hides the auth green/red branch that must be explicit and independently checkpointed.
+- **Gate the whole mission on Craig first completing agent login** — A sandboxed headless worker cannot complete interactive login nor read keychain creds anyway, and 'defer' is a first-class mission outcome — blocking would stall a probe that is designed to characterize exactly that blocker.
+
+## Validation contract
+
+Defined before any feature; gates mission completion.
+
+- **[a1]** A decisive, well-formed probe manifest exists: it records the CLI version and flag surface, an explicit auth_usable boolean, and a recommendation that is exactly one of direct-parser, acp, or defer. 
+  `jq -e 'has("cli_version") and (.flags|length>0) and (.auth_usable!=null) and (.recommendation|test("^(direct-parser|acp|defer)$"))' docs/scoping/cursor-probe-evidence/probe-result.json`
+- **[a2]** The model-selection matrix records the actual observed CLI behavior (a successful selection or an auth/availability error) for the default model, Grok 4.5, and an invalid model id — each entry non-empty. 
+  `jq -e '.model_matrix|has("default") and has("grok") and has("invalid") and (.default|length>0) and (.grok|length>0) and (.invalid|length>0)' docs/scoping/cursor-probe-evidence/probe-result.json`
+- **[a3]** The fixture/blocker invariant holds: if auth was usable a committed fixture path is present and that fixture parses as JSON-lines carrying `type` event fields; if auth was not usable a concrete blocker is recorded instead. 
+  `bash -c 'set -e; P=docs/scoping/cursor-probe-evidence/probe-result.json; jq -e "if .auth_usable then .fixture != null else .blocker != null end" "$P" >/dev/null; F=$(jq -r ".fixture // empty" "$P"); if [ -n "$F" ]; then jq -e -s "length>0 and any(.[]; has(\"type\"))" "$F" >/dev/null; fi'`
+- **[a4]** The backend was not built and no engine code was touched: nothing under crates/ changed relative to the pinned mission base. 
+  `test -z "$(git diff --name-only $KRANZ_BASE_SHA -- 'crates/')"`
+- **[a5]** The recommendation in docs/scoping/cursor-cli-backend.md is grounded in observed structure (or the concrete auth/model blocker), and every scoping acceptance-bar item — terminal text stitching, tool-use/result observability, usage/cost availability, worktree/--workspace honoring, deterministic model-availability failures, permission mapping preserving no-push/no-publish/no-main-write, and an offline fixture test — is marked satisfied-with-evidence or explicitly unresolved. *(agent judgement)*
+
+## Milestone 1 — Preflight & CLI-surface characterization
+
+### 1.1 Cursor CLI preflight probe
+
+You are probing the locally-installed Cursor CLI (`agent`, version 2026.04.13-a9d7fb5, at ~/.local/bin/agent) to characterize its headless surface for a future kranz backend. DO NOT build any backend or touch any Rust code — this is evidence gathering only.
+
+Run and capture the verbatim output of these read-only commands (redact any email, token, or account identifier to <redacted> before recording): `agent --version`, `agent --help`, `agent status`, `agent models`, `agent --list-models`. From `--help`, extract the exact flag surface relevant to a backend (expected: --print, --output-format text|json|stream-json, --model, --list-models, --mode plan|ask, --force, --sandbox, --trust, --workspace, --worktree).
+
+Determine auth_usable: true only if a headless prompt could plausibly authenticate (e.g. `agent status` reports a usable session AND `agent models` lists at least one model). If commands return `Authentication required` or `No models available for this account`, set auth_usable=false and record the exact failing command + output.
+
+Characterize model selection at whatever layer is reachable WITHOUT spending money (do NOT run `agent --print` in this feature): record what `agent --model <default>`, `agent --model grok-4.5` (try plausible ids; note that the public display name may not be the CLI id), and `agent --model definitely-not-a-real-model` do at the arg/preflight/validation layer (arg-parse error vs auth error vs availability error).
+
+Create docs/scoping/cursor-probe-evidence/ and write two files:
+1. probe-result.json with this schema (fill every field you can; leave fixture=null, blocker=null-or-string, recommendation="defer" as a placeholder to be finalized in f3): {"cli_version":string,"flags":[string],"auth_usable":bool,"status_output":string,"models_output":string,"model_matrix":{"default":string,"grok":string,"invalid":string},"fixture":string|null,"blocker":string|null,"recommendation":"direct-parser"|"acp"|"defer","acceptance_bar":{}}.
+2. preflight.md — a human-readable log of every command run and its redacted output.
+
+Encode the validationCriteria below as a shell test script (e.g. docs/scoping/cursor-probe-evidence/check-preflight.sh) that a fresh validator can run offline against the committed files, and confirm it passes before finishing. Commit both artifacts.
+
+Done when:
+- docs/scoping/cursor-probe-evidence/probe-result.json exists and `jq -e 'has("cli_version") and (.flags|length>0) and (.auth_usable!=null)'` succeeds on it
+- The recorded flags array contains --print, --output-format, --model, --workspace, and --sandbox
+- probe-result.json.model_matrix has non-empty default, grok, and invalid entries recording the actual observed CLI behavior
+- preflight.md exists and contains the captured (redacted) output of agent --version, agent status, and agent models
+- No file under crates/ is modified: `git diff --name-only $KRANZ_BASE_SHA -- 'crates/'` is empty
+
+
+## Milestone 2 — Live capture (conditional) & route decision
+
+### 2.1 Live prompt capture & fixtures (best-effort)
+
+Continue the Cursor CLI probe from docs/scoping/cursor-probe-evidence/probe-result.json (written by the preflight feature). DO NOT touch Rust code or build a backend.
+
+Read probe-result.json. Branch on auth_usable:
+
+IF auth_usable is true: create a throwaway temp git repo (e.g. under $TMPDIR), and against it run a small controlled prompt three ways — `agent --print --output-format text`, `--output-format json`, and `--output-format stream-json` — using a prompt that produces a short assistant reply plus at least one tool/shell action so tool-use/result structure is visible. Also exercise write-capable behavior in the temp repo (a file edit, a shell command, a command that fails/is denied, and a no-op) and inspect the resulting git diff + output stream. Capture the live model matrix by actually selecting the default model, Grok 4.5, and an invalid model and recording the real responses. Choose the SMALLEST stream-json capture that still shows: assistant text, a tool-use event, a tool-result event, and a terminal usage/cost event. REDACT any email/token/session-id/absolute home path to <redacted>. Commit that redacted fixture as docs/scoping/cursor-probe-evidence/cursor_stream_json.jsonl and set probe-result.json.fixture to its repo-relative path. Update probe-result.json.model_matrix with the live observations.
+
+IF auth_usable is false: do NOT attempt paid prompts. Record in probe-result.json.blocker the exact command(s) attempted at preflight and their verbatim (redacted) output that establish the block (e.g. `agent --print ... -> Authentication required`, `agent models -> No models available for this account`), plus the concrete preconditions to unblock (a reachable CURSOR_API_KEY in the session env and provisioned account models, since a sandboxed headless worker cannot complete interactive `agent login` nor read keychain creds). Leave fixture=null.
+
+In BOTH branches, ensure probe-result.json satisfies the invariant: auth_usable=>fixture!=null, else blocker!=null. Encode the validationCriteria as an offline shell check and confirm it passes. Commit updated artifacts.
+
+Done when:
+- The invariant holds: `jq -e 'if .auth_usable then .fixture != null else .blocker != null end' docs/scoping/cursor-probe-evidence/probe-result.json` succeeds
+- If probe-result.json.fixture is non-null, that file exists, parses as JSON-lines, and at least one line has a `type` field (`jq -e -s 'any(.[]; has("type"))'`)
+- If a fixture was committed, no unredacted email/token/absolute-home-path appears in it
+- If auth_usable is false, probe-result.json.blocker is a non-empty string naming the exact failing command(s) and the unblock preconditions
+- No file under crates/ is modified: `git diff --name-only $KRANZ_BASE_SHA -- 'crates/'` is empty
+
+### 2.2 Route decision & implementation brief
+
+Finalize the Cursor CLI backend probe decision. Read docs/scoping/cursor-probe-evidence/probe-result.json and preflight.md (and the fixture if present). DO NOT touch Rust code.
+
+Evaluate each scoping acceptance-bar item from docs/scoping/cursor-cli-backend.md against the collected evidence: (1) terminal assistant text can be stitched into a Result.text; (2) tool-use and tool-results are observable enough for transcripts and denial reporting; (3) usage/cost is on the wire or priceable from model ids; (4) cwd/--workspace honors kranz worktree isolation; (5) model-availability failures are deterministic and user-readable; (6) permission mapping can preserve kranz's no-push/no-publish/no-main-write invariants; (7) a fixture test can prove parser behavior without network. For each, write `satisfied: <evidence>` or `unresolved: <why>` into probe-result.json.acceptance_bar.
+
+Decide the route strictly from observed structure, not guesswork: direct-parser if stream-json exposes enough per-event structure (analogous to backend_codex's item.started/item.completed/turn.completed with usage); acp if the CLI output is too lossy but ACP offers a stable protocol; defer if auth/model availability is not reliably reachable headlessly. Set probe-result.json.recommendation accordingly.
+
+Update docs/scoping/cursor-cli-backend.md: add a dated 'Decision' section stating the recommendation and its rationale grounded in the evidence, the acceptance-bar verdict table, and — if the recommendation is direct-parser or acp — a scoped backend implementation brief (single-shot, validator-first, mirroring the Codex path: binary discovery, argv construction, stream parser stitching terminal text, usage/cost, sandbox/permission mapping, and a fixture-driven offline test). If the recommendation is defer, replace the brief with the precise preconditions that would make the probe green. Commit the updated doc and manifest.
+
+Done when:
+- probe-result.json.recommendation is exactly one of direct-parser, acp, defer and is consistent with auth_usable (recommendation is not direct-parser/acp unless the evidence — including a fixture — supports it)
+- probe-result.json.acceptance_bar has an entry for all seven scoping acceptance-bar items, each marked satisfied or unresolved with a reason
+- docs/scoping/cursor-cli-backend.md contains a dated Decision section naming the recommendation, its rationale, and either a scoped implementation brief (if green) or explicit unblock preconditions (if defer)
+- No file under crates/ is modified: `git diff --name-only $KRANZ_BASE_SHA -- 'crates/'` is empty
+
