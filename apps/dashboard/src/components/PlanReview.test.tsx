@@ -65,4 +65,15 @@ describe('PlanReview', () => {
     expect(screen.getByText(/big bang/)).toBeTruthy();
     expect(screen.getByText(/docs only/)).toBeTruthy();
   });
+
+  it('disables the Approve button and shows Approving… while planning.approving', () => {
+    useKranzStore.setState((s) => ({
+      planning: { ...s.planning, approving: true },
+    }));
+
+    render(<PlanReview />);
+
+    const button = screen.getByRole('button', { name: 'Approving…' }) as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+  });
 });

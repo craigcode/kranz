@@ -257,10 +257,16 @@ pub enum Command {
 
         /// Bind address. Default loopback; set e.g. 0.0.0.0 (LAN) or a
         /// tailnet IP to reach the API from other devices (glasses app,
-        /// phones). POSTs stay token-gated; GETs (states, transcripts) are
-        /// tokenless — widen only on networks where that is acceptable.
+        /// phones). Non-loopback binds require `--insecure-lan` — POSTs stay
+        /// token-gated, but GETs (states, transcripts) are tokenless.
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
+
+        /// Acknowledge that a non-loopback bind exposes tokenless GETs on
+        /// the network. Required when `--host` is not a loopback address;
+        /// ignored for 127.0.0.1 / ::1.
+        #[arg(long)]
+        insecure_lan: bool,
 
         /// Open the dashboard in the default browser
         #[arg(long)]

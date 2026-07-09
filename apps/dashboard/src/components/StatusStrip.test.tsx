@@ -18,6 +18,7 @@ vi.mock('../lib/api', async () => {
     ...actual,
     api: {
       startMission: vi.fn(),
+      control: vi.fn(),
     },
   };
 });
@@ -91,6 +92,7 @@ const INITIAL_STORE_STATE = useKranzStore.getState();
 beforeEach(() => {
   cleanup();
   vi.mocked(api.startMission).mockReset();
+  vi.mocked(api.control).mockReset();
   useKranzStore.setState(
     {
       ...INITIAL_STORE_STATE,
@@ -132,6 +134,30 @@ describe('StatusStrip Start action', () => {
 
     const alert = await screen.findByText(/already running/);
     expect(alert).toBeTruthy();
+    expect(alert.getAttribute('role')).toBe('alert');
+  });
+});
+
+describe('StatusStrip pause/resume errors', () => {
+  it('surfaces a failed pause control as an alert', async () => {
+    useKranzStore.setState({ state: makeState('running', { r1: makeWorkerRun('r1') }) });
+    vi.mocked(api.control).mockRejectedValueOnce(new ApiError(503, 'control channel down'));
+    render(<StatusStrip />);
+
+    fireEvent.click(screen.getByText(/pause/i));
+
+    const alert = await screen.findByText('control channel down');
+    expect(alert.getAttribute('role')).toBe('alert');
+  });
+
+  it('surfaces a failed resume control as an alert', async () => {
+    useKranzStore.setState({ state: makeState('paused', {}) });
+    vi.mocked(api.control).mockRejectedValueOnce(new ApiError(503, 'resume refused'));
+    render(<StatusStrip />);
+
+    fireEvent.click(screen.getByText(/resume/i));
+
+    const alert = await screen.findByText('resume refused');
     expect(alert.getAttribute('role')).toBe('alert');
   });
 });

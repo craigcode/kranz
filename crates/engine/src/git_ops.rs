@@ -209,6 +209,49 @@ impl GitRepo {
         self.head_sha()
     }
 
+    /// Paths currently dirty in the working tree (`git status --porcelain`),
+    /// relative to the repo root. Empty when clean.
+    pub fn dirty_paths(&self) -> Result<Vec<PathBuf>> {
+        let out = self.run(&["status", "--porcelain", "-z"])?;
+        let mut paths = Vec::new();
+        for entry in out.split('\0') {
+            if entry.is_empty() {
+                continue;
+            }
+            // Porcelain -z: XY<space>path, or for renames XY<space>new\0old.
+            // We only need the path after the two-letter status + space.
+            let path_bytes = entry.as_bytes();
+            if path_bytes.len() < 4 {
+                continue;
+            }
+            // Status is two chars; path starts at index 3 when a space follows.
+            let path = if path_bytes.get(2) == Some(&b' ') {
+                &entry[3..]
+            } else {
+                // Unusual but tolerate "XY path" without assuming space.
+                entry.trim()
+            };
+            if path.is_empty() {
+                continue;
+            }
+            paths.push(PathBuf::from(path));
+        }
+        Ok(paths)
+    }
+
+    /// Stage and commit only currently-dirty paths (scoped checkpoint).
+    /// Prefer this over [`Self::add_all_and_commit`] for engine checkpoints so
+    /// a concurrent operator edit outside the worker's tree is not scooped in
+    /// via `git add -A`. No-op (returns current HEAD) when the tree is clean.
+    pub fn commit_dirty_paths(&self, message: &str) -> Result<String> {
+        let paths = self.dirty_paths()?;
+        if paths.is_empty() {
+            return self.head_sha();
+        }
+        let refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+        self.commit_paths(&refs, message)
+    }
+
     /// Stage and commit only the given paths; returns the new head sha.
     ///
     /// Paths may be absolute or relative to the repo root. Content staged

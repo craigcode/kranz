@@ -284,13 +284,28 @@ struct RepoBusyGuard {
 
 impl RepoBusyGuard {
     fn acquire(repo_root: &Path, mission_id: &str) -> Result<Self> {
+        Self::acquire_allowing_own_legacy(repo_root, mission_id, false)
+    }
+
+    /// Acquire the repo-wide busy lock. When `allow_own_legacy` is true, a
+    /// live `events.jsonl.lock` for *this* `mission_id` is ignored (hosted
+    /// start already holds the single-writer lock); any other mission's
+    /// legacy lock still conflicts. Queue claims keep `allow_own_legacy =
+    /// false` so a live engine for the claimed id cannot be double-run.
+    fn acquire_allowing_own_legacy(
+        repo_root: &Path,
+        mission_id: &str,
+        allow_own_legacy: bool,
+    ) -> Result<Self> {
         std::fs::create_dir_all(queue_dir(repo_root))?;
         let lock_path = repo_busy_lock(repo_root);
         let mission_path = repo_busy_mission_file(repo_root);
 
         for _ in 0..16 {
-            if legacy_mission_lock_busy(repo_root).is_some() {
-                return Err(lock_held_for_repo(repo_root));
+            if let Some(holder) = legacy_mission_lock_busy(repo_root) {
+                if !(allow_own_legacy && holder == mission_id) {
+                    return Err(lock_held_for_repo(repo_root));
+                }
             }
 
             match std::fs::OpenOptions::new()
@@ -333,6 +348,26 @@ impl Drop for RepoBusyGuard {
         let _ = std::fs::remove_file(&self.mission_path);
         let _ = std::fs::remove_file(&self.lock_path);
     }
+}
+
+/// Public RAII hold on the repo-wide busy lock — same underlying guard the
+/// queue claim path uses. Drop (or end of scope) releases the lock so a
+/// sibling dispatcher or hosted start can proceed.
+#[derive(Debug)]
+pub struct RepoBusyHold {
+    _inner: RepoBusyGuard,
+}
+
+/// Acquire the repo-wide busy lock for `mission_id`. Returns
+/// [`EngineError::LockHeld`] when another live holder already owns it.
+///
+/// Unlike the queue claim path, this allows the caller to already hold
+/// `events.jsonl.lock` for `mission_id` (hosted start: the planning engine
+/// is about to become the run).
+pub fn acquire_repo_busy(repo_root: &Path, mission_id: &str) -> Result<RepoBusyHold> {
+    Ok(RepoBusyHold {
+        _inner: RepoBusyGuard::acquire_allowing_own_legacy(repo_root, mission_id, true)?,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -426,18 +461,47 @@ pub fn claim_front_when_repo_free(repo_root: &Path) -> Result<ClaimFront> {
 }
 
 /// The mission ran to a terminal state (any outcome): retire the claim.
-pub fn finish_claim(claim: Claim) {
+pub fn finish_claim(mut claim: Claim) {
     let _ = std::fs::remove_file(&claim.claimed_path);
+    claim.disarm();
 }
 
 /// The mission could NOT be run (start failure, lock held, config error):
 /// put the entry back so the work is not lost.
-pub fn release_claim(claim: Claim) {
+pub fn release_claim(mut claim: Claim) {
     if std::fs::rename(&claim.claimed_path, &claim.original_path).is_err() {
         tracing::warn!(
             path = %claim.claimed_path.display(),
             "failed to release queue claim; entry remains claimed on disk"
         );
+    }
+    claim.disarm();
+}
+
+impl Claim {
+    /// Mark the claim as consumed so [`Drop`] does not re-release it.
+    /// The embedded [`RepoBusyGuard`] still drops normally.
+    fn disarm(&mut self) {
+        self.claimed_path = PathBuf::new();
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        // RAII safety net: an early `?` in drain_queue used to leak the
+        // `.claimed.<pid>` rename + RepoBusyGuard. If the claimed file is
+        // still present when Claim goes out of scope, put the entry back.
+        if self.claimed_path.as_os_str().is_empty() {
+            return;
+        }
+        if self.claimed_path.exists()
+            && std::fs::rename(&self.claimed_path, &self.original_path).is_err()
+        {
+            tracing::warn!(
+                path = %self.claimed_path.display(),
+                "Claim::drop failed to release queue claim"
+            );
+        }
     }
 }
 
@@ -606,5 +670,48 @@ mod tests {
         finish_claim(second);
         assert!(list(repo).is_empty());
         assert_eq!(is_repo_busy(repo), None);
+    }
+
+    #[test]
+    fn acquire_repo_busy_holds_until_drop_and_conflicts_with_second() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+
+        let hold = acquire_repo_busy(repo, "m-hosted").expect("first acquire");
+        assert_eq!(is_repo_busy(repo).as_deref(), Some("m-hosted"));
+
+        let err = acquire_repo_busy(repo, "m-other").expect_err("second must conflict");
+        assert!(
+            matches!(err, EngineError::LockHeld(_)),
+            "expected LockHeld, got {err:?}"
+        );
+
+        drop(hold);
+        assert_eq!(is_repo_busy(repo), None);
+        let again = acquire_repo_busy(repo, "m-hosted").expect("re-acquire after drop");
+        drop(again);
+        assert_eq!(is_repo_busy(repo), None);
+    }
+
+    #[test]
+    fn acquire_repo_busy_ignores_own_mission_events_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let paths = crate::paths::MissionPaths::new(repo, "m-self");
+        // Hold the single-writer lock the way a hosted planning engine would.
+        let _log = crate::event_log::EventLog::acquire(
+            &paths,
+            "m-self",
+            Duration::ZERO,
+            crate::event_log::LockForce::No,
+        )
+        .expect("mission lock");
+
+        let hold = acquire_repo_busy(repo, "m-self").expect("self legacy lock must not block");
+        assert_eq!(is_repo_busy(repo).as_deref(), Some("m-self"));
+
+        let err = acquire_repo_busy(repo, "m-other").expect_err("other must still conflict");
+        assert!(matches!(err, EngineError::LockHeld(_)));
+        drop(hold);
     }
 }

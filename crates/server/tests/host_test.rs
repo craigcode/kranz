@@ -798,6 +798,44 @@ async fn mutation_token_gates_every_post_and_no_get() {
 }
 
 #[tokio::test]
+async fn non_loopback_bind_requires_token_on_gets() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    seed_mission_log(&root, "m-01");
+    let host = Arc::new(kranz_server::MissionHost::new(root));
+    let app = kranz_server::router_with_shared_host_and_bind(
+        host,
+        None,
+        Some(TOKEN.to_string()),
+        Some(4560),
+        true, // require_read_token — as if bind were non-loopback
+    );
+
+    // GETs under /api/ now need the token.
+    let (status, body) = get_json(&app, "/api/missions/m-01/state").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"], "missing or invalid token");
+
+    let (status, body) = get_json(&app, "/api/health").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"], "missing or invalid token");
+
+    // With the token, reads succeed.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/missions/m-01/state")
+                .header("x-kranz-token", TOKEN)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn revision_routes_expose_diff_and_enqueue_decisions() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();

@@ -718,6 +718,42 @@ async fn control_post_enqueues_a_drainable_command() {
     assert!(body["error"].is_string());
 }
 
+#[tokio::test]
+async fn control_post_rejects_terminal_mission() {
+    let (_tmp, _repo_root, paths, app) = fixture();
+    let uri = format!("/api/missions/{MISSION_ID}/control");
+
+    // Advance the seeded mission to Complete.
+    {
+        let mut log = EventLog::acquire(&paths, MISSION_ID, Duration::ZERO, LockForce::No).unwrap();
+        log.append(EventKind::MissionCompleted {}).unwrap();
+    }
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(&uri)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"kind":"pause"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        body["error"].as_str().unwrap().contains("Complete"),
+        "{body}"
+    );
+    assert!(
+        control::drain(&paths).unwrap().is_empty(),
+        "terminal control must not enqueue"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // CORS: only local dev origins and the Tauri webview are approved
 // ---------------------------------------------------------------------------
@@ -1258,6 +1294,24 @@ async fn ws_unknown_mission_is_rejected() {
     .await
     .unwrap();
     assert!(result.is_err(), "handshake to an unknown mission must fail");
+}
+
+#[tokio::test]
+async fn ws_rejects_invalid_since() {
+    let (_tmp, _repo_root, _paths, app) = fixture();
+    let addr = spawn_server(app).await;
+
+    let url = format!("ws://{addr}/api/missions/{MISSION_ID}/ws?since=nope");
+    let result = tokio::time::timeout(
+        WAIT,
+        connect_async(ws_request(&url, Some("http://localhost:5173"))),
+    )
+    .await
+    .unwrap();
+    assert!(
+        result.is_err(),
+        "unparsable ?since= must reject the upgrade (align with REST)"
+    );
 }
 
 // ---------------------------------------------------------------------------

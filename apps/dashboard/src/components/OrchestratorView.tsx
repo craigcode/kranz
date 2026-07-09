@@ -137,7 +137,7 @@ function Composer() {
           interrupt current worker
         </label>
         {sendError !== null && <span className="composer-error">{sendError}</span>}
-        {disabled && <span className="composer-hint dim">messages queue when reconnected</span>}
+        {disabled && <span className="composer-hint dim">sending disabled until reconnected</span>}
         <button
           type="button"
           className="composer-send"

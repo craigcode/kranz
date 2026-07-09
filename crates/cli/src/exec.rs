@@ -37,6 +37,11 @@ use std::sync::Arc;
 /// orchestrator wanted clarification it cannot get headlessly (`NotReady`).
 pub const EXIT_UNDERSPECIFIED: i32 = 3;
 
+/// Exit code when the mission COMPLETE'd but `--push` failed. Distinct from
+/// mission failure (1) and underspecified (3) so CI can tell delivery apart
+/// from the run itself. Stdout still reports `pushed=false`.
+pub const EXIT_PUSH_FAILED: i32 = 4;
+
 /// Map a terminal mission status to the process exit code exec returns.
 ///
 /// `Complete` → 0, `Failed` → 1, `Blocked` → 2. Any other status is not a
@@ -222,10 +227,11 @@ pub async fn cmd_exec(
 
     // Cloud handoff: on a COMPLETE run, push the mission's kranz/* branch to the
     // requested remote so a human reviews it and opens the PR. GitRepo enforces
-    // the kranz/* guard — this never pushes main or force-pushes. Failure to
-    // push is surfaced but does not change the mission's own exit code (the work
-    // is done and committed locally; the push is a delivery step).
+    // the kranz/* guard — this never pushes main or force-pushes. A push failure
+    // keeps stdout `pushed=false` and returns [`EXIT_PUSH_FAILED`] (distinct
+    // from the mission's own exit code) so CI can detect a delivery miss.
     let mut pushed = false;
+    let mut push_failed = false;
     if let (Some(remote), MissionStatus::Complete) = (&push, status) {
         match kranz_engine::git_ops::GitRepo::open(&repo)
             .and_then(|r| r.push_mission_branch(remote, &branch))
@@ -234,7 +240,10 @@ pub async fn cmd_exec(
                 pushed = true;
                 eprintln!("kranz exec: pushed {branch} to {remote}");
             }
-            Err(e) => eprintln!("kranz exec: WARNING failed to push {branch} to {remote}: {e}"),
+            Err(e) => {
+                push_failed = true;
+                eprintln!("kranz exec: WARNING failed to push {branch} to {remote}: {e}");
+            }
         }
     }
 
@@ -243,6 +252,9 @@ pub async fn cmd_exec(
         "kranz exec {mission_id} {} cost=${cost:.2} branch={branch} pushed={pushed}",
         output::mission_status_label(status)
     );
+    if push_failed {
+        return Ok(EXIT_PUSH_FAILED);
+    }
     Ok(code)
 }
 
@@ -258,5 +270,57 @@ mod tests {
         // Non-terminal statuses (should not arise from run()) map to failure.
         assert_eq!(exit_code_for(MissionStatus::Running), 1);
         assert_eq!(exit_code_for(MissionStatus::Abandoned), 1);
+    }
+
+    #[test]
+    fn push_failure_exit_code_is_distinct() {
+        // Mission COMPLETE → 0; push failure must not reuse that (or 1/2/3).
+        assert_eq!(exit_code_for(MissionStatus::Complete), 0);
+        assert_eq!(EXIT_PUSH_FAILED, 4);
+        assert_ne!(EXIT_PUSH_FAILED, exit_code_for(MissionStatus::Complete));
+        assert_ne!(EXIT_PUSH_FAILED, exit_code_for(MissionStatus::Failed));
+        assert_ne!(EXIT_PUSH_FAILED, EXIT_UNDERSPECIFIED);
+    }
+
+    /// Pure helper mirroring the post-run push decision in [`cmd_exec`]: when
+    /// `--push` is set and the push Errs after COMPLETE, the process exit is
+    /// [`EXIT_PUSH_FAILED`] while the summary still reports `pushed=false`.
+    fn exit_after_push(mission_code: i32, push_requested: bool, push_ok: bool) -> (i32, bool) {
+        let mut pushed = false;
+        let mut push_failed = false;
+        if push_requested {
+            if push_ok {
+                pushed = true;
+            } else {
+                push_failed = true;
+            }
+        }
+        let code = if push_failed {
+            EXIT_PUSH_FAILED
+        } else {
+            mission_code
+        };
+        (code, pushed)
+    }
+
+    #[test]
+    fn push_failure_returns_exit_4_with_pushed_false() {
+        let (code, pushed) = exit_after_push(0, true, false);
+        assert_eq!(code, EXIT_PUSH_FAILED);
+        assert!(!pushed);
+    }
+
+    #[test]
+    fn push_success_keeps_mission_exit_and_pushed_true() {
+        let (code, pushed) = exit_after_push(0, true, true);
+        assert_eq!(code, 0);
+        assert!(pushed);
+    }
+
+    #[test]
+    fn no_push_flag_leaves_mission_exit_unchanged() {
+        let (code, pushed) = exit_after_push(0, false, false);
+        assert_eq!(code, 0);
+        assert!(!pushed);
     }
 }

@@ -41,6 +41,7 @@ export function StatusStrip() {
   const startRunError = useKranzStore((s) => s.startRunError);
   const startRun = useKranzStore((s) => s.startRun);
   const [armedAbandon, setArmedAbandon] = useState(false);
+  const [controlError, setControlError] = useState<string | null>(null);
 
   // An armed abandon disarms itself: a stray click must not lie in wait.
   useEffect(() => {
@@ -98,7 +99,12 @@ export function StatusStrip() {
         <button
           type="button"
           className="strip-btn"
-          onClick={() => void sendControl({ kind: 'resume' }).catch(() => {})}
+          onClick={() => {
+            setControlError(null);
+            void sendControl({ kind: 'resume' }).catch((err: unknown) => {
+              setControlError(err instanceof Error ? err.message : String(err));
+            });
+          }}
         >
           ▶ resume
         </button>
@@ -117,7 +123,12 @@ export function StatusStrip() {
           <button
             type="button"
             className="strip-btn"
-            onClick={() => void sendControl({ kind: 'pause' }).catch(() => {})}
+            onClick={() => {
+              setControlError(null);
+              void sendControl({ kind: 'pause' }).catch((err: unknown) => {
+                setControlError(err instanceof Error ? err.message : String(err));
+              });
+            }}
           >
             ⏸ pause
           </button>
@@ -159,6 +170,11 @@ export function StatusStrip() {
       {startRunError !== null && (
         <span className="strip-reason" role="alert">
           {startRunError}
+        </span>
+      )}
+      {controlError !== null && (
+        <span className="strip-reason" role="alert">
+          {controlError}
         </span>
       )}
 

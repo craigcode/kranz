@@ -112,17 +112,17 @@ fn add_worktree_checkout_mirrors_mission_worktree_setup() {
 }
 
 #[test]
-fn worker_isolation_config_defaults_to_checkout() {
+fn worker_isolation_config_defaults_to_worktree() {
     assert_eq!(
         MissionConfig::default().worker_isolation,
-        WorkerIsolation::Checkout
+        WorkerIsolation::Worktree
     );
 
     let dir = tempfile::tempdir().expect("tempdir");
     let layer = write_layer(&dir, "config.json", r#"{"maxRespawns":3}"#);
 
     let cfg = load_layers(&[layer]).expect("load layers");
-    assert_eq!(cfg.worker_isolation, WorkerIsolation::Checkout);
+    assert_eq!(cfg.worker_isolation, WorkerIsolation::Worktree);
     assert_eq!(cfg.max_respawns, 3);
 }
 
@@ -138,7 +138,7 @@ fn worker_isolation_config_parses_worktree() {
 #[test]
 fn worker_isolation_config_serializes_camel_case() {
     let value = serde_json::to_value(MissionConfig::default()).expect("serialize");
-    assert_eq!(value["workerIsolation"], "checkout");
+    assert_eq!(value["workerIsolation"], "worktree");
 }
 
 #[test]
@@ -256,6 +256,7 @@ fn checkout_cfg() -> MissionConfig {
     MissionConfig {
         skip_scrutiny: true,
         skip_functional: true,
+        worker_isolation: WorkerIsolation::Checkout,
         ..MissionConfig::default()
     }
 }
@@ -675,9 +676,13 @@ async fn mission_branch_carries_deliverables_in_worktree_mode() {
         "mission branch log missing the mission-report commit: {log}"
     );
 
-    // Deliverables stay readable: human-readable twins in the primary
-    // runtime dir (untracked, never committed there).
+    // Deliverables stay readable: untracked twins in the primary runtime
+    // dir (never committed there — canonical copies are on the mission branch).
     let mission_dir = root.join(".kranz/missions").join(&mission_id);
+    assert!(
+        mission_dir.join("plan.json").is_file(),
+        "plan.json twin must be readable in the primary runtime dir"
+    );
     assert!(
         mission_dir.join("plan.md").is_file(),
         "plan.md twin must be readable in the primary runtime dir"

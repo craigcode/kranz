@@ -68,6 +68,9 @@ pub struct ServerState {
     /// the Slack bridge: web and Slack are two clients of one set of live
     /// engines, never two engines fighting over one mission lock.
     pub host: Arc<MissionHost>,
+    /// Serve bind port threaded into CORS / WS origin checks. `None` keeps
+    /// the test/back-compat wildcard (any localhost/127.0.0.1 port).
+    pub bind_port: Option<u16>,
 }
 
 /// Build the full router (public so tests can drive it with
@@ -92,6 +95,9 @@ pub fn router_with_static(repo_root: PathBuf, static_assets: Option<DashboardSta
 /// Build the full router with an optional mutation token gating every
 /// `POST /api/...` (`None` disables the gate — back-compat test wrappers
 /// only; real serving always passes `Some`).
+///
+/// Test/back-compat path: CORS allows any localhost/127.0.0.1 port (and
+/// Tauri), and GETs stay tokenless.
 pub fn router_with_token(
     repo_root: PathBuf,
     static_assets: Option<DashboardStatic>,
@@ -113,14 +119,32 @@ pub fn router_with_host(
 
 /// [`router_with_host`] over an already-shared registry — the `kranz serve
 /// --slack` path, where the Slack bridge holds a clone of the same host.
+///
+/// Test/back-compat path: CORS allows any localhost/127.0.0.1 port (and
+/// Tauri), and GETs stay tokenless. Prefer
+/// [`router_with_shared_host_and_bind`] when the bind address/port are known.
 pub fn router_with_shared_host(
     host: Arc<MissionHost>,
     static_assets: Option<DashboardStatic>,
     token: Option<String>,
 ) -> Router {
+    router_with_shared_host_and_bind(host, static_assets, token, None, false)
+}
+
+/// Router constructor that threads the serve bind port into CORS / WS origin
+/// checks and optionally requires the mutation token on GET + WS upgrade
+/// (`require_read_token`, true when the bind address is not loopback).
+pub fn router_with_shared_host_and_bind(
+    host: Arc<MissionHost>,
+    static_assets: Option<DashboardStatic>,
+    token: Option<String>,
+    bind_port: Option<u16>,
+    require_read_token: bool,
+) -> Router {
     let state = Arc::new(ServerState {
         repo_root: host.repo_root().clone(),
         host,
+        bind_port,
     });
     let app = Router::new()
         .route("/api/health", get(rest::health))
@@ -211,12 +235,15 @@ pub fn router_with_shared_host(
     // headers for approved origins and a non-JSON POST is rejected before the
     // token is examined.
     app.layer(middleware::from_fn_with_state(
-        token,
+        TokenGate {
+            token,
+            require_read_token,
+        },
         require_mutation_token,
     ))
     .layer(middleware::from_fn(require_json_api_posts))
     .layer(middleware::from_fn(require_local_host))
-    .layer(cors_layer())
+    .layer(cors_layer(bind_port))
 }
 
 fn embedded_static_response(uri: Uri, files: &'static [EmbeddedFile]) -> Response {
@@ -262,32 +289,54 @@ fn embedded_static_response(uri: Uri, files: &'static [EmbeddedFile]) -> Respons
 ///
 /// Non-browser clients (curl, the engine, tests) send no `Origin` header and
 /// pass through untouched — CORS is a browser-enforced mechanism.
-fn cors_layer() -> CorsLayer {
+fn cors_layer(bind_port: Option<u16>) -> CorsLayer {
     CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(
-            |origin: &HeaderValue, _request_parts| origin.to_str().is_ok_and(origin_allowed),
+            move |origin: &HeaderValue, _request_parts| {
+                origin.to_str().is_ok_and(|o| origin_allowed(o, bind_port))
+            },
         ))
         .allow_methods([Method::GET, Method::POST])
         .allow_headers([header::CONTENT_TYPE, HeaderName::from_static(TOKEN_HEADER)])
 }
 
-/// Trusted origins: `http://localhost:<any port>`, `http://127.0.0.1:<any
-/// port>` (dashboard dev servers), `tauri://localhost` (macOS/Linux Tauri
-/// webview) and `http://tauri.localhost` (Windows Tauri webview).
+/// Trusted origins for CORS and the WebSocket upgrade Origin check.
 ///
-/// The port wildcard is prefix + `u16` parse — NEVER substring matching,
+/// Always: `tauri://localhost` (macOS/Linux Tauri) and
+/// `http://tauri.localhost` (Windows Tauri).
+///
+/// When `bind_port` is `Some(p)`: only `http://localhost:p` /
+/// `http://127.0.0.1:p`, plus the empty-port forms (`http://localhost`,
+/// `http://127.0.0.1`) when they match the default HTTP port (80).
+///
+/// When `bind_port` is `None` (test/back-compat routers): any
+/// `http://localhost:<u16>` / `http://127.0.0.1:<u16>` (and empty-port
+/// forms). Port matching is prefix + `u16` parse — NEVER substring matching,
 /// which would also approve e.g. `http://localhost.evil.example`.
-fn origin_allowed(origin: &str) -> bool {
+pub(crate) fn origin_allowed(origin: &str, bind_port: Option<u16>) -> bool {
     if origin == "tauri://localhost" || origin == "http://tauri.localhost" {
         return true;
     }
     ["http://localhost", "http://127.0.0.1"].iter().any(|base| {
-        origin.strip_prefix(base).is_some_and(|rest| {
-            rest.is_empty()
-                || rest
-                    .strip_prefix(':')
-                    .is_some_and(|port| port.parse::<u16>().is_ok())
-        })
+        origin
+            .strip_prefix(base)
+            .is_some_and(|rest| match bind_port {
+                Some(expected) => {
+                    if rest.is_empty() {
+                        // Empty-port form is the default HTTP port.
+                        expected == 80
+                    } else {
+                        rest.strip_prefix(':')
+                            .is_some_and(|port| port.parse::<u16>().is_ok_and(|p| p == expected))
+                    }
+                }
+                None => {
+                    rest.is_empty()
+                        || rest
+                            .strip_prefix(':')
+                            .is_some_and(|port| port.parse::<u16>().is_ok())
+                }
+            })
     })
 }
 
@@ -366,21 +415,36 @@ async fn require_json_api_posts(request: Request, next: Next) -> Response {
     next.run(request).await
 }
 
+/// Token gate state: the optional mutation token plus whether non-loopback
+/// binds also require it on GET / WS upgrade.
+#[derive(Clone)]
+struct TokenGate {
+    token: Option<String>,
+    require_read_token: bool,
+}
+
 /// Require the per-serve mutation token on every `POST /api/...` (protocol
-/// "Authority: mutation token"). GETs and the WS upgrade stay tokenless —
-/// read-only observation. `None` (back-compat test wrappers only) disables
-/// the gate.
+/// "Authority: mutation token"). When [`TokenGate::require_read_token`] is
+/// set (non-loopback bind), GETs and the WS upgrade under `/api/` require
+/// the token too. `token: None` (back-compat test wrappers only) disables
+/// the gate entirely.
 ///
 /// Rationale: the 127.0.0.1 bind + CORS allowlist stop the network and the
 /// browser; the token stops other local processes and link-borne CSRF from
-/// creating or steering missions that spend money.
+/// creating or steering missions that spend money. Off-loopback, tokenless
+/// reads would expose mission state to the LAN, so reads are gated too.
 async fn require_mutation_token(
-    State(token): State<Option<String>>,
+    State(gate): State<TokenGate>,
     request: Request,
     next: Next,
 ) -> Response {
-    if let Some(expected) = token.as_deref() {
-        if request.method() == Method::POST && request.uri().path().starts_with("/api/") {
+    if let Some(expected) = gate.token.as_deref() {
+        let path = request.uri().path();
+        let needs_token = path.starts_with("/api/")
+            && (request.method() == Method::POST
+                || (gate.require_read_token
+                    && (request.method() == Method::GET || request.method() == Method::HEAD)));
+        if needs_token {
             let presented = request
                 .headers()
                 .get(TOKEN_HEADER)
@@ -435,9 +499,9 @@ pub async fn serve_with_static(
 /// [`serve_with_static`] over an already-shared registry (see
 /// [`router_with_shared_host`]).
 /// `bind` widens reachability beyond loopback (e.g. for the glasses app on
-/// the same LAN / tailnet). Every POST stays mutation-token-gated, but GETs
-/// (states, transcripts) are tokenless by design — bind beyond loopback only
-/// on networks where that is acceptable. The CLI prints a loud warning.
+/// the same LAN / tailnet). Every POST stays mutation-token-gated; when
+/// `bind` is not loopback, GETs and WS upgrades require the token too. The
+/// CLI prints a loud warning for non-loopback binds.
 pub async fn serve_with_shared_host(
     host: Arc<MissionHost>,
     bind: IpAddr,
@@ -464,7 +528,14 @@ pub async fn serve_with_shutdown(
     token: Option<String>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    let app = router_with_shared_host(host, static_assets, token);
+    let require_read_token = !bind.is_loopback();
+    let app = router_with_shared_host_and_bind(
+        host,
+        static_assets,
+        token,
+        Some(port),
+        require_read_token,
+    );
     let addr = SocketAddr::from((bind, port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local_addr = listener.local_addr()?;
@@ -481,6 +552,7 @@ mod tests {
 
     #[test]
     fn origin_allowlist_accepts_only_local_dev_and_tauri() {
+        // Back-compat / test path: any localhost port.
         for allowed in [
             "http://localhost",
             "http://localhost:80",
@@ -490,7 +562,7 @@ mod tests {
             "tauri://localhost",
             "http://tauri.localhost",
         ] {
-            assert!(origin_allowed(allowed), "should allow {allowed}");
+            assert!(origin_allowed(allowed, None), "should allow {allowed}");
         }
         for denied in [
             "https://evil.example",
@@ -512,7 +584,41 @@ mod tests {
             "null",
             "",
         ] {
-            assert!(!origin_allowed(denied), "should deny {denied}");
+            assert!(!origin_allowed(denied, None), "should deny {denied}");
+        }
+    }
+
+    #[test]
+    fn origin_allowlist_scopes_to_bind_port() {
+        let port = Some(4560u16);
+        for allowed in [
+            "http://localhost:4560",
+            "http://127.0.0.1:4560",
+            "tauri://localhost",
+            "http://tauri.localhost",
+        ] {
+            assert!(
+                origin_allowed(allowed, port),
+                "should allow {allowed} for bind 4560"
+            );
+        }
+        // Empty-port forms only match default HTTP port 80.
+        assert!(!origin_allowed("http://localhost", port));
+        assert!(!origin_allowed("http://127.0.0.1", port));
+        assert!(origin_allowed("http://localhost", Some(80)));
+        assert!(origin_allowed("http://127.0.0.1", Some(80)));
+
+        for denied in [
+            "http://localhost:5173",
+            "http://127.0.0.1:8080",
+            "http://localhost:80",
+            "http://localhost.evil.example:4560",
+            "https://localhost:4560",
+        ] {
+            assert!(
+                !origin_allowed(denied, port),
+                "should deny {denied} for bind 4560"
+            );
         }
     }
 

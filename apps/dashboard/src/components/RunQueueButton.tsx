@@ -13,6 +13,8 @@ const POLL_MS = 3000;
 export function RunQueueButton() {
   const [queue, setQueue] = useState<QueueState | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** True while the drain POST is in flight (guards double-click). */
+  const [draining, setDraining] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -32,18 +34,20 @@ export function RunQueueButton() {
 
   const onClick = useCallback(() => {
     setError(null);
+    setDraining(true);
     api
       .drainQueue()
       .then((drain) => setQueue((q) => (q === null ? q : { ...q, drain })))
       .catch((err: unknown) => {
         setError(err instanceof ApiError ? err.message : String(err));
-      });
+      })
+      .finally(() => setDraining(false));
   }, []);
 
   const count = queue?.entries.length ?? 0;
   const live = queue?.drain.live ?? false;
   const empty = queue !== null && count === 0;
-  const disabled = live || empty;
+  const disabled = live || empty || draining;
 
   let status: string;
   if (live) {

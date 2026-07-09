@@ -17,7 +17,7 @@ use kranz_engine::runner::{
 };
 use kranz_engine::types::{
     Assertion, AssertionCheck, ControlCommand, Feature, FeatureOrigin, FeatureStatus, Milestone,
-    MilestoneStatus, MissionConfig, Role, RunResult, TokenUsage,
+    MilestoneStatus, MissionConfig, Role, RunResult, TokenUsage, WorkerIsolation,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -159,6 +159,7 @@ fn worker_profile_denies_push_publish_network_and_config_extras() {
             "Bash(dd*)".to_string(),    // already a tool rule (has parens)
             "NotebookEdit".to_string(), // known tool name → kept verbatim
         ],
+        worker_isolation: WorkerIsolation::Checkout,
         ..MissionConfig::default()
     };
     let profile = permissions::for_role(Role::Worker, &cfg, &[], &[]);
@@ -324,6 +325,7 @@ fn read_only_git_allows_cover_listing_but_not_ref_mutation() {
 fn validator_profile_allows_contract_commands_as_bash_patterns() {
     let cfg = MissionConfig {
         allow_validator_commands: vec!["npm run lint".to_string()],
+        worker_isolation: WorkerIsolation::Checkout,
         ..MissionConfig::default()
     };
     let commands = vec!["cargo test --all".to_string()];
@@ -363,6 +365,7 @@ fn validator_profile_allows_contract_commands_as_bash_patterns() {
 fn dangerously_allow_all_bypasses_every_role() {
     let cfg = MissionConfig {
         dangerously_allow_all: true,
+        worker_isolation: WorkerIsolation::Checkout,
         ..MissionConfig::default()
     };
     for role in [
@@ -1025,6 +1028,7 @@ async fn run_validator_builds_spec_permissions_and_parses_report() {
     let mut log = seeded_log(&p);
     let cfg = MissionConfig {
         allow_validator_commands: vec!["npm run lint".to_string()],
+        worker_isolation: WorkerIsolation::Checkout,
         ..MissionConfig::default()
     };
     let contract = vec![

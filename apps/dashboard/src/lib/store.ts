@@ -49,6 +49,8 @@ export interface PlanningSlice {
   notHosted: boolean;
   /** request-plan came back ready:true — the PlanReview panel takes over. */
   review: { plan: Plan; estimate: CostEstimate } | null;
+  /** True while POST approve-pending is in flight. */
+  approving: boolean;
   /** Branch returned by approve; consent #2 (start) is still pending. */
   approvedBranch: string | null;
   /** True while POST start is in flight. */
@@ -63,6 +65,7 @@ const PLANNING_RESET: PlanningSlice = {
   queued: [],
   notHosted: false,
   review: null,
+  approving: false,
   approvedBranch: null,
   starting: false,
   error: null,
@@ -76,6 +79,8 @@ interface KranzStore {
   tickets: TicketSummary[];
   ticketsError: string | null;
   ticketError: string | null;
+  /** Slug with an in-flight draftTicket/approveTicket POST, or null. */
+  ticketBusySlug: string | null;
   missionId: string | null;
   state: MissionState | null;
   events: MissionEvent[];
@@ -103,9 +108,10 @@ interface KranzStore {
   /** Load the backlog list for the dashboard panel (`GET /api/tickets`). */
   loadTickets: () => Promise<void>;
   /** POST draft for a ticket, then connect to the returned mission's live
-   *  feed via the existing `connectMission` action. */
+   *  feed via the existing `connectMission` action. Reloads tickets and
+   *  missions so PipelineView stages stay current. */
   draftTicket: (slug: string) => Promise<void>;
-  /** POST approve for a ticket; refreshes the backlog list on success and
+  /** POST approve for a ticket; refreshes tickets and missions on success and
    *  surfaces the server's refusal message verbatim on failure. */
   approveTicket: (slug: string, force: boolean) => Promise<void>;
   connectMission: (id: string) => void;
@@ -271,6 +277,7 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
     tickets: [],
     ticketsError: null,
     ticketError: null,
+    ticketBusySlug: null,
     missionId: null,
     state: null,
     events: [],
@@ -303,22 +310,29 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
     },
 
     draftTicket: async (slug: string) => {
-      set({ ticketError: null });
+      if (get().ticketBusySlug !== null) return;
+      set({ ticketError: null, ticketBusySlug: slug });
       try {
         const { missionId } = await api.draftTicket(slug);
         get().connectMission(missionId);
+        await Promise.all([get().loadTickets(), get().loadMissions()]);
       } catch (err) {
         set({ ticketError: err instanceof Error ? err.message : String(err) });
+      } finally {
+        if (get().ticketBusySlug === slug) set({ ticketBusySlug: null });
       }
     },
 
     approveTicket: async (slug: string, force: boolean) => {
-      set({ ticketError: null });
+      if (get().ticketBusySlug !== null) return;
+      set({ ticketError: null, ticketBusySlug: slug });
       try {
         await api.approveTicket(slug, force);
-        await get().loadTickets();
+        await Promise.all([get().loadTickets(), get().loadMissions()]);
       } catch (err) {
         set({ ticketError: err instanceof Error ? err.message : String(err) });
+      } finally {
+        if (get().ticketBusySlug === slug) set({ ticketBusySlug: null });
       }
     },
 
@@ -490,16 +504,18 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
     approvePlan: () => {
       const id = get().missionId;
       const review = get().planning.review;
-      if (id === null || review === null) return;
-      patchPlanning({ error: null });
+      if (id === null || review === null || get().planning.approving) return;
+      patchPlanning({ error: null, approving: true });
       api
         .approvePending(id)
         .then(({ branch }) => {
           if (get().missionId !== id) return;
-          patchPlanning({ approvedBranch: branch });
+          patchPlanning({ approving: false, approvedBranch: branch });
         })
         .catch((err: unknown) => {
-          if (get().missionId === id) failPlanning(err);
+          if (get().missionId !== id) return;
+          patchPlanning({ approving: false });
+          failPlanning(err);
         });
     },
 

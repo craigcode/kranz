@@ -109,7 +109,7 @@ export async function postJson<T>(path: string, body: unknown): Promise<T> {
       body: JSON.stringify(body),
     });
     if (res.status === 401) {
-      await awaitToken(); // resolves when a token is provided; throws on cancel
+      await awaitToken(); // clears stale token, then waits for a fresh paste
       continue;
     }
     if (!res.ok) {

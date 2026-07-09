@@ -16,11 +16,11 @@ Format:
 
 ## Now
 
-- **Core safety and reliability polish** - finish the cleanup train before more demo-shaped work.
-  Why: These items protect the mission/audit promise and keep later work from landing on shaky operator surfaces.
-  Trigger: Pick whenever no human-gated ecosystem step is unblocked.
-  Source: .kranz/tickets/fix-slack-mission-id-path-traversal.md; .kranz/tickets/stale-base-merge-warning.md; .kranz/tickets/mission-cost-trailers.md
-  Ticket: multiple
+- **Cursor CLI / Grok 4.5 backend probe** - prove whether Cursor's headless CLI can satisfy kranz's `AgentBackend` contract before building `backend_cursor`.
+  Why: Cursor now overlaps unattended agent work, but kranz's defensible layer is the mission/audit/consent harness; importing Cursor as a backend turns that pressure into model/runtime leverage.
+  Trigger: Active next; finish the probe before implementing the backend.
+  Source: docs/scoping/cursor-cli-backend.md; .kranz/tickets/cursor-cli-grok45-backend-probe.md
+  Ticket: cursor-cli-grok45-backend-probe
 
 - **Roadmap surface v1** - keep `/kranz roadmap` backed by this tracked file so strategic options remain visible from Slack.
   Why: The backlog shows captured work, and `/kranz todo` shows immediate human actions; this file keeps conditional futures from collapsing into either.

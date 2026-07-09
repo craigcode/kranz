@@ -20,13 +20,53 @@ use globset::{Glob, GlobBuilder};
 
 pub const FINDING_CLASS: &str = "out-of-contract-write";
 
-/// Commit message prefix used for engine/meta commits (approved-plan,
-/// mission-report). Never attributed to a worker, never flagged.
+/// Commit message prefix shared by every engine/meta commit template.
 const ENGINE_COMMIT_PREFIX: &str = "[kranz]";
 
-/// Whether `subject` is an engine/meta commit message (`"[kranz] ..."`).
+/// Known engine-authored commit subjects. A bare `[kranz]` prefix is NOT
+/// enough — workers with `git commit` could otherwise spoof meta and bypass
+/// the empty-deliverable gate and out-of-contract path sweep.
+///
+/// Dirty-tree checkpoints are intentionally NOT meta: they carry real worker
+/// file changes and must count as deliverables / be path-swept.
+const ENGINE_META_TEMPLATES: &[&str] = &[
+    "[kranz] approved plan for ",
+    "[kranz] revised plan for ",
+    "[kranz] mission report",
+];
+
+/// Whether a contract `command` assertion that runs `cargo test` includes the
+/// anti-vacuity guard (`test result: ok. [1-9]`) so a filter matching zero
+/// tests cannot pass. Returns `true` when the command is not a cargo-test
+/// gate, or when it already has the guard.
+pub fn cargo_test_has_anti_vacuity(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    if !lower.contains("cargo test") && !lower.contains("cargo\ttest") {
+        return true;
+    }
+    // AGENTS.md rule 5: grep must require at least one passed test.
+    command.contains("[1-9]") || command.contains("ok\\. [1-9]") || command.contains("ok. [1-9]")
+}
+
+/// Message used when the engine checkpoints a dirty worker tree.
+pub fn checkpoint_commit_message(feature_id: &str) -> String {
+    format!("[{feature_id}] checkpoint (engine commit)")
+}
+
+/// Message used when a parallel worktree checkpoints a dirty feature branch.
+pub fn parallel_checkpoint_commit_message(feature_id: &str) -> String {
+    format!("[{feature_id}] parallel worktree checkpoint (engine commit)")
+}
+
+/// Whether `subject` is a known engine/meta commit (never attributed to a
+/// worker, never counted as a deliverable, never path-swept).
 pub fn is_meta_commit(subject: &str) -> bool {
-    subject.starts_with(ENGINE_COMMIT_PREFIX)
+    if !subject.starts_with(ENGINE_COMMIT_PREFIX) {
+        return false;
+    }
+    ENGINE_META_TEMPLATES
+        .iter()
+        .any(|tmpl| subject == *tmpl || subject.starts_with(tmpl))
 }
 
 /// Mission meta paths (relative to repo root, forward-slash, matching
@@ -125,8 +165,11 @@ pub fn path_findings(touch_set: &[String], changes: &[AttributedChange<'_>]) -> 
             Err(e) => findings.push(Finding {
                 subject: change.path.to_string(),
                 severity: "major".to_string(),
-                evidence: format!("touch-set glob compile error while checking {}: {e}", change.path),
-                suggested_fix: "fix the mission's touchSet glob syntax".to_string(),
+                evidence: format!(
+                    "touch-set glob compile error while checking {}: {e}",
+                    change.path
+                ),
+                suggested_fix: "fix the mission's touchSet globs".to_string(),
                 class: FINDING_CLASS.to_string(),
             }),
         }
@@ -134,36 +177,31 @@ pub fn path_findings(touch_set: &[String], changes: &[AttributedChange<'_>]) -> 
     findings
 }
 
-/// Build the critical `primary-checkout` finding when the primary checkout
-/// is dirty and/or has moved off the branch recorded at mission start.
-/// Returns `None` when the primary is clean and unmoved.
+/// Finding when the primary checkout is dirty or has moved off the branch it
+/// was on when the mission started (worktree-mode invariant).
 pub fn primary_checkout_finding(
     is_clean: bool,
     current_branch: &str,
     branch_at_start: &str,
 ) -> Option<Finding> {
-    let mut issues = Vec::new();
-    if !is_clean {
-        issues.push(
-            "primary checkout has uncommitted changes (git status --porcelain is non-empty)"
-                .to_string(),
-        );
-    }
-    if current_branch != branch_at_start {
-        issues.push(format!(
-            "primary checkout branch moved from '{branch_at_start}' (recorded at mission start) to '{current_branch}'"
-        ));
-    }
-    if issues.is_empty() {
+    if is_clean && current_branch == branch_at_start {
         return None;
     }
+    let evidence = if !is_clean && current_branch != branch_at_start {
+        format!(
+            "primary checkout is dirty and moved from '{branch_at_start}' to '{current_branch}'"
+        )
+    } else if !is_clean {
+        "primary checkout has tracked changes while a worktree-mode mission is running".to_string()
+    } else {
+        format!("primary checkout moved from '{branch_at_start}' to '{current_branch}'")
+    };
     Some(Finding {
         subject: "primary-checkout".to_string(),
         severity: "critical".to_string(),
-        evidence: issues.join("; "),
-        suggested_fix:
-            "worker/validator sessions must run in the mission's integration worktree, never the primary checkout"
-                .to_string(),
+        evidence,
+        suggested_fix: "restore the primary checkout to a clean state on the starting branch"
+            .to_string(),
         class: FINDING_CLASS.to_string(),
     })
 }
@@ -184,70 +222,58 @@ mod tests {
     #[test]
     fn out_of_contract_path_outside_touch_set_produces_one_finding() {
         let touch_set = vec!["src/**".to_string()];
-        let c = commit("abc123", "[f-1] add widget");
-        let changes = vec![AttributedChange {
-            path: "docs/random.md",
+        let c = commit("abc123", "[f-1] add");
+        let changes = [AttributedChange {
+            path: "docs/oops.md",
             commit: &c,
         }];
         let findings = path_findings(&touch_set, &changes);
         assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].subject, "docs/oops.md");
         assert_eq!(findings[0].class, FINDING_CLASS);
-        assert_eq!(findings[0].subject, "docs/random.md");
         assert_eq!(findings[0].severity, "major");
     }
 
     #[test]
     fn out_of_contract_path_inside_touch_set_produces_no_finding() {
         let touch_set = vec!["src/**".to_string()];
-        let c = commit("abc123", "[f-1] add widget");
-        let changes = vec![AttributedChange {
-            path: "src/widget.rs",
+        let c = commit("abc123", "[f-1] add");
+        let changes = [AttributedChange {
+            path: "src/lib.rs",
             commit: &c,
         }];
-        let findings = path_findings(&touch_set, &changes);
-        assert!(findings.is_empty());
-    }
-
-    #[test]
-    fn out_of_contract_negated_glob_excludes_from_touch_set() {
-        let touch_set = vec!["src/**".to_string(), "!src/generated/**".to_string()];
-        let c = commit("abc123", "[f-1] add widget");
-        let changes = vec![AttributedChange {
-            path: "src/generated/schema.rs",
-            commit: &c,
-        }];
-        let findings = path_findings(&touch_set, &changes);
-        assert_eq!(
-            findings.len(),
-            1,
-            "negated path must be flagged as out-of-contract"
-        );
+        assert!(path_findings(&touch_set, &changes).is_empty());
     }
 
     #[test]
     fn out_of_contract_duplicate_path_produces_exactly_one_finding() {
         let touch_set = vec!["src/**".to_string()];
-        let c1 = commit("abc123", "[f-1] add widget");
-        let c2 = commit("def456", "[f-1] tweak widget");
-        let changes = vec![
+        let c1 = commit("aaa", "[f-1] first");
+        let c2 = commit("bbb", "[f-1] second");
+        let changes = [
             AttributedChange {
-                path: "docs/random.md",
+                path: "docs/oops.md",
                 commit: &c1,
             },
             AttributedChange {
-                path: "docs/random.md",
+                path: "docs/oops.md",
                 commit: &c2,
             },
         ];
         let findings = path_findings(&touch_set, &changes);
         assert_eq!(findings.len(), 1);
+        assert!(findings[0].evidence.contains("aaa"));
+    }
+
+    #[test]
+    fn out_of_contract_negated_glob_excludes_from_touch_set() {
+        let touch_set = vec!["src/**".to_string(), "!src/generated/**".to_string()];
+        assert!(touch_set_includes(&touch_set, "src/lib.rs").unwrap());
+        assert!(!touch_set_includes(&touch_set, "src/generated/x.rs").unwrap());
     }
 
     #[test]
     fn out_of_contract_empty_touch_set_is_advisory_off() {
-        // Caller-level contract: an empty touch_set means the path sweep is
-        // skipped entirely (no findings emitted), checked by the orchestrator
-        // before calling path_findings. Encode the "would-be" match here too:
         // touch_set_includes on an empty set always excludes, so callers MUST
         // gate on emptiness rather than calling path_findings with `[]`.
         let touch_set: Vec<String> = vec![];
@@ -260,7 +286,16 @@ mod tests {
     fn engine_commit_exempt_kranz_prefixed_commit_is_meta() {
         assert!(is_meta_commit("[kranz] approved plan for m-abc123"));
         assert!(is_meta_commit("[kranz] mission report"));
+        assert!(is_meta_commit("[kranz] mission report for m-abc123"));
+        assert!(is_meta_commit("[kranz] revised plan for m-abc123 (rev 2)"));
         assert!(!is_meta_commit("[f-1-2] add sweep"));
+        // Spoof: any `[kranz]` prefix used to count as meta — workers must not
+        // be able to hide real deliverables behind a forged subject.
+        assert!(!is_meta_commit("[kranz] spoofed worker commit"));
+        assert!(!is_meta_commit("[kranz]"));
+        // Dirty-tree checkpoints carry worker files — not meta.
+        assert!(!is_meta_commit(&checkpoint_commit_message("f-1")));
+        assert!(!is_meta_commit(&parallel_checkpoint_commit_message("f-1")));
     }
 
     #[test]
@@ -281,8 +316,6 @@ mod tests {
 
     #[test]
     fn engine_commit_exempt_kranz_commit_outside_touch_set_produces_no_finding() {
-        // The orchestrator filters meta commits/paths BEFORE calling
-        // path_findings; this test proves that filtering, end to end.
         let touch_set = vec!["src/**".to_string()];
         let meta_commit = commit("abc123", "[kranz] approved plan for m-abc123");
         let worker_commit = commit("def456", "[f-1-2] add sweep");
@@ -324,5 +357,16 @@ mod tests {
     #[test]
     fn primary_checkout_clean_and_unmoved_yields_no_finding() {
         assert!(primary_checkout_finding(true, "main", "main").is_none());
+    }
+
+    #[test]
+    fn anti_vacuity_detects_cargo_test_without_guard() {
+        assert!(!cargo_test_has_anti_vacuity(
+            "cargo test --workspace foo 2>&1 | grep -qE 'test result: ok\\.'"
+        ));
+        assert!(cargo_test_has_anti_vacuity(
+            "cargo test --workspace foo 2>&1 | grep -qE 'test result: ok\\. [1-9]'"
+        ));
+        assert!(cargo_test_has_anti_vacuity("npm run test"));
     }
 }

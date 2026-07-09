@@ -95,4 +95,29 @@ describe('RunQueueButton', () => {
     const alert = await screen.findByRole('alert');
     expect(alert.textContent).toBe('missing token');
   });
+
+  it('disables the button while the drain POST is in flight (double-click guard)', async () => {
+    vi.mocked(api.queue).mockResolvedValueOnce(makeQueue({ entries: [makeEntry()] }));
+    let resolveDrain!: (v: DrainState) => void;
+    vi.mocked(api.drainQueue).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveDrain = resolve;
+        }),
+    );
+
+    render(<RunQueueButton />);
+
+    const button = (await screen.findByRole('button', { name: 'Run queue' })) as HTMLButtonElement;
+    await waitFor(() => expect(button.hasAttribute('disabled')).toBe(false));
+
+    fireEvent.click(button);
+    expect(button.hasAttribute('disabled')).toBe(true);
+
+    fireEvent.click(button);
+    expect(api.drainQueue).toHaveBeenCalledTimes(1);
+
+    resolveDrain({ live: true, currentMissionId: 'm-1', ran: [] });
+    expect(await screen.findByText('Draining… m-1')).toBeTruthy();
+  });
 });

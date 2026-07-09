@@ -6,6 +6,7 @@ vi.mock('./token', () => ({
 }));
 
 import { getJson, postJson, ApiError } from './api';
+import { awaitToken, resolveToken } from './token';
 
 function htmlResponse(): Response {
   return new Response('<!doctype html><html><body>app</body></html>', {
@@ -17,6 +18,13 @@ function htmlResponse(): Response {
 function jsonResponse(body: unknown): Response {
   return new Response(JSON.stringify(body), {
     status: 200,
+    headers: { 'content-type': 'application/json' },
+  });
+}
+
+function unauthorizedResponse(): Response {
+  return new Response(JSON.stringify({ error: 'invalid token' }), {
+    status: 401,
     headers: { 'content-type': 'application/json' },
   });
 }
@@ -65,5 +73,32 @@ describe('getJson / postJson non-JSON guard', () => {
     vi.mocked(fetch).mockImplementation(() => Promise.resolve(jsonResponse({ id: 'm-1' })));
 
     await expect(postJson('/api/missions', { goal: 'x' })).resolves.toEqual({ id: 'm-1' });
+  });
+});
+
+describe('postJson 401 token gate', () => {
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn());
+    vi.mocked(resolveToken).mockReturnValue('stale-token');
+    vi.mocked(awaitToken).mockReset().mockImplementation(async () => {
+      // Real awaitToken clears the stale token then waits for a paste.
+      vi.mocked(resolveToken).mockReturnValue('fresh-token');
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.clearAllMocks();
+  });
+
+  it('awaits a fresh token after 401 then retries the POST', async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(unauthorizedResponse())
+      .mockResolvedValueOnce(jsonResponse({ ok: true }));
+
+    await expect(postJson('/api/missions', { goal: 'x' })).resolves.toEqual({ ok: true });
+
+    expect(awaitToken).toHaveBeenCalledOnce();
+    expect(fetch).toHaveBeenCalledTimes(2);
   });
 });

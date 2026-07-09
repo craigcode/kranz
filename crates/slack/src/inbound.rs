@@ -76,11 +76,15 @@ pub enum Action {
         text: String,
         user_id: Option<String>,
     },
-    /// `/kranz ticket <title>` → scaffold a new ticket file.
+    /// `/kranz ticket <title>` → scaffold a new ticket file. Spend-adjacent
+    /// (writes backlog state), so allowlist-gated; `user_id` rides along for
+    /// the gate and `response_url` for the not-authorized ephemeral.
     NewTicket {
         title: String,
         channel: String,
         thread_ts: Option<String>,
+        user_id: Option<String>,
+        response_url: Option<String>,
     },
     /// `/kranz ticket new <slug> <title...>` → open the multiline
     /// goal/context modal (a slash command is single-line, so a real ticket
@@ -103,12 +107,16 @@ pub enum Action {
     /// single-line slash command can't carry; the bridge creates it through
     /// the same primitive `POST /api/tickets` uses
     /// (`kranz_engine::ticket::Ticket::scaffold`), off the socket read loop.
+    /// `user_id` is the submitting Slack user (spend/allowlist gate); a
+    /// `view_submission` has no `response_url`, so refusals go via
+    /// `chat.postEphemeral` into `channel`.
     CreateTicket {
         slug: String,
         title: String,
         goal: String,
         context: String,
         channel: String,
+        user_id: Option<String>,
     },
     /// `/kranz ticket list` → one row per backlog ticket. Read-only, so not
     /// gated (no `user_id`); replies over `response_url`, same as
@@ -489,7 +497,7 @@ fn route_view_submission(payload: &Value) -> Action {
     match view.get("callback_id").and_then(Value::as_str) {
         Some(NEW_MISSION_CALLBACK_ID) => {}
         Some(CONFIG_CALLBACK_ID) => return route_config_submission(payload, view),
-        Some(NEW_TICKET_CALLBACK_ID) => return route_new_ticket_submission(view),
+        Some(NEW_TICKET_CALLBACK_ID) => return route_new_ticket_submission(payload, view),
         _ => return Action::Ignore,
     }
     let goal = view
@@ -578,9 +586,10 @@ fn route_config_submission(payload: &Value, view: &Value) -> Action {
 /// `slug`/`title`/`channel` come back out of `private_metadata` (the JSON
 /// object [`crate::format::build_new_ticket_modal`] stashed at open — a
 /// `view_submission` carries no other way to recover them); `goal`/`context`
-/// come from the modal's two (optional) multiline inputs. A malformed/foreign
-/// payload (missing slug/title/channel) is ignored — nothing sane to create.
-fn route_new_ticket_submission(view: &Value) -> Action {
+/// come from the modal's two (optional) multiline inputs; `user_id` from
+/// `payload.user.id` (the allowlist gate). A malformed/foreign payload
+/// (missing slug/title/channel) is ignored — nothing sane to create.
+fn route_new_ticket_submission(payload: &Value, view: &Value) -> Action {
     let metadata = view
         .get("private_metadata")
         .and_then(Value::as_str)
@@ -620,12 +629,18 @@ fn route_new_ticket_submission(view: &Value) -> Action {
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim();
+    let user_id = payload
+        .get("user")
+        .and_then(|u| u.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
     Action::CreateTicket {
         slug: slug.to_string(),
         title: title.to_string(),
         goal: goal.to_string(),
         context: context.to_string(),
         channel: channel.to_string(),
+        user_id,
     }
 }
 
@@ -794,6 +809,8 @@ fn route_slash(payload: &Value) -> Action {
                 title: title.to_string(),
                 channel,
                 thread_ts,
+                user_id,
+                response_url,
             };
         }
         // `ticket` with no title → fall through to help.
@@ -1525,7 +1542,9 @@ mod tests {
             Action::NewTicket {
                 title: "Rate-limit the notes API".into(),
                 channel: "C123".into(),
-                thread_ts: Some("1700000000.000100".into())
+                thread_ts: Some("1700000000.000100".into()),
+                user_id: None,
+                response_url: None,
             }
         );
     }
@@ -1541,7 +1560,9 @@ mod tests {
             Action::NewTicket {
                 title: "Fix the thing".into(),
                 channel: "C1".into(),
-                thread_ts: None
+                thread_ts: None,
+                user_id: None,
+                response_url: None,
             }
         );
     }
@@ -1608,7 +1629,9 @@ mod tests {
             Action::NewTicket {
                 title: "show".into(),
                 channel: "C1".into(),
-                thread_ts: None
+                thread_ts: None,
+                user_id: None,
+                response_url: None,
             }
         );
     }
@@ -2103,6 +2126,7 @@ mod tests {
                 goal: "the goal".into(),
                 context: "the context".into(),
                 channel: "C1".into(),
+                user_id: Some("U777".into()),
             }
         );
 
@@ -2141,6 +2165,8 @@ mod tests {
                 title: "Fix the thing".into(),
                 channel: "C1".into(),
                 thread_ts: None,
+                user_id: None,
+                response_url: None,
             }
         );
     }

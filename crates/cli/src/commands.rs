@@ -183,11 +183,24 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
         Command::Serve {
             port,
             host,
+            insecure_lan,
             open,
             dashboard,
             token,
             slack,
-        } => cmd_serve(repo, host, port, open, dashboard, token, slack).await,
+        } => {
+            cmd_serve(
+                repo,
+                host,
+                port,
+                insecure_lan,
+                open,
+                dashboard,
+                token,
+                slack,
+            )
+            .await
+        }
         Command::Release { url, token } => {
             let mission = select_mission(&repo, cli.mission.as_deref())?;
             cmd_release(&repo, &mission, &url, token).await
@@ -1227,14 +1240,33 @@ fn confirm_clean() -> Result<bool> {
 /// `kranz serve`: run the REST/WS server, serving the dashboard build from
 /// the first location that exists (see [`resolve_dashboard_dist`]).
 ///
+/// Refuse a non-loopback bind unless the operator passed `--insecure-lan`.
+/// Extracted so the gate is unit-testable without starting the server.
+pub(crate) fn refuse_non_loopback_without_insecure_lan(
+    bind: std::net::IpAddr,
+    insecure_lan: bool,
+) -> Result<()> {
+    if !bind.is_loopback() && !insecure_lan {
+        anyhow::bail!(
+            "refusing to bind {bind}: non-loopback serves expose tokenless GETs \
+             (mission states, transcripts) on the network. Re-run with \
+             `--insecure-lan` if you intentionally trust this network \
+             (LAN/tailnet), or keep the default `--host 127.0.0.1`."
+        );
+    }
+    Ok(())
+}
+
 /// Every `POST /api/...` requires the mutation token (protocol "Authority:
 /// mutation token"): generated per serve (or pinned via `--token` for
 /// scripting), printed for the operator, and handed to `--open`'s browser as
 /// a `#token=<t>` fragment the dashboard stores.
+#[allow(clippy::too_many_arguments)]
 async fn cmd_serve(
     repo: PathBuf,
     host: String,
     port: u16,
+    insecure_lan: bool,
     open: bool,
     dashboard: Option<PathBuf>,
     token: Option<String>,
@@ -1243,11 +1275,12 @@ async fn cmd_serve(
     let bind: std::net::IpAddr = host
         .parse()
         .map_err(|e| anyhow!("--host '{host}' is not an IP address: {e}"))?;
+    refuse_non_loopback_without_insecure_lan(bind, insecure_lan)?;
     if !bind.is_loopback() {
         eprintln!(
-            "WARNING: binding {bind} — the API is reachable beyond this machine. \
-             POSTs require the mutation token; GETs (mission states, transcripts) \
-             do NOT. Use only on a network you trust (LAN/tailnet)."
+            "WARNING: binding {bind} with --insecure-lan — the API is reachable \
+             beyond this machine. POSTs require the mutation token; GETs \
+             (mission states, transcripts) do NOT. Use only on a network you trust."
         );
     }
     // One hosted-engine registry for BOTH clients: the axum handlers below and
@@ -1902,5 +1935,28 @@ mod tests {
             "embedded dashboard source: {}",
             crate::embedded_dashboard::EMBEDDED_DASHBOARD_SOURCE
         );
+    }
+
+    #[test]
+    fn serve_refuses_non_loopback_without_insecure_lan() {
+        let bind: std::net::IpAddr = "0.0.0.0".parse().unwrap();
+        let err = refuse_non_loopback_without_insecure_lan(bind, false).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("refusing to bind") && msg.contains("--insecure-lan"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn serve_allows_non_loopback_with_insecure_lan() {
+        let bind: std::net::IpAddr = "0.0.0.0".parse().unwrap();
+        refuse_non_loopback_without_insecure_lan(bind, true).unwrap();
+    }
+
+    #[test]
+    fn serve_allows_loopback_without_insecure_lan() {
+        let bind: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        refuse_non_loopback_without_insecure_lan(bind, false).unwrap();
     }
 }

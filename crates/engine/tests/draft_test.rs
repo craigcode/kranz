@@ -9,7 +9,7 @@ use kranz_engine::draft::{drive_draft, looks_like_plan_json, DraftOutcome};
 use kranz_engine::orchestrator::MissionEngine;
 use kranz_engine::queue;
 use kranz_engine::ticket::{Ticket, TicketState};
-use kranz_engine::types::MissionConfig;
+use kranz_engine::types::{MissionConfig, WorkerIsolation};
 use kranz_engine::MockBackend;
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -94,6 +94,7 @@ fn test_cfg() -> MissionConfig {
     MissionConfig {
         skip_scrutiny: true,
         skip_functional: true,
+        worker_isolation: WorkerIsolation::Checkout,
         ..MissionConfig::default()
     }
 }

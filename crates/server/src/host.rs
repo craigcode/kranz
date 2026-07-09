@@ -72,8 +72,13 @@ enum HostedMission {
         pending_plan: Arc<Mutex<Option<Plan>>>,
     },
     /// `engine.run()` owns the engine inside this background task; the task
-    /// removes this entry when the run ends.
-    Running(tokio::task::JoinHandle<()>),
+    /// removes this entry when the run ends. `_repo_busy` holds the
+    /// repo-wide busy lock for the lifetime of the hosted run so a sibling
+    /// queue drain / `kranz work` cannot claim the same repo.
+    Running {
+        handle: tokio::task::JoinHandle<()>,
+        _repo_busy: kranz_engine::queue::RepoBusyHold,
+    },
 }
 
 /// Registry of missions this server process hosts (see module docs).
@@ -466,13 +471,18 @@ impl MissionHost {
             let mut map = self.missions.lock().expect("missions registry lock");
             match map.remove(id) {
                 None => None,
-                Some(HostedMission::Running(handle)) => {
+                Some(HostedMission::Running { handle, _repo_busy }) => {
                     if handle.is_finished() {
                         // The task ended but its cleanup lost the race with
                         // this request: treat as not hosted (resume below).
+                        // Drop the busy hold so a resume can re-acquire.
+                        drop(_repo_busy);
                         None
                     } else {
-                        map.insert(id.to_string(), HostedMission::Running(handle));
+                        map.insert(
+                            id.to_string(),
+                            HostedMission::Running { handle, _repo_busy },
+                        );
                         return Err(ApiError::conflict(format!(
                             "mission '{id}' is already running — observe it via GET \
                              /api/missions/{id}/state or steer it via POST \
@@ -513,8 +523,8 @@ impl MissionHost {
             }
         };
 
-        let engine = match taken {
-            Some(engine) => engine,
+        let (engine, from_registry) = match taken {
+            Some(engine) => (engine, true),
             None => {
                 // Re-invocable path: resume from the log. A live engine
                 // elsewhere (CLI, or a hosted run racing this request) holds
@@ -553,7 +563,26 @@ impl MissionHost {
                     }
                     _ => {}
                 }
-                engine
+                (engine, false)
+            }
+        };
+
+        // Acquire the repo-wide busy lock before spawning: a sibling
+        // `kranz work` / hosted drain must not run in parallel. Held for the
+        // lifetime of the Running entry (dropped when the run ends).
+        let repo_busy = match kranz_engine::queue::acquire_repo_busy(&self.repo_root, id) {
+            Ok(hold) => hold,
+            Err(e) => {
+                if from_registry {
+                    // Put the planning/approved engine back so the operator
+                    // can retry once the sibling run finishes.
+                    self.missions
+                        .lock()
+                        .expect("missions registry lock")
+                        .insert(id.to_string(), new_planning(new_cell(engine)));
+                }
+                // Resume path: dropping `engine` releases the mission lock.
+                return Err(ApiError::from(e));
             }
         };
 
@@ -565,7 +594,13 @@ impl MissionHost {
             let missions = Arc::clone(&self.missions);
             let mission_id = id.to_string();
             let handle = tokio::spawn(run_to_end(engine, mission_id, missions));
-            map.insert(id.to_string(), HostedMission::Running(handle));
+            map.insert(
+                id.to_string(),
+                HostedMission::Running {
+                    handle,
+                    _repo_busy: repo_busy,
+                },
+            );
         }
         Ok(())
     }
@@ -848,14 +883,16 @@ impl MissionHost {
                     return Err(turn_in_flight());
                 }
             },
-            Some(HostedMission::Running(handle)) => {
+            Some(HostedMission::Running { handle, _repo_busy }) => {
                 if !handle.is_finished() {
                     handle.abort();
                 }
                 // Cancelled or finished either way: await settles the task so
                 // the engine is dropped (log flushed, lock freed) before we
-                // append the abandon event.
+                // append the abandon event. Dropping `_repo_busy` releases the
+                // repo-wide busy lock.
                 let _ = handle.await;
+                drop(_repo_busy);
             }
         }
         kranz_engine::orchestrator::abandon_mission(
@@ -1094,7 +1131,7 @@ impl MissionHost {
                 *last_use.lock().expect("last-use lock") = Instant::now();
                 Ok(Arc::clone(cell))
             }
-            Some(HostedMission::Running(_)) => Err(ApiError::conflict(format!(
+            Some(HostedMission::Running { .. }) => Err(ApiError::conflict(format!(
                 "mission '{id}' is running — steer it via POST /api/missions/{id}/control"
             ))),
             None => Err(self.not_hosted(id)),
@@ -1407,6 +1444,9 @@ where
         }
         Err(e) => {
             tracing::error!(error = %e, "hosted queue drain errored");
+            // Same restore as the success path: an errored drain must not
+            // leave the operator stranded on a mission branch.
+            restore_drain_checkout(&repo_root, dispatch_branch.as_deref());
         }
     }
     state.lock().expect("drain state lock").live = false;
@@ -1542,10 +1582,13 @@ fn release_from(
     let mut map = missions.lock().expect("missions registry lock");
     match map.remove(id) {
         None => Ok(true),
-        Some(HostedMission::Running(handle)) => {
+        Some(HostedMission::Running { handle, _repo_busy }) => {
             let finished = handle.is_finished();
             if !finished {
-                map.insert(id.to_string(), HostedMission::Running(handle));
+                map.insert(
+                    id.to_string(),
+                    HostedMission::Running { handle, _repo_busy },
+                );
             }
             Ok(finished)
         }
@@ -1590,7 +1633,7 @@ fn sweep_idle_from(
                     let elapsed = last_use.lock().expect("last-use lock").elapsed();
                     (elapsed >= threshold).then(|| id.clone())
                 }
-                HostedMission::Running(_) => None,
+                HostedMission::Running { .. } => None,
             })
             .collect()
     };
@@ -2019,6 +2062,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_is_409_when_repo_busy() {
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
+        // Hold the repo busy lock BEFORE hosting a mission — a live
+        // events.jsonl.lock for the mission under test would block a
+        // sibling acquire (legacy probe), so take the hold first.
+        let _hold =
+            kranz_engine::queue::acquire_repo_busy(&root, "m-sibling").expect("sibling busy hold");
+        let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+        let host = MissionHost::with_backend(root.clone(), backend);
+        let id = host.create("ship it", None).await.expect("create mission");
+        let plan: Plan = serde_json::from_value(plan_json()).expect("plan");
+        host.approve(&id, plan).await.expect("approve");
+
+        let err = host.start(&id).await.expect_err("start must 409 when busy");
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert!(
+            err.message.contains("busy"),
+            "expected busy conflict, got: {}",
+            err.message
+        );
+        // Engine restored to the registry so the operator can retry.
+        assert!(host.planning_cell(&id).is_ok());
+    }
+
+    #[tokio::test]
     async fn sweep_idle_leaves_a_mid_turn_mission_hosted() {
         let Some((_dir, root)) = init_repo() else {
             return;
@@ -2334,6 +2404,34 @@ mod tests {
             git.current_branch().expect("current branch"),
             "main",
             "the operator's dispatch-time checkout must be restored on drain exit"
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_drain_restores_dispatch_checkout_on_err() {
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
+        let state = seed_one_queued(&root, "m-err-restore");
+
+        let run_root = root.clone();
+        drain_task(root.clone(), state, move |mission_id| {
+            let root = run_root.clone();
+            async move {
+                let git = GitRepo::open(&root)?;
+                let branch = format!("kranz/mission-{mission_id}");
+                git.create_branch(&branch, None)?;
+                git.checkout(&branch)?;
+                Err(anyhow::anyhow!("simulated drain runner failure"))
+            }
+        })
+        .await;
+
+        let git = GitRepo::open(&root).expect("open repo");
+        assert_eq!(
+            git.current_branch().expect("current branch"),
+            "main",
+            "an errored drain must still restore the operator's dispatch-time checkout"
         );
     }
 

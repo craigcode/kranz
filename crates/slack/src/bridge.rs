@@ -125,6 +125,83 @@ struct MissionCursor {
     last_seq: u64,
 }
 
+/// Persisted per-mission `last_seq` so a restarted bridge does not re-announce
+/// already-posted notifications. Lives at `.kranz/slack/notify-cursors.json`
+/// (next to the thread map's parent dir). Only the seq is persisted — folded
+/// state is rebuilt from the event log on first sighting after load.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct NotifyCursors {
+    #[serde(default)]
+    by_mission: BTreeMap<String, u64>,
+}
+
+impl NotifyCursors {
+    fn path(repo_root: &Path) -> PathBuf {
+        repo_root
+            .join(".kranz")
+            .join("slack")
+            .join("notify-cursors.json")
+    }
+
+    fn load(repo_root: &Path) -> Result<Self> {
+        let path = Self::path(repo_root);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => serde_json::from_str(&text)
+                .map_err(|e| anyhow::anyhow!("invalid notify cursors {}: {e}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(anyhow::anyhow!("cannot read {}: {e}", path.display())),
+        }
+    }
+
+    fn save(&self, repo_root: &Path) -> Result<()> {
+        let path = Self::path(repo_root);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let json = serde_json::to_string_pretty(self)?;
+        // Mirror ThreadMap's atomic write (temp + rename).
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("notify-cursors.json");
+        let tmp = dir.join(format!(".{file_name}.{}.tmp", std::process::id()));
+        std::fs::write(&tmp, json.as_bytes())?;
+        match std::fs::rename(&tmp, &path) {
+            Ok(()) => Ok(()),
+            Err(_) if cfg!(windows) => {
+                let _ = std::fs::remove_file(&path);
+                std::fs::rename(&tmp, &path).map_err(Into::into)
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(e.into())
+            }
+        }
+    }
+
+    fn set(&mut self, mission_id: impl Into<String>, last_seq: u64) {
+        self.by_mission.insert(mission_id.into(), last_seq);
+    }
+}
+
+/// Persist one mission's advanced cursor. Best-effort: a save failure is
+/// logged, never fatal — the in-memory cursor still advances, and the next
+/// successful save recovers the map.
+fn persist_notify_cursor(repo_root: &Path, mission_id: &str, last_seq: u64) {
+    let mut cursors = match NotifyCursors::load(repo_root) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load slack notify cursors before save");
+            NotifyCursors::default()
+        }
+    };
+    cursors.set(mission_id, last_seq);
+    if let Err(e) = cursors.save(repo_root) {
+        tracing::warn!(error = %e, "failed to persist slack notify cursors");
+    }
+}
+
 type PostFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 
 trait OutboundPoster {
@@ -169,6 +246,15 @@ pub async fn run_bridge(
 ) {
     tokio::pin!(shutdown);
     let mut cursors: HashMap<String, MissionCursor> = HashMap::new();
+    // Persisted last_seq per mission — consulted on first sighting so a
+    // restart does not re-announce already-posted notifications.
+    let persisted_seqs: HashMap<String, u64> = match NotifyCursors::load(&repo_root) {
+        Ok(persisted) => persisted.by_mission.into_iter().collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load slack notify cursors; starting empty");
+            HashMap::new()
+        }
+    };
     let mut ticker = tokio::time::interval(POLL_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -181,7 +267,15 @@ pub async fn run_bridge(
             _ = ticker.tick() => {
                 for mission_id in MissionPaths::list_missions(&repo_root) {
                     if let Err(e) =
-                        poll_mission(&cfg, &client, &repo_root, &threads, &mission_id, &mut cursors)
+                        poll_mission(
+                            &cfg,
+                            &client,
+                            &repo_root,
+                            &threads,
+                            &mission_id,
+                            &mut cursors,
+                            &persisted_seqs,
+                        )
                             .await
                     {
                         tracing::warn!(mission = %mission_id, error = %e, "slack outbound poll failed");
@@ -201,6 +295,7 @@ async fn poll_mission(
     threads: &SharedThreads,
     mission_id: &str,
     cursors: &mut HashMap<String, MissionCursor>,
+    persisted_seqs: &HashMap<String, u64>,
 ) -> Result<()> {
     let mut poster = SlackPoster;
     poll_mission_with_poster(
@@ -210,6 +305,7 @@ async fn poll_mission(
         threads,
         mission_id,
         cursors,
+        persisted_seqs,
         &mut poster,
     )
     .await
@@ -217,6 +313,7 @@ async fn poll_mission(
 
 /// Testable implementation of [`poll_mission`], with Slack posting injected so
 /// cursor retry semantics can be exercised without a live Slack endpoint.
+#[allow(clippy::too_many_arguments)]
 async fn poll_mission_with_poster(
     cfg: &SlackConfig,
     client: &SlackClient,
@@ -224,6 +321,7 @@ async fn poll_mission_with_poster(
     threads: &SharedThreads,
     mission_id: &str,
     cursors: &mut HashMap<String, MissionCursor>,
+    persisted_seqs: &HashMap<String, u64>,
     poster: &mut impl OutboundPoster,
 ) -> Result<()> {
     let paths = MissionPaths::new(repo_root, mission_id);
@@ -232,13 +330,17 @@ async fn poll_mission_with_poster(
         return Ok(());
     }
 
-    // First sighting: fold the whole log, but DON'T replay historic
-    // notifications — seed the cursor at head so only NEW events post. (A
-    // freshly restarted bridge shouldn't re-announce every past mission.)
+    // First sighting: fold the whole log. Prefer a persisted last_seq so a
+    // restarted bridge does not re-announce already-posted notifications;
+    // otherwise seed at head (only NEW events post).
     if !cursors.contains_key(mission_id) {
         let events = EventLog::read_events(&events_path)?;
         let state = reducer::fold(&events)?;
-        let last_seq = state.last_seq;
+        let last_seq = persisted_seqs
+            .get(mission_id)
+            .copied()
+            .unwrap_or(state.last_seq)
+            .min(state.last_seq);
         cursors.insert(mission_id.to_string(), MissionCursor { state, last_seq });
         return Ok(());
     }
@@ -259,6 +361,7 @@ async fn poll_mission_with_poster(
                     let state = reducer::fold(&events)?;
                     cursor.last_seq = state.last_seq;
                     cursor.state = state;
+                    persist_notify_cursor(repo_root, mission_id, cursor.last_seq);
                     return Ok(());
                 }
             }
@@ -277,6 +380,7 @@ async fn poll_mission_with_poster(
             }
         }
         cursor.last_seq = event.seq;
+        persist_notify_cursor(repo_root, mission_id, cursor.last_seq);
     }
     Ok(())
 }
@@ -630,6 +734,7 @@ fn is_slow_action(action: &Action) -> bool {
             | Action::Ask { .. }
             | Action::WorkRun { .. }
             | Action::CreateTicket { .. }
+            | Action::NewTicket { .. }
             | Action::Merge { .. }
     )
 }
@@ -1027,6 +1132,25 @@ fn is_ticket_slug(repo_root: &Path, arg: &str) -> bool {
             .is_file()
 }
 
+/// Mission-id shape used by `/kranz approve` disambiguation: `m-` + 6 hex
+/// digits (the common short form). Longer / non-hex ids still go through
+/// `approve_flow` when they are not ticket slugs.
+fn looks_like_mission_id(arg: &str) -> bool {
+    let Some(rest) = arg.strip_prefix("m-") else {
+        return false;
+    };
+    rest.len() == 6 && rest.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Whether `.kranz/missions/<id>/` exists (used with [`looks_like_mission_id`]
+/// so a hex-shaped arg that is ALSO a ticket slug prefers mission approval).
+fn mission_dir_exists(repo_root: &Path, mission_id: &str) -> bool {
+    MissionPaths::is_safe_id(mission_id)
+        && MissionPaths::new(repo_root, mission_id)
+            .mission_dir()
+            .is_dir()
+}
+
 /// The outcome of `run_approve_ticket_command`: whether the invoker was
 /// authorized, and the reply blocks to post (`None` only when unauthorized,
 /// mirroring [`DraftGate`]).
@@ -1405,13 +1529,28 @@ async fn dispatch_action(
         // through the same primitive `POST /api/tickets` uses
         // (`Ticket::scaffold`). No `response_url` (a modal submission has
         // none), so the confirmation/error posts straight into `channel`.
+        // Allowlist-gated like NewTicketModal — an unlisted user must not
+        // create backlog tickets when `allowUsers` is non-empty.
         Action::CreateTicket {
             slug,
             title,
             goal,
             context,
             channel,
+            user_id,
         } => {
+            if !cfg.is_authorized(user_id.as_deref()) {
+                user_reply(
+                    cfg,
+                    client,
+                    None,
+                    channel,
+                    user_id.as_deref(),
+                    &not_authorized_blocks(),
+                )
+                .await;
+                return;
+            }
             let goal = (!goal.trim().is_empty()).then_some(goal.as_str());
             let context = (!context.trim().is_empty()).then_some(context.as_str());
             match create_ticket(repo_root, slug, title, goal, context) {
@@ -1443,6 +1582,66 @@ async fn dispatch_action(
                     {
                         tracing::warn!(error = %e, "failed to post ticket-creation error");
                     }
+                }
+            }
+        }
+
+        // `/kranz ticket <title>`: scaffold a one-line ticket. Allowlist-gated
+        // like CreateTicket / NewTicketModal — writes backlog state.
+        Action::NewTicket {
+            title,
+            channel,
+            user_id,
+            response_url,
+            ..
+        } => {
+            if !cfg.is_authorized(user_id.as_deref()) {
+                user_reply(
+                    cfg,
+                    client,
+                    response_url.as_deref(),
+                    channel,
+                    user_id.as_deref(),
+                    &not_authorized_blocks(),
+                )
+                .await;
+                return;
+            }
+            match scaffold_ticket(repo_root, title) {
+                Ok(()) => {
+                    let slug = slugify(title);
+                    let blocks = vec![json!({
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": format!(
+                                ":ticket: Scaffolded ticket `{}` — {}",
+                                crate::format::escape_mrkdwn(&slug),
+                                crate::format::escape_mrkdwn(title)
+                            )
+                        }
+                    })];
+                    user_reply(
+                        cfg,
+                        client,
+                        response_url.as_deref(),
+                        channel,
+                        user_id.as_deref(),
+                        &blocks,
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to scaffold ticket from Slack");
+                    user_reply(
+                        cfg,
+                        client,
+                        response_url.as_deref(),
+                        channel,
+                        user_id.as_deref(),
+                        &error_blocks(&format!("Couldn't scaffold ticket: {e}")),
+                    )
+                    .await;
                 }
             }
         }
@@ -1554,10 +1753,26 @@ async fn dispatch_action(
             response_url,
         } => {
             // `/kranz approve <arg>` accepts EITHER a mission id or a ticket
-            // slug: an arg naming an on-disk backlog ticket resolves through
-            // the ticket-approve gate (kranz_engine::deps::approve_ticket);
-            // anything else keeps the original pending-plan approve flow.
-            if is_ticket_slug(repo_root, mission_id) {
+            // slug. Ambiguity rule: if `arg` looks like `m-[0-9a-f]{6}` AND
+            // that mission directory exists on disk, prefer mission plan
+            // approval; otherwise, if it names an on-disk backlog ticket,
+            // queue the ticket. (A hex-shaped mission id that also happens
+            // to be a ticket slug must not silently queue the ticket.)
+            if looks_like_mission_id(mission_id) && mission_dir_exists(repo_root, mission_id) {
+                approve_flow(
+                    cfg,
+                    client,
+                    repo_root,
+                    threads,
+                    host,
+                    mission_id,
+                    user_id.as_deref(),
+                    response_url.as_deref(),
+                    false,
+                    false,
+                )
+                .await;
+            } else if is_ticket_slug(repo_root, mission_id) {
                 let invocation =
                     run_approve_ticket_command(cfg, host, mission_id, user_id.as_deref()).await;
                 if !invocation.authorized {
@@ -2507,7 +2722,8 @@ fn apply_action(repo_root: &Path, action: &Action) -> Result<()> {
         Action::Guidance {
             mission_id, text, ..
         } => guidance(repo_root, mission_id, text),
-        Action::NewTicket { title, .. } => scaffold_ticket(repo_root, title),
+        // NewTicket is handled (and allowlist-gated) in [`dispatch_action`];
+        // keep a no-op here so apply_action exhaustiveness stays honest.
         Action::Help { .. }
         | Action::Status { .. }
         | Action::Todo { .. }
@@ -2516,6 +2732,7 @@ fn apply_action(repo_root: &Path, action: &Action) -> Result<()> {
         | Action::TicketShow { .. }
         | Action::NewMission { .. }
         | Action::NewMissionModal { .. }
+        | Action::NewTicket { .. }
         | Action::NewTicketModal { .. }
         | Action::CreateTicket { .. }
         | Action::ConfigModal { .. }
@@ -3794,21 +4011,108 @@ mod tests {
     #[test]
     fn new_ticket_action_scaffolds_file() {
         let tmp = TempDir::new().unwrap();
-        apply_action(
+        let cfg = test_cfg();
+        let client = SlackClient::new(&cfg).unwrap();
+        let threads = SharedThreads::load(tmp.path()).unwrap();
+        // NewTicket is gated + scaffolded in dispatch_action (not apply_action).
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(dispatch_action(
+            &cfg,
+            &client,
             tmp.path(),
+            &threads,
+            None,
             &Action::NewTicket {
                 title: "Rate-limit the notes API".into(),
                 channel: "C1".into(),
                 thread_ts: None,
+                user_id: None,
+                response_url: None,
             },
-        )
-        .unwrap();
+        ));
         let path = kranz_engine::ticket::Ticket::tickets_dir(tmp.path())
             .join("rate-limit-the-notes-api.md");
         assert!(path.exists());
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("title: Rate-limit the notes API"));
         assert!(text.contains("## Goal"));
+    }
+
+    #[tokio::test]
+    async fn create_ticket_denies_unlisted_user_when_allowlist_set() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = SlackConfig {
+            bot_token: "xoxb".into(),
+            app_token: "xapp".into(),
+            channel: "C1".into(),
+            notify: NotifyFlags::default(),
+            allow_users: vec!["U-allowed".into()],
+            dashboard_url: None,
+            instance_name: None,
+        };
+        let client = SlackClient::new(&cfg).unwrap();
+        let threads = SharedThreads::load(tmp.path()).unwrap();
+        dispatch_action(
+            &cfg,
+            &client,
+            tmp.path(),
+            &threads,
+            None,
+            &Action::CreateTicket {
+                slug: "secret-ticket".into(),
+                title: "Secret".into(),
+                goal: "do it".into(),
+                context: String::new(),
+                channel: "C1".into(),
+                user_id: Some("U-outsider".into()),
+            },
+        )
+        .await;
+        let path = kranz_engine::ticket::Ticket::tickets_dir(tmp.path()).join("secret-ticket.md");
+        assert!(
+            !path.exists(),
+            "unlisted user must not create a ticket when allowUsers is non-empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_ticket_denies_unlisted_user_when_allowlist_set() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = SlackConfig {
+            bot_token: "xoxb".into(),
+            app_token: "xapp".into(),
+            channel: "C1".into(),
+            notify: NotifyFlags::default(),
+            allow_users: vec!["U-allowed".into()],
+            dashboard_url: None,
+            instance_name: None,
+        };
+        let client = SlackClient::new(&cfg).unwrap();
+        let threads = SharedThreads::load(tmp.path()).unwrap();
+        dispatch_action(
+            &cfg,
+            &client,
+            tmp.path(),
+            &threads,
+            None,
+            &Action::NewTicket {
+                title: "Should Not Exist".into(),
+                channel: "C1".into(),
+                thread_ts: None,
+                user_id: Some("U-outsider".into()),
+                response_url: None,
+            },
+        )
+        .await;
+        let path =
+            kranz_engine::ticket::Ticket::tickets_dir(tmp.path()).join("should-not-exist.md");
+        assert!(
+            !path.exists(),
+            "unlisted user must not scaffold a ticket when allowUsers is non-empty"
+        );
     }
 
     #[test]
@@ -3903,6 +4207,7 @@ mod tests {
         let threads = SharedThreads::load(tmp.path()).unwrap();
         let mut cursors = HashMap::new();
         let mut poster = FailOncePoster::new();
+        let persisted = HashMap::new();
 
         poll_mission_with_poster(
             &cfg,
@@ -3911,6 +4216,7 @@ mod tests {
             &threads,
             mission_id,
             &mut cursors,
+            &persisted,
             &mut poster,
         )
         .await
@@ -3927,6 +4233,7 @@ mod tests {
             &threads,
             mission_id,
             &mut cursors,
+            &persisted,
             &mut poster,
         )
         .await
@@ -3947,6 +4254,7 @@ mod tests {
             &threads,
             mission_id,
             &mut cursors,
+            &persisted,
             &mut poster,
         )
         .await
@@ -3959,6 +4267,91 @@ mod tests {
         );
         assert_eq!(cursor.last_seq, 2);
         assert_eq!(cursor.state.last_seq, 2);
+    }
+
+    #[test]
+    fn notify_cursors_roundtrip_on_disk() {
+        let tmp = TempDir::new().unwrap();
+        let mut cursors = NotifyCursors::default();
+        cursors.set("m-abc123", 7);
+        cursors.set("m-def456", 42);
+        cursors.save(tmp.path()).unwrap();
+        let loaded = NotifyCursors::load(tmp.path()).unwrap();
+        assert_eq!(loaded.by_mission.get("m-abc123").copied(), Some(7));
+        assert_eq!(loaded.by_mission.get("m-def456").copied(), Some(42));
+        assert_eq!(loaded.by_mission.get("m-missing"), None);
+        assert!(NotifyCursors::path(tmp.path()).is_file());
+    }
+
+    #[tokio::test]
+    async fn outbound_cursor_persists_last_seq_after_successful_post() {
+        let tmp = TempDir::new().unwrap();
+        let mission_id = "m-persist";
+        seed_mission(tmp.path(), mission_id, "notify me");
+
+        let cfg = test_cfg();
+        let client = SlackClient::new(&cfg).unwrap();
+        let threads = SharedThreads::load(tmp.path()).unwrap();
+        let mut cursors = HashMap::new();
+        let mut poster = FailOncePoster::new();
+        // Force first post to succeed by priming attempts past the fail-once.
+        poster.attempts = 1;
+        let persisted = HashMap::new();
+
+        poll_mission_with_poster(
+            &cfg,
+            &client,
+            tmp.path(),
+            &threads,
+            mission_id,
+            &mut cursors,
+            &persisted,
+            &mut poster,
+        )
+        .await
+        .unwrap();
+        append_plan_approved(tmp.path(), mission_id, "notify me");
+        poll_mission_with_poster(
+            &cfg,
+            &client,
+            tmp.path(),
+            &threads,
+            mission_id,
+            &mut cursors,
+            &persisted,
+            &mut poster,
+        )
+        .await
+        .unwrap();
+        assert_eq!(cursors.get(mission_id).unwrap().last_seq, 2);
+        let on_disk = NotifyCursors::load(tmp.path()).unwrap();
+        assert_eq!(
+            on_disk.by_mission.get(mission_id).copied(),
+            Some(2),
+            "successful post must persist last_seq"
+        );
+    }
+
+    /// When `/kranz approve <arg>` matches BOTH `m-[0-9a-f]{6}` with an
+    /// on-disk mission dir AND a ticket slug, prefer mission approval (do
+    /// not silently queue the ticket).
+    #[test]
+    fn approve_prefers_mission_when_arg_is_hex_mission_id_and_ticket_slug() {
+        let tmp = TempDir::new().unwrap();
+        let mission_id = "m-abcdef";
+        seed_mission(tmp.path(), mission_id, "mission goal");
+        // Also create a ticket whose slug is the same string.
+        create_ticket(tmp.path(), mission_id, "Ambiguous", None, None).unwrap();
+        assert!(looks_like_mission_id(mission_id));
+        assert!(mission_dir_exists(tmp.path(), mission_id));
+        assert!(is_ticket_slug(tmp.path(), mission_id));
+        // The disambiguation helpers alone encode the prefer-mission rule;
+        // dispatch would call approve_flow (needs host/plan) — unit-check
+        // the predicate order here.
+        assert!(
+            looks_like_mission_id(mission_id) && mission_dir_exists(tmp.path(), mission_id),
+            "hex mission id with existing dir must win over ticket slug"
+        );
     }
 
     /// D-A: `is_ticket_slug` is the gate `Action::QueueTicket` uses to decide

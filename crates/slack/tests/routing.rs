@@ -97,6 +97,8 @@ fn slash_command_ticket_fixture_routes_to_new_ticket() {
             title: "Rate-limit the notes API".into(),
             channel: "C0G9QF9GW".into(),
             thread_ts: None,
+            user_id: Some("U0263M3QW".into()),
+            response_url: Some("https://hooks.slack.com/commands/T024BE7LD/1234/abcd".into(),),
         }
     );
 }

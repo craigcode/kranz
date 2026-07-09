@@ -50,7 +50,7 @@ pub(crate) async fn ws_handler(
     else {
         return StatusCode::FORBIDDEN.into_response();
     };
-    if !crate::origin_allowed(origin) {
+    if !crate::origin_allowed(origin, server.bind_port) {
         return StatusCode::FORBIDDEN.into_response();
     }
 
@@ -61,8 +61,18 @@ pub(crate) async fn ws_handler(
     if !paths.events_file().is_file() {
         return ApiError::not_found(format!("unknown mission '{id}'")).into_response();
     }
-    // An unparsable `since` falls back to a fresh snapshot (protocol.md).
-    let since = params.get("since").and_then(|raw| raw.parse::<u64>().ok());
+    // Align with REST `GET .../events?since=`: reject unparsable values
+    // instead of silently falling back to a full snapshot.
+    let since = match params.get("since") {
+        None => None,
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(n) => Some(n),
+            Err(_) => {
+                return ApiError::bad_request(format!("invalid 'since' value: '{raw}'"))
+                    .into_response();
+            }
+        },
+    };
     ws.on_upgrade(move |socket| session(socket, paths, since))
 }
 

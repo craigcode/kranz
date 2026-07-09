@@ -239,15 +239,44 @@ repos operate from one Slack workspace with unambiguous routing; and a
 brand-new repo's first mission runs with no hand-editing beyond
 `kranz init` answers.
 
-## Product pattern notes from Warp/Oz/Factory scan (2026-07-08)
+## Product pattern notes from Warp/Oz/Factory scan (2026-07-08) and Cursor scan (2026-07-09)
 
 External scan: Warp Agent/Oz and Factory's Droid/AutoWiki surfaces are useful
-as UX/product benchmarks, not architecture targets. The broad "agentic IDE"
-lane (terminal replacement, built-in editor/LSP, voice, general local coding
-environment) belongs to the sgian side product, not kranz. The
-kranz-compatible lessons are narrower and should reinforce the
-mission/audit/gate model:
+as UX/product benchmarks, not architecture targets. Cursor is now a stronger
+direct overlap on unattended agent work (Agents Window, cloud agents,
+worktrees, automations, hooks, Agent Review, and Grok 4.5 in its first-party
+model pool), so "agent orchestrator" is no longer a useful differentiator.
+The broad "agentic IDE" lane (terminal replacement, built-in editor/LSP,
+voice, general local coding environment) still belongs to the sgian side
+product, not kranz. The kranz-compatible lessons are narrower and should
+reinforce the mission/audit/gate model:
 
+- **Cursor CLI / Grok 4.5 backend.** Treat Cursor as a runtime/backend to
+  absorb, not an IDE lane to chase: add a `backend_cursor` (or ACP-backed
+  equivalent if the CLI print mode lacks enough event structure) so workers
+  and validators can use Cursor first-party models such as Grok 4.5 and
+  Composer under the existing kranz mission contract. The backend must prove
+  terminal report text parsing, model/cost capture, worktree cwd discipline,
+  permission mapping, and the no-push/no-main-write invariants before it is a
+  default option.
+- **Positioning correction.** Cursor now credibly owns much of the polished
+  agentic development-platform story. Kranz should describe itself as the
+  git-native mission recorder, consent gate, and validation harness around
+  headless agents, not as a generalized agentic IDE or model router.
+- **Automation triggers without losing the gate.** Cursor's automations make
+  event-triggered background agents feel normal. Add kranz-side triggers only
+  where they preserve explicit mission semantics: GitHub/Slack/Linear/webhook
+  events should create or draft tickets, queue approved plans, or request
+  human approval, never silently merge or push.
+- **Cloud/network policy as first-class mission config.** Cursor's cloud-agent
+  docs make egress policy, secret visibility modes, artifact hosting, and
+  managed/self-hosted execution part of the operator story. Fold the same
+  concerns into M6/M7 as mission/profile fields, with consent diffs before
+  approval and event-log records of the effective policy.
+- **Artifact evidence.** Cursor attaches screenshots, videos, and log
+  references to PRs. Kranz's `report.md`/mission record should grow a simple
+  artifact index for validator screenshots, browser/computer-use recordings,
+  command logs, and demo URLs, all referenced from the append-only event trail.
 - **Plan UX as an audited artifact.** Keep `plan.json`/`plan.md` as the source
   of truth, but make the dashboard feel more like a plan workspace: revision
   timeline, compare/restore prior revisions, clearer mid-mission plan diffs,

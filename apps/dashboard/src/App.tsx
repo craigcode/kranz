@@ -67,18 +67,18 @@ export default function App() {
   const route = useRoute();
   const missionId = route.view === 'mission' ? route.id : null;
   const connectMission = useKranzStore((s) => s.connectMission);
-  const disconnect = useKranzStore((s) => s.disconnect);
   const selectedRun = useKranzStore((s) => s.selectedRun);
   const status = useKranzStore((s) => s.state?.mission.status ?? null);
 
+  // Connect when the hash points at a mission. Do NOT disconnect on null
+  // (pipeline / backlog / ticket routes): draftTicket already connects the
+  // returned mission, and TicketDetail needs that WS feed while staying on
+  // the ticket route. connectMission replaces any previous socket; explicit
+  // disconnect stays available for abandon/delete callers.
   useEffect(() => {
-    if (missionId === null) {
-      disconnect();
-      return;
-    }
+    if (missionId === null) return;
     connectMission(missionId);
-    return () => disconnect();
-  }, [missionId, connectMission, disconnect]);
+  }, [missionId, connectMission]);
 
   if (route.view === 'pipeline') {
     return (

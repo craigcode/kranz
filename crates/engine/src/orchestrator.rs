@@ -652,6 +652,16 @@ impl MissionEngine {
                     ),
                 });
             }
+            if !contract_sweep::cargo_test_has_anti_vacuity(command) {
+                issues.push(PreflightIssue {
+                    severity: "warn",
+                    message: format!(
+                        "command assertion [{}] runs `cargo test` without anti-vacuity \
+                         (`ok. [1-9]`); a zero-test filter would pass vacuously",
+                        assertion.id
+                    ),
+                });
+            }
         }
 
         // Sandbox preflight (f-2-3/f-2-4): surface unsupported/missing
@@ -1163,15 +1173,25 @@ impl MissionEngine {
             commit_result?;
 
             // Deliverable visibility (plan §f-2-3): the primary never checks
-            // out the mission branch in worktree mode, so this untracked twin
-            // in the runtime dir is how an operator reads plan.md without
-            // leaving the primary checkout. Never committed — the canonical,
-            // committed copy lives on the mission branch above.
-            let primary_plan_md = self.paths.plan_md_file();
-            if let Some(parent) = primary_plan_md.parent() {
+            // out the mission branch in worktree mode, so untracked twins in
+            // the runtime dir are how operators (and reseed/digest/host
+            // delete) read the approved plan without leaving the primary
+            // checkout. Never committed here — the canonical copies live on
+            // the mission branch above.
+            let primary_plan = self.paths.plan_file();
+            if let Some(parent) = primary_plan.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(&primary_plan_md, &plan_md_body)?;
+            std::fs::write(&primary_plan, serde_json::to_string_pretty(&plan)?)?;
+            std::fs::write(self.paths.plan_md_file(), &plan_md_body)?;
+            let primary_index = self.paths.missions_dir().join("index.md");
+            let index_body = upsert_mission_index(
+                &std::fs::read_to_string(&primary_index).unwrap_or_default(),
+                &self.state.mission.id,
+                &plan.goal,
+                chrono::Utc::now().date_naive(),
+            );
+            std::fs::write(&primary_index, index_body)?;
             if let Some(body) = &research_md {
                 std::fs::write(self.paths.research_file(), body)?;
             }
@@ -2299,7 +2319,7 @@ impl MissionEngine {
             return Ok(false);
         }
         self.active_repo()
-            .add_all_and_commit(&format!("[{feature_id}] checkpoint (engine commit)"))?;
+            .commit_dirty_paths(&contract_sweep::checkpoint_commit_message(feature_id))?;
         Ok(true)
     }
 
@@ -2977,10 +2997,9 @@ impl MissionEngine {
         // here rather than run through the sequential dirty-tree turn — the
         // parallel subset keeps its worktree self-contained.
         if !wt_repo.is_clean().unwrap_or(true) {
-            let _ = wt_repo.add_all_and_commit(&format!(
-                "[{}] parallel worktree checkpoint (engine commit)",
-                ws.feature_id
-            ));
+            let _ = wt_repo.commit_dirty_paths(
+                &contract_sweep::parallel_checkpoint_commit_message(&ws.feature_id),
+            );
         }
 
         // Judge the run against the worktree's own commit range (start_sha..HEAD
@@ -3228,34 +3247,48 @@ impl MissionEngine {
         let mut findings = Vec::new();
 
         let touch_set = &self.state.mission.touch_set;
-        if touch_set.is_empty() {
-            tracing::info!(
-                "out-of-contract-write path sweep is advisory-off: mission has no declared touchSet"
-            );
-        } else {
-            let repo = self.active_repo();
-            let commits = repo.commits_between(milestone_start_sha, "HEAD")?;
-            let mission_id = self.state.mission.id.clone();
+        let repo = self.active_repo();
+        let commits = repo.commits_between(milestone_start_sha, "HEAD")?;
+        let mission_id = self.state.mission.id.clone();
 
-            // Attribute each changed path to the commit that made it, via a
-            // per-commit diff against its predecessor in the range; engine
-            // ([kranz]-authored) commits are skipped entirely so their paths
-            // never enter the candidate set, even when outside the touch-set.
-            let mut changes: Vec<(String, CommitInfo)> = Vec::new();
-            let mut prev_sha = milestone_start_sha.to_string();
-            for commit in &commits {
-                if contract_sweep::is_meta_commit(&commit.subject) {
-                    prev_sha = commit.sha.clone();
-                    continue;
-                }
-                let paths = repo.changed_paths(&prev_sha, &commit.sha)?;
-                for path in paths {
-                    if !contract_sweep::is_meta_path(&mission_id, &path) {
-                        changes.push((path, commit.clone()));
-                    }
-                }
+        // Attribute each changed path to the commit that made it, via a
+        // per-commit diff against its predecessor in the range; engine
+        // ([kranz]-authored) commits are skipped entirely so their paths
+        // never enter the candidate set, even when outside the touch-set.
+        let mut changes: Vec<(String, CommitInfo)> = Vec::new();
+        let mut prev_sha = milestone_start_sha.to_string();
+        let mut worker_commit_count = 0usize;
+        for commit in &commits {
+            if contract_sweep::is_meta_commit(&commit.subject) {
                 prev_sha = commit.sha.clone();
+                continue;
             }
+            worker_commit_count += 1;
+            let paths = repo.changed_paths(&prev_sha, &commit.sha)?;
+            for path in paths {
+                if !contract_sweep::is_meta_path(&mission_id, &path) {
+                    changes.push((path, commit.clone()));
+                }
+            }
+            prev_sha = commit.sha.clone();
+        }
+
+        if touch_set.is_empty() {
+            // Advisory-off: do not emit a finding (that would force an extra
+            // convert_findings turn and desync mock/scripted missions). Log
+            // loudly when workers landed commits so operators still see the gap.
+            if worker_commit_count > 0 {
+                tracing::warn!(
+                    worker_commits = worker_commit_count,
+                    "out-of-contract-write path sweep is advisory-off: mission has no \
+                     declared touchSet but worker commits landed"
+                );
+            } else {
+                tracing::info!(
+                    "out-of-contract-write path sweep is advisory-off: mission has no declared touchSet"
+                );
+            }
+        } else {
             let attributed: Vec<contract_sweep::AttributedChange> = changes
                 .iter()
                 .map(|(path, commit)| contract_sweep::AttributedChange { path, commit })
@@ -3344,10 +3377,32 @@ impl MissionEngine {
         if specs.is_empty() && !waived.is_empty() && unwaived_findings.is_empty() {
             return Ok(FindingsConversion::Waive { waived });
         }
+        // Partial fixFeatures must not drop uncovered findings. When the model
+        // returns fewer specs than unwaived findings, union with synthesized
+        // fixes for subjects its titles do not reference. When it returns at
+        // least one spec per unwaived finding, trust the model — titles are
+        // often generic ("fix issue 1") and must not force an extra worker.
         let specs = if specs.is_empty() {
             synthesize_fix_specs(unwaived_findings)
-        } else {
+        } else if specs.len() >= unwaived_findings.len() {
             specs
+        } else {
+            let covered: std::collections::HashSet<String> =
+                specs.iter().map(|s| s.title.clone()).collect();
+            let mut merged = specs;
+            let uncovered: Vec<&Finding> = unwaived_findings
+                .iter()
+                .copied()
+                .filter(|f| {
+                    !covered.iter().any(|title| {
+                        title == &f.subject
+                            || title.contains(&f.subject)
+                            || title == &format!("fix {}", f.subject)
+                    })
+                })
+                .collect();
+            merged.extend(synthesize_fix_specs(uncovered));
+            merged
         };
         Ok(FindingsConversion::Fix {
             specs,
@@ -3493,7 +3548,7 @@ impl MissionEngine {
                     severity: "critical".to_string(),
                     evidence: scrub::scrub(&format!("command failed: {command}\n{output}")),
                     suggested_fix: String::new(),
-                    class: String::new(),
+                    class: "command-assertion".to_string(),
                 });
             }
         }
@@ -3524,10 +3579,31 @@ impl MissionEngine {
                 finding: finding.clone(),
             })?;
         }
-        // Gate findings go through the same conversion turn as a milestone
-        // validation round: the orchestrator may waive them all, in which
-        // case the mission proceeds to completion.
-        match self.convert_findings(&last_milestone_id, &findings).await? {
+
+        // Engine-hard command assertions are NOT waivable: a RED contract
+        // command must not become COMPLETE by model discretion. Split them
+        // out; only agent-judgement / synthesized findings may enter
+        // convert_findings.
+        let (command_findings, waivable): (Vec<_>, Vec<_>) = findings
+            .into_iter()
+            .partition(|f| f.class == "command-assertion");
+        if !command_findings.is_empty() {
+            let subjects: Vec<&str> = command_findings
+                .iter()
+                .map(|f| f.subject.as_str())
+                .collect();
+            self.emit(EventKind::MissionFailed {
+                reason: format!(
+                    "final-gate command assertion(s) failed and are non-waivable: {}",
+                    subjects.join(", ")
+                ),
+            })?;
+            return Ok(Some(MissionStatus::Failed));
+        }
+
+        // Remaining gate findings go through the same conversion turn as a
+        // milestone validation round: the orchestrator may waive them all.
+        match self.convert_findings(&last_milestone_id, &waivable).await? {
             FindingsConversion::Waive { waived } => {
                 self.emit_waive_decision(&waived)?;
                 // Report AFTER the waive decision (so the gate waiver is in
@@ -3552,7 +3628,7 @@ impl MissionEngine {
                         milestone_id: last_milestone_id,
                         reason: format!(
                             "{} final-gate finding(s) but the fix-cycle cap ({}) is reached",
-                            findings.len(),
+                            waivable.len(),
                             self.state.config.max_fix_cycles_per_milestone
                         ),
                     })?;
@@ -6376,9 +6452,10 @@ mod tests {
         assert_eq!(findings[0].subject, "oops.md");
     }
 
-    /// An empty (undeclared) touch-set skips the path sweep entirely: no
-    /// out-of-contract-write path findings, even for a path that would
-    /// otherwise be flagged.
+    /// An empty (undeclared) touch-set skips the path sweep (advisory-off):
+    /// no out-of-contract-write path findings, even for a path that would
+    /// otherwise be flagged. Operators still get a warn log when worker
+    /// commits landed.
     #[test]
     fn out_of_contract_sweep_empty_touch_set_is_advisory_off() {
         let Some((_dir, root)) = lessons_test_repo() else {
@@ -7362,6 +7439,7 @@ mod tests {
         let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
         let cfg = MissionConfig {
             event_stream_throttle_ms: 10,
+            worker_isolation: WorkerIsolation::Checkout,
             ..MissionConfig::default()
         };
         let mut engine = MissionEngine::create(backend, &root, "goal", cfg).expect("create engine");
@@ -7510,6 +7588,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn partial_fix_features_synthesizes_when_fewer_specs_than_findings() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        // Model returns one fixFeature for two unwaived findings — must
+        // synthesize a fix for the omitted subject.
+        let reply = serde_json::json!({
+            "fixFeatures": [{
+                "title": "fix covered",
+                "spec": "address covered",
+                "validationCriteria": ["covered fixed"]
+            }],
+            "waived": [],
+            "summary": "fix one"
+        })
+        .to_string();
+        let backend: Arc<dyn AgentBackend> =
+            Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+                lesson_orch_script(&reply),
+            ]));
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+
+        let conversion = engine
+            .convert_findings("ms-1", &[finding("covered"), finding("uncovered")])
+            .await
+            .unwrap();
+
+        match conversion {
+            FindingsConversion::Fix { specs, .. } => {
+                assert_eq!(
+                    specs.len(),
+                    2,
+                    "model fix + synthesized uncovered: {specs:?}"
+                );
+                assert!(
+                    specs.iter().any(|s| s.title.contains("uncovered")),
+                    "expected synthesized fix for uncovered: {specs:?}"
+                );
+            }
+            FindingsConversion::Waive { .. } => {
+                panic!("partial fixFeatures must not waive")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fix_features_matching_finding_count_are_trusted() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        // Generic titles that do not contain finding subjects — still trusted
+        // when the model returned one spec per unwaived finding.
+        let reply = serde_json::json!({
+            "fixFeatures": [{
+                "title": "fix issue 1",
+                "spec": "resolve validation finding 1",
+                "validationCriteria": ["finding 1 resolved"]
+            }],
+            "waived": [],
+            "summary": "1 fix feature(s)"
+        })
+        .to_string();
+        let backend: Arc<dyn AgentBackend> =
+            Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+                lesson_orch_script(&reply),
+            ]));
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+
+        let conversion = engine
+            .convert_findings("ms-1", &[finding("part 1 works")])
+            .await
+            .unwrap();
+
+        match conversion {
+            FindingsConversion::Fix { specs, .. } => {
+                assert_eq!(specs.len(), 1, "must not synthesize a duplicate: {specs:?}");
+                assert_eq!(specs[0].title, "fix issue 1");
+            }
+            FindingsConversion::Waive { .. } => panic!("expected Fix"),
+        }
+    }
+
+    #[tokio::test]
     async fn all_waived_findings_still_waive() {
         let Some((_dir, root)) = lessons_test_repo() else {
             return;
@@ -7565,6 +7728,7 @@ mod tests {
         let backend: Arc<dyn AgentBackend> = mock.clone();
         let cfg = MissionConfig {
             max_respawns: 0,
+            worker_isolation: WorkerIsolation::Checkout,
             ..MissionConfig::default()
         };
         let mut engine = MissionEngine::create(backend, &root, "goal", cfg).unwrap();
@@ -7624,6 +7788,7 @@ mod tests {
         let backend: Arc<dyn AgentBackend> = mock;
         let cfg = MissionConfig {
             skip_functional: true,
+            worker_isolation: WorkerIsolation::Checkout,
             ..MissionConfig::default()
         };
         let mut engine = MissionEngine::create(backend, &root, "goal", cfg).unwrap();

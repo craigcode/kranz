@@ -183,15 +183,24 @@ pub fn build_args(spec: &SessionSpec) -> Vec<String> {
     } else {
         "read-only"
     };
-    vec![
+    let mut args = vec![
         "exec".into(),
         "--json".into(),
         "--sandbox".into(),
         sandbox.into(),
-        "--model".into(),
-        spec.model.clone(),
-        effective_prompt(spec),
-    ]
+    ];
+    // Temp-dir worktrees (macOS /var/folders → /private/var) are outside
+    // Codex's default workspace-write roots. Pin the session cwd explicitly
+    // so workers can land deliverables (fix-codex-sandbox-writable-roots-worktree).
+    if spec.writable {
+        let root = spec.cwd.display().to_string().replace('\'', "\\'");
+        args.push("-c".into());
+        args.push(format!("sandbox_workspace_write.writable_roots=['{root}']"));
+    }
+    args.push("--model".into());
+    args.push(spec.model.clone());
+    args.push(effective_prompt(spec));
+    args
 }
 
 // ---------------------------------------------------------------------------
@@ -915,6 +924,8 @@ mod tests {
                 "--json".to_string(),
                 "--sandbox".to_string(),
                 "workspace-write".to_string(),
+                "-c".to_string(),
+                "sandbox_workspace_write.writable_roots=['.']".to_string(),
                 "--model".to_string(),
                 "gpt-5-codex".to_string(),
                 "do the thing".to_string(),

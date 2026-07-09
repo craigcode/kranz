@@ -57,6 +57,17 @@ export function setToken(token: string): void {
   }
 }
 
+/** Drop the cached + sessionStorage token (e.g. after a 401 rejection so a
+ *  stale post-restart token cannot keep failing silently). */
+export function clearToken(): void {
+  cached = null;
+  try {
+    sessionStorage.removeItem(STORAGE_KEY);
+  } catch {
+    /* ignore storage failures */
+  }
+}
+
 /** Resolve the current mutation token, or null when we have none. */
 export function resolveToken(): string | null {
   if (cached !== null) return cached;
@@ -117,10 +128,12 @@ export function tokenGateSnapshot(): TokenGateState {
 
 /**
  * Called by api.ts after a 401: blocks until the user provides a token via
- * provideToken() (resolve → caller retries) or cancels (reject).
+ * provideToken() (resolve → caller retries) or cancels (reject). Clears any
+ * cached token first so a stale post-restart value cannot be retried.
  */
 export function awaitToken(): Promise<void> {
   rejectedLast = resolveToken() !== null;
+  if (rejectedLast) clearToken();
   return new Promise<void>((resolve, reject) => {
     waiters.push({ resolve, reject });
     notify();

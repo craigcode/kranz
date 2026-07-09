@@ -144,7 +144,7 @@ pub struct Milestone {
     /// produced findings; milestone blocks when it exceeds the configured cap.
     pub fix_cycles: u32,
     /// Recorded at milestone.started so validators diff start..HEAD (§4.4).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_sha: Option<String>,
 }
 
@@ -438,11 +438,15 @@ impl BackendKind {
 }
 
 /// How worker/validator sessions are isolated from the primary checkout.
+///
+/// Default is [`Worktree`]: the primary checkout must stay byte-untouched
+/// across a mission (AGENTS.md). Operators may still opt into [`Checkout`]
+/// for backends that cannot write into temp-dir worktrees.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum WorkerIsolation {
-    Worktree,
     #[default]
+    Worktree,
     Checkout,
 }
 
@@ -547,7 +551,7 @@ impl Default for MissionConfig {
             dangerously_allow_all: false,
             allow_below_default_worker_model: false,
             claude_binary: None,
-            worker_isolation: WorkerIsolation::Checkout,
+            worker_isolation: WorkerIsolation::Worktree,
         }
     }
 }

@@ -79,6 +79,9 @@ pub struct EventLog {
     mission_id: String,
     events_path: PathBuf,
     lock_path: PathBuf,
+    /// Generation written into the lock file at acquire. Re-checked on every
+    /// append so a stolen-from process fails closed instead of dual-writing.
+    lock_generation: u64,
     file: File,
     /// Seq to assign to the next appended event.
     next_seq: u64,
@@ -136,13 +139,16 @@ impl EventLog {
         std::fs::create_dir_all(paths.control_dir())?;
 
         let lock_path = paths.lock_file();
-        let mut lock_file = match OpenOptions::new()
+        let (mut lock_file, lock_generation) = match OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&lock_path)
         {
-            Ok(f) => f,
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => steal_lock(&lock_path, force)?,
+            Ok(f) => (f, 0u64),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                let (f, prev_gen) = steal_lock(&lock_path, force)?;
+                (f, prev_gen.saturating_add(1))
+            }
             Err(e) => return Err(e.into()),
         };
 
@@ -153,7 +159,11 @@ impl EventLog {
             // detection is the token's job). Line 3: our own identity token,
             // where this platform can produce one; a probe that finds it
             // missing degrades to plain pid liveness, never to Dead.
-            lock_file.write_all(current_lock_holder_record().as_bytes())?;
+            // Line 4: generation — increments on every steal so a stolen-from
+            // process fails closed on its next append.
+            lock_file.write_all(
+                current_lock_holder_record_with_generation(lock_generation).as_bytes(),
+            )?;
             lock_file.flush()?;
 
             let events_path = paths.events_file();
@@ -200,6 +210,7 @@ impl EventLog {
                 mission_id: mission_id.to_string(),
                 events_path,
                 lock_path: lock_path.clone(),
+                lock_generation,
                 file,
                 next_seq: last_seq + 1,
                 throttle,
@@ -266,6 +277,16 @@ impl EventLog {
     /// Append one event after scanning/redacting string payloads. Returns the
     /// sanitized event plus secret findings (fingerprints only, never values).
     pub fn append_redacting(&mut self, kind: EventKind) -> Result<(Event, Vec<SecretFinding>)> {
+        // Fail closed if another process stole the lock out from under us —
+        // otherwise two engines dual-write one log (seq gaps / corruption).
+        let current_gen = read_lock_info(&self.lock_path).generation.unwrap_or(0);
+        if current_gen != self.lock_generation {
+            return Err(EngineError::LockHeld(format!(
+                "event log lock for '{}' was stolen (generation {} → {}); refusing append",
+                self.mission_id, self.lock_generation, current_gen
+            )));
+        }
+
         let event = Event {
             seq: self.next_seq,
             ts: Utc::now(),
@@ -467,7 +488,7 @@ impl Drop for EventLog {
 /// auto-steal path cannot trigger; steals happen only under explicit operator
 /// force flags, which are deliberate one-off actions rather than the
 /// concurrent-by-accident crash-recovery restarts the guard defends against.
-fn steal_lock(lock_path: &Path, force: LockForce) -> Result<File> {
+fn steal_lock(lock_path: &Path, force: LockForce) -> Result<(File, u64)> {
     #[cfg(unix)]
     let _guard = StealGuard::acquire(lock_path)?;
 
@@ -479,12 +500,13 @@ fn steal_lock(lock_path: &Path, force: LockForce) -> Result<File> {
             .create_new(true)
             .open(lock_path)
         {
-            Ok(f) => return Ok(f),
+            Ok(f) => return Ok((f, 0)),
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e.into()),
         }
 
         authorize_steal(lock_path, force)?;
+        let prev_gen = read_lock_info(lock_path).generation.unwrap_or(0);
 
         // Guarded steals never interleave here, but a rival acquire's FIRST
         // (unguarded) create attempt can still slip into the remove→create
@@ -500,7 +522,7 @@ fn steal_lock(lock_path: &Path, force: LockForce) -> Result<File> {
             .create_new(true)
             .open(lock_path)
         {
-            Ok(f) => return Ok(f),
+            Ok(f) => return Ok((f, prev_gen)),
             Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e.into()),
         }
@@ -665,7 +687,17 @@ pub fn lock_holder_is_alive(lock_path: &Path) -> bool {
 
 /// Lock-file contents for a lock held by the current process, in the same
 /// format parsed by [`lock_holder_is_alive`].
+///
+/// Format (four lines):
+/// `<pid>\n<acquired_unix_secs>\n<identity_token>\n<generation>\n`
+///
+/// `generation` increments on every steal so a stolen-from process can detect
+/// that its append handle is no longer authoritative.
 pub fn current_lock_holder_record() -> String {
+    current_lock_holder_record_with_generation(0)
+}
+
+fn current_lock_holder_record_with_generation(generation: u64) -> String {
     let acquired_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -674,7 +706,10 @@ pub fn current_lock_holder_record() -> String {
     if let Some(token) = process_identity_token(std::process::id() as i32) {
         contents.push_str(&token);
         contents.push('\n');
+    } else {
+        contents.push('\n');
     }
+    contents.push_str(&format!("{generation}\n"));
     contents
 }
 
@@ -712,11 +747,14 @@ struct LockInfo {
     /// one-/two-line formats and on platforms that cannot produce one —
     /// reuse detection is then impossible and an alive pid is simply Alive.
     token: Option<String>,
+    /// Steal generation (fourth line). `None` for legacy lock files — treated
+    /// as generation 0 by append ownership checks.
+    generation: Option<u64>,
 }
 
 /// Best-effort parse of a lock file:
-/// `<pid>\n<acquired_unix_epoch_secs>\n<identity_token>`, tolerating the
-/// legacy one- and two-line formats and arbitrary garbage.
+/// `<pid>\n<acquired_unix_epoch_secs>\n<identity_token>\n<generation>`,
+/// tolerating the legacy one-/two-/three-line formats and arbitrary garbage.
 fn read_lock_info(lock_path: &Path) -> LockInfo {
     let contents = std::fs::read_to_string(lock_path).unwrap_or_default();
     let mut lines = contents.lines();
@@ -733,11 +771,13 @@ fn read_lock_info(lock_path: &Path) -> LockInfo {
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .map(String::from);
+    let generation = lines.next().and_then(|l| l.trim().parse::<u64>().ok());
     LockInfo {
         holder,
         pid,
         acquired_secs,
         token,
+        generation,
     }
 }
 
@@ -1049,6 +1089,7 @@ mod tests {
             pid: Some(pid),
             acquired_secs: Some(0),
             token: Some(own.clone()),
+            generation: None,
         };
         assert_eq!(probe_liveness(&info), LockLiveness::Alive);
 
@@ -1109,6 +1150,7 @@ mod tests {
             pid: Some(pid),
             acquired_secs: Some(0),
             token: Some(format!("{own}-not")),
+            generation: None,
         };
         // `current` comes from the cache primed above, but the differing
         // `recorded` token must still be judged Dead — the comparison is

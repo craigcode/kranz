@@ -64,5 +64,29 @@ describe('approvePlan', () => {
 
     expect(api.approvePending).toHaveBeenCalledOnce();
     expect(api.approvePending).toHaveBeenCalledWith('m-test');
+    expect(useKranzStore.getState().planning.approving).toBe(false);
+  });
+
+  it('sets planning.approving while the approve POST is in flight', async () => {
+    let resolveApprove!: (v: { branch: string; started: boolean }) => void;
+    vi.mocked(api.approvePending).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveApprove = resolve;
+        }),
+    );
+
+    useKranzStore.getState().approvePlan();
+    expect(useKranzStore.getState().planning.approving).toBe(true);
+
+    // A second click while in flight is a no-op.
+    useKranzStore.getState().approvePlan();
+    expect(api.approvePending).toHaveBeenCalledTimes(1);
+
+    resolveApprove({ branch: 'kranz/mission-m-test', started: false });
+    await vi.waitFor(() => {
+      expect(useKranzStore.getState().planning.approving).toBe(false);
+    });
+    expect(useKranzStore.getState().planning.approvedBranch).toBe('kranz/mission-m-test');
   });
 });

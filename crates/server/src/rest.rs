@@ -260,7 +260,8 @@ pub(crate) async fn run_transcript(
 
 /// `POST /api/missions/:id/control` — enqueue a [`ControlCommand`] into the
 /// mission's control inbox (the engine drains it). `202 {"queued":true}`;
-/// 400 on a body that is not a valid command.
+/// 400 on a body that is not a valid command; 409 when the mission is
+/// terminal (mirrors [`control::resolve_active_mission`]).
 pub(crate) async fn post_control(
     State(server): State<Arc<ServerState>>,
     UrlPath(id): UrlPath<String>,
@@ -269,6 +270,15 @@ pub(crate) async fn post_control(
     let paths = mission_paths(&server, &id)?;
     if !paths.mission_dir().is_dir() {
         return Err(unknown_mission(&id));
+    }
+    if paths.events_file().is_file() {
+        let state = fold_log(&paths).map_err(ApiError::internal)?;
+        if kranz_engine::orchestrator::is_terminal_status(state.mission.status) {
+            return Err(ApiError::conflict(format!(
+                "mission '{id}' is {:?}; control commands apply only to active missions",
+                state.mission.status
+            )));
+        }
     }
     let command: ControlCommand = serde_json::from_slice(&body)
         .map_err(|e| ApiError::bad_request(format!("invalid ControlCommand body: {e}")))?;

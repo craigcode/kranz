@@ -288,6 +288,7 @@ fn parses_serve() {
         Command::Serve {
             port,
             ref host,
+            insecure_lan,
             open,
             ref dashboard,
             ref token,
@@ -295,6 +296,7 @@ fn parses_serve() {
         } => {
             assert_eq!(port, 4560);
             assert_eq!(host, "127.0.0.1", "default bind stays loopback");
+            assert!(!insecure_lan);
             assert!(!open && !slack);
             assert!(dashboard.is_none() && token.is_none());
         }
@@ -309,10 +311,18 @@ fn parses_serve() {
             ..
         }
     ));
-    // --host widens the bind (glasses/LAN clients).
-    let cli = Cli::try_parse_from(["kranz", "serve", "--host", "0.0.0.0"]).unwrap();
+    // --host widens the bind (glasses/LAN clients); --insecure-lan acknowledges it.
+    let cli =
+        Cli::try_parse_from(["kranz", "serve", "--host", "0.0.0.0", "--insecure-lan"]).unwrap();
     match cli.command {
-        Command::Serve { ref host, .. } => assert_eq!(host, "0.0.0.0"),
+        Command::Serve {
+            ref host,
+            insecure_lan,
+            ..
+        } => {
+            assert_eq!(host, "0.0.0.0");
+            assert!(insecure_lan);
+        }
         other => panic!("expected Serve, got {other:?}"),
     }
     // --token pins the mutation token (scripting).

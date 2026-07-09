@@ -274,6 +274,7 @@ export function PipelineView({ initialLens = 'actionable' }: { initialLens?: Len
   const loadMissions = useKranzStore((s) => s.loadMissions);
   const draftTicket = useKranzStore((s) => s.draftTicket);
   const approveTicket = useKranzStore((s) => s.approveTicket);
+  const ticketBusySlug = useKranzStore((s) => s.ticketBusySlug);
   const [lens, setLens] = useState<Lens>(initialLens);
 
   useEffect(() => {
@@ -293,28 +294,31 @@ export function PipelineView({ initialLens = 'actionable' }: { initialLens?: Len
     if (action === null) return null;
 
     if (stage === 'captured' && row.slug !== undefined) {
+      const busy = ticketBusySlug === row.slug;
       return (
         <button
           type="button"
           className="btn-small pipeline-primary-action"
+          disabled={ticketBusySlug !== null}
           onClick={() => void draftTicket(row.slug!)}
         >
-          {action.label}
+          {busy ? 'Drafting…' : action.label}
         </button>
       );
     }
 
     if (stage === 'reviewable' && row.slug !== undefined) {
+      const busy = ticketBusySlug === row.slug;
       const title = row.isBlocked ? `blocked by ${row.blockedBy.join(', ')}` : 'queue for run';
       return (
         <button
           type="button"
           className="btn-small pipeline-primary-action"
-          disabled={row.isBlocked}
+          disabled={row.isBlocked || ticketBusySlug !== null}
           title={title}
           onClick={() => void approveTicket(row.slug!, false)}
         >
-          Queue for run
+          {busy ? 'Queuing…' : 'Queue for run'}
         </button>
       );
     }

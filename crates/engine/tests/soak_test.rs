@@ -130,6 +130,7 @@ fn test_cfg() -> MissionConfig {
     MissionConfig {
         skip_scrutiny: true,
         skip_functional: true,
+        worker_isolation: WorkerIsolation::Checkout,
         ..MissionConfig::default()
     }
 }

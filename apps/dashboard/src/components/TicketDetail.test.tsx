@@ -59,7 +59,14 @@ beforeEach(() => {
   vi.mocked(api.approveTicket).mockReset();
   vi.mocked(api.tickets).mockResolvedValue([]);
   useKranzStore.setState(
-    { ...INITIAL_STORE_STATE, tickets: [], ticketsError: null, ticketError: null, missionId: null },
+    {
+      ...INITIAL_STORE_STATE,
+      tickets: [],
+      ticketsError: null,
+      ticketError: null,
+      ticketBusySlug: null,
+      missionId: null,
+    },
     true,
   );
 });

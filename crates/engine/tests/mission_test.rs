@@ -155,11 +155,14 @@ fn init_repo() -> (TempDir, PathBuf) {
 const GOAL: &str = "ship the demo feature";
 
 /// Baseline test config: both validators off (individual tests re-enable the
-/// functional validator where the scenario needs a validation round).
+/// functional validator where the scenario needs a validation round). Pin
+/// Checkout isolation — production default is Worktree, but these mock-driven
+/// e2e tests exercise the sequential checkout path.
 fn test_cfg() -> MissionConfig {
     MissionConfig {
         skip_scrutiny: true,
         skip_functional: true,
+        worker_isolation: WorkerIsolation::Checkout,
         ..MissionConfig::default()
     }
 }
@@ -958,32 +961,30 @@ async fn waive_at_cap_completes_instead_of_blocking() {
 }
 
 // ---------------------------------------------------------------------------
-// 3d. Waive at the final gate: all-waived gate findings complete the mission
+// 3d. Final-gate command assertions are non-waivable (engine-hard)
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
-async fn waive_at_final_gate_completes_mission() {
+async fn command_assertion_at_final_gate_is_non_waivable() {
     if !setup() {
         return;
     }
     let (_dir, root) = init_repo();
 
-    // One command assertion that fails portably (`cd` into a missing dir
-    // errors under both `sh -c` and `cmd /C`) → one final-gate finding.
+    // Portable failing command → final-gate must FAIL even if a waive reply
+    // is queued (convert_findings is never consulted for command assertions).
     let contract = vec![assertion(
         "a-1",
         "the build succeeds",
         Some("cd kranz-no-such-dir"),
     )];
 
-    // Orchestrator turns: seed, judgement f-1-1, gate conversion (waive).
     let backend = Arc::new(MockBackend::with_scripts(vec![
         worker_pass(),
         orch_script(vec![
             dirty_tree_commit_as_is(),
             judgement("complete", ""),
             waive_reply("a-1", "command not runnable in this environment"),
-            "Always check that build commands are portable across shells.".to_string(),
         ]),
     ]));
 
@@ -994,9 +995,8 @@ async fn waive_at_final_gate_completes_mission() {
         .await
         .expect("run must not hang")
         .unwrap();
-    assert_eq!(status, MissionStatus::Complete);
+    assert_eq!(status, MissionStatus::Failed);
 
-    let mission_id = engine.mission_id().to_string();
     let paths = engine.paths().clone();
     drop(engine);
     let events = read_log(&paths);
@@ -1006,59 +1006,13 @@ async fn waive_at_final_gate_completes_mission() {
         "gate finding surfaced: {types:?}"
     );
     assert!(
-        !types.contains(&"fixfeature.created"),
-        "no fix feature: {types:?}"
+        types.contains(&"mission.failed"),
+        "non-waivable command failure must fail the mission: {types:?}"
     );
     assert!(
-        !types.contains(&"milestone.blocked"),
-        "must not block: {types:?}"
+        !types.contains(&"mission.completed"),
+        "command assertion must not COMPLETE via waive: {types:?}"
     );
-    assert!(
-        types.contains(&"mission.completed"),
-        "mission completed: {types:?}"
-    );
-    assert!(seq_of(&events, "mission.validating") < seq_of(&events, "mission.completed"));
-    assert!(events.iter().any(|e| matches!(
-        &e.kind,
-        EventKind::OrchestratorDecision { summary, .. }
-            if summary.starts_with("waived 1 finding(s)") && summary.contains("a-1")
-    )));
-
-    // The waive branch also runs the capture turn — exactly once — and its
-    // outcome is noted on the event feed.
-    let capture_decisions: Vec<&String> = events
-        .iter()
-        .filter_map(|e| match &e.kind {
-            EventKind::OrchestratorDecision { summary, .. }
-                if summary.contains("lesson captured")
-                    || summary.contains("no cross-mission lesson") =>
-            {
-                Some(summary)
-            }
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        capture_decisions.len(),
-        1,
-        "capture turn runs exactly once: {events:?}"
-    );
-
-    // The captured lesson file + index landed in the SAME report commit as
-    // report.md (not a separate commit).
-    let subject = raw_git(&root, &["log", "-1", "--format=%s"]);
-    assert_eq!(
-        subject.trim(),
-        format!("[kranz] mission report for {mission_id}")
-    );
-    let files = raw_git(&root, &["show", "--name-only", "--format=", "HEAD"]);
-    let files: Vec<&str> = files.lines().filter(|l| !l.trim().is_empty()).collect();
-    assert!(
-        files.contains(&format!(".kranz/lessons/{mission_id}.md").as_str()),
-        "{files:?}"
-    );
-    assert!(files.contains(&".kranz/lessons/index.md"), "{files:?}");
-    assert!(files.iter().any(|f| f.ends_with("report.md")), "{files:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -2604,7 +2558,8 @@ async fn preflight_flags_missing_program_and_ignores_present_ones() {
 
 /// run() emits exactly one `orchestrator.decision` summarizing preflight
 /// issues (before any worker spawns) when the contract names a missing
-/// program, and the mission still completes — preflight never blocks.
+/// program. Preflight never blocks; the final gate still fails the mission
+/// because command assertions are non-waivable.
 #[tokio::test(flavor = "multi_thread")]
 async fn run_emits_preflight_decision_when_issues_exist() {
     if !setup() {
@@ -2612,26 +2567,20 @@ async fn run_emits_preflight_decision_when_issues_exist() {
     }
     let (_dir, root) = init_repo();
 
-    // The one command assertion names a program that cannot resolve, so its
-    // final-gate command would fail — so we WAIVE it at the gate to let the
-    // mission complete (preflight is orthogonal to the gate; we are asserting
-    // the preflight decision fires, not the gate outcome).
+    // The one command assertion names a program that cannot resolve. Preflight
+    // warns; the final gate fails the mission (command assertions are not
+    // waivable — convert_findings is never consulted).
     let contract = vec![assertion(
         "a-1",
         "the check passes",
         Some("definitely-not-a-real-program-xyz --check"),
     )];
 
-    // Orchestrator turns: seed, judgement f-1-1, then the final-gate conversion
-    // turn waives the failing command assertion.
+    // Orchestrator turns: seed, judgement f-1-1. No conversion / lesson —
+    // MissionFailed ends the run at the final gate.
     let backend = Arc::new(MockBackend::with_scripts(vec![
         worker_pass(),
-        orch_script(vec![
-            dirty_tree_commit_as_is(),
-            judgement("complete", ""),
-            waive_reply("a-1", "command program unavailable in this environment"),
-            no_lesson(),
-        ]),
+        orch_script(vec![dirty_tree_commit_as_is(), judgement("complete", "")]),
     ]));
 
     let mut engine = make_engine(&backend, &root, test_cfg());
@@ -2641,7 +2590,7 @@ async fn run_emits_preflight_decision_when_issues_exist() {
         .await
         .expect("run must not hang")
         .unwrap();
-    assert_eq!(status, MissionStatus::Complete);
+    assert_eq!(status, MissionStatus::Failed);
 
     let paths = engine.paths().clone();
     drop(engine);

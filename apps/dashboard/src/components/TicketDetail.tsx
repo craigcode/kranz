@@ -52,6 +52,7 @@ export function TicketDetail({ slug }: { slug: string }) {
   const ticketError = useKranzStore((s) => s.ticketError);
   const draftTicket = useKranzStore((s) => s.draftTicket);
   const approveTicket = useKranzStore((s) => s.approveTicket);
+  const ticketBusySlug = useKranzStore((s) => s.ticketBusySlug);
   const missionId = useKranzStore((s) => s.missionId);
   const connection = useKranzStore((s) => s.connection);
   const events = useKranzStore((s) => s.events);
@@ -91,8 +92,9 @@ export function TicketDetail({ slug }: { slug: string }) {
   }
 
   const showApprove = ticket.state === 'review';
-  const approveDisabled = ticket.isBlocked;
-  const approveTitle = approveDisabled
+  const ticketBusy = ticketBusySlug !== null;
+  const approveDisabled = ticket.isBlocked || ticketBusy;
+  const approveTitle = ticket.isBlocked
     ? `blocked by ${ticket.blockedBy.join(', ')}`
     : 'queue for run';
 
@@ -140,7 +142,12 @@ export function TicketDetail({ slug }: { slug: string }) {
         )}
 
         <div className="composer-row">
-          <button type="button" className="btn-small" onClick={() => void draftTicket(slug)}>
+          <button
+            type="button"
+            className="btn-small"
+            disabled={ticketBusy}
+            onClick={() => void draftTicket(slug)}
+          >
             Draft
           </button>
           {showApprove && (

@@ -20,6 +20,7 @@ function renderCostEstimate(e: CostEstimate): string {
 export function PlanReview() {
   const review = useKranzStore((s) => s.planning.review);
   const approvedBranch = useKranzStore((s) => s.planning.approvedBranch);
+  const approving = useKranzStore((s) => s.planning.approving);
   const starting = useKranzStore((s) => s.planning.starting);
   const error = useKranzStore((s) => s.planning.error);
   const approvePlan = useKranzStore((s) => s.approvePlan);
@@ -130,8 +131,13 @@ export function PlanReview() {
         )}
         {approvedBranch === null ? (
           <div className="consent-row">
-            <button type="button" className="composer-send" onClick={approvePlan}>
-              Approve &amp; commit plan
+            <button
+              type="button"
+              className="composer-send"
+              disabled={approving}
+              onClick={approvePlan}
+            >
+              {approving ? 'Approving…' : 'Approve & commit plan'}
             </button>
             <button type="button" className="link-btn" onClick={planningBack}>
               back to conversation
