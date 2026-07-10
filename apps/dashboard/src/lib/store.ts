@@ -81,6 +81,13 @@ interface KranzStore {
   ticketError: string | null;
   /** Slug with an in-flight draftTicket/approveTicket POST, or null. */
   ticketBusySlug: string | null;
+  /** Slug of the ticket whose Draft action created the current mission
+   *  connection, or null. The ticket record's own missionId only catches up
+   *  on re-fetch (the server serializes undrafted tickets as missionId:null),
+   *  so TicketDetail uses this to show the fresh draft's live feed right
+   *  away — and only on that ticket's page. Cleared whenever the connection
+   *  moves to a mission the draft didn't create (connectMission/disconnect). */
+  draftingSlug: string | null;
   missionId: string | null;
   state: MissionState | null;
   events: MissionEvent[];
@@ -278,6 +285,7 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
     ticketsError: null,
     ticketError: null,
     ticketBusySlug: null,
+    draftingSlug: null,
     missionId: null,
     state: null,
     events: [],
@@ -314,7 +322,10 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
       set({ ticketError: null, ticketBusySlug: slug });
       try {
         const { missionId } = await api.draftTicket(slug);
+        // connectMission resets draftingSlug (any prior draft's claim is
+        // stale for a new connection), so record ours only after it runs.
         get().connectMission(missionId);
+        set({ draftingSlug: slug });
         await Promise.all([get().loadTickets(), get().loadMissions()]);
       } catch (err) {
         set({ ticketError: err instanceof Error ? err.message : String(err) });
@@ -359,6 +370,7 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
       socket?.close();
       socket = null;
       set({
+        draftingSlug: null,
         missionId: id,
         state: null,
         events: [],
@@ -437,6 +449,7 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
       socket?.close();
       socket = null;
       set({
+        draftingSlug: null,
         missionId: null,
         state: null,
         events: [],

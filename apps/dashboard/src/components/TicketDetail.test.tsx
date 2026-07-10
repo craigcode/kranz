@@ -11,11 +11,20 @@ vi.mock('../lib/api', async () => {
     api: {
       ticket: vi.fn(),
       tickets: vi.fn(),
+      missions: vi.fn(),
+      events: vi.fn(),
       draftTicket: vi.fn(),
       approveTicket: vi.fn(),
     },
   };
 });
+
+vi.mock('../lib/ws', () => ({
+  MissionSocket: class {
+    connect() {}
+    close() {}
+  },
+}));
 
 import { api } from '../lib/api';
 
@@ -33,6 +42,8 @@ function makeTicket(overrides: Partial<Ticket> = {}): Ticket {
     acceptanceHints: [],
     state: 'review',
     needsContext: [],
+    // Real wire shape: the server always emits the key, null when undrafted.
+    missionId: null,
     ...overrides,
   };
 }
@@ -45,6 +56,7 @@ function makeSummary(overrides: Partial<TicketSummary> = {}): TicketSummary {
     title: 'Dependency',
     blockedBy: [],
     isBlocked: false,
+    missionId: null,
     ...overrides,
   };
 }
@@ -55,9 +67,13 @@ beforeEach(() => {
   cleanup();
   vi.mocked(api.ticket).mockReset();
   vi.mocked(api.tickets).mockReset();
+  vi.mocked(api.missions).mockReset();
+  vi.mocked(api.events).mockReset();
   vi.mocked(api.draftTicket).mockReset();
   vi.mocked(api.approveTicket).mockReset();
   vi.mocked(api.tickets).mockResolvedValue([]);
+  vi.mocked(api.missions).mockResolvedValue([]);
+  vi.mocked(api.events).mockResolvedValue([]);
   useKranzStore.setState(
     {
       ...INITIAL_STORE_STATE,
@@ -65,6 +81,7 @@ beforeEach(() => {
       ticketsError: null,
       ticketError: null,
       ticketBusySlug: null,
+      draftingSlug: null,
       missionId: null,
     },
     true,
@@ -125,8 +142,11 @@ describe('TicketDetail', () => {
     expect(screen.queryByRole('button', { name: /Approve/ })).toBeFalsy();
   });
 
-  it('dispatches draftTicket when the Draft button is clicked', async () => {
-    vi.mocked(api.ticket).mockResolvedValueOnce(makeTicket());
+  it('shows draft progress after Draft is clicked on an undrafted ticket (missionId null)', async () => {
+    // The server serializes undrafted tickets as missionId:null; the local
+    // ticket record keeps that until re-fetched, so the feed must appear via
+    // the store's draftingSlug, not the ticket's own missionId.
+    vi.mocked(api.ticket).mockResolvedValueOnce(makeTicket({ missionId: null }));
     vi.mocked(api.draftTicket).mockResolvedValueOnce({ missionId: 'm-1' });
 
     render(<TicketDetail slug="fix-b" />);
@@ -136,5 +156,37 @@ describe('TicketDetail', () => {
 
     await screen.findByText(/Draft progress/);
     expect(api.draftTicket).toHaveBeenCalledWith('fix-b');
+    expect(useKranzStore.getState().draftingSlug).toBe('fix-b');
+  });
+
+  it('hides draft progress on an undrafted ticket when the live feed is an unrelated mission', async () => {
+    // Leak regression: a previously viewed mission's feed must not surface
+    // on a ticket page it does not belong to.
+    vi.mocked(api.ticket).mockResolvedValueOnce(makeTicket({ missionId: null }));
+    useKranzStore.setState({ missionId: 'm-other', draftingSlug: null });
+
+    render(<TicketDetail slug="fix-b" />);
+
+    await screen.findByText('Fix the second thing');
+    expect(screen.queryByText(/Draft progress/)).toBeFalsy();
+  });
+
+  it('hides draft progress when the current draft belongs to a different ticket', async () => {
+    vi.mocked(api.ticket).mockResolvedValueOnce(makeTicket({ missionId: null }));
+    useKranzStore.setState({ missionId: 'm-other', draftingSlug: 'other-ticket' });
+
+    render(<TicketDetail slug="fix-b" />);
+
+    await screen.findByText('Fix the second thing');
+    expect(screen.queryByText(/Draft progress/)).toBeFalsy();
+  });
+
+  it("shows draft progress when the ticket's missionId matches the connected mission", async () => {
+    vi.mocked(api.ticket).mockResolvedValueOnce(makeTicket({ missionId: 'm-9' }));
+    useKranzStore.setState({ missionId: 'm-9', draftingSlug: null });
+
+    render(<TicketDetail slug="fix-b" />);
+
+    await screen.findByText(/Draft progress/);
   });
 });

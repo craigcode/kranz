@@ -606,6 +606,65 @@ async fn primary_checkout_untouched_in_worktree_mode() {
     );
 }
 
+/// Regression guard: with `.kranz/missions/index.md` TRACKED and committed
+/// on the default branch (a repo with merged missions), a worktree-mode
+/// mission must not dirty any tracked file in the PRIMARY checkout.
+/// `approve_plan` once wrote the missions catalog into the primary runtime
+/// dir, leaving a tracked ` M .kranz/missions/index.md` behind that tripped
+/// the worktree-mode cleanliness sweep — the catalog is committed on the
+/// mission branch only, never rewritten on the primary.
+#[tokio::test(flavor = "multi_thread")]
+async fn tracked_missions_index_not_dirtied_in_primary_in_worktree_mode() {
+    let Some((_dir, root)) = mission_init_repo() else {
+        return;
+    };
+    // Track the missions catalog on main, as in a repo with merged missions.
+    let index_rel = ".kranz/missions/index.md";
+    let index_path = root.join(index_rel);
+    std::fs::create_dir_all(index_path.parent().unwrap()).unwrap();
+    let seeded_index = "# Missions\n\n- 2026-01-01 — earlier mission ([plan](m-old/plan.md))\n";
+    std::fs::write(&index_path, seeded_index).unwrap();
+    raw_git(&root, &["add", index_rel]);
+    raw_git(&root, &["commit", "-m", "track missions catalog"]);
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script_complete_no_lesson(),
+    ]));
+    let backend_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend) as Arc<dyn AgentBackend>;
+    let mut engine =
+        MissionEngine::create(backend_dyn, &root, GOAL, worktree_cfg()).expect("create engine");
+    engine.seed_worker_auth_verdict_for_test(AuthVerdict::Inconclusive);
+    engine.approve_plan(one_feature_plan()).unwrap();
+
+    // The regression fired at approval time, so pin approve_plan itself
+    // before running the rest of the mission.
+    assert_eq!(
+        raw_git(&root, &["diff", "--name-only", "HEAD"]).trim(),
+        "",
+        "approve_plan must not modify tracked files in the primary checkout"
+    );
+
+    let status = timeout(TokioDuration::from_secs(60), engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+
+    // No tracked file in the primary checkout was modified by the whole
+    // mission (untracked runtime twins like plan.json are expected and fine).
+    assert_eq!(
+        raw_git(&root, &["diff", "--name-only", "HEAD"]).trim(),
+        "",
+        "the mission must not modify tracked files in the primary checkout"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&index_path).unwrap(),
+        seeded_index,
+        "the tracked missions catalog in the primary checkout must be byte-identical"
+    );
+}
+
 /// After the mission, the mission branch tip carries the committed plan.json
 /// and report.md (and the engine's approval/report commits), while the
 /// primary HEAD is unchanged from before the mission — and human-readable

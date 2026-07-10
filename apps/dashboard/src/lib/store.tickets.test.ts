@@ -35,6 +35,7 @@ function makeSummary(slug: string): TicketSummary {
     title: `Ticket ${slug}`,
     blockedBy: [],
     isBlocked: false,
+    missionId: null,
   };
 }
 
@@ -154,11 +155,28 @@ describe('draftTicket', () => {
 
     expect(api.draftTicket).toHaveBeenCalledWith('a');
     expect(useKranzStore.getState().missionId).toBe('m-42');
+    // The drafting slug survives draftTicket's own connectMission, so
+    // TicketDetail can attribute the fresh feed to this ticket.
+    expect(useKranzStore.getState().draftingSlug).toBe('a');
     expect(api.tickets).toHaveBeenCalledOnce();
     expect(api.missions).toHaveBeenCalledOnce();
     expect(useKranzStore.getState().tickets).toEqual(rows);
     expect(useKranzStore.getState().missions).toEqual(missions);
     expect(useKranzStore.getState().ticketBusySlug).toBeNull();
+  });
+
+  it('clears draftingSlug when an unrelated mission connects or on disconnect', async () => {
+    vi.mocked(api.draftTicket).mockResolvedValueOnce({ missionId: 'm-42' });
+    vi.mocked(api.tickets).mockResolvedValueOnce([]);
+    vi.mocked(api.missions).mockResolvedValueOnce([]);
+    await useKranzStore.getState().draftTicket('a');
+    expect(useKranzStore.getState().draftingSlug).toBe('a');
+
+    useKranzStore.getState().connectMission('m-other');
+    expect(useKranzStore.getState().draftingSlug).toBeNull();
+
+    useKranzStore.getState().disconnect();
+    expect(useKranzStore.getState().draftingSlug).toBeNull();
   });
 
   it('sets ticketError on failure without touching missionId', async () => {

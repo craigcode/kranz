@@ -2238,6 +2238,61 @@ mod tests {
         }
     }
 
+    // --- strip_ci_prefix (UTF-8 regression) ---------------------------------
+
+    #[test]
+    fn strip_ci_prefix_multibyte_mid_char_cut_returns_none_without_panicking() {
+        // Regression: `split_at(prefix.len())` panicked when the prefix's byte
+        // length fell inside a multibyte char — "статус" has char boundaries
+        // at 0,2,4,… while "new".len() == 3 — and the panic killed the whole
+        // bridge task. The boundary guard must refuse the cut instead.
+        assert_eq!(strip_ci_prefix("статус", "new"), None);
+        // Longer multibyte text, same mid-char cut.
+        assert_eq!(strip_ci_prefix("статус сборки", "new"), None);
+    }
+
+    #[test]
+    fn strip_ci_prefix_multibyte_shorter_or_non_matching_returns_none() {
+        // Shorter than the prefix in bytes → refused by the length guard.
+        assert_eq!(strip_ci_prefix("ст", "status"), None);
+        // "стату" is 10 bytes and "status".len() == 6 lands ON a char
+        // boundary, so the cut itself is safe — the head just doesn't match.
+        assert_eq!(strip_ci_prefix("стату", "status"), None);
+        assert_eq!(strip_ci_prefix("статус", "status"), None);
+    }
+
+    #[test]
+    fn strip_ci_prefix_ascii_prefix_with_multibyte_rest_still_matches() {
+        // The boundary guard must not over-reject: an ASCII subcommand
+        // followed by multibyte arguments is valid input.
+        assert_eq!(strip_ci_prefix("status статус", "status"), Some(" статус"));
+        assert_eq!(strip_ci_prefix("STATUS статус", "status"), Some(" статус"));
+    }
+
+    #[test]
+    fn slash_multibyte_text_routes_to_help_without_panicking() {
+        // Regression: `/kranz статус` panicked inside strip_ci_prefix (byte
+        // split mid-char) instead of falling through — multibyte text is just
+        // an unknown subcommand and must land on help like any other typo.
+        for text in ["статус", "стату", "новая миссия"] {
+            let env = json!({
+                "type": "slash_commands",
+                "envelope_id": "env-mb",
+                "payload": { "command": "/kranz", "text": text,
+                             "response_url": "https://hooks.slack/mb" }
+            });
+            let routed = route(&env, &lookup_none());
+            assert_eq!(routed.envelope_id.as_deref(), Some("env-mb"), "text={text:?}");
+            assert_eq!(
+                routed.action,
+                Action::Help {
+                    response_url: Some("https://hooks.slack/mb".into())
+                },
+                "text={text:?} should route to help, not panic"
+            );
+        }
+    }
+
     // --- /kranz config -----------------------------------------------------
 
     /// Build a `/kranz config <text>` slash envelope.

@@ -1281,6 +1281,72 @@ async fn ws_rejects_missing_or_foreign_origin() {
     assert!(foreign.is_err(), "foreign Origin must be rejected");
 }
 
+/// Off-loopback (`--insecure-lan`) serves: the browser sends the page's own
+/// `http://<lan-ip>:<port>` Origin on the SAME-origin WS handshake, and
+/// native clients send no Origin at all — both must upgrade once the read
+/// token is presented (`?token=`, since `new WebSocket` cannot set headers).
+/// Regression: the upgrade once kept the loopback-only Origin allowlist,
+/// 403ing every LAN live view. The LAN posture lives in the router, so it
+/// is exercised here over a local listener.
+#[tokio::test]
+async fn ws_lan_mode_accepts_ip_origin_and_native_clients_with_token() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_root = tmp.path().to_path_buf();
+    let _paths = seed_mission(&repo_root);
+    let token = "lan-test-token";
+    let host = std::sync::Arc::new(kranz_server::MissionHost::new(repo_root));
+    let app = kranz_server::router_with_shared_host_and_bind(
+        host,
+        None,
+        Some(token.to_string()),
+        Some(4560),
+        true, // non-loopback bind: read token required, LAN origins allowed
+    );
+    let addr = spawn_server(app).await;
+    let url = format!("ws://{addr}/api/missions/{MISSION_ID}/ws?token={token}");
+
+    // Same-origin LAN dashboard: IP-literal Origin + query token.
+    let lan_origin = tokio::time::timeout(
+        WAIT,
+        connect_async(ws_request(&url, Some("http://192.168.1.5:4560"))),
+    )
+    .await
+    .unwrap();
+    assert!(
+        lan_origin.is_ok(),
+        "IP-literal Origin must upgrade off loopback: {:?}",
+        lan_origin.err()
+    );
+
+    // Native (non-browser) clients send no Origin; the token authenticates.
+    let native = tokio::time::timeout(WAIT, connect_async(&url))
+        .await
+        .unwrap();
+    assert!(native.is_ok(), "missing Origin must upgrade off loopback");
+
+    // DNS-named origins stay out (rebinding pages)...
+    let dns = tokio::time::timeout(
+        WAIT,
+        connect_async(ws_request(&url, Some("http://evil.example:4560"))),
+    )
+    .await
+    .unwrap();
+    assert!(dns.is_err(), "DNS-named Origin must be rejected");
+
+    // ...and the read token stays required on the upgrade.
+    let untokened_url = format!("ws://{addr}/api/missions/{MISSION_ID}/ws");
+    let untokened = tokio::time::timeout(
+        WAIT,
+        connect_async(ws_request(&untokened_url, Some("http://192.168.1.5:4560"))),
+    )
+    .await
+    .unwrap();
+    assert!(
+        untokened.is_err(),
+        "upgrade without the read token must be rejected"
+    );
+}
+
 #[tokio::test]
 async fn ws_unknown_mission_is_rejected() {
     let (_tmp, _repo_root, _paths, app) = fixture();

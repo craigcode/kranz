@@ -8,7 +8,7 @@
 
 use kranz_engine::error::EngineError;
 use kranz_engine::git_ops::{CommitInfo, GitRepo, MergeOutcome};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Once;
 use tempfile::TempDir;
@@ -319,6 +319,115 @@ fn commit_paths_is_idempotent_when_nothing_staged() {
         .commit_paths(&[Path::new("a.txt")], "add a (replay)")
         .expect("re-committing identical content must not error");
     assert_eq!(first, second, "head must not advance on a no-op re-commit");
+}
+
+/// A staged rename (`git mv a b`) reports BOTH sides: the destination and
+/// the source. Dropping the source made `commit_dirty_paths` commit only the
+/// destination, leaving the staged `D a` behind — the engine reported the
+/// tree resolved while it was still dirty.
+#[test]
+fn dirty_paths_reports_both_sides_of_a_staged_rename() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, _) = seeded_repo();
+    write(&dir, "a.txt", "content\n");
+    repo.add_all_and_commit("add a.txt").unwrap();
+
+    raw_git(dir.path(), &["mv", "a.txt", "b.txt"]);
+
+    let dirty = repo.dirty_paths().unwrap();
+    assert!(
+        dirty.contains(&PathBuf::from("b.txt")),
+        "rename destination missing from dirty set: {dirty:?}"
+    );
+    assert!(
+        dirty.contains(&PathBuf::from("a.txt")),
+        "rename SOURCE missing from dirty set: {dirty:?}"
+    );
+}
+
+/// The checkpoint path end-to-end: after a worker's staged `git mv`,
+/// `commit_dirty_paths` consumes the WHOLE rename — porcelain status is
+/// empty afterwards, and the committed tree carries the new path only.
+#[test]
+fn commit_dirty_paths_commits_a_staged_rename_leaving_a_clean_tree() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, _) = seeded_repo();
+    write(&dir, "a.txt", "content\n");
+    let base = repo.add_all_and_commit("add a.txt").unwrap();
+
+    raw_git(dir.path(), &["mv", "a.txt", "b.txt"]);
+
+    let sha = repo.commit_dirty_paths("checkpoint the rename").unwrap();
+    assert_ne!(sha, base, "the rename must land in a real commit");
+    assert_eq!(repo.head_sha().unwrap(), sha);
+    let status = raw_git(dir.path(), &["status", "--porcelain"]);
+    assert!(
+        status.trim().is_empty(),
+        "no staged `D a.txt` may be left behind: {status}"
+    );
+    let tree = raw_git(dir.path(), &["ls-tree", "-r", "--name-only", "HEAD"]);
+    assert!(tree.lines().any(|l| l == "b.txt"), "tree: {tree}");
+    assert!(!tree.lines().any(|l| l == "a.txt"), "tree: {tree}");
+}
+
+/// Same as above with a SPACE in the rename source — the porcelain `-z`
+/// oldpath record is unquoted, so the space must survive parsing intact.
+#[test]
+fn commit_dirty_paths_commits_a_staged_rename_with_space_in_source() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, _) = seeded_repo();
+    write(&dir, "old name.txt", "content\n");
+    repo.add_all_and_commit("add file with a space").unwrap();
+
+    raw_git(dir.path(), &["mv", "old name.txt", "new.txt"]);
+
+    let dirty = repo.dirty_paths().unwrap();
+    assert!(
+        dirty.contains(&PathBuf::from("new.txt")),
+        "rename destination missing from dirty set: {dirty:?}"
+    );
+    assert!(
+        dirty.contains(&PathBuf::from("old name.txt")),
+        "spaced rename source missing from dirty set: {dirty:?}"
+    );
+
+    repo.commit_dirty_paths("checkpoint the spaced rename")
+        .unwrap();
+    let status = raw_git(dir.path(), &["status", "--porcelain"]);
+    assert!(
+        status.trim().is_empty(),
+        "no staged deletion may be left behind: {status}"
+    );
+}
+
+/// Guard for the add-step filter the rename fix introduced: a plain UNSTAGED
+/// working-tree deletion (gone from disk, still in the index) must still be
+/// staged and committed by `commit_dirty_paths`.
+#[test]
+fn commit_dirty_paths_still_stages_an_unstaged_deletion() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, _) = seeded_repo();
+    write(&dir, "doomed.txt", "content\n");
+    repo.add_all_and_commit("add doomed.txt").unwrap();
+
+    std::fs::remove_file(dir.path().join("doomed.txt")).unwrap();
+
+    repo.commit_dirty_paths("checkpoint the deletion").unwrap();
+    let status = raw_git(dir.path(), &["status", "--porcelain"]);
+    assert!(
+        status.trim().is_empty(),
+        "the deletion must be committed: {status}"
+    );
+    let tree = raw_git(dir.path(), &["ls-tree", "-r", "--name-only", "HEAD"]);
+    assert!(!tree.lines().any(|l| l == "doomed.txt"), "tree: {tree}");
 }
 
 #[test]

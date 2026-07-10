@@ -54,6 +54,7 @@ export function TicketDetail({ slug }: { slug: string }) {
   const approveTicket = useKranzStore((s) => s.approveTicket);
   const ticketBusySlug = useKranzStore((s) => s.ticketBusySlug);
   const missionId = useKranzStore((s) => s.missionId);
+  const draftingSlug = useKranzStore((s) => s.draftingSlug);
   const connection = useKranzStore((s) => s.connection);
   const events = useKranzStore((s) => s.events);
   const missionState = useKranzStore((s) => s.state);
@@ -98,12 +99,13 @@ export function TicketDetail({ slug }: { slug: string }) {
     ? `blocked by ${ticket.blockedBy.join(', ')}`
     : 'queue for run';
   // Only show draft progress when the live feed belongs to THIS ticket —
-  // matching ticket.missionId, or no linked mission yet (fresh draft before
-  // the ticket record catches up). Hide when the feed is for a different
-  // mission so a previously viewed mission cannot leak here.
+  // matching ticket.missionId, or a mission this ticket's own Draft action
+  // just created (draftingSlug: the local ticket record still says
+  // missionId:null until it is re-fetched). Hide when the feed is for a
+  // different mission so a previously viewed mission cannot leak here.
   const showDraftProgress =
     missionId !== null &&
-    (ticket.missionId === undefined || ticket.missionId === missionId);
+    (ticket.missionId === missionId || draftingSlug === ticket.slug);
 
   return (
     <div className="picker">

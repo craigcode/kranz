@@ -44,13 +44,10 @@ pub(crate) async fn ws_handler(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let Some(origin) = headers
+    let origin = headers
         .get(header::ORIGIN)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return StatusCode::FORBIDDEN.into_response();
-    };
-    if !crate::origin_allowed(origin, server.bind_port) {
+        .and_then(|value| value.to_str().ok());
+    if !crate::ws_origin_allowed(origin, server.bind_port, server.bind_is_loopback) {
         return StatusCode::FORBIDDEN.into_response();
     }
 

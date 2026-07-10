@@ -243,14 +243,22 @@ impl GitRepo {
                 continue;
             }
             paths.push(PathBuf::from(path));
-            // Rename/copy: consume the following oldpath record without
-            // treating it as another dirty path.
+            // Rename/copy: the record continues as `\0oldpath\0`. The source
+            // path is part of the same change — a staged `git mv a b` must
+            // report BOTH `b` and `a`, or a checkpoint commit scoped to the
+            // dirty set commits only `b` and leaves the staged `D a` behind —
+            // so it joins the dirty set rather than being skipped.
             if status.contains('R') || status.contains('C') {
+                let old_start = i;
                 while i < bytes.len() && bytes[i] != 0 {
                     i += 1;
                 }
+                let old = std::str::from_utf8(&bytes[old_start..i]).unwrap_or("");
                 if i < bytes.len() {
                     i += 1; // skip NUL after oldpath
+                }
+                if !old.is_empty() {
+                    paths.push(PathBuf::from(old));
                 }
             }
         }
@@ -298,9 +306,19 @@ impl GitRepo {
         }
         let path_args = paths.iter().map(|p| p.as_os_str().to_os_string());
 
-        let mut add: Vec<OsString> = vec!["add".into(), "--".into()];
-        add.extend(path_args.clone());
-        self.run_os(&add)?;
+        // `git add` fatals ("pathspec ... did not match any files") on a path
+        // that is gone from BOTH the working tree and the index — exactly a
+        // rename/copy source whose deletion `git mv` already staged. Such a
+        // path needs no staging (the commit pathspec below still carries the
+        // staged deletion into the commit), so it is left out of the add. A
+        // path merely deleted from the working tree but still in the index
+        // stays in: `git add` stages that removal.
+        let add_paths = self.addable_paths(paths)?;
+        if !add_paths.is_empty() {
+            let mut add: Vec<OsString> = vec!["add".into(), "--".into()];
+            add.extend(add_paths.iter().map(|p| p.as_os_str().to_os_string()));
+            self.run_os(&add)?;
+        }
 
         // Idempotent: if staging these pathspecs produced nothing (e.g. a
         // crash-replayed re-approval that rewrites byte-identical files), skip
@@ -323,6 +341,49 @@ impl GitRepo {
         self.run_os(&commit)?;
 
         self.head_sha()
+    }
+
+    /// The subset of `paths` that `git add` can act on: present in the
+    /// working tree (`symlink_metadata`, so a dangling symlink still counts)
+    /// or still known to the index (a working-tree deletion whose removal
+    /// `git add` stages). A path in NEITHER — e.g. the source of an
+    /// already-staged rename — would make `git add` fail with "pathspec did
+    /// not match any files", and has nothing left to stage anyway.
+    fn addable_paths<'a>(&self, paths: &[&'a Path]) -> Result<Vec<&'a Path>> {
+        let missing: Vec<&Path> = paths
+            .iter()
+            .copied()
+            .filter(|p| {
+                let full = if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    self.root.join(p)
+                };
+                std::fs::symlink_metadata(full).is_err()
+            })
+            .collect();
+        if missing.is_empty() {
+            return Ok(paths.to_vec());
+        }
+        // One batched index probe for the disk-missing subset. `git ls-files`
+        // exits 0 with empty output for pathspecs that match nothing, and
+        // prints matches relative to the repo root.
+        let mut ls: Vec<OsString> = vec!["ls-files".into(), "-z".into(), "--".into()];
+        ls.extend(missing.iter().map(|p| p.as_os_str().to_os_string()));
+        let in_index: std::collections::HashSet<PathBuf> = self
+            .run_os(&ls)?
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .collect();
+        Ok(paths
+            .iter()
+            .copied()
+            .filter(|p| {
+                let rel = p.strip_prefix(&self.root).unwrap_or(p);
+                std::fs::symlink_metadata(self.root.join(rel)).is_ok() || in_index.contains(rel)
+            })
+            .collect())
     }
 
     /// Commits reachable from `to` but not `from` (`from..to`), oldest first.

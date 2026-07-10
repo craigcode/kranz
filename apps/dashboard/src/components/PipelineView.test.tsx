@@ -32,6 +32,7 @@ function makeTicket(overrides: Partial<TicketSummary> = {}): TicketSummary {
     title: 'Fix the thing',
     blockedBy: [],
     isBlocked: false,
+    missionId: null,
     ...overrides,
   };
 }
@@ -324,6 +325,7 @@ describe('PipelineView', () => {
       title: 'Polish the thing',
       blockedBy: [],
       isBlocked: false,
+      missionId: null,
     });
 
     render(<PipelineView />);

@@ -76,7 +76,7 @@ describe('getJson / postJson non-JSON guard', () => {
   });
 });
 
-describe('postJson 401 token gate', () => {
+describe('401 token gate', () => {
   beforeEach(() => {
     vi.stubGlobal('fetch', vi.fn());
     vi.mocked(resolveToken).mockReturnValue('stale-token');
@@ -91,7 +91,13 @@ describe('postJson 401 token gate', () => {
     vi.clearAllMocks();
   });
 
-  it('awaits a fresh token after 401 then retries the POST', async () => {
+  /** The x-kranz-token header sent on the nth fetch call (0-based). */
+  function sentToken(call: number): string | undefined {
+    const init = vi.mocked(fetch).mock.calls[call][1];
+    return (init?.headers as Record<string, string> | undefined)?.['x-kranz-token'];
+  }
+
+  it('postJson awaits a fresh token after 401 then retries with the fresh header', async () => {
     vi.mocked(fetch)
       .mockResolvedValueOnce(unauthorizedResponse())
       .mockResolvedValueOnce(jsonResponse({ ok: true }));
@@ -100,5 +106,21 @@ describe('postJson 401 token gate', () => {
 
     expect(awaitToken).toHaveBeenCalledOnce();
     expect(fetch).toHaveBeenCalledTimes(2);
+    expect(sentToken(0)).toBe('stale-token');
+    // The retry must re-resolve the token — not replay the rejected one.
+    expect(sentToken(1)).toBe('fresh-token');
+  });
+
+  it('getJson awaits a fresh token after 401 then retries with the fresh header', async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(unauthorizedResponse())
+      .mockResolvedValueOnce(jsonResponse({ ok: true }));
+
+    await expect(getJson('/api/missions')).resolves.toEqual({ ok: true });
+
+    expect(awaitToken).toHaveBeenCalledOnce();
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(sentToken(0)).toBe('stale-token');
+    expect(sentToken(1)).toBe('fresh-token');
   });
 });

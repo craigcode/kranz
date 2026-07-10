@@ -74,7 +74,9 @@ export interface TicketSummary {
   title: string;
   blockedBy: string[];
   isBlocked: boolean;
-  missionId?: string;
+  /** Joined mission id. The server always emits the key (Rust
+   *  `Option<String>`): null when the ticket has never been drafted. */
+  missionId: string | null;
   /** Ancestry-probe bit: joined mission's branch tip is an ancestor of the
    *  live base branch tip. `null`/absent when there's no joined mission or
    *  the probe found nothing to merge yet. */
@@ -95,7 +97,9 @@ export interface Ticket {
   acceptanceHints: string[];
   state: TicketState;
   needsContext: string[];
-  missionId?: string;
+  /** Joined mission id. The server always emits the key (Rust
+   *  `Option<String>`): null when the ticket has never been drafted. */
+  missionId: string | null;
   merged?: boolean | null;
 }
 

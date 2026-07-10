@@ -292,6 +292,22 @@ fn slash_pause_resume_work_bad_input_routes_to_help() {
 }
 
 #[test]
+fn slash_multibyte_text_routes_to_help_not_panic() {
+    // Regression: `/kranz статус` used to panic inside the prefix matcher
+    // (byte-length split_at landed mid-char in the UTF-8 text), killing the
+    // bridge task. Multibyte text is an unknown subcommand → help.
+    for text in ["статус", "стату"] {
+        assert_eq!(
+            route(&steer_env(text), &no_lookup()).action,
+            Action::Help {
+                response_url: Some("https://hooks.slack/steer".into())
+            },
+            "text={text:?} should route to help"
+        );
+    }
+}
+
+#[test]
 fn app_home_opened_fixture_routes_to_app_home() {
     let routed = route(&fixture("app_home_opened.json"), &no_lookup());
     assert_eq!(

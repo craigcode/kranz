@@ -43,6 +43,7 @@ describe('NewTicket', () => {
       title: 'Fix the login bug',
       blockedBy: [],
       isBlocked: false,
+      missionId: null,
     });
 
     render(<NewTicket />);
@@ -80,6 +81,7 @@ describe('NewTicket', () => {
       title: 'Fix the login bug',
       blockedBy: [],
       isBlocked: false,
+      missionId: null,
     });
 
     render(<NewTicket />);

@@ -35,7 +35,7 @@ function buildRows(tickets: TicketSummary[], missions: MissionSummary[]): Row[] 
   const consumedMissionIds = new Set<string>();
 
   const ticketRows: Row[] = tickets.map((t) => {
-    const mission = t.missionId !== undefined ? missionsById.get(t.missionId) : undefined;
+    const mission = t.missionId !== null ? missionsById.get(t.missionId) : undefined;
     if (mission !== undefined) consumedMissionIds.add(mission.id);
     return {
       key: `ticket-${t.slug}`,
@@ -48,7 +48,7 @@ function buildRows(tickets: TicketSummary[], missions: MissionSummary[]): Row[] 
       title: t.title,
       isBlocked: t.isBlocked,
       blockedBy: t.blockedBy,
-      missionId: t.missionId,
+      missionId: t.missionId ?? undefined,
       slug: t.slug,
       missionCreatedAt: mission?.createdAt,
     };

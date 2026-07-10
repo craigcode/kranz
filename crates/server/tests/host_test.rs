@@ -838,6 +838,106 @@ async fn non_loopback_bind_requires_token_on_gets() {
     assert_eq!(status, StatusCode::OK);
 }
 
+/// Real LAN clients present `Host: <lan-ip>:<port>` — the Host gate must
+/// pass them through to the token gate off loopback (and keep rejecting
+/// them on loopback binds). Regression: the gate once accepted only
+/// localhost Hosts, making the whole `--insecure-lan` surface unreachable —
+/// invisible to Host-less `oneshot` requests, so these set Host explicitly.
+#[tokio::test]
+async fn lan_host_header_reaches_token_gate_off_loopback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    seed_mission_log(&root, "m-01");
+    let host = Arc::new(kranz_server::MissionHost::new(root));
+    let lan_app = kranz_server::router_with_shared_host_and_bind(
+        host.clone(),
+        None,
+        Some(TOKEN.to_string()),
+        Some(4560),
+        true, // non-loopback bind
+    );
+
+    let lan_get = |token: Option<&'static str>| {
+        let mut builder = Request::builder()
+            .uri("/api/missions/m-01/state")
+            .header("host", "192.168.1.5:4560");
+        if let Some(token) = token {
+            builder = builder.header("x-kranz-token", token);
+        }
+        builder.body(Body::empty()).unwrap()
+    };
+
+    let response = lan_app.clone().oneshot(lan_get(Some(TOKEN))).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "LAN Host + token must reach the mission state"
+    );
+
+    let response = lan_app.clone().oneshot(lan_get(None)).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "LAN Host without the token stops at the token gate, not the Host gate"
+    );
+
+    // Loopback binds keep the strict Host allowlist (DNS-rebinding guard).
+    let loopback_app = kranz_server::router_with_shared_host_and_bind(
+        host,
+        None,
+        Some(TOKEN.to_string()),
+        Some(4560),
+        false,
+    );
+    let response = loopback_app.oneshot(lan_get(Some(TOKEN))).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "loopback binds must keep rejecting non-local Hosts"
+    );
+}
+
+/// `?token=` exists only for the browser WS upgrade, so it is honored solely
+/// on token-gated reads: a POST carrying the token in the URL (shell
+/// history, proxy logs) must NOT be accepted.
+#[tokio::test]
+async fn query_token_is_rejected_on_posts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    seed_mission_log(&root, "m-01");
+    let host = Arc::new(kranz_server::MissionHost::new(root));
+    let app = kranz_server::router_with_shared_host_and_bind(
+        host,
+        None,
+        Some(TOKEN.to_string()),
+        Some(4560),
+        true,
+    );
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/missions/m-01/control?token={TOKEN}"),
+        None,
+        json!({ "command": "pause" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "got: {body}");
+
+    // The same POST with the header token clears the gate.
+    let (status, _) = post_json(
+        &app,
+        "/api/missions/m-01/control",
+        Some(TOKEN),
+        json!({ "command": "pause" }),
+    )
+    .await;
+    assert_ne!(status, StatusCode::UNAUTHORIZED);
+
+    // GETs keep the query form — the browser WebSocket depends on it.
+    let (status, _) = get_json(&app, &format!("/api/missions/m-01/state?token={TOKEN}")).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
 #[tokio::test]
 async fn revision_routes_expose_diff_and_enqueue_decisions() {
     let tmp = tempfile::tempdir().unwrap();
