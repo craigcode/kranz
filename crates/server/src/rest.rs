@@ -8,7 +8,6 @@ use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
-use kranz_engine::control;
 use kranz_engine::cost;
 use kranz_engine::event_log::EventLog;
 use kranz_engine::events::{Event, EventKind};
@@ -17,6 +16,7 @@ use kranz_engine::orchestrator::render_plan_markdown;
 use kranz_engine::paths::MissionPaths;
 use kranz_engine::reducer;
 use kranz_engine::types::{ControlCommand, MissionState, MissionStatus};
+use kranz_engine::{config, control};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -282,6 +282,11 @@ pub(crate) async fn post_control(
     }
     let command: ControlCommand = serde_json::from_slice(&body)
         .map_err(|e| ApiError::bad_request(format!("invalid ControlCommand body: {e}")))?;
+    if let ControlCommand::ConfigChange { patch } = &command {
+        let events = EventLog::read_events(&paths.events_file())?;
+        let state = reducer::fold(&events)?;
+        config::apply_validated_patch(&state.config, patch)?;
+    }
     control::enqueue(&paths, &command)?;
     Ok((StatusCode::ACCEPTED, Json(json!({ "queued": true }))))
 }

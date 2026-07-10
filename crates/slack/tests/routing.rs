@@ -218,6 +218,7 @@ fn slash_command_config_fixture_routes_to_config() {
         Action::Config {
             mission_id: None,
             role: "worker".into(),
+            backend: None,
             model: "sonnet".into(),
             effort: Some("high".into()),
             user_id: Some("U0263M3QW".into()),

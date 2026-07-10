@@ -669,6 +669,9 @@ impl MissionHost {
             MergeReport::GateFailed { gate, output } => Err(ApiError::unprocessable(
                 kranz_engine::scrub::scrub(&format!("{gate} failed:\n{output}")),
             )),
+            MergeReport::GateConfigInvalid { detail } => Err(ApiError::unprocessable(format!(
+                "refusing to merge without a valid repo gate suite: {detail}"
+            ))),
             MergeReport::SecretScanFailed { findings } => Err(ApiError::unprocessable(format!(
                 "secret scan failed; add a fingerprint to {} only for a reviewed false positive:\n{}",
                 kranz_engine::scrub::SECRET_ALLOWLIST_PATH,

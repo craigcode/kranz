@@ -709,27 +709,29 @@ fn seed_worker_env(
     // logs which HOME branch was taken and the non-sensitive reason, so a
     // fallback to the real HOME is never silent. Never logs secret/credential
     // values — only the verdict and the decision.
-    if relocated {
-        tracing::info!(
-            session_id = %spec.session_id,
-            decision = "relocated",
-            auth_verdict = ?auth_verdict,
-            "worker HOME relocated to verified scratch env"
-        );
+    let (decision, reason) = if relocated {
+        (
+            "relocated",
+            "auth preflight confirmed and scratch HOME seeded",
+        )
     } else {
         let reason = if auth_verdict == AuthVerdict::Authenticated {
             "scratch HOME seeding failed after a successful auth preflight"
         } else {
             "auth preflight did not confirm authentication in the scratch env"
         };
-        tracing::info!(
-            session_id = %spec.session_id,
-            decision = "inherited",
-            auth_verdict = ?auth_verdict,
-            reason,
-            "worker HOME inherited from the real environment (loud fail-safe)"
-        );
-    }
+        ("inherited", reason)
+    };
+    // One callsite for both decisions keeps this operational event consistent
+    // and makes subscriber behavior independent of which branch registered
+    // its callsite first.
+    tracing::info!(
+        session_id = %spec.session_id,
+        decision,
+        auth_verdict = ?auth_verdict,
+        reason,
+        "worker HOME isolation decision"
+    );
 
     if let Ok(repo) = crate::git_ops::GitRepo::open(&spec.cwd) {
         if let Ok((name, email)) = repo.resolved_identity() {
@@ -1282,6 +1284,16 @@ mod tests {
     }
 
     impl tracing::Subscriber for CapturingSubscriber {
+        fn register_callsite(
+            &self,
+            _metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            // Other parallel tests emit through these same static callsites
+            // without a subscriber. Mark them always-interesting while this
+            // dispatcher is installed so the global callsite cache cannot
+            // make this capture test order-dependent.
+            tracing::subscriber::Interest::always()
+        }
         fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
             true
         }
@@ -1318,6 +1330,32 @@ mod tests {
     /// reason, and that no secret/credential value is ever logged.
     #[test]
     fn worker_auth_decision_is_recorded() {
+        const CAPTURE_CHILD: &str = "KRANZ_WORKER_AUTH_CAPTURE_CHILD";
+        if std::env::var_os(CAPTURE_CHILD).is_none() {
+            // `tracing` callsite interest is process-global even when the
+            // subscriber is thread-local. Parallel tests exercising the same
+            // static info! callsite can therefore suppress this capture. Run
+            // the actual assertion in this test binary with one test thread;
+            // the env marker prevents recursion.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "runner::tests::worker_auth_decision_is_recorded",
+                    "--exact",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CAPTURE_CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated tracing capture failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
         let repo_dir = tempfile::tempdir().unwrap();
         assert!(git(repo_dir.path(), &["init", "-q"]).status.success());
         let real_home = tempfile::tempdir().unwrap();
@@ -1334,9 +1372,9 @@ mod tests {
         let subscriber = CapturingSubscriber {
             events: events.clone(),
         };
+        let _guard = tracing::subscriber::set_default(subscriber);
 
         // Authenticated branch: must record "relocated".
-        let guard = tracing::subscriber::set_default(subscriber);
         let mut spec = minimal_worker_spec(repo_dir.path().to_path_buf());
         seed_worker_env(
             &mut spec,
@@ -1348,8 +1386,6 @@ mod tests {
             spec.env.contains_key("HOME"),
             "sanity: Authenticated verdict should have relocated HOME"
         );
-        drop(guard);
-
         {
             let recorded = events.lock().unwrap();
             assert!(
@@ -1371,18 +1407,12 @@ mod tests {
         // non-sensitive reason.
         for verdict in [AuthVerdict::Unauthenticated, AuthVerdict::Inconclusive] {
             events.lock().unwrap().clear();
-            let subscriber = CapturingSubscriber {
-                events: events.clone(),
-            };
-            let guard = tracing::subscriber::set_default(subscriber);
             let mut spec = minimal_worker_spec(repo_dir.path().to_path_buf());
             seed_worker_env(&mut spec, verdict, Some(real_home.path()), None);
             assert!(
                 !spec.env.contains_key("HOME"),
                 "sanity: {verdict:?} must not relocate HOME"
             );
-            drop(guard);
-
             let recorded = events.lock().unwrap();
             assert!(
                 !recorded.is_empty(),

@@ -32,3 +32,16 @@ never executed end-to-end — pair this with a live-verify runbook.
 - Per-mission override supported; omitted == today's all-claude default.
 - cd apps/dashboard && npx tsc --noEmit && npm run test && npm run build,
   and cargo test --workspace, all pass.
+
+## Receipt — 2026-07-10
+
+- Dashboard new-mission overrides and the live mission model panel expose
+  `claude | codex | droid`, model, and effort per role. The worker editor also
+  exposes the explicit below-default-model mission opt-in.
+- Slack's config modal carries the same backend picker; the one-line command
+  accepts `/kranz config [<id>] <role> [backend] <model> [effort]` while
+  preserving the legacy no-backend form.
+- REST and Slack validate the merged patch with the engine's canonical config
+  validator before enqueueing it, so unsupported backend/model combinations
+  and safety-floor failures are returned to the operator immediately. The
+  engine repeats validation at drain time for race safety.

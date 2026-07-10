@@ -151,30 +151,36 @@ Slack; forensics one tap away in the browser.
 
 ## Slice 2 & 3 implementation notes
 
-### `/kranz config [<id>] <role> <model> [effort]`
+### `/kranz config [<id>] <role> [backend] <model> [effort]`
 
-Per-role model/effort change, mid-mission. **Spend-adjacent** (it re-shapes what
-future turns spend), so it is gated on the `slack.allowUsers` allowlist exactly
-like `/kranz new`; unlisted users get the same ephemeral "not authorized" reply.
+Per-role backend/model/effort change, mid-mission. **Spend-adjacent** (it
+re-shapes what future turns spend), so it is gated on the `slack.allowUsers`
+allowlist exactly like `/kranz new`; unlisted users get the same ephemeral
+"not authorized" reply.
 
 - **Roles**: `orchestrator` · `worker` · `scrutiny` · `functional`. The two
   validator roles use the short forms; they map to the engine's config keys
-  `validatorScrutiny` / `validatorFunctional`. `effort` (optional) is one of
-  `low` · `medium` · `high` · `xhigh` · `max`.
+  `validatorScrutiny` / `validatorFunctional`. `backend` is optional for the
+  one-line form and is one of `claude` · `codex` · `droid`; the modal always
+  presents the picker. `effort` (optional) is one of `low` · `medium` · `high`
+  · `xhigh` · `max`.
 - **Mission targeting** (chosen convention): the id is **optional** and
   disambiguated positionally. If the first argument is a known role, there is no
   id and the change applies to the repo's **single active mission** — with
   several active it refuses and asks for an explicit id, and a terminal target
   is rejected (its control inbox is never drained, so the change would be a
   silent no-op). Otherwise the first argument is the mission id:
-  `/kranz config m-42 worker sonnet high`. A bad role/effort or wrong arity
-  falls through to `/kranz help` (a typo is discoverable, never a silent
-  surprising action). An unknown mission id is a plain ephemeral error.
+  `/kranz config m-42 worker codex gpt-5-codex high`. The legacy no-backend
+  form remains valid. A bad role/backend/effort or wrong arity falls through
+  to `/kranz help` (a typo is discoverable, never a silent surprising action).
+  An unknown mission id is a plain ephemeral error.
 - **Wiring**: on authorization, the bridge enqueues
   `ControlCommand::ConfigChange { patch }` onto the target mission's control
   inbox, where `patch` is the camelCase engine patch, e.g.
-  `{"worker":{"model":"sonnet","reasoningEffort":"high"}}`. The role→key mapping
-  and patch shape are a pure, table-tested function (`inbound::config_patch`).
+  `{"worker":{"backend":"codex","model":"gpt-5-codex","reasoningEffort":"high"}}`.
+  Before enqueueing, the bridge folds the current mission and runs the engine's
+  canonical config validation; backend/model mismatches and safety floors are
+  returned ephemerally instead of being acknowledged and discarded later.
 - **CLI twin**: `kranz config role <role> <model> [effort] [--mission <id>]`
   enqueues the identical patch through the same machinery; target resolution
   (active missions only, refuse ambiguous/terminal) is shared via

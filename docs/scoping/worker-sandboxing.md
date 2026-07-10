@@ -1,7 +1,10 @@
 # M7 scoping — Worker sandboxing (containment, not just detection)
 
-Status: scoped 2026-07-05, unscheduled. Build as kranz missions
-(single-feature briefs; see sequencing).
+Status: tiers 1–2 shipped. Dedicated worktrees, write auditing, env hygiene,
+macOS Seatbelt filesystem enforcement, Linux bubblewrap filesystem/network
+isolation, and fail-closed preflight behavior are implemented. Remaining:
+Windows parity, a macOS-capable network boundary, container provider, and live
+cross-platform overhead/hostile-brief proof.
 
 ## Why
 
@@ -99,13 +102,14 @@ All of it asks the agent nicely. None of it constrains the process.
   fails closed before launching a worker or validator. macOS `fs+net` hostname
   egress allowlisting and Windows support remain open (see Sequencing below).
 
-### Tier 3 — container backend (the Gas City / fleet stepping stone)
+### Tier 3 — container workspace provider (the Gas City / fleet stepping stone)
 
-- Backend option running the session's `claude` inside the M6 Dockerfile
+- Workspace-provider option running any selected agent backend inside an M6
   image: mount worktree + mission dir only, container-level network policy.
   Slow path, opt-in, aimed at autonomous dispatch and later cross-machine
   execution (the "heterogeneous fleet" future docs/gascity.md says is one of
-  the three that make City integration earn its keep).
+  the three that make City integration earn its keep). Provisioning remains a
+  separate seam from model/CLI selection.
 
 ## Sequencing (kranz missions, one feature per brief)
 
@@ -119,7 +123,7 @@ All of it asks the agent nicely. None of it constrains the process.
 5. Linux bwrap parity (Tier 2): implemented as filesystem allowlists plus
    `--unshare-net` for `fs+net`; a live ubuntu runner remains the preferred
    external proof.
-6. Container backend (Tier 3) — may defer into a City-driven milestone.
+6. Container workspace provider (Tier 3) — may defer into a City-driven milestone.
 
 Briefs 1–2 are pure-Rust engine work (gate `--workspace`, per the M5
 meta-lesson). Briefs 3–5 need macOS/Linux runners to validate for real.

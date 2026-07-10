@@ -1,6 +1,6 @@
 // Small formatting helpers shared across panels.
 
-import type { MissionEvent, ReasoningEffort, Role } from './types';
+import type { AgentBackend, MissionEvent, ReasoningEffort, Role } from './types';
 
 /** "12s" / "5m" / "3h" / "10d" style relative age. */
 export function relTime(iso: string, nowMs: number = Date.now()): string {
@@ -50,6 +50,14 @@ export function effortLevel(effort: string): number {
 }
 
 export const EFFORT_OPTIONS: ReasoningEffort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
+
+export const BACKEND_OPTIONS: AgentBackend[] = ['claude', 'codex', 'droid'];
+
+export const MODEL_PLACEHOLDERS: Record<AgentBackend, string> = {
+  claude: 'opus · sonnet · haiku',
+  codex: 'gpt-5-codex',
+  droid: 'fable · accounts/fireworks/models/glm-5p2',
+};
 
 export function roleLabel(role: Role): string {
   switch (role) {

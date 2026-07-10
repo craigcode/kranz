@@ -70,6 +70,8 @@ pub const CONFIG_MISSION_BLOCK: &str = "mission";
 pub const CONFIG_MISSION_ACTION: &str = "mission_id";
 pub const CONFIG_ROLE_BLOCK: &str = "role";
 pub const CONFIG_ROLE_ACTION: &str = "role_select";
+pub const CONFIG_BACKEND_BLOCK: &str = "backend";
+pub const CONFIG_BACKEND_ACTION: &str = "backend_select";
 pub const CONFIG_MODEL_BLOCK: &str = "model";
 pub const CONFIG_MODEL_ACTION: &str = "model_text";
 pub const CONFIG_EFFORT_BLOCK: &str = "effort";
@@ -798,9 +800,9 @@ pub fn build_new_ticket_modal(slug: &str, title: &str, channel: &str) -> Value {
     })
 }
 
-/// The config modal: role select + free-form model + optional effort — the
-/// structured twin of `/kranz config [<id>] <role> <model> [effort]`, for
-/// people who prefer pickers to positional args. Channel rides in
+/// The config modal: role/backend selects + free-form model + optional effort
+/// — the structured twin of `/kranz config [<id>] <role> [backend] <model>
+/// [effort]`, for people who prefer pickers to positional args. Channel rides in
 /// `private_metadata` (for the ephemeral reply); the mission id input is
 /// optional — blank targets the single active mission, same resolution as
 /// the slash form. Pure; unit-tested.
@@ -833,6 +835,17 @@ pub fn build_config_modal(channel: &str) -> Value {
                     "type": "static_select",
                     "action_id": CONFIG_ROLE_ACTION,
                     "options": [opt("orchestrator"), opt("worker"), opt("scrutiny"), opt("functional")]
+                }
+            },
+            {
+                "type": "input",
+                "block_id": CONFIG_BACKEND_BLOCK,
+                "label": { "type": "plain_text", "text": "Backend" },
+                "element": {
+                    "type": "static_select",
+                    "action_id": CONFIG_BACKEND_ACTION,
+                    "initial_option": opt("claude"),
+                    "options": [opt("claude"), opt("codex"), opt("droid")]
                 }
             },
             {
@@ -1265,8 +1278,8 @@ pub fn build_help() -> Vec<Value> {
              • `/kranz revise <id> <instructions>` — request a mid-mission plan revision\n\
              • `/kranz revision approve|reject <id> <rev>` — decide a proposed revision\n\
              • `/kranz queue <slug>` — queue a reviewed backlog ticket\n\
-             • `/kranz config [<id>] <role> <model> [effort]` — change a role's model/effort \
-             (roles: orchestrator·worker·scrutiny·functional; effort: low·medium·high·xhigh·max)\n\
+             • `/kranz config [<id>] <role> [backend] <model> [effort]` — change a role's lane \
+             (backends: claude·codex·droid; roles: orchestrator·worker·scrutiny·functional)\n\
              • `/kranz pause [<id>]` — pause a running mission (between worker runs)\n\
              • `/kranz resume [<id>]` — resume a paused mission\n\
              • `/kranz work` — show the execution queue (drain it with the `kranz work` dispatcher)\n\
@@ -1932,6 +1945,26 @@ mod tests {
             input["element"]["multiline"], true,
             "the whole point: a multiline goal field"
         );
+    }
+
+    #[test]
+    fn config_modal_carries_a_backend_picker_defaulting_to_claude() {
+        let view = build_config_modal("C0BF6SAJLJ0");
+        let backend = view["blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|block| block["block_id"] == CONFIG_BACKEND_BLOCK)
+            .expect("backend input");
+        assert_eq!(backend["element"]["action_id"], CONFIG_BACKEND_ACTION);
+        assert_eq!(backend["element"]["initial_option"]["value"], "claude");
+        let values: Vec<&str> = backend["element"]["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|option| option["value"].as_str())
+            .collect();
+        assert_eq!(values, vec!["claude", "codex", "droid"]);
     }
 
     #[test]

@@ -21,6 +21,7 @@ function makeConfig(): MissionConfig {
     denyPatterns: [],
     allowValidatorCommands: [],
     dangerouslyAllowAll: false,
+    allowBelowDefaultWorkerModel: false,
   };
 }
 

@@ -1,5 +1,8 @@
 # Kranz handoff
 
+> Historical snapshot from 2026-07-03. For current priorities and shipped
+> status, use [roadmap.md](roadmap.md) and [roadmap-options.md](roadmap-options.md).
+
 State as of 2026-07-03. Everything below is built, merged to `main`, and
 **CI-green on all three jobs — `rust (ubuntu-latest)`, `rust (windows-latest)`,
 and `dashboard`** (github.com/craigcode/kranz). 445 workspace tests, `clippy
@@ -142,7 +145,7 @@ would mean re-implementing the TUI without a terminal to draw it in. No
 crate-free enhancement clears that bar, so this item is closed with no
 functional change.
 
-## Suggested next (from the roadmap)
+## Suggested next (historical; superseded)
 
 - **M2** — mission hygiene (`kranz clean`/`abandon`), mid-mission re-planning,
   environment preflight. The natural **first dogfood mission** (additive,

@@ -14,7 +14,7 @@ pub const MSG_LONG_ABOUT: &str = "Queue a message for the mission's orchestrator
      the current work is headed the wrong way.";
 
 /// kranz — a local mission-control harness: an orchestrator plans, fresh
-/// Claude Code sessions implement features, validators judge milestones,
+/// headless-agent sessions implement features, validators judge milestones,
 /// and git is the source of truth.
 #[derive(Parser, Debug)]
 #[command(name = "kranz", version, about, author = None)]

@@ -1116,6 +1116,17 @@ button {
   font-size: 12px;
 }
 
+.model-backend {
+  width: 44px;
+  flex: none;
+  overflow: hidden;
+  color: var(--dim);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
 .model-name {
   flex: 1;
   min-width: 0;
@@ -1178,6 +1189,19 @@ button {
   font-size: 11px;
 }
 
+.role-editor-optin {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  color: var(--dim);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.role-editor-optin input {
+  margin: 1px 0 0;
+}
+
 .role-editor-actions {
   display: flex;
   justify-content: flex-end;
@@ -1208,6 +1232,10 @@ button {
 .panel-notice {
   padding: 0 10px 8px;
   font-size: 11px;
+}
+
+.panel-error {
+  color: var(--red);
 }
 
 /* features panel */
@@ -1652,6 +1680,10 @@ button {
 .new-mission-role {
   width: 130px;
   flex: none;
+}
+
+.new-mission-optin {
+  margin-top: 2px;
 }
 
 .new-mission-actions {

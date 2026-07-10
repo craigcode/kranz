@@ -80,6 +80,7 @@ const config = {
   denyPatterns: ['git push'],
   allowValidatorCommands: ['npm test'],
   dangerouslyAllowAll: false,
+  allowBelowDefaultWorkerModel: false,
 };
 
 // Strip nulls so shapes match serde's skip_serializing_if = Option::is_none.

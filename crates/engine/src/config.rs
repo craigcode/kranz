@@ -190,6 +190,24 @@ pub fn deep_merge(base: &mut serde_json::Value, patch: &serde_json::Value) {
     }
 }
 
+/// Apply a partial JSON patch to an effective mission config and validate the
+/// merged result exactly as the engine would before accepting it.
+///
+/// Submission surfaces use this before enqueueing `config-change`, while the
+/// engine repeats the check when it drains the command. The second check is
+/// still required because another queued patch may win the race in between.
+pub fn apply_validated_patch(
+    current: &MissionConfig,
+    patch: &serde_json::Value,
+) -> Result<MissionConfig> {
+    let mut value = serde_json::to_value(current)?;
+    deep_merge(&mut value, patch);
+    let merged: MissionConfig = serde_json::from_value(value)
+        .map_err(|e| EngineError::Config(format!("patch produces invalid config: {e}")))?;
+    validate(&merged)?;
+    Ok(merged)
+}
+
 /// Validate invariants the engine relies on (plan §6). Returns
 /// [`EngineError::Config`] describing the first violation found.
 pub fn validate(cfg: &MissionConfig) -> Result<()> {

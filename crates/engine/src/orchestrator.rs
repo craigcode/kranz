@@ -6227,11 +6227,7 @@ pub fn mission_lock_is_live(paths: &MissionPaths) -> bool {
 /// and validate, or the event must not be appended (the reducer would poison
 /// every future fold of the log).
 fn preview_config_patch(current: &MissionConfig, patch: &serde_json::Value) -> Result<()> {
-    let mut value = serde_json::to_value(current)?;
-    config::deep_merge(&mut value, patch);
-    let merged: MissionConfig = serde_json::from_value(value)
-        .map_err(|e| EngineError::Config(format!("patch produces invalid config: {e}")))?;
-    config::validate(&merged)
+    config::apply_validated_patch(current, patch).map(|_| ())
 }
 
 /// Run one user-authored contract command line at the final gate.

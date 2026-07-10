@@ -1,0 +1,48 @@
+{
+  "gates": [
+    {
+      "command": "cargo fmt --all --check"
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets -- -D warnings"
+    },
+    {
+      "command": "cargo test --workspace"
+    },
+    {
+      "command": "npm ci",
+      "cwd": "apps/dashboard",
+      "whenPaths": [
+        "apps/dashboard"
+      ]
+    },
+    {
+      "command": "npx tsc --noEmit",
+      "cwd": "apps/dashboard",
+      "whenPaths": [
+        "apps/dashboard"
+      ]
+    },
+    {
+      "command": "npm run build",
+      "cwd": "apps/dashboard",
+      "whenPaths": [
+        "apps/dashboard"
+      ]
+    },
+    {
+      "command": "npm run test",
+      "cwd": "apps/dashboard",
+      "whenPaths": [
+        "apps/dashboard"
+      ]
+    },
+    {
+      "command": "npm run lint",
+      "cwd": "apps/dashboard",
+      "whenPaths": [
+        "apps/dashboard"
+      ]
+    }
+  ]
+}

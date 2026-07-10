@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   secret-scan:
@@ -17,7 +18,9 @@ jobs:
       - name: Determine scan range
         shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "SCAN_RANGE=HEAD" >> "$GITHUB_ENV"
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
             echo "SCAN_RANGE=${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}" >> "$GITHUB_ENV"
           elif [[ "${{ github.event.before }}" =~ ^0+$ ]]; then
             echo "SCAN_RANGE=HEAD" >> "$GITHUB_ENV"
@@ -73,5 +76,30 @@ jobs:
   smoke:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
     steps:
-      - run: echo "wire ANTHROPIC_API_KEY + kranz plan/run against a sample repo here"
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install Claude Code
+        run: npm install --global @anthropic-ai/claude-code
+      - name: Build kranz
+        run: cargo build --release --locked --package kranz --bin kranz
+      - name: Run flagship live acceptance mission
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          KRANZ_BIN: ${{ github.workspace }}/target/release/kranz
+          ARTIFACT_DIR: ${{ runner.temp }}/kranz-acceptance-artifacts
+        run: bash scripts/acceptance-smoke.sh
+      - name: Upload mission record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flagship-acceptance-mission
+          path: ${{ runner.temp }}/kranz-acceptance-artifacts
+          if-no-files-found: warn

@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-07-08
+last_verified: 2026-07-09
 verified_against:
   - AGENTS.md
   - crates/engine/src/orchestrator.rs
@@ -94,11 +94,20 @@ in order, refusing early and leaving base untouched on any failure:
 2. **Secret scan** — `scan_unified_diff(diff_full(base_sha, mission_branch))`
    filtered against the allowlist read from the mission branch;
    `SecretScanFailed` on any unwaived finding.
-3. `run_gate_suite` ([merge_gate.rs](../../../crates/engine/src/merge_gate.rs))
-   replays CI locally — `cargo fmt --all --check`, then clippy, then
-   `cargo test --workspace`, then the five dashboard gates only when
-   `dashboard_touched`. Stops at the first failure → `GateFailed`.
-4. `merge_no_ff` into the base branch; a conflict rolls back to a clean tree.
+3. Parse the tracked `.kranz/merge-gates.json` from the live base branch. A
+   missing, invalid, empty, or conditional-only suite fails closed before any
+   command; the mission branch cannot weaken the policy judging itself.
+4. `run_gate_suite` ([merge_gate.rs](../../../crates/engine/src/merge_gate.rs))
+   runs applicable repo-defined commands in order. `cwd` must be repo-relative
+   without parent components;
+   optional `whenPaths` prefixes select component-specific gates. Stops at the
+   first failure → `GateFailed`.
+5. `merge_no_ff` into the base branch; a conflict rolls back to a clean tree.
+
+Kranz's tracked suite mirrors its CI: fmt/clippy/workspace tests always, plus
+the five dashboard gates when `apps/dashboard` changed. Other repositories
+define their own language/toolchain commands; see
+[docs/merge-gates.md](../../merge-gates.md).
 
 The engine **never pushes** ([AGENTS.md](../../../AGENTS.md) rule 4); a human
 runs `git push`. A non-blocking `StaleBaseWarning` fires when the pinned base

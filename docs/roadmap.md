@@ -5,11 +5,13 @@ TUI, dashboard + Tauri shell — hardened by live missions and an adversarial
 review. What follows, in priority order. Each milestone states its "done when"
 criteria, in keeping with the product's own contract-first ethos.
 
-## M1 — Prove it at scale (confidence before features)
+## M1 — Prove it at scale ✅ (acceptance proven twice; report + calibrated estimates shipped)
 
-The plan's flagship acceptance was never run end-to-end: a 2-milestone /
-5-feature mission with a deliberately seeded defect, default models, fully
-unattended. Everything after this milestone builds on the confidence it buys.
+The plan's flagship acceptance was run end-to-end twice (Opus and Fable
+orchestrators): a 2-milestone / 5-feature mission with a deliberately seeded
+defect, default models, fully unattended. The reproducible manual CI smoke
+workflow now makes that proof repeatable after engine changes; each live
+dispatch remains an explicit, token-spending operator action.
 
 - Run the §5 Phase 1 acceptance mission on a sample repo (REST endpoint with
   auth + tests, then a CLI client; seeded defect → fix-feature → green).
@@ -114,7 +116,8 @@ log, engine-serialized appends); the work is orchestration.
   corruption half of the done-when: repeated parallel missions cycling
   clean / crash+resume / real-merge-conflict variants, with contiguous-seq,
   fold, snapshot, worktree and branch invariants asserted after every run.
-  The wall-clock/cost half still requires live missions.
+  The wall-clock/cost half was proven by the live A/B recorded in
+  `docs/m3-measurement.md`.
 
 Done when: a 2-milestone mission with independent features completes in
 materially less wall-clock than sequential at comparable cost, with zero
@@ -122,8 +125,9 @@ event-log corruption across 20 repeated runs.
 
 ## M4 — Windows first-class + distribution ◑ (CI green on ubuntu+windows incl. kill/resume; v0.1.0 tagged 2026-07-04 with linux/macos/windows binaries attached; remaining: crates.io + Homebrew, gated on the repo going public)
 
-The code is path-safe and lock-file based per §9, but never proven on Windows,
-and the project has no distribution story.
+The code is path-safe and lock-file based per §9 and is proven on Windows CI,
+including kill/resume. Tagged cross-platform binaries exist; crates.io and
+Homebrew publication remain gated on the repository going public.
 
 - Push to a remote so the existing CI matrix (ubuntu + windows) actually runs;
   fix what Windows breaks. Process-tree kill via Job Objects (the documented
@@ -135,15 +139,16 @@ and the project has no distribution story.
 Done when: CI is green on both platforms including the kill/resume test, and
 a new machine goes from nothing to `kranz plan` without cloning the repo.
 
-## M5 — Deeper validation & automation ◑ (kranz exec + secret scanning shipped; QA/skill-capture/OTEL deferred)
+## M5 — Deeper validation & automation ◑ (exec, functional QA, OTEL, and secret scanning shipped; skill authoring remains)
 
-- Functional QA via browser/computer-use driven by the validator, for target
+- [x] Functional QA via browser/computer-use driven by the validator, for target
   repos with a scriptable run harness (same prerequisite Factory imposes).
 - [x] `kranz exec -f mission.md` — fully headless missions for CI (plan file in,
   exit code out; no interactive approval, contract gates only).
-- Skill capture: orchestrator proposes `.claude/skills` entries from repeated
-  worker patterns; human approves before write.
-- OTEL export of engine events (opt-in `kranz otel` sidecar shipped).
+- Skill capture: the lessons loop records reusable mission knowledge, but
+  proposing human-approved `.claude/skills` entries from repeated worker
+  patterns remains open.
+- [x] OTEL export of engine events (opt-in `kranz otel` sidecar shipped).
 - [x] Real secret scanning replacing the regex scrub — shipped 2026-07-07
   (`0b731d0`): curated + entropy detectors, redact-at-write ingest gate with
   `secret.redacted` audit events, merge pre-gate + CI job + `kranz scan`,
@@ -169,33 +174,35 @@ Design changes required (eyes open):
   still reviews. Locally the rule stands unchanged.
 - **Auth grows up**: token required on reads too (transcripts are source
   code), TLS via platform, `ANTHROPIC_API_KEY` instead of local OAuth.
-- **Workspace provisioning**: clone-on-create (mission carries repo URL +
-  ref); toolchain via `devcontainer.json` when present, one fat default
-  image otherwise. This is the messy part — timebox it.
+- **Workspace contract + provider seam**: a tracked, base-branch-owned
+  workspace contract describes bootstrap, services, health checks, dynamic
+  ports, data clone/reset, previews, and secret *names* (never values).
+  Provisioning is separate from `AgentBackend`: start with the existing local
+  worktree provider, then add container and remote/Coder-style providers. Pin
+  the effective provider and template/image version in the mission record.
+- **Runnable data plane**: worktrees isolate source, not ports, Docker state,
+  caches, or databases. A cloud/parallel workspace must be able to receive an
+  isolated application runtime and, when configured, a de-identified golden
+  data clone with readiness and reset hooks.
 - Platform notes: Railway/Fly/VPS are the right shape; RunPod CPU pods only
   (API-bound workload, no GPU); Lambda is a non-fit (hours-long stateful
   processes vs 15-minute stateless invocations).
 
 Done when: a mission file pushed to a repo runs unattended in a throwaway
-container and delivers a reviewable `kranz/*` branch; a Railway-hosted
-`kranz serve` takes a mission from browser conversation to COMPLETE with no
-local Kranz install; a leaked dashboard URL without the token reveals
-nothing and mutates nothing.
+workspace, proves its declared services/data are ready, and delivers a
+reviewable `kranz/*` branch; a Railway-hosted `kranz serve` takes a mission
+from browser conversation to COMPLETE with no local Kranz install; a human
+can open declared previews or take over the same workspace; and a leaked
+dashboard URL without the token reveals nothing and mutates nothing.
 
-## M7 — Worker sandboxing ○ (scoped 2026-07-05, unscheduled — docs/scoping/worker-sandboxing.md)
+## M7 — Worker sandboxing ◑ (tiers 1–2 shipped; container provider and live cross-platform proof remain)
 
-Containment, not just detection: today every guard is policy-level (scrutiny
-validators, tool patterns, pinned base SHAs) while the worker's `claude`
-process keeps the operator's full user privileges — out-of-repo writes and
-arbitrary egress are both possible and invisible. Receipts: the Gas City
-spike's letter-over-spirit incident, wrong-cwd blast radius, injection reach
-on third-party repo content. Three independently shippable tiers: (1)
-workers/validators always in dedicated worktrees + out-of-contract write
-audit + env hygiene; (2) OS-enforced FS/network allowlists (macOS Seatbelt /
-Linux bwrap), config-gated `sandbox: {enforce, extraWrite, egress}` with a
-floor-for-autonomous-runs posture mirroring the scrutiny floor; (3)
-container backend (the Gas City fleet stepping stone). Complements scrutiny —
-the sandbox bounds what CAN happen; validators judge what DID.
+Containment now includes dedicated worktrees, out-of-contract write auditing,
+environment hygiene, macOS Seatbelt `enforce: "fs"`, and Linux bubblewrap
+`enforce: "fs" | "fs+net"` with fail-closed platform/preflight behavior.
+macOS hostname egress cannot be honestly enforced by Seatbelt, Windows parity
+and the container workspace provider remain open. The sandbox still
+complements scrutiny: it bounds what CAN happen; validators judge what DID.
 
 Done when: a deliberately hostile brief under `enforce: "fs+net"` leaves zero
 writes outside its worktree + mission dir with blocked attempts surfaced as
@@ -203,19 +210,19 @@ findings; a normal mission's contract commands still pass under the sandbox
 at <~10% wall-clock overhead; and the primary checkout never changes branch
 during any mission, sequential included.
 
-## M8 — Multi-repo operation ○ (captured 2026-07-06, unscoped)
+## M8 — Multi-repo operation ◑ (per-repo merge gates shipped; routing and onboarding remain)
 
 Kranz is per-repo by construction (`.kranz/` state, tickets, missions,
 calibration, lessons all live in the repo) — but the operator surfaces
 assume exactly one repo. Make "point kranz at any repo" true end to end,
 in any language.
 
-- **Per-repo merge gates**: the gated Merge's suite is a hardcoded
-  `RUST_GATES` constant mirroring this repo's ci.yml — unusable in a
-  Python/TS repo (mission validation contracts are already per-plan
-  commands and work anywhere). Gates become repo config (or CI-file
-  detection) with the Rust suite as this repo's config, not the engine's
-  assumption. Non-Rust repos get the Merge button.
+- [x] **Per-repo merge gates**: the gated Merge reads the live base branch's
+  tracked `.kranz/merge-gates.json`; gates declare a command, cwd, and optional
+  changed-path prefixes. Missing/invalid/conditional-only suites fail closed,
+  and a mission cannot weaken the gate file that judges its own diff. This
+  repo carries the Rust/dashboard suite explicitly; other languages carry
+  their own commands.
 - **One Slack bridge, many repos**: per-repo bridges can't work — Slack
   socket mode load-balances events across connections from one app, so N
   bridges each see 1/N of commands. Instead the single bridge routes:
@@ -239,7 +246,7 @@ repos operate from one Slack workspace with unambiguous routing; and a
 brand-new repo's first mission runs with no hand-editing beyond
 `kranz init` answers.
 
-## Product pattern notes from Warp/Oz/Factory scan (2026-07-08) and Cursor scan (2026-07-09)
+## Product pattern notes from Warp/Oz/Factory (2026-07-08), Cursor (2026-07-09), and Monaco (2026-07-10)
 
 External scan: Warp Agent/Oz and Factory's Droid/AutoWiki surfaces are useful
 as UX/product benchmarks, not architecture targets. Cursor is now a stronger
@@ -250,6 +257,24 @@ The broad "agentic IDE" lane (terminal replacement, built-in editor/LSP,
 voice, general local coding environment) still belongs to the sgian side
 product, not kranz. The kranz-compatible lessons are narrower and should
 reinforce the mission/audit/gate model:
+
+- **A worktree is not a workspace.** Monaco's failed local-worktree phase
+  exposed the shared runtime problems source isolation does not solve: port
+  collisions, Docker contention, dependency setup, disk pruning, and awkward
+  human handoff. Keep worktrees as the local source-isolation provider, but
+  make a complete runnable application environment the unit M6 provisions.
+- **Buy the substrate; keep the policy plane.** Do not build a VM scheduler or
+  cloud IDE. Integrate with Coder/container/vendor providers behind a small
+  workspace seam while kranz continues to own the plan, consent, audit,
+  validation, and delivery contract.
+- **Seeded data is validation infrastructure.** Treat a scoped, de-identified
+  golden data clone and its migration/reset lifecycle as first-class workspace
+  inputs. This is likely to improve functional validation more than another
+  model integration for database-backed repositories.
+- **Human takeover and feedback are workspace artifacts.** Record workspace
+  and preview links, readiness, provider/template identity, and lifecycle in
+  the event trail. GitHub PR-comment/CI-failure triggers should create audited
+  fix-features or follow-up missions rather than hide polling loops in prompts.
 
 - **Cursor CLI / Grok 4.5 backend.** Treat Cursor as a runtime/backend to
   absorb, not an IDE lane to chase: add a `backend_cursor` (or ACP-backed

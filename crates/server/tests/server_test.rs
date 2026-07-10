@@ -20,6 +20,7 @@ use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -236,6 +237,13 @@ fn init_repo() -> (tempfile::TempDir, PathBuf, String) {
     raw_git(dir.path(), &["config", "user.name", "test"]);
     raw_git(dir.path(), &["config", "user.email", "test@example.com"]);
     std::fs::write(dir.path().join("README.md"), "seed\n").unwrap();
+    let gate_path = dir.path().join(kranz_engine::merge_gate::MERGE_GATES_PATH);
+    std::fs::create_dir_all(gate_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        gate_path,
+        "{\"gates\":[{\"command\":\"cargo fmt --all --check\"},{\"command\":\"cargo test --workspace\"}]}\n",
+    )
+    .unwrap();
     raw_git(dir.path(), &["add", "-A"]);
     raw_git(dir.path(), &["commit", "-m", "seed"]);
     let root = std::fs::canonicalize(dir.path()).expect("canonicalize repo root");
@@ -716,6 +724,37 @@ async fn control_post_enqueues_a_drainable_command() {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     let body: Value = serde_json::from_slice(&bytes).unwrap();
     assert!(body["error"].is_string());
+}
+
+#[tokio::test]
+async fn control_post_rejects_an_invalid_config_change_before_enqueueing() {
+    let (_tmp, _repo_root, paths, app) = fixture();
+    let uri = format!("/api/missions/{MISSION_ID}/control");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(&uri)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"kind":"config-change","patch":{"worker":{"backend":"droid","model":"accounts/fireworks/models/glm-5p2"}}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    let error = body["error"].as_str().unwrap();
+    assert!(error.contains("below the default worker tier"), "{error}");
+    assert!(
+        error.contains("allowBelowDefaultWorkerModel=true"),
+        "{error}"
+    );
+    assert!(control::drain(&paths).unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1531,6 +1570,48 @@ async fn merge_route_merges_on_green_gates_and_flips_the_merged_bit() {
     let rows = body.as_array().unwrap();
     let row = rows.iter().find(|r| r["id"] == "m-green").unwrap();
     assert_eq!(row["merged"], true, "{row}");
+}
+
+#[tokio::test]
+async fn merge_route_fails_closed_when_base_has_no_gate_config() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo_root, _) = init_repo();
+    raw_git(
+        &repo_root,
+        &["rm", kranz_engine::merge_gate::MERGE_GATES_PATH],
+    );
+    raw_git(&repo_root, &["commit", "-m", "remove merge gates"]);
+    let base_sha = raw_git(&repo_root, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+    seed_diffable_mission(&repo_root, "m-no-gates", &base_sha, true);
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let calls_for_executor = Arc::clone(&calls);
+    let app = merge_app(&repo_root, move |cmd, _cwd| {
+        calls_for_executor.lock().unwrap().push(cmd.to_string());
+        (true, String::new())
+    });
+
+    let (status, body) = post_json(
+        &app,
+        "/api/missions/m-no-gates/merge",
+        Some(MERGE_TOKEN),
+        json!({}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("no tracked .kranz/merge-gates.json"),
+        "{body}"
+    );
+    assert!(calls.lock().unwrap().is_empty());
+    assert_eq!(raw_git(&repo_root, &["rev-parse", "main"]).trim(), base_sha);
 }
 
 #[tokio::test]

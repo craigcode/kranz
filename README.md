@@ -1,16 +1,16 @@
 # Kranz
 
-**Mission control for Claude Code.** Kranz is a local orchestration harness —
+**Git-native mission control for headless coding agents.** Kranz is a local orchestration harness —
 named for Gene Kranz, the Apollo flight director — that runs long-horizon
 software missions the way Factory.ai's Missions/Mission Control does: an
 orchestrator plans, fresh-context workers implement one feature at a time,
 independent validators judge each milestone, and a human steers as project
 manager. The harness never touches the spacecraft; it runs the room.
 
-Built in Rust on top of the `claude` CLI (headless stream-json sessions), so
-every session inherits your repo's CLAUDE.md, `.claude/skills`, `.mcp.json`,
-and hooks for free. Git is the source of truth; an append-only event log makes
-every mission `kill -9`-safe.
+Built in Rust with Claude Code as the default runtime and optional Codex/Droid
+role backends. Claude sessions inherit your repo's CLAUDE.md,
+`.claude/skills`, `.mcp.json`, and hooks for free. Git is the source of truth;
+an append-only event log makes every mission `kill -9`-safe.
 
 ```
 ┌───────────┐   plan/judge    ┌────────────────────────────────┐
@@ -140,6 +140,14 @@ edit the layers with `kranz config show|set|unset` (`--global` targets the home
 file; edits are validated before writing and only shape *future* missions);
 `kranz config role <role> <model> [effort]` is the mid-mission path — it queues
 a config-change on the running mission, like Slack's `/kranz config`.
+
+The human-triggered Merge action uses the tracked
+`.kranz/merge-gates.json` from the live base branch (schema and examples:
+[docs/merge-gates.md](docs/merge-gates.md)). Each gate declares a
+command, optional repo-relative working directory, and optional changed-path
+prefixes; missing or invalid suites fail closed. Because the mission branch
+does not supply the suite that judges it, a mission cannot weaken its own
+merge checks.
 
 ## Development
 

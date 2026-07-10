@@ -224,12 +224,14 @@ export interface WorkerRun {
   promptHash: string;
 }
 
+export type AgentBackend = 'claude' | 'codex' | 'droid';
+
 export interface RoleConfig {
   model: string;
   reasoningEffort: string;
   maxTurns?: number;
   maxBudgetUsd?: number;
-  backend?: string;
+  backend?: AgentBackend;
 }
 
 export interface MissionConfig {
@@ -246,6 +248,7 @@ export interface MissionConfig {
   denyPatterns: string[];
   allowValidatorCommands: string[];
   dangerouslyAllowAll: boolean;
+  allowBelowDefaultWorkerModel: boolean;
   claudeBinary?: string;
 }
 

@@ -236,19 +236,25 @@ fn ci_config(repo: &Path) -> ReadyDimension {
 }
 
 fn gitignore_hygiene(repo: &Path) -> ReadyDimension {
-    let text = fs::read_to_string(repo.join(".gitignore")).unwrap_or_default();
-    let required = [
-        ".kranz/missions/*/events.jsonl",
-        ".kranz/missions/*/events.jsonl.lock",
-        ".kranz/missions/*/state.json",
-        ".kranz/missions/*/runs/",
-        ".kranz/missions/*/control/",
+    // Ask Git about concrete sentinel paths instead of parsing the root
+    // .gitignore as text. Kranz writes its canonical rules to the nested
+    // .kranz/.gitignore, and Git's own matcher also handles negation and any
+    // equivalent rule shapes correctly.
+    let sentinels = [
+        ".kranz/missions/m-ready/events.jsonl",
+        ".kranz/missions/m-ready/events.jsonl.lock",
+        ".kranz/missions/m-ready/state.json",
+        ".kranz/missions/m-ready/runs/run.jsonl",
+        ".kranz/missions/m-ready/control/0001.json",
         ".kranz/config.json",
         ".kranz/serve.token",
-        ".kranz/tickets/*.status",
+        ".kranz/tickets/ready.status",
     ];
-    let present = required.iter().filter(|p| text.contains(*p)).count();
-    if present == required.len() {
+    let present = sentinels
+        .iter()
+        .filter(|path| git_ignores(repo, path))
+        .count();
+    if present == sentinels.len() {
         dim(
             "kranz runtime gitignore",
             10,
@@ -260,10 +266,10 @@ fn gitignore_hygiene(repo: &Path) -> ReadyDimension {
     } else if present > 0 {
         dim(
             "kranz runtime gitignore",
-            ((present * 10) / required.len()) as u8,
+            ((present * 10) / sentinels.len()) as u8,
             10,
             ReadyStatus::Warn,
-            format!("{present}/{} runtime patterns ignored", required.len()),
+            format!("{present}/{} runtime paths ignored", sentinels.len()),
             "add missing .kranz runtime patterns to .gitignore",
         )
     } else {
@@ -276,6 +282,17 @@ fn gitignore_hygiene(repo: &Path) -> ReadyDimension {
             "ignore .kranz runtime logs, snapshots, runs, control files, tokens, and status files",
         )
     }
+}
+
+fn git_ignores(repo: &Path, relative_path: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["check-ignore", "--quiet", "--no-index", "--"])
+        .arg(relative_path)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
 }
 
 fn contract_prerequisites(commands: &[ValidationCommand]) -> ReadyDimension {
@@ -503,27 +520,33 @@ mod tests {
         write(&dir.path().join("README.md"), "readme");
         write(&dir.path().join("Cargo.toml"), "[workspace]\n");
         write(&dir.path().join(".github/workflows/ci.yml"), "name: ci\n");
-        write(
-            &dir.path().join(".gitignore"),
-            ".kranz/missions/*/events.jsonl\n\
-             .kranz/missions/*/events.jsonl.lock\n\
-             .kranz/missions/*/state.json\n\
-             .kranz/missions/*/runs/\n\
-             .kranz/missions/*/control/\n\
-             .kranz/config.json\n\
-             .kranz/serve.token\n\
-             .kranz/tickets/*.status\n",
-        );
         Command::new("git")
             .arg("-C")
             .arg(dir.path())
             .arg("init")
             .output()
             .unwrap();
+        write(
+            &dir.path().join(".kranz/.gitignore"),
+            "missions/*/events.jsonl\n\
+             missions/*/events.jsonl.lock\n\
+             missions/*/state.json\n\
+             missions/*/runs/\n\
+             missions/*/control/\n\
+             config.json\n\
+             serve.token\n\
+             tickets/*.status\n",
+        );
 
         let report = assess(dir.path());
 
         assert!(report.score >= 80, "{report:?}");
         assert_eq!(report.level, ReadyLevel::Ready);
+        let hygiene = report
+            .dimensions
+            .iter()
+            .find(|dimension| dimension.name == "kranz runtime gitignore")
+            .unwrap();
+        assert_eq!(hygiene.status, ReadyStatus::Pass, "{hygiene:?}");
     }
 }

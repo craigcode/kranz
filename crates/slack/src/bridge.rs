@@ -994,7 +994,7 @@ pub fn not_authorized_blocks() -> Vec<Value> {
 /// ephemeral refusal pointing at the CLI ([`no_host_blocks`]).
 ///
 /// ## M2.9 slices 2 & 3 additions
-/// - **Config** (`/kranz config [<id>] <role> <model> [effort]`) — spend-adjacent,
+/// - **Config** (`/kranz config [<id>] <role> [backend] <model> [effort]`) — spend-adjacent,
 ///   so allowlist-gated like `new`; on authorization enqueues a
 ///   `config-change` control command with the camelCase patch ([`config_change`]).
 ///   A pure local write, so it stays inline (fast ack).
@@ -1517,7 +1517,7 @@ async fn dispatch_action(
             }
         }
 
-        // Bare `/kranz config`: open the role/model/effort picker modal.
+        // Bare `/kranz config`: open the role/backend/model/effort picker modal.
         // Inline for the same trigger_id-expiry reason as the goal modal.
         Action::ConfigModal {
             trigger_id,
@@ -1544,7 +1544,7 @@ async fn dispatch_action(
                     response_url.as_deref(),
                     &error_blocks(&format!(
                         "Couldn't open the config form: {e}. One-line fallback: \
-                         `/kranz config [<id>] <role> <model> [effort]`."
+                         `/kranz config [<id>] <role> [backend] <model> [effort]`."
                     )),
                 )
                 .await;
@@ -1973,6 +1973,7 @@ async fn dispatch_action(
         Action::Config {
             mission_id,
             role,
+            backend,
             model,
             effort,
             user_id,
@@ -1995,10 +1996,15 @@ async fn dispatch_action(
                 repo_root,
                 mission_id.as_deref(),
                 role,
+                backend.as_deref(),
                 model,
                 effort.as_deref(),
             ) {
                 Ok(applied_to) => {
+                    let backend_note = backend
+                        .as_deref()
+                        .map(|b| format!(" backend `{b}`,"))
+                        .unwrap_or_default();
                     let effort_note = effort
                         .as_deref()
                         .map(|e| format!(", effort `{e}`"))
@@ -2010,7 +2016,7 @@ async fn dispatch_action(
                         channel.as_deref().unwrap_or(&cfg.channel),
                         user_id.as_deref(),
                         &error_blocks(&format!(
-                            ":gear: Set `{role}` model `{model}`{effort_note} on `{applied_to}`."
+                            ":gear: Set `{role}`{backend_note} model `{model}`{effort_note} on `{applied_to}`."
                         )),
                     )
                     .await
@@ -3576,7 +3582,7 @@ fn approve_mission(repo_root: &Path, mission_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// `/kranz config [<id>] <role> <model> [effort]` → enqueue a `config-change`
+/// `/kranz config [<id>] <role> [backend] <model> [effort]` → enqueue a `config-change`
 /// control command on the target mission's inbox. `role` is the canonical
 /// friendly name from the router; the camelCase engine patch is built by
 /// [`crate::inbound::config_patch`]. When `mission_id` is `None`, the repo's
@@ -3586,6 +3592,7 @@ fn config_change(
     repo_root: &Path,
     mission_id: Option<&str>,
     role: &str,
+    backend: Option<&str>,
     model: &str,
     effort: Option<&str>,
 ) -> Result<String> {
@@ -3600,11 +3607,13 @@ fn config_change(
     //    more than one mission is active.
     let mission_id = resolve_active_config_target(repo_root, mission_id)?;
     let paths = MissionPaths::new(repo_root, &mission_id);
-    let patch = crate::inbound::config_patch(role, model, effort)
+    let patch = crate::inbound::config_patch_with_backend(role, backend, model, effort)
         .ok_or_else(|| anyhow::anyhow!("unknown role `{role}`"))?;
+    let state = read_mission_state(&paths)?;
+    kranz_engine::config::apply_validated_patch(&state.config, &patch)?;
     kranz_engine::control::enqueue(&paths, &ControlCommand::ConfigChange { patch })
         .context("enqueue config change")?;
-    tracing::info!(mission = %mission_id, role, model, "config change enqueued from Slack");
+    tracing::info!(mission = %mission_id, role, backend, model, "config change enqueued from Slack");
     Ok(mission_id)
 }
 
@@ -5414,8 +5423,15 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         seed_mission(tmp.path(), "m-cfg", "goal");
         // scrutiny → validatorScrutiny, with effort → reasoningEffort.
-        let applied =
-            config_change(tmp.path(), Some("m-cfg"), "scrutiny", "opus", Some("high")).unwrap();
+        let applied = config_change(
+            tmp.path(),
+            Some("m-cfg"),
+            "scrutiny",
+            None,
+            "opus",
+            Some("high"),
+        )
+        .unwrap();
         assert_eq!(applied, "m-cfg");
         let paths = MissionPaths::new(tmp.path(), "m-cfg");
         let drained = kranz_engine::control::drain(&paths).unwrap();
@@ -5435,7 +5451,7 @@ mod tests {
     fn config_change_without_id_targets_most_recent_and_omits_effort() {
         let tmp = TempDir::new().unwrap();
         seed_mission(tmp.path(), "m-only", "goal");
-        let applied = config_change(tmp.path(), None, "worker", "sonnet", None).unwrap();
+        let applied = config_change(tmp.path(), None, "worker", None, "sonnet", None).unwrap();
         assert_eq!(applied, "m-only");
         let drained =
             kranz_engine::control::drain(&MissionPaths::new(tmp.path(), "m-only")).unwrap();
@@ -5448,9 +5464,64 @@ mod tests {
     }
 
     #[test]
+    fn config_change_enqueues_a_valid_backend_selection() {
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-backend", "goal");
+        config_change(
+            tmp.path(),
+            Some("m-backend"),
+            "worker",
+            Some("codex"),
+            "gpt-5-codex",
+            Some("high"),
+        )
+        .unwrap();
+
+        let drained =
+            kranz_engine::control::drain(&MissionPaths::new(tmp.path(), "m-backend")).unwrap();
+        match &drained[0].1 {
+            ControlCommand::ConfigChange { patch } => assert_eq!(
+                *patch,
+                json!({
+                    "worker": {
+                        "backend": "codex",
+                        "model": "gpt-5-codex",
+                        "reasoningEffort": "high"
+                    }
+                })
+            ),
+            other => panic!("expected ConfigChange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_change_rejects_an_invalid_backend_floor_before_enqueueing() {
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-floor", "goal");
+        let err = config_change(
+            tmp.path(),
+            Some("m-floor"),
+            "worker",
+            Some("droid"),
+            "accounts/fireworks/models/glm-5p2",
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("below the default worker tier"), "{err}");
+        assert!(err.contains("allowBelowDefaultWorkerModel=true"), "{err}");
+        assert!(
+            kranz_engine::control::drain(&MissionPaths::new(tmp.path(), "m-floor"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn config_change_unknown_mission_is_error() {
         let tmp = TempDir::new().unwrap();
-        let err = config_change(tmp.path(), Some("m-nope"), "worker", "sonnet", None)
+        let err = config_change(tmp.path(), Some("m-nope"), "worker", None, "sonnet", None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("m-nope"), "error names the unknown mission");
@@ -5464,7 +5535,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         seed_mission(tmp.path(), "m-a", "goal a");
         seed_mission(tmp.path(), "m-b", "goal b");
-        let err = config_change(tmp.path(), None, "worker", "opus", None)
+        let err = config_change(tmp.path(), None, "worker", None, "opus", None)
             .unwrap_err()
             .to_string();
         assert!(
@@ -5487,7 +5558,7 @@ mod tests {
         // change there would be a silent no-op reported as success. Reject it.
         let tmp = TempDir::new().unwrap();
         seed_completed_mission(tmp.path(), "m-done");
-        let err = config_change(tmp.path(), Some("m-done"), "worker", "opus", None)
+        let err = config_change(tmp.path(), Some("m-done"), "worker", None, "opus", None)
             .unwrap_err()
             .to_string();
         assert!(
@@ -5851,6 +5922,7 @@ mod tests {
             &Action::Config {
                 mission_id: Some("m-1".into()),
                 role: "worker".into(),
+                backend: None,
                 model: "sonnet".into(),
                 effort: None,
                 user_id: None,

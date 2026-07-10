@@ -1,6 +1,6 @@
 //! Gated merge orchestration (roadmap M6): a human-triggered Merge action
-//! that refuses on a dirty tracked tree, runs the CI gate suite, and merges
-//! `--no-ff` into the base branch only on green — never pushing.
+//! that refuses on a dirty tracked tree, runs the repo's tracked gate suite,
+//! and merges `--no-ff` into the base branch only on green — never pushing.
 //!
 //! `merge_mission` ties together three primitives that each already carry
 //! their own safety contract: [`GitRepo::is_clean_tracked`] (refuse dirty),
@@ -11,7 +11,7 @@
 
 use crate::error::Result;
 use crate::git_ops::{with_kranz_trailers, GitRepo, KranzCommitMetadata, MergeOutcome};
-use crate::merge_gate::{run_gate_suite, GateSuiteResult};
+use crate::merge_gate::{parse_gate_suite, run_gate_suite, GateSuiteResult, MERGE_GATES_PATH};
 use crate::scrub::{self, SecretFinding};
 use std::path::Path;
 
@@ -32,6 +32,10 @@ pub enum MergeReport {
         /// That gate's verbatim captured output.
         output: String,
     },
+    /// The live base branch has no valid tracked merge-gate suite. Nothing
+    /// ran and base is untouched; this fails closed instead of silently
+    /// treating an empty suite as green.
+    GateConfigInvalid { detail: String },
     /// The mission branch diff contains an unwaived secret finding. Base is
     /// untouched and no other gates ran.
     SecretScanFailed { findings: Vec<SecretFinding> },
@@ -97,9 +101,23 @@ where
         return Ok(MergeReport::SecretScanFailed { findings });
     }
 
-    let dashboard_touched = repo.dashboard_touched(base_sha, mission_branch)?;
+    let changed_paths = repo.changed_paths(base_sha, mission_branch)?;
+    let gate_bytes = match repo.show_file(base_branch, MERGE_GATES_PATH)? {
+        Some(bytes) => bytes,
+        None => {
+            return Ok(MergeReport::GateConfigInvalid {
+                detail: format!(
+                    "live base branch {base_branch:?} has no tracked {MERGE_GATES_PATH}; add an explicit repo gate suite before merging"
+                ),
+            })
+        }
+    };
+    let gate_suite = match parse_gate_suite(&gate_bytes) {
+        Ok(suite) => suite,
+        Err(detail) => return Ok(MergeReport::GateConfigInvalid { detail }),
+    };
 
-    match run_gate_suite(repo.root(), dashboard_touched, executor) {
+    match run_gate_suite(repo.root(), &changed_paths, &gate_suite, executor) {
         GateSuiteResult::Failed { gate, output } => {
             return Ok(MergeReport::GateFailed { gate, output });
         }

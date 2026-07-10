@@ -5,6 +5,7 @@
 
 use kranz_engine::git_ops::{GitRepo, KranzCommitMetadata};
 use kranz_engine::merge::{merge_mission, MergeReport};
+use kranz_engine::merge_gate::MERGE_GATES_PATH;
 use kranz_engine::scrub;
 use kranz_engine::types::TokenUsage;
 use std::io::Write as _;
@@ -119,17 +120,75 @@ fn init_repo_with_identity() -> (TempDir, GitRepo) {
 }
 
 fn write(dir: &TempDir, name: &str, content: &str) {
-    std::fs::write(dir.path().join(name), content).expect("write file");
+    let path = dir.path().join(name);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create parent directory");
+    }
+    std::fs::write(path, content).expect("write file");
 }
 
 /// Repo with identity and one seed commit on `main`; returns the seed sha.
 fn seeded_repo() -> (TempDir, GitRepo, String) {
     let (dir, repo) = init_repo_with_identity();
     write(&dir, "README.md", "hello\n");
+    write(
+        &dir,
+        MERGE_GATES_PATH,
+        "{\"gates\":[{\"command\":\"cargo fmt --all --check\"}]}\n",
+    );
     let sha = repo
         .add_all_and_commit("initial commit")
         .expect("seed commit");
     (dir, repo, sha)
+}
+
+#[test]
+fn missing_gate_config_fails_closed_without_running_or_merging() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo) = init_repo_with_identity();
+    write(&dir, "README.md", "hello\n");
+    let seed = repo.add_all_and_commit("initial commit").unwrap();
+    seed_mission_branch(&dir, &repo, &seed, "src/lib.rs", "fn a() {}\n");
+
+    let calls = std::cell::RefCell::new(Vec::new());
+    let report = merge_mission(&repo, "main", &seed, "kranz/mission-x", None, |cmd, _| {
+        calls.borrow_mut().push(cmd.to_string());
+        (true, String::new())
+    })
+    .unwrap();
+
+    assert!(matches!(report, MergeReport::GateConfigInvalid { .. }));
+    assert!(calls.borrow().is_empty());
+    assert_eq!(repo.head_sha().unwrap(), seed);
+}
+
+#[test]
+fn gate_config_is_read_from_base_not_the_mission_branch() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, seed) = seeded_repo();
+    seed_mission_branch_with_files(
+        &dir,
+        &repo,
+        &seed,
+        &[
+            ("src/lib.rs", "fn a() {}\n"),
+            (MERGE_GATES_PATH, "{\"gates\":[{\"command\":\"true\"}]}\n"),
+        ],
+    );
+
+    let calls = std::cell::RefCell::new(Vec::new());
+    let report = merge_mission(&repo, "main", &seed, "kranz/mission-x", None, |cmd, _| {
+        calls.borrow_mut().push(cmd.to_string());
+        (true, String::new())
+    })
+    .unwrap();
+
+    assert!(matches!(report, MergeReport::Merged { .. }));
+    assert_eq!(calls.borrow().as_slice(), ["cargo fmt --all --check"]);
 }
 
 /// Creates `kranz/mission-x` off the seed sha with one commit touching `path`.

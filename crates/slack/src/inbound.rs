@@ -34,13 +34,13 @@
 //! - anything else → [`Action::Ignore`].
 
 use crate::format::{
-    APPROVE_ACTION_ID, APPROVE_REVISION_ACTION_ID, CONFIG_CALLBACK_ID, CONFIG_EFFORT_ACTION,
-    CONFIG_EFFORT_BLOCK, CONFIG_MISSION_ACTION, CONFIG_MISSION_BLOCK, CONFIG_MODEL_ACTION,
-    CONFIG_MODEL_BLOCK, CONFIG_ROLE_ACTION, CONFIG_ROLE_BLOCK, MERGE_ACTION_ID,
-    NEW_MISSION_CALLBACK_ID, NEW_MISSION_GOAL_ACTION, NEW_MISSION_GOAL_BLOCK,
-    NEW_TICKET_CALLBACK_ID, NEW_TICKET_CONTEXT_ACTION, NEW_TICKET_CONTEXT_BLOCK,
-    NEW_TICKET_GOAL_ACTION, NEW_TICKET_GOAL_BLOCK, QUEUE_TICKET_ACTION_ID,
-    REJECT_REVISION_ACTION_ID, START_ACTION_ID,
+    APPROVE_ACTION_ID, APPROVE_REVISION_ACTION_ID, CONFIG_BACKEND_ACTION, CONFIG_BACKEND_BLOCK,
+    CONFIG_CALLBACK_ID, CONFIG_EFFORT_ACTION, CONFIG_EFFORT_BLOCK, CONFIG_MISSION_ACTION,
+    CONFIG_MISSION_BLOCK, CONFIG_MODEL_ACTION, CONFIG_MODEL_BLOCK, CONFIG_ROLE_ACTION,
+    CONFIG_ROLE_BLOCK, MERGE_ACTION_ID, NEW_MISSION_CALLBACK_ID, NEW_MISSION_GOAL_ACTION,
+    NEW_MISSION_GOAL_BLOCK, NEW_TICKET_CALLBACK_ID, NEW_TICKET_CONTEXT_ACTION,
+    NEW_TICKET_CONTEXT_BLOCK, NEW_TICKET_GOAL_ACTION, NEW_TICKET_GOAL_BLOCK,
+    QUEUE_TICKET_ACTION_ID, REJECT_REVISION_ACTION_ID, START_ACTION_ID,
 };
 use serde_json::Value;
 
@@ -213,8 +213,8 @@ pub enum Action {
         user_id: Option<String>,
         response_url: Option<String>,
     },
-    /// `/kranz config [<id>] <role> <model> [effort]` → change a role's model
-    /// (and optionally reasoning effort) mid-mission via a `config-change`
+    /// `/kranz config [<id>] <role> [backend] <model> [effort]` → change a
+    /// role's backend/model (and optionally reasoning effort) mid-mission via a `config-change`
     /// control command. SPEND-ADJACENT (it re-shapes what future turns spend),
     /// so it is gated on the allowlist exactly like `/kranz new`. `mission_id`
     /// absent = the most-recent mission (like `/kranz status`). `role` /
@@ -224,6 +224,7 @@ pub enum Action {
     Config {
         mission_id: Option<String>,
         role: String,
+        backend: Option<String>,
         model: String,
         effort: Option<String>,
         user_id: Option<String>,
@@ -232,7 +233,7 @@ pub enum Action {
         /// (the modal path): chat.postEphemeral needs the channel.
         channel: Option<String>,
     },
-    /// Bare `/kranz config` → open the config modal (role/model/effort
+    /// Bare `/kranz config` → open the config modal (role/backend/model/effort
     /// pickers). Free to open; the SUBMISSION is the gated change. The
     /// trigger_id expires ~3 s after the slash, so the bridge opens the view
     /// inline.
@@ -532,8 +533,8 @@ fn route_view_submission(payload: &Value) -> Action {
 }
 
 /// The config modal's `view_submission` → [`Action::Config`], canonicalized
-/// through the same [`parse_role`]/[`parse_effort`] tables as the slash form
-/// so the bridge never sees an unvalidated role/effort. Missing/blank
+/// through the same role/backend/effort tables as the slash form so the
+/// bridge never sees an unvalidated selection. Missing/blank
 /// mission id targets the single active mission (bridge-side resolution).
 fn route_config_submission(payload: &Value, view: &Value) -> Action {
     let val = |block: &str, action: &str| -> Option<String> {
@@ -550,6 +551,11 @@ fn route_config_submission(payload: &Value, view: &Value) -> Action {
     };
     let Some(role) =
         val(CONFIG_ROLE_BLOCK, CONFIG_ROLE_ACTION).and_then(|r| parse_role(&r).map(str::to_string))
+    else {
+        return Action::Ignore;
+    };
+    let Some(backend) = val(CONFIG_BACKEND_BLOCK, CONFIG_BACKEND_ACTION)
+        .and_then(|b| parse_backend(&b).map(str::to_string))
     else {
         return Action::Ignore;
     };
@@ -574,6 +580,7 @@ fn route_config_submission(payload: &Value, view: &Value) -> Action {
     Action::Config {
         mission_id,
         role,
+        backend: Some(backend),
         model,
         effort,
         user_id,
@@ -967,9 +974,10 @@ fn route_slash(payload: &Value) -> Action {
         // `draft` with no slug → help.
     }
 
-    // `config [<id>] <role> <model> [effort]` → per-role model/effort change
-    // (spend-adjacent, gated in the bridge). A bad role/effort or too few args
-    // falls through to help so a typo is discoverable rather than silent.
+    // `config [<id>] <role> [backend] <model> [effort]` → per-role backend /
+    // model / effort change (spend-adjacent, gated in the bridge). The legacy
+    // no-backend form remains accepted. A bad selection or arity falls through
+    // to help so a typo is discoverable rather than silent.
     if let Some(rest) = strip_ci_prefix(text, "config") {
         if rest.trim().is_empty() {
             // Bare `config` → the modal (pickers beat positional args).
@@ -1097,6 +1105,9 @@ fn route_slash(payload: &Value) -> Action {
 /// validator roles.
 const ROLES: [&str; 4] = ["orchestrator", "worker", "scrutiny", "functional"];
 
+/// Agent backends accepted by `/kranz config` (mirrors engine config).
+const BACKENDS: [&str; 3] = ["claude", "codex", "droid"];
+
 /// Reasoning-effort values accepted by `/kranz config` (mirrors the engine's
 /// `claude --effort` set).
 const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
@@ -1110,6 +1121,14 @@ fn parse_role(token: &str) -> Option<&'static str> {
         .find(|r| r.eq_ignore_ascii_case(token))
 }
 
+/// Parse a backend token case-insensitively to its canonical spelling.
+fn parse_backend(token: &str) -> Option<&'static str> {
+    BACKENDS
+        .iter()
+        .copied()
+        .find(|backend| backend.eq_ignore_ascii_case(token))
+}
+
 /// Parse an effort token (case-insensitively) to its canonical spelling, or
 /// `None` if it is not a valid effort.
 fn parse_effort(token: &str) -> Option<&'static str> {
@@ -1120,13 +1139,15 @@ fn parse_effort(token: &str) -> Option<&'static str> {
 }
 
 /// Parse the arguments after `config` into an [`Action::Config`], or `None`
-/// when the shape is wrong (which routes to help). Accepts two shapes,
-/// disambiguated by whether the FIRST token is a known role:
-/// - `<role> <model> [effort]`         → applies to the most-recent mission
-/// - `<id> <role> <model> [effort]`    → applies to `<id>`
+/// when the shape is wrong (which routes to help). The mission id and backend
+/// are independently optional:
+/// - `<role> [backend] <model> [effort]`      → single active mission
+/// - `<id> <role> [backend] <model> [effort]` → explicit mission
 ///
-/// `model` is any non-empty token (model aliases/ids are open-ended, so we
-/// don't validate them). `effort`, when present, must be a valid effort.
+/// A token immediately after the role is a backend only when it is one of the
+/// three canonical backend names and another token follows for the model. This
+/// preserves the old `<role> <model> [effort]` form. The merged config is
+/// validated against the mission before the bridge enqueues it.
 fn parse_config_args(
     rest: &str,
     user_id: Option<String>,
@@ -1147,22 +1168,33 @@ fn parse_config_args(
     };
 
     let role = parse_role(tokens.get(role_idx)?)?.to_string();
+    let selection_idx = role_idx + 1;
+    let (backend, model_idx) = match (
+        tokens
+            .get(selection_idx)
+            .and_then(|token| parse_backend(token)),
+        tokens.get(selection_idx + 1),
+    ) {
+        (Some(backend), Some(_)) => (Some(backend.to_string()), selection_idx + 1),
+        _ => (None, selection_idx),
+    };
     let model = tokens
-        .get(role_idx + 1)
+        .get(model_idx)
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())?;
     // At most one trailing effort token; extra tokens make it ambiguous → help.
-    let effort = match tokens.get(role_idx + 2) {
+    let effort = match tokens.get(model_idx + 1) {
         Some(tok) => Some(parse_effort(tok)?.to_string()),
         None => None,
     };
-    if tokens.len() > role_idx + 3 {
+    if tokens.len() > model_idx + 2 {
         return None;
     }
 
     Some(Action::Config {
         mission_id,
         role,
+        backend,
         model: model.to_string(),
         effort,
         user_id,
@@ -1218,6 +1250,18 @@ fn clean_id(raw: &str) -> &str {
 /// `scrutiny → validatorScrutiny`, `functional → validatorFunctional`, the
 /// other two unchanged — and `effort → reasoningEffort`.
 pub fn config_patch(role: &str, model: &str, effort: Option<&str>) -> Option<Value> {
+    config_patch_with_backend(role, None, model, effort)
+}
+
+/// Backend-aware form used by the dashboard/Slack selection surfaces. The
+/// legacy wrapper above deliberately omits `backend`, preserving existing
+/// commands and the meaning of older control-inbox patches.
+pub fn config_patch_with_backend(
+    role: &str,
+    backend: Option<&str>,
+    model: &str,
+    effort: Option<&str>,
+) -> Option<Value> {
     let key = match role {
         "orchestrator" => "orchestrator",
         "worker" => "worker",
@@ -1226,6 +1270,9 @@ pub fn config_patch(role: &str, model: &str, effort: Option<&str>) -> Option<Val
         _ => return None,
     };
     let mut role_obj = serde_json::Map::new();
+    if let Some(backend) = backend {
+        role_obj.insert("backend".to_string(), Value::String(backend.to_string()));
+    }
     role_obj.insert("model".to_string(), Value::String(model.to_string()));
     if let Some(effort) = effort {
         role_obj.insert(
@@ -1787,7 +1834,8 @@ mod tests {
                     "state": { "values": {
                         CONFIG_MISSION_BLOCK: { CONFIG_MISSION_ACTION: { "type": "plain_text_input", "value": " `m-42` " } },
                         CONFIG_ROLE_BLOCK: { CONFIG_ROLE_ACTION: { "type": "static_select", "selected_option": { "value": "worker" } } },
-                        CONFIG_MODEL_BLOCK: { CONFIG_MODEL_ACTION: { "type": "plain_text_input", "value": "sonnet" } },
+                        CONFIG_BACKEND_BLOCK: { CONFIG_BACKEND_ACTION: { "type": "static_select", "selected_option": { "value": "codex" } } },
+                        CONFIG_MODEL_BLOCK: { CONFIG_MODEL_ACTION: { "type": "plain_text_input", "value": "gpt-5-codex" } },
                         CONFIG_EFFORT_BLOCK: { CONFIG_EFFORT_ACTION: { "type": "static_select", "selected_option": { "value": "high" } } }
                     }}
                 }
@@ -1798,7 +1846,8 @@ mod tests {
             Action::Config {
                 mission_id: Some("m-42".into()),
                 role: "worker".into(),
-                model: "sonnet".into(),
+                backend: Some("codex".into()),
+                model: "gpt-5-codex".into(),
                 effort: Some("high".into()),
                 user_id: Some("U777".into()),
                 response_url: None,
@@ -1820,6 +1869,7 @@ mod tests {
                     "private_metadata": "C123",
                     "state": { "values": {
                         CONFIG_ROLE_BLOCK: { CONFIG_ROLE_ACTION: { "type": "static_select", "selected_option": { "value": "orchestrator" } } },
+                        CONFIG_BACKEND_BLOCK: { CONFIG_BACKEND_ACTION: { "type": "static_select", "selected_option": { "value": "claude" } } },
                         CONFIG_MODEL_BLOCK: { CONFIG_MODEL_ACTION: { "type": "plain_text_input", "value": "opus" } }
                     }}
                 }
@@ -1830,12 +1880,14 @@ mod tests {
                 mission_id,
                 effort,
                 role,
+                backend,
                 model,
                 ..
             } => {
                 assert_eq!(mission_id, None, "blank id -> single-active resolution");
                 assert_eq!(effort, None);
                 assert_eq!(role, "orchestrator");
+                assert_eq!(backend.as_deref(), Some("claude"));
                 assert_eq!(model, "opus");
             }
             other => panic!("expected Config, got {other:?}"),
@@ -2321,6 +2373,7 @@ mod tests {
             Action::Config {
                 mission_id: None,
                 role: "worker".into(),
+                backend: None,
                 model: "sonnet".into(),
                 effort: None,
                 user_id: Some("Ucfg".into()),
@@ -2337,8 +2390,26 @@ mod tests {
             Action::Config {
                 mission_id: None,
                 role: "orchestrator".into(),
+                backend: None,
                 model: "opus".into(),
                 effort: Some("xhigh".into()),
+                user_id: Some("Ucfg".into()),
+                response_url: Some("https://hooks.slack/c".into()),
+                channel: None,
+            }
+        );
+    }
+
+    #[test]
+    fn slash_config_backend_model_effort_routes_to_config() {
+        assert_eq!(
+            route(&config_env("worker CODEX gpt-5-codex HIGH"), &lookup_none()).action,
+            Action::Config {
+                mission_id: None,
+                role: "worker".into(),
+                backend: Some("codex".into()),
+                model: "gpt-5-codex".into(),
+                effort: Some("high".into()),
                 user_id: Some("Ucfg".into()),
                 response_url: Some("https://hooks.slack/c".into()),
                 channel: None,
@@ -2354,6 +2425,7 @@ mod tests {
             Action::Config {
                 mission_id: Some("m-42".into()),
                 role: "scrutiny".into(),
+                backend: None,
                 model: "opus".into(),
                 effort: Some("high".into()),
                 user_id: Some("Ucfg".into()),
@@ -2412,6 +2484,17 @@ mod tests {
         assert!(
             config_patch("nope", "sonnet", None).is_none(),
             "unknown role → None"
+        );
+        assert_eq!(
+            config_patch_with_backend("worker", Some("codex"), "gpt-5-codex", Some("high"))
+                .unwrap(),
+            json!({
+                "worker": {
+                    "backend": "codex",
+                    "model": "gpt-5-codex",
+                    "reasoningEffort": "high"
+                }
+            })
         );
     }
 
