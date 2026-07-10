@@ -762,6 +762,41 @@ async fn control_post_rejects_an_invalid_config_change_before_enqueueing() {
     assert!(control::drain(&paths).unwrap().is_empty());
 }
 
+/// Happy-path mirror of the rejection test: a VALID backend selection posted
+/// through the dashboard's wire shape must 202 and land in the control inbox
+/// as the exact ConfigChange patch the engine will drain (drain-side apply +
+/// folded `config.changed` are pinned by the engine's own drain tests).
+#[tokio::test]
+async fn control_post_enqueues_a_valid_backend_selection() {
+    let (_tmp, _repo_root, paths, app) = fixture();
+    let uri = format!("/api/missions/{MISSION_ID}/control");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(&uri)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"kind":"config-change","patch":{"worker":{"backend":"codex","model":"gpt-5-codex"}}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let commands = control::drain(&paths).unwrap();
+    assert_eq!(commands.len(), 1);
+    match &commands[0].1 {
+        ControlCommand::ConfigChange { patch } => {
+            assert_eq!(patch["worker"]["backend"], "codex");
+            assert_eq!(patch["worker"]["model"], "gpt-5-codex");
+        }
+        other => panic!("expected a ConfigChange, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn control_post_rejects_terminal_mission() {
     let (_tmp, _repo_root, paths, app) = fixture();

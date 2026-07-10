@@ -83,7 +83,7 @@ fn setup() -> bool {
     }
 }
 
-fn raw_git(dir: &Path, args: &[&str]) {
+fn raw_git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .args(args)
         .current_dir(dir)
@@ -94,6 +94,7 @@ fn raw_git(dir: &Path, args: &[&str]) {
         "git {args:?} failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
 /// Fresh repo on branch `main` with one seed commit, canonicalized root.
@@ -1532,4 +1533,89 @@ async fn queue_drain_route_runs_a_queued_mission_to_complete() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Gated merge: the PRODUCTION gate-executor wiring (no injected stub)
+// ---------------------------------------------------------------------------
+
+/// Complete mission with `base_sha` pinned and one commit on its branch —
+/// the minimal shape `POST /merge` acts on (mirrors server_test.rs fixtures).
+#[cfg(unix)]
+fn seed_complete_mission(repo_root: &Path, id: &str, base_sha: &str) {
+    let branch = format!("kranz/mission-{id}");
+    let paths = MissionPaths::new(repo_root, id);
+    let mut log = EventLog::acquire(&paths, id, Duration::ZERO, LockForce::No).unwrap();
+    log.append(EventKind::MissionCreated {
+        goal: "prove the real gate executor".into(),
+        base_branch: "main".into(),
+        mission_branch: branch.clone(),
+        config: MissionConfig::default(),
+    })
+    .unwrap();
+    let plan: Plan = serde_json::from_value(plan_json()).unwrap();
+    log.append(EventKind::PlanApproved {
+        plan,
+        base_sha: Some(base_sha.to_string()),
+    })
+    .unwrap();
+    log.append(EventKind::MissionCompleted {}).unwrap();
+    drop(log);
+
+    raw_git(repo_root, &["checkout", "-b", &branch, base_sha]);
+    std::fs::write(repo_root.join("feature.txt"), "new feature\n").unwrap();
+    raw_git(repo_root, &["add", "--", "feature.txt"]);
+    raw_git(repo_root, &["commit", "-m", "add feature"]);
+    raw_git(repo_root, &["checkout", "main"]);
+}
+
+/// Pins the PRODUCTION executor wiring end to end. Every other merge test
+/// injects a fake executor, so nothing else would catch a revert of
+/// `real_gate_executor` to a raw inherited-env `sh -c` (or a flipped
+/// clear_env): here a REAL MissionHost drives a real merge whose base-tracked
+/// gate suite fails if a server-process env var is visible — and a second
+/// gate fails if whitelisted vars (PATH) stopped coming through. Unix-only:
+/// the gate commands are `sh` syntax.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn real_gate_executor_hides_server_env_and_passes_whitelisted_vars() {
+    if !setup() {
+        return;
+    }
+    // Canary in the SERVER process environment: must never reach a gate.
+    std::env::set_var("KRANZ_TEST_CANARY", "leaked-server-secret");
+
+    let (_dir, root) = init_repo();
+    let gates = root.join(kranz_engine::merge_gate::MERGE_GATES_PATH);
+    std::fs::create_dir_all(gates.parent().unwrap()).unwrap();
+    std::fs::write(
+        &gates,
+        "{\"gates\":[{\"command\":\"test -z \\\"$KRANZ_TEST_CANARY\\\"\"},{\"command\":\"test -n \\\"$PATH\\\"\"}]}\n",
+    )
+    .unwrap();
+    raw_git(&root, &["add", "-A"]);
+    raw_git(&root, &["commit", "-m", "add merge gates"]);
+    let base_sha = raw_git(&root, &["rev-parse", "HEAD"]).trim().to_string();
+    seed_complete_mission(&root, "m-canary", &base_sha);
+
+    // A real host: no with_gate_executor, no injected backend — the merge
+    // path never touches the agent backend, so lazy discovery stays unused.
+    let host = kranz_server::MissionHost::new(root.clone());
+    let app = kranz_server::router_with_host(host, None, Some(TOKEN.to_string()));
+
+    let (status, body) =
+        post_json(&app, "/api/missions/m-canary/merge", Some(TOKEN), json!({})).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "gates must pass — the canary leaked into the gate env, or PATH \
+         stopped coming through the whitelist: {body}"
+    );
+    assert_eq!(body["merged"], true, "{body}");
+    let main_tip = raw_git(&root, &["rev-parse", "main"]).trim().to_string();
+    assert_ne!(
+        main_tip, base_sha,
+        "the gated merge must have landed on main"
+    );
 }

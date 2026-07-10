@@ -47,7 +47,7 @@ pub(crate) async fn ws_handler(
     let origin = headers
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok());
-    if !crate::ws_origin_allowed(origin, server.bind_port, server.bind_is_loopback) {
+    if !crate::ws_origin_allowed(origin, server.bind_addr, server.bind_is_loopback) {
         return StatusCode::FORBIDDEN.into_response();
     }
 

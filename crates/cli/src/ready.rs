@@ -62,6 +62,7 @@ pub fn assess(repo: &Path) -> ReadyReport {
         readme_docs(repo),
         test_runner(repo, &validation_commands),
         ci_config(repo),
+        merge_gates(repo),
         gitignore_hygiene(repo),
         backend_lanes(repo),
         contract_prerequisites(&validation_commands),
@@ -219,8 +220,8 @@ fn ci_config(repo: &Path) -> ReadyDimension {
     if has_ci {
         dim(
             "CI config",
-            10,
-            10,
+            5,
+            5,
             ReadyStatus::Pass,
             "CI config detected",
             "",
@@ -229,11 +230,67 @@ fn ci_config(repo: &Path) -> ReadyDimension {
         dim(
             "CI config",
             0,
-            10,
+            5,
             ReadyStatus::Fail,
             "no common CI config detected",
             "add CI that runs the same validation commands kranz will gate on",
         )
+    }
+}
+
+/// `kranz merge` fails closed without a tracked, parseable gate suite on the
+/// base branch, so readiness validates the same artifact the merge will read:
+/// the file committed to the CURRENT branch's tree (never the working tree —
+/// an uncommitted suite would not gate the first merge).
+fn merge_gates(repo: &Path) -> ReadyDimension {
+    use kranz_engine::merge_gate::MERGE_GATES_PATH;
+    let committed = kranz_engine::git_ops::GitRepo::open(repo)
+        .and_then(|git| git.show_file("HEAD", MERGE_GATES_PATH));
+    let bytes = match committed {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            return dim(
+                "merge gates",
+                0,
+                5,
+                ReadyStatus::Fail,
+                format!("no tracked {MERGE_GATES_PATH} on the current branch"),
+                format!(
+                    "commit a {MERGE_GATES_PATH} gate suite so the first merge does not fail closed"
+                ),
+            )
+        }
+        Err(error) => {
+            return dim(
+                "merge gates",
+                0,
+                5,
+                ReadyStatus::Fail,
+                format!("cannot read committed {MERGE_GATES_PATH}: {error}"),
+                format!("commit a parseable {MERGE_GATES_PATH} on a committed branch"),
+            )
+        }
+    };
+    match kranz_engine::merge_gate::parse_gate_suite(&bytes) {
+        Ok(suite) => dim(
+            "merge gates",
+            5,
+            5,
+            ReadyStatus::Pass,
+            format!(
+                "committed {MERGE_GATES_PATH} defines {} gate(s)",
+                suite.gates.len()
+            ),
+            "",
+        ),
+        Err(detail) => dim(
+            "merge gates",
+            0,
+            5,
+            ReadyStatus::Fail,
+            detail,
+            format!("fix {MERGE_GATES_PATH} so merges can run real gates"),
+        ),
     }
 }
 
@@ -287,12 +344,29 @@ fn gitignore_hygiene(repo: &Path) -> ReadyDimension {
 }
 
 fn git_ignores(repo: &Path, relative_path: &str) -> bool {
-    let output = Command::new("git")
+    // Verdict first. `check-ignore --verbose` exits 0 whenever ANY rule
+    // decides the path — including a negation such as `!config.json` that
+    // makes it committable — so only `--quiet` (success == actually ignored)
+    // is trusted for the verdict; `--verbose` below is source attribution
+    // only.
+    let ignored = Command::new("git")
         .arg("-C")
         .arg(repo)
         // Readiness is a repository property: ignore an operator's global
-        // excludes, and ask for the rule source so `.git/info/exclude` and an
-        // uncommitted `.gitignore` cannot make a repo look ready.
+        // excludes here and reject non-repo rule sources below, so
+        // `.git/info/exclude` and an uncommitted `.gitignore` cannot make a
+        // repo look ready.
+        .args(["-c", "core.excludesFile=", "check-ignore", "--quiet", "--"])
+        .arg(relative_path)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    if !ignored {
+        return false;
+    }
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
         .args([
             "-c",
             "core.excludesFile=",
@@ -338,11 +412,19 @@ fn git_ignores(repo: &Path, relative_path: &str) -> bool {
     if relative_source.file_name().and_then(|name| name.to_str()) != Some(".gitignore") {
         return false;
     }
+    // The decisive rule must come from a *committed* .gitignore, so verify
+    // against HEAD's tree — `ls-files --error-unmatch` consults the index,
+    // where a staged-but-never-committed .gitignore would already count.
+    let source_spec = relative_source
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
     Command::new("git")
         .arg("-C")
         .arg(repo)
-        .args(["ls-files", "--error-unmatch", "--"])
-        .arg(relative_source)
+        .args(["cat-file", "-e"])
+        .arg(format!("HEAD:{source_spec}"))
         .output()
         .map(|tracked| tracked.status.success())
         .unwrap_or(false)
@@ -400,21 +482,10 @@ fn backend_lanes(repo: &Path) -> ReadyDimension {
             )
         }
     };
-    let probes = [
-        (
-            "claude",
-            kranz_engine::backend_claude::discover_claude_binary(cfg.claude_binary.as_deref())
-                .is_ok(),
-        ),
-        (
-            "codex",
-            kranz_engine::backend_codex::discover_codex_binary(None).is_ok(),
-        ),
-        (
-            "droid",
-            kranz_engine::backend_droid::discover_droid_binary(None).is_ok(),
-        ),
-    ];
+    backend_lanes_for_config(&cfg)
+}
+
+fn backend_lanes_for_config(cfg: &kranz_engine::types::MissionConfig) -> ReadyDimension {
     let required = [
         cfg.orchestrator.backend.as_deref().unwrap_or("claude"),
         cfg.worker.backend.as_deref().unwrap_or("claude"),
@@ -427,13 +498,34 @@ fn backend_lanes(repo: &Path) -> ReadyDimension {
             .as_deref()
             .unwrap_or("claude"),
     ];
+    // Probe only backends some role actually selects: a `--version` probe
+    // still execs a real binary, so an unrelated broken (or hung) CLI on
+    // PATH must not slow down or fail readiness for a repo that never
+    // dispatches to it. `None` marks a lane that was skipped, not probed.
+    let probes: Vec<(&str, Option<bool>)> = ["claude", "codex", "droid"]
+        .iter()
+        .map(|&backend| {
+            if !required.contains(&backend) {
+                return (backend, None);
+            }
+            let available = match backend {
+                "claude" => kranz_engine::backend_claude::discover_claude_binary(
+                    cfg.claude_binary.as_deref(),
+                )
+                .is_ok(),
+                "codex" => kranz_engine::backend_codex::discover_codex_binary(None).is_ok(),
+                _ => kranz_engine::backend_droid::discover_droid_binary(None).is_ok(),
+            };
+            (backend, Some(available))
+        })
+        .collect();
     let missing_required: Vec<&str> = required
         .iter()
         .copied()
         .filter(|required| {
             !probes
                 .iter()
-                .any(|(backend, available)| backend == required && *available)
+                .any(|(backend, available)| backend == required && *available == Some(true))
         })
         .collect();
     let evidence = format!(
@@ -442,7 +534,11 @@ fn backend_lanes(repo: &Path) -> ReadyDimension {
             .iter()
             .map(|(backend, available)| format!(
                 "{backend}={}",
-                if *available { "ready" } else { "unavailable" }
+                match available {
+                    Some(true) => "ready",
+                    Some(false) => "unavailable",
+                    None => "skipped (no role selects it)",
+                }
             ))
             .collect::<Vec<_>>()
             .join(", ")
@@ -692,6 +788,10 @@ mod tests {
              serve.token\n\
              tickets/*.status\n",
         );
+        write(
+            &dir.path().join(".kranz/merge-gates.json"),
+            r#"{"gates":[{"command":"cargo test --workspace"}]}"#,
+        );
         commit_all(dir.path());
 
         let report = assess(dir.path());
@@ -704,6 +804,12 @@ mod tests {
             .find(|dimension| dimension.name == "kranz runtime gitignore")
             .unwrap();
         assert_eq!(hygiene.status, ReadyStatus::Pass, "{hygiene:?}");
+        let gates = report
+            .dimensions
+            .iter()
+            .find(|dimension| dimension.name == "merge gates")
+            .unwrap();
+        assert_eq!(gates.status, ReadyStatus::Pass, "{gates:?}");
     }
 
     #[test]
@@ -743,5 +849,114 @@ mod tests {
 
         let hygiene = gitignore_hygiene(dir.path());
         assert_eq!(hygiene.status, ReadyStatus::Fail, "{hygiene:?}");
+    }
+
+    #[test]
+    fn gitignore_hygiene_rejects_negated_ignore_rules() {
+        let dir = TempDir::new().unwrap();
+        git(dir.path(), &["init"]);
+        // `*` ignores the runtime files, but the trailing negation makes
+        // config.json committable without -f — the probe must not count it
+        // as ignored (check-ignore --verbose exits 0 for negated matches).
+        write(
+            &dir.path().join(".kranz/.gitignore"),
+            "*\n!.gitignore\n!config.json\n",
+        );
+        commit_all(dir.path());
+
+        assert!(!git_ignores(dir.path(), ".kranz/config.json"));
+        let hygiene = gitignore_hygiene(dir.path());
+        assert_ne!(hygiene.status, ReadyStatus::Pass, "{hygiene:?}");
+        assert!(hygiene.evidence.contains("7/8"), "{hygiene:?}");
+    }
+
+    #[test]
+    fn gitignore_hygiene_rejects_staged_but_uncommitted_gitignore() {
+        let dir = TempDir::new().unwrap();
+        git(dir.path(), &["init"]);
+        write(&dir.path().join("README.md"), "readme");
+        commit_all(dir.path());
+        // Staged but never committed: the rules are not yet a repository
+        // property, so the dimension must not pass.
+        write(
+            &dir.path().join(".kranz/.gitignore"),
+            "missions/*/events.jsonl\n\
+             missions/*/events.jsonl.lock\n\
+             missions/*/state.json\n\
+             missions/*/runs/\n\
+             missions/*/control/\n\
+             config.json\n\
+             serve.token\n\
+             tickets/*.status\n",
+        );
+        git(dir.path(), &["add", ".kranz/.gitignore"]);
+
+        assert!(!git_ignores(dir.path(), ".kranz/config.json"));
+        let hygiene = gitignore_hygiene(dir.path());
+        assert_eq!(hygiene.status, ReadyStatus::Fail, "{hygiene:?}");
+    }
+
+    #[test]
+    fn merge_gates_dimension_requires_a_tracked_suite() {
+        let dir = TempDir::new().unwrap();
+        git(dir.path(), &["init"]);
+        write(&dir.path().join("README.md"), "readme");
+        commit_all(dir.path());
+        // A working-tree-only suite must not count: merges read the file
+        // from the committed tree, never the working tree.
+        write(
+            &dir.path().join(".kranz/merge-gates.json"),
+            r#"{"gates":[{"command":"cargo test --workspace"}]}"#,
+        );
+
+        let gates = merge_gates(dir.path());
+        assert_eq!(gates.status, ReadyStatus::Fail, "{gates:?}");
+        assert!(gates.evidence.contains("no tracked"), "{gates:?}");
+        assert!(
+            gates.remedy.contains(".kranz/merge-gates.json"),
+            "{gates:?}"
+        );
+    }
+
+    #[test]
+    fn merge_gates_dimension_rejects_unparseable_suites() {
+        let dir = TempDir::new().unwrap();
+        git(dir.path(), &["init"]);
+        write(&dir.path().join(".kranz/merge-gates.json"), "not json");
+        commit_all(dir.path());
+
+        let gates = merge_gates(dir.path());
+        assert_eq!(gates.status, ReadyStatus::Fail, "{gates:?}");
+        assert!(
+            gates.evidence.contains("invalid .kranz/merge-gates.json"),
+            "{gates:?}"
+        );
+        assert!(!gates.remedy.is_empty(), "{gates:?}");
+    }
+
+    #[test]
+    fn merge_gates_dimension_passes_on_a_committed_valid_suite() {
+        let dir = TempDir::new().unwrap();
+        git(dir.path(), &["init"]);
+        write(
+            &dir.path().join(".kranz/merge-gates.json"),
+            r#"{"gates":[{"command":"cargo test --workspace"}]}"#,
+        );
+        commit_all(dir.path());
+
+        let gates = merge_gates(dir.path());
+        assert_eq!(gates.status, ReadyStatus::Pass, "{gates:?}");
+        assert!(gates.evidence.contains("1 gate"), "{gates:?}");
+    }
+
+    #[test]
+    fn backend_lanes_probe_only_backends_some_role_selects() {
+        // The default config dispatches every role to claude, so the codex
+        // and droid lanes must be skipped instead of exec'd.
+        let cfg = kranz_engine::types::MissionConfig::default();
+        let lanes = backend_lanes_for_config(&cfg);
+        assert!(!lanes.evidence.contains("claude=skipped"), "{lanes:?}");
+        assert!(lanes.evidence.contains("codex=skipped"), "{lanes:?}");
+        assert!(lanes.evidence.contains("droid=skipped"), "{lanes:?}");
     }
 }

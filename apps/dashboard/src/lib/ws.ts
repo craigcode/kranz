@@ -5,14 +5,23 @@
 // replays `event` frames (no snapshot) and we keep our state; otherwise it
 // sends a fresh `snapshot`. Backoff is exponential: 0.5s doubling to 8s.
 //
+// The one terminal state: a mission deleted out-of-band (`kranz clean` in a
+// terminal, another tab) 404s on every upgrade, which would reconnect-loop
+// at the backoff cap forever. After repeated failures a cheap REST probe
+// checks whether the mission still exists; a 404 stops the socket for good
+// and reports 'gone' through onStatus.
+//
 // Off-loopback serves also require ?token= (browsers cannot set the
 // x-kranz-token header on WebSocket upgrades).
 
+import { ApiError, getJson } from './api';
 import { resolveToken, subscribeTokenGate } from './token';
 import type { WsFrame } from './types';
 
 const BACKOFF_MIN_MS = 500;
 const BACKOFF_MAX_MS = 8000;
+/** Closes-without-open tolerated before the existence probe kicks in. */
+const GONE_PROBE_AFTER_FAILURES = 2;
 
 export interface MissionSocketOptions {
   /** http(s) origin of the server (no trailing slash). */
@@ -21,7 +30,9 @@ export interface MissionSocketOptions {
   /** Last seq seen, or null to request a fresh snapshot. */
   getSince: () => number | null;
   onFrame: (frame: WsFrame) => void;
-  onStatus: (status: 'connecting' | 'live' | 'lost') => void;
+  /** 'gone' is terminal: the mission 404s server-side and the socket has
+   *  stopped reconnecting for good. */
+  onStatus: (status: 'connecting' | 'live' | 'lost' | 'gone') => void;
 }
 
 export class MissionSocket {
@@ -29,6 +40,10 @@ export class MissionSocket {
   private closed = false;
   private backoffMs = BACKOFF_MIN_MS;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Consecutive closes without a successful open (resets on 'live'). */
+  private failures = 0;
+  /** True while an existence probe is in flight (at most one at a time). */
+  private probing = false;
   private readonly opts: MissionSocketOptions;
   private readonly unsubscribeToken: () => void;
 
@@ -64,6 +79,7 @@ export class MissionSocket {
     ws.onopen = () => {
       if (this.closed) return;
       this.backoffMs = BACKOFF_MIN_MS;
+      this.failures = 0;
       this.opts.onStatus('live');
     };
 
@@ -80,8 +96,15 @@ export class MissionSocket {
 
     ws.onclose = () => {
       if (this.closed) return;
+      this.failures += 1;
       this.opts.onStatus('lost');
       this.scheduleReconnect();
+      // Repeated closes without ever opening look like the mission is gone
+      // (its dir deleted out-of-band — the upgrade 404s before onopen). The
+      // probe runs ALONGSIDE the scheduled retry, not instead of it, so a
+      // token nudge keeps its immediate reconnect; a terminal 404 cancels
+      // the pending retry via close().
+      if (this.failures >= GONE_PROBE_AFTER_FAILURES) void this.probeMissionGone();
     };
 
     ws.onerror = () => {
@@ -123,5 +146,28 @@ export class MissionSocket {
       this.reconnectTimer = null;
       this.connect();
     }, delay);
+  }
+
+  /** Fail-fast existence check for the mission behind this socket. An HTTP
+   *  404 is terminal: the socket closes for good and reports 'gone' (the
+   *  store tears the dead connection down). Anything else — success, a 401
+   *  off-loopback, a network error — is inconclusive and leaves the normal
+   *  reconnect schedule alone. */
+  private async probeMissionGone(): Promise<void> {
+    if (this.probing) return;
+    this.probing = true;
+    let gone = false;
+    try {
+      await getJson(`/api/missions/${encodeURIComponent(this.opts.missionId)}/state`, {
+        tokenGate: false,
+      });
+    } catch (err) {
+      gone = err instanceof ApiError && err.status === 404;
+    } finally {
+      this.probing = false;
+    }
+    if (this.closed || !gone) return;
+    this.close();
+    this.opts.onStatus('gone');
   }
 }

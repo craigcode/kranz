@@ -299,9 +299,21 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
 
     loadMissions: async () => {
       set({ missionsError: null });
+      // For the vanished-mission check below: only let the fresh list rule
+      // on a connection that already existed when the fetch STARTED — a
+      // mission connected mid-flight may legitimately postdate the list.
+      const connectedAtStart = get().missionId;
       try {
         const missions = await api.missions();
         set({ missions });
+        // The connected mission vanishing from a fresh list means it was
+        // deleted out-of-band (`kranz clean` in a terminal, another tab, or
+        // a delete POST whose response was lost): tear the socket down, or
+        // it reconnect-loops against the server's 404 forever.
+        const id = get().missionId;
+        if (id !== null && id === connectedAtStart && !missions.some((m) => m.id === id)) {
+          get().disconnect();
+        }
       } catch (err) {
         set({ missionsError: err instanceof Error ? err.message : String(err) });
       }
@@ -412,6 +424,13 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
         getSince: () => (get().state !== null ? get().lastSeq : null),
         onFrame: applyFrame,
         onStatus: (connection) => {
+          if (connection === 'gone') {
+            // The socket proved the mission 404s (deleted out-of-band —
+            // `kranz clean`, another tab) and stopped reconnecting for
+            // good; drop the dead connection entirely.
+            if (get().missionId === id) get().disconnect();
+            return;
+          }
           set({ connection });
           // Reconnects with ?since= replay events without a snapshot; re-fetch
           // the fold once so lifecycle changes missed offline aren't stale.

@@ -4050,8 +4050,11 @@ fn worker_leaks_secret() -> MockScript {
 /// The refusal must NOT error the run (the old `?` wedged the mission: the
 /// tree is still dirty on resume, so resume re-hit the identical error).
 /// Instead it is recorded — an orchestrator.decision plus feature.failed
-/// carrying the scan's reason — and the mission runs on to a clean,
-/// recorded terminal state.
+/// carrying the scan's reason — and the milestone BLOCKS: the refused
+/// content is still dirty in the shared sequential tree, so running further
+/// features would only cascade the same refusal onto them. The mission ends
+/// Blocked (resumable once the operator cleans or allowlists the named
+/// paths), a recorded state rather than a raw Err.
 #[tokio::test(flavor = "multi_thread")]
 async fn secret_scan_refusal_fails_feature_instead_of_erroring_run() {
     if !setup() {
@@ -4062,8 +4065,8 @@ async fn secret_scan_refusal_fails_feature_instead_of_erroring_run() {
     let backend = Arc::new(MockBackend::with_scripts(vec![
         worker_leaks_secret(),
         // Turns: seed, dirty-tree decision. The refusal fails the feature
-        // BEFORE any judgement turn, and the mission then fails at the final
-        // gate's empty-deliverable net without further turns.
+        // BEFORE any judgement turn, then blocks the milestone; the blocked
+        // flow returns without further turns (no queued user message).
         orch_script(vec![dirty_tree_commit_as_is()]),
     ]));
 
@@ -4074,10 +4077,16 @@ async fn secret_scan_refusal_fails_feature_instead_of_erroring_run() {
         .await
         .expect("run must not hang")
         .expect("a scan refusal must not error the run loop");
-    // The only feature failed, so no deliverable landed: the mission ends
-    // Failed via the final gate's empty-diff net — a recorded terminal
-    // state, not a raw Err the operator can only retry into the same wall.
-    assert_eq!(status, MissionStatus::Failed);
+    // The refusal poisons the shared tree, so the milestone blocks and the
+    // mission ends Blocked — a recorded, resumable state, not a raw Err the
+    // operator can only retry into the same wall.
+    assert_eq!(status, MissionStatus::Blocked);
+    assert_eq!(engine.state().mission.status, MissionStatus::Blocked);
+    assert_eq!(
+        engine.state().mission.milestones[0].status,
+        MilestoneStatus::Blocked,
+        "the milestone blocks against the poisoned tree"
+    );
     assert_eq!(
         engine.state().mission.milestones[0].features[0].status,
         FeatureStatus::Failed,
@@ -4115,11 +4124,106 @@ async fn secret_scan_refusal_fails_feature_instead_of_erroring_run() {
         "an orchestrator.decision records the refusal"
     );
 
+    // milestone.blocked names the cleanup cue: the still-dirty paths.
+    let blocked_reason = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::MilestoneBlocked { reason, .. } => Some(reason.clone()),
+            _ => None,
+        })
+        .expect("milestone.blocked with the cleanup cue is on the log");
+    assert!(
+        blocked_reason.contains("secret scan") && blocked_reason.contains("leak.txt"),
+        "blocked reason names the scan and the dirty path: {blocked_reason}"
+    );
+
     // And the raw secret never reaches the event log in any event.
     let raw_log = std::fs::read_to_string(paths.events_file()).unwrap();
     assert!(
         !raw_log.contains(LEAKED_SECRET),
         "the raw secret must never land in events.jsonl"
+    );
+}
+
+/// The cascade the block prevents: with a second Pending feature behind the
+/// leaking one, feature B must never RUN against the poisoned tree — the old
+/// continue-the-milestone behaviour spawned B, tripped B's dirty-tree turn on
+/// A's still-uncommitted secret, and failed B with a reason naming A's leak
+/// (cascading misattribution). B's worker script and a second dirty-tree
+/// reply are queued so that old behaviour would be visible; they must go
+/// unconsumed.
+#[tokio::test(flavor = "multi_thread")]
+async fn secret_scan_refusal_blocks_milestone_so_later_features_never_run() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_leaks_secret(),
+        // One dirty-tree reply for f-1-1's refusal, plus a second one that
+        // only a (wrong) f-1-2 dirty-tree turn would consume.
+        orch_script(vec![dirty_tree_commit_as_is(), dirty_tree_commit_as_is()]),
+        // Would be popped by f-1-2's worker spawn — must never happen.
+        worker_pass_no_write(),
+    ]));
+
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(simple_plan(2, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .expect("a scan refusal must not error the run loop");
+    assert_eq!(status, MissionStatus::Blocked);
+    let ms = &engine.state().mission.milestones[0];
+    assert_eq!(ms.status, MilestoneStatus::Blocked);
+    assert_eq!(ms.features[0].status, FeatureStatus::Failed);
+    assert_eq!(
+        ms.features[1].status,
+        FeatureStatus::Pending,
+        "feature B must stay Pending, not be failed against A's poisoned tree"
+    );
+
+    // Exactly two sessions started: f-1-1's worker and the orchestrator.
+    // f-1-2's queued worker script was never popped.
+    assert_eq!(
+        backend.started_specs().len(),
+        2,
+        "no session may spawn for feature B after the milestone blocked"
+    );
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+
+    // Only f-1-1 was ever spawned and only f-1-1 failed; no event blames
+    // feature B with feature A's leak.
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::WorkerSpawned { feature_id: Some(id), .. } if id == "f-1-1"
+        )),
+        "feature A's worker spawned"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::WorkerSpawned { feature_id: Some(id), .. } if id == "f-1-2"
+        )),
+        "feature B's worker must never spawn"
+    );
+    let failed: Vec<&String> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::FeatureFailed { feature_id, .. } => Some(feature_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        failed,
+        vec!["f-1-1"],
+        "exactly one feature.failed, for the feature that actually leaked"
     );
 }
 

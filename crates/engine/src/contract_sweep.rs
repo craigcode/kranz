@@ -98,18 +98,43 @@ pub fn is_meta_commit_with_paths(
             .all(|path| is_mission_record_path(mission_id, path))
 }
 
+/// The record files a genuine engine meta commit writes inside the CURRENT
+/// mission's `.kranz/missions/<id>/` dir. Enumerated (not a prefix match)
+/// from the engine's actual commit sites — see [`is_mission_record_path`].
+const MISSION_RECORD_FILES: &[&str] = &[
+    "plan.json",       // approve_plan / commit_revised_plan_record
+    "plan.md",         // approve_plan / commit_revised_plan_record
+    "revised-plan.md", // commit_revised_plan_record / approve_revised_plan
+    "research.md",     // approve_plan / commit_revised_plan_record
+    "report.md",       // try_write_mission_report
+];
+
 /// Whether `path` (relative to the repo root, forward-slash, as
 /// `git diff --name-only` reports) is mission-record metadata a genuine
-/// engine meta commit writes. Derived from the engine's actual commit sites
-/// (orchestrator.rs `approve_plan` / `commit_revised_plan_record` /
+/// engine meta commit writes. Enumerated from the engine's actual commit
+/// sites (orchestrator.rs `approve_plan` / `commit_revised_plan_record` /
 /// `approve_revised_plan` / `try_write_mission_report` / `capture_lesson`):
-/// the mission's own record dir (plan.json, plan.md, revised-plan.md,
-/// research.md, report.md), the missions catalog, and the cross-mission
-/// lessons store (report commits fold captured lesson files in).
+/// the missions catalog (`.kranz/missions/index.md`), the exact record files
+/// in the CURRENT mission's dir ([`MISSION_RECORD_FILES`]), and — folded into
+/// the report commit — the lessons index plus THIS mission's own lesson file.
+///
+/// Deliberately no broader than that: a prefix match on all of
+/// `.kranz/lessons/` or `.kranz/missions/<id>/` would let a worker commit
+/// with a spoofed meta subject smuggle arbitrary files past the deliverable
+/// count and the path sweep — and lessons are ingested verbatim into FUTURE
+/// missions' planning prompts, so an exempt `.kranz/lessons/evil.md` is
+/// prompt-injection persistence, not just a miscount.
 pub fn is_mission_record_path(mission_id: &str, path: &str) -> bool {
-    path == ".kranz/missions/index.md"
-        || path.starts_with(&format!(".kranz/missions/{mission_id}/"))
-        || path.starts_with(".kranz/lessons/")
+    if path == ".kranz/missions/index.md" || path == ".kranz/lessons/index.md" {
+        return true;
+    }
+    if path == format!(".kranz/lessons/{mission_id}.md") {
+        return true;
+    }
+    match path.strip_prefix(&format!(".kranz/missions/{mission_id}/")) {
+        Some(record) => MISSION_RECORD_FILES.contains(&record),
+        None => false,
+    }
 }
 
 /// Mission meta paths (relative to repo root, forward-slash, matching
@@ -406,10 +431,15 @@ mod tests {
     #[test]
     fn mission_record_path_matches_engine_commit_sites_only() {
         let mission_id = "m-abc123";
+        // The complete set the engine's commit sites write (approve_plan,
+        // commit_revised_plan_record, approve_revised_plan,
+        // try_write_mission_report, capture_lesson) — nothing else.
         for path in [
             ".kranz/missions/index.md",
             ".kranz/missions/m-abc123/plan.json",
+            ".kranz/missions/m-abc123/plan.md",
             ".kranz/missions/m-abc123/revised-plan.md",
+            ".kranz/missions/m-abc123/research.md",
             ".kranz/missions/m-abc123/report.md",
             ".kranz/lessons/m-abc123.md",
             ".kranz/lessons/index.md",
@@ -423,6 +453,13 @@ mod tests {
             ".kranz/missions/m-abc1234/plan.json", // id prefix, other mission
             ".kranz/missions/m-other/plan.json",
             "kranz/missions/m-abc123/plan.json", // missing leading .kranz
+            // Smuggle shapes: the engine never commits these, so a spoofed
+            // meta subject touching them must NOT be sweep-exempt.
+            ".kranz/missions/m-abc123/arbitrary.rs",
+            ".kranz/missions/m-abc123/nested/plan.json",
+            ".kranz/lessons/evil.md", // ingested into future planning prompts
+            ".kranz/lessons/m-other.md", // another mission's lesson file
+            ".kranz/lessons/nested/index.md",
         ] {
             assert!(!is_mission_record_path(mission_id, path), "{path}");
         }

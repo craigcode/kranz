@@ -5,7 +5,7 @@ vi.mock('./token', () => ({
   awaitToken: vi.fn(),
 }));
 
-import { getJson, postJson, ApiError, isTokenRequired } from './api';
+import { api, getJson, postJson, ApiError, isTokenRequired } from './api';
 import { awaitToken, resolveToken } from './token';
 
 function htmlResponse(): Response {
@@ -144,5 +144,23 @@ describe('401 token gate', () => {
   it('isTokenRequired is false for non-401 failures', () => {
     expect(isTokenRequired(new ApiError(500, 'boom'))).toBe(false);
     expect(isTokenRequired(new Error('network down'))).toBe(false);
+  });
+
+  it('api.queue forwards its opts to getJson: tokenGate:false fails fast on 401', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(unauthorizedResponse());
+
+    let rejection: unknown;
+    try {
+      await api.queue({ tokenGate: false });
+    } catch (err) {
+      rejection = err;
+    }
+
+    // Pins the queue(opts) → getJson(path, opts) forwarding: if queue()
+    // dropped its opts, the 401 would park on the token gate and retry
+    // (awaitToken called, a second fetch) instead of failing fast.
+    expect(awaitToken).not.toHaveBeenCalled();
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(isTokenRequired(rejection)).toBe(true);
   });
 });

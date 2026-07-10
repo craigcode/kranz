@@ -191,6 +191,54 @@ fn gate_config_is_read_from_base_not_the_mission_branch() {
     assert_eq!(calls.borrow().as_slice(), ["cargo fmt --all --check"]);
 }
 
+/// The regression this pins: reading the WORKING-TREE gates file instead of
+/// the tracked file on the live BASE branch. With the primary checked out on
+/// the MISSION branch (clean tree), the working-tree merge-gates.json IS the
+/// mission's weakened suite — the base branch's suite must still be the one
+/// that runs, and the merge outcome must be unchanged.
+#[test]
+fn gate_config_is_read_from_base_even_with_the_mission_branch_checked_out() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, seed) = seeded_repo();
+    seed_mission_branch_with_files(
+        &dir,
+        &repo,
+        &seed,
+        &[
+            ("src/lib.rs", "fn a() {}\n"),
+            (MERGE_GATES_PATH, "{\"gates\":[{\"command\":\"true\"}]}\n"),
+        ],
+    );
+    // Check the primary out on the mission branch: the (clean, tracked)
+    // working tree now holds the weakened suite at the gates path.
+    repo.checkout("kranz/mission-x").unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(MERGE_GATES_PATH)).unwrap(),
+        "{\"gates\":[{\"command\":\"true\"}]}\n",
+        "fixture: the working tree must hold the mission's weakened suite"
+    );
+
+    let calls = std::cell::RefCell::new(Vec::new());
+    let report = merge_mission(&repo, "main", &seed, "kranz/mission-x", None, |cmd, _| {
+        calls.borrow_mut().push(cmd.to_string());
+        (true, String::new())
+    })
+    .unwrap();
+
+    match report {
+        MergeReport::Merged { commit, .. } => assert_eq!(commit, repo.head_sha().unwrap()),
+        other => panic!("expected Merged, got {other:?}"),
+    }
+    assert_eq!(
+        calls.borrow().as_slice(),
+        ["cargo fmt --all --check"],
+        "the BASE suite must run, never the mission's working-tree suite"
+    );
+    assert_eq!(repo.current_branch().unwrap(), "main");
+}
+
 /// Creates `kranz/mission-x` off the seed sha with one commit touching `path`.
 fn seed_mission_branch(dir: &TempDir, repo: &GitRepo, seed: &str, path: &str, content: &str) {
     repo.create_branch("kranz/mission-x", Some(seed)).unwrap();
@@ -607,6 +655,113 @@ fn mission_branch_movement_after_integration_does_not_change_what_lands() {
         std::fs::read_to_string(dir.path().join("pinned.txt")).unwrap(),
         "content from the gated tip\n",
         "the exact SHA merged into the scratch tree must be the SHA that lands"
+    );
+}
+
+/// merge_mission re-checks the pinned live-base sha after the gate suite:
+/// external/manual movement of the base branch while gates ran must refuse
+/// the merge (fail closed) and preserve the mover's new tip — no
+/// fast-forward may land.
+#[test]
+fn base_movement_while_gates_run_is_refused_and_the_moved_tip_survives() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, seed) = seeded_repo();
+    seed_mission_branch(&dir, &repo, &seed, "src/lib.rs", "fn a() {}\n");
+
+    // The injected executor plays a racing external writer: while the gate
+    // "runs" it advances refs/heads/main in the primary (main is checked out
+    // there; an empty commit keeps the tracked tree clean).
+    let external_tip = std::cell::RefCell::new(String::new());
+    let report = merge_mission(
+        &repo,
+        "main",
+        &seed,
+        "kranz/mission-x",
+        None,
+        |_cmd, _cwd| {
+            raw_git(
+                dir.path(),
+                &["commit", "--allow-empty", "-m", "external commit on main"],
+            );
+            *external_tip.borrow_mut() = raw_git(dir.path(), &["rev-parse", "main"])
+                .trim()
+                .to_string();
+            (true, String::new())
+        },
+    )
+    .unwrap();
+
+    match &report {
+        MergeReport::RefusedPreMerge { detail } => {
+            assert!(detail.contains("moved from"), "{detail}");
+            assert!(detail.contains("retry"), "{detail}");
+        }
+        other => panic!("expected RefusedPreMerge, got {other:?}"),
+    }
+    let external_tip = external_tip.borrow();
+    assert!(!external_tip.is_empty(), "the gate executor must have run");
+    assert_eq!(
+        repo.rev_parse("main").unwrap(),
+        *external_tip,
+        "the externally-moved base tip must be preserved (no fast-forward)"
+    );
+}
+
+/// Mission-authored gate code shares the primary `.git` through the scratch
+/// worktree, so it can plant `.git/hooks/*`; the merge path's own git
+/// commands (worktree add, checkout, merge, ff) must never execute them.
+#[cfg(unix)]
+#[test]
+fn planted_git_hooks_do_not_run_during_the_merge_flow() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if !setup() {
+        return;
+    }
+    let (dir, repo, seed) = seeded_repo();
+    seed_mission_branch(&dir, &repo, &seed, "src/lib.rs", "fn a() {}\n");
+
+    // Plant executable hooks AFTER branch setup (the fixture's own checkouts
+    // run hooks-enabled, like any worker-side git call would).
+    let sentinel = dir.path().join("hook-ran-sentinel");
+    let hooks_dir = dir.path().join(".git/hooks");
+    std::fs::create_dir_all(&hooks_dir).unwrap();
+    for name in ["post-checkout", "post-merge"] {
+        let hook = hooks_dir.join(name);
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\ntouch \"{}\"\n", sentinel.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // Control: the hook genuinely fires for a normal (hooks-enabled)
+    // checkout, proving the no-sentinel assertion below is not vacuous.
+    repo.checkout("kranz/mission-x").unwrap();
+    repo.checkout("main").unwrap();
+    assert!(
+        sentinel.exists(),
+        "control checkout must fire the planted hook"
+    );
+    std::fs::remove_file(&sentinel).unwrap();
+
+    let report = merge_mission(
+        &repo,
+        "main",
+        &seed,
+        "kranz/mission-x",
+        None,
+        passing_executor,
+    )
+    .unwrap();
+
+    assert!(matches!(report, MergeReport::Merged { .. }), "{report:?}");
+    assert!(
+        !sentinel.exists(),
+        "a planted .git hook must never run under the merge path's git commands"
     );
 }
 

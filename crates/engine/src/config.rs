@@ -514,6 +514,41 @@ mod tests {
     }
 
     #[test]
+    fn floor_violations_lead_with_the_effective_model() {
+        // A role that keeps its default model on a non-Claude backend runs
+        // the backend default, not the configured name — floor messages must
+        // lead with that effective model so a revert to naming only the
+        // configured model cannot ship silently.
+        let mut cfg = MissionConfig::default();
+        cfg.worker.backend = Some("droid".into());
+        let configured = cfg.worker.model.clone();
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!("worker effective model {DEFAULT_DROID_MODEL:?}")),
+            "{err}"
+        );
+        assert!(
+            err.contains(&format!("(configured as {configured:?})")),
+            "{err}"
+        );
+
+        let mut cfg = MissionConfig::default();
+        cfg.orchestrator.backend = Some("droid".into());
+        let configured = cfg.orchestrator.model.clone();
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!(
+                "orchestrator effective model {DEFAULT_DROID_MODEL:?}"
+            )),
+            "{err}"
+        );
+        assert!(
+            err.contains(&format!("(configured as {configured:?})")),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn validate_enforces_orchestrator_frontier_floor() {
         let mut cfg = MissionConfig::default();
         cfg.orchestrator.model = "sonnet".into();

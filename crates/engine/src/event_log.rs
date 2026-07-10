@@ -468,12 +468,17 @@ impl EventLog {
         use std::io::{Read, Seek, SeekFrom};
         let mut file = std::fs::File::open(path)?;
         let len = file.metadata()?.len();
-        let start = len.saturating_sub(max_bytes);
+        let window_start = len.saturating_sub(max_bytes);
+        // Read from one byte BEFORE the window: when the window happens to
+        // start exactly on a line boundary, that extra byte is the previous
+        // line's '\n', so the drop-through-first-'\n' below discards zero
+        // content bytes instead of eating one complete in-window line.
+        let start = window_start.saturating_sub(1);
         file.seek(SeekFrom::Start(start))?;
         let mut bytes = Vec::with_capacity((len - start) as usize);
         file.read_to_end(&mut bytes)?;
         let mut slice = bytes.as_slice();
-        if start > 0 {
+        if window_start > 0 {
             // Drop the line the window cut into; its head is outside.
             match slice.iter().position(|&b| b == b'\n') {
                 Some(nl) => slice = &slice[nl + 1..],

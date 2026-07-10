@@ -1462,7 +1462,9 @@ fn clip(s: &str) -> String {
 }
 
 /// Clip on a char boundary, appending an ellipsis when truncated.
-fn clip_to(s: &str, max: usize) -> String {
+/// `pub(crate)` so the bridge's reply builders share this one helper — a
+/// second local truncation (with its own constant) would silently drift.
+pub(crate) fn clip_to(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }

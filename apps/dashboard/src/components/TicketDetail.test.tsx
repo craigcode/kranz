@@ -148,6 +148,11 @@ describe('TicketDetail', () => {
     // the store's draftingSlug, not the ticket's own missionId.
     vi.mocked(api.ticket).mockResolvedValueOnce(makeTicket({ missionId: null }));
     vi.mocked(api.draftTicket).mockResolvedValueOnce({ missionId: 'm-1' });
+    // The refresh must list the freshly drafted mission — loadMissions treats
+    // a connected mission missing from a fresh list as deleted out-of-band.
+    vi.mocked(api.missions).mockResolvedValue([
+      { id: 'm-1', status: 'planning', goal: 'Ship the fix.', createdAt: '2026-01-01T00:00:00Z' },
+    ]);
 
     render(<TicketDetail slug="fix-b" />);
 

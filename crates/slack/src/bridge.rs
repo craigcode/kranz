@@ -253,18 +253,31 @@ impl OutboundPoster for SlackPoster {
 /// actually changed since the last tick — an idle bridge must not reload
 /// notify-cursors.json every 500ms. The first tick counts as changed so
 /// missions deleted while the bridge was down are still pruned at startup.
+///
+/// `listing_failed` tracks whether the PREVIOUS tick's listing failed, so a
+/// persistent failure (which repeats every 500ms — ~120 ticks/min) warns once
+/// at onset, downgrades repeats to debug, and logs an info on recovery.
 fn prune_tick(
     repo_root: &Path,
     cursors: &mut HashMap<String, MissionCursor>,
     last_live: &mut Option<std::collections::HashSet<String>>,
+    listing_failed: &mut bool,
 ) -> Option<std::collections::HashSet<String>> {
     let live: std::collections::HashSet<String> = match MissionPaths::try_list_missions(repo_root) {
         Ok(ids) => ids.into_iter().collect(),
         Err(e) => {
-            tracing::warn!(error = %e, "failed to list missions; skipping cursor prune this tick");
+            if *listing_failed {
+                tracing::debug!(error = %e, "mission listing still failing; outbound poll still skipped");
+            } else {
+                *listing_failed = true;
+                tracing::warn!(error = %e, "failed to list missions; skipping outbound poll until the mission listing recovers");
+            }
             return None;
         }
     };
+    if std::mem::take(listing_failed) {
+        tracing::info!("mission listing recovered; resuming outbound poll");
+    }
     if last_live.as_ref() != Some(&live) {
         // Prune persisted cursors for deleted missions (best-effort).
         match NotifyCursors::load(repo_root) {
@@ -316,6 +329,9 @@ pub async fn run_bridge(
     // Live mission set observed on the previous tick; the prune step only
     // touches notify-cursors.json when this changes (cheap idle ticks).
     let mut last_live: Option<std::collections::HashSet<String>> = None;
+    // Whether the previous tick's mission listing failed (warn-once state for
+    // `prune_tick` — see its doc).
+    let mut listing_failed = false;
 
     loop {
         tokio::select! {
@@ -326,7 +342,7 @@ pub async fn run_bridge(
             _ = ticker.tick() => {
                 // On a listing failure `prune_tick` prunes nothing and we skip
                 // the whole tick (there is no trustworthy live set to poll).
-                let Some(live) = prune_tick(&repo_root, &mut cursors, &mut last_live) else {
+                let Some(live) = prune_tick(&repo_root, &mut cursors, &mut last_live, &mut listing_failed) else {
                     continue;
                 };
                 for mission_id in &live {
@@ -420,6 +436,14 @@ async fn poll_mission_with_poster(
             }
         };
         let last_seq = persisted_seq.unwrap_or(state.last_seq).min(state.last_seq);
+        if persisted_seq.is_none() {
+            // Seeding at head: persist immediately (one write per NEW mission).
+            // Without this, a mission first seen at head has no on-disk cursor
+            // until its next event posts — a bridge stopped in that window
+            // reseeds at the NEW head on restart, silently dropping everything
+            // appended while it was down.
+            persist_notify_cursor(repo_root, mission_id, last_seq);
+        }
         cursors.insert(mission_id.to_string(), MissionCursor { state, last_seq });
         return Ok(());
     }
@@ -2626,9 +2650,11 @@ async fn approve_flow(
 
 /// A single mrkdwn section block for a short status / error / confirmation
 /// ephemeral. (Not every reply warrants the full header/section/context frame.)
+/// Clipped with a trailing ellipsis safely below Slack's 3,000-char section
+/// cap, leaving room for instance labeling.
 fn error_blocks(msg: &str) -> Vec<Value> {
     const MAX_SLACK_FIELD: usize = 2500;
-    let text: String = msg.chars().take(MAX_SLACK_FIELD).collect();
+    let text = crate::format::clip_to(msg, MAX_SLACK_FIELD);
     vec![json!({ "type": "section", "text": { "type": "mrkdwn", "text": text } })]
 }
 
@@ -2649,7 +2675,23 @@ fn merge_error_blocks(mission_id: &str, detail: &str) -> Vec<Value> {
     error_blocks(&format!("Couldn't merge `{mission_id}`:\n{clipped}"))
 }
 
-fn ask_answer_blocks(question: &str, outcome: &AskOutcome) -> Vec<Value> {
+/// The `/kranz ask` answer reply. `pub` so tests can pin the overflow clipping
+/// without a live host (mirrors [`run_merge`] / [`not_authorized_blocks`]).
+pub fn ask_answer_blocks(question: &str, outcome: &AskOutcome) -> Vec<Value> {
+    // Clip AFTER escaping (escape_mrkdwn lengthens `&<>`), keeping the HEAD:
+    // answers front-load their conclusion, unlike merge output, which
+    // back-loads its assertion summary (so [`merge_error_blocks`] keeps the
+    // tail instead). Unclipped, a long answer blows Slack's 3,000-char section
+    // cap and the whole post is rejected as `msg_too_long` — the operator pays
+    // for the ask turn and sees nothing. 2,300 keeps the final message under
+    // 2,500 chars total alongside the header/context blocks and instance
+    // labeling.
+    const MAX_BODY: usize = 2300;
+    let body = format!(
+        "*Q:* {}\n\n{}",
+        crate::format::escape_mrkdwn(question),
+        crate::format::escape_mrkdwn(&outcome.answer)
+    );
     vec![
         json!({
             "type": "header",
@@ -2659,7 +2701,7 @@ fn ask_answer_blocks(question: &str, outcome: &AskOutcome) -> Vec<Value> {
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": format!("*Q:* {}\n\n{}", crate::format::escape_mrkdwn(question), crate::format::escape_mrkdwn(&outcome.answer))
+                "text": crate::format::clip_to(&body, MAX_BODY)
             }
         }),
         json!({
@@ -4480,6 +4522,45 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn first_sighting_at_head_persists_the_seed_cursor_immediately() {
+        let tmp = TempDir::new().unwrap();
+        let mission_id = "m-seedhead";
+        seed_mission(tmp.path(), mission_id, "notify me");
+
+        let cfg = test_cfg();
+        let client = SlackClient::new(&cfg).unwrap();
+        let threads = SharedThreads::load(tmp.path()).unwrap();
+        let mut cursors = HashMap::new();
+        let mut poster = FailOncePoster::new();
+        let persisted = HashMap::new();
+
+        poll_mission_with_poster(
+            &cfg,
+            &client,
+            tmp.path(),
+            &threads,
+            mission_id,
+            &mut cursors,
+            &persisted,
+            &mut poster,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(poster.attempts, 0, "first sighting never posts");
+        let head = cursors.get(mission_id).unwrap().last_seq;
+        let on_disk = NotifyCursors::load(tmp.path()).unwrap();
+        assert_eq!(
+            on_disk.by_mission.get(mission_id).copied(),
+            Some(head),
+            "a mission first seen at head must persist its seed cursor at once — \
+             without the write, a bridge stopped before this mission's next event \
+             reseeds at the NEW head on restart and silently drops everything \
+             appended while it was down"
+        );
+    }
+
     /// Build an in-memory cursor for prune tests; the folded state's content
     /// is irrelevant to pruning, only the map entry's presence matters.
     fn dummy_cursor(last_seq: u64) -> MissionCursor {
@@ -4509,7 +4590,13 @@ mod tests {
         std::fs::write(tmp.path().join(".kranz").join("missions"), b"boom").unwrap();
 
         let mut last_live = None;
-        let live = prune_tick(tmp.path(), &mut cursors, &mut last_live);
+        let mut listing_failed = false;
+        let live = prune_tick(
+            tmp.path(),
+            &mut cursors,
+            &mut last_live,
+            &mut listing_failed,
+        );
 
         assert!(live.is_none(), "a failed listing must not yield a live set");
         assert!(
@@ -4528,6 +4615,58 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn prune_tick_marks_a_listing_outage_once_and_clears_it_on_recovery() {
+        // The bridge polls every 500ms, so a persistent listing failure must
+        // not warn ~120 times a minute. The onset warn / repeat debug /
+        // recovery info are keyed off `listing_failed`, so the cheap
+        // observable contract is the flag's transitions: set on the first
+        // failure (the one warn), still set on repeats (debug only), cleared
+        // by a successful listing (the recovery info).
+        let tmp = TempDir::new().unwrap();
+        let kranz_dir = tmp.path().join(".kranz");
+        std::fs::create_dir_all(&kranz_dir).unwrap();
+        // Same failure shape as the prune test above: the missions path is a
+        // file, so read_dir errors with something other than NotFound.
+        std::fs::write(kranz_dir.join("missions"), b"boom").unwrap();
+        let mut cursors = HashMap::new();
+        let mut last_live = None;
+        let mut listing_failed = false;
+
+        assert!(prune_tick(
+            tmp.path(),
+            &mut cursors,
+            &mut last_live,
+            &mut listing_failed
+        )
+        .is_none());
+        assert!(listing_failed, "first failure marks the outage onset");
+        assert!(prune_tick(
+            tmp.path(),
+            &mut cursors,
+            &mut last_live,
+            &mut listing_failed
+        )
+        .is_none());
+        assert!(listing_failed, "repeat failures keep the outage marked");
+
+        // Recovery: remove the bogus file — a missing missions dir is a
+        // GENUINE empty listing (NotFound), not a failure.
+        std::fs::remove_file(kranz_dir.join("missions")).unwrap();
+        assert!(prune_tick(
+            tmp.path(),
+            &mut cursors,
+            &mut last_live,
+            &mut listing_failed
+        )
+        .is_some());
+        assert!(
+            !listing_failed,
+            "a successful listing clears the outage (the recovery info fires once)"
+        );
+    }
+
     #[test]
     fn prune_tick_prunes_deleted_missions_on_a_genuinely_empty_listing() {
         let tmp = TempDir::new().unwrap();
@@ -4541,7 +4680,14 @@ mod tests {
         cursors.insert("m-gone11".to_string(), dummy_cursor(9));
 
         let mut last_live = None;
-        let live = prune_tick(tmp.path(), &mut cursors, &mut last_live).unwrap();
+        let mut listing_failed = false;
+        let live = prune_tick(
+            tmp.path(),
+            &mut cursors,
+            &mut last_live,
+            &mut listing_failed,
+        )
+        .unwrap();
 
         assert!(live.contains("m-live11") && !live.contains("m-gone11"));
         assert!(cursors.contains_key("m-live11"));
@@ -4561,7 +4707,14 @@ mod tests {
         seed_mission(tmp.path(), "m-idle11", "goal");
         let mut cursors = HashMap::new();
         let mut last_live = None;
-        prune_tick(tmp.path(), &mut cursors, &mut last_live).unwrap();
+        let mut listing_failed = false;
+        prune_tick(
+            tmp.path(),
+            &mut cursors,
+            &mut last_live,
+            &mut listing_failed,
+        )
+        .unwrap();
 
         // Sneak a stale entry into the persisted file. With an unchanged live
         // set the next tick must not even reload the file (the 500ms idle
@@ -4569,7 +4722,13 @@ mod tests {
         let mut persisted = NotifyCursors::default();
         persisted.set("m-stale1", 7);
         persisted.save(tmp.path()).unwrap();
-        prune_tick(tmp.path(), &mut cursors, &mut last_live).unwrap();
+        prune_tick(
+            tmp.path(),
+            &mut cursors,
+            &mut last_live,
+            &mut listing_failed,
+        )
+        .unwrap();
         assert_eq!(
             NotifyCursors::load(tmp.path())
                 .unwrap()
@@ -4582,7 +4741,13 @@ mod tests {
 
         // …until the live set changes, when the normal prune reclaims it.
         seed_mission(tmp.path(), "m-fresh1", "goal");
-        prune_tick(tmp.path(), &mut cursors, &mut last_live).unwrap();
+        prune_tick(
+            tmp.path(),
+            &mut cursors,
+            &mut last_live,
+            &mut listing_failed,
+        )
+        .unwrap();
         assert_eq!(
             NotifyCursors::load(tmp.path())
                 .unwrap()
@@ -4637,7 +4802,8 @@ mod tests {
             disk_seq_at_post: Vec::new(),
         };
 
-        // First sighting seeds at head (seq 1): no posts, nothing persisted.
+        // First sighting seeds at head (seq 1): no posts, and the seed cursor
+        // itself is persisted (the seed-at-head write).
         poll_mission_with_poster(
             &cfg,
             &client,
@@ -4668,11 +4834,12 @@ mod tests {
         .await
         .unwrap();
 
-        // Both posts observed the PRE-batch on-disk value: no per-event
-        // persist ran between them, and no persist ran before a post.
+        // Both posts observed the PRE-batch on-disk value (the seq-1 seed):
+        // no per-event persist ran between them, and no persist ran before a
+        // post.
         assert_eq!(
             poster.disk_seq_at_post,
-            vec![None, None],
+            vec![Some(1), Some(1)],
             "one poll's burst must not persist between (or before) its posts"
         );
         // The single batch persist then recorded the final seq.
@@ -5570,6 +5737,53 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "authorization must happen before config_change writes the inbox"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_action_denies_unlisted_user_at_the_dispatch_arm() {
+        // The test above pins the extracted `change_config` fn; this one
+        // drives the real `dispatch_action` Action::Config arm end-to-end, so
+        // re-inlining ungated config logic in the dispatch arm (bypassing
+        // `change_config`) cannot pass the suite.
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-gated-dispatch", "goal");
+        let cfg = SlackConfig {
+            bot_token: "xoxb".into(),
+            app_token: "xapp".into(),
+            channel: "C1".into(),
+            notify: NotifyFlags::default(),
+            allow_users: vec!["U-allowed".into()],
+            dashboard_url: None,
+            instance_name: None,
+        };
+        let client = SlackClient::new(&cfg).unwrap();
+        let threads = SharedThreads::load(tmp.path()).unwrap();
+
+        dispatch_action(
+            &cfg,
+            &client,
+            tmp.path(),
+            &threads,
+            None,
+            &Action::Config {
+                mission_id: Some("m-gated-dispatch".into()),
+                role: "worker".into(),
+                backend: Some("codex".into()),
+                model: "gpt-5-codex".into(),
+                effort: None,
+                user_id: Some("U-outsider".into()),
+                response_url: None,
+                channel: None,
+            },
+        )
+        .await;
+
+        assert!(
+            kranz_engine::control::drain(&MissionPaths::new(tmp.path(), "m-gated-dispatch"))
+                .unwrap()
+                .is_empty(),
+            "an unlisted user's Action::Config must enqueue nothing via dispatch_action"
         );
     }
 

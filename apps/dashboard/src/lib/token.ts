@@ -121,6 +121,15 @@ export function subscribeTokenGate(listener: () => void): () => void {
   return () => listeners.delete(listener);
 }
 
+/** TEST-ONLY seam: how many token-gate subscribers are registered. Lets the
+ *  ws tests prove MissionSocket.close() actually unsubscribes — a leaked
+ *  listener is inert behind the socket's `closed` guard (invisible to
+ *  behavioural assertions) but would pile up one dead entry per mission
+ *  switch. Not for production use. */
+export function tokenGateListenerCount(): number {
+  return listeners.size;
+}
+
 /** useSyncExternalStore snapshot function (stable reference between changes). */
 export function tokenGateSnapshot(): TokenGateState {
   return snapshot;

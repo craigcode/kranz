@@ -168,7 +168,9 @@ describe('draftTicket', () => {
   it('clears draftingSlug when an unrelated mission connects or on disconnect', async () => {
     vi.mocked(api.draftTicket).mockResolvedValueOnce({ missionId: 'm-42' });
     vi.mocked(api.tickets).mockResolvedValueOnce([]);
-    vi.mocked(api.missions).mockResolvedValueOnce([]);
+    // The refresh must list the freshly drafted mission — loadMissions treats
+    // a connected mission missing from a fresh list as deleted out-of-band.
+    vi.mocked(api.missions).mockResolvedValueOnce([makeMission('m-42')]);
     await useKranzStore.getState().draftTicket('a');
     expect(useKranzStore.getState().draftingSlug).toBe('a');
 

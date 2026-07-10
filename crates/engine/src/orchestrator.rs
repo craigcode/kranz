@@ -2235,7 +2235,7 @@ impl MissionEngine {
             self.drain_control().await?;
 
             // §4.4 dirty-tree discipline (applies to interrupted runs too).
-            if !self.active_repo().is_clean()? && !self.resolve_dirty_tree(&feature.id).await? {
+            if !self.active_repo().is_clean()? && !self.resolve_dirty_tree(mi, &feature.id).await? {
                 return Ok(()); // orchestrator chose fail-feature
             }
             let commits: Vec<String> = self
@@ -2286,8 +2286,11 @@ impl MissionEngine {
     /// Dirty tree after a worker run: ask the orchestrator (JSON), defaulting
     /// to commit-as-is (deterministic, documented). Returns `false` when the
     /// feature was failed instead — by the orchestrator's own decision, or
-    /// because the checkpoint's secret scan refused the commit.
-    async fn resolve_dirty_tree(&mut self, feature_id: &str) -> Result<bool> {
+    /// because the checkpoint's secret scan refused the commit (which also
+    /// blocks milestone `mi`: the refused content stays dirty in the shared
+    /// sequential tree, so running further features would only cascade the
+    /// same refusal onto them).
+    async fn resolve_dirty_tree(&mut self, mi: usize, feature_id: &str) -> Result<bool> {
         let message = format!(
             "The worker for feature {feature_id} left uncommitted changes in the working \
              tree. Decide what to do. Respond with ONLY this JSON:\n\
@@ -2328,10 +2331,9 @@ impl MissionEngine {
                 // propagating it would error the whole run, and the tree is
                 // still dirty on resume, so the mission would wedge re-hitting
                 // the same refusal. Record it and fail the FEATURE instead —
-                // the mission continues (or blocks) with an audit trail, and
-                // the leftover tree plus the refusal's allowlist guidance is
-                // the operator's cleanup cue. Real git failures still `?` out
-                // above.
+                // with an audit trail, and the leftover tree plus the
+                // refusal's allowlist guidance as the operator's cleanup cue.
+                // Real git failures still `?` out above.
                 self.emit_decision(
                     &format!("dirty tree after {feature_id}: checkpoint refused by secret scan"),
                     Some(detail.clone()),
@@ -2339,6 +2341,34 @@ impl MissionEngine {
                 self.emit(EventKind::FeatureFailed {
                     feature_id: feature_id.to_string(),
                     reason: format!("dirty-tree checkpoint refused by secret scan: {detail}"),
+                })?;
+                // Then BLOCK the milestone: the refused content is still
+                // sitting uncommitted in the SHARED sequential working tree
+                // (nothing was staged or committed), so every later feature
+                // in this milestone would trip its own dirty-tree turn,
+                // re-hit the SAME refusal, and be failed with a reason naming
+                // THIS feature's leak — a cascade of misattributed failures
+                // against a poisoned tree. Blocking routes resume through the
+                // normal blocked flow (`handle_blocked`: the run returns
+                // Blocked, no tight loop) until the operator cleans or
+                // allowlists the named paths. The parallel path needs no
+                // such guard: its checkpoints run in per-feature worktrees
+                // that are torn down with the batch.
+                let dirty = self
+                    .active_repo()
+                    .dirty_paths()?
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let milestone_id = self.state.mission.milestones[mi].id.clone();
+                self.emit(EventKind::MilestoneBlocked {
+                    milestone_id,
+                    reason: format!(
+                        "dirty-tree checkpoint for {feature_id} refused by secret scan; the \
+                         working tree still holds the refused content — clean or allowlist \
+                         these paths, then resume: {dirty}"
+                    ),
                 })?;
                 Ok(false)
             }
@@ -3294,20 +3324,20 @@ impl MissionEngine {
         let mission_id = self.state.mission.id.clone();
 
         // Attribute each changed path to the commit that made it, via a
-        // per-commit diff against its predecessor in the range. Engine/meta
-        // commits are skipped entirely so their paths never enter the
-        // candidate set, even when outside the touch-set — but only when the
-        // commit's own paths PROVE it is one: a subject template alone is
+        // per-commit diff against its own FIRST parent (see
+        // `commit_changed_paths` — chaining consecutive range entries would
+        // interleave merge parents and invent paths a commit never touched).
+        // Engine/meta commits are skipped entirely so their paths never enter
+        // the candidate set, even when outside the touch-set — but only when
+        // the commit's own paths PROVE it is one: a subject template alone is
         // spoofable by a worker's `git commit` ("[kranz] mission report
         // cleanup"), so a template-subject commit touching anything beyond
         // mission-record metadata is swept like any other worker commit
         // (contract_sweep::is_meta_commit_with_paths).
         let mut changes: Vec<(String, CommitInfo)> = Vec::new();
-        let mut prev_sha = milestone_start_sha.to_string();
         let mut worker_commit_count = 0usize;
         for commit in &commits {
-            let paths = repo.changed_paths(&prev_sha, &commit.sha)?;
-            prev_sha = commit.sha.clone();
+            let paths = commit_changed_paths(repo, &commit.sha)?;
             if contract_sweep::is_meta_commit_with_paths(&commit.subject, &mission_id, &paths) {
                 continue;
             }
@@ -3559,14 +3589,15 @@ impl MissionEngine {
         // real files must still count as a deliverable, or a forged subject
         // could hide worker writes from this gate (and desync it from the
         // path sweep, which applies the same check — see
-        // contract_sweep::is_meta_commit_with_paths).
+        // contract_sweep::is_meta_commit_with_paths). Each commit is diffed
+        // against its own FIRST parent (`commit_changed_paths`), never the
+        // previous range entry — chaining interleaves merge parents and can
+        // fail a genuine meta commit's path check, inflating the count.
         let commits = self.active_repo().commits_between(&base, "HEAD")?;
         let gate_mission_id = self.state.mission.id.clone();
-        let mut prev_sha = base.clone();
         let mut non_meta_commit_count = 0usize;
         for commit in &commits {
-            let paths = self.active_repo().changed_paths(&prev_sha, &commit.sha)?;
-            prev_sha = commit.sha.clone();
+            let paths = commit_changed_paths(self.active_repo(), &commit.sha)?;
             if !contract_sweep::is_meta_commit_with_paths(&commit.subject, &gate_mission_id, &paths)
             {
                 non_meta_commit_count += 1;
@@ -4801,6 +4832,32 @@ fn next_feature(milestone: &Milestone) -> Option<usize> {
         .features
         .iter()
         .position(|f| matches!(f.status, FeatureStatus::Pending | FeatureStatus::Active))
+}
+
+/// git's well-known empty-tree object id (SHA-1 object format — the only
+/// format the engine's throwaway and host repos use today): the `from` side
+/// when diffing a parentless commit, whose whole tree is what it introduced.
+const EMPTY_TREE_SHA: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+/// Paths changed by the commit `sha` relative to its own FIRST parent.
+///
+/// Per-commit attribution must never chain consecutive entries of a
+/// `commits_between` list: `from..to` interleaves merge parents, so adjacent
+/// entries are not parent-child and a chained diff invents paths the commit
+/// never touched — inflating the final gate's deliverable count and creating
+/// spurious out-of-contract sweep findings (false-positive direction only).
+/// A merge commit diffs against its first parent, i.e. what the merge itself
+/// landed on the mission branch.
+///
+/// A parentless commit (reachable only via a merged orphan history — a
+/// milestone range never STARTS at one) diffs against the empty tree:
+/// everything it contains is exactly what it introduced. A real git failure
+/// still surfaces, because the fallback runs the same plumbing.
+fn commit_changed_paths(repo: &GitRepo, sha: &str) -> Result<Vec<String>> {
+    match repo.changed_paths(&format!("{sha}^"), sha) {
+        Ok(paths) => Ok(paths),
+        Err(_) => repo.changed_paths(EMPTY_TREE_SHA, sha),
+    }
 }
 
 /// De-duplicated, first-seen-order commands run by this milestone's workers,
@@ -6697,6 +6754,59 @@ mod tests {
         assert_eq!(findings.len(), 1, "findings: {findings:?}");
         assert_eq!(findings[0].subject, "smuggled.md");
         assert_eq!(findings[0].class, contract_sweep::FINDING_CLASS);
+    }
+
+    /// A merge commit inside the milestone range must not create spurious
+    /// findings: each commit is diffed against its own FIRST parent, never
+    /// chained through the `commits_between` list (which interleaves merge
+    /// parents, so adjacent entries are not parent-child). Regression shape:
+    /// a genuine engine meta commit lands on the mission branch while a
+    /// worker commit lands on a side branch; the chained diff compared the
+    /// meta commit against the SIDE branch's tip, saw the worker's file,
+    /// failed the meta exemption's path check, and flagged the meta commit's
+    /// own research.md (mission-record, but not in `meta_paths`) as an
+    /// out-of-contract write.
+    #[test]
+    fn out_of_contract_sweep_merge_commit_yields_no_spurious_finding() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+        engine.state.mission.touch_set = vec!["src/**".to_string()];
+        let start_sha = engine.repo.head_sha().unwrap();
+        let mission_id = engine.state.mission.id.clone();
+
+        // Side branch off the milestone start: one worker commit, entirely
+        // inside the touch-set.
+        engine.repo.create_branch("side", None).unwrap();
+        engine.repo.checkout("side").unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src").join("widget.rs"), "// in contract\n").unwrap();
+        engine.repo.add_all_and_commit("[f-1] add widget").unwrap();
+
+        // Meanwhile a genuine engine meta commit lands on main.
+        engine.repo.checkout("main").unwrap();
+        let record_dir = root.join(".kranz").join("missions").join(&mission_id);
+        std::fs::create_dir_all(&record_dir).unwrap();
+        std::fs::write(record_dir.join("research.md"), "evidence\n").unwrap();
+        engine
+            .repo
+            .add_all_and_commit(&format!("[kranz] approved plan for {mission_id}"))
+            .unwrap();
+
+        // A real merge commit inside the range.
+        assert_eq!(
+            engine.repo.merge_no_ff("side").unwrap(),
+            crate::git_ops::MergeOutcome::Clean
+        );
+
+        let findings = engine.out_of_contract_sweep(&start_sha).unwrap();
+        assert!(
+            findings.is_empty(),
+            "first-parent attribution must not invent findings across merge parents: {findings:?}"
+        );
     }
 
     /// A dirty primary checkout in worktree mode yields a critical

@@ -95,6 +95,10 @@ pub enum CheckpointOutcome {
 #[derive(Debug, Clone)]
 pub struct GitRepo {
     root: PathBuf,
+    /// When true, every git invocation from this handle runs with hooks
+    /// disabled via `-c core.hooksPath=` (see [`GitRepo::with_hooks_disabled`]).
+    /// Default false: worker-side git behavior keeps the repo's hooks.
+    hooks_disabled: bool,
 }
 
 impl GitRepo {
@@ -104,7 +108,10 @@ impl GitRepo {
     /// [`EngineError::Git`] when `root` is not a repository (or git itself
     /// cannot be invoked).
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
-        let repo = GitRepo { root: root.into() };
+        let repo = GitRepo {
+            root: root.into(),
+            hooks_disabled: false,
+        };
         let out = repo.probe(&["rev-parse", "--git-dir"])?;
         if out.status.success() {
             Ok(repo)
@@ -120,6 +127,23 @@ impl GitRepo {
     /// The working-tree root this handle operates on.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// A handle to the same repository whose every git invocation runs with
+    /// hooks disabled (`git -c core.hooksPath=` — the empty value resolves
+    /// every hook lookup to nothing, so no hook file is ever executed).
+    ///
+    /// The gated merge path uses this: its scratch worktree's gitdir points
+    /// into the primary `.git`, so mission-authored gate/test code can plant
+    /// `.git/hooks/*` — which the merge's own checkout / merge / worktree
+    /// commands would then execute with the server's full inherited
+    /// environment, exactly the tokens the sanitized gate executor withholds.
+    /// Opt-in per handle: worker-side git behavior is deliberately unchanged.
+    pub fn with_hooks_disabled(&self) -> GitRepo {
+        GitRepo {
+            root: self.root.clone(),
+            hooks_disabled: true,
+        }
     }
 
     /// Sha of `HEAD` (`git rev-parse HEAD`).
@@ -969,8 +993,13 @@ impl GitRepo {
     }
 
     fn probe_os(&self, args: &[OsString]) -> Result<Output> {
-        Command::new("git")
-            .args(args)
+        let mut cmd = Command::new("git");
+        if self.hooks_disabled {
+            // `-c` must precede the subcommand; the empty value makes every
+            // hook lookup resolve to nothing (see with_hooks_disabled).
+            cmd.args(["-c", "core.hooksPath="]);
+        }
+        cmd.args(args)
             .current_dir(&self.root)
             .stdin(Stdio::null())
             .output()

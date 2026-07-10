@@ -117,12 +117,25 @@ impl MissionPaths {
         format!("runs/{run_id}.jsonl")
     }
 
-    /// List mission ids present under a repo (sorted), treating any listing
-    /// failure as an empty result. Use [`Self::try_list_missions`] when the
-    /// caller must distinguish "no missions" from "could not list missions"
-    /// (e.g. before pruning per-mission bookkeeping keyed on this listing).
+    /// List mission ids present under a repo (sorted), lenient: an unreadable
+    /// missions dir lists as empty, and an erroring directory entry (fd
+    /// exhaustion, mid-deletion races, permission flaps) is skipped while the
+    /// REST are kept — one bad entry must not collapse the whole listing to
+    /// "no missions". Use [`Self::try_list_missions`] when the caller must
+    /// distinguish "no missions" from "could not list missions" (e.g. before
+    /// pruning per-mission bookkeeping keyed on this listing).
     pub fn list_missions(repo_root: &Path) -> Vec<String> {
-        Self::try_list_missions(repo_root).unwrap_or_default()
+        let dir = repo_root.join(".kranz").join("missions");
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = rd
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+            .collect();
+        out.sort();
+        out
     }
 
     /// List mission ids present under a repo (sorted), distinguishing
@@ -220,6 +233,14 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join(".kranz")).unwrap();
         std::fs::write(tmp.path().join(".kranz").join("missions"), b"not a dir").unwrap();
         assert!(MissionPaths::try_list_missions(tmp.path()).is_err());
+        // The lenient listing stays lenient on the same failure: empty, not a
+        // panic or an error. (A single erroring dir ENTRY — skipped while the
+        // rest are kept — is not portably constructible in a test; the walk
+        // uses `.flatten()` to encode that contract.)
+        assert_eq!(
+            MissionPaths::list_missions(tmp.path()),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

@@ -747,6 +747,71 @@ fn read_events_after_returns_suffix() {
     assert!(none.is_empty());
 }
 
+/// `read_tail_events` window alignment: a window that starts EXACTLY on a
+/// line boundary must keep that whole line (the old unconditional
+/// drop-through-first-'\n' ate one complete event), while a window cutting
+/// into the middle of a line still drops only the torn head.
+#[test]
+fn read_tail_events_window_on_line_boundary_keeps_the_full_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    let lines: Vec<String> = (1..=3).map(|i| raw_event(i, lifecycle("e"))).collect();
+    write_raw_log(&p.events_file(), &lines);
+
+    // Window sized to hold lines 2 and 3 exactly (each line is written with
+    // a trailing '\n'): the window start lands on line 2's first byte.
+    let window = (lines[1].len() + 1 + lines[2].len() + 1) as u64;
+    let tail = EventLog::read_tail_events(&p.events_file(), window).unwrap();
+    assert_eq!(
+        tail.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        vec![2, 3],
+        "a boundary-aligned window must not drop its first complete line"
+    );
+}
+
+#[test]
+fn read_tail_events_window_mid_line_drops_only_the_torn_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    let lines: Vec<String> = (1..=3).map(|i| raw_event(i, lifecycle("e"))).collect();
+    write_raw_log(&p.events_file(), &lines);
+
+    // Window starts a few bytes into line 2: line 2's head is outside the
+    // window, so only line 3 is complete inside it.
+    let window = (lines[2].len() + 1 + 3) as u64;
+    let tail = EventLog::read_tail_events(&p.events_file(), window).unwrap();
+    assert_eq!(tail.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![3]);
+}
+
+#[test]
+fn read_tail_events_window_covering_whole_file_returns_all_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    let lines: Vec<String> = (1..=3).map(|i| raw_event(i, lifecycle("e"))).collect();
+    write_raw_log(&p.events_file(), &lines);
+
+    let total: u64 = lines.iter().map(|l| (l.len() + 1) as u64).sum();
+    for window in [total, total + 1024, u64::MAX] {
+        let tail = EventLog::read_tail_events(&p.events_file(), window).unwrap();
+        assert_eq!(
+            tail.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "window {window} covers the whole file"
+        );
+    }
+}
+
+#[test]
+fn read_tail_events_empty_file_reads_as_no_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    std::fs::create_dir_all(p.events_file().parent().unwrap()).unwrap();
+    std::fs::write(p.events_file(), b"").unwrap();
+    assert!(EventLog::read_tail_events(&p.events_file(), 4096)
+        .unwrap()
+        .is_empty());
+}
+
 /// A lock whose recorded holder is provably dead is stale: EVERY tier steals
 /// it, force flags not required. (Legacy one-line pid-only lock format —
 /// compat is exercised at the same time.)

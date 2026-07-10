@@ -597,8 +597,12 @@ impl MissionHost {
             return Err(ApiError::not_found(format!("unknown mission '{id}'")));
         }
         // Serialize the complete read/pin/integrate/gate/advance transaction
-        // against mission runs and other merges in this repo.
-        let _repo_busy = kranz_engine::queue::acquire_repo_busy(&self.repo_root, id)?;
+        // against mission runs and other merges in this repo. The hold moves
+        // INTO the blocking task below: if the client disconnects mid-gate-
+        // suite this handler future is dropped, but the detached blocking
+        // merge keeps mutating the primary tree — a hold living here would
+        // be released early, letting a dispatcher claim the busy repo.
+        let repo_busy = kranz_engine::queue::acquire_repo_busy(&self.repo_root, id)?;
         let events = EventLog::read_events(&paths.events_file())?;
         let state = kranz_engine::reducer::fold(&events).map_err(ApiError::from)?;
         if state.mission.status != MissionStatus::Complete {
@@ -624,14 +628,18 @@ impl MissionHost {
         let gate_executor = Arc::clone(&self.gate_executor);
         let report = tokio::task::spawn_blocking(move || {
             let repo = GitRepo::open(&repo_root)?;
-            merge_mission(
+            let report = merge_mission(
                 &repo,
                 &base_branch,
                 &base_sha,
                 &mission_branch,
                 Some(metadata),
                 |cmd, cwd| gate_executor(cmd, cwd),
-            )
+            );
+            // Explicit: the repo-busy hold is released HERE, once the merge
+            // has fully finished — never earlier by a dropped handler future.
+            drop(repo_busy);
+            report
         })
         .await
         .map_err(|e| ApiError::internal(format!("merge task panicked: {e}")))?

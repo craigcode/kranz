@@ -8,8 +8,10 @@
 //! [`crate::merge_gate::run_gate_suite`] (refuse on a failing gate, base
 //! untouched), and [`GitRepo::merge_no_ff`] (clean-abort on conflict). The
 //! merge and gates run in a detached scratch worktree; the primary base only
-//! fast-forwards to that exact tested commit. This module never calls
-//! [`GitRepo::push_mission_branch`] or any other push.
+//! fast-forwards to that exact tested commit. Every git command on this path
+//! runs via [`GitRepo::with_hooks_disabled`], so mission-planted
+//! `.git/hooks/*` never execute with the server's environment. This module
+//! never calls [`GitRepo::push_mission_branch`] or any other push.
 
 use crate::error::Result;
 use crate::git_ops::{with_kranz_trailers, GitRepo, KranzCommitMetadata, MergeOutcome};
@@ -89,6 +91,14 @@ pub fn merge_mission<F>(
 where
     F: Fn(&str, &Path) -> (bool, String),
 {
+    // Every git command this merge issues — primary tree and scratch worktree
+    // alike — runs with hooks disabled: the scratch worktree shares the
+    // primary `.git`, so mission-authored gate code could plant
+    // `.git/hooks/*` and have the merge's own checkout/merge/worktree
+    // commands execute it with the server's full environment (exactly what
+    // the sanitized gate executor withholds). Worker-side git is untouched.
+    let repo = &repo.with_hooks_disabled();
+
     if !repo.is_clean_tracked()? {
         return Ok(MergeReport::RefusedDirtyTree);
     }
@@ -129,54 +139,122 @@ where
         .as_ref()
         .map(|metadata| with_kranz_trailers(&format!("Merge {mission_branch}"), metadata));
 
+    // Sweep scratch leftovers from any earlier merge that died between add
+    // and remove (a panic, kill -9, power loss): stale kranz-merge-* temp
+    // dirs and their .git/worktrees registrations would otherwise pile up
+    // forever. Best-effort — this merge proceeds either way.
+    remove_stale_scratch_worktrees(repo);
+
     let scratch_path =
         std::env::temp_dir().join(format!("kranz-merge-{}", uuid::Uuid::new_v4().simple()));
     repo.add_detached_worktree(&scratch_path, &live_base_sha)?;
-    let attempt = (|| -> Result<MergeReport> {
-        let scratch = GitRepo::open(&scratch_path)?;
-        match scratch.merge_no_ff_with_message(&mission_tip_sha, merge_message.as_deref())? {
-            MergeOutcome::Conflict { files } => return Ok(MergeReport::Conflict { files }),
-            MergeOutcome::RefusedPreMerge { detail } => {
-                return Ok(MergeReport::RefusedPreMerge { detail })
+    // RAII cleanup, created immediately after the worktree so a panic or an
+    // overlooked error path cannot leak it. Drop is best-effort (warn, never
+    // propagate): a merge that already landed must be reported as Merged,
+    // not turned into an error by a failed cleanup — the sweep above retries
+    // the removal on the next merge anyway.
+    let _scratch_cleanup = ScratchWorktree {
+        repo,
+        path: scratch_path.clone(),
+    };
+
+    let scratch = GitRepo::open(&scratch_path)?.with_hooks_disabled();
+    match scratch.merge_no_ff_with_message(&mission_tip_sha, merge_message.as_deref())? {
+        MergeOutcome::Conflict { files } => return Ok(MergeReport::Conflict { files }),
+        MergeOutcome::RefusedPreMerge { detail } => {
+            return Ok(MergeReport::RefusedPreMerge { detail })
+        }
+        MergeOutcome::Clean => {}
+    }
+    let tested_commit = scratch.head_sha()?;
+
+    match run_gate_suite(scratch.root(), &changed_paths, &gate_suite, executor) {
+        GateSuiteResult::Failed { gate, output } => {
+            return Ok(MergeReport::GateFailed { gate, output });
+        }
+        GateSuiteResult::Passed => {}
+    }
+
+    // Production holds the repo-wide busy guard throughout this call.
+    // Re-check anyway so external/manual movement fails closed.
+    let current_base = repo.rev_parse(base_branch)?;
+    if current_base != live_base_sha {
+        return Ok(MergeReport::RefusedPreMerge {
+            detail: format!(
+                "base branch {base_branch:?} moved from {live_base_sha} to {current_base} while gates ran; retry the merge"
+            ),
+        });
+    }
+
+    repo.checkout(base_branch)?;
+    strip_identical_untracked_twins(repo, base_sha, &mission_tip_sha)?;
+    match repo.fast_forward_to(&tested_commit)? {
+        MergeOutcome::Clean => Ok(MergeReport::Merged {
+            commit: tested_commit,
+            stale_base,
+        }),
+        MergeOutcome::RefusedPreMerge { detail } => Ok(MergeReport::RefusedPreMerge { detail }),
+        MergeOutcome::Conflict { .. } => unreachable!("--ff-only cannot create conflicts"),
+    }
+}
+
+/// RAII cleanup for the merge's detached scratch worktree.
+///
+/// Removal lives in `Drop` so a panic mid-merge (or an error path this module
+/// missed) cannot leak the temp directory and its
+/// `.git/worktrees/kranz-merge-*` registration. Cleanup is best-effort: a
+/// failure is logged at warn and never propagated, so a merge whose report is
+/// already decided keeps that report — [`remove_stale_scratch_worktrees`]
+/// retries the removal at the start of the next merge.
+struct ScratchWorktree<'a> {
+    repo: &'a GitRepo,
+    path: std::path::PathBuf,
+}
+
+impl Drop for ScratchWorktree<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.repo.remove_worktree(&self.path) {
+            tracing::warn!(
+                path = %self.path.display(),
+                %error,
+                "failed to remove merge scratch worktree; the next merge will retry"
+            );
+        }
+    }
+}
+
+/// Best-effort removal of `kranz-merge-*` scratch worktrees leaked by an
+/// earlier merge that died between add and remove, plus a
+/// `git worktree prune` for registrations whose directories are already gone
+/// (invisible to `worktree remove`). Failures are logged and swallowed — a
+/// stale leftover must never block a fresh merge.
+fn remove_stale_scratch_worktrees(repo: &GitRepo) {
+    match repo.list_worktrees() {
+        Ok(worktrees) => {
+            for worktree in worktrees {
+                let path = Path::new(&worktree);
+                let is_scratch = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("kranz-merge-"));
+                if !is_scratch {
+                    continue;
+                }
+                if let Err(error) = repo.remove_worktree(path) {
+                    tracing::warn!(
+                        path = %path.display(),
+                        %error,
+                        "failed to remove stale merge scratch worktree"
+                    );
+                }
             }
-            MergeOutcome::Clean => {}
         }
-        let tested_commit = scratch.head_sha()?;
-
-        match run_gate_suite(scratch.root(), &changed_paths, &gate_suite, executor) {
-            GateSuiteResult::Failed { gate, output } => {
-                return Ok(MergeReport::GateFailed { gate, output });
-            }
-            GateSuiteResult::Passed => {}
+        Err(error) => {
+            tracing::warn!(%error, "failed to list worktrees for stale merge-scratch cleanup")
         }
-
-        // Production holds the repo-wide busy guard throughout this call.
-        // Re-check anyway so external/manual movement fails closed.
-        let current_base = repo.rev_parse(base_branch)?;
-        if current_base != live_base_sha {
-            return Ok(MergeReport::RefusedPreMerge {
-                detail: format!(
-                    "base branch {base_branch:?} moved from {live_base_sha} to {current_base} while gates ran; retry the merge"
-                ),
-            });
-        }
-
-        repo.checkout(base_branch)?;
-        strip_identical_untracked_twins(repo, base_sha, &mission_tip_sha)?;
-        match repo.fast_forward_to(&tested_commit)? {
-            MergeOutcome::Clean => Ok(MergeReport::Merged {
-                commit: tested_commit,
-                stale_base,
-            }),
-            MergeOutcome::RefusedPreMerge { detail } => Ok(MergeReport::RefusedPreMerge { detail }),
-            MergeOutcome::Conflict { .. } => unreachable!("--ff-only cannot create conflicts"),
-        }
-    })();
-    let cleanup = repo.remove_worktree(&scratch_path);
-    match (attempt, cleanup) {
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
-        (Ok(report), Ok(())) => Ok(report),
+    }
+    if let Err(error) = repo.prune_worktrees() {
+        tracing::warn!(%error, "failed to prune stale worktree registrations");
     }
 }
 

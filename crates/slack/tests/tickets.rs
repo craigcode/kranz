@@ -898,6 +898,43 @@ async fn merge_failure_reply_is_bounded_and_keeps_the_gate_output_tail() {
     assert!(text.chars().count() <= 2500, "{}", text.chars().count());
 }
 
+// -- /kranz ask: the answer reply is bounded, keeping the head ---------------
+
+use kranz_engine::types::TokenUsage;
+use kranz_slack::bridge::ask_answer_blocks;
+
+#[test]
+fn ask_answer_reply_is_bounded_and_keeps_the_answer_head() {
+    // Answers front-load their conclusion (unlike merge output, which
+    // back-loads its assertion summary), so overflow keeps the HEAD. The `&`
+    // in the filler also exercises escape_mrkdwn's lengthening (`&` →
+    // `&amp;`) — the clip must bound the POST-escape text Slack measures,
+    // or the whole post is rejected as `msg_too_long` and the operator pays
+    // for the ask turn but sees nothing.
+    let answer = format!(
+        "HEAD_CONCLUSION_FIRST\n{}",
+        "supporting detail & citations\n".repeat(500)
+    );
+    let outcome = AskOutcome {
+        answer,
+        cost_usd: 0.0123,
+        tokens: TokenUsage::default(),
+    };
+
+    let blocks = ask_answer_blocks("why is the sky blue?", &outcome);
+    let text = blocks[1]["text"]["text"].as_str().unwrap();
+    assert!(
+        text.contains("HEAD_CONCLUSION_FIRST"),
+        "the answer's head must survive the clip: {text}"
+    );
+    assert!(
+        text.contains("why is the sky blue?"),
+        "the question must survive the clip: {text}"
+    );
+    assert!(text.ends_with('…'), "overflow is marked with an ellipsis");
+    assert!(text.chars().count() <= 2500, "{}", text.chars().count());
+}
+
 #[tokio::test]
 async fn merge_without_a_host_is_an_honest_refusal_pointing_at_the_cli() {
     let cfg = gated_cfg(vec!["U-allowed".into()]);

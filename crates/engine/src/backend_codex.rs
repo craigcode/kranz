@@ -137,18 +137,53 @@ fn fallback_candidates() -> Vec<PathBuf> {
     out
 }
 
-/// Validate a candidate by running `<candidate> --version` and waiting for it
-/// to exit. These invocations are fast, so a plain blocking wait suffices.
+/// Deadline for a `--version` probe. Generous for a healthy CLI, but bounds
+/// a hung shim on PATH so binary discovery (`kranz ready`, session spawn)
+/// can never block forever on a candidate.
+const VERSION_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Validate a candidate by running `<candidate> --version`, polling with a
+/// bounded wall-clock ([`VERSION_PROBE_TIMEOUT`]) rather than blocking
+/// forever. A candidate that has not exited by the deadline is killed and
+/// reported as broken.
 fn probe_version(binary: &Path) -> std::result::Result<String, String> {
-    let output = std::process::Command::new(binary)
+    let mut child = std::process::Command::new(binary)
         .arg("--version")
         .stdin(std::process::Stdio::null())
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|e| format!("could not run --version: {e}"))?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        Err(format!("--version exited with {}", output.status))
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let output = child
+                    .wait_with_output()
+                    .map_err(|e| format!("could not read --version output: {e}"))?;
+                return if status.success() {
+                    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+                } else {
+                    Err(format!("--version exited with {status}"))
+                };
+            }
+            Ok(None) => {
+                if start.elapsed() >= VERSION_PROBE_TIMEOUT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "--version did not exit within {}s (killed)",
+                        VERSION_PROBE_TIMEOUT.as_secs()
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("could not wait for --version: {e}"));
+            }
+        }
     }
 }
 
@@ -734,6 +769,26 @@ impl AgentSession for CodexSession {
 mod tests {
     use super::*;
     use crate::cost::DEFAULT_CODEX_MODEL;
+
+    #[test]
+    #[cfg(unix)]
+    fn probe_version_kills_a_hung_binary_within_the_deadline() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("hung-codex");
+        std::fs::write(&stub, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let start = std::time::Instant::now();
+        let result = probe_version(&stub);
+
+        let error = result.expect_err("a hung probe must be reported as broken");
+        assert!(error.contains("did not exit"), "{error}");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "probe returned within the deadline, not after the stub's sleep"
+        );
+    }
 
     fn fixture_lines() -> Vec<String> {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

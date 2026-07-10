@@ -241,11 +241,9 @@ mod tests {
     use crate::types::MissionConfig;
     use tempfile::TempDir;
 
-    /// Seed a mission's `events.jsonl` with a `mission.created` event (and
-    /// optionally a `mission.completed`) so it folds like a real log.
-    fn seed_mission(repo_root: &Path, mission_id: &str, completed: bool) {
-        let paths = MissionPaths::new(repo_root, mission_id);
-        std::fs::create_dir_all(paths.mission_dir()).unwrap();
+    /// Serialized `events.jsonl` lines for a `mission.created` event (and
+    /// optionally a `mission.completed`) that fold like a real log.
+    fn events_lines(mission_id: &str, completed: bool) -> String {
         let mut lines = String::new();
         let created = Event {
             seq: 1,
@@ -270,7 +268,14 @@ mod tests {
             lines.push_str(&serde_json::to_string(&done).unwrap());
             lines.push('\n');
         }
-        std::fs::write(paths.events_file(), lines).unwrap();
+        lines
+    }
+
+    /// Seed a mission's `events.jsonl` under the repo's missions dir.
+    fn seed_mission(repo_root: &Path, mission_id: &str, completed: bool) {
+        let paths = MissionPaths::new(repo_root, mission_id);
+        std::fs::create_dir_all(paths.mission_dir()).unwrap();
+        std::fs::write(paths.events_file(), events_lines(mission_id, completed)).unwrap();
     }
 
     #[test]
@@ -298,8 +303,31 @@ mod tests {
     #[test]
     fn resolve_explicit_mission_rejects_path_traversal_before_reading() {
         let tmp = TempDir::new().unwrap();
-        for id in ["../outside", "a/b", r"a\b", "C:escape"] {
-            let error = resolve_active_mission(tmp.path(), Some(id))
+        let repo_root = tmp.path().join("nested").join("repo");
+        std::fs::create_dir_all(repo_root.join(".kranz").join("missions")).unwrap();
+        // Seed a real, foldable ACTIVE mission log at the traversal TARGET:
+        // from `<repo>/.kranz/missions/<id>`, the `../../..` id below lands
+        // in `<tmp>/nested/outside-target/`. An empty repo would mask a
+        // reverted guard — every traversal id would fail as "unknown mission"
+        // for the wrong reason.
+        let outside = tmp.path().join("nested").join("outside-target");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(
+            outside.join("events.jsonl"),
+            events_lines("outside-target", false),
+        )
+        .unwrap();
+        let traversal_id = "../../../outside-target";
+        // Fixture liveness: the traversal id really folds to an active
+        // mission, so a reverted `is_safe_id` guard would ACCEPT it.
+        assert!(
+            mission_status(&repo_root, traversal_id)
+                .is_some_and(|status| !crate::orchestrator::is_terminal_status(status)),
+            "fixture: traversal target must fold as an active mission"
+        );
+
+        for id in [traversal_id, "a/b", r"a\b", "C:escape"] {
+            let error = resolve_active_mission(&repo_root, Some(id))
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("unknown mission"), "{id}: {error}");
