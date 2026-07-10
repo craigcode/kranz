@@ -1244,6 +1244,11 @@ fn strip_ci_prefix<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
     if text.len() < prefix.len() {
         return None;
     }
+    // Byte-length split_at panics if `prefix.len()` is not a char boundary
+    // (e.g. `/kranz` against a UTF-8 `/kranz статус`). Refuse mid-char cuts.
+    if !text.is_char_boundary(prefix.len()) {
+        return None;
+    }
     let (head, rest) = text.split_at(prefix.len());
     if !head.eq_ignore_ascii_case(prefix) {
         return None;

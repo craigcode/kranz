@@ -811,14 +811,13 @@ async fn non_loopback_bind_requires_token_on_gets() {
         true, // require_read_token — as if bind were non-loopback
     );
 
-    // GETs under /api/ now need the token.
+    // GETs under /api/ now need the token (except /api/health for probes).
     let (status, body) = get_json(&app, "/api/missions/m-01/state").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(body["error"], "missing or invalid token");
 
-    let (status, body) = get_json(&app, "/api/health").await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert_eq!(body["error"], "missing or invalid token");
+    let (status, _) = get_json(&app, "/api/health").await;
+    assert_eq!(status, StatusCode::OK, "health stays unauthenticated");
 
     // With the token, reads succeed.
     let response = app
@@ -833,6 +832,10 @@ async fn non_loopback_bind_requires_token_on_gets() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+
+    // Query-param token also works (browser WebSocket / simple clients).
+    let (status, _) = get_json(&app, &format!("/api/missions/m-01/state?token={TOKEN}")).await;
+    assert_eq!(status, StatusCode::OK);
 }
 
 #[tokio::test]
@@ -1039,12 +1042,31 @@ async fn hosted_lifecycle_reaches_complete_without_a_terminal() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["branch"], format!("kranz/mission-{id}"));
     let paths = MissionPaths::new(&root, &id);
-    assert!(paths.plan_file().is_file(), "plan.json committed");
+    assert!(
+        paths.plan_file().is_file(),
+        "plan.json twin in primary runtime"
+    );
     assert!(
         paths.mission_dir().join("plan.md").is_file(),
-        "plan.md committed"
+        "plan.md twin in primary runtime"
     );
-    let index = std::fs::read_to_string(paths.missions_dir().join("index.md")).unwrap();
+    // Worktree mode commits index.md on the mission branch only — writing it
+    // to the primary would dirty the tracked catalog and trip the cleanliness
+    // sweep. Verify it landed on the branch tip.
+    let out = std::process::Command::new("git")
+        .args([
+            "show",
+            &format!("kranz/mission-{id}:.kranz/missions/index.md"),
+        ])
+        .current_dir(&root)
+        .output()
+        .expect("git show index.md");
+    assert!(
+        out.status.success(),
+        "index.md must be on the mission branch: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let index = String::from_utf8_lossy(&out.stdout);
     assert!(
         index.contains(&id),
         "missions catalog lists the mission: {index}"

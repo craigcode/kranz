@@ -4,7 +4,11 @@
 // and passes it as ?since=<seq> on reconnect. If the gap is small the server
 // replays `event` frames (no snapshot) and we keep our state; otherwise it
 // sends a fresh `snapshot`. Backoff is exponential: 0.5s doubling to 8s.
+//
+// Off-loopback serves also require ?token= (browsers cannot set the
+// x-kranz-token header on WebSocket upgrades).
 
+import { resolveToken } from './token';
 import type { WsFrame } from './types';
 
 const BACKOFF_MIN_MS = 500;
@@ -87,9 +91,14 @@ export class MissionSocket {
 
   private url(): string {
     const wsOrigin = this.opts.origin.replace(/^http/i, 'ws');
+    const params = new URLSearchParams();
     const since = this.opts.getSince();
-    const query = since !== null ? `?since=${since}` : '';
-    return `${wsOrigin}/api/missions/${encodeURIComponent(this.opts.missionId)}/ws${query}`;
+    if (since !== null) params.set('since', String(since));
+    const token = resolveToken();
+    if (token !== null) params.set('token', token);
+    const query = params.toString();
+    const q = query === '' ? '' : `?${query}`;
+    return `${wsOrigin}/api/missions/${encodeURIComponent(this.opts.missionId)}/ws${q}`;
   }
 
   private scheduleReconnect(): void {

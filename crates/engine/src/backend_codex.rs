@@ -171,6 +171,25 @@ fn effective_prompt(spec: &SessionSpec) -> String {
     }
 }
 
+/// Build a TOML basic string literal (double-quoted with escapes) for a
+/// path that may contain spaces, backslashes, or single quotes.
+fn toml_basic_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Build the argv (excluding the binary itself) for one session.
 ///
 /// Public so tests can assert the exact CLI wire format without spawning.
@@ -193,9 +212,11 @@ pub fn build_args(spec: &SessionSpec) -> Vec<String> {
     // Codex's default workspace-write roots. Pin the session cwd explicitly
     // so workers can land deliverables (fix-codex-sandbox-writable-roots-worktree).
     if spec.writable {
-        let root = spec.cwd.display().to_string().replace('\'', "\\'");
+        // TOML basic string (double-quoted) — literal `'…'` has no escapes
+        // and breaks on paths containing `'`.
+        let root = toml_basic_string(&spec.cwd.display().to_string());
         args.push("-c".into());
-        args.push(format!("sandbox_workspace_write.writable_roots=['{root}']"));
+        args.push(format!("sandbox_workspace_write.writable_roots=[{root}]"));
     }
     args.push("--model".into());
     args.push(spec.model.clone());
@@ -925,7 +946,7 @@ mod tests {
                 "--sandbox".to_string(),
                 "workspace-write".to_string(),
                 "-c".to_string(),
-                "sandbox_workspace_write.writable_roots=['.']".to_string(),
+                "sandbox_workspace_write.writable_roots=[\".\"]".to_string(),
                 "--model".to_string(),
                 "gpt-5-codex".to_string(),
                 "do the thing".to_string(),

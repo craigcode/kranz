@@ -268,6 +268,25 @@ fn drop_removes_lock_file() {
     let _again = EventLog::acquire(&p, MISSION, NEVER, LockForce::No).unwrap();
 }
 
+/// After a force-steal, the stolen-from EventLog's Drop must NOT delete the
+/// stealer's lock (otherwise the stealer sees generation 0 and fails closed).
+#[test]
+fn stolen_from_drop_leaves_stealers_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    let first = EventLog::acquire(&p, MISSION, NEVER, LockForce::No).unwrap();
+    let mut stealer = EventLog::acquire(&p, MISSION, NEVER, LockForce::EvenIfLive).unwrap();
+    assert!(p.lock_file().exists());
+    drop(first);
+    assert!(
+        p.lock_file().exists(),
+        "stolen-from Drop must not remove the stealer's lock"
+    );
+    stealer.append(lifecycle("still holding")).unwrap();
+    drop(stealer);
+    assert!(!p.lock_file().exists());
+}
+
 #[test]
 fn failed_acquire_releases_lock() {
     let dir = tempfile::tempdir().unwrap();

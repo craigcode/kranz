@@ -86,11 +86,22 @@ async function parseJsonBody<T>(res: Response): Promise<T> {
 }
 
 export async function getJson<T>(path: string): Promise<T> {
-  const res = await fetch(serverBase() + path);
-  if (!res.ok) {
-    throw new Error(`GET ${path} failed: ${res.status} ${res.statusText}`);
+  // Off-loopback serves require the mutation token on GETs too (header or
+  // ?token=). Always attach when we have one — loopback ignores it.
+  for (;;) {
+    const token = resolveToken();
+    const headers: Record<string, string> = {};
+    if (token !== null) headers['x-kranz-token'] = token;
+    const res = await fetch(serverBase() + path, { headers });
+    if (res.status === 401) {
+      await awaitToken();
+      continue;
+    }
+    if (!res.ok) {
+      throw await errorFrom(res, `GET ${path} failed: ${res.status} ${res.statusText}`);
+    }
+    return parseJsonBody<T>(res);
   }
-  return parseJsonBody<T>(res);
 }
 
 /**

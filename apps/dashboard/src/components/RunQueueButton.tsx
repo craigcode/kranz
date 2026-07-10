@@ -37,7 +37,22 @@ export function RunQueueButton() {
     setDraining(true);
     api
       .drainQueue()
-      .then((drain) => setQueue((q) => (q === null ? q : { ...q, drain })))
+      .then(async (drain) => {
+        // Prefer the host's live drain; if the immediate poll still lags and
+        // reports idle/empty, keep the drain we just received so the button
+        // stays disabled through the race window.
+        try {
+          const state = await api.queue();
+          setQueue({
+            ...state,
+            drain: state.drain.live ? state.drain : drain,
+          });
+        } catch {
+          setQueue((q) =>
+            q === null ? { entries: [], busyWith: null, drain } : { ...q, drain },
+          );
+        }
+      })
       .catch((err: unknown) => {
         setError(err instanceof ApiError ? err.message : String(err));
       })

@@ -29,7 +29,7 @@ export function TokenPrompt() {
       <span className="token-prompt-text">
         {gate.rejected ? (
           <>
-            <strong>token rejected</strong> — paste the mutation token printed by{' '}
+            <strong>token invalid or expired</strong> — paste the mutation token printed by{' '}
             <code>kranz serve</code>
           </>
         ) : (

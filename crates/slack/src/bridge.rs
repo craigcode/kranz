@@ -183,6 +183,14 @@ impl NotifyCursors {
     fn set(&mut self, mission_id: impl Into<String>, last_seq: u64) {
         self.by_mission.insert(mission_id.into(), last_seq);
     }
+
+    /// Drop cursors whose mission is no longer on disk (deleted/abandoned
+    /// cleanup). Returns the number of entries removed.
+    fn prune_absent(&mut self, live_ids: &std::collections::HashSet<String>) -> usize {
+        let before = self.by_mission.len();
+        self.by_mission.retain(|id, _| live_ids.contains(id));
+        before.saturating_sub(self.by_mission.len())
+    }
 }
 
 /// Persist one mission's advanced cursor. Best-effort: a save failure is
@@ -265,14 +273,28 @@ pub async fn run_bridge(
                 return;
             }
             _ = ticker.tick() => {
-                for mission_id in MissionPaths::list_missions(&repo_root) {
+                let live: std::collections::HashSet<String> =
+                    MissionPaths::list_missions(&repo_root).into_iter().collect();
+                // Prune persisted cursors for deleted missions (best-effort).
+                match NotifyCursors::load(&repo_root) {
+                    Ok(mut persisted) => {
+                        if persisted.prune_absent(&live) > 0 {
+                            let _ = persisted.save(&repo_root);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to load slack notify cursors for prune");
+                    }
+                }
+                cursors.retain(|id, _| live.contains(id));
+                for mission_id in &live {
                     if let Err(e) =
                         poll_mission(
                             &cfg,
                             &client,
                             &repo_root,
                             &threads,
-                            &mission_id,
+                            mission_id,
                             &mut cursors,
                             &persisted_seqs,
                         )

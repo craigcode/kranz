@@ -82,6 +82,11 @@ pub struct EventLog {
     /// Generation written into the lock file at acquire. Re-checked on every
     /// append so a stolen-from process fails closed instead of dual-writing.
     lock_generation: u64,
+    /// Identity token written into the lock file at acquire (when the
+    /// platform can produce one). Drop deletes the lock file only when the
+    /// on-disk generation (and token, when present) still match — so a
+    /// stolen-from teardown cannot wipe the stealer's lock.
+    lock_token: Option<String>,
     file: File,
     /// Seq to assign to the next appended event.
     next_seq: u64,
@@ -211,6 +216,7 @@ impl EventLog {
                 events_path,
                 lock_path: lock_path.clone(),
                 lock_generation,
+                lock_token: process_identity_token(std::process::id() as i32),
                 file,
                 next_seq: last_seq + 1,
                 throttle,
@@ -459,13 +465,28 @@ impl Drop for EventLog {
                 "failed to flush event buffer on drop; buffered deltas retained for a future drain"
             );
         }
-        if let Err(e) = std::fs::remove_file(&self.lock_path) {
-            if e.kind() != ErrorKind::NotFound {
-                tracing::warn!(
-                    path = %self.lock_path.display(),
-                    error = %e,
-                    "failed to remove lock file on drop"
-                );
+        // Only remove the lock if we still own it. After a --force-lock steal
+        // the stolen-from process's teardown would otherwise delete the
+        // stealer's lock file; the stealer would then see generation 0 and
+        // fail closed on its next append (MutationLock in queue.rs uses the
+        // same still-ours check).
+        let info = read_lock_info(&self.lock_path);
+        let generation_matches = info.generation.unwrap_or(0) == self.lock_generation;
+        let token_matches = match (&self.lock_token, &info.token) {
+            (Some(ours), Some(theirs)) => ours == theirs,
+            // Platforms/legacy files without a token: generation alone is
+            // the ownership fence.
+            _ => true,
+        };
+        if generation_matches && token_matches {
+            if let Err(e) = std::fs::remove_file(&self.lock_path) {
+                if e.kind() != ErrorKind::NotFound {
+                    tracing::warn!(
+                        path = %self.lock_path.display(),
+                        error = %e,
+                        "failed to remove lock file on drop"
+                    );
+                }
             }
         }
     }

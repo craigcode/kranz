@@ -961,7 +961,7 @@ async fn waive_at_cap_completes_instead_of_blocking() {
 }
 
 // ---------------------------------------------------------------------------
-// 3d. Final-gate command assertions are non-waivable (engine-hard)
+// 3d. Final-gate command assertions are non-waivable (but still fixable)
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
@@ -971,8 +971,9 @@ async fn command_assertion_at_final_gate_is_non_waivable() {
     }
     let (_dir, root) = init_repo();
 
-    // Portable failing command → final-gate must FAIL even if a waive reply
-    // is queued (convert_findings is never consulted for command assertions).
+    // Portable failing command. Waive is refused and replaced with a fix
+    // feature; when the fix still leaves the command red and the cap is
+    // spent, the mission Blocks (never Completes via waive).
     let contract = vec![assertion(
         "a-1",
         "the build succeeds",
@@ -985,17 +986,25 @@ async fn command_assertion_at_final_gate_is_non_waivable() {
             dirty_tree_commit_as_is(),
             judgement("complete", ""),
             waive_reply("a-1", "command not runnable in this environment"),
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            waive_reply("a-1", "still not runnable"),
         ]),
+        worker_pass(), // fix feature for the refused waive
     ]));
 
-    let mut engine = make_engine(&backend, &root, test_cfg());
+    let cfg = MissionConfig {
+        max_fix_cycles_per_milestone: 1,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
     engine.approve_plan(simple_plan(1, contract)).unwrap();
 
     let status = timeout(TEST_TIMEOUT, engine.run())
         .await
         .expect("run must not hang")
         .unwrap();
-    assert_eq!(status, MissionStatus::Failed);
+    assert_eq!(status, MissionStatus::Blocked);
 
     let paths = engine.paths().clone();
     drop(engine);
@@ -1006,12 +1015,24 @@ async fn command_assertion_at_final_gate_is_non_waivable() {
         "gate finding surfaced: {types:?}"
     );
     assert!(
-        types.contains(&"mission.failed"),
-        "non-waivable command failure must fail the mission: {types:?}"
+        types.contains(&"fixfeature.created"),
+        "refused waive must synthesize a fix feature: {types:?}"
+    );
+    assert!(
+        types.contains(&"milestone.blocked"),
+        "second refused waive at the fix-cycle cap must block: {types:?}"
     );
     assert!(
         !types.contains(&"mission.completed"),
         "command assertion must not COMPLETE via waive: {types:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::OrchestratorDecision { summary, .. }
+                if summary.contains("refused waive") && summary.contains("a-1")
+        )),
+        "must surface the refuse-waive decision: {types:?}"
     );
 }
 
@@ -2558,8 +2579,8 @@ async fn preflight_flags_missing_program_and_ignores_present_ones() {
 
 /// run() emits exactly one `orchestrator.decision` summarizing preflight
 /// issues (before any worker spawns) when the contract names a missing
-/// program. Preflight never blocks; the final gate still fails the mission
-/// because command assertions are non-waivable.
+/// program. Preflight never blocks; the final gate still refuses a waive of
+/// the failing command assertion (non-waivable, fixable).
 #[tokio::test(flavor = "multi_thread")]
 async fn run_emits_preflight_decision_when_issues_exist() {
     if !setup() {
@@ -2567,30 +2588,38 @@ async fn run_emits_preflight_decision_when_issues_exist() {
     }
     let (_dir, root) = init_repo();
 
-    // The one command assertion names a program that cannot resolve. Preflight
-    // warns; the final gate fails the mission (command assertions are not
-    // waivable — convert_findings is never consulted).
     let contract = vec![assertion(
         "a-1",
         "the check passes",
         Some("definitely-not-a-real-program-xyz --check"),
     )];
 
-    // Orchestrator turns: seed, judgement f-1-1. No conversion / lesson —
-    // MissionFailed ends the run at the final gate.
+    // Cap=1: refused waive → fix feature → second refuse at cap → Blocked.
     let backend = Arc::new(MockBackend::with_scripts(vec![
         worker_pass(),
-        orch_script(vec![dirty_tree_commit_as_is(), judgement("complete", "")]),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            waive_reply("a-1", "command program unavailable in this environment"),
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            waive_reply("a-1", "still unavailable"),
+        ]),
+        worker_pass(),
     ]));
 
-    let mut engine = make_engine(&backend, &root, test_cfg());
+    let cfg = MissionConfig {
+        max_fix_cycles_per_milestone: 1,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
     engine.approve_plan(simple_plan(1, contract)).unwrap();
 
     let status = timeout(TEST_TIMEOUT, engine.run())
         .await
         .expect("run must not hang")
         .unwrap();
-    assert_eq!(status, MissionStatus::Failed);
+    assert_eq!(status, MissionStatus::Blocked);
 
     let paths = engine.paths().clone();
     drop(engine);

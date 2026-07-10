@@ -1184,14 +1184,12 @@ impl MissionEngine {
             }
             std::fs::write(&primary_plan, serde_json::to_string_pretty(&plan)?)?;
             std::fs::write(self.paths.plan_md_file(), &plan_md_body)?;
-            let primary_index = self.paths.missions_dir().join("index.md");
-            let index_body = upsert_mission_index(
-                &std::fs::read_to_string(&primary_index).unwrap_or_default(),
-                &self.state.mission.id,
-                &plan.goal,
-                chrono::Utc::now().date_naive(),
-            );
-            std::fs::write(&primary_index, index_body)?;
+            // Do NOT write missions/index.md on the primary: that catalog is
+            // tracked on main in repos with merged missions, and a primary
+            // rewrite would trip the worktree-mode cleanliness sweep (a
+            // finding the worktree fix worker can never clear). Canonical
+            // index lives on the mission branch above; REST/CLI read it from
+            // there or from later merge.
             if let Some(body) = &research_md {
                 std::fs::write(self.paths.research_file(), body)?;
             }
@@ -3486,9 +3484,12 @@ impl MissionEngine {
 
     /// All milestones complete: run every `command` assertion ourselves and
     /// put `agent-judgement` assertions to the orchestrator. Failures become
-    /// findings routed through the same conversion turn as a validation
-    /// round, on the LAST milestone: fix features reopen it, an all-waived
-    /// answer completes the mission.
+    /// findings on the last milestone. Command-assertion findings are
+    /// **non-waivable** (a RED cargo test must not become COMPLETE by model
+    /// discretion) but remain **fixable** through [`Self::convert_findings`] —
+    /// the orchestrator may emit fix features or, if the fix-cycle cap is
+    /// spent, the mission blocks. Agent-judgement / synthesized findings may
+    /// still be waived.
     /// Returns `Some(status)` to end `run()`, `None` to continue the loop.
     async fn final_gate(&mut self) -> Result<Option<MissionStatus>> {
         if self.state.mission.status != MissionStatus::Validating {
@@ -3580,36 +3581,80 @@ impl MissionEngine {
             })?;
         }
 
-        // Engine-hard command assertions are NOT waivable: a RED contract
-        // command must not become COMPLETE by model discretion. Split them
-        // out; only agent-judgement / synthesized findings may enter
-        // convert_findings.
-        let (command_findings, waivable): (Vec<_>, Vec<_>) = findings
-            .into_iter()
-            .partition(|f| f.class == "command-assertion");
-        if !command_findings.is_empty() {
-            let subjects: Vec<&str> = command_findings
-                .iter()
-                .map(|f| f.subject.as_str())
-                .collect();
-            self.emit(EventKind::MissionFailed {
-                reason: format!(
-                    "final-gate command assertion(s) failed and are non-waivable: {}",
-                    subjects.join(", ")
-                ),
-            })?;
-            return Ok(Some(MissionStatus::Failed));
-        }
-
-        // Remaining gate findings go through the same conversion turn as a
-        // milestone validation round: the orchestrator may waive them all.
-        match self.convert_findings(&last_milestone_id, &waivable).await? {
-            FindingsConversion::Waive { waived } => {
+        // Command assertions are non-waivable but still fixable: send every
+        // finding through convert_findings, then refuse an all-waive that
+        // covers any command-assertion subject (synthesize fixes instead).
+        let command_subjects: std::collections::HashSet<String> = findings
+            .iter()
+            .filter(|f| f.class == "command-assertion")
+            .map(|f| f.subject.clone())
+            .collect();
+        let all_findings = findings;
+        match self
+            .convert_findings(&last_milestone_id, &all_findings)
+            .await?
+        {
+            FindingsConversion::Waive { waived }
+                if waived
+                    .iter()
+                    .all(|w| !command_subjects.contains(w.subject.as_str())) =>
+            {
                 self.emit_waive_decision(&waived)?;
                 // Report AFTER the waive decision (so the gate waiver is in
                 // the replayed history) and BEFORE mission.completed.
                 self.complete_mission().await?;
                 Ok(Some(MissionStatus::Complete))
+            }
+            FindingsConversion::Waive { waived } => {
+                // Model waived a command assertion — refuse. Fix every
+                // command-classified finding the waive covered (and any
+                // other unwaived remainder is already handled by convert
+                // synthesizing; here the waive emptied the set, so rebuild
+                // from command findings only).
+                let refuse_note = waived
+                    .iter()
+                    .filter(|w| command_subjects.contains(w.subject.as_str()))
+                    .map(|w| w.subject.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.emit_decision(
+                    &format!(
+                        "refused waive of final-gate command assertion(s): {refuse_note}; synthesizing fix feature(s)"
+                    ),
+                    Some(
+                        waived
+                            .iter()
+                            .map(|w| format!("- {}: {}", w.subject, w.reason))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    ),
+                )?;
+                let command_only: Vec<&Finding> = all_findings
+                    .iter()
+                    .filter(|f| command_subjects.contains(&f.subject))
+                    .collect();
+                let specs = synthesize_fix_specs(command_only);
+                if self.fix_cycle_exhausted(li) {
+                    self.emit(EventKind::MilestoneBlocked {
+                        milestone_id: last_milestone_id,
+                        reason: format!(
+                            "{} final-gate command assertion(s) failed but the fix-cycle cap ({}) is reached",
+                            specs.len(),
+                            self.state.config.max_fix_cycles_per_milestone
+                        ),
+                    })?;
+                    return Ok(None);
+                }
+                self.emit(EventKind::MilestoneValidating {
+                    milestone_id: last_milestone_id,
+                })?;
+                self.emit_fix_features(
+                    li,
+                    specs,
+                    &format!("fix non-waivable command assertion(s): {refuse_note}"),
+                    refuse_note,
+                )?;
+                Ok(None)
             }
             FindingsConversion::Fix {
                 specs,
@@ -3628,7 +3673,7 @@ impl MissionEngine {
                         milestone_id: last_milestone_id,
                         reason: format!(
                             "{} final-gate finding(s) but the fix-cycle cap ({}) is reached",
-                            waivable.len(),
+                            all_findings.len(),
                             self.state.config.max_fix_cycles_per_milestone
                         ),
                     })?;

@@ -42,6 +42,8 @@ export function StatusStrip() {
   const startRun = useKranzStore((s) => s.startRun);
   const [armedAbandon, setArmedAbandon] = useState(false);
   const [controlError, setControlError] = useState<string | null>(null);
+  const missionKey = state?.mission.id ?? null;
+  const statusKey = state?.mission.status ?? null;
 
   // An armed abandon disarms itself: a stray click must not lie in wait.
   useEffect(() => {
@@ -49,6 +51,11 @@ export function StatusStrip() {
     const t = window.setTimeout(() => setArmedAbandon(false), 5000);
     return () => window.clearTimeout(t);
   }, [armedAbandon]);
+
+  // Clear stale control errors when the mission (or its status) changes.
+  useEffect(() => {
+    setControlError(null);
+  }, [missionKey, statusKey]);
 
   if (!state) return <div className="status-strip status-planning" />;
 

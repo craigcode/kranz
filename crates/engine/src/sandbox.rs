@@ -223,12 +223,13 @@ pub fn effective_egress(configured: &[String]) -> Vec<String> {
 /// Generate an SBPL profile: deny-by-default, broad read (Seatbelt cannot
 /// usefully scope toolchain/dyld reads without breaking `/bin/sh`), write
 /// limited to subpaths of `session_cwd`, `mission_dir`, `tmpdir`, and each
-/// `extra_write` entry. `fs` denies network (write-only containment must not
-/// imply egress); `fs+net` restricts outbound TCP to the configured egress
-/// list plus the default Anthropic endpoints. macOS no longer resolves
-/// `fs+net` to Seatbelt because `sandbox-exec` rejects those hostname rules;
-/// this generator remains covered so the fail-closed proof can exercise the
-/// rejected profile shape.
+/// `extra_write` entry. `fs` allows network — the profile wraps the agent
+/// binary itself, so denying egress bricks Anthropic/API sessions; write
+/// containment is the fs-tier promise. `fs+net` restricts outbound TCP to
+/// the configured egress list plus the default Anthropic endpoints. macOS
+/// no longer resolves `fs+net` to Seatbelt because `sandbox-exec` rejects
+/// those hostname rules; this generator remains covered so the fail-closed
+/// proof can exercise the rejected profile shape.
 pub fn generate_profile(inputs: &SandboxInputs) -> String {
     let write_paths = write_allowlist(inputs);
 
@@ -245,8 +246,7 @@ pub fn generate_profile(inputs: &SandboxInputs) -> String {
     profile.push('\n');
     // Reads stay broad: Seatbelt cannot usefully express "toolchain + dyld +
     // locale" without a long allowlist that still breaks `/bin/sh` redirects.
-    // Secrecy is not the fs-tier promise — write containment is. Network is
-    // denied under `fs` so the tier label matches operator expectation.
+    // Secrecy is not the fs-tier promise — write containment is.
     profile.push_str("(allow file-read*)\n");
     profile.push('\n');
     match inputs.enforce {
@@ -260,12 +260,10 @@ pub fn generate_profile(inputs: &SandboxInputs) -> String {
             }
             profile.push_str(")\n");
         }
-        // `fs` is write containment only — deny network so the tier label
-        // matches operator expectation (egress is a separate `fs+net` concern).
-        crate::types::SandboxEnforce::Fs => {
-            profile.push_str("(deny network*)\n");
-        }
-        crate::types::SandboxEnforce::Off => {
+        // `fs` (and Off) must allow network: this profile wraps the agent
+        // binary, so `deny network*` bricks API egress. Egress restriction
+        // is an `fs+net` concern (and currently unsupported-warn on macOS).
+        crate::types::SandboxEnforce::Fs | crate::types::SandboxEnforce::Off => {
             profile.push_str("(allow network*)\n");
         }
     }
@@ -443,9 +441,9 @@ mod tests {
         assert!(profile.contains("(version 1)"));
         assert!(profile.contains("(deny default)"));
         assert!(profile.contains("(allow file-read*)"));
-        // `fs` enforce denies network (write-only containment).
-        assert!(profile.contains("(deny network*)"));
-        assert!(!profile.contains("(allow network*)"));
+        // `fs` must allow network so the sandboxed agent can reach its API.
+        assert!(profile.contains("(allow network*)"));
+        assert!(!profile.contains("(deny network*)"));
 
         let session_abs = absolutize(session.path());
         let mission_abs = absolutize(mission.path());

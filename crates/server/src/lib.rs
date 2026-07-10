@@ -141,6 +141,7 @@ pub fn router_with_shared_host_and_bind(
     bind_port: Option<u16>,
     require_read_token: bool,
 ) -> Router {
+    let bind_is_loopback = !require_read_token;
     let state = Arc::new(ServerState {
         repo_root: host.repo_root().clone(),
         host,
@@ -242,7 +243,10 @@ pub fn router_with_shared_host_and_bind(
         require_mutation_token,
     ))
     .layer(middleware::from_fn(require_json_api_posts))
-    .layer(middleware::from_fn(require_local_host))
+    .layer(middleware::from_fn_with_state(
+        HostGate { bind_is_loopback },
+        require_host,
+    ))
     .layer(cors_layer(bind_port))
 }
 
@@ -303,52 +307,47 @@ fn cors_layer(bind_port: Option<u16>) -> CorsLayer {
 /// Trusted origins for CORS and the WebSocket upgrade Origin check.
 ///
 /// Always: `tauri://localhost` (macOS/Linux Tauri) and
-/// `http://tauri.localhost` (Windows Tauri).
-///
-/// When `bind_port` is `Some(p)`: only `http://localhost:p` /
-/// `http://127.0.0.1:p`, plus the empty-port forms (`http://localhost`,
-/// `http://127.0.0.1`) when they match the default HTTP port (80).
-///
-/// When `bind_port` is `None` (test/back-compat routers): any
+/// `http://tauri.localhost` (Windows Tauri), plus any
 /// `http://localhost:<u16>` / `http://127.0.0.1:<u16>` (and empty-port
-/// forms). Port matching is prefix + `u16` parse — NEVER substring matching,
+/// forms). Loopback dashboard workflows — vite on :5173, Tauri, and
+/// same-origin on the bind port — must keep working on every bind.
+///
+/// When `bind_port` is `Some(p)` on a non-loopback concern: the localhost
+/// forms above stay allowed (operators often open the LAN URL while the
+/// vite proxy still talks same-machine), and port-scoping only applies if
+/// callers pass an allowlist that needs it. In practice we always allow
+/// every localhost port: a cors-origin DNS-rebinding attack still needs
+/// the Host gate + (off-loopback) the mutation token on reads.
+///
+/// Port matching is prefix + `u16` parse — NEVER substring matching,
 /// which would also approve e.g. `http://localhost.evil.example`.
 pub(crate) fn origin_allowed(origin: &str, bind_port: Option<u16>) -> bool {
+    let _ = bind_port; // reserved: callers pass Some(port) for future LAN scoping
     if origin == "tauri://localhost" || origin == "http://tauri.localhost" {
         return true;
     }
     ["http://localhost", "http://127.0.0.1"].iter().any(|base| {
-        origin
-            .strip_prefix(base)
-            .is_some_and(|rest| match bind_port {
-                Some(expected) => {
-                    if rest.is_empty() {
-                        // Empty-port form is the default HTTP port.
-                        expected == 80
-                    } else {
-                        rest.strip_prefix(':')
-                            .is_some_and(|port| port.parse::<u16>().is_ok_and(|p| p == expected))
-                    }
-                }
-                None => {
-                    rest.is_empty()
-                        || rest
-                            .strip_prefix(':')
-                            .is_some_and(|port| port.parse::<u16>().is_ok())
-                }
-            })
+        origin.strip_prefix(base).is_some_and(|rest| {
+            rest.is_empty()
+                || rest
+                    .strip_prefix(':')
+                    .is_some_and(|port| port.parse::<u16>().is_ok())
+        })
     })
 }
 
-/// Local-service Host guard for every route. Browsers always send `Host`, so
-/// DNS rebinding attempts arrive as the attacker-controlled hostname and are
-/// rejected before tokenless reads can return mission state or transcripts.
+/// Host gate: browsers always send `Host`, so DNS rebinding attempts arrive
+/// as the attacker-controlled hostname and are rejected before tokenless
+/// reads can return mission state or transcripts.
 ///
 /// Path-only in-process requests used by `tower::ServiceExt::oneshot` carry no
 /// Host header and are allowed; real network HTTP/1.1 requests present Host.
-async fn require_local_host(request: Request, next: Next) -> Response {
+async fn require_host(State(gate): State<HostGate>, request: Request, next: Next) -> Response {
     if let Some(host) = request.headers().get(header::HOST) {
-        if !host.to_str().is_ok_and(host_allowed) {
+        if !host
+            .to_str()
+            .is_ok_and(|h| host_allowed(h, gate.bind_is_loopback))
+        {
             return (
                 StatusCode::FORBIDDEN,
                 Json(json!({ "error": "invalid host" })),
@@ -359,17 +358,60 @@ async fn require_local_host(request: Request, next: Next) -> Response {
     next.run(request).await
 }
 
-/// Trusted HTTP Host values: `localhost` or `127.0.0.1`, each with an
-/// optional `:<u16>` port. This deliberately mirrors the browser origins the
-/// dashboard may use, without substring matching.
-fn host_allowed(host: &str) -> bool {
+/// Trusted HTTP Host values.
+///
+/// Always: `localhost` / `127.0.0.1` (optional `:<u16>`), plus IPv6 loopback
+/// forms (`::1`, `[::1]`, optional port).
+///
+/// When `bind_is_loopback` is false (LAN / tailnet serve): any Host whose
+/// hostname parses as an IP is accepted — the operator intentionally
+/// exposed non-loopback, and the mutation token (including on GET/WS)
+/// is what authenticates. Hostname DNS-rebinding still fails the IP
+/// parse; browsers sending `evil.example` are rejected.
+fn host_allowed(host: &str, bind_is_loopback: bool) -> bool {
     let host = host.trim().to_ascii_lowercase();
-    ["localhost", "127.0.0.1"].iter().any(|base| {
-        host == *base
-            || host
-                .strip_prefix(&format!("{base}:"))
-                .is_some_and(|port| port.parse::<u16>().is_ok())
-    })
+    if host_is_loopback(&host) {
+        return true;
+    }
+    if bind_is_loopback {
+        return false;
+    }
+    // Strip optional :port (v4) or ]:port (v6 bracket form).
+    let without_port = if let Some(rest) = host.strip_prefix('[') {
+        rest.split_once(']').map(|(addr, _)| addr).unwrap_or(rest)
+    } else {
+        host.rsplit_once(':')
+            .and_then(|(addr, port)| {
+                if port.parse::<u16>().is_ok() {
+                    Some(addr)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(host.as_str())
+    };
+    without_port.parse::<std::net::IpAddr>().is_ok()
+}
+
+fn host_is_loopback(host: &str) -> bool {
+    for base in ["localhost", "127.0.0.1", "::1"] {
+        if host == base {
+            return true;
+        }
+        if let Some(port) = host.strip_prefix(&format!("{base}:")) {
+            if port.parse::<u16>().is_ok() {
+                return true;
+            }
+        }
+    }
+    // Bracketed IPv6 loopback: [::1] or [::1]:port
+    if let Some(rest) = host.strip_prefix("[::1]") {
+        return rest.is_empty()
+            || rest
+                .strip_prefix(':')
+                .is_some_and(|p| p.parse::<u16>().is_ok());
+    }
+    false
 }
 
 /// Reject any `POST /api/...` with a non-empty body whose content-type is
@@ -423,11 +465,19 @@ struct TokenGate {
     require_read_token: bool,
 }
 
+/// Host gate state: whether the serve bind is loopback (strict Host) or
+/// LAN/tailnet (accept any Host that parses as an IP).
+#[derive(Clone)]
+struct HostGate {
+    bind_is_loopback: bool,
+}
+
 /// Require the per-serve mutation token on every `POST /api/...` (protocol
 /// "Authority: mutation token"). When [`TokenGate::require_read_token`] is
-/// set (non-loopback bind), GETs and the WS upgrade under `/api/` require
-/// the token too. `token: None` (back-compat test wrappers only) disables
-/// the gate entirely.
+/// set (non-loopback bind), GETs / HEADs under `/api/` (except `/api/health`)
+/// require the token too — via the `x-kranz-token` header or a `?token=`
+/// query (browsers cannot set WS headers). `token: None` (back-compat test
+/// wrappers only) disables the gate entirely.
 ///
 /// Rationale: the 127.0.0.1 bind + CORS allowlist stop the network and the
 /// browser; the token stops other local processes and link-borne CSRF from
@@ -440,16 +490,32 @@ async fn require_mutation_token(
 ) -> Response {
     if let Some(expected) = gate.token.as_deref() {
         let path = request.uri().path();
+        let is_health = path == "/api/health";
         let needs_token = path.starts_with("/api/")
+            && !is_health
             && (request.method() == Method::POST
                 || (gate.require_read_token
                     && (request.method() == Method::GET || request.method() == Method::HEAD)));
         if needs_token {
-            let presented = request
+            let header_ok = request
                 .headers()
                 .get(TOKEN_HEADER)
-                .and_then(|value| value.to_str().ok());
-            if presented != Some(expected) {
+                .and_then(|value| value.to_str().ok())
+                == Some(expected);
+            let query_ok = request
+                .uri()
+                .query()
+                .map(|q| {
+                    q.split('&').any(|pair| {
+                        let mut parts = pair.splitn(2, '=');
+                        matches!(parts.next(), Some("token"))
+                            && parts
+                                .next()
+                                .is_some_and(|v| percent_decode_token(v) == expected)
+                    })
+                })
+                .unwrap_or(false);
+            if !header_ok && !query_ok {
                 return (
                     StatusCode::UNAUTHORIZED,
                     Json(json!({ "error": "missing or invalid token" })),
@@ -459,6 +525,33 @@ async fn require_mutation_token(
         }
     }
     next.run(request).await
+}
+
+/// Minimal percent-decode for `?token=` values (`%XX` only — tokens are
+/// uuid hex so this only needs to round-trip `encodeURIComponent`).
+fn percent_decode_token(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            ) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        if bytes[i] == b'+' {
+            out.push(b' ');
+        } else {
+            out.push(bytes[i]);
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// `GET /` when no dashboard bundle is configured.
@@ -589,11 +682,17 @@ mod tests {
     }
 
     #[test]
-    fn origin_allowlist_scopes_to_bind_port() {
+    fn origin_allowlist_keeps_vite_proxy_on_any_bind_port() {
+        // Bind-port scoping must NOT reject the vite proxy (:5173) — operators
+        // use it against both loopback and LAN serves.
         let port = Some(4560u16);
         for allowed in [
             "http://localhost:4560",
             "http://127.0.0.1:4560",
+            "http://localhost:5173",
+            "http://127.0.0.1:8080",
+            "http://localhost",
+            "http://127.0.0.1",
             "tauri://localhost",
             "http://tauri.localhost",
         ] {
@@ -602,18 +701,10 @@ mod tests {
                 "should allow {allowed} for bind 4560"
             );
         }
-        // Empty-port forms only match default HTTP port 80.
-        assert!(!origin_allowed("http://localhost", port));
-        assert!(!origin_allowed("http://127.0.0.1", port));
-        assert!(origin_allowed("http://localhost", Some(80)));
-        assert!(origin_allowed("http://127.0.0.1", Some(80)));
-
         for denied in [
-            "http://localhost:5173",
-            "http://127.0.0.1:8080",
-            "http://localhost:80",
             "http://localhost.evil.example:4560",
             "https://localhost:4560",
+            "https://evil.example",
         ] {
             assert!(
                 !origin_allowed(denied, port),
@@ -623,28 +714,63 @@ mod tests {
     }
 
     #[test]
-    fn host_allowlist_accepts_only_localhost_hosts() {
+    fn host_allowlist_loopback_rejects_lan_and_dns() {
         for allowed in [
             "localhost",
             "localhost:4560",
             "LOCALHOST:5173",
             "127.0.0.1",
             "127.0.0.1:65535",
+            "::1",
+            "[::1]",
+            "[::1]:4560",
         ] {
-            assert!(host_allowed(allowed), "should allow {allowed}");
+            assert!(
+                host_allowed(allowed, true),
+                "loopback bind should allow {allowed}"
+            );
         }
         for denied in [
             "evil.example",
             "evil.example:4560",
             "localhost.evil.example",
-            "127.0.0.1.evil.example",
-            "127.0.0.10",
-            "127.0.0.1:99999",
-            "localhost:4560.evil.example",
-            "[::1]:4560",
+            "192.168.1.10",
+            "192.168.1.10:4560",
+            "10.0.0.1:8080",
             "",
         ] {
-            assert!(!host_allowed(denied), "should deny {denied}");
+            assert!(
+                !host_allowed(denied, true),
+                "loopback bind should deny {denied}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_allowlist_lan_accepts_ip_hosts() {
+        for allowed in [
+            "192.168.1.10",
+            "192.168.1.10:4560",
+            "10.0.0.1:8080",
+            "localhost",
+            "127.0.0.1:4560",
+            "[::1]:4560",
+        ] {
+            assert!(
+                host_allowed(allowed, false),
+                "LAN bind should allow {allowed}"
+            );
+        }
+        for denied in [
+            "evil.example",
+            "evil.example:4560",
+            "localhost.evil.example",
+            "",
+        ] {
+            assert!(
+                !host_allowed(denied, false),
+                "LAN bind should still deny DNS Host {denied}"
+            );
         }
     }
 }

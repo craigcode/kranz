@@ -214,27 +214,45 @@ impl GitRepo {
     pub fn dirty_paths(&self) -> Result<Vec<PathBuf>> {
         let out = self.run(&["status", "--porcelain", "-z"])?;
         let mut paths = Vec::new();
-        for entry in out.split('\0') {
-            if entry.is_empty() {
+        // Porcelain -z records: XY<space>path\0, or for rename/copy
+        // XY<space>newpath\0oldpath\0. Walk byte-wise so a bare oldpath
+        // record is not mistaken for a status line.
+        let bytes = out.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == 0 {
+                i += 1;
                 continue;
             }
-            // Porcelain -z: XY<space>path, or for renames XY<space>new\0old.
-            // We only need the path after the two-letter status + space.
-            let path_bytes = entry.as_bytes();
-            if path_bytes.len() < 4 {
+            let start = i;
+            while i < bytes.len() && bytes[i] != 0 {
+                i += 1;
+            }
+            let entry = std::str::from_utf8(&bytes[start..i]).unwrap_or("");
+            i += 1; // skip NUL
+            if entry.len() < 4 {
                 continue;
             }
-            // Status is two chars; path starts at index 3 when a space follows.
-            let path = if path_bytes.get(2) == Some(&b' ') {
+            let status = &entry[..2];
+            let path = if entry.as_bytes().get(2) == Some(&b' ') {
                 &entry[3..]
             } else {
-                // Unusual but tolerate "XY path" without assuming space.
                 entry.trim()
             };
             if path.is_empty() {
                 continue;
             }
             paths.push(PathBuf::from(path));
+            // Rename/copy: consume the following oldpath record without
+            // treating it as another dirty path.
+            if status.contains('R') || status.contains('C') {
+                while i < bytes.len() && bytes[i] != 0 {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1; // skip NUL after oldpath
+                }
+            }
         }
         Ok(paths)
     }

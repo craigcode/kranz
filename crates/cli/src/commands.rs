@@ -1248,10 +1248,10 @@ pub(crate) fn refuse_non_loopback_without_insecure_lan(
 ) -> Result<()> {
     if !bind.is_loopback() && !insecure_lan {
         anyhow::bail!(
-            "refusing to bind {bind}: non-loopback serves expose tokenless GETs \
-             (mission states, transcripts) on the network. Re-run with \
-             `--insecure-lan` if you intentionally trust this network \
-             (LAN/tailnet), or keep the default `--host 127.0.0.1`."
+            "refusing to bind {bind}: non-loopback binds expose the API on the \
+             network (every /api GET/POST/WS requires the mutation token). \
+             Re-run with `--insecure-lan` if you intentionally trust this \
+             network (LAN/tailnet), or keep the default `--host 127.0.0.1`."
         );
     }
     Ok(())
@@ -1279,8 +1279,8 @@ async fn cmd_serve(
     if !bind.is_loopback() {
         eprintln!(
             "WARNING: binding {bind} with --insecure-lan — the API is reachable \
-             beyond this machine. POSTs require the mutation token; GETs \
-             (mission states, transcripts) do NOT. Use only on a network you trust."
+             beyond this machine. Every /api GET, POST, and WS upgrade requires \
+             the mutation token (header or ?token=). Use only on a network you trust."
         );
     }
     // One hosted-engine registry for BOTH clients: the axum handlers below and

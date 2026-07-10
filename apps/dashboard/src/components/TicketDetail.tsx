@@ -97,6 +97,13 @@ export function TicketDetail({ slug }: { slug: string }) {
   const approveTitle = ticket.isBlocked
     ? `blocked by ${ticket.blockedBy.join(', ')}`
     : 'queue for run';
+  // Only show draft progress when the live feed belongs to THIS ticket —
+  // matching ticket.missionId, or no linked mission yet (fresh draft before
+  // the ticket record catches up). Hide when the feed is for a different
+  // mission so a previously viewed mission cannot leak here.
+  const showDraftProgress =
+    missionId !== null &&
+    (ticket.missionId === undefined || ticket.missionId === missionId);
 
   return (
     <div className="picker">
@@ -163,7 +170,7 @@ export function TicketDetail({ slug }: { slug: string }) {
           )}
         </div>
 
-        {missionId !== null && (
+        {showDraftProgress && (
           <div className="ticket-section">
             <div className="section-label">Draft progress ({connection})</div>
             {missionState !== null && (
