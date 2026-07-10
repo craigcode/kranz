@@ -72,6 +72,25 @@ pub enum MergeOutcome {
     RefusedPreMerge { detail: String },
 }
 
+/// Outcome of a scoped engine checkpoint commit ([`GitRepo::commit_dirty_paths`]).
+///
+/// The pre-commit secret scan refusing a checkpoint is a POLICY decision, not
+/// a git failure, so it is an outcome (mirroring [`MergeOutcome`]) rather than
+/// an [`EngineError::Git`]: callers on the mission loop must be able to record
+/// the refusal and keep the mission moving — a dirty tree survives resume, so
+/// a propagated refusal would wedge the mission re-hitting the same error
+/// forever. Real git failures still surface as `Err`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckpointOutcome {
+    /// The checkpoint landed (or the tree was already clean); carries the
+    /// resulting head sha.
+    Committed(String),
+    /// The secret scan refused the checkpoint. `detail` names the findings
+    /// (rule ids + fingerprints, never raw secret bytes) and the allowlist
+    /// path for a reviewed waiver. Nothing was staged or committed.
+    RefusedBySecretScan { detail: String },
+}
+
 /// Handle to a local git repository rooted at a working-tree directory.
 #[derive(Debug, Clone)]
 pub struct GitRepo {
@@ -269,13 +288,24 @@ impl GitRepo {
     /// Prefer this over [`Self::add_all_and_commit`] for engine checkpoints so
     /// a concurrent operator edit outside the worker's tree is not scooped in
     /// via `git add -A`. No-op (returns current HEAD) when the tree is clean.
-    pub fn commit_dirty_paths(&self, message: &str) -> Result<String> {
+    ///
+    /// A secret-scan refusal is reported as
+    /// [`CheckpointOutcome::RefusedBySecretScan`], never as an `Err` —
+    /// checkpoint callers sit on the mission loop and must record the refusal
+    /// instead of erroring the run (see [`CheckpointOutcome`]). Real git
+    /// failures still propagate.
+    pub fn commit_dirty_paths(&self, message: &str) -> Result<CheckpointOutcome> {
         let paths = self.dirty_paths()?;
         if paths.is_empty() {
-            return self.head_sha();
+            return Ok(CheckpointOutcome::Committed(self.head_sha()?));
         }
         let refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
-        self.commit_paths(&refs, message)
+        if let Some(detail) = self.secret_scan_refusal(&refs) {
+            return Ok(CheckpointOutcome::RefusedBySecretScan { detail });
+        }
+        Ok(CheckpointOutcome::Committed(
+            self.commit_paths_unscanned(&refs, message)?,
+        ))
     }
 
     /// Stage and commit only the given paths; returns the new head sha.
@@ -292,18 +322,43 @@ impl GitRepo {
         if paths.is_empty() {
             return Err(EngineError::Git("commit_paths: no paths given".into()));
         }
+        // Durable-record commits (plans, reports) treat a scan refusal as a
+        // hard error: the engine authored those files itself, so a finding
+        // there is a bug, not a worker leftover to route around. Checkpoint
+        // callers go through commit_dirty_paths, which surfaces the same
+        // refusal as a CheckpointOutcome instead.
+        if let Some(detail) = self.secret_scan_refusal(paths) {
+            return Err(EngineError::Git(detail));
+        }
+        self.commit_paths_unscanned(paths, message)
+    }
+
+    /// The formatted refusal message when the engine secret scan (minus
+    /// allowlisted fingerprints) finds anything in `paths`, or `None` when
+    /// the commit may proceed. The message names the findings via
+    /// [`scrub::format_findings`] (rule ids + fingerprints, never raw secret
+    /// bytes) and the allowlist path for a reviewed waiver.
+    fn secret_scan_refusal(&self, paths: &[&Path]) -> Option<String> {
         let allowed = std::fs::read_to_string(self.root.join(scrub::SECRET_ALLOWLIST_PATH))
             .ok()
             .map(|text| scrub::read_allowlist_text(&text))
             .unwrap_or_default();
         let findings = scrub::filter_allowed(scrub::scan_paths(&self.root, paths), &allowed);
-        if !findings.is_empty() {
-            return Err(EngineError::Git(format!(
+        if findings.is_empty() {
+            None
+        } else {
+            Some(format!(
                 "secret scan blocked engine commit; add a fingerprint to {} only for a reviewed false positive:\n{}",
                 scrub::SECRET_ALLOWLIST_PATH,
                 scrub::format_findings(&findings)
-            )));
+            ))
         }
+    }
+
+    /// [`Self::commit_paths`] minus the secret scan. Private on purpose:
+    /// every public commit path must either run the scan (commit_paths) or
+    /// surface its refusal as a [`CheckpointOutcome`] (commit_dirty_paths).
+    fn commit_paths_unscanned(&self, paths: &[&Path], message: &str) -> Result<String> {
         let path_args = paths.iter().map(|p| p.as_os_str().to_os_string());
 
         // `git add` fatals ("pathspec ... did not match any files") on a path

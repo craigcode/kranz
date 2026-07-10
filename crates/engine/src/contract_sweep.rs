@@ -23,9 +23,12 @@ pub const FINDING_CLASS: &str = "out-of-contract-write";
 /// Commit message prefix shared by every engine/meta commit template.
 const ENGINE_COMMIT_PREFIX: &str = "[kranz]";
 
-/// Known engine-authored commit subjects. A bare `[kranz]` prefix is NOT
-/// enough — workers with `git commit` could otherwise spoof meta and bypass
-/// the empty-deliverable gate and out-of-contract path sweep.
+/// Known engine-authored commit subject templates. A bare `[kranz]` prefix is
+/// NOT enough to match — but even a full template match is only NECESSARY,
+/// never sufficient: a worker with `git commit` can title a commit
+/// "[kranz] mission report cleanup" just as easily. The enforced exemption is
+/// [`is_meta_commit_with_paths`], which additionally requires every touched
+/// path to be mission-record metadata (see [`is_mission_record_path`]).
 ///
 /// Dirty-tree checkpoints are intentionally NOT meta: they carry real worker
 /// file changes and must count as deliverables / be path-swept.
@@ -58,8 +61,12 @@ pub fn parallel_checkpoint_commit_message(feature_id: &str) -> String {
     format!("[{feature_id}] parallel worktree checkpoint (engine commit)")
 }
 
-/// Whether `subject` is a known engine/meta commit (never attributed to a
-/// worker, never counted as a deliverable, never path-swept).
+/// Whether `subject` matches a known engine/meta commit template.
+///
+/// Subject templates are SPOOFABLE by a worker's own `git commit`, so this
+/// alone must never exempt a commit from the deliverable count or the path
+/// sweep — use [`is_meta_commit_with_paths`] wherever the commit's changed
+/// paths are available (the orchestrator's sweep and final gate both do).
 pub fn is_meta_commit(subject: &str) -> bool {
     if !subject.starts_with(ENGINE_COMMIT_PREFIX) {
         return false;
@@ -67,6 +74,42 @@ pub fn is_meta_commit(subject: &str) -> bool {
     ENGINE_META_TEMPLATES
         .iter()
         .any(|tmpl| subject == *tmpl || subject.starts_with(tmpl))
+}
+
+/// Whether a commit is a GENUINE engine/meta commit (never attributed to a
+/// worker, never counted as a deliverable, never path-swept): the subject
+/// must match a known engine template AND every path the commit touches must
+/// be mission-record metadata (see [`is_mission_record_path`]). A
+/// spoofed-subject worker commit touching anything else (src/, docs/, …) is
+/// treated as a worker commit — counted and swept like any other.
+///
+/// An empty `changed_paths` slice counts as meta when the subject matches:
+/// engine commits are never empty (`commit_paths` no-ops instead of
+/// committing), and an empty spoof carries no deliverable content to count
+/// or sweep anyway.
+pub fn is_meta_commit_with_paths(
+    subject: &str,
+    mission_id: &str,
+    changed_paths: &[String],
+) -> bool {
+    is_meta_commit(subject)
+        && changed_paths
+            .iter()
+            .all(|path| is_mission_record_path(mission_id, path))
+}
+
+/// Whether `path` (relative to the repo root, forward-slash, as
+/// `git diff --name-only` reports) is mission-record metadata a genuine
+/// engine meta commit writes. Derived from the engine's actual commit sites
+/// (orchestrator.rs `approve_plan` / `commit_revised_plan_record` /
+/// `approve_revised_plan` / `try_write_mission_report` / `capture_lesson`):
+/// the mission's own record dir (plan.json, plan.md, revised-plan.md,
+/// research.md, report.md), the missions catalog, and the cross-mission
+/// lessons store (report commits fold captured lesson files in).
+pub fn is_mission_record_path(mission_id: &str, path: &str) -> bool {
+    path == ".kranz/missions/index.md"
+        || path.starts_with(&format!(".kranz/missions/{mission_id}/"))
+        || path.starts_with(".kranz/lessons/")
 }
 
 /// Mission meta paths (relative to repo root, forward-slash, matching
@@ -134,7 +177,7 @@ pub struct AttributedChange<'a> {
 
 /// Build out-of-contract-write findings from a milestone's worker-authored
 /// path changes (engine/meta commits already excluded by the caller — see
-/// [`is_meta_commit`]) against the mission's declared touch-set.
+/// [`is_meta_commit_with_paths`]) against the mission's declared touch-set.
 ///
 /// Returns one finding per distinct out-of-contract path (first attribution
 /// wins when a path is touched by more than one commit). Empty `touch_set`
@@ -289,13 +332,100 @@ mod tests {
         assert!(is_meta_commit("[kranz] mission report for m-abc123"));
         assert!(is_meta_commit("[kranz] revised plan for m-abc123 (rev 2)"));
         assert!(!is_meta_commit("[f-1-2] add sweep"));
-        // Spoof: any `[kranz]` prefix used to count as meta — workers must not
-        // be able to hide real deliverables behind a forged subject.
+        // A bare `[kranz]` prefix does not match a template. (A forged
+        // TEMPLATE subject still passes this check — the path-verified
+        // is_meta_commit_with_paths is what closes that hole.)
         assert!(!is_meta_commit("[kranz] spoofed worker commit"));
         assert!(!is_meta_commit("[kranz]"));
         // Dirty-tree checkpoints carry worker files — not meta.
         assert!(!is_meta_commit(&checkpoint_commit_message("f-1")));
         assert!(!is_meta_commit(&parallel_checkpoint_commit_message("f-1")));
+    }
+
+    #[test]
+    fn engine_commit_exempt_requires_mission_record_paths_not_just_subject() {
+        let mission_id = "m-abc123";
+        // Genuine meta commits: template subject, only mission-record paths
+        // (the exact sets the engine's commit sites write).
+        assert!(is_meta_commit_with_paths(
+            "[kranz] approved plan for m-abc123",
+            mission_id,
+            &[
+                ".kranz/missions/m-abc123/plan.json".to_string(),
+                ".kranz/missions/m-abc123/plan.md".to_string(),
+                ".kranz/missions/m-abc123/research.md".to_string(),
+                ".kranz/missions/index.md".to_string(),
+            ],
+        ));
+        assert!(is_meta_commit_with_paths(
+            "[kranz] revised plan for m-abc123 (rev 2)",
+            mission_id,
+            &[".kranz/missions/m-abc123/revised-plan.md".to_string()],
+        ));
+        assert!(is_meta_commit_with_paths(
+            "[kranz] mission report for m-abc123",
+            mission_id,
+            &[
+                ".kranz/missions/m-abc123/report.md".to_string(),
+                ".kranz/missions/index.md".to_string(),
+                ".kranz/lessons/m-abc123.md".to_string(),
+                ".kranz/lessons/index.md".to_string(),
+            ],
+        ));
+        // Spoof: a template-matching subject on a commit touching a real
+        // file must NOT be meta — it would otherwise dodge the deliverable
+        // count and the out-of-contract path sweep.
+        assert!(!is_meta_commit_with_paths(
+            "[kranz] mission report cleanup",
+            mission_id,
+            &["src/lib.rs".to_string()],
+        ));
+        // Even one non-record path among record paths breaks the exemption.
+        assert!(!is_meta_commit_with_paths(
+            "[kranz] mission report for m-abc123",
+            mission_id,
+            &[
+                ".kranz/missions/m-abc123/report.md".to_string(),
+                "docs/oops.md".to_string(),
+            ],
+        ));
+        // ANOTHER mission's record dir is not this mission's metadata.
+        assert!(!is_meta_commit_with_paths(
+            "[kranz] mission report for m-abc123",
+            mission_id,
+            &[".kranz/missions/m-other/report.md".to_string()],
+        ));
+        // A non-template subject is never meta, whatever the paths.
+        assert!(!is_meta_commit_with_paths(
+            "[f-1-2] add sweep",
+            mission_id,
+            &[".kranz/missions/m-abc123/report.md".to_string()],
+        ));
+    }
+
+    #[test]
+    fn mission_record_path_matches_engine_commit_sites_only() {
+        let mission_id = "m-abc123";
+        for path in [
+            ".kranz/missions/index.md",
+            ".kranz/missions/m-abc123/plan.json",
+            ".kranz/missions/m-abc123/revised-plan.md",
+            ".kranz/missions/m-abc123/report.md",
+            ".kranz/lessons/m-abc123.md",
+            ".kranz/lessons/index.md",
+        ] {
+            assert!(is_mission_record_path(mission_id, path), "{path}");
+        }
+        for path in [
+            "src/lib.rs",
+            ".kranz/secret-allowlist",
+            ".kranz/missions/m-abc123", // the dir itself, not a record
+            ".kranz/missions/m-abc1234/plan.json", // id prefix, other mission
+            ".kranz/missions/m-other/plan.json",
+            "kranz/missions/m-abc123/plan.json", // missing leading .kranz
+        ] {
+            assert!(!is_mission_record_path(mission_id, path), "{path}");
+        }
     }
 
     #[test]

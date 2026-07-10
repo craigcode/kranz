@@ -11,7 +11,7 @@ use axum::Json;
 use kranz_engine::control;
 use kranz_engine::cost;
 use kranz_engine::event_log::EventLog;
-use kranz_engine::events::Event;
+use kranz_engine::events::{Event, EventKind};
 use kranz_engine::merged::merged_bit;
 use kranz_engine::orchestrator::render_plan_markdown;
 use kranz_engine::paths::MissionPaths;
@@ -272,11 +272,11 @@ pub(crate) async fn post_control(
         return Err(unknown_mission(&id));
     }
     if paths.events_file().is_file() {
-        let state = fold_log(&paths).map_err(ApiError::internal)?;
-        if kranz_engine::orchestrator::is_terminal_status(state.mission.status) {
+        if let Some(status) =
+            terminal_status_from_tail(&paths).map_err(|e| ApiError::internal(e.to_string()))?
+        {
             return Err(ApiError::conflict(format!(
-                "mission '{id}' is {:?}; control commands apply only to active missions",
-                state.mission.status
+                "mission '{id}' is {status:?}; control commands apply only to active missions"
             )));
         }
     }
@@ -284,6 +284,26 @@ pub(crate) async fn post_control(
         .map_err(|e| ApiError::bad_request(format!("invalid ControlCommand body: {e}")))?;
     control::enqueue(&paths, &command)?;
     Ok((StatusCode::ACCEPTED, Json(json!({ "queued": true }))))
+}
+
+/// O(tail) terminal probe for the control route — the hottest write path
+/// only needs "is the mission over?", not a full-log fold. Sound because a
+/// terminal lifecycle event always sits in the trailing window: the engine
+/// stops appending after emitting it (the report and any lesson land BEFORE
+/// `mission.completed`; only the redaction audits attached to the same
+/// append can follow `mission.abandoned`), and every mutation surface
+/// refuses terminal missions.
+fn terminal_status_from_tail(
+    paths: &MissionPaths,
+) -> kranz_engine::error::Result<Option<MissionStatus>> {
+    const TAIL_WINDOW_BYTES: u64 = 64 * 1024;
+    let events = EventLog::read_tail_events(&paths.events_file(), TAIL_WINDOW_BYTES)?;
+    Ok(events.iter().rev().find_map(|e| match e.kind {
+        EventKind::MissionCompleted {} => Some(MissionStatus::Complete),
+        EventKind::MissionFailed { .. } => Some(MissionStatus::Failed),
+        EventKind::MissionAbandoned { .. } => Some(MissionStatus::Abandoned),
+        _ => None,
+    }))
 }
 
 #[derive(Debug, Deserialize)]

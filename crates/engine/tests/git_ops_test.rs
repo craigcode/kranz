@@ -7,7 +7,7 @@
 //! `ensure_identity` behaves deterministically.
 
 use kranz_engine::error::EngineError;
-use kranz_engine::git_ops::{CommitInfo, GitRepo, MergeOutcome};
+use kranz_engine::git_ops::{CheckpointOutcome, CommitInfo, GitRepo, MergeOutcome};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Once;
@@ -361,7 +361,10 @@ fn commit_dirty_paths_commits_a_staged_rename_leaving_a_clean_tree() {
 
     raw_git(dir.path(), &["mv", "a.txt", "b.txt"]);
 
-    let sha = repo.commit_dirty_paths("checkpoint the rename").unwrap();
+    let outcome = repo.commit_dirty_paths("checkpoint the rename").unwrap();
+    let CheckpointOutcome::Committed(sha) = outcome else {
+        panic!("expected a committed checkpoint, got: {outcome:?}");
+    };
     assert_ne!(sha, base, "the rename must land in a real commit");
     assert_eq!(repo.head_sha().unwrap(), sha);
     let status = raw_git(dir.path(), &["status", "--porcelain"]);
@@ -397,8 +400,13 @@ fn commit_dirty_paths_commits_a_staged_rename_with_space_in_source() {
         "spaced rename source missing from dirty set: {dirty:?}"
     );
 
-    repo.commit_dirty_paths("checkpoint the spaced rename")
+    let outcome = repo
+        .commit_dirty_paths("checkpoint the spaced rename")
         .unwrap();
+    assert!(
+        matches!(outcome, CheckpointOutcome::Committed(_)),
+        "expected a committed checkpoint, got: {outcome:?}"
+    );
     let status = raw_git(dir.path(), &["status", "--porcelain"]);
     assert!(
         status.trim().is_empty(),
@@ -420,7 +428,11 @@ fn commit_dirty_paths_still_stages_an_unstaged_deletion() {
 
     std::fs::remove_file(dir.path().join("doomed.txt")).unwrap();
 
-    repo.commit_dirty_paths("checkpoint the deletion").unwrap();
+    let outcome = repo.commit_dirty_paths("checkpoint the deletion").unwrap();
+    assert!(
+        matches!(outcome, CheckpointOutcome::Committed(_)),
+        "expected a committed checkpoint, got: {outcome:?}"
+    );
     let status = raw_git(dir.path(), &["status", "--porcelain"]);
     assert!(
         status.trim().is_empty(),
@@ -466,6 +478,52 @@ fn commit_paths_blocks_unwaived_secret_findings_before_staging() {
             .trim()
             .is_empty(),
         "blocked commit must not stage the secret file"
+    );
+}
+
+/// The CHECKPOINT path surfaces the same scan block as a typed outcome, not
+/// an error: a mission-loop caller must be able to record the refusal and
+/// keep going (erroring the run would wedge the mission — the tree is still
+/// dirty on resume, so it re-hits the identical refusal forever).
+#[test]
+fn commit_dirty_paths_surfaces_secret_scan_refusal_as_outcome() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, base) = seeded_repo();
+    let secret = "sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    write(&dir, "leak.txt", &format!("ANTHROPIC_API_KEY={secret}\n"));
+
+    let outcome = repo
+        .commit_dirty_paths("checkpoint the leak")
+        .expect("a scan refusal is an outcome, not a git error");
+    match outcome {
+        CheckpointOutcome::RefusedBySecretScan { detail } => {
+            assert!(
+                detail.contains("secret scan blocked engine commit"),
+                "missing scan context: {detail}"
+            );
+            assert!(
+                detail.contains(".kranz/secret-allowlist"),
+                "missing waiver guidance: {detail}"
+            );
+            assert!(
+                detail.contains("anthropic-api-key"),
+                "missing rule id: {detail}"
+            );
+            assert!(
+                !detail.contains(secret),
+                "secret value leaked through the refusal detail: {detail}"
+            );
+        }
+        other => panic!("expected RefusedBySecretScan, got: {other:?}"),
+    }
+    assert_eq!(repo.head_sha().unwrap(), base, "commit must not advance");
+    assert!(
+        raw_git(dir.path(), &["diff", "--cached", "--name-only"])
+            .trim()
+            .is_empty(),
+        "refused checkpoint must not stage the secret file"
     );
 }
 

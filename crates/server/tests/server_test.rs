@@ -754,6 +754,57 @@ async fn control_post_rejects_terminal_mission() {
     );
 }
 
+/// The control route's terminal check reads only the log's TAIL (it is the
+/// hottest write path); both verdicts must hold when the log outgrows that
+/// window and the probe takes the seek-and-skip-partial-line path.
+#[tokio::test]
+async fn control_post_terminal_probe_survives_logs_larger_than_the_tail_window() {
+    let (_tmp, _repo_root, paths, app) = fixture();
+    let uri = format!("/api/missions/{MISSION_ID}/control");
+    let post = |body: &'static str| {
+        Request::builder()
+            .method("POST")
+            .uri(&uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    };
+
+    // Grow the log well past the 64 KiB probe window with stream deltas.
+    {
+        let mut log = EventLog::acquire(&paths, MISSION_ID, Duration::ZERO, LockForce::No).unwrap();
+        let filler = "x".repeat(256);
+        for _ in 0..400 {
+            log.append(EventKind::WorkerMessage {
+                run_id: "run-1".into(),
+                tag: "text".into(),
+                content: filler.clone(),
+            })
+            .unwrap();
+        }
+    }
+
+    // Active mission, huge log: still 202.
+    let response = app
+        .clone()
+        .oneshot(post(r#"{"kind":"pause"}"#))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    // Terminal event at the tail of the huge log: 409.
+    {
+        let mut log = EventLog::acquire(&paths, MISSION_ID, Duration::ZERO, LockForce::No).unwrap();
+        log.append(EventKind::MissionCompleted {}).unwrap();
+    }
+    let response = app
+        .clone()
+        .oneshot(post(r#"{"kind":"pause"}"#))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
 // ---------------------------------------------------------------------------
 // CORS: only local dev origins and the Tauri webview are approved
 // ---------------------------------------------------------------------------

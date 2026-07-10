@@ -238,6 +238,53 @@ impl OutboundPoster for SlackPoster {
     }
 }
 
+/// One tick's mission-listing + cursor-prune step, factored from
+/// [`run_bridge`] so the error-vs-empty distinction is testable.
+///
+/// Returns the live mission set on a successful listing, or `None` when the
+/// listing FAILED — in which case nothing is pruned, persisted or in-memory.
+/// Treating a transient listing error (fd exhaustion, mid-deletion race) as
+/// "no missions" would wipe every cursor in one tick; when the missions then
+/// "reappear" on the next tick they re-seed from scratch, re-announcing
+/// history to Slack and, for idle missions, silently dropping notifications
+/// after a later restart.
+///
+/// The persisted prune (a file read + JSON parse) only runs when the live set
+/// actually changed since the last tick — an idle bridge must not reload
+/// notify-cursors.json every 500ms. The first tick counts as changed so
+/// missions deleted while the bridge was down are still pruned at startup.
+fn prune_tick(
+    repo_root: &Path,
+    cursors: &mut HashMap<String, MissionCursor>,
+    last_live: &mut Option<std::collections::HashSet<String>>,
+) -> Option<std::collections::HashSet<String>> {
+    let live: std::collections::HashSet<String> = match MissionPaths::try_list_missions(repo_root) {
+        Ok(ids) => ids.into_iter().collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to list missions; skipping cursor prune this tick");
+            return None;
+        }
+    };
+    if last_live.as_ref() != Some(&live) {
+        // Prune persisted cursors for deleted missions (best-effort).
+        match NotifyCursors::load(repo_root) {
+            Ok(mut persisted) => {
+                if persisted.prune_absent(&live) > 0 {
+                    if let Err(e) = persisted.save(repo_root) {
+                        tracing::warn!(error = %e, "failed to save pruned slack notify cursors");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to load slack notify cursors for prune");
+            }
+        }
+        *last_live = Some(live.clone());
+    }
+    cursors.retain(|id, _| live.contains(id));
+    Some(live)
+}
+
 /// Outbound loop: tail every mission under `repo_root`, posting classified
 /// notifications to Slack. Runs until `shutdown` resolves.
 ///
@@ -254,8 +301,9 @@ pub async fn run_bridge(
 ) {
     tokio::pin!(shutdown);
     let mut cursors: HashMap<String, MissionCursor> = HashMap::new();
-    // Persisted last_seq per mission — consulted on first sighting so a
-    // restart does not re-announce already-posted notifications.
+    // Startup snapshot of persisted last_seq per mission. First sightings
+    // re-read the cursor file from disk (it advances while the bridge runs);
+    // this snapshot is only the fallback when that re-read fails.
     let persisted_seqs: HashMap<String, u64> = match NotifyCursors::load(&repo_root) {
         Ok(persisted) => persisted.by_mission.into_iter().collect(),
         Err(e) => {
@@ -265,6 +313,9 @@ pub async fn run_bridge(
     };
     let mut ticker = tokio::time::interval(POLL_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Live mission set observed on the previous tick; the prune step only
+    // touches notify-cursors.json when this changes (cheap idle ticks).
+    let mut last_live: Option<std::collections::HashSet<String>> = None;
 
     loop {
         tokio::select! {
@@ -273,20 +324,11 @@ pub async fn run_bridge(
                 return;
             }
             _ = ticker.tick() => {
-                let live: std::collections::HashSet<String> =
-                    MissionPaths::list_missions(&repo_root).into_iter().collect();
-                // Prune persisted cursors for deleted missions (best-effort).
-                match NotifyCursors::load(&repo_root) {
-                    Ok(mut persisted) => {
-                        if persisted.prune_absent(&live) > 0 {
-                            let _ = persisted.save(&repo_root);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "failed to load slack notify cursors for prune");
-                    }
-                }
-                cursors.retain(|id, _| live.contains(id));
+                // On a listing failure `prune_tick` prunes nothing and we skip
+                // the whole tick (there is no trustworthy live set to poll).
+                let Some(live) = prune_tick(&repo_root, &mut cursors, &mut last_live) else {
+                    continue;
+                };
                 for mission_id in &live {
                     if let Err(e) =
                         poll_mission(
@@ -355,20 +397,37 @@ async fn poll_mission_with_poster(
     // First sighting: fold the whole log. Prefer a persisted last_seq so a
     // restarted bridge does not re-announce already-posted notifications;
     // otherwise seed at head (only NEW events post).
+    //
+    // The persisted cursor is re-read from disk here rather than trusted from
+    // the startup `persisted_seqs` snapshot: the on-disk value advances while
+    // the bridge runs, and a cursor can be dropped and re-seeded long after
+    // start (fold error, mission briefly absent from a listing). Seeding from
+    // the stale startup snapshot would replay every notification posted since
+    // the bridge started. The snapshot remains only as a fallback when the
+    // disk read itself fails.
     if !cursors.contains_key(mission_id) {
         let events = EventLog::read_events(&events_path)?;
         let state = reducer::fold(&events)?;
-        let last_seq = persisted_seqs
-            .get(mission_id)
-            .copied()
-            .unwrap_or(state.last_seq)
-            .min(state.last_seq);
+        let persisted_seq = match NotifyCursors::load(repo_root) {
+            Ok(on_disk) => on_disk.by_mission.get(mission_id).copied(),
+            Err(e) => {
+                tracing::warn!(
+                    mission = %mission_id,
+                    error = %e,
+                    "failed to re-read slack notify cursors at first sighting; using startup snapshot"
+                );
+                persisted_seqs.get(mission_id).copied()
+            }
+        };
+        let last_seq = persisted_seq.unwrap_or(state.last_seq).min(state.last_seq);
         cursors.insert(mission_id.to_string(), MissionCursor { state, last_seq });
         return Ok(());
     }
 
     let cursor = cursors.get_mut(mission_id).expect("just checked");
     let new_events = EventLog::read_events_after(&events_path, cursor.last_seq)?;
+    let seq_at_entry = cursor.last_seq;
+    let mut outcome = Ok(());
     for event in &new_events {
         // Advance the fold first so `classify` sees post-apply state.
         let state_before_event = cursor.state.clone();
@@ -379,12 +438,18 @@ async fn poll_mission_with_poster(
                 Ok(rebuilt) => cursor.state = rebuilt,
                 Err(e) => {
                     tracing::warn!(mission = %mission_id, error = %e, "slack re-fold failed; resyncing");
-                    let events = EventLog::read_events(&events_path)?;
-                    let state = reducer::fold(&events)?;
-                    cursor.last_seq = state.last_seq;
-                    cursor.state = state;
-                    persist_notify_cursor(repo_root, mission_id, cursor.last_seq);
-                    return Ok(());
+                    let resync = (|| -> Result<MissionState> {
+                        let events = EventLog::read_events(&events_path)?;
+                        Ok(reducer::fold(&events)?)
+                    })();
+                    match resync {
+                        Ok(state) => {
+                            cursor.last_seq = state.last_seq;
+                            cursor.state = state;
+                        }
+                        Err(e) => outcome = Err(e),
+                    }
+                    break;
                 }
             }
         }
@@ -397,14 +462,25 @@ async fn poll_mission_with_poster(
                 {
                     cursor.state = state_before_event;
                     tracing::warn!(mission = %mission_id, seq = event.seq, error = %e, "slack post failed; will retry");
-                    return Ok(());
+                    break;
                 }
             }
         }
         cursor.last_seq = event.seq;
+    }
+    // ONE persist per poll, after the event loop. Post-then-persist ordering
+    // is deliberate and must stay: persisting before posting would mark
+    // notifications as sent that were never posted, silently LOSING them on a
+    // crash. The cost of batching is that a crash between the last post and
+    // this persist re-announces up to one poll's burst of events (instead of
+    // at most one event when we persisted per event) — a consciously accepted
+    // trade-off: duplicates are visible and harmless, drops are silent, and
+    // batching removes a full load+parse+serialize+rename per event from the
+    // hot poll loop.
+    if cursor.last_seq != seq_at_entry {
         persist_notify_cursor(repo_root, mission_id, cursor.last_seq);
     }
-    Ok(())
+    outcome
 }
 
 /// Rebuild state from the log prefix ending at `seq` (mirrors the server WS).
@@ -4354,6 +4430,284 @@ mod tests {
         );
     }
 
+    /// Build an in-memory cursor for prune tests; the folded state's content
+    /// is irrelevant to pruning, only the map entry's presence matters.
+    fn dummy_cursor(last_seq: u64) -> MissionCursor {
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-dummy1", "goal");
+        let paths = MissionPaths::new(tmp.path(), "m-dummy1");
+        let events = EventLog::read_events(&paths.events_file()).unwrap();
+        MissionCursor {
+            state: reducer::fold(&events).unwrap(),
+            last_seq,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_tick_prunes_nothing_when_mission_listing_fails() {
+        let tmp = TempDir::new().unwrap();
+        // A mission the bridge knows about, both persisted and in-memory.
+        let mut persisted = NotifyCursors::default();
+        persisted.set("m-alive1", 5);
+        persisted.save(tmp.path()).unwrap();
+        let mut cursors = HashMap::new();
+        cursors.insert("m-alive1".to_string(), dummy_cursor(5));
+        // Make the listing FAIL (missions path is a file, so read_dir errors
+        // with something other than NotFound) — the transient-error shape
+        // that previously read as "every mission was deleted".
+        std::fs::write(tmp.path().join(".kranz").join("missions"), b"boom").unwrap();
+
+        let mut last_live = None;
+        let live = prune_tick(tmp.path(), &mut cursors, &mut last_live);
+
+        assert!(live.is_none(), "a failed listing must not yield a live set");
+        assert!(
+            cursors.contains_key("m-alive1"),
+            "in-memory cursor must survive a listing failure"
+        );
+        let on_disk = NotifyCursors::load(tmp.path()).unwrap();
+        assert_eq!(
+            on_disk.by_mission.get("m-alive1").copied(),
+            Some(5),
+            "persisted cursor must survive a listing failure"
+        );
+        assert!(
+            last_live.is_none(),
+            "a failed listing must not be remembered as an observed live set"
+        );
+    }
+
+    #[test]
+    fn prune_tick_prunes_deleted_missions_on_a_genuinely_empty_listing() {
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-live11", "goal");
+        let mut persisted = NotifyCursors::default();
+        persisted.set("m-live11", 3);
+        persisted.set("m-gone11", 9);
+        persisted.save(tmp.path()).unwrap();
+        let mut cursors = HashMap::new();
+        cursors.insert("m-live11".to_string(), dummy_cursor(3));
+        cursors.insert("m-gone11".to_string(), dummy_cursor(9));
+
+        let mut last_live = None;
+        let live = prune_tick(tmp.path(), &mut cursors, &mut last_live).unwrap();
+
+        assert!(live.contains("m-live11") && !live.contains("m-gone11"));
+        assert!(cursors.contains_key("m-live11"));
+        assert!(!cursors.contains_key("m-gone11"));
+        let on_disk = NotifyCursors::load(tmp.path()).unwrap();
+        assert_eq!(on_disk.by_mission.get("m-live11").copied(), Some(3));
+        assert_eq!(
+            on_disk.by_mission.get("m-gone11"),
+            None,
+            "cursor for a genuinely deleted mission is pruned"
+        );
+    }
+
+    #[test]
+    fn prune_tick_skips_cursor_file_reload_when_live_set_is_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-idle11", "goal");
+        let mut cursors = HashMap::new();
+        let mut last_live = None;
+        prune_tick(tmp.path(), &mut cursors, &mut last_live).unwrap();
+
+        // Sneak a stale entry into the persisted file. With an unchanged live
+        // set the next tick must not even reload the file (the 500ms idle
+        // path stays free of file reads), so the stale entry survives…
+        let mut persisted = NotifyCursors::default();
+        persisted.set("m-stale1", 7);
+        persisted.save(tmp.path()).unwrap();
+        prune_tick(tmp.path(), &mut cursors, &mut last_live).unwrap();
+        assert_eq!(
+            NotifyCursors::load(tmp.path())
+                .unwrap()
+                .by_mission
+                .get("m-stale1")
+                .copied(),
+            Some(7),
+            "unchanged live set must skip the per-tick cursor-file prune"
+        );
+
+        // …until the live set changes, when the normal prune reclaims it.
+        seed_mission(tmp.path(), "m-fresh1", "goal");
+        prune_tick(tmp.path(), &mut cursors, &mut last_live).unwrap();
+        assert_eq!(
+            NotifyCursors::load(tmp.path())
+                .unwrap()
+                .by_mission
+                .get("m-stale1"),
+            None,
+            "a changed live set re-runs the prune"
+        );
+    }
+
+    /// Poster that records, at each post, the mission's last_seq currently
+    /// persisted ON DISK — pinning both persist batching (no write happens
+    /// between the posts of one poll's burst) and crash-window ordering
+    /// (posts happen before the batch persist, never after).
+    struct DiskObservingPoster {
+        repo_root: PathBuf,
+        mission_id: String,
+        disk_seq_at_post: Vec<Option<u64>>,
+    }
+
+    impl OutboundPoster for DiskObservingPoster {
+        fn post<'a>(
+            &'a mut self,
+            _cfg: &'a SlackConfig,
+            _client: &'a SlackClient,
+            _threads: &'a SharedThreads,
+            _mission_id: &'a str,
+            _outbound: &'a Outbound,
+        ) -> PostFuture<'a> {
+            let seq = NotifyCursors::load(&self.repo_root)
+                .ok()
+                .and_then(|c| c.by_mission.get(&self.mission_id).copied());
+            self.disk_seq_at_post.push(seq);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn poll_persists_once_after_the_last_post_of_a_batch() {
+        let tmp = TempDir::new().unwrap();
+        let mission_id = "m-batch1";
+        seed_mission(tmp.path(), mission_id, "notify me");
+
+        let cfg = test_cfg();
+        let client = SlackClient::new(&cfg).unwrap();
+        let threads = SharedThreads::load(tmp.path()).unwrap();
+        let mut cursors = HashMap::new();
+        let persisted = HashMap::new();
+        let mut poster = DiskObservingPoster {
+            repo_root: tmp.path().to_path_buf(),
+            mission_id: mission_id.to_string(),
+            disk_seq_at_post: Vec::new(),
+        };
+
+        // First sighting seeds at head (seq 1): no posts, nothing persisted.
+        poll_mission_with_poster(
+            &cfg,
+            &client,
+            tmp.path(),
+            &threads,
+            mission_id,
+            &mut cursors,
+            &persisted,
+            &mut poster,
+        )
+        .await
+        .unwrap();
+        assert!(poster.disk_seq_at_post.is_empty());
+
+        // A burst of two classified events lands before the next poll.
+        append_plan_approved(tmp.path(), mission_id, "notify me"); // seq 2
+        append_mission_completed(tmp.path(), mission_id); // seq 3
+        poll_mission_with_poster(
+            &cfg,
+            &client,
+            tmp.path(),
+            &threads,
+            mission_id,
+            &mut cursors,
+            &persisted,
+            &mut poster,
+        )
+        .await
+        .unwrap();
+
+        // Both posts observed the PRE-batch on-disk value: no per-event
+        // persist ran between them, and no persist ran before a post.
+        assert_eq!(
+            poster.disk_seq_at_post,
+            vec![None, None],
+            "one poll's burst must not persist between (or before) its posts"
+        );
+        // The single batch persist then recorded the final seq.
+        assert_eq!(cursors.get(mission_id).unwrap().last_seq, 3);
+        assert_eq!(
+            NotifyCursors::load(tmp.path())
+                .unwrap()
+                .by_mission
+                .get(mission_id)
+                .copied(),
+            Some(3),
+            "the batch persist after the last post records the final seq"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_first_sighting_reseeds_from_disk_and_posts_only_missed_events() {
+        let tmp = TempDir::new().unwrap();
+        let mission_id = "m-resume1";
+        seed_mission(tmp.path(), mission_id, "notify me");
+        // Session #1 posted through seq 1 and persisted that cursor…
+        let mut session_one = NotifyCursors::default();
+        session_one.set(mission_id, 1);
+        session_one.save(tmp.path()).unwrap();
+        // …then the bridge went down and the plan got approved (seq 2).
+        append_plan_approved(tmp.path(), mission_id, "notify me");
+
+        // Session #2: fresh in-memory cursors, and a deliberately EMPTY
+        // startup snapshot — first sighting must re-read the persisted file
+        // from disk; trusting a stale/missing snapshot would seed at head
+        // and silently drop the notification appended while down.
+        let cfg = test_cfg();
+        let client = SlackClient::new(&cfg).unwrap();
+        let threads = SharedThreads::load(tmp.path()).unwrap();
+        let mut cursors = HashMap::new();
+        let persisted = HashMap::new();
+        let mut poster = FailOncePoster::new();
+        poster.attempts = 1; // prime past the fail-once: every post succeeds
+
+        poll_mission_with_poster(
+            &cfg,
+            &client,
+            tmp.path(),
+            &threads,
+            mission_id,
+            &mut cursors,
+            &persisted,
+            &mut poster,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            cursors.get(mission_id).unwrap().last_seq,
+            1,
+            "first sighting reseeds from the on-disk cursor, not at head"
+        );
+        assert!(poster.classes.is_empty(), "first sighting never posts");
+
+        poll_mission_with_poster(
+            &cfg,
+            &client,
+            tmp.path(),
+            &threads,
+            mission_id,
+            &mut cursors,
+            &persisted,
+            &mut poster,
+        )
+        .await
+        .unwrap();
+        // Exactly the one event missed while down posts — no duplicate of the
+        // already-announced prefix, no silent drop of seq 2.
+        assert_eq!(poster.classes, vec![NotifyClass::PlanReady]);
+        let cursor = cursors.get(mission_id).unwrap();
+        assert_eq!(cursor.last_seq, 2, "cursor ends at head");
+        assert_eq!(
+            NotifyCursors::load(tmp.path())
+                .unwrap()
+                .by_mission
+                .get(mission_id)
+                .copied(),
+            Some(2)
+        );
+    }
+
     /// When `/kranz approve <arg>` matches BOTH `m-[0-9a-f]{6}` with an
     /// on-disk mission dir AND a ticket slug, prefer mission approval (do
     /// not silently queue the ticket).
@@ -4615,6 +4969,16 @@ mod tests {
             base_sha: None,
         })
         .unwrap();
+    }
+
+    fn append_mission_completed(repo_root: &Path, mission_id: &str) {
+        use kranz_engine::event_log::LockForce;
+        use kranz_engine::events::EventKind;
+
+        let paths = MissionPaths::new(repo_root, mission_id);
+        let mut log =
+            EventLog::acquire(&paths, mission_id, Duration::from_millis(0), LockForce::No).unwrap();
+        log.append(EventKind::MissionCompleted {}).unwrap();
     }
 
     /// Seed a mission that folds to [`MissionStatus::Complete`] — a `created`

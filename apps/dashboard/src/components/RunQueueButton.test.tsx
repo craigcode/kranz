@@ -81,6 +81,18 @@ describe('RunQueueButton', () => {
     await waitFor(() => expect(button.hasAttribute('disabled')).toBe(true));
   });
 
+  it('shows a passive "token required" status when the poll 401s (no error banner)', async () => {
+    vi.mocked(api.queue).mockRejectedValueOnce(new ApiError(401, 'missing or invalid token'));
+
+    render(<RunQueueButton />);
+
+    expect(await screen.findByText('token required')).toBeTruthy();
+    // Passive state only: no alert banner, and the poll went through the
+    // fail-fast path so the TokenPrompt gate is never touched.
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(api.queue).toHaveBeenCalledWith({ tokenGate: false });
+  });
+
   it('surfaces a failed drain POST as an inline error', async () => {
     vi.mocked(api.queue).mockResolvedValueOnce(makeQueue({ entries: [makeEntry()] }));
     vi.mocked(api.drainQueue).mockRejectedValueOnce(new ApiError(401, 'missing token'));

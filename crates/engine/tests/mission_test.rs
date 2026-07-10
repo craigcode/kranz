@@ -3974,3 +3974,224 @@ async fn delivering_mission_still_completes() {
         "delivering mission must not trip the empty-deliverable safety net: {types:?}"
     );
 }
+
+/// Closing the meta-subject spoof hole at the final gate: a worker-authored
+/// commit titled like an engine meta commit ("[kranz] mission report
+/// cleanup" matches the "[kranz] mission report" template) but carrying a
+/// real file IS a deliverable. The empty-diff safety net must count it (the
+/// meta exemption is path-verified), where the old subject-only match
+/// excluded it and failed the mission on a supposedly empty diff.
+#[tokio::test(flavor = "multi_thread")]
+async fn spoofed_meta_subject_commit_counts_as_deliverable() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass_no_write(),
+        orch_script(vec![judgement("complete", ""), no_lesson()]),
+    ]));
+
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    // A misbehaving worker's own commit on the mission branch (checkout mode
+    // keeps it checked out after approval): meta-template subject, real file.
+    std::fs::write(root.join("smuggled.txt"), "real deliverable\n").unwrap();
+    raw_git(&root, &["add", "smuggled.txt"]);
+    raw_git(&root, &["commit", "-m", "[kranz] mission report cleanup"]);
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(
+        status,
+        MissionStatus::Complete,
+        "a spoofed-subject commit carrying a real file is a deliverable; \
+         the empty-deliverable net must count it, not hide it"
+    );
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let types = event_types(&read_log(&paths));
+    assert!(
+        !types.contains(&"mission.failed"),
+        "must not fail as empty-deliverable: {types:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 13. Checkpoint secret-scan refusals (§4.4 dirty-tree turn meets the scan)
+// ---------------------------------------------------------------------------
+
+/// Fixture secret for the refusal tests below (same shape as
+/// git_ops_test.rs's scan-block test; rule id "anthropic-api-key").
+const LEAKED_SECRET: &str = "sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+/// Worker script: passing report, but the session leaves an UNCOMMITTED
+/// secret-bearing file in its cwd — the §4.4 checkpoint's secret scan will
+/// refuse to commit it.
+fn worker_leaks_secret() -> MockScript {
+    MockScript::single_shot_json(&json!({
+        "result": "pass",
+        "summary": "implemented and tested",
+        "filesTouched": ["leak.txt"],
+        "testsAdded": [],
+        "testEvidence": "all green",
+        "commits": []
+    }))
+    .writes_file("leak.txt", format!("ANTHROPIC_API_KEY={LEAKED_SECRET}\n"))
+}
+
+/// Sequential path: the worker leaves a secret-bearing uncommitted file, the
+/// orchestrator says commit-as-is, and the checkpoint's secret scan refuses.
+/// The refusal must NOT error the run (the old `?` wedged the mission: the
+/// tree is still dirty on resume, so resume re-hit the identical error).
+/// Instead it is recorded — an orchestrator.decision plus feature.failed
+/// carrying the scan's reason — and the mission runs on to a clean,
+/// recorded terminal state.
+#[tokio::test(flavor = "multi_thread")]
+async fn secret_scan_refusal_fails_feature_instead_of_erroring_run() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_leaks_secret(),
+        // Turns: seed, dirty-tree decision. The refusal fails the feature
+        // BEFORE any judgement turn, and the mission then fails at the final
+        // gate's empty-deliverable net without further turns.
+        orch_script(vec![dirty_tree_commit_as_is()]),
+    ]));
+
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .expect("a scan refusal must not error the run loop");
+    // The only feature failed, so no deliverable landed: the mission ends
+    // Failed via the final gate's empty-diff net — a recorded terminal
+    // state, not a raw Err the operator can only retry into the same wall.
+    assert_eq!(status, MissionStatus::Failed);
+    assert_eq!(
+        engine.state().mission.milestones[0].features[0].status,
+        FeatureStatus::Failed,
+        "the leaking feature is failed, not left Active"
+    );
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+
+    // feature.failed carries the scan's reason (rule id, no secret bytes).
+    let reason = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::FeatureFailed { reason, .. } => Some(reason.clone()),
+            _ => None,
+        })
+        .expect("feature.failed with the refusal reason is on the log");
+    assert!(
+        reason.contains("secret scan"),
+        "reason names the scan: {reason}"
+    );
+    assert!(
+        reason.contains("anthropic-api-key"),
+        "reason names the rule: {reason}"
+    );
+
+    // The refusal decision is recorded for the audit trail.
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::OrchestratorDecision { summary, .. }
+                if summary.contains("refused by secret scan")
+        )),
+        "an orchestrator.decision records the refusal"
+    );
+
+    // And the raw secret never reaches the event log in any event.
+    let raw_log = std::fs::read_to_string(paths.events_file()).unwrap();
+    assert!(
+        !raw_log.contains(LEAKED_SECRET),
+        "the raw secret must never land in events.jsonl"
+    );
+}
+
+/// Parallel path of the same refusal: parallel workers leave secret-bearing
+/// files in their worktrees. The old code `let _ =`-swallowed the checkpoint
+/// error, silently dropping the dirty deliverables before judgement; now
+/// each refusal is recorded (orchestrator.decision + feature.failed) and the
+/// batch — and run loop — still finishes cleanly instead of erroring. Both
+/// workers leak (scripts pop FIFO, and worker/feature pairing within the
+/// batch is scheduler-dependent), so the assertion holds per feature.
+#[tokio::test(flavor = "multi_thread")]
+async fn parallel_secret_scan_refusal_is_recorded_not_swallowed() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    // Session start order: orchestrator (parallelization decision) first,
+    // then both workers. Neither feature reaches a judgement turn — each
+    // checkpoint refusal short-circuits to not-ready-to-merge.
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        orch_script(vec![parallel_plan(&["f-1-1", "f-1-2"])]),
+        worker_leaks_secret(),
+        worker_leaks_secret(),
+    ]));
+
+    let cfg = MissionConfig {
+        max_parallel_workers: 2,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(2, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .expect("a parallel scan refusal must not error the run loop");
+    // Both features failed their checkpoints → nothing merged → the final
+    // gate's empty-deliverable net fails the mission as a recorded state.
+    assert_eq!(status, MissionStatus::Failed);
+    let ms = &engine.state().mission.milestones[0];
+    assert_eq!(ms.features[0].status, FeatureStatus::Failed);
+    assert_eq!(ms.features[1].status, FeatureStatus::Failed);
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+
+    // One refusal decision per feature — recorded, not swallowed.
+    for feature_id in ["f-1-1", "f-1-2"] {
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.kind,
+                EventKind::OrchestratorDecision { summary, .. }
+                    if summary.contains("refused by secret scan")
+                        && summary.contains(feature_id)
+            )),
+            "a refusal decision names {feature_id}"
+        );
+    }
+    let raw_log = std::fs::read_to_string(paths.events_file()).unwrap();
+    assert!(
+        !raw_log.contains(LEAKED_SECRET),
+        "the raw secret must never land in events.jsonl"
+    );
+
+    // The cleanup guard still reaped the (dirty) per-feature worktrees.
+    let repo = GitRepo::open(&root).unwrap();
+    let worktrees = repo.list_worktrees().unwrap();
+    assert_eq!(
+        worktrees.len(),
+        1,
+        "only the primary worktree remains: {worktrees:?}"
+    );
+}

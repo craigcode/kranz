@@ -5,7 +5,7 @@ vi.mock('./token', () => ({
   awaitToken: vi.fn(),
 }));
 
-import { getJson, postJson, ApiError } from './api';
+import { getJson, postJson, ApiError, isTokenRequired } from './api';
 import { awaitToken, resolveToken } from './token';
 
 function htmlResponse(): Response {
@@ -122,5 +122,27 @@ describe('401 token gate', () => {
     expect(fetch).toHaveBeenCalledTimes(2);
     expect(sentToken(0)).toBe('stale-token');
     expect(sentToken(1)).toBe('fresh-token');
+  });
+
+  it('getJson with tokenGate:false rejects the 401 without parking on the gate', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(unauthorizedResponse());
+
+    let rejection: unknown;
+    try {
+      await getJson('/api/queue', { tokenGate: false });
+    } catch (err) {
+      rejection = err;
+    }
+
+    expect(awaitToken).not.toHaveBeenCalled();
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(rejection).toBeInstanceOf(ApiError);
+    expect((rejection as ApiError).status).toBe(401);
+    expect(isTokenRequired(rejection)).toBe(true);
+  });
+
+  it('isTokenRequired is false for non-401 failures', () => {
+    expect(isTokenRequired(new ApiError(500, 'boom'))).toBe(false);
+    expect(isTokenRequired(new Error('network down'))).toBe(false);
   });
 });

@@ -266,7 +266,8 @@ pub enum Command {
         /// Acknowledge that a non-loopback bind exposes the API on the
         /// network. Required when `--host` is not a loopback address;
         /// off-loopback, GETs and WS upgrades require the mutation token
-        /// (same as POSTs). Ignored for 127.0.0.1 / ::1.
+        /// (same as POSTs). Ignored for loopback addresses (127.0.0.0/8,
+        /// ::1).
         #[arg(long)]
         insecure_lan: bool,
 

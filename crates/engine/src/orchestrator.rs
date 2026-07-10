@@ -2284,7 +2284,8 @@ impl MissionEngine {
 
     /// Dirty tree after a worker run: ask the orchestrator (JSON), defaulting
     /// to commit-as-is (deterministic, documented). Returns `false` when the
-    /// feature was failed instead.
+    /// feature was failed instead — by the orchestrator's own decision, or
+    /// because the checkpoint's secret scan refused the commit.
     async fn resolve_dirty_tree(&mut self, feature_id: &str) -> Result<bool> {
         let message = format!(
             "The worker for feature {feature_id} left uncommitted changes in the working \
@@ -2316,9 +2317,31 @@ impl MissionEngine {
             })?;
             return Ok(false);
         }
-        self.active_repo()
+        let outcome = self
+            .active_repo()
             .commit_dirty_paths(&contract_sweep::checkpoint_commit_message(feature_id))?;
-        Ok(true)
+        match outcome {
+            crate::git_ops::CheckpointOutcome::Committed(_) => Ok(true),
+            crate::git_ops::CheckpointOutcome::RefusedBySecretScan { detail } => {
+                // A scan refusal is a policy decision, not a git failure:
+                // propagating it would error the whole run, and the tree is
+                // still dirty on resume, so the mission would wedge re-hitting
+                // the same refusal. Record it and fail the FEATURE instead —
+                // the mission continues (or blocks) with an audit trail, and
+                // the leftover tree plus the refusal's allowlist guidance is
+                // the operator's cleanup cue. Real git failures still `?` out
+                // above.
+                self.emit_decision(
+                    &format!("dirty tree after {feature_id}: checkpoint refused by secret scan"),
+                    Some(detail.clone()),
+                )?;
+                self.emit(EventKind::FeatureFailed {
+                    feature_id: feature_id.to_string(),
+                    reason: format!("dirty-tree checkpoint refused by secret scan: {detail}"),
+                })?;
+                Ok(false)
+            }
+        }
     }
 
     /// Post-run judgement turn (§4.5 f): report + commits + diff stat →
@@ -2993,11 +3016,31 @@ impl MissionEngine {
         // so the merge carries it. The worker session's own commits (if any)
         // already landed on the branch; a dirty tree is checkpoint-committed
         // here rather than run through the sequential dirty-tree turn — the
-        // parallel subset keeps its worktree self-contained.
+        // parallel subset keeps its worktree self-contained. A real git
+        // failure `?`-aborts the batch (the caller's cleanup guard still
+        // reaps every worktree); a secret-scan refusal is recorded below, so
+        // dirty deliverables are never silently dropped before judgement.
         if !wt_repo.is_clean().unwrap_or(true) {
-            let _ = wt_repo.commit_dirty_paths(
+            match wt_repo.commit_dirty_paths(
                 &contract_sweep::parallel_checkpoint_commit_message(&ws.feature_id),
-            );
+            )? {
+                crate::git_ops::CheckpointOutcome::Committed(_) => {}
+                crate::git_ops::CheckpointOutcome::RefusedBySecretScan { detail } => {
+                    // Same policy refusal as the sequential dirty-tree turn:
+                    // record it and report the run not-ready-to-merge — the
+                    // caller fails the feature, and the batch cleanup guard
+                    // discards the worktree along with its secret-bearing
+                    // leftovers.
+                    self.emit_decision(
+                        &format!(
+                            "parallel checkpoint for {}: refused by secret scan",
+                            ws.feature_id
+                        ),
+                        Some(detail),
+                    )?;
+                    return Ok(false);
+                }
+            }
         }
 
         // Judge the run against the worktree's own commit range (start_sha..HEAD
@@ -3250,25 +3293,29 @@ impl MissionEngine {
         let mission_id = self.state.mission.id.clone();
 
         // Attribute each changed path to the commit that made it, via a
-        // per-commit diff against its predecessor in the range; engine
-        // ([kranz]-authored) commits are skipped entirely so their paths
-        // never enter the candidate set, even when outside the touch-set.
+        // per-commit diff against its predecessor in the range. Engine/meta
+        // commits are skipped entirely so their paths never enter the
+        // candidate set, even when outside the touch-set — but only when the
+        // commit's own paths PROVE it is one: a subject template alone is
+        // spoofable by a worker's `git commit` ("[kranz] mission report
+        // cleanup"), so a template-subject commit touching anything beyond
+        // mission-record metadata is swept like any other worker commit
+        // (contract_sweep::is_meta_commit_with_paths).
         let mut changes: Vec<(String, CommitInfo)> = Vec::new();
         let mut prev_sha = milestone_start_sha.to_string();
         let mut worker_commit_count = 0usize;
         for commit in &commits {
-            if contract_sweep::is_meta_commit(&commit.subject) {
-                prev_sha = commit.sha.clone();
+            let paths = repo.changed_paths(&prev_sha, &commit.sha)?;
+            prev_sha = commit.sha.clone();
+            if contract_sweep::is_meta_commit_with_paths(&commit.subject, &mission_id, &paths) {
                 continue;
             }
             worker_commit_count += 1;
-            let paths = repo.changed_paths(&prev_sha, &commit.sha)?;
             for path in paths {
                 if !contract_sweep::is_meta_path(&mission_id, &path) {
                     changes.push((path, commit.clone()));
                 }
             }
-            prev_sha = commit.sha.clone();
         }
 
         if touch_set.is_empty() {
@@ -3506,12 +3553,24 @@ impl MissionEngine {
             Some(sha) if !sha.is_empty() => sha.to_string(),
             _ => self.state.mission.base_branch.clone(),
         };
-        let non_meta_commit_count = self
-            .active_repo()
-            .commits_between(&base, "HEAD")?
-            .iter()
-            .filter(|commit| !contract_sweep::is_meta_commit(&commit.subject))
-            .count();
+        // The meta exemption is path-verified, not subject-only: a worker
+        // titling its commit "[kranz] mission report cleanup" while touching
+        // real files must still count as a deliverable, or a forged subject
+        // could hide worker writes from this gate (and desync it from the
+        // path sweep, which applies the same check — see
+        // contract_sweep::is_meta_commit_with_paths).
+        let commits = self.active_repo().commits_between(&base, "HEAD")?;
+        let gate_mission_id = self.state.mission.id.clone();
+        let mut prev_sha = base.clone();
+        let mut non_meta_commit_count = 0usize;
+        for commit in &commits {
+            let paths = self.active_repo().changed_paths(&prev_sha, &commit.sha)?;
+            prev_sha = commit.sha.clone();
+            if !contract_sweep::is_meta_commit_with_paths(&commit.subject, &gate_mission_id, &paths)
+            {
+                non_meta_commit_count += 1;
+            }
+        }
         if non_meta_commit_count == 0 {
             self.emit(EventKind::MissionFailed {
                 reason: format!(
@@ -6546,6 +6605,33 @@ mod tests {
 
         let findings = engine.out_of_contract_sweep(&start_sha).unwrap();
         assert!(findings.is_empty(), "findings: {findings:?}");
+    }
+
+    /// A worker commit that SPOOFS an engine meta subject ("[kranz] mission
+    /// report cleanup" matches the "[kranz] mission report" template) but
+    /// touches a real file outside the touch-set is still swept: the meta
+    /// exemption is path-verified, never subject-only.
+    #[test]
+    fn out_of_contract_sweep_flags_spoofed_meta_subject_commit() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+        engine.state.mission.touch_set = vec!["src/**".to_string()];
+        let start_sha = engine.repo.head_sha().unwrap();
+
+        std::fs::write(root.join("smuggled.md"), "out of contract\n").unwrap();
+        engine
+            .repo
+            .add_all_and_commit("[kranz] mission report cleanup")
+            .unwrap();
+
+        let findings = engine.out_of_contract_sweep(&start_sha).unwrap();
+        assert_eq!(findings.len(), 1, "findings: {findings:?}");
+        assert_eq!(findings[0].subject, "smuggled.md");
+        assert_eq!(findings[0].class, contract_sweep::FINDING_CLASS);
     }
 
     /// A dirty primary checkout in worktree mode yields a critical

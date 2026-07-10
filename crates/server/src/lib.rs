@@ -337,17 +337,42 @@ pub(crate) fn origin_allowed(origin: &str, bind_port: Option<u16>) -> bool {
         Some(bind) => port == bind || DEV_PORTS.contains(&port),
         None => true,
     };
-    ["http://localhost", "http://127.0.0.1"].iter().any(|base| {
-        origin.strip_prefix(base).is_some_and(|rest| {
-            if rest.is_empty() {
-                // Portless origin: an implied :80.
-                return port_allowed(80);
-            }
-            rest.strip_prefix(':')
-                .and_then(|port| port.parse::<u16>().ok())
-                .is_some_and(port_allowed)
-        })
-    })
+    let Some(authority) = origin.strip_prefix("http://") else {
+        return false;
+    };
+    let Some((host, port)) = split_host_port(authority) else {
+        return false;
+    };
+    // `localhost` by name, or any LOOPBACK IP literal — a page on
+    // 127.0.0.2 / [::1] is the same trust class as 127.0.0.1, and serves
+    // bound there need their same-origin WS handshake approved. DNS names
+    // (localhost.evil.example) fail the IP parse.
+    let host_local = host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    host_local && port_allowed(port)
+}
+
+/// Split an origin authority — `host[:port]` or `[v6][:port]` — into
+/// hostname and port (default 80). `None` on malformed brackets or ports.
+/// An unbracketed hostname containing `:` is a bare IPv6 authority, which
+/// cannot carry a port.
+fn split_host_port(authority: &str) -> Option<(&str, u16)> {
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (addr, tail) = rest.split_once(']')?;
+        let port = if tail.is_empty() {
+            80
+        } else {
+            tail.strip_prefix(':')?.parse().ok()?
+        };
+        return Some((addr, port));
+    }
+    match authority.rsplit_once(':') {
+        Some((host, _)) if host.contains(':') => Some((authority, 80)),
+        Some((host, port)) => Some((host, port.parse().ok()?)),
+        None => Some((authority, 80)),
+    }
 }
 
 /// Origin policy for the WebSocket upgrade.
@@ -377,20 +402,10 @@ pub(crate) fn ws_origin_allowed(
 /// sends for a page loaded straight off a LAN/tailnet serve. DNS-named
 /// origins fail the IP parse, keeping rebinding pages out.
 fn origin_host_is_ip(origin: &str) -> bool {
-    let Some(rest) = origin.strip_prefix("http://") else {
-        return false;
-    };
-    let host = if let Some(bracketed) = rest.strip_prefix('[') {
-        match bracketed.split_once(']') {
-            Some((addr, _)) => addr,
-            None => return false,
-        }
-    } else {
-        rest.rsplit_once(':')
-            .and_then(|(addr, port)| port.parse::<u16>().is_ok().then_some(addr))
-            .unwrap_or(rest)
-    };
-    host.parse::<std::net::IpAddr>().is_ok()
+    origin
+        .strip_prefix("http://")
+        .and_then(split_host_port)
+        .is_some_and(|(host, _)| host.parse::<std::net::IpAddr>().is_ok())
 }
 
 /// Host gate: browsers always send `Host`, so DNS rebinding attempts arrive
@@ -417,8 +432,11 @@ async fn require_host(State(gate): State<HostGate>, request: Request, next: Next
 
 /// Trusted HTTP Host values.
 ///
-/// Always: `localhost` / `127.0.0.1` (optional `:<u16>`), plus IPv6 loopback
-/// forms (`::1`, `[::1]`, optional port).
+/// Always: `localhost` (optional `:<u16>`) and any LOOPBACK IP literal —
+/// `127.0.0.1`, other 127/8 addresses, `::1` (bare or bracketed), each with
+/// an optional port. Loopback literals cannot be planted by DNS rebinding
+/// (browsers send the attacker's hostname, not the IP it resolves to), and
+/// operators legitimately bind e.g. `--host 127.0.0.2`.
 ///
 /// When `bind_is_loopback` is false (LAN / tailnet serve): any Host whose
 /// hostname parses as an IP is accepted — the operator intentionally
@@ -433,42 +451,43 @@ fn host_allowed(host: &str, bind_is_loopback: bool) -> bool {
     if bind_is_loopback {
         return false;
     }
-    // Strip optional :port (v4) or ]:port (v6 bracket form).
-    let without_port = if let Some(rest) = host.strip_prefix('[') {
-        rest.split_once(']').map(|(addr, _)| addr).unwrap_or(rest)
-    } else {
-        host.rsplit_once(':')
-            .and_then(|(addr, port)| {
-                if port.parse::<u16>().is_ok() {
-                    Some(addr)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(host.as_str())
-    };
-    without_port.parse::<std::net::IpAddr>().is_ok()
+    host_ip(&host).is_some()
 }
 
 fn host_is_loopback(host: &str) -> bool {
-    for base in ["localhost", "127.0.0.1", "::1"] {
-        if host == base {
-            return true;
-        }
-        if let Some(port) = host.strip_prefix(&format!("{base}:")) {
-            if port.parse::<u16>().is_ok() {
-                return true;
-            }
-        }
+    if host == "localhost" {
+        return true;
     }
-    // Bracketed IPv6 loopback: [::1] or [::1]:port
-    if let Some(rest) = host.strip_prefix("[::1]") {
-        return rest.is_empty()
-            || rest
+    if let Some(port) = host.strip_prefix("localhost:") {
+        return port.parse::<u16>().is_ok();
+    }
+    host_ip(host).is_some_and(|ip| ip.is_loopback())
+}
+
+/// Parse the hostname of a `Host` header value — bare IP (v4, or unbracketed
+/// v6, which may itself contain `:` and carries no port), `v4:port`, or
+/// `[v6]` with optional `:port` — as an IP address. `None` for DNS names,
+/// malformed brackets, and invalid ports.
+fn host_ip(host: &str) -> Option<std::net::IpAddr> {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Some(ip);
+    }
+    if let Some(rest) = host.strip_prefix('[') {
+        let (addr, tail) = rest.split_once(']')?;
+        if !(tail.is_empty()
+            || tail
                 .strip_prefix(':')
-                .is_some_and(|p| p.parse::<u16>().is_ok());
+                .is_some_and(|p| p.parse::<u16>().is_ok()))
+        {
+            return None;
+        }
+        return addr.parse().ok();
     }
-    false
+    let (addr, port) = host.rsplit_once(':')?;
+    if port.parse::<u16>().is_err() {
+        return None;
+    }
+    addr.parse().ok()
 }
 
 /// Reject any `POST /api/...` with a non-empty body whose content-type is
@@ -561,7 +580,7 @@ async fn require_mutation_token(
                 .headers()
                 .get(TOKEN_HEADER)
                 .and_then(|value| value.to_str().ok())
-                == Some(expected);
+                .is_some_and(|presented| token_matches(presented, expected));
             let query_ok = gate.require_read_token
                 && is_read
                 && request
@@ -571,9 +590,9 @@ async fn require_mutation_token(
                         q.split('&').any(|pair| {
                             let mut parts = pair.splitn(2, '=');
                             matches!(parts.next(), Some("token"))
-                                && parts
-                                    .next()
-                                    .is_some_and(|v| percent_decode_token(v) == expected)
+                                && parts.next().is_some_and(|v| {
+                                    token_matches(&percent_decode_token(v), expected)
+                                })
                         })
                     })
                     .unwrap_or(false);
@@ -587,6 +606,16 @@ async fn require_mutation_token(
         }
     }
     next.run(request).await
+}
+
+/// Constant-time token equality: off-loopback binds expose the token gate
+/// to remote timing probes, and a short-circuiting `==` leaks how many
+/// leading bytes matched. Only the length is observable (standard for
+/// `ct_eq`, and unavoidable), which reveals nothing useful about a
+/// fixed-length uuid-hex token.
+fn token_matches(presented: &str, expected: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    presented.as_bytes().ct_eq(expected.as_bytes()).into()
 }
 
 /// Minimal percent-decode for `?token=` values (`%XX` only — tokens are
@@ -683,12 +712,31 @@ pub async fn serve_with_shutdown(
     token: Option<String>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    let require_read_token = !bind.is_loopback();
-    // Bind BEFORE building the router so `--port 0` scopes the origin
-    // allowlist to the real ephemeral port, not the literal 0.
-    let addr = SocketAddr::from((bind, port));
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = bind_listener(bind, port).await?;
+    serve_on_listener(host, listener, static_assets, token, shutdown).await
+}
+
+/// Bind `bind:port` and return the listener. Callers that need the REAL
+/// bound address before serving — `--port 0` picks an ephemeral port, and
+/// the CLI prints/opens the URL — bind first and hand the listener to
+/// [`serve_on_listener`].
+pub async fn bind_listener(bind: IpAddr, port: u16) -> anyhow::Result<tokio::net::TcpListener> {
+    Ok(tokio::net::TcpListener::bind(SocketAddr::from((bind, port))).await?)
+}
+
+/// Serve the router on an already-bound listener. The router is built from
+/// the listener's REAL local address, so `--port 0` scopes the origin
+/// allowlist to the actual ephemeral port and a non-loopback bind gets the
+/// read-token gate.
+pub async fn serve_on_listener(
+    host: Arc<MissionHost>,
+    listener: tokio::net::TcpListener,
+    static_assets: Option<DashboardStatic>,
+    token: Option<String>,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
     let local_addr = listener.local_addr()?;
+    let require_read_token = !local_addr.ip().is_loopback();
     let app = router_with_shared_host_and_bind(
         host,
         static_assets,
@@ -709,13 +757,17 @@ mod tests {
 
     #[test]
     fn origin_allowlist_accepts_only_local_dev_and_tauri() {
-        // Back-compat / test path: any localhost port.
+        // Back-compat / test path (bind None): any port, any loopback host —
+        // localhost by name or a loopback IP literal (127/8, [::1]); a page
+        // on 127.0.0.10 is the same trust class as one on 127.0.0.1.
         for allowed in [
             "http://localhost",
             "http://localhost:80",
             "http://localhost:5173",
             "http://127.0.0.1",
             "http://127.0.0.1:65535",
+            "http://127.0.0.10:8080",
+            "http://[::1]:5173",
             "tauri://localhost",
             "http://tauri.localhost",
         ] {
@@ -728,8 +780,9 @@ mod tests {
             "http://localhost.evil.example:5173",
             "http://127.0.0.1.evil.example",
             "http://localhostx",
-            "http://127.0.0.10",
-            "http://127.0.0.10:8080",
+            // Non-loopback IP origins are the WS LAN path's business
+            // (ws_origin_allowed), never CORS-approved here.
+            "http://192.168.1.5:4560",
             // Not a valid u16 port.
             "http://localhost:99999",
             "http://localhost:5173.evil.example",
@@ -737,7 +790,6 @@ mod tests {
             "https://localhost:5173",
             "https://tauri.localhost",
             "tauri://evil.example",
-            "http://[::1]:5173",
             "null",
             "",
         ] {
@@ -847,6 +899,8 @@ mod tests {
             "LOCALHOST:5173",
             "127.0.0.1",
             "127.0.0.1:65535",
+            // Any loopback literal serves: `--host 127.0.0.2` must answer.
+            "127.0.0.2:4560",
             "::1",
             "[::1]",
             "[::1]:4560",
@@ -863,6 +917,10 @@ mod tests {
             "192.168.1.10",
             "192.168.1.10:4560",
             "10.0.0.1:8080",
+            // A full (non-loopback) IPv6 address, NOT ::1 with a port.
+            "::1:4560",
+            // Unclosed bracket.
+            "[::1",
             "",
         ] {
             assert!(

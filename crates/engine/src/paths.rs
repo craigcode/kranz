@@ -117,21 +117,39 @@ impl MissionPaths {
         format!("runs/{run_id}.jsonl")
     }
 
-    /// List mission ids present under a repo (sorted).
+    /// List mission ids present under a repo (sorted), treating any listing
+    /// failure as an empty result. Use [`Self::try_list_missions`] when the
+    /// caller must distinguish "no missions" from "could not list missions"
+    /// (e.g. before pruning per-mission bookkeeping keyed on this listing).
     pub fn list_missions(repo_root: &Path) -> Vec<String> {
+        Self::try_list_missions(repo_root).unwrap_or_default()
+    }
+
+    /// List mission ids present under a repo (sorted), distinguishing
+    /// filesystem errors from a genuinely empty listing.
+    ///
+    /// A missing missions dir is `Ok(vec![])` — the repo simply has no
+    /// missions yet. Any other `read_dir` failure, or an erroring directory
+    /// entry (fd exhaustion, mid-deletion races, permission flaps), is `Err`:
+    /// a transient error must not masquerade as "every mission was deleted".
+    pub fn try_list_missions(repo_root: &Path) -> std::io::Result<Vec<String>> {
         let dir = repo_root.join(".kranz").join("missions");
+        let rd = match std::fs::read_dir(dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
         let mut out = Vec::new();
-        if let Ok(rd) = std::fs::read_dir(dir) {
-            for entry in rd.flatten() {
-                if entry.path().is_dir() {
-                    if let Some(name) = entry.file_name().to_str() {
-                        out.push(name.to_string());
-                    }
+        for entry in rd {
+            let entry = entry?;
+            if entry.path().is_dir() {
+                if let Some(name) = entry.file_name().to_str() {
+                    out.push(name.to_string());
                 }
             }
         }
         out.sort();
-        out
+        Ok(out)
     }
 }
 
@@ -171,6 +189,37 @@ mod tests {
             paths.report_file(),
             PathBuf::from("/repo/.kranz/missions/m-abc123/report.md")
         );
+    }
+
+    #[test]
+    fn try_list_missions_distinguishes_missing_dir_from_real_listing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // No .kranz/missions dir at all: genuinely empty, not an error.
+        assert_eq!(
+            MissionPaths::try_list_missions(tmp.path()).unwrap(),
+            Vec::<String>::new()
+        );
+        // With mission subdirs (plus a stray file that must be skipped):
+        // listed and sorted.
+        let missions = tmp.path().join(".kranz").join("missions");
+        std::fs::create_dir_all(missions.join("m-bbb222")).unwrap();
+        std::fs::create_dir_all(missions.join("m-aaa111")).unwrap();
+        std::fs::write(missions.join("stray.txt"), b"x").unwrap();
+        let listed = MissionPaths::try_list_missions(tmp.path()).unwrap();
+        assert_eq!(listed, vec!["m-aaa111".to_string(), "m-bbb222".to_string()]);
+        // The lenient wrapper agrees on the happy path.
+        assert_eq!(MissionPaths::list_missions(tmp.path()), listed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn try_list_missions_reports_errors_instead_of_swallowing_them() {
+        // A missions *file* (not dir) makes read_dir fail with a non-NotFound
+        // error; the fallible listing must surface it, not return "empty".
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".kranz")).unwrap();
+        std::fs::write(tmp.path().join(".kranz").join("missions"), b"not a dir").unwrap();
+        assert!(MissionPaths::try_list_missions(tmp.path()).is_err());
     }
 
     #[test]

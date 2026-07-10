@@ -51,4 +51,23 @@ describe('awaitToken on 401 rejection', () => {
     await pending;
     expect(resolveToken()).toBe('fresh-token');
   });
+
+  it('keeps rejected:true when a second 401 arrives after the first cleared the token', async () => {
+    setToken('stale-after-restart');
+
+    // First 401: had a token, so the gate escalates to rejected and clears it.
+    const first = awaitToken();
+    expect(tokenGateSnapshot()).toEqual({ needed: true, rejected: true });
+    expect(resolveToken()).toBeNull();
+
+    // Second concurrent 401 arrives with no stored token left — it must not
+    // downgrade the prompt back to the generic wording.
+    const second = awaitToken();
+    expect(tokenGateSnapshot()).toEqual({ needed: true, rejected: true });
+
+    // Gate resolution resets the escalation for the next round.
+    provideToken('fresh-token');
+    await Promise.all([first, second]);
+    expect(tokenGateSnapshot()).toEqual({ needed: false, rejected: false });
+  });
 });

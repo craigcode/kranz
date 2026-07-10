@@ -53,6 +53,12 @@ export function isNotHosted(err: unknown): boolean {
   return err instanceof ApiError && err.status === 409 && /not hosted/i.test(err.message);
 }
 
+/** True for a 401 surfaced by `{ tokenGate: false }` — a token is required
+ *  but the caller opted out of parking on the token gate. */
+export function isTokenRequired(err: unknown): boolean {
+  return err instanceof ApiError && err.status === 401;
+}
+
 async function errorFrom(res: Response, fallback: string): Promise<ApiError> {
   let message = fallback;
   try {
@@ -85,7 +91,15 @@ async function parseJsonBody<T>(res: Response): Promise<T> {
   }
 }
 
-export async function getJson<T>(path: string): Promise<T> {
+export interface GetJsonOptions {
+  /** false: reject a 401 immediately (see isTokenRequired) instead of parking
+   *  on the token gate. For interval-driven background polls only — a poll
+   *  tick must never (re)open the TokenPrompt or pile waiters onto the gate.
+   *  User-initiated fetches keep the default gate behaviour. */
+  tokenGate?: boolean;
+}
+
+export async function getJson<T>(path: string, opts?: GetJsonOptions): Promise<T> {
   // Off-loopback serves require the mutation token on GETs too (header or
   // ?token=). Always attach when we have one — loopback ignores it.
   for (;;) {
@@ -94,6 +108,9 @@ export async function getJson<T>(path: string): Promise<T> {
     if (token !== null) headers['x-kranz-token'] = token;
     const res = await fetch(serverBase() + path, { headers });
     if (res.status === 401) {
+      if (opts?.tokenGate === false) {
+        throw await errorFrom(res, `GET ${path} failed: 401 token required`);
+      }
       await awaitToken();
       continue;
     }
@@ -275,8 +292,8 @@ export const api = {
 
   // --- queue (run-the-queue affordance) ------------------------------------
 
-  queue(): Promise<QueueState> {
-    return getJson('/api/queue');
+  queue(opts?: GetJsonOptions): Promise<QueueState> {
+    return getJson('/api/queue', opts);
   },
 
   drainQueue(): Promise<DrainState> {

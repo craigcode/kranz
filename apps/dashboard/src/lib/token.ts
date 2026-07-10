@@ -132,8 +132,14 @@ export function tokenGateSnapshot(): TokenGateState {
  * cached token first so a stale post-restart value cannot be retried.
  */
 export function awaitToken(): Promise<void> {
-  rejectedLast = resolveToken() !== null;
-  if (rejectedLast) clearToken();
+  // Escalate-only: with two concurrent 401s the second waiter arrives after
+  // the first already cleared the stored token, and must not downgrade the
+  // prompt from "token invalid or expired" back to the generic wording.
+  // provideToken/cancelTokenPrompt reset the flag when the gate resolves.
+  if (resolveToken() !== null) {
+    rejectedLast = true;
+    clearToken();
+  }
   return new Promise<void>((resolve, reject) => {
     waiters.push({ resolve, reject });
     notify();
@@ -145,6 +151,7 @@ export function provideToken(token: string): void {
   setToken(token.trim());
   const pending = waiters;
   waiters = [];
+  rejectedLast = false;
   notify();
   for (const w of pending) w.resolve();
 }

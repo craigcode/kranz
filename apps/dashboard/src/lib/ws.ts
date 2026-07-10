@@ -8,7 +8,7 @@
 // Off-loopback serves also require ?token= (browsers cannot set the
 // x-kranz-token header on WebSocket upgrades).
 
-import { resolveToken } from './token';
+import { resolveToken, subscribeTokenGate } from './token';
 import type { WsFrame } from './types';
 
 const BACKOFF_MIN_MS = 500;
@@ -30,9 +30,22 @@ export class MissionSocket {
   private backoffMs = BACKOFF_MIN_MS;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly opts: MissionSocketOptions;
+  private readonly unsubscribeToken: () => void;
 
   constructor(opts: MissionSocketOptions) {
     this.opts = opts;
+    // A freshly pasted token must not wait out the backoff (up to 8s of
+    // "lost"): when the token gate resolves with a token in hand, reset the
+    // backoff and — if a reconnect is pending — retry immediately.
+    this.unsubscribeToken = subscribeTokenGate(() => {
+      if (this.closed || resolveToken() === null) return;
+      this.backoffMs = BACKOFF_MIN_MS;
+      if (this.reconnectTimer !== null) {
+        clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
+        this.connect();
+      }
+    });
   }
 
   connect(): void {
@@ -78,6 +91,7 @@ export class MissionSocket {
 
   close(): void {
     this.closed = true;
+    this.unsubscribeToken();
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;

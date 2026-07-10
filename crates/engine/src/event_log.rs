@@ -454,6 +454,38 @@ impl EventLog {
         events.retain(|e| e.seq > after_seq);
         Ok(events)
     }
+
+    /// Read the events on the last `max_bytes` of the log WITHOUT reading or
+    /// validating the full file — O(tail) I/O for hot callers that only need
+    /// trailing facts (e.g. "has a terminal lifecycle event been appended?").
+    ///
+    /// The window is aligned to the first complete line inside it, and
+    /// unparseable lines (a torn final write) are skipped rather than treated
+    /// as corruption — callers that need validation use
+    /// [`EventLog::read_events`]. Returns the whole log when the file fits
+    /// inside the window.
+    pub fn read_tail_events(path: &Path, max_bytes: u64) -> Result<Vec<Event>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = std::fs::File::open(path)?;
+        let len = file.metadata()?.len();
+        let start = len.saturating_sub(max_bytes);
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = Vec::with_capacity((len - start) as usize);
+        file.read_to_end(&mut bytes)?;
+        let mut slice = bytes.as_slice();
+        if start > 0 {
+            // Drop the line the window cut into; its head is outside.
+            match slice.iter().position(|&b| b == b'\n') {
+                Some(nl) => slice = &slice[nl + 1..],
+                None => return Ok(Vec::new()),
+            }
+        }
+        Ok(slice
+            .split(|&b| b == b'\n')
+            .filter(|line| !line.is_empty())
+            .filter_map(|line| serde_json::from_str(&String::from_utf8_lossy(line)).ok())
+            .collect())
+    }
 }
 
 impl Drop for EventLog {

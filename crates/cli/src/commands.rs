@@ -1283,6 +1283,14 @@ async fn cmd_serve(
              the mutation token (header or ?token=). Use only on a network you trust."
         );
     }
+    // Bind BEFORE printing anything: `--port 0` picks an ephemeral port, and
+    // the printed / `--open`ed URL must carry the REAL one.
+    let listener = kranz_server::bind_listener(bind, port)
+        .await
+        .map_err(|e| anyhow!("failed to bind {bind}:{port}: {e}"))?;
+    let local_addr = listener
+        .local_addr()
+        .map_err(|e| anyhow!("failed to read bound address: {e}"))?;
     // One hosted-engine registry for BOTH clients: the axum handlers below and
     // (when --slack) the bridge. Handing the bridge its own MissionHost would
     // mean two engines contending for one mission's single-writer lock.
@@ -1311,12 +1319,13 @@ async fn cmd_serve(
     }
 
     let dashboard_assets = resolve_dashboard_assets(&repo, dashboard);
-    let display_host = if bind.is_loopback() {
-        "127.0.0.1".to_string()
-    } else {
-        bind.to_string()
+    // Display the ADDRESS ACTUALLY BOUND: `--host ::1` must not print an
+    // unconnectable 127.0.0.1 URL, and v6 literals need brackets.
+    let display_host = match local_addr.ip() {
+        std::net::IpAddr::V6(v6) => format!("[{v6}]"),
+        std::net::IpAddr::V4(v4) => v4.to_string(),
     };
-    let url = format!("http://{display_host}:{port}/");
+    let url = format!("http://{display_host}:{}/", local_addr.port());
     let token = token.unwrap_or_else(kranz_server::generate_token);
 
     println!("kranz server on {url}");
@@ -1358,7 +1367,7 @@ async fn cmd_serve(
         }
     };
     let result =
-        serve_with_token_cleanup(&repo, host, bind, port, static_assets, token, shutdown).await;
+        serve_with_token_cleanup(&repo, host, listener, static_assets, token, shutdown).await;
     match result {
         Ok(()) => Ok(0),
         Err(e) => Err(anyhow!("server failed: {e}")),
@@ -1373,8 +1382,7 @@ async fn cmd_serve(
 async fn serve_with_token_cleanup(
     repo: &Path,
     host: Arc<kranz_server::MissionHost>,
-    bind: std::net::IpAddr,
-    port: u16,
+    listener: tokio::net::TcpListener,
     static_assets: Option<kranz_server::DashboardStatic>,
     token: String,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
@@ -1385,8 +1393,7 @@ async fn serve_with_token_cleanup(
     let token_file = write_serve_token(repo, &token).ok();
 
     let result =
-        kranz_server::serve_with_shutdown(host, bind, port, static_assets, Some(token), shutdown)
-            .await;
+        kranz_server::serve_on_listener(host, listener, static_assets, Some(token), shutdown).await;
 
     if token_file.is_some() {
         remove_serve_token(repo);
@@ -1812,11 +1819,14 @@ mod tests {
         let path = repo.join(".kranz").join("serve.token");
 
         let host = std::sync::Arc::new(kranz_server::MissionHost::new(repo.clone()));
+        let listener =
+            kranz_server::bind_listener(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0)
+                .await
+                .unwrap();
         serve_with_token_cleanup(
             &repo,
             host,
-            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            0,
+            listener,
             None,
             "tok".to_string(),
             std::future::ready(()),

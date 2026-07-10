@@ -5,7 +5,7 @@
 // loop itself.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { api, ApiError } from '../lib/api';
+import { api, ApiError, isTokenRequired } from '../lib/api';
 import type { QueueState } from '../lib/types';
 
 const POLL_MS = 3000;
@@ -13,15 +13,22 @@ const POLL_MS = 3000;
 export function RunQueueButton() {
   const [queue, setQueue] = useState<QueueState | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** Off-loopback 401 on the poll: passive status, never the TokenPrompt. */
+  const [tokenRequired, setTokenRequired] = useState(false);
   /** True while the drain POST is in flight (guards double-click). */
   const [draining, setDraining] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
-      const state = await api.queue();
+      // tokenGate:false — a background poll must not park on the token gate
+      // (it would reopen a dismissed TokenPrompt on the next tick).
+      const state = await api.queue({ tokenGate: false });
       setQueue(state);
-    } catch {
-      // keep the last known state; the next poll tick retries
+      setTokenRequired(false);
+    } catch (err) {
+      // 401 shows as a passive status; anything else keeps the last known
+      // state and the next poll tick retries.
+      if (isTokenRequired(err)) setTokenRequired(true);
     }
   }, []);
 
@@ -47,6 +54,7 @@ export function RunQueueButton() {
             ...state,
             drain: state.drain.live ? state.drain : drain,
           });
+          setTokenRequired(false);
         } catch {
           setQueue((q) =>
             q === null ? { entries: [], busyWith: null, drain } : { ...q, drain },
@@ -65,7 +73,9 @@ export function RunQueueButton() {
   const disabled = live || empty || draining;
 
   let status: string;
-  if (live) {
+  if (tokenRequired) {
+    status = 'token required';
+  } else if (live) {
     const id = queue?.drain.currentMissionId;
     status = id !== null && id !== undefined ? `Draining… ${id}` : 'Draining…';
   } else if (empty) {

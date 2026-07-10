@@ -2282,7 +2282,11 @@ mod tests {
                              "response_url": "https://hooks.slack/mb" }
             });
             let routed = route(&env, &lookup_none());
-            assert_eq!(routed.envelope_id.as_deref(), Some("env-mb"), "text={text:?}");
+            assert_eq!(
+                routed.envelope_id.as_deref(),
+                Some("env-mb"),
+                "text={text:?}"
+            );
             assert_eq!(
                 routed.action,
                 Action::Help {

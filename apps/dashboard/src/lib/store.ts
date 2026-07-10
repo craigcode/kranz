@@ -359,6 +359,10 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
     deleteMission: async (id: string, all: boolean) => {
       try {
         await api.deleteMission(id, all);
+        // Deleting the connected mission removes its dir server-side; the WS
+        // would otherwise reconnect-loop against a 404 forever with stale
+        // state (abandon keeps the dir, so it needs no such teardown).
+        if (get().missionId === id) get().disconnect();
       } catch (err) {
         set({ missionsError: err instanceof Error ? err.message : String(err) });
       }
