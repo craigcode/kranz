@@ -345,7 +345,8 @@ fn cors_layer(bind_addr: Option<SocketAddr>) -> CorsLayer {
 ///
 /// Scoping against the bound address (`Some(bind)`):
 /// - the dev-server ports (vite :5173, Tauri devUrl :1420) are approved for
-///   any local host — those pages are the operator's own dev tooling;
+///   canonical localhost only (`localhost`, `127.0.0.1`, or `::1`), never
+///   another address in 127/8 that a co-resident process can claim;
 /// - the bind port is approved only for the SAME-ORIGIN page: an IP host
 ///   must equal the bound IP (any loopback IP when the bind is
 ///   unspecified/0.0.0.0, which listens on them all), and the `localhost`
@@ -362,7 +363,9 @@ pub(crate) fn origin_allowed(origin: &str, bind_addr: Option<SocketAddr>) -> boo
         return true;
     }
     // Dev-server origins that must keep working on every bind: the vite
-    // proxy (5173) and Tauri's devUrl (1420).
+    // proxy (5173) and Tauri's devUrl (1420). Restrict these privileged ports
+    // to canonical localhost; every other 127/8 address is independently
+    // bindable by an unprivileged co-resident process.
     const DEV_PORTS: [u16; 2] = [5173, 1420];
     let Some(authority) = origin.strip_prefix("http://") else {
         return false;
@@ -379,7 +382,9 @@ pub(crate) fn origin_allowed(origin: &str, bind_addr: Option<SocketAddr>) -> boo
         return true; // back-compat wildcard
     };
     if DEV_PORTS.contains(&port) {
-        return true;
+        return host == "localhost"
+            || host_ip == Some(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST))
+            || host_ip == Some(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
     }
     if port != bind.port() {
         return false;
@@ -869,6 +874,8 @@ mod tests {
             // Linux); its page must not get tokenless cross-origin reads.
             "http://127.0.0.2:4560",
             "http://127.0.0.10:4560",
+            "http://127.0.0.2:5173",
+            "http://127.0.0.10:1420",
             "http://[::1]:4560",
             "http://localhost.evil.example:4560",
             "https://localhost:4560",
@@ -933,6 +940,10 @@ mod tests {
         assert!(
             !ws_origin_allowed(Some("http://127.0.0.2:4560"), bind, true),
             "co-resident loopback listener page must not open the tokenless WS"
+        );
+        assert!(
+            !ws_origin_allowed(Some("http://127.0.0.2:5173"), bind, true),
+            "a dev port must not privilege another independently bindable loopback IP"
         );
         assert!(!ws_origin_allowed(Some("http://evil.example"), bind, true));
     }

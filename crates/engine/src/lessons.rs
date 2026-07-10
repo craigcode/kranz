@@ -23,6 +23,11 @@ const HEADER: &str = "## Lessons from past missions in this repo\n\n";
 /// planning seed, or `None` if there are no lessons to inject.
 pub fn render_lessons_index(repo_root: &Path) -> Option<String> {
     let lessons_dir = repo_root.join(".kranz").join("lessons");
+    let canonical_repo_root = repo_root.canonicalize().ok()?;
+    let canonical_lessons_dir = lessons_dir.canonicalize().ok()?;
+    if canonical_lessons_dir != canonical_repo_root.join(".kranz").join("lessons") {
+        return None;
+    }
     let manifest = std::fs::read_to_string(lessons_dir.join("index.md")).ok()?;
 
     let lines: Vec<&str> = manifest
@@ -51,22 +56,36 @@ pub fn render_lessons_index(repo_root: &Path) -> Option<String> {
     let entries: Vec<Entry> = recent
         .iter()
         .enumerate()
-        .map(|(i, line)| {
-            let (filename, summary) = parse_manifest_line(line);
-            let file_text = std::fs::read_to_string(lessons_dir.join(&filename)).ok();
+        .filter_map(|(i, line)| {
+            let (filename, summary) = parse_manifest_line(line)?;
+            let lesson_path = lessons_dir.join(&filename);
+            let file_text = lesson_path
+                .canonicalize()
+                .ok()
+                .filter(|path| path.parent() == Some(canonical_lessons_dir.as_path()))
+                .and_then(|canonical_lesson| {
+                    std::fs::symlink_metadata(&lesson_path)
+                        .ok()
+                        .filter(|metadata| metadata.file_type().is_file())
+                        .map(|_| canonical_lesson)
+                })
+                .and_then(|canonical_lesson| std::fs::read_to_string(canonical_lesson).ok());
             let first_line = file_text
                 .as_deref()
                 .and_then(first_nonempty_line)
                 .map(str::to_string)
                 .unwrap_or(summary);
             let full_body = if i < MAX_FULL_BODIES { file_text } else { None };
-            Entry {
+            Some(Entry {
                 filename,
                 first_line,
                 full_body,
-            }
+            })
         })
         .collect();
+    if entries.is_empty() {
+        return None;
+    }
 
     let mut out = String::with_capacity(LESSONS_INJECT_MAX_BYTES);
     out.push_str(HEADER);
@@ -109,13 +128,26 @@ pub fn render_lessons_index(repo_root: &Path) -> Option<String> {
 }
 
 /// Split a manifest line of the form `- <filename> · <summary>` into its
-/// filename and summary parts. Falls back gracefully on unexpected shapes.
-fn parse_manifest_line(line: &str) -> (String, String) {
+/// filename and summary parts. Only a single `.md` basename is accepted:
+/// manifest contents are repository-controlled and must never escape the
+/// lessons directory when joined.
+fn parse_manifest_line(line: &str) -> Option<(String, String)> {
     let line = line.trim_start_matches('-').trim();
-    match line.split_once('·') {
-        Some((filename, summary)) => (filename.trim().to_string(), summary.trim().to_string()),
-        None => (line.to_string(), String::new()),
+    let (filename, summary) = match line.split_once('·') {
+        Some((filename, summary)) => (filename.trim(), summary.trim()),
+        None => (line, ""),
+    };
+    if filename.is_empty()
+        || !filename.ends_with(".md")
+        || filename.contains(['/', '\\'])
+        || Path::new(filename)
+            .file_name()
+            .and_then(|name| name.to_str())
+            != Some(filename)
+    {
+        return None;
     }
+    Some((filename.to_string(), summary.to_string()))
 }
 
 fn first_nonempty_line(text: &str) -> Option<&str> {
@@ -170,6 +202,66 @@ mod tests {
         let lessons_dir = dir.path().join(".kranz").join("lessons");
         std::fs::create_dir_all(&lessons_dir).unwrap();
         std::fs::write(lessons_dir.join("index.md"), "").unwrap();
+        assert!(render_lessons_index(dir.path()).is_none());
+    }
+
+    #[test]
+    fn ignores_manifest_paths_outside_the_lessons_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let lessons_dir = dir.path().join(".kranz").join("lessons");
+        std::fs::create_dir_all(&lessons_dir).unwrap();
+        let outside = dir.path().join("outside.md");
+        std::fs::write(&outside, "LOCAL SECRET\n").unwrap();
+        std::fs::write(lessons_dir.join("safe.md"), "SAFE LESSON\n").unwrap();
+        std::fs::write(
+            lessons_dir.join("index.md"),
+            format!(
+                "- ../../outside.md · traversal\n- {} · absolute\n- safe.md · safe\n",
+                outside.display()
+            ),
+        )
+        .unwrap();
+
+        let rendered = render_lessons_index(dir.path()).expect("safe lesson remains");
+        assert!(rendered.contains("SAFE LESSON"), "{rendered}");
+        assert!(!rendered.contains("LOCAL SECRET"), "{rendered}");
+        assert!(!rendered.contains("../../outside.md"), "{rendered}");
+        assert!(
+            !rendered.contains(&outside.display().to_string()),
+            "{rendered}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ignores_symlinked_lesson_files() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let lessons_dir = dir.path().join(".kranz").join("lessons");
+        std::fs::create_dir_all(&lessons_dir).unwrap();
+        let outside = dir.path().join("outside.md");
+        std::fs::write(&outside, "LOCAL SECRET\n").unwrap();
+        symlink(&outside, lessons_dir.join("linked.md")).unwrap();
+        std::fs::write(lessons_dir.join("index.md"), "- linked.md · fallback\n").unwrap();
+
+        let rendered = render_lessons_index(dir.path()).expect("summary remains safe");
+        assert!(rendered.contains("fallback"), "{rendered}");
+        assert!(!rendered.contains("LOCAL SECRET"), "{rendered}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ignores_a_symlinked_lessons_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("index.md"), "- linked.md · fallback\n").unwrap();
+        std::fs::write(outside.path().join("linked.md"), "LOCAL SECRET\n").unwrap();
+        std::fs::create_dir_all(dir.path().join(".kranz")).unwrap();
+        symlink(outside.path(), dir.path().join(".kranz/lessons")).unwrap();
+
         assert!(render_lessons_index(dir.path()).is_none());
     }
 

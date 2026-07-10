@@ -242,6 +242,21 @@ impl GitRepo {
             .is_empty())
     }
 
+    /// Like [`Self::is_clean_tracked`], but also rejects index flags that can
+    /// hide working-tree changes (`assume-unchanged` / `skip-worktree`).
+    ///
+    /// Scratch merge worktrees are never sparse and never need either flag,
+    /// so every tracked entry must have git's normal `H` tag.
+    pub fn is_clean_tracked_strict(&self) -> Result<bool> {
+        if !self.is_clean_tracked()? {
+            return Ok(false);
+        }
+        Ok(self
+            .run(&["ls-files", "-v"])?
+            .lines()
+            .all(|line| line.starts_with("H ")))
+    }
+
     /// `git add -A` then `git commit -m <message>`; returns the new head sha.
     ///
     /// A no-change commit attempt exits non-zero, so it surfaces as an

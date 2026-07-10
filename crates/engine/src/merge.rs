@@ -99,9 +99,11 @@ where
     // the sanitized gate executor withholds). Worker-side git is untouched.
     let repo = &repo.with_hooks_disabled();
 
-    if !repo.is_clean_tracked()? {
+    if !repo.is_clean_tracked_strict()? {
         return Ok(MergeReport::RefusedDirtyTree);
     }
+    let primary_head_before_gates = repo.head_sha()?;
+    let primary_branch_before_gates = repo.current_branch()?;
 
     // Resolve moving refs once. Every read, merge, and final advance below
     // uses these SHAs so a late branch update cannot bypass validation.
@@ -175,6 +177,18 @@ where
         GateSuiteResult::Passed => {}
     }
 
+    let post_gate_head = scratch.head_sha()?;
+    let tracked_tree_clean = scratch.is_clean_tracked_strict()?;
+    if post_gate_head != tested_commit || !tracked_tree_clean {
+        return Ok(MergeReport::RefusedPreMerge {
+            detail: format!(
+                "merge gates mutated the integrated tree: expected HEAD {tested_commit}, \
+                 found {post_gate_head}, tracked files clean={tracked_tree_clean}; \
+                 refusing to land bytes other than the tested commit"
+            ),
+        });
+    }
+
     // Production holds the repo-wide busy guard throughout this call.
     // Re-check anyway so external/manual movement fails closed.
     let current_base = repo.rev_parse(base_branch)?;
@@ -182,6 +196,23 @@ where
         return Ok(MergeReport::RefusedPreMerge {
             detail: format!(
                 "base branch {base_branch:?} moved from {live_base_sha} to {current_base} while gates ran; retry the merge"
+            ),
+        });
+    }
+
+    let primary_head_after_gates = repo.head_sha()?;
+    let primary_branch_after_gates = repo.current_branch()?;
+    let primary_tree_clean = repo.is_clean_tracked_strict()?;
+    if primary_head_after_gates != primary_head_before_gates
+        || primary_branch_after_gates != primary_branch_before_gates
+        || !primary_tree_clean
+    {
+        return Ok(MergeReport::RefusedPreMerge {
+            detail: format!(
+                "merge gates mutated the primary checkout: expected \
+                 {primary_branch_before_gates}@{primary_head_before_gates}, found \
+                 {primary_branch_after_gates}@{primary_head_after_gates}, tracked files \
+                 clean={primary_tree_clean}; refusing to overwrite operator work"
             ),
         });
     }

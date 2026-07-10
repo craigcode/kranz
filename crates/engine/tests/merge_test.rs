@@ -620,6 +620,151 @@ fn gates_run_against_the_integrated_mission_tree_not_the_primary_checkout() {
 }
 
 #[test]
+fn gate_that_mutates_tracked_files_is_refused() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, seed) = seeded_repo();
+    seed_mission_branch(
+        &dir,
+        &repo,
+        &seed,
+        "mission-only.txt",
+        "validated mission content\n",
+    );
+
+    let report = merge_mission(
+        &repo,
+        "main",
+        &seed,
+        "kranz/mission-x",
+        None,
+        |_cmd, cwd| {
+            std::fs::write(cwd.join("mission-only.txt"), "gate-mutated content\n").unwrap();
+            (true, String::new())
+        },
+    )
+    .unwrap();
+
+    match report {
+        MergeReport::RefusedPreMerge { detail } => {
+            assert!(detail.contains("gates mutated"), "{detail}");
+            assert!(detail.contains("tracked files clean=false"), "{detail}");
+        }
+        other => panic!("expected RefusedPreMerge, got {other:?}"),
+    }
+    assert_eq!(repo.rev_parse("main").unwrap(), seed);
+    assert!(!dir.path().join("mission-only.txt").exists());
+}
+
+#[test]
+fn gate_cannot_hide_a_tracked_mutation_with_index_flags() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, seed) = seeded_repo();
+    seed_mission_branch(
+        &dir,
+        &repo,
+        &seed,
+        "mission-only.txt",
+        "validated mission content\n",
+    );
+
+    let report = merge_mission(
+        &repo,
+        "main",
+        &seed,
+        "kranz/mission-x",
+        None,
+        |_cmd, cwd| {
+            raw_git(
+                cwd,
+                &["update-index", "--assume-unchanged", "mission-only.txt"],
+            );
+            std::fs::write(cwd.join("mission-only.txt"), "hidden gate mutation\n").unwrap();
+            (true, String::new())
+        },
+    )
+    .unwrap();
+
+    match report {
+        MergeReport::RefusedPreMerge { detail } => {
+            assert!(detail.contains("gates mutated"), "{detail}");
+            assert!(detail.contains("tracked files clean=false"), "{detail}");
+        }
+        other => panic!("expected RefusedPreMerge, got {other:?}"),
+    }
+    assert_eq!(repo.rev_parse("main").unwrap(), seed);
+}
+
+#[test]
+fn gate_that_mutates_the_primary_checkout_is_refused() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, seed) = seeded_repo();
+    seed_mission_branch(&dir, &repo, &seed, "src/lib.rs", "fn mission() {}\n");
+
+    let report = merge_mission(
+        &repo,
+        "main",
+        &seed,
+        "kranz/mission-x",
+        None,
+        |_cmd, _cwd| {
+            std::fs::write(
+                dir.path().join("README.md"),
+                "gate corrupted operator file\n",
+            )
+            .unwrap();
+            (true, String::new())
+        },
+    )
+    .unwrap();
+
+    match report {
+        MergeReport::RefusedPreMerge { detail } => {
+            assert!(detail.contains("primary checkout"), "{detail}");
+            assert!(detail.contains("tracked files clean=false"), "{detail}");
+        }
+        other => panic!("expected RefusedPreMerge, got {other:?}"),
+    }
+    assert_eq!(repo.rev_parse("main").unwrap(), seed);
+}
+
+#[test]
+fn gate_that_moves_head_is_refused() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, seed) = seeded_repo();
+    seed_mission_branch(&dir, &repo, &seed, "src/lib.rs", "fn mission() {}\n");
+
+    let report = merge_mission(
+        &repo,
+        "main",
+        &seed,
+        "kranz/mission-x",
+        None,
+        |_cmd, cwd| {
+            raw_git(cwd, &["commit", "--allow-empty", "-m", "gate moved head"]);
+            (true, String::new())
+        },
+    )
+    .unwrap();
+
+    match report {
+        MergeReport::RefusedPreMerge { detail } => {
+            assert!(detail.contains("gates mutated"), "{detail}");
+            assert!(detail.contains("tracked files clean=true"), "{detail}");
+        }
+        other => panic!("expected RefusedPreMerge, got {other:?}"),
+    }
+    assert_eq!(repo.rev_parse("main").unwrap(), seed);
+}
+
+#[test]
 fn mission_branch_movement_after_integration_does_not_change_what_lands() {
     if !setup() {
         return;

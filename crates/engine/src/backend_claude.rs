@@ -267,49 +267,10 @@ fn fallback_candidates() -> Vec<PathBuf> {
 /// can never block forever on a candidate.
 const VERSION_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// Validate a candidate by running `<candidate> --version`, polling with a
-/// bounded wall-clock ([`VERSION_PROBE_TIMEOUT`]) rather than blocking
-/// forever. A candidate that has not exited by the deadline is killed and
-/// reported as broken.
+/// Validate a candidate by running `<candidate> --version`, draining both
+/// output pipes concurrently while enforcing [`VERSION_PROBE_TIMEOUT`].
 fn probe_version(binary: &Path) -> std::result::Result<String, String> {
-    let mut child = std::process::Command::new(binary)
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("could not run --version: {e}"))?;
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let output = child
-                    .wait_with_output()
-                    .map_err(|e| format!("could not read --version output: {e}"))?;
-                return if status.success() {
-                    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-                } else {
-                    Err(format!("--version exited with {status}"))
-                };
-            }
-            Ok(None) => {
-                if start.elapsed() >= VERSION_PROBE_TIMEOUT {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!(
-                        "--version did not exit within {}s (killed)",
-                        VERSION_PROBE_TIMEOUT.as_secs()
-                    ));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("could not wait for --version: {e}"));
-            }
-        }
-    }
+    crate::backend_probe::probe_version(binary, VERSION_PROBE_TIMEOUT)
 }
 
 // ---------------------------------------------------------------------------

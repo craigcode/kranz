@@ -412,21 +412,28 @@ fn git_ignores(repo: &Path, relative_path: &str) -> bool {
     if relative_source.file_name().and_then(|name| name.to_str()) != Some(".gitignore") {
         return false;
     }
-    // The decisive rule must come from a *committed* .gitignore, so verify
-    // against HEAD's tree — `ls-files --error-unmatch` consults the index,
-    // where a staged-but-never-committed .gitignore would already count.
+    // The decisive rule must come from the committed .gitignore bytes, not an
+    // uncommitted edit to a file that merely also exists in HEAD.
     let source_spec = relative_source
         .components()
         .map(|component| component.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .join("/");
+    let committed = kranz_engine::git_ops::GitRepo::open(repo)
+        .and_then(|git| git.show_file("HEAD", &source_spec));
+    let Ok(Some(_)) = committed else {
+        return false;
+    };
+    // Let Git compare through its normal text conversion rules. This rejects
+    // staged and unstaged rule changes while accepting a clean CRLF worktree
+    // backed by an LF blob under core.autocrlf / .gitattributes.
     Command::new("git")
         .arg("-C")
         .arg(repo)
-        .args(["cat-file", "-e"])
-        .arg(format!("HEAD:{source_spec}"))
-        .output()
-        .map(|tracked| tracked.status.success())
+        .args(["diff", "--quiet", "HEAD", "--"])
+        .arg(&source_spec)
+        .status()
+        .map(|status| status.success())
         .unwrap_or(false)
 }
 
@@ -894,6 +901,33 @@ mod tests {
         assert!(!git_ignores(dir.path(), ".kranz/config.json"));
         let hygiene = gitignore_hygiene(dir.path());
         assert_eq!(hygiene.status, ReadyStatus::Fail, "{hygiene:?}");
+    }
+
+    #[test]
+    fn gitignore_hygiene_rejects_uncommitted_rules_in_a_tracked_gitignore() {
+        let dir = TempDir::new().unwrap();
+        git(dir.path(), &["init"]);
+        write(&dir.path().join(".kranz/.gitignore"), "missions/\n");
+        commit_all(dir.path());
+        write(
+            &dir.path().join(".kranz/.gitignore"),
+            "missions/\nconfig.json\n",
+        );
+
+        let git_verdict = Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["check-ignore", "--quiet", "--", ".kranz/config.json"])
+            .status()
+            .unwrap();
+        assert!(
+            git_verdict.success(),
+            "fixture's working-tree rule must ignore config.json"
+        );
+        assert!(
+            !git_ignores(dir.path(), ".kranz/config.json"),
+            "readiness must evaluate the committed .gitignore bytes"
+        );
     }
 
     #[test]

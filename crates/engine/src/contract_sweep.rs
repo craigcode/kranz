@@ -115,20 +115,16 @@ const MISSION_RECORD_FILES: &[&str] = &[
 /// sites (orchestrator.rs `approve_plan` / `commit_revised_plan_record` /
 /// `approve_revised_plan` / `try_write_mission_report` / `capture_lesson`):
 /// the missions catalog (`.kranz/missions/index.md`), the exact record files
-/// in the CURRENT mission's dir ([`MISSION_RECORD_FILES`]), and — folded into
-/// the report commit — the lessons index plus THIS mission's own lesson file.
+/// in the CURRENT mission's dir ([`MISSION_RECORD_FILES`]).
 ///
 /// Deliberately no broader than that: a prefix match on all of
 /// `.kranz/lessons/` or `.kranz/missions/<id>/` would let a worker commit
 /// with a spoofed meta subject smuggle arbitrary files past the deliverable
-/// count and the path sweep — and lessons are ingested verbatim into FUTURE
-/// missions' planning prompts, so an exempt `.kranz/lessons/evil.md` is
-/// prompt-injection persistence, not just a miscount.
+/// count and the path sweep. No lesson path is exempt, including the current
+/// mission's lesson and index: lessons are ingested into FUTURE missions'
+/// planning prompts, and a worker can spoof every commit-subject template.
 pub fn is_mission_record_path(mission_id: &str, path: &str) -> bool {
-    if path == ".kranz/missions/index.md" || path == ".kranz/lessons/index.md" {
-        return true;
-    }
-    if path == format!(".kranz/lessons/{mission_id}.md") {
+    if path == ".kranz/missions/index.md" {
         return true;
     }
     match path.strip_prefix(&format!(".kranz/missions/{mission_id}/")) {
@@ -393,10 +389,15 @@ mod tests {
             &[
                 ".kranz/missions/m-abc123/report.md".to_string(),
                 ".kranz/missions/index.md".to_string(),
-                ".kranz/lessons/m-abc123.md".to_string(),
-                ".kranz/lessons/index.md".to_string(),
             ],
         ));
+        for lesson_path in [".kranz/lessons/m-abc123.md", ".kranz/lessons/index.md"] {
+            assert!(!is_meta_commit_with_paths(
+                "[kranz] mission report for m-abc123",
+                mission_id,
+                &[lesson_path.to_string()],
+            ));
+        }
         // Spoof: a template-matching subject on a commit touching a real
         // file must NOT be meta — it would otherwise dodge the deliverable
         // count and the out-of-contract path sweep.
@@ -431,9 +432,9 @@ mod tests {
     #[test]
     fn mission_record_path_matches_engine_commit_sites_only() {
         let mission_id = "m-abc123";
-        // The complete set the engine's commit sites write (approve_plan,
-        // commit_revised_plan_record, approve_revised_plan,
-        // try_write_mission_report, capture_lesson) — nothing else.
+        // The complete exempt set from the engine's commit sites
+        // (approve_plan, commit_revised_plan_record, approve_revised_plan,
+        // try_write_mission_report) — nothing else.
         for path in [
             ".kranz/missions/index.md",
             ".kranz/missions/m-abc123/plan.json",
@@ -441,8 +442,6 @@ mod tests {
             ".kranz/missions/m-abc123/revised-plan.md",
             ".kranz/missions/m-abc123/research.md",
             ".kranz/missions/m-abc123/report.md",
-            ".kranz/lessons/m-abc123.md",
-            ".kranz/lessons/index.md",
         ] {
             assert!(is_mission_record_path(mission_id, path), "{path}");
         }
@@ -457,8 +456,10 @@ mod tests {
             // meta subject touching them must NOT be sweep-exempt.
             ".kranz/missions/m-abc123/arbitrary.rs",
             ".kranz/missions/m-abc123/nested/plan.json",
-            ".kranz/lessons/evil.md", // ingested into future planning prompts
-            ".kranz/lessons/m-other.md", // another mission's lesson file
+            ".kranz/lessons/index.md",
+            ".kranz/lessons/m-abc123.md", // even this mission's lesson is spoofable
+            ".kranz/lessons/evil.md",     // ingested into future planning prompts
+            ".kranz/lessons/m-other.md",  // another mission's lesson file
             ".kranz/lessons/nested/index.md",
         ] {
             assert!(!is_mission_record_path(mission_id, path), "{path}");

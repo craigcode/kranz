@@ -64,6 +64,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::Notify;
 
 /// Max chars of an `orchestrator.decision` summary (matches digest cap).
@@ -6360,10 +6361,12 @@ async fn run_shell_command_with_timeout_env(
     #[cfg(unix)]
     cmd.process_group(0);
 
-    let child = match cmd.spawn() {
+    let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => return (false, format!("failed to spawn shell: {e}")),
     };
+    let stdout = child.stdout.take().expect("stdout was configured as piped");
+    let stderr = child.stderr.take().expect("stderr was configured as piped");
     #[cfg(unix)]
     let group_pid = child.id();
 
@@ -6384,12 +6387,23 @@ async fn run_shell_command_with_timeout_env(
         None => None,
     };
 
-    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+    let execution = async {
+        let (status, stdout, stderr) = tokio::join!(
+            child.wait(),
+            read_stream_tail(stdout),
+            read_stream_tail(stderr)
+        );
+        Ok::<_, String>((
+            status.map_err(|e| format!("failed waiting for shell: {e}"))?,
+            stdout.map_err(|e| format!("failed reading shell stdout: {e}"))?,
+            stderr.map_err(|e| format!("failed reading shell stderr: {e}"))?,
+        ))
+    };
+    match tokio::time::timeout(timeout, execution).await {
         Err(_elapsed) => {
-            // The dropped wait future already killed the shell wrapper via
-            // kill_on_drop; SIGKILL the whole group so its descendants die
-            // too (a still-live member keeps the pgid valid, and the leader
-            // zombie pins it until reaped).
+            // The read futures were dropped with `execution`; SIGKILL the
+            // whole group so descendants die too (a still-live member keeps
+            // the pgid valid, and the leader zombie pins it until reaped).
             #[cfg(unix)]
             if let Some(pid) = group_pid {
                 // Negative pid targets every process in the group.
@@ -6404,22 +6418,52 @@ async fn run_shell_command_with_timeout_env(
             if let Some(job) = &job {
                 job.kill();
             }
+            let _ = child.kill().await;
+            let _ = child.wait().await;
             (false, format!("timed out after {}s", timeout.as_secs()))
         }
-        Ok(Err(e)) => (false, format!("failed waiting for shell: {e}")),
-        Ok(Ok(output)) => {
-            let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        Ok(Err(error)) => (false, error),
+        Ok(Ok((status, stdout, stderr))) => {
+            let mut combined = stdout;
             if !stderr.trim().is_empty() {
                 combined.push_str("\n--- stderr ---\n");
                 combined.push_str(stderr.trim_end());
             }
             (
-                output.status.success(),
+                status.success(),
                 tail_chars(combined.trim_end(), COMMAND_OUTPUT_TAIL),
             )
         }
     }
+}
+
+async fn read_stream_tail<R>(mut reader: R) -> std::io::Result<String>
+where
+    R: AsyncRead + Unpin,
+{
+    let max_bytes = COMMAND_OUTPUT_TAIL * 4;
+    let mut tail = Vec::with_capacity(max_bytes);
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+        if read >= max_bytes {
+            tail.clear();
+            tail.extend_from_slice(&chunk[read - max_bytes..read]);
+            continue;
+        }
+        let excess = tail.len().saturating_add(read).saturating_sub(max_bytes);
+        if excess > 0 {
+            tail.drain(..excess);
+        }
+        tail.extend_from_slice(&chunk[..read]);
+    }
+    Ok(tail_chars(
+        &String::from_utf8_lossy(&tail),
+        COMMAND_OUTPUT_TAIL,
+    ))
 }
 
 /// Execute one repository-owned merge gate with the same process-tree timeout
@@ -7504,6 +7548,31 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_command_drains_large_output_while_running_and_keeps_only_the_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let command = "i=0; while [ \"$i\" -lt 20000 ]; do \
+                       printf '0123456789abcdef0123456789abcdef\\n'; \
+                       i=$((i + 1)); done; printf 'OUTPUT-END'";
+
+        let (ok, output) = run_shell_command_with_timeout(
+            dir.path(),
+            command,
+            Duration::from_secs(10),
+            &std::collections::HashMap::new(),
+        )
+        .await;
+
+        assert!(ok, "large-output command must complete: {output}");
+        assert!(output.ends_with("OUTPUT-END"), "{output}");
+        assert!(
+            output.chars().count() <= COMMAND_OUTPUT_TAIL,
+            "retained output exceeded the cap: {} chars",
+            output.chars().count()
+        );
     }
 
     /// The final gate's command executor must carry the same
