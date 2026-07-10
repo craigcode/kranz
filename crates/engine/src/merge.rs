@@ -1,12 +1,14 @@
 //! Gated merge orchestration (roadmap M6): a human-triggered Merge action
 //! that refuses on a dirty tracked tree, runs the repo's tracked gate suite,
-//! and merges `--no-ff` into the base branch only on green — never pushing.
+//! and advances the base to an exact, gate-tested integration commit only on
+//! green — never pushing.
 //!
 //! `merge_mission` ties together three primitives that each already carry
 //! their own safety contract: [`GitRepo::is_clean_tracked`] (refuse dirty),
 //! [`crate::merge_gate::run_gate_suite`] (refuse on a failing gate, base
-//! untouched), and [`GitRepo::merge_no_ff`] (clean-abort on conflict). This
-//! module only sequences them and never calls
+//! untouched), and [`GitRepo::merge_no_ff`] (clean-abort on conflict). The
+//! merge and gates run in a detached scratch worktree; the primary base only
+//! fast-forwards to that exact tested commit. This module never calls
 //! [`GitRepo::push_mission_branch`] or any other push.
 
 use crate::error::Result;
@@ -91,9 +93,14 @@ where
         return Ok(MergeReport::RefusedDirtyTree);
     }
 
-    let diff = repo.diff_full(base_sha, mission_branch)?;
+    // Resolve moving refs once. Every read, merge, and final advance below
+    // uses these SHAs so a late branch update cannot bypass validation.
+    let live_base_sha = repo.rev_parse(base_branch)?;
+    let mission_tip_sha = repo.rev_parse(mission_branch)?;
+
+    let diff = repo.diff_full(base_sha, &mission_tip_sha)?;
     let allowlist = repo
-        .show_file(mission_branch, scrub::SECRET_ALLOWLIST_PATH)?
+        .show_file(&live_base_sha, scrub::SECRET_ALLOWLIST_PATH)?
         .map(|bytes| scrub::read_allowlist_text(&String::from_utf8_lossy(&bytes)))
         .unwrap_or_default();
     let findings = scrub::filter_allowed(scrub::scan_unified_diff(&diff), &allowlist);
@@ -101,8 +108,8 @@ where
         return Ok(MergeReport::SecretScanFailed { findings });
     }
 
-    let changed_paths = repo.changed_paths(base_sha, mission_branch)?;
-    let gate_bytes = match repo.show_file(base_branch, MERGE_GATES_PATH)? {
+    let changed_paths = repo.changed_paths(base_sha, &mission_tip_sha)?;
+    let gate_bytes = match repo.show_file(&live_base_sha, MERGE_GATES_PATH)? {
         Some(bytes) => bytes,
         None => {
             return Ok(MergeReport::GateConfigInvalid {
@@ -117,27 +124,59 @@ where
         Err(detail) => return Ok(MergeReport::GateConfigInvalid { detail }),
     };
 
-    match run_gate_suite(repo.root(), &changed_paths, &gate_suite, executor) {
-        GateSuiteResult::Failed { gate, output } => {
-            return Ok(MergeReport::GateFailed { gate, output });
-        }
-        GateSuiteResult::Passed => {}
-    }
-
     let stale_base = stale_base_warning(repo, base_branch, base_sha)?;
-
-    repo.checkout(base_branch)?;
-    strip_identical_untracked_twins(repo, base_sha, mission_branch)?;
     let merge_message = metadata
         .as_ref()
         .map(|metadata| with_kranz_trailers(&format!("Merge {mission_branch}"), metadata));
-    match repo.merge_no_ff_with_message(mission_branch, merge_message.as_deref())? {
-        MergeOutcome::Conflict { files } => Ok(MergeReport::Conflict { files }),
-        MergeOutcome::RefusedPreMerge { detail } => Ok(MergeReport::RefusedPreMerge { detail }),
-        MergeOutcome::Clean => {
-            let commit = repo.head_sha()?;
-            Ok(MergeReport::Merged { commit, stale_base })
+
+    let scratch_path =
+        std::env::temp_dir().join(format!("kranz-merge-{}", uuid::Uuid::new_v4().simple()));
+    repo.add_detached_worktree(&scratch_path, &live_base_sha)?;
+    let attempt = (|| -> Result<MergeReport> {
+        let scratch = GitRepo::open(&scratch_path)?;
+        match scratch.merge_no_ff_with_message(&mission_tip_sha, merge_message.as_deref())? {
+            MergeOutcome::Conflict { files } => return Ok(MergeReport::Conflict { files }),
+            MergeOutcome::RefusedPreMerge { detail } => {
+                return Ok(MergeReport::RefusedPreMerge { detail })
+            }
+            MergeOutcome::Clean => {}
         }
+        let tested_commit = scratch.head_sha()?;
+
+        match run_gate_suite(scratch.root(), &changed_paths, &gate_suite, executor) {
+            GateSuiteResult::Failed { gate, output } => {
+                return Ok(MergeReport::GateFailed { gate, output });
+            }
+            GateSuiteResult::Passed => {}
+        }
+
+        // Production holds the repo-wide busy guard throughout this call.
+        // Re-check anyway so external/manual movement fails closed.
+        let current_base = repo.rev_parse(base_branch)?;
+        if current_base != live_base_sha {
+            return Ok(MergeReport::RefusedPreMerge {
+                detail: format!(
+                    "base branch {base_branch:?} moved from {live_base_sha} to {current_base} while gates ran; retry the merge"
+                ),
+            });
+        }
+
+        repo.checkout(base_branch)?;
+        strip_identical_untracked_twins(repo, base_sha, &mission_tip_sha)?;
+        match repo.fast_forward_to(&tested_commit)? {
+            MergeOutcome::Clean => Ok(MergeReport::Merged {
+                commit: tested_commit,
+                stale_base,
+            }),
+            MergeOutcome::RefusedPreMerge { detail } => Ok(MergeReport::RefusedPreMerge { detail }),
+            MergeOutcome::Conflict { .. } => unreachable!("--ff-only cannot create conflicts"),
+        }
+    })();
+    let cleanup = repo.remove_worktree(&scratch_path);
+    match (attempt, cleanup) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(report), Ok(())) => Ok(report),
     }
 }
 

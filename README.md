@@ -147,7 +147,9 @@ The human-triggered Merge action uses the tracked
 command, optional repo-relative working directory, and optional changed-path
 prefixes; missing or invalid suites fail closed. Because the mission branch
 does not supply the suite that judges it, a mission cannot weaken its own
-merge checks.
+merge checks or secret waivers. Gates run on the exact pinned mission/base
+integration commit in a scratch worktree; only that tested commit can advance
+the base.
 
 ## Development
 

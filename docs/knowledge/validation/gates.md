@@ -91,18 +91,24 @@ in order, refusing early and leaving base untouched on any failure:
 
 1. `is_clean_tracked()` — refuse a dirty tracked tree (`RefusedDirtyTree`); no
    gates run.
-2. **Secret scan** — `scan_unified_diff(diff_full(base_sha, mission_branch))`
-   filtered against the allowlist read from the mission branch;
+2. Pin the live base and mission tip SHAs. **Secret scan** —
+   `scan_unified_diff(diff_full(base_sha, mission_tip_sha))` filtered against
+   the allowlist read from the pinned live base;
    `SecretScanFailed` on any unwaived finding.
-3. Parse the tracked `.kranz/merge-gates.json` from the live base branch. A
+3. Parse the tracked `.kranz/merge-gates.json` from the pinned live base. A
    missing, invalid, empty, or conditional-only suite fails closed before any
    command; the mission branch cannot weaken the policy judging itself.
-4. `run_gate_suite` ([merge_gate.rs](../../../crates/engine/src/merge_gate.rs))
-   runs applicable repo-defined commands in order. `cwd` must be repo-relative
-   without parent components;
+4. Merge the pinned mission SHA into the pinned live base in a detached scratch
+   worktree. A conflict is aborted and the primary checkout remains untouched.
+5. `run_gate_suite` ([merge_gate.rs](../../../crates/engine/src/merge_gate.rs))
+   runs applicable repo-defined commands against that exact integration commit
+   in order, with a 600-second process-tree timeout and sanitized environment.
+   `cwd` must be repo-relative without parent components;
    optional `whenPaths` prefixes select component-specific gates. Stops at the
    first failure → `GateFailed`.
-5. `merge_no_ff` into the base branch; a conflict rolls back to a clean tree.
+6. Recheck that the live base SHA has not moved, then fast-forward it to the
+   exact tested merge commit. The repo-busy lock serializes this transaction
+   against runs and sibling Merge requests.
 
 Kranz's tracked suite mirrors its CI: fmt/clippy/workspace tests always, plus
 the five dashboard gates when `apps/dashboard` changed. Other repositories

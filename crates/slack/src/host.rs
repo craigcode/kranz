@@ -113,8 +113,8 @@ pub trait PlanningHost: Send + Sync + 'static {
     /// seam): refuses on a dirty tracked tree, runs the full CI gate suite,
     /// and merges `--no-ff` into the base branch on green — never pushes.
     /// `Ok(value)` carries the host's `{"merged":true,"commit":…}`; `Err`
-    /// carries the refusal VERBATIM (dirty tree / failing gate with its
-    /// captured output / merge conflict) for the bridge to forward unchanged.
+    /// carries the refusal (dirty tree / failing gate with captured output /
+    /// merge conflict); the bridge clips long output to Slack's field limit.
     fn merge<'a>(&'a self, id: &'a str) -> BoxFuture<'a, anyhow::Result<Value>>;
 
     /// `/kranz ask <question>` → answer a read-only question grounded in

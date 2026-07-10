@@ -45,10 +45,38 @@ pub enum GateSuiteResult {
 /// closed: a Merge action must never become green merely because its repo
 /// config is absent or malformed.
 pub fn parse_gate_suite(bytes: &[u8]) -> Result<GateSuite, String> {
-    let suite: GateSuite =
+    let mut suite: GateSuite =
         serde_json::from_slice(bytes).map_err(|e| format!("invalid {MERGE_GATES_PATH}: {e}"))?;
     validate_gate_suite(&suite)?;
+    for gate in &mut suite.gates {
+        gate.cwd = normalize_relative_path(&gate.cwd, true);
+        for prefix in &mut gate.when_paths {
+            *prefix = normalize_relative_path(prefix, false);
+            if prefix.is_empty() {
+                return Err(format!(
+                    "{MERGE_GATES_PATH} whenPaths entries must name a repo path, not only '.' components"
+                ));
+            }
+        }
+    }
     Ok(suite)
+}
+
+fn normalize_relative_path(raw: &str, dot_for_empty: bool) -> String {
+    let normalized = Path::new(raw)
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            Component::CurDir => None,
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    if normalized.is_empty() && dot_for_empty {
+        ".".to_string()
+    } else {
+        normalized
+    }
 }
 
 fn validate_gate_suite(suite: &GateSuite) -> Result<(), String> {
@@ -245,6 +273,26 @@ mod tests {
                 ("npm test".to_string(), root.join("apps/dashboard")),
             ]
         );
+    }
+
+    #[test]
+    fn dot_prefixed_paths_are_normalized_before_matching() {
+        let suite = parse_gate_suite(
+            br#"{"gates":[{"command":"always"},{"command":"web","cwd":"./apps/dashboard","whenPaths":["./apps/dashboard/"]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(suite.gates[1].cwd, "apps/dashboard");
+        assert_eq!(suite.gates[1].when_paths, ["apps/dashboard"]);
+
+        let exec = FakeExecutor::all_pass();
+        let result = run_gate_suite(
+            Path::new("/repo"),
+            &["apps/dashboard/src/App.tsx".to_string()],
+            &suite,
+            |cmd, cwd| exec.run(cmd, cwd),
+        );
+        assert_eq!(result, GateSuiteResult::Passed);
+        assert_eq!(exec.calls.borrow().len(), 2);
     }
 
     #[test]

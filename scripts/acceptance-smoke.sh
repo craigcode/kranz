@@ -6,7 +6,7 @@ set -euo pipefail
 
 scratch="$(mktemp -d "${RUNNER_TEMP:-/tmp}/kranz-acceptance.XXXXXX")"
 repo="$scratch/sample-repo"
-artifact_dir="${ARTIFACT_DIR:-$scratch/artifacts}"
+artifact_dir="${ARTIFACT_DIR:-$scratch-artifacts}"
 
 capture_artifacts() {
   mkdir -p "$artifact_dir"
@@ -14,7 +14,16 @@ capture_artifacts() {
     cp -R "$repo/.kranz/missions" "$artifact_dir/"
   fi
 }
-trap capture_artifacts EXIT
+finish() {
+  status=$?
+  if ! capture_artifacts; then
+    [[ $status -ne 0 ]] || status=1
+  fi
+  rm -rf -- "$scratch"
+  trap - EXIT
+  exit "$status"
+}
+trap finish EXIT
 
 mkdir -p "$repo"
 git -C "$repo" init -b main

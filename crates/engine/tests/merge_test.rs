@@ -456,7 +456,7 @@ fn secret_scan_failure_stops_before_gates_and_leaves_base_unchanged() {
 }
 
 #[test]
-fn committed_secret_fingerprint_waiver_allows_merge() {
+fn mission_authored_secret_fingerprint_waiver_is_rejected() {
     if !setup() {
         return;
     }
@@ -488,9 +488,125 @@ fn committed_secret_fingerprint_waiver_allows_merge() {
     )
     .unwrap();
 
+    assert!(matches!(report, MergeReport::SecretScanFailed { .. }));
+    assert_eq!(repo.head_sha().unwrap(), seed);
+}
+
+#[test]
+fn base_owned_secret_fingerprint_waiver_allows_merge() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, seed) = seeded_repo();
+    let secret = "sk-ant-api03-AbCdEf_123-xyz";
+    let fingerprint = scrub::scan_text(secret)
+        .into_iter()
+        .next()
+        .expect("secret finding")
+        .fingerprint;
+    seed_mission_branch(&dir, &repo, &seed, ".env", &format!("KEY={secret}\n"));
+
+    write(
+        &dir,
+        scrub::SECRET_ALLOWLIST_PATH,
+        &format!("# reviewed test fixture\n{fingerprint}\n"),
+    );
+    repo.add_all_and_commit("review secret waiver on base")
+        .unwrap();
+
+    let report = merge_mission(
+        &repo,
+        "main",
+        &seed,
+        "kranz/mission-x",
+        None,
+        passing_executor,
+    )
+    .unwrap();
+
     assert!(
         matches!(report, MergeReport::Merged { .. }),
-        "expected waived secret finding to merge, got {report:?}"
+        "expected base-waived secret finding to merge, got {report:?}"
+    );
+}
+
+#[test]
+fn gates_run_against_the_integrated_mission_tree_not_the_primary_checkout() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, seed) = seeded_repo();
+    seed_mission_branch(
+        &dir,
+        &repo,
+        &seed,
+        "mission-only.txt",
+        "validated mission content\n",
+    );
+    assert!(!dir.path().join("mission-only.txt").exists());
+
+    let report = merge_mission(
+        &repo,
+        "main",
+        &seed,
+        "kranz/mission-x",
+        None,
+        |_cmd, cwd| {
+            let mission_content = std::fs::read_to_string(cwd.join("mission-only.txt")).ok();
+            let primary_untouched = !dir.path().join("mission-only.txt").exists();
+            let ok = mission_content.as_deref() == Some("validated mission content\n")
+                && primary_untouched;
+            (
+                ok,
+                format!("mission={mission_content:?}, primary_untouched={primary_untouched}"),
+            )
+        },
+    )
+    .unwrap();
+
+    assert!(matches!(report, MergeReport::Merged { .. }), "{report:?}");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("mission-only.txt")).unwrap(),
+        "validated mission content\n"
+    );
+}
+
+#[test]
+fn mission_branch_movement_after_integration_does_not_change_what_lands() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, seed) = seeded_repo();
+    seed_mission_branch(
+        &dir,
+        &repo,
+        &seed,
+        "pinned.txt",
+        "content from the gated tip\n",
+    );
+
+    let report = merge_mission(
+        &repo,
+        "main",
+        &seed,
+        "kranz/mission-x",
+        None,
+        |_cmd, cwd| {
+            let saw_pinned_content = cwd.join("pinned.txt").is_file();
+            raw_git(
+                dir.path(),
+                &["update-ref", "refs/heads/kranz/mission-x", &seed],
+            );
+            (saw_pinned_content, String::new())
+        },
+    )
+    .unwrap();
+
+    assert!(matches!(report, MergeReport::Merged { .. }), "{report:?}");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("pinned.txt")).unwrap(),
+        "content from the gated tip\n",
+        "the exact SHA merged into the scratch tree must be the SHA that lands"
     );
 }
 

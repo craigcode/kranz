@@ -607,6 +607,27 @@ impl GitRepo {
         Ok(())
     }
 
+    /// Create a detached worktree at `path` pinned to `commit`.
+    ///
+    /// Gated merge uses this to build and validate an integration commit
+    /// without checking out either moving branch in the primary tree.
+    pub fn add_detached_worktree(&self, path: &Path, commit: &str) -> Result<()> {
+        if commit.starts_with('-') {
+            return Err(EngineError::Git(format!(
+                "refusing detached worktree add with flag-shaped commit {commit:?}"
+            )));
+        }
+        let args: Vec<OsString> = vec![
+            "worktree".into(),
+            "add".into(),
+            "--detach".into(),
+            path.as_os_str().to_os_string(),
+            commit.into(),
+        ];
+        self.run_os(&args)?;
+        Ok(())
+    }
+
     /// Remove a worktree at `path` (`git worktree remove --force <path>`),
     /// tolerating a worktree that is already gone.
     ///
@@ -709,6 +730,25 @@ impl GitRepo {
             ))
         })?;
         Ok(MergeOutcome::Conflict { files })
+    }
+
+    /// Move the current branch to an already-created descendant commit with
+    /// `git merge --ff-only`. Gated merge uses this after validating the exact
+    /// integration commit in a scratch worktree.
+    pub fn fast_forward_to(&self, commit: &str) -> Result<MergeOutcome> {
+        if commit.starts_with('-') {
+            return Err(EngineError::Git(format!(
+                "refusing fast-forward to flag-shaped commit {commit:?}"
+            )));
+        }
+        let out = self.probe(&["merge", "--ff-only", commit])?;
+        if out.status.success() {
+            Ok(MergeOutcome::Clean)
+        } else {
+            Ok(MergeOutcome::RefusedPreMerge {
+                detail: failure_detail(&out),
+            })
+        }
     }
 
     /// Bytes of `path` as it exists on `branch` (`git show <branch>:<path>`),

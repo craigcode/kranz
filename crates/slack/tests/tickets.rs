@@ -282,6 +282,7 @@ struct FakeHost {
     /// Records how many times `merge` (the `/kranz merge` host call) is
     /// called.
     merge_calls: AtomicUsize,
+    merge_error: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -300,6 +301,7 @@ impl FakeHost {
             approve_ticket_calls: AtomicUsize::new(0),
             drain_calls: AtomicUsize::new(0),
             merge_calls: AtomicUsize::new(0),
+            merge_error: None,
         }
     }
 
@@ -311,7 +313,14 @@ impl FakeHost {
             approve_ticket_calls: AtomicUsize::new(0),
             drain_calls: AtomicUsize::new(0),
             merge_calls: AtomicUsize::new(0),
+            merge_error: None,
         }
+    }
+
+    fn with_merge_error(error: String) -> Self {
+        let mut host = Self::new(DraftOutcomeKind::ParkedForReview);
+        host.merge_error = Some(error);
+        host
     }
 }
 
@@ -393,7 +402,13 @@ impl PlanningHost for FakeHost {
 
     fn merge<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, anyhow::Result<Value>> {
         self.merge_calls.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async { Ok(json!({ "merged": true, "commit": "abc123" })) })
+        let error = self.merge_error.clone();
+        Box::pin(async move {
+            match error {
+                Some(error) => Err(anyhow::anyhow!(error)),
+                None => Ok(json!({ "merged": true, "commit": "abc123" })),
+            }
+        })
     }
 
     fn ask<'a>(&'a self, _question: &'a str) -> BoxFuture<'a, anyhow::Result<AskOutcome>> {
@@ -869,6 +884,18 @@ async fn merge_gate_acks_before_any_merge_call_then_run_triggers_exactly_once() 
         1,
         "run_merge triggers exactly one host.merge call"
     );
+}
+
+#[tokio::test]
+async fn merge_failure_reply_is_bounded_and_keeps_the_gate_output_tail() {
+    let detail = format!("{}\nTAIL_ASSERTION_FAILED", "early noise\n".repeat(1000));
+    let fake = Arc::new(FakeHost::with_merge_error(detail));
+    let host: SharedHost = fake;
+
+    let blocks = run_merge(&host, "m-long").await;
+    let text = blocks[0]["text"]["text"].as_str().unwrap();
+    assert!(text.contains("TAIL_ASSERTION_FAILED"), "{text}");
+    assert!(text.chars().count() <= 2500, "{}", text.chars().count());
 }
 
 #[tokio::test]

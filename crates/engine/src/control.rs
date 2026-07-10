@@ -130,6 +130,9 @@ fn mission_status(repo_root: &Path, id: &str) -> Option<MissionStatus> {
 pub fn resolve_active_mission(repo_root: &Path, explicit: Option<&str>) -> Result<String> {
     let is_terminal = crate::orchestrator::is_terminal_status;
     if let Some(id) = explicit {
+        if !MissionPaths::is_safe_id(id) {
+            return Err(EngineError::Other(format!("unknown mission `{id}`")));
+        }
         match mission_status(repo_root, id) {
             None => Err(EngineError::Other(format!("unknown mission `{id}`"))),
             Some(s) if is_terminal(s) => Err(EngineError::Other(format!(
@@ -290,6 +293,17 @@ mod tests {
             err.contains("m-nope"),
             "error names the unknown mission: {err}"
         );
+    }
+
+    #[test]
+    fn resolve_explicit_mission_rejects_path_traversal_before_reading() {
+        let tmp = TempDir::new().unwrap();
+        for id in ["../outside", "a/b", r"a\b", "C:escape"] {
+            let error = resolve_active_mission(tmp.path(), Some(id))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("unknown mission"), "{id}: {error}");
+        }
     }
 
     #[test]

@@ -283,7 +283,7 @@ pub fn validate(cfg: &MissionConfig) -> Result<()> {
         let effective = effective_model(role, kind, &role_cfg.model);
         let tier = model_tier(kind, &effective).ok_or_else(|| {
             EngineError::Config(format!(
-                "{name}.model {:?} is not supported by backend {:?}",
+                "{name} effective model {effective:?} (configured as {:?}) is not supported by backend {:?}",
                 role_cfg.model,
                 kind.as_str()
             ))
@@ -294,7 +294,7 @@ pub fn validate(cfg: &MissionConfig) -> Result<()> {
             && !cfg.allow_below_default_worker_model
         {
             return Err(EngineError::Config(format!(
-                "worker.model {:?} on backend {:?} is below the default worker tier; set \
+                "worker effective model {effective:?} (configured as {:?}) on backend {:?} is below the default worker tier; set \
                  allowBelowDefaultWorkerModel=true on this mission to opt in",
                 role_cfg.model,
                 kind.as_str()
@@ -303,7 +303,7 @@ pub fn validate(cfg: &MissionConfig) -> Result<()> {
 
         if role == Role::Orchestrator && tier < ModelTier::Frontier {
             return Err(EngineError::Config(format!(
-                "orchestrator.model {:?} on backend {:?} is below the frontier-model floor",
+                "orchestrator effective model {effective:?} (configured as {:?}) on backend {:?} is below the frontier-model floor",
                 role_cfg.model,
                 kind.as_str()
             )));

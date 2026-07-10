@@ -2002,6 +2002,7 @@ impl MissionEngine {
                         // Invalid patch: warn and fall through to the delete —
                         // re-processing it forever would only spam the log.
                         tracing::warn!(error = %e, "skipping invalid config patch");
+                        self.emit_decision(&format!("config change ignored: {e}"), None)?;
                     } else {
                         self.emit(EventKind::ConfigChanged { patch })?;
                     }
@@ -6266,6 +6267,16 @@ async fn run_shell_command_with_timeout(
     timeout: Duration,
     env: &HashMap<String, String>,
 ) -> (bool, String) {
+    run_shell_command_with_timeout_env(cwd, command, timeout, env, false).await
+}
+
+async fn run_shell_command_with_timeout_env(
+    cwd: &std::path::Path,
+    command: &str,
+    timeout: Duration,
+    env: &HashMap<String, String>,
+    clear_env: bool,
+) -> (bool, String) {
     #[cfg(windows)]
     let mut cmd = {
         let mut c = tokio::process::Command::new("cmd");
@@ -6278,6 +6289,9 @@ async fn run_shell_command_with_timeout(
         c.arg("-c").arg(command);
         c
     };
+    if clear_env {
+        cmd.env_clear();
+    }
     cmd.current_dir(cwd)
         .envs(env)
         .stdin(std::process::Stdio::null())
@@ -6349,6 +6363,61 @@ async fn run_shell_command_with_timeout(
             )
         }
     }
+}
+
+/// Execute one repository-owned merge gate with the same process-tree timeout
+/// used by validation-contract commands, but with a deliberately small
+/// inherited environment. This synchronous wrapper is intended for a
+/// `spawn_blocking` thread; it owns a current-thread runtime so the robust
+/// async timeout/kill implementation remains the single source of truth.
+pub fn run_bounded_gate_command(cwd: &std::path::Path, command: &str) -> (bool, String) {
+    let env = sanitized_gate_env();
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => return (false, format!("failed to create gate runtime: {error}")),
+    };
+    runtime.block_on(run_shell_command_with_timeout_env(
+        cwd,
+        command,
+        COMMAND_TIMEOUT,
+        &env,
+        true,
+    ))
+}
+
+fn sanitized_gate_env() -> HashMap<String, String> {
+    // Keep only process/toolchain location and locale values. In particular,
+    // API keys, GitHub/Slack tokens, cloud credentials, SSH agent sockets and
+    // arbitrary server configuration never cross into mission-authored tests.
+    const SAFE: &[&str] = &[
+        "PATH",
+        "HOME",
+        "USERPROFILE",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "SYSTEMROOT",
+        "SystemRoot",
+        "COMSPEC",
+        "ComSpec",
+        "PATHEXT",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "NPM_CONFIG_CACHE",
+        "CI",
+        "TERM",
+        "LANG",
+        "LC_ALL",
+        "TZ",
+    ];
+    SAFE.iter()
+        .filter_map(|key| {
+            std::env::var_os(key).map(|value| ((*key).to_string(), value.to_string_lossy().into()))
+        })
+        .collect()
 }
 
 /// Last `max` characters of `text` (char-safe).
@@ -7252,6 +7321,35 @@ mod tests {
         assert!(preview_config_patch(&cfg, &good).is_ok());
     }
 
+    #[tokio::test]
+    async fn invalid_drain_time_config_patch_emits_an_audit_decision() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+        control::enqueue(
+            &engine.paths,
+            &ControlCommand::ConfigChange {
+                patch: serde_json::json!({ "worker": { "model": "haiku" } }),
+            },
+        )
+        .unwrap();
+
+        engine.drain_control().await.unwrap();
+
+        assert!(
+            engine
+                .state
+                .recent_decisions
+                .iter()
+                .any(|decision| decision.contains("config change ignored")),
+            "invalid command must leave an operator-visible audit receipt"
+        );
+        assert!(control::drain(&engine.paths).unwrap().is_empty());
+    }
+
     /// Timeout kill discipline: the whole process GROUP dies, not just the
     /// `sh -c` wrapper — a backgrounded child must not survive the gate
     /// giving up. Unix-only test (`kill(-pgid)`); the Windows equivalent uses
@@ -7334,6 +7432,44 @@ mod tests {
             !env.contains_key("KRANZ_BASE_SHA"),
             "None base_sha must not define KRANZ_BASE_SHA in the gate env"
         );
+    }
+
+    #[test]
+    fn merge_gate_environment_excludes_server_secrets() {
+        let env = sanitized_gate_env();
+        for secret in [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "SLACK_BOT_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_TOKEN",
+            "SSH_AUTH_SOCK",
+            "AWS_SECRET_ACCESS_KEY",
+        ] {
+            assert!(!env.contains_key(secret), "gate env leaked {secret}");
+        }
+        assert!(env.keys().all(|key| matches!(
+            key.as_str(),
+            "PATH"
+                | "HOME"
+                | "USERPROFILE"
+                | "TMPDIR"
+                | "TMP"
+                | "TEMP"
+                | "SYSTEMROOT"
+                | "SystemRoot"
+                | "COMSPEC"
+                | "ComSpec"
+                | "PATHEXT"
+                | "CARGO_HOME"
+                | "RUSTUP_HOME"
+                | "NPM_CONFIG_CACHE"
+                | "CI"
+                | "TERM"
+                | "LANG"
+                | "LC_ALL"
+                | "TZ"
+        )));
     }
 
     #[test]

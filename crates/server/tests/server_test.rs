@@ -288,6 +288,11 @@ fn seed_diffable_mission(
     paths
 }
 
+fn mark_mission_complete(paths: &MissionPaths, id: &str) {
+    let mut log = EventLog::acquire(paths, id, Duration::ZERO, LockForce::No).unwrap();
+    log.append(EventKind::MissionCompleted {}).unwrap();
+}
+
 fn fixture() -> (tempfile::TempDir, PathBuf, MissionPaths, axum::Router) {
     let tmp = tempfile::tempdir().unwrap();
     let repo_root = tmp.path().to_path_buf();
@@ -1520,7 +1525,8 @@ async fn merge_route_requires_token() {
         return;
     }
     let (_dir, repo_root, base_sha) = init_repo();
-    seed_diffable_mission(&repo_root, "m-tok", &base_sha, true);
+    let paths = seed_diffable_mission(&repo_root, "m-tok", &base_sha, true);
+    mark_mission_complete(&paths, "m-tok");
     let app = merge_app(&repo_root, |_cmd, _cwd| (true, String::new()));
 
     let (status, _) = post_json(&app, "/api/missions/m-tok/merge", None, json!({})).await;
@@ -1537,12 +1543,65 @@ async fn merge_route_requires_token() {
 }
 
 #[tokio::test]
+async fn merge_route_requires_a_complete_mission() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo_root, base_sha) = init_repo();
+    seed_diffable_mission(&repo_root, "m-running", &base_sha, false);
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let calls_for_executor = Arc::clone(&calls);
+    let app = merge_app(&repo_root, move |cmd, _cwd| {
+        calls_for_executor.lock().unwrap().push(cmd.to_string());
+        (true, String::new())
+    });
+
+    let (status, body) = post_json(
+        &app,
+        "/api/missions/m-running/merge",
+        Some(MERGE_TOKEN),
+        json!({}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("complete"));
+    assert!(calls.lock().unwrap().is_empty());
+    assert_eq!(raw_git(&repo_root, &["rev-parse", "main"]).trim(), base_sha);
+}
+
+#[tokio::test]
+async fn merge_route_refuses_while_the_repo_busy_lock_is_held() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo_root, base_sha) = init_repo();
+    let paths = seed_diffable_mission(&repo_root, "m-busy", &base_sha, true);
+    mark_mission_complete(&paths, "m-busy");
+    let _hold = kranz_engine::queue::acquire_repo_busy(&repo_root, "m-other").unwrap();
+    let app = merge_app(&repo_root, |_cmd, _cwd| (true, String::new()));
+
+    let (status, body) = post_json(
+        &app,
+        "/api/missions/m-busy/merge",
+        Some(MERGE_TOKEN),
+        json!({}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("busy"), "{body}");
+    assert_eq!(raw_git(&repo_root, &["rev-parse", "main"]).trim(), base_sha);
+}
+
+#[tokio::test]
 async fn merge_route_merges_on_green_gates_and_flips_the_merged_bit() {
     if !setup() {
         return;
     }
     let (_dir, repo_root, base_sha) = init_repo();
-    seed_diffable_mission(&repo_root, "m-green", &base_sha, true);
+    let paths = seed_diffable_mission(&repo_root, "m-green", &base_sha, true);
+    mark_mission_complete(&paths, "m-green");
     let app = merge_app(&repo_root, |_cmd, _cwd| (true, String::new()));
 
     let (status, body) = post_json(
@@ -1586,7 +1645,8 @@ async fn merge_route_fails_closed_when_base_has_no_gate_config() {
     let base_sha = raw_git(&repo_root, &["rev-parse", "HEAD"])
         .trim()
         .to_string();
-    seed_diffable_mission(&repo_root, "m-no-gates", &base_sha, true);
+    let paths = seed_diffable_mission(&repo_root, "m-no-gates", &base_sha, true);
+    mark_mission_complete(&paths, "m-no-gates");
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
     let calls_for_executor = Arc::clone(&calls);
     let app = merge_app(&repo_root, move |cmd, _cwd| {
@@ -1620,7 +1680,8 @@ async fn merge_route_surfaces_stale_base_warning_without_blocking() {
         return;
     }
     let (_dir, repo_root, base_sha) = init_repo();
-    seed_diffable_mission(&repo_root, "m-stale", &base_sha, true);
+    let paths = seed_diffable_mission(&repo_root, "m-stale", &base_sha, true);
+    mark_mission_complete(&paths, "m-stale");
 
     raw_git(&repo_root, &["checkout", "-b", "kranz/sibling", &base_sha]);
     std::fs::write(repo_root.join("sibling.txt"), "sibling change\n").unwrap();
@@ -1661,7 +1722,8 @@ async fn merge_route_refuses_a_dirty_tracked_tree_and_leaves_base_unchanged() {
         return;
     }
     let (_dir, repo_root, base_sha) = init_repo();
-    seed_diffable_mission(&repo_root, "m-dirty", &base_sha, true);
+    let paths = seed_diffable_mission(&repo_root, "m-dirty", &base_sha, true);
+    mark_mission_complete(&paths, "m-dirty");
     // Dirty the TRACKED working tree (README.md is already tracked).
     std::fs::write(repo_root.join("README.md"), "dirty\n").unwrap();
     let app = merge_app(&repo_root, |_cmd, _cwd| (true, String::new()));
@@ -1690,7 +1752,8 @@ async fn merge_route_surfaces_redacted_failing_gate_output_and_leaves_base_uncha
         return;
     }
     let (_dir, repo_root, base_sha) = init_repo();
-    seed_diffable_mission(&repo_root, "m-red", &base_sha, true);
+    let paths = seed_diffable_mission(&repo_root, "m-red", &base_sha, true);
+    mark_mission_complete(&paths, "m-red");
     const SECRET: &str = "sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let app = merge_app(&repo_root, |cmd, _cwd| {
         if cmd == "cargo test --workspace" {

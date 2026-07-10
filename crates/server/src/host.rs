@@ -121,34 +121,11 @@ struct DrainState {
 /// seam shape as [`MissionHost::with_backend`] for the agent backend.
 type GateExecutor = Arc<dyn Fn(&str, &Path) -> (bool, String) + Send + Sync>;
 
-/// The real gate executor: shells out synchronously (`sh -c` / `cmd /C`),
-/// combining stdout+stderr so a failing gate's captured output can be
-/// surfaced verbatim. Runs only from inside `tokio::task::spawn_blocking`
-/// (see [`MissionHost::merge`]), so blocking here never stalls the runtime.
+/// The real gate executor delegates to the engine's 600-second process-tree
+/// bounded shell runner with a sanitized environment. It runs only from
+/// inside `tokio::task::spawn_blocking` (see [`MissionHost::merge`]).
 fn real_gate_executor() -> GateExecutor {
-    Arc::new(|command: &str, cwd: &Path| -> (bool, String) {
-        let output = if cfg!(windows) {
-            std::process::Command::new("cmd")
-                .arg("/C")
-                .arg(command)
-                .current_dir(cwd)
-                .output()
-        } else {
-            std::process::Command::new("sh")
-                .arg("-c")
-                .arg(command)
-                .current_dir(cwd)
-                .output()
-        };
-        match output {
-            Ok(out) => {
-                let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
-                combined.push_str(&String::from_utf8_lossy(&out.stderr));
-                (out.status.success(), combined)
-            }
-            Err(e) => (false, format!("failed to spawn shell: {e}")),
-        }
-    })
+    Arc::new(|command, cwd| kranz_engine::orchestrator::run_bounded_gate_command(cwd, command))
 }
 
 /// The autoWork watcher's decision function, factored out so it's testable
@@ -612,12 +589,24 @@ impl MissionHost {
     /// [`kranz_engine::merge::merge_mission`] under `spawn_blocking` (git and
     /// the gate suite are both blocking work). Never pushes.
     pub async fn merge(&self, id: &str) -> Result<Value, ApiError> {
+        if !MissionPaths::is_safe_id(id) {
+            return Err(ApiError::not_found(format!("unknown mission '{id}'")));
+        }
         let paths = MissionPaths::new(&self.repo_root, id);
         if !paths.events_file().is_file() {
             return Err(ApiError::not_found(format!("unknown mission '{id}'")));
         }
+        // Serialize the complete read/pin/integrate/gate/advance transaction
+        // against mission runs and other merges in this repo.
+        let _repo_busy = kranz_engine::queue::acquire_repo_busy(&self.repo_root, id)?;
         let events = EventLog::read_events(&paths.events_file())?;
         let state = kranz_engine::reducer::fold(&events).map_err(ApiError::from)?;
+        if state.mission.status != MissionStatus::Complete {
+            return Err(ApiError::conflict(format!(
+                "mission '{id}' is {:?}; only a complete mission can be merged",
+                state.mission.status
+            )));
+        }
         let base_branch = state.mission.base_branch.clone();
         let base_sha = state.mission.base_sha.clone().ok_or_else(|| {
             ApiError::conflict(format!(

@@ -2,8 +2,9 @@
 //!
 //! This is deliberately read-only and deterministic: it detects the signals a
 //! repo exposes for autonomous missions, but does not run test suites or mutate
-//! anything. The output is a serializable scorecard so the dashboard can reuse
-//! the same shape later.
+//! anything. It may run agent CLIs with `--version`, but never starts a model
+//! turn or a repository test suite. The output is a serializable scorecard so
+//! the dashboard can reuse the same shape later.
 
 use kranz_engine::cost;
 use serde::Serialize;
@@ -62,6 +63,7 @@ pub fn assess(repo: &Path) -> ReadyReport {
         test_runner(repo, &validation_commands),
         ci_config(repo),
         gitignore_hygiene(repo),
+        backend_lanes(repo),
         contract_prerequisites(&validation_commands),
         clean_git_state(repo),
         calibration_corpus(repo),
@@ -285,13 +287,64 @@ fn gitignore_hygiene(repo: &Path) -> ReadyDimension {
 }
 
 fn git_ignores(repo: &Path, relative_path: &str) -> bool {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        // Readiness is a repository property: ignore an operator's global
+        // excludes, and ask for the rule source so `.git/info/exclude` and an
+        // uncommitted `.gitignore` cannot make a repo look ready.
+        .args([
+            "-c",
+            "core.excludesFile=",
+            "check-ignore",
+            "--verbose",
+            "--",
+        ])
+        .arg(relative_path)
+        .output();
+    let Ok(output) = output else { return false };
+    if !output.status.success() {
+        return false;
+    }
+    let Ok(verbose) = std::str::from_utf8(&output.stdout) else {
+        return false;
+    };
+    let Some(metadata) = verbose.split_once('\t').map(|(metadata, _)| metadata) else {
+        return false;
+    };
+    // `--verbose` is `<source>:<line>:<pattern>\t<path>`. Locate the numeric
+    // line segment rather than splitting on the first colon (Windows sources
+    // begin with a drive designator such as `C:`).
+    let source_end = metadata.char_indices().find_map(|(index, character)| {
+        if character != ':' {
+            return None;
+        }
+        let rest = &metadata[index + 1..];
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        (digits > 0 && rest.as_bytes().get(digits) == Some(&b':')).then_some(index)
+    });
+    let Some(source_end) = source_end else {
+        return false;
+    };
+    let source = Path::new(&metadata[..source_end]);
+    let relative_source = if source.is_absolute() {
+        match source.strip_prefix(repo) {
+            Ok(relative) => relative,
+            Err(_) => return false,
+        }
+    } else {
+        source
+    };
+    if relative_source.file_name().and_then(|name| name.to_str()) != Some(".gitignore") {
+        return false;
+    }
     Command::new("git")
         .arg("-C")
         .arg(repo)
-        .args(["check-ignore", "--quiet", "--no-index", "--"])
-        .arg(relative_path)
+        .args(["ls-files", "--error-unmatch", "--"])
+        .arg(relative_source)
         .output()
-        .map(|output| output.status.success())
+        .map(|tracked| tracked.status.success())
         .unwrap_or(false)
 }
 
@@ -300,7 +353,7 @@ fn contract_prerequisites(commands: &[ValidationCommand]) -> ReadyDimension {
         return dim(
             "contract prerequisites",
             0,
-            10,
+            5,
             ReadyStatus::Fail,
             "no validation command to preflight",
             "add a runnable validation command before the first mission",
@@ -310,8 +363,8 @@ fn contract_prerequisites(commands: &[ValidationCommand]) -> ReadyDimension {
     if missing.is_empty() {
         dim(
             "contract prerequisites",
-            10,
-            10,
+            5,
+            5,
             ReadyStatus::Pass,
             "validation command programs are on PATH",
             "",
@@ -324,11 +377,92 @@ fn contract_prerequisites(commands: &[ValidationCommand]) -> ReadyDimension {
             .join(", ");
         dim(
             "contract prerequisites",
-            4,
-            10,
+            2,
+            5,
             ReadyStatus::Warn,
             format!("missing program(s): {names}"),
             "install the missing validation-command programs or document the setup",
+        )
+    }
+}
+
+fn backend_lanes(repo: &Path) -> ReadyDimension {
+    let cfg = match kranz_engine::config::load(repo) {
+        Ok(cfg) => cfg,
+        Err(error) => {
+            return dim(
+                "agent backend lanes",
+                0,
+                5,
+                ReadyStatus::Fail,
+                format!("cannot resolve mission config: {error}"),
+                "fix mission config before probing agent backends",
+            )
+        }
+    };
+    let probes = [
+        (
+            "claude",
+            kranz_engine::backend_claude::discover_claude_binary(cfg.claude_binary.as_deref())
+                .is_ok(),
+        ),
+        (
+            "codex",
+            kranz_engine::backend_codex::discover_codex_binary(None).is_ok(),
+        ),
+        (
+            "droid",
+            kranz_engine::backend_droid::discover_droid_binary(None).is_ok(),
+        ),
+    ];
+    let required = [
+        cfg.orchestrator.backend.as_deref().unwrap_or("claude"),
+        cfg.worker.backend.as_deref().unwrap_or("claude"),
+        cfg.validator_scrutiny
+            .backend
+            .as_deref()
+            .unwrap_or("claude"),
+        cfg.validator_functional
+            .backend
+            .as_deref()
+            .unwrap_or("claude"),
+    ];
+    let missing_required: Vec<&str> = required
+        .iter()
+        .copied()
+        .filter(|required| {
+            !probes
+                .iter()
+                .any(|(backend, available)| backend == required && *available)
+        })
+        .collect();
+    let evidence = format!(
+        "{}; executable/version probes only (authentication is proven by the first live mission)",
+        probes
+            .iter()
+            .map(|(backend, available)| format!(
+                "{backend}={}",
+                if *available { "ready" } else { "unavailable" }
+            ))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if missing_required.is_empty() {
+        dim("agent backend lanes", 5, 5, ReadyStatus::Pass, evidence, "")
+    } else {
+        let mut missing = missing_required;
+        missing.sort_unstable();
+        missing.dedup();
+        dim(
+            "agent backend lanes",
+            0,
+            5,
+            ReadyStatus::Fail,
+            evidence,
+            format!(
+                "install or configure the selected backend CLI(s): {}",
+                missing.join(", ")
+            ),
         )
     }
 }
@@ -494,6 +628,27 @@ mod tests {
         fs::write(path, text).unwrap();
     }
 
+    fn git(dir: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn commit_all(dir: &Path) {
+        git(dir, &["config", "user.name", "ready-test"]);
+        git(dir, &["config", "user.email", "ready@example.com"]);
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-m", "fixture"]);
+    }
+
     #[test]
     fn bare_repo_scores_low_and_names_test_runner_first() {
         let dir = TempDir::new().unwrap();
@@ -537,6 +692,7 @@ mod tests {
              serve.token\n\
              tickets/*.status\n",
         );
+        commit_all(dir.path());
 
         let report = assess(dir.path());
 
@@ -548,5 +704,44 @@ mod tests {
             .find(|dimension| dimension.name == "kranz runtime gitignore")
             .unwrap();
         assert_eq!(hygiene.status, ReadyStatus::Pass, "{hygiene:?}");
+    }
+
+    #[test]
+    fn gitignore_hygiene_rejects_tracked_runtime_files() {
+        let dir = TempDir::new().unwrap();
+        git(dir.path(), &["init"]);
+        write(
+            &dir.path().join(".kranz/.gitignore"),
+            "missions/\nconfig.json\nserve.token\ntickets/*.status\n",
+        );
+        write(
+            &dir.path().join(".kranz/serve.token"),
+            "must-not-be-tracked",
+        );
+        git(dir.path(), &["config", "user.name", "ready-test"]);
+        git(dir.path(), &["config", "user.email", "ready@example.com"]);
+        git(dir.path(), &["add", ".kranz/.gitignore"]);
+        git(dir.path(), &["add", "-f", ".kranz/serve.token"]);
+        git(dir.path(), &["commit", "-m", "tracked token fixture"]);
+
+        let hygiene = gitignore_hygiene(dir.path());
+        assert_ne!(hygiene.status, ReadyStatus::Pass, "{hygiene:?}");
+        assert!(hygiene.evidence.contains("7/8"), "{hygiene:?}");
+    }
+
+    #[test]
+    fn gitignore_hygiene_ignores_global_and_git_info_excludes() {
+        let dir = TempDir::new().unwrap();
+        git(dir.path(), &["init"]);
+        let global = dir.path().join("global-excludes");
+        write(&global, ".kranz/\n");
+        git(
+            dir.path(),
+            &["config", "core.excludesFile", global.to_str().unwrap()],
+        );
+        write(&dir.path().join(".git/info/exclude"), ".kranz/\n");
+
+        let hygiene = gitignore_hygiene(dir.path());
+        assert_eq!(hygiene.status, ReadyStatus::Fail, "{hygiene:?}");
     }
 }

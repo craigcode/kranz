@@ -1197,8 +1197,8 @@ pub fn gate_merge_command(
 /// The async run phase of `/kranz merge <slug|id>`, called ONLY after the
 /// caller has posted the `MergeGate::Ready` ack. Drives
 /// [`crate::host::PlanningHost::merge`] and forwards its outcome — merged
-/// commit, or the refusal (dirty tree / failing gate with verbatim output /
-/// conflict) — unchanged.
+/// commit, or the refusal (dirty tree / failing gate / conflict). Long gate
+/// failures preserve their useful tail within Slack's Block Kit limit.
 pub async fn run_merge(host: &SharedHost, mission_id: &str) -> Vec<Value> {
     match host.merge(mission_id).await {
         Ok(value) => {
@@ -1214,7 +1214,7 @@ pub async fn run_merge(host: &SharedHost, mission_id: &str) -> Vec<Value> {
             }
             error_blocks(&message)
         }
-        Err(e) => error_blocks(&format!("Couldn't merge `{mission_id}`: {e}")),
+        Err(e) => merge_error_blocks(mission_id, &e.to_string()),
     }
 }
 
@@ -1980,60 +1980,20 @@ async fn dispatch_action(
             response_url,
             channel,
         } => {
-            if !cfg.is_authorized(user_id.as_deref()) {
-                user_reply(
-                    cfg,
-                    client,
-                    response_url.as_deref(),
-                    channel.as_deref().unwrap_or(&cfg.channel),
-                    user_id.as_deref(),
-                    &not_authorized_blocks(),
-                )
-                .await;
-                return;
-            }
-            match config_change(
+            change_config(
+                cfg,
+                client,
                 repo_root,
                 mission_id.as_deref(),
                 role,
                 backend.as_deref(),
                 model,
                 effort.as_deref(),
-            ) {
-                Ok(applied_to) => {
-                    let backend_note = backend
-                        .as_deref()
-                        .map(|b| format!(" backend `{b}`,"))
-                        .unwrap_or_default();
-                    let effort_note = effort
-                        .as_deref()
-                        .map(|e| format!(", effort `{e}`"))
-                        .unwrap_or_default();
-                    user_reply(
-                        cfg,
-                        client,
-                        response_url.as_deref(),
-                        channel.as_deref().unwrap_or(&cfg.channel),
-                        user_id.as_deref(),
-                        &error_blocks(&format!(
-                            ":gear: Set `{role}`{backend_note} model `{model}`{effort_note} on `{applied_to}`."
-                        )),
-                    )
-                    .await
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to apply config change from Slack");
-                    user_reply(
-                        cfg,
-                        client,
-                        response_url.as_deref(),
-                        channel.as_deref().unwrap_or(&cfg.channel),
-                        user_id.as_deref(),
-                        &error_blocks(&format!("Couldn't change config: {e}")),
-                    )
-                    .await
-                }
-            }
+                user_id.as_deref(),
+                response_url.as_deref(),
+                channel.as_deref(),
+            )
+            .await;
         }
 
         // Pause / resume: STEERING (not spend), but they disrupt a running
@@ -2667,7 +2627,26 @@ async fn approve_flow(
 /// A single mrkdwn section block for a short status / error / confirmation
 /// ephemeral. (Not every reply warrants the full header/section/context frame.)
 fn error_blocks(msg: &str) -> Vec<Value> {
-    vec![json!({ "type": "section", "text": { "type": "mrkdwn", "text": msg } })]
+    const MAX_SLACK_FIELD: usize = 2500;
+    let text: String = msg.chars().take(MAX_SLACK_FIELD).collect();
+    vec![json!({ "type": "section", "text": { "type": "mrkdwn", "text": text } })]
+}
+
+fn merge_error_blocks(mission_id: &str, detail: &str) -> Vec<Value> {
+    // Gate runners put the useful assertion summary at the end. Preserve that
+    // tail while keeping the complete Block Kit field safely below Slack's
+    // 3,000-character limit (and leave room for instance labeling).
+    const MAX_DETAIL: usize = 2300;
+    let chars: Vec<char> = detail.chars().collect();
+    let clipped = if chars.len() > MAX_DETAIL {
+        format!(
+            "…{}",
+            chars[chars.len() - MAX_DETAIL..].iter().collect::<String>()
+        )
+    } else {
+        detail.to_string()
+    };
+    error_blocks(&format!("Couldn't merge `{mission_id}`:\n{clipped}"))
 }
 
 fn ask_answer_blocks(question: &str, outcome: &AskOutcome) -> Vec<Value> {
@@ -3615,6 +3594,68 @@ fn config_change(
         .context("enqueue config change")?;
     tracing::info!(mission = %mission_id, role, backend, model, "config change enqueued from Slack");
     Ok(mission_id)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn change_config(
+    cfg: &SlackConfig,
+    client: &SlackClient,
+    repo_root: &Path,
+    mission_id: Option<&str>,
+    role: &str,
+    backend: Option<&str>,
+    model: &str,
+    effort: Option<&str>,
+    user_id: Option<&str>,
+    response_url: Option<&str>,
+    channel: Option<&str>,
+) {
+    let channel = channel.unwrap_or(&cfg.channel);
+    if !cfg.is_authorized(user_id) {
+        user_reply(
+            cfg,
+            client,
+            response_url,
+            channel,
+            user_id,
+            &not_authorized_blocks(),
+        )
+        .await;
+        return;
+    }
+    match config_change(repo_root, mission_id, role, backend, model, effort) {
+        Ok(applied_to) => {
+            let backend_note = backend
+                .map(|backend| format!(" backend `{backend}`,"))
+                .unwrap_or_default();
+            let effort_note = effort
+                .map(|effort| format!(", effort `{effort}`"))
+                .unwrap_or_default();
+            user_reply(
+                cfg,
+                client,
+                response_url,
+                channel,
+                user_id,
+                &error_blocks(&format!(
+                    ":gear: Set `{role}`{backend_note} model `{model}`{effort_note} on `{applied_to}`."
+                )),
+            )
+            .await;
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to apply config change from Slack");
+            user_reply(
+                cfg,
+                client,
+                response_url,
+                channel,
+                user_id,
+                &error_blocks(&format!("Couldn't change config: {error}")),
+            )
+            .await;
+        }
+    }
 }
 
 /// `/kranz pause|resume [<id>]` handler: allowlist-gate, resolve the target
@@ -5492,6 +5533,44 @@ mod tests {
             ),
             other => panic!("expected ConfigChange, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn config_change_denies_an_unlisted_user_and_enqueues_nothing() {
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-gated-config", "goal");
+        let cfg = SlackConfig {
+            bot_token: "xoxb".into(),
+            app_token: "xapp".into(),
+            channel: "C1".into(),
+            notify: NotifyFlags::default(),
+            allow_users: vec!["U-allowed".into()],
+            dashboard_url: None,
+            instance_name: None,
+        };
+        let client = SlackClient::new(&cfg).unwrap();
+
+        change_config(
+            &cfg,
+            &client,
+            tmp.path(),
+            Some("m-gated-config"),
+            "worker",
+            Some("codex"),
+            "gpt-5-codex",
+            None,
+            Some("U-outsider"),
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            kranz_engine::control::drain(&MissionPaths::new(tmp.path(), "m-gated-config"))
+                .unwrap()
+                .is_empty(),
+            "authorization must happen before config_change writes the inbox"
+        );
     }
 
     #[test]

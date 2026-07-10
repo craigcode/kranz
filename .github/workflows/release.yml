@@ -29,11 +29,11 @@ jobs:
             bin: kranz.exe
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Build kranz (release)
         run: cargo build --release --locked -p kranz --bin kranz
@@ -55,7 +55,7 @@ jobs:
           Copy-Item "target/release/${{ matrix.bin }}" "dist/${{ matrix.asset }}.exe"
 
       - name: Attach to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: dist/${{ matrix.asset }}*
           fail_on_unmatched_files: true

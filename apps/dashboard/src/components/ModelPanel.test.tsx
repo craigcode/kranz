@@ -89,7 +89,6 @@ describe('ModelPanel', () => {
             model: 'gpt-5-codex',
             reasoningEffort: 'high',
           },
-          allowBelowDefaultWorkerModel: false,
         },
       });
     });
@@ -110,5 +109,48 @@ describe('ModelPanel', () => {
     const alert = await screen.findByRole('alert');
     expect(alert.textContent).toContain('below the default worker tier');
     expect(screen.getByLabelText('Worker backend')).toBeTruthy();
+  });
+
+  it('does not overwrite backend or model changes received while the editor is open', async () => {
+    const sendControl = vi.fn().mockResolvedValue(undefined);
+    useKranzStore.setState({ sendControl });
+    render(<ModelPanel />);
+
+    fireEvent.click(screen.getByRole('button', { name: /Worker/ }));
+    const updated = missionState();
+    updated.config.worker = {
+      backend: 'droid',
+      model: 'fable',
+      reasoningEffort: 'medium',
+    };
+    useKranzStore.setState({ state: updated });
+    fireEvent.change(screen.getByLabelText('Worker reasoning effort'), {
+      target: { value: 'high' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+
+    await waitFor(() => {
+      expect(sendControl).toHaveBeenCalledWith({
+        kind: 'config-change',
+        patch: { worker: { reasoningEffort: 'high' } },
+      });
+    });
+  });
+
+  it('clears editor and notice state when the selected mission changes', async () => {
+    const sendControl = vi.fn().mockResolvedValue(undefined);
+    useKranzStore.setState({ sendControl });
+    render(<ModelPanel />);
+
+    fireEvent.click(screen.getByRole('button', { name: /Worker/ }));
+    fireEvent.change(screen.getByLabelText('Worker backend'), { target: { value: 'codex' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+    await screen.findByRole('status');
+
+    useKranzStore.setState({ missionId: 'm-2', state: missionState() });
+    await waitFor(() => {
+      expect(screen.queryByRole('status')).toBeNull();
+      expect(screen.queryByLabelText('Worker backend')).toBeNull();
+    });
   });
 });
