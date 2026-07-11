@@ -822,30 +822,37 @@ fn claim_lifecycle_finish_release_and_dead_recovery() {
     assert_eq!(queue::peek(root).unwrap().mission_id, "m-b");
 
     // A claim held by a DEAD pid is recovered; one held by THIS live process
-    // is left alone.
+    // is left alone. Foreign-pid liveness detection is unix-only
+    // (`libc::kill(pid, 0)` → ESRCH); on Windows a claim held by another pid
+    // can't be proven dead, so recover_dead_claims is a documented no-op there
+    // and the forged claim simply persists — hence the recovery assertion is
+    // cfg(unix), mirroring the queue/lock liveness tests above.
     let claim = queue::claim_front(root).unwrap();
-    let claimed_dir = queue::queue_dir(root);
-    let live_name = std::fs::read_dir(&claimed_dir)
-        .unwrap()
-        .flatten()
-        .map(|f| f.file_name().to_string_lossy().to_string())
-        .find(|n| n.contains(".claimed."))
-        .expect("live claim file present");
-    // Forge a dead-pid claim beside it.
-    let dead_name = live_name.replace(
-        &format!(".claimed.{}", std::process::id()),
-        ".claimed.999999999",
-    );
-    std::fs::copy(claimed_dir.join(&live_name), claimed_dir.join(&dead_name)).unwrap();
-    let recovered = queue::recover_dead_claims(root);
-    assert_eq!(
-        recovered, 1,
-        "dead-pid claim recovered, live claim untouched"
-    );
-    assert!(
-        claimed_dir.join(&live_name).exists(),
-        "live claim survives recovery"
-    );
+    #[cfg(unix)]
+    {
+        let claimed_dir = queue::queue_dir(root);
+        let live_name = std::fs::read_dir(&claimed_dir)
+            .unwrap()
+            .flatten()
+            .map(|f| f.file_name().to_string_lossy().to_string())
+            .find(|n| n.contains(".claimed."))
+            .expect("live claim file present");
+        // Forge a dead-pid claim beside it.
+        let dead_name = live_name.replace(
+            &format!(".claimed.{}", std::process::id()),
+            ".claimed.999999999",
+        );
+        std::fs::copy(claimed_dir.join(&live_name), claimed_dir.join(&dead_name)).unwrap();
+        let recovered = queue::recover_dead_claims(root);
+        assert_eq!(
+            recovered, 1,
+            "dead-pid claim recovered, live claim untouched"
+        );
+        assert!(
+            claimed_dir.join(&live_name).exists(),
+            "live claim survives recovery"
+        );
+    }
     queue::finish_claim(claim);
 }
 
