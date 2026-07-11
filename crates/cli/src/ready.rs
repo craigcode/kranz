@@ -419,11 +419,15 @@ fn git_ignores(repo: &Path, relative_path: &str) -> bool {
         .map(|component| component.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .join("/");
-    let committed = kranz_engine::git_ops::GitRepo::open(repo)
-        .and_then(|git| git.show_file("HEAD", &source_spec));
-    let Ok(Some(_)) = committed else {
+    let Ok(git) = kranz_engine::git_ops::GitRepo::open(repo) else {
         return false;
     };
+    let Ok(Some(_)) = git.show_file("HEAD", &source_spec) else {
+        return false;
+    };
+    if !git.has_normal_index_entry(&source_spec).unwrap_or(false) {
+        return false;
+    }
     // Let Git compare through its normal text conversion rules. This rejects
     // staged and unstaged rule changes while accepting a clean CRLF worktree
     // backed by an LF blob under core.autocrlf / .gitattributes.
@@ -928,6 +932,33 @@ mod tests {
             !git_ignores(dir.path(), ".kranz/config.json"),
             "readiness must evaluate the committed .gitignore bytes"
         );
+    }
+
+    #[test]
+    fn gitignore_hygiene_rejects_rules_hidden_by_index_flags() {
+        for flag in ["--assume-unchanged", "--skip-worktree"] {
+            let dir = TempDir::new().unwrap();
+            git(dir.path(), &["init"]);
+            write(&dir.path().join(".kranz/.gitignore"), "missions/\n");
+            commit_all(dir.path());
+            git(dir.path(), &["update-index", flag, ".kranz/.gitignore"]);
+            write(
+                &dir.path().join(".kranz/.gitignore"),
+                "missions/\nconfig.json\n",
+            );
+
+            let git_verdict = Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(["check-ignore", "--quiet", "--", ".kranz/config.json"])
+                .status()
+                .unwrap();
+            assert!(git_verdict.success(), "fixture failed for {flag}");
+            assert!(
+                !git_ignores(dir.path(), ".kranz/config.json"),
+                "readiness trusted a .gitignore hidden by {flag}"
+            );
+        }
     }
 
     #[test]

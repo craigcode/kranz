@@ -4032,26 +4032,13 @@ impl MissionEngine {
         // mode) because these files are folded into write_mission_report's
         // commit, which commits via active_repo — see that method's doc note.
         let active_paths = self.active_paths();
-        let lessons_dir = active_paths.lessons_dir();
-        std::fs::create_dir_all(&lessons_dir)?;
         let mission_id = self.state.mission.id.clone();
-        let lesson_file = lessons_dir.join(format!("{mission_id}.md"));
         let body = normalize_lesson_body(trimmed);
-        std::fs::write(&lesson_file, &body)?;
-
-        let summary = first_nonempty_line(&body);
-        let index = active_paths.lessons_index();
-        let line = format!("- {mission_id}.md · {summary}\n");
-        {
-            use std::io::Write as _;
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&index)?;
-            file.write_all(line.as_bytes())?;
-        }
-
-        Ok(Some(vec![lesson_file, index]))
+        Ok(Some(lessons::write_lesson(
+            &active_paths.repo_root,
+            &mission_id,
+            &body,
+        )?))
     }
 
     // -----------------------------------------------------------------------

@@ -257,6 +257,15 @@ impl GitRepo {
             .all(|line| line.starts_with("H ")))
     }
 
+    /// Whether one tracked path has Git's normal index tag. Lowercase tags
+    /// (`assume-unchanged`) and `S` (`skip-worktree`) can hide worktree bytes
+    /// from ordinary diff/status commands and must not guard a trust decision.
+    pub fn has_normal_index_entry(&self, path: &str) -> Result<bool> {
+        let output = self.run(&["ls-files", "-v", "--", path])?;
+        let mut lines = output.lines();
+        Ok(lines.next() == Some(format!("H {path}").as_str()) && lines.next().is_none())
+    }
+
     /// `git add -A` then `git commit -m <message>`; returns the new head sha.
     ///
     /// A no-change commit attempt exits non-zero, so it surfaces as an
