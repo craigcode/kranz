@@ -22,6 +22,12 @@ Format:
   Source: docs/scoping/cursor-cli-backend.md; docs/scoping/cursor-probe-evidence/fixture-stream-json.jsonl
   Ticket: none
 
+- **Local-inference trace flywheel** - record model identity + quant + validation outcome per completion and export a validation-passed, regenerable fine-tuning dataset — on frontier traces first.
+  Why: It sharpens the audit/record pillar and yields a standalone dataset asset with zero local-inference dependency; the highest-leverage, lowest-risk, most mission-independent slice of the local-inference workstream.
+  Trigger: Pick up now — it needs no GPU and gates nothing; do it before the local-executor tier so the executor eval and validator miss-rate have provenance to measure against.
+  Source: docs/scoping/local-inference-executor-tier.md
+  Ticket: local-inference-trace-provenance-flywheel
+
 - **Roadmap surface v1** - keep `/kranz roadmap` backed by this tracked file so strategic options remain visible from Slack.
   Why: The backlog shows captured work, and `/kranz todo` shows immediate human actions; this file keeps conditional futures from collapsing into either.
   Trigger: Maintain whenever roadmap/scoping docs add or retire a strategic option.
@@ -49,6 +55,12 @@ Format:
   Trigger: Start when the next capability lane beats cleanup on leverage; slice 3 waits until enough notes exist to drift.
   Source: docs/scoping/repo-knowledge-store.md
   Ticket: none
+
+- **Local-inference executor tier** - route bounded, well-specified execution-class work to a local OpenAI-compatible endpoint (backend_local, HTTP-in-engine), with deterministic tier routing and two-fail escalation to frontier; validator stays frontier until its local miss-rate is measured.
+  Why: Kranz runs parallel batch workers continuously; local executors lift the per-token ceiling on how many run at once — but only past quota saturation. Per the workstream's own counter-evidence, a mixed setup loses to solo Opus while frontier calls are free at the margin.
+  Trigger: A stretch of missions where frontier QUOTA — not local-model competence — is the binding constraint. Until then only the trace flywheel (in Now) is worth building. backend_local also reuses the shipped per-role backend machinery, so the harness entry cost is low.
+  Source: docs/scoping/local-inference-executor-tier.md
+  Ticket: local-inference-backend-local; local-inference-router-escalation; local-inference-validator-guarded; local-inference-cost-accounting
 
 - **Gas City event dispatch and mission events** - after Stage 1, build the two stub-verifiable pack improvements.
   Why: Event dispatch lowers bead latency, and `kranz.mission.*` events make kranz a better City citizen without adopting beads as the core work model.
