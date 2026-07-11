@@ -984,6 +984,7 @@ mod win_process_tree {
 mod sandbox_wrap {
     use super::*;
     use kranz_engine::backend_claude::sandbox_command;
+    #[cfg(target_os = "macos")]
     use kranz_engine::sandbox::{
         generate_profile, write_profile_file, ResolvedSandbox, SandboxBackend, SandboxInputs,
     };

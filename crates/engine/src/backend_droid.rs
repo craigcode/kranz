@@ -15,6 +15,7 @@
 use crate::backend::{
     AgentBackend, AgentEvent, AgentSession, PromptMode, SessionExit, SessionSpec,
 };
+#[cfg(unix)]
 use crate::backend_claude::kill_group;
 #[cfg(windows)]
 use crate::backend_claude::win_job;
