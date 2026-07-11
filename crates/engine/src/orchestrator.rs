@@ -6634,6 +6634,27 @@ mod tests {
     // Mission integration worktree primitive (M7 tier 1, feature f-1-2)
     // -----------------------------------------------------------------------
 
+    /// Whether a `git worktree list` entry refers to the same directory as a
+    /// Rust-canonicalized path. `list_worktrees` yields forward-slash paths
+    /// with no verbatim prefix on every platform, whereas
+    /// `std::fs::canonicalize` returns a `\\?\C:\...` backslash path on
+    /// Windows — a raw `Path` equality never matches there. Normalizing both
+    /// sides (unify separators, strip a leading `\\?\` verbatim prefix, and —
+    /// on Windows only, where the filesystem is case-insensitive — lowercase)
+    /// makes them comparable without another filesystem round-trip.
+    fn worktree_entry_is(listed: &str, canonical: &std::path::Path) -> bool {
+        fn norm(s: &str) -> String {
+            let unified = s.replace('\\', "/");
+            let stripped = unified.strip_prefix("//?/").unwrap_or(&unified);
+            if cfg!(windows) {
+                stripped.to_ascii_lowercase()
+            } else {
+                stripped.to_string()
+            }
+        }
+        norm(listed) == norm(&canonical.to_string_lossy())
+    }
+
     /// `setup_mission_worktree` creates the integration worktree on the
     /// mission branch WITHOUT moving the primary checkout off `main`, and
     /// `teardown_mission_worktree` removes it (proven via `list_worktrees`).
@@ -6663,18 +6684,14 @@ mod tests {
         let listed = engine.repo.list_worktrees().unwrap();
         let canon_path = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
         assert!(
-            listed
-                .iter()
-                .any(|p| std::path::Path::new(p) == canon_path.as_path()),
+            listed.iter().any(|p| worktree_entry_is(p, &canon_path)),
             "integration worktree not in list_worktrees: {listed:?}"
         );
 
         engine.teardown_mission_worktree();
         let after = engine.repo.list_worktrees().unwrap();
         assert!(
-            !after
-                .iter()
-                .any(|p| std::path::Path::new(p) == canon_path.as_path()),
+            !after.iter().any(|p| worktree_entry_is(p, &canon_path)),
             "integration worktree still listed after teardown: {after:?}"
         );
         assert!(!path.exists(), "integration worktree dir must be gone");
@@ -6918,9 +6935,7 @@ mod tests {
         let listed = engine.repo.list_worktrees().unwrap();
         let canon_path = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
         assert!(
-            listed
-                .iter()
-                .any(|p| std::path::Path::new(p) == canon_path.as_path()),
+            listed.iter().any(|p| worktree_entry_is(p, &canon_path)),
             "integration worktree not in list_worktrees before crash: {listed:?}"
         );
 
@@ -6934,9 +6949,7 @@ mod tests {
 
         let after = resumed.repo.list_worktrees().unwrap();
         assert!(
-            !after
-                .iter()
-                .any(|p| std::path::Path::new(p) == canon_path.as_path()),
+            !after.iter().any(|p| worktree_entry_is(p, &canon_path)),
             "integration worktree still listed after resume: {after:?}"
         );
         assert!(
