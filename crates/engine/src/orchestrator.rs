@@ -8636,6 +8636,9 @@ mod tests {
         cfg
     }
 
+    // Every caller is a `cfg(unix)` stub-backend test (like its sibling
+    // `codex_scrutiny_cfg`); ungated it is dead code under windows clippy.
+    #[cfg(unix)]
     fn codex_scrutiny_milestone() -> Milestone {
         Milestone {
             id: "ms-1".to_string(),
