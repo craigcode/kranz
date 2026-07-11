@@ -8,7 +8,10 @@
 
 use crate::error::{EngineError, Result};
 use crate::paths::MissionPaths;
-use std::io::{ErrorKind, Write as _};
+use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, OpenOptions};
+use std::io::{ErrorKind, Read as _, Write as _};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -37,110 +40,120 @@ pub(crate) fn write_lesson(
             "unsafe mission id for lesson capture: {mission_id}"
         )));
     }
-    let lessons_dir = prepare_lessons_dir(repo_root)?;
-    let lesson_file = lessons_dir.join(format!("{mission_id}.md"));
-    let index = lessons_dir.join("index.md");
+    let lessons = open_lessons_dir(repo_root, true)?;
+    write_lesson_in_dir(&lessons, mission_id, body)?;
 
-    ensure_absent_or_regular(&lesson_file, &lessons_dir)?;
-    let mut manifest = read_existing_regular(&index, &lessons_dir)?.unwrap_or_default();
+    let lessons_path = repo_root.join(".kranz").join("lessons");
+    Ok(vec![
+        lessons_path.join(format!("{mission_id}.md")),
+        lessons_path.join("index.md"),
+    ])
+}
+
+fn write_lesson_in_dir(lessons: &Dir, mission_id: &str, body: &str) -> Result<()> {
+    let lesson_name = format!("{mission_id}.md");
+    ensure_absent_or_regular(lessons, &lesson_name)?;
+    let mut manifest = read_existing_regular(lessons, "index.md")?.unwrap_or_default();
     let summary = first_nonempty_line(body).unwrap_or_default();
     manifest.push_str(&format!("- {mission_id}.md · {summary}\n"));
 
-    atomic_replace(&lesson_file, body.as_bytes())?;
-    atomic_replace(&index, manifest.as_bytes())?;
-    Ok(vec![lesson_file, index])
+    atomic_replace(lessons, &lesson_name, body.as_bytes())?;
+    atomic_replace(lessons, "index.md", manifest.as_bytes())
 }
 
-fn prepare_lessons_dir(repo_root: &Path) -> Result<std::path::PathBuf> {
-    let canonical_repo = repo_root.canonicalize()?;
-    let kranz_dir = repo_root.join(".kranz");
-    let kranz_metadata = std::fs::symlink_metadata(&kranz_dir)?;
-    let canonical_kranz = kranz_dir.canonicalize()?;
-    if !kranz_metadata.file_type().is_dir() || canonical_kranz != canonical_repo.join(".kranz") {
-        return Err(unsafe_lessons_path(&kranz_dir));
+fn open_lessons_dir(repo_root: &Path, create: bool) -> Result<Dir> {
+    let repo = Dir::open_ambient_dir(repo_root, ambient_authority())?;
+    let kranz_metadata = repo.symlink_metadata(".kranz")?;
+    if !kranz_metadata.file_type().is_dir() {
+        return Err(unsafe_lessons_path(&repo_root.join(".kranz")));
     }
+    let kranz = repo
+        .open_dir_nofollow(".kranz")
+        .map_err(|_| unsafe_lessons_path(&repo_root.join(".kranz")))?;
 
-    let lessons_dir = kranz_dir.join("lessons");
-    match std::fs::symlink_metadata(&lessons_dir) {
+    match kranz.symlink_metadata("lessons") {
         Ok(metadata) if metadata.file_type().is_dir() => {}
-        Ok(_) => return Err(unsafe_lessons_path(&lessons_dir)),
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            std::fs::create_dir(&lessons_dir)?;
+        Ok(_) => return Err(unsafe_lessons_path(&repo_root.join(".kranz/lessons"))),
+        Err(error) if error.kind() == ErrorKind::NotFound && create => {
+            match kranz.create_dir("lessons") {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         Err(error) => return Err(error.into()),
     }
-    let canonical_lessons = lessons_dir.canonicalize()?;
-    if canonical_lessons != canonical_kranz.join("lessons") {
-        return Err(unsafe_lessons_path(&lessons_dir));
-    }
-    Ok(lessons_dir)
+    kranz
+        .open_dir_nofollow("lessons")
+        .map_err(|_| unsafe_lessons_path(&repo_root.join(".kranz/lessons")))
 }
 
-fn ensure_absent_or_regular(path: &Path, canonical_parent: &Path) -> Result<()> {
-    let canonical_parent = canonical_parent.canonicalize()?;
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() => {
-            let canonical = path.canonicalize()?;
-            if canonical.parent() != Some(canonical_parent.as_path()) {
-                return Err(unsafe_lessons_path(path));
-            }
-            Ok(())
-        }
-        Ok(_) => Err(unsafe_lessons_path(path)),
+fn ensure_absent_or_regular(dir: &Dir, name: &str) -> Result<()> {
+    match dir.symlink_metadata(name) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(_) => Err(unsafe_lessons_path(Path::new(name))),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
 }
 
-fn read_existing_regular(path: &Path, canonical_parent: &Path) -> Result<Option<String>> {
-    let canonical_parent = canonical_parent.canonicalize()?;
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() => {
-            let canonical = path.canonicalize()?;
-            if canonical.parent() != Some(canonical_parent.as_path()) {
-                return Err(unsafe_lessons_path(path));
+fn read_existing_regular(dir: &Dir, name: &str) -> Result<Option<String>> {
+    match dir.symlink_metadata(name) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => return Err(unsafe_lessons_path(Path::new(name))),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    match dir.open_with(name, &options) {
+        Ok(mut file) => {
+            if !file.metadata()?.is_file() {
+                return Err(unsafe_lessons_path(Path::new(name)));
             }
-            Ok(Some(std::fs::read_to_string(canonical)?))
+            let mut text = String::new();
+            file.read_to_string(&mut text)?;
+            Ok(Some(text))
         }
-        Ok(_) => Err(unsafe_lessons_path(path)),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
 }
 
-fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path.parent().ok_or_else(|| unsafe_lessons_path(path))?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("lesson");
-    let tmp = parent.join(format!(
-        ".{file_name}.{}.{}.tmp",
+fn atomic_replace(dir: &Dir, name: &str, bytes: &[u8]) -> Result<()> {
+    let tmp = format!(
+        ".{name}.{}.{}.tmp",
         std::process::id(),
         LESSON_TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
+    );
     let result = (|| -> Result<()> {
-        let mut file = std::fs::OpenOptions::new()
+        let mut options = OpenOptions::new();
+        options
             .write(true)
             .create_new(true)
-            .open(&tmp)?;
+            .follow(FollowSymlinks::No);
+        let mut file = dir.open_with(&tmp, &options)?;
         file.write_all(bytes)?;
         drop(file);
-        match std::fs::rename(&tmp, path) {
+        match dir.rename(&tmp, dir, name) {
             Ok(()) => Ok(()),
-            Err(_) if cfg!(windows) => {
-                ensure_absent_or_regular(path, parent)?;
-                if path.exists() {
-                    std::fs::remove_file(path)?;
+            #[cfg(windows)]
+            Err(_) => {
+                ensure_absent_or_regular(dir, name)?;
+                match dir.symlink_metadata(name) {
+                    Ok(_) => dir.remove_file_or_symlink(name)?,
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
                 }
-                std::fs::rename(&tmp, path)?;
+                dir.rename(&tmp, dir, name)?;
                 Ok(())
             }
+            #[cfg(not(windows))]
             Err(error) => Err(error.into()),
         }
     })();
     if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = dir.remove_file(&tmp);
     }
     result
 }
@@ -155,19 +168,12 @@ fn unsafe_lessons_path(path: &Path) -> EngineError {
 /// Render the byte-capped recent-lessons index for injection into a
 /// planning seed, or `None` if there are no lessons to inject.
 pub fn render_lessons_index(repo_root: &Path) -> Option<String> {
-    let lessons_dir = repo_root.join(".kranz").join("lessons");
-    let canonical_repo_root = repo_root.canonicalize().ok()?;
-    let canonical_lessons_dir = lessons_dir.canonicalize().ok()?;
-    if canonical_lessons_dir != canonical_repo_root.join(".kranz").join("lessons") {
-        return None;
-    }
-    let manifest_path = lessons_dir.join("index.md");
-    let manifest = std::fs::symlink_metadata(&manifest_path)
-        .ok()
-        .filter(|metadata| metadata.file_type().is_file())
-        .and_then(|_| manifest_path.canonicalize().ok())
-        .filter(|path| path.parent() == Some(canonical_lessons_dir.as_path()))
-        .and_then(|path| std::fs::read_to_string(path).ok())?;
+    let lessons = open_lessons_dir(repo_root, false).ok()?;
+    render_lessons_index_in_dir(&lessons)
+}
+
+fn render_lessons_index_in_dir(lessons: &Dir) -> Option<String> {
+    let manifest = read_existing_regular(lessons, "index.md").ok()??;
 
     let lines: Vec<&str> = manifest
         .lines()
@@ -197,18 +203,7 @@ pub fn render_lessons_index(repo_root: &Path) -> Option<String> {
         .enumerate()
         .filter_map(|(i, line)| {
             let (filename, summary) = parse_manifest_line(line)?;
-            let lesson_path = lessons_dir.join(&filename);
-            let file_text = lesson_path
-                .canonicalize()
-                .ok()
-                .filter(|path| path.parent() == Some(canonical_lessons_dir.as_path()))
-                .and_then(|canonical_lesson| {
-                    std::fs::symlink_metadata(&lesson_path)
-                        .ok()
-                        .filter(|metadata| metadata.file_type().is_file())
-                        .map(|_| canonical_lesson)
-                })
-                .and_then(|canonical_lesson| std::fs::read_to_string(canonical_lesson).ok());
+            let file_text = read_existing_regular(lessons, &filename).ok().flatten();
             let first_line = file_text
                 .as_deref()
                 .and_then(first_nonempty_line)
@@ -420,6 +415,33 @@ mod tests {
         assert!(render_lessons_index(dir.path()).is_none());
     }
 
+    #[test]
+    fn lesson_write_replaces_the_existing_manifest_without_temp_residue() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".kranz")).unwrap();
+
+        super::write_lesson(dir.path(), "m-one", "FIRST LESSON\n").unwrap();
+        super::write_lesson(dir.path(), "m-two", "SECOND LESSON\n").unwrap();
+
+        let lessons_dir = dir.path().join(".kranz/lessons");
+        assert_eq!(
+            std::fs::read_to_string(lessons_dir.join("index.md")).unwrap(),
+            "- m-one.md · FIRST LESSON\n- m-two.md · SECOND LESSON\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(lessons_dir.join("m-two.md")).unwrap(),
+            "SECOND LESSON\n"
+        );
+        assert!(
+            std::fs::read_dir(lessons_dir).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")),
+            "atomic replacement must clean temporary files"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn lesson_write_refuses_symlinked_destinations_without_touching_targets() {
@@ -461,6 +483,60 @@ mod tests {
         );
         assert!(!outside.path().join("m-safe.md").exists());
         assert!(!outside.path().join("index.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lesson_write_stays_bound_to_the_open_directory_after_path_swap() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let lessons_path = dir.path().join(".kranz/lessons");
+        std::fs::create_dir_all(&lessons_path).unwrap();
+        let lessons = open_lessons_dir(dir.path(), false).unwrap();
+        let held_path = dir.path().join(".kranz/lessons-held");
+        std::fs::rename(&lessons_path, &held_path).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), &lessons_path).unwrap();
+
+        write_lesson_in_dir(&lessons, "m-safe", "SAFE LESSON").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(held_path.join("m-safe.md")).unwrap(),
+            "SAFE LESSON"
+        );
+        assert!(held_path.join("index.md").is_file());
+        assert!(!outside.path().join("m-safe.md").exists());
+        assert!(!outside.path().join("index.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lesson_render_stays_bound_to_the_open_directory_after_path_swap() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let lessons_path = dir.path().join(".kranz/lessons");
+        std::fs::create_dir_all(&lessons_path).unwrap();
+        std::fs::write(lessons_path.join("index.md"), "- safe.md · SAFE SUMMARY\n").unwrap();
+        std::fs::write(lessons_path.join("safe.md"), "SAFE LESSON\n").unwrap();
+        let lessons = open_lessons_dir(dir.path(), false).unwrap();
+        let held_path = dir.path().join(".kranz/lessons-held");
+        std::fs::rename(&lessons_path, &held_path).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(
+            outside.path().join("index.md"),
+            "- evil.md · EXTERNAL SUMMARY\n",
+        )
+        .unwrap();
+        std::fs::write(outside.path().join("evil.md"), "LOCAL SECRET\n").unwrap();
+        symlink(outside.path(), &lessons_path).unwrap();
+
+        let rendered = render_lessons_index_in_dir(&lessons).unwrap();
+
+        assert!(rendered.contains("SAFE LESSON"), "{rendered}");
+        assert!(!rendered.contains("LOCAL SECRET"), "{rendered}");
+        assert!(!rendered.contains("EXTERNAL SUMMARY"), "{rendered}");
     }
 
     #[test]

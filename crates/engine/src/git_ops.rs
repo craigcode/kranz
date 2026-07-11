@@ -243,7 +243,8 @@ impl GitRepo {
     }
 
     /// Like [`Self::is_clean_tracked`], but also rejects index flags that can
-    /// hide working-tree changes (`assume-unchanged` / `skip-worktree`).
+    /// hide working-tree changes (`assume-unchanged`, `skip-worktree`, or
+    /// fsmonitor-valid).
     ///
     /// Scratch merge worktrees are never sparse and never need either flag,
     /// so every tracked entry must have git's normal `H` tag.
@@ -252,16 +253,17 @@ impl GitRepo {
             return Ok(false);
         }
         Ok(self
-            .run(&["ls-files", "-v"])?
+            .run(&["ls-files", "-v", "-f"])?
             .lines()
             .all(|line| line.starts_with("H ")))
     }
 
     /// Whether one tracked path has Git's normal index tag. Lowercase tags
-    /// (`assume-unchanged`) and `S` (`skip-worktree`) can hide worktree bytes
-    /// from ordinary diff/status commands and must not guard a trust decision.
+    /// (`assume-unchanged` or fsmonitor-valid) and `S` (`skip-worktree`) can
+    /// hide worktree bytes from ordinary diff/status commands and must not
+    /// guard a trust decision.
     pub fn has_normal_index_entry(&self, path: &str) -> Result<bool> {
-        let output = self.run(&["ls-files", "-v", "--", path])?;
+        let output = self.run(&["ls-files", "-v", "-f", "--", path])?;
         let mut lines = output.lines();
         Ok(lines.next() == Some(format!("H {path}").as_str()) && lines.next().is_none())
     }

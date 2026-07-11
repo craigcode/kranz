@@ -962,6 +962,49 @@ mod tests {
     }
 
     #[test]
+    fn gitignore_hygiene_rejects_rules_hidden_by_fsmonitor_valid() {
+        let dir = TempDir::new().unwrap();
+        git(dir.path(), &["init"]);
+        write(&dir.path().join(".kranz/.gitignore"), "missions/\n");
+        commit_all(dir.path());
+        git(dir.path(), &["config", "core.fsmonitor", "true"]);
+        write(
+            &dir.path().join(".kranz/.gitignore"),
+            "missions/\nconfig.json\n",
+        );
+        git(
+            dir.path(),
+            &["update-index", "--fsmonitor-valid", ".kranz/.gitignore"],
+        );
+
+        let index_tag = Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["ls-files", "-f", "--", ".kranz/.gitignore"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&index_tag.stdout),
+            "h .kranz/.gitignore\n",
+            "fixture must set fsmonitor-valid"
+        );
+        let hidden_diff = Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["diff", "--quiet", "HEAD", "--", ".kranz/.gitignore"])
+            .status()
+            .unwrap();
+        assert!(
+            hidden_diff.success(),
+            "fixture must hide the modified worktree bytes from git diff"
+        );
+        assert!(
+            !git_ignores(dir.path(), ".kranz/config.json"),
+            "readiness trusted a .gitignore hidden by fsmonitor-valid"
+        );
+    }
+
+    #[test]
     fn merge_gates_dimension_requires_a_tracked_suite() {
         let dir = TempDir::new().unwrap();
         git(dir.path(), &["init"]);
