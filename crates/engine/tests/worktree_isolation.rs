@@ -543,12 +543,20 @@ async fn base_sha_reaches_sessions_in_worktree_mode() {
         "validator session env must carry KRANZ_BASE_SHA"
     );
 
-    let gate_capture =
-        std::fs::read_to_string(&capture_file).expect("final gate must have run the command");
-    assert_eq!(
-        gate_capture, base_sha,
-        "final-gate contract-command env must carry KRANZ_BASE_SHA"
-    );
+    // The final-gate contract command probes the env with POSIX sh
+    // (`printf '%s' "$KRANZ_BASE_SHA"`); Windows runs gate commands through
+    // cmd, which doesn't expand `$VAR`, so this shell-expansion probe is
+    // unix-only. The session-env assertions above already prove the variable
+    // is injected cross-platform.
+    #[cfg(unix)]
+    {
+        let gate_capture =
+            std::fs::read_to_string(&capture_file).expect("final gate must have run the command");
+        assert_eq!(
+            gate_capture, base_sha,
+            "final-gate contract-command env must carry KRANZ_BASE_SHA"
+        );
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -1233,13 +1241,19 @@ async fn multi_milestone_worktree_mode_preserves_a1_a6_a7() {
             "every worker session env must carry KRANZ_BASE_SHA"
         );
     }
-    // ...and the final-gate contract-command env.
-    let gate_capture =
-        std::fs::read_to_string(&capture_file).expect("final gate must have run the command");
-    assert_eq!(
-        gate_capture, base_sha,
-        "final-gate contract-command env must carry KRANZ_BASE_SHA"
-    );
+    // ...and the final-gate contract-command env. The probe expands
+    // `$KRANZ_BASE_SHA` via POSIX sh; Windows gate commands run under cmd
+    // (no `$VAR` expansion), so this content check is unix-only — the
+    // session-env assertions above cover the cross-platform injection.
+    #[cfg(unix)]
+    {
+        let gate_capture =
+            std::fs::read_to_string(&capture_file).expect("final gate must have run the command");
+        assert_eq!(
+            gate_capture, base_sha,
+            "final-gate contract-command env must carry KRANZ_BASE_SHA"
+        );
+    }
 
     // No worktrees leaked either.
     let worktrees = repo.list_worktrees().unwrap();

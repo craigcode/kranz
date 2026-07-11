@@ -50,7 +50,9 @@ jobs:
           git config --global user.email ci@kranz.local
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      # --no-fail-fast: report every failing test target, not just the first,
+      # so a cross-platform break surfaces in one run instead of one per push.
+      - run: cargo test --workspace --no-fail-fast
 
   dashboard:
     runs-on: ubuntu-latest
