@@ -51,7 +51,10 @@ fn gate_base_sha_capture_command(capture_file: &Path) -> String {
     }
     #[cfg(windows)]
     {
-        format!("echo %KRANZ_BASE_SHA%> \"{}\"", capture_file.display())
+        // Redirect first: `echo %VAR%>file` treats a trailing digit of the
+        // expanded SHA as a stream handle (`N>`), so hex SHAs ending in 0-9
+        // flaky-fail on cmd. Leading `>file` avoids that parse.
+        format!(">\"{}\" echo %KRANZ_BASE_SHA%", capture_file.display())
     }
 }
 
