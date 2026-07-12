@@ -5,5 +5,5 @@ the Slack bridge reads these bullets instead of hardcoding roadmap gates.
 
 - [ ] repo public + history scrub
 - [ ] M6 live deploy
-- [ ] M2.9 live Slack validation
+- [x] M2.9 live Slack validation
 - [ ] G2 hardware

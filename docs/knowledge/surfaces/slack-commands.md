@@ -2,7 +2,7 @@
 title: Slack /kranz command surface
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-07-08
+last_verified: 2026-07-12
 verified_against:
   - crates/slack/src/inbound.rs
   - crates/slack/src/bridge.rs
@@ -112,3 +112,14 @@ Kit's per-text limits.
 Everything in `format.rs` is a pure `data -> serde_json::Value` transform; the
 button `action_id` constants (`APPROVE_ACTION_ID`, …) and modal `callback_id`s
 are the shared contract that `route_interactive` keys on.
+
+## Dogfood 2026-07-12 — live M2.9 Slack validation
+
+This mission (m-6a20dc) was driven end-to-end through the Slack surface as its
+own live validation of the M2.9 gate. The operator ran `kranz serve --slack`
+once to bring the bridge up, then completed the rest of the loop entirely from
+Slack: `/kranz draft <slug>` to draft, the **Approve & queue** button to
+approve and queue, `/kranz work run` to execute, and the **Merge** button to
+merge. The interactive deep-link buttons resolved via `slack.dashboardUrl`
+(configured to http://127.0.0.1:4560/ for this run). No other CLI commands
+were used — the CLI's role was limited to starting the bridge process.
