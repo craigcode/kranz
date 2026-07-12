@@ -1,0 +1,3 @@
+Scope any "docs-only / no product code changed" contract assertion in this repo to BOTH `crates` and `apps` — Rust lives under `crates/*` a…
+
+Scope any "docs-only / no product code changed" contract assertion in this repo to BOTH `crates` and `apps` — Rust lives under `crates/*` and also `apps/dashboard/src-tauri/` — and prove absence shell-free with `git diff --quiet $KRANZ_BASE_SHA -- crates apps` (exit-code based; no leading `!`, no pipes). Guarding `crates` alone would silently let Tauri/frontend edits slip past.
