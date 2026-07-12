@@ -18,11 +18,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Hard cap (bytes) on the rendered lessons-index string.
 pub const LESSONS_INJECT_MAX_BYTES: usize = 2048;
 
-/// At most this many of the most recent lessons appear as index entries.
+/// At most this many of the most recent lessons appear as manifest entries.
 const MAX_INDEX_ENTRIES: usize = 10;
-
-/// Of those, at most this many (the newest) get their full body inlined.
-const MAX_FULL_BODIES: usize = 3;
 
 const HEADER: &str = "## Lessons from past missions in this repo\n\n";
 
@@ -165,14 +162,28 @@ fn unsafe_lessons_path(path: &Path) -> EngineError {
     ))
 }
 
-/// Render the byte-capped recent-lessons index for injection into a
-/// planning seed, or `None` if there are no lessons to inject.
-pub fn render_lessons_index(repo_root: &Path) -> Option<String> {
+/// Render the byte-capped recent-lessons MANIFEST (id + one-line summary
+/// only, no verbatim bodies) for injection into a planning seed, keeping only
+/// lessons the provenance predicate accepts. `None` when nothing survives.
+///
+/// `is_provenance_clean` is called with each lesson's filename (`<id>.md`);
+/// the caller supplies the git-history check (was this file added by a
+/// `[kranz] mission report` commit for that mission?) so this module stays
+/// filesystem-only and unit-testable. Bodies used to be inlined here; they
+/// now arrive, mechanically pre-selected, through a separate path so a worker
+/// can't get arbitrary text into a future planner's prompt.
+pub fn render_lessons_manifest(
+    repo_root: &Path,
+    is_provenance_clean: &dyn Fn(&str) -> bool,
+) -> Option<String> {
     let lessons = open_lessons_dir(repo_root, false).ok()?;
-    render_lessons_index_in_dir(&lessons)
+    render_lessons_manifest_in_dir(&lessons, is_provenance_clean)
 }
 
-fn render_lessons_index_in_dir(lessons: &Dir) -> Option<String> {
+fn render_lessons_manifest_in_dir(
+    lessons: &Dir,
+    is_provenance_clean: &dyn Fn(&str) -> bool,
+) -> Option<String> {
     let manifest = read_existing_regular(lessons, "index.md").ok()??;
 
     let lines: Vec<&str> = manifest
@@ -184,81 +195,61 @@ fn render_lessons_index_in_dir(lessons: &Dir) -> Option<String> {
         return None;
     }
 
-    // Manifest is append-only, oldest first; take the most recent, newest first.
-    let recent: Vec<&str> = lines
-        .iter()
-        .rev()
-        .take(MAX_INDEX_ENTRIES)
-        .copied()
-        .collect();
-
-    struct Entry {
-        filename: String,
-        first_line: String,
-        full_body: Option<String>,
-    }
-
-    let entries: Vec<Entry> = recent
-        .iter()
-        .enumerate()
-        .filter_map(|(i, line)| {
-            let (filename, summary) = parse_manifest_line(line)?;
-            let file_text = read_existing_regular(lessons, &filename).ok().flatten();
-            let first_line = file_text
-                .as_deref()
-                .and_then(first_nonempty_line)
-                .map(str::to_string)
-                .unwrap_or(summary);
-            let full_body = if i < MAX_FULL_BODIES { file_text } else { None };
-            Some(Entry {
-                filename,
-                first_line,
-                full_body,
-            })
-        })
-        .collect();
-    if entries.is_empty() {
-        return None;
-    }
-
     let mut out = String::with_capacity(LESSONS_INJECT_MAX_BYTES);
     out.push_str(HEADER);
+    let mut any = false;
 
-    // Index entries are highest priority: add newest-first, stopping (and
-    // truncating the last one) the moment the cap would be exceeded.
-    for entry in &entries {
+    // Manifest is append-only, oldest first; take the most recent, newest
+    // first, keeping only provenance-clean lessons, one line each.
+    for line in lines.iter().rev() {
+        if any_count(&out, HEADER) >= MAX_INDEX_ENTRIES {
+            break;
+        }
+        let Some((filename, summary)) = parse_manifest_line(line) else {
+            continue;
+        };
+        if !is_provenance_clean(&filename) {
+            continue;
+        }
+        // Prefer the actual (provenance-checked) file's first line over the
+        // manifest summary, which a worker could have rewritten.
+        let first_line = read_existing_regular(lessons, &filename)
+            .ok()
+            .flatten()
+            .as_deref()
+            .and_then(first_nonempty_line)
+            .map(str::to_string)
+            .unwrap_or(summary);
+        let entry = format!("- {filename} — {first_line}\n");
         let remaining = LESSONS_INJECT_MAX_BYTES.saturating_sub(out.len());
         if remaining == 0 {
             break;
         }
-        let line = format!("- {} — {}\n", entry.filename, entry.first_line);
-        if line.len() <= remaining {
-            out.push_str(&line);
+        if entry.len() <= remaining {
+            out.push_str(&entry);
+            any = true;
         } else {
-            out.push_str(&truncate_to_bytes(&line, remaining));
+            out.push_str(&truncate_to_bytes(&entry, remaining));
+            any = true;
             break;
         }
     }
 
-    // Full bodies for the newest few lessons: lower priority than index
-    // entries, so they are dropped/truncated first when space is tight.
-    for entry in entries.iter().filter(|e| e.full_body.is_some()) {
-        let remaining = LESSONS_INJECT_MAX_BYTES.saturating_sub(out.len());
-        if remaining == 0 {
-            break;
-        }
-        let body = entry.full_body.as_deref().unwrap_or_default();
-        let chunk = format!("\n### {}\n{}\n", entry.filename, body.trim_end());
-        if chunk.len() <= remaining {
-            out.push_str(&chunk);
-        } else {
-            out.push_str(&truncate_to_bytes(&chunk, remaining));
-            break;
-        }
+    if !any {
+        return None;
     }
-
     debug_assert!(out.len() <= LESSONS_INJECT_MAX_BYTES);
     Some(out)
+}
+
+/// How many manifest entry lines are already in `out` (everything after the
+/// header), so the newest-first loop can stop at [`MAX_INDEX_ENTRIES`].
+fn any_count(out: &str, header: &str) -> usize {
+    out.strip_prefix(header)
+        .unwrap_or(out)
+        .lines()
+        .filter(|l| l.starts_with("- "))
+        .count()
 }
 
 /// Split a manifest line of the form `- <filename> · <summary>` into its
@@ -327,7 +318,7 @@ mod tests {
     #[test]
     fn returns_none_when_index_missing() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(render_lessons_index(dir.path()).is_none());
+        assert!(render_lessons_manifest(dir.path(), &|_: &str| true).is_none());
     }
 
     #[test]
@@ -336,7 +327,7 @@ mod tests {
         let lessons_dir = dir.path().join(".kranz").join("lessons");
         std::fs::create_dir_all(&lessons_dir).unwrap();
         std::fs::write(lessons_dir.join("index.md"), "").unwrap();
-        assert!(render_lessons_index(dir.path()).is_none());
+        assert!(render_lessons_manifest(dir.path(), &|_: &str| true).is_none());
     }
 
     #[test]
@@ -356,7 +347,8 @@ mod tests {
         )
         .unwrap();
 
-        let rendered = render_lessons_index(dir.path()).expect("safe lesson remains");
+        let rendered =
+            render_lessons_manifest(dir.path(), &|_: &str| true).expect("safe lesson remains");
         assert!(rendered.contains("SAFE LESSON"), "{rendered}");
         assert!(!rendered.contains("LOCAL SECRET"), "{rendered}");
         assert!(!rendered.contains("../../outside.md"), "{rendered}");
@@ -379,7 +371,8 @@ mod tests {
         symlink(&outside, lessons_dir.join("linked.md")).unwrap();
         std::fs::write(lessons_dir.join("index.md"), "- linked.md · fallback\n").unwrap();
 
-        let rendered = render_lessons_index(dir.path()).expect("summary remains safe");
+        let rendered =
+            render_lessons_manifest(dir.path(), &|_: &str| true).expect("summary remains safe");
         assert!(rendered.contains("fallback"), "{rendered}");
         assert!(!rendered.contains("LOCAL SECRET"), "{rendered}");
     }
@@ -397,7 +390,7 @@ mod tests {
         std::fs::write(lessons_dir.join("safe.md"), "SAFE LESSON\n").unwrap();
         symlink(&outside, lessons_dir.join("index.md")).unwrap();
 
-        assert!(render_lessons_index(dir.path()).is_none());
+        assert!(render_lessons_manifest(dir.path(), &|_: &str| true).is_none());
     }
 
     #[cfg(unix)]
@@ -412,7 +405,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".kranz")).unwrap();
         symlink(outside.path(), dir.path().join(".kranz/lessons")).unwrap();
 
-        assert!(render_lessons_index(dir.path()).is_none());
+        assert!(render_lessons_manifest(dir.path(), &|_: &str| true).is_none());
     }
 
     #[test]
@@ -532,7 +525,7 @@ mod tests {
         std::fs::write(outside.path().join("evil.md"), "LOCAL SECRET\n").unwrap();
         symlink(outside.path(), &lessons_path).unwrap();
 
-        let rendered = render_lessons_index_in_dir(&lessons).unwrap();
+        let rendered = render_lessons_manifest_in_dir(&lessons, &|_: &str| true).unwrap();
 
         assert!(rendered.contains("SAFE LESSON"), "{rendered}");
         assert!(!rendered.contains("LOCAL SECRET"), "{rendered}");
@@ -540,7 +533,7 @@ mod tests {
     }
 
     #[test]
-    fn lists_up_to_ten_newest_first_with_three_full_bodies() {
+    fn lists_up_to_ten_newest_first_manifest_only_no_bodies() {
         let dir = tempfile::tempdir().unwrap();
         for i in 1..=13 {
             write_lesson(
@@ -551,63 +544,63 @@ mod tests {
             );
         }
 
-        let rendered = render_lessons_index(dir.path()).expect("lessons present");
+        let rendered =
+            render_lessons_manifest(dir.path(), &|_: &str| true).expect("lessons present");
         assert!(rendered.starts_with("## Lessons from past missions in this repo"));
 
-        // Newest-first: m13 before m12 before ... only 10 index entries total.
+        // Newest-first, at most the 10 most recent.
         let pos_m13 = rendered.find("m13.md").expect("m13 listed");
         let pos_m12 = rendered.find("m12.md").expect("m12 listed");
         assert!(pos_m13 < pos_m12, "newest lesson must appear first");
         assert!(
             !rendered.contains("m03.md"),
-            "only the 10 most recent get index entries"
+            "only the 10 most recent listed"
         );
         assert!(
             rendered.contains("m04.md"),
-            "the 10th most recent (m04) is still listed"
+            "the 10th most recent still listed"
         );
 
         for i in 1..=13 {
-            assert!(
-                rendered.contains(&format!("SUMMARY-{i:02}-END")) == (i >= 4),
-                "index entry present only for the 10 most recent (mission {i})"
+            assert_eq!(
+                rendered.contains(&format!("SUMMARY-{i:02}-END")),
+                i >= 4,
+                "manifest summary present only for the 10 most recent (mission {i})"
             );
         }
 
-        // Full text only for the 3 newest (m13, m12, m11).
-        for i in [13, 12, 11] {
-            assert!(
-                rendered.contains(&format!("DETAIL-{i:02}-END")),
-                "full body expected for mission {i}"
-            );
-        }
-        for i in [10, 9, 4] {
+        // NO verbatim bodies are inlined any more — this is the whole point of
+        // the split: a worker can't get arbitrary lesson text into a prompt.
+        for i in 1..=13 {
             assert!(
                 !rendered.contains(&format!("DETAIL-{i:02}-END")),
-                "full body must NOT be inlined beyond the 3 newest (mission {i})"
+                "no lesson body may be inlined (mission {i})"
             );
         }
     }
 
     #[test]
-    fn hard_byte_cap_holds_with_many_large_lessons() {
+    fn provenance_predicate_filters_out_unclean_lessons() {
         let dir = tempfile::tempdir().unwrap();
-        let huge = "x".repeat(50_000);
-        for i in 1..=20 {
-            write_lesson(
-                dir.path(),
-                &format!("m{i:02}"),
-                &format!("summary {i}"),
-                &huge,
-            );
-        }
+        write_lesson(dir.path(), "m-clean", "CLEAN SUMMARY", "clean detail");
+        write_lesson(dir.path(), "m-forged", "FORGED SUMMARY", "forged detail");
 
-        let rendered = render_lessons_index(dir.path()).expect("lessons present");
+        // Predicate accepts only the clean lesson (as the git-history check
+        // would for a genuine `[kranz] mission report` commit).
+        let rendered =
+            render_lessons_manifest(dir.path(), &|filename: &str| filename == "m-clean.md")
+                .expect("the clean lesson survives");
+
+        assert!(rendered.contains("m-clean.md"), "{rendered}");
+        assert!(rendered.contains("CLEAN SUMMARY"), "{rendered}");
         assert!(
-            rendered.len() <= LESSONS_INJECT_MAX_BYTES,
-            "rendered index must respect the hard byte cap, got {} bytes",
-            rendered.len()
+            !rendered.contains("m-forged.md") && !rendered.contains("FORGED SUMMARY"),
+            "a lesson the predicate rejects must never reach the prompt: {rendered}"
         );
+
+        // When the predicate rejects everything, nothing is injected (not even
+        // a bare header).
+        assert!(render_lessons_manifest(dir.path(), &|_: &str| false).is_none());
     }
 
     #[test]
@@ -618,7 +611,8 @@ mod tests {
             write_lesson(dir.path(), &format!("m{i:02}"), &huge_line, "");
         }
 
-        let rendered = render_lessons_index(dir.path()).expect("lessons present");
+        let rendered =
+            render_lessons_manifest(dir.path(), &|_: &str| true).expect("lessons present");
         assert!(rendered.len() <= LESSONS_INJECT_MAX_BYTES);
     }
 
@@ -641,7 +635,7 @@ mod tests {
             .collect();
         let index_before = std::fs::read_to_string(lessons_dir.join("index.md")).unwrap();
 
-        let _ = render_lessons_index(dir.path());
+        let _ = render_lessons_manifest(dir.path(), &|_: &str| true);
 
         let mut after: Vec<_> = std::fs::read_dir(&lessons_dir)
             .unwrap()

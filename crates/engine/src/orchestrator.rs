@@ -4013,6 +4013,22 @@ impl MissionEngine {
         }
     }
 
+    /// Provenance-filtered lessons MANIFEST for a planning seed: only lessons
+    /// whose file was ADDED (in the current branch's reachable history) by a
+    /// `[kranz] mission report` commit carrying a matching `Kranz-Mission`
+    /// trailer reach the prompt. This keeps a worker-dropped or otherwise
+    /// arbitrary file in `.kranz/lessons/` from injecting text into a future
+    /// planner. Bodies are no longer inlined here (see the ticket
+    /// lessons-manifest-body-split); a mechanically pre-selected few arrive
+    /// through a separate path. The git check runs per listed lesson, bounded
+    /// to the manifest cap — negligible at planning frequency.
+    fn render_lessons_for_planning(&self) -> Option<String> {
+        let repo = &self.repo;
+        crate::lessons::render_lessons_manifest(&self.paths.repo_root, &|filename: &str| {
+            lesson_provenance_clean(repo, filename)
+        })
+    }
+
     /// Fallible body of [`Self::capture_lesson`].
     async fn try_capture_lesson(&mut self) -> Result<Option<Vec<PathBuf>>> {
         let message = format!(
@@ -4123,7 +4139,7 @@ impl MissionEngine {
                  milestones and features. Do not emit the plan JSON until asked.",
                 self.state.mission.goal
             );
-            if let Some(index) = lessons::render_lessons_index(&self.paths.repo_root) {
+            if let Some(index) = self.render_lessons_for_planning() {
                 seed.push_str("\n\n");
                 seed.push_str(&index);
             }
@@ -4223,7 +4239,7 @@ impl MissionEngine {
                  milestones and features. Do not emit the plan JSON until asked.",
                 self.state.mission.goal
             );
-            if let Some(index) = lessons::render_lessons_index(&self.paths.repo_root) {
+            if let Some(index) = self.render_lessons_for_planning() {
                 seed.push_str("\n\n");
                 seed.push_str(&index);
             }
@@ -4251,7 +4267,7 @@ impl MissionEngine {
                          the plan JSON until asked.",
                         self.state.mission.goal
                     );
-                    if let Some(index) = lessons::render_lessons_index(&self.paths.repo_root) {
+                    if let Some(index) = self.render_lessons_for_planning() {
                         seed.push_str("\n\n");
                         seed.push_str(&index);
                     }
@@ -5109,6 +5125,34 @@ fn judge_diff_base(base_sha: Option<&str>, base_branch: &str) -> String {
         Some(sha) if !sha.is_empty() => sha.to_string(),
         _ => base_branch.to_string(),
     }
+}
+
+/// Whether a lesson file (`<id>.md`) was legitimately produced by the engine:
+/// added — in the current branch's reachable history — by a `[kranz] mission
+/// report` commit whose `Kranz-Mission` trailer equals the file's mission id.
+///
+/// Rejects the two "outside the engine's commit flow" cases the manifest must
+/// exclude: an untracked file dropped into `.kranz/lessons/` (no adding
+/// commit → `None`), and a worker feature-commit (subject/trailer mismatch). A
+/// perfectly forged report commit is separately caught by the contract sweep —
+/// a lesson path is not mission-record, so a spoofed-subject commit touching
+/// one is still swept as out-of-contract in its own mission.
+fn lesson_provenance_clean(repo: &GitRepo, filename: &str) -> bool {
+    let Some(id) = filename.strip_suffix(".md") else {
+        return false;
+    };
+    if id.is_empty() {
+        return false;
+    }
+    let rel = format!(".kranz/lessons/{filename}");
+    let Ok(Some(add)) = repo.commit_that_added(&rel) else {
+        return false;
+    };
+    let trailer = format!("Kranz-Mission: {id}");
+    add.subject
+        .trim_start()
+        .starts_with("[kranz] mission report")
+        && add.body.lines().any(|line| line.trim() == trailer)
 }
 
 /// Prompt policy asking the orchestrator to document its research for
@@ -7971,6 +8015,72 @@ mod tests {
         Some((dir, root))
     }
 
+    /// Provenance gate (lessons-manifest-body-split): a lesson only reaches a
+    /// planning prompt if a genuine `[kranz] mission report` commit with a
+    /// MATCHING `Kranz-Mission` trailer introduced its file. Pins the four
+    /// rejection cases a forged/dropped lesson must fail.
+    #[test]
+    fn lesson_provenance_clean_accepts_only_engine_report_commits() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .expect("spawn git");
+            assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        };
+        let lessons = root.join(".kranz/lessons");
+        std::fs::create_dir_all(&lessons).unwrap();
+
+        // (1) genuine engine report commit adding the lesson + matching trailer.
+        std::fs::write(lessons.join("m-good.md"), "GOOD\n").unwrap();
+        git(&["add", ".kranz/lessons/m-good.md"]);
+        git(&[
+            "commit",
+            "-m",
+            "[kranz] mission report for m-good\n\nKranz-Mission: m-good",
+        ]);
+        // (2) a worker feature-commit (plain subject) adding a lesson-shaped file.
+        std::fs::write(lessons.join("m-worker.md"), "WORKER\n").unwrap();
+        git(&["add", ".kranz/lessons/m-worker.md"]);
+        git(&["commit", "-m", "[f-1-1] implement thing"]);
+        // (3) report subject but a trailer pointing at a DIFFERENT mission.
+        std::fs::write(lessons.join("m-mismatch.md"), "MISMATCH\n").unwrap();
+        git(&["add", ".kranz/lessons/m-mismatch.md"]);
+        git(&[
+            "commit",
+            "-m",
+            "[kranz] mission report for m-mismatch\n\nKranz-Mission: m-other",
+        ]);
+        // (4) an untracked drop — never committed at all.
+        std::fs::write(lessons.join("m-drop.md"), "DROP\n").unwrap();
+
+        let repo = GitRepo::open(&root).unwrap();
+        assert!(
+            lesson_provenance_clean(&repo, "m-good.md"),
+            "a genuine engine report commit is clean"
+        );
+        assert!(
+            !lesson_provenance_clean(&repo, "m-worker.md"),
+            "a worker feature-commit must be rejected"
+        );
+        assert!(
+            !lesson_provenance_clean(&repo, "m-mismatch.md"),
+            "a mismatched Kranz-Mission trailer must be rejected"
+        );
+        assert!(
+            !lesson_provenance_clean(&repo, "m-drop.md"),
+            "an untracked dropped file must be rejected"
+        );
+        assert!(
+            !lesson_provenance_clean(&repo, "not-a-lesson"),
+            "a non-.md name must be rejected"
+        );
+    }
+
     /// One streaming orchestrator script: session init + one turn reply.
     fn lesson_orch_script(reply: &str) -> crate::backend_mock::MockScript {
         use crate::backend_mock::{mock_init, mock_result_text, mock_text};
@@ -8391,6 +8501,24 @@ mod tests {
             .unwrap();
         f.write_all(format!("- {id}.md · {first_line}\n").as_bytes())
             .unwrap();
+        // Commit the lesson through a genuine report commit so it passes the
+        // manifest's git-history provenance check (added by a
+        // `[kranz] mission report` commit with a matching Kranz-Mission
+        // trailer) — the real capture flow, mirrored for the test.
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("spawn git");
+            assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        };
+        git(&["add", ".kranz/lessons"]);
+        git(&[
+            "commit",
+            "-m",
+            &format!("[kranz] mission report for {id}\n\nKranz-Mission: {id}"),
+        ]);
     }
 
     fn streaming_seed(spec: &SessionSpec) -> &str {
@@ -8430,6 +8558,52 @@ mod tests {
         assert!(seed.contains("m01.md"));
         assert!(seed.contains("Always check the plan for a base_branch override."));
         assert!(seed.contains("## Lessons from past missions in this repo"));
+    }
+
+    /// Ticket pin (lessons-manifest-body-split): a lesson file dropped into
+    /// `.kranz/lessons/` OUTSIDE the engine's commit flow (no `[kranz] mission
+    /// report` commit introduced it) must never reach a planning prompt. This
+    /// exercises the provenance filter end-to-end, not just its logic — a
+    /// revert to an unfiltered render would fail here.
+    #[tokio::test]
+    async fn planning_seed_omits_a_dropped_lesson_without_provenance() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        // Write the file + index entry but DO NOT commit it (an arbitrary drop).
+        let lessons_dir = root.join(".kranz").join("lessons");
+        std::fs::create_dir_all(&lessons_dir).unwrap();
+        std::fs::write(lessons_dir.join("m-drop.md"), "INJECTED PAYLOAD\n").unwrap();
+        std::fs::write(
+            lessons_dir.join("index.md"),
+            "- m-drop.md · INJECTED PAYLOAD\n",
+        )
+        .unwrap();
+
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            lesson_orch_script("ready"),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock.clone();
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+        assert_eq!(engine.state.mission.status, MissionStatus::Planning);
+
+        engine
+            .ensure_orchestrator()
+            .await
+            .expect("ensure orchestrator");
+
+        let specs = mock.started_specs();
+        assert_eq!(specs.len(), 1);
+        let seed = streaming_seed(&specs[0]);
+        assert!(
+            !seed.contains("INJECTED PAYLOAD") && !seed.contains("m-drop.md"),
+            "an uncommitted lesson must be filtered out: {seed}"
+        );
+        assert!(
+            !seed.contains("Lessons from past missions"),
+            "with no provenance-clean lessons, no lessons block is injected: {seed}"
+        );
     }
 
     #[tokio::test]

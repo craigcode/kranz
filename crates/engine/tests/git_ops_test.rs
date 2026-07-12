@@ -303,6 +303,50 @@ fn commit_paths_commits_only_named_paths() {
 }
 
 #[test]
+fn commit_that_added_reports_the_introducing_commit_or_none() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, _seed) = seeded_repo();
+    std::fs::create_dir_all(dir.path().join(".kranz/lessons")).unwrap();
+    write(&dir, ".kranz/lessons/m-x.md", "LESSON\n");
+    raw_git(dir.path(), &["add", ".kranz/lessons/m-x.md"]);
+    raw_git(
+        dir.path(),
+        &[
+            "commit",
+            "-m",
+            "[kranz] mission report for m-x\n\nKranz-Mission: m-x\nKranz-Cost-USD: 0.0000",
+        ],
+    );
+
+    let add = repo
+        .commit_that_added(".kranz/lessons/m-x.md")
+        .unwrap()
+        .expect("the introducing commit is found");
+    assert!(
+        add.subject.starts_with("[kranz] mission report for m-x"),
+        "subject: {}",
+        add.subject
+    );
+    assert!(
+        add.body.contains("Kranz-Mission: m-x"),
+        "body must carry the trailer block: {}",
+        add.body
+    );
+    assert_eq!(add.sha.len(), 40, "full sha expected: {}", add.sha);
+
+    // A path never added under version control resolves to None.
+    assert!(repo
+        .commit_that_added(".kranz/lessons/m-absent.md")
+        .unwrap()
+        .is_none());
+
+    // Flag-shaped path is refused, not passed to git.
+    assert!(repo.commit_that_added("--all").is_err());
+}
+
+#[test]
 fn commit_paths_is_idempotent_when_nothing_staged() {
     if !setup() {
         return;

@@ -24,6 +24,17 @@ pub struct CommitInfo {
     pub subject: String,
 }
 
+/// The commit that introduced a path, from [`GitRepo::commit_that_added`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddedCommit {
+    /// Full commit sha.
+    pub sha: String,
+    /// First line of the commit message.
+    pub subject: String,
+    /// The message body after the subject (carries the trailer block).
+    pub body: String,
+}
+
 /// Mission facts attached to kranz-authored durable commits as git trailers.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KranzCommitMetadata {
@@ -588,6 +599,45 @@ impl GitRepo {
             .changed_paths(from, to)?
             .iter()
             .any(|p| p.starts_with("apps/dashboard/")))
+    }
+
+    /// The most recent commit that ADDED `rel_path` (repo-relative,
+    /// forward-slash), with its subject and full message body — or `None` if
+    /// the path is untracked / was never added under version control.
+    ///
+    /// Used to check lesson-file provenance: a lesson only reaches a planning
+    /// prompt if a `[kranz] mission report` commit carrying a matching
+    /// `Kranz-Mission` trailer introduced it, so an untracked drop or a
+    /// worker feature-commit fails the check (see the lesson-manifest render).
+    pub fn commit_that_added(&self, rel_path: &str) -> Result<Option<AddedCommit>> {
+        if rel_path.starts_with('-') {
+            return Err(EngineError::Git(format!(
+                "refusing commit_that_added with flag-shaped path {rel_path:?}"
+            )));
+        }
+        // Unit-separator (\x1f) between fields; -n 1 → the newest add commit
+        // (lessons are append-only and never rewritten, so there is one).
+        let out = self.run(&[
+            "log",
+            "--diff-filter=A",
+            "-n",
+            "1",
+            "--format=%H%x1f%s%x1f%b",
+            "--",
+            rel_path,
+        ])?;
+        let out = out.trim_end_matches('\n');
+        if out.is_empty() {
+            return Ok(None);
+        }
+        let mut parts = out.splitn(3, '\u{1f}');
+        let sha = parts.next().unwrap_or_default().trim().to_string();
+        if sha.is_empty() {
+            return Ok(None);
+        }
+        let subject = parts.next().unwrap_or_default().to_string();
+        let body = parts.next().unwrap_or_default().to_string();
+        Ok(Some(AddedCommit { sha, subject, body }))
     }
 
     /// Create an annotated tag at `HEAD` (`git tag -a <name> -m <message>`).
