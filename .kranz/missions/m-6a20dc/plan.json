@@ -1,0 +1,69 @@
+{
+  "goal": "Close the M2.9 live-Slack-validation operator gate and record a dated dogfood note of the Slack control loop — docs-only, no product code.",
+  "validationContract": [
+    {
+      "id": "a1",
+      "statement": "docs/operator-gates.md marks the M2.9 live Slack validation gate as checked ([x]).",
+      "check": "command",
+      "command": "grep -Fq -- '[x] M2.9 live Slack validation' docs/operator-gates.md"
+    },
+    {
+      "id": "a2",
+      "statement": "docs/knowledge/surfaces/slack-commands.md references dashboardUrl deep links (absent before this mission).",
+      "check": "command",
+      "command": "grep -Fq -- dashboardUrl docs/knowledge/surfaces/slack-commands.md"
+    },
+    {
+      "id": "a3",
+      "statement": "The dogfood note in docs/knowledge/surfaces/slack-commands.md carries the mission date 2026-07-12.",
+      "check": "command",
+      "command": "grep -Fq -- 2026-07-12 docs/knowledge/surfaces/slack-commands.md"
+    },
+    {
+      "id": "a4",
+      "statement": "The mission is docs-only: no product code under crates/ or apps/ changed relative to the base commit pinned at plan approval.",
+      "check": "command",
+      "command": "git diff --quiet $KRANZ_BASE_SHA -- crates apps"
+    },
+    {
+      "id": "a5",
+      "statement": "The appended note is a coherent 5-10 line dated dogfood entry documenting the Slack control path (serve --slack -> /kranz draft -> Approve & queue -> work run -> merge) and stating that deep-link buttons used dashboardUrl.",
+      "check": "agent-judgement"
+    }
+  ],
+  "milestones": [
+    {
+      "title": "M2.9 gate closed and dogfood loop recorded",
+      "features": [
+        {
+          "title": "Flip the M2.9 gate and append the dated Slack dogfood note",
+          "spec": "Docs-only change, two files. You have read nothing else about this mission; everything you need is here.\n\nCONTEXT: This mission (m-6a20dc) is itself the live validation of the Kranz Slack control surface (roadmap M2.9). A human operator has driven the whole mission through Slack: `kranz serve --slack` to bring the bridge up, then `/kranz draft <slug>` to draft, the **Approve & queue** button to approve and queue, `/kranz work run` to execute, and the **Merge** button to merge. Your job is only to record that this happened, by editing two docs files. You do NOT operate Slack yourself.\n\nEDIT 1 — docs/operator-gates.md: On the line that currently reads exactly `- [ ] M2.9 live Slack validation`, change the empty checkbox to a checked one so it reads `- [x] M2.9 live Slack validation`. Change nothing else in that file; leave the other three gate bullets untouched.\n\nEDIT 2 — docs/knowledge/surfaces/slack-commands.md: Append a new short section at the END of the file — a dated dogfood note of 5 to 10 lines. It MUST: (a) be dated 2026-07-12 (e.g. a `## Dogfood 2026-07-12 — live M2.9 Slack validation` heading or a `**2026-07-12**` marker); (b) name the exact path the operator used, in order: `kranz serve --slack`, `/kranz draft`, the **Approve & queue** button, `/kranz work run`, and the **Merge** button; (c) explicitly state that the deep-link buttons used `slack.dashboardUrl` (configured to http://127.0.0.1:4560/ for this run), i.e. the note must contain the literal token `dashboardUrl`; (d) state that the loop was completed entirely via Slack surfaces (CLI used only for `kranz serve --slack`). Keep it factual and concise (5-10 lines). Also update the file's frontmatter `last_verified:` field from `2026-07-08` to `2026-07-12`, honoring the doc's own `freshness: check-on-touch` policy since you are touching it. Do not otherwise rewrite existing prose in this file.\n\nSTRICT CONSTRAINTS: Do NOT modify any Rust or frontend product code — nothing under crates/ or apps/. This is intentionally docs-only so the Slack loop is the risk under test, not code. If you discover a genuine blocker that seems to require a bridge/code change, DO NOT change code: instead create a follow-up ticket file under .kranz/tickets/ describing the blocker, leave the docs edits you can safely make, and record the blocker in your WorkerReport knownGaps.\n\nVERIFICATION: There is no runtime surface here, so do not write Rust tests. Verify your work with these exact commands (each must succeed): `grep -Fq -- '[x] M2.9 live Slack validation' docs/operator-gates.md`; `grep -Fq -- dashboardUrl docs/knowledge/surfaces/slack-commands.md`; `grep -Fq -- 2026-07-12 docs/knowledge/surfaces/slack-commands.md`; `git diff --quiet $KRANZ_BASE_SHA -- crates apps` (must exit 0 — i.e. you changed no code). Paste the command runs into your WorkerReport testEvidence.",
+          "validationCriteria": [
+            "docs/operator-gates.md contains the line `- [x] M2.9 live Slack validation` and the other gate bullets are unchanged.",
+            "docs/knowledge/surfaces/slack-commands.md ends with a 5-10 line note dated 2026-07-12 documenting the path serve --slack -> /kranz draft -> Approve & queue -> work run -> merge.",
+            "That note contains the literal token `dashboardUrl` and states the deep-link buttons used it.",
+            "The file's frontmatter last_verified is 2026-07-12.",
+            "No files under crates/ or apps/ are modified: `git diff --quiet $KRANZ_BASE_SHA -- crates apps` exits 0."
+          ]
+        }
+      ]
+    }
+  ],
+  "consideredAlternatives": {
+    "chosen": "A single docs-only feature under one milestone. Both edits are one coherent deliverable (flip the gate + record the note documenting the same validation event), tiny, and finish well within one fresh session. The contract verifies the artifacts via greps plus a shell-free docs-only guard against $KRANZ_BASE_SHA; the Slack-loop proof is inherently operational and carried by the note's testimony.",
+    "rejected": [
+      {
+        "approach": "Split into two features, one per file.",
+        "tradeOff": "Adds a handoff seam and a second session for two ~1-line-region edits that must agree on the same date and framing; higher coordination cost, zero parallelism benefit."
+      },
+      {
+        "approach": "Add contract assertions that verify the Slack transport itself (draft/approve/merge ran over Slack).",
+        "tradeOff": "No command can observe the Slack operation from the repo; it is an operator action outside the diff, forcing brittle agent-judgement on unobservable facts. The mission is deliberately docs-only, so the artifacts are the correct thing to assert."
+      }
+    ]
+  },
+  "touchSet": [
+    "docs/operator-gates.md",
+    "docs/knowledge/surfaces/slack-commands.md"
+  ]
+}
