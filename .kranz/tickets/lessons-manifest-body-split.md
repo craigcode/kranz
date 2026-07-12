@@ -4,6 +4,19 @@ priority: 2
 schedule: once
 ---
 
+## Progress
+- **Slice 1 SHIPPED (af5b187):** manifest-only planning injection (verbatim
+  bodies dropped) + git-history provenance filter (lesson must be added by a
+  `[kranz] mission report` commit with a matching `Kranz-Mission` trailer).
+  New `git_ops::commit_that_added`; `lessons::render_lessons_manifest` takes a
+  provenance predicate. Acceptance pin met: a dropped uncommitted lesson never
+  reaches the planning seed.
+- **Slice 2 REMAINING:** mechanical top-N body fetch — reuse
+  `contract_sweep::touch_set_includes` to overlap each provenance-clean
+  lesson's authoring-mission `plan.json` touchSet against the current mission's
+  touch_set/repo_refs, pulling only the top-N full bodies back into context. No
+  agent-driven fetch surface.
+
 ## Goal
 Planning prompts today ingest lesson FILE BODIES verbatim via
 render_lessons_index. Split that into two layers: prompts get only a
