@@ -16,9 +16,9 @@ Format:
 
 ## Now
 
-- **Cursor CLI / Grok 4.5 backend implementation** - implement the completed probe's direct-parser route as a single-shot, validator-first `backend_cursor`.
-  Why: Cursor now overlaps unattended agent work, but kranz's defensible layer is the mission/audit/consent harness; importing Cursor as a backend turns that pressure into model/runtime leverage.
-  Trigger: The authenticated stream-json fixture and route decision are complete; build the parser/backend, live-soak validator use, then expose it in the backend picker.
+- **Headless CLI backends: Cursor (Grok 4.5) + ChatGPT CLI (gpt-5.6-sol)** - implement the completed probe's direct-parser route as a single-shot, validator-first `backend_cursor`, and build a sibling ChatGPT-CLI backend for gpt-5.6-sol in the same pass.
+  Why: Cursor now overlaps unattended agent work, but kranz's defensible layer is the mission/audit/consent harness; importing headless coding CLIs as backends turns that pressure into model/runtime leverage. Cursor and the ChatGPT CLI are the same "absorb a CLI as a backend" pattern, so build them together and share the probe → parser → picker path.
+  Trigger: Cursor's authenticated stream-json fixture and route decision are complete; build the parser/backend, live-soak validator use, then expose it in the backend picker. The ChatGPT-CLI/gpt-5.6-sol backend needs its own probe first (auth, print-mode event structure, model/cost capture) — verify those, then reuse the Cursor parser scaffold. `gpt-5.6-sol` is Craig's stated target model; confirm the exact CLI + model id at probe time (post-cutoff, not vouched here).
   Source: docs/scoping/cursor-cli-backend.md; docs/scoping/cursor-probe-evidence/fixture-stream-json.jsonl
   Ticket: none
 
