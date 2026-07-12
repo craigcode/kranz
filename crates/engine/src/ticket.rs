@@ -429,6 +429,33 @@ impl Ticket {
         Self::read_status_file(repo_root, slug).and_then(|sf| sf.mission_id)
     }
 
+    /// Reverse of [`Self::mission_for`]: find the ticket whose `.status`
+    /// records this mission id. Used when a mission-id approve/queue path
+    /// (e.g. Slack `/kranz approve m-…`) must still advance the linked
+    /// ticket's pipeline state. First match wins; tickets without a
+    /// mission link are skipped.
+    pub fn slug_for_mission(repo_root: &Path, mission_id: &str) -> Option<String> {
+        if mission_id.is_empty() {
+            return None;
+        }
+        let dir = Self::tickets_dir(repo_root);
+        let rd = std::fs::read_dir(&dir).ok()?;
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("status") {
+                continue;
+            }
+            let slug = match path.file_stem().and_then(|s| s.to_str()) {
+                Some(s) if Self::valid_slug(s) => s.to_string(),
+                _ => continue,
+            };
+            if Self::mission_for(repo_root, &slug).as_deref() == Some(mission_id) {
+                return Some(slug);
+            }
+        }
+        None
+    }
+
     /// Append the orchestrator's verbatim clarifying questions to the ticket
     /// `.md` under a `## Needs context (from orchestrator)` heading, and set
     /// the state to [`TicketState::NeedsContext`].

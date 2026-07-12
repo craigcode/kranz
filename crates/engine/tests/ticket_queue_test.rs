@@ -891,3 +891,20 @@ fn mission_link_records_and_survives_state_flips() {
     assert_eq!(Ticket::mission_for(root, "../evil"), None);
     assert!(Ticket::record_mission(root, "../evil", "m-x").is_err());
 }
+
+#[test]
+fn slug_for_mission_reverse_lookup() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+
+    assert_eq!(Ticket::slug_for_mission(root, "m-abc123"), None);
+    assert_eq!(Ticket::slug_for_mission(root, ""), None);
+
+    Ticket::scaffold(root, "my-fix", "Fix", None, None).unwrap();
+    Ticket::record_mission(root, "my-fix", "m-abc123").unwrap();
+    assert_eq!(
+        Ticket::slug_for_mission(root, "m-abc123").as_deref(),
+        Some("my-fix")
+    );
+    assert_eq!(Ticket::slug_for_mission(root, "m-other"), None);
+}

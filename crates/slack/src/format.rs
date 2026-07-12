@@ -492,12 +492,14 @@ fn push_dashboard_button(blocks: &mut Vec<Value>, dashboard_url: Option<&str>, m
     }
 }
 
-/// Plan-APPROVED announcement: header + goal + milestone list + assertion
-/// count. Fires from the `PlanApproved` event, i.e. AFTER someone approved
-/// (button, web, CLI, headless exec) — so it carries NO approve button. (It
-/// did in the M2.75 era, when this post was the approval surface; slice 5's
-/// interactive plan-review card superseded that, and the leftover button
-/// invited stale second approvals — observed live on m-c9c915.) When
+/// Plan-ready announcement for the `plan.approved` event (plan committed on
+/// the mission branch, awaiting human queue/start). Header says "ready for
+/// review" — not "approved" — because this fires when the *engine* accepts
+/// the plan (draft park or interactive approve), before the operator queues
+/// it. Carries **Approve & start** / **Approve & queue** so the draft path
+/// has the same affordances as [`build_plan_review`]. Re-queue is a no-op
+/// ([`kranz_engine::queue::enqueue`]); stale second taps after interactive
+/// approve are refused by [`approve_flow`]'s state guards. When
 /// `dashboard_url` is set, an "Open in dashboard" deep-link is appended.
 pub fn build_plan_ready(p: &PlanReady, dashboard_url: Option<&str>) -> Vec<Value> {
     let mut milestones = String::new();
@@ -511,7 +513,7 @@ pub fn build_plan_ready(p: &PlanReady, dashboard_url: Option<&str>) -> Vec<Value
     }
 
     let mut blocks = vec![
-        header(&format!("Plan approved — {}", p.mission_id)),
+        header(&format!("Plan ready for review — {}", p.mission_id)),
         section(&format!("*Goal*\n{}", clip(&p.goal))),
         section(&format!("*Milestones*\n{}", clip(milestones.trim_end()))),
         context(&format!(
@@ -520,6 +522,24 @@ pub fn build_plan_ready(p: &PlanReady, dashboard_url: Option<&str>) -> Vec<Value
             plural(p.assertion_count),
             p.mission_id
         )),
+        json!({
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "style": "primary",
+                    "text": { "type": "plain_text", "text": "Approve & start" },
+                    "action_id": START_ACTION_ID,
+                    "value": p.mission_id,
+                },
+                {
+                    "type": "button",
+                    "text": { "type": "plain_text", "text": "Approve & queue" },
+                    "action_id": APPROVE_ACTION_ID,
+                    "value": p.mission_id,
+                }
+            ]
+        }),
     ];
     push_dashboard_button(&mut blocks, dashboard_url, &p.mission_id);
     blocks
@@ -1510,7 +1530,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_approved_announcement_has_facts_and_no_button() {
+    fn plan_ready_announcement_has_facts_and_approve_buttons() {
         let blocks = build_plan_ready(
             &PlanReady {
                 mission_id: "m-42".into(),
@@ -1530,15 +1550,23 @@ mod tests {
             "assertion count present"
         );
         assert!(
-            text.contains("Plan approved"),
-            "announces the approval, not a review ask"
+            text.contains("Plan ready for review"),
+            "asks for review, not claiming the human already approved"
         );
 
-        // Approval already happened — the announcement must carry NO approve
-        // button (a live one invited stale second approvals; seen on m-c9c915).
+        // Draft-path surface: same affordances as build_plan_review.
+        let buttons = all_buttons(&blocks);
+        let ids: Vec<&str> = buttons
+            .iter()
+            .filter_map(|b| b["action_id"].as_str())
+            .collect();
         assert!(
-            find_button(&blocks).is_none(),
-            "no button on a post-approval announcement"
+            ids.contains(&APPROVE_ACTION_ID),
+            "Approve & queue button present: {ids:?}"
+        );
+        assert!(
+            ids.contains(&START_ACTION_ID),
+            "Approve & start button present: {ids:?}"
         );
     }
 
@@ -1697,22 +1725,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// Find the first `button` element inside any `actions` block.
-    fn find_button(blocks: &[Value]) -> Option<Value> {
-        for b in blocks {
-            if b["type"] == "actions" {
-                if let Some(elems) = b["elements"].as_array() {
-                    for e in elems {
-                        if e["type"] == "button" {
-                            return Some(e.clone());
-                        }
-                    }
-                }
-            }
-        }
-        None
     }
 
     /// All `button` elements across every `actions` block.
@@ -2291,7 +2303,7 @@ mod tests {
             "leading prefix on the header: {head}"
         );
         assert!(
-            head.contains("Plan approved — m-42"),
+            head.contains("Plan ready for review — m-42"),
             "original header text intact"
         );
         // Only the first block was touched.

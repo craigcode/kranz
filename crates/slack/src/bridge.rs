@@ -3035,6 +3035,16 @@ fn pipeline_todo_actions(
                 });
             }
             PipelineStage::Delivered if row.mission_id.is_some() => {
+                // Stacked husks (base is another mission branch) cannot use the
+                // gated merge-into-trunk path — merge refuses for missing
+                // merge-gates on that base. Don't nag Merge in `/kranz todo`.
+                if row
+                    .base_branch
+                    .as_deref()
+                    .is_some_and(|b| b.starts_with("kranz/mission-"))
+                {
+                    continue;
+                }
                 let mission_id = row.mission_id.clone().expect("checked above");
                 actions.push(TodoAction {
                     kind: TodoActionKind::Delivered,
@@ -3086,6 +3096,8 @@ struct PipelineRow {
     is_blocked: bool,
     mission_status: Option<MissionStageStatus>,
     cost_usd: Option<f64>,
+    /// Mission `base_branch` when known (for Delivered merge affordance).
+    base_branch: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -3095,6 +3107,7 @@ struct MissionProjection {
     merged: Option<bool>,
     goal: String,
     cost_usd: Option<f64>,
+    base_branch: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3134,6 +3147,7 @@ fn build_pipeline_rows(repo_root: &Path) -> Vec<PipelineRow> {
             is_blocked: kranz_engine::deps::is_blocked(repo_root, &ticket.slug).unwrap_or(false),
             mission_status: mission.map(|m| m.status),
             cost_usd: mission.and_then(|m| m.cost_usd),
+            base_branch: mission.map(|m| m.base_branch.clone()),
         });
     }
 
@@ -3146,12 +3160,13 @@ fn build_pipeline_rows(repo_root: &Path) -> Vec<PipelineRow> {
             stage: stage_from_mission(mission.status, mission.merged),
             id: mission.id.clone(),
             title: mission.goal.clone(),
-            mission_id: Some(mission.id),
+            mission_id: Some(mission.id.clone()),
             slug: None,
             blocked_by: vec![],
             is_blocked: false,
             mission_status: Some(mission.status),
             cost_usd: mission.cost_usd,
+            base_branch: Some(mission.base_branch),
         });
     }
 
@@ -3174,6 +3189,7 @@ fn mission_projections(repo_root: &Path) -> Vec<MissionProjection> {
                     merged: None,
                     goal: "deleted mission (no data recorded)".to_string(),
                     cost_usd: None,
+                    base_branch: String::new(),
                 };
             }
             match EventLog::read_events(&paths.events_file()).and_then(|e| reducer::fold(&e)) {
@@ -3185,6 +3201,7 @@ fn mission_projections(repo_root: &Path) -> Vec<MissionProjection> {
                         .and_then(|repo| kranz_engine::merged::merged_bit(repo, &state.mission)),
                     goal: state.mission.goal,
                     cost_usd: (state.total_cost_usd > 0.0).then_some(state.total_cost_usd),
+                    base_branch: state.mission.base_branch,
                 },
                 Err(e) => MissionProjection {
                     id,
@@ -3192,6 +3209,7 @@ fn mission_projections(repo_root: &Path) -> Vec<MissionProjection> {
                     merged: None,
                     goal: format!("unreadable mission ({e})"),
                     cost_usd: None,
+                    base_branch: String::new(),
                 },
             }
         })
@@ -3273,16 +3291,13 @@ fn read_operator_gates(repo_root: &Path) -> Vec<crate::format::GateItem> {
 }
 
 fn parse_operator_gates(markdown: &str) -> Vec<crate::format::GateItem> {
+    // Only unchecked boxes — checked gates (`[x]`) are done and must not nag
+    // `/kranz todo` (observed live after M2.9 dogfood left `[x]` still listed).
     markdown
         .lines()
         .filter_map(|line| {
             let trimmed = line.trim_start();
-            let item = trimmed
-                .strip_prefix("- [ ] ")
-                .or_else(|| trimmed.strip_prefix("- [x] "))
-                .or_else(|| trimmed.strip_prefix("- [X] "))
-                .or_else(|| trimmed.strip_prefix("- "))?
-                .trim();
+            let item = trimmed.strip_prefix("- [ ] ")?.trim();
             (!item.is_empty()).then(|| crate::format::GateItem {
                 title: item.to_string(),
             })
@@ -3588,18 +3603,33 @@ fn render_status_body(state: &MissionState) -> String {
 /// approve→queue path.
 fn approve_mission(repo_root: &Path, mission_id: &str) -> Result<()> {
     use kranz_engine::queue::{self, QueueEntry};
-    // Priority mirrors the ticket if one drove this mission; default 2 (normal)
-    // when the mission wasn't ticket-born. We don't have the ticket slug here
-    // (it lives with the mission dir if at all), so enqueue at the default and
-    // let the queue's own ordering apply.
+    use kranz_engine::ticket::{Ticket, TicketState};
+
+    // Reverse-lookup the ticket that recorded this mission at draft time so
+    // `/kranz approve m-…` advances the same pipeline state as `/kranz queue
+    // <slug>` (Queued → Running → Done via drain).
+    let ticket_slug = Ticket::slug_for_mission(repo_root, mission_id);
+    let priority = ticket_slug
+        .as_deref()
+        .and_then(|slug| {
+            let path = Ticket::tickets_dir(repo_root).join(format!("{slug}.md"));
+            Ticket::load(&path).ok().map(|t| t.priority)
+        })
+        .unwrap_or(2);
     let entry = QueueEntry {
         mission_id: mission_id.to_string(),
-        ticket_slug: None,
-        priority: 2,
+        ticket_slug: ticket_slug.clone(),
+        priority,
         seq: 0, // assigned by enqueue
     };
     queue::enqueue(repo_root, entry).context("enqueue approved mission")?;
-    tracing::info!(mission = %mission_id, "approved+queued from Slack");
+    if let Some(slug) = &ticket_slug {
+        // Only Review → Queued; don't stomp Running/Done on a re-queue no-op.
+        if Ticket::read_state(repo_root, slug) == TicketState::Review {
+            Ticket::write_state(repo_root, slug, TicketState::Queued, None)?;
+        }
+    }
+    tracing::info!(mission = %mission_id, ticket = ?ticket_slug, "approved+queued from Slack");
     Ok(())
 }
 
@@ -5394,6 +5424,7 @@ mod tests {
             merged: Some(false),
             goal: "g".into(),
             cost_usd: None,
+            base_branch: "main".into(),
         };
         let complete_unknown = MissionProjection {
             merged: None,
@@ -5519,7 +5550,7 @@ mod tests {
         std::fs::create_dir_all(&docs).unwrap();
         std::fs::write(
             docs.join("operator-gates.md"),
-            "# Gates\n\n- [ ] repo public + history scrub\n- [ ] M6 live deploy\n",
+            "# Gates\n\n- [ ] repo public + history scrub\n- [x] M2.9 live Slack validation\n- [ ] M6 live deploy\n",
         )
         .unwrap();
 
@@ -5534,6 +5565,95 @@ mod tests {
         assert!(text.contains("http://127.0.0.1:4600/#/backlog/needs-you"));
         assert!(text.contains("repo public + history scrub"));
         assert!(text.contains("M6 live deploy"));
+        assert!(
+            !text.contains("M2.9 live Slack validation"),
+            "checked gates must not nag todo"
+        );
+    }
+
+    #[test]
+    fn parse_operator_gates_skips_checked_boxes() {
+        let items = parse_operator_gates(
+            "# Gates\n\n- [ ] still open\n- [x] M2.9 live Slack validation\n- [X] also done\n- [ ] another open\n",
+        );
+        let titles: Vec<&str> = items.iter().map(|g| g.title.as_str()).collect();
+        assert_eq!(titles, vec!["still open", "another open"]);
+    }
+
+    #[test]
+    fn build_todo_reply_omits_stacked_mission_base_from_merge_actions() {
+        // Complete mission whose base is another mission branch (stacked husk):
+        // gated merge into that base refuses; `/kranz todo` must not offer Merge.
+        use kranz_engine::events::{Event, EventKind};
+        use kranz_engine::types::MissionConfig;
+
+        let tmp = TempDir::new().unwrap();
+        let mission_id = "m-stacked";
+        let paths = MissionPaths::new(tmp.path(), mission_id);
+        std::fs::create_dir_all(paths.mission_dir()).unwrap();
+        let created = Event {
+            seq: 1,
+            ts: chrono::Utc::now(),
+            mission_id: mission_id.to_string(),
+            kind: EventKind::MissionCreated {
+                goal: "stacked leftover".into(),
+                base_branch: "kranz/mission-m-parent".into(),
+                mission_branch: format!("kranz/mission-{mission_id}"),
+                config: MissionConfig::default(),
+            },
+        };
+        let completed = Event {
+            seq: 2,
+            ts: chrono::Utc::now(),
+            mission_id: mission_id.to_string(),
+            kind: EventKind::MissionCompleted {},
+        };
+        std::fs::write(
+            paths.events_file(),
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&created).unwrap(),
+                serde_json::to_string(&completed).unwrap()
+            ),
+        )
+        .unwrap();
+
+        seed_completed_mission(tmp.path(), "m-trunk");
+
+        let blocks = build_todo_reply(tmp.path(), None);
+        let text = serde_json::to_string(&blocks).unwrap();
+        assert!(
+            text.contains("m-trunk"),
+            "trunk-based Delivered still listed"
+        );
+        assert!(
+            !text.contains("m-stacked"),
+            "stacked husk must not appear in todo Merge actions: {text}"
+        );
+    }
+
+    #[test]
+    fn approve_mission_links_ticket_and_advances_review_to_queued() {
+        use kranz_engine::queue;
+        use kranz_engine::ticket::{Ticket, TicketState};
+
+        let tmp = TempDir::new().unwrap();
+        Ticket::scaffold(tmp.path(), "dogfood", "Dogfood", None, None).unwrap();
+        Ticket::record_mission(tmp.path(), "dogfood", "m-approve").unwrap();
+        Ticket::write_state(tmp.path(), "dogfood", TicketState::Review, None).unwrap();
+        seed_mission(tmp.path(), "m-approve", "goal");
+        append_plan_approved(tmp.path(), "m-approve", "goal");
+
+        approve_mission(tmp.path(), "m-approve").unwrap();
+
+        assert_eq!(
+            Ticket::read_state(tmp.path(), "dogfood"),
+            TicketState::Queued
+        );
+        let q = queue::list(tmp.path());
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].mission_id, "m-approve");
+        assert_eq!(q[0].ticket_slug.as_deref(), Some("dogfood"));
     }
 
     #[test]

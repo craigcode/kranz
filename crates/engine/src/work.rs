@@ -147,7 +147,14 @@ where
             }
             queue::ClaimFront::Claimed(claim) => {
                 let mission_id = claim.entry.mission_id.clone();
-                let ticket_slug = claim.entry.ticket_slug.clone();
+                // Mission-id approve paths (e.g. Slack `/kranz approve m-…`)
+                // historically enqueued with `ticket_slug: None`. Resolve the
+                // linked ticket so Running/Done still advance.
+                let ticket_slug = claim
+                    .entry
+                    .ticket_slug
+                    .clone()
+                    .or_else(|| Ticket::slug_for_mission(repo_root, &mission_id));
                 if let Some(slug) = &ticket_slug {
                     if let Some(blocker) = work_skip_for_failed_blocker(repo_root, slug)? {
                         queue::finish_claim(claim);

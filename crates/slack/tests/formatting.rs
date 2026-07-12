@@ -64,14 +64,19 @@ fn plan_ready_block_kit() {
     assert!(text.contains("Token bucket") && text.contains("429 responses"));
     assert!(text.contains("2 validation assertions"));
 
-    // Post-approval announcement: NO actions block (a live approve button
-    // after approval invited stale second approvals — seen on m-c9c915) and
+    // Plan-ready surface: Approve & start / Approve & queue (draft path) and
     // still serializable (it goes straight into a chat.postMessage body).
+    let action_ids: Vec<&str> = blocks
+        .iter()
+        .filter(|b| b["type"] == "actions")
+        .flat_map(|b| b["elements"].as_array().into_iter().flatten())
+        .filter_map(|e| e["action_id"].as_str())
+        .collect();
     assert!(
-        blocks.iter().all(|b| b["type"] != "actions"),
-        "no buttons on the plan-approved announcement"
+        action_ids.contains(&"kranz_approve") && action_ids.contains(&"kranz_start"),
+        "approve affordances present: {action_ids:?}"
     );
-    assert!(text.contains("Plan approved"));
+    assert!(text.contains("Plan ready for review"));
     assert!(serde_json::to_string(&blocks).is_ok());
 }
 
