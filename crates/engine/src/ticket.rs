@@ -397,8 +397,18 @@ impl Ticket {
         if !Self::valid_slug(slug) {
             return None;
         }
-        let text = std::fs::read_to_string(Self::status_path(repo_root, slug)).ok()?;
-        serde_json::from_str(&text).ok()
+        let path = Self::status_path(repo_root, slug);
+        // A missing file is the normal "never drafted/approved" case (no log);
+        // a PRESENT but unparseable file is corruption worth surfacing, so the
+        // reverse lookup and mission-link preservation don't fail silently.
+        let text = std::fs::read_to_string(&path).ok()?;
+        match serde_json::from_str(&text) {
+            Ok(sf) => Some(sf),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "unreadable ticket status; ignoring");
+                None
+            }
+        }
     }
 
     /// Durably link the ticket to the mission `kranz draft` created for it.
@@ -432,28 +442,47 @@ impl Ticket {
     /// Reverse of [`Self::mission_for`]: find the ticket whose `.status`
     /// records this mission id. Used when a mission-id approve/queue path
     /// (e.g. Slack `/kranz approve m-…`) must still advance the linked
-    /// ticket's pipeline state. First match wins; tickets without a
-    /// mission link are skipped.
+    /// ticket's pipeline state. Tickets without a mission link are skipped.
+    ///
+    /// Slugs are scanned in sorted order so the result is deterministic (the
+    /// event-sourced engine must not depend on `read_dir` order) if two
+    /// tickets ever record the same mission id — an unexpected state, so a
+    /// duplicate link is also logged.
     pub fn slug_for_mission(repo_root: &Path, mission_id: &str) -> Option<String> {
         if mission_id.is_empty() {
             return None;
         }
         let dir = Self::tickets_dir(repo_root);
         let rd = std::fs::read_dir(&dir).ok()?;
-        for entry in rd.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("status") {
-                continue;
-            }
-            let slug = match path.file_stem().and_then(|s| s.to_str()) {
-                Some(s) if Self::valid_slug(s) => s.to_string(),
-                _ => continue,
-            };
+        let mut slugs: Vec<String> = rd
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("status"))
+            .filter_map(|e| {
+                e.path()
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .filter(|s| Self::valid_slug(s))
+                    .map(str::to_string)
+            })
+            .collect();
+        slugs.sort();
+        let mut found: Option<String> = None;
+        for slug in slugs {
             if Self::mission_for(repo_root, &slug).as_deref() == Some(mission_id) {
-                return Some(slug);
+                match &found {
+                    None => found = Some(slug),
+                    Some(first) => {
+                        tracing::warn!(
+                            mission_id,
+                            resolved = %first,
+                            duplicate = %slug,
+                            "multiple tickets link one mission; using the first by sorted slug"
+                        );
+                    }
+                }
             }
         }
-        None
+        found
     }
 
     /// Append the orchestrator's verbatim clarifying questions to the ticket

@@ -391,6 +391,25 @@ pub fn escape_mrkdwn(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// Render milestone titles as a bulleted mrkdwn list, escaping each title.
+/// Titles are LLM-authored (the orchestrator's refined plan), so a title like
+/// `<https://evil|click>` must not render as a live Slack link. Empty input
+/// yields the italic placeholder. Shared by every plan/revision card so the
+/// escaping can't drift between them.
+fn milestone_bullets(titles: &[String]) -> String {
+    if titles.is_empty() {
+        return "_(no milestones listed)_".to_string();
+    }
+    let mut out = String::new();
+    for title in titles {
+        out.push_str("• ");
+        out.push_str(&escape_mrkdwn(title.trim()));
+        out.push('\n');
+    }
+    out.truncate(out.trim_end().len());
+    out
+}
+
 // -- instance labels ----------------------------------------------------------
 
 /// Label a message with the configured instance name: a leading `[name] `
@@ -502,19 +521,11 @@ fn push_dashboard_button(blocks: &mut Vec<Value>, dashboard_url: Option<&str>, m
 /// approve are refused by [`approve_flow`]'s state guards. When
 /// `dashboard_url` is set, an "Open in dashboard" deep-link is appended.
 pub fn build_plan_ready(p: &PlanReady, dashboard_url: Option<&str>) -> Vec<Value> {
-    let mut milestones = String::new();
-    for title in &p.milestone_titles {
-        milestones.push_str("• ");
-        milestones.push_str(title.trim());
-        milestones.push('\n');
-    }
-    if milestones.is_empty() {
-        milestones.push_str("_(no milestones listed)_");
-    }
+    let milestones = milestone_bullets(&p.milestone_titles);
 
     let mut blocks = vec![
         header(&format!("Plan ready for review — {}", p.mission_id)),
-        section(&format!("*Goal*\n{}", clip(&p.goal))),
+        section(&format!("*Goal*\n{}", clip(&escape_mrkdwn(&p.goal)))),
         section(&format!("*Milestones*\n{}", clip(milestones.trim_end()))),
         context(&format!(
             "{} validation assertion{} · mission `{}` · plan committed on the mission branch",
@@ -549,15 +560,7 @@ pub fn build_plan_ready(p: &PlanReady, dashboard_url: Option<&str>) -> Vec<Value
 /// milestone list, and explicit approve/reject buttons carrying the exact
 /// revision number.
 pub fn build_revision_ready(r: &RevisionReady, dashboard_url: Option<&str>) -> Vec<Value> {
-    let mut milestones = String::new();
-    for title in &r.milestone_titles {
-        milestones.push_str("• ");
-        milestones.push_str(title.trim());
-        milestones.push('\n');
-    }
-    if milestones.is_empty() {
-        milestones.push_str("_(no milestones listed)_");
-    }
+    let milestones = milestone_bullets(&r.milestone_titles);
     let value = format!("{}:{}", r.mission_id, r.revision);
     let mut blocks = vec![
         header(&format!(
@@ -1215,19 +1218,11 @@ fn todo_button(target: &TodoTarget) -> Option<Value> {
 /// and **Approve & queue** ([`APPROVE_ACTION_ID`]) buttons, both carrying the
 /// mission id in `value`.
 pub fn build_plan_review(p: &PlanReview) -> Vec<Value> {
-    let mut milestones = String::new();
-    for title in &p.milestone_titles {
-        milestones.push_str("• ");
-        milestones.push_str(title.trim());
-        milestones.push('\n');
-    }
-    if milestones.is_empty() {
-        milestones.push_str("_(no milestones listed)_");
-    }
+    let milestones = milestone_bullets(&p.milestone_titles);
 
     let mut blocks = vec![
         header(&format!("Review plan — {}", p.mission_id)),
-        section(&format!("*Goal*\n{}", clip(p.goal.trim()))),
+        section(&format!("*Goal*\n{}", clip(&escape_mrkdwn(p.goal.trim())))),
         section(&format!("*Milestones*\n{}", clip(milestones.trim_end()))),
     ];
     if let Some(alternatives) = &p.considered_alternatives {

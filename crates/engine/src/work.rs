@@ -549,4 +549,64 @@ mod tests {
             .collect();
         assert!(leftover.is_empty(), "claim file was not retired");
     }
+
+    /// The mission-id approve path (Slack `/kranz approve m-…`) enqueues a bare
+    /// entry with `ticket_slug: None`; drain must resolve the linked ticket via
+    /// the reverse lookup so its pipeline state still advances to Done. Pins the
+    /// `.or_else(Ticket::slug_for_mission)` fallback — without it, a bare entry
+    /// runs but the ticket is left stuck in Review.
+    #[tokio::test]
+    async fn drain_queue_resolves_a_bare_entry_to_its_linked_ticket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+
+        write_ticket(
+            repo,
+            "linked",
+            "---\ntitle: linked\npriority: 2\nschedule: once\n---\n\n## Goal\nship\n",
+        );
+        // Link the ticket to the mission and park it mid-pipeline, exactly as
+        // the Slack approve-by-mission-id flow leaves it.
+        Ticket::record_mission(repo, "linked", "m-linked").unwrap();
+        Ticket::write_state(repo, "linked", TicketState::Queued, None).unwrap();
+
+        // A sibling ticket linked to a DIFFERENT mission must not be resolved.
+        write_ticket(
+            repo,
+            "other",
+            "---\ntitle: other\npriority: 2\nschedule: once\n---\n\n## Goal\nnope\n",
+        );
+        Ticket::record_mission(repo, "other", "m-other").unwrap();
+
+        queue::enqueue(
+            repo,
+            QueueEntry {
+                mission_id: "m-linked".to_string(),
+                ticket_slug: None, // bare: the fallback must find "linked"
+                priority: 2,
+                seq: 0,
+            },
+        )
+        .unwrap();
+
+        let report = drain_queue(repo, false, move |mission_id| async move {
+            assert_eq!(mission_id, "m-linked");
+            Ok(0)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(report.ran, vec!["m-linked".to_string()]);
+        assert_eq!(
+            Ticket::read_state(repo, "linked"),
+            TicketState::Done,
+            "the linked ticket must advance via the reverse lookup"
+        );
+        assert_eq!(
+            Ticket::read_state(repo, "other"),
+            TicketState::Drafting,
+            "an unrelated ticket must be untouched (record_mission left it Drafting)"
+        );
+        assert!(queue::list(repo).is_empty());
+    }
 }
