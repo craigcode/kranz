@@ -32,9 +32,11 @@ orchestrator e2e (approve→complete, deny→blocked, timeout, over-eager-park g
 cap boundary, retry re-check), CLI + REST route tests. Dashboard renders the three
 events crash-safe in the feed.
 
-STILL DEFERRED (B-surfaces ergonomics): a dashboard GrantRequestPanel with
-approve/deny buttons, and the Slack approve/deny card (clone RevisionPanel /
-`build_revision_ready`). The functional vertical works without them via CLI/REST.
+B-surfaces SHIPPED 2026-07-13 (commit 958e353): the dashboard GrantRequestPanel
+(appears on `pendingGrantRequest`, approve/deny → REST) and the Slack
+`build_grant_ready` card (approve/deny buttons → `grant_control`, is_authorized-
+gated, cross-checked against the parked request). Grant decisions are now
+one-click from all four surfaces: CLI, REST, dashboard, Slack. Nothing deferred.
 
 ## FIRST ATTEMPT REVERTED 2026-07-13 — the premise below is WRONG; read this first
 
