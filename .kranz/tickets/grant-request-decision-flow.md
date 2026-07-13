@@ -4,6 +4,48 @@ priority: 2
 schedule: once
 ---
 
+## Implementation blueprint (mapped 2026-07-12; scope confirmed with Craig)
+
+MVP scope (confirmed): trigger = COMMAND-outside-grants only (defer touch-set
+and egress); grant is MISSION-WIDE, not per-role (command_grants live on
+Mission/Plan, extend-only — a config-scoped per-role grant is only possible for
+egress, which is unobservable today). Structural clone of the pending-REVISION
+flow throughout (that is the existing human approve/deny gate; OrchestratorDecision
+is display-only and NOT the gate).
+
+Slices:
+- **B-core (engine):** 3 events `GrantRequested{feature_id, command}` /
+  `GrantApproved{command}` / `GrantDenied{command, reason}` (events.rs, clone
+  PlanRevision*); `MissionState.pending_grant_request: Option<PendingGrantRequest>`
+  (types.rs, clone pending_revision at :356) + reducer folding (set on Requested,
+  clear on Approved/Denied, and on Approved EXTEND command_grants — reuse the
+  extend-only path at reducer.rs:399-403); trigger in `run_feature` (orchestrator.rs
+  ~2231, after `let outcome = outcome?`): when `RunOutcome.denied_count > 0`,
+  derive the denied command and emit GrantRequested, then PARK the run loop
+  (mirror the pending_revision park at orchestrator.rs:1914) with a
+  timeout→auto-DENY (deny-default); `ControlCommand::ApproveGrant`/`DenyGrant`
+  (types.rs:598, clone ApproveRevision) in `drain_control` (orchestrator.rs:2023);
+  approve → GrantApproved + respawn the feature (respawn loop already at
+  orchestrator.rs:2271); deny → GrantDenied + FeatureFailed.
+  - NOTE (trigger fiddliness): the denied event gives `tool` + `summary` (e.g.
+    `Bash: <summary>`), NOT a clean grantable prefix — `RunOutcome` only carries
+    `denied_count` (runner.rs:187). Extend `RunOutcome` with
+    `denied_commands: Vec<String>` captured at runner.rs:301 (RunSink::handle
+    returns denied; grab the `tool`/`summary` there), and derive a minimal
+    command prefix for the grant (or name tool+summary and let the operator
+    confirm the prefix). This is the load-bearing design decision.
+- **B-surfaces (next):** REST `POST /api/missions/:id/grant/approve|deny` →
+  ApproveGrant/DenyGrant control commands (rest.rs, clone :349-377, guard the
+  pending grant); dashboard GrantRequestPanel (clone RevisionPanel.tsx) with
+  approve/deny; Slack card (clone format.rs build_revision_ready:562 +
+  inbound.rs:405 action ids + bridge dispatch), all `is_authorized`-gated
+  (config.rs:91). Minimal FUNCTIONAL vertical = B-core + the REST route (a
+  parked grant needs at least one approve path); dashboard/Slack are ergonomics.
+
+Deny-default + timeout-to-denied is the safety valve; every grant lands in the
+event log with who/when. See the full architecture map in the session that
+filed this (mission/audit/consent harness is the product).
+
 ## Goal
 When a worker run is stopped by a capability boundary — a command outside
 command_grants, a sandbox egress denial, a write outside the touch-set that
