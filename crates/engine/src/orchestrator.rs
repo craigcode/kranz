@@ -1514,7 +1514,10 @@ impl MissionEngine {
             command: pending.command.clone(),
         })?;
         self.emit_decision(
-            &format!("grant approved: `{}` added to command grants", pending.command),
+            &format!(
+                "grant approved: `{}` added to command grants",
+                pending.command
+            ),
             Some("the milestone's validators will re-run with the widened allow-set".to_string()),
         )?;
         self.grant_requested_at = None;
@@ -1601,7 +1604,8 @@ impl MissionEngine {
             )?;
             return Ok(false);
         }
-        self.grant_requests.insert(milestone_id.to_string(), prior + 1);
+        self.grant_requests
+            .insert(milestone_id.to_string(), prior + 1);
         self.emit(EventKind::GrantRequested {
             milestone_id: milestone_id.to_string(),
             command: command.clone(),

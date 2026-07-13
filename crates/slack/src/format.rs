@@ -1649,7 +1649,10 @@ mod tests {
             .iter()
             .filter_map(|b| b["action_id"].as_str())
             .collect();
-        assert!(ids.contains(&APPROVE_GRANT_ACTION_ID), "approve button: {ids:?}");
+        assert!(
+            ids.contains(&APPROVE_GRANT_ACTION_ID),
+            "approve button: {ids:?}"
+        );
         assert!(ids.contains(&DENY_GRANT_ACTION_ID), "deny button: {ids:?}");
         // The button value carries `<mission-id>:<command>` so the inbound
         // router can round-trip it back to the exact parked request.

@@ -610,17 +610,33 @@ impl MissionConfig {
 pub enum ControlCommand {
     Pause,
     Resume,
-    Msg { text: String, interrupt: bool },
-    ConfigChange { patch: serde_json::Value },
-    RequestRevision { instructions: String },
-    ApproveRevision { revision: u32 },
-    RejectRevision { revision: u32 },
+    Msg {
+        text: String,
+        interrupt: bool,
+    },
+    ConfigChange {
+        patch: serde_json::Value,
+    },
+    RequestRevision {
+        instructions: String,
+    },
+    ApproveRevision {
+        revision: u32,
+    },
+    RejectRevision {
+        revision: u32,
+    },
     /// Approve the parked grant request for `command` (extend `command_grants`
     /// and respawn). The command is echoed back so a stale approval can't apply
     /// to a different pending request than the operator saw.
-    ApproveGrant { command: String },
+    ApproveGrant {
+        command: String,
+    },
     /// Deny the parked grant request for `command` (fail the feature closed).
-    DenyGrant { command: String, reason: String },
+    DenyGrant {
+        command: String,
+        reason: String,
+    },
 }
 
 #[cfg(test)]

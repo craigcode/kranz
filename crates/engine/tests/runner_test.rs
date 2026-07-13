@@ -588,8 +588,14 @@ async fn denied_commands_captured_from_a_real_claude_stream() {
     assert!(matches!(&parsed_use[0],
         AgentEvent::ToolUse { tool, summary, .. } if tool == "Bash" && summary == "gc lint --strict"));
     let parsed_denied = parse_stream_line(&denied_line);
-    assert!(matches!(&parsed_denied[0],
-        AgentEvent::ToolResult { tool: None, denied: true, .. }));
+    assert!(matches!(
+        &parsed_denied[0],
+        AgentEvent::ToolResult {
+            tool: None,
+            denied: true,
+            ..
+        }
+    ));
 
     let mut events = vec![mock_init("s-real")];
     events.extend(parsed_use);
