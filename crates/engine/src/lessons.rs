@@ -21,6 +21,9 @@ pub const LESSONS_INJECT_MAX_BYTES: usize = 2048;
 /// At most this many of the most recent lessons appear as manifest entries.
 const MAX_INDEX_ENTRIES: usize = 10;
 
+/// Of those, at most this many (the newest) get their full body inlined.
+const MAX_FULL_BODIES: usize = 3;
+
 const HEADER: &str = "## Lessons from past missions in this repo\n\n";
 
 static LESSON_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -162,16 +165,18 @@ fn unsafe_lessons_path(path: &Path) -> EngineError {
     ))
 }
 
-/// Render the byte-capped recent-lessons MANIFEST (id + one-line summary
-/// only, no verbatim bodies) for injection into a planning seed, keeping only
-/// lessons the provenance predicate accepts. `None` when nothing survives.
+/// Render the byte-capped recent-lessons block for a planning seed: a
+/// manifest (id + one-line summary) of the most recent provenance-clean
+/// lessons, plus the full body of the newest [`MAX_FULL_BODIES`] of them.
+/// `None` when no provenance-clean lesson survives.
 ///
 /// `is_provenance_clean` is called with each lesson's filename (`<id>.md`);
 /// the caller supplies the git-history check (was this file added by a
 /// `[kranz] mission report` commit for that mission?) so this module stays
-/// filesystem-only and unit-testable. Bodies used to be inlined here; they
-/// now arrive, mechanically pre-selected, through a separate path so a worker
-/// can't get arbitrary text into a future planner's prompt.
+/// filesystem-only and unit-testable. That filter is what stops a
+/// worker-dropped or otherwise arbitrary file in `.kranz/lessons/` from
+/// injecting text into a future planner. Bodies are recency-selected (a
+/// mission has no touch_set at planning time to rank relevance against).
 pub fn render_lessons_manifest(
     repo_root: &Path,
     is_provenance_clean: &dyn Fn(&str) -> bool,
@@ -195,14 +200,19 @@ fn render_lessons_manifest_in_dir(
         return None;
     }
 
-    let mut out = String::with_capacity(LESSONS_INJECT_MAX_BYTES);
-    out.push_str(HEADER);
-    let mut any = false;
+    struct Entry {
+        filename: String,
+        first_line: String,
+        body: Option<String>,
+    }
 
-    // Manifest is append-only, oldest first; take the most recent, newest
-    // first, keeping only provenance-clean lessons, one line each.
+    // Manifest is append-only, oldest first; collect the most recent
+    // provenance-clean lessons, newest first, up to the index cap. The body
+    // is read for the newest few (recency-selected, since a mission has no
+    // touch_set at planning time to rank relevance against).
+    let mut entries: Vec<Entry> = Vec::new();
     for line in lines.iter().rev() {
-        if any_count(&out, HEADER) >= MAX_INDEX_ENTRIES {
+        if entries.len() >= MAX_INDEX_ENTRIES {
             break;
         }
         let Some((filename, summary)) = parse_manifest_line(line) else {
@@ -211,45 +221,67 @@ fn render_lessons_manifest_in_dir(
         if !is_provenance_clean(&filename) {
             continue;
         }
+        let file_text = read_existing_regular(lessons, &filename).ok().flatten();
         // Prefer the actual (provenance-checked) file's first line over the
         // manifest summary, which a worker could have rewritten.
-        let first_line = read_existing_regular(lessons, &filename)
-            .ok()
-            .flatten()
+        let first_line = file_text
             .as_deref()
             .and_then(first_nonempty_line)
             .map(str::to_string)
             .unwrap_or(summary);
-        let entry = format!("- {filename} — {first_line}\n");
+        let body = if entries.len() < MAX_FULL_BODIES {
+            file_text
+        } else {
+            None
+        };
+        entries.push(Entry {
+            filename,
+            first_line,
+            body,
+        });
+    }
+    if entries.is_empty() {
+        return None;
+    }
+
+    let mut out = String::with_capacity(LESSONS_INJECT_MAX_BYTES);
+    out.push_str(HEADER);
+
+    // Manifest lines are highest priority: newest-first, stopping (and
+    // truncating the last) the moment the cap would be exceeded.
+    for entry in &entries {
         let remaining = LESSONS_INJECT_MAX_BYTES.saturating_sub(out.len());
         if remaining == 0 {
             break;
         }
-        if entry.len() <= remaining {
-            out.push_str(&entry);
-            any = true;
+        let line = format!("- {} — {}\n", entry.filename, entry.first_line);
+        if line.len() <= remaining {
+            out.push_str(&line);
         } else {
-            out.push_str(&truncate_to_bytes(&entry, remaining));
-            any = true;
+            out.push_str(&truncate_to_bytes(&line, remaining));
             break;
         }
     }
 
-    if !any {
-        return None;
+    // Full bodies for the newest few clean lessons: lower priority than the
+    // manifest, so they are dropped/truncated first when space is tight.
+    for entry in entries.iter().filter(|e| e.body.is_some()) {
+        let remaining = LESSONS_INJECT_MAX_BYTES.saturating_sub(out.len());
+        if remaining == 0 {
+            break;
+        }
+        let body = entry.body.as_deref().unwrap_or_default();
+        let chunk = format!("\n### {}\n{}\n", entry.filename, body.trim_end());
+        if chunk.len() <= remaining {
+            out.push_str(&chunk);
+        } else {
+            out.push_str(&truncate_to_bytes(&chunk, remaining));
+            break;
+        }
     }
+
     debug_assert!(out.len() <= LESSONS_INJECT_MAX_BYTES);
     Some(out)
-}
-
-/// How many manifest entry lines are already in `out` (everything after the
-/// header), so the newest-first loop can stop at [`MAX_INDEX_ENTRIES`].
-fn any_count(out: &str, header: &str) -> usize {
-    out.strip_prefix(header)
-        .unwrap_or(out)
-        .lines()
-        .filter(|l| l.starts_with("- "))
-        .count()
 }
 
 /// Split a manifest line of the form `- <filename> · <summary>` into its
@@ -533,7 +565,7 @@ mod tests {
     }
 
     #[test]
-    fn lists_up_to_ten_newest_first_manifest_only_no_bodies() {
+    fn lists_up_to_ten_newest_first_with_three_clean_bodies() {
         let dir = tempfile::tempdir().unwrap();
         for i in 1..=13 {
             write_lesson(
@@ -548,7 +580,7 @@ mod tests {
             render_lessons_manifest(dir.path(), &|_: &str| true).expect("lessons present");
         assert!(rendered.starts_with("## Lessons from past missions in this repo"));
 
-        // Newest-first, at most the 10 most recent.
+        // Newest-first, at most the 10 most recent as manifest entries.
         let pos_m13 = rendered.find("m13.md").expect("m13 listed");
         let pos_m12 = rendered.find("m12.md").expect("m12 listed");
         assert!(pos_m13 < pos_m12, "newest lesson must appear first");
@@ -560,7 +592,6 @@ mod tests {
             rendered.contains("m04.md"),
             "the 10th most recent still listed"
         );
-
         for i in 1..=13 {
             assert_eq!(
                 rendered.contains(&format!("SUMMARY-{i:02}-END")),
@@ -569,12 +600,44 @@ mod tests {
             );
         }
 
-        // NO verbatim bodies are inlined any more — this is the whole point of
-        // the split: a worker can't get arbitrary lesson text into a prompt.
-        for i in 1..=13 {
+        // Full bodies only for the 3 newest (recency-selected), never beyond.
+        for i in [13, 12, 11] {
+            assert!(
+                rendered.contains(&format!("DETAIL-{i:02}-END")),
+                "full body expected for the newest lessons (mission {i})"
+            );
+        }
+        for i in [10, 9, 4] {
             assert!(
                 !rendered.contains(&format!("DETAIL-{i:02}-END")),
-                "no lesson body may be inlined (mission {i})"
+                "no body beyond the 3 newest (mission {i})"
+            );
+        }
+    }
+
+    #[test]
+    fn body_selection_skips_lessons_the_provenance_predicate_rejects() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 1..=5 {
+            write_lesson(
+                dir.path(),
+                &format!("m{i:02}"),
+                &format!("SUMMARY-{i:02}"),
+                &format!("DETAIL-{i:02}-END"),
+            );
+        }
+        // Reject the two newest — their bodies must not slip in, and the body
+        // budget applies to the CLEAN lessons only (m03, m02, m01).
+        let rejected = ["m05.md", "m04.md"];
+        let rendered = render_lessons_manifest(dir.path(), &|f: &str| !rejected.contains(&f))
+            .expect("clean lessons remain");
+
+        assert!(!rendered.contains("m05.md") && !rendered.contains("DETAIL-05-END"));
+        assert!(!rendered.contains("m04.md") && !rendered.contains("DETAIL-04-END"));
+        for i in [3, 2, 1] {
+            assert!(
+                rendered.contains(&format!("DETAIL-{i:02}-END")),
+                "clean lesson body expected (mission {i})"
             );
         }
     }
