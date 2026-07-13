@@ -34,7 +34,8 @@
 //! - anything else → [`Action::Ignore`].
 
 use crate::format::{
-    APPROVE_ACTION_ID, APPROVE_REVISION_ACTION_ID, CONFIG_BACKEND_ACTION, CONFIG_BACKEND_BLOCK,
+    APPROVE_ACTION_ID, APPROVE_GRANT_ACTION_ID, APPROVE_REVISION_ACTION_ID, CONFIG_BACKEND_ACTION,
+    CONFIG_BACKEND_BLOCK, DENY_GRANT_ACTION_ID,
     CONFIG_CALLBACK_ID, CONFIG_EFFORT_ACTION, CONFIG_EFFORT_BLOCK, CONFIG_MISSION_ACTION,
     CONFIG_MISSION_BLOCK, CONFIG_MODEL_ACTION, CONFIG_MODEL_BLOCK, CONFIG_ROLE_ACTION,
     CONFIG_ROLE_BLOCK, MERGE_ACTION_ID, NEW_MISSION_CALLBACK_ID, NEW_MISSION_GOAL_ACTION,
@@ -285,6 +286,21 @@ pub enum Action {
         user_id: Option<String>,
         response_url: Option<String>,
     },
+    /// Approve a parked capability grant from a button. The command must match
+    /// the parked request (checked at enqueue).
+    ApproveGrant {
+        mission_id: String,
+        command: String,
+        user_id: Option<String>,
+        response_url: Option<String>,
+    },
+    /// Deny a parked capability grant from a button (block the milestone).
+    DenyGrant {
+        mission_id: String,
+        command: String,
+        user_id: Option<String>,
+        response_url: Option<String>,
+    },
     /// `/kranz work` → report the queue state (entries + whether the repo is
     /// busy) as an ephemeral, and point at the `kranz work` dispatcher for
     /// actually draining it. REPORT-ONLY: the bridge must never spawn a mission
@@ -395,6 +411,8 @@ fn route_interactive(payload: &Value) -> Action {
         QueueTicket,
         ApproveRevision,
         RejectRevision,
+        ApproveGrant,
+        DenyGrant,
     }
     for action in actions {
         let kind = match action.get("action_id").and_then(Value::as_str) {
@@ -404,6 +422,8 @@ fn route_interactive(payload: &Value) -> Action {
             Some(id) if id == QUEUE_TICKET_ACTION_ID => ButtonKind::QueueTicket,
             Some(id) if id == APPROVE_REVISION_ACTION_ID => ButtonKind::ApproveRevision,
             Some(id) if id == REJECT_REVISION_ACTION_ID => ButtonKind::RejectRevision,
+            Some(id) if id == APPROVE_GRANT_ACTION_ID => ButtonKind::ApproveGrant,
+            Some(id) if id == DENY_GRANT_ACTION_ID => ButtonKind::DenyGrant,
             _ => continue,
         };
         // The mission id or ticket slug rides in the button `value`.
@@ -448,6 +468,28 @@ fn route_interactive(payload: &Value) -> Action {
                             response_url,
                         }
                     }
+                    ButtonKind::ApproveGrant => {
+                        let Some((mission_id, command)) = parse_grant_button_value(&value) else {
+                            return Action::Ignore;
+                        };
+                        Action::ApproveGrant {
+                            mission_id,
+                            command,
+                            user_id,
+                            response_url,
+                        }
+                    }
+                    ButtonKind::DenyGrant => {
+                        let Some((mission_id, command)) = parse_grant_button_value(&value) else {
+                            return Action::Ignore;
+                        };
+                        Action::DenyGrant {
+                            mission_id,
+                            command,
+                            user_id,
+                            response_url,
+                        }
+                    }
                     ButtonKind::Start => Action::ApproveStart {
                         mission_id: value,
                         user_id,
@@ -483,6 +525,19 @@ fn parse_revision_button_value(value: &str) -> Option<(String, u32)> {
     }
     let revision = revision.trim().parse::<u32>().ok()?;
     Some((mission_id.to_string(), revision))
+}
+
+/// Split a grant button value `<mission-id>:<command>`. Mission ids never
+/// contain `:`, so the FIRST colon splits cleanly and the command keeps any
+/// remaining colons. The command is NOT trimmed — it must match the parked
+/// request byte-for-byte for the enqueue's cross-check to accept it.
+fn parse_grant_button_value(value: &str) -> Option<(String, String)> {
+    let (mission_id, command) = value.split_once(':')?;
+    let mission_id = mission_id.trim();
+    if mission_id.is_empty() || command.is_empty() {
+        return None;
+    }
+    Some((mission_id.to_string(), command.to_string()))
 }
 
 /// A modal `view_submission` → [`Action::NewMission`] when it is our
@@ -1443,6 +1498,53 @@ mod tests {
                 revision: 3,
                 user_id: Some("Urev".into()),
                 response_url: Some("https://hooks.slack/rev".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn block_actions_grant_buttons_route_to_grant_actions() {
+        let approve = json!({
+            "type": "interactive",
+            "payload": {
+                "type": "block_actions",
+                "user": { "id": "Ugrant" },
+                "response_url": "https://hooks.slack/g",
+                "actions": [
+                    { "action_id": APPROVE_GRANT_ACTION_ID, "value": "m-42:gc audit --deep", "type": "button" }
+                ]
+            }
+        });
+        assert_eq!(
+            route(&approve, &lookup_none()).action,
+            Action::ApproveGrant {
+                mission_id: "m-42".into(),
+                command: "gc audit --deep".into(),
+                user_id: Some("Ugrant".into()),
+                response_url: Some("https://hooks.slack/g".into()),
+            }
+        );
+
+        // A command containing colons is preserved: only the FIRST colon splits
+        // the mission id from the command.
+        let deny = json!({
+            "type": "interactive",
+            "payload": {
+                "type": "block_actions",
+                "user": { "id": "Ugrant" },
+                "response_url": "https://hooks.slack/g",
+                "actions": [
+                    { "action_id": DENY_GRANT_ACTION_ID, "value": "m-42:psql host:5432", "type": "button" }
+                ]
+            }
+        });
+        assert_eq!(
+            route(&deny, &lookup_none()).action,
+            Action::DenyGrant {
+                mission_id: "m-42".into(),
+                command: "psql host:5432".into(),
+                user_id: Some("Ugrant".into()),
+                response_url: Some("https://hooks.slack/g".into()),
             }
         );
     }

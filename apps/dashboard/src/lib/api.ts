@@ -224,6 +224,22 @@ export const api = {
     );
   },
 
+  async approveGrant(id: string, command: string): Promise<void> {
+    await postJson<{ queued: boolean }>(
+      `/api/missions/${encodeURIComponent(id)}/grant/approve`,
+      { command },
+    );
+  },
+
+  async denyGrant(id: string, command: string, reason?: string): Promise<void> {
+    const body: { command: string; reason?: string } = { command };
+    if (reason !== undefined) body.reason = reason;
+    await postJson<{ queued: boolean }>(
+      `/api/missions/${encodeURIComponent(id)}/grant/deny`,
+      body,
+    );
+  },
+
   // --- mission lifecycle (server-hosted engine; M2.5) ----------------------
 
   createMission(goal: string, config?: Record<string, unknown>): Promise<{ id: string }> {

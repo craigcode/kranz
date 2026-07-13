@@ -18,7 +18,7 @@
 //! ticket file), so the bridge emits that one directly from the ticket layer;
 //! see [`crate::format::build_needs_context`]. It is intentionally absent here.
 
-use crate::format::{Blocked, Complete, Outcome, PlanReady, RevisionReady};
+use crate::format::{Blocked, Complete, GrantReady, Outcome, PlanReady, RevisionReady};
 use kranz_engine::events::{Event, EventKind};
 use kranz_engine::types::MissionState;
 use std::path::Path;
@@ -29,6 +29,7 @@ use std::path::Path;
 pub enum Outbound {
     PlanReady(PlanReady),
     RevisionReady(RevisionReady),
+    GrantReady(GrantReady),
     Blocked(Blocked),
     Complete(Complete),
 }
@@ -40,6 +41,9 @@ impl Outbound {
         match self {
             Outbound::PlanReady(_) => NotifyClass::PlanReady,
             Outbound::RevisionReady(_) => NotifyClass::PlanReady,
+            // A parked grant is an attention-needed block on the milestone, so
+            // it rides the same notify flag as `milestone.blocked`.
+            Outbound::GrantReady(_) => NotifyClass::Blocked,
             Outbound::Blocked(_) => NotifyClass::Blocked,
             Outbound::Complete(_) => NotifyClass::Complete,
         }
@@ -83,6 +87,15 @@ pub fn classify(event: &Event, state: &MissionState, repo_root: &Path) -> Option
             instructions: instructions.clone(),
             milestone_titles: plan.milestones.iter().map(|m| m.title.clone()).collect(),
             assertion_count: plan.validation_contract.len(),
+        })),
+
+        EventKind::GrantRequested {
+            milestone_id,
+            command,
+        } => Some(Outbound::GrantReady(GrantReady {
+            mission_id: state.mission.id.clone(),
+            milestone_id: milestone_id.clone(),
+            command: command.clone(),
         })),
 
         EventKind::MilestoneBlocked {
@@ -283,6 +296,27 @@ mod tests {
         assert_eq!(r.instructions, "reduce scope");
         assert_eq!(r.milestone_titles, vec!["Safer bucket".to_string()]);
         assert_eq!(r.assertion_count, 1);
+    }
+
+    #[test]
+    fn grant_requested_classifies_grant_ready() {
+        let out = classify(
+            &ev(EventKind::GrantRequested {
+                milestone_id: "ms-1".into(),
+                command: "gc audit --deep".into(),
+            }),
+            &base_state(),
+            no_repo(),
+        )
+        .unwrap();
+        // A parked grant rides the Blocked notify flag (attention-needed).
+        assert_eq!(out.class(), NotifyClass::Blocked);
+        let Outbound::GrantReady(g) = out else {
+            panic!("wrong variant")
+        };
+        assert_eq!(g.mission_id, "m-1");
+        assert_eq!(g.milestone_id, "ms-1");
+        assert_eq!(g.command, "gc audit --deep");
     }
 
     #[test]

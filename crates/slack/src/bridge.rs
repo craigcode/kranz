@@ -527,6 +527,7 @@ async fn post_outbound(
     let blocks = match outbound {
         Outbound::PlanReady(p) => crate::format::build_plan_ready(p, dash),
         Outbound::RevisionReady(r) => crate::format::build_revision_ready(r, dash),
+        Outbound::GrantReady(g) => crate::format::build_grant_ready(g, dash),
         Outbound::Blocked(b) => crate::format::build_blocked(b, dash),
         Outbound::Complete(c) => crate::format::build_complete(c, dash),
     };
@@ -2120,6 +2121,47 @@ async fn dispatch_action(
             )
             .await;
         }
+        Action::ApproveGrant {
+            mission_id,
+            command,
+            user_id,
+            response_url,
+        } => {
+            grant_control(
+                cfg,
+                client,
+                repo_root,
+                mission_id,
+                user_id.as_deref(),
+                response_url.as_deref(),
+                ControlCommand::ApproveGrant {
+                    command: command.clone(),
+                },
+                "grant approval queued",
+            )
+            .await;
+        }
+        Action::DenyGrant {
+            mission_id,
+            command,
+            user_id,
+            response_url,
+        } => {
+            grant_control(
+                cfg,
+                client,
+                repo_root,
+                mission_id,
+                user_id.as_deref(),
+                response_url.as_deref(),
+                ControlCommand::DenyGrant {
+                    command: command.clone(),
+                    reason: "denied from Slack".to_string(),
+                },
+                "grant denial queued",
+            )
+            .await;
+        }
 
         // Queue report. READ-ONLY and REPORT-ONLY: the bridge never drains the
         // queue on the socket loop (that would spawn `claude`); it reads the
@@ -2873,6 +2915,8 @@ fn apply_action(repo_root: &Path, action: &Action) -> Result<()> {
         | Action::Revise { .. }
         | Action::ApproveRevision { .. }
         | Action::RejectRevision { .. }
+        | Action::ApproveGrant { .. }
+        | Action::DenyGrant { .. }
         | Action::Work { .. }
         | Action::WorkRun { .. }
         | Action::AppHome { .. }
@@ -3859,6 +3903,72 @@ fn enqueue_revision_control(
     }
     kranz_engine::control::enqueue(&paths, &cmd).context("enqueue revision control")?;
     tracing::info!(mission = %mission_id, ?cmd, "revision control enqueued from Slack");
+    Ok(mission_id)
+}
+
+/// Allowlist-gate a grant approve/deny button, enqueue it, and ack over the
+/// button's `response_url`. Mirrors [`revision_control`].
+#[allow(clippy::too_many_arguments)]
+async fn grant_control(
+    cfg: &SlackConfig,
+    client: &SlackClient,
+    repo_root: &Path,
+    mission_id: &str,
+    user_id: Option<&str>,
+    response_url: Option<&str>,
+    cmd: ControlCommand,
+    queued: &str,
+) {
+    if !cfg.is_authorized(user_id) {
+        reply_ephemeral(cfg, client, response_url, &not_authorized_blocks()).await;
+        return;
+    }
+    match enqueue_grant_control(repo_root, mission_id, cmd) {
+        Ok(applied_to) => {
+            reply_ephemeral(
+                cfg,
+                client,
+                response_url,
+                &error_blocks(&format!(":memo: {queued} for `{applied_to}`.")),
+            )
+            .await;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to enqueue grant control from Slack");
+            reply_ephemeral(
+                cfg,
+                client,
+                response_url,
+                &error_blocks(&format!("Couldn't queue grant command: {e}")),
+            )
+            .await;
+        }
+    }
+}
+
+fn enqueue_grant_control(
+    repo_root: &Path,
+    mission_id: &str,
+    cmd: ControlCommand,
+) -> Result<String> {
+    let mission_id = resolve_active_config_target(repo_root, Some(mission_id))?;
+    let paths = MissionPaths::new(repo_root, &mission_id);
+    let state = read_mission_state(&paths)?;
+    let command = match &cmd {
+        ControlCommand::ApproveGrant { command } => command,
+        ControlCommand::DenyGrant { command, .. } => command,
+        _ => anyhow::bail!("not a grant control command"),
+    };
+    match state.pending_grant_request {
+        Some(pending) if pending.command == *command => {}
+        Some(pending) => anyhow::bail!(
+            "mission `{mission_id}` is awaiting a grant for `{}`, not `{command}`",
+            pending.command
+        ),
+        None => anyhow::bail!("mission `{mission_id}` has no pending grant request"),
+    }
+    kranz_engine::control::enqueue(&paths, &cmd).context("enqueue grant control")?;
+    tracing::info!(mission = %mission_id, ?cmd, "grant control enqueued from Slack");
     Ok(mission_id)
 }
 

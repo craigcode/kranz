@@ -38,6 +38,15 @@ pub const APPROVE_REVISION_ACTION_ID: &str = "kranz_approve_revision";
 /// The button value is `<mission-id>:<revision>`.
 pub const REJECT_REVISION_ACTION_ID: &str = "kranz_reject_revision";
 
+/// `action_id` of the "Approve grant" button on a grant-request card. The
+/// button value is `<mission-id>:<command>` (mission ids never contain `:`, so
+/// the first colon splits cleanly and the command may contain more).
+pub const APPROVE_GRANT_ACTION_ID: &str = "kranz_approve_grant";
+
+/// `action_id` of the "Deny" button on a grant-request card. The button value
+/// is `<mission-id>:<command>`.
+pub const DENY_GRANT_ACTION_ID: &str = "kranz_deny_grant";
+
 /// `action_id` of the "Queue" button on a `/kranz todo` Reviewable-ticket row.
 /// The button value carries the ticket slug and routes through the same
 /// allowlist-gated [`crate::inbound::Action::QueueTicket`] path as
@@ -97,6 +106,15 @@ pub struct RevisionReady {
     pub instructions: String,
     pub milestone_titles: Vec<String>,
     pub assertion_count: usize,
+}
+
+/// A parked capability-grant request awaiting human consent: a validator was
+/// stopped by a command outside its allow-set.
+#[derive(Debug, Clone)]
+pub struct GrantReady {
+    pub mission_id: String,
+    pub milestone_id: String,
+    pub command: String,
 }
 
 /// A ticket that bounced back needing more context, with the orchestrator's
@@ -605,6 +623,48 @@ pub fn build_revision_ready(r: &RevisionReady, dashboard_url: Option<&str>) -> V
         }),
     ];
     push_dashboard_button(&mut blocks, dashboard_url, &r.mission_id);
+    blocks
+}
+
+/// Parked-grant announcement: names the exact command a validator was denied
+/// and offers approve/deny buttons carrying `<mission-id>:<command>`. Approving
+/// extends `command_grants` and re-validates; denying blocks the milestone.
+pub fn build_grant_ready(g: &GrantReady, dashboard_url: Option<&str>) -> Vec<Value> {
+    let value = format!("{}:{}", g.mission_id, g.command);
+    let mut blocks = vec![
+        header(&format!("Grant requested — {}", g.mission_id)),
+        section("A validator is blocked on a command outside its allow-set."),
+        // The command is scrubbed at capture, but escape Slack control
+        // sequences defensively before rendering it as text.
+        section(&format!(
+            "*Blocked command*\n{}",
+            clip(&escape_mrkdwn(g.command.trim()))
+        )),
+        context(&format!(
+            "milestone `{}` · mission `{}`",
+            g.milestone_id, g.mission_id
+        )),
+        json!({
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "style": "primary",
+                    "text": { "type": "plain_text", "text": "Approve grant" },
+                    "action_id": APPROVE_GRANT_ACTION_ID,
+                    "value": value.clone(),
+                },
+                {
+                    "type": "button",
+                    "style": "danger",
+                    "text": { "type": "plain_text", "text": "Deny" },
+                    "action_id": DENY_GRANT_ACTION_ID,
+                    "value": value,
+                }
+            ]
+        }),
+    ];
+    push_dashboard_button(&mut blocks, dashboard_url, &g.mission_id);
     blocks
 }
 
@@ -1562,6 +1622,41 @@ mod tests {
         assert!(
             ids.contains(&START_ACTION_ID),
             "Approve & start button present: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn grant_ready_names_the_command_with_approve_deny_buttons() {
+        let blocks = build_grant_ready(
+            &GrantReady {
+                mission_id: "m-42".into(),
+                milestone_id: "ms-1".into(),
+                command: "gc audit --deep".into(),
+            },
+            None,
+        );
+        let text = all_text(&blocks);
+        assert!(text.contains("m-42"), "mission id present");
+        assert!(text.contains("ms-1"), "milestone present");
+        assert!(
+            text.contains("gc audit --deep"),
+            "the blocked command is named"
+        );
+        assert!(text.contains("Grant requested"), "asks for a decision");
+
+        let buttons = all_buttons(&blocks);
+        let ids: Vec<&str> = buttons
+            .iter()
+            .filter_map(|b| b["action_id"].as_str())
+            .collect();
+        assert!(ids.contains(&APPROVE_GRANT_ACTION_ID), "approve button: {ids:?}");
+        assert!(ids.contains(&DENY_GRANT_ACTION_ID), "deny button: {ids:?}");
+        // The button value carries `<mission-id>:<command>` so the inbound
+        // router can round-trip it back to the exact parked request.
+        let values: Vec<&str> = buttons.iter().filter_map(|b| b["value"].as_str()).collect();
+        assert!(
+            values.contains(&"m-42:gc audit --deep"),
+            "button value round-trips: {values:?}"
         );
     }
 

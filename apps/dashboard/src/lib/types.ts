@@ -181,6 +181,11 @@ export interface PendingRevision {
   instructions: string;
 }
 
+export interface PendingGrantRequest {
+  milestoneId: string;
+  command: string;
+}
+
 export interface TokenUsage {
   input: number;
   output: number;
@@ -262,6 +267,7 @@ export interface MissionState {
   config: MissionConfig;
   latestPlanRevision: number;
   pendingRevision?: PendingRevision;
+  pendingGrantRequest?: PendingGrantRequest;
   lastSeq: number;
 }
 
