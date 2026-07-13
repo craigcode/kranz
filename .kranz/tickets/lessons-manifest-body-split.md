@@ -11,11 +11,13 @@ schedule: once
   New `git_ops::commit_that_added`; `lessons::render_lessons_manifest` takes a
   provenance predicate. Acceptance pin met: a dropped uncommitted lesson never
   reaches the planning seed.
-- **Slice 2 REMAINING:** mechanical top-N body fetch — reuse
-  `contract_sweep::touch_set_includes` to overlap each provenance-clean
-  lesson's authoring-mission `plan.json` touchSet against the current mission's
-  touch_set/repo_refs, pulling only the top-N full bodies back into context. No
-  agent-driven fetch surface.
+- **Slice 2 SHIPPED (54b4f79):** full bodies for the newest MAX_FULL_BODIES
+  provenance-clean lessons, inlined below the manifest, byte-capped. Selection
+  is RECENCY, not touch-set overlap: investigation found a mission has no
+  touch_set at planning time (set only at plan approval) and Mission carries no
+  repo_refs, so there is no mechanical relevance signal to rank against —
+  recency is the honest selector (Craig's call). The provenance predicate gates
+  body selection too. TICKET DONE.
 
 ## Goal
 Planning prompts today ingest lesson FILE BODIES verbatim via
