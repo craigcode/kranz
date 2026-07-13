@@ -72,9 +72,11 @@ the `dispatch_action` arm itself or a gate helper it calls (`approve_flow`,
 [<id>]`, `revise <id> <instr>`, `revision approve|reject <id> <rev>`, and
 `ticket new <slug> <title…>` (the modal-open is gated). Buttons carry the same
 gate: **Approve & queue** (`kranz_approve`), **Approve & start** (`kranz_start`),
-**Merge** (`kranz_merge`), the todo **Queue** button (`kranz_queue_ticket`), and
-**Approve/Reject revision** all capture `user.id` + `response_url` so the bridge
-refuses an unlisted clicker exactly like the slash twin. A thread reply
+**Merge** (`kranz_merge`), the todo **Queue** button (`kranz_queue_ticket`),
+**Approve/Reject revision**, and **Approve/Deny grant** (`kranz_approve_grant` /
+`kranz_deny_grant`, on the parked capability-grant card) all capture `user.id` +
+`response_url` so the bridge refuses an unlisted clicker exactly like the slash
+twin. A thread reply
 (`Action::Guidance`) is gated too: a planning-mission reply runs a hosted
 planning turn, and steering a running mission is gated as spend-adjacent.
 
