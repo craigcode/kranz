@@ -4,7 +4,53 @@ priority: 2
 schedule: once
 ---
 
-## Implementation blueprint (mapped 2026-07-12; scope confirmed with Craig)
+## FIRST ATTEMPT REVERTED 2026-07-13 — the premise below is WRONG; read this first
+
+A B-core build (commit 79d3f5e) was reverted after adversarial review found it
+DEAD IN PRODUCTION on two counts (both verified in code):
+
+1. **The worker-denial trigger cannot fire.** The capture keyed off
+   `ToolResult { tool: Some("bash") }`, but Claude ALWAYS sets `tool: None`
+   (backend_claude.rs — the tool name is on the tool_use block, never
+   correlated to the tool_result); Codex sets `tool: "command_execution"`
+   with the command's OUTPUT (not the command) as summary; Droid emits no
+   ToolResult. So `denied_commands` is always empty in prod and GrantRequested
+   never fires. The green "end-to-end" tests only passed because
+   `mock_denied("Bash", cmd)` fabricates a shape no backend produces.
+2. **Even if it fired, an approved grant cannot unblock a WORKER denial.**
+   `command_grants` adds an ALLOW; workers already have a blanket `Bash` allow,
+   so their only denials are WORKER_DENY (curl/git push/sudo), `deny_patterns`,
+   or hooks — all in `disallowed_tools`, and DENY WINS over allow in Claude
+   Code (permissions.rs:4). So approving the command is a no-op unblock.
+
+Corrected approach for the next attempt:
+- **Trigger on VALIDATOR command-denials, not worker denials.** Validators get
+  NO blanket Bash; a command outside their allow-set is a real allow-set miss
+  that extending `command_grants` genuinely unblocks (permissions.rs: validator
+  denials "surface as findings"). That is the case the grant flow can actually
+  fix. (Worker deny-rule/hook denials would need the grant to SUBTRACT from the
+  deny set, a bigger change — defer or scope out.)
+- **Get the command from the preceding `ToolUse` block** (correlate by
+  tool_use_id), never from `ToolResult.tool`/`summary`.
+- **Decide approve-vs-deny from the EVENT** (GrantApproved vs GrantDenied), not
+  by re-deriving "is the command in command_grants" — a concurrent plan
+  revision that extends command_grants can otherwise flip a DENY into approve.
+- **Add a per-feature grant-request CAP** (the reverted build removed the
+  respawn-budget charge with no replacement → unbounded loop under any
+  auto-approver).
+- **Route the gate at the run-loop level, not deep inside run_feature.** The
+  reverted build's park called the full `drain_control`, which applied plan
+  revisions under stale mi/fi indices (OOB / wrong-feature) and bypassed the
+  §4.4 dirty-tree gate and the pending_revision/pause gates.
+- **Reducer must cross-check `pending_grant_request`** on GrantApproved/Denied
+  (like PlanRevised does on `pending.revision`), or a forged/replayed
+  grant.approved silently widens command_grants.
+- **Test from a REAL Claude event fixture** (`backend_claude::parse_user` or a
+  captured stream), NOT `mock_denied`, so a dead trigger can't pass green again.
+- Editing `crates/engine/src/types.rs` (a CONTRACT FILE) was needed for the new
+  state/config — additive, but flag/confirm before doing it again.
+
+## Implementation blueprint (mapped 2026-07-12; scope confirmed with Craig — NOTE: superseded by the reverted-attempt findings above, esp. the worker-vs-validator trigger)
 
 MVP scope (confirmed): trigger = COMMAND-outside-grants only (defer touch-set
 and egress); grant is MISSION-WIDE, not per-role (command_grants live on
