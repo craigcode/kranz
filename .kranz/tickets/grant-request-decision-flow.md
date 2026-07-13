@@ -36,7 +36,24 @@ B-surfaces SHIPPED 2026-07-13 (commit 958e353): the dashboard GrantRequestPanel
 (appears on `pendingGrantRequest`, approve/deny → REST) and the Slack
 `build_grant_ready` card (approve/deny buttons → `grant_control`, is_authorized-
 gated, cross-checked against the parked request). Grant decisions are now
-one-click from all four surfaces: CLI, REST, dashboard, Slack. Nothing deferred.
+one-click from all four surfaces: CLI, REST, dashboard, Slack.
+
+TOUCH-SET GRANTS SHIPPED 2026-07-13: the flow now generalizes over a `GrantKind`
+(`command` → `command_grants`; `touch-path` → `touch_set`), reusing the whole
+park/approve/deny/timeout/cap machinery and all four surfaces. A worker write
+outside the `touch_set` (surfaced by the deterministic out-of-contract sweep,
+`grantable_touch_path`) parks a touch grant: approve extends `touch_set` and
+re-validates clean; deny/timeout does NOT block — the write flows to the normal
+fix/waive path (deny asymmetry from command grants, which block). Cleared a
+focused adversarial review (fixed: touch trigger wrongly offering the
+primary-checkout / glob-error findings, and trusting non-engine findings).
+Known bounded limitations documented in `deny_pending_grant`: touch-deny is
+process-durable via the cap, not log-durable (restart may re-prompt); the
+per-milestone cap is shared with command grants (fails closed).
+
+REMAINING: worker deny-rule grants (deny-set subtraction — a safety tradeoff,
+separate slice) and egress grants (blocked on sandbox instrumentation, see
+`egress-grant-sandbox-instrumentation.md`).
 
 ## FIRST ATTEMPT REVERTED 2026-07-13 — the premise below is WRONG; read this first
 

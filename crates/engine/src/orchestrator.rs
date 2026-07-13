@@ -1511,34 +1511,51 @@ impl MissionEngine {
             )));
         }
         self.emit(EventKind::GrantApproved {
+            kind: pending.kind,
             command: pending.command.clone(),
         })?;
+        let (list_label, detail) = match pending.kind {
+            GrantKind::Command => (
+                "command grants",
+                "the milestone's validators will re-run with the widened allow-set",
+            ),
+            GrantKind::TouchPath => (
+                "touch set",
+                "the milestone re-validates with the path inside the contract",
+            ),
+        };
         self.emit_decision(
             &format!(
-                "grant approved: `{}` added to command grants",
+                "grant approved: `{}` added to {list_label}",
                 pending.command
             ),
-            Some("the milestone's validators will re-run with the widened allow-set".to_string()),
+            Some(detail.to_string()),
         )?;
         self.grant_requested_at = None;
         Ok(())
     }
 
     /// Deny the parked grant for `command`: append `grant.denied` (clears the
-    /// pending request) and then block the milestone that hit the boundary with
-    /// the existing refusal semantics. The block is what actually stops the run
-    /// loop re-entering validation forever; without it, clearing the pending
-    /// request alone would let the next validation round re-request the same
-    /// grant. Same command-match guard as approval.
+    /// pending request), then apply the kind's refusal semantics.
     ///
-    /// The `MilestoneBlocked` emit is guarded on the milestone still existing: a
-    /// concurrent plan revision can drop the parked (in-flight) milestone, and
-    /// `MilestoneBlocked` for an unknown milestone fails its OWN reducer fold —
-    /// which, because `emit` appends before it folds, would brick the mission on
-    /// every future load (and the deny-default timeout makes that automatic). If
-    /// the milestone is gone, the revision already moved past it, so clearing
-    /// the grant (`grant.denied`, which folds unconditionally) is enough — the
-    /// run loop re-evaluates the revised plan.
+    /// - `Command`: block the milestone. The block is what stops the run loop
+    ///   re-entering validation forever; without it, clearing the pending
+    ///   request alone would let the next round re-request the same grant.
+    /// - `TouchPath`: do NOT block — the out-of-contract write is a normal
+    ///   finding, so let it flow to the fix/waive path exactly as it did before
+    ///   touch grants existed. Instead, saturate the per-milestone grant counter
+    ///   so the next validation round doesn't re-offer the same touch grant (the
+    ///   sweep re-produces the finding, but the cap-reached branch then falls
+    ///   through to `convert_findings`).
+    ///
+    /// The `Command` `MilestoneBlocked` emit is guarded on the milestone still
+    /// existing: a concurrent plan revision can drop the parked (in-flight)
+    /// milestone, and `MilestoneBlocked` for an unknown milestone fails its OWN
+    /// reducer fold — which, because `emit` appends before it folds, would brick
+    /// the mission on every future load (the deny-default timeout makes that
+    /// automatic). If the milestone is gone, the revision already moved past it,
+    /// so clearing the grant (`grant.denied`, which folds unconditionally) is
+    /// enough — the run loop re-evaluates the revised plan.
     fn deny_pending_grant(&mut self, command: &str, reason: &str) -> Result<()> {
         let pending = self.state.pending_grant_request.clone().ok_or_else(|| {
             EngineError::InvalidState("no pending grant request to deny".to_string())
@@ -1550,20 +1567,47 @@ impl MissionEngine {
             )));
         }
         self.emit(EventKind::GrantDenied {
+            kind: pending.kind,
             command: pending.command.clone(),
             reason: reason.to_string(),
         })?;
-        let milestone_exists = self
-            .state
-            .mission
-            .milestones
-            .iter()
-            .any(|m| m.id == pending.milestone_id);
-        if milestone_exists {
-            self.emit(EventKind::MilestoneBlocked {
-                milestone_id: pending.milestone_id.clone(),
-                reason: format!("validator command denied: `{}` — {reason}", pending.command),
-            })?;
+        match pending.kind {
+            GrantKind::Command => {
+                let milestone_exists = self
+                    .state
+                    .mission
+                    .milestones
+                    .iter()
+                    .any(|m| m.id == pending.milestone_id);
+                if milestone_exists {
+                    self.emit(EventKind::MilestoneBlocked {
+                        milestone_id: pending.milestone_id.clone(),
+                        reason: format!(
+                            "validator command denied: `{}` — {reason}",
+                            pending.command
+                        ),
+                    })?;
+                }
+            }
+            GrantKind::TouchPath => {
+                // No block: saturate the cap so re-validation stops re-offering
+                // and the finding flows to convert_findings (fix/waive).
+                //
+                // Two bounded, fail-safe limitations of using the ephemeral
+                // counter (vs a durable MilestoneBlocked) here:
+                //  - Restart re-arm: the counter is process-local, so a crash
+                //    during the re-validation window loses the "already denied"
+                //    memory and the deterministic sweep re-offers the grant once
+                //    more. Safe (re-prompt, not a brick/loop) and bounded by the
+                //    cap; the alternative — a durable "denied path" marker —
+                //    isn't worth the event-schema weight for a re-prompt.
+                //  - Cap coupling: the counter is shared with command grants for
+                //    this milestone, so a later command denial in the SAME run
+                //    won't be offered a grant (falls through to block). Fails
+                //    closed; rare (both boundaries in one milestone-run).
+                self.grant_requests
+                    .insert(pending.milestone_id.clone(), self.grant_request_cap);
+            }
         }
         self.emit_decision(
             &format!("grant denied: `{}`", pending.command),
@@ -1573,31 +1617,24 @@ impl MissionEngine {
         Ok(())
     }
 
-    /// If `outcome` was stopped by a grantable command denial, offer the
-    /// operator the narrowest grant and park (emit `GrantRequested`), returning
+    /// Park a `kind` grant for `target` (emit `GrantRequested`), returning
     /// `true`. Bounded by `grant_request_cap` per milestone: over the cap it
-    /// emits an informational decision and returns `false` so the caller blocks
-    /// via the normal path (this monotonic, never-reset counter is what bounds
-    /// the park→approve→re-validate loop). Returns `false` when there is no
-    /// denied command to grant. Callers gate this on an UNTRUSTED outcome.
-    fn maybe_park_for_grant(
+    /// emits an informational decision and returns `false` so the caller falls
+    /// through to its normal path (this monotonic, never-reset counter is what
+    /// bounds the park→approve→re-validate loop). `blocked_desc` is the
+    /// human-readable "what was blocked" clause for the decision line.
+    fn park_for_grant(
         &mut self,
         milestone_id: &str,
-        role: Role,
-        outcome: &runner::RunOutcome,
+        kind: GrantKind,
+        target: &str,
+        blocked_desc: &str,
     ) -> Result<bool> {
-        // Only the first denied command is offered; a re-run surfaces the next.
-        // Non-command denials (Write/Edit/web — READ_ONLY_DENY, deny-wins) never
-        // populate `denied_commands`, so they don't reach here.
-        let Some(command) = outcome.denied_commands.first().cloned() else {
-            return Ok(false);
-        };
         let prior = *self.grant_requests.get(milestone_id).unwrap_or(&0);
         if prior >= self.grant_request_cap {
             self.emit_decision(
                 &format!(
-                    "{} still blocked on `{command}` after {} grant request(s); not offering another",
-                    role_label(role),
+                    "still blocked on `{target}` after {} grant request(s); not offering another",
                     self.grant_request_cap
                 ),
                 None,
@@ -1608,16 +1645,63 @@ impl MissionEngine {
             .insert(milestone_id.to_string(), prior + 1);
         self.emit(EventKind::GrantRequested {
             milestone_id: milestone_id.to_string(),
-            command: command.clone(),
+            kind,
+            command: target.to_string(),
         })?;
         self.emit_decision(
-            &format!(
-                "{} validation blocked on `{command}`; parked for an operator grant decision",
-                role_label(role)
-            ),
+            &format!("{blocked_desc}; parked for an operator grant decision"),
             None,
         )?;
         Ok(true)
+    }
+
+    /// If `outcome` was stopped by a grantable command denial, offer the
+    /// operator the narrowest command grant and park, returning `true`. Only the
+    /// first denied command is offered; a re-run surfaces the next. Non-command
+    /// denials (Write/Edit/web — READ_ONLY_DENY, deny-wins) never populate
+    /// `denied_commands`, so they don't reach here. Callers gate this on an
+    /// UNTRUSTED outcome.
+    fn maybe_park_for_grant(
+        &mut self,
+        milestone_id: &str,
+        role: Role,
+        outcome: &runner::RunOutcome,
+    ) -> Result<bool> {
+        let Some(command) = outcome.denied_commands.first().cloned() else {
+            return Ok(false);
+        };
+        let desc = format!("{} validation blocked on `{command}`", role_label(role));
+        self.park_for_grant(milestone_id, GrantKind::Command, &command, &desc)
+    }
+
+    /// If the milestone's findings include a genuine out-of-contract write,
+    /// offer the operator a touch-set grant for that path and park, returning
+    /// `true`. Approving extends `touch_set` so the write is in-contract on
+    /// re-validate; denying (or a timeout) lets the write flow to the normal
+    /// fix/waive path. Bounded by the same per-milestone cap.
+    ///
+    /// Only the TRUSTED deterministic engine sweep (`ENGINE_RUN_ID`) can offer a
+    /// touch grant — never a spawned validator that merely emitted a finding
+    /// with the same class string. And only a genuinely GRANTABLE path is
+    /// offered ([`contract_sweep::grantable_touch_path`]): the `FINDING_CLASS`
+    /// string is shared by the primary-checkout sentinel and glob-compile-error
+    /// findings, neither of which extending `touch_set` can resolve.
+    fn maybe_park_for_touch_grant(
+        &mut self,
+        milestone_id: &str,
+        findings: &[(String, Finding)],
+    ) -> Result<bool> {
+        let touch_set = &self.state.mission.touch_set;
+        let Some(path) = findings
+            .iter()
+            .filter(|(run_id, _)| run_id.as_str() == crate::reducer::ENGINE_RUN_ID)
+            .find_map(|(_, f)| contract_sweep::grantable_touch_path(f, touch_set))
+            .map(str::to_string)
+        else {
+            return Ok(false);
+        };
+        let desc = format!("worker wrote `{path}` outside the touch-set");
+        self.park_for_grant(milestone_id, GrantKind::TouchPath, &path, &desc)
     }
 
     /// Persist the approval-time cost estimate to the primary mission dir as
@@ -3483,6 +3567,16 @@ impl MissionEngine {
         // exactly like `final_gate`'s synthesized findings.
         for finding in self.out_of_contract_sweep(&start_sha)? {
             findings.push((crate::reducer::ENGINE_RUN_ID.to_string(), finding));
+        }
+
+        // Touch-set grant (grant-request-decision-flow): an out-of-contract
+        // write can be resolved by extending the touch_set instead of fixing or
+        // waiving it. Offer the operator that grant and park BEFORE recording
+        // the findings (so a re-validation on approve doesn't double-emit them):
+        // approve extends touch_set and re-validates clean; deny/timeout
+        // saturates the cap and lets the write flow to the fix/waive path below.
+        if self.maybe_park_for_touch_grant(&milestone_id, &findings)? {
+            return Ok(());
         }
 
         for (run_id, finding) in &findings {

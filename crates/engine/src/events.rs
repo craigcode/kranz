@@ -66,28 +66,44 @@ pub enum EventKind {
     #[serde(rename = "plan.revision.rejected")]
     PlanRevisionRejected { revision: u32, reason: String },
 
-    /// A validator run was stopped by a command outside its allow-set. Names
-    /// the exact command a `command_grants` extension would unblock, and parks
-    /// the milestone's validation for an operator approve/deny decision — the
-    /// capability-denial analogue of `plan.revision.proposed`. Validators are
-    /// keyed to a milestone (they diff its start..HEAD), so this is too. Deny
-    /// is the default; an unanswered request times out to `grant.denied`.
+    /// A run was stopped by a capability boundary and parks the milestone's
+    /// validation for an operator approve/deny decision — the capability-denial
+    /// analogue of `plan.revision.proposed`. `kind` selects the boundary: a
+    /// `command` (validator command outside its allow-set → `command_grants`) or
+    /// a `touch-path` (worker write outside the `touch_set` → `touch_set`).
+    /// Validators/sweeps are keyed to a milestone (they diff its start..HEAD),
+    /// so this is too. Deny is the default; an unanswered request times out to
+    /// `grant.denied`. `command` holds the target (a command, or a path glob
+    /// for `touch-path`).
     #[serde(rename = "grant.requested")]
     GrantRequested {
         #[serde(rename = "milestoneId")]
         milestone_id: String,
+        #[serde(default)]
+        kind: crate::types::GrantKind,
         command: String,
     },
 
-    /// Operator approved the parked grant. The reducer extends
-    /// `command_grants` (extend-only) so the retried run clears the boundary.
+    /// Operator approved the parked grant. The reducer extends the list `kind`
+    /// selects (`command_grants` or `touch_set`), extend-only, so the retried
+    /// run clears the boundary.
     #[serde(rename = "grant.approved")]
-    GrantApproved { command: String },
+    GrantApproved {
+        #[serde(default)]
+        kind: crate::types::GrantKind,
+        command: String,
+    },
 
-    /// Operator denied the parked grant, or it timed out (deny-default). The
-    /// feature fails with the existing refusal semantics.
+    /// Operator denied the parked grant, or it timed out (deny-default). A
+    /// denied command-grant blocks the milestone (refusal); a denied touch-path
+    /// grant lets the out-of-contract write flow to the normal fix/waive path.
     #[serde(rename = "grant.denied")]
-    GrantDenied { command: String, reason: String },
+    GrantDenied {
+        #[serde(default)]
+        kind: crate::types::GrantKind,
+        command: String,
+        reason: String,
+    },
 
     #[serde(rename = "milestone.started")]
     MilestoneStarted {

@@ -91,10 +91,12 @@ pub fn classify(event: &Event, state: &MissionState, repo_root: &Path) -> Option
 
         EventKind::GrantRequested {
             milestone_id,
+            kind,
             command,
         } => Some(Outbound::GrantReady(GrantReady {
             mission_id: state.mission.id.clone(),
             milestone_id: milestone_id.clone(),
+            kind: *kind,
             command: command.clone(),
         })),
 
@@ -303,6 +305,7 @@ mod tests {
         let out = classify(
             &ev(EventKind::GrantRequested {
                 milestone_id: "ms-1".into(),
+                kind: kranz_engine::types::GrantKind::Command,
                 command: "gc audit --deep".into(),
             }),
             &base_state(),

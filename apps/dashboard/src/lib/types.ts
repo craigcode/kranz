@@ -181,8 +181,13 @@ export interface PendingRevision {
   instructions: string;
 }
 
+export type GrantKind = 'command' | 'touch-path';
+
 export interface PendingGrantRequest {
   milestoneId: string;
+  /** Defaults to 'command' for pre-`kind` snapshots. */
+  kind?: GrantKind;
+  /** The granted target: a command string, or a path glob for a touch grant. */
   command: string;
 }
 

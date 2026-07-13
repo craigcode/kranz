@@ -20,6 +20,34 @@ use globset::{Glob, GlobBuilder};
 
 pub const FINDING_CLASS: &str = "out-of-contract-write";
 
+/// Sentinel `subject` of the worktree-mode primary-checkout finding — a
+/// condition the touch-set has nothing to do with, so it is NOT a grantable
+/// touch path (see [`grantable_touch_path`]).
+pub const PRIMARY_CHECKOUT_SUBJECT: &str = "primary-checkout";
+
+/// The path a touch-set grant would extend to resolve `finding`, if any. Only a
+/// genuine "path outside the declared touch-set globs" is grantable — extending
+/// `touch_set` with it clears the finding. The `FINDING_CLASS` string is shared
+/// by findings that a grant CANNOT fix: the [`PRIMARY_CHECKOUT_SUBJECT`]
+/// sentinel (a dirty/moved primary checkout) and the glob-compile-error variant
+/// (the touch-set globs are themselves malformed). Both are excluded — the
+/// latter because it is not `Ok(false)` from [`touch_set_includes`] (a broken
+/// glob errors on every path). `current_touch_set` is the mission's touch_set as
+/// of the sweep.
+pub fn grantable_touch_path<'a>(
+    finding: &'a Finding,
+    current_touch_set: &[String],
+) -> Option<&'a str> {
+    if finding.class != FINDING_CLASS || finding.subject == PRIMARY_CHECKOUT_SUBJECT {
+        return None;
+    }
+    matches!(
+        touch_set_includes(current_touch_set, &finding.subject),
+        Ok(false)
+    )
+    .then_some(finding.subject.as_str())
+}
+
 /// Commit message prefix shared by every engine/meta commit template.
 const ENGINE_COMMIT_PREFIX: &str = "[kranz]";
 
@@ -261,7 +289,7 @@ pub fn primary_checkout_finding(
         format!("primary checkout moved from '{branch_at_start}' to '{current_branch}'")
     };
     Some(Finding {
-        subject: "primary-checkout".to_string(),
+        subject: PRIMARY_CHECKOUT_SUBJECT.to_string(),
         severity: "critical".to_string(),
         evidence,
         suggested_fix: "restore the primary checkout to a clean state on the starting branch"
@@ -296,6 +324,48 @@ mod tests {
         assert_eq!(findings[0].subject, "docs/oops.md");
         assert_eq!(findings[0].class, FINDING_CLASS);
         assert_eq!(findings[0].severity, "major");
+    }
+
+    #[test]
+    fn grantable_touch_path_only_for_a_real_out_of_contract_path() {
+        let touch_set = vec!["src/**".to_string()];
+
+        // A genuine path outside the globs is grantable — its subject is the path.
+        let c = commit("abc123", "[f-1] add");
+        let real = path_findings(
+            &touch_set,
+            &[AttributedChange {
+                path: "docs/oops.md",
+                commit: &c,
+            }],
+        )
+        .remove(0);
+        assert_eq!(
+            grantable_touch_path(&real, &touch_set),
+            Some("docs/oops.md")
+        );
+        // Already-in-contract path (were it somehow a finding) is not grantable.
+        assert_eq!(grantable_touch_path(&real, &["docs/**".to_string()]), None);
+
+        // The primary-checkout sentinel shares FINDING_CLASS but a touch grant
+        // can't resolve it → not grantable.
+        let pc = primary_checkout_finding(false, "main", "main").unwrap();
+        assert_eq!(pc.class, FINDING_CLASS);
+        assert_eq!(grantable_touch_path(&pc, &touch_set), None);
+
+        // A glob-compile-error finding (malformed touch_set) is not grantable —
+        // extending an already-broken glob set can't clear it.
+        let bad_set = vec!["[".to_string()];
+        let glob_err = path_findings(
+            &bad_set,
+            &[AttributedChange {
+                path: "anything.rs",
+                commit: &c,
+            }],
+        )
+        .remove(0);
+        assert!(glob_err.evidence.contains("glob compile error"));
+        assert_eq!(grantable_touch_path(&glob_err, &bad_set), None);
     }
 
     #[test]

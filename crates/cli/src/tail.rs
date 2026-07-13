@@ -9,7 +9,7 @@
 use crate::output::{ansi, one_line};
 use kranz_engine::event_log::EventLog;
 use kranz_engine::events::{Event, EventKind};
-use kranz_engine::types::{MissionState, Role, RunResult};
+use kranz_engine::types::{GrantKind, MissionState, Role, RunResult};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -134,21 +134,32 @@ impl EventRenderer {
             ),
             EventKind::GrantRequested {
                 milestone_id,
+                kind,
                 command,
             } => (
                 format!("milestone {milestone_id}"),
                 ansi::YELLOW,
-                format!("grant requested: `{command}`; awaiting approval"),
+                format!(
+                    "{} grant requested: `{command}`; awaiting approval",
+                    grant_kind_label(kind)
+                ),
             ),
-            EventKind::GrantApproved { command } => (
+            EventKind::GrantApproved { kind, command } => (
                 "mission".to_string(),
                 ansi::YELLOW,
-                format!("grant approved: `{command}`"),
+                format!("{} grant approved: `{command}`", grant_kind_label(kind)),
             ),
-            EventKind::GrantDenied { command, reason } => (
+            EventKind::GrantDenied {
+                kind,
+                command,
+                reason,
+            } => (
                 "mission".to_string(),
                 ansi::YELLOW,
-                format!("grant denied: `{command}` ({reason})"),
+                format!(
+                    "{} grant denied: `{command}` ({reason})",
+                    grant_kind_label(kind)
+                ),
             ),
             EventKind::MilestoneStarted { milestone_id, .. } => (
                 format!("milestone {milestone_id}"),
@@ -344,6 +355,14 @@ impl EventRenderer {
         } else {
             format!("[{tag}] {body}")
         }
+    }
+}
+
+/// Short label for a grant's kind, prefixed onto the tail line.
+fn grant_kind_label(kind: &GrantKind) -> &'static str {
+    match kind {
+        GrantKind::Command => "command",
+        GrantKind::TouchPath => "touch-set",
     }
 }
 

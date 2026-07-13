@@ -1487,7 +1487,7 @@ async fn validator_denial_grant_approved_extends_grants_and_completes() {
     }
     // request names the exact command; approve carries the same command.
     assert!(events.iter().any(|e| matches!(&e.kind,
-        EventKind::GrantRequested { command, milestone_id }
+        EventKind::GrantRequested { command, milestone_id, .. }
             if command == denied_cmd && milestone_id == "ms-1")));
     // Ordering: request → approve → milestone tag.
     assert!(seq_of(&events, "grant.requested") < seq_of(&events, "grant.approved"));
@@ -1798,6 +1798,204 @@ async fn grant_offered_from_the_claude_retry_when_primary_had_no_command() {
         .mission
         .command_grants
         .contains(&denied_cmd.to_string()));
+}
+
+/// A worker write outside the touch_set parks a TOUCH-PATH grant naming the
+/// path (driven by the out-of-contract sweep, validators skipped). Approving it
+/// extends touch_set so the re-validation sweep is clean and the mission
+/// completes.
+#[tokio::test]
+async fn out_of_contract_write_parks_a_touch_grant_and_approve_completes() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    // A plan with a touch_set the worker then writes OUTSIDE of.
+    let plan = Plan {
+        goal: GOAL.to_string(),
+        validation_contract: vec![],
+        milestones: vec![PlanMilestone {
+            title: "M1".to_string(),
+            features: vec![PlanFeature {
+                title: "feature 1".to_string(),
+                spec: "build part 1".to_string(),
+                validation_criteria: vec!["part 1 works".to_string()],
+            }],
+        }],
+        considered_alternatives: None,
+        command_grants: vec![],
+        touch_set: vec!["src/**".to_string()],
+    };
+    let worker = MockScript::single_shot_json(&json!({
+        "result": "pass",
+        "summary": "implemented",
+        "filesTouched": ["out-of-bounds.txt"],
+        "testsAdded": [],
+        "testEvidence": "ok",
+        "commits": []
+    }))
+    .writes_file("out-of-bounds.txt", "written outside the touch-set\n");
+
+    // Validators skipped (test_cfg default): the engine's out-of-contract sweep
+    // alone produces the finding, so no validator scripts are needed.
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker,
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+    ]));
+
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(plan).unwrap();
+    let paths = engine.paths().clone();
+
+    let handle = tokio::spawn(async move {
+        let result = engine.run().await;
+        (engine, result)
+    });
+
+    wait_for_pending_grant(&paths).await;
+    let snap = reducer::read_snapshot(&paths.state_file()).unwrap();
+    let pending = snap.pending_grant_request.expect("parked touch grant");
+    assert_eq!(pending.kind, GrantKind::TouchPath);
+    assert_eq!(pending.command, "out-of-bounds.txt");
+    control::enqueue(
+        &paths,
+        &ControlCommand::ApproveGrant {
+            command: "out-of-bounds.txt".to_string(),
+        },
+    )
+    .unwrap();
+
+    let (engine, result) = timeout(TEST_TIMEOUT, handle)
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(result.unwrap(), MissionStatus::Complete);
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    let types = event_types(&events);
+    for expected in [
+        "grant.requested",
+        "grant.approved",
+        "milestone.completed",
+        "mission.completed",
+    ] {
+        assert!(types.contains(&expected), "missing {expected}: {types:?}");
+    }
+    // The approved path joined touch_set (extend-only), not command_grants.
+    let state = reducer::fold(&events).unwrap();
+    assert_eq!(state.mission.status, MissionStatus::Complete);
+    assert!(
+        state
+            .mission
+            .touch_set
+            .contains(&"out-of-bounds.txt".to_string()),
+        "approved path must join touch_set: {:?}",
+        state.mission.touch_set
+    );
+    assert!(state.mission.command_grants.is_empty());
+}
+
+/// Denying a touch grant does NOT block the milestone (unlike a command deny):
+/// the out-of-contract write flows to the normal fix/waive path. Here the
+/// orchestrator waives it and the mission completes — touch_set never widened.
+#[tokio::test]
+async fn out_of_contract_write_touch_grant_denied_flows_to_waive() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let plan = Plan {
+        goal: GOAL.to_string(),
+        validation_contract: vec![],
+        milestones: vec![PlanMilestone {
+            title: "M1".to_string(),
+            features: vec![PlanFeature {
+                title: "feature 1".to_string(),
+                spec: "build part 1".to_string(),
+                validation_criteria: vec!["part 1 works".to_string()],
+            }],
+        }],
+        considered_alternatives: None,
+        command_grants: vec![],
+        touch_set: vec!["src/**".to_string()],
+    };
+    let worker = MockScript::single_shot_json(&json!({
+        "result": "pass",
+        "summary": "implemented",
+        "filesTouched": ["out-of-bounds.txt"],
+        "testsAdded": [],
+        "testEvidence": "ok",
+        "commits": []
+    }))
+    .writes_file("out-of-bounds.txt", "written outside the touch-set\n");
+
+    // After the deny, the re-validation round's sweep re-produces the finding;
+    // the cap is saturated (no re-offer) so it reaches the conversion turn,
+    // which waives it → milestone completes → capture turn.
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker,
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            waive_reply("out-of-bounds.txt", "acceptable scratch file"),
+            no_lesson(),
+        ]),
+    ]));
+
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(plan).unwrap();
+    let paths = engine.paths().clone();
+
+    let handle = tokio::spawn(async move {
+        let result = engine.run().await;
+        (engine, result)
+    });
+
+    wait_for_pending_grant(&paths).await;
+    control::enqueue(
+        &paths,
+        &ControlCommand::DenyGrant {
+            command: "out-of-bounds.txt".to_string(),
+            reason: "keep it out of contract".to_string(),
+        },
+    )
+    .unwrap();
+
+    let (engine, result) = timeout(TEST_TIMEOUT, handle)
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    // Waived, not blocked → the mission completes.
+    assert_eq!(result.unwrap(), MissionStatus::Complete);
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    let types = event_types(&events);
+    assert!(types.contains(&"grant.denied"), "{types:?}");
+    // A touch deny must NOT block the milestone (that's the command-deny path).
+    assert!(!types.contains(&"milestone.blocked"), "{types:?}");
+    // The out-of-contract finding was recorded (flowed to fix/waive), and the
+    // denied path was never added to touch_set.
+    assert!(types.contains(&"validation.finding"), "{types:?}");
+    let state = reducer::fold(&events).unwrap();
+    assert_eq!(state.mission.status, MissionStatus::Complete);
+    assert!(
+        !state
+            .mission
+            .touch_set
+            .contains(&"out-of-bounds.txt".to_string()),
+        "deny must not widen touch_set: {:?}",
+        state.mission.touch_set
+    );
 }
 
 // ---------------------------------------------------------------------------

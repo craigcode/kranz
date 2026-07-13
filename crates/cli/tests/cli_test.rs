@@ -849,6 +849,7 @@ fn seed_pending_grant(repo: &Path, mission: &str, command: &str) {
             },
             EventKind::GrantRequested {
                 milestone_id: "ms-1".into(),
+                kind: kranz_engine::types::GrantKind::Command,
                 command: command.into(),
             },
         ],

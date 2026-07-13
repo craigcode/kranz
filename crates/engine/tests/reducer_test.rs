@@ -1922,6 +1922,7 @@ fn grant_requested_sets_pending_and_approved_extends_grants() {
         &ev(
             next,
             EventKind::GrantRequested {
+                kind: GrantKind::Command,
                 milestone_id: "ms-1".to_string(),
                 command: "gc lint --strict".to_string(),
             },
@@ -1940,6 +1941,7 @@ fn grant_requested_sets_pending_and_approved_extends_grants() {
         &ev(
             next + 1,
             EventKind::GrantApproved {
+                kind: GrantKind::Command,
                 command: "gc lint --strict".to_string(),
             },
         ),
@@ -1962,6 +1964,7 @@ fn grant_denied_clears_pending_without_widening_grants() {
         &ev(
             next,
             EventKind::GrantRequested {
+                kind: GrantKind::Command,
                 milestone_id: "ms-1".to_string(),
                 command: "gc lint --strict".to_string(),
             },
@@ -1973,6 +1976,7 @@ fn grant_denied_clears_pending_without_widening_grants() {
         &ev(
             next + 1,
             EventKind::GrantDenied {
+                kind: GrantKind::Command,
                 command: "gc lint --strict".to_string(),
                 reason: "operator denied".to_string(),
             },
@@ -1996,6 +2000,7 @@ fn grant_approved_without_pending_is_rejected() {
         &ev(
             next,
             EventKind::GrantApproved {
+                kind: GrantKind::Command,
                 command: "gc lint".to_string(),
             },
         ),
@@ -2016,6 +2021,7 @@ fn grant_approved_for_a_different_command_is_rejected() {
         &ev(
             next,
             EventKind::GrantRequested {
+                kind: GrantKind::Command,
                 milestone_id: "ms-1".to_string(),
                 command: "gc lint --strict".to_string(),
             },
@@ -2027,6 +2033,7 @@ fn grant_approved_for_a_different_command_is_rejected() {
         &ev(
             next + 1,
             EventKind::GrantApproved {
+                kind: GrantKind::Command,
                 command: "rm -rf /".to_string(),
             },
         ),
@@ -2049,6 +2056,7 @@ fn grant_requested_for_unknown_milestone_is_rejected() {
         &ev(
             next,
             EventKind::GrantRequested {
+                kind: GrantKind::Command,
                 milestone_id: "ms-nope".to_string(),
                 command: "gc lint".to_string(),
             },
@@ -2068,6 +2076,7 @@ fn grant_requested_with_empty_command_is_rejected() {
         &ev(
             next,
             EventKind::GrantRequested {
+                kind: GrantKind::Command,
                 milestone_id: "ms-1".to_string(),
                 command: "   ".to_string(),
             },
@@ -2089,6 +2098,7 @@ fn grant_approved_is_extend_only_and_deduped() {
         &ev(
             next,
             EventKind::GrantRequested {
+                kind: GrantKind::Command,
                 milestone_id: "ms-1".to_string(),
                 command: "gc lint".to_string(),
             },
@@ -2100,6 +2110,7 @@ fn grant_approved_is_extend_only_and_deduped() {
         &ev(
             next + 1,
             EventKind::GrantApproved {
+                kind: GrantKind::Command,
                 command: "gc lint".to_string(),
             },
         ),
@@ -2130,6 +2141,7 @@ fn grant_denied_folds_after_its_milestone_is_dropped_but_blocking_it_would_brick
         &ev(
             next,
             EventKind::GrantRequested {
+                kind: GrantKind::Command,
                 milestone_id: "ms-2".to_string(),
                 command: "gc audit".to_string(),
             },
@@ -2147,6 +2159,7 @@ fn grant_denied_folds_after_its_milestone_is_dropped_but_blocking_it_would_brick
         &ev(
             next + 1,
             EventKind::GrantDenied {
+                kind: GrantKind::Command,
                 command: "gc audit".to_string(),
                 reason: "timed out".to_string(),
             },
@@ -2169,4 +2182,77 @@ fn grant_denied_folds_after_its_milestone_is_dropped_but_blocking_it_would_brick
     )
     .expect_err("MilestoneBlocked for a dropped milestone must be rejected");
     assert!(matches!(err, EngineError::InvalidState(_)), "got {err:?}");
+}
+
+#[test]
+fn touch_path_grant_extends_touch_set_not_command_grants() {
+    let mut state = state_at_active_milestone();
+    let next = state.last_seq + 1;
+    apply(
+        &mut state,
+        &ev(
+            next,
+            EventKind::GrantRequested {
+                milestone_id: "ms-1".to_string(),
+                kind: GrantKind::TouchPath,
+                command: "docs/report.md".to_string(),
+            },
+        ),
+    )
+    .expect("touch grant parked");
+    assert_eq!(
+        state.pending_grant_request.as_ref().map(|p| p.kind),
+        Some(GrantKind::TouchPath)
+    );
+
+    apply(
+        &mut state,
+        &ev(
+            next + 1,
+            EventKind::GrantApproved {
+                kind: GrantKind::TouchPath,
+                command: "docs/report.md".to_string(),
+            },
+        ),
+    )
+    .expect("touch grant approved");
+    // The approved path joins touch_set — NOT command_grants.
+    assert_eq!(state.mission.touch_set, vec!["docs/report.md".to_string()]);
+    assert!(state.mission.command_grants.is_empty());
+    assert!(state.pending_grant_request.is_none());
+}
+
+#[test]
+fn grant_approved_with_mismatched_kind_is_rejected() {
+    // A forged approval that flips the kind must not apply the target to the
+    // wrong list (e.g. a touch path landing in command_grants).
+    let mut state = state_at_active_milestone();
+    let next = state.last_seq + 1;
+    apply(
+        &mut state,
+        &ev(
+            next,
+            EventKind::GrantRequested {
+                milestone_id: "ms-1".to_string(),
+                kind: GrantKind::TouchPath,
+                command: "docs/report.md".to_string(),
+            },
+        ),
+    )
+    .unwrap();
+    let err = apply(
+        &mut state,
+        &ev(
+            next + 1,
+            EventKind::GrantApproved {
+                kind: GrantKind::Command,
+                command: "docs/report.md".to_string(),
+            },
+        ),
+    )
+    .expect_err("kind must match the parked request");
+    assert!(matches!(err, EngineError::InvalidState(_)), "got {err:?}");
+    assert!(state.mission.command_grants.is_empty());
+    assert!(state.mission.touch_set.is_empty());
+    assert!(state.pending_grant_request.is_some());
 }

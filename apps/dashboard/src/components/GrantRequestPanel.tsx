@@ -20,6 +20,11 @@ export function GrantRequestPanel() {
 
   if (mission === null || pending === undefined) return null;
 
+  const blurb =
+    pending.kind === 'touch-path'
+      ? 'A worker wrote a path outside the mission’s touch-set:'
+      : 'A validator is blocked on a command outside its allow-set:';
+
   const decide = async (kind: 'approve' | 'deny') => {
     setBusy(kind);
     setError(null);
@@ -43,7 +48,7 @@ export function GrantRequestPanel() {
         <span className="section-count mono">{pending.milestoneId}</span>
       </div>
       <div className="revision-body">
-        <div className="dim">A validator is blocked on a command outside its allow-set:</div>
+        <div className="dim">{blurb}</div>
         <pre className="revision-diff">{pending.command}</pre>
         <div className="revision-actions">
           <button

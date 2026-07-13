@@ -372,15 +372,35 @@ pub struct PendingRevision {
     pub instructions: String,
 }
 
+/// What a grant would extend on approval. All kinds park through the SAME
+/// operator approve/deny gate (and reuse its timeout + per-milestone cap); they
+/// differ only in the boundary that triggered them and what the reducer
+/// extends. `#[default]` = `Command` so pre-`kind` events (and the wire
+/// default) fold as the original command-grant behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GrantKind {
+    /// A validator command outside its allow-set → extend `command_grants`.
+    #[default]
+    Command,
+    /// A worker write outside the `touch_set` → extend `touch_set`.
+    TouchPath,
+}
+
 /// A parked capability-grant request (see [`MissionState::pending_grant_request`]).
-/// Names the exact command a `command_grants` extension would unblock and the
-/// milestone whose validation hit the boundary, so the operator's approve/deny
-/// decision — and the reducer's cross-check on `grant.approved`/`grant.denied`
-/// — key off the same command that was requested.
+/// Names the exact target a grant would unblock and the milestone whose
+/// validation hit the boundary, so the operator's approve/deny decision — and
+/// the reducer's cross-check on `grant.approved`/`grant.denied` — key off the
+/// same target that was requested.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingGrantRequest {
     pub milestone_id: String,
+    #[serde(default)]
+    pub kind: GrantKind,
+    /// The granted target: a command string (`Command`) or a repo-relative path
+    /// glob (`TouchPath`). Named `command` for wire back-compat with the
+    /// original command-only grant events.
     pub command: String,
 }
 

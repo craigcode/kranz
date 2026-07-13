@@ -1036,6 +1036,7 @@ fn seed_pending_grant_log(repo_root: &Path, id: &str, command: &str) {
     .unwrap();
     log.append(EventKind::GrantRequested {
         milestone_id: "ms-1".into(),
+        kind: kranz_engine::types::GrantKind::Command,
         command: command.into(),
     })
     .unwrap();

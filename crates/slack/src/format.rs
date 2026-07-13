@@ -108,12 +108,13 @@ pub struct RevisionReady {
     pub assertion_count: usize,
 }
 
-/// A parked capability-grant request awaiting human consent: a validator was
-/// stopped by a command outside its allow-set.
+/// A parked capability-grant request awaiting human consent.
 #[derive(Debug, Clone)]
 pub struct GrantReady {
     pub mission_id: String,
     pub milestone_id: String,
+    pub kind: kranz_engine::types::GrantKind,
+    /// The granted target: a command string, or a path glob for a touch grant.
     pub command: String,
 }
 
@@ -631,13 +632,23 @@ pub fn build_revision_ready(r: &RevisionReady, dashboard_url: Option<&str>) -> V
 /// extends `command_grants` and re-validates; denying blocks the milestone.
 pub fn build_grant_ready(g: &GrantReady, dashboard_url: Option<&str>) -> Vec<Value> {
     let value = format!("{}:{}", g.mission_id, g.command);
+    let (blurb, field_label) = match g.kind {
+        kranz_engine::types::GrantKind::Command => (
+            "A validator is blocked on a command outside its allow-set.",
+            "*Blocked command*",
+        ),
+        kranz_engine::types::GrantKind::TouchPath => (
+            "A worker wrote a path outside the mission's touch-set.",
+            "*Out-of-contract path*",
+        ),
+    };
     let mut blocks = vec![
         header(&format!("Grant requested — {}", g.mission_id)),
-        section("A validator is blocked on a command outside its allow-set."),
-        // The command is scrubbed at capture, but escape Slack control
+        section(blurb),
+        // The target is scrubbed at capture, but escape Slack control
         // sequences defensively before rendering it as text.
         section(&format!(
-            "*Blocked command*\n{}",
+            "{field_label}\n{}",
             clip(&escape_mrkdwn(g.command.trim()))
         )),
         context(&format!(
@@ -1631,6 +1642,7 @@ mod tests {
             &GrantReady {
                 mission_id: "m-42".into(),
                 milestone_id: "ms-1".into(),
+                kind: kranz_engine::types::GrantKind::Command,
                 command: "gc audit --deep".into(),
             },
             None,
@@ -1661,6 +1673,33 @@ mod tests {
             values.contains(&"m-42:gc audit --deep"),
             "button value round-trips: {values:?}"
         );
+    }
+
+    #[test]
+    fn grant_ready_labels_a_touch_path_grant() {
+        let blocks = build_grant_ready(
+            &GrantReady {
+                mission_id: "m-9".into(),
+                milestone_id: "ms-2".into(),
+                kind: kranz_engine::types::GrantKind::TouchPath,
+                command: "docs/report.md".into(),
+            },
+            None,
+        );
+        let text = all_text(&blocks);
+        assert!(text.contains("docs/report.md"), "the path is named");
+        assert!(
+            text.contains("touch-set"),
+            "card frames it as a touch-set write, not a command: {text}"
+        );
+        // Same approve/deny affordances as a command grant.
+        let buttons = all_buttons(&blocks);
+        let ids: Vec<&str> = buttons
+            .iter()
+            .filter_map(|b| b["action_id"].as_str())
+            .collect();
+        assert!(ids.contains(&APPROVE_GRANT_ACTION_ID));
+        assert!(ids.contains(&DENY_GRANT_ACTION_ID));
     }
 
     #[test]
