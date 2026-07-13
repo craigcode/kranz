@@ -20,8 +20,10 @@
 
 use kranz_engine::auth_verify::AuthVerdict;
 use kranz_engine::backend::{AgentBackend, PromptMode};
+use kranz_engine::backend_claude::parse_stream_line;
 use kranz_engine::backend_mock::{
-    mock_init, mock_result_error, mock_result_text, mock_text, MockBackend, MockScript,
+    mock_init, mock_result_error, mock_result_json, mock_result_text, mock_text, MockBackend,
+    MockScript,
 };
 use kranz_engine::control;
 use kranz_engine::cost;
@@ -264,6 +266,106 @@ fn worker_fail() -> MockScript {
 /// Validator script returning the given findings.
 fn validator_with(findings: serde_json::Value) -> MockScript {
     MockScript::single_shot_json(&json!({ "findings": findings, "summary": "validated" }))
+}
+
+/// Validator script that is DENIED `command` and, blocked on it, fails to
+/// produce a trusted report (result is an error, no parseable report) — the
+/// realistic shape of a validator stopped by a capability boundary, and the
+/// case the grant flow is gated on (`!validator_outcome_trusted`). The tool_use
+/// and denied tool_result are built from real Claude stream shapes via
+/// `parse_stream_line` (a denied `tool_result` carries `tool: None`; the command
+/// lives only on the preceding `tool_use`), so the runner's positional
+/// ToolUse→ToolResult correlation is exercised exactly as in production — not
+/// the fabricated `mock_denied` shape a prior attempt leaned on and shipped a
+/// dead trigger behind.
+fn validator_denied(command: &str) -> MockScript {
+    let tool_use_line = json!({
+        "type": "assistant",
+        "message": { "id": "vm1", "content": [
+            { "type": "tool_use", "name": "Bash", "input": { "command": command } }
+        ] }
+    })
+    .to_string();
+    let denied_line = json!({
+        "type": "user",
+        "message": { "role": "user", "content": [
+            { "type": "tool_result", "tool_use_id": "vt1",
+              "content": format!("Permission denied: Bash({command}) requires approval"),
+              "is_error": true }
+        ] }
+    })
+    .to_string();
+    let mut events = vec![mock_init("mock-session")];
+    events.extend(parse_stream_line(&tool_use_line));
+    events.extend(parse_stream_line(&denied_line));
+    events.push(mock_result_error(&format!(
+        "stopped: `{command}` was denied and the checks could not run"
+    )));
+    MockScript {
+        events,
+        ..Default::default()
+    }
+}
+
+/// Validator script that is DENIED `command` but STILL produces a trusted PASS
+/// (clean report) — an incidental denial that did not block validation. The
+/// grant flow must NOT park on this (gated on `!validator_outcome_trusted`), or
+/// a later deny would wrongly block a milestone that actually passed.
+fn validator_denied_but_passing(command: &str) -> MockScript {
+    let tool_use_line = json!({
+        "type": "assistant",
+        "message": { "id": "vm2", "content": [
+            { "type": "tool_use", "name": "Bash", "input": { "command": command } }
+        ] }
+    })
+    .to_string();
+    let denied_line = json!({
+        "type": "user",
+        "message": { "role": "user", "content": [
+            { "type": "tool_result", "tool_use_id": "vt2",
+              "content": format!("Permission denied: Bash({command}) requires approval"),
+              "is_error": true }
+        ] }
+    })
+    .to_string();
+    let report = json!({ "findings": [], "summary": "validated despite one denied probe" });
+    let mut events = vec![mock_init("mock-session")];
+    events.extend(parse_stream_line(&tool_use_line));
+    events.extend(parse_stream_line(&denied_line));
+    events.push(mock_text(&report.to_string()));
+    events.push(mock_result_json(&report));
+    MockScript {
+        events,
+        ..Default::default()
+    }
+}
+
+/// Validator script that produces NO trusted report and NO capturable denial
+/// (a plain error). Models a primary backend whose failure the runner can't map
+/// to a command (e.g. a Droid validator, which emits no tool events) — so the
+/// grant, if any, can only be detected on the Claude retry.
+fn validator_untrusted_no_denial() -> MockScript {
+    MockScript {
+        events: vec![
+            mock_init("mock-session"),
+            mock_result_error("stopped: backend produced no trusted report"),
+        ],
+        ..Default::default()
+    }
+}
+
+/// Poll the state snapshot until a grant request is parked (mirrors the
+/// pause/resume test's snapshot poll — `emit` keeps state.json in lockstep).
+async fn wait_for_pending_grant(paths: &MissionPaths) {
+    for _ in 0..400 {
+        if let Ok(snap) = reducer::read_snapshot(&paths.state_file()) {
+            if snap.pending_grant_request.is_some() {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("timed out waiting for a parked grant request");
 }
 
 /// The orchestrator streaming script. `events` covers the SEED turn (the
@@ -1307,6 +1409,395 @@ async fn pause_resume_and_user_message_flow() {
         leftover.is_empty(),
         "control inbox must be empty after apply: {leftover:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 5c. Grant-request decision flow (capability denial → operator approve/deny)
+// ---------------------------------------------------------------------------
+
+/// A validator denied a command outside its allow-set parks a grant request
+/// naming that exact command; approving it extends command_grants (mission-wide)
+/// and the re-run validation round clears, driving the mission to Complete.
+#[tokio::test]
+async fn validator_denial_grant_approved_extends_grants_and_completes() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let denied_cmd = "gc audit --deep";
+
+    // FIFO by session start: worker f-1-1, orchestrator (dirty-tree, judgement,
+    // capture), denied validator (round 1 → park), clean validator (round 2
+    // after approve → milestone tag).
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+        validator_denied(denied_cmd),
+        validator_with(json!([])),
+    ]));
+
+    let cfg = MissionConfig {
+        skip_functional: false,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+    let paths = engine.paths().clone();
+
+    let handle = tokio::spawn(async move {
+        let result = engine.run().await;
+        (engine, result)
+    });
+
+    // Wait for the parked request, verify it names the exact command, approve.
+    wait_for_pending_grant(&paths).await;
+    let snap = reducer::read_snapshot(&paths.state_file()).unwrap();
+    let pending = snap.pending_grant_request.expect("parked grant request");
+    assert_eq!(pending.command, denied_cmd);
+    assert_eq!(pending.milestone_id, "ms-1");
+    control::enqueue(
+        &paths,
+        &ControlCommand::ApproveGrant {
+            command: denied_cmd.to_string(),
+        },
+    )
+    .unwrap();
+
+    let (engine, result) = timeout(TEST_TIMEOUT, handle)
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(result.unwrap(), MissionStatus::Complete);
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    let types = event_types(&events);
+    for expected in [
+        "grant.requested",
+        "grant.approved",
+        "milestone.completed",
+        "mission.completed",
+    ] {
+        assert!(types.contains(&expected), "missing {expected}: {types:?}");
+    }
+    // request names the exact command; approve carries the same command.
+    assert!(events.iter().any(|e| matches!(&e.kind,
+        EventKind::GrantRequested { command, milestone_id }
+            if command == denied_cmd && milestone_id == "ms-1")));
+    // Ordering: request → approve → milestone tag.
+    assert!(seq_of(&events, "grant.requested") < seq_of(&events, "grant.approved"));
+    assert!(seq_of(&events, "grant.approved") < seq_of(&events, "milestone.completed"));
+    // The approved command is now a durable mission-wide grant.
+    let state = reducer::fold(&events).unwrap();
+    assert_eq!(state.mission.status, MissionStatus::Complete);
+    assert!(
+        state
+            .mission
+            .command_grants
+            .contains(&denied_cmd.to_string()),
+        "approved command must join command_grants: {:?}",
+        state.mission.command_grants
+    );
+    assert!(state.pending_grant_request.is_none());
+}
+
+/// Denying a parked grant appends grant.denied and blocks the milestone with
+/// the existing refusal semantics — the mission ends Blocked and command_grants
+/// is never widened.
+#[tokio::test]
+async fn validator_denial_grant_denied_blocks_the_milestone() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let denied_cmd = "gc audit --deep";
+
+    // FIFO: worker f-1-1, orchestrator (dirty-tree, judgement), denied
+    // validator. Deny blocks the milestone before any final gate, so no
+    // capture turn / second validator is scripted.
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![dirty_tree_commit_as_is(), judgement("complete", "")]),
+        validator_denied(denied_cmd),
+    ]));
+
+    let cfg = MissionConfig {
+        skip_functional: false,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+    let paths = engine.paths().clone();
+
+    let handle = tokio::spawn(async move {
+        let result = engine.run().await;
+        (engine, result)
+    });
+
+    wait_for_pending_grant(&paths).await;
+    control::enqueue(
+        &paths,
+        &ControlCommand::DenyGrant {
+            command: denied_cmd.to_string(),
+            reason: "not authorized this run".to_string(),
+        },
+    )
+    .unwrap();
+
+    let (engine, result) = timeout(TEST_TIMEOUT, handle)
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(result.unwrap(), MissionStatus::Blocked);
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    let types = event_types(&events);
+    for expected in ["grant.requested", "grant.denied", "milestone.blocked"] {
+        assert!(types.contains(&expected), "missing {expected}: {types:?}");
+    }
+    // Ordering: denial precedes the block it triggers.
+    assert!(seq_of(&events, "grant.denied") < seq_of(&events, "milestone.blocked"));
+    let state = reducer::fold(&events).unwrap();
+    assert!(
+        state.mission.command_grants.is_empty(),
+        "deny must never widen command_grants: {:?}",
+        state.mission.command_grants
+    );
+    assert!(state.pending_grant_request.is_none());
+}
+
+/// Deny-default safety valve: an unanswered grant request times out to
+/// grant.denied on its own (no operator input), blocking the milestone. Proves
+/// a parked request can never silently stall a mission open forever.
+#[tokio::test]
+async fn unanswered_grant_request_times_out_to_denied() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let denied_cmd = "gc audit --deep";
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![dirty_tree_commit_as_is(), judgement("complete", "")]),
+        validator_denied(denied_cmd),
+    ]));
+
+    let cfg = MissionConfig {
+        skip_functional: false,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+    // Fail closed on the very first park-gate tick — no control command needed.
+    engine.set_grant_request_timeout(Duration::from_millis(0));
+    let paths = engine.paths().clone();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Blocked);
+    drop(engine);
+
+    let events = read_log(&paths);
+    let types = event_types(&events);
+    for expected in ["grant.requested", "grant.denied", "milestone.blocked"] {
+        assert!(types.contains(&expected), "missing {expected}: {types:?}");
+    }
+    // The denial reason records the timeout (deny-default), not an operator.
+    assert!(events.iter().any(|e| matches!(&e.kind,
+        EventKind::GrantDenied { reason, .. } if reason.contains("timed out"))));
+    let state = reducer::fold(&events).unwrap();
+    assert!(state.mission.command_grants.is_empty());
+}
+
+/// An incidental command denial on a validator that STILL produced a trusted
+/// PASS must NOT park for a grant (the grant flow is gated on an untrusted
+/// outcome). Otherwise a later deny would wrongly block a milestone that
+/// actually passed. The milestone completes with no grant.requested.
+#[tokio::test]
+async fn incidental_denial_on_a_passing_validator_does_not_park() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+        validator_denied_but_passing("gc audit --deep"),
+    ]));
+
+    let cfg = MissionConfig {
+        skip_functional: false,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+    let paths = engine.paths().clone();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+    drop(engine);
+
+    let events = read_log(&paths);
+    let types = event_types(&events);
+    assert!(
+        !types.contains(&"grant.requested"),
+        "a passing validator must not park for a grant: {types:?}"
+    );
+    assert!(types.contains(&"milestone.completed"));
+    assert!(types.contains(&"mission.completed"));
+}
+
+/// The per-milestone grant-request cap bounds the park→approve→re-validate loop:
+/// once the cap is hit, no further grant is offered and the milestone blocks via
+/// the existing refusal path (never spins). Driven with cap = 1 so a single
+/// approval reaches the boundary.
+#[tokio::test]
+async fn grant_request_cap_blocks_instead_of_looping() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let denied_cmd = "gc audit --deep";
+
+    // r1 parks (count→1); after approve, r2 is over the cap (1 ≥ 1) → falls
+    // through to the Claude retry (3rd denied script) → still over cap → block.
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![dirty_tree_commit_as_is(), judgement("complete", "")]),
+        validator_denied(denied_cmd),
+        validator_denied(denied_cmd),
+        validator_denied(denied_cmd),
+    ]));
+
+    let cfg = MissionConfig {
+        skip_functional: false,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+    engine.set_grant_request_cap(1);
+    let paths = engine.paths().clone();
+
+    let handle = tokio::spawn(async move {
+        let result = engine.run().await;
+        (engine, result)
+    });
+
+    // Approve the one grant the cap allows; the next round must block, not spin.
+    wait_for_pending_grant(&paths).await;
+    control::enqueue(
+        &paths,
+        &ControlCommand::ApproveGrant {
+            command: denied_cmd.to_string(),
+        },
+    )
+    .unwrap();
+
+    let (engine, result) = timeout(TEST_TIMEOUT, handle)
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(result.unwrap(), MissionStatus::Blocked);
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    // Exactly one grant was offered (the cap), then the milestone blocked.
+    let requested = events
+        .iter()
+        .filter(|e| e.kind.type_name() == "grant.requested")
+        .count();
+    assert_eq!(requested, 1, "cap = 1 must offer exactly one grant");
+    assert!(event_types(&events).contains(&"milestone.blocked"));
+}
+
+/// A denial the runner can only read on the CLAUDE RETRY (the primary validator
+/// backend produced no capturable command) still surfaces a grant. Guards the
+/// post-retry grant check, so Codex/Droid-backed validators aren't silently
+/// un-grantable.
+#[tokio::test]
+async fn grant_offered_from_the_claude_retry_when_primary_had_no_command() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let denied_cmd = "gc audit --deep";
+
+    // Round 1: primary validator untrusted with NO command → retry with Claude,
+    // which IS denied → grant parked. Approve → round 2 clean → complete.
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+        validator_untrusted_no_denial(),
+        validator_denied(denied_cmd),
+        validator_with(json!([])),
+    ]));
+
+    let cfg = MissionConfig {
+        skip_functional: false,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+    let paths = engine.paths().clone();
+
+    let handle = tokio::spawn(async move {
+        let result = engine.run().await;
+        (engine, result)
+    });
+
+    wait_for_pending_grant(&paths).await;
+    let snap = reducer::read_snapshot(&paths.state_file()).unwrap();
+    assert_eq!(
+        snap.pending_grant_request.expect("parked").command,
+        denied_cmd,
+        "the grant must name the command the retry surfaced"
+    );
+    control::enqueue(
+        &paths,
+        &ControlCommand::ApproveGrant {
+            command: denied_cmd.to_string(),
+        },
+    )
+    .unwrap();
+
+    let (engine, result) = timeout(TEST_TIMEOUT, handle)
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(result.unwrap(), MissionStatus::Complete);
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    assert!(event_types(&events).contains(&"grant.requested"));
+    let state = reducer::fold(&events).unwrap();
+    assert!(state
+        .mission
+        .command_grants
+        .contains(&denied_cmd.to_string()));
 }
 
 // ---------------------------------------------------------------------------

@@ -132,6 +132,24 @@ impl EventRenderer {
                 ansi::YELLOW,
                 format!("revision {revision} rejected"),
             ),
+            EventKind::GrantRequested {
+                milestone_id,
+                command,
+            } => (
+                format!("milestone {milestone_id}"),
+                ansi::YELLOW,
+                format!("grant requested: `{command}`; awaiting approval"),
+            ),
+            EventKind::GrantApproved { command } => (
+                "mission".to_string(),
+                ansi::YELLOW,
+                format!("grant approved: `{command}`"),
+            ),
+            EventKind::GrantDenied { command, reason } => (
+                "mission".to_string(),
+                ansi::YELLOW,
+                format!("grant denied: `{command}` ({reason})"),
+            ),
             EventKind::MilestoneStarted { milestone_id, .. } => (
                 format!("milestone {milestone_id}"),
                 ansi::YELLOW,

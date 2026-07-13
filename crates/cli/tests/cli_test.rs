@@ -837,6 +837,93 @@ fn revision_commands_reject_bad_state() {
     assert!(commands::cmd_request_revision(repo, "m-none", "x").is_err());
 }
 
+fn seed_pending_grant(repo: &Path, mission: &str, command: &str) {
+    write_events(
+        repo,
+        mission,
+        vec![
+            created_kind("goal", mission),
+            EventKind::PlanApproved {
+                plan: sample_plan(),
+                base_sha: None,
+            },
+            EventKind::GrantRequested {
+                milestone_id: "ms-1".into(),
+                command: command.into(),
+            },
+        ],
+    );
+}
+
+#[test]
+fn grant_commands_enqueue_the_right_control_command() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+
+    seed_pending_grant(repo, "m-a", "gc audit --deep");
+    commands::cmd_approve_grant(repo, "m-a", "gc audit --deep").unwrap();
+    let files = queued_json_files(repo, "m-a");
+    assert_eq!(files.len(), 1);
+    let value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&files[0]).unwrap()).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({ "kind": "approve-grant", "command": "gc audit --deep" })
+    );
+
+    seed_pending_grant(repo, "m-b", "gc audit --deep");
+    commands::cmd_deny_grant(repo, "m-b", "gc audit --deep", "not this run").unwrap();
+    let files = queued_json_files(repo, "m-b");
+    assert_eq!(files.len(), 1);
+    let value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&files[0]).unwrap()).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "kind": "deny-grant",
+            "command": "gc audit --deep",
+            "reason": "not this run"
+        })
+    );
+}
+
+#[test]
+fn grant_commands_reject_bad_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+
+    // Approved mission with no pending grant.
+    write_events(
+        repo,
+        "m-1",
+        vec![
+            created_kind("goal", "m-1"),
+            EventKind::PlanApproved {
+                plan: sample_plan(),
+                base_sha: None,
+            },
+        ],
+    );
+    assert!(
+        commands::cmd_approve_grant(repo, "m-1", "gc audit").is_err(),
+        "no pending grant to approve"
+    );
+    assert!(
+        commands::cmd_deny_grant(repo, "m-1", "gc audit", "x").is_err(),
+        "no pending grant to deny"
+    );
+
+    // Pending grant for one command, but the operator names a different one.
+    seed_pending_grant(repo, "m-2", "gc audit --deep");
+    assert!(
+        commands::cmd_approve_grant(repo, "m-2", "rm -rf /").is_err(),
+        "the command must match the parked request"
+    );
+
+    // Unknown mission.
+    assert!(commands::cmd_approve_grant(repo, "m-none", "gc audit").is_err());
+}
+
 // ---------------------------------------------------------------------------
 // Control-command targeting (pause/resume/msg refuse terminal missions —
 // their inbox is never drained, so "success" there would be a silent no-op)

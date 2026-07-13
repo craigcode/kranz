@@ -1890,3 +1890,283 @@ fn fixfeature_created_rejects_a_duplicate_feature_id() {
         .count();
     assert_eq!(count, 1, "no silent duplicate");
 }
+
+// ---------------------------------------------------------------------------
+// Capability grant flow (grant.requested / grant.approved / grant.denied)
+// ---------------------------------------------------------------------------
+
+/// State folded up to ms-1 Active: created → plan approved → milestone started.
+fn state_at_active_milestone() -> MissionState {
+    fold_kinds(vec![
+        created(),
+        EventKind::PlanApproved {
+            plan: plan(),
+            base_sha: None,
+        },
+        EventKind::MilestoneStarted {
+            milestone_id: "ms-1".to_string(),
+            start_sha: "sha-1".to_string(),
+        },
+    ])
+}
+
+#[test]
+fn grant_requested_sets_pending_and_approved_extends_grants() {
+    let mut state = state_at_active_milestone();
+    let next = state.last_seq + 1;
+    assert!(state.pending_grant_request.is_none());
+    assert!(state.mission.command_grants.is_empty());
+
+    apply(
+        &mut state,
+        &ev(
+            next,
+            EventKind::GrantRequested {
+                milestone_id: "ms-1".to_string(),
+                command: "gc lint --strict".to_string(),
+            },
+        ),
+    )
+    .expect("grant.requested accepted");
+    let pending = state
+        .pending_grant_request
+        .clone()
+        .expect("pending grant set");
+    assert_eq!(pending.milestone_id, "ms-1");
+    assert_eq!(pending.command, "gc lint --strict");
+
+    apply(
+        &mut state,
+        &ev(
+            next + 1,
+            EventKind::GrantApproved {
+                command: "gc lint --strict".to_string(),
+            },
+        ),
+    )
+    .expect("grant.approved accepted");
+    assert!(state.pending_grant_request.is_none(), "pending cleared");
+    assert_eq!(
+        state.mission.command_grants,
+        vec!["gc lint --strict".to_string()],
+        "approved command extends command_grants"
+    );
+}
+
+#[test]
+fn grant_denied_clears_pending_without_widening_grants() {
+    let mut state = state_at_active_milestone();
+    let next = state.last_seq + 1;
+    apply(
+        &mut state,
+        &ev(
+            next,
+            EventKind::GrantRequested {
+                milestone_id: "ms-1".to_string(),
+                command: "gc lint --strict".to_string(),
+            },
+        ),
+    )
+    .unwrap();
+    apply(
+        &mut state,
+        &ev(
+            next + 1,
+            EventKind::GrantDenied {
+                command: "gc lint --strict".to_string(),
+                reason: "operator denied".to_string(),
+            },
+        ),
+    )
+    .expect("grant.denied accepted");
+    assert!(state.pending_grant_request.is_none(), "pending cleared");
+    assert!(
+        state.mission.command_grants.is_empty(),
+        "deny must never widen command_grants"
+    );
+}
+
+#[test]
+fn grant_approved_without_pending_is_rejected() {
+    // A forged/replayed grant.approved with nothing parked must not widen.
+    let mut state = state_at_active_milestone();
+    let next = state.last_seq + 1;
+    let err = apply(
+        &mut state,
+        &ev(
+            next,
+            EventKind::GrantApproved {
+                command: "gc lint".to_string(),
+            },
+        ),
+    )
+    .expect_err("grant.approved with no pending must be rejected");
+    assert!(matches!(err, EngineError::InvalidState(_)), "got {err:?}");
+    assert!(state.mission.command_grants.is_empty());
+}
+
+#[test]
+fn grant_approved_for_a_different_command_is_rejected() {
+    // The command echoed on approval must match the parked request, so a
+    // stale/forged approval can't apply a grant the operator never saw.
+    let mut state = state_at_active_milestone();
+    let next = state.last_seq + 1;
+    apply(
+        &mut state,
+        &ev(
+            next,
+            EventKind::GrantRequested {
+                milestone_id: "ms-1".to_string(),
+                command: "gc lint --strict".to_string(),
+            },
+        ),
+    )
+    .unwrap();
+    let err = apply(
+        &mut state,
+        &ev(
+            next + 1,
+            EventKind::GrantApproved {
+                command: "rm -rf /".to_string(),
+            },
+        ),
+    )
+    .expect_err("mismatched grant.approved must be rejected");
+    assert!(matches!(err, EngineError::InvalidState(_)), "got {err:?}");
+    assert!(
+        state.pending_grant_request.is_some(),
+        "pending request survives a rejected approval"
+    );
+    assert!(state.mission.command_grants.is_empty());
+}
+
+#[test]
+fn grant_requested_for_unknown_milestone_is_rejected() {
+    let mut state = state_at_active_milestone();
+    let next = state.last_seq + 1;
+    let err = apply(
+        &mut state,
+        &ev(
+            next,
+            EventKind::GrantRequested {
+                milestone_id: "ms-nope".to_string(),
+                command: "gc lint".to_string(),
+            },
+        ),
+    )
+    .expect_err("grant.requested for an unknown milestone must be rejected");
+    assert!(matches!(err, EngineError::InvalidState(_)), "got {err:?}");
+    assert!(state.pending_grant_request.is_none());
+}
+
+#[test]
+fn grant_requested_with_empty_command_is_rejected() {
+    let mut state = state_at_active_milestone();
+    let next = state.last_seq + 1;
+    let err = apply(
+        &mut state,
+        &ev(
+            next,
+            EventKind::GrantRequested {
+                milestone_id: "ms-1".to_string(),
+                command: "   ".to_string(),
+            },
+        ),
+    )
+    .expect_err("empty grant command must be rejected");
+    assert!(matches!(err, EngineError::InvalidState(_)), "got {err:?}");
+}
+
+#[test]
+fn grant_approved_is_extend_only_and_deduped() {
+    // Approving a command already granted (e.g. via the plan) is a no-op push,
+    // not a duplicate.
+    let mut state = state_at_active_milestone();
+    state.mission.command_grants = vec!["gc lint".to_string()];
+    let next = state.last_seq + 1;
+    apply(
+        &mut state,
+        &ev(
+            next,
+            EventKind::GrantRequested {
+                milestone_id: "ms-1".to_string(),
+                command: "gc lint".to_string(),
+            },
+        ),
+    )
+    .unwrap();
+    apply(
+        &mut state,
+        &ev(
+            next + 1,
+            EventKind::GrantApproved {
+                command: "gc lint".to_string(),
+            },
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        state.mission.command_grants,
+        vec!["gc lint".to_string()],
+        "no duplicate grant appended"
+    );
+}
+
+#[test]
+fn grant_denied_folds_after_its_milestone_is_dropped_but_blocking_it_would_brick() {
+    // Regression for the deny-path brick (adversarial review): a parked grant
+    // references a milestone that a later plan revision can DROP. `grant.denied`
+    // must still fold — it only touches `pending_grant_request`, never the
+    // milestone — so denying (or the deny-default timeout) clears the request
+    // cleanly. But a `MilestoneBlocked` for the now-missing milestone fails its
+    // OWN reducer fold; since `emit` appends before it folds, emitting it would
+    // brick the mission on every future load. That is precisely why
+    // `deny_pending_grant` guards the block on the milestone still existing —
+    // this test pins both halves of that invariant.
+    let mut state = state_at_active_milestone(); // ms-1 (active) + ms-2 (pending)
+    let next = state.last_seq + 1;
+    apply(
+        &mut state,
+        &ev(
+            next,
+            EventKind::GrantRequested {
+                milestone_id: "ms-2".to_string(),
+                command: "gc audit".to_string(),
+            },
+        ),
+    )
+    .expect("grant parked for ms-2");
+
+    // Simulate a revision dropping ms-2 (the exact effect apply_revised_plan has
+    // when the revised plan has fewer milestones).
+    state.mission.milestones.retain(|m| m.id != "ms-2");
+
+    // grant.denied still folds and clears the pending request — no brick.
+    apply(
+        &mut state,
+        &ev(
+            next + 1,
+            EventKind::GrantDenied {
+                command: "gc audit".to_string(),
+                reason: "timed out".to_string(),
+            },
+        ),
+    )
+    .expect("grant.denied folds even though ms-2 is gone");
+    assert!(state.pending_grant_request.is_none());
+
+    // Whereas a MilestoneBlocked for the dropped ms-2 WOULD brick — proving the
+    // orchestrator's existence guard on that emit is load-bearing.
+    let err = apply(
+        &mut state,
+        &ev(
+            next + 2,
+            EventKind::MilestoneBlocked {
+                milestone_id: "ms-2".to_string(),
+                reason: "would brick".to_string(),
+            },
+        ),
+    )
+    .expect_err("MilestoneBlocked for a dropped milestone must be rejected");
+    assert!(matches!(err, EngineError::InvalidState(_)), "got {err:?}");
+}

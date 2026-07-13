@@ -377,6 +377,57 @@ pub(crate) async fn post_revision_reject(
     Ok((StatusCode::ACCEPTED, Json(json!({ "queued": true }))))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GrantApproveBody {
+    command: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GrantDenyBody {
+    command: String,
+    #[serde(default = "default_grant_deny_reason")]
+    reason: String,
+}
+
+fn default_grant_deny_reason() -> String {
+    "denied by operator".to_string()
+}
+
+/// `POST /api/missions/:id/grant/approve` — approve the parked grant request.
+pub(crate) async fn post_grant_approve(
+    State(server): State<Arc<ServerState>>,
+    UrlPath(id): UrlPath<String>,
+    Json(body): Json<GrantApproveBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let paths = require_pending_grant(&server, &id, &body.command)?;
+    control::enqueue(
+        &paths,
+        &ControlCommand::ApproveGrant {
+            command: body.command,
+        },
+    )?;
+    Ok((StatusCode::ACCEPTED, Json(json!({ "queued": true }))))
+}
+
+/// `POST /api/missions/:id/grant/deny` — deny the parked grant request.
+pub(crate) async fn post_grant_deny(
+    State(server): State<Arc<ServerState>>,
+    UrlPath(id): UrlPath<String>,
+    Json(body): Json<GrantDenyBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let paths = require_pending_grant(&server, &id, &body.command)?;
+    control::enqueue(
+        &paths,
+        &ControlCommand::DenyGrant {
+            command: body.command,
+            reason: body.reason,
+        },
+    )?;
+    Ok((StatusCode::ACCEPTED, Json(json!({ "queued": true }))))
+}
+
 // ---------------------------------------------------------------------------
 // Shared helpers (also used by the WS handler)
 // ---------------------------------------------------------------------------
@@ -441,6 +492,28 @@ fn require_pending_revision(
         ))),
         None => Err(ApiError::conflict(format!(
             "mission '{id}' has no pending revision"
+        ))),
+    }
+}
+
+/// Confirm a grant request for exactly `command` is parked, so the enqueued
+/// approve/deny can't target a different (or absent) request than the operator
+/// saw. Same active-mission preconditions as the revision gate.
+fn require_pending_grant(
+    server: &ServerState,
+    id: &str,
+    command: &str,
+) -> Result<MissionPaths, ApiError> {
+    let paths = require_revisable_mission(server, id)?;
+    let state = fold_log(&paths).map_err(ApiError::internal)?;
+    match state.pending_grant_request {
+        Some(pending) if pending.command == command => Ok(paths),
+        Some(pending) => Err(ApiError::conflict(format!(
+            "mission '{id}' is awaiting a grant for `{}`, not `{command}`",
+            pending.command
+        ))),
+        None => Err(ApiError::conflict(format!(
+            "mission '{id}' has no pending grant request"
         ))),
     }
 }

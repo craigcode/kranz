@@ -87,6 +87,18 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(600);
 /// minutes of *nothing* on a stream-json pipe is not).
 const DEFAULT_ORCH_STALL_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// Default deadline for an unanswered grant request before it fails closed
+/// (deny-default safety valve). Shrunk by tests via
+/// [`MissionEngine::set_grant_request_timeout`].
+const DEFAULT_GRANT_REQUEST_TIMEOUT: Duration = Duration::from_secs(3600);
+
+/// Max grant requests one milestone's validation may raise per process run.
+/// Each approval extends `command_grants` and re-runs the validator, which can
+/// hit a *fresh* command and request again; without a ceiling an auto-approver
+/// would spin that park→approve→re-validate loop unbounded. Over the cap, the
+/// milestone blocks with the existing refusal semantics instead.
+const GRANT_REQUEST_CAP: u32 = 3;
+
 /// Retry nudge sent when a JSON decision turn fails to parse.
 const JSON_RETRY_MSG: &str =
     "Your previous reply was not parseable. Output ONLY the requested JSON object — \
@@ -314,6 +326,19 @@ pub struct MissionEngine {
     /// preflight session is spawned exactly once, not once per worker. `None`
     /// until the first call to [`Self::worker_auth_verdict`].
     worker_auth_verdict: Option<AuthVerdict>,
+    /// See [`DEFAULT_GRANT_REQUEST_TIMEOUT`]; shrunk by tests.
+    grant_request_timeout: Duration,
+    /// When the currently-parked grant request was raised, for the timeout →
+    /// deny-default valve. Set alongside `pending_grant_request`, cleared when
+    /// it resolves. Ephemeral: a restart re-arms the clock, but the parked
+    /// request itself is durable in `pending_grant_request`.
+    grant_requested_at: Option<std::time::Instant>,
+    /// Per-milestone count of grant requests raised this process run, capped by
+    /// `grant_request_cap`. Ephemeral: a restart re-arms the budget.
+    grant_requests: HashMap<String, u32>,
+    /// Ceiling on grant requests per milestone per run (default
+    /// [`GRANT_REQUEST_CAP`]; shrunk by tests to exercise the cap boundary).
+    grant_request_cap: u32,
 }
 
 impl MissionEngine {
@@ -390,6 +415,10 @@ impl MissionEngine {
             active_tree: None,
             primary_branch_at_start: None,
             worker_auth_verdict: None,
+            grant_request_timeout: DEFAULT_GRANT_REQUEST_TIMEOUT,
+            grant_requested_at: None,
+            grant_requests: HashMap::new(),
+            grant_request_cap: GRANT_REQUEST_CAP,
         })
     }
 
@@ -490,6 +519,10 @@ impl MissionEngine {
             active_tree: None,
             primary_branch_at_start: None,
             worker_auth_verdict: None,
+            grant_request_timeout: DEFAULT_GRANT_REQUEST_TIMEOUT,
+            grant_requested_at: None,
+            grant_requests: HashMap::new(),
+            grant_request_cap: GRANT_REQUEST_CAP,
         })
     }
 
@@ -544,6 +577,18 @@ impl MissionEngine {
     /// path without waiting ten minutes).
     pub fn set_orch_stall_timeout(&mut self, timeout: Duration) {
         self.orch_stall_timeout = timeout;
+    }
+
+    /// Shrink the grant-request timeout (tests exercise the timeout →
+    /// deny-default path without waiting an hour).
+    pub fn set_grant_request_timeout(&mut self, timeout: Duration) {
+        self.grant_request_timeout = timeout;
+    }
+
+    /// Shrink the per-milestone grant-request cap (tests exercise the
+    /// cap-boundary → block path without scripting three approvals).
+    pub fn set_grant_request_cap(&mut self, cap: u32) {
+        self.grant_request_cap = cap;
     }
 
     /// Test hook (plan §4.8 acceptance): drop the live orchestrator session
@@ -1449,6 +1494,128 @@ impl MissionEngine {
         Ok(())
     }
 
+    /// Approve the parked grant for `command`: append `grant.approved` (the
+    /// reducer extends `command_grants` extend-only and clears the pending
+    /// request), so the milestone's validators re-run with the widened
+    /// allow-set. The `command` echoed back by the operator must match the
+    /// parked request — a stale approval for a different command is refused,
+    /// not silently applied to whatever is parked now.
+    fn approve_pending_grant(&mut self, command: &str) -> Result<()> {
+        let pending = self.state.pending_grant_request.clone().ok_or_else(|| {
+            EngineError::InvalidState("no pending grant request to approve".to_string())
+        })?;
+        if pending.command != command {
+            return Err(EngineError::InvalidState(format!(
+                "pending grant is {:?}, not {command:?}",
+                pending.command
+            )));
+        }
+        self.emit(EventKind::GrantApproved {
+            command: pending.command.clone(),
+        })?;
+        self.emit_decision(
+            &format!("grant approved: `{}` added to command grants", pending.command),
+            Some("the milestone's validators will re-run with the widened allow-set".to_string()),
+        )?;
+        self.grant_requested_at = None;
+        Ok(())
+    }
+
+    /// Deny the parked grant for `command`: append `grant.denied` (clears the
+    /// pending request) and then block the milestone that hit the boundary with
+    /// the existing refusal semantics. The block is what actually stops the run
+    /// loop re-entering validation forever; without it, clearing the pending
+    /// request alone would let the next validation round re-request the same
+    /// grant. Same command-match guard as approval.
+    ///
+    /// The `MilestoneBlocked` emit is guarded on the milestone still existing: a
+    /// concurrent plan revision can drop the parked (in-flight) milestone, and
+    /// `MilestoneBlocked` for an unknown milestone fails its OWN reducer fold —
+    /// which, because `emit` appends before it folds, would brick the mission on
+    /// every future load (and the deny-default timeout makes that automatic). If
+    /// the milestone is gone, the revision already moved past it, so clearing
+    /// the grant (`grant.denied`, which folds unconditionally) is enough — the
+    /// run loop re-evaluates the revised plan.
+    fn deny_pending_grant(&mut self, command: &str, reason: &str) -> Result<()> {
+        let pending = self.state.pending_grant_request.clone().ok_or_else(|| {
+            EngineError::InvalidState("no pending grant request to deny".to_string())
+        })?;
+        if pending.command != command {
+            return Err(EngineError::InvalidState(format!(
+                "pending grant is {:?}, not {command:?}",
+                pending.command
+            )));
+        }
+        self.emit(EventKind::GrantDenied {
+            command: pending.command.clone(),
+            reason: reason.to_string(),
+        })?;
+        let milestone_exists = self
+            .state
+            .mission
+            .milestones
+            .iter()
+            .any(|m| m.id == pending.milestone_id);
+        if milestone_exists {
+            self.emit(EventKind::MilestoneBlocked {
+                milestone_id: pending.milestone_id.clone(),
+                reason: format!("validator command denied: `{}` — {reason}", pending.command),
+            })?;
+        }
+        self.emit_decision(
+            &format!("grant denied: `{}`", pending.command),
+            Some(reason.to_string()),
+        )?;
+        self.grant_requested_at = None;
+        Ok(())
+    }
+
+    /// If `outcome` was stopped by a grantable command denial, offer the
+    /// operator the narrowest grant and park (emit `GrantRequested`), returning
+    /// `true`. Bounded by `grant_request_cap` per milestone: over the cap it
+    /// emits an informational decision and returns `false` so the caller blocks
+    /// via the normal path (this monotonic, never-reset counter is what bounds
+    /// the park→approve→re-validate loop). Returns `false` when there is no
+    /// denied command to grant. Callers gate this on an UNTRUSTED outcome.
+    fn maybe_park_for_grant(
+        &mut self,
+        milestone_id: &str,
+        role: Role,
+        outcome: &runner::RunOutcome,
+    ) -> Result<bool> {
+        // Only the first denied command is offered; a re-run surfaces the next.
+        // Non-command denials (Write/Edit/web — READ_ONLY_DENY, deny-wins) never
+        // populate `denied_commands`, so they don't reach here.
+        let Some(command) = outcome.denied_commands.first().cloned() else {
+            return Ok(false);
+        };
+        let prior = *self.grant_requests.get(milestone_id).unwrap_or(&0);
+        if prior >= self.grant_request_cap {
+            self.emit_decision(
+                &format!(
+                    "{} still blocked on `{command}` after {} grant request(s); not offering another",
+                    role_label(role),
+                    self.grant_request_cap
+                ),
+                None,
+            )?;
+            return Ok(false);
+        }
+        self.grant_requests.insert(milestone_id.to_string(), prior + 1);
+        self.emit(EventKind::GrantRequested {
+            milestone_id: milestone_id.to_string(),
+            command: command.clone(),
+        })?;
+        self.emit_decision(
+            &format!(
+                "{} validation blocked on `{command}`; parked for an operator grant decision",
+                role_label(role)
+            ),
+            None,
+        )?;
+        Ok(true)
+    }
+
     /// Persist the approval-time cost estimate to the primary mission dir as
     /// gitignored runtime bookkeeping (see [`MissionPaths::estimate_file`]). The
     /// completion report reads it back so "estimated vs actual" reflects the
@@ -1917,6 +2084,32 @@ impl MissionEngine {
                 continue;
             }
 
+            // (c') capability-grant gate: a validator hit a command outside its
+            // allow-set and parked the milestone for an operator decision.
+            // Mirror the revision gate — a passive park drained by
+            // `drain_control` (ApproveGrant/DenyGrant) — with a deny-default
+            // timeout so an unanswered request fails closed. Routing the gate
+            // here (not inside validation_round) keeps the park shallow: control
+            // draining, pause, and the revision gate all still apply, and no
+            // stale milestone index is held across the wait.
+            if let Some(pending) = self.state.pending_grant_request.clone() {
+                // Arm the clock on first observation — also covers a restart
+                // that reloaded a durable pending request with no timestamp.
+                let requested_at = *self
+                    .grant_requested_at
+                    .get_or_insert_with(std::time::Instant::now);
+                if requested_at.elapsed() >= self.grant_request_timeout {
+                    self.deny_pending_grant(
+                        &pending.command,
+                        "grant request timed out with no operator decision (deny-default)",
+                    )?;
+                    continue;
+                }
+                self.log.flush_if_due()?;
+                tokio::time::sleep(PAUSE_POLL).await;
+                continue;
+            }
+
             // (d) first incomplete milestone; none → final gate (h).
             let Some(mi) = first_incomplete(&self.state) else {
                 match self.final_gate().await? {
@@ -2034,6 +2227,24 @@ impl MissionEngine {
                         tracing::warn!(error = %e, revision, "revision rejection ignored");
                         self.emit(EventKind::OrchestratorDecision {
                             summary: format!("revision {revision} rejection ignored: {e}"),
+                            detail: None,
+                        })?;
+                    }
+                }
+                ControlCommand::ApproveGrant { command } => {
+                    if let Err(e) = self.approve_pending_grant(&command) {
+                        tracing::warn!(error = %e, command, "grant approval ignored");
+                        self.emit(EventKind::OrchestratorDecision {
+                            summary: format!("grant approval for `{command}` ignored: {e}"),
+                            detail: None,
+                        })?;
+                    }
+                }
+                ControlCommand::DenyGrant { command, reason } => {
+                    if let Err(e) = self.deny_pending_grant(&command, &reason) {
+                        tracing::warn!(error = %e, command, "grant denial ignored");
+                        self.emit(EventKind::OrchestratorDecision {
+                            summary: format!("grant denial for `{command}` ignored: {e}"),
                             detail: None,
                         })?;
                     }
@@ -3180,6 +3391,21 @@ impl MissionEngine {
             // injected Claude backend. A crashed/aborted validator must never
             // collapse into "no findings" and green-light validation.
             if !validator_outcome_trusted(&outcome) {
+                // Capability-boundary check (grant-request-decision-flow),
+                // gated on the UNTRUSTED outcome: a validator stopped by a
+                // command outside its allow-set is a grantable allow-set MISS
+                // (validators carry no blanket Bash; `command_grants` fold into
+                // their allow-set as `Bash(<cmd>*)` patterns, so extending the
+                // grants genuinely unblocks the re-run — unlike a worker
+                // deny-rule/hook denial, where deny wins). Offer the narrowest
+                // grant and park BEFORE burning the retry (same allow-set). The
+                // !trusted gate matters: a validator that hit an incidental
+                // denial but still produced a trusted PASS must NOT park, or a
+                // later deny would wrongly block a milestone that actually
+                // passed.
+                if self.maybe_park_for_grant(&milestone_id, role, &outcome)? {
+                    return Ok(());
+                }
                 self.emit_decision(
                     &format!(
                         "{} {} run did not produce a trusted validator report ({}); retrying once with \
@@ -3213,6 +3439,16 @@ impl MissionEngine {
                 let caught = self.catch_up();
                 outcome = retry_outcome?;
                 caught?;
+
+                // A denial the runner could only read on the Claude retry (a
+                // Codex/Droid primary whose events don't map to a command, or a
+                // primary that failed some other way) surfaces its grant here,
+                // so those backends aren't silently un-grantable.
+                if !validator_outcome_trusted(&outcome)
+                    && self.maybe_park_for_grant(&milestone_id, role, &outcome)?
+                {
+                    return Ok(());
+                }
             }
 
             if !validator_outcome_trusted(&outcome) {
@@ -7482,6 +7718,7 @@ mod tests {
             config: MissionConfig::default(),
             latest_plan_revision: 0,
             pending_revision: None,
+            pending_grant_request: None,
             last_seq: 0,
         };
 

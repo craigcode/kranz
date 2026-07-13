@@ -207,6 +207,14 @@ pub fn router_with_shared_host_and_addr(
             post(rest::post_revision_reject),
         )
         .route(
+            "/api/missions/{id}/grant/approve",
+            post(rest::post_grant_approve),
+        )
+        .route(
+            "/api/missions/{id}/grant/deny",
+            post(rest::post_grant_deny),
+        )
+        .route(
             "/api/missions/{id}/planning/turn",
             post(host::planning_turn),
         )

@@ -131,6 +131,41 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             state.pending_revision = None;
         }
 
+        EventKind::GrantRequested {
+            milestone_id,
+            command,
+        } => {
+            milestone_mut(state, milestone_id)?; // existence check
+            if command.trim().is_empty() {
+                return Err(EngineError::InvalidState(
+                    "grant.requested command must not be empty".to_string(),
+                ));
+            }
+            state.pending_grant_request = Some(PendingGrantRequest {
+                milestone_id: milestone_id.clone(),
+                command: command.clone(),
+            });
+        }
+
+        EventKind::GrantApproved { command } => {
+            // Cross-check against the parked request (mirrors PlanRevised): a
+            // forged or replayed grant.approved with no matching pending
+            // request — or one naming a different command than was requested —
+            // must never silently widen command_grants.
+            expect_pending_grant(state, command, "grant.approved")?;
+            // Extend-only, deduped: the granted command joins command_grants
+            // so the retried validator clears the boundary.
+            if !state.mission.command_grants.iter().any(|c| c == command) {
+                state.mission.command_grants.push(command.clone());
+            }
+            state.pending_grant_request = None;
+        }
+
+        EventKind::GrantDenied { command, .. } => {
+            expect_pending_grant(state, command, "grant.denied")?;
+            state.pending_grant_request = None;
+        }
+
         EventKind::MilestoneStarted {
             milestone_id,
             start_sha,
@@ -387,8 +422,27 @@ fn initial_state(event: &Event) -> Result<MissionState> {
         config: config.clone(),
         latest_plan_revision: 0,
         pending_revision: None,
+        pending_grant_request: None,
         last_seq: event.seq,
     })
+}
+
+/// Assert that `command` matches the parked `pending_grant_request`. Both
+/// `grant.approved` and `grant.denied` gate on this, so a forged or replayed
+/// decision event can neither widen `command_grants` (approve) nor clear a
+/// request the operator never saw (deny). Mirrors the `pending.revision`
+/// cross-check that `PlanRevised`/`PlanRevisionRejected` perform.
+fn expect_pending_grant(state: &MissionState, command: &str, event: &str) -> Result<()> {
+    match &state.pending_grant_request {
+        Some(pending) if pending.command == command => Ok(()),
+        Some(pending) => Err(EngineError::InvalidState(format!(
+            "{event} command {command:?} does not match pending grant {:?}",
+            pending.command
+        ))),
+        None => Err(EngineError::InvalidState(format!(
+            "{event} with no pending grant request"
+        ))),
+    }
 }
 
 fn apply_revised_plan(state: &mut MissionState, plan: &Plan, revision: u32) -> Result<()> {

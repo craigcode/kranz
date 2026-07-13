@@ -4,6 +4,38 @@ priority: 2
 schedule: once
 ---
 
+## SECOND ATTEMPT SHIPPED 2026-07-13 — B-core + CLI + REST landed and review-cleared
+
+Built on the corrected (validator-path) premise and cleared a three-agent
+adversarial review before commit. What shipped:
+
+- **Runner** (`runner.rs`): `RunOutcome.denied_commands`, correlated positionally
+  from the preceding `ToolUse` (no tool-use id on Claude). Recognises Claude
+  `Bash` AND Codex `command_execution`; consume-once guards a stale re-attribution.
+- **Events/state/reducer**: `grant.requested{milestoneId,command}` /
+  `grant.approved{command}` / `grant.denied{command,reason}`;
+  `MissionState.pending_grant_request`; folding with a forged-event cross-check
+  (`expect_pending_grant`), extend-only+deduped command_grants.
+- **Orchestrator**: trigger in `validation_round` gated on an UNTRUSTED validator
+  outcome (an incidental denial on a passing validator must not park); runs
+  before AND after the Claude retry (so Codex/Droid primaries get a grant via the
+  retry); run-loop-level park gate; deny-default timeout; per-milestone
+  `grant_request_cap` (monotonic, never reset). Approve extends grants + re-runs;
+  deny/timeout blocks the milestone — guarded on the milestone still existing
+  (a revision can drop it; an unguarded MilestoneBlocked would brick the log).
+- **Operator surfaces**: `kranz grant approve|deny <id> <command>` (CLI) and
+  `POST /api/missions/:id/grant/approve|deny` (REST), both echoing the command so
+  a stale decision can't target a different parked request.
+
+Coverage: runner real-fixture (Claude + Codex), reducer folding + brick-invariant,
+orchestrator e2e (approve→complete, deny→blocked, timeout, over-eager-park guard,
+cap boundary, retry re-check), CLI + REST route tests. Dashboard renders the three
+events crash-safe in the feed.
+
+STILL DEFERRED (B-surfaces ergonomics): a dashboard GrantRequestPanel with
+approve/deny buttons, and the Slack approve/deny card (clone RevisionPanel /
+`build_revision_ready`). The functional vertical works without them via CLI/REST.
+
 ## FIRST ATTEMPT REVERTED 2026-07-13 — the premise below is WRONG; read this first
 
 A B-core build (commit 79d3f5e) was reverted after adversarial review found it

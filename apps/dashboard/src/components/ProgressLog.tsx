@@ -28,6 +28,15 @@ function describe(e: MissionEvent, state: MissionState | null): { text: string; 
       return { text: `Revision ${e.payload.revision} approved`, tone: 'ok' };
     case 'plan.revision.rejected':
       return { text: `Revision ${e.payload.revision} rejected`, tone: 'warn' };
+    case 'grant.requested':
+      return {
+        text: `Grant requested: ${truncate(e.payload.command, 80)} — awaiting approval`,
+        tone: 'warn',
+      };
+    case 'grant.approved':
+      return { text: `Grant approved: ${truncate(e.payload.command, 80)}`, tone: 'ok' };
+    case 'grant.denied':
+      return { text: `Grant denied: ${truncate(e.payload.command, 80)}`, tone: 'bad' };
     case 'milestone.started':
       return { text: `Milestone ${e.payload.milestoneId} started`, tone: 'info' };
     case 'feature.started':

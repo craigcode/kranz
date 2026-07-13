@@ -192,6 +192,7 @@ mod tests {
             config: MissionConfig::default(),
             latest_plan_revision: 0,
             pending_revision: None,
+            pending_grant_request: None,
             last_seq: 1,
         }
     }

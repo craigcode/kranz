@@ -121,6 +121,12 @@ pub enum Command {
         command: RevisionCommand,
     },
 
+    /// Approve or deny a parked capability-grant request
+    Grant {
+        #[command(subcommand)]
+        command: GrantCommand,
+    },
+
     /// List this repo's missions
     Missions,
 
@@ -362,6 +368,31 @@ pub enum RevisionCommand {
 
         /// Revision number to reject
         revision: u32,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum GrantCommand {
+    /// Approve the parked grant request (extend command_grants + re-validate)
+    Approve {
+        /// Mission id whose pending grant should be approved
+        id: String,
+
+        /// The exact command to grant, quoted (must match the parked request)
+        command: String,
+    },
+
+    /// Deny the parked grant request (block the milestone, fail closed)
+    Deny {
+        /// Mission id whose pending grant should be denied
+        id: String,
+
+        /// The exact command being denied, quoted (must match the parked request)
+        command: String,
+
+        /// Reason recorded on the denial
+        #[arg(long, default_value = "denied by operator")]
+        reason: String,
     },
 }
 

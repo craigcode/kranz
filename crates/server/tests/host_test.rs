@@ -1018,6 +1018,85 @@ async fn revision_routes_expose_diff_and_enqueue_decisions() {
         .contains("must not be empty"));
 }
 
+fn seed_pending_grant_log(repo_root: &Path, id: &str, command: &str) {
+    let paths = MissionPaths::new(repo_root, id);
+    let plan: Plan = serde_json::from_value(plan_json()).unwrap();
+    let mut log = EventLog::acquire(&paths, id, Duration::ZERO, LockForce::No).unwrap();
+    log.append(EventKind::MissionCreated {
+        goal: "observe".into(),
+        base_branch: "main".into(),
+        mission_branch: format!("kranz/mission-{id}"),
+        config: MissionConfig::default(),
+    })
+    .unwrap();
+    log.append(EventKind::PlanApproved {
+        plan,
+        base_sha: Some("base-1".into()),
+    })
+    .unwrap();
+    log.append(EventKind::GrantRequested {
+        milestone_id: "ms-1".into(),
+        command: command.into(),
+    })
+    .unwrap();
+}
+
+#[tokio::test]
+async fn grant_routes_enqueue_approve_and_deny_decisions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let command = "gc audit --deep";
+    seed_pending_grant_log(&root, "m-grant", command);
+    let app = kranz_server::router_with_token(root.clone(), None, Some(TOKEN.to_string()));
+
+    // A command that doesn't match the parked request is refused.
+    let (status, body) = post_json(
+        &app,
+        "/api/missions/m-grant/grant/approve",
+        Some(TOKEN),
+        json!({ "command": "rm -rf /" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(body["error"].as_str().unwrap().contains("awaiting a grant"));
+
+    // The exact command approves and enqueues ApproveGrant.
+    let (status, body) = post_json(
+        &app,
+        "/api/missions/m-grant/grant/approve",
+        Some(TOKEN),
+        json!({ "command": command }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(body["queued"], true);
+    let drained = kranz_engine::control::drain(&MissionPaths::new(&root, "m-grant")).unwrap();
+    assert_eq!(drained.len(), 1);
+    assert!(matches!(
+        &drained[0].1,
+        kranz_engine::types::ControlCommand::ApproveGrant { command: c } if c == command
+    ));
+
+    // Clear the (non-destructively drained) inbox, then deny.
+    for (path, _) in kranz_engine::control::drain(&MissionPaths::new(&root, "m-grant")).unwrap() {
+        std::fs::remove_file(path).unwrap();
+    }
+    let (status, body) = post_json(
+        &app,
+        "/api/missions/m-grant/grant/deny",
+        Some(TOKEN),
+        json!({ "command": command, "reason": "not this run" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(body["queued"], true);
+    let drained = kranz_engine::control::drain(&MissionPaths::new(&root, "m-grant")).unwrap();
+    assert!(matches!(
+        &drained[0].1,
+        kranz_engine::types::ControlCommand::DenyGrant { command: c, reason } if c == command && reason == "not this run"
+    ));
+}
+
 // ---------------------------------------------------------------------------
 // Hosted lifecycle: goal → conversation → plan → approve → start → COMPLETE
 // ---------------------------------------------------------------------------

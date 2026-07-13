@@ -185,6 +185,23 @@ pub struct RunOutcome {
     pub exit: SessionExit,
     /// Guardrail hits: denied tool results seen in the stream (§4.7).
     pub denied_count: u32,
+    /// Distinct denied SHELL commands (`Bash`), each correlated from the tool
+    /// call that was blocked — the candidates a grant could unblock
+    /// (grant-request-decision-flow). Captured for validator runs, whose
+    /// denials are allow-set misses that extending `command_grants` clears;
+    /// scrubbed + bounded + de-duplicated. `ToolResult` carries no tool-use id
+    /// on the Claude backend, so this is the command from the immediately
+    /// preceding `ToolUse` (a denied result follows its call in the stream).
+    pub denied_commands: Vec<String>,
+}
+
+/// Whether `tool` names a shell whose `ToolUse` summary is a runnable command a
+/// `command_grants` entry could unblock. Claude's `Bash` and Codex's
+/// `command_execution` both carry the literal command in the summary
+/// (`backend_claude.rs`, `backend_codex.rs`); Droid emits no tool events, so its
+/// command denials never reach this path.
+fn is_grantable_shell_tool(tool: &str) -> bool {
+    tool.eq_ignore_ascii_case("bash") || tool.eq_ignore_ascii_case("command_execution")
 }
 
 // ---------------------------------------------------------------------------
@@ -276,6 +293,11 @@ pub async fn run_session_to(
     let mut final_text = String::new();
     let mut last_is_error = false;
     let mut denied_count: u32 = 0;
+    // Positional ToolUse↔ToolResult correlation for grant-request: remember
+    // the last tool call so a denied result can name the command it blocked.
+    let mut last_tool_use: Option<(String, String)> = None;
+    let mut denied_commands: Vec<String> = Vec::new();
+    const DENIED_COMMANDS_CAP: usize = 16;
     let mut cancelled = false;
 
     {
@@ -298,8 +320,34 @@ pub async fn run_session_to(
                 }
                 Step::Event(None) => break,
                 Step::Event(Some(event)) => {
+                    if let AgentEvent::ToolUse { tool, summary, .. } = &event {
+                        last_tool_use = Some((tool.clone(), summary.clone()));
+                    }
                     if sink.handle(&run_meta.run_id, &event)? {
                         denied_count += 1;
+                        // Attribute the denial to the immediately-preceding tool
+                        // call: a ToolResult carries no tool-use id (Claude sets
+                        // tool=None, Codex/Droid don't correlate), so the command
+                        // lives only on the preceding ToolUse. Only a shell tool's
+                        // summary is a grantable command — Claude's "Bash" and
+                        // Codex's "command_execution" both put the literal command
+                        // there. `take()` consumes it: a later unrelated denial
+                        // can't re-attribute a stale command. (A parallel-tool-call
+                        // batch can still mis-pick within one turn; the grant is
+                        // operator-confirmed, so the worst case is a visible wrong
+                        // prefix, never a fabricated denial. Trim-guard matches the
+                        // reducer's non-empty check so a whitespace-only capture
+                        // can't be emitted and then rejected on fold.)
+                        if let Some((tool, summary)) = last_tool_use.take() {
+                            if is_grantable_shell_tool(&tool)
+                                && denied_commands.len() < DENIED_COMMANDS_CAP
+                            {
+                                let cmd = scrub::scrub_and_truncate(&summary, MESSAGE_CONTENT_MAX);
+                                if !cmd.trim().is_empty() && !denied_commands.contains(&cmd) {
+                                    denied_commands.push(cmd);
+                                }
+                            }
+                        }
                     }
                     if let AgentEvent::Result {
                         text,
@@ -390,6 +438,7 @@ pub async fn run_session_to(
         validator_report,
         exit,
         denied_count,
+        denied_commands,
     })
 }
 

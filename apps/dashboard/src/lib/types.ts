@@ -305,6 +305,9 @@ export type EventKind =
   | { type: 'plan.revision.proposed'; payload: { revision: number; plan: Plan; instructions: string } }
   | { type: 'plan.revised'; payload: { revision: number; plan: Plan } }
   | { type: 'plan.revision.rejected'; payload: { revision: number; reason: string } }
+  | { type: 'grant.requested'; payload: { milestoneId: string; command: string } }
+  | { type: 'grant.approved'; payload: { command: string } }
+  | { type: 'grant.denied'; payload: { command: string; reason: string } }
   | { type: 'milestone.started'; payload: { milestoneId: string; startSha: string } }
   | { type: 'feature.started'; payload: { featureId: string } }
   | { type: 'worker.spawned'; payload: { runId: string; role: Role; featureId?: string; milestoneId?: string; sdkSessionId: string; model: string; promptHash: string; transcriptPath: string } }

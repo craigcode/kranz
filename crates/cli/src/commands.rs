@@ -6,7 +6,7 @@
 //! work on machines without a `claude` binary installed.
 
 use crate::backlog;
-use crate::cli::{Cli, Command, RevisionCommand, TicketCommand};
+use crate::cli::{Cli, Command, GrantCommand, RevisionCommand, TicketCommand};
 use crate::output::{self, ansi};
 use crate::planning_tui::PlanningOutcome;
 use crate::tail::{self, EventRenderer};
@@ -119,6 +119,29 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
                 RevisionCommand::Reject { id, revision } => {
                     cmd_reject_revision(&repo, &id, revision)?;
                     println!("revision {revision} rejection queued for mission {id}");
+                    if let Some(hint) = control_queue_hint(&repo, &id) {
+                        println!("{hint}");
+                    }
+                }
+            }
+            Ok(0)
+        }
+        Command::Grant { command } => {
+            match command {
+                GrantCommand::Approve { id, command } => {
+                    cmd_approve_grant(&repo, &id, &command)?;
+                    println!("grant approval for `{command}` queued for mission {id}");
+                    if let Some(hint) = control_queue_hint(&repo, &id) {
+                        println!("{hint}");
+                    }
+                }
+                GrantCommand::Deny {
+                    id,
+                    command,
+                    reason,
+                } => {
+                    cmd_deny_grant(&repo, &id, &command, &reason)?;
+                    println!("grant denial for `{command}` queued for mission {id}");
                     if let Some(hint) = control_queue_hint(&repo, &id) {
                         println!("{hint}");
                     }
@@ -956,6 +979,34 @@ pub fn cmd_reject_revision(repo: &Path, mission_id: &str, revision: u32) -> Resu
     )?)
 }
 
+/// Enqueue an ApproveGrant control command. Returns the queued file path.
+pub fn cmd_approve_grant(repo: &Path, mission_id: &str, command: &str) -> Result<PathBuf> {
+    let paths = require_pending_grant(repo, mission_id, command)?;
+    Ok(control::enqueue(
+        &paths,
+        &ControlCommand::ApproveGrant {
+            command: command.to_string(),
+        },
+    )?)
+}
+
+/// Enqueue a DenyGrant control command. Returns the queued file path.
+pub fn cmd_deny_grant(
+    repo: &Path,
+    mission_id: &str,
+    command: &str,
+    reason: &str,
+) -> Result<PathBuf> {
+    let paths = require_pending_grant(repo, mission_id, command)?;
+    Ok(control::enqueue(
+        &paths,
+        &ControlCommand::DenyGrant {
+            command: command.to_string(),
+            reason: reason.to_string(),
+        },
+    )?)
+}
+
 fn require_revisable_mission(repo: &Path, mission_id: &str) -> Result<MissionPaths> {
     let mission_id = control::resolve_active_mission(repo, Some(mission_id))?;
     let state = load_state(repo, &mission_id)?;
@@ -975,6 +1026,22 @@ fn require_pending_revision(repo: &Path, mission_id: &str, revision: u32) -> Res
             pending.revision
         ),
         None => bail!("mission {mission_id} has no pending revision"),
+    }
+}
+
+/// Resolve the mission and confirm a grant request for exactly `command` is
+/// parked, so the enqueued approve/deny can't silently target a different (or
+/// absent) request than the operator saw.
+fn require_pending_grant(repo: &Path, mission_id: &str, command: &str) -> Result<MissionPaths> {
+    let mission_id = control::resolve_active_mission(repo, Some(mission_id))?;
+    let state = load_state(repo, &mission_id)?;
+    match state.pending_grant_request {
+        Some(pending) if pending.command == command => Ok(MissionPaths::new(repo, &mission_id)),
+        Some(pending) => bail!(
+            "mission {mission_id} is awaiting a grant for `{}`, not `{command}`",
+            pending.command
+        ),
+        None => bail!("mission {mission_id} has no pending grant request"),
     }
 }
 

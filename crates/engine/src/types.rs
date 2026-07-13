@@ -354,6 +354,12 @@ pub struct MissionState {
     /// gate and the repo stays busy until consent arrives.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_revision: Option<PendingRevision>,
+    /// A capability denial (today: a validator command outside its allow-set)
+    /// awaiting an operator approve/deny decision. Like `pending_revision`, the
+    /// run loop parks on this gate; approving extends `command_grants` and
+    /// respawns, denying (or a timeout) fails the feature closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_grant_request: Option<PendingGrantRequest>,
     /// Seq of the last event folded in.
     pub last_seq: u64,
 }
@@ -364,6 +370,18 @@ pub struct PendingRevision {
     pub revision: u32,
     pub plan: Plan,
     pub instructions: String,
+}
+
+/// A parked capability-grant request (see [`MissionState::pending_grant_request`]).
+/// Names the exact command a `command_grants` extension would unblock and the
+/// milestone whose validation hit the boundary, so the operator's approve/deny
+/// decision — and the reducer's cross-check on `grant.approved`/`grant.denied`
+/// — key off the same command that was requested.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingGrantRequest {
+    pub milestone_id: String,
+    pub command: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -597,6 +615,12 @@ pub enum ControlCommand {
     RequestRevision { instructions: String },
     ApproveRevision { revision: u32 },
     RejectRevision { revision: u32 },
+    /// Approve the parked grant request for `command` (extend `command_grants`
+    /// and respawn). The command is echoed back so a stale approval can't apply
+    /// to a different pending request than the operator saw.
+    ApproveGrant { command: String },
+    /// Deny the parked grant request for `command` (fail the feature closed).
+    DenyGrant { command: String, reason: String },
 }
 
 #[cfg(test)]

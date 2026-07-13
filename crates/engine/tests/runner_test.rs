@@ -2,7 +2,8 @@
 //! runner (plan §4.6), driven entirely through the mock backend.
 
 use kranz_engine::auth_verify::AuthVerdict;
-use kranz_engine::backend::{PromptMode, SessionExit, SessionSpec};
+use kranz_engine::backend::{AgentEvent, PromptMode, SessionExit, SessionSpec};
+use kranz_engine::backend_claude::parse_stream_line;
 use kranz_engine::backend_mock::{
     mock_denied, mock_init, mock_result_text, mock_text, mock_tool_use, MockBackend, MockScript,
 };
@@ -547,6 +548,105 @@ async fn run_session_tags_denied_tool_results() {
         |e| matches!(&e.kind, EventKind::WorkerMessage { tag, content, .. }
             if tag == "tool-use" && content.starts_with("Bash: "))
     ));
+}
+
+/// grant-request-decision-flow foundation: `denied_commands` must capture the
+/// denied SHELL command from a REAL Claude stream — parsed through the actual
+/// `parse_stream_line`, not the fabricated `mock_denied` shape. This is the
+/// exact chain a prior attempt got wrong: a denied Claude `tool_result`
+/// carries `tool: None` (the tool name is only on the preceding `tool_use`),
+/// so the command must be correlated positionally from that `tool_use`.
+#[tokio::test]
+async fn denied_commands_captured_from_a_real_claude_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    let mut log = seeded_log(&p);
+
+    // A real assistant `tool_use` (Bash) and a real permission-denied
+    // `tool_result`, both through the production parser.
+    let tool_use_line = json!({
+        "type": "assistant",
+        "message": { "id": "m1", "content": [
+            { "type": "tool_use", "name": "Bash", "input": { "command": "gc lint --strict" } }
+        ] }
+    })
+    .to_string();
+    let denied_line = json!({
+        "type": "user",
+        "message": { "role": "user", "content": [
+            { "type": "tool_result", "tool_use_id": "toolu_01",
+              "content": "Permission denied: Bash(gc lint --strict) requires approval",
+              "is_error": true }
+        ] }
+    })
+    .to_string();
+
+    // Sanity: the parser yields exactly the shapes the correlation relies on —
+    // a Bash ToolUse whose summary is the command, and a denied ToolResult
+    // whose `tool` is None.
+    let parsed_use = parse_stream_line(&tool_use_line);
+    assert!(matches!(&parsed_use[0],
+        AgentEvent::ToolUse { tool, summary, .. } if tool == "Bash" && summary == "gc lint --strict"));
+    let parsed_denied = parse_stream_line(&denied_line);
+    assert!(matches!(&parsed_denied[0],
+        AgentEvent::ToolResult { tool: None, denied: true, .. }));
+
+    let mut events = vec![mock_init("s-real")];
+    events.extend(parsed_use);
+    events.extend(parsed_denied);
+    events.push(mock_result_text("stopped: needs approval"));
+    let script = MockScript {
+        events,
+        ..Default::default()
+    };
+    let backend = MockBackend::with_scripts(vec![script]);
+    let spec = session_spec(PromptMode::SingleShot("run the check".to_string()));
+    let outcome = run_session(&backend, spec, &mut log, &p, worker_meta("run-real"), None)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.denied_count, 1);
+    assert_eq!(
+        outcome.denied_commands,
+        vec!["gc lint --strict".to_string()],
+        "the denied Bash command must be correlated from the preceding tool_use"
+    );
+}
+
+/// The capture must also fire for the Codex backend, whose shell ToolUse is
+/// named `command_execution` (not `Bash`) but likewise carries the literal
+/// command in its summary. A prior review found the runner's `bash`-only guard
+/// silently dropped these — the command was right there but rejected.
+#[tokio::test]
+async fn denied_commands_captured_from_codex_command_execution() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    let mut log = seeded_log(&p);
+
+    let script = MockScript {
+        events: vec![
+            mock_init("s-codex"),
+            // Codex's shell tool: tool name "command_execution", summary = cmd.
+            mock_tool_use("command_execution", "gc scan --all"),
+            // The denied result (its own `tool`/`summary` are irrelevant — the
+            // command is correlated from the preceding ToolUse).
+            mock_denied("command_execution", "sandbox refused"),
+            mock_result_text("stopped: needs approval"),
+        ],
+        ..Default::default()
+    };
+    let backend = MockBackend::with_scripts(vec![script]);
+    let spec = session_spec(PromptMode::SingleShot("run the scan".to_string()));
+    let outcome = run_session(&backend, spec, &mut log, &p, worker_meta("run-codex"), None)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.denied_count, 1);
+    assert_eq!(
+        outcome.denied_commands,
+        vec!["gc scan --all".to_string()],
+        "a Codex command_execution denial must be captured, not dropped"
+    );
 }
 
 #[tokio::test]
