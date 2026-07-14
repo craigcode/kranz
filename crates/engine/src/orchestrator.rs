@@ -336,6 +336,12 @@ pub struct MissionEngine {
     /// Per-milestone count of grant requests raised this process run, capped by
     /// `grant_request_cap`. Ephemeral: a restart re-arms the budget.
     grant_requests: HashMap<String, u32>,
+    /// Per-feature count of worker respawns caused by a `WorkerDeny` grant park
+    /// (each park re-runs the worker on re-entry). Subtracted from
+    /// `feature.respawns` in the judgement `max_respawns` check so an operator
+    /// approving deny-lifts doesn't consume the failure-retry budget. Ephemeral
+    /// (a restart re-couples them — fail-safe, same as the cap counter).
+    grant_respawns: HashMap<String, u32>,
     /// Ceiling on grant requests per milestone per run (default
     /// [`GRANT_REQUEST_CAP`]; shrunk by tests to exercise the cap boundary).
     grant_request_cap: u32,
@@ -418,6 +424,7 @@ impl MissionEngine {
             grant_request_timeout: DEFAULT_GRANT_REQUEST_TIMEOUT,
             grant_requested_at: None,
             grant_requests: HashMap::new(),
+            grant_respawns: HashMap::new(),
             grant_request_cap: GRANT_REQUEST_CAP,
         })
     }
@@ -522,6 +529,7 @@ impl MissionEngine {
             grant_request_timeout: DEFAULT_GRANT_REQUEST_TIMEOUT,
             grant_requested_at: None,
             grant_requests: HashMap::new(),
+            grant_respawns: HashMap::new(),
             grant_request_cap: GRANT_REQUEST_CAP,
         })
     }
@@ -2621,6 +2629,10 @@ impl MissionEngine {
             if outcome.result != RunResult::Pass {
                 let milestone_id = self.state.mission.milestones[mi].id.clone();
                 if self.maybe_park_for_worker_deny_grant(&milestone_id, &outcome)? {
+                    // This park re-runs the worker on re-entry (approve OR deny
+                    // both re-run it); credit that respawn so it doesn't charge
+                    // the failure-retry budget below.
+                    *self.grant_respawns.entry(feature.id.clone()).or_insert(0) += 1;
                     return Ok(());
                 }
             }
@@ -2645,7 +2657,11 @@ impl MissionEngine {
                 }
                 JudgementOutcome::Respawn(new_guidance) => {
                     let respawns = self.state.mission.milestones[mi].features[fi].respawns;
-                    if respawns < self.state.config.max_respawns {
+                    // Don't let operator-approved deny-lift respawns eat the
+                    // failure-retry budget: subtract them so `max_respawns`
+                    // bounds only judgement-driven retries.
+                    let grant_respawns = *self.grant_respawns.get(&feature.id).unwrap_or(&0);
+                    if respawns.saturating_sub(grant_respawns) < self.state.config.max_respawns {
                         guidance = Some(new_guidance);
                         continue;
                     }

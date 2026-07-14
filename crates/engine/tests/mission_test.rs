@@ -2175,6 +2175,103 @@ async fn worker_denial_on_a_passing_run_does_not_park() {
     assert!(types.contains(&"mission.completed"));
 }
 
+/// A worker-deny grant respawn does NOT consume the failure-retry budget: with
+/// `max_respawns = 1`, a grant respawn followed by a genuine judgement respawn
+/// still completes (it would fail "respawn budget exhausted" without the
+/// grant-respawn decoupling).
+#[tokio::test]
+async fn worker_deny_grant_respawn_does_not_eat_the_respawn_budget() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let denied_cmd = "git push origin main";
+
+    // Run 1: denied `git push`, reports fail → parks a deny-lift grant.
+    let tool_use = json!({
+        "type": "assistant",
+        "message": { "id": "w1", "content": [
+            { "type": "tool_use", "name": "Bash", "input": { "command": denied_cmd } }
+        ] }
+    })
+    .to_string();
+    let denied = json!({
+        "type": "user",
+        "message": { "role": "user", "content": [
+            { "type": "tool_result", "tool_use_id": "t1",
+              "content": format!("Permission denied: Bash({denied_cmd})"), "is_error": true }
+        ] }
+    })
+    .to_string();
+    let report1 = json!({ "result": "fail", "summary": "blocked from pushing" });
+    let mut w1 = vec![mock_init("w1")];
+    w1.extend(parse_stream_line(&tool_use));
+    w1.extend(parse_stream_line(&denied));
+    w1.push(mock_text(&report1.to_string()));
+    w1.push(mock_result_json(&report1));
+    let worker_denied = MockScript {
+        events: w1,
+        ..Default::default()
+    };
+
+    // FIFO: run 1 (denied → park; grant respawn), run 2 (plain fail →
+    // judgement respawn), run 3 (pass, deliverable). Orch turns: judge run 2
+    // (respawn), dirty-tree + judge run 3 (complete), capture.
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_denied,
+        worker_fail(),
+        worker_pass(),
+        orch_script(vec![
+            judgement("respawn", "try without the push"),
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+    ]));
+
+    // max_respawns = 1: the ONE judgement respawn (run 2 → run 3) must survive
+    // the earlier grant respawn (run 1 → run 2), which the decoupling exempts.
+    let cfg = MissionConfig {
+        max_respawns: 1,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+    let paths = engine.paths().clone();
+
+    let handle = tokio::spawn(async move {
+        let result = engine.run().await;
+        (engine, result)
+    });
+
+    wait_for_pending_grant(&paths).await;
+    control::enqueue(
+        &paths,
+        &ControlCommand::ApproveGrant {
+            command: "Bash(git push*)".to_string(),
+        },
+    )
+    .unwrap();
+
+    let (engine, result) = timeout(TEST_TIMEOUT, handle)
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    // Completes — the grant respawn did NOT exhaust the retry budget.
+    assert_eq!(result.unwrap(), MissionStatus::Complete);
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    let types = event_types(&events);
+    assert!(types.contains(&"mission.completed"), "{types:?}");
+    assert!(
+        !events.iter().any(|e| matches!(&e.kind,
+            EventKind::FeatureFailed { reason, .. } if reason.contains("respawn budget"))),
+        "the grant respawn must not exhaust the budget"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 5b. Scrubbing: orchestrator decision detail (structured-field leak)
 // ---------------------------------------------------------------------------

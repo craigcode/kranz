@@ -23,21 +23,47 @@ nothing tells the engine "egress to `<host>` was denied." So the grant flow has
 no signal to trigger on, and can't name the destination the operator would
 grant.
 
-## What this ticket needs FIRST (the actual work)
+## Feasibility research (2026-07-14) — the signal EXISTS on macOS, not on Linux
 
-Instrument the sandbox to emit a per-destination egress-denial signal the engine
-can attribute to a run:
-- Investigate whether Seatbelt / bubblewrap can log denied outbound connections
-  with the destination (Seatbelt has `(deny network-outbound (with report))`
-  style reporting; bubblewrap has no native per-host deny logging — may need a
-  userspace proxy or eBPF). Feasibility is genuinely uncertain, especially on
-  Linux.
-- If feasible: parse those denials into a structured signal (host + run id),
-  surface it on `RunOutcome` (mirror `denied_commands`), and add an
-  `egress` `GrantKind` that extends the mission's egress allowlist on approval.
+Revises the "wholly unobservable" framing above. Confidence is mixed; verify
+each against current OS docs before building.
 
-Only once the emission exists is the grant flow itself a small addition (a third
-`GrantKind`, reusing park/approve/deny/timeout/cap and all four surfaces).
+**macOS (Seatbelt) — an observable signal exists, but fragile.** Seatbelt writes
+every denial to the unified log under a `Sandbox:` prefix, format
+`Sandbox: <process>(<pid>) deny(1) <operation> <detail>` — for a blocked
+connection the operation is `network-outbound` and the detail carries the
+destination. So the engine COULD tail `log stream --predicate 'eventMessage
+CONTAINS "Sandbox: "'`, parse the `network-outbound` denials, and correlate by
+pid to the run. Caveats that make this real work: the log format is not a stable
+API; pid→run correlation is fragile (workers spawn subprocesses); `sandbox-exec`
+is Apple-deprecated; and our own `sandbox.rs` currently REFUSES `fs+net` on macOS
+because Seatbelt's allow side only takes `*`/`localhost` (per-host `(remote tcp …)`
+allow rules exist on some versions but aren't what we emit today). So macOS needs
+both a per-host egress profile AND a log-tailing denial reader.
+
+**Linux (bubblewrap) — no signal; needs new enforcement infra.** bwrap isolates
+network via a namespace: it's all-or-nothing (`--unshare-net` = no network), with
+NO per-host allowlist and NO per-destination deny logging. A blocked connection
+is a bare `connect()` error. Getting per-destination egress denials requires
+building egress *enforcement* first — realistically a userspace filtering proxy
+(route worker traffic through it, it logs blocked hosts) or a cgroup/socket eBPF
+hook. Both are substantial, and the proxy is probably the portable path (works on
+macOS too, sidestepping the Seatbelt fragility).
+
+## Recommended sequence (the actual work)
+
+1. Build per-host egress ENFORCEMENT with a structured denial signal — most
+   likely a filtering egress proxy shared by both platforms (portable, gives a
+   clean `host + run-id` denial event, avoids unified-log/log-tailing fragility).
+2. Surface the denial on `RunOutcome` (mirror `denied_commands`).
+3. THEN the grant flow is a small addition: a fourth `GrantKind` (`egress`) that
+   extends the mission's egress allowlist on approval, reusing
+   park/approve/deny/timeout/cap and all four surfaces.
+
+Sources for the macOS findings:
+- <https://theapplewiki.com/wiki/Dev:Seatbelt>
+- <https://github.com/microsoft/mxc/blob/main/docs/macos-support/seatbelt-backend.md>
+- <https://github.com/michaelneale/agent-seatbelt-sandbox>
 
 Deferred from the grant-request-decision-flow work (see
 `grant-request-decision-flow.md`), where command + touch-set grants shipped and

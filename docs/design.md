@@ -45,6 +45,27 @@ Deny rules take precedence over allows in Claude Code.
 `--dangerously-allow-all` → `bypassPermissions`, loud in UI, never default.
 Denied tool results are tagged `denied` on `worker.message` events.
 
+### Runtime grants (operator consent widens the profile)
+
+The profile above is the STARTING point; three mission-state lists mutate it at
+runtime, each extended only through the grant-request decision flow (an operator
+approving a `grant.requested` event — see the grant tickets). All are recorded
+in the event log with who/when.
+
+- **`command_grants`** — read-only shell commands folded as `Bash(<cmd>*)` allows
+  into BOTH the worker and validator profiles. Extends the ALLOW set (a validator
+  command outside its allow-set is the grantable case; a worker already has bare
+  `Bash`, so this is a no-op for it against deny-wins).
+- **`touch_set`** — gitignore-style globs the mission may write; enforced by the
+  out-of-contract-write sweep, not this tool profile. A `touch-path` grant adds a
+  path.
+- **`deny_exceptions`** — worker deny rules an operator has LIFTED. Subtracted
+  from the Worker `deny` column by exact-string `retain`, so a `worker-deny`
+  grant removes exactly the one rule the operator approved (e.g. `Bash(git push*)`
+  or `Bash(sudo*)`). This is the one grant that ERODES a guardrail; it is
+  per-mission, explicit, logged, and never plan-declared. Deny-wins still holds
+  for every rule NOT in `deny_exceptions`.
+
 Live-QA mode (functional validator only): any EXTRA tool configured in
 `validatorFunctional.tools` beyond the standard inspect set
 (`Bash,Read,Glob,Grep`) — e.g. a browser/computer-use tool — is also folded
