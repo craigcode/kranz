@@ -1998,6 +1998,183 @@ async fn out_of_contract_write_touch_grant_denied_flows_to_waive() {
     );
 }
 
+/// A worker command blocked by a deny rule parks a WORKER-DENY grant naming the
+/// RULE (not the command). Approving it adds the rule to deny_exceptions —
+/// subtracting it from the worker deny set — and the respawned worker completes.
+#[tokio::test]
+async fn worker_deny_grant_lifts_the_rule_and_respawn_completes() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let denied_cmd = "git push origin main";
+
+    // Worker run 1: blocked by a denied `git push` and reports FAIL (the deny
+    // gate only offers a guardrail-lift when the worker didn't succeed anyway).
+    // Clean tree (no deliverable) so there's no dirty-tree turn before the park.
+    let tool_use = json!({
+        "type": "assistant",
+        "message": { "id": "w1", "content": [
+            { "type": "tool_use", "name": "Bash", "input": { "command": denied_cmd } }
+        ] }
+    })
+    .to_string();
+    let denied = json!({
+        "type": "user",
+        "message": { "role": "user", "content": [
+            { "type": "tool_result", "tool_use_id": "t1",
+              "content": format!("Permission denied: Bash({denied_cmd})"), "is_error": true }
+        ] }
+    })
+    .to_string();
+    let report1 = json!({
+        "result": "fail", "summary": "blocked from pushing",
+        "filesTouched": [], "testsAdded": [], "testEvidence": "", "commits": []
+    });
+    let mut w1 = vec![mock_init("w1")];
+    w1.extend(parse_stream_line(&tool_use));
+    w1.extend(parse_stream_line(&denied));
+    w1.push(mock_text(&report1.to_string()));
+    w1.push(mock_result_json(&report1));
+    let worker_denied = MockScript {
+        events: w1,
+        ..Default::default()
+    };
+
+    // FIFO: worker run 1 (denied → park), worker run 2 (respawn after lift,
+    // writes a deliverable), orchestrator (dirty-tree, judgement, capture).
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_denied,
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+    ]));
+
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+    let paths = engine.paths().clone();
+
+    let handle = tokio::spawn(async move {
+        let result = engine.run().await;
+        (engine, result)
+    });
+
+    wait_for_pending_grant(&paths).await;
+    let snap = reducer::read_snapshot(&paths.state_file()).unwrap();
+    let pending = snap
+        .pending_grant_request
+        .expect("parked worker-deny grant");
+    assert_eq!(pending.kind, GrantKind::WorkerDeny);
+    // The grant target is the RULE the operator lifts, not the raw command.
+    assert_eq!(pending.command, "Bash(git push*)");
+    control::enqueue(
+        &paths,
+        &ControlCommand::ApproveGrant {
+            command: "Bash(git push*)".to_string(),
+        },
+    )
+    .unwrap();
+
+    let (engine, result) = timeout(TEST_TIMEOUT, handle)
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(result.unwrap(), MissionStatus::Complete);
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    let types = event_types(&events);
+    for expected in ["grant.requested", "grant.approved", "mission.completed"] {
+        assert!(types.contains(&expected), "missing {expected}: {types:?}");
+    }
+    // The lifted rule is now a durable, logged deny exception.
+    let state = reducer::fold(&events).unwrap();
+    assert_eq!(state.mission.status, MissionStatus::Complete);
+    assert!(
+        state
+            .mission
+            .deny_exceptions
+            .contains(&"Bash(git push*)".to_string()),
+        "the lifted rule must join deny_exceptions: {:?}",
+        state.mission.deny_exceptions
+    );
+}
+
+/// A worker that hit a denial but STILL reported success must NOT park a
+/// worker-deny grant — eroding a guardrail for a run that already succeeded
+/// would be a spurious prompt. The milestone completes with no grant.requested.
+#[tokio::test]
+async fn worker_denial_on_a_passing_run_does_not_park() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let denied_cmd = "git push origin main";
+
+    // Worker reports PASS despite a denied `git push`, and writes a deliverable.
+    let tool_use = json!({
+        "type": "assistant",
+        "message": { "id": "w1", "content": [
+            { "type": "tool_use", "name": "Bash", "input": { "command": denied_cmd } }
+        ] }
+    })
+    .to_string();
+    let denied = json!({
+        "type": "user",
+        "message": { "role": "user", "content": [
+            { "type": "tool_result", "tool_use_id": "t1",
+              "content": format!("Permission denied: Bash({denied_cmd})"), "is_error": true }
+        ] }
+    })
+    .to_string();
+    let report = json!({
+        "result": "pass", "summary": "shipped without the push",
+        "filesTouched": ["delivered.txt"], "testsAdded": [], "testEvidence": "ok", "commits": []
+    });
+    let mut w = vec![mock_init("w1")];
+    w.extend(parse_stream_line(&tool_use));
+    w.extend(parse_stream_line(&denied));
+    w.push(mock_text(&report.to_string()));
+    w.push(mock_result_json(&report));
+    let worker = MockScript {
+        events: w,
+        ..Default::default()
+    }
+    .writes_file("delivered.txt", "shipped\n");
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker,
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+    ]));
+
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+    let paths = engine.paths().clone();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+    drop(engine);
+
+    let events = read_log(&paths);
+    let types = event_types(&events);
+    assert!(
+        !types.contains(&"grant.requested"),
+        "a passing worker must not park a deny-lift grant: {types:?}"
+    );
+    assert!(types.contains(&"mission.completed"));
+}
+
 // ---------------------------------------------------------------------------
 // 5b. Scrubbing: orchestrator decision detail (structured-field leak)
 // ---------------------------------------------------------------------------

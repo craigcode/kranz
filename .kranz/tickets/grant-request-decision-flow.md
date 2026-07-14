@@ -51,9 +51,21 @@ Known bounded limitations documented in `deny_pending_grant`: touch-deny is
 process-durable via the cap, not log-durable (restart may re-prompt); the
 per-milestone cap is shared with command grants (fails closed).
 
-REMAINING: worker deny-rule grants (deny-set subtraction — a safety tradeoff,
-separate slice) and egress grants (blocked on sandbox instrumentation, see
-`egress-grant-sandbox-instrumentation.md`).
+WORKER-DENY GRANTS SHIPPED 2026-07-13 (maximum-consent, per Craig): the third
+`GrantKind` (`worker-deny`) lets an operator LIFT any `WORKER_DENY` rule (incl.
+sudo/git push/publish) by explicit, logged, per-mission consent — subtracting it
+from the worker deny set (`Mission.deny_exceptions`, permissions.rs exact-match
+`retain`). Trigger in `run_feature` on a NON-successful worker run's denial
+(`matching_deny_rule` names the narrowest blocking rule); approve lifts + respawns
+the worker, deny/timeout flows to normal judgement. Cleared a focused SAFETY
+review — confirmed the lift is exactly the approved rule (no over-lift, no
+forgery, no cross-list contamination); fixed the park firing on already-passing
+runs and made rule-matching pick the most-specific rule. Bounded, fail-safe
+limitation documented: grant respawns charge the `max_respawns` budget.
+
+REMAINING: egress grants only — blocked on sandbox instrumentation, see
+`egress-grant-sandbox-instrumentation.md`. All command/touch/worker-deny grants
+are live across CLI, REST, dashboard, and Slack.
 
 ## FIRST ATTEMPT REVERTED 2026-07-13 — the premise below is WRONG; read this first
 

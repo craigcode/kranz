@@ -582,6 +582,7 @@ pub async fn run_worker(
     cancel: Option<Arc<Notify>>,
     base_sha: Option<&str>,
     grants: &[String],
+    deny_exceptions: &[String],
     auth_verdict: AuthVerdict,
 ) -> Result<RunOutcome> {
     let cwd = paths.repo_root.clone();
@@ -598,6 +599,7 @@ pub async fn run_worker(
         &cwd,
         base_sha,
         grants,
+        deny_exceptions,
         auth_verdict,
     )
     .await
@@ -625,6 +627,7 @@ pub async fn run_worker_in(
     session_cwd: &std::path::Path,
     base_sha: Option<&str>,
     grants: &[String],
+    deny_exceptions: &[String],
     auth_verdict: AuthVerdict,
 ) -> Result<RunOutcome> {
     let (spec, run_meta) = build_worker_spec(
@@ -636,6 +639,7 @@ pub async fn run_worker_in(
         session_cwd,
         base_sha,
         grants,
+        deny_exceptions,
         paths.mission_dir(),
         auth_verdict,
     )?;
@@ -672,6 +676,7 @@ pub async fn run_worker_in_buffered(
     session_cwd: &std::path::Path,
     base_sha: Option<&str>,
     grants: &[String],
+    deny_exceptions: &[String],
     auth_verdict: AuthVerdict,
 ) -> Result<(Vec<EventKind>, RunOutcome)> {
     let (spec, run_meta) = build_worker_spec(
@@ -683,6 +688,7 @@ pub async fn run_worker_in_buffered(
         session_cwd,
         base_sha,
         grants,
+        deny_exceptions,
         paths.mission_dir(),
         auth_verdict,
     )?;
@@ -808,6 +814,7 @@ fn build_worker_spec(
     session_cwd: &std::path::Path,
     base_sha: Option<&str>,
     grants: &[String],
+    deny_exceptions: &[String],
     mission_dir: std::path::PathBuf,
     auth_verdict: AuthVerdict,
 ) -> Result<(SessionSpec, RunMeta)> {
@@ -879,7 +886,10 @@ fn build_worker_spec(
         real_config_dir.as_deref(),
     );
     spec.sandbox = resolve_sandbox_or_refuse(role_cfg, session_cwd, &mission_dir)?;
-    permissions::apply(permissions::for_role(role, cfg, &[], grants), &mut spec);
+    permissions::apply(
+        permissions::for_role(role, cfg, &[], grants, deny_exceptions),
+        &mut spec,
+    );
 
     let run_meta = RunMeta {
         run_id: uuid::Uuid::new_v4().to_string(),
@@ -1048,7 +1058,7 @@ pub async fn run_validator_in(
     spec.env = contract_env(base_sha);
     spec.sandbox = resolve_sandbox_or_refuse(role_cfg, session_cwd, &paths.mission_dir())?;
     permissions::apply(
-        permissions::for_role(kind, cfg, &combined_commands, grants),
+        permissions::for_role(kind, cfg, &combined_commands, grants, &[]),
         &mut spec,
     );
 

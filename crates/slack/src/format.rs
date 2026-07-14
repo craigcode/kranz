@@ -641,6 +641,11 @@ pub fn build_grant_ready(g: &GrantReady, dashboard_url: Option<&str>) -> Vec<Val
             "A worker wrote a path outside the mission's touch-set.",
             "*Out-of-contract path*",
         ),
+        kranz_engine::types::GrantKind::WorkerDeny => (
+            "A worker command was blocked by a deny rule. Approving LIFTS that \
+             rule for this mission (a deliberate erosion of a safety guardrail).",
+            "*Deny rule to lift*",
+        ),
     };
     let mut blocks = vec![
         header(&format!("Grant requested — {}", g.mission_id)),

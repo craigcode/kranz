@@ -130,6 +130,7 @@ pub fn for_role(
     cfg: &MissionConfig,
     validator_commands: &[String],
     grants: &[String],
+    deny_exceptions: &[String],
 ) -> PermissionProfile {
     if cfg.dangerously_allow_all {
         return PermissionProfile {
@@ -147,6 +148,14 @@ pub fn for_role(
                 disallowed.push(as_tool_rule(pattern));
             }
             dedup_preserving_order(&mut disallowed);
+            // Subtract operator-lifted rules (WorkerDeny grants). Exact-match
+            // removal: the event log names the precise rule lifted, and only
+            // that rule leaves the worker deny set — a deliberate, auditable
+            // erosion of the guardrail. Applied AFTER dedup so a lifted rule is
+            // gone whether it came from WORKER_DENY or config deny_patterns.
+            if !deny_exceptions.is_empty() {
+                disallowed.retain(|rule| !deny_exceptions.contains(rule));
+            }
             let mut allowed = vec!["Bash".to_string()];
             for grant in grants {
                 allowed.extend(command_allow_patterns(grant));
@@ -260,6 +269,33 @@ pub fn command_allow_patterns(command: &str) -> Vec<String> {
     patterns
 }
 
+/// The worker deny rule that blocks `command`, if any — used to name the rule a
+/// `WorkerDeny` grant would lift. Best-effort: parses `Bash(<pattern>*)` rules
+/// and prefix-matches the command against `<pattern>`. Non-`Bash(...)` rules
+/// (WebFetch/WebSearch/tool names) never match a shell command.
+///
+/// When several rules match, returns the MOST SPECIFIC (longest-prefix) one —
+/// so a narrow config rule (`Bash(git push --force*)`) is offered over the broad
+/// built-in (`Bash(git push*)`), keeping the operator's lift as narrow as the
+/// rule that actually blocked the command. A wrong or absent match just means
+/// the grant offers the wrong/no rule and the command stays denied (cap-bounded);
+/// the authoritative enforcement is Claude Code removing the exact rule string
+/// from `disallowed_tools`.
+pub fn matching_deny_rule(command: &str, deny_rules: &[String]) -> Option<String> {
+    let cmd = command.trim();
+    deny_rules
+        .iter()
+        .filter_map(|rule| {
+            let pat = rule
+                .strip_prefix("Bash(")
+                .and_then(|r| r.strip_suffix(')'))?;
+            let prefix = pat.strip_suffix('*').unwrap_or(pat);
+            (!prefix.is_empty() && cmd.starts_with(prefix)).then_some((rule, prefix.len()))
+        })
+        .max_by_key(|(_, len)| *len)
+        .map(|(rule, _)| rule.clone())
+}
+
 /// Wrap a config `deny_patterns` entry as `Bash(<pattern>)` unless it already
 /// looks like a tool rule: contains `(` (e.g. `Bash(dd*)`) or exactly matches
 /// a known tool name (e.g. `WebFetch`).
@@ -287,6 +323,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn worker_deny_exceptions_lift_exactly_the_named_rule() {
+        let cfg = MissionConfig::default();
+        // Baseline: git push is denied.
+        let base = for_role(Role::Worker, &cfg, &[], &[], &[]);
+        assert!(base.disallowed_tools.iter().any(|r| r == "Bash(git push*)"));
+
+        // Lifting `Bash(git push*)` removes exactly that rule; the other rails
+        // (sudo, curl, …) stay in force.
+        let lifted = for_role(
+            Role::Worker,
+            &cfg,
+            &[],
+            &[],
+            &["Bash(git push*)".to_string()],
+        );
+        assert!(!lifted
+            .disallowed_tools
+            .iter()
+            .any(|r| r == "Bash(git push*)"));
+        assert!(lifted.disallowed_tools.iter().any(|r| r == "Bash(sudo*)"));
+        assert!(lifted.disallowed_tools.iter().any(|r| r == "Bash(curl*)"));
+    }
+
+    #[test]
+    fn matching_deny_rule_maps_a_command_to_the_rule_that_blocks_it() {
+        let deny = to_strings(WORKER_DENY);
+        assert_eq!(
+            matching_deny_rule("git push origin main", &deny).as_deref(),
+            Some("Bash(git push*)")
+        );
+        assert_eq!(
+            matching_deny_rule("sudo rm -rf /", &deny).as_deref(),
+            Some("Bash(sudo*)")
+        );
+        // A command no deny rule blocks maps to nothing.
+        assert_eq!(matching_deny_rule("cargo build", &deny), None);
+        // Non-Bash rules (WebFetch/WebSearch/tool names) never match a command.
+        assert_eq!(
+            matching_deny_rule("anything at all", &["WebFetch".to_string()]),
+            None
+        );
+        // Most specific wins: a narrower config rule is offered over the broad
+        // built-in, so the operator's lift stays as narrow as what blocked it.
+        let mixed = vec![
+            "Bash(git push*)".to_string(),
+            "Bash(git push --force*)".to_string(),
+        ];
+        assert_eq!(
+            matching_deny_rule("git push --force origin main", &mixed).as_deref(),
+            Some("Bash(git push --force*)")
+        );
+    }
+
+    #[test]
     fn grants_reach_worker_and_validator() {
         let cfg = MissionConfig::default();
         let grants = vec!["gc lint".to_string()];
@@ -295,13 +385,13 @@ mod tests {
         // a `*`-suffixed prefix match, not a verbatim match.
         assert!(command_allow_patterns("gc lint").contains(&"Bash(gc lint*)".to_string()));
 
-        let worker = for_role(Role::Worker, &cfg, &[], &grants);
+        let worker = for_role(Role::Worker, &cfg, &[], &grants, &[]);
         assert!(worker.allowed_tools.contains(&"Bash(gc lint*)".to_string()));
         // Grants are additive: the bare worker Bash allow must survive.
         assert!(worker.allowed_tools.contains(&"Bash".to_string()));
         assert_eq!(worker.permission_mode, Some("acceptEdits".to_string()));
 
-        let validator = for_role(Role::ValidatorScrutiny, &cfg, &[], &grants);
+        let validator = for_role(Role::ValidatorScrutiny, &cfg, &[], &grants, &[]);
         assert!(validator
             .allowed_tools
             .contains(&"Bash(gc lint*)".to_string()));
@@ -320,7 +410,7 @@ mod tests {
             }
         }
 
-        let validator = for_role(Role::ValidatorScrutiny, &cfg, &combined, &[]);
+        let validator = for_role(Role::ValidatorScrutiny, &cfg, &combined, &[], &[]);
         assert!(validator
             .allowed_tools
             .contains(&"Bash(cargo test*)".to_string()));

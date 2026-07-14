@@ -160,6 +160,7 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             let list = match kind {
                 GrantKind::Command => &mut state.mission.command_grants,
                 GrantKind::TouchPath => &mut state.mission.touch_set,
+                GrantKind::WorkerDeny => &mut state.mission.deny_exceptions,
             };
             if !list.iter().any(|c| c == command) {
                 list.push(command.clone());
@@ -419,6 +420,7 @@ fn initial_state(event: &Event) -> Result<MissionState> {
             mission_branch: mission_branch.clone(),
             command_grants: Vec::new(),
             touch_set: Vec::new(),
+            deny_exceptions: Vec::new(),
         },
         runs: BTreeMap::new(),
         totals: TokenUsage::default(),

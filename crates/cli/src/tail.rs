@@ -363,6 +363,7 @@ fn grant_kind_label(kind: &GrantKind) -> &'static str {
     match kind {
         GrantKind::Command => "command",
         GrantKind::TouchPath => "touch-set",
+        GrantKind::WorkerDeny => "deny-lift",
     }
 }
 

@@ -181,7 +181,7 @@ export interface PendingRevision {
   instructions: string;
 }
 
-export type GrantKind = 'command' | 'touch-path';
+export type GrantKind = 'command' | 'touch-path' | 'worker-deny';
 
 export interface PendingGrantRequest {
   milestoneId: string;

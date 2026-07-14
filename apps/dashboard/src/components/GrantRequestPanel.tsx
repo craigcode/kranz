@@ -23,7 +23,9 @@ export function GrantRequestPanel() {
   const blurb =
     pending.kind === 'touch-path'
       ? 'A worker wrote a path outside the mission’s touch-set:'
-      : 'A validator is blocked on a command outside its allow-set:';
+      : pending.kind === 'worker-deny'
+        ? 'A worker command was blocked by a deny rule. Approving LIFTS that rule for this mission:'
+        : 'A validator is blocked on a command outside its allow-set:';
 
   const decide = async (kind: 'approve' | 'deny') => {
     setBusy(kind);

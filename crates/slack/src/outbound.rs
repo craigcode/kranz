@@ -198,6 +198,7 @@ mod tests {
                 mission_branch: "kranz/mission-m-1".into(),
                 command_grants: vec![],
                 touch_set: vec![],
+                deny_exceptions: vec![],
             },
             runs: Default::default(),
             totals: TokenUsage::default(),

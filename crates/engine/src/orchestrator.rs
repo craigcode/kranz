@@ -1523,6 +1523,10 @@ impl MissionEngine {
                 "touch set",
                 "the milestone re-validates with the path inside the contract",
             ),
+            GrantKind::WorkerDeny => (
+                "worker deny exceptions",
+                "the worker respawns with the deny rule lifted",
+            ),
         };
         self.emit_decision(
             &format!(
@@ -1589,22 +1593,24 @@ impl MissionEngine {
                     })?;
                 }
             }
-            GrantKind::TouchPath => {
-                // No block: saturate the cap so re-validation stops re-offering
-                // and the finding flows to convert_findings (fix/waive).
+            GrantKind::TouchPath | GrantKind::WorkerDeny => {
+                // No block: saturate the cap so the re-run stops re-offering and
+                // the run flows on its normal path — TouchPath's out-of-contract
+                // finding to convert_findings (fix/waive), WorkerDeny's still-
+                // denied worker command to the normal judgement/respawn.
                 //
                 // Two bounded, fail-safe limitations of using the ephemeral
                 // counter (vs a durable MilestoneBlocked) here:
                 //  - Restart re-arm: the counter is process-local, so a crash
-                //    during the re-validation window loses the "already denied"
-                //    memory and the deterministic sweep re-offers the grant once
-                //    more. Safe (re-prompt, not a brick/loop) and bounded by the
-                //    cap; the alternative — a durable "denied path" marker —
-                //    isn't worth the event-schema weight for a re-prompt.
-                //  - Cap coupling: the counter is shared with command grants for
-                //    this milestone, so a later command denial in the SAME run
-                //    won't be offered a grant (falls through to block). Fails
-                //    closed; rare (both boundaries in one milestone-run).
+                //    during the re-run window loses the "already denied" memory
+                //    and the deterministic trigger re-offers the grant once more.
+                //    Safe (re-prompt, not a brick/loop) and bounded by the cap;
+                //    a durable "denied" marker isn't worth the event-schema
+                //    weight for a re-prompt.
+                //  - Cap coupling: the counter is shared across grant kinds for
+                //    this milestone, so a later denial of another kind in the
+                //    SAME run won't be offered a grant (falls through). Fails
+                //    closed; rare (multiple boundaries in one milestone-run).
                 self.grant_requests
                     .insert(pending.milestone_id.clone(), self.grant_request_cap);
             }
@@ -1702,6 +1708,44 @@ impl MissionEngine {
         };
         let desc = format!("worker wrote `{path}` outside the touch-set");
         self.park_for_grant(milestone_id, GrantKind::TouchPath, &path, &desc)
+    }
+
+    /// If the worker's `outcome` was blocked by a deny rule, offer the operator
+    /// a grant to LIFT that rule and park, returning `true`. Approving adds the
+    /// rule to `deny_exceptions` (subtracting it from the worker deny set); the
+    /// run loop re-enters this still-Active feature and respawns the worker with
+    /// the rule lifted. Deny/timeout leaves the rule in force and the run flows
+    /// to the normal judgement/respawn. Bounded by the same per-milestone cap.
+    ///
+    /// The grant TARGET is the deny RULE (e.g. `Bash(git push*)`), not the
+    /// command — that is what `deny_exceptions` removes and what the operator is
+    /// consenting to lift (coarser than one command, but deny-rule removal is
+    /// inherently rule-granular). Only a command blocked by a liftable
+    /// `Bash(...)` deny rule is offered; a hook denial or a non-Bash tool denial
+    /// matches no rule and is not grantable this way.
+    fn maybe_park_for_worker_deny_grant(
+        &mut self,
+        milestone_id: &str,
+        outcome: &runner::RunOutcome,
+    ) -> Result<bool> {
+        let Some(command) = outcome.denied_commands.first().cloned() else {
+            return Ok(false);
+        };
+        // The worker's CURRENT deny set (already-lifted rules removed) still
+        // contains the rule that blocked this command.
+        let profile = permissions::for_role(
+            Role::Worker,
+            &self.state.config,
+            &[],
+            &self.state.mission.command_grants,
+            &self.state.mission.deny_exceptions,
+        );
+        let Some(rule) = permissions::matching_deny_rule(&command, &profile.disallowed_tools)
+        else {
+            return Ok(false);
+        };
+        let desc = format!("worker command `{command}` blocked by deny rule `{rule}`");
+        self.park_for_grant(milestone_id, GrantKind::WorkerDeny, &rule, &desc)
     }
 
     /// Persist the approval-time cost estimate to the primary mission dir as
@@ -2458,6 +2502,7 @@ impl MissionEngine {
             let milestone_title = self.state.mission.milestones[mi].title.clone();
             let base_sha = self.state.mission.base_sha.clone();
             let grants = self.state.mission.command_grants.clone();
+            let deny_exceptions = self.state.mission.deny_exceptions.clone();
             let pre_run_sha = self.active_repo().head_sha()?;
 
             // Interrupt wiring: a control watcher polls the inbox and fires
@@ -2503,6 +2548,7 @@ impl MissionEngine {
                     &session_cwd,
                     base_sha.as_deref(),
                     &grants,
+                    &deny_exceptions,
                     auth_verdict,
                 )
                 .await
@@ -2519,6 +2565,7 @@ impl MissionEngine {
                     Some(cancel),
                     base_sha.as_deref(),
                     &grants,
+                    &deny_exceptions,
                     auth_verdict,
                 )
                 .await
@@ -2548,6 +2595,35 @@ impl MissionEngine {
                 .active_repo()
                 .diff_stat(&pre_run_sha, "HEAD")
                 .unwrap_or_default();
+
+            // Worker-deny grant (grant-request-decision-flow): a worker command
+            // blocked by a deny rule (deny-wins) can only be unblocked by
+            // lifting the rule. Offer that grant and park BEFORE judging — after
+            // the dirty-tree checkpoint above, so the worker's partial work is
+            // preserved. Approve lifts the rule and the run loop re-enters this
+            // still-Active feature to respawn the worker; deny/timeout falls
+            // through to the normal judgement. Routed through the run-loop park
+            // gate (return Ok) — never a deep park holding this `mi`/`fi`.
+            //
+            // Gated on a NON-successful outcome (mirrors the validator flow's
+            // `!trusted` gate): a worker that hit a denial but still reported
+            // `pass` worked around it, so eroding a guardrail on its behalf
+            // would be a spurious prompt — and an approve would pointlessly
+            // re-run an already-done feature.
+            //
+            // Budget coupling (bounded, fail-safe): each approve→respawn here
+            // is a fresh worker spawn, so it charges `feature.respawns` without
+            // consulting `max_respawns` (that check lives in the judgement
+            // branch). Grant respawns are bounded by `grant_request_cap`, but
+            // they DO deplete the respawn budget, so a later judgement respawn
+            // can find it already exhausted and fail the feature closed. Unique
+            // to WorkerDeny (Command/TouchPath re-run validation, not a worker).
+            if outcome.result != RunResult::Pass {
+                let milestone_id = self.state.mission.milestones[mi].id.clone();
+                if self.maybe_park_for_worker_deny_grant(&milestone_id, &outcome)? {
+                    return Ok(());
+                }
+            }
 
             match self
                 .judge_worker_run(&feature.id, &outcome, &commits, &diff_stat)
@@ -3080,6 +3156,7 @@ impl MissionEngine {
         let milestone_title = self.state.mission.milestones[mi].title.clone();
         let base_sha = self.state.mission.base_sha.clone();
         let grants = self.state.mission.command_grants.clone();
+        let deny_exceptions = self.state.mission.deny_exceptions.clone();
         let tracker = ConcurrencyTracker::new();
         let selected = self.select_backend(Role::Worker);
         if let Some(reason) = selected.fallback_reason.as_deref() {
@@ -3111,6 +3188,7 @@ impl MissionEngine {
             let guard = tracker.clone();
             let base_sha = base_sha.clone();
             let grants = grants.clone();
+            let deny_exceptions = deny_exceptions.clone();
             set.spawn(async move {
                 let _live = guard.enter(); // count this session as live
                 let result = runner::run_worker_in_buffered(
@@ -3124,6 +3202,7 @@ impl MissionEngine {
                     &ws_path,
                     base_sha.as_deref(),
                     &grants,
+                    &deny_exceptions,
                     auth_verdict,
                 )
                 .await;
@@ -4503,7 +4582,7 @@ impl MissionEngine {
             sandbox: None,
         };
         permissions::apply(
-            permissions::for_role(Role::Orchestrator, &cfg, &[], &[]),
+            permissions::for_role(Role::Orchestrator, &cfg, &[], &[], &[]),
             &mut spec,
         );
 
@@ -4666,7 +4745,7 @@ impl MissionEngine {
             sandbox: None,
         };
         permissions::apply(
-            permissions::for_role(Role::Orchestrator, &cfg, &[], &[]),
+            permissions::for_role(Role::Orchestrator, &cfg, &[], &[], &[]),
             &mut spec,
         );
 
@@ -7807,6 +7886,7 @@ mod tests {
                 mission_branch: "kranz/mission-m-1".to_string(),
                 command_grants: vec![],
                 touch_set: vec![],
+                deny_exceptions: vec![],
             },
             runs,
             totals: TokenUsage::default(),

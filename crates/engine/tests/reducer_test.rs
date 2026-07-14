@@ -2256,3 +2256,40 @@ fn grant_approved_with_mismatched_kind_is_rejected() {
     assert!(state.mission.touch_set.is_empty());
     assert!(state.pending_grant_request.is_some());
 }
+
+#[test]
+fn worker_deny_grant_extends_deny_exceptions_only() {
+    let mut state = state_at_active_milestone();
+    let next = state.last_seq + 1;
+    apply(
+        &mut state,
+        &ev(
+            next,
+            EventKind::GrantRequested {
+                milestone_id: "ms-1".to_string(),
+                kind: GrantKind::WorkerDeny,
+                command: "Bash(git push*)".to_string(),
+            },
+        ),
+    )
+    .expect("worker-deny grant parked");
+    apply(
+        &mut state,
+        &ev(
+            next + 1,
+            EventKind::GrantApproved {
+                kind: GrantKind::WorkerDeny,
+                command: "Bash(git push*)".to_string(),
+            },
+        ),
+    )
+    .expect("worker-deny grant approved");
+    // The lifted rule joins deny_exceptions — NOT command_grants or touch_set.
+    assert_eq!(
+        state.mission.deny_exceptions,
+        vec!["Bash(git push*)".to_string()]
+    );
+    assert!(state.mission.command_grants.is_empty());
+    assert!(state.mission.touch_set.is_empty());
+    assert!(state.pending_grant_request.is_none());
+}

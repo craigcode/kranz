@@ -60,6 +60,12 @@ pub struct Mission {
     /// `Plan`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub touch_set: Vec<String>,
+    /// Worker deny rules (e.g. `Bash(git push*)`) an operator has LIFTED for
+    /// this mission via a `WorkerDeny` grant — subtracted from the worker deny
+    /// set by `permissions::for_role`. Extend-only, runtime-only (never plan-
+    /// declared): a deliberate, logged erosion of a safety guardrail.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny_exceptions: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -385,6 +391,10 @@ pub enum GrantKind {
     Command,
     /// A worker write outside the `touch_set` → extend `touch_set`.
     TouchPath,
+    /// A worker command blocked by a deny rule (deny-wins) → lift that rule by
+    /// adding it to `deny_exceptions`. Unlike the others this SUBTRACTS from a
+    /// safety guardrail, so it is per-mission, explicit, and logged.
+    WorkerDeny,
 }
 
 /// A parked capability-grant request (see [`MissionState::pending_grant_request`]).

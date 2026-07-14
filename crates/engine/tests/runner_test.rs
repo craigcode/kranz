@@ -163,7 +163,7 @@ fn worker_profile_denies_push_publish_network_and_config_extras() {
         worker_isolation: WorkerIsolation::Checkout,
         ..MissionConfig::default()
     };
-    let profile = permissions::for_role(Role::Worker, &cfg, &[], &[]);
+    let profile = permissions::for_role(Role::Worker, &cfg, &[], &[], &[]);
 
     assert_eq!(profile.permission_mode.as_deref(), Some("acceptEdits"));
     assert_eq!(profile.allowed_tools, vec!["Bash".to_string()]);
@@ -199,7 +199,7 @@ fn worker_profile_denies_push_publish_network_and_config_extras() {
 #[test]
 fn orchestrator_profile_is_read_only() {
     let cfg = MissionConfig::default();
-    let profile = permissions::for_role(Role::Orchestrator, &cfg, &[], &[]);
+    let profile = permissions::for_role(Role::Orchestrator, &cfg, &[], &[], &[]);
 
     assert_eq!(profile.permission_mode.as_deref(), Some("default"));
     for expected in [
@@ -272,7 +272,7 @@ fn read_only_git_allows_cover_listing_but_not_ref_mutation() {
         Role::ValidatorScrutiny,
         Role::ValidatorFunctional,
     ] {
-        let profile = permissions::for_role(role, &cfg, &[], &[]);
+        let profile = permissions::for_role(role, &cfg, &[], &[], &[]);
 
         for mutating in [
             "git branch -D x",
@@ -332,7 +332,7 @@ fn validator_profile_allows_contract_commands_as_bash_patterns() {
     let commands = vec!["cargo test --all".to_string()];
 
     for role in [Role::ValidatorScrutiny, Role::ValidatorFunctional] {
-        let profile = permissions::for_role(role, &cfg, &commands, &[]);
+        let profile = permissions::for_role(role, &cfg, &commands, &[], &[]);
         assert_eq!(profile.permission_mode.as_deref(), Some("default"));
         for expected in [
             "Bash(cargo test --all*)", // contract command
@@ -375,7 +375,7 @@ fn dangerously_allow_all_bypasses_every_role() {
         Role::ValidatorScrutiny,
         Role::ValidatorFunctional,
     ] {
-        let profile = permissions::for_role(role, &cfg, &["cargo test".to_string()], &[]);
+        let profile = permissions::for_role(role, &cfg, &["cargo test".to_string()], &[], &[]);
         assert_eq!(
             profile.permission_mode.as_deref(),
             Some("bypassPermissions")
@@ -960,6 +960,7 @@ async fn run_worker_builds_spec_and_uses_report_result() {
         None,
         None,
         &[],
+        &[],
         AuthVerdict::Inconclusive,
     )
     .await
@@ -1053,6 +1054,7 @@ async fn run_worker_seeds_scratch_home_and_config_dir_worker_env_hygiene() {
         None,
         Some(base_sha),
         &[],
+        &[],
         AuthVerdict::Authenticated,
     )
     .await
@@ -1111,6 +1113,7 @@ async fn run_worker_refuses_unsupported_macos_fs_net_sandbox() {
         None,
         None,
         None,
+        &[],
         &[],
         AuthVerdict::Inconclusive,
     )
@@ -1329,6 +1332,7 @@ fn validator_command_patterns_cover_natural_variations() {
         &cfg,
         &["python3 -m pytest test_x.py -v".to_string()],
         &[],
+        &[],
     );
     assert!(profile
         .allowed_tools
@@ -1377,6 +1381,7 @@ async fn run_worker_in_buffered_collects_kinds_without_touching_the_log() {
         None,
         &cwd,
         None,
+        &[],
         &[],
         AuthVerdict::Inconclusive,
     )
