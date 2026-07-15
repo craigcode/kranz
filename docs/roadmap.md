@@ -246,7 +246,7 @@ repos operate from one Slack workspace with unambiguous routing; and a
 brand-new repo's first mission runs with no hand-editing beyond
 `kranz init` answers.
 
-## Product pattern notes from Warp/Oz/Factory (2026-07-08), Cursor (2026-07-09), and Monaco (2026-07-10)
+## Product pattern notes from Warp/Oz/Factory (2026-07-08), Cursor (2026-07-09), Monaco (2026-07-10), and Mission Control (2026-07-13)
 
 External scan: Warp Agent/Oz and Factory's Droid/AutoWiki surfaces are useful
 as UX/product benchmarks, not architecture targets. Cursor is now a stronger
@@ -257,6 +257,21 @@ The broad "agentic IDE" lane (terminal replacement, built-in editor/LSP,
 voice, general local coding environment) still belongs to the sgian side
 product, not kranz. The kranz-compatible lessons are narrower and should
 reinforce the mission/audit/gate model:
+
+AgentSystemLabs Mission Control reinforces the same boundary from the other
+side: it is a polished desktop PTY/session manager, not a mission-validation
+engine. Borrow its sensing and operator ergonomics, not its IDE shell:
+hook-derived lifecycle status, structured human questions, project-grid
+orientation for many repos, explicit workspace/sandbox scope, freshness-aware
+repo memory selection, backend readiness/quota visibility, and a no-auto-push
+GitHub PR handoff are now captured as
+`.kranz/tickets/agent-hooks-status-signals.md`,
+`.kranz/tickets/structured-human-question-events.md`,
+`.kranz/tickets/multi-repo-project-picker.md`,
+`.kranz/tickets/workspace-sandbox-visibility.md`,
+`.kranz/tickets/repo-knowledge-ranked-brief-injection.md`, and
+`.kranz/tickets/backend-readiness-quota-preflight.md`, plus
+`.kranz/tickets/post-complete-pr-handoff-no-push.md`.
 
 - **A worktree is not a workspace.** Monaco's failed local-worktree phase
   exposed the shared runtime problems source isolation does not solve: port
