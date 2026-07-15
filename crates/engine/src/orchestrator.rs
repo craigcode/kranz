@@ -339,8 +339,11 @@ pub struct MissionEngine {
     /// Per-feature count of worker respawns caused by a `WorkerDeny` grant park
     /// (each park re-runs the worker on re-entry). Subtracted from
     /// `feature.respawns` in the judgement `max_respawns` check so an operator
-    /// approving deny-lifts doesn't consume the failure-retry budget. Ephemeral
-    /// (a restart re-couples them — fail-safe, same as the cap counter).
+    /// approving deny-lifts doesn't consume the failure-retry budget. Ephemeral:
+    /// a restart drops the credit and re-couples the counters, so pre-restart
+    /// grant re-runs count against `max_respawns` again and can exhaust the
+    /// budget earlier than intended — fail-safe (fails closed, never loops),
+    /// the same trade-off as the cap counter.
     grant_respawns: HashMap<String, u32>,
     /// Ceiling on grant requests per milestone per run (default
     /// [`GRANT_REQUEST_CAP`]; shrunk by tests to exercise the cap boundary).
@@ -1719,11 +1722,13 @@ impl MissionEngine {
     }
 
     /// If the worker's `outcome` was blocked by a deny rule, offer the operator
-    /// a grant to LIFT that rule and park, returning `true`. Approving adds the
-    /// rule to `deny_exceptions` (subtracting it from the worker deny set); the
-    /// run loop re-enters this still-Active feature and respawns the worker with
-    /// the rule lifted. Deny/timeout leaves the rule in force and the run flows
-    /// to the normal judgement/respawn. Bounded by the same per-milestone cap.
+    /// a grant to LIFT that rule and park, returning `true`. The park discards
+    /// this run's outcome, so either decision re-runs the worker when the run
+    /// loop re-enters this still-Active feature. Approving adds the rule to
+    /// `deny_exceptions` (subtracting it from the worker deny set) so the
+    /// re-run has it lifted; deny/timeout leaves it in force and saturates the
+    /// request cap, so the re-run's denial is not re-offered and flows to the
+    /// normal judgement/respawn. Bounded by the same per-milestone cap.
     ///
     /// The grant TARGET is the deny RULE (e.g. `Bash(git push*)`), not the
     /// command — that is what `deny_exceptions` removes and what the operator is
@@ -2608,10 +2613,12 @@ impl MissionEngine {
             // blocked by a deny rule (deny-wins) can only be unblocked by
             // lifting the rule. Offer that grant and park BEFORE judging — after
             // the dirty-tree checkpoint above, so the worker's partial work is
-            // preserved. Approve lifts the rule and the run loop re-enters this
-            // still-Active feature to respawn the worker; deny/timeout falls
-            // through to the normal judgement. Routed through the run-loop park
-            // gate (return Ok) — never a deep park holding this `mi`/`fi`.
+            // preserved. Parking discards this run's outcome, so EITHER decision
+            // re-runs the worker on re-entry: approve lifts the rule for the
+            // re-run; deny/timeout keeps it in force and saturates the request
+            // cap, so the re-run's denial is not re-offered and flows to the
+            // normal judgement. Routed through the run-loop park gate (return
+            // Ok) — never a deep park holding this `mi`/`fi`.
             //
             // Gated on a NON-successful outcome (mirrors the validator flow's
             // `!trusted` gate): a worker that hit a denial but still reported
@@ -2619,13 +2626,16 @@ impl MissionEngine {
             // would be a spurious prompt — and an approve would pointlessly
             // re-run an already-done feature.
             //
-            // Budget coupling (bounded, fail-safe): each approve→respawn here
-            // is a fresh worker spawn, so it charges `feature.respawns` without
-            // consulting `max_respawns` (that check lives in the judgement
-            // branch). Grant respawns are bounded by `grant_request_cap`, but
-            // they DO deplete the respawn budget, so a later judgement respawn
-            // can find it already exhausted and fail the feature closed. Unique
-            // to WorkerDeny (Command/TouchPath re-run validation, not a worker).
+            // Budget coupling (bounded, fail-safe): the re-run is a fresh worker
+            // spawn, so the reducer still charges `feature.respawns` — but the
+            // judgement branch below subtracts `grant_respawns`, so grant-driven
+            // re-runs do NOT deplete the `max_respawns` failure-retry budget
+            // (they are bounded by `grant_request_cap` instead). The credit is
+            // process-local: a restart drops it and re-couples the counters, so
+            // pre-restart grant re-runs count against `max_respawns` again and
+            // can fail the feature earlier than intended — fails closed, never
+            // loops. Unique to WorkerDeny (Command/TouchPath re-run validation,
+            // not a worker).
             if outcome.result != RunResult::Pass {
                 let milestone_id = self.state.mission.milestones[mi].id.clone();
                 if self.maybe_park_for_worker_deny_grant(&milestone_id, &outcome)? {

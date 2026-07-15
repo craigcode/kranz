@@ -10,8 +10,8 @@ Egress grants would extend the grant-request decision flow to sandbox egress
 denials: a worker/validator blocked from reaching a host parks for an operator
 approve/deny → extend the mission's egress allowlist. The park/approve/deny
 machinery already exists (see the shipped `GrantKind` flow — command + touch
-grants). The BLOCKER is the trigger: there is no observable egress-denial
-signal to park on.
+grants). The BLOCKER is the trigger: no egress-denial signal reaches the
+engine today.
 
 `crates/engine/src/sandbox.rs` uses OS-level containment (macOS Seatbelt SBPL
 `network-outbound` allowlist; Linux bubblewrap). A blocked connection is a
@@ -19,14 +19,16 @@ kernel-level failure delivered to the sandboxed process as a generic connection
 error — NOT a structured event carrying the destination host back to the
 engine's event stream. Unlike command denials (a `tool_result` the runner
 correlates) or touch-set writes (the out-of-contract sweep names the path),
-nothing tells the engine "egress to `<host>` was denied." So the grant flow has
-no signal to trigger on, and can't name the destination the operator would
-grant.
+nothing wired into the engine says "egress to `<host>` was denied." macOS does
+log denials OS-side (see the research below), but that signal is untapped and
+fragile, and Linux has none at all — so the grant flow has nothing to trigger
+on today, and can't name the destination the operator would grant.
 
 ## Feasibility research (2026-07-14) — the signal EXISTS on macOS, not on Linux
 
-Revises the "wholly unobservable" framing above. Confidence is mixed; verify
-each against current OS docs before building.
+Detail behind the opener's caveat: what signal each OS offers and what it would
+take to tap it. Confidence is mixed; verify each against current OS docs before
+building.
 
 **macOS (Seatbelt) — an observable signal exists, but fragile.** Seatbelt writes
 every denial to the unified log under a `Sandbox:` prefix, format

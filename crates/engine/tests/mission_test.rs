@@ -2214,15 +2214,14 @@ async fn worker_deny_grant_respawn_does_not_eat_the_respawn_budget() {
         ..Default::default()
     };
 
-    // FIFO: run 1 (denied → park; grant respawn), run 2 (plain fail →
-    // judgement respawn), run 3 (pass, deliverable). Orch turns: judge run 2
-    // (respawn), dirty-tree + judge run 3 (complete), capture.
+    // FIFO: run 1 (denied → park; grant respawn), run 2 (plain fail → the
+    // deterministic runner-verdict respawn, NO orch turn), run 3 (pass,
+    // deliverable). Orch turns: dirty-tree + judge run 3 (complete), capture.
     let backend = Arc::new(MockBackend::with_scripts(vec![
         worker_denied,
         worker_fail(),
         worker_pass(),
         orch_script(vec![
-            judgement("respawn", "try without the push"),
             dirty_tree_commit_as_is(),
             judgement("complete", ""),
             no_lesson(),
@@ -2259,6 +2258,14 @@ async fn worker_deny_grant_respawn_does_not_eat_the_respawn_budget() {
         .unwrap();
     // Completes — the grant respawn did NOT exhaust the retry budget.
     assert_eq!(result.unwrap(), MissionStatus::Complete);
+    // Three spawns for the one feature: initial + grant respawn + judgement
+    // respawn. Two respawns recorded where max_respawns = 1 allows only one
+    // judgement-driven retry — proof the grant respawn was exempted, not
+    // merely that the mission completed some other way.
+    let feature = &engine.state().mission.milestones[0].features[0];
+    assert_eq!(feature.status, FeatureStatus::Complete);
+    assert_eq!(feature.worker_runs.len(), 3, "initial + 2 respawns");
+    assert_eq!(feature.respawns, 2, "grant respawn + judgement respawn");
     let paths = engine.paths().clone();
     drop(engine);
 
