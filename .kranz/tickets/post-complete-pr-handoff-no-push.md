@@ -5,30 +5,32 @@ schedule: once
 ---
 
 ## Goal
-Add an optional GitHub PR handoff for completed missions that never pushes
-automatically. When a mission branch is complete and reviewable, kranz should
-help the operator create a pull request only if the branch already exists on a
-remote, or else show the exact push command the human must run first. The
-handoff can live in the dashboard, CLI, and Slack, but it must preserve the
-local rule: kranz does not push refs from the operator's machine.
+Add an optional GitHub PR handoff for COMPLETE-but-unmerged missions that
+never pushes. If the mission branch already exists on the remote, kranz may
+run or prepare `gh pr create`. If not, show a copyable `git push` for the
+human. Preserve the local rule: kranz does not push refs from the operator
+machine.
 
 ## Context
-Mission Control has commit/push/PR affordances. The useful kranz-sized slice is
-not auto-push and not general git publishing; it is a post-completion review
-bridge for teams that want GitHub PR review around a delivered mission branch.
+Mission Control's PR button is the UX reference; kranz adapts handoff only.
+M6 cloud/CI may push `kranz/*` under explicit deploy-key scope — that path is
+out of scope for this ticket. Local operator flow stays stricter.
 
-This overlaps with M6's scoped push exception, but the local product rule stays
-stricter. Cloud/CI execution may push `kranz/*` refs under explicit deploy-key
-scope; local kranz should only detect remote branch presence and run or prepare
-`gh pr create` when no push is required.
+## PR body rules
+- Derive title/body from plan/report artifacts (scrubbed, length-capped).
+- Include mission id, plan/report paths, and validation/contract summary from
+  `report.md`.
+- **Do not** claim merge-gate status as passed/failed before `/merge` has run.
+  Say clearly: merge gates run at merge time and are still pending.
+- Do not imply the mission is landed on the base branch.
 
 ## Acceptance hints
-- COMPLETE-but-unmerged missions show a PR handoff affordance when the repo has
-  a GitHub remote and `gh` is available/authenticated.
-- If the mission branch is not present on the chosen remote, kranz shows a
-  copyable `git push origin <branch>` command and performs no push.
-- If the branch is already present remotely, kranz can run `gh pr create` (or
-  open a prefilled command) with title/body derived from plan/report artifacts.
-- The generated PR body links mission id, plan/report paths, validation
-  summary, and merge-gate status, with secrets scrubbed and bounded length.
-- Tests prove no local PR handoff path invokes `git push`.
+- COMPLETE-but-unmerged missions show the affordance when a GitHub remote
+  exists and `gh` is available/authenticated (else a clear "unavailable"
+  reason).
+- Missing remote branch → copyable `git push origin <mission-branch>`; no
+  push performed.
+- Present remote branch → `gh pr create` (or prefilled command) only.
+- Tests prove no local PR-handoff path invokes `git push` (string/command
+  deny or process spy).
+- Anti-vacuity grep on the named test filter.

@@ -6,30 +6,35 @@ schedule: once
 
 ## Goal
 Before a queued mission spends real work cycles, run a lightweight readiness
-preflight for the selected backends and models: CLI installed, auth usable,
-minimum version satisfied, model available, quota or rate-limit state known
-when the provider exposes it, sandbox compatibility understood, and configured
-model floors satisfied. Surface the result in CLI, dashboard, and Slack.
+preflight for the backends/models that mission will use. Surface
+`ok` / `unauthenticated` / `rate_limited` / `missing` / `unsupported` /
+`unknown` (or `meterless`) with a next action in CLI, dashboard, and Slack.
 
 ## Context
-Mission Control's provider-usage panel is broad, but the kranz-sized lesson is
-simple: operators need to know whether a backend can run before the queue
-starts draining. Kranz already validates backend selection in config paths and
-records cost after the fact, but readiness is still scattered across backend
-spawn failures, auth preflight, and model floor checks.
+Reuse existing probes (config validation, worker auth preflight, model
+floors, environment preflight). This is **not** `kranz ready` (repo
+agent-readiness score — different ticket, already shipped as a command
+shape). This ticket is per-backend/per-mission drain gating.
 
-This should reuse existing backend probes where possible and stay honest about
-unknowns. Do not fabricate a "0%" usage bar for providers that do not expose
-quota. Report `ok`, `unauthenticated`, `rate_limited`, `missing`, `unsupported`,
-or `unknown` with clear next action.
+Mission Control's usage panel is broader than needed; stay honest about
+providers that expose no quota API.
+
+## Park policy (non-negotiable)
+| Probe result | Drain behavior |
+|---|---|
+| `missing`, `unauthenticated`, `unsupported`, sandbox mismatch, invalid model | **Park** ticket/mission with actionable reason; do not claim |
+| `rate_limited` | **Requeue/delay** with backoff (or park with retry-after); do not burn a doomed start |
+| `unknown` / `meterless` quota | **Warn + proceed** — never treat unknown as failure |
+| `ok` | Claim and run |
+
+Fabricating a "0% quota" bar for metered-less providers is forbidden.
 
 ## Acceptance hints
-- `kranz work` and hosted queue drain run backend readiness before claiming a
-  mission for execution; failures park the mission or ticket with an actionable
-  reason instead of starting a doomed run.
-- Dashboard and Slack show readiness state for queued or approved work.
-- The probe is bounded and does not leak server environment secrets into child
-  processes.
-- Providers without quota APIs report honest `unknown` or `meterless` status.
-- Tests cover missing binary, expired auth, invalid model, sandbox mismatch,
-  and a passing backend.
+- `kranz work` and hosted queue drain invoke the probe before claim.
+- Dashboard/Slack show readiness for queued/approved work using the enum
+  above.
+- Probe is bounded (time + no secret leakage into child env beyond what
+  spawn already needs).
+- Tests: missing binary, expired auth, invalid model, sandbox mismatch,
+  unknown-quota proceeds, passing backend.
+- Anti-vacuity grep on the named filter.

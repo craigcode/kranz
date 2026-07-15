@@ -1,33 +1,29 @@
 ---
 title: Multi-repo project picker with groups, pins, search, and activity counts
-priority: 2
+priority: 3
 schedule: once
+blocked-by: [m8-multi-root-host-design]
 ---
 
 ## Goal
-Build the M8 operator surface for choosing and monitoring many repos from one
-kranz serve: a project picker with pinned repos, optional groups, search, and
-at-a-glance counts for queued, running, needs-input, complete-unmerged, and
-failed work. The surface should route into each repo's missions and tickets
-without weakening per-repo gates, auth, or queue serialization.
+Build the M8 operator home surface for choosing and monitoring many repos
+from one kranz serve: pinned repos, optional groups, search, and at-a-glance
+counts for queued, running, needs-input, complete-unmerged, and failed work.
+Route into each repo's missions/tickets without weakening per-repo gates,
+auth, or queue serialization.
 
 ## Context
-Mission Control's home grid is the best direct inspiration: every project is a
-card with path, branch, status counts, grouping, pinning, density, and search.
-Kranz needs the same orientation layer once one Slack bridge or one server can
-host several repos.
-
-Keep the kranz boundary clear. This is not a terminal launcher and not an IDE
-workspace. It is the repo selection and work-state overview needed for M8:
-one bridge, many repos; one dashboard, many repo-local mission logs.
+Mission Control's project grid is the orientation reference — not a terminal
+launcher. This ticket is UI/API on top of the accepted multi-root host design
+(`m8-multi-root-host-design`). Do not invent a second token or queue model
+here.
 
 ## Acceptance hints
-- A single serve instance can list multiple configured repos and show status
-  counts without reading or mutating another repo's runtime state incorrectly.
-- Pins, groups, and search are persisted in operator config, not inside the
-  target repos unless deliberately chosen.
-- Selecting a repo scopes tickets, missions, merge gates, Slack routing, and
-  mutation token behavior to that repo.
-- The UI distinguishes complete-but-unmerged from landed work.
-- Missing, moved, or temporarily unavailable repos degrade to a visible error
-  row instead of breaking the whole picker.
+- Lists configured repos with status counts using the host's scoped reads
+  only (no cross-repo state bleed).
+- Pins/groups/search live in operator config as decided by the host design.
+- Selecting a repo scopes subsequent UI/API actions per that design's auth
+  and routing rules (tested against the design's fixtures).
+- Distinguishes complete-unmerged from landed.
+- Missing/moved repos show an error row; picker remains usable.
+- Anti-vacuity grep on the named filter.

@@ -50,76 +50,35 @@ Format:
 
 ## Scoping-ready
 
-- **Agent hook status signals** - use Claude/Codex/Cursor lifecycle hooks as a
-  non-authoritative observability lane for "running", "needs input",
-  "interrupted", and "turn finished".
-  Why: Mission Control's hook approach is the cleanest way to detect waiting
-  states outside the model loop. Kranz should keep reducer/event outcomes
-  authoritative, but hooks can make Slack/dashboard status much more truthful,
-  especially for new CLI backends.
-  Trigger: Build with Cursor/ChatGPT backend work, or sooner if Slack/dashboard
-  "whose move is it?" inaccuracies recur.
-  Source: AgentSystemLabs/mission-control docs/agent-status-detection.md
-  Ticket: agent-hooks-status-signals
-
-- **Structured human-question events** - represent agent questions and answers
-  as replayable mission events rendered by dashboard and Slack.
-  Why: Blocking work should converge to a precise human decision, not a prose
-  blob buried in a transcript. Mission Control's AskUserQuestion contract is a
-  good shape to borrow without copying PTY key injection.
-  Trigger: Pick up with the next Slack/dashboard steering pass, or when a
-  backend exposes structured questions.
-  Source: AgentSystemLabs/mission-control AskUserQuestion surface
-  Ticket: structured-human-question-events
-
-- **Multi-repo project picker** - give M8 a home surface with pinned repos,
-  groups, search, and activity counts across tickets and missions.
-  Why: Mission Control's project grid solves the orientation problem that
-  appears once one serve or one Slack bridge fronts multiple repos. Kranz needs
-  repo selection and work-state overview, not terminal launching.
-  Trigger: Start before one-serve-many-repos or one-Slack-bridge-many-repos
-  ships.
-  Source: docs/roadmap.md M8; AgentSystemLabs/mission-control README/SPEC
-  Ticket: multi-repo-project-picker
-
-- **Workspace and sandbox visibility** - show the effective execution
-  workspace, provider, readiness, preview links, and takeover details as
-  mission artifacts.
-  Why: M6 needs a complete runnable workspace as the unit of execution.
-  Mission Control's scope switcher reinforces the operator value of making
-  local/worktree/remote context explicit.
-  Trigger: Build alongside the next M6 workspace-provider slice or before the
-  live cloud deploy.
-  Source: docs/roadmap.md M6; docs/scoping/worker-sandboxing.md
-  Ticket: workspace-sandbox-visibility
-
-- **Repo knowledge store slices 2-3** - slice 1 (the `docs/knowledge/` vault + `research.md` artifacts) shipped 2026-07-08; next is slice 2 (ranked/capped knowledge injection into planning and M2 revision) then slice 3 (`kranz knowledge refresh` drift checks).
-  Why: Slice 1 made the knowledge browsable and captured; slice 2 is where it starts paying off — the planner stops rediscovering the repo every draft.
-  Trigger: Start when the next capability lane beats cleanup on leverage; slice 3 waits until enough notes exist to drift.
-  Source: docs/scoping/repo-knowledge-store.md
+- **Repo knowledge store slice 2** - ranked/capped knowledge injection into planning and M2 revision (4 KiB budget, stale excluded, separate from lessons).
+  Why: Slice 1 made the vault browsable; slice 2 is where planning stops rediscovering the repo every draft.
+  Trigger: Next capability lane when leverage beats cleanup.
+  Source: docs/scoping/repo-knowledge-store.md D-C
   Ticket: repo-knowledge-ranked-brief-injection
 
-- **Backend readiness and quota preflight** - before queue drain, show whether
-  the selected backends can actually run: binary, auth, model, version, quota
-  where available, sandbox compatibility, and model floor.
-  Why: Mission Control's provider-usage panel is broader than kranz needs, but
-  the readiness lesson is sharp: do not discover missing auth or quota only
-  after a mission is claimed.
-  Trigger: Pick up before unattended queue drain becomes routine across
-  multiple backends, or with the Cursor/ChatGPT backend rollout.
-  Source: AgentSystemLabs/mission-control docs/provider-usage.md
-  Ticket: backend-readiness-quota-preflight
-
-- **Post-complete PR handoff, no auto-push** - help an operator create a
-  GitHub PR for a completed mission branch only when the branch already exists
-  remotely; otherwise show the human-run push command.
-  Why: Mission Control's PR affordance is worth adapting, but kranz's local
-  invariant stands: it does not push. PR creation is review plumbing, not a
-  delivery shortcut.
-  Trigger: Build with pipeline merge/review polish or when team GitHub review
-  becomes the common handoff for delivered missions.
+- **Post-complete PR handoff, no auto-push** - `gh pr create` only when the mission branch already exists remotely; otherwise show the human push command.
+  Why: Review plumbing without violating "kranz never pushes" locally.
+  Trigger: Pipeline merge/review polish or team GitHub review becomes common.
   Source: AgentSystemLabs/mission-control CreatePullRequestButton pattern
   Ticket: post-complete-pr-handoff-no-push
+
+- **Backend readiness preflight before drain** - probe binary/auth/model/sandbox; park on hard failures; warn+proceed on unknown quota.
+  Why: Do not discover missing auth only after claiming a mission.
+  Trigger: Unattended multi-backend drain, or Cursor/ChatGPT backend rollout.
+  Source: existing auth/env preflight; AgentSystemLabs/mission-control provider-usage
+  Ticket: backend-readiness-quota-preflight
+
+- **Local workspace/sandbox visibility** - show isolation mode, worktree cwd, and sandbox tier in dashboard/report (no remote provider inventing).
+  Why: Operators should not infer the runtime environment from branch names.
+  Trigger: Anytime; unblocks clearer M6 UI later.
+  Source: docs/scoping/worker-sandboxing.md
+  Ticket: workspace-sandbox-visibility
+
+- **M8 multi-root host design** - config, tokens, queues, Slack routing for one serve / many repos — design only.
+  Why: The project picker cannot honestly scope tokens until the host model exists.
+  Trigger: Before one-serve-many-repos or one-Slack-bridge-many-repos UI.
+  Source: docs/roadmap.md M8
+  Ticket: m8-multi-root-host-design
 
 - **Local-inference executor tier** - route bounded, well-specified execution-class work to a local OpenAI-compatible endpoint (backend_local, HTTP-in-engine), with deterministic tier routing and two-fail escalation to frontier; validator stays frontier until its local miss-rate is measured.
   Why: Kranz runs parallel batch workers continuously; local executors lift the per-token ceiling on how many run at once — but only past quota saturation. Per the workstream's own counter-evidence, a mixed setup loses to solo Opus while frontier calls are free at the margin.
@@ -132,6 +91,38 @@ Format:
   Trigger: Stage 1 live-city validation has run at least once.
   Source: docs/gascity-citizenship.md
   Ticket: docs briefs 1 and 3
+
+## Later / gated
+
+- **Structured human-question events** - replayable ask/answer events feeding one pending-decision projection; grants/NeedsContext stay their own channels.
+  Why: Precise "whose move" without a third inbox.
+  Trigger: Next Slack/dashboard steering pass.
+  Source: AgentSystemLabs/mission-control AskUserQuestion surface
+  Ticket: structured-human-question-events
+
+- **Agent hook status signals** - non-authoritative ephemeral projection from CLI lifecycle hooks; no primary-checkout hook rewrites.
+  Why: Waiting-state sensing for interactive CLI backends.
+  Trigger: With Cursor/ChatGPT backend work (blocked-by route decision).
+  Source: AgentSystemLabs/mission-control docs/agent-status-detection.md
+  Ticket: agent-hooks-status-signals
+
+- **Multi-repo project picker** - pins/groups/search/activity counts across configured repos.
+  Why: M8 orientation layer once the host can front many roots.
+  Trigger: After m8-multi-root-host-design is accepted.
+  Source: docs/roadmap.md M8; AgentSystemLabs/mission-control README/SPEC
+  Ticket: multi-repo-project-picker
+
+- **Workspace provider pin at approval (M6)** - pin provider/template/image at approve; surface readiness/previews/takeover.
+  Why: Cloud workspace is the unit M6 provisions; local visibility came first.
+  Trigger: When a real workspace provider implementation exists.
+  Source: docs/roadmap.md M6; docs/scoping/worker-sandboxing.md Tier 3
+  Ticket: workspace-provider-pin-at-approval
+
+- **Repo knowledge store slice 3** - `kranz knowledge refresh` drift checks.
+  Why: Freshness enforcement once enough notes exist to drift.
+  Trigger: After slice 2 and a non-trivial vault.
+  Source: docs/scoping/repo-knowledge-store.md
+  Ticket: none yet
 
 ## Parked/demo
 

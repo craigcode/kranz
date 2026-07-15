@@ -1,34 +1,34 @@
 ---
-title: Workspace and sandbox visibility in mission records and dashboard
+title: Workspace and sandbox visibility for local worktree missions
 priority: 2
 schedule: once
 ---
 
 ## Goal
-Make the effective execution workspace visible everywhere an operator reviews
-or steers a mission: provider, worktree path or remote workspace id, template
-or image version, readiness checks, setup command status, preview URLs, and
-human takeover instructions. Record these as mission artifacts/events so the
-workspace can be audited after the run.
+Make the **effective local execution workspace** visible wherever an operator
+reviews or steers a mission: isolation mode, active worktree/cwd, sandbox
+enforce tier, and setup/preflight outcomes that already exist. Record a short
+workspace summary in report.md / dashboard so operators stop inferring it from
+branch names.
 
 ## Context
-Mission Control's scope switcher for local, worktree, and remote VM sandboxes
-is a good operator pattern. Monaco's post already pushed kranz toward the same
-lesson: a worktree is not a full runnable workspace. M6 needs a clear
-workspace seam, and the dashboard must show the actual runtime environment
-without making the operator infer it from branch names or logs.
+Mission Control's scope switcher inspired the operator need. This ticket is
+**visibility of what kranz already has** (worktree isolation, sandbox tiers,
+auth/preflight). It does **not** invent a remote workspace provider or pin
+provider/image identity at approval — that is
+`workspace-provider-pin-at-approval`.
 
-This should complement, not replace, the existing event-sourced mission model.
-The workspace provider provisions source, services, data, and previews; kranz
-still owns plan approval, validation, merge gates, and audit.
+## Out of scope
+- Container / remote VM provider APIs
+- Preview URLs / takeover SSH for cloud workspaces
+- Approval-time provider version pinning
 
 ## Acceptance hints
-- Mission approval pins the effective workspace provider and provider version
-  or template/image identity.
-- Dashboard and report.md show workspace readiness, setup results, preview
-  links, and takeover details when present.
-- Workspace failures are surfaced as preflight or blocked states with a clear
-  owner: operator, provider, or repo setup.
-- Remote workspace URLs or preview links reveal nothing sensitive without
-  their own access control; secrets are never recorded in the event log.
-- Local worktree-only missions still render a useful workspace summary.
+- Dashboard mission view and `report.md` show isolation mode, mission worktree
+  path (when worktree mode), and sandbox enforce setting actually used.
+- Preflight/setup failures already in the event log are linked or summarized
+  in that panel.
+- Local checkout-mode missions still render an honest summary (not
+  "worktree: n/a" as an error).
+- No new secrets in the event log.
+- Anti-vacuity grep on the named filter.

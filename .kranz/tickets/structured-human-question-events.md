@@ -1,35 +1,37 @@
 ---
 title: Structured human-question events for dashboard and Slack
-priority: 2
+priority: 3
 schedule: once
 ---
 
 ## Goal
-Represent agent questions as first-class, structured kranz events instead of
-only prose in transcripts or Slack text. When an agent needs a human choice,
-the question, options, multi-select flag, free-text affordance, and answer
-should round-trip through dashboard and Slack as mission events that can be
-replayed, audited, and resumed.
+When an agent needs a human choice, represent that decision as a structured,
+replayable pending-decision projection rendered by dashboard and Slack —
+without creating a third competing human-input inbox beside grants,
+NeedsContext, blocked+msg, and revision approve/reject.
 
 ## Context
-Mission Control's `AskUserQuestion` overlay is a useful UX reference: it
-defensively parses the tool payload, caps question and option sizes, renders a
-native choice UI, and records whether the user answered with options, free
-text, or "chat about this". Kranz should borrow the contract, not the PTY key
-injection.
+Mission Control's AskUserQuestion overlay is a UX contract reference (caps,
+options, free text), not a PTY key-injection port.
 
-Kranz already has the product rule that blocked work must converge to a human.
-Structured questions make that rule more precise: a blocker can name exactly
-what decision is needed, Slack can render buttons or choices, and the dashboard
-can show the pending decision without scraping prose.
+## D-X — unify channels (accepted for this ticket)
+1. **Permission / deny-rule / allow-set / touch-path prompts** → existing
+   `grant.requested` / approve / deny flow. Do **not** invent parallel
+   question events for grants.
+2. **Ticket underspecification** → existing NeedsContext on the ticket.
+3. **Orchestrator/worker "ask the human" tool payloads** (structured choices)
+   → additive mission events (`question.opened` / `question.answered` /
+   `question.cleared` or equivalent) that feed **one** pending-decision
+   projection consumed by dashboard + Slack. Answers submit through existing
+   control paths (`msg` / dedicated control kind), not a new server.
+4. **Milestone blocked prose** may *link* to a structured question when one
+   is open; blocked alone remains valid for backends that only emit prose.
 
 ## Acceptance hints
-- New additive event types record `question.opened`, `question.answered`, and
-  `question.cleared` or equivalent without breaking old logs.
-- Dashboard and Slack both render pending structured questions and can submit
-  answers back through existing control paths.
-- Answers are replayable from the event log after a server restart.
-- Question text, headers, options, and free-text answers are size-capped and
-  scrubbed before persistence.
-- Existing prose guidance still works for backends that cannot emit structured
-  questions.
+- Additive event kinds only (`#[serde(default)]`); old logs still fold.
+- Dashboard and Slack render at most one clear "your move" surface for
+  grants vs questions (distinct kinds, shared projection chrome).
+- Answers replay after restart from the event log.
+- Question text/options/answers size-capped and scrubbed.
+- Backends without structured ask tools keep working via prose guidance.
+- Anti-vacuity grep on the named filter.

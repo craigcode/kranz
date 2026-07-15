@@ -260,18 +260,17 @@ reinforce the mission/audit/gate model:
 
 AgentSystemLabs Mission Control reinforces the same boundary from the other
 side: it is a polished desktop PTY/session manager, not a mission-validation
-engine. Borrow its sensing and operator ergonomics, not its IDE shell:
-hook-derived lifecycle status, structured human questions, project-grid
-orientation for many repos, explicit workspace/sandbox scope, freshness-aware
-repo memory selection, backend readiness/quota visibility, and a no-auto-push
-GitHub PR handoff are now captured as
-`.kranz/tickets/agent-hooks-status-signals.md`,
-`.kranz/tickets/structured-human-question-events.md`,
-`.kranz/tickets/multi-repo-project-picker.md`,
-`.kranz/tickets/workspace-sandbox-visibility.md`,
-`.kranz/tickets/repo-knowledge-ranked-brief-injection.md`, and
-`.kranz/tickets/backend-readiness-quota-preflight.md`, plus
-`.kranz/tickets/post-complete-pr-handoff-no-push.md`.
+engine. Borrow sensing and operator ergonomics, not the IDE shell. The
+follow-up backlog (rewritten after adversarial review) is sequenced as:
+
+- **Near-term (P2):** `repo-knowledge-ranked-brief-injection`,
+  `post-complete-pr-handoff-no-push`, `backend-readiness-quota-preflight`,
+  `workspace-sandbox-visibility` (local visibility only),
+  `m8-multi-root-host-design` (prerequisite for the picker).
+- **Later / gated (P3):** `structured-human-question-events` (unify with
+  grants/NeedsContext), `agent-hooks-status-signals` (blocked on Cursor
+  backend lane), `multi-repo-project-picker` (blocked on multi-root host
+  design), `workspace-provider-pin-at-approval` (M6 provider pin).
 
 - **A worktree is not a workspace.** Monaco's failed local-worktree phase
   exposed the shared runtime problems source isolation does not solve: port

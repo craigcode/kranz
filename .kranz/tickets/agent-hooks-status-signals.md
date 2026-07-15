@@ -1,40 +1,46 @@
 ---
 title: Use agent lifecycle hooks as non-authoritative status signals
-priority: 2
+priority: 3
 schedule: once
+blocked-by: [cursor-cli-live-capture-route-decision]
 ---
 
 ## Goal
-Add a hook-derived observability lane for supported CLI backends so kranz can
-surface "running", "needs input", "interrupted", and "turn finished" signals
-when the backend exposes them. These signals must help the dashboard, Slack,
-and operator status views answer "whose move is it?" without becoming the
-authoritative mission state. The event log, backend stream parser, reducer,
-and validation outcomes remain the source of truth.
+Add an optional hook-derived observability lane for CLI backends that expose
+lifecycle hooks, so dashboard/Slack can surface "running", "needs input",
+"interrupted", and "turn finished" when the backend stream is silent.
+Hooks must never become authoritative mission state.
 
 ## Context
-AgentSystemLabs Mission Control has the right pattern: install project-local
-Claude/Codex/Cursor hooks, preserve user hooks, tag managed entries, map
-`UserPromptSubmit`, `Stop`, `PermissionRequest`, and narrowed notification
-events into task status, and fail soft when the local HTTP endpoint is down.
+Useful mainly for Cursor/ChatGPT CLI backends (and similar interactive CLIs).
+Headless Claude path already owns status via the engine event fold — do not
+require hooks there.
 
-For kranz, the useful slice is not a terminal manager. It is a backend-neutral
-status side channel for backends whose own stream format does not reliably say
-when they are waiting on a human. This should be especially relevant to the
-Cursor/ChatGPT CLI backend work and to Slack notifications that currently have
-to infer too much from mission status alone.
+Blocked on the Cursor backend route decision / implementation lane so this
+does not ship as an orphan hook installer with no consumer.
 
-The hook payload is untrusted input, even when it arrives over a local token.
-Do not let hook-reported paths, transcript references, or status values mutate
-mission state outside a narrow, typed event path.
+## Persistence choice (accepted)
+Prefer an **ephemeral derived projection** keyed by `run_id` / mission id
+(in-memory or gitignored runtime), updated from hook POSTs.
+Do **not** add reducer-driving EventKinds for hook status.
+If durable audit of hook receipts is later required, that is a separate
+additive observability event that the reducer ignores for transitions.
+
+## Install / hygiene rules (non-negotiable)
+- Do **not** rewrite tracked project hook files on the primary checkout as a
+  side effect of `kranz serve`.
+- Prefer env-injected / worktree-local / `~/.kranz/` managed hook dirs for
+  headless runs.
+- If a repo-local install is ever offered, it must be an explicit operator
+  action that produces a reviewable diff — not silent mutation.
+- Hook payloads are untrusted even on loopback+token: reject path traversal,
+  stale ids, oversized bodies; never let hooks emit FeatureFailed / Blocked /
+  Complete / grant mutations.
 
 ## Acceptance hints
-- A supported backend can opt into lifecycle hooks without clobbering existing
-  project hooks; kranz-managed hook entries are replaceable and identifiable.
-- Hook events append typed observability events, or update a derived status
-  projection, without changing mission terminal state by themselves.
-- Permission or approval prompts surface as "needs input" in dashboard and
-  Slack quickly enough to be useful.
-- Malformed hook payloads, stale task ids, and path traversal attempts are
-  rejected or ignored with tests.
-- Existing headless backends keep working with hooks disabled.
+- Opt-in per backend; headless backends work with hooks disabled.
+- "Needs input" appears in dashboard/Slack from the projection without
+  changing folded mission terminal state.
+- Malformed payloads ignored with tests.
+- No test or code path writes hooks into the primary tracked tree implicitly.
+- Anti-vacuity grep on the named filter.
