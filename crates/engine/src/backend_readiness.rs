@@ -1,0 +1,483 @@
+//! Backend readiness / quota preflight before queue drain.
+//!
+//! Lightweight probe of the backends a queued mission will use. Park on hard
+//! failures; requeue/delay on rate limits; warn+proceed when quota is unknown
+//! or the provider exposes no meter (never invent a "0% quota" bar).
+
+use crate::config;
+use crate::error::Result;
+use crate::paths::MissionPaths;
+use crate::types::{BackendKind, MissionConfig, MissionState, Role, SandboxEnforce};
+use serde::{Deserialize, Serialize};
+use std::io::Read;
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+/// Probe outcome enum (ticket acceptance surface).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadinessStatus {
+    Ok,
+    Missing,
+    Unauthenticated,
+    RateLimited,
+    Unsupported,
+    Unknown,
+    /// Provider has no quota API — treat like unknown for drain (warn+proceed).
+    Meterless,
+}
+
+/// One role's readiness row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoleReadiness {
+    pub role: String,
+    pub backend: String,
+    pub status: ReadinessStatus,
+    pub detail: String,
+    /// Operator-facing next action (install binary, login, fix model, …).
+    pub next_action: String,
+}
+
+/// Aggregate verdict for a mission before claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadinessReport {
+    pub mission_id: String,
+    pub roles: Vec<RoleReadiness>,
+    /// Worst actionable status across roles (drives drain policy).
+    pub overall: ReadinessStatus,
+    pub warnings: Vec<String>,
+}
+
+/// What the drain loop should do with this probe result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DrainDecision {
+    /// Claim and run.
+    Proceed { warnings: Vec<String> },
+    /// Remove from queue / park ticket with reason; do not claim.
+    Park { reason: String },
+    /// Leave queued; delay before retrying (rate limit).
+    RequeueDelay { reason: String, delay: Duration },
+}
+
+impl ReadinessReport {
+    pub fn drain_decision(&self) -> DrainDecision {
+        match self.overall {
+            ReadinessStatus::Ok => DrainDecision::Proceed {
+                warnings: self.warnings.clone(),
+            },
+            ReadinessStatus::Unknown | ReadinessStatus::Meterless => DrainDecision::Proceed {
+                warnings: {
+                    let mut w = self.warnings.clone();
+                    if w.is_empty() {
+                        w.push(
+                            "backend quota unknown/meterless — proceeding without a fabricated \
+                             quota bar"
+                                .into(),
+                        );
+                    }
+                    w
+                },
+            },
+            ReadinessStatus::RateLimited => {
+                let reason = self
+                    .roles
+                    .iter()
+                    .find(|r| r.status == ReadinessStatus::RateLimited)
+                    .map(|r| r.detail.clone())
+                    .unwrap_or_else(|| "backend rate limited".into());
+                DrainDecision::RequeueDelay {
+                    reason,
+                    delay: Duration::from_secs(60),
+                }
+            }
+            ReadinessStatus::Missing
+            | ReadinessStatus::Unauthenticated
+            | ReadinessStatus::Unsupported => {
+                let reason = self
+                    .roles
+                    .iter()
+                    .find(|r| {
+                        matches!(
+                            r.status,
+                            ReadinessStatus::Missing
+                                | ReadinessStatus::Unauthenticated
+                                | ReadinessStatus::Unsupported
+                        )
+                    })
+                    .map(|r| format!("{}: {} — {}", r.role, r.detail, r.next_action))
+                    .unwrap_or_else(|| "backend not ready".into());
+                DrainDecision::Park { reason }
+            }
+        }
+    }
+}
+
+/// Probe readiness for a queued mission using its persisted config (or layered
+/// repo config when state is missing).
+pub fn probe_mission(repo_root: &Path, mission_id: &str) -> Result<ReadinessReport> {
+    let cfg = load_mission_config(repo_root, mission_id)?;
+    Ok(probe_config(mission_id, repo_root, &cfg))
+}
+
+fn load_mission_config(repo_root: &Path, mission_id: &str) -> Result<MissionConfig> {
+    let paths = MissionPaths::new(repo_root, mission_id);
+    if paths.state_file().is_file() {
+        let text = std::fs::read_to_string(paths.state_file())?;
+        if let Ok(state) = serde_json::from_str::<MissionState>(&text) {
+            return Ok(state.config);
+        }
+    }
+    config::load(repo_root)
+}
+
+/// Pure-ish probe against an already-loaded config (tests inject stubs via
+/// env/PATH; binary discovery is the live side effect).
+pub fn probe_config(mission_id: &str, repo_root: &Path, cfg: &MissionConfig) -> ReadinessReport {
+    let mut roles = Vec::new();
+    let mut warnings = Vec::new();
+
+    // Config validation first — invalid model / sandbox mismatch parks.
+    if let Err(e) = config::validate(cfg) {
+        let detail = e.to_string();
+        let status = ReadinessStatus::Unsupported;
+        roles.push(RoleReadiness {
+            role: "config".into(),
+            backend: "n/a".into(),
+            status,
+            detail: detail.clone(),
+            next_action: "fix .kranz/config.json / mission config and re-queue".into(),
+        });
+        return ReadinessReport {
+            mission_id: mission_id.to_string(),
+            roles,
+            overall: status,
+            warnings,
+        };
+    }
+
+    for role in [
+        Role::Orchestrator,
+        Role::Worker,
+        Role::ValidatorScrutiny,
+        Role::ValidatorFunctional,
+    ] {
+        roles.push(probe_role(role, cfg));
+    }
+
+    // Sandbox resolve: hard unsupported when enforce is on and tooling missing.
+    if cfg.worker.sandbox.enforce != SandboxEnforce::Off {
+        let mission_dir = MissionPaths::new(repo_root, mission_id).mission_dir();
+        let (_resolved, warn) =
+            crate::sandbox::resolve_for_session(&cfg.worker.sandbox, repo_root, &mission_dir);
+        if let Some(w) = warn {
+            let lower = w.to_ascii_lowercase();
+            if lower.contains("unsupported") || lower.contains("not available") {
+                roles.push(RoleReadiness {
+                    role: "worker.sandbox".into(),
+                    backend: "sandbox".into(),
+                    status: ReadinessStatus::Unsupported,
+                    detail: w,
+                    next_action: "set worker.sandbox.enforce to \"off\" or install sandbox tooling"
+                        .into(),
+                });
+            } else {
+                warnings.push(w);
+            }
+        }
+    }
+
+    // Quota: no provider API wired — always meteless/unknown for honesty.
+    warnings.push(
+        "provider quota not queried (meterless/unknown) — proceeding does not imply headroom"
+            .into(),
+    );
+
+    let overall = worst_status(roles.iter().map(|r| r.status));
+    // Unknown/meterless from quota alone shouldn't override Ok binaries —
+    // we only attached a warning. Overall stays the worst *role* status.
+    let overall = match overall {
+        ReadinessStatus::Ok => ReadinessStatus::Meterless, // quota unknown → warn+proceed
+        other => other,
+    };
+
+    ReadinessReport {
+        mission_id: mission_id.to_string(),
+        roles,
+        overall,
+        warnings,
+    }
+}
+
+fn probe_role(role: Role, cfg: &MissionConfig) -> RoleReadiness {
+    let role_key = match role {
+        Role::Orchestrator => "orchestrator",
+        Role::Worker => "worker",
+        Role::ValidatorScrutiny => "validatorScrutiny",
+        Role::ValidatorFunctional => "validatorFunctional",
+    };
+    let kind = cfg.backend_kind(role);
+    let backend = kind.as_str().to_string();
+
+    let discover = match kind {
+        BackendKind::Claude => crate::backend_claude::discover_claude_binary(None),
+        BackendKind::Codex => crate::backend_codex::discover_codex_binary(None),
+        BackendKind::Droid => crate::backend_droid::discover_droid_binary(None),
+    };
+
+    match discover {
+        Ok(binary) => match probe_cli_login(&binary, kind) {
+            AuthProbe::Ok => RoleReadiness {
+                role: role_key.into(),
+                backend,
+                status: ReadinessStatus::Ok,
+                detail: "binary found; login probe ok/unknown".into(),
+                next_action: "none".into(),
+            },
+            AuthProbe::Unauthenticated(detail) => RoleReadiness {
+                role: role_key.into(),
+                backend: backend.clone(),
+                status: ReadinessStatus::Unauthenticated,
+                detail,
+                next_action: format!("authenticate the {backend} CLI and re-queue"),
+            },
+            AuthProbe::RateLimited(detail) => RoleReadiness {
+                role: role_key.into(),
+                backend,
+                status: ReadinessStatus::RateLimited,
+                detail,
+                next_action: "wait for rate-limit reset, then drain again".into(),
+            },
+            AuthProbe::Unknown(detail) => RoleReadiness {
+                role: role_key.into(),
+                backend,
+                status: ReadinessStatus::Ok,
+                detail: format!("binary found; auth probe inconclusive ({detail})"),
+                next_action: "none".into(),
+            },
+        },
+        Err(e) => RoleReadiness {
+            role: role_key.into(),
+            backend: backend.clone(),
+            status: ReadinessStatus::Missing,
+            detail: e.to_string(),
+            next_action: format!("install the {backend} CLI on PATH and re-queue"),
+        },
+    }
+}
+
+enum AuthProbe {
+    Ok,
+    Unauthenticated(String),
+    RateLimited(String),
+    Unknown(String),
+}
+
+/// Bounded login probe (≤3s). Prefer an explicit auth-status subcommand when
+/// the CLI supports it; never treat a missing subcommand as unauthenticated.
+fn probe_cli_login(binary: &Path, kind: BackendKind) -> AuthProbe {
+    let args: &[&str] = match kind {
+        BackendKind::Claude => &["auth", "status"],
+        BackendKind::Codex => &["login", "status"],
+        BackendKind::Droid => return AuthProbe::Unknown("no auth-status subcommand".into()),
+    };
+    match run_bounded(binary, args, Duration::from_secs(3)) {
+        Ok((code, out)) => {
+            let lower = out.to_ascii_lowercase();
+            if lower.contains("not logged")
+                || lower.contains("not authenticated")
+                || lower.contains("unauthenticated")
+                || (lower.contains("please run") && lower.contains("login"))
+            {
+                return AuthProbe::Unauthenticated(out);
+            }
+            if (lower.contains("rate") && lower.contains("limit"))
+                || lower.contains("429")
+                || (lower.contains("quota") && lower.contains("exceed"))
+            {
+                return AuthProbe::RateLimited(out);
+            }
+            if code == 0 {
+                AuthProbe::Ok
+            } else if lower.contains("unknown")
+                || lower.contains("unrecognized")
+                || lower.contains("invalid command")
+                || lower.contains("no such command")
+            {
+                AuthProbe::Unknown(format!("auth status unsupported: {out}"))
+            } else {
+                AuthProbe::Unknown(format!("exit {code}: {out}"))
+            }
+        }
+        Err(e) => AuthProbe::Unknown(e),
+    }
+}
+
+fn run_bounded(
+    binary: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> std::result::Result<(i32, String), String> {
+    use std::process::{Command, Stdio};
+    let mut command = Command::new(binary);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|e| format!("spawn failed: {e}"))?;
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stdout = String::new();
+                let mut stderr = String::new();
+                if let Some(mut out) = child.stdout.take() {
+                    let _ = out.read_to_string(&mut stdout);
+                }
+                if let Some(mut err) = child.stderr.take() {
+                    let _ = err.read_to_string(&mut stderr);
+                }
+                let combined = format!("{stdout}{stderr}").trim().to_string();
+                return Ok((status.code().unwrap_or(-1), combined));
+            }
+            Ok(None) if start.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("timed out after {}s", timeout.as_secs()));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(e) => {
+                let _ = child.kill();
+                return Err(format!("wait failed: {e}"));
+            }
+        }
+    }
+}
+
+fn worst_status(statuses: impl Iterator<Item = ReadinessStatus>) -> ReadinessStatus {
+    // Priority: missing/unauth/unsupported > rate_limited > ok > unknown/meterless
+    let mut worst = ReadinessStatus::Ok;
+    for s in statuses {
+        worst = match (worst, s) {
+            (_, ReadinessStatus::Missing) => ReadinessStatus::Missing,
+            (ReadinessStatus::Missing, _) => ReadinessStatus::Missing,
+            (_, ReadinessStatus::Unauthenticated) => ReadinessStatus::Unauthenticated,
+            (ReadinessStatus::Unauthenticated, _) => ReadinessStatus::Unauthenticated,
+            (_, ReadinessStatus::Unsupported) => ReadinessStatus::Unsupported,
+            (ReadinessStatus::Unsupported, _) => ReadinessStatus::Unsupported,
+            (_, ReadinessStatus::RateLimited) => ReadinessStatus::RateLimited,
+            (ReadinessStatus::RateLimited, _) => ReadinessStatus::RateLimited,
+            (ReadinessStatus::Ok, other) => other,
+            (a, _) => a,
+        };
+    }
+    worst
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::MissionConfig;
+
+    #[test]
+    fn unknown_quota_proceeds_with_warning() {
+        // Default config on a machine with claude may be Ok or Missing —
+        // force overall Meterless path via drain_decision.
+        let report = ReadinessReport {
+            mission_id: "m-1".into(),
+            roles: vec![RoleReadiness {
+                role: "worker".into(),
+                backend: "claude".into(),
+                status: ReadinessStatus::Ok,
+                detail: "ok".into(),
+                next_action: "none".into(),
+            }],
+            overall: ReadinessStatus::Meterless,
+            warnings: vec![],
+        };
+        match report.drain_decision() {
+            DrainDecision::Proceed { warnings } => {
+                assert!(!warnings.is_empty());
+            }
+            other => panic!("expected Proceed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_binary_parks() {
+        let report = ReadinessReport {
+            mission_id: "m-1".into(),
+            roles: vec![RoleReadiness {
+                role: "worker".into(),
+                backend: "codex".into(),
+                status: ReadinessStatus::Missing,
+                detail: "no codex binary".into(),
+                next_action: "install codex".into(),
+            }],
+            overall: ReadinessStatus::Missing,
+            warnings: vec![],
+        };
+        assert!(matches!(
+            report.drain_decision(),
+            DrainDecision::Park { .. }
+        ));
+    }
+
+    #[test]
+    fn rate_limited_requeues() {
+        let report = ReadinessReport {
+            mission_id: "m-1".into(),
+            roles: vec![RoleReadiness {
+                role: "orchestrator".into(),
+                backend: "claude".into(),
+                status: ReadinessStatus::RateLimited,
+                detail: "429".into(),
+                next_action: "wait".into(),
+            }],
+            overall: ReadinessStatus::RateLimited,
+            warnings: vec![],
+        };
+        match report.drain_decision() {
+            DrainDecision::RequeueDelay { delay, .. } => {
+                assert!(delay.as_secs() >= 1);
+            }
+            other => panic!("expected RequeueDelay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_model_parks_via_validate() {
+        let mut cfg = MissionConfig::default();
+        cfg.orchestrator.model = "not-a-real-model-xyz".into();
+        let report = probe_config("m-x", Path::new("/tmp"), &cfg);
+        assert_eq!(report.overall, ReadinessStatus::Unsupported);
+        assert!(matches!(
+            report.drain_decision(),
+            DrainDecision::Park { .. }
+        ));
+    }
+
+    #[test]
+    fn passing_default_config_does_not_park_on_quota() {
+        let cfg = MissionConfig::default();
+        // May be Missing if claude absent in CI — either Proceed or Park(missing),
+        // but never Park for meteless alone when binaries are Ok.
+        let report = probe_config("m-ok", Path::new("/tmp"), &cfg);
+        match report.drain_decision() {
+            DrainDecision::Proceed { .. } => {}
+            DrainDecision::Park { reason } => {
+                assert!(
+                    reason.contains("Missing")
+                        || reason.to_ascii_lowercase().contains("install")
+                        || reason.to_ascii_lowercase().contains("binary")
+                        || reason.to_ascii_lowercase().contains("not found")
+                        || reason.to_ascii_lowercase().contains("could not"),
+                    "unexpected park reason: {reason}"
+                );
+            }
+            DrainDecision::RequeueDelay { .. } => panic!("default config should not rate-limit"),
+        }
+    }
+}

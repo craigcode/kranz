@@ -155,6 +155,9 @@ pub struct Complete {
     /// computed (needs a pinned `base_sha` and a live git repo). `None`
     /// degrades to omitting the diff-stat line, same as `cost_usd`.
     pub diff_stat: Option<String>,
+    /// Optional PR handoff hint (copyable command / unavailable reason).
+    /// Never implies kranz pushed.
+    pub pr_handoff: Option<String>,
 }
 
 /// A just-created mission whose planning conversation opened in a thread. The
@@ -755,6 +758,14 @@ pub fn build_complete(c: &Complete, dashboard_url: Option<&str>) -> Vec<Value> {
         blocks.push(section(&format!("*Diff stat*\n```{}```", clip(diff_stat))));
     }
     blocks.push(context(&meta));
+    if let Some(hint) = c
+        .pr_handoff
+        .as_deref()
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+    {
+        blocks.push(section(&format!("*PR handoff*\n```{}```", clip(hint))));
+    }
     push_dashboard_button(&mut blocks, dashboard_url, &c.mission_id);
     if c.outcome == Outcome::Completed {
         blocks.push(json!({
@@ -1766,6 +1777,7 @@ mod tests {
                 branch: "kranz/mission-m-9".into(),
                 cost_usd: Some(4.2),
                 diff_stat: None,
+                pr_handoff: None,
             },
             None,
         );
@@ -1787,6 +1799,7 @@ mod tests {
                 branch: "kranz/mission-m-9".into(),
                 cost_usd: Some(4.2),
                 diff_stat: Some(" 2 files changed, 40 insertions(+), 3 deletions(-)".into()),
+                pr_handoff: None,
             },
             Some("http://dash"),
         );
@@ -1821,6 +1834,7 @@ mod tests {
                 branch: "kranz/mission-m-9".into(),
                 cost_usd: None,
                 diff_stat: None,
+                pr_handoff: None,
             },
             None,
         );
@@ -2264,6 +2278,7 @@ mod tests {
                 branch: "b".into(),
                 cost_usd: None,
                 diff_stat: None,
+                pr_handoff: None,
             },
             Some("http://dash"),
         );
@@ -2280,6 +2295,7 @@ mod tests {
                 branch: "b".into(),
                 cost_usd: None,
                 diff_stat: None,
+                pr_handoff: None,
             },
             None,
         );
@@ -2387,6 +2403,7 @@ mod tests {
                     branch: "b".into(),
                     cost_usd: Some(1.0),
                     diff_stat: None,
+                    pr_handoff: None,
                 },
                 None,
             ),
@@ -2471,6 +2488,7 @@ mod tests {
                     branch: "b".into(),
                     cost_usd: None,
                     diff_stat: None,
+                    pr_handoff: None,
                 },
                 None,
             ),

@@ -11,6 +11,8 @@ vi.mock('../lib/api', async () => {
       missions: vi.fn(),
       reportMd: vi.fn(),
       diffStat: vi.fn(),
+      prHandoff: vi.fn(),
+      createPr: vi.fn(),
       merge: vi.fn(),
     },
   };
@@ -34,12 +36,18 @@ beforeEach(() => {
   vi.mocked(api.missions).mockReset();
   vi.mocked(api.reportMd).mockReset();
   vi.mocked(api.diffStat).mockReset();
+  vi.mocked(api.prHandoff).mockReset();
+  vi.mocked(api.createPr).mockReset();
   vi.mocked(api.merge).mockReset();
   vi.mocked(api.reportMd).mockResolvedValue({ markdown: '# Report\n\nAll done.' });
   vi.mocked(api.diffStat).mockResolvedValue({
     diffStat: ' 1 file changed, 2 insertions(+)',
     baseSha: 'abc',
     tip: 'def',
+  });
+  vi.mocked(api.prHandoff).mockResolvedValue({
+    kind: 'unavailable',
+    reason: 'no git remote named "origin"',
   });
 });
 
@@ -109,5 +117,42 @@ describe('DeliveredPanel', () => {
     expect(alert.textContent).toBe(gateOutput);
     // still unmerged: button remains present and enabled
     expect(screen.getByRole('button', { name: 'Merge' })).toBeTruthy();
+  });
+
+  it('shows PR handoff needsPush copy affordance', async () => {
+    vi.mocked(api.missions).mockResolvedValueOnce([makeSummary({ merged: false })]);
+    vi.mocked(api.prHandoff).mockResolvedValueOnce({
+      kind: 'needsPush',
+      command: 'git push origin kranz/mission-m-1',
+      remote: 'origin',
+      branch: 'kranz/mission-m-1',
+    });
+
+    render(<DeliveredPanel missionId="m-1" status="complete" />);
+
+    expect(await screen.findByText(/kranz never pushes/i)).toBeTruthy();
+    expect(screen.getByText('git push origin kranz/mission-m-1')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Copy push command' })).toBeTruthy();
+  });
+
+  it('shows Create PR when readyToCreate', async () => {
+    vi.mocked(api.missions).mockResolvedValueOnce([makeSummary({ merged: false })]);
+    vi.mocked(api.prHandoff).mockResolvedValueOnce({
+      kind: 'readyToCreate',
+      command: 'gh pr create --base main --head kranz/mission-m-1 --title "x" --body "y"',
+      title: 'x',
+      body: 'y',
+      remote: 'origin',
+      branch: 'kranz/mission-m-1',
+      base: 'main',
+    });
+    vi.mocked(api.createPr).mockResolvedValueOnce({ url: 'https://github.com/o/r/pull/1' });
+
+    render(<DeliveredPanel missionId="m-1" status="complete" />);
+
+    const create = await screen.findByRole('button', { name: 'Create PR' });
+    fireEvent.click(create);
+    expect(api.createPr).toHaveBeenCalledWith('m-1');
+    expect(await screen.findByText('https://github.com/o/r/pull/1')).toBeTruthy();
   });
 });

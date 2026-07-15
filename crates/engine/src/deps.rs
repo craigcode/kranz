@@ -117,11 +117,14 @@ pub struct ApprovedTicket {
 /// so the two surfaces can never drift apart on what "approvable" means.
 ///
 /// Refuses (via [`EngineError::InvalidState`]) when: the ticket is not
-/// [`TicketState::Review`]; a `blocked-by` cycle is reachable from `slug`
-/// (never overridable by `force`); or an unsatisfied blocker exists and
-/// `force` is false. On success, enqueues the ticket's drafted mission
-/// (`explicit_mission`, else the recorded/discovered one) and sets the
-/// ticket [`TicketState::Queued`].
+/// [`TicketState::Review`] or [`TicketState::Parked`]; a `blocked-by` cycle
+/// is reachable from `slug` (never overridable by `force`); or an
+/// unsatisfied blocker exists and `force` is false. On success, enqueues the
+/// ticket's drafted mission (`explicit_mission`, else the recorded/discovered
+/// one) and sets the ticket [`TicketState::Queued`].
+///
+/// [`TicketState::Parked`] is accepted so a readiness park can be re-queued
+/// after the operator fixes auth/binaries — the plan is already committed.
 pub fn approve_ticket(
     repo_root: &Path,
     slug: &str,
@@ -133,10 +136,10 @@ pub fn approve_ticket(
     let ticket = Ticket::load(&ticket_path)?;
 
     let state = Ticket::read_state(repo_root, slug);
-    if state != TicketState::Review {
+    if !matches!(state, TicketState::Review | TicketState::Parked) {
         return Err(EngineError::InvalidState(format!(
-            "ticket '{slug}' is {} — only a REVIEW ticket (drafted, plan committed) \
-             can be approved; run `kranz draft {slug}` first",
+            "ticket '{slug}' is {} — only a REVIEW or PARKED ticket \
+             can be queued; run `kranz draft {slug}` first",
             ticket_state_label(state)
         )));
     }
@@ -199,6 +202,7 @@ fn ticket_state_label(state: TicketState) -> &'static str {
         TicketState::Running => "RUNNING",
         TicketState::Done => "DONE",
         TicketState::Failed => "FAILED",
+        TicketState::Parked => "PARKED",
     }
 }
 

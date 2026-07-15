@@ -948,6 +948,49 @@ impl GitRepo {
         }
     }
 
+    /// URL of remote `name` (`git remote get-url`), or `Ok(None)` when absent.
+    pub fn remote_url(&self, name: &str) -> Result<Option<String>> {
+        if name.starts_with('-') || name.chars().any(char::is_whitespace) {
+            return Err(EngineError::Git(format!(
+                "refusing remote_url of malformed remote {name:?}"
+            )));
+        }
+        let out = self.probe(&["remote", "get-url", name])?;
+        if !out.status.success() {
+            return Ok(None);
+        }
+        let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if url.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(url))
+        }
+    }
+
+    /// Whether `remote` advertises branch `branch` (`git ls-remote --heads`).
+    /// Read-only network probe — never updates local refs.
+    pub fn remote_has_branch(&self, remote: &str, branch: &str) -> Result<bool> {
+        for slot in [remote, branch] {
+            if slot.starts_with('-') || slot.contains(':') || slot.chars().any(char::is_whitespace)
+            {
+                return Err(EngineError::Git(format!(
+                    "refusing remote_has_branch with malformed ref {slot:?}"
+                )));
+            }
+        }
+        let out = self.probe(&["ls-remote", "--heads", remote, branch])?;
+        if !out.status.success() {
+            return Err(EngineError::Git(format!(
+                "git ls-remote --heads {remote} {branch} failed ({}): {}",
+                out.status,
+                failure_detail(&out)
+            )));
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let needle = format!("refs/heads/{branch}");
+        Ok(stdout.lines().any(|line| line.contains(&needle)))
+    }
+
     /// Whether a remote named `name` is configured (`git remote get-url`).
     ///
     /// A probe, not an assertion: returns `Ok(false)` when the remote is
@@ -955,8 +998,7 @@ impl GitRepo {
     /// this to decide whether a cloud mission has anywhere to push to before
     /// calling [`GitRepo::push_mission_branch`].
     pub fn has_remote(&self, name: &str) -> Result<bool> {
-        let out = self.probe(&["remote", "get-url", name])?;
-        Ok(out.status.success())
+        Ok(self.remote_url(name)?.is_some())
     }
 
     /// Push a single `kranz/*` mission ref to `remote` — **the one and only

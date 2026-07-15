@@ -193,6 +193,15 @@ pub fn router_with_shared_host_and_addr(
         .route("/api/missions/{id}/report.md", get(rest::mission_report_md))
         .route("/api/missions/{id}/diff-stat", get(rest::mission_diff_stat))
         .route(
+            "/api/missions/{id}/pr-handoff",
+            get(rest::mission_pr_handoff),
+        )
+        .route(
+            "/api/missions/{id}/pr-handoff/create",
+            post(rest::mission_pr_create),
+        )
+        .route("/api/missions/{id}/readiness", get(rest::mission_readiness))
+        .route(
             "/api/missions/{id}/runs/{run_id}/transcript",
             get(rest::run_transcript),
         )

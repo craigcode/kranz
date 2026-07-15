@@ -1170,7 +1170,9 @@ pub fn gate_work_run_command(
         ));
     }
     WorkRunGate::Ready(error_blocks(
-        ":hourglass_flowing_sand: Running the queue — draining now; progress posts per mission.",
+        ":hourglass_flowing_sand: Running the queue — draining now; progress posts per mission. \
+         Backend readiness (ok/missing/unauthenticated/rate_limited/unsupported/meterless) is on \
+         the Mission Control queue; hard failures park with a ticket note instead of a doomed start.",
     ))
 }
 
@@ -3316,6 +3318,7 @@ fn pipeline_stage_for_ticket(
             }
         },
         TicketState::Failed => PipelineStage::Failed,
+        TicketState::Parked => PipelineStage::Reviewable,
     }
 }
 

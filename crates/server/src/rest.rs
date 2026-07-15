@@ -236,6 +236,55 @@ pub(crate) async fn mission_diff_stat(
     })))
 }
 
+/// `GET /api/missions/:id/pr-handoff` — optional GitHub PR handoff for a
+/// COMPLETE-but-unmerged mission. Never pushes; may return a copyable
+/// `git push` or a `gh pr create` command.
+pub(crate) async fn mission_pr_handoff(
+    State(server): State<Arc<ServerState>>,
+    UrlPath(id): UrlPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let paths = mission_paths(&server, &id)?;
+    if !paths.events_file().is_file() {
+        return Err(unknown_mission(&id));
+    }
+    let handoff = kranz_engine::pr_handoff::assess_mission(&server.repo_root, &id)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(
+        serde_json::to_value(handoff).map_err(|e| ApiError::internal(e.to_string()))?,
+    ))
+}
+
+/// `POST /api/missions/:id/pr-handoff/create` — run `gh pr create` only when
+/// the handoff is `readyToCreate` (remote branch already present). Never pushes.
+pub(crate) async fn mission_pr_create(
+    State(server): State<Arc<ServerState>>,
+    UrlPath(id): UrlPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let paths = mission_paths(&server, &id)?;
+    if !paths.events_file().is_file() {
+        return Err(unknown_mission(&id));
+    }
+    let handoff = kranz_engine::pr_handoff::assess_mission(&server.repo_root, &id)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let url = kranz_engine::pr_handoff::create_pull_request(&server.repo_root, &handoff)
+        .map_err(|e| ApiError::conflict(e.to_string()))?;
+    Ok(Json(json!({ "url": url })))
+}
+
+/// `GET /api/missions/:id/readiness` — backend readiness probe (same enum as
+/// pre-drain gating). Tokenless read.
+pub(crate) async fn mission_readiness(
+    State(server): State<Arc<ServerState>>,
+    UrlPath(id): UrlPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let _ = mission_paths(&server, &id)?;
+    let report = kranz_engine::backend_readiness::probe_mission(&server.repo_root, &id)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(
+        serde_json::to_value(report).map_err(|e| ApiError::internal(e.to_string()))?,
+    ))
+}
+
 /// `GET /api/missions/:id/runs/:runId/transcript` — the run's JSONL parsed
 /// into a JSON array of raw stream values; 404 if the file is missing.
 pub(crate) async fn run_transcript(

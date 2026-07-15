@@ -71,6 +71,9 @@ export function RunQueueButton() {
   const live = queue?.drain.live ?? false;
   const empty = queue !== null && count === 0;
   const disabled = live || empty || draining;
+  const front = queue?.entries[0];
+  const frontReadiness = front?.readiness;
+  const parkedN = queue?.drain.parked?.length ?? 0;
 
   let status: string;
   if (tokenRequired) {
@@ -79,9 +82,17 @@ export function RunQueueButton() {
     const id = queue?.drain.currentMissionId;
     status = id !== null && id !== undefined ? `Draining… ${id}` : 'Draining…';
   } else if (empty) {
-    status = 'queue empty';
+    status = parkedN > 0 ? `queue empty · ${parkedN} parked` : 'queue empty';
   } else {
-    status = `${count} queued`;
+    const readyBit =
+      frontReadiness !== undefined
+        ? ` · front ${frontReadiness.overall}${
+            frontReadiness.roles.some((r) => r.status !== 'ok' && r.status !== 'meterless')
+              ? ` (${frontReadiness.roles.find((r) => r.status !== 'ok' && r.status !== 'meterless')?.nextAction ?? ''})`
+              : ''
+          }`
+        : '';
+    status = `${count} queued${readyBit}`;
   }
 
   return (
@@ -90,6 +101,14 @@ export function RunQueueButton() {
         Run queue
       </button>
       <span className="dim run-queue-status">{status}</span>
+      {frontReadiness !== undefined &&
+        frontReadiness.warnings.length > 0 &&
+        !live &&
+        !empty && (
+          <div className="dim run-queue-readiness" title={frontReadiness.warnings.join('\n')}>
+            readiness: {frontReadiness.overall}
+          </div>
+        )}
       {error !== null && (
         <div className="picker-error" role="alert">
           {error}

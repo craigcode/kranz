@@ -1,12 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { pipelineStage, primaryAction, type WorkItem, type PipelineStage } from './pipelineStage';
 
-function ticket(state: 'new' | 'drafting' | 'needs-context' | 'review' | 'queued' | 'running' | 'done' | 'failed'): WorkItem {
+function ticket(state: 'new' | 'drafting' | 'needs-context' | 'review' | 'queued' | 'running' | 'done' | 'failed' | 'parked'): WorkItem {
   return { kind: 'ticket', ticket: { slug: 't-1', state } };
 }
 
 function ticketWithMission(
-  state: 'new' | 'drafting' | 'needs-context' | 'review' | 'queued' | 'running' | 'done' | 'failed',
+  state: 'new' | 'drafting' | 'needs-context' | 'review' | 'queued' | 'running' | 'done' | 'failed' | 'parked',
   mission: { status: any; merged: boolean | null },
 ): WorkItem {
   return { kind: 'ticket', ticket: { slug: 't-1', state }, mission };
@@ -31,6 +31,10 @@ describe('pipelineStage', () => {
 
   it('maps ticket state failed directly to failed', () => {
     expect(pipelineStage(ticket('failed'))).toBe('failed');
+  });
+
+  it('maps parked readiness parks to reviewable (re-queue)', () => {
+    expect(pipelineStage(ticket('parked'))).toBe('reviewable');
   });
 
   it('maps a done ticket with no joined mission to landed (direct-fixed, terminal)', () => {

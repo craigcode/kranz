@@ -96,6 +96,9 @@ export function pipelineStage(item: WorkItem): PipelineStage {
     }
     case 'failed':
       return 'failed';
+    case 'parked':
+      // Plan is already committed — surface under reviewable so Queue works.
+      return 'reviewable';
     default:
       return item.ticket.state satisfies never;
   }

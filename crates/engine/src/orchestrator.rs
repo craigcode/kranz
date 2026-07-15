@@ -49,6 +49,7 @@ use crate::error::{EngineError, Result};
 use crate::event_log::{EventLog, LockForce};
 use crate::events::{Event, EventKind};
 use crate::git_ops::{with_kranz_trailers, CommitInfo, GitRepo, KranzCommitMetadata};
+use crate::knowledge::{self, KnowledgeQuery};
 use crate::lessons;
 use crate::paths::MissionPaths;
 use crate::permissions;
@@ -56,6 +57,7 @@ use crate::prompts;
 use crate::reducer;
 use crate::runner;
 use crate::scrub;
+use crate::ticket::Ticket;
 use crate::types::*;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -1359,7 +1361,7 @@ impl MissionEngine {
         } else {
             format!("Operator revision request:\n{instructions}")
         };
-        let message = format!(
+        let mut message = format!(
             "The mission is already underway. Propose a REVISED plan for the work that is \
              NOT yet complete. Rules: keep every already-COMPLETE milestone exactly as it is \
              and list those completed milestones FIRST and unchanged (same title, same \
@@ -1372,6 +1374,12 @@ impl MissionEngine {
             research_prompt_policy(&self.state.config),
             instructions_block
         );
+        // Revised-planning is in scope for knowledge injection (D-C); lessons
+        // stay on the initial planning-seed path only.
+        if let Some(block) = self.render_knowledge_for_planning() {
+            message.push_str("\n\n");
+            message.push_str(&block);
+        }
         let text = self.orch_turn(&message).await?;
         if let Some(plan) = runner::parse_report::<Plan>(&text) {
             self.pending_research = extract_research(&text);
@@ -4468,6 +4476,52 @@ impl MissionEngine {
         })
     }
 
+    /// Ranked ≤4 KiB `docs/knowledge/` block for planning / revised-planning
+    /// seeds (slice 2 / D-C). Separate budget from lessons. Missing vault →
+    /// `None` (planning continues).
+    fn render_knowledge_for_planning(&self) -> Option<String> {
+        let ticket_body = Ticket::slug_for_mission(&self.paths.repo_root, &self.state.mission.id)
+            .and_then(|slug| {
+                std::fs::read_to_string(Ticket::md_path(&self.paths.repo_root, &slug)).ok()
+            });
+        let changed = self.knowledge_changed_files();
+        knowledge::render_knowledge_for_planning(
+            &self.paths.repo_root,
+            &KnowledgeQuery {
+                goal: &self.state.mission.goal,
+                ticket_body: ticket_body.as_deref(),
+                touch_hints: &self.state.mission.touch_set,
+                changed_files: &changed,
+            },
+        )
+    }
+
+    /// Best-effort `base_sha..HEAD` path list for knowledge tier-3 overlap.
+    /// Empty during early planning (no base pin yet) or on git errors.
+    fn knowledge_changed_files(&self) -> Vec<String> {
+        let Some(base) = self.state.mission.base_sha.as_deref() else {
+            return Vec::new();
+        };
+        let Ok(head) = self.repo.head_sha() else {
+            return Vec::new();
+        };
+        self.repo.changed_paths(base, &head).unwrap_or_default()
+    }
+
+    /// Append knowledge (then lessons) onto a planning seed. Order and
+    /// separate budgets are load-bearing (ticket
+    /// repo-knowledge-ranked-brief-injection).
+    fn append_planning_context(&self, seed: &mut String) {
+        if let Some(block) = self.render_knowledge_for_planning() {
+            seed.push_str("\n\n");
+            seed.push_str(&block);
+        }
+        if let Some(index) = self.render_lessons_for_planning() {
+            seed.push_str("\n\n");
+            seed.push_str(&index);
+        }
+    }
+
     /// Fallible body of [`Self::capture_lesson`].
     async fn try_capture_lesson(&mut self) -> Result<Option<Vec<PathBuf>>> {
         let message = format!(
@@ -4578,10 +4632,7 @@ impl MissionEngine {
                  milestones and features. Do not emit the plan JSON until asked.",
                 self.state.mission.goal
             );
-            if let Some(index) = self.render_lessons_for_planning() {
-                seed.push_str("\n\n");
-                seed.push_str(&index);
-            }
+            self.append_planning_context(&mut seed);
             format!("{seed}\n\nUSER TURN:\n{message}")
         } else {
             format!("{}\n\n{}", digest::render(&self.state), message)
@@ -4678,10 +4729,7 @@ impl MissionEngine {
                  milestones and features. Do not emit the plan JSON until asked.",
                 self.state.mission.goal
             );
-            if let Some(index) = self.render_lessons_for_planning() {
-                seed.push_str("\n\n");
-                seed.push_str(&index);
-            }
+            self.append_planning_context(&mut seed);
             (seed, None)
         } else {
             (digest::render_reseed(&self.state, &self.plan_json()?), None)
@@ -4706,10 +4754,7 @@ impl MissionEngine {
                          the plan JSON until asked.",
                         self.state.mission.goal
                     );
-                    if let Some(index) = self.render_lessons_for_planning() {
-                        seed.push_str("\n\n");
-                        seed.push_str(&index);
-                    }
+                    self.append_planning_context(&mut seed);
                     seed
                 } else {
                     digest::render_reseed(&self.state, &self.plan_json()?)

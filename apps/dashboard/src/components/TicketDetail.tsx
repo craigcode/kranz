@@ -92,7 +92,7 @@ export function TicketDetail({ slug }: { slug: string }) {
     );
   }
 
-  const showApprove = ticket.state === 'review';
+  const showApprove = ticket.state === 'review' || ticket.state === 'parked';
   const ticketBusy = ticketBusySlug !== null;
   const approveDisabled = ticket.isBlocked || ticketBusy;
   const approveTitle = ticket.isBlocked

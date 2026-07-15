@@ -103,7 +103,19 @@ pub struct MissionHost {
     /// `spawn_blocking`; real shell commands by default, a scripted stub in
     /// tests (see [`MissionHost::with_gate_executor`]).
     gate_executor: GateExecutor,
+    /// Short-TTL cache for the queue-front readiness probe so a 3s dashboard
+    /// poll does not re-shell every backend CLI on every GET /api/queue.
+    readiness_front_cache: Mutex<Option<FrontReadinessCache>>,
 }
+
+/// Cached `GET /api/queue` readiness for the current queue front only.
+struct FrontReadinessCache {
+    mission_id: String,
+    report: Value,
+    at: Instant,
+}
+
+const READINESS_FRONT_CACHE_TTL: Duration = Duration::from_secs(5);
 
 /// One background drain task's observable progress — shared between the task
 /// (which updates it as it goes) and [`MissionHost::drain`] /
@@ -113,6 +125,7 @@ struct DrainState {
     live: bool,
     current_mission_id: Option<String>,
     ran: Vec<String>,
+    parked: Vec<String>,
 }
 
 /// One gate-suite command execution: `executor(command, cwd)` →
@@ -140,6 +153,7 @@ fn drain_state_json(state: &DrainState) -> Value {
         "live": state.live,
         "currentMissionId": state.current_mission_id,
         "ran": state.ran,
+        "parked": state.parked,
     })
 }
 
@@ -176,6 +190,7 @@ impl MissionHost {
             drain: Mutex::new(DrainSlot::Idle),
             auto_work: Mutex::new(None),
             gate_executor: real_gate_executor(),
+            readiness_front_cache: Mutex::new(None),
         }
     }
 
@@ -190,6 +205,7 @@ impl MissionHost {
             drain: Mutex::new(DrainSlot::Idle),
             auto_work: Mutex::new(None),
             gate_executor: real_gate_executor(),
+            readiness_front_cache: Mutex::new(None),
         }
     }
 
@@ -209,6 +225,7 @@ impl MissionHost {
             drain: Mutex::new(DrainSlot::Idle),
             auto_work: Mutex::new(None),
             gate_executor: Arc::new(gate_executor),
+            readiness_front_cache: Mutex::new(None),
         }
     }
 
@@ -1054,6 +1071,7 @@ impl MissionHost {
                 live: true,
                 current_mission_id: None,
                 ran: Vec::new(),
+                parked: Vec::new(),
             }));
             *guard = DrainSlot::Starting(Arc::clone(&state));
             state
@@ -1099,6 +1117,10 @@ impl MissionHost {
 
     /// `GET /api/queue`: the queue front-to-back, who (if anyone) currently
     /// holds the busy lock, and this host's own drain tracker.
+    ///
+    /// Readiness is probed for the **front entry only** (with a short TTL
+    /// cache). Deeper entries omit `readiness` so a long queue cannot turn
+    /// every dashboard poll into N CLI shells.
     pub fn queue_state(&self) -> Value {
         let entries = kranz_engine::queue::list(&self.repo_root);
         let busy_with = kranz_engine::queue::is_repo_busy(&self.repo_root);
@@ -1111,8 +1133,56 @@ impl MissionHost {
             }
             DrainSlot::Idle => drain_state_json(&DrainState::default()),
         };
+
+        let front_readiness = entries.first().map(|e| {
+            let mid = e.mission_id.as_str();
+            {
+                let cache = self
+                    .readiness_front_cache
+                    .lock()
+                    .expect("readiness front cache lock");
+                if let Some(cached) = cache.as_ref() {
+                    if cached.mission_id == mid && cached.at.elapsed() < READINESS_FRONT_CACHE_TTL {
+                        return (mid.to_string(), cached.report.clone());
+                    }
+                }
+            }
+            let report = kranz_engine::backend_readiness::probe_mission(&self.repo_root, mid)
+                .ok()
+                .and_then(|r| serde_json::to_value(r).ok())
+                .unwrap_or(Value::Null);
+            *self
+                .readiness_front_cache
+                .lock()
+                .expect("readiness front cache lock") = Some(FrontReadinessCache {
+                mission_id: mid.to_string(),
+                report: report.clone(),
+                at: Instant::now(),
+            });
+            (mid.to_string(), report)
+        });
+
+        let entries_json: Vec<Value> = entries
+            .into_iter()
+            .map(|e| {
+                let readiness = front_readiness.as_ref().and_then(|(id, report)| {
+                    if id == &e.mission_id && !report.is_null() {
+                        Some(report.clone())
+                    } else {
+                        None
+                    }
+                });
+                json!({
+                    "missionId": e.mission_id,
+                    "ticketSlug": e.ticket_slug,
+                    "priority": e.priority,
+                    "seq": e.seq,
+                    "readiness": readiness,
+                })
+            })
+            .collect();
         json!({
-            "entries": entries,
+            "entries": entries_json,
             "busyWith": busy_with,
             "drain": drain,
         })
@@ -1434,9 +1504,23 @@ where
 
     match &result {
         Ok(report) if !report.stopped_busy => {
+            {
+                let mut guard = state.lock().expect("drain state lock");
+                for id in &report.parked {
+                    if !guard.parked.contains(id) {
+                        guard.parked.push(id.clone());
+                    }
+                }
+            }
             restore_drain_checkout(&repo_root, dispatch_branch.as_deref());
         }
-        Ok(_) => {
+        Ok(report) => {
+            let mut guard = state.lock().expect("drain state lock");
+            for id in &report.parked {
+                if !guard.parked.contains(id) {
+                    guard.parked.push(id.clone());
+                }
+            }
             // `stopped_busy` (only possible with `once`, which the hosted
             // drain never sets — wired for parity with `cmd_work` anyway):
             // a sibling dispatcher may still be mid-mission, so leave the
@@ -2274,6 +2358,7 @@ mod tests {
             live: true,
             current_mission_id: Some("m-fake".to_string()),
             ran: vec!["m-earlier".to_string()],
+            parked: Vec::new(),
         }));
         let never_finishes = tokio::spawn(async {
             std::future::pending::<()>().await;
@@ -2512,6 +2597,7 @@ mod tests {
             live: true,
             current_mission_id: Some("m-inflight".to_string()),
             ran: Vec::new(),
+            parked: Vec::new(),
         }));
         let never_finishes = tokio::spawn(async {
             std::future::pending::<()>().await;
@@ -2570,6 +2656,7 @@ mod tests {
             live: true,
             current_mission_id: Some("m-reserved".to_string()),
             ran: Vec::new(),
+            parked: Vec::new(),
         }));
         *host.drain.lock().expect("drain tracker lock") = DrainSlot::Starting(Arc::clone(&state));
         let before = Arc::as_ptr(&state);
@@ -2639,6 +2726,7 @@ mod tests {
             live: true,
             current_mission_id: Some("m-starting".to_string()),
             ran: Vec::new(),
+            parked: Vec::new(),
         }));
         *host.drain.lock().expect("drain tracker lock") = DrainSlot::Starting(state);
 

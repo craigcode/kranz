@@ -19,15 +19,18 @@ pub mod paths;
 pub mod types;
 
 pub mod auth_verify;
+pub mod backend_readiness;
 pub mod config;
 pub mod contract_sweep;
 pub mod cost;
 pub mod deps;
 pub mod event_log;
 pub mod git_ops;
+pub mod knowledge;
 pub mod lessons;
 pub mod merge;
 pub mod merged;
+pub mod pr_handoff;
 pub mod prompts;
 pub mod queue;
 pub mod reducer;

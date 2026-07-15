@@ -116,6 +116,7 @@ pub fn classify(event: &Event, state: &MissionState, repo_root: &Path) -> Option
             branch: state.mission.mission_branch.clone(),
             cost_usd: nonzero(state.total_cost_usd),
             diff_stat: mission_diff_stat(repo_root, &state.mission),
+            pr_handoff: mission_pr_handoff_hint(repo_root, &state.mission),
         })),
 
         EventKind::MissionFailed { reason } => Some(Outbound::Complete(Complete {
@@ -125,6 +126,7 @@ pub fn classify(event: &Event, state: &MissionState, repo_root: &Path) -> Option
             branch: state.mission.mission_branch.clone(),
             cost_usd: nonzero(state.total_cost_usd),
             diff_stat: None,
+            pr_handoff: None,
         })),
 
         _ => None,
@@ -144,6 +146,31 @@ fn mission_diff_stat(repo_root: &Path, mission: &kranz_engine::types::Mission) -
     }
     let tip = repo.rev_parse(&mission.mission_branch).ok()?;
     repo.diff_stat(base_sha, &tip).ok()
+}
+
+/// Copyable PR handoff hint for Slack (push command or gh create). Never
+/// performs a push — assessment only.
+fn mission_pr_handoff_hint(
+    repo_root: &Path,
+    mission: &kranz_engine::types::Mission,
+) -> Option<String> {
+    use kranz_engine::pr_handoff::{assess, PrHandoff, PrHandoffInputs};
+    // Never probe the remote from Slack notify — ls-remote can hang the bridge.
+    let handoff = assess(
+        repo_root,
+        &PrHandoffInputs {
+            mission,
+            report_md: None,
+            plan_md: None,
+            remote: "origin",
+            probe_remote: false,
+        },
+    );
+    match handoff {
+        PrHandoff::NeedsPush { command, .. } => Some(command),
+        PrHandoff::ReadyToCreate { command, .. } => Some(command),
+        PrHandoff::Unavailable { reason } => Some(reason),
+    }
 }
 
 /// A one-line completion summary from the folded state: the mission goal plus a

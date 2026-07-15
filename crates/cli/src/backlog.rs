@@ -70,6 +70,7 @@ pub fn ticket_state_label(state: TicketState) -> &'static str {
         TicketState::Running => "RUNNING",
         TicketState::Done => "DONE",
         TicketState::Failed => "FAILED",
+        TicketState::Parked => "PARKED",
     }
 }
 
@@ -544,8 +545,18 @@ pub async fn cmd_work(repo: PathBuf, once: bool) -> Result<i32> {
         // still-running mission.
         return Ok(0);
     }
-    if report.ran.is_empty() && report.skipped.is_empty() {
+    if report.ran.is_empty() && report.skipped.is_empty() && report.parked.is_empty() {
         println!("queue empty — nothing to do.");
+    } else {
+        if !report.parked.is_empty() {
+            println!("parked (backend not ready): {}", report.parked.join(", "));
+        }
+        if !report.skipped.is_empty() {
+            println!("skipped: {}", report.skipped.join(", "));
+        }
+        if !report.ran.is_empty() {
+            println!("ran: {}", report.ran.join(", "));
+        }
     }
     restore_work_checkout(&repo, dispatch_branch.as_deref());
     Ok(0)
@@ -775,6 +786,7 @@ mod tests {
             TicketState::Review,
             TicketState::Running,
             TicketState::Failed,
+            TicketState::Parked,
         ] {
             assert_eq!(
                 ticket_terminal_label(&repo_root, "queued", state),

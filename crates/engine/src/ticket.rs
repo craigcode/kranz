@@ -80,6 +80,11 @@ pub enum TicketState {
     Running,
     Done,
     Failed,
+    /// Claimed then removed from the queue because backend readiness failed
+    /// (missing binary, unauthenticated, unsupported config). Distinct from
+    /// [`Failed`] so operators can re-queue after fixing the environment
+    /// without treating the mission run itself as a failure.
+    Parked,
 }
 
 /// On-disk shape of `<slug>.status`.
@@ -346,7 +351,7 @@ impl Ticket {
     }
 
     /// Path of the ticket markdown for a slug.
-    fn md_path(repo_root: &Path, slug: &str) -> PathBuf {
+    pub(crate) fn md_path(repo_root: &Path, slug: &str) -> PathBuf {
         Self::tickets_dir(repo_root).join(format!("{slug}.md"))
     }
 

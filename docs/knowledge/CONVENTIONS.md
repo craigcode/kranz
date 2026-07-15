@@ -64,10 +64,12 @@ verified_against:
 
 ## What this is *not* (yet)
 
-Slice 1 (this) establishes the vault and its conventions, and adds a per-mission
-`research.md` evidence artifact beside `plan.md`. It does **not** yet inject
-notes into prompts (slice 2) or run drift checks (slice 3). See the scoping
-doc's build slicing. Until slice 2, these notes are for browsing and review.
+Slice 1 established the vault and its conventions, plus a per-mission
+`research.md` evidence artifact beside `plan.md`. Slice 2 injects a ranked,
+≤4 KiB "Knowledge from this repo" block into **planning and revised-planning**
+seeds only (stale/unverified notes excluded; separate from the lessons budget).
+Slice 3 (`kranz knowledge refresh` drift checks) is still outstanding. See the
+scoping doc's build slicing.
 
 ## Relationship to lessons
 

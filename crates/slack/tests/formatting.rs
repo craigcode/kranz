@@ -124,6 +124,7 @@ fn complete_block_kit() {
             branch: "kranz/mission-m-9".into(),
             cost_usd: Some(4.2),
             diff_stat: None,
+            pr_handoff: None,
         },
         None,
     );
@@ -146,6 +147,7 @@ fn failed_block_kit_reads_failed() {
             branch: "kranz/mission-m-9".into(),
             cost_usd: None,
             diff_stat: None,
+            pr_handoff: None,
         },
         None,
     );

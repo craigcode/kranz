@@ -64,7 +64,8 @@ export type TicketState =
   | 'queued'
   | 'running'
   | 'done'
-  | 'failed';
+  | 'failed'
+  | 'parked';
 
 /** Row shape from `GET /api/tickets` — enough to render a backlog table. */
 export interface TicketSummary {
@@ -419,6 +420,22 @@ export interface QueueEntry {
   ticketSlug?: string;
   priority: number;
   seq: number;
+  /** Best-effort readiness probe (same shape as GET /readiness). */
+  readiness?: ReadinessReport;
+}
+
+/** `GET /api/missions/:id/readiness` */
+export interface ReadinessReport {
+  missionId: string;
+  roles: Array<{
+    role: string;
+    backend: string;
+    status: string;
+    detail: string;
+    nextAction: string;
+  }>;
+  overall: string;
+  warnings: string[];
 }
 
 /** This host's queue-drain tracker (`MissionHost::drain` / `drain_state_json`). */
@@ -426,6 +443,8 @@ export interface DrainState {
   live: boolean;
   currentMissionId: string | null;
   ran: string[];
+  /** Missions removed before claim due to backend readiness failure. */
+  parked?: string[];
 }
 
 /** `GET /api/queue` response shape. */
@@ -434,3 +453,17 @@ export interface QueueState {
   busyWith: string | null;
   drain: DrainState;
 }
+
+/** `GET /api/missions/:id/pr-handoff` — never auto-pushes. */
+export type PrHandoff =
+  | { kind: 'needsPush'; command: string; remote: string; branch: string }
+  | {
+      kind: 'readyToCreate';
+      command: string;
+      title: string;
+      body: string;
+      remote: string;
+      branch: string;
+      base: string;
+    }
+  | { kind: 'unavailable'; reason: string };

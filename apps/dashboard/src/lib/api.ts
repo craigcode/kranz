@@ -16,7 +16,9 @@ import type {
   MissionSummary,
   Plan,
   PlanRequestResponse,
+  PrHandoff,
   QueueState,
+  ReadinessReport,
   Ticket,
   TicketSummary,
   TranscriptEntry,
@@ -175,6 +177,18 @@ export const api = {
 
   diffStat(id: string): Promise<{ diffStat: string; baseSha: string; tip: string }> {
     return getJson(`/api/missions/${encodeURIComponent(id)}/diff-stat`);
+  },
+
+  prHandoff(id: string): Promise<PrHandoff> {
+    return getJson(`/api/missions/${encodeURIComponent(id)}/pr-handoff`);
+  },
+
+  createPr(id: string): Promise<{ url: string }> {
+    return postJson(`/api/missions/${encodeURIComponent(id)}/pr-handoff/create`, {});
+  },
+
+  readiness(id: string): Promise<ReadinessReport> {
+    return getJson(`/api/missions/${encodeURIComponent(id)}/readiness`);
   },
 
   revisionDiff(id: string): Promise<{
