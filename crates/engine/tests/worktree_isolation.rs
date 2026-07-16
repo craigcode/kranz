@@ -19,20 +19,10 @@ use kranz_engine::types::{
     WorkerIsolation,
 };
 use serde_json::json;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use tokio::time::{timeout, Duration as TokioDuration};
-
-/// Windows CI performs substantially more process and filesystem work per git
-/// operation than Unix runners. Keep the same hang guard while allowing the
-/// mocked end-to-end missions enough wall-clock headroom under parallel test
-/// load.
-fn test_timeout(seconds: u64) -> TokioDuration {
-    #[cfg(windows)]
-    let seconds = seconds * 3;
-    TokioDuration::from_secs(seconds)
-}
 
 fn write_layer(dir: &tempfile::TempDir, name: &str, contents: &str) -> PathBuf {
     let path = dir.path().join(name);
@@ -48,23 +38,21 @@ fn git_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Native-shell probe for the final-gate command environment. Contract
+/// Native-shell assertion for the final-gate command environment. Contract
 /// commands run through `sh` on Unix and `cmd` on Windows, so the variable
 /// syntax must match the executor while asserting the same value everywhere.
-fn gate_base_sha_capture_command(capture_file: &Path) -> String {
+/// Compare in the shell instead of redirecting to a capture file: cmd's
+/// redirection parsing is sensitive to quoting and previously sent the test
+/// into the failure-conversion dialogue on Windows, where its success-only
+/// mock script correctly had no reply queued.
+fn gate_base_sha_assertion_command(expected: &str) -> String {
     #[cfg(unix)]
     {
-        format!(
-            "printf '%s' \"$KRANZ_BASE_SHA\" > \"{}\"",
-            capture_file.display()
-        )
+        format!("test \"$KRANZ_BASE_SHA\" = '{expected}'")
     }
     #[cfg(windows)]
     {
-        // Redirect first: `echo %VAR%>file` treats a trailing digit of the
-        // expanded SHA as a stream handle (`N>`), so hex SHAs ending in 0-9
-        // flaky-fail on cmd. Leading `>file` avoids that parse.
-        format!(">\"{}\" echo %KRANZ_BASE_SHA%", capture_file.display())
+        format!("if \"%KRANZ_BASE_SHA%\"==\"{expected}\" (exit /b 0) else (exit /b 1)")
     }
 }
 
@@ -345,7 +333,7 @@ async fn worker_session_cwd_is_worktree() {
         .to_string();
     assert_eq!(branch_before, "main");
 
-    let status = timeout(test_timeout(60), engine.run())
+    let status = timeout(TokioDuration::from_secs(60), engine.run())
         .await
         .expect("run must not hang")
         .unwrap();
@@ -406,7 +394,7 @@ async fn checkout_mode_runs_worker_in_primary_root() {
     let mission_branch = engine.state().mission.mission_branch.clone();
     engine.approve_plan(one_feature_plan()).unwrap();
 
-    let status = timeout(test_timeout(60), engine.run())
+    let status = timeout(TokioDuration::from_secs(60), engine.run())
         .await
         .expect("run must not hang")
         .unwrap();
@@ -466,7 +454,7 @@ async fn validator_session_cwd_is_worktree() {
     engine.approve_plan(one_feature_plan()).unwrap();
     raw_git(&root, &["checkout", "main"]);
 
-    let status = timeout(test_timeout(60), engine.run())
+    let status = timeout(TokioDuration::from_secs(60), engine.run())
         .await
         .expect("run must not hang")
         .unwrap();
@@ -511,8 +499,10 @@ async fn base_sha_reaches_sessions_in_worktree_mode() {
     let Some((_dir, root)) = mission_init_repo() else {
         return;
     };
-    let capture_dir = tempfile::tempdir().expect("capture dir");
-    let capture_file = capture_dir.path().join("gate_base_sha.txt");
+    let expected_base_sha = GitRepo::open(&root)
+        .expect("open repo")
+        .head_sha()
+        .expect("seed sha");
 
     let mut cfg = worktree_cfg();
     cfg.skip_scrutiny = false; // only scrutiny runs; functional stays skipped
@@ -528,10 +518,10 @@ async fn base_sha_reaches_sessions_in_worktree_mode() {
 
     let mut plan = one_feature_plan();
     plan.validation_contract.push(Assertion {
-        id: "capture-base-sha".to_string(),
+        id: "assert-base-sha".to_string(),
         statement: "the final gate command env carries KRANZ_BASE_SHA".to_string(),
         check: AssertionCheck::Command,
-        command: Some(gate_base_sha_capture_command(&capture_file)),
+        command: Some(gate_base_sha_assertion_command(&expected_base_sha)),
     });
     engine.approve_plan(plan).unwrap();
     raw_git(&root, &["checkout", "main"]);
@@ -542,12 +532,17 @@ async fn base_sha_reaches_sessions_in_worktree_mode() {
         .base_sha
         .clone()
         .expect("mission must pin a base sha at approval");
+    assert_eq!(base_sha, expected_base_sha);
 
-    let status = timeout(test_timeout(60), engine.run())
+    let status = timeout(TokioDuration::from_secs(60), engine.run())
         .await
         .expect("run must not hang")
         .unwrap();
-    assert_eq!(status, MissionStatus::Complete);
+    assert_eq!(
+        status,
+        MissionStatus::Complete,
+        "completion proves the final-gate equality command observed the pinned base sha"
+    );
 
     let specs = backend.started_specs();
     let worker_spec = specs
@@ -568,14 +563,6 @@ async fn base_sha_reaches_sessions_in_worktree_mode() {
         validator_spec.env.get("KRANZ_BASE_SHA"),
         Some(&base_sha),
         "validator session env must carry KRANZ_BASE_SHA"
-    );
-
-    let gate_capture =
-        std::fs::read_to_string(&capture_file).expect("final gate must have run the command");
-    assert_eq!(
-        gate_capture.trim_end_matches(['\r', '\n']),
-        base_sha,
-        "final-gate contract-command env must carry KRANZ_BASE_SHA"
     );
 }
 
@@ -610,7 +597,7 @@ async fn primary_checkout_untouched_in_worktree_mode() {
     engine.seed_worker_auth_verdict_for_test(AuthVerdict::Inconclusive);
     engine.approve_plan(one_feature_plan()).unwrap();
 
-    let status = timeout(test_timeout(60), engine.run())
+    let status = timeout(TokioDuration::from_secs(60), engine.run())
         .await
         .expect("run must not hang")
         .unwrap();
@@ -673,7 +660,7 @@ async fn tracked_missions_index_not_dirtied_in_primary_in_worktree_mode() {
         "approve_plan must not modify tracked files in the primary checkout"
     );
 
-    let status = timeout(test_timeout(60), engine.run())
+    let status = timeout(TokioDuration::from_secs(60), engine.run())
         .await
         .expect("run must not hang")
         .unwrap();
@@ -717,7 +704,7 @@ async fn mission_branch_carries_deliverables_in_worktree_mode() {
     let mission_id = engine.mission_id().to_string();
     engine.approve_plan(one_feature_plan()).unwrap();
 
-    let status = timeout(test_timeout(60), engine.run())
+    let status = timeout(TokioDuration::from_secs(60), engine.run())
         .await
         .expect("run must not hang")
         .unwrap();
@@ -892,7 +879,7 @@ async fn worktrees_removed_at_mission_end_in_worktree_mode() {
     let mission_id = engine.mission_id().to_string();
     engine.approve_plan(two_milestone_plan()).unwrap();
 
-    let status = timeout(test_timeout(90), engine.run())
+    let status = timeout(TokioDuration::from_secs(90), engine.run())
         .await
         .expect("run must not hang")
         .unwrap();
@@ -999,7 +986,7 @@ async fn checkout_mode_matches_legacy_sequential() {
         .to_string();
     assert_eq!(branch_right_after_approval, mission_branch);
 
-    let status = timeout(test_timeout(90), engine.run())
+    let status = timeout(TokioDuration::from_secs(90), engine.run())
         .await
         .expect("run must not hang")
         .unwrap();
@@ -1075,7 +1062,7 @@ async fn approve_revised_plan_untouched_primary_in_worktree_mode() {
     // event), which flips the mission from `Approved` to `Running` — the
     // state `approve_revised_plan` requires. Neither step touches the
     // primary tree in worktree mode.
-    let request = timeout(test_timeout(60), engine.request_revised_plan())
+    let request = timeout(TokioDuration::from_secs(60), engine.request_revised_plan())
         .await
         .expect("request_revised_plan must not hang")
         .expect("scripted plan JSON is not a backend error");
@@ -1170,8 +1157,7 @@ async fn multi_milestone_worktree_mode_preserves_a1_a6_a7() {
     let head_before = repo.head_sha().unwrap();
     let status_before = raw_git(&root, &["status", "--porcelain", "--untracked-files=no"]);
 
-    let capture_dir = tempfile::tempdir().expect("capture dir");
-    let capture_file = capture_dir.path().join("gate_base_sha.txt");
+    let expected_base_sha = repo.head_sha().expect("seed sha");
 
     let mut cfg = worktree_cfg();
     cfg.max_parallel_workers = 2;
@@ -1185,10 +1171,10 @@ async fn multi_milestone_worktree_mode_preserves_a1_a6_a7() {
 
     let mut plan = two_milestone_plan();
     plan.validation_contract.push(Assertion {
-        id: "capture-base-sha".to_string(),
+        id: "assert-base-sha".to_string(),
         statement: "the final gate command env carries KRANZ_BASE_SHA".to_string(),
         check: AssertionCheck::Command,
-        command: Some(gate_base_sha_capture_command(&capture_file)),
+        command: Some(gate_base_sha_assertion_command(&expected_base_sha)),
     });
     engine.approve_plan(plan).unwrap();
 
@@ -1198,12 +1184,17 @@ async fn multi_milestone_worktree_mode_preserves_a1_a6_a7() {
         .base_sha
         .clone()
         .expect("mission must pin a base sha at approval");
+    assert_eq!(base_sha, expected_base_sha);
 
-    let status = timeout(test_timeout(90), engine.run())
+    let status = timeout(TokioDuration::from_secs(90), engine.run())
         .await
         .expect("run must not hang")
         .unwrap();
-    assert_eq!(status, MissionStatus::Complete);
+    assert_eq!(
+        status,
+        MissionStatus::Complete,
+        "completion proves the final-gate equality command observed the pinned base sha"
+    );
 
     // a1: primary checkout byte-untouched across the whole multi-feature,
     // multi-milestone, parallel+sequential mission.
@@ -1258,15 +1249,6 @@ async fn multi_milestone_worktree_mode_preserves_a1_a6_a7() {
             "every worker session env must carry KRANZ_BASE_SHA"
         );
     }
-    // ...and the final-gate contract-command env.
-    let gate_capture =
-        std::fs::read_to_string(&capture_file).expect("final gate must have run the command");
-    assert_eq!(
-        gate_capture.trim_end_matches(['\r', '\n']),
-        base_sha,
-        "final-gate contract-command env must carry KRANZ_BASE_SHA"
-    );
-
     // No worktrees leaked either.
     let worktrees = repo.list_worktrees().unwrap();
     assert_eq!(
@@ -1364,7 +1346,7 @@ async fn worker_auth_preflight_cached_once_per_mission() {
     let mut engine = MissionEngine::create(backend_dyn, &root, GOAL, cfg).expect("create engine");
     engine.approve_plan(two_milestone_plan()).unwrap();
 
-    let status = timeout(test_timeout(90), engine.run())
+    let status = timeout(TokioDuration::from_secs(90), engine.run())
         .await
         .expect("run must not hang")
         .unwrap();
@@ -1436,7 +1418,7 @@ async fn worker_auth_both_spawn_paths_gated() {
             MissionEngine::create(backend_dyn, &root, GOAL, cfg).expect("create engine");
         engine.approve_plan(two_milestone_plan()).unwrap();
 
-        let status = timeout(test_timeout(90), engine.run())
+        let status = timeout(TokioDuration::from_secs(90), engine.run())
             .await
             .expect("run must not hang")
             .unwrap();
