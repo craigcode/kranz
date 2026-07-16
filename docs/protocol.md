@@ -7,13 +7,22 @@ same server and points its webview at it. The server NEVER writes
 Base: `http://127.0.0.1:<port>` (default 4560). All JSON camelCase, matching
 the engine's serde shapes.
 
+When global `host.repos` is configured, every repository operation below is
+also available under `/api/repos/:repoId/...` (for example,
+`/api/repos/kranz/missions`). `GET /api/repos` returns the static operator
+catalog with health, display, grouping, and pin metadata. The unscoped forms
+remain migration aliases only for an explicit `host.defaultRepo` or one sole
+healthy repository; otherwise they fail without selecting a repository.
+Unknown `/api/*` paths always return JSON and never fall through to the
+dashboard SPA.
+
 ## REST
 
 | Method/Path | Response |
 |---|---|
 | `GET /api/missions` | `[{ "id", "status", "goal", "createdAt", "merged" }]` (folds each log; tolerate corrupt ones with `"status":"failed"` + `"error"`; `status` now also includes `"approved"` for an approved mission with no run activity yet — additive, backward-compatible). `merged` is a cheap `git merge-base --is-ancestor` probe of the mission branch tip against the LIVE base branch tip (not the pinned `base_sha`): `true` once the base has absorbed the mission's commits (Landed), `false` while still unmerged (Delivered), `null`/absent when there is no mission branch yet or a ref fails to resolve — a per-mission git failure degrades only that row, never the whole list |
 | `GET /api/missions/:id/state` | full `MissionState` JSON (fold of events.jsonl; NOT the state.json cache) |
-| `GET /api/missions/:id/workspace` | derived local workspace summary: `{"isolation","cwd","lifecycle","worktreeActive","sandboxes":[{role,enforce,extraWriteCount,egressCount}],"preflight":{status,summary,eventSeq}}`. Values come from folded config, the deterministic integration-worktree path, and the latest existing `preflight:` decision event; no configured paths, hosts, or secrets are copied into the sandbox rows |
+| `GET /api/missions/:id/workspace` | derived local workspace summary: `{"isolation","cwd","lifecycle","worktreeActive","sandboxes":[{role,enforce,extraWriteCount,egressCount}],"preflight":{status,summary,eventSeq}}`. Values come from folded config, the repository-namespaced deterministic integration-worktree path, and the latest existing `preflight:` decision event (including an explicit clean outcome that supersedes older warnings); no configured paths, hosts, or secrets are copied into the sandbox rows |
 | `GET /api/missions/:id/events?since=<seq>` | `[Event]` with `seq > since` (omit `since` → all) |
 | `GET /api/missions/:id/plan` | contents of plan.json (404 if not approved yet) |
 | `GET /api/missions/:id/plan.md` | `{"markdown": "<plan.md contents>"}` (404 if not approved yet) |
@@ -92,7 +101,10 @@ paste-token field when a mutation is attempted without one. Missing/wrong
 token → `401 {"error":"missing or invalid token"}`. Rationale: 127.0.0.1
 binding + CORS stop the network and the browser; the token stops other local
 processes and link-borne CSRF from creating or steering missions that spend
-money.
+money. Single-repo compatibility stores it at `<repo>/.kranz/serve.token`;
+an operator-catalog serve stores the one process token at
+`~/.kranz/serve/<bound-port>.token` with mode `0600`, never in every hosted
+repository.
 
 ## WebSocket `GET /api/missions/:id/ws?since=<seq>`
 

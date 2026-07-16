@@ -15,19 +15,24 @@
 
 mod error;
 mod host;
+mod multi;
 mod rest;
 mod tickets;
 mod ws;
 
 pub use error::ApiError;
 pub use host::MissionHost;
+pub use multi::{
+    load_host_config, HostConfig, MultiRepoHost, RepoConfig, RepoContext, RepoSlackConfig,
+    RepoSummary, SlackChannelRoute,
+};
 
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use serde_json::json;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -169,100 +174,57 @@ pub fn router_with_shared_host_and_addr(
     bind_addr: Option<SocketAddr>,
     require_read_token: bool,
 ) -> Router {
-    let bind_is_loopback = !require_read_token;
-    let state = Arc::new(ServerState {
-        repo_root: host.repo_root().clone(),
-        host,
+    router_with_multi_repo_host_and_addr(
+        Arc::new(MultiRepoHost::with_host(host)),
+        static_assets,
+        token,
         bind_addr,
-        bind_is_loopback,
-    });
-    let app = Router::new()
-        .route("/api/health", get(rest::health))
-        .route(
-            "/api/missions",
-            get(rest::list_missions).post(host::create_mission),
-        )
-        .route("/api/missions/{id}/state", get(rest::mission_state))
-        .route("/api/missions/{id}/workspace", get(rest::mission_workspace))
-        .route("/api/missions/{id}/events", get(rest::mission_events))
-        .route("/api/missions/{id}/plan", get(rest::mission_plan))
-        .route("/api/missions/{id}/plan.md", get(rest::mission_plan_md))
-        .route(
-            "/api/missions/{id}/revision-diff",
-            get(rest::mission_revision_diff),
-        )
-        .route("/api/missions/{id}/report.md", get(rest::mission_report_md))
-        .route("/api/missions/{id}/diff-stat", get(rest::mission_diff_stat))
-        .route(
-            "/api/missions/{id}/pr-handoff",
-            get(rest::mission_pr_handoff),
-        )
-        .route(
-            "/api/missions/{id}/pr-handoff/create",
-            post(rest::mission_pr_create),
-        )
-        .route("/api/missions/{id}/readiness", get(rest::mission_readiness))
-        .route(
-            "/api/missions/{id}/runs/{run_id}/transcript",
-            get(rest::run_transcript),
-        )
-        .route("/api/missions/{id}/control", post(rest::post_control))
-        .route("/api/missions/{id}/revise", post(rest::post_revise))
-        .route(
-            "/api/missions/{id}/revision/approve",
-            post(rest::post_revision_approve),
-        )
-        .route(
-            "/api/missions/{id}/revision/reject",
-            post(rest::post_revision_reject),
-        )
-        .route(
-            "/api/missions/{id}/grant/approve",
-            post(rest::post_grant_approve),
-        )
-        .route("/api/missions/{id}/grant/deny", post(rest::post_grant_deny))
-        .route(
-            "/api/missions/{id}/planning/turn",
-            post(host::planning_turn),
-        )
-        .route(
-            "/api/missions/{id}/planning/request-plan",
-            post(host::request_plan),
-        )
-        .route("/api/missions/{id}/approve", post(host::approve_mission))
-        .route("/api/missions/{id}/start", post(host::start_mission))
-        .route(
-            "/api/missions/{id}/pending-plan",
-            get(host::pending_plan_route),
-        )
-        .route(
-            "/api/missions/{id}/approve-pending",
-            post(host::approve_pending_route),
-        )
-        .route(
-            "/api/missions/{id}/abandon",
-            post(host::abandon_mission_route),
-        )
-        .route(
-            "/api/missions/{id}/release",
-            post(host::release_mission_route),
-        )
-        .route(
-            "/api/missions/{id}/delete",
-            post(host::delete_mission_route),
-        )
-        .route("/api/missions/{id}/merge", post(host::merge_mission_route))
-        .route("/api/missions/{id}/ws", get(ws::ws_handler))
-        .route(
-            "/api/tickets",
-            get(tickets::list_tickets).post(tickets::create_ticket),
-        )
-        .route("/api/tickets/{slug}", get(tickets::get_ticket))
-        .route("/api/tickets/{slug}/draft", post(tickets::draft_ticket))
-        .route("/api/tickets/{slug}/approve", post(tickets::approve_ticket))
-        .route("/api/queue", get(host::queue_state_route))
-        .route("/api/queue/drain", post(host::drain_queue_route))
-        .with_state(state);
+        require_read_token,
+    )
+}
+
+/// Build one process router around a static catalog of per-repository hosts.
+/// Each configured id is mounted at `/api/repos/{id}`; the historical
+/// unscoped routes are mounted only when the catalog has an explicit default
+/// or exactly one healthy repository.
+pub fn router_with_multi_repo_host_and_addr(
+    multi_host: Arc<MultiRepoHost>,
+    static_assets: Option<DashboardStatic>,
+    token: Option<String>,
+    bind_addr: Option<SocketAddr>,
+    require_read_token: bool,
+) -> Router {
+    let bind_is_loopback = !require_read_token;
+    let catalog = Arc::clone(&multi_host);
+    let mut app = Router::new().route("/api/health", get(rest::health)).route(
+        "/api/repos",
+        get(move || {
+            let catalog = Arc::clone(&catalog);
+            async move { Json(catalog.summaries()) }
+        }),
+    );
+
+    for context in multi_host.contexts() {
+        let prefix = format!("/api/repos/{}", context.id());
+        app = app.nest(
+            &prefix,
+            repo_context_router(context, bind_addr, bind_is_loopback),
+        );
+    }
+
+    if let Some(context) = multi_host.compatibility_context() {
+        app = app.nest(
+            "/api",
+            repo_context_router(context, bind_addr, bind_is_loopback),
+        );
+    }
+
+    // API misses must never fall through to the SPA fallback. In particular,
+    // an ambiguous unscoped mutation in multi-repo mode must fail as JSON,
+    // not return `200 index.html` and look successful to an API client.
+    app = app
+        .route("/api", any(api_not_found))
+        .route("/api/{*path}", any(api_not_found));
 
     let app = match static_assets {
         Some(DashboardStatic::Dir(dir)) => {
@@ -292,6 +254,118 @@ pub fn router_with_shared_host_and_addr(
         require_host,
     ))
     .layer(cors_layer(bind_addr))
+}
+
+async fn api_not_found() -> impl IntoResponse {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({ "error": "API route not found or repository scope required" })),
+    )
+}
+
+fn repo_context_router(
+    context: Arc<RepoContext>,
+    bind_addr: Option<SocketAddr>,
+    bind_is_loopback: bool,
+) -> Router {
+    let Some(host) = context.host().cloned() else {
+        let id = context.id().to_string();
+        let reason = context
+            .unavailable_reason()
+            .unwrap_or("repository is unavailable")
+            .to_string();
+        return Router::new().fallback(move || {
+            let id = id.clone();
+            let reason = reason.clone();
+            async move {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({
+                        "error": "repository unavailable",
+                        "repoId": id,
+                        "detail": reason,
+                    })),
+                )
+            }
+        });
+    };
+    let state = Arc::new(ServerState {
+        repo_root: context.root().to_path_buf(),
+        host,
+        bind_addr,
+        bind_is_loopback,
+    });
+    repo_api_routes().with_state(state)
+}
+
+fn repo_api_routes() -> Router<Arc<ServerState>> {
+    Router::new()
+        .route(
+            "/missions",
+            get(rest::list_missions).post(host::create_mission),
+        )
+        .route("/missions/{id}/state", get(rest::mission_state))
+        .route("/missions/{id}/workspace", get(rest::mission_workspace))
+        .route("/missions/{id}/events", get(rest::mission_events))
+        .route("/missions/{id}/plan", get(rest::mission_plan))
+        .route("/missions/{id}/plan.md", get(rest::mission_plan_md))
+        .route(
+            "/missions/{id}/revision-diff",
+            get(rest::mission_revision_diff),
+        )
+        .route("/missions/{id}/report.md", get(rest::mission_report_md))
+        .route("/missions/{id}/diff-stat", get(rest::mission_diff_stat))
+        .route("/missions/{id}/pr-handoff", get(rest::mission_pr_handoff))
+        .route(
+            "/missions/{id}/pr-handoff/create",
+            post(rest::mission_pr_create),
+        )
+        .route("/missions/{id}/readiness", get(rest::mission_readiness))
+        .route(
+            "/missions/{id}/runs/{run_id}/transcript",
+            get(rest::run_transcript),
+        )
+        .route("/missions/{id}/control", post(rest::post_control))
+        .route("/missions/{id}/revise", post(rest::post_revise))
+        .route(
+            "/missions/{id}/revision/approve",
+            post(rest::post_revision_approve),
+        )
+        .route(
+            "/missions/{id}/revision/reject",
+            post(rest::post_revision_reject),
+        )
+        .route(
+            "/missions/{id}/grant/approve",
+            post(rest::post_grant_approve),
+        )
+        .route("/missions/{id}/grant/deny", post(rest::post_grant_deny))
+        .route("/missions/{id}/planning/turn", post(host::planning_turn))
+        .route(
+            "/missions/{id}/planning/request-plan",
+            post(host::request_plan),
+        )
+        .route("/missions/{id}/approve", post(host::approve_mission))
+        .route("/missions/{id}/start", post(host::start_mission))
+        .route("/missions/{id}/pending-plan", get(host::pending_plan_route))
+        .route(
+            "/missions/{id}/approve-pending",
+            post(host::approve_pending_route),
+        )
+        .route("/missions/{id}/abandon", post(host::abandon_mission_route))
+        .route("/missions/{id}/release", post(host::release_mission_route))
+        .route("/missions/{id}/delete", post(host::delete_mission_route))
+        .route("/missions/{id}/merge", post(host::merge_mission_route))
+        .route("/missions/{id}/ws", get(ws::ws_handler))
+        .route(
+            "/tickets",
+            get(tickets::list_tickets).post(tickets::create_ticket),
+        )
+        .route("/tickets/{slug}", get(tickets::get_ticket))
+        .route("/tickets/{slug}/draft", post(tickets::draft_ticket))
+        .route("/tickets/{slug}/approve", post(tickets::approve_ticket))
+        .route("/queue", get(host::queue_state_route))
+        .route("/queue/drain", post(host::drain_queue_route))
 }
 
 fn embedded_static_response(uri: Uri, files: &'static [EmbeddedFile]) -> Response {
@@ -797,10 +871,28 @@ pub async fn serve_on_listener(
     token: Option<String>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
+    serve_multi_on_listener(
+        Arc::new(MultiRepoHost::with_host(host)),
+        listener,
+        static_assets,
+        token,
+        shutdown,
+    )
+    .await
+}
+
+/// Serve a static multi-repository catalog on an already-bound listener.
+pub async fn serve_multi_on_listener(
+    multi_host: Arc<MultiRepoHost>,
+    listener: tokio::net::TcpListener,
+    static_assets: Option<DashboardStatic>,
+    token: Option<String>,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
     let local_addr = listener.local_addr()?;
     let require_read_token = !local_addr.ip().is_loopback();
-    let app = router_with_shared_host_and_addr(
-        host,
+    let app = router_with_multi_repo_host_and_addr(
+        multi_host,
         static_assets,
         token,
         Some(local_addr),
@@ -815,7 +907,150 @@ pub async fn serve_on_listener(
 
 #[cfg(test)]
 mod tests {
-    use super::{host_allowed, origin_allowed};
+    use super::{
+        host_allowed, origin_allowed, router_with_multi_repo_host_and_addr, EmbeddedFile,
+        HostConfig, MultiRepoHost, RepoConfig, RepoSlackConfig,
+    };
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use kranz_engine::event_log::{EventLog, LockForce};
+    use kranz_engine::events::EventKind;
+    use kranz_engine::paths::MissionPaths;
+    use kranz_engine::types::MissionConfig;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tower::ServiceExt;
+
+    fn seed_planning_mission(root: &Path, goal: &str) {
+        std::fs::create_dir_all(root).unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let paths = MissionPaths::new(root, "same-id");
+        let mut log = EventLog::acquire(&paths, "same-id", Duration::ZERO, LockForce::No).unwrap();
+        log.append(EventKind::MissionCreated {
+            goal: goal.to_string(),
+            base_branch: "main".to_string(),
+            mission_branch: "kranz/mission-same-id".to_string(),
+            config: MissionConfig::default(),
+        })
+        .unwrap();
+    }
+
+    fn repo_config(id: &str, root: PathBuf) -> RepoConfig {
+        RepoConfig {
+            id: id.to_string(),
+            root,
+            display_name: None,
+            group: None,
+            pinned: false,
+            slack: RepoSlackConfig::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn repo_scoped_routes_isolate_duplicate_mission_ids_and_mutations() {
+        let temp = tempfile::tempdir().unwrap();
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        seed_planning_mission(&a, "goal-a");
+        seed_planning_mission(&b, "goal-b");
+
+        let multi = Arc::new(
+            MultiRepoHost::from_config(HostConfig {
+                default_repo: None,
+                max_concurrent_repos: 1,
+                repos: vec![repo_config("a", a.clone()), repo_config("b", b.clone())],
+            })
+            .unwrap(),
+        );
+        static EMBEDDED: &[EmbeddedFile] = &[EmbeddedFile {
+            path: "index.html",
+            bytes: b"dashboard",
+            content_type: "text/html",
+        }];
+        let app = router_with_multi_repo_host_and_addr(
+            multi,
+            Some(super::DashboardStatic::Embedded(EMBEDDED)),
+            Some("tok".to_string()),
+            None,
+            false,
+        );
+
+        for (repo_id, expected_goal) in [("a", "goal-a"), ("b", "goal-b")] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/repos/{repo_id}/missions/same-id/state"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let state: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(state["mission"]["goal"], expected_goal);
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/repos/a/missions/same-id/control")
+                    .header("content-type", "application/json")
+                    .header(super::TOKEN_HEADER, "tok")
+                    .body(Body::from(r#"{"kind":"pause"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            std::fs::read_dir(MissionPaths::new(&a, "same-id").control_dir())
+                .unwrap()
+                .count(),
+            1
+        );
+        assert_eq!(
+            std::fs::read_dir(MissionPaths::new(&b, "same-id").control_dir())
+                .unwrap()
+                .count(),
+            0
+        );
+
+        // No explicit default and two healthy roots: the legacy mutation path
+        // is not mounted and therefore cannot guess a target.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/missions/same-id/control")
+                    .header("content-type", "application/json")
+                    .header(super::TOKEN_HEADER, "tok")
+                    .body(Body::from(r#"{"kind":"pause"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.headers()["content-type"], "application/json");
+
+        let response = app
+            .oneshot(Request::builder().uri("/api").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.headers()["content-type"], "application/json");
+    }
 
     #[test]
     fn origin_allowlist_accepts_only_local_dev_and_tauri() {

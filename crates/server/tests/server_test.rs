@@ -520,7 +520,7 @@ async fn workspace_summary_surfaces_isolation_sandbox_and_preflight_without_gran
     assert_eq!(body["worktreeActive"], false);
     assert_eq!(
         body["cwd"],
-        kranz_engine::orchestrator::mission_worktree_path(MISSION_ID)
+        kranz_engine::orchestrator::mission_worktree_path(&repo_root, MISSION_ID)
             .to_string_lossy()
             .as_ref()
     );
@@ -536,6 +536,22 @@ async fn workspace_summary_surfaces_isolation_sandbox_and_preflight_without_gran
     assert!(!body
         .to_string()
         .contains(repo_root.to_string_lossy().as_ref()));
+
+    {
+        let mut log = EventLog::acquire(&paths, MISSION_ID, Duration::ZERO, LockForce::No).unwrap();
+        log.append(EventKind::OrchestratorDecision {
+            summary: kranz_engine::orchestrator::PREFLIGHT_CLEAR_SUMMARY.into(),
+            detail: None,
+        })
+        .unwrap();
+    }
+    let (status, body) = get_json(&app, &format!("/api/missions/{MISSION_ID}/workspace")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["preflight"]["status"], "clear");
+    assert_eq!(
+        body["preflight"]["summary"],
+        kranz_engine::orchestrator::PREFLIGHT_CLEAR_SUMMARY
+    );
 }
 
 #[tokio::test]

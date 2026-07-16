@@ -897,14 +897,14 @@ async fn worktrees_removed_at_mission_end_in_worktree_mode() {
         .filter(|s| matches!(s.prompt, PromptMode::SingleShot(ref t) if t.contains("Implement feature")))
         .find(|s| {
             let cwd = s.cwd.to_string_lossy();
-            (cwd.contains(&format!("kranz-wt-{mission_id}-f-1-1"))
-                || cwd.contains(&format!("kranz-wt-{mission_id}-f-1-2")))
+            (cwd.contains(&format!("-{mission_id}-f-1-1"))
+                || cwd.contains(&format!("-{mission_id}-f-1-2")))
                 && !cwd.contains("_integration")
         });
     assert!(
         parallel_worker_cwd.is_some(),
         "expected at least one M1 worker to run in a per-feature parallel worktree \
-         (kranz-wt-{mission_id}-f-1-1 or -f-1-2), proving the parallel-batch path engaged: {:?}",
+         (*-{mission_id}-f-1-1 or -f-1-2), proving the parallel-batch path engaged: {:?}",
         specs.iter().map(|s| &s.cwd).collect::<Vec<_>>()
     );
 
@@ -944,12 +944,12 @@ async fn worktrees_removed_at_mission_end_in_worktree_mode() {
     }
 
     // No leaked worktree dir (parallel OR integration) for this mission.
-    let leak_prefix = format!("kranz-wt-{mission_id}-");
+    let leak_marker = format!("-{mission_id}-");
     for entry in std::fs::read_dir(std::env::temp_dir()).unwrap().flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         assert!(
-            !name.starts_with(&leak_prefix),
+            !(name.starts_with("kranz-wt-") && name.contains(&leak_marker)),
             "a worktree dir leaked into temp: {name}"
         );
     }
@@ -1129,12 +1129,12 @@ async fn approve_revised_plan_untouched_primary_in_worktree_mode() {
         1,
         "only the primary worktree remains: {worktrees:?}"
     );
-    let leak_prefix = format!("kranz-wt-{mission_id}-");
+    let leak_marker = format!("-{mission_id}-");
     for entry in std::fs::read_dir(std::env::temp_dir()).unwrap().flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         assert!(
-            !name.starts_with(&leak_prefix),
+            !(name.starts_with("kranz-wt-") && name.contains(&leak_marker)),
             "a worktree dir leaked into temp: {name}"
         );
     }

@@ -12,7 +12,9 @@ use kranz_engine::cost;
 use kranz_engine::event_log::EventLog;
 use kranz_engine::events::{Event, EventKind};
 use kranz_engine::merged::merged_bit;
-use kranz_engine::orchestrator::{mission_worktree_path, render_plan_markdown};
+use kranz_engine::orchestrator::{
+    mission_worktree_path, render_plan_markdown, PREFLIGHT_CLEAR_SUMMARY,
+};
 use kranz_engine::paths::MissionPaths;
 use kranz_engine::reducer;
 use kranz_engine::types::{
@@ -118,7 +120,7 @@ pub(crate) async fn mission_workspace(
     let state = reducer::fold(&events)?;
     let isolation = state.config.isolation();
     let cwd = match isolation {
-        WorkerIsolation::Worktree => mission_worktree_path(&id),
+        WorkerIsolation::Worktree => mission_worktree_path(&server.repo_root, &id),
         WorkerIsolation::Checkout => server.repo_root.clone(),
     };
     let worktree_active = isolation == WorkerIsolation::Worktree && cwd.is_dir();
@@ -138,7 +140,7 @@ pub(crate) async fn mission_workspace(
     let preflight = events.iter().rev().find_map(|event| match &event.kind {
         EventKind::OrchestratorDecision { summary, .. } if summary.starts_with("preflight:") => {
             Some(json!({
-                "status": "issues",
+                "status": if summary == PREFLIGHT_CLEAR_SUMMARY { "clear" } else { "issues" },
                 "summary": summary,
                 "eventSeq": event.seq,
             }))

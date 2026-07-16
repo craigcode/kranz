@@ -61,6 +61,7 @@ use crate::ticket::Ticket;
 use crate::types::*;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -263,6 +264,10 @@ pub struct PreflightIssue {
     pub severity: &'static str,
     pub message: String,
 }
+
+/// Durable marker emitted when a run's environment preflight is clean. A
+/// clean event is necessary to supersede an issue recorded by an earlier run.
+pub const PREFLIGHT_CLEAR_SUMMARY: &str = "preflight: clear — no advisory issues recorded";
 
 // ---------------------------------------------------------------------------
 // MissionEngine
@@ -489,18 +494,26 @@ impl MissionEngine {
         // -D a branch checked out in a still-registered worktree).
         for milestone in &state.mission.milestones {
             for feature in &milestone.features {
-                let path = parallel_worktree_path(mission_id, &feature.id);
-                if path.exists() {
-                    let _ = repo.remove_worktree(&path);
+                for path in [
+                    parallel_worktree_path(&repo_root, mission_id, &feature.id),
+                    legacy_parallel_worktree_path(mission_id, &feature.id),
+                ] {
+                    if path.exists() {
+                        let _ = repo.remove_worktree(&path);
+                    }
                 }
             }
         }
         // A leaked mission integration worktree (M7 tier 1) is the same story:
         // it exists only while a lock-holding engine has one set up, so with
         // the lock now held it is a crash leak. Reap it the same way.
-        let integration_path = mission_worktree_path(mission_id);
-        if integration_path.exists() {
-            let _ = repo.remove_worktree(&integration_path);
+        for integration_path in [
+            mission_worktree_path(&repo_root, mission_id),
+            legacy_mission_worktree_path(mission_id),
+        ] {
+            if integration_path.exists() {
+                let _ = repo.remove_worktree(&integration_path);
+            }
         }
         let _ = repo.prune_worktrees();
         for milestone in &state.mission.milestones {
@@ -2197,11 +2210,13 @@ impl MissionEngine {
         // Environment preflight (roadmap M2): surface obvious missing
         // prerequisites of the contract commands as ONE advisory decision
         // before the first worker spawns. Never blocks — the contract gate at
-        // completion stays authoritative. Emitted only once per run() call, and
-        // only when there is something to report.
+        // completion stays authoritative. Emit one outcome on every run so a
+        // later clean preflight durably supersedes an earlier warning.
         let issues = self.preflight();
-        if !issues.is_empty() {
-            let summary = format!(
+        let summary = if issues.is_empty() {
+            PREFLIGHT_CLEAR_SUMMARY.to_string()
+        } else {
+            format!(
                 "preflight: {} issue(s): {}",
                 issues.len(),
                 issues
@@ -2209,9 +2224,9 @@ impl MissionEngine {
                     .map(|i| format!("[{}] {}", i.severity, i.message))
                     .collect::<Vec<_>>()
                     .join("; ")
-            );
-            self.emit_decision(&summary, None)?;
-        }
+            )
+        };
+        self.emit_decision(&summary, None)?;
 
         loop {
             // (a) drain the control inbox.
@@ -3051,7 +3066,11 @@ impl MissionEngine {
             .map(|(feature_id, _fi)| ParallelWorkspace {
                 feature_id: feature_id.clone(),
                 branch: format!("kranz/wt/{}/{}", self.state.mission.id, feature_id),
-                path: parallel_worktree_path(&self.state.mission.id, feature_id),
+                path: parallel_worktree_path(
+                    &self.paths.repo_root,
+                    &self.state.mission.id,
+                    feature_id,
+                ),
             })
             .collect();
 
@@ -3099,11 +3118,14 @@ impl MissionEngine {
             self.repo.create_branch(&mission_branch, Some(&from))?;
         }
 
-        let path = mission_worktree_path(&self.state.mission.id);
+        let path = mission_worktree_path(&self.paths.repo_root, &self.state.mission.id);
         // Idempotent: a stale integration worktree from a prior crash must be
         // gone before checking the branch out again (git refuses to check the
         // same branch out twice).
         let _ = self.repo.remove_worktree(&path);
+        let _ = self
+            .repo
+            .remove_worktree(&legacy_mission_worktree_path(&self.state.mission.id));
         let _ = self.repo.prune_worktrees();
 
         self.repo.add_worktree_checkout(&path, &mission_branch)?;
@@ -3115,7 +3137,7 @@ impl MissionEngine {
     /// [`Self::setup_mission_worktree`]. Best-effort and idempotent, mirroring
     /// the parallel-batch cleanup guard: failures are logged, never fatal.
     fn teardown_mission_worktree(&self) {
-        let path = mission_worktree_path(&self.state.mission.id);
+        let path = mission_worktree_path(&self.paths.repo_root, &self.state.mission.id);
         if let Err(e) = self.repo.remove_worktree(&path) {
             tracing::warn!(path = %path.display(), error = %e, "mission worktree cleanup failed");
         }
@@ -5257,9 +5279,57 @@ pub fn synthesize_conflict_resolution(
 /// Lives under the system temp dir — OUTSIDE the repo working tree, so a
 /// worktree is never mistaken for mission content — namespaced by mission +
 /// feature so concurrent batches never collide.
-fn parallel_worktree_path(mission_id: &str, feature_id: &str) -> PathBuf {
+fn parallel_worktree_path(
+    repo_root: &std::path::Path,
+    mission_id: &str,
+    feature_id: &str,
+) -> PathBuf {
     // Feature ids are `f-<m>-<n>` / `ms-<id>-...` — filesystem-safe already,
     // but replace anything unexpected defensively.
+    let safe: String = feature_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    std::env::temp_dir().join(format!(
+        "kranz-wt-{}-{mission_id}-{safe}",
+        repo_worktree_namespace(repo_root)
+    ))
+}
+
+/// Absolute directory for one mission's INTEGRATION worktree (M7 tier 1):
+/// the single worktree, checked out to the mission branch, that all
+/// mission-branch mutations run in when `workerIsolation = worktree`. Lives
+/// under the same temp-dir base as [`parallel_worktree_path`], namespaced
+/// with a `_integration` suffix that no real feature id can produce (feature
+/// ids never start with `_`), so it never collides with a per-feature path.
+pub fn mission_worktree_path(repo_root: &std::path::Path, mission_id: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "kranz-wt-{}-{mission_id}-_integration",
+        repo_worktree_namespace(repo_root)
+    ))
+}
+
+/// Stable, non-secret repository namespace for process-global temporary
+/// worktree paths. Mission ids are repository-local, so the repository root
+/// must participate in every worktree identity at the host boundary.
+fn repo_worktree_namespace(repo_root: &std::path::Path) -> String {
+    let canonical = canonical_root(repo_root.to_path_buf());
+    let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
+    digest[..12]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Pre-M8 worktree locations, retained only so crash recovery can reap a
+/// worktree left behind by an older kranz process after an upgrade.
+fn legacy_parallel_worktree_path(mission_id: &str, feature_id: &str) -> PathBuf {
     let safe: String = feature_id
         .chars()
         .map(|c| {
@@ -5273,13 +5343,7 @@ fn parallel_worktree_path(mission_id: &str, feature_id: &str) -> PathBuf {
     std::env::temp_dir().join(format!("kranz-wt-{mission_id}-{safe}"))
 }
 
-/// Absolute directory for one mission's INTEGRATION worktree (M7 tier 1):
-/// the single worktree, checked out to the mission branch, that all
-/// mission-branch mutations run in when `workerIsolation = worktree`. Lives
-/// under the same temp-dir base as [`parallel_worktree_path`], namespaced
-/// with a `_integration` suffix that no real feature id can produce (feature
-/// ids never start with `_`), so it never collides with a per-feature path.
-pub fn mission_worktree_path(mission_id: &str) -> PathBuf {
+fn legacy_mission_worktree_path(mission_id: &str) -> PathBuf {
     std::env::temp_dir().join(format!("kranz-wt-{mission_id}-_integration"))
 }
 
@@ -7241,7 +7305,7 @@ mod tests {
         let mission_branch = engine.state.mission.mission_branch.clone();
 
         let (path, wt_repo) = engine.setup_mission_worktree().expect("setup");
-        assert_eq!(path, mission_worktree_path(&mission_id));
+        assert_eq!(path, mission_worktree_path(&root, &mission_id));
         assert!(path.exists(), "integration worktree dir must exist");
 
         // The mission branch now exists and is checked out in the new
@@ -7500,7 +7564,7 @@ mod tests {
         let mission_id = engine.state.mission.id.clone();
 
         let (path, _wt_repo) = engine.setup_mission_worktree().expect("setup");
-        assert_eq!(path, mission_worktree_path(&mission_id));
+        assert_eq!(path, mission_worktree_path(&root, &mission_id));
         assert!(path.exists(), "integration worktree dir must exist");
 
         let listed = engine.repo.list_worktrees().unwrap();
@@ -7534,14 +7598,28 @@ mod tests {
     #[test]
     fn mission_worktree_path_does_not_collide_with_feature_paths() {
         let mission_id = "m-collide-test";
-        let integration = mission_worktree_path(mission_id);
+        let repo_root = std::path::Path::new("/tmp/repo-a");
+        let integration = mission_worktree_path(repo_root, mission_id);
         for feature_id in ["f-1-1", "f-1-2", "ms-collide-test-1"] {
             assert_ne!(
                 integration,
-                parallel_worktree_path(mission_id, feature_id),
+                parallel_worktree_path(repo_root, mission_id, feature_id),
                 "collided with feature id {feature_id:?}"
             );
         }
+    }
+
+    #[test]
+    fn duplicate_mission_ids_in_different_repos_have_distinct_worktree_paths() {
+        let mission_id = "m-same-id";
+        assert_ne!(
+            mission_worktree_path(std::path::Path::new("/tmp/repo-a"), mission_id),
+            mission_worktree_path(std::path::Path::new("/tmp/repo-b"), mission_id),
+        );
+        assert_ne!(
+            parallel_worktree_path(std::path::Path::new("/tmp/repo-a"), mission_id, "f-1-1",),
+            parallel_worktree_path(std::path::Path::new("/tmp/repo-b"), mission_id, "f-1-1",),
+        );
     }
 
     // -----------------------------------------------------------------------
