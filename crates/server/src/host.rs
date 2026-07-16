@@ -52,6 +52,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// The engine cell of a planning-phase mission: turns lock it, `start`
 /// consumes it.
@@ -78,6 +79,9 @@ enum HostedMission {
     Running {
         handle: tokio::task::JoinHandle<()>,
         _repo_busy: kranz_engine::queue::RepoBusyHold,
+        /// Process-wide multi-repository execution permit. `None` preserves
+        /// the historical standalone [`MissionHost`] behavior.
+        _global_run_permit: Option<OwnedSemaphorePermit>,
     },
 }
 
@@ -96,9 +100,10 @@ pub struct MissionHost {
     /// The single tracked background queue drain slot (see
     /// [`MissionHost::drain`]).
     drain: Mutex<DrainSlot>,
-    /// The lazily-spawned autoWork background task, started at most once
-    /// (see [`MissionHost::ensure_auto_work_started`]).
-    auto_work: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Shared by every repository in a [`crate::MultiRepoHost`]. A permit is
+    /// held for the complete background mission/drain lifetime, so the
+    /// operator's `host.maxConcurrentRepos` is a real spend/load bound.
+    global_run_permits: Option<Arc<Semaphore>>,
     /// The gate-suite executor [`MissionHost::merge`] runs under
     /// `spawn_blocking`; real shell commands by default, a scripted stub in
     /// tests (see [`MissionHost::with_gate_executor`]).
@@ -188,7 +193,7 @@ impl MissionHost {
             missions: Arc::new(Mutex::new(HashMap::new())),
             sweeper: Mutex::new(None),
             drain: Mutex::new(DrainSlot::Idle),
-            auto_work: Mutex::new(None),
+            global_run_permits: None,
             gate_executor: real_gate_executor(),
             readiness_front_cache: Mutex::new(None),
         }
@@ -203,7 +208,7 @@ impl MissionHost {
             missions: Arc::new(Mutex::new(HashMap::new())),
             sweeper: Mutex::new(None),
             drain: Mutex::new(DrainSlot::Idle),
-            auto_work: Mutex::new(None),
+            global_run_permits: None,
             gate_executor: real_gate_executor(),
             readiness_front_cache: Mutex::new(None),
         }
@@ -223,8 +228,45 @@ impl MissionHost {
             missions: Arc::new(Mutex::new(HashMap::new())),
             sweeper: Mutex::new(None),
             drain: Mutex::new(DrainSlot::Idle),
-            auto_work: Mutex::new(None),
+            global_run_permits: None,
             gate_executor: Arc::new(gate_executor),
+            readiness_front_cache: Mutex::new(None),
+        }
+    }
+
+    /// Host participating in a process-wide multi-repository execution cap.
+    pub(crate) fn new_with_global_run_permits(
+        repo_root: PathBuf,
+        global_run_permits: Arc<Semaphore>,
+    ) -> Self {
+        MissionHost {
+            repo_root,
+            backend: tokio::sync::OnceCell::new(),
+            missions: Arc::new(Mutex::new(HashMap::new())),
+            sweeper: Mutex::new(None),
+            drain: Mutex::new(DrainSlot::Idle),
+            global_run_permits: Some(global_run_permits),
+            gate_executor: real_gate_executor(),
+            readiness_front_cache: Mutex::new(None),
+        }
+    }
+
+    /// Test helper: inject a backend into a host that already shares the
+    /// multi-repository run semaphore.
+    #[cfg(test)]
+    pub(crate) fn with_backend_and_global_run_permits(
+        repo_root: PathBuf,
+        backend: Arc<dyn AgentBackend>,
+        global_run_permits: Arc<Semaphore>,
+    ) -> Self {
+        MissionHost {
+            repo_root,
+            backend: tokio::sync::OnceCell::new_with(Some(backend)),
+            missions: Arc::new(Mutex::new(HashMap::new())),
+            sweeper: Mutex::new(None),
+            drain: Mutex::new(DrainSlot::Idle),
+            global_run_permits: Some(global_run_permits),
+            gate_executor: real_gate_executor(),
             readiness_front_cache: Mutex::new(None),
         }
     }
@@ -232,6 +274,19 @@ impl MissionHost {
     /// The repository this host creates missions in.
     pub fn repo_root(&self) -> &PathBuf {
         &self.repo_root
+    }
+
+    pub(crate) fn try_global_run_permit(&self) -> Result<Option<OwnedSemaphorePermit>, ApiError> {
+        self.global_run_permits
+            .as_ref()
+            .map(|permits| {
+                Arc::clone(permits).try_acquire_owned().map_err(|_| {
+                    ApiError::conflict(
+                        "host.maxConcurrentRepos is saturated; retry when another repository finishes",
+                    )
+                })
+            })
+            .transpose()
     }
 
     /// The backend, constructing [`ClaudeBackend`] on first use.
@@ -465,17 +520,25 @@ impl MissionHost {
             let mut map = self.missions.lock().expect("missions registry lock");
             match map.remove(id) {
                 None => None,
-                Some(HostedMission::Running { handle, _repo_busy }) => {
+                Some(HostedMission::Running {
+                    handle,
+                    _repo_busy,
+                    _global_run_permit,
+                }) => {
                     if handle.is_finished() {
                         // The task ended but its cleanup lost the race with
                         // this request: treat as not hosted (resume below).
                         // Drop the busy hold so a resume can re-acquire.
-                        drop(_repo_busy);
+                        drop((_repo_busy, _global_run_permit));
                         None
                     } else {
                         map.insert(
                             id.to_string(),
-                            HostedMission::Running { handle, _repo_busy },
+                            HostedMission::Running {
+                                handle,
+                                _repo_busy,
+                                _global_run_permit,
+                            },
                         );
                         return Err(ApiError::conflict(format!(
                             "mission '{id}' is already running — observe it via GET \
@@ -561,6 +624,19 @@ impl MissionHost {
             }
         };
 
+        let global_run_permit = match self.try_global_run_permit() {
+            Ok(permit) => permit,
+            Err(error) => {
+                if from_registry {
+                    self.missions
+                        .lock()
+                        .expect("missions registry lock")
+                        .insert(id.to_string(), new_planning(new_cell(engine)));
+                }
+                return Err(error);
+            }
+        };
+
         // Acquire the repo-wide busy lock before spawning: a sibling
         // `kranz work` / hosted drain must not run in parallel. Held for the
         // lifetime of the Running entry (dropped when the run ends).
@@ -593,6 +669,7 @@ impl MissionHost {
                 HostedMission::Running {
                     handle,
                     _repo_busy: repo_busy,
+                    _global_run_permit: global_run_permit,
                 },
             );
         }
@@ -817,7 +894,7 @@ impl MissionHost {
     /// Whether a tracked drain is currently live (a `Starting` reservation or
     /// a `Running` handle that hasn't finished). Read-only: never installs a
     /// reservation, so it never races [`Self::drain`]'s own check.
-    fn drain_is_live(&self) -> bool {
+    pub(crate) fn drain_is_live(&self) -> bool {
         match &*self.drain.lock().expect("drain tracker lock") {
             DrainSlot::Idle => false,
             DrainSlot::Starting(_) => true,
@@ -828,39 +905,25 @@ impl MissionHost {
     /// One autoWork check: re-read config fresh (so a live `autoWork` toggle
     /// takes effect without a restart, exactly like the idle sweeper reads
     /// `planningIdleReleaseMinutes`), and kick off a drain when
-    /// [`should_auto_drain`] says to. Split out from
-    /// [`Self::ensure_auto_work_started`] so tests can invoke a single tick
-    /// directly instead of waiting on the real interval.
-    async fn auto_work_tick(&self) {
+    /// [`should_auto_drain`] says to. Invoked by the process-wide
+    /// [`crate::MultiRepoHost`] watcher (and by tests) — per-host watchers
+    /// are not started.
+    pub(crate) async fn auto_work_tick(&self) -> bool {
         let cfg = match config::load(&self.repo_root) {
             Ok(cfg) => cfg,
-            Err(_) => return,
+            Err(_) => return false,
         };
         let queue_non_empty = kranz_engine::queue::peek(&self.repo_root).is_some();
         if should_auto_drain(cfg.auto_work, queue_non_empty, self.drain_is_live()) {
-            if let Err(e) = self.drain().await {
-                tracing::error!(error = %e.message, "autoWork drain failed");
+            match self.drain().await {
+                Ok(_) => return true,
+                Err(e)
+                    if e.message
+                        .starts_with("host.maxConcurrentRepos is saturated") => {}
+                Err(e) => tracing::error!(error = %e.message, "autoWork drain failed"),
             }
         }
-    }
-
-    /// Spawn the autoWork watcher at most once. It loops for the lifetime of
-    /// the host, sleeping between [`Self::auto_work_tick`] calls. Started
-    /// explicitly from `kranz serve` (not from [`Self::new`]) so test hosts
-    /// stay inert unless they opt in.
-    pub fn ensure_auto_work_started(self: &Arc<Self>) {
-        let mut guard = self.auto_work.lock().expect("auto_work lock");
-        if guard.is_some() {
-            return;
-        }
-        let host = Arc::clone(self);
-        *guard = Some(tokio::spawn(async move {
-            const AUTO_WORK_INTERVAL: Duration = Duration::from_secs(10);
-            loop {
-                tokio::time::sleep(AUTO_WORK_INTERVAL).await;
-                host.auto_work_tick().await;
-            }
-        }));
+        false
     }
 
     /// `POST /api/missions/:id/abandon`: retire a mission through the
@@ -900,7 +963,11 @@ impl MissionHost {
                     return Err(turn_in_flight());
                 }
             },
-            Some(HostedMission::Running { handle, _repo_busy }) => {
+            Some(HostedMission::Running {
+                handle,
+                _repo_busy,
+                _global_run_permit,
+            }) => {
                 if !handle.is_finished() {
                     handle.abort();
                 }
@@ -909,7 +976,7 @@ impl MissionHost {
                 // append the abandon event. Dropping `_repo_busy` releases the
                 // repo-wide busy lock.
                 let _ = handle.await;
-                drop(_repo_busy);
+                drop((_repo_busy, _global_run_permit));
             }
         }
         kranz_engine::orchestrator::abandon_mission(
@@ -1048,13 +1115,34 @@ impl MissionHost {
     /// drain task has not finished returns THAT drain's current state
     /// instead of spawning a second one.
     pub async fn drain(&self) -> Result<Value, ApiError> {
-        // Reserve the drain slot BEFORE the `.await`s below, under the same
-        // lock acquisition that checks for an existing live drain. This
-        // closes the time-of-check/time-of-use gap: a concurrent caller can
-        // never observe "nothing tracked yet" while this call is still
-        // constructing its backend, because the reservation is installed
-        // before the lock is released.
-        let state = {
+        // Fast path: a live drain already owns the slot.
+        {
+            let guard = self.drain.lock().expect("drain tracker lock");
+            match &*guard {
+                DrainSlot::Starting(state) => {
+                    return Ok(drain_state_json(&state.lock().expect("drain state lock")));
+                }
+                DrainSlot::Running(handle) if !handle.join.is_finished() => {
+                    return Ok(drain_state_json(
+                        &handle.state.lock().expect("drain state lock"),
+                    ));
+                }
+                DrainSlot::Idle | DrainSlot::Running(_) => {}
+            }
+        }
+
+        // Discover config/backend before reserving the drain slot or taking a
+        // process-wide run permit. Holding either across `.await` would either
+        // publish a false-live Starting reservation (on later saturation) or
+        // starve sibling repositories during Claude discovery.
+        let cfg = config::load(&self.repo_root)?;
+        let backend = self.backend(cfg.claude_binary.as_deref()).await?;
+        let repo_root = self.repo_root.clone();
+
+        // Re-check under the drain lock, then acquire the global permit and
+        // install Starting in one critical section so saturation never leaves
+        // a rolled-back live reservation for concurrent callers to observe.
+        let (state, global_run_permit) = {
             let mut guard = self.drain.lock().expect("drain tracker lock");
             match &*guard {
                 DrainSlot::Starting(state) => {
@@ -1067,6 +1155,7 @@ impl MissionHost {
                 }
                 DrainSlot::Idle | DrainSlot::Running(_) => {}
             }
+            let global_run_permit = self.try_global_run_permit()?;
             let state = Arc::new(Mutex::new(DrainState {
                 live: true,
                 current_mission_id: None,
@@ -1074,24 +1163,8 @@ impl MissionHost {
                 parked: Vec::new(),
             }));
             *guard = DrainSlot::Starting(Arc::clone(&state));
-            state
+            (state, global_run_permit)
         };
-
-        let cfg = match config::load(&self.repo_root) {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                *self.drain.lock().expect("drain tracker lock") = DrainSlot::Idle;
-                return Err(e.into());
-            }
-        };
-        let backend = match self.backend(cfg.claude_binary.as_deref()).await {
-            Ok(backend) => backend,
-            Err(e) => {
-                *self.drain.lock().expect("drain tracker lock") = DrainSlot::Idle;
-                return Err(e);
-            }
-        };
-        let repo_root = self.repo_root.clone();
 
         // Cold spawn path only (never the early-return branches above): the
         // dispatch branch is still whatever the operator's checkout was, so
@@ -1099,15 +1172,15 @@ impl MissionHost {
         // can ever land on a mission branch. See `drain_task` for the
         // restore-on-exit half of this contract.
         let task_state = Arc::clone(&state);
-        let join = tokio::spawn(drain_task(
-            repo_root.clone(),
-            task_state,
-            move |mission_id| {
+        let join = tokio::spawn(async move {
+            let _global_run_permit = global_run_permit;
+            drain_task(repo_root.clone(), task_state, move |mission_id| {
                 let backend = Arc::clone(&backend);
                 let repo_root = repo_root.clone();
                 async move { run_mission_headless(backend, repo_root, mission_id).await }
-            },
-        ));
+            })
+            .await;
+        });
 
         let initial = drain_state_json(&state.lock().expect("drain state lock"));
         *self.drain.lock().expect("drain tracker lock") =
@@ -1697,12 +1770,20 @@ fn release_from(
     let mut map = missions.lock().expect("missions registry lock");
     match map.remove(id) {
         None => Ok(true),
-        Some(HostedMission::Running { handle, _repo_busy }) => {
+        Some(HostedMission::Running {
+            handle,
+            _repo_busy,
+            _global_run_permit,
+        }) => {
             let finished = handle.is_finished();
             if !finished {
                 map.insert(
                     id.to_string(),
-                    HostedMission::Running { handle, _repo_busy },
+                    HostedMission::Running {
+                        handle,
+                        _repo_busy,
+                        _global_run_permit,
+                    },
                 );
             }
             Ok(finished)
@@ -2204,6 +2285,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_is_409_when_global_repository_limit_is_saturated() {
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
+        let permits = Arc::new(Semaphore::new(1));
+        let _other_repo = Arc::clone(&permits).try_acquire_owned().unwrap();
+        let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+        let mut host = MissionHost::with_backend(root, backend);
+        host.global_run_permits = Some(permits);
+        let id = host.create("ship it", None).await.expect("create mission");
+        let plan: Plan = serde_json::from_value(plan_json()).expect("plan");
+        host.approve(&id, plan).await.expect("approve");
+
+        let error = host.start(&id).await.expect_err("global cap must refuse");
+
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert!(error.message.contains("maxConcurrentRepos"));
+        assert!(
+            host.planning_cell(&id).is_ok(),
+            "refused start must restore the hosted engine"
+        );
+    }
+
+    #[tokio::test]
     async fn sweep_idle_leaves_a_mid_turn_mission_hosted() {
         let Some((_dir, root)) = init_repo() else {
             return;
@@ -2373,6 +2478,27 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn drain_is_409_when_global_repository_limit_is_saturated() {
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
+        let permits = Arc::new(Semaphore::new(1));
+        let _other_repo = Arc::clone(&permits).try_acquire_owned().unwrap();
+        let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+        let mut host = MissionHost::with_backend(root, backend);
+        host.global_run_permits = Some(permits);
+
+        let error = host.drain().await.expect_err("global cap must refuse");
+
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert!(error.message.contains("maxConcurrentRepos"));
+        assert!(matches!(
+            &*host.drain.lock().expect("drain tracker lock"),
+            DrainSlot::Idle
+        ));
     }
 
     #[tokio::test]

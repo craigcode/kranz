@@ -7,7 +7,9 @@ use kranz_engine::git_ops::GitRepo;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::Semaphore;
 
 fn default_max_concurrent_repos() -> usize {
     1
@@ -85,6 +87,16 @@ pub fn load_host_config(path: &Path) -> Result<HostConfig> {
     Ok(global.host)
 }
 
+/// Map a local checkout root to its `host.repos` id without constructing
+/// [`MissionHost`] instances (CLI release scoping is lookup-only).
+pub fn repo_id_for_root_in_config(config: &HostConfig, root: &Path) -> Option<String> {
+    let root = canonical_or_lexical(root);
+    config
+        .repos
+        .iter()
+        .find_map(|repo| (canonical_or_lexical(&repo.root) == root).then(|| repo.id.clone()))
+}
+
 /// A resolved catalog entry. The root is fixed at startup and requests only
 /// ever resolve this entry by its validated id.
 #[derive(Clone)]
@@ -142,18 +154,18 @@ impl RepoContext {
 }
 
 /// Public `GET /api/repos` row.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RepoSummary {
     pub id: String,
     pub root: String,
     pub display_name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     pub pinned: bool,
     pub is_default: bool,
     pub status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
@@ -164,6 +176,9 @@ pub struct MultiRepoHost {
     default_repo: Option<String>,
     max_concurrent_repos: usize,
     operator_catalog: bool,
+    global_run_permits: Arc<Semaphore>,
+    auto_work_cursor: Mutex<usize>,
+    auto_work: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl MultiRepoHost {
@@ -189,6 +204,9 @@ impl MultiRepoHost {
             default_repo: Some(id),
             max_concurrent_repos: 1,
             operator_catalog: false,
+            global_run_permits: Arc::new(Semaphore::new(1)),
+            auto_work_cursor: Mutex::new(0),
+            auto_work: Mutex::new(None),
         }
     }
 
@@ -243,6 +261,7 @@ impl MultiRepoHost {
         let mut ids = HashSet::new();
         let mut roots = HashSet::new();
         let mut repos = BTreeMap::new();
+        let global_run_permits = Arc::new(Semaphore::new(config.max_concurrent_repos));
 
         for repo in &mut config.repos {
             validate_repo_id(&repo.id)?;
@@ -265,9 +284,12 @@ impl MultiRepoHost {
             }
 
             let unavailable_reason = repository_unavailable_reason(&repo.root);
-            let host = unavailable_reason
-                .is_none()
-                .then(|| Arc::new(MissionHost::new(repo.root.clone())));
+            let host = unavailable_reason.is_none().then(|| {
+                Arc::new(MissionHost::new_with_global_run_permits(
+                    repo.root.clone(),
+                    Arc::clone(&global_run_permits),
+                ))
+            });
             repos.insert(
                 repo.id.clone(),
                 Arc::new(RepoContext {
@@ -293,6 +315,9 @@ impl MultiRepoHost {
             default_repo: config.default_repo,
             max_concurrent_repos: config.max_concurrent_repos,
             operator_catalog,
+            global_run_permits,
+            auto_work_cursor: Mutex::new(0),
+            auto_work: Mutex::new(None),
         })
     }
 
@@ -306,6 +331,20 @@ impl MultiRepoHost {
 
     pub fn resolve(&self, id: &str) -> Option<Arc<RepoContext>> {
         self.repos.get(id).cloned()
+    }
+
+    /// Resolve a local CLI `--repo` root back to its stable operator id.
+    pub fn repo_id_for_root(&self, root: &Path) -> Option<String> {
+        let root = canonical_or_lexical(root);
+        self.repos
+            .values()
+            .find(|context| context.root() == root)
+            .map(|context| context.id().to_string())
+    }
+
+    /// One fair auto-work scheduling pass (test + serve watcher entrypoint).
+    pub async fn auto_work_tick(&self) -> usize {
+        self.auto_work_tick_inner().await
     }
 
     /// Existing unscoped routes are available for an explicit default, or
@@ -330,12 +369,106 @@ impl MultiRepoHost {
         self.max_concurrent_repos
     }
 
-    pub fn is_multi_repo(&self) -> bool {
-        self.repos.len() > 1
-    }
-
     pub fn uses_operator_catalog(&self) -> bool {
         self.operator_catalog
+    }
+
+    /// One fair auto-work scheduling pass. At most one pass over the static
+    /// catalog is made; each successful start advances the next pass beyond
+    /// that repository, while the shared semaphore enforces the configured
+    /// concurrency bound for the complete drain lifetime.
+    async fn auto_work_tick_inner(&self) -> usize {
+        if self.global_run_permits.available_permits() == 0 {
+            return 0;
+        }
+        let contexts: Vec<_> = self.healthy_contexts().collect();
+        if contexts.is_empty() {
+            return 0;
+        }
+        let start = *self.auto_work_cursor.lock().expect("auto-work cursor lock") % contexts.len();
+        let mut started = 0;
+        let mut last_started = None;
+        for offset in 0..contexts.len() {
+            if self.global_run_permits.available_permits() == 0 {
+                break;
+            }
+            let index = (start + offset) % contexts.len();
+            if let Some(host) = contexts[index].host() {
+                if host.auto_work_tick().await {
+                    started += 1;
+                    last_started = Some(index);
+                }
+            }
+        }
+        if let Some(index) = last_started {
+            *self.auto_work_cursor.lock().expect("auto-work cursor lock") =
+                (index + 1) % contexts.len();
+        }
+        started
+    }
+
+    /// Spawn the single process-wide fair auto-work watcher at most once.
+    pub fn ensure_auto_work_started(self: &Arc<Self>) {
+        let mut guard = self.auto_work.lock().expect("multi auto-work lock");
+        if guard.is_some() {
+            return;
+        }
+        let host = Arc::clone(self);
+        *guard = Some(tokio::spawn(async move {
+            const AUTO_WORK_INTERVAL: Duration = Duration::from_secs(10);
+            loop {
+                tokio::time::sleep(AUTO_WORK_INTERVAL).await;
+                let _ = host.auto_work_tick().await;
+            }
+        }));
+    }
+
+    #[cfg(test)]
+    fn available_global_run_permits(&self) -> usize {
+        self.global_run_permits.available_permits()
+    }
+
+    #[cfg(test)]
+    fn auto_work_cursor(&self) -> usize {
+        *self.auto_work_cursor.lock().expect("auto-work cursor lock")
+    }
+
+    /// Test-only catalog that reuses already-constructed hosts (injected
+    /// backends + a shared semaphore) without rediscovering Claude.
+    #[cfg(test)]
+    fn from_injected_hosts(
+        entries: Vec<(String, Arc<MissionHost>)>,
+        max_concurrent_repos: usize,
+        global_run_permits: Arc<Semaphore>,
+    ) -> Self {
+        let mut repos = BTreeMap::new();
+        for (id, host) in entries {
+            let root = host.repo_root().clone();
+            repos.insert(
+                id.clone(),
+                Arc::new(RepoContext {
+                    config: RepoConfig {
+                        id: id.clone(),
+                        root,
+                        display_name: None,
+                        group: None,
+                        pinned: false,
+                        slack: RepoSlackConfig::default(),
+                    },
+                    host: Some(host),
+                    unavailable_reason: None,
+                }),
+            );
+        }
+        Self {
+            repos,
+            default_repo: None,
+            max_concurrent_repos,
+            operator_catalog: true,
+            global_run_permits,
+            auto_work_cursor: Mutex::new(0),
+            auto_work: Mutex::new(None),
+        }
     }
 }
 
@@ -511,10 +644,172 @@ mod tests {
             init_git(root);
         }
         let catalog = MultiRepoHost::from_config(HostConfig {
-            repos: vec![repo_config("a", a), repo_config("b", b)],
+            repos: vec![repo_config("a", a.clone()), repo_config("b", b)],
             ..HostConfig::default()
         })
         .unwrap();
         assert!(catalog.compatibility_context().is_none());
+        assert_eq!(catalog.repo_id_for_root(&a).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn configured_concurrency_limit_is_shared_across_repository_hosts() {
+        let temp = tempfile::tempdir().unwrap();
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        for root in [&a, &b] {
+            init_git(root);
+        }
+        let catalog = MultiRepoHost::from_config(HostConfig {
+            max_concurrent_repos: 1,
+            repos: vec![repo_config("a", a), repo_config("b", b)],
+            ..HostConfig::default()
+        })
+        .unwrap();
+        let a = catalog.resolve("a").unwrap();
+        let b = catalog.resolve("b").unwrap();
+        let permit = a.host().unwrap().try_global_run_permit().unwrap().unwrap();
+        assert_eq!(catalog.available_global_run_permits(), 0);
+        let error = b.host().unwrap().try_global_run_permit().unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::CONFLICT);
+        drop(permit);
+        assert_eq!(catalog.available_global_run_permits(), 1);
+        assert!(b.host().unwrap().try_global_run_permit().unwrap().is_some());
+    }
+
+    #[test]
+    fn repo_id_for_root_in_config_matches_without_building_hosts() {
+        let temp = tempfile::tempdir().unwrap();
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        init_git(&a);
+        init_git(&b);
+        let config = HostConfig {
+            repos: vec![repo_config("alpha", a.clone()), repo_config("beta", b)],
+            ..HostConfig::default()
+        };
+        assert_eq!(
+            repo_id_for_root_in_config(&config, &a).as_deref(),
+            Some("alpha")
+        );
+        assert!(repo_id_for_root_in_config(&config, temp.path()).is_none());
+    }
+
+    fn write_auto_work_config(root: &Path, enabled: bool) {
+        let dir = root.join(".kranz");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::json!({ "autoWork": enabled }).to_string(),
+        )
+        .unwrap();
+    }
+
+    fn enqueue_placeholder(root: &Path, mission_id: &str) {
+        kranz_engine::queue::enqueue(
+            root,
+            kranz_engine::queue::QueueEntry {
+                mission_id: mission_id.to_string(),
+                ticket_slug: None,
+                priority: 2,
+                seq: 0,
+            },
+        )
+        .unwrap();
+    }
+
+    async fn wait_for_idle_drain(host: &MissionHost) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let state = host.queue_state();
+            if state["drain"]["live"] == false {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "drain never settled idle: {state}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_work_tick_is_noop_when_global_permits_saturated() {
+        let temp = tempfile::tempdir().unwrap();
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        for root in [&a, &b] {
+            init_git(root);
+            write_auto_work_config(root, true);
+            enqueue_placeholder(root, "m-queued");
+        }
+        let permits = Arc::new(Semaphore::new(1));
+        let backend: Arc<dyn kranz_engine::backend::AgentBackend> =
+            Arc::new(kranz_engine::backend_mock::MockBackend::new());
+        let host_a = Arc::new(MissionHost::with_backend_and_global_run_permits(
+            a,
+            Arc::clone(&backend),
+            Arc::clone(&permits),
+        ));
+        let host_b = Arc::new(MissionHost::with_backend_and_global_run_permits(
+            b,
+            backend,
+            Arc::clone(&permits),
+        ));
+        let catalog = MultiRepoHost::from_injected_hosts(
+            vec![("a".into(), host_a), ("b".into(), host_b)],
+            1,
+            Arc::clone(&permits),
+        );
+        let _hold = Arc::clone(&permits).try_acquire_owned().unwrap();
+
+        assert_eq!(catalog.auto_work_tick().await, 0);
+        assert_eq!(catalog.auto_work_cursor(), 0);
+    }
+
+    #[tokio::test]
+    async fn auto_work_tick_rotates_fairly_under_max_concurrent_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        for root in [&a, &b] {
+            init_git(root);
+            write_auto_work_config(root, true);
+            enqueue_placeholder(root, "m-queued");
+        }
+        let permits = Arc::new(Semaphore::new(1));
+        let backend: Arc<dyn kranz_engine::backend::AgentBackend> =
+            Arc::new(kranz_engine::backend_mock::MockBackend::new());
+        let host_a = Arc::new(MissionHost::with_backend_and_global_run_permits(
+            a,
+            Arc::clone(&backend),
+            Arc::clone(&permits),
+        ));
+        let host_b = Arc::new(MissionHost::with_backend_and_global_run_permits(
+            b,
+            backend,
+            Arc::clone(&permits),
+        ));
+        let catalog = MultiRepoHost::from_injected_hosts(
+            vec![
+                ("a".into(), Arc::clone(&host_a)),
+                ("b".into(), Arc::clone(&host_b)),
+            ],
+            1,
+            permits,
+        );
+
+        assert_eq!(catalog.auto_work_tick().await, 1);
+        assert!(host_a.drain_is_live() || host_b.drain_is_live());
+        // BTreeMap order is a then b; cursor starts at 0 so a starts first.
+        assert!(host_a.drain_is_live());
+        assert!(!host_b.drain_is_live());
+        assert_eq!(catalog.auto_work_cursor(), 1);
+
+        wait_for_idle_drain(&host_a).await;
+        assert_eq!(catalog.auto_work_tick().await, 1);
+        assert!(host_b.drain_is_live());
+        assert_eq!(catalog.auto_work_cursor(), 0);
+        wait_for_idle_drain(&host_b).await;
     }
 }
