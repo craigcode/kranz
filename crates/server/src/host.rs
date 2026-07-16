@@ -1480,26 +1480,57 @@ where
     R: Fn(String) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<i32>>,
 {
+    drain_task_with_probe(
+        repo_root,
+        state,
+        run_mission,
+        kranz_engine::backend_readiness::probe_mission,
+    )
+    .await;
+}
+
+/// [`drain_task`] with an injectable readiness probe so checkout-restoration
+/// tests remain hermetic on clean CI runners that intentionally have no agent
+/// CLI installed.
+async fn drain_task_with_probe<R, Fut, P>(
+    repo_root: PathBuf,
+    state: Arc<Mutex<DrainState>>,
+    run_mission: R,
+    readiness_probe: P,
+) where
+    R: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<i32>>,
+    P: Fn(
+        &Path,
+        &str,
+    ) -> kranz_engine::error::Result<kranz_engine::backend_readiness::ReadinessReport>,
+{
     // Capture BEFORE `drain_queue` runs anything — nothing has touched the
     // checkout yet, so this is genuinely the operator's dispatch-time branch.
     let dispatch_branch = GitRepo::open(&repo_root)
         .ok()
         .and_then(|g| g.current_branch().ok());
 
-    let result = kranz_engine::work::drain_queue(&repo_root, false, |mission_id| {
-        let state = Arc::clone(&state);
-        let fut = run_mission(mission_id.clone());
-        async move {
-            state.lock().expect("drain state lock").current_mission_id = Some(mission_id.clone());
-            let outcome = fut.await;
-            let mut guard = state.lock().expect("drain state lock");
-            guard.current_mission_id = None;
-            if outcome.is_ok() {
-                guard.ran.push(mission_id);
+    let result = kranz_engine::work::drain_queue_with_probe(
+        &repo_root,
+        false,
+        |mission_id| {
+            let state = Arc::clone(&state);
+            let fut = run_mission(mission_id.clone());
+            async move {
+                state.lock().expect("drain state lock").current_mission_id =
+                    Some(mission_id.clone());
+                let outcome = fut.await;
+                let mut guard = state.lock().expect("drain state lock");
+                guard.current_mission_id = None;
+                if outcome.is_ok() {
+                    guard.ran.push(mission_id);
+                }
+                outcome
             }
-            outcome
-        }
-    })
+        },
+        readiness_probe,
+    )
     .await;
 
     match &result {
@@ -2464,6 +2495,18 @@ mod tests {
         Arc::new(Mutex::new(DrainState::default()))
     }
 
+    fn proceed_readiness(
+        _repo_root: &Path,
+        mission_id: &str,
+    ) -> kranz_engine::error::Result<kranz_engine::backend_readiness::ReadinessReport> {
+        Ok(kranz_engine::backend_readiness::ReadinessReport {
+            mission_id: mission_id.to_string(),
+            roles: Vec::new(),
+            overall: kranz_engine::backend_readiness::ReadinessStatus::Ok,
+            warnings: Vec::new(),
+        })
+    }
+
     #[tokio::test]
     async fn hosted_drain_restores_dispatch_checkout() {
         let Some((_dir, root)) = init_repo() else {
@@ -2472,17 +2515,28 @@ mod tests {
         let state = seed_one_queued(&root, "m-restore");
 
         let run_root = root.clone();
-        drain_task(root.clone(), state, move |mission_id| {
-            let root = run_root.clone();
-            async move {
-                let git = GitRepo::open(&root)?;
-                let branch = format!("kranz/mission-{mission_id}");
-                git.create_branch(&branch, None)?;
-                git.checkout(&branch)?;
-                Ok(0)
-            }
-        })
+        drain_task_with_probe(
+            root.clone(),
+            Arc::clone(&state),
+            move |mission_id| {
+                let root = run_root.clone();
+                async move {
+                    let git = GitRepo::open(&root)?;
+                    let branch = format!("kranz/mission-{mission_id}");
+                    git.create_branch(&branch, None)?;
+                    git.checkout(&branch)?;
+                    Ok(0)
+                }
+            },
+            proceed_readiness,
+        )
         .await;
+
+        assert_eq!(
+            state.lock().expect("drain state lock").ran,
+            ["m-restore"],
+            "the injected mission runner must execute"
+        );
 
         let git = GitRepo::open(&root).expect("open repo");
         assert_eq!(
@@ -2500,17 +2554,31 @@ mod tests {
         let state = seed_one_queued(&root, "m-err-restore");
 
         let run_root = root.clone();
-        drain_task(root.clone(), state, move |mission_id| {
-            let root = run_root.clone();
-            async move {
-                let git = GitRepo::open(&root)?;
-                let branch = format!("kranz/mission-{mission_id}");
-                git.create_branch(&branch, None)?;
-                git.checkout(&branch)?;
-                Err(anyhow::anyhow!("simulated drain runner failure"))
-            }
-        })
+        let runner_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called = Arc::clone(&runner_called);
+        drain_task_with_probe(
+            root.clone(),
+            state,
+            move |mission_id| {
+                let root = run_root.clone();
+                let called = Arc::clone(&called);
+                async move {
+                    called.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let git = GitRepo::open(&root)?;
+                    let branch = format!("kranz/mission-{mission_id}");
+                    git.create_branch(&branch, None)?;
+                    git.checkout(&branch)?;
+                    Err(anyhow::anyhow!("simulated drain runner failure"))
+                }
+            },
+            proceed_readiness,
+        )
         .await;
+
+        assert!(
+            runner_called.load(std::sync::atomic::Ordering::SeqCst),
+            "the injected mission runner must execute"
+        );
 
         let git = GitRepo::open(&root).expect("open repo");
         assert_eq!(
@@ -2534,7 +2602,19 @@ mod tests {
         }
         let state = seed_one_queued(&root, "m-skip");
 
-        drain_task(root.clone(), state, |_mission_id| async { Ok(0) }).await;
+        drain_task_with_probe(
+            root.clone(),
+            Arc::clone(&state),
+            |_mission_id| async { Ok(0) },
+            proceed_readiness,
+        )
+        .await;
+
+        assert_eq!(
+            state.lock().expect("drain state lock").ran,
+            ["m-skip"],
+            "the injected mission runner must execute"
+        );
 
         let git = GitRepo::open(&root).expect("open repo");
         assert_eq!(
@@ -2552,18 +2632,29 @@ mod tests {
         let state = seed_one_queued(&root, "m-dirty");
 
         let run_root = root.clone();
-        drain_task(root.clone(), state, move |mission_id| {
-            let root = run_root.clone();
-            async move {
-                let git = GitRepo::open(&root)?;
-                let branch = format!("kranz/mission-{mission_id}");
-                git.create_branch(&branch, None)?;
-                git.checkout(&branch)?;
-                std::fs::write(root.join("README.md"), "dirty tracked edit\n")?;
-                Ok(0)
-            }
-        })
+        drain_task_with_probe(
+            root.clone(),
+            Arc::clone(&state),
+            move |mission_id| {
+                let root = run_root.clone();
+                async move {
+                    let git = GitRepo::open(&root)?;
+                    let branch = format!("kranz/mission-{mission_id}");
+                    git.create_branch(&branch, None)?;
+                    git.checkout(&branch)?;
+                    std::fs::write(root.join("README.md"), "dirty tracked edit\n")?;
+                    Ok(0)
+                }
+            },
+            proceed_readiness,
+        )
         .await;
+
+        assert_eq!(
+            state.lock().expect("drain state lock").ran,
+            ["m-dirty"],
+            "the injected mission runner must execute"
+        );
 
         let git = GitRepo::open(&root).expect("open repo");
         assert_eq!(

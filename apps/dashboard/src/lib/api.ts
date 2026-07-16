@@ -22,6 +22,7 @@ import type {
   Ticket,
   TicketSummary,
   TranscriptEntry,
+  WorkspaceSummary,
 } from './types';
 
 declare global {
@@ -156,6 +157,10 @@ export const api = {
 
   missionState(id: string): Promise<MissionState> {
     return getJson(`/api/missions/${encodeURIComponent(id)}/state`);
+  },
+
+  workspace(id: string): Promise<WorkspaceSummary> {
+    return getJson(`/api/missions/${encodeURIComponent(id)}/workspace`);
   },
 
   events(id: string, since?: number): Promise<MissionEvent[]> {

@@ -24,6 +24,16 @@ use std::process::Command;
 use std::sync::Arc;
 use tokio::time::{timeout, Duration as TokioDuration};
 
+/// Windows CI performs substantially more process and filesystem work per git
+/// operation than Unix runners. Keep the same hang guard while allowing the
+/// mocked end-to-end missions enough wall-clock headroom under parallel test
+/// load.
+fn test_timeout(seconds: u64) -> TokioDuration {
+    #[cfg(windows)]
+    let seconds = seconds * 3;
+    TokioDuration::from_secs(seconds)
+}
+
 fn write_layer(dir: &tempfile::TempDir, name: &str, contents: &str) -> PathBuf {
     let path = dir.path().join(name);
     std::fs::write(&path, contents).expect("write layer");
@@ -335,7 +345,7 @@ async fn worker_session_cwd_is_worktree() {
         .to_string();
     assert_eq!(branch_before, "main");
 
-    let status = timeout(TokioDuration::from_secs(60), engine.run())
+    let status = timeout(test_timeout(60), engine.run())
         .await
         .expect("run must not hang")
         .unwrap();
@@ -396,7 +406,7 @@ async fn checkout_mode_runs_worker_in_primary_root() {
     let mission_branch = engine.state().mission.mission_branch.clone();
     engine.approve_plan(one_feature_plan()).unwrap();
 
-    let status = timeout(TokioDuration::from_secs(60), engine.run())
+    let status = timeout(test_timeout(60), engine.run())
         .await
         .expect("run must not hang")
         .unwrap();
@@ -456,7 +466,7 @@ async fn validator_session_cwd_is_worktree() {
     engine.approve_plan(one_feature_plan()).unwrap();
     raw_git(&root, &["checkout", "main"]);
 
-    let status = timeout(TokioDuration::from_secs(60), engine.run())
+    let status = timeout(test_timeout(60), engine.run())
         .await
         .expect("run must not hang")
         .unwrap();
@@ -533,7 +543,7 @@ async fn base_sha_reaches_sessions_in_worktree_mode() {
         .clone()
         .expect("mission must pin a base sha at approval");
 
-    let status = timeout(TokioDuration::from_secs(60), engine.run())
+    let status = timeout(test_timeout(60), engine.run())
         .await
         .expect("run must not hang")
         .unwrap();
@@ -600,7 +610,7 @@ async fn primary_checkout_untouched_in_worktree_mode() {
     engine.seed_worker_auth_verdict_for_test(AuthVerdict::Inconclusive);
     engine.approve_plan(one_feature_plan()).unwrap();
 
-    let status = timeout(TokioDuration::from_secs(60), engine.run())
+    let status = timeout(test_timeout(60), engine.run())
         .await
         .expect("run must not hang")
         .unwrap();
@@ -663,7 +673,7 @@ async fn tracked_missions_index_not_dirtied_in_primary_in_worktree_mode() {
         "approve_plan must not modify tracked files in the primary checkout"
     );
 
-    let status = timeout(TokioDuration::from_secs(60), engine.run())
+    let status = timeout(test_timeout(60), engine.run())
         .await
         .expect("run must not hang")
         .unwrap();
@@ -707,7 +717,7 @@ async fn mission_branch_carries_deliverables_in_worktree_mode() {
     let mission_id = engine.mission_id().to_string();
     engine.approve_plan(one_feature_plan()).unwrap();
 
-    let status = timeout(TokioDuration::from_secs(60), engine.run())
+    let status = timeout(test_timeout(60), engine.run())
         .await
         .expect("run must not hang")
         .unwrap();
@@ -882,7 +892,7 @@ async fn worktrees_removed_at_mission_end_in_worktree_mode() {
     let mission_id = engine.mission_id().to_string();
     engine.approve_plan(two_milestone_plan()).unwrap();
 
-    let status = timeout(TokioDuration::from_secs(90), engine.run())
+    let status = timeout(test_timeout(90), engine.run())
         .await
         .expect("run must not hang")
         .unwrap();
@@ -989,7 +999,7 @@ async fn checkout_mode_matches_legacy_sequential() {
         .to_string();
     assert_eq!(branch_right_after_approval, mission_branch);
 
-    let status = timeout(TokioDuration::from_secs(90), engine.run())
+    let status = timeout(test_timeout(90), engine.run())
         .await
         .expect("run must not hang")
         .unwrap();
@@ -1065,7 +1075,7 @@ async fn approve_revised_plan_untouched_primary_in_worktree_mode() {
     // event), which flips the mission from `Approved` to `Running` — the
     // state `approve_revised_plan` requires. Neither step touches the
     // primary tree in worktree mode.
-    let request = timeout(TokioDuration::from_secs(60), engine.request_revised_plan())
+    let request = timeout(test_timeout(60), engine.request_revised_plan())
         .await
         .expect("request_revised_plan must not hang")
         .expect("scripted plan JSON is not a backend error");
@@ -1189,7 +1199,7 @@ async fn multi_milestone_worktree_mode_preserves_a1_a6_a7() {
         .clone()
         .expect("mission must pin a base sha at approval");
 
-    let status = timeout(TokioDuration::from_secs(90), engine.run())
+    let status = timeout(test_timeout(90), engine.run())
         .await
         .expect("run must not hang")
         .unwrap();
@@ -1354,7 +1364,7 @@ async fn worker_auth_preflight_cached_once_per_mission() {
     let mut engine = MissionEngine::create(backend_dyn, &root, GOAL, cfg).expect("create engine");
     engine.approve_plan(two_milestone_plan()).unwrap();
 
-    let status = timeout(TokioDuration::from_secs(90), engine.run())
+    let status = timeout(test_timeout(90), engine.run())
         .await
         .expect("run must not hang")
         .unwrap();
@@ -1426,7 +1436,7 @@ async fn worker_auth_both_spawn_paths_gated() {
             MissionEngine::create(backend_dyn, &root, GOAL, cfg).expect("create engine");
         engine.approve_plan(two_milestone_plan()).unwrap();
 
-        let status = timeout(TokioDuration::from_secs(90), engine.run())
+        let status = timeout(test_timeout(90), engine.run())
             .await
             .expect("run must not hang")
             .unwrap();

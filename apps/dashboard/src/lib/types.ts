@@ -237,12 +237,21 @@ export interface WorkerRun {
 
 export type AgentBackend = 'claude' | 'codex' | 'droid';
 
+export type SandboxEnforce = 'off' | 'fs' | 'fs+net';
+
+export interface SandboxConfig {
+  enforce: SandboxEnforce;
+  extraWrite: string[];
+  egress: string[];
+}
+
 export interface RoleConfig {
   model: string;
   reasoningEffort: string;
   maxTurns?: number;
   maxBudgetUsd?: number;
   backend?: AgentBackend;
+  sandbox?: SandboxConfig;
 }
 
 export interface MissionConfig {
@@ -261,6 +270,7 @@ export interface MissionConfig {
   dangerouslyAllowAll: boolean;
   allowBelowDefaultWorkerModel: boolean;
   claudeBinary?: string;
+  workerIsolation?: 'worktree' | 'checkout';
 }
 
 export interface MissionState {
@@ -436,6 +446,25 @@ export interface ReadinessReport {
   }>;
   overall: string;
   warnings: string[];
+}
+
+/** `GET /api/missions/:id/workspace` — derived local execution context. */
+export interface WorkspaceSummary {
+  isolation: 'worktree' | 'checkout';
+  cwd: string;
+  lifecycle: 'active' | 'pending' | 'removed' | 'primary-checkout';
+  worktreeActive: boolean;
+  sandboxes: Array<{
+    role: 'worker' | 'scrutiny' | 'functional';
+    enforce: SandboxEnforce;
+    extraWriteCount: number;
+    egressCount: number;
+  }>;
+  preflight: {
+    status: 'pending' | 'clear' | 'issues';
+    summary: string;
+    eventSeq: number | null;
+  };
 }
 
 /** This host's queue-drain tracker (`MissionHost::drain` / `drain_state_json`). */

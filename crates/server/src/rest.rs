@@ -12,10 +12,12 @@ use kranz_engine::cost;
 use kranz_engine::event_log::EventLog;
 use kranz_engine::events::{Event, EventKind};
 use kranz_engine::merged::merged_bit;
-use kranz_engine::orchestrator::render_plan_markdown;
+use kranz_engine::orchestrator::{mission_worktree_path, render_plan_markdown};
 use kranz_engine::paths::MissionPaths;
 use kranz_engine::reducer;
-use kranz_engine::types::{ControlCommand, MissionState, MissionStatus};
+use kranz_engine::types::{
+    ControlCommand, MissionState, MissionStatus, RoleConfig, SandboxEnforce, WorkerIsolation,
+};
 use kranz_engine::{config, control};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -99,6 +101,95 @@ pub(crate) async fn mission_state(
     }
     let events = EventLog::read_events(&events_path)?;
     Ok(Json(reducer::fold(&events)?))
+}
+
+/// `GET /api/missions/:id/workspace` — effective local execution workspace,
+/// sandbox tiers, and the latest already-recorded environment-preflight
+/// outcome. This is a derived read model: no new durable state or events.
+pub(crate) async fn mission_workspace(
+    State(server): State<Arc<ServerState>>,
+    UrlPath(id): UrlPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let paths = mission_paths(&server, &id)?;
+    if !paths.events_file().is_file() {
+        return Err(unknown_mission(&id));
+    }
+    let events = EventLog::read_events(&paths.events_file())?;
+    let state = reducer::fold(&events)?;
+    let isolation = state.config.isolation();
+    let cwd = match isolation {
+        WorkerIsolation::Worktree => mission_worktree_path(&id),
+        WorkerIsolation::Checkout => server.repo_root.clone(),
+    };
+    let worktree_active = isolation == WorkerIsolation::Worktree && cwd.is_dir();
+    let lifecycle = match isolation {
+        WorkerIsolation::Checkout => "primary-checkout",
+        WorkerIsolation::Worktree if worktree_active => "active",
+        WorkerIsolation::Worktree
+            if matches!(
+                state.mission.status,
+                MissionStatus::Planning | MissionStatus::Approved
+            ) =>
+        {
+            "pending"
+        }
+        WorkerIsolation::Worktree => "removed",
+    };
+    let preflight = events.iter().rev().find_map(|event| match &event.kind {
+        EventKind::OrchestratorDecision { summary, .. } if summary.starts_with("preflight:") => {
+            Some(json!({
+                "status": "issues",
+                "summary": summary,
+                "eventSeq": event.seq,
+            }))
+        }
+        _ => None,
+    });
+    let preflight = preflight.unwrap_or_else(|| {
+        let pending = matches!(
+            state.mission.status,
+            MissionStatus::Planning | MissionStatus::Approved
+        );
+        json!({
+            "status": if pending { "pending" } else { "clear" },
+            "summary": if pending {
+                "environment preflight has not run yet"
+            } else {
+                "no advisory preflight issues recorded"
+            },
+            "eventSeq": Value::Null,
+        })
+    });
+
+    Ok(Json(json!({
+        "isolation": isolation,
+        "cwd": cwd.to_string_lossy(),
+        "lifecycle": lifecycle,
+        "worktreeActive": worktree_active,
+        "sandboxes": [
+            sandbox_summary("worker", &state.config.worker),
+            sandbox_summary("scrutiny", &state.config.validator_scrutiny),
+            sandbox_summary("functional", &state.config.validator_functional),
+        ],
+        "preflight": preflight,
+    })))
+}
+
+fn sandbox_summary(role: &str, config: &RoleConfig) -> Value {
+    json!({
+        "role": role,
+        "enforce": sandbox_enforce_label(config.sandbox.enforce),
+        "extraWriteCount": config.sandbox.extra_write.len(),
+        "egressCount": config.sandbox.egress.len(),
+    })
+}
+
+fn sandbox_enforce_label(enforce: SandboxEnforce) -> &'static str {
+    match enforce {
+        SandboxEnforce::Off => "off",
+        SandboxEnforce::Fs => "fs",
+        SandboxEnforce::FsNet => "fs+net",
+    }
 }
 
 /// `GET /api/missions/:id/events?since=<seq>` — events with `seq > since`

@@ -210,7 +210,7 @@ findings; a normal mission's contract commands still pass under the sandbox
 at <~10% wall-clock overhead; and the primary checkout never changes branch
 during any mission, sequential included.
 
-## M8 — Multi-repo operation ◑ (per-repo merge gates shipped; routing and onboarding remain)
+## M8 — Multi-repo operation ◑ (merge gates and multi-root host design shipped; implementation and onboarding remain)
 
 Kranz is per-repo by construction (`.kranz/` state, tickets, missions,
 calibration, lessons all live in the repo) — but the operator surfaces
@@ -223,6 +223,11 @@ in any language.
   and a mission cannot weaken the gate file that judges its own diff. This
   repo carries the Rust/dashboard suite explicitly; other languages carry
   their own commands.
+- [x] **Multi-root host design**: one serve process composes one existing
+  `MissionHost` per operator-configured repo; API and mission identity become
+  repo-scoped, queues remain local under a fair bounded scheduler, one process
+  token protects the local host, and Slack routes explicitly or fails closed.
+  See [the accepted M8 decisions](scoping/m8-multi-root-host.md).
 - **One Slack bridge, many repos**: per-repo bridges can't work — Slack
   socket mode load-balances events across connections from one app, so N
   bridges each see 1/N of commands. Instead the single bridge routes:
@@ -230,10 +235,9 @@ in any language.
   override in shared channels; mission threads already carry affinity
   (slack-threads.json). Spend-adjacent verbs keep the allowlist gate
   per repo.
-- **Serve story**: port allocation for concurrent serves (or one serve
-  hosting N repos — decide at scoping; the MissionHost registry is
-  already keyed by mission, not repo-global). Dashboard repo picker if
-  one-serve-many-repos wins.
+- **Serve story**: implement the accepted one-serve-many-repos host catalog,
+  repo-scoped API, and fair queue scheduler. The dashboard repo picker follows
+  as its own ticket after those routing boundaries exist.
 - **Fresh-repo onboarding**: `kranz init`-shaped first run (scaffold,
   gitignore template, config prompts), cold-start calibration honesty
   ("based on 0 missions" must read as the warning it is), and promoting
@@ -263,7 +267,7 @@ side: it is a polished desktop PTY/session manager, not a mission-validation
 engine. Borrow sensing and operator ergonomics, not the IDE shell. The
 follow-up backlog (rewritten after adversarial review) is sequenced as:
 
-- **Near-term (P2):** `repo-knowledge-ranked-brief-injection`,
+- **Near-term P2 slices shipped:** `repo-knowledge-ranked-brief-injection`,
   `post-complete-pr-handoff-no-push`, `backend-readiness-quota-preflight`,
   `workspace-sandbox-visibility` (local visibility only),
   `m8-multi-root-host-design` (prerequisite for the picker).
@@ -358,8 +362,9 @@ follow-up backlog (rewritten after adversarial review) is sequenced as:
 
 ## Explicitly still out of scope
 
-Cloud/remote execution, multi-user/RBAC, and org policy remain non-goals
-(plan §3); the architecture continues to not preclude them.
+For the current local v1 defaults, automatic pushes to main,
+multi-user/RBAC, and org policy remain non-goals. M6 cloud/remote execution is
+an explicit future, operator-gated milestone rather than a current default.
 Also out of scope for kranz: terminal replacement, a general-purpose code
 editor/LSP shell, voice-first coding, and the broader agentic-IDE product shape
 now parked for sgian.

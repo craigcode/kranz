@@ -502,6 +502,43 @@ async fn report_md_404_until_file_exists_then_returns_markdown() {
 }
 
 #[tokio::test]
+async fn workspace_summary_surfaces_isolation_sandbox_and_preflight_without_grant_values() {
+    let (_tmp, repo_root, paths, app) = fixture();
+    {
+        let mut log = EventLog::acquire(&paths, MISSION_ID, Duration::ZERO, LockForce::No).unwrap();
+        log.append(EventKind::OrchestratorDecision {
+            summary: "preflight: 1 issue(s): [warn] cargo missing".into(),
+            detail: None,
+        })
+        .unwrap();
+    }
+
+    let (status, body) = get_json(&app, &format!("/api/missions/{MISSION_ID}/workspace")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["isolation"], "worktree");
+    assert_eq!(body["lifecycle"], "removed");
+    assert_eq!(body["worktreeActive"], false);
+    assert_eq!(
+        body["cwd"],
+        kranz_engine::orchestrator::mission_worktree_path(MISSION_ID)
+            .to_string_lossy()
+            .as_ref()
+    );
+    assert_eq!(body["sandboxes"][0]["role"], "worker");
+    assert_eq!(body["sandboxes"][0]["enforce"], "off");
+    assert_eq!(body["sandboxes"][0]["extraWriteCount"], 0);
+    assert_eq!(body["sandboxes"][0]["egressCount"], 0);
+    assert_eq!(body["preflight"]["status"], "issues");
+    assert!(body["preflight"]["summary"]
+        .as_str()
+        .unwrap()
+        .contains("cargo missing"));
+    assert!(!body
+        .to_string()
+        .contains(repo_root.to_string_lossy().as_ref()));
+}
+
+#[tokio::test]
 async fn diff_stat_returns_stat_baseline_and_tip_when_diffable() {
     if !setup() {
         return;

@@ -1023,6 +1023,50 @@ button {
   max-height: 34%;
 }
 
+.workspace-body {
+  display: grid;
+  gap: 5px;
+  padding: 0 8px 8px;
+  font-size: 11px;
+}
+
+.workspace-row {
+  display: grid;
+  grid-template-columns: 62px minmax(0, 1fr);
+  gap: 6px;
+  align-items: baseline;
+}
+
+.workspace-value {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.workspace-path {
+  display: block;
+  max-height: 36px;
+  overflow: auto;
+  white-space: normal;
+}
+
+.workspace-sandboxes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.workspace-chip {
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 1px 4px;
+  font-family: var(--mono);
+  font-size: 10px;
+}
+
+.workspace-preflight-issues {
+  color: var(--amber);
+}
+
 .panel-log {
   flex: 1.4 1 auto;
   min-height: 120px;

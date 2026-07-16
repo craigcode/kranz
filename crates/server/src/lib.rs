@@ -183,6 +183,7 @@ pub fn router_with_shared_host_and_addr(
             get(rest::list_missions).post(host::create_mission),
         )
         .route("/api/missions/{id}/state", get(rest::mission_state))
+        .route("/api/missions/{id}/workspace", get(rest::mission_workspace))
         .route("/api/missions/{id}/events", get(rest::mission_events))
         .route("/api/missions/{id}/plan", get(rest::mission_plan))
         .route("/api/missions/{id}/plan.md", get(rest::mission_plan_md))

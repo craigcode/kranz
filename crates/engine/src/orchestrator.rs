@@ -4383,7 +4383,8 @@ impl MissionEngine {
                     &calibration,
                 )
             });
-        let report = render_mission_report(&self.state, &events, &plan, &estimate);
+        let report =
+            render_mission_report(&self.state, &events, &plan, &estimate, self.active_root());
 
         let active_paths = self.active_paths();
         let report_file = active_paths.mission_dir().join("report.md");
@@ -5278,13 +5279,21 @@ fn parallel_worktree_path(mission_id: &str, feature_id: &str) -> PathBuf {
 /// under the same temp-dir base as [`parallel_worktree_path`], namespaced
 /// with a `_integration` suffix that no real feature id can produce (feature
 /// ids never start with `_`), so it never collides with a per-feature path.
-fn mission_worktree_path(mission_id: &str) -> PathBuf {
+pub fn mission_worktree_path(mission_id: &str) -> PathBuf {
     std::env::temp_dir().join(format!("kranz-wt-{mission_id}-_integration"))
 }
 
 // ---------------------------------------------------------------------------
 // Pure helpers
 // ---------------------------------------------------------------------------
+
+fn sandbox_enforce_label(enforce: SandboxEnforce) -> &'static str {
+    match enforce {
+        SandboxEnforce::Off => "off",
+        SandboxEnforce::Fs => "fs",
+        SandboxEnforce::FsNet => "fs+net",
+    }
+}
 
 fn role_config_key(role: Role) -> &'static str {
     match role {
@@ -6040,6 +6049,7 @@ pub fn render_mission_report(
     events: &[Event],
     plan: &Plan,
     estimate: &cost::CostEstimate,
+    execution_root: &Path,
 ) -> String {
     use std::fmt::Write as _;
     let mission = &state.mission;
@@ -6080,6 +6090,39 @@ pub fn render_mission_report(
         "**Cost:** ${:.2} actual vs ${:.2}–${:.2} estimated (expected ${:.2})",
         state.total_cost_usd, estimate.low_usd, estimate.high_usd, estimate.expected_usd
     );
+
+    let _ = writeln!(md, "\n## Workspace");
+    let isolation = match state.config.isolation() {
+        WorkerIsolation::Worktree => "worktree",
+        WorkerIsolation::Checkout => "checkout",
+    };
+    let _ = writeln!(md, "- **Isolation:** `{isolation}`");
+    let _ = writeln!(
+        md,
+        "- **Worker/validator cwd:** `{}`",
+        execution_root.display()
+    );
+    let _ = writeln!(
+        md,
+        "- **Sandbox:** worker `{}`; scrutiny `{}`; functional `{}`",
+        sandbox_enforce_label(state.config.worker.sandbox.enforce),
+        sandbox_enforce_label(state.config.validator_scrutiny.sandbox.enforce),
+        sandbox_enforce_label(state.config.validator_functional.sandbox.enforce),
+    );
+    let preflight = events.iter().rev().find_map(|event| match &event.kind {
+        EventKind::OrchestratorDecision { summary, .. } if summary.starts_with("preflight:") => {
+            Some(summary.as_str())
+        }
+        _ => None,
+    });
+    match preflight {
+        Some(summary) => {
+            let _ = writeln!(md, "- **Preflight:** {summary}");
+        }
+        None => {
+            let _ = writeln!(md, "- **Preflight:** clear — no advisory issues recorded");
+        }
+    }
 
     // What shipped — per milestone, per feature (fix features included, in
     // the order the reducer materialized them).

@@ -23,6 +23,7 @@ import { OrchestratorView } from './components/OrchestratorView';
 import { PlanningView } from './components/PlanningView';
 import { TranscriptView } from './components/TranscriptView';
 import { ModelPanel } from './components/ModelPanel';
+import { WorkspacePanel } from './components/WorkspacePanel';
 import { GrantRequestPanel } from './components/GrantRequestPanel';
 import { RevisionPanel } from './components/RevisionPanel';
 import { FeaturesPanel } from './components/FeaturesPanel';
@@ -131,6 +132,7 @@ export default function App() {
           <main className="centre">{centre}</main>
           <aside className="right-col" aria-label="Mission panels">
             <ModelPanel />
+            <WorkspacePanel />
             <GrantRequestPanel />
             <RevisionPanel />
             <FeaturesPanel />
