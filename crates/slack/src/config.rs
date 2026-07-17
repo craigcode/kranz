@@ -149,6 +149,17 @@ impl SlackConfig {
         let file = load_file_config()?;
         Ok(resolve(file, EnvVars::from_process()))
     }
+
+    /// Resolve the global credentials while taking the posting channel from
+    /// an operator-owned repository route. Multi-repository mode must not let
+    /// the legacy global channel override catalog scope.
+    pub fn from_config_for_channel(repo_root: &Path, channel: &str) -> Result<Option<SlackConfig>> {
+        let _ = repo_root;
+        let file = load_file_config()?;
+        let mut env = EnvVars::from_process();
+        env.channel = Some(channel.to_string());
+        Ok(resolve(file, env))
+    }
 }
 
 /// The three env vars we read, captured so tests can inject them without

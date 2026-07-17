@@ -1373,26 +1373,38 @@ async fn cmd_serve(
     // process exits. serve_slack is a no-op (logs) when Slack is unconfigured,
     // so `--slack` is safe to pass unconditionally.
     if slack {
-        let context = single_repo_slack_context(&multi_host)?;
-        let repo_slack = context.root().to_path_buf();
-        let hosted = context.host().ok_or_else(|| {
-            anyhow!(
-                "cannot start Slack bridge for unavailable repository '{}': {}",
-                context.id(),
-                context.unavailable_reason().unwrap_or("unavailable")
-            )
-        })?;
-        let bridge_host: kranz_slack::SharedHost =
-            Arc::new(crate::host_bridge::HostedPlanning(hosted.clone()));
-        tokio::spawn(async move {
-            // No graceful-shutdown wiring for the CLI's long-lived server:
-            // this future never resolves, so the bridge runs until the
-            // process is killed (same lifetime as the server below).
-            let never = std::future::pending::<()>();
-            if let Err(e) = kranz_slack::serve_slack(&repo_slack, Some(bridge_host), never).await {
-                tracing::error!(error = %e, "slack bridge exited with an error");
-            }
-        });
+        if multi_host.uses_operator_catalog() {
+            let catalog = multi_repo_slack_catalog(&multi_host)?;
+            tokio::spawn(async move {
+                let never = std::future::pending::<()>();
+                if let Err(error) = kranz_slack::serve_slack_catalog(catalog, never).await {
+                    tracing::error!(%error, "slack catalog bridge exited with an error");
+                }
+            });
+        } else {
+            let context = single_repo_slack_context(&multi_host)?;
+            let repo_slack = context.root().to_path_buf();
+            let hosted = context.host().ok_or_else(|| {
+                anyhow!(
+                    "cannot start Slack bridge for unavailable repository '{}': {}",
+                    context.id(),
+                    context.unavailable_reason().unwrap_or("unavailable")
+                )
+            })?;
+            let bridge_host: kranz_slack::SharedHost =
+                Arc::new(crate::host_bridge::HostedPlanning(hosted.clone()));
+            tokio::spawn(async move {
+                // No graceful-shutdown wiring for the CLI's long-lived server:
+                // this future never resolves, so the bridge runs until the
+                // process is killed (same lifetime as the server below).
+                let never = std::future::pending::<()>();
+                if let Err(e) =
+                    kranz_slack::serve_slack(&repo_slack, Some(bridge_host), never).await
+                {
+                    tracing::error!(error = %e, "slack bridge exited with an error");
+                }
+            });
+        }
     }
 
     let dashboard_assets = resolve_dashboard_assets(&repo, dashboard);
@@ -1455,14 +1467,54 @@ async fn cmd_serve(
 fn single_repo_slack_context(
     multi_host: &kranz_server::MultiRepoHost,
 ) -> Result<Arc<kranz_server::RepoContext>> {
-    if multi_host.uses_operator_catalog() {
-        bail!(
-            "--slack refuses host.repos catalogs until catalog-owned channel routing and allowUsers enforcement are enabled"
-        );
-    }
     multi_host
         .compatibility_context()
         .ok_or_else(|| anyhow!("--slack requires one healthy configured repository"))
+}
+
+fn multi_repo_slack_catalog(
+    multi_host: &kranz_server::MultiRepoHost,
+) -> Result<kranz_slack::SlackCatalog> {
+    let global_config = kranz_engine::paths::global_config()
+        .ok_or_else(|| anyhow!("cannot locate the operator config directory for Slack affinity"))?;
+    let affinity_path = global_config
+        .parent()
+        .expect("global config has a parent")
+        .join("slack")
+        .join("thread-affinity.json");
+    let repos = multi_host
+        .contexts()
+        .map(|context| {
+            let host = context.host().map(|host| {
+                Arc::new(crate::host_bridge::HostedPlanning(host.clone()))
+                    as kranz_slack::SharedHost
+            });
+            kranz_slack::SlackRepo {
+                id: context.id().to_string(),
+                root: context.root().to_path_buf(),
+                display_name: context
+                    .config()
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| context.id().to_string()),
+                routes: context
+                    .config()
+                    .slack
+                    .channels
+                    .iter()
+                    .map(|route| kranz_slack::SlackRoute {
+                        team_id: route.team.clone(),
+                        channel_id: route.channel.clone(),
+                    })
+                    .collect(),
+                allow_users: context.config().slack.allow_users.clone(),
+                available: context.is_healthy(),
+                host,
+                unavailable_reason: context.unavailable_reason().map(str::to_string),
+            }
+        })
+        .collect();
+    kranz_slack::SlackCatalog::new(repos, affinity_path)
 }
 
 async fn serve_multi_with_token_cleanup(
@@ -2530,7 +2582,7 @@ mod tests {
     }
 
     #[test]
-    fn slack_refuses_even_single_repo_operator_catalog_before_bridge_start() {
+    fn slack_operator_catalog_is_not_rejected_by_legacy_context_helper() {
         fn init_git(root: &Path) {
             std::fs::create_dir_all(root).unwrap();
             let status = std::process::Command::new("git")
@@ -2557,8 +2609,8 @@ mod tests {
             }],
         })
         .unwrap();
-        let error = single_repo_slack_context(&multi).err().unwrap();
-        assert!(error.to_string().contains("refuses host.repos catalogs"));
+        let context = single_repo_slack_context(&multi).unwrap();
+        assert_eq!(context.id(), "a");
     }
 
     #[test]

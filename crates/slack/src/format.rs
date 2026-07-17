@@ -816,10 +816,25 @@ pub fn build_new_mission_ack(a: &NewMissionAck) -> Vec<Value> {
 /// `private_metadata` (a `view_submission` doesn't carry the channel), so the
 /// planning thread lands where the command was issued. Pure; unit-tested.
 pub fn build_new_mission_modal(channel: &str) -> Value {
+    build_new_mission_modal_with_metadata(Value::String(channel.to_string()))
+}
+
+pub fn build_new_mission_modal_scoped(channel: &str, repo_id: &str, team_id: &str) -> Value {
+    build_new_mission_modal_with_metadata(json!({
+        "channel": channel,
+        "repoId": repo_id,
+        "teamId": team_id,
+    }))
+}
+
+fn build_new_mission_modal_with_metadata(metadata: Value) -> Value {
     json!({
         "type": "modal",
         "callback_id": NEW_MISSION_CALLBACK_ID,
-        "private_metadata": channel,
+        "private_metadata": match metadata {
+            Value::String(value) => value,
+            value => value.to_string(),
+        },
         "title": { "type": "plain_text", "text": "New mission" },
         "submit": { "type": "plain_text", "text": "Create" },
         "close": { "type": "plain_text", "text": "Cancel" },
@@ -861,6 +876,28 @@ pub fn build_new_mission_modal(channel: &str) -> Value {
 /// unit-tested.
 pub fn build_new_ticket_modal(slug: &str, title: &str, channel: &str) -> Value {
     let metadata = json!({ "slug": slug, "title": title, "channel": channel }).to_string();
+    build_new_ticket_modal_with_metadata(slug, title, metadata)
+}
+
+pub fn build_new_ticket_modal_scoped(
+    slug: &str,
+    title: &str,
+    channel: &str,
+    repo_id: &str,
+    team_id: &str,
+) -> Value {
+    let metadata = json!({
+        "slug": slug,
+        "title": title,
+        "channel": channel,
+        "repoId": repo_id,
+        "teamId": team_id,
+    })
+    .to_string();
+    build_new_ticket_modal_with_metadata(slug, title, metadata)
+}
+
+fn build_new_ticket_modal_with_metadata(slug: &str, title: &str, metadata: String) -> Value {
     json!({
         "type": "modal",
         "callback_id": NEW_TICKET_CALLBACK_ID,
@@ -917,11 +954,24 @@ pub fn build_new_ticket_modal(slug: &str, title: &str, channel: &str) -> Value {
 /// optional — blank targets the single active mission, same resolution as
 /// the slash form. Pure; unit-tested.
 pub fn build_config_modal(channel: &str) -> Value {
+    build_config_modal_with_metadata(Value::String(channel.to_string()))
+}
+
+pub fn build_config_modal_scoped(channel: &str, repo_id: &str, team_id: &str) -> Value {
+    build_config_modal_with_metadata(
+        json!({ "channel": channel, "repoId": repo_id, "teamId": team_id }),
+    )
+}
+
+fn build_config_modal_with_metadata(metadata: Value) -> Value {
     let opt = |v: &str| json!({ "text": { "type": "plain_text", "text": v }, "value": v });
     json!({
         "type": "modal",
         "callback_id": CONFIG_CALLBACK_ID,
-        "private_metadata": channel,
+        "private_metadata": match metadata {
+            Value::String(value) => value,
+            value => value.to_string(),
+        },
         "title": { "type": "plain_text", "text": "Mission config" },
         "submit": { "type": "plain_text", "text": "Apply" },
         "close": { "type": "plain_text", "text": "Cancel" },

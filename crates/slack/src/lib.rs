@@ -33,6 +33,7 @@
 //! the server stops.
 
 pub mod bridge;
+pub mod catalog;
 pub mod client;
 pub mod config;
 pub mod format;
@@ -42,6 +43,7 @@ pub mod inbound;
 pub mod outbound;
 pub mod threads;
 
+pub use catalog::{SlackCatalog, SlackRepo, SlackRoute};
 pub use client::SlackClient;
 pub use config::{NotifyFlags, SlackConfig};
 pub use host::{AskOutcome, PlanOutcome, PlanningHost, SharedHost};
@@ -106,5 +108,62 @@ pub async fn serve_slack(
         outbound,
         inbound,
     );
+    Ok(())
+}
+
+/// Start one Socket Mode bridge for an operator-owned repository catalog.
+/// Each healthy repository keeps its own outbound cursor while inbound
+/// envelopes are resolved once through [`SlackCatalog`].
+pub async fn serve_slack_catalog(
+    catalog: SlackCatalog,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<()> {
+    let repos: Vec<_> = catalog
+        .repos()
+        .filter(|repo| repo.is_healthy() && repo.primary_route().is_some())
+        .collect();
+    let Some(first) = repos.first() else {
+        anyhow::bail!("Slack catalog has no healthy repository with a channel route");
+    };
+    let first_route = first.primary_route().expect("filtered above");
+    let Some(base_cfg) =
+        SlackConfig::from_config_for_channel(&first.root, &first_route.channel_id)?
+    else {
+        tracing::info!("slack not configured; bridge disabled");
+        return Ok(());
+    };
+    let client = SlackClient::new(&base_cfg)?;
+    let stop = std::sync::Arc::new(tokio::sync::Notify::new());
+    let mut tasks = Vec::new();
+
+    for repo in repos {
+        let route = repo.primary_route().expect("filtered above");
+        let mut cfg = base_cfg.clone();
+        cfg.channel = route.channel_id.clone();
+        cfg.allow_users = repo.allow_users.clone();
+        let threads = catalog.scoped_threads(&repo.id, &route.team_id, &route.channel_id);
+        let task_stop = stop.clone();
+        tasks.push(tokio::spawn(bridge::run_bridge(
+            cfg,
+            client.clone(),
+            repo.root.clone(),
+            threads,
+            async move { task_stop.notified().await },
+        )));
+    }
+
+    let inbound_stop = stop.clone();
+    let inbound = tokio::spawn(bridge::run_catalog_socket(
+        base_cfg,
+        client,
+        catalog,
+        async move { inbound_stop.notified().await },
+    ));
+    shutdown.await;
+    stop.notify_waiters();
+    for task in tasks {
+        let _ = task.await;
+    }
+    let _ = inbound.await;
     Ok(())
 }

@@ -563,12 +563,7 @@ fn route_view_submission(payload: &Value) -> Action {
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim();
-    let channel = view
-        .get("private_metadata")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_string();
+    let channel = modal_channel(view).unwrap_or_default();
     if goal.is_empty() || channel.is_empty() {
         // Slack enforces the required input; an empty goal or a lost channel
         // means a malformed submission — nothing sane to create.
@@ -626,12 +621,7 @@ fn route_config_submission(payload: &Value, view: &Value) -> Action {
         .and_then(|u| u.get("id"))
         .and_then(Value::as_str)
         .map(str::to_string);
-    let channel = view
-        .get("private_metadata")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|c| !c.is_empty())
-        .map(str::to_string);
+    let channel = modal_channel(view);
     Action::Config {
         mission_id,
         role,
@@ -641,6 +631,22 @@ fn route_config_submission(payload: &Value, view: &Value) -> Action {
         user_id,
         response_url: None,
         channel,
+    }
+}
+
+fn modal_channel(view: &Value) -> Option<String> {
+    let metadata = view.get("private_metadata")?.as_str()?.trim();
+    if metadata.is_empty() {
+        return None;
+    }
+    match serde_json::from_str::<Value>(metadata) {
+        Ok(value) => value
+            .get("channel")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|channel| !channel.is_empty())
+            .map(str::to_string),
+        Err(_) => Some(metadata.to_string()),
     }
 }
 

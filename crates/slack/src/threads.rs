@@ -1,4 +1,4 @@
-//! Mission ↔ Slack thread mapping, persisted so a restarted bridge re-threads.
+//! Slack thread affinity, persisted so a restarted bridge re-threads.
 //!
 //! One Slack thread per mission keeps routing trivial: an inbound message event
 //! carries a `thread_ts`, and this map turns it back into a mission id. The map
@@ -78,6 +78,135 @@ impl ThreadMap {
     pub fn contains(&self, mission_id: &str) -> bool {
         self.by_mission.contains_key(mission_id)
     }
+
+    /// Existing entries, used once when a single-repository thread map is
+    /// migrated into the operator-owned multi-repository affinity map.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.by_mission
+            .iter()
+            .map(|(mission, thread)| (mission.as_str(), thread.as_str()))
+    }
+}
+
+/// Composite mission identity at the Slack host boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepoMissionId {
+    pub repo_id: String,
+    pub mission_id: String,
+}
+
+/// One operator-owned team/channel/thread affinity record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadAffinity {
+    pub team_id: String,
+    pub channel_id: String,
+    pub thread_ts: String,
+    pub target: RepoMissionId,
+}
+
+/// Multi-repository affinity map. A vector keeps the persisted shape readable;
+/// the bridge volume is human-scale, so linear lookup is preferable to an
+/// encoded composite string key.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AffinityMap {
+    #[serde(default)]
+    entries: Vec<ThreadAffinity>,
+}
+
+impl AffinityMap {
+    pub fn load(path: &Path) -> Result<Self> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => serde_json::from_str(&text)
+                .map_err(|error| anyhow!("invalid thread affinity {}: {error}", path.display())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(anyhow!("cannot read {}: {error}", path.display())),
+        }
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let json = serde_json::to_string_pretty(self)?;
+        atomic_write(path, json.as_bytes())
+    }
+
+    pub fn target_for(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        thread_ts: &str,
+    ) -> Option<&RepoMissionId> {
+        self.entries
+            .iter()
+            .find(|entry| {
+                entry.team_id == team_id
+                    && entry.channel_id == channel_id
+                    && entry.thread_ts == thread_ts
+            })
+            .map(|entry| &entry.target)
+    }
+
+    pub fn thread_for(
+        &self,
+        repo_id: &str,
+        mission_id: &str,
+        team_id: &str,
+        channel_id: &str,
+    ) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|entry| {
+                entry.target.repo_id == repo_id
+                    && entry.target.mission_id == mission_id
+                    && entry.team_id == team_id
+                    && entry.channel_id == channel_id
+            })
+            .map(|entry| entry.thread_ts.as_str())
+    }
+
+    pub fn set(
+        &mut self,
+        team_id: impl Into<String>,
+        channel_id: impl Into<String>,
+        thread_ts: impl Into<String>,
+        repo_id: impl Into<String>,
+        mission_id: impl Into<String>,
+    ) {
+        let (team_id, channel_id, thread_ts, repo_id, mission_id) = (
+            team_id.into(),
+            channel_id.into(),
+            thread_ts.into(),
+            repo_id.into(),
+            mission_id.into(),
+        );
+        self.entries.retain(|entry| {
+            !(entry.team_id == team_id
+                && entry.channel_id == channel_id
+                && (entry.thread_ts == thread_ts
+                    || (entry.target.repo_id == repo_id && entry.target.mission_id == mission_id)))
+        });
+        self.entries.push(ThreadAffinity {
+            team_id,
+            channel_id,
+            thread_ts,
+            target: RepoMissionId {
+                repo_id,
+                mission_id,
+            },
+        });
+        self.entries.sort_by(|left, right| {
+            (&left.team_id, &left.channel_id, &left.thread_ts).cmp(&(
+                &right.team_id,
+                &right.channel_id,
+                &right.thread_ts,
+            ))
+        });
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 /// Atomic write via a sibling temp file + rename (mirrors the engine's helpers
@@ -125,5 +254,27 @@ mod tests {
         map.set("m-01", "ts-a");
         assert_eq!(map.set("m-01", "ts-b"), Some("ts-a".to_string()));
         assert_eq!(map.thread_ts("m-01"), Some("ts-b"));
+    }
+
+    #[test]
+    fn affinity_uses_the_complete_slack_and_mission_identity() {
+        let mut map = AffinityMap::default();
+        map.set("T1", "C1", "100.1", "alpha", "m-same");
+        map.set("T1", "C2", "100.1", "beta", "m-same");
+
+        assert_eq!(
+            map.target_for("T1", "C1", "100.1"),
+            Some(&RepoMissionId {
+                repo_id: "alpha".into(),
+                mission_id: "m-same".into(),
+            })
+        );
+        assert_eq!(
+            map.target_for("T1", "C2", "100.1")
+                .map(|target| target.repo_id.as_str()),
+            Some("beta")
+        );
+        assert_eq!(map.thread_for("alpha", "m-same", "T1", "C1"), Some("100.1"));
+        assert_eq!(map.thread_for("alpha", "m-same", "T1", "C2"), None);
     }
 }
