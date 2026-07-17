@@ -210,7 +210,7 @@ findings; a normal mission's contract commands still pass under the sandbox
 at <~10% wall-clock overhead; and the primary checkout never changes branch
 during any mission, sequential included.
 
-## M8 — Multi-repo operation ◑ (merge gates and multi-root host design shipped; implementation and onboarding remain)
+## M8 — Multi-repo operation ◑ (implementation shipped; cross-language end-to-end proof remains)
 
 Kranz is per-repo by construction (`.kranz/` state, tickets, missions,
 calibration, lessons all live in the repo) — but the operator surfaces
@@ -228,21 +228,23 @@ in any language.
   repo-scoped, queues remain local under a fair bounded scheduler, one process
   token protects the local host, and Slack routes explicitly or fails closed.
   See [the accepted M8 decisions](scoping/m8-multi-root-host.md).
-- **One Slack bridge, many repos**: per-repo bridges can't work — Slack
+- [x] **One Slack bridge, many repos**: per-repo bridges can't work — Slack
   socket mode load-balances events across connections from one app, so N
   bridges each see 1/N of commands. Instead the single bridge routes:
   channel→repo default mapping in config plus an explicit repo tag to
   override in shared channels; mission threads already carry affinity
   (slack-threads.json). Spend-adjacent verbs keep the allowlist gate
   per repo.
-- **Serve story**: implement the accepted one-serve-many-repos host catalog,
+- [x] **Serve story**: implement the accepted one-serve-many-repos host catalog,
   repo-scoped API, and fair queue scheduler. The dashboard repo picker follows
   as its own ticket after those routing boundaries exist.
-- **Fresh-repo onboarding**: `kranz init`-shaped first run (scaffold,
-  gitignore template, config prompts), cold-start calibration honesty
+- [x] **Dashboard project picker**: groups, pins, search, repository-scoped
+  routes, unavailable-root errors, and queued/running/needs-input/unmerged/
+  failed activity counts on top of the host catalog.
+- [x] **Fresh-repo onboarding**: `kranz init` first run (additive scaffold,
+  gitignore template, gate/registration answers), cold-start calibration honesty
   ("based on 0 missions" must read as the warning it is), and promoting
-  proven per-repo defaults (workerIsolation=worktree post-soak) to
-  global config so new repos start isolated.
+  the proven workerIsolation=worktree default so new repos start isolated.
 
 Done when: a TypeScript repo goes ticket → draft → queue → worktree run →
 gated merge (its own gates) without touching this repo's config; two

@@ -100,6 +100,39 @@ fn parses_plan() {
 }
 
 #[test]
+fn kranz_init_parses_detection_and_registration_answers() {
+    let cli = Cli::try_parse_from([
+        "kranz",
+        "init",
+        "--gate",
+        "make test",
+        "--gate",
+        "make lint",
+        "--register",
+        "--id",
+        "alpha",
+        "--display-name",
+        "Alpha App",
+    ])
+    .unwrap();
+    match cli.command {
+        Command::Init {
+            gates,
+            register,
+            id,
+            display_name,
+        } => {
+            assert_eq!(gates, ["make test", "make lint"]);
+            assert!(register);
+            assert_eq!(id.as_deref(), Some("alpha"));
+            assert_eq!(display_name.as_deref(), Some("Alpha App"));
+        }
+        other => panic!("expected init, got {other:?}"),
+    }
+    assert!(Cli::try_parse_from(["kranz", "init", "--id", "alpha"]).is_err());
+}
+
+#[test]
 fn parses_run_with_global_flags() {
     let cli = Cli::try_parse_from([
         "kranz",

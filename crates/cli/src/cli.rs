@@ -67,6 +67,31 @@ impl Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Prepare an existing Git worktree for its first Kranz mission.
+    ///
+    /// Scaffolds an additive runtime-ignore block, a tracked merge-gate
+    /// suite, and the tickets directory. Common Rust, Node, and Python gates
+    /// are detected; unfamiliar toolchains must supply --gate. Re-running is
+    /// safe: existing gates are validated and never replaced.
+    Init {
+        /// Unconditional validation command (repeat for multiple gates).
+        /// Overrides toolchain detection when creating a new gate suite.
+        #[arg(long = "gate", value_name = "COMMAND")]
+        gates: Vec<String>,
+
+        /// Register this canonical root in the global multi-repo host catalog.
+        #[arg(long)]
+        register: bool,
+
+        /// Host-catalog repository id (defaults to a slug of the directory).
+        #[arg(long, value_name = "ID", requires = "register")]
+        id: Option<String>,
+
+        /// Friendly name shown in the dashboard project picker.
+        #[arg(long, value_name = "NAME", requires = "register")]
+        display_name: Option<String>,
+    },
+
     /// Create a mission and shape its plan in an interactive conversation.
     ///
     /// With no goal, resumes the most recent mission still in planning

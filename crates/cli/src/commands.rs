@@ -40,6 +40,21 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
     }
 
     match cli.command {
+        Command::Init {
+            gates,
+            register,
+            id,
+            display_name,
+        } => {
+            let options = crate::init::InitOptions {
+                gates,
+                registration: register.then_some(crate::init::Registration { id, display_name }),
+                global_config: kranz_engine::paths::global_config(),
+            };
+            let report = crate::init::initialize(&repo, &options)?;
+            print!("{}", crate::init::render(&report));
+            Ok(0)
+        }
         Command::Plan { goal } => {
             let cfg = load_config(&repo, cli.dangerously_allow_all)?;
             cmd_plan(repo, goal, cfg, cli.mission.as_deref(), lock_force)
