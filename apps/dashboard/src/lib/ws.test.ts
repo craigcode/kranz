@@ -61,6 +61,22 @@ afterEach(() => {
 });
 
 describe('MissionSocket token nudge', () => {
+  it('uses the captured repository id for the websocket path', () => {
+    const socket = new MissionSocket({
+      origin: 'http://127.0.0.1:4560',
+      repoId: 'alpha',
+      missionId: 'm-1',
+      getSince: () => null,
+      onFrame: () => {},
+      onStatus: () => {},
+    });
+    socket.connect();
+    expect(FakeWebSocket.instances[0].url).toBe(
+      'ws://127.0.0.1:4560/api/repos/alpha/missions/m-1/ws',
+    );
+    socket.close();
+  });
+
   it('reconnects immediately on provideToken instead of waiting out the backoff', () => {
     const socket = makeSocket();
     socket.connect();

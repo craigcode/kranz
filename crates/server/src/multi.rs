@@ -3,7 +3,13 @@
 
 use crate::MissionHost;
 use anyhow::{anyhow, Context, Result};
+use kranz_engine::event_log::EventLog;
 use kranz_engine::git_ops::GitRepo;
+use kranz_engine::merged::merged_bit;
+use kranz_engine::paths::MissionPaths;
+use kranz_engine::reducer;
+use kranz_engine::ticket::{Ticket, TicketState};
+use kranz_engine::types::MissionStatus;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Component, Path, PathBuf};
@@ -139,6 +145,11 @@ impl RepoContext {
                 "unavailable".to_string()
             },
             error: self.unavailable_reason.clone(),
+            activity: if self.is_healthy() {
+                repo_activity(&self.config.root)
+            } else {
+                RepoActivity::default()
+            },
         }
     }
 }
@@ -157,6 +168,80 @@ pub struct RepoSummary {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default)]
+    pub activity: RepoActivity,
+}
+
+/// At-a-glance pipeline counts for the repository picker. Counts follow the
+/// dashboard's work-item projection: ticket-backed missions count once under
+/// the ticket state; only ticketless missions are folded independently.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RepoActivity {
+    pub queued: usize,
+    pub running: usize,
+    pub needs_input: usize,
+    pub complete_unmerged: usize,
+    pub failed: usize,
+}
+
+fn repo_activity(repo_root: &Path) -> RepoActivity {
+    let mut activity = RepoActivity::default();
+    let tickets = Ticket::list(repo_root);
+    let mut linked = HashSet::new();
+    for ticket in tickets {
+        let mission_id = Ticket::mission_for(repo_root, &ticket.slug);
+        if let Some(id) = mission_id.as_ref() {
+            linked.insert(id.clone());
+        }
+        match Ticket::read_state(repo_root, &ticket.slug) {
+            TicketState::Queued => activity.queued += 1,
+            TicketState::Running => activity.running += 1,
+            TicketState::NeedsContext => activity.needs_input += 1,
+            TicketState::Failed => activity.failed += 1,
+            TicketState::Done
+                if mission_id.is_some()
+                    && kranz_engine::merged::ticket_merged(repo_root, &ticket.slug)
+                        != Some(true) =>
+            {
+                activity.complete_unmerged += 1;
+            }
+            _ => {}
+        }
+    }
+
+    let repo = GitRepo::open(repo_root).ok();
+    for id in MissionPaths::list_missions(repo_root) {
+        if linked.contains(&id) {
+            continue;
+        }
+        let paths = MissionPaths::new(repo_root, &id);
+        let state = EventLog::read_events(&paths.events_file())
+            .ok()
+            .and_then(|events| reducer::fold(&events).ok());
+        let Some(state) = state else {
+            activity.failed += 1;
+            continue;
+        };
+        match state.mission.status {
+            MissionStatus::Approved => activity.queued += 1,
+            MissionStatus::Running | MissionStatus::Paused | MissionStatus::Validating => {
+                activity.running += 1
+            }
+            MissionStatus::Blocked => activity.needs_input += 1,
+            MissionStatus::Complete
+                if repo
+                    .as_ref()
+                    .and_then(|repo| merged_bit(repo, &state.mission))
+                    != Some(true) =>
+            {
+                activity.complete_unmerged += 1;
+            }
+            MissionStatus::Failed => activity.failed += 1,
+            _ => {}
+        }
+    }
+    activity
 }
 
 /// Static process-lifetime catalog plus one existing single-repo host per
@@ -611,6 +696,48 @@ mod tests {
         let summary = &catalog.summaries()[0];
         assert_eq!(summary.status, "unavailable");
         assert!(summary.error.as_deref().unwrap().contains("usable Git"));
+    }
+
+    #[test]
+    fn picker_activity_counts_each_ticket_once_and_complete_unmerged_separately() {
+        use kranz_engine::event_log::LockForce;
+        use kranz_engine::events::EventKind;
+        use kranz_engine::types::MissionConfig;
+
+        let temp = tempfile::tempdir().unwrap();
+        init_git(temp.path());
+        for (slug, state) in [
+            ("queued", TicketState::Queued),
+            ("running", TicketState::Running),
+            ("needs-input", TicketState::NeedsContext),
+            ("failed", TicketState::Failed),
+        ] {
+            Ticket::scaffold(temp.path(), slug, slug, None, None).unwrap();
+            Ticket::write_state(temp.path(), slug, state, None).unwrap();
+        }
+        let paths = MissionPaths::new(temp.path(), "m-unmerged");
+        let mut log =
+            EventLog::acquire(&paths, "m-unmerged", Duration::ZERO, LockForce::No).unwrap();
+        log.append(EventKind::MissionCreated {
+            goal: "complete but not merged".into(),
+            base_branch: "main".into(),
+            mission_branch: "kranz/mission-m-unmerged".into(),
+            config: MissionConfig::default(),
+        })
+        .unwrap();
+        log.append(EventKind::MissionCompleted {}).unwrap();
+        drop(log);
+
+        assert_eq!(
+            repo_activity(temp.path()),
+            RepoActivity {
+                queued: 1,
+                running: 1,
+                needs_input: 1,
+                complete_unmerged: 1,
+                failed: 1,
+            }
+        );
     }
 
     #[test]

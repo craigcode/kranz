@@ -141,6 +141,10 @@ pub async fn serve_slack_catalog(
         let mut cfg = base_cfg.clone();
         cfg.channel = route.channel_id.clone();
         cfg.allow_users = repo.allow_users.clone();
+        cfg.dashboard_url = cfg
+            .dashboard_url
+            .as_deref()
+            .map(|base| format::dashboard_repo_url(base, &repo.id));
         let threads = catalog.scoped_threads(&repo.id, &route.team_id, &route.channel_id);
         let task_stop = stop.clone();
         tasks.push(tokio::spawn(bridge::run_bridge(

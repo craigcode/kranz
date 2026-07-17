@@ -299,6 +299,27 @@ export interface MissionSummary {
   merged?: boolean | null;
 }
 
+export interface RepoActivity {
+  queued: number;
+  running: number;
+  needsInput: number;
+  completeUnmerged: number;
+  failed: number;
+}
+
+/** Operator-owned row from `GET /api/repos`. */
+export interface RepoSummary {
+  id: string;
+  root: string;
+  displayName: string;
+  group?: string;
+  pinned: boolean;
+  isDefault: boolean;
+  status: 'healthy' | 'unavailable';
+  error?: string;
+  activity: RepoActivity;
+}
+
 // ---------------------------------------------------------------------------
 // Mission lifecycle (server-hosted engine; M2.5) — docs/protocol.md
 // ---------------------------------------------------------------------------

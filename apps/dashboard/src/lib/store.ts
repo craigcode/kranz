@@ -6,6 +6,7 @@
 
 import { create } from 'zustand';
 import { api, httpOrigin, isNotHosted } from './api';
+import { repoIdFromHash } from './routes';
 import { MissionSocket } from './ws';
 import type {
   ConnectionStatus,
@@ -74,6 +75,7 @@ const PLANNING_RESET: PlanningSlice = {
 let nextLocalId = 1;
 
 interface KranzStore {
+  repoId: string | null;
   missions: MissionSummary[];
   missionsError: string | null;
   tickets: TicketSummary[];
@@ -111,6 +113,7 @@ interface KranzStore {
    *  double-start conflict), or null. */
   startRunError: string | null;
 
+  selectRepo: (repoId: string | null) => void;
   loadMissions: () => Promise<void>;
   /** Load the backlog list for the dashboard panel (`GET /api/tickets`). */
   loadTickets: () => Promise<void>;
@@ -150,6 +153,7 @@ interface KranzStore {
 }
 
 let socket: MissionSocket | null = null;
+let repoGeneration = 0;
 
 function capEvents(events: MissionEvent[]): MissionEvent[] {
   return events.length > EVENT_BUFFER_CAP
@@ -237,16 +241,17 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
   async function runPlanningTurn(text: string): Promise<void> {
     const id = get().missionId;
     if (id === null) return;
+    const generation = repoGeneration;
     patchPlanning({ busy: 'turn', busySince: Date.now(), error: null });
     pushLocal('user', text);
     try {
       const { reply } = await api.planningTurn(id, text);
-      if (get().missionId !== id) return;
+      if (repoGeneration !== generation || get().missionId !== id) return;
       if (reply.trim() !== '') pushLocal('reply', reply);
       patchPlanning({ busy: null, busySince: null });
       drainPlanningQueue();
     } catch (err) {
-      if (get().missionId !== id) return;
+      if (repoGeneration !== generation || get().missionId !== id) return;
       failPlanning(err);
     }
   }
@@ -279,6 +284,7 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
   }
 
   return {
+    repoId: null,
     missions: [],
     missionsError: null,
     tickets: [],
@@ -297,7 +303,35 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
     startingRun: false,
     startRunError: null,
 
+    selectRepo: (repoId: string | null) => {
+      if (get().repoId === repoId) return;
+      repoGeneration += 1;
+      socket?.close();
+      socket = null;
+      set({
+        repoId,
+        missions: [],
+        missionsError: null,
+        tickets: [],
+        ticketsError: null,
+        ticketError: null,
+        ticketBusySlug: null,
+        draftingSlug: null,
+        missionId: null,
+        state: null,
+        events: [],
+        pauseEvents: [],
+        connection: 'connecting',
+        selectedRun: null,
+        lastSeq: null,
+        planning: PLANNING_RESET,
+        startingRun: false,
+        startRunError: null,
+      });
+    },
+
     loadMissions: async () => {
+      const generation = repoGeneration;
       set({ missionsError: null });
       // For the vanished-mission check below: only let the fresh list rule
       // on a connection that already existed when the fetch STARTED — a
@@ -305,6 +339,7 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
       const connectedAtStart = get().missionId;
       try {
         const missions = await api.missions();
+        if (repoGeneration !== generation) return;
         set({ missions });
         // The connected mission vanishing from a fresh list means it was
         // deleted out-of-band (`kranz clean` in a terminal, another tab, or
@@ -315,16 +350,20 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
           get().disconnect();
         }
       } catch (err) {
+        if (repoGeneration !== generation) return;
         set({ missionsError: err instanceof Error ? err.message : String(err) });
       }
     },
 
     loadTickets: async () => {
+      const generation = repoGeneration;
       set({ ticketsError: null });
       try {
         const tickets = await api.tickets();
+        if (repoGeneration !== generation) return;
         set({ tickets });
       } catch (err) {
+        if (repoGeneration !== generation) return;
         set({ ticketsError: err instanceof Error ? err.message : String(err) });
       }
     },
@@ -332,52 +371,69 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
     draftTicket: async (slug: string) => {
       if (get().ticketBusySlug !== null) return;
       set({ ticketError: null, ticketBusySlug: slug });
+      const generation = repoGeneration;
       try {
         const { missionId } = await api.draftTicket(slug);
+        if (repoGeneration !== generation) return;
         // connectMission resets draftingSlug (any prior draft's claim is
         // stale for a new connection), so record ours only after it runs.
         get().connectMission(missionId);
         set({ draftingSlug: slug });
         await Promise.all([get().loadTickets(), get().loadMissions()]);
       } catch (err) {
+        if (repoGeneration !== generation) return;
         set({ ticketError: err instanceof Error ? err.message : String(err) });
       } finally {
-        if (get().ticketBusySlug === slug) set({ ticketBusySlug: null });
+        if (repoGeneration === generation && get().ticketBusySlug === slug) {
+          set({ ticketBusySlug: null });
+        }
       }
     },
 
     approveTicket: async (slug: string, force: boolean) => {
       if (get().ticketBusySlug !== null) return;
       set({ ticketError: null, ticketBusySlug: slug });
+      const generation = repoGeneration;
       try {
         await api.approveTicket(slug, force);
+        if (repoGeneration !== generation) return;
         await Promise.all([get().loadTickets(), get().loadMissions()]);
       } catch (err) {
+        if (repoGeneration !== generation) return;
         set({ ticketError: err instanceof Error ? err.message : String(err) });
       } finally {
-        if (get().ticketBusySlug === slug) set({ ticketBusySlug: null });
+        if (repoGeneration === generation && get().ticketBusySlug === slug) {
+          set({ ticketBusySlug: null });
+        }
       }
     },
 
     abandonMission: async (id: string) => {
+      const generation = repoGeneration;
       try {
         await api.abandonMission(id);
       } catch (err) {
+        if (repoGeneration !== generation) return;
         set({ missionsError: err instanceof Error ? err.message : String(err) });
       }
+      if (repoGeneration !== generation) return;
       await get().loadMissions();
     },
 
     deleteMission: async (id: string, all: boolean) => {
+      const generation = repoGeneration;
       try {
         await api.deleteMission(id, all);
+        if (repoGeneration !== generation) return;
         // Deleting the connected mission removes its dir server-side; the WS
         // would otherwise reconnect-loop against a 404 forever with stale
         // state (abandon keeps the dir, so it needs no such teardown).
         if (get().missionId === id) get().disconnect();
       } catch (err) {
+        if (repoGeneration !== generation) return;
         set({ missionsError: err instanceof Error ? err.message : String(err) });
       }
+      if (repoGeneration !== generation) return;
       await get().loadMissions();
     },
 
@@ -385,6 +441,7 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
       if (get().missionId === id && socket) return;
       socket?.close();
       socket = null;
+      const generation = repoGeneration;
       set({
         draftingSlug: null,
         missionId: id,
@@ -406,7 +463,7 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
       api
         .events(id)
         .then((seeded) => {
-          if (get().missionId !== id) return;
+          if (repoGeneration !== generation || get().missionId !== id) return;
           set((s) => ({
             events: mergeEvents(seeded, s.events),
             pauseEvents: mergePauseEvents(s.pauseEvents, seeded),
@@ -419,11 +476,13 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
       socket = new MissionSocket({
         origin: httpOrigin(),
         missionId: id,
+        repoId: get().repoId ?? repoIdFromHash(),
         // Only ask for a replay once we hold a state to apply events onto;
         // otherwise request a fresh snapshot.
         getSince: () => (get().state !== null ? get().lastSeq : null),
         onFrame: applyFrame,
         onStatus: (connection) => {
+          if (repoGeneration !== generation || get().missionId !== id) return;
           if (connection === 'gone') {
             // The socket proved the mission 404s (deleted out-of-band —
             // `kranz clean`, another tab) and stopped reconnecting for
@@ -438,7 +497,7 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
             api
               .missionState(id)
               .then((fresh) => {
-                if (get().missionId !== id) return;
+                if (repoGeneration !== generation || get().missionId !== id) return;
                 set((s) =>
                   s.state === null || fresh.lastSeq >= s.state.lastSeq
                     ? { state: fresh, lastSeq: Math.max(s.lastSeq ?? 0, fresh.lastSeq) }
@@ -453,7 +512,7 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
                 const bufTail = buffered.length > 0 ? buffered[buffered.length - 1].seq : 0;
                 if (fresh.lastSeq > bufTail) {
                   return api.events(id, bufTail).then((missing) => {
-                    if (get().missionId !== id) return;
+                    if (repoGeneration !== generation || get().missionId !== id) return;
                     set((s) => ({
                       events: mergeEvents(s.events, missing),
                       pauseEvents: mergePauseEvents(s.pauseEvents, missing),
@@ -512,11 +571,12 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
       if (id === null) return;
       const p = get().planning;
       if (p.busy !== null || p.notHosted) return;
+      const generation = repoGeneration;
       patchPlanning({ busy: 'plan-request', busySince: Date.now(), error: null });
       api
         .requestPlan(id)
         .then((res) => {
-          if (get().missionId !== id) return;
+          if (repoGeneration !== generation || get().missionId !== id) return;
           if (res.ready) {
             patchPlanning({
               busy: null,
@@ -533,7 +593,7 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
           drainPlanningQueue();
         })
         .catch((err: unknown) => {
-          if (get().missionId === id) failPlanning(err);
+          if (repoGeneration === generation && get().missionId === id) failPlanning(err);
         });
     },
 
@@ -542,14 +602,15 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
       const review = get().planning.review;
       if (id === null || review === null || get().planning.approving) return;
       patchPlanning({ error: null, approving: true });
+      const generation = repoGeneration;
       api
         .approvePending(id)
         .then(({ branch }) => {
-          if (get().missionId !== id) return;
+          if (repoGeneration !== generation || get().missionId !== id) return;
           patchPlanning({ approving: false, approvedBranch: branch });
         })
         .catch((err: unknown) => {
-          if (get().missionId !== id) return;
+          if (repoGeneration !== generation || get().missionId !== id) return;
           patchPlanning({ approving: false });
           failPlanning(err);
         });
@@ -558,17 +619,18 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
     startMission: () => {
       const id = get().missionId;
       if (id === null) return;
+      const generation = repoGeneration;
       patchPlanning({ starting: true, error: null });
       api
         .startMission(id)
         .then(() => {
-          if (get().missionId !== id) return;
+          if (repoGeneration !== generation || get().missionId !== id) return;
           // The WS state frame flips mission.status to running; the live
           // mission view takes over from there.
           patchPlanning({ starting: false, review: null, approvedBranch: null });
         })
         .catch((err: unknown) => {
-          if (get().missionId !== id) return;
+          if (repoGeneration !== generation || get().missionId !== id) return;
           patchPlanning({ starting: false });
           failPlanning(err);
         });
@@ -579,12 +641,15 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
     startRun: async () => {
       const id = get().missionId;
       if (id === null) return;
+      const generation = repoGeneration;
       set({ startingRun: true, startRunError: null });
       try {
         await api.startMission(id);
-        if (get().missionId === id) set({ startingRun: false });
+        if (repoGeneration === generation && get().missionId === id) {
+          set({ startingRun: false });
+        }
       } catch (err) {
-        if (get().missionId === id) {
+        if (repoGeneration === generation && get().missionId === id) {
           set({ startingRun: false, startRunError: err instanceof Error ? err.message : String(err) });
         }
       }

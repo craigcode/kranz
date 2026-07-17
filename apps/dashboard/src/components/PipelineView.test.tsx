@@ -10,6 +10,7 @@ vi.mock('../lib/api', async () => {
     ...actual,
     api: {
       ...actual.api,
+      repos: vi.fn(),
       tickets: vi.fn(),
       missions: vi.fn(),
       queue: vi.fn().mockResolvedValue({ entries: [], busyWith: null, drain: { live: false, currentMissionId: null, ran: [] } }),
@@ -52,6 +53,7 @@ const INITIAL_STORE_STATE = useKranzStore.getState();
 beforeEach(() => {
   cleanup();
   vi.mocked(api.tickets).mockReset();
+  vi.mocked(api.repos).mockReset();
   vi.mocked(api.missions).mockReset();
   vi.mocked(api.planMd).mockReset();
   vi.mocked(api.reportMd).mockReset();
@@ -503,21 +505,16 @@ describe('PipelineView', () => {
   });
 });
 
-describe('App default route', () => {
-  it('renders the pipeline view at the default hash', async () => {
+describe('App routes', () => {
+  it('renders the project picker at the default hash', async () => {
     window.location.hash = '';
-    vi.mocked(api.tickets).mockResolvedValueOnce([]);
-    vi.mocked(api.missions).mockResolvedValueOnce([]);
+    vi.mocked(api.repos).mockResolvedValueOnce([]);
 
     const { default: App } = await import('../App');
     render(<App />);
 
-    expect(await screen.findByText('Pipeline')).toBeTruthy();
-    const missionsTab = Array.from(document.querySelectorAll('.lens-tab')).find(
-      (el) => el.textContent === 'Missions',
-    );
-    expect(missionsTab).toBeTruthy();
-    expect(screen.queryByText('+ new mission')).toBeTruthy();
+    expect(await screen.findByRole('heading', { name: 'Projects' })).toBeTruthy();
+    expect(screen.queryByText('Pipeline')).toBeNull();
   });
 
   it('routes #/backlog to the pipeline with the Backlog lens selected', async () => {

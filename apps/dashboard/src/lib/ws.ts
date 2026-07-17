@@ -14,7 +14,8 @@
 // Off-loopback serves also require ?token= (browsers cannot set the
 // x-kranz-token header on WebSocket upgrades).
 
-import { ApiError, getJson } from './api';
+import { ApiError, getJson, scopedApiPath } from './api';
+import { repoIdFromHash } from './routes';
 import { resolveToken, subscribeTokenGate } from './token';
 import type { WsFrame } from './types';
 
@@ -27,6 +28,8 @@ export interface MissionSocketOptions {
   /** http(s) origin of the server (no trailing slash). */
   origin: string;
   missionId: string;
+  /** Repository captured when the socket is created. */
+  repoId?: string | null;
   /** Last seq seen, or null to request a fresh snapshot. */
   getSince: () => number | null;
   onFrame: (frame: WsFrame) => void;
@@ -135,7 +138,12 @@ export class MissionSocket {
     if (token !== null) params.set('token', token);
     const query = params.toString();
     const q = query === '' ? '' : `?${query}`;
-    return `${wsOrigin}/api/missions/${encodeURIComponent(this.opts.missionId)}/ws${q}`;
+    const repoId = this.opts.repoId === undefined ? repoIdFromHash() : this.opts.repoId;
+    const path = scopedApiPath(
+      `/api/missions/${encodeURIComponent(this.opts.missionId)}/ws`,
+      repoId,
+    );
+    return `${wsOrigin}${path}${q}`;
   }
 
   private scheduleReconnect(): void {
@@ -158,7 +166,8 @@ export class MissionSocket {
     this.probing = true;
     let gone = false;
     try {
-      await getJson(`/api/missions/${encodeURIComponent(this.opts.missionId)}/state`, {
+      const repoId = this.opts.repoId === undefined ? repoIdFromHash() : this.opts.repoId;
+      await getJson(scopedApiPath(`/api/missions/${encodeURIComponent(this.opts.missionId)}/state`, repoId), {
         tokenGate: false,
       });
     } catch (err) {

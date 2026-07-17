@@ -501,7 +501,17 @@ pub fn label_home_view(mut view: Value, instance_name: Option<&str>) -> Value {
 /// whether the base ended in `/`). Pure; unit-tested.
 pub fn dashboard_deep_link(dashboard_url: &str, mission_id: &str) -> String {
     let base = dashboard_url.trim_end_matches('/');
-    format!("{base}/#/m/{mission_id}")
+    if base.contains("#/r/") {
+        format!("{base}/m/{mission_id}")
+    } else {
+        format!("{base}/#/m/{mission_id}")
+    }
+}
+
+/// Scope a dashboard base URL to one repository without changing legacy
+/// single-repository links.
+pub fn dashboard_repo_url(dashboard_url: &str, repo_id: &str) -> String {
+    format!("{}/#/r/{}", dashboard_url.trim_end_matches('/'), repo_id)
 }
 
 /// A Block Kit `actions` block carrying a single "Open in dashboard" link
@@ -2246,6 +2256,13 @@ mod tests {
         assert_eq!(
             dashboard_deep_link("http://127.0.0.1:4600/", "m-42"),
             "http://127.0.0.1:4600/#/m/m-42"
+        );
+        assert_eq!(
+            dashboard_deep_link(
+                &dashboard_repo_url("http://127.0.0.1:4600/", "alpha"),
+                "m-42"
+            ),
+            "http://127.0.0.1:4600/#/r/alpha/m/m-42"
         );
     }
 

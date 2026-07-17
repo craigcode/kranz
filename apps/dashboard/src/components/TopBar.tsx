@@ -3,6 +3,7 @@
 import { useKranzStore } from '../lib/store';
 import { fmtCost, fmtElapsed, fmtTokens, pausedMs } from '../lib/format';
 import { useNow } from '../lib/useNow';
+import { repoHash } from '../lib/routes';
 
 // KRANZ wordmark as the way back to the mission list from any mission view.
 function HomeButton() {
@@ -12,7 +13,7 @@ function HomeButton() {
       className="topbar-home mono"
       title="all missions"
       onClick={() => {
-        window.location.hash = '#/';
+        window.location.hash = repoHash();
       }}
     >
       KRANZ

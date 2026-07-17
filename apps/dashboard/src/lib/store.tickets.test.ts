@@ -91,6 +91,25 @@ describe('loadTickets', () => {
     expect(useKranzStore.getState().ticketsError).toBe('backlog unreachable');
     expect(useKranzStore.getState().tickets).toEqual([]);
   });
+
+  it('does not let a stale repository response overwrite the newly selected repo', async () => {
+    let resolveAlpha!: (rows: TicketSummary[]) => void;
+    vi.mocked(api.tickets)
+      .mockImplementationOnce(() => new Promise((resolve) => (resolveAlpha = resolve)))
+      .mockResolvedValueOnce([makeSummary('beta-ticket')]);
+
+    useKranzStore.getState().selectRepo('alpha');
+    const alphaLoad = useKranzStore.getState().loadTickets();
+    useKranzStore.getState().selectRepo('beta');
+    await useKranzStore.getState().loadTickets();
+    resolveAlpha([makeSummary('alpha-ticket')]);
+    await alphaLoad;
+
+    expect(useKranzStore.getState().repoId).toBe('beta');
+    expect(useKranzStore.getState().tickets.map((ticket) => ticket.slug)).toEqual([
+      'beta-ticket',
+    ]);
+  });
 });
 
 describe('approveTicket', () => {

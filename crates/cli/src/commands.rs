@@ -2565,6 +2565,7 @@ mod tests {
                 is_default: true,
                 status: "healthy".to_string(),
                 error: None,
+                activity: kranz_server::RepoActivity::default(),
             },
             kranz_server::RepoSummary {
                 id: "beta".to_string(),
@@ -2575,6 +2576,7 @@ mod tests {
                 is_default: false,
                 status: "healthy".to_string(),
                 error: None,
+                activity: kranz_server::RepoActivity::default(),
             },
         ];
         let error = release_repo_id_from_summaries(&repo, &summaries).unwrap_err();
@@ -2635,6 +2637,7 @@ mod tests {
             is_default: true,
             status: "healthy".to_string(),
             error: None,
+            activity: kranz_server::RepoActivity::default(),
         }];
         assert_eq!(
             release_repo_id_from_summaries(&repo, &summaries)
@@ -2660,6 +2663,7 @@ mod tests {
             is_default: false,
             status: "healthy".to_string(),
             error: None,
+            activity: kranz_server::RepoActivity::default(),
         }];
         let error = release_repo_id_from_summaries(&repo, &summaries).unwrap_err();
         assert!(error

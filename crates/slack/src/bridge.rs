@@ -295,6 +295,10 @@ impl SocketContext {
                 );
                 let mut scoped_cfg = cfg.clone();
                 scoped_cfg.allow_users = resolved.repo.allow_users.clone();
+                scoped_cfg.dashboard_url = scoped_cfg
+                    .dashboard_url
+                    .as_deref()
+                    .map(|base| crate::format::dashboard_repo_url(base, &resolved.repo.id));
                 if !resolved.channel_id.is_empty() {
                     scoped_cfg.channel = resolved.channel_id.clone();
                 }
