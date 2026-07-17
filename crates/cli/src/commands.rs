@@ -1831,13 +1831,15 @@ fn resolve_release_token(
     resolve_release_token_from_sources(repo, operator_token, allow_repo_file, flag)
 }
 
-/// Outcome of scanning `~/.kranz/serve/<endpoint>.token` for a release URL.
-/// `Ambiguous` must not fall through to the single-repo compatibility file —
-/// that would bypass the "refuse to guess" policy with a different credential.
+/// Outcome of scanning endpoint-scoped and legacy operator token files for a
+/// release URL. `Ambiguous` must not fall through to the single-repo
+/// compatibility file — that would bypass the "refuse to guess" policy with
+/// a different credential.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OperatorTokenLookup {
     Absent,
     Found(String),
+    Legacy(String),
     Ambiguous,
 }
 
@@ -1861,6 +1863,16 @@ fn resolve_release_token_from_sources(
     }
     match operator_token {
         OperatorTokenLookup::Found(token) => Ok(token),
+        // The port-only file predates endpoint scoping and may have survived
+        // an ungraceful shutdown. A live single-repo serve writes the more
+        // specific repository token, so prefer that before using the legacy
+        // compatibility credential.
+        OperatorTokenLookup::Legacy(token) => {
+            let repo_token = allow_repo_file
+                .then(|| read_token_file(&repo.join(".kranz").join("serve.token")))
+                .flatten();
+            Ok(repo_token.unwrap_or(token))
+        }
         OperatorTokenLookup::Ambiguous => Err(ReleaseTokenError::Ambiguous),
         OperatorTokenLookup::Absent => allow_repo_file
             .then(|| read_token_file(&repo.join(".kranz").join("serve.token")))
@@ -1947,7 +1959,7 @@ fn operator_token_for_url(global_config: &Path, url: &reqwest::Url) -> OperatorT
         OperatorTokenLookup::Absent => {
             // Deprecated port-only filename from before endpoint scoping.
             match read_token_file(&legacy_operator_serve_token_path(global_config, port)) {
-                Some(token) => OperatorTokenLookup::Found(token),
+                Some(token) => OperatorTokenLookup::Legacy(token),
                 None => OperatorTokenLookup::Absent,
             }
         }
@@ -2434,7 +2446,31 @@ mod tests {
 
         assert_eq!(
             operator_token_for_url(&global, &url),
-            OperatorTokenLookup::Found("legacy-token".to_string())
+            OperatorTokenLookup::Legacy("legacy-token".to_string())
+        );
+    }
+
+    #[test]
+    fn stale_legacy_operator_token_does_not_mask_live_repo_token() {
+        let _guard = KRANZ_TOKEN_ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("KRANZ_TOKEN");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        write_serve_token(&repo, "live-repo-token").unwrap();
+        let global = tmp.path().join(".kranz").join("config.json");
+        write_token_file(
+            &legacy_operator_serve_token_path(&global, 4560),
+            "stale-legacy-token",
+        )
+        .unwrap();
+        let url = reqwest::Url::parse("http://127.0.0.1:4560").unwrap();
+        let operator = operator_token_for_url(&global, &url);
+
+        assert_eq!(
+            resolve_release_token_from_sources(&repo, operator, true, None),
+            Ok("live-repo-token".to_string())
         );
     }
 

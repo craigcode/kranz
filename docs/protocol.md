@@ -108,7 +108,9 @@ repository. Automatic CLI discovery matches the URL's complete local endpoint
 and refuses host-ambiguous credentials. As a temporary compatibility fallback,
 when no endpoint-scoped file matches, discovery also accepts a legacy
 `~/.kranz/serve/<port>.token` from earlier serves (deprecated — the next
-`kranz serve` rewrite writes the endpoint-scoped name).
+`kranz serve` rewrite writes the endpoint-scoped name). A live single-repo
+`.kranz/serve.token` takes precedence over this legacy-only fallback so a
+credential left by an ungraceful older serve cannot mask the current token.
 
 ## WebSocket `GET /api/missions/:id/ws?since=<seq>`
 
