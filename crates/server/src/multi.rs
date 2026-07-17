@@ -87,16 +87,6 @@ pub fn load_host_config(path: &Path) -> Result<HostConfig> {
     Ok(global.host)
 }
 
-/// Map a local checkout root to its `host.repos` id without constructing
-/// [`MissionHost`] instances (CLI release scoping is lookup-only).
-pub fn repo_id_for_root_in_config(config: &HostConfig, root: &Path) -> Option<String> {
-    let root = canonical_or_lexical(root);
-    config
-        .repos
-        .iter()
-        .find_map(|repo| (canonical_or_lexical(&repo.root) == root).then(|| repo.id.clone()))
-}
-
 /// A resolved catalog entry. The root is fixed at startup and requests only
 /// ever resolve this entry by its validated id.
 #[derive(Clone)]
@@ -331,15 +321,6 @@ impl MultiRepoHost {
 
     pub fn resolve(&self, id: &str) -> Option<Arc<RepoContext>> {
         self.repos.get(id).cloned()
-    }
-
-    /// Resolve a local CLI `--repo` root back to its stable operator id.
-    pub fn repo_id_for_root(&self, root: &Path) -> Option<String> {
-        let root = canonical_or_lexical(root);
-        self.repos
-            .values()
-            .find(|context| context.root() == root)
-            .map(|context| context.id().to_string())
     }
 
     /// One fair auto-work scheduling pass (test + serve watcher entrypoint).
@@ -644,12 +625,11 @@ mod tests {
             init_git(root);
         }
         let catalog = MultiRepoHost::from_config(HostConfig {
-            repos: vec![repo_config("a", a.clone()), repo_config("b", b)],
+            repos: vec![repo_config("a", a), repo_config("b", b)],
             ..HostConfig::default()
         })
         .unwrap();
         assert!(catalog.compatibility_context().is_none());
-        assert_eq!(catalog.repo_id_for_root(&a).as_deref(), Some("a"));
     }
 
     #[test]
@@ -675,24 +655,6 @@ mod tests {
         drop(permit);
         assert_eq!(catalog.available_global_run_permits(), 1);
         assert!(b.host().unwrap().try_global_run_permit().unwrap().is_some());
-    }
-
-    #[test]
-    fn repo_id_for_root_in_config_matches_without_building_hosts() {
-        let temp = tempfile::tempdir().unwrap();
-        let a = temp.path().join("a");
-        let b = temp.path().join("b");
-        init_git(&a);
-        init_git(&b);
-        let config = HostConfig {
-            repos: vec![repo_config("alpha", a.clone()), repo_config("beta", b)],
-            ..HostConfig::default()
-        };
-        assert_eq!(
-            repo_id_for_root_in_config(&config, &a).as_deref(),
-            Some("alpha")
-        );
-        assert!(repo_id_for_root_in_config(&config, temp.path()).is_none());
     }
 
     fn write_auto_work_config(root: &Path, enabled: bool) {
@@ -765,6 +727,48 @@ mod tests {
 
         assert_eq!(catalog.auto_work_tick().await, 0);
         assert_eq!(catalog.auto_work_cursor(), 0);
+    }
+
+    #[tokio::test]
+    async fn auto_work_tick_skips_busy_repo_and_starts_next_ready_repo() {
+        let temp = tempfile::tempdir().unwrap();
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        for root in [&a, &b] {
+            init_git(root);
+            write_auto_work_config(root, true);
+            enqueue_placeholder(root, "m-queued");
+        }
+        let busy = kranz_engine::queue::acquire_repo_busy(&a, "m-external").unwrap();
+        let permits = Arc::new(Semaphore::new(1));
+        let backend: Arc<dyn kranz_engine::backend::AgentBackend> =
+            Arc::new(kranz_engine::backend_mock::MockBackend::new());
+        let host_a = Arc::new(MissionHost::with_backend_and_global_run_permits(
+            a,
+            Arc::clone(&backend),
+            Arc::clone(&permits),
+        ));
+        let host_b = Arc::new(MissionHost::with_backend_and_global_run_permits(
+            b,
+            backend,
+            Arc::clone(&permits),
+        ));
+        let catalog = MultiRepoHost::from_injected_hosts(
+            vec![
+                ("a".into(), Arc::clone(&host_a)),
+                ("b".into(), Arc::clone(&host_b)),
+            ],
+            1,
+            permits,
+        );
+
+        assert_eq!(catalog.auto_work_tick().await, 1);
+        assert!(!host_a.drain_is_live());
+        assert!(host_b.drain_is_live());
+        assert_eq!(catalog.auto_work_cursor(), 0);
+
+        wait_for_idle_drain(&host_b).await;
+        drop(busy);
     }
 
     #[tokio::test]

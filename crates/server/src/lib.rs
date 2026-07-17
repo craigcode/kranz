@@ -23,8 +23,8 @@ mod ws;
 pub use error::ApiError;
 pub use host::MissionHost;
 pub use multi::{
-    load_host_config, repo_id_for_root_in_config, HostConfig, MultiRepoHost, RepoConfig,
-    RepoContext, RepoSlackConfig, RepoSummary, SlackChannelRoute,
+    load_host_config, HostConfig, MultiRepoHost, RepoConfig, RepoContext, RepoSlackConfig,
+    RepoSummary, SlackChannelRoute,
 };
 
 use axum::body::Body;

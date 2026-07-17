@@ -302,10 +302,10 @@ pub enum Command {
 
     /// Free the mission's single-writer lock held by a running `kranz serve`.
     ///
-    /// POSTs to a running serve's repository-scoped release endpoint (or the
-    /// single-repo migration alias when no operator catalog is configured; the
-    /// CLI runs in a different process and cannot reach serve's in-memory
-    /// registry directly). The mission id comes from the global --mission /
+    /// Resolves the selected root against the running serve's live catalog,
+    /// then POSTs to its repository-scoped release endpoint. The CLI runs in
+    /// a different process and cannot reach serve's in-memory registry
+    /// directly. The mission id comes from the global --mission /
     /// auto-selection, same as `kranz abandon`.
     Release {
         /// Base URL of the running `kranz serve` instance

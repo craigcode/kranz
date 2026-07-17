@@ -1941,7 +1941,7 @@ async fn cmd_release(
     })?;
 
     let client = reqwest::Client::new();
-    let repo_id = resolve_release_repo_id(repo, url, &client).await?;
+    let repo_id = resolve_release_repo_id(repo, url, &client, &token).await?;
     let endpoint = release_endpoint(url, mission_id, repo_id.as_deref());
 
     let response = client
@@ -1995,28 +1995,17 @@ async fn cmd_release(
     }
 }
 
-/// Prefer the local operator catalog when present; otherwise ask the live
-/// serve which repository the selected root maps to. An empty local catalog
-/// is never treated as proof the serve is single-repo.
+/// Ask the target serve which repository the selected root maps to. The
+/// process-global config may have changed since that serve started, or the
+/// URL may name a different process entirely, so it is never authoritative
+/// for a mutation target.
 async fn resolve_release_repo_id(
     repo: &Path,
     url: &str,
     client: &reqwest::Client,
+    token: &str,
 ) -> Result<Option<String>> {
-    if let Some(global_config) = kranz_engine::paths::global_config() {
-        let config = kranz_server::load_host_config(&global_config)?;
-        if !config.repos.is_empty() {
-            return kranz_server::repo_id_for_root_in_config(&config, repo)
-                .map(Some)
-                .ok_or_else(|| {
-                    anyhow!(
-                        "selected repository '{}' is not present in host.repos; refusing an unscoped release",
-                        repo.display()
-                    )
-                });
-        }
-    }
-    live_release_repo_id(repo, url, client).await
+    live_release_repo_id(repo, url, client, token).await
 }
 
 fn release_repo_id_from_summaries(
@@ -2024,7 +2013,7 @@ fn release_repo_id_from_summaries(
     repos: &[kranz_server::RepoSummary],
 ) -> Result<Option<String>> {
     if repos.is_empty() {
-        return Ok(None);
+        bail!("the live serve returned an empty repository catalog; refusing an unscoped release");
     }
     let root = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
     let root_str = root.to_string_lossy();
@@ -2054,10 +2043,12 @@ async fn live_release_repo_id(
     repo: &Path,
     url: &str,
     client: &reqwest::Client,
+    token: &str,
 ) -> Result<Option<String>> {
     let base = url.trim_end_matches('/');
     let response = client
         .get(format!("{base}/api/repos"))
+        .header("x-kranz-token", token)
         .send()
         .await
         .map_err(|e| {
@@ -2388,6 +2379,52 @@ mod tests {
         assert!(error
             .to_string()
             .contains("not present in the live serve catalog"));
+    }
+
+    #[test]
+    fn release_repo_id_from_summaries_refuses_empty_catalog() {
+        let tmp = tempfile::tempdir().unwrap();
+        let error = release_repo_id_from_summaries(tmp.path(), &[]).unwrap_err();
+        assert!(error.to_string().contains("empty repository catalog"));
+    }
+
+    #[tokio::test]
+    async fn live_release_repo_lookup_authenticates_protected_catalog() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let catalog = Arc::new(kranz_server::MultiRepoHost::single(repo.clone()).unwrap());
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = kranz_server::router_with_multi_repo_host_and_addr(
+            catalog,
+            None,
+            Some("catalog-token".to_string()),
+            Some(address),
+            true,
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+        let url = format!("http://{address}");
+
+        let repo_id = live_release_repo_id(&repo, &url, &client, "catalog-token")
+            .await
+            .unwrap();
+
+        server.abort();
+        let _ = server.await;
+        assert_eq!(repo_id.as_deref(), Some("repo"));
     }
 
     #[test]

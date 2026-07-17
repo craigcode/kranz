@@ -79,9 +79,6 @@ enum HostedMission {
     Running {
         handle: tokio::task::JoinHandle<()>,
         _repo_busy: kranz_engine::queue::RepoBusyHold,
-        /// Process-wide multi-repository execution permit. `None` preserves
-        /// the historical standalone [`MissionHost`] behavior.
-        _global_run_permit: Option<OwnedSemaphorePermit>,
     },
 }
 
@@ -520,25 +517,17 @@ impl MissionHost {
             let mut map = self.missions.lock().expect("missions registry lock");
             match map.remove(id) {
                 None => None,
-                Some(HostedMission::Running {
-                    handle,
-                    _repo_busy,
-                    _global_run_permit,
-                }) => {
+                Some(HostedMission::Running { handle, _repo_busy }) => {
                     if handle.is_finished() {
                         // The task ended but its cleanup lost the race with
                         // this request: treat as not hosted (resume below).
                         // Drop the busy hold so a resume can re-acquire.
-                        drop((_repo_busy, _global_run_permit));
+                        drop(_repo_busy);
                         None
                     } else {
                         map.insert(
                             id.to_string(),
-                            HostedMission::Running {
-                                handle,
-                                _repo_busy,
-                                _global_run_permit,
-                            },
+                            HostedMission::Running { handle, _repo_busy },
                         );
                         return Err(ApiError::conflict(format!(
                             "mission '{id}' is already running — observe it via GET \
@@ -663,13 +652,15 @@ impl MissionHost {
             let mut map = self.missions.lock().expect("missions registry lock");
             let missions = Arc::clone(&self.missions);
             let mission_id = id.to_string();
-            let handle = tokio::spawn(run_to_end(engine, mission_id, missions));
+            let handle = spawn_with_global_run_permit(
+                global_run_permit,
+                run_to_end(engine, mission_id, missions),
+            );
             map.insert(
                 id.to_string(),
                 HostedMission::Running {
                     handle,
                     _repo_busy: repo_busy,
-                    _global_run_permit: global_run_permit,
                 },
             );
         }
@@ -915,7 +906,14 @@ impl MissionHost {
         };
         let queue_non_empty = kranz_engine::queue::peek(&self.repo_root).is_some();
         if should_auto_drain(cfg.auto_work, queue_non_empty, self.drain_is_live()) {
-            match self.drain().await {
+            // A sibling dispatcher already owns this repository. Skip it
+            // before taking a process-wide permit so the catalog scheduler
+            // can try another ready root in this same pass. `drain_once`
+            // also stops on busy if ownership races this check.
+            if kranz_engine::queue::is_repo_busy(&self.repo_root).is_some() {
+                return false;
+            }
+            match self.drain_once().await {
                 Ok(_) => return true,
                 Err(e)
                     if e.message
@@ -963,11 +961,7 @@ impl MissionHost {
                     return Err(turn_in_flight());
                 }
             },
-            Some(HostedMission::Running {
-                handle,
-                _repo_busy,
-                _global_run_permit,
-            }) => {
+            Some(HostedMission::Running { handle, _repo_busy }) => {
                 if !handle.is_finished() {
                     handle.abort();
                 }
@@ -976,7 +970,7 @@ impl MissionHost {
                 // append the abandon event. Dropping `_repo_busy` releases the
                 // repo-wide busy lock.
                 let _ = handle.await;
-                drop((_repo_busy, _global_run_permit));
+                drop(_repo_busy);
             }
         }
         kranz_engine::orchestrator::abandon_mission(
@@ -1115,6 +1109,16 @@ impl MissionHost {
     /// drain task has not finished returns THAT drain's current state
     /// instead of spawning a second one.
     pub async fn drain(&self) -> Result<Value, ApiError> {
+        self.drain_with_mode(false).await
+    }
+
+    /// Auto-work drains at most one queue front so the process-wide scheduler
+    /// can rotate fairly to another ready repository after this mission.
+    async fn drain_once(&self) -> Result<Value, ApiError> {
+        self.drain_with_mode(true).await
+    }
+
+    async fn drain_with_mode(&self, once: bool) -> Result<Value, ApiError> {
         // Fast path: a live drain already owns the slot.
         {
             let guard = self.drain.lock().expect("drain tracker lock");
@@ -1174,7 +1178,7 @@ impl MissionHost {
         let task_state = Arc::clone(&state);
         let join = tokio::spawn(async move {
             let _global_run_permit = global_run_permit;
-            drain_task(repo_root.clone(), task_state, move |mission_id| {
+            drain_task(repo_root.clone(), task_state, once, move |mission_id| {
                 let backend = Arc::clone(&backend);
                 let repo_root = repo_root.clone();
                 async move { run_mission_headless(backend, repo_root, mission_id).await }
@@ -1359,6 +1363,21 @@ impl MissionHost {
 /// drop the engine FIRST (flushes the log, releases the single-writer lock),
 /// THEN remove the registry entry — from that moment the mission is
 /// observable and resumable anywhere (server or CLI).
+fn spawn_with_global_run_permit<F>(
+    global_run_permit: Option<OwnedSemaphorePermit>,
+    task: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        // Task ownership is deliberate: abort and panic both drop the permit
+        // even when registry cleanup inside the future never runs.
+        let _global_run_permit = global_run_permit;
+        task.await;
+    })
+}
+
 async fn run_to_end(
     mut engine: Box<MissionEngine>,
     mission_id: String,
@@ -1548,14 +1567,19 @@ fn truncate(text: &str, max: usize) -> String {
 /// dispatcher's `restore_work_checkout` (`crates/cli/src/backlog.rs`), so a
 /// hosted drain can never leave the repo stranded on a
 /// `kranz/mission-*` branch.
-async fn drain_task<R, Fut>(repo_root: PathBuf, state: Arc<Mutex<DrainState>>, run_mission: R)
-where
+async fn drain_task<R, Fut>(
+    repo_root: PathBuf,
+    state: Arc<Mutex<DrainState>>,
+    once: bool,
+    run_mission: R,
+) where
     R: Fn(String) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<i32>>,
 {
     drain_task_with_probe(
         repo_root,
         state,
+        once,
         run_mission,
         kranz_engine::backend_readiness::probe_mission,
     )
@@ -1568,6 +1592,7 @@ where
 async fn drain_task_with_probe<R, Fut, P>(
     repo_root: PathBuf,
     state: Arc<Mutex<DrainState>>,
+    once: bool,
     run_mission: R,
     readiness_probe: P,
 ) where
@@ -1586,7 +1611,7 @@ async fn drain_task_with_probe<R, Fut, P>(
 
     let result = kranz_engine::work::drain_queue_with_probe(
         &repo_root,
-        false,
+        once,
         |mission_id| {
             let state = Arc::clone(&state);
             let fut = run_mission(mission_id.clone());
@@ -1770,20 +1795,12 @@ fn release_from(
     let mut map = missions.lock().expect("missions registry lock");
     match map.remove(id) {
         None => Ok(true),
-        Some(HostedMission::Running {
-            handle,
-            _repo_busy,
-            _global_run_permit,
-        }) => {
+        Some(HostedMission::Running { handle, _repo_busy }) => {
             let finished = handle.is_finished();
             if !finished {
                 map.insert(
                     id.to_string(),
-                    HostedMission::Running {
-                        handle,
-                        _repo_busy,
-                        _global_run_permit,
-                    },
+                    HostedMission::Running { handle, _repo_busy },
                 );
             }
             Ok(finished)
@@ -2309,6 +2326,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn global_run_permit_is_released_when_hosted_task_panics() {
+        let permits = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&permits).try_acquire_owned().unwrap();
+        assert_eq!(permits.available_permits(), 0);
+
+        let handle = spawn_with_global_run_permit(Some(permit), async {
+            panic!("simulated hosted-run panic");
+        });
+        assert!(handle.await.unwrap_err().is_panic());
+
+        assert_eq!(permits.available_permits(), 1);
+    }
+
+    #[tokio::test]
     async fn sweep_idle_leaves_a_mid_turn_mission_hosted() {
         let Some((_dir, root)) = init_repo() else {
             return;
@@ -2634,6 +2665,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auto_work_drain_mode_processes_only_one_queue_front() {
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
+        let state = seed_one_queued(&root, "m-first");
+        kranz_engine::queue::enqueue(
+            &root,
+            kranz_engine::queue::QueueEntry {
+                mission_id: "m-second".to_string(),
+                ticket_slug: None,
+                priority: 5,
+                seq: 0,
+            },
+        )
+        .expect("enqueue second mission");
+
+        drain_task_with_probe(
+            root.clone(),
+            Arc::clone(&state),
+            true,
+            |_mission_id| async { Ok(0) },
+            proceed_readiness,
+        )
+        .await;
+
+        assert_eq!(state.lock().expect("drain state lock").ran, ["m-first"]);
+        let remaining = kranz_engine::queue::list(&root);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].mission_id, "m-second");
+    }
+
+    #[tokio::test]
     async fn hosted_drain_restores_dispatch_checkout() {
         let Some((_dir, root)) = init_repo() else {
             return;
@@ -2644,6 +2707,7 @@ mod tests {
         drain_task_with_probe(
             root.clone(),
             Arc::clone(&state),
+            false,
             move |mission_id| {
                 let root = run_root.clone();
                 async move {
@@ -2685,6 +2749,7 @@ mod tests {
         drain_task_with_probe(
             root.clone(),
             state,
+            false,
             move |mission_id| {
                 let root = run_root.clone();
                 let called = Arc::clone(&called);
@@ -2731,6 +2796,7 @@ mod tests {
         drain_task_with_probe(
             root.clone(),
             Arc::clone(&state),
+            false,
             |_mission_id| async { Ok(0) },
             proceed_readiness,
         )
@@ -2761,6 +2827,7 @@ mod tests {
         drain_task_with_probe(
             root.clone(),
             Arc::clone(&state),
+            false,
             move |mission_id| {
                 let root = run_root.clone();
                 async move {
