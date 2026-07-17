@@ -8,30 +8,40 @@ export type Route =
   | { view: 'mission'; repoId: string | null; id: string }
   | { view: 'ticket'; repoId: string | null; slug: string };
 
+function decodeSegment(raw: string): string {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    // A manually edited or truncated hash must not take down Mission Control.
+    // Keep the literal bytes; the scoped API will return an ordinary 404.
+    return raw;
+  }
+}
+
 function parseRepoRoute(repoId: string, rest: string): Route {
   if (rest === '' || rest === '/') return { view: 'pipeline', repoId };
   if (rest === '/new') return { view: 'new', repoId };
   if (rest === '/new-ticket') return { view: 'new-ticket', repoId };
   if (rest === '/backlog') return { view: 'pipeline', repoId, lens: 'backlog' };
   const mission = /^\/m\/(.+)$/.exec(rest);
-  if (mission) return { view: 'mission', repoId, id: decodeURIComponent(mission[1]) };
+  if (mission) return { view: 'mission', repoId, id: decodeSegment(mission[1]) };
   const ticket = /^\/backlog\/(.+)$/.exec(rest);
-  if (ticket) return { view: 'ticket', repoId, slug: decodeURIComponent(ticket[1]) };
+  if (ticket) return { view: 'ticket', repoId, slug: decodeSegment(ticket[1]) };
   return { view: 'pipeline', repoId };
 }
 
 export function parseHash(hash = window.location.hash): Route {
   const scoped = /^#\/r\/([^/]+)(.*)$/.exec(hash);
-  if (scoped) return parseRepoRoute(decodeURIComponent(scoped[1]), scoped[2]);
+  if (scoped) return parseRepoRoute(decodeSegment(scoped[1]), scoped[2]);
 
   // Historical unscoped routes remain usable against a single/default repo.
   if (hash === '#/new') return { view: 'new', repoId: null };
   if (hash === '#/new-ticket') return { view: 'new-ticket', repoId: null };
   const mission = /^#\/m\/(.+)$/.exec(hash);
-  if (mission) return { view: 'mission', repoId: null, id: decodeURIComponent(mission[1]) };
+  if (mission) return { view: 'mission', repoId: null, id: decodeSegment(mission[1]) };
   if (hash === '#/backlog') return { view: 'pipeline', repoId: null, lens: 'backlog' };
   const ticket = /^#\/backlog\/(.+)$/.exec(hash);
-  if (ticket) return { view: 'ticket', repoId: null, slug: decodeURIComponent(ticket[1]) };
+  if (ticket) return { view: 'ticket', repoId: null, slug: decodeSegment(ticket[1]) };
   if (hash !== '' && hash !== '#/' && hash !== '#') return { view: 'pipeline', repoId: null };
   return { view: 'projects', repoId: null };
 }

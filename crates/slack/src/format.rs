@@ -511,7 +511,11 @@ pub fn dashboard_deep_link(dashboard_url: &str, mission_id: &str) -> String {
 /// Scope a dashboard base URL to one repository without changing legacy
 /// single-repository links.
 pub fn dashboard_repo_url(dashboard_url: &str, repo_id: &str) -> String {
-    format!("{}/#/r/{}", dashboard_url.trim_end_matches('/'), repo_id)
+    let base = dashboard_url
+        .split_once('#')
+        .map_or(dashboard_url, |(base, _)| base)
+        .trim_end_matches('/');
+    format!("{base}/#/r/{repo_id}")
 }
 
 /// A Block Kit `actions` block carrying a single "Open in dashboard" link
@@ -2263,6 +2267,10 @@ mod tests {
                 "m-42"
             ),
             "http://127.0.0.1:4600/#/r/alpha/m/m-42"
+        );
+        assert_eq!(
+            dashboard_repo_url("http://127.0.0.1:4600/#/r/stale", "alpha"),
+            "http://127.0.0.1:4600/#/r/alpha"
         );
     }
 

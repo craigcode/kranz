@@ -200,7 +200,14 @@ pub fn router_with_multi_repo_host_and_addr(
         "/api/repos",
         get(move || {
             let catalog = Arc::clone(&catalog);
-            async move { Json(catalog.summaries()) }
+            async move {
+                let summaries = tokio::task::spawn_blocking(move || catalog.summaries())
+                    .await
+                    .map_err(|error| {
+                        ApiError::internal(format!("repository summary task failed: {error}"))
+                    })?;
+                Ok::<_, ApiError>(Json(summaries))
+            }
         }),
     );
 

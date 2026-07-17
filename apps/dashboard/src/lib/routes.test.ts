@@ -21,4 +21,12 @@ describe('multi-repository dashboard routes', () => {
     expect(parseHash('#/m/m-1')).toEqual({ view: 'mission', repoId: null, id: 'm-1' });
     expect(parseHash('#/backlog')).toEqual({ view: 'pipeline', repoId: null, lens: 'backlog' });
   });
+
+  it('keeps a malformed manually edited hash from crashing the dashboard', () => {
+    expect(parseHash('#/r/%/m/%E0%A4%A')).toEqual({
+      view: 'mission',
+      repoId: '%',
+      id: '%E0%A4%A',
+    });
+  });
 });
