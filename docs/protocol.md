@@ -81,7 +81,7 @@ started — the event log is the source of truth).
 | `POST /api/missions/:id/delete` | optional body `{"all":true}` → removes a TERMINAL mission's directory, mirroring `kranz clean`: Failed/Abandoned (and planning husks) delete by default; Complete needs `"all":true` (completed missions feed the cost-calibration corpus); live missions and live locks → `409`. POST (not the DELETE verb) so the mutation-token gate applies by construction → `200 {"deleted":true}` |
 | `POST /api/missions/:id/release` | un-hosts an idle in-planning mission: drops the engine from the registry and frees its single-writer lock so an external runner (a terminal `kranz plan`, `kranz work`) can take over → `200 {"released":true}`. `409` while a planning turn is in flight (the web never force-steals). `404` for an unknown mission. POST so the mutation-token gate applies by construction; idempotent — calling it on a mission that is not currently hosted still returns `200 {"released":true}`. Prefer the repo-scoped form `POST /api/repos/:repoId/missions/:id/release`; `kranz release` authenticates `GET /api/repos`, maps the selected root against that live catalog, and refuses an unmatched/empty catalog before posting. The unscoped path remains a migration alias only |
 | `POST /api/queue/drain` | runs the queue's drain/claim/skip loop (`kranz_engine::work::drain_queue`) as a background task on the serve process — just ANOTHER dispatcher, arbitrating against an external `kranz work` process through the queue claim files and the events.jsonl single-writer lock exactly as today (no new locking) → `200 {"live":bool,"currentMissionId":string|null,"ran":[string],"parked":[string]}`. IDEMPOTENT while a drain is live: a second call while the tracked drain task has not finished returns that live drain's current state instead of spawning a second one. An empty queue settles `live:false` quickly. `409` when a multi-repository serve's `host.maxConcurrentRepos` budget is saturated. Gated by the mutation token like every other POST |
-| `GET /api/queue` | the queue front-to-back, who (if anyone) currently holds the busy lock, and this host's own drain tracker → `200 {"entries":[{"missionId","ticketSlug"?,"priority","seq","readiness"?}],"busyWith":string|null,"drain":{"live":bool,"currentMissionId":string|null,"ran":[string],"parked":[string]}}`. Each entry's `readiness` is the same shape as `GET /api/missions/:id/readiness` (best-effort; omitted when the probe fails). Tokenless — read-only |
+| `GET /api/queue` | the queue front-to-back, who (if anyone) currently holds the busy lock, and this host's own drain tracker → `200 {"entries":[{"missionId","ticketSlug"?,"priority","seq","readiness"?}],"busyWith":string|null,"drain":{"live":bool,"currentMissionId":string|null,"ran":[string],"parked":[string]},"maxConcurrentReposAvailable"?,"maxConcurrentReposSaturated"?}`. Each entry's `readiness` is the same shape as `GET /api/missions/:id/readiness` (best-effort; omitted when the probe fails). The optional `maxConcurrentRepos*` fields appear only when the host participates in a multi-repository `host.maxConcurrentRepos` budget — agents use `maxConcurrentReposSaturated:true` to distinguish "queue empty / autoWork idle" from "global cap blocking drains". Tokenless — read-only |
 
 Hosted-engine rules: planning endpoints serialize per mission (one turn at a
 time) and lazily ATTACH an on-disk in-planning mission into the registry
@@ -105,7 +105,10 @@ money. Single-repo compatibility stores it at `<repo>/.kranz/serve.token`;
 an operator-catalog serve stores the one process token at
 `~/.kranz/serve/<bound-endpoint>.token` with mode `0600`, never in every hosted
 repository. Automatic CLI discovery matches the URL's complete local endpoint
-and refuses host-ambiguous credentials.
+and refuses host-ambiguous credentials. As a temporary compatibility fallback,
+when no endpoint-scoped file matches, discovery also accepts a legacy
+`~/.kranz/serve/<port>.token` from earlier serves (deprecated — the next
+`kranz serve` rewrite writes the endpoint-scoped name).
 
 ## WebSocket `GET /api/missions/:id/ws?since=<seq>`
 

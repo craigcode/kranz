@@ -359,9 +359,6 @@ impl MultiRepoHost {
     /// that repository, while the shared semaphore enforces the configured
     /// concurrency bound for the complete drain lifetime.
     async fn auto_work_tick_inner(&self) -> usize {
-        if self.global_run_permits.available_permits() == 0 {
-            return 0;
-        }
         let contexts: Vec<_> = self.healthy_contexts().collect();
         if contexts.is_empty() {
             return 0;
@@ -369,10 +366,10 @@ impl MultiRepoHost {
         let start = *self.auto_work_cursor.lock().expect("auto-work cursor lock") % contexts.len();
         let mut started = 0;
         let mut last_started = None;
+        // Do not pre-check `available_permits()` — that races HTTP start/drain
+        // and can skip a fair rotation pass. Each host's try_acquire inside
+        // start/drain is the authoritative saturation gate (returns false).
         for offset in 0..contexts.len() {
-            if self.global_run_permits.available_permits() == 0 {
-                break;
-            }
             let index = (start + offset) % contexts.len();
             if let Some(host) = contexts[index].host() {
                 if host.auto_work_tick().await {
@@ -404,8 +401,8 @@ impl MultiRepoHost {
         }));
     }
 
-    #[cfg(test)]
-    fn available_global_run_permits(&self) -> usize {
+    /// Remaining process-wide run slots under `host.maxConcurrentRepos`.
+    pub fn available_global_run_permits(&self) -> usize {
         self.global_run_permits.available_permits()
     }
 

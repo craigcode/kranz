@@ -1258,11 +1258,20 @@ impl MissionHost {
                 })
             })
             .collect();
-        json!({
+        let mut state = json!({
             "entries": entries_json,
             "busyWith": busy_with,
             "drain": drain,
-        })
+        });
+        // Additive observation for automation: when this host participates in
+        // host.maxConcurrentRepos, surface whether the process-wide budget is
+        // currently exhausted so agents can distinguish "no work" from "capped".
+        if let Some(permits) = &self.global_run_permits {
+            let available = permits.available_permits();
+            state["maxConcurrentReposAvailable"] = json!(available);
+            state["maxConcurrentReposSaturated"] = json!(available == 0);
+        }
+        state
     }
 
     // -----------------------------------------------------------------------
@@ -2530,6 +2539,26 @@ mod tests {
             &*host.drain.lock().expect("drain tracker lock"),
             DrainSlot::Idle
         ));
+    }
+
+    #[tokio::test]
+    async fn queue_state_reports_global_concurrency_saturation() {
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
+        let permits = Arc::new(Semaphore::new(1));
+        let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+        let mut host = MissionHost::with_backend(root, backend);
+        host.global_run_permits = Some(Arc::clone(&permits));
+
+        let open = host.queue_state();
+        assert_eq!(open["maxConcurrentReposAvailable"], 1);
+        assert_eq!(open["maxConcurrentReposSaturated"], false);
+
+        let _hold = permits.try_acquire_owned().unwrap();
+        let saturated = host.queue_state();
+        assert_eq!(saturated["maxConcurrentReposAvailable"], 0);
+        assert_eq!(saturated["maxConcurrentReposSaturated"], true);
     }
 
     #[tokio::test]

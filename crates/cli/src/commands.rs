@@ -1560,6 +1560,17 @@ fn operator_serve_token_path(global_config: &Path, address: std::net::SocketAddr
         .join(format!("{endpoint}.token"))
 }
 
+/// Pre-endpoint migration path: `~/.kranz/serve/<port>.token`. Kept as a
+/// last-resort discovery fallback so a live serve that still has only the
+/// legacy file remains usable until the next `kranz serve` rewrite.
+fn legacy_operator_serve_token_path(global_config: &Path, port: u16) -> PathBuf {
+    global_config
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("serve")
+        .join(format!("{port}.token"))
+}
+
 fn write_token_file(path: &Path, token: &str) -> std::io::Result<PathBuf> {
     let dir = path.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "token path has no parent")
@@ -1889,45 +1900,59 @@ fn operator_token_for_url(global_config: &Path, url: &reqwest::Url) -> OperatorT
     // Exact named endpoints first; only if none match, fall back to
     // unspecified-bind aliases. That keeps a live 127.0.0.1 token usable
     // even when a stale 0.0.0.0 file from an earlier bind remains on disk.
-    if host.eq_ignore_ascii_case("localhost") {
+    let endpoint_lookup = if host.eq_ignore_ascii_case("localhost") {
         let primary = [
             std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
             std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port)),
         ];
         match scan_operator_token_addresses(global_config, &primary) {
-            OperatorTokenLookup::Absent => {}
-            other => return other,
+            OperatorTokenLookup::Absent => scan_operator_token_addresses(
+                global_config,
+                &[
+                    std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port)),
+                    std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)),
+                ],
+            ),
+            other => other,
         }
-        return scan_operator_token_addresses(
-            global_config,
-            &[
-                std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port)),
-                std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)),
-            ],
-        );
-    }
-
-    let Ok(ip) = host.parse::<std::net::IpAddr>() else {
-        return OperatorTokenLookup::Absent;
+    } else {
+        let Ok(ip) = host.parse::<std::net::IpAddr>() else {
+            return OperatorTokenLookup::Absent;
+        };
+        // Automatic discovery is loopback-only — same trust boundary as
+        // automatic_repo_token_allowed. Non-loopback URLs require --token.
+        if !ip.is_loopback() {
+            return OperatorTokenLookup::Absent;
+        }
+        let primary = [std::net::SocketAddr::new(ip, port)];
+        match scan_operator_token_addresses(global_config, &primary) {
+            OperatorTokenLookup::Absent => {
+                let unspecified = match ip {
+                    std::net::IpAddr::V4(_) => {
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+                    }
+                    std::net::IpAddr::V6(_) => {
+                        std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+                    }
+                };
+                scan_operator_token_addresses(
+                    global_config,
+                    &[std::net::SocketAddr::new(unspecified, port)],
+                )
+            }
+            other => other,
+        }
     };
-    // Automatic discovery is loopback-only — same trust boundary as
-    // automatic_repo_token_allowed. Non-loopback URLs require --token.
-    if !ip.is_loopback() {
-        return OperatorTokenLookup::Absent;
+    match endpoint_lookup {
+        OperatorTokenLookup::Absent => {
+            // Deprecated port-only filename from before endpoint scoping.
+            match read_token_file(&legacy_operator_serve_token_path(global_config, port)) {
+                Some(token) => OperatorTokenLookup::Found(token),
+                None => OperatorTokenLookup::Absent,
+            }
+        }
+        other => other,
     }
-    let primary = [std::net::SocketAddr::new(ip, port)];
-    match scan_operator_token_addresses(global_config, &primary) {
-        OperatorTokenLookup::Absent => {}
-        other => return other,
-    }
-    let unspecified = match ip {
-        std::net::IpAddr::V4(_) => std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-        std::net::IpAddr::V6(_) => std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
-    };
-    scan_operator_token_addresses(
-        global_config,
-        &[std::net::SocketAddr::new(unspecified, port)],
-    )
 }
 
 fn automatic_repo_token_allowed(url: &reqwest::Url) -> bool {
@@ -2394,6 +2419,78 @@ mod tests {
             operator_token_for_url(&global, &url),
             OperatorTokenLookup::Found("live-token".to_string())
         );
+    }
+
+    #[test]
+    fn operator_token_discovery_falls_back_to_legacy_port_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join(".kranz").join("config.json");
+        write_token_file(
+            &legacy_operator_serve_token_path(&global, 4560),
+            "legacy-token",
+        )
+        .unwrap();
+        let url = reqwest::Url::parse("http://127.0.0.1:4560").unwrap();
+
+        assert_eq!(
+            operator_token_for_url(&global, &url),
+            OperatorTokenLookup::Found("legacy-token".to_string())
+        );
+    }
+
+    #[test]
+    fn operator_token_discovery_prefers_endpoint_file_over_legacy_port_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join(".kranz").join("config.json");
+        let loopback = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 4560));
+        write_token_file(
+            &operator_serve_token_path(&global, loopback),
+            "endpoint-token",
+        )
+        .unwrap();
+        write_token_file(
+            &legacy_operator_serve_token_path(&global, 4560),
+            "legacy-token",
+        )
+        .unwrap();
+        let url = reqwest::Url::parse("http://127.0.0.1:4560").unwrap();
+
+        assert_eq!(
+            operator_token_for_url(&global, &url),
+            OperatorTokenLookup::Found("endpoint-token".to_string())
+        );
+    }
+
+    #[test]
+    fn release_repo_id_from_summaries_refuses_duplicate_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let root = repo.to_string_lossy().into_owned();
+        let summaries = vec![
+            kranz_server::RepoSummary {
+                id: "alpha".to_string(),
+                root: root.clone(),
+                display_name: "alpha".to_string(),
+                group: None,
+                pinned: false,
+                is_default: true,
+                status: "healthy".to_string(),
+                error: None,
+            },
+            kranz_server::RepoSummary {
+                id: "beta".to_string(),
+                root,
+                display_name: "beta".to_string(),
+                group: None,
+                pinned: false,
+                is_default: false,
+                status: "healthy".to_string(),
+                error: None,
+            },
+        ];
+        let error = release_repo_id_from_summaries(&repo, &summaries).unwrap_err();
+        assert!(error.to_string().contains("matches multiple"));
     }
 
     #[test]
