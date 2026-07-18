@@ -294,7 +294,10 @@ impl SocketContext {
                     &resolved.channel_id,
                 );
                 let mut scoped_cfg = cfg.clone();
-                scoped_cfg.allow_users = resolved.repo.allow_users.clone();
+                scoped_cfg.allow_users = SlackConfig::merge_repo_allow_users(
+                    &cfg.allow_users,
+                    &resolved.repo.allow_users,
+                );
                 scoped_cfg.dashboard_url = scoped_cfg
                     .dashboard_url
                     .as_deref()

@@ -140,7 +140,8 @@ pub async fn serve_slack_catalog(
         let route = repo.primary_route().expect("filtered above");
         let mut cfg = base_cfg.clone();
         cfg.channel = route.channel_id.clone();
-        cfg.allow_users = repo.allow_users.clone();
+        cfg.allow_users =
+            SlackConfig::merge_repo_allow_users(&base_cfg.allow_users, &repo.allow_users);
         cfg.dashboard_url = cfg
             .dashboard_url
             .as_deref()
