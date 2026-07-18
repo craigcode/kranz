@@ -413,7 +413,15 @@ fn prepare_registration(
         }
         repos.push(Value::Object(entry));
     }
-    if !host.contains_key("defaultRepo") || host.get("defaultRepo") == Some(&Value::Null) {
+    // Elect a default only when this repository is the catalog's sole entry.
+    // An established multi-repo catalog with no defaultRepo is a deliberate
+    // state — the serve refuses to guess a target for unscoped routes — and
+    // registering one more repo must not silently retarget that refusal onto
+    // the newcomer.
+    let sole_entry = repos.len() == 1;
+    if sole_entry
+        && (!host.contains_key("defaultRepo") || host.get("defaultRepo") == Some(&Value::Null))
+    {
         host.insert("defaultRepo".into(), json!(id));
     }
 
@@ -636,6 +644,45 @@ mod tests {
             value["host"]["repos"][0]["root"],
             canonical_or_lexical(&root).to_string_lossy().as_ref()
         );
+        // The catalog's sole entry is elected default — single-repo catalogs
+        // keep the unscoped compatibility routes without extra configuration.
+        assert_eq!(value["host"]["defaultRepo"], "catalog-app");
+    }
+
+    #[test]
+    fn kranz_init_registration_never_elects_a_default_for_established_catalogs() {
+        let (parent, root) = repo("second-app");
+        fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+        let existing = parent.path().join("existing");
+        fs::create_dir_all(&existing).unwrap();
+        let global = parent.path().join("home/.kranz/config.json");
+        fs::create_dir_all(global.parent().unwrap()).unwrap();
+        // Hand-authored catalog: one repo, deliberately no defaultRepo. The
+        // serve treats that as "refuse to guess" for unscoped routes;
+        // registering a newcomer must preserve the refusal, not adopt the
+        // newest repo as everyone's default.
+        fs::write(
+            &global,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "host": { "repos": [{ "id": "existing", "root": existing }] }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let options = InitOptions {
+            registration: Some(Registration {
+                id: Some("second-app".into()),
+                display_name: None,
+            }),
+            global_config: Some(global.clone()),
+            ..InitOptions::default()
+        };
+
+        initialize(&root, &options).unwrap();
+
+        let value: Value = serde_json::from_slice(&fs::read(&global).unwrap()).unwrap();
+        assert_eq!(value["host"]["repos"].as_array().unwrap().len(), 2);
+        assert!(value["host"].get("defaultRepo").is_none());
     }
 
     #[test]
