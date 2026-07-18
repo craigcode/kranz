@@ -2222,13 +2222,26 @@ async fn live_release_repo_id(
     if !loopback_catalog {
         request = request.header("x-kranz-token", token);
     }
-    let response = request.send().await.map_err(|e| {
+    let send_error = |e: reqwest::Error| {
         if e.is_connect() {
             anyhow!("no kranz serve reachable at {url} — is it running?")
         } else {
             anyhow::Error::new(e).context("listing live serve repositories")
         }
-    })?;
+    };
+    let mut response = request.send().await.map_err(send_error)?;
+    // A loopback URL does not imply a loopback bind: `serve --host 0.0.0.0`
+    // gates reads even when reached via 127.0.0.1. Only once the tokenless
+    // read is refused is the token proven necessary — resend it then, to the
+    // very server that just demanded it.
+    if loopback_catalog && response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        response = client
+            .get(format!("{base}/api/repos"))
+            .header("x-kranz-token", token)
+            .send()
+            .await
+            .map_err(send_error)?;
+    }
     if !response.status().is_success() {
         bail!(
             "cannot list repositories at {url}: HTTP {}",
@@ -2717,6 +2730,49 @@ mod tests {
             Some("catalog-token".to_string()),
             Some(address),
             false,
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = release_http_client().unwrap();
+        let url = format!("http://{address}");
+
+        let repo_id = live_release_repo_id(&repo, &url, &client, "catalog-token")
+            .await
+            .unwrap();
+
+        server.abort();
+        let _ = server.await;
+        assert_eq!(repo_id.as_deref(), Some("repo"));
+    }
+
+    #[tokio::test]
+    async fn live_release_repo_lookup_retries_with_token_when_read_gated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let catalog = Arc::new(kranz_server::MultiRepoHost::single(repo.clone()).unwrap());
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        // Non-loopback bind => reads are token-gated, but the operator on the
+        // serve host still reaches it through a loopback URL. The tokenless
+        // first read 401s; the lookup must retry with the token instead of
+        // failing (`serve --host 0.0.0.0` + default `kranz release` URL).
+        let app = kranz_server::router_with_multi_repo_host_and_addr(
+            catalog,
+            None,
+            Some("catalog-token".to_string()),
+            Some(address),
+            true,
         );
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
