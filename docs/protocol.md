@@ -13,6 +13,10 @@ also available under `/api/repos/:repoId/...` (for example,
 catalog with health, display, grouping, and pin metadata. The unscoped forms
 remain migration aliases only for an explicit `host.defaultRepo` or one sole
 healthy repository; otherwise they fail without selecting a repository.
+Every path under an unavailable repository — and every unscoped path when
+the explicit default repository is unavailable — returns
+`503 {"error":"repository unavailable","repoId",…,"detail",…}`, so an
+unhealthy root stays distinguishable from an unknown repo id (404).
 Unknown `/api/*` paths always return JSON and never fall through to the
 dashboard SPA.
 

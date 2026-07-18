@@ -213,25 +213,56 @@ pub fn router_with_multi_repo_host_and_addr(
 
     for context in multi_host.contexts() {
         let prefix = format!("/api/repos/{}", context.id());
-        app = app.nest(
-            &prefix,
-            repo_context_router(context, bind_addr, bind_is_loopback),
-        );
+        match context.host().cloned() {
+            Some(host) => {
+                app = app.nest(
+                    &prefix,
+                    repo_context_router(context, host, bind_addr, bind_is_loopback),
+                );
+            }
+            None => {
+                // A nested router's fallback registers in the outer *fallback*
+                // router, which the `/api/{*path}` catch-all below always
+                // shadows — an unavailable repository must claim its paths as
+                // explicit routes (which beat the catch-all on the static
+                // `repos/<id>` segments) for the designed 503 to ever fire.
+                let handler = repo_unavailable_handler(&context);
+                app = app
+                    .route(&prefix, any(handler.clone()))
+                    .route(&format!("{prefix}/{{*path}}"), any(handler));
+            }
+        }
     }
 
+    let mut unavailable_default = None;
     if let Some(context) = multi_host.compatibility_context() {
-        app = app.nest(
-            "/api",
-            repo_context_router(context, bind_addr, bind_is_loopback),
-        );
+        match context.host().cloned() {
+            Some(host) => {
+                app = app.nest(
+                    "/api",
+                    repo_context_router(context, host, bind_addr, bind_is_loopback),
+                );
+            }
+            // An explicit `defaultRepo` is not health-filtered; the whole
+            // unscoped alias belongs to it, so report its unavailability
+            // below instead of mounting anything.
+            None => unavailable_default = Some(repo_unavailable_handler(&context)),
+        }
     }
 
     // API misses must never fall through to the SPA fallback. In particular,
     // an ambiguous unscoped mutation in multi-repo mode must fail as JSON,
-    // not return `200 index.html` and look successful to an API client.
-    app = app
-        .route("/api", any(api_not_found))
-        .route("/api/{*path}", any(api_not_found));
+    // not return `200 index.html` and look successful to an API client. When
+    // the unscoped alias targets an unavailable default repository, misses
+    // report that unavailability (503 + reason) instead of a generic 404.
+    app = match unavailable_default {
+        Some(handler) => app
+            .route("/api", any(handler.clone()))
+            .route("/api/{*path}", any(handler)),
+        None => app
+            .route("/api", any(api_not_found))
+            .route("/api/{*path}", any(api_not_found)),
+    };
 
     let app = match static_assets {
         Some(DashboardStatic::Dir(dir)) => {
@@ -270,32 +301,35 @@ async fn api_not_found() -> impl IntoResponse {
     )
 }
 
+/// `503 {"error":"repository unavailable", ...}` handler for every path under
+/// an unmounted repository. Returned as a `Clone` closure so one context can
+/// back both the bare-prefix and `{*path}` routes.
+fn repo_unavailable_handler(
+    context: &RepoContext,
+) -> impl Fn() -> std::future::Ready<(StatusCode, Json<serde_json::Value>)> + Clone {
+    let id = context.id().to_string();
+    let reason = context
+        .unavailable_reason()
+        .unwrap_or("repository is unavailable")
+        .to_string();
+    move || {
+        std::future::ready((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "repository unavailable",
+                "repoId": id.clone(),
+                "detail": reason.clone(),
+            })),
+        ))
+    }
+}
+
 fn repo_context_router(
     context: Arc<RepoContext>,
+    host: Arc<MissionHost>,
     bind_addr: Option<SocketAddr>,
     bind_is_loopback: bool,
 ) -> Router {
-    let Some(host) = context.host().cloned() else {
-        let id = context.id().to_string();
-        let reason = context
-            .unavailable_reason()
-            .unwrap_or("repository is unavailable")
-            .to_string();
-        return Router::new().fallback(move || {
-            let id = id.clone();
-            let reason = reason.clone();
-            async move {
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(json!({
-                        "error": "repository unavailable",
-                        "repoId": id,
-                        "detail": reason,
-                    })),
-                )
-            }
-        });
-    };
     let state = Arc::new(ServerState {
         repo_root: context.root().to_path_buf(),
         host,
@@ -958,6 +992,128 @@ mod tests {
             pinned: false,
             slack: RepoSlackConfig::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn unavailable_repo_routes_return_503_with_reason() {
+        let temp = tempfile::tempdir().unwrap();
+        let good = temp.path().join("good");
+        seed_planning_mission(&good, "goal");
+        let missing = temp.path().join("missing");
+
+        let multi = Arc::new(
+            MultiRepoHost::from_config(HostConfig {
+                default_repo: None,
+                max_concurrent_repos: 1,
+                repos: vec![repo_config("good", good), repo_config("gone", missing)],
+            })
+            .unwrap(),
+        );
+        let app =
+            router_with_multi_repo_host_and_addr(multi, None, Some("tok".to_string()), None, false);
+
+        // Bare prefix and deep path both 503 with the reason (explicit routes
+        // beat the `/api/{*path}` catch-all; a nested fallback would not).
+        for uri in ["/api/repos/gone", "/api/repos/gone/queue"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["error"], "repository unavailable", "{uri}");
+            assert_eq!(json["repoId"], "gone", "{uri}");
+            assert!(json["detail"].as_str().unwrap().contains("does not exist"));
+        }
+
+        // An unknown repo id still misses as 404 — unavailable stays
+        // distinguishable from a typo.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/repos/nope/queue")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // The healthy sibling is unaffected.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/repos/good/missions/same-id/state")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn unavailable_default_repo_reports_503_on_the_unscoped_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let good = temp.path().join("good");
+        seed_planning_mission(&good, "goal");
+        let missing = temp.path().join("missing");
+
+        let multi = Arc::new(
+            MultiRepoHost::from_config(HostConfig {
+                default_repo: Some("gone".to_string()),
+                max_concurrent_repos: 1,
+                repos: vec![repo_config("good", good), repo_config("gone", missing)],
+            })
+            .unwrap(),
+        );
+        let app =
+            router_with_multi_repo_host_and_addr(multi, None, Some("tok".to_string()), None, false);
+
+        // Every unscoped route addresses the default repo; its unavailability
+        // is reported instead of a generic "scope required" 404.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/queue")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["repoId"], "gone");
+
+        // The health probe and healthy scoped routes stay live.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/repos/good/missions/same-id/state")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
