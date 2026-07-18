@@ -1,0 +1,56 @@
+# Dependabot version updates. Security updates are separate (repo settings →
+# Dependabot alerts) and fire immediately regardless of these schedules.
+# Shape: weekly, grouped minor/patch per ecosystem, low PR cap — major bumps
+# still arrive as individual PRs and deserve a human eye (runtime against the
+# real agent CLIs is only covered by the manual smoke job).
+version: 2
+updates:
+  # Actions are SHA-pinned for supply-chain reasons; dependabot preserves the
+  # pin and updates the version comment — this is what keeps pinning cheap.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  # Root cargo workspace (crates/*); Cargo.lock is committed, and the msrv CI
+  # job catches any dep that quietly raises its floor.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  # The Tauri shell is a standalone cargo workspace — same treatment, capped
+  # lower since it changes rarely.
+  - package-ecosystem: cargo
+    directory: /apps/dashboard/src-tauri
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 2
+    groups:
+      tauri-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  # Dashboard deps are few; group them so the trickle stays one PR.
+  - package-ecosystem: npm
+    directory: /apps/dashboard
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    groups:
+      npm-minor-patch:
+        update-types:
+          - minor
+          - patch
