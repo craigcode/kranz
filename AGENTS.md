@@ -29,7 +29,7 @@ cargo build --workspace
 cargo install --path crates/cli --force   # rebuild+install the kranz binary
 
 # Dashboard (run all four when apps/dashboard changed):
-cd apps/dashboard && npx tsc --noEmit && npm run test && npm run build && npm run lint
+cd apps/dashboard && npx tsc -b && npm run test && npm run build && npm run lint
 
 # Operate:
 kranz serve                     # dashboard + REST/WS on 127.0.0.1:4560

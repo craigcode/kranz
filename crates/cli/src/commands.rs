@@ -1886,7 +1886,7 @@ fn resolve_release_token(
     flag: Option<String>,
 ) -> Result<String, ReleaseTokenError> {
     let parsed = reqwest::Url::parse(url).ok();
-    let operator_token = parsed
+    let operator_lookup = parsed
         .as_ref()
         .and_then(|url| {
             kranz_engine::paths::global_config()
@@ -1894,8 +1894,8 @@ fn resolve_release_token(
                 .map(|global| operator_token_for_url(global, url))
         })
         .unwrap_or(OperatorTokenLookup::Absent);
-    let allow_repo_file = parsed.as_ref().is_some_and(automatic_repo_token_allowed);
-    resolve_release_token_from_sources(repo, operator_token, allow_repo_file, flag)
+    let allow_repo_fallback = parsed.as_ref().is_some_and(automatic_repo_token_allowed);
+    resolve_release_token_from_sources(repo, operator_lookup, allow_repo_fallback, flag)
 }
 
 /// Outcome of scanning endpoint-scoped and legacy operator token files for a
@@ -1918,8 +1918,8 @@ enum ReleaseTokenError {
 
 fn resolve_release_token_from_sources(
     repo: &Path,
-    operator_token: OperatorTokenLookup,
-    allow_repo_file: bool,
+    operator_lookup: OperatorTokenLookup,
+    allow_repo_fallback: bool,
     flag: Option<String>,
 ) -> Result<String, ReleaseTokenError> {
     if let Some(flag) = flag {
@@ -1928,20 +1928,20 @@ fn resolve_release_token_from_sources(
     if let Ok(env) = std::env::var("KRANZ_TOKEN") {
         return Ok(env);
     }
-    match operator_token {
-        OperatorTokenLookup::Found(token) => Ok(token),
+    match operator_lookup {
+        OperatorTokenLookup::Found(authority) => Ok(authority),
         // The port-only file predates endpoint scoping and may have survived
         // an ungraceful shutdown. A live single-repo serve writes the more
         // specific repository token, so prefer that before using the legacy
         // compatibility credential.
-        OperatorTokenLookup::Legacy(token) => {
-            let repo_token = allow_repo_file
+        OperatorTokenLookup::Legacy(authority) => {
+            let repo_authority = allow_repo_fallback
                 .then(|| read_token_file(&repo.join(".kranz").join("serve.token")))
                 .flatten();
-            Ok(repo_token.unwrap_or(token))
+            Ok(repo_authority.unwrap_or(authority))
         }
         OperatorTokenLookup::Ambiguous => Err(ReleaseTokenError::Ambiguous),
-        OperatorTokenLookup::Absent => allow_repo_file
+        OperatorTokenLookup::Absent => allow_repo_fallback
             .then(|| read_token_file(&repo.join(".kranz").join("serve.token")))
             .flatten()
             .ok_or(ReleaseTokenError::Absent),
@@ -1952,19 +1952,19 @@ fn scan_operator_token_addresses(
     global_config: &Path,
     addresses: &[std::net::SocketAddr],
 ) -> OperatorTokenLookup {
-    let mut token = None;
+    let mut authority = None;
     for address in addresses {
         if let Some(found) = read_token_file(&operator_serve_token_path(global_config, *address)) {
-            if token.is_some() {
+            if authority.is_some() {
                 // Several local servers match this URL (for example both v4
                 // and v6 localhost). Refuse to guess which authority to send.
                 return OperatorTokenLookup::Ambiguous;
             }
-            token = Some(found);
+            authority = Some(found);
         }
     }
-    match token {
-        Some(token) => OperatorTokenLookup::Found(token),
+    match authority {
+        Some(authority) => OperatorTokenLookup::Found(authority),
         None => OperatorTokenLookup::Absent,
     }
 }
@@ -2053,12 +2053,12 @@ fn normalized_url_host(url: &reqwest::Url) -> Option<&str> {
 }
 
 fn read_token_file(path: &Path) -> Option<String> {
-    let token = std::fs::read_to_string(path).ok()?;
-    let token = token.trim_end().to_string();
-    if token.is_empty() {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let authority = contents.trim_end().to_string();
+    if authority.is_empty() {
         None
     } else {
-        Some(token)
+        Some(authority)
     }
 }
 

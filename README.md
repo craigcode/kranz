@@ -25,7 +25,7 @@ an append-only event log makes every mission `kill -9`-safe.
 
 ## Quick start
 
-Prerequisites: Rust 1.85+, git, and the [Claude Code CLI](https://claude.com/claude-code)
+Prerequisites: Rust 1.88+, git, and the [Claude Code CLI](https://claude.com/claude-code)
 (`claude`) installed and authenticated — Kranz discovers it on PATH and in the
 usual install locations, or set `KRANZ_CLAUDE_BIN` / `claudeBinary` in config.
 

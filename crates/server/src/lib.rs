@@ -190,7 +190,7 @@ pub fn router_with_shared_host_and_addr(
 pub fn router_with_multi_repo_host_and_addr(
     multi_host: Arc<MultiRepoHost>,
     static_assets: Option<DashboardStatic>,
-    token: Option<String>,
+    authority: Option<String>,
     bind_addr: Option<SocketAddr>,
     require_read_token: bool,
 ) -> Router {
@@ -250,7 +250,7 @@ pub fn router_with_multi_repo_host_and_addr(
     // token is examined.
     app.layer(middleware::from_fn_with_state(
         TokenGate {
-            token,
+            authority,
             require_read_token,
         },
         require_mutation_token,
@@ -680,7 +680,7 @@ async fn require_json_api_posts(request: Request, next: Next) -> Response {
 /// binds also require it on GET / WS upgrade.
 #[derive(Clone)]
 struct TokenGate {
-    token: Option<String>,
+    authority: Option<String>,
     require_read_token: bool,
 }
 
@@ -711,7 +711,7 @@ async fn require_mutation_token(
     request: Request,
     next: Next,
 ) -> Response {
-    if let Some(expected) = gate.token.as_deref() {
+    if let Some(expected) = gate.authority.as_deref() {
         let path = request.uri().path();
         let is_health = path == "/api/health";
         let is_read = request.method() == Method::GET || request.method() == Method::HEAD;
@@ -893,7 +893,7 @@ pub async fn serve_multi_on_listener(
     multi_host: Arc<MultiRepoHost>,
     listener: tokio::net::TcpListener,
     static_assets: Option<DashboardStatic>,
-    token: Option<String>,
+    authority: Option<String>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     let local_addr = listener.local_addr()?;
@@ -901,7 +901,7 @@ pub async fn serve_multi_on_listener(
     let app = router_with_multi_repo_host_and_addr(
         multi_host,
         static_assets,
-        token,
+        authority,
         Some(local_addr),
         require_read_token,
     );

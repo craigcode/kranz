@@ -495,8 +495,22 @@ fn atomic_write(path: &Path, bytes: &[u8], private: bool) -> Result<()> {
         fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))
             .with_context(|| format!("setting permissions on {}", tmp.display()))?;
     }
-    fs::rename(&tmp, path)
-        .with_context(|| format!("replacing {} from {}", path.display(), tmp.display()))
+    // POSIX rename replaces; on Windows the destination must be removed first
+    // (same pattern as crates/engine ticket/queue atomic writes).
+    match fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(_) if cfg!(windows) && path.exists() => {
+            fs::remove_file(path)
+                .with_context(|| format!("removing {} before Windows replace", path.display()))?;
+            fs::rename(&tmp, path)
+                .with_context(|| format!("replacing {} from {}", path.display(), tmp.display()))
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&tmp);
+            Err(error)
+                .with_context(|| format!("replacing {} from {}", path.display(), tmp.display()))
+        }
+    }
 }
 
 #[cfg(test)]

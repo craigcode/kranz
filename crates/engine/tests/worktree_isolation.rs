@@ -1,10 +1,13 @@
 //! Tests for the `workerIsolation` mission-config key (M7 tier 1, feature f-1-1)
-//! and the mission integration-worktree git primitive (feature f-1-2).
+//! and the mission integration-worktree mode it enables (feature f-1-2).
 //!
-//! f-1-1 only added the config surface; f-1-2 adds the git plumbing
-//! (`GitRepo::add_worktree_checkout`) that a later milestone will use to
-//! re-route mission-branch mutations through a dedicated worktree. Nothing
-//! consumes either yet.
+//! The config surface (f-1-1) and the git plumbing
+//! (`GitRepo::add_worktree_checkout`, f-1-2) are fully wired: in worktree mode
+//! `run()` routes mission-branch mutations through a dedicated integration
+//! worktree (`setup_mission_worktree`/`teardown_mission_worktree` in
+//! orchestrator.rs), worker/validator sessions run with that worktree as cwd,
+//! `approve_plan` writes through it, and the primary checkout stays
+//! byte-untouched for the whole mission.
 
 use kranz_engine::auth_verify::AuthVerdict;
 use kranz_engine::backend::{AgentBackend, PromptMode};

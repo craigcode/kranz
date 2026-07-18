@@ -502,6 +502,10 @@ export interface QueueState {
   entries: QueueEntry[];
   busyWith: string | null;
   drain: DrainState;
+  /** Run slots left under `host.maxConcurrentRepos` (multi-repo hosts only). */
+  maxConcurrentReposAvailable?: number;
+  /** True when the process-wide run budget is exhausted. */
+  maxConcurrentReposSaturated?: boolean;
 }
 
 /** `GET /api/missions/:id/pr-handoff` — never auto-pushes. */

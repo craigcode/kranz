@@ -85,7 +85,7 @@ plan → Slack approve → queued run → blocked-to-unblocked entirely in a
 thread; underspecified tickets bounce back with the orchestrator's actual
 questions; per-repo serialization holds).
 
-## M2.9 — Slack as a full control surface ◑ (shipped in slices: new/plan/approve, config, pause/resume/work, App Home, deep links; full goal→complete lifecycle in Slack pending live validation)
+## M2.9 — Slack as a full control surface ◑ (shipped in slices: new/plan/approve, config, pause/resume/work, App Home, deep links; full goal→complete lifecycle live-validated 2026-07-12: mission m-6a20dc driven draft→approve→work→merge entirely from Slack — docs/knowledge/surfaces/slack-commands.md)
 
 Extend the Slack bridge from notifications+light-steering to FULL management:
 create, plan (thread conversation), review, approve, start, steer, configure,

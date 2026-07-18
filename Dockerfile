@@ -16,7 +16,7 @@
 #      "Workspace provisioning"). Keeping those out here keeps the base small.
 
 # ---- builder -----------------------------------------------------------------
-# rust:1 tracks the latest 1.x; the workspace needs Rust 1.85+ (edition 2021,
+# rust:1 tracks the latest 1.x; the workspace needs Rust 1.88+ (edition 2021,
 # README quick-start). The committed dashboard dist under
 # crates/cli/assets/dashboard/dist is embedded by crates/cli/build.rs, so the
 # release build needs no Node.js — pure cargo.
@@ -31,8 +31,8 @@ RUN apt-get update \
 WORKDIR /src
 COPY . .
 
-# Build only the CLI crate (binary name: `kranz`) in release.
-RUN cargo build --release -p kranz-cli \
+# Build only the CLI crate (package `kranz`, binary name: `kranz`) in release.
+RUN cargo build --release --locked -p kranz \
     && strip target/release/kranz
 
 # ---- runtime -----------------------------------------------------------------

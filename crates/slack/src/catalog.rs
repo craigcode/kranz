@@ -284,8 +284,8 @@ fn strip_explicit_repo(envelope: &mut Value) -> Option<String> {
     }
     let text = envelope.get("payload")?.get("text")?.as_str()?.trim();
     let mut parts = text.splitn(2, char::is_whitespace);
-    let token = parts.next()?;
-    let repo_id = token.strip_prefix("repo:")?.trim().to_string();
+    let selector = parts.next()?;
+    let repo_id = selector.strip_prefix("repo:")?.trim().to_string();
     if repo_id.is_empty() {
         return None;
     }

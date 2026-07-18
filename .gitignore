@@ -8,11 +8,19 @@ dist/
 .DS_Store
 
 # per-repo mission data (plan.json is committed on the mission branch, not here)
+# (mirrors the runtime-ignore block `kranz init` writes — keep in sync with
+# crates/cli/src/init.rs RUNTIME_IGNORE_PATTERNS)
+.kranz/config.json
 .kranz/missions/*/events.jsonl
 .kranz/missions/*/events.jsonl.lock
 .kranz/missions/*/state.json
+.kranz/missions/*/state.json.tmp
 .kranz/missions/*/estimate.json
 .kranz/missions/*/runs/
 .kranz/missions/*/control/
+.kranz/slack-threads.json
 .kranz/slack/
+.kranz/queue/
+.kranz/tickets/*.status
+.kranz/serve.token
 /notes.txt

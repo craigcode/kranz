@@ -7,26 +7,30 @@ fn main() {
     println!("cargo:rerun-if-env-changed=KRANZ_EMBED_DASHBOARD_DIST");
 
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest dir"));
-    let dashboard_dir = dashboard_candidates(&manifest_dir).into_iter().find(|dir| {
-        println!("cargo:rerun-if-changed={}", dir.display());
-        dir.join("index.html").is_file()
-    });
+    let candidates = dashboard_candidates(&manifest_dir);
+    let dashboard_dir = candidates
+        .iter()
+        .find(|dir| {
+            println!("cargo:rerun-if-changed={}", dir.display());
+            dir.join("index.html").is_file()
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "dashboard dist not found; refusing to build a UI-less kranz binary. Looked for \
+                 index.html in: {}",
+                candidates
+                    .iter()
+                    .map(|dir| dir.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        });
 
     let out_path =
         PathBuf::from(env::var_os("OUT_DIR").expect("out dir")).join("embedded_dashboard.rs");
     let mut out = fs::File::create(out_path).expect("create embedded dashboard module");
 
-    let Some(dashboard_dir) = dashboard_dir else {
-        writeln!(
-            out,
-            "pub const EMBEDDED_DASHBOARD_SOURCE: &str = \"\";\n\
-             pub const EMBEDDED_DASHBOARD: &[kranz_server::EmbeddedFile] = &[];"
-        )
-        .expect("write empty embedded dashboard module");
-        return;
-    };
-
-    let files = dashboard_files(&dashboard_dir).expect("read dashboard files");
+    let files = dashboard_files(dashboard_dir).expect("read dashboard files");
     writeln!(
         out,
         "pub const EMBEDDED_DASHBOARD_SOURCE: &str = {:?};",
@@ -40,7 +44,7 @@ fn main() {
     .expect("write embedded dashboard header");
     for file in files {
         println!("cargo:rerun-if-changed={}", file.display());
-        let rel = relative_slash_path(&dashboard_dir, &file);
+        let rel = relative_slash_path(dashboard_dir, &file);
         writeln!(
             out,
             "    kranz_server::EmbeddedFile {{ path: {:?}, bytes: include_bytes!({:?}), content_type: {:?} }},",
