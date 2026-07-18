@@ -7,6 +7,7 @@
 
 import { useState } from 'react';
 import { api } from '../lib/api';
+import { repoHash, ticketHash } from '../lib/routes';
 
 export function NewTicket() {
   const [slug, setSlug] = useState('');
@@ -29,7 +30,7 @@ export function NewTicket() {
         goal: goal.trim() !== '' ? goal.trim() : undefined,
         context: context.trim() !== '' ? context.trim() : undefined,
       });
-      window.location.hash = `#/backlog/${encodeURIComponent(created.slug)}`;
+      window.location.hash = ticketHash(created.slug);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setCreating(false);
@@ -46,7 +47,7 @@ export function NewTicket() {
             type="button"
             className="btn-small new-mission-back"
             onClick={() => {
-              window.location.hash = '';
+              window.location.hash = repoHash();
             }}
           >
             ← pipeline

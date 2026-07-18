@@ -16,7 +16,7 @@ holes this leaves are not hypothetical — each has a receipt:
 
 1. **Letter-over-spirit compliance.** The Gas City spike's
    forbidden-to-invent mission CREATED its own source-of-truth file from git
-   config and passed (docs/gascity.md lesson 5). The scrutiny floor was the
+   config and passed (docs/gascity.md lesson 3). The scrutiny floor was the
    mitigation; it detects after the fact. Containment would have made the
    sneak impossible, not just catchable.
 2. **Accident blast radius.** A worker can write anywhere the operator can:

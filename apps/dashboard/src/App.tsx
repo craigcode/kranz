@@ -2,12 +2,12 @@
 // left sidebar (sessions) | top bar | status strip | centre (conversation,
 // planning, or transcript) | right column (models / features / progress log).
 //
-// Routes (location.hash): ''  → the pipeline view (default screen, one row
-// per work item across all nine stages), '#/new' → new-mission form,
-// '#/m/<id>' → mission view. While the mission's status is "planning" the
-// centre pane is the PlanningView (M2.5 lifecycle); once execution starts the
-// live conversation view takes over. <TokenPrompt/> is global: any mutation
-// hitting a 401 surfaces the paste-token bar wherever you are.
+// Routes (location.hash): '' → the project picker, '#/r/<repo>' → that
+// repository's pipeline, and '#/r/<repo>/m/<id>' → its mission view. Legacy
+// unscoped routes remain available for a single/default repository. While a
+// mission is planning, the centre pane is PlanningView; once execution starts
+// the live conversation view takes over. <TokenPrompt/> is global: any
+// mutation hitting a 401 surfaces the paste-token bar wherever you are.
 
 import { useEffect, useState } from 'react';
 import { useKranzStore } from './lib/store';
@@ -23,36 +23,19 @@ import { OrchestratorView } from './components/OrchestratorView';
 import { PlanningView } from './components/PlanningView';
 import { TranscriptView } from './components/TranscriptView';
 import { ModelPanel } from './components/ModelPanel';
+import { WorkspacePanel } from './components/WorkspacePanel';
 import { GrantRequestPanel } from './components/GrantRequestPanel';
 import { RevisionPanel } from './components/RevisionPanel';
 import { FeaturesPanel } from './components/FeaturesPanel';
 import { ProgressLog } from './components/ProgressLog';
 import { TokenPrompt } from './components/TokenPrompt';
 import { TicketDetail } from './components/TicketDetail';
-import type { Lens } from './lib/lensFilter';
+import { ProjectPicker } from './components/ProjectPicker';
+import { parseHash, type Route } from './lib/routes';
 
 // Capture a `#token=<t>` from `kranz serve --open` BEFORE the router reads
 // the hash (resolveToken strips it and persists to sessionStorage).
 resolveToken();
-
-type Route =
-  | { view: 'pipeline'; lens?: Lens }
-  | { view: 'new' }
-  | { view: 'new-ticket' }
-  | { view: 'mission'; id: string }
-  | { view: 'ticket'; slug: string };
-
-function parseHash(): Route {
-  const hash = window.location.hash;
-  if (hash === '#/new') return { view: 'new' };
-  if (hash === '#/new-ticket') return { view: 'new-ticket' };
-  const match = /^#\/m\/(.+)$/.exec(hash);
-  if (match) return { view: 'mission', id: decodeURIComponent(match[1]) };
-  if (hash === '#/backlog') return { view: 'pipeline', lens: 'backlog' };
-  const ticketMatch = /^#\/backlog\/(.+)$/.exec(hash);
-  if (ticketMatch) return { view: 'ticket', slug: decodeURIComponent(ticketMatch[1]) };
-  return { view: 'pipeline' };
-}
 
 function useRoute(): Route {
   const [route, setRoute] = useState<Route>(() => parseHash());
@@ -67,9 +50,15 @@ function useRoute(): Route {
 export default function App() {
   const route = useRoute();
   const missionId = route.view === 'mission' ? route.id : null;
+  const selectRepo = useKranzStore((s) => s.selectRepo);
+  const activeRepoId = useKranzStore((s) => s.repoId);
   const connectMission = useKranzStore((s) => s.connectMission);
   const selectedRun = useKranzStore((s) => s.selectedRun);
   const status = useKranzStore((s) => s.state?.mission.status ?? null);
+
+  useEffect(() => {
+    selectRepo(route.repoId);
+  }, [route.repoId, selectRepo]);
 
   // Connect when the hash points at a mission. Do NOT disconnect on null
   // (pipeline / backlog / ticket routes): draftTicket already connects the
@@ -79,8 +68,19 @@ export default function App() {
   useEffect(() => {
     if (missionId === null) return;
     connectMission(missionId);
-  }, [missionId, connectMission]);
+  }, [route.repoId, missionId, connectMission]);
 
+  if (route.view === 'projects') {
+    return (
+      <>
+        <ProjectPicker />
+        <TokenPrompt />
+      </>
+    );
+  }
+  if (route.repoId !== activeRepoId) {
+    return <div className="picker-empty dim">Switching repository…</div>;
+  }
   if (route.view === 'pipeline') {
     return (
       <>
@@ -131,6 +131,7 @@ export default function App() {
           <main className="centre">{centre}</main>
           <aside className="right-col" aria-label="Mission panels">
             <ModelPanel />
+            <WorkspacePanel />
             <GrantRequestPanel />
             <RevisionPanel />
             <FeaturesPanel />

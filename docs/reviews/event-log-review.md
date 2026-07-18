@@ -125,6 +125,17 @@ is the only exit from the loop body and that all three call sites
 path to recover the lost suffix. The trigger, mechanism, and line references
 hold exactly as stated; this finding survives unchanged.
 
+**Remediated (F1):** Fixed in commit 24bbf7a (`[f-1-1] drain_buffer: retain
+unwritten deltas on mid-drain write failure`). `drain_buffer` no longer
+loops over `self.buffer.drain(..)`; a new front-to-back `drain_lines` helper
+removes each line from the buffer only after it is successfully written, so
+a mid-loop write failure leaves the failing line and everything after it in
+`self.buffer`, in original order, for the next `drain_buffer` call to retry.
+`Drop` now logs how many buffered deltas were retained when a drop-time
+flush fails, per the suggested remediation. See
+`drain_retains_unwritten_deltas_on_write_failure` in `event_log.rs`'s test
+module (feature f-1-1).
+
 ## F2 — Throttle-based drain has no independent time source (Medium)
 
 **Location:** event_log.rs:231-236 (throttle check inside `append`), header contract at event_log.rs:5-9.
@@ -196,6 +207,18 @@ inside `append`. The header and doc-comment wording cited
 (event_log.rs:6-8, 219-220) matches the source verbatim, and the throttle
 check at event_log.rs:231-236 is confirmed to run only on the next
 `append()` call, never on a wall-clock schedule. Finding survives unchanged.
+
+**Remediated (F2):** Fixed in commit 234f702 (`[f-2-1] add
+buffer_age/flush_if_due for wall-clock-driven idle flush`) — suggested
+remediation option (b). `EventLog` grows `buffer_age()` (elapsed time since
+the oldest buffered delta, `None` when empty) and `flush_if_due()`, which
+drains the buffer without waiting for another `append()` once the oldest
+delta has aged past `throttle`, giving an idle mission a wall-clock-driven
+flush path. The module header and `append`'s doc comment now state the
+throttle is checked on each append or on demand via `flush_if_due`. See
+`flush_if_due_drains_idle_buffer_by_age` and
+`buffer_age_reports_oldest_and_none_when_empty` in
+`crates/engine/tests/event_log_test.rs` (feature f-2-1).
 
 ## F3 — Mission-id guard only checks the first log line (Low)
 

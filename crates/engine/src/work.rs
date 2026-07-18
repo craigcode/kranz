@@ -146,9 +146,11 @@ where
     .await
 }
 
-/// [`drain_queue`] with an injectable readiness probe (tests script park /
-/// rate-limit without shelling out to real CLIs).
-pub(crate) async fn drain_queue_with_probe<R, Fut, P>(
+/// [`drain_queue`] with an injectable readiness probe. Engine and host tests
+/// use this seam to script proceed / park / rate-limit decisions without
+/// shelling out to whichever agent CLIs happen to be installed on the test
+/// machine.
+pub async fn drain_queue_with_probe<R, Fut, P>(
     repo_root: &Path,
     once: bool,
     run_mission: R,

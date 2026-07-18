@@ -7,12 +7,26 @@ same server and points its webview at it. The server NEVER writes
 Base: `http://127.0.0.1:<port>` (default 4560). All JSON camelCase, matching
 the engine's serde shapes.
 
+When global `host.repos` is configured, every repository operation below is
+also available under `/api/repos/:repoId/...` (for example,
+`/api/repos/kranz/missions`). `GET /api/repos` returns the static operator
+catalog with health, display, grouping, and pin metadata. The unscoped forms
+remain migration aliases only for an explicit `host.defaultRepo` or one sole
+healthy repository; otherwise they fail without selecting a repository.
+Every path under an unavailable repository — and every unscoped path when
+the explicit default repository is unavailable — returns
+`503 {"error":"repository unavailable","repoId",…,"detail",…}`, so an
+unhealthy root stays distinguishable from an unknown repo id (404).
+Unknown `/api/*` paths always return JSON and never fall through to the
+dashboard SPA.
+
 ## REST
 
 | Method/Path | Response |
 |---|---|
 | `GET /api/missions` | `[{ "id", "status", "goal", "createdAt", "merged" }]` (folds each log; tolerate corrupt ones with `"status":"failed"` + `"error"`; `status` now also includes `"approved"` for an approved mission with no run activity yet — additive, backward-compatible). `merged` is a cheap `git merge-base --is-ancestor` probe of the mission branch tip against the LIVE base branch tip (not the pinned `base_sha`): `true` once the base has absorbed the mission's commits (Landed), `false` while still unmerged (Delivered), `null`/absent when there is no mission branch yet or a ref fails to resolve — a per-mission git failure degrades only that row, never the whole list |
 | `GET /api/missions/:id/state` | full `MissionState` JSON (fold of events.jsonl; NOT the state.json cache) |
+| `GET /api/missions/:id/workspace` | derived local workspace summary: `{"isolation","cwd","lifecycle","worktreeActive","sandboxes":[{role,enforce,extraWriteCount,egressCount}],"preflight":{status,summary,eventSeq}}`. Values come from folded config, the repository-namespaced deterministic integration-worktree path, and the latest existing `preflight:` decision event (including an explicit clean outcome that supersedes older warnings); no configured paths, hosts, or secrets are copied into the sandbox rows |
 | `GET /api/missions/:id/events?since=<seq>` | `[Event]` with `seq > since` (omit `since` → all) |
 | `GET /api/missions/:id/plan` | contents of plan.json (404 if not approved yet) |
 | `GET /api/missions/:id/plan.md` | `{"markdown": "<plan.md contents>"}` (404 if not approved yet) |
@@ -65,13 +79,13 @@ started — the event log is the source of truth).
 | `POST /api/missions/:id/planning/turn` | body `{"text":"..."}` → runs one planning turn → `200 {"reply":"..."}`. Seed replies are prepended. Activity streams over the WS feed as usual. `409` if the mission is not hosted here, not in planning, or a turn is already in flight |
 | `POST /api/missions/:id/planning/request-plan` | → `200 {"ready":true, "plan":{...}, "estimate":{...CostEstimate}}` or `200 {"ready":false, "reply":"<orchestrator prose>"}` (NotReady returns to conversation) |
 | `POST /api/missions/:id/approve` | body `{"plan":{...}}` (the plan previously returned) → commits plan.json/plan.md/index.md exactly like the CLI → `200 {"branch":"kranz/mission-…"}` |
-| `POST /api/missions/:id/start` | spawns `engine.run()` as a background task → `202 {"running":true}`. Re-invocable when the mission is Blocked (after queueing guidance via control) or after a server restart (`resume` semantics). `409` while already running |
+| `POST /api/missions/:id/start` | spawns `engine.run()` as a background task → `202 {"running":true}`. Re-invocable when the mission is Blocked (after queueing guidance via control) or after a server restart (`resume` semantics). `409` while already running, or when a multi-repository serve's `host.maxConcurrentRepos` budget is saturated |
 | `POST /api/missions/:id/merge` | COMPLETE missions only. Acquires the repo-busy lock, pins live-base + mission-tip SHAs, merges in a detached scratch worktree, runs the base-owned bounded gate suite there, and fast-forwards the base only to the exact tested integration commit → `200 {"merged":true,"commit":"…"}`. Busy/non-complete/conflict/moving-base requests return `409`; invalid/failing gates or secrets return `422` |
 | `POST /api/missions/:id/abandon` | optional body `{"reason":"..."}` → the engine's canonical abandon (terminal-refusing, `mission.abandoned` recorded) → `200 {"abandoned":true}`. A mission hosted here is taken out of the registry first (an idle engine is dropped; a running task is aborted and awaited). A lock held by a foreign process → `409` — the web never force-steals |
 | `POST /api/missions/:id/delete` | optional body `{"all":true}` → removes a TERMINAL mission's directory, mirroring `kranz clean`: Failed/Abandoned (and planning husks) delete by default; Complete needs `"all":true` (completed missions feed the cost-calibration corpus); live missions and live locks → `409`. POST (not the DELETE verb) so the mutation-token gate applies by construction → `200 {"deleted":true}` |
-| `POST /api/missions/:id/release` | un-hosts an idle in-planning mission: drops the engine from the registry and frees its single-writer lock so an external runner (a terminal `kranz plan`, `kranz work`) can take over → `200 {"released":true}`. `409` while a planning turn is in flight (the web never force-steals). `404` for an unknown mission. POST so the mutation-token gate applies by construction; idempotent — calling it on a mission that is not currently hosted still returns `200 {"released":true}` |
-| `POST /api/queue/drain` | runs the queue's drain/claim/skip loop (`kranz_engine::work::drain_queue`) as a background task on the serve process — just ANOTHER dispatcher, arbitrating against an external `kranz work` process through the queue claim files and the events.jsonl single-writer lock exactly as today (no new locking) → `200 {"live":bool,"currentMissionId":string|null,"ran":[string],"parked":[string]}`. IDEMPOTENT while a drain is live: a second call while the tracked drain task has not finished returns that live drain's current state instead of spawning a second one. An empty queue settles `live:false` quickly. Gated by the mutation token like every other POST |
-| `GET /api/queue` | the queue front-to-back, who (if anyone) currently holds the busy lock, and this host's own drain tracker → `200 {"entries":[{"missionId","ticketSlug"?,"priority","seq","readiness"?}],"busyWith":string|null,"drain":{"live":bool,"currentMissionId":string|null,"ran":[string],"parked":[string]}}`. Each entry's `readiness` is the same shape as `GET /api/missions/:id/readiness` (best-effort; omitted when the probe fails). Tokenless — read-only |
+| `POST /api/missions/:id/release` | un-hosts an idle in-planning mission: drops the engine from the registry and frees its single-writer lock so an external runner (a terminal `kranz plan`, `kranz work`) can take over → `200 {"released":true}`. `409` while a planning turn is in flight (the web never force-steals). `404` for an unknown mission. POST so the mutation-token gate applies by construction; idempotent — calling it on a mission that is not currently hosted still returns `200 {"released":true}`. Prefer the repo-scoped form `POST /api/repos/:repoId/missions/:id/release`; `kranz release` authenticates `GET /api/repos`, maps the selected root against that live catalog, and refuses an unmatched/empty catalog before posting. The unscoped path remains a migration alias only |
+| `POST /api/queue/drain` | runs the queue's drain/claim/skip loop (`kranz_engine::work::drain_queue`) as a background task on the serve process — just ANOTHER dispatcher, arbitrating against an external `kranz work` process through the queue claim files and the events.jsonl single-writer lock exactly as today (no new locking) → `200 {"live":bool,"currentMissionId":string|null,"ran":[string],"parked":[string]}`. IDEMPOTENT while a drain is live: a second call while the tracked drain task has not finished returns that live drain's current state instead of spawning a second one. An empty queue settles `live:false` quickly. `409` when a multi-repository serve's `host.maxConcurrentRepos` budget is saturated. Gated by the mutation token like every other POST |
+| `GET /api/queue` | the queue front-to-back, who (if anyone) currently holds the busy lock, and this host's own drain tracker → `200 {"entries":[{"missionId","ticketSlug"?,"priority","seq","readiness"?}],"busyWith":string|null,"drain":{"live":bool,"currentMissionId":string|null,"ran":[string],"parked":[string]},"maxConcurrentReposAvailable"?,"maxConcurrentReposSaturated"?}`. Each entry's `readiness` is the same shape as `GET /api/missions/:id/readiness` (best-effort; omitted when the probe fails). The optional `maxConcurrentRepos*` fields appear only when the host participates in a multi-repository `host.maxConcurrentRepos` budget — agents use `maxConcurrentReposSaturated:true` to distinguish "queue empty / autoWork idle" from "global cap blocking drains". Tokenless — read-only |
 
 Hosted-engine rules: planning endpoints serialize per mission (one turn at a
 time) and lazily ATTACH an on-disk in-planning mission into the registry
@@ -91,7 +105,16 @@ paste-token field when a mutation is attempted without one. Missing/wrong
 token → `401 {"error":"missing or invalid token"}`. Rationale: 127.0.0.1
 binding + CORS stop the network and the browser; the token stops other local
 processes and link-borne CSRF from creating or steering missions that spend
-money.
+money. Single-repo compatibility stores it at `<repo>/.kranz/serve.token`;
+an operator-catalog serve stores the one process token at
+`~/.kranz/serve/<bound-endpoint>.token` with mode `0600`, never in every hosted
+repository. Automatic CLI discovery matches the URL's complete local endpoint
+and refuses host-ambiguous credentials. As a temporary compatibility fallback,
+when no endpoint-scoped file matches, discovery also accepts a legacy
+`~/.kranz/serve/<port>.token` from earlier serves (deprecated — the next
+`kranz serve` rewrite writes the endpoint-scoped name). A live single-repo
+`.kranz/serve.token` takes precedence over this legacy-only fallback so a
+credential left by an ungraceful older serve cannot mask the current token.
 
 ## WebSocket `GET /api/missions/:id/ws?since=<seq>`
 

@@ -5,8 +5,10 @@ members = ["crates/engine", "crates/cli", "crates/server", "crates/slack"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+# README quick-start floor; inherited by every member crate and checked in CI.
+rust-version = "1.88"
 license = "MIT"
-description = "Local mission-control harness for Claude Code."
+description = "Local mission-control harness for headless AI agent CLIs (Claude Code, Codex, Droid)."
 readme = "README.md"
 # release.yml and the Homebrew formula reference this same craigcode/kranz
 # slug (see docs/releasing.md).

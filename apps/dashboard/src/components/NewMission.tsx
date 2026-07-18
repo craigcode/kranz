@@ -7,6 +7,7 @@
 import { useState } from 'react';
 import { api } from '../lib/api';
 import { BACKEND_OPTIONS, EFFORT_OPTIONS, MODEL_PLACEHOLDERS } from '../lib/format';
+import { missionHash, repoHash } from '../lib/routes';
 import type { AgentBackend } from '../lib/types';
 
 type RoleKey = 'orchestrator' | 'worker' | 'validatorScrutiny' | 'validatorFunctional';
@@ -70,7 +71,7 @@ export function NewMission() {
         trimmed,
         buildConfigPatch(overrides, allowBelowDefaultWorkerModel),
       );
-      window.location.hash = `#/m/${encodeURIComponent(id)}`;
+      window.location.hash = missionHash(id);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setCreating(false);
@@ -87,7 +88,7 @@ export function NewMission() {
             type="button"
             className="btn-small new-mission-back"
             onClick={() => {
-              window.location.hash = '';
+              window.location.hash = repoHash();
             }}
           >
             ← missions

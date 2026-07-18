@@ -6,6 +6,11 @@ recommended for the current cycle.
 
 ## OTEL (observability export)
 
+**Update: shipped 2026-07-04** — `kranz otel` exists as the opt-in read-side
+sidecar this brief describes (spans replayed from the event log, no engine
+changes); see `docs/otel.md`. The rest of this section is the historical
+point-in-time record.
+
 **What it would be.** An opt-in OTLP exporter translating kranz's event log
 into spans: mission = trace, milestone/feature/worker-run = nested spans,
 cost/tokens as attributes. The event log is already the single source of
@@ -25,6 +30,11 @@ answers every question OTEL would. Verdict: build at first cloud deploy,
 not before.
 
 ## Computer-use QA (functional validator with a browser/GUI)
+
+**Update: shipped 2026-07-05** — live UI validation exists: the functional
+validator drives the running app via browser/computer-use tools when
+`validatorFunctional.tools` grants them; see `docs/validating-uis.md`. The
+rest of this section is the historical point-in-time record.
 
 **What it would be.** A functional-validator mode that drives the built
 app (web UI via browser automation; TUI via pty) to verify acceptance

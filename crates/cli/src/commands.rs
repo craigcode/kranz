@@ -40,6 +40,21 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
     }
 
     match cli.command {
+        Command::Init {
+            gates,
+            register,
+            id,
+            display_name,
+        } => {
+            let options = crate::init::InitOptions {
+                gates,
+                registration: register.then_some(crate::init::Registration { id, display_name }),
+                global_config: kranz_engine::paths::global_config(),
+            };
+            let report = crate::init::initialize(&repo, &options)?;
+            print!("{}", crate::init::render(&report));
+            Ok(0)
+        }
         Command::Plan { goal } => {
             let cfg = load_config(&repo, cli.dangerously_allow_all)?;
             cmd_plan(repo, goal, cfg, cli.mission.as_deref(), lock_force)
@@ -1358,31 +1373,53 @@ async fn cmd_serve(
     let local_addr = listener
         .local_addr()
         .map_err(|e| anyhow!("failed to read bound address: {e}"))?;
-    // One hosted-engine registry for BOTH clients: the axum handlers below and
-    // (when --slack) the bridge. Handing the bridge its own MissionHost would
-    // mean two engines contending for one mission's single-writer lock.
-    let host = Arc::new(kranz_server::MissionHost::new(repo.clone()));
-    // autoWork (default off) drains the queue automatically whenever entries
-    // are waiting; started here (not in `MissionHost::new`) so test hosts
-    // stay inert unless they opt in.
-    host.ensure_auto_work_started();
+    // The global operator catalog composes one existing MissionHost per root.
+    // With no host.repos block this resolves to the historical current-repo
+    // host and retains every unscoped route.
+    let multi_host = Arc::new(kranz_server::MultiRepoHost::from_global_config(
+        kranz_engine::paths::global_config().as_deref(),
+        repo.clone(),
+    )?);
+    // One watcher schedules ready repository queues in round-robin order;
+    // each run holds a process-wide maxConcurrentRepos permit until it ends.
+    multi_host.ensure_auto_work_started();
 
     // Opt-in Slack bridge, spawned alongside the server and stopped when the
     // process exits. serve_slack is a no-op (logs) when Slack is unconfigured,
     // so `--slack` is safe to pass unconditionally.
     if slack {
-        let repo_slack = repo.clone();
-        let bridge_host: kranz_slack::SharedHost =
-            Arc::new(crate::host_bridge::HostedPlanning(host.clone()));
-        tokio::spawn(async move {
-            // No graceful-shutdown wiring for the CLI's long-lived server:
-            // this future never resolves, so the bridge runs until the
-            // process is killed (same lifetime as the server below).
-            let never = std::future::pending::<()>();
-            if let Err(e) = kranz_slack::serve_slack(&repo_slack, Some(bridge_host), never).await {
-                tracing::error!(error = %e, "slack bridge exited with an error");
-            }
-        });
+        if multi_host.uses_operator_catalog() {
+            let catalog = multi_repo_slack_catalog(&multi_host)?;
+            tokio::spawn(async move {
+                let never = std::future::pending::<()>();
+                if let Err(error) = kranz_slack::serve_slack_catalog(catalog, never).await {
+                    tracing::error!(%error, "slack catalog bridge exited with an error");
+                }
+            });
+        } else {
+            let context = single_repo_slack_context(&multi_host)?;
+            let repo_slack = context.root().to_path_buf();
+            let hosted = context.host().ok_or_else(|| {
+                anyhow!(
+                    "cannot start Slack bridge for unavailable repository '{}': {}",
+                    context.id(),
+                    context.unavailable_reason().unwrap_or("unavailable")
+                )
+            })?;
+            let bridge_host: kranz_slack::SharedHost =
+                Arc::new(crate::host_bridge::HostedPlanning(hosted.clone()));
+            tokio::spawn(async move {
+                // No graceful-shutdown wiring for the CLI's long-lived server:
+                // this future never resolves, so the bridge runs until the
+                // process is killed (same lifetime as the server below).
+                let never = std::future::pending::<()>();
+                if let Err(e) =
+                    kranz_slack::serve_slack(&repo_slack, Some(bridge_host), never).await
+                {
+                    tracing::error!(error = %e, "slack bridge exited with an error");
+                }
+            });
+        }
     }
 
     let dashboard_assets = resolve_dashboard_assets(&repo, dashboard);
@@ -1434,11 +1471,95 @@ async fn cmd_serve(
         }
     };
     let result =
-        serve_with_token_cleanup(&repo, host, listener, static_assets, token, shutdown).await;
+        serve_multi_with_token_cleanup(&repo, multi_host, listener, static_assets, token, shutdown)
+            .await;
     match result {
         Ok(()) => Ok(0),
         Err(e) => Err(anyhow!("server failed: {e}")),
     }
+}
+
+fn single_repo_slack_context(
+    multi_host: &kranz_server::MultiRepoHost,
+) -> Result<Arc<kranz_server::RepoContext>> {
+    multi_host
+        .compatibility_context()
+        .ok_or_else(|| anyhow!("--slack requires one healthy configured repository"))
+}
+
+fn multi_repo_slack_catalog(
+    multi_host: &kranz_server::MultiRepoHost,
+) -> Result<kranz_slack::SlackCatalog> {
+    let global_config = kranz_engine::paths::global_config()
+        .ok_or_else(|| anyhow!("cannot locate the operator config directory for Slack affinity"))?;
+    let affinity_path = global_config
+        .parent()
+        .expect("global config has a parent")
+        .join("slack")
+        .join("thread-affinity.json");
+    let repos = multi_host
+        .contexts()
+        .map(|context| {
+            let host = context.host().map(|host| {
+                Arc::new(crate::host_bridge::HostedPlanning(host.clone()))
+                    as kranz_slack::SharedHost
+            });
+            kranz_slack::SlackRepo {
+                id: context.id().to_string(),
+                root: context.root().to_path_buf(),
+                display_name: context
+                    .config()
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| context.id().to_string()),
+                routes: context
+                    .config()
+                    .slack
+                    .channels
+                    .iter()
+                    .map(|route| kranz_slack::SlackRoute {
+                        team_id: route.team.clone(),
+                        channel_id: route.channel.clone(),
+                    })
+                    .collect(),
+                allow_users: context.config().slack.allow_users.clone(),
+                available: context.is_healthy(),
+                host,
+                unavailable_reason: context.unavailable_reason().map(str::to_string),
+                default: multi_host.default_repo() == Some(context.id()),
+            }
+        })
+        .collect();
+    kranz_slack::SlackCatalog::new(repos, affinity_path)
+}
+
+async fn serve_multi_with_token_cleanup(
+    repo: &Path,
+    multi_host: Arc<kranz_server::MultiRepoHost>,
+    listener: tokio::net::TcpListener,
+    static_assets: Option<kranz_server::DashboardStatic>,
+    token: String,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
+    let token_file = if multi_host.uses_operator_catalog() {
+        let address = listener
+            .local_addr()
+            .context("cannot resolve the bound address for operator token storage")?;
+        write_operator_serve_token(address, &token)
+            .context("cannot securely store the operator serve token")?
+    } else {
+        write_serve_token(repo, &token).context("cannot securely store the serve token")?
+    };
+    let result = kranz_server::serve_multi_on_listener(
+        multi_host,
+        listener,
+        static_assets,
+        Some(token),
+        shutdown,
+    )
+    .await;
+    remove_token_file(&token_file);
+    result
 }
 
 /// Owns the write→serve→remove sequence for `.kranz/serve.token` so the
@@ -1446,6 +1567,7 @@ async fn cmd_serve(
 /// asserted by a helper the tests bypass. Removes the token file on both the
 /// `Ok` and `Err` serve paths — a server that fails to bind must not leave a
 /// stale mutation token behind.
+#[cfg(test)]
 async fn serve_with_token_cleanup(
     repo: &Path,
     host: Arc<kranz_server::MissionHost>,
@@ -1457,14 +1579,12 @@ async fn serve_with_token_cleanup(
     // Filesystem read access to .kranz/serve.token confers mutation
     // authority — the same trust boundary as the .kranz/ directory itself,
     // so this file must never be written world- or group-readable.
-    let token_file = write_serve_token(repo, &token).ok();
+    let token_file = write_serve_token(repo, &token)?;
 
     let result =
         kranz_server::serve_on_listener(host, listener, static_assets, Some(token), shutdown).await;
 
-    if token_file.is_some() {
-        remove_serve_token(repo);
-    }
+    remove_token_file(&token_file);
 
     result
 }
@@ -1475,24 +1595,97 @@ async fn serve_with_token_cleanup(
 /// mutation authority over the served repo — the same trust boundary as the
 /// `.kranz/` directory itself, so it is written owner-only (0600 on Unix).
 fn write_serve_token(repo: &Path, token: &str) -> std::io::Result<PathBuf> {
-    let dir = repo.join(".kranz");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join("serve.token");
-    std::fs::write(&path, token)?;
+    write_token_file(&repo.join(".kranz").join("serve.token"), token)
+}
+
+/// Multi-root token location: `~/.kranz/serve/<endpoint>.token`. The complete
+/// bound socket address distinguishes servers sharing a port on different
+/// interfaces and lets `kranz release --url ...` refuse host-ambiguous
+/// automatic credential discovery.
+fn write_operator_serve_token(
+    address: std::net::SocketAddr,
+    token: &str,
+) -> std::io::Result<PathBuf> {
+    let global = kranz_engine::paths::global_config().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "cannot resolve operator config directory",
+        )
+    })?;
+    let path = operator_serve_token_path(&global, address);
+    write_token_file(&path, token)
+}
+
+fn operator_serve_token_path(global_config: &Path, address: std::net::SocketAddr) -> PathBuf {
+    let endpoint = match address.ip() {
+        std::net::IpAddr::V4(ip) => format!("v4-{:08x}-{}", u32::from(ip), address.port()),
+        std::net::IpAddr::V6(ip) => format!("v6-{:032x}-{}", u128::from(ip), address.port()),
+    };
+    global_config
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("serve")
+        .join(format!("{endpoint}.token"))
+}
+
+/// Pre-endpoint migration path: `~/.kranz/serve/<port>.token`. Kept as a
+/// last-resort discovery fallback so a live serve that still has only the
+/// legacy file remains usable until the next `kranz serve` rewrite.
+fn legacy_operator_serve_token_path(global_config: &Path, port: u16) -> PathBuf {
+    global_config
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("serve")
+        .join(format!("{port}.token"))
+}
+
+fn write_token_file(path: &Path, token: &str) -> std::io::Result<PathBuf> {
+    let dir = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "token path has no parent")
+    })?;
+    std::fs::create_dir_all(dir)?;
+    // Write a sibling temp file then rename over the destination so a crash
+    // never leaves an empty/truncated credential at the stable path, and an
+    // existing inode (or symlink) is replaced rather than rewritten in place.
+    // A random suffix avoids PID-reuse create_new collisions after a crash.
+    let tmp = dir.join(format!(
+        ".{}.tmp-{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("serve.token"),
+        uuid::Uuid::new_v4().as_simple()
+    ));
+    let write_tmp = || -> std::io::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        file.write_all(token.as_bytes())?;
+        file.flush()?;
+        Ok(())
+    };
+    if let Err(error) = write_tmp() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
     }
-    Ok(path)
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    Ok(path.to_path_buf())
 }
 
-/// Remove `<repo>/.kranz/serve.token` on clean shutdown. A process killed by
-/// SIGKILL may leave a stale file behind; that's acceptable since the next
-/// `kranz serve` overwrites it.
-fn remove_serve_token(repo: &Path) {
-    let path = repo.join(".kranz").join("serve.token");
-    if let Err(err) = std::fs::remove_file(&path) {
+fn remove_token_file(path: &Path) {
+    if let Err(err) = std::fs::remove_file(path) {
         if err.kind() != std::io::ErrorKind::NotFound {
             eprintln!("kranz: could not remove {}: {err}", path.display());
         }
@@ -1686,14 +1879,204 @@ fn open_browser(url: &str) {
 /// CLI runs in a different process and cannot reach serve's in-memory
 /// registry directly, so this always goes over HTTP — never the event log.
 /// Resolve the mutation token for `kranz release`, in precedence order:
-/// `--token` flag > `$KRANZ_TOKEN` > `<repo>/.kranz/serve.token`.
-fn resolve_release_token(repo: &Path, flag: Option<String>) -> Option<String> {
-    flag.or_else(|| std::env::var("KRANZ_TOKEN").ok())
-        .or_else(|| {
-            std::fs::read_to_string(repo.join(".kranz").join("serve.token"))
-                .ok()
-                .map(|s| s.trim_end().to_string())
+/// `--token` > `$KRANZ_TOKEN` > operator process token for `--url` > the
+/// single-repo compatibility file (loopback URLs only).
+fn resolve_release_token(
+    repo: &Path,
+    url: &str,
+    flag: Option<String>,
+) -> Result<String, ReleaseTokenError> {
+    let parsed = reqwest::Url::parse(url).ok();
+    let operator_lookup = parsed
+        .as_ref()
+        .and_then(|url| {
+            kranz_engine::paths::global_config()
+                .as_deref()
+                .map(|global| operator_token_for_url(global, url))
         })
+        .unwrap_or(OperatorTokenLookup::Absent);
+    let allow_repo_fallback = parsed.as_ref().is_some_and(automatic_repo_token_allowed);
+    resolve_release_token_from_sources(repo, operator_lookup, allow_repo_fallback, flag)
+}
+
+/// Outcome of scanning endpoint-scoped and legacy operator token files for a
+/// release URL. `Ambiguous` must not fall through to the single-repo
+/// compatibility file — that would bypass the "refuse to guess" policy with
+/// a different credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OperatorTokenLookup {
+    Absent,
+    Found(String),
+    Legacy(String),
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReleaseTokenError {
+    Absent,
+    Ambiguous,
+}
+
+fn resolve_release_token_from_sources(
+    repo: &Path,
+    operator_lookup: OperatorTokenLookup,
+    allow_repo_fallback: bool,
+    flag: Option<String>,
+) -> Result<String, ReleaseTokenError> {
+    if let Some(flag) = flag {
+        return Ok(flag);
+    }
+    if let Ok(env) = std::env::var("KRANZ_TOKEN") {
+        return Ok(env);
+    }
+    match operator_lookup {
+        OperatorTokenLookup::Found(authority) => Ok(authority),
+        // The port-only file predates endpoint scoping and may have survived
+        // an ungraceful shutdown. A live single-repo serve writes the more
+        // specific repository token, so prefer that before using the legacy
+        // compatibility credential.
+        OperatorTokenLookup::Legacy(authority) => {
+            let repo_authority = allow_repo_fallback
+                .then(|| read_token_file(&repo.join(".kranz").join("serve.token")))
+                .flatten();
+            Ok(repo_authority.unwrap_or(authority))
+        }
+        OperatorTokenLookup::Ambiguous => Err(ReleaseTokenError::Ambiguous),
+        OperatorTokenLookup::Absent => allow_repo_fallback
+            .then(|| read_token_file(&repo.join(".kranz").join("serve.token")))
+            .flatten()
+            .ok_or(ReleaseTokenError::Absent),
+    }
+}
+
+fn scan_operator_token_addresses(
+    global_config: &Path,
+    addresses: &[std::net::SocketAddr],
+) -> OperatorTokenLookup {
+    let mut authority = None;
+    for address in addresses {
+        if let Some(found) = read_token_file(&operator_serve_token_path(global_config, *address)) {
+            if authority.is_some() {
+                // Several local servers match this URL (for example both v4
+                // and v6 localhost). Refuse to guess which authority to send.
+                return OperatorTokenLookup::Ambiguous;
+            }
+            authority = Some(found);
+        }
+    }
+    match authority {
+        Some(authority) => OperatorTokenLookup::Found(authority),
+        None => OperatorTokenLookup::Absent,
+    }
+}
+
+fn operator_token_for_url(global_config: &Path, url: &reqwest::Url) -> OperatorTokenLookup {
+    let Some(port) = url.port_or_known_default() else {
+        return OperatorTokenLookup::Absent;
+    };
+    let Some(host) = normalized_url_host(url) else {
+        return OperatorTokenLookup::Absent;
+    };
+    // Exact named endpoints first; only if none match, fall back to
+    // unspecified-bind aliases. That keeps a live 127.0.0.1 token usable
+    // even when a stale 0.0.0.0 file from an earlier bind remains on disk.
+    let endpoint_lookup = if host.eq_ignore_ascii_case("localhost") {
+        let primary = [
+            std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
+            std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port)),
+        ];
+        match scan_operator_token_addresses(global_config, &primary) {
+            OperatorTokenLookup::Absent => scan_operator_token_addresses(
+                global_config,
+                &[
+                    std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port)),
+                    std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)),
+                ],
+            ),
+            other => other,
+        }
+    } else {
+        let Ok(ip) = host.parse::<std::net::IpAddr>() else {
+            return OperatorTokenLookup::Absent;
+        };
+        // Automatic discovery is loopback-only — same trust boundary as
+        // automatic_repo_token_allowed. Non-loopback URLs require --token.
+        if !ip.is_loopback() {
+            return OperatorTokenLookup::Absent;
+        }
+        let primary = [std::net::SocketAddr::new(ip, port)];
+        match scan_operator_token_addresses(global_config, &primary) {
+            OperatorTokenLookup::Absent => {
+                let unspecified = match ip {
+                    std::net::IpAddr::V4(_) => {
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+                    }
+                    std::net::IpAddr::V6(_) => {
+                        std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+                    }
+                };
+                scan_operator_token_addresses(
+                    global_config,
+                    &[std::net::SocketAddr::new(unspecified, port)],
+                )
+            }
+            other => other,
+        }
+    };
+    match endpoint_lookup {
+        OperatorTokenLookup::Absent => {
+            // Deprecated port-only filename from before endpoint scoping.
+            match read_token_file(&legacy_operator_serve_token_path(global_config, port)) {
+                Some(token) => OperatorTokenLookup::Legacy(token),
+                None => OperatorTokenLookup::Absent,
+            }
+        }
+        other => other,
+    }
+}
+
+fn automatic_repo_token_allowed(url: &reqwest::Url) -> bool {
+    normalized_url_host(url).is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    })
+}
+
+fn normalized_url_host(url: &reqwest::Url) -> Option<&str> {
+    let host = url.host_str()?;
+    Some(
+        host.strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host),
+    )
+}
+
+fn read_token_file(path: &Path) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let authority = contents.trim_end().to_string();
+    if authority.is_empty() {
+        None
+    } else {
+        Some(authority)
+    }
+}
+
+fn release_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("building release HTTP client")
+}
+
+fn release_repo_id_is_valid(id: &str) -> bool {
+    let mut chars = id.chars();
+    let valid_first = chars.next().is_some_and(|ch| ch.is_ascii_alphanumeric());
+    let valid_rest = chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'));
+    valid_first && valid_rest
 }
 
 async fn cmd_release(
@@ -1702,18 +2085,32 @@ async fn cmd_release(
     url: &str,
     token: Option<String>,
 ) -> Result<i32> {
-    let token = resolve_release_token(repo, token).ok_or_else(|| {
-        anyhow!(
-            "no mutation token available — pass --token, set $KRANZ_TOKEN, or run from a repo \
-             with a `kranz serve` still holding <repo>/.kranz/serve.token \
-             (the token `kranz serve` prints on startup)"
-        )
-    })?;
+    let token = match resolve_release_token(repo, url, token) {
+        Ok(token) => token,
+        Err(ReleaseTokenError::Ambiguous) => {
+            bail!(
+                "multiple ~/.kranz/serve/<endpoint>.token files match {url}; \
+                 pass --token for the intended serve instead of guessing"
+            );
+        }
+        Err(ReleaseTokenError::Absent) => {
+            bail!(
+                "no mutation token available — pass --token, set $KRANZ_TOKEN, or use a local URL matching \
+                 a live ~/.kranz/serve/<endpoint>.token / single-repo .kranz/serve.token \
+                 (the token `kranz serve` prints on startup)"
+            );
+        }
+    };
 
-    let base = url.trim_end_matches('/');
-    let endpoint = format!("{base}/api/missions/{mission_id}/release");
+    let client = release_http_client()?;
+    let repo_id = resolve_release_repo_id(repo, url, &client, &token).await?;
+    if let Some(id) = repo_id.as_deref() {
+        if !release_repo_id_is_valid(id) {
+            bail!("live serve returned an invalid repository id '{id}'; refusing release");
+        }
+    }
+    let endpoint = release_endpoint(url, mission_id, repo_id.as_deref());
 
-    let client = reqwest::Client::new();
     let response = client
         .post(&endpoint)
         .header("x-kranz-token", token)
@@ -1765,6 +2162,110 @@ async fn cmd_release(
     }
 }
 
+/// Ask the target serve which repository the selected root maps to. The
+/// process-global config may have changed since that serve started, or the
+/// URL may name a different process entirely, so it is never authoritative
+/// for a mutation target.
+async fn resolve_release_repo_id(
+    repo: &Path,
+    url: &str,
+    client: &reqwest::Client,
+    token: &str,
+) -> Result<Option<String>> {
+    live_release_repo_id(repo, url, client, token).await
+}
+
+fn release_repo_id_from_summaries(
+    repo: &Path,
+    repos: &[kranz_server::RepoSummary],
+) -> Result<Option<String>> {
+    if repos.is_empty() {
+        bail!("the live serve returned an empty repository catalog; refusing an unscoped release");
+    }
+    let root = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
+    let root_str = root.to_string_lossy();
+    let matches: Vec<&kranz_server::RepoSummary> = repos
+        .iter()
+        .filter(|entry| {
+            let entry_root = PathBuf::from(&entry.root);
+            let entry_canon =
+                std::fs::canonicalize(&entry_root).unwrap_or_else(|_| entry_root.clone());
+            entry_canon == root || entry.root == root_str
+        })
+        .collect();
+    match matches.as_slice() {
+        [one] => Ok(Some(one.id.clone())),
+        [] => Err(anyhow!(
+            "selected repository '{}' is not present in the live serve catalog; refusing an unscoped release",
+            repo.display()
+        )),
+        _ => Err(anyhow!(
+            "selected repository '{}' matches multiple live serve catalog entries; refusing release",
+            repo.display()
+        )),
+    }
+}
+
+async fn live_release_repo_id(
+    repo: &Path,
+    url: &str,
+    client: &reqwest::Client,
+    token: &str,
+) -> Result<Option<String>> {
+    let base = url.trim_end_matches('/');
+    // On loopback binds GETs are tokenless (docs/protocol.md). Attaching the
+    // mutation token would leak it to any process listening on a wrong
+    // loopback port. Off-loopback serves require the read token — send it then.
+    let mut request = client.get(format!("{base}/api/repos"));
+    let loopback_catalog = reqwest::Url::parse(url)
+        .ok()
+        .is_some_and(|parsed| automatic_repo_token_allowed(&parsed));
+    if !loopback_catalog {
+        request = request.header("x-kranz-token", token);
+    }
+    let send_error = |e: reqwest::Error| {
+        if e.is_connect() {
+            anyhow!("no kranz serve reachable at {url} — is it running?")
+        } else {
+            anyhow::Error::new(e).context("listing live serve repositories")
+        }
+    };
+    let mut response = request.send().await.map_err(send_error)?;
+    // A loopback URL does not imply a loopback bind: `serve --host 0.0.0.0`
+    // gates reads even when reached via 127.0.0.1. Only once the tokenless
+    // read is refused is the token proven necessary — resend it then, to the
+    // very server that just demanded it.
+    if loopback_catalog && response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        response = client
+            .get(format!("{base}/api/repos"))
+            .header("x-kranz-token", token)
+            .send()
+            .await
+            .map_err(send_error)?;
+    }
+    if !response.status().is_success() {
+        bail!(
+            "cannot list repositories at {url}: HTTP {}",
+            response.status()
+        );
+    }
+    let repos: Vec<kranz_server::RepoSummary> = response
+        .json()
+        .await
+        .context("parsing GET /api/repos response")?;
+    release_repo_id_from_summaries(repo, &repos)
+}
+
+fn release_endpoint(url: &str, mission_id: &str, repo_id: Option<&str>) -> String {
+    let base = url.trim_end_matches('/');
+    match repo_id {
+        Some(repo_id) => {
+            format!("{base}/api/repos/{repo_id}/missions/{mission_id}/release")
+        }
+        None => format!("{base}/api/missions/{mission_id}/release"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1813,8 +2314,8 @@ mod tests {
         write_serve_token(&repo, "file-token").unwrap();
 
         assert_eq!(
-            resolve_release_token(&repo, None),
-            Some("file-token".to_string())
+            resolve_release_token_from_sources(&repo, OperatorTokenLookup::Absent, true, None),
+            Ok("file-token".to_string())
         );
     }
 
@@ -1830,8 +2331,13 @@ mod tests {
         write_serve_token(&repo, "file-token").unwrap();
 
         assert_eq!(
-            resolve_release_token(&repo, Some("flag-token".to_string())),
-            Some("flag-token".to_string())
+            resolve_release_token_from_sources(
+                &repo,
+                OperatorTokenLookup::Absent,
+                true,
+                Some("flag-token".to_string()),
+            ),
+            Ok("flag-token".to_string())
         );
     }
 
@@ -1846,14 +2352,15 @@ mod tests {
         let repo = tmp.path().to_path_buf();
         write_serve_token(&repo, "file-token").unwrap();
 
-        let result = resolve_release_token(&repo, None);
+        let result =
+            resolve_release_token_from_sources(&repo, OperatorTokenLookup::Absent, true, None);
         unsafe {
             std::env::remove_var("KRANZ_TOKEN");
         }
-        assert_eq!(result, Some("env-token".to_string()));
+        assert_eq!(result, Ok("env-token".to_string()));
     }
 
-    /// When flag, env, and file are all absent, resolution yields `None` so
+    /// When flag, env, and file are all absent, resolution yields Absent so
     /// `cmd_release` can raise its actionable error.
     #[test]
     fn release_reads_token_file_none_present_yields_none() {
@@ -1865,7 +2372,430 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().to_path_buf();
 
-        assert_eq!(resolve_release_token(&repo, None), None);
+        assert_eq!(
+            resolve_release_token_from_sources(&repo, OperatorTokenLookup::Absent, true, None),
+            Err(ReleaseTokenError::Absent)
+        );
+    }
+
+    #[test]
+    fn release_prefers_operator_process_token_over_repo_compatibility_token() {
+        let _guard = KRANZ_TOKEN_ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("KRANZ_TOKEN");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        write_serve_token(&repo, "repo-token").unwrap();
+        let global = tmp.path().join("operator").join("config.json");
+        let address = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 4560));
+        let operator = operator_serve_token_path(&global, address);
+        write_token_file(&operator, "operator-token").unwrap();
+        let url = reqwest::Url::parse("http://127.0.0.1:4560").unwrap();
+
+        assert_eq!(
+            resolve_release_token_from_sources(
+                &repo,
+                operator_token_for_url(&global, &url),
+                true,
+                None,
+            ),
+            Ok("operator-token".to_string())
+        );
+    }
+
+    #[test]
+    fn ambiguous_operator_token_does_not_fall_through_to_repo_file() {
+        let _guard = KRANZ_TOKEN_ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("KRANZ_TOKEN");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        write_serve_token(&repo, "repo-token").unwrap();
+
+        assert_eq!(
+            resolve_release_token_from_sources(&repo, OperatorTokenLookup::Ambiguous, true, None,),
+            Err(ReleaseTokenError::Ambiguous)
+        );
+    }
+
+    #[test]
+    fn operator_token_discovery_is_ambiguous_for_dual_localhost_endpoint_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join(".kranz").join("config.json");
+        let v4 = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 4560));
+        let v6 = std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 4560));
+        write_token_file(&operator_serve_token_path(&global, v4), "v4-token").unwrap();
+        write_token_file(&operator_serve_token_path(&global, v6), "v6-token").unwrap();
+        let url = reqwest::Url::parse("http://localhost:4560").unwrap();
+
+        assert_eq!(
+            operator_token_for_url(&global, &url),
+            OperatorTokenLookup::Ambiguous
+        );
+    }
+
+    #[test]
+    fn operator_token_path_is_scoped_by_full_bound_endpoint() {
+        let global = Path::new("/operator/.kranz/config.json");
+        let a =
+            operator_serve_token_path(global, std::net::SocketAddr::from(([127, 0, 0, 1], 4560)));
+        let b =
+            operator_serve_token_path(global, std::net::SocketAddr::from(([127, 0, 0, 2], 4560)));
+        assert_ne!(a, b);
+        assert_eq!(
+            a,
+            Path::new("/operator/.kranz/serve/v4-7f000001-4560.token")
+        );
+    }
+
+    #[test]
+    fn operator_token_discovery_handles_ipv6_url_brackets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join(".kranz").join("config.json");
+        let address = std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 4560));
+        write_token_file(&operator_serve_token_path(&global, address), "ipv6-token").unwrap();
+        let url = reqwest::Url::parse("http://[::1]:4560").unwrap();
+
+        assert_eq!(
+            operator_token_for_url(&global, &url),
+            OperatorTokenLookup::Found("ipv6-token".to_string())
+        );
+    }
+
+    #[test]
+    fn automatic_token_discovery_refuses_remote_domain_urls() {
+        let _guard = KRANZ_TOKEN_ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("KRANZ_TOKEN");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        write_serve_token(&repo, "repo-token").unwrap();
+
+        assert_eq!(
+            resolve_release_token(&repo, "https://example.com:4560", None),
+            Err(ReleaseTokenError::Absent)
+        );
+    }
+
+    #[test]
+    fn operator_token_discovery_refuses_non_loopback_ip_literals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join(".kranz").join("config.json");
+        let address = std::net::SocketAddr::from(([203, 0, 113, 10], 4560));
+        write_token_file(&operator_serve_token_path(&global, address), "remote-token").unwrap();
+        let url = reqwest::Url::parse("http://203.0.113.10:4560").unwrap();
+
+        assert_eq!(
+            operator_token_for_url(&global, &url),
+            OperatorTokenLookup::Absent
+        );
+    }
+
+    #[test]
+    fn operator_token_discovery_prefers_exact_loopback_over_stale_unspecified() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join(".kranz").join("config.json");
+        let loopback = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 4560));
+        let unspecified = std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 4560));
+        write_token_file(&operator_serve_token_path(&global, loopback), "live-token").unwrap();
+        write_token_file(
+            &operator_serve_token_path(&global, unspecified),
+            "stale-token",
+        )
+        .unwrap();
+        let url = reqwest::Url::parse("http://127.0.0.1:4560").unwrap();
+
+        assert_eq!(
+            operator_token_for_url(&global, &url),
+            OperatorTokenLookup::Found("live-token".to_string())
+        );
+    }
+
+    #[test]
+    fn operator_token_discovery_falls_back_to_legacy_port_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join(".kranz").join("config.json");
+        write_token_file(
+            &legacy_operator_serve_token_path(&global, 4560),
+            "legacy-token",
+        )
+        .unwrap();
+        let url = reqwest::Url::parse("http://127.0.0.1:4560").unwrap();
+
+        assert_eq!(
+            operator_token_for_url(&global, &url),
+            OperatorTokenLookup::Legacy("legacy-token".to_string())
+        );
+    }
+
+    #[test]
+    fn stale_legacy_operator_token_does_not_mask_live_repo_token() {
+        let _guard = KRANZ_TOKEN_ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("KRANZ_TOKEN");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        write_serve_token(&repo, "live-repo-token").unwrap();
+        let global = tmp.path().join(".kranz").join("config.json");
+        write_token_file(
+            &legacy_operator_serve_token_path(&global, 4560),
+            "stale-legacy-token",
+        )
+        .unwrap();
+        let url = reqwest::Url::parse("http://127.0.0.1:4560").unwrap();
+        let operator = operator_token_for_url(&global, &url);
+
+        assert_eq!(
+            resolve_release_token_from_sources(&repo, operator, true, None),
+            Ok("live-repo-token".to_string())
+        );
+    }
+
+    #[test]
+    fn operator_token_discovery_prefers_endpoint_file_over_legacy_port_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join(".kranz").join("config.json");
+        let loopback = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 4560));
+        write_token_file(
+            &operator_serve_token_path(&global, loopback),
+            "endpoint-token",
+        )
+        .unwrap();
+        write_token_file(
+            &legacy_operator_serve_token_path(&global, 4560),
+            "legacy-token",
+        )
+        .unwrap();
+        let url = reqwest::Url::parse("http://127.0.0.1:4560").unwrap();
+
+        assert_eq!(
+            operator_token_for_url(&global, &url),
+            OperatorTokenLookup::Found("endpoint-token".to_string())
+        );
+    }
+
+    #[test]
+    fn release_repo_id_from_summaries_refuses_duplicate_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let root = repo.to_string_lossy().into_owned();
+        let summaries = vec![
+            kranz_server::RepoSummary {
+                id: "alpha".to_string(),
+                root: root.clone(),
+                display_name: "alpha".to_string(),
+                group: None,
+                pinned: false,
+                is_default: true,
+                status: "healthy".to_string(),
+                error: None,
+                activity: kranz_server::RepoActivity::default(),
+            },
+            kranz_server::RepoSummary {
+                id: "beta".to_string(),
+                root,
+                display_name: "beta".to_string(),
+                group: None,
+                pinned: false,
+                is_default: false,
+                status: "healthy".to_string(),
+                error: None,
+                activity: kranz_server::RepoActivity::default(),
+            },
+        ];
+        let error = release_repo_id_from_summaries(&repo, &summaries).unwrap_err();
+        assert!(error.to_string().contains("matches multiple"));
+    }
+
+    #[test]
+    fn slack_operator_catalog_is_not_rejected_by_legacy_context_helper() {
+        fn init_git(root: &Path) {
+            std::fs::create_dir_all(root).unwrap();
+            let status = std::process::Command::new("git")
+                .args(["init", "-q"])
+                .arg(root)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        init_git(&a);
+        let multi = kranz_server::MultiRepoHost::from_config(kranz_server::HostConfig {
+            default_repo: Some("a".to_string()),
+            max_concurrent_repos: 1,
+            repos: vec![kranz_server::RepoConfig {
+                id: "a".to_string(),
+                root: a,
+                display_name: None,
+                group: None,
+                pinned: false,
+                slack: kranz_server::RepoSlackConfig::default(),
+            }],
+        })
+        .unwrap();
+        let context = single_repo_slack_context(&multi).unwrap();
+        assert_eq!(context.id(), "a");
+    }
+
+    #[test]
+    fn release_endpoint_is_repo_scoped_when_catalog_id_is_known() {
+        assert_eq!(
+            release_endpoint("http://127.0.0.1:4560/", "same-id", Some("repo-b")),
+            "http://127.0.0.1:4560/api/repos/repo-b/missions/same-id/release"
+        );
+    }
+
+    #[test]
+    fn release_repo_id_from_summaries_matches_live_catalog_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let summaries = vec![kranz_server::RepoSummary {
+            id: "alpha".to_string(),
+            root: repo.to_string_lossy().into_owned(),
+            display_name: "alpha".to_string(),
+            group: None,
+            pinned: false,
+            is_default: true,
+            status: "healthy".to_string(),
+            error: None,
+            activity: kranz_server::RepoActivity::default(),
+        }];
+        assert_eq!(
+            release_repo_id_from_summaries(&repo, &summaries)
+                .unwrap()
+                .as_deref(),
+            Some("alpha")
+        );
+    }
+
+    #[test]
+    fn release_repo_id_from_summaries_refuses_unmatched_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("local");
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let summaries = vec![kranz_server::RepoSummary {
+            id: "other".to_string(),
+            root: other.to_string_lossy().into_owned(),
+            display_name: "other".to_string(),
+            group: None,
+            pinned: false,
+            is_default: false,
+            status: "healthy".to_string(),
+            error: None,
+            activity: kranz_server::RepoActivity::default(),
+        }];
+        let error = release_repo_id_from_summaries(&repo, &summaries).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("not present in the live serve catalog"));
+    }
+
+    #[test]
+    fn release_repo_id_from_summaries_refuses_empty_catalog() {
+        let tmp = tempfile::tempdir().unwrap();
+        let error = release_repo_id_from_summaries(tmp.path(), &[]).unwrap_err();
+        assert!(error.to_string().contains("empty repository catalog"));
+    }
+
+    #[tokio::test]
+    async fn live_release_repo_lookup_authenticates_protected_catalog() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let catalog = Arc::new(kranz_server::MultiRepoHost::single(repo.clone()).unwrap());
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        // Loopback bind => read routes stay tokenless (matches production serve).
+        let app = kranz_server::router_with_multi_repo_host_and_addr(
+            catalog,
+            None,
+            Some("catalog-token".to_string()),
+            Some(address),
+            false,
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = release_http_client().unwrap();
+        let url = format!("http://{address}");
+
+        let repo_id = live_release_repo_id(&repo, &url, &client, "catalog-token")
+            .await
+            .unwrap();
+
+        server.abort();
+        let _ = server.await;
+        assert_eq!(repo_id.as_deref(), Some("repo"));
+    }
+
+    #[tokio::test]
+    async fn live_release_repo_lookup_retries_with_token_when_read_gated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let catalog = Arc::new(kranz_server::MultiRepoHost::single(repo.clone()).unwrap());
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        // Non-loopback bind => reads are token-gated, but the operator on the
+        // serve host still reaches it through a loopback URL. The tokenless
+        // first read 401s; the lookup must retry with the token instead of
+        // failing (`serve --host 0.0.0.0` + default `kranz release` URL).
+        let app = kranz_server::router_with_multi_repo_host_and_addr(
+            catalog,
+            None,
+            Some("catalog-token".to_string()),
+            Some(address),
+            true,
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = release_http_client().unwrap();
+        let url = format!("http://{address}");
+
+        let repo_id = live_release_repo_id(&repo, &url, &client, "catalog-token")
+            .await
+            .unwrap();
+
+        server.abort();
+        let _ = server.await;
+        assert_eq!(repo_id.as_deref(), Some("repo"));
+    }
+
+    #[test]
+    fn empty_token_files_are_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("serve.token");
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(read_token_file(&path), None);
     }
 
     #[cfg(unix)]
@@ -1875,6 +2805,22 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().to_path_buf();
         let path = write_serve_token(&repo, "secret").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_token_permissions_are_hardened_before_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("serve.token");
+        std::fs::write(&path, "old-token").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_token_file(&path, "new-token").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new-token");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
     }

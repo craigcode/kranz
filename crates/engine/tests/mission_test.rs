@@ -599,6 +599,11 @@ async fn happy_path_completes_mission_with_tag_and_contract_gate() {
         "{report}"
     );
     assert!(report.contains("## What shipped"), "{report}");
+    assert!(report.contains("## Workspace"), "{report}");
+    assert!(report.contains("**Isolation:** `checkout`"), "{report}");
+    assert!(report.contains("**Worker/validator cwd:**"), "{report}");
+    assert!(report.contains("**Sandbox:**"), "{report}");
+    assert!(report.contains("**Preflight:**"), "{report}");
     assert!(report.contains("feature 1"), "{report}");
     assert!(report.contains("## Validation history"), "{report}");
     assert!(report.contains("actual vs"), "{report}");

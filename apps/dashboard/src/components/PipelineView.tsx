@@ -13,6 +13,7 @@ import { pipelineStage, primaryAction, parseEstimateFromPlanMd } from '../lib/pi
 import type { WorkItem, WorkItemMission } from '../lib/pipelineStage';
 import type { MissionSummary, TicketSummary } from '../lib/types';
 import { LENSES, filterLensRows, landedCount, type Lens } from '../lib/lensFilter';
+import { missionHash, repoHash, ticketHash } from '../lib/routes';
 
 interface Row {
   key: string;
@@ -228,7 +229,7 @@ function IterateControl({ missionId, className }: { missionId: string; className
         goal: trimmed,
         context,
       });
-      window.location.hash = `#/backlog/${encodeURIComponent(created.slug)}`;
+      window.location.hash = ticketHash(created.slug);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setSubmitting(false);
@@ -266,6 +267,7 @@ function IterateControl({ missionId, className }: { missionId: string; className
 }
 
 export function PipelineView({ initialLens = 'actionable' }: { initialLens?: Lens }) {
+  const repoId = useKranzStore((s) => s.repoId);
   const tickets = useKranzStore((s) => s.tickets);
   const ticketsError = useKranzStore((s) => s.ticketsError);
   const loadTickets = useKranzStore((s) => s.loadTickets);
@@ -327,7 +329,7 @@ export function PipelineView({ initialLens = 'actionable' }: { initialLens?: Len
       return (
         <a
           className="btn-small pipeline-primary-action"
-          href={`#/m/${encodeURIComponent(row.missionId)}`}
+          href={missionHash(row.missionId)}
         >
           Approve plan
         </a>
@@ -338,7 +340,7 @@ export function PipelineView({ initialLens = 'actionable' }: { initialLens?: Len
       return (
         <a
           className="btn-small pipeline-primary-action"
-          href={`#/m/${encodeURIComponent(row.missionId)}`}
+          href={missionHash(row.missionId)}
         >
           {action.label}
         </a>
@@ -352,9 +354,9 @@ export function PipelineView({ initialLens = 'actionable' }: { initialLens?: Len
     if (stage === 'failed') {
       const href =
         row.slug !== undefined
-          ? `#/backlog/${encodeURIComponent(row.slug)}`
+          ? ticketHash(row.slug)
           : row.missionId !== undefined
-            ? `#/m/${encodeURIComponent(row.missionId)}`
+            ? missionHash(row.missionId)
             : undefined;
       if (href === undefined) return null;
       return (
@@ -368,7 +370,7 @@ export function PipelineView({ initialLens = 'actionable' }: { initialLens?: Len
       return (
         <a
           className="btn-small pipeline-primary-action"
-          href={`#/backlog/${encodeURIComponent(row.slug)}`}
+          href={ticketHash(row.slug)}
         >
           {action.label}
         </a>
@@ -386,7 +388,7 @@ export function PipelineView({ initialLens = 'actionable' }: { initialLens?: Len
       return (
         <a
           className="btn-small pipeline-secondary-action"
-          href={`#/backlog/${encodeURIComponent(row.slug)}`}
+          href={ticketHash(row.slug)}
         >
           {action.secondary}
         </a>
@@ -415,7 +417,7 @@ export function PipelineView({ initialLens = 'actionable' }: { initialLens?: Len
     const missionId = linkedMissionId(row);
     if (missionId !== undefined) {
       return (
-        <a className="mono picker-id" href={`#/m/${encodeURIComponent(missionId)}`}>
+        <a className="mono picker-id" href={missionHash(missionId)}>
           {row.id}
         </a>
       );
@@ -469,12 +471,24 @@ export function PipelineView({ initialLens = 'actionable' }: { initialLens?: Len
       <div className="picker-box">
         <div className="picker-title">
           <span className="picker-brand mono">KRANZ</span>
+          {repoId !== null && (
+            <button
+              type="button"
+              className="btn-small"
+              onClick={() => {
+                window.location.hash = '#/';
+              }}
+            >
+              projects
+            </button>
+          )}
+          {repoId !== null && <span className="mono project-current">{repoId}</span>}
           <span className="section-label">Pipeline</span>
           <button
             type="button"
             className="btn-small new-ticket-btn"
             onClick={() => {
-              window.location.hash = '#/new-ticket';
+              window.location.hash = repoHash('new-ticket');
             }}
           >
             + new ticket
@@ -483,7 +497,7 @@ export function PipelineView({ initialLens = 'actionable' }: { initialLens?: Len
             type="button"
             className="btn-small new-mission-btn"
             onClick={() => {
-              window.location.hash = '#/new';
+              window.location.hash = repoHash('new');
             }}
           >
             + new mission

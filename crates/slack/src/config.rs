@@ -97,6 +97,19 @@ impl SlackConfig {
             None => false,
         }
     }
+
+    /// Resolve the spend allowlist for a catalog repository.
+    ///
+    /// A non-empty per-repo list wins. An omitted/empty per-repo list inherits
+    /// the global list so enabling `host.repos` cannot fail-open spend that
+    /// was already locked at `slack.allowUsers`.
+    pub fn merge_repo_allow_users(global: &[String], repo: &[String]) -> Vec<String> {
+        if repo.is_empty() {
+            global.to_vec()
+        } else {
+            repo.to_vec()
+        }
+    }
 }
 
 /// On-disk shape of the `slack` object inside `~/.kranz/config.json`. Every
@@ -148,6 +161,17 @@ impl SlackConfig {
         let _ = repo_root; // reserved for future per-repo notify overrides
         let file = load_file_config()?;
         Ok(resolve(file, EnvVars::from_process()))
+    }
+
+    /// Resolve the global credentials while taking the posting channel from
+    /// an operator-owned repository route. Multi-repository mode must not let
+    /// the legacy global channel override catalog scope.
+    pub fn from_config_for_channel(repo_root: &Path, channel: &str) -> Result<Option<SlackConfig>> {
+        let _ = repo_root;
+        let file = load_file_config()?;
+        let mut env = EnvVars::from_process();
+        env.channel = Some(channel.to_string());
+        Ok(resolve(file, env))
     }
 }
 
@@ -374,6 +398,20 @@ mod tests {
             cfg.allow_users,
             vec!["U123".to_string(), "U456".to_string()]
         );
+    }
+
+    #[test]
+    fn catalog_allow_users_inherit_global_when_repo_list_omitted() {
+        let global = vec!["U-global".to_string()];
+        assert_eq!(
+            SlackConfig::merge_repo_allow_users(&global, &[]),
+            vec!["U-global".to_string()]
+        );
+        assert_eq!(
+            SlackConfig::merge_repo_allow_users(&global, &["U-repo".into()]),
+            vec!["U-repo".to_string()]
+        );
+        assert!(SlackConfig::merge_repo_allow_users(&[], &[]).is_empty());
     }
 
     #[test]

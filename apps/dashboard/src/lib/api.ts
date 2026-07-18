@@ -8,6 +8,7 @@
 // the request retries; cancelling rejects with a clear error.
 
 import { awaitToken, resolveToken } from './token';
+import { repoIdFromHash } from './routes';
 import type {
   ControlCommand,
   DrainState,
@@ -19,9 +20,11 @@ import type {
   PrHandoff,
   QueueState,
   ReadinessReport,
+  RepoSummary,
   Ticket,
   TicketSummary,
   TranscriptEntry,
+  WorkspaceSummary,
 } from './types';
 
 declare global {
@@ -37,6 +40,19 @@ export function serverBase(): string {
 /** http(s) origin used for both fetch and the ws:// URL derivation. */
 export function httpOrigin(): string {
   return serverBase() || window.location.origin;
+}
+
+export function scopedApiPath(path: string, repoId = repoIdFromHash()): string {
+  if (
+    repoId === null ||
+    path === '/api/repos' ||
+    path.startsWith('/api/repos/') ||
+    path === '/api/health' ||
+    !path.startsWith('/api/')
+  ) {
+    return path;
+  }
+  return `/api/repos/${encodeURIComponent(repoId)}${path.slice('/api'.length)}`;
 }
 
 /** Error carrying the HTTP status + the server's `{"error":...}` text. */
@@ -104,11 +120,14 @@ export interface GetJsonOptions {
 export async function getJson<T>(path: string, opts?: GetJsonOptions): Promise<T> {
   // Off-loopback serves require the mutation token on GETs too (header or
   // ?token=). Always attach when we have one — loopback ignores it.
+  // Capture repository scope once: a token retry after navigation must keep
+  // targeting the operation's original repository.
+  const requestPath = scopedApiPath(path);
   for (;;) {
     const token = resolveToken();
     const headers: Record<string, string> = {};
     if (token !== null) headers['x-kranz-token'] = token;
-    const res = await fetch(serverBase() + path, { headers });
+    const res = await fetch(serverBase() + requestPath, { headers });
     if (res.status === 401) {
       if (opts?.tokenGate === false) {
         throw await errorFrom(res, `GET ${path} failed: 401 token required`);
@@ -129,11 +148,14 @@ export async function getJson<T>(path: string, opts?: GetJsonOptions): Promise<T
  * failure, or the user cancels the prompt).
  */
 export async function postJson<T>(path: string, body: unknown): Promise<T> {
+  // Same fixed-scope rule as GET: never retarget a parked mutation because
+  // the operator selected another repository while entering a token.
+  const requestPath = scopedApiPath(path);
   for (;;) {
     const token = resolveToken();
     const headers: Record<string, string> = { 'content-type': 'application/json' };
     if (token !== null) headers['x-kranz-token'] = token;
-    const res = await fetch(serverBase() + path, {
+    const res = await fetch(serverBase() + requestPath, {
       method: 'POST',
       headers,
       body: JSON.stringify(body),
@@ -150,12 +172,20 @@ export async function postJson<T>(path: string, body: unknown): Promise<T> {
 }
 
 export const api = {
+  repos(): Promise<RepoSummary[]> {
+    return getJson('/api/repos');
+  },
+
   missions(): Promise<MissionSummary[]> {
     return getJson('/api/missions');
   },
 
   missionState(id: string): Promise<MissionState> {
     return getJson(`/api/missions/${encodeURIComponent(id)}/state`);
+  },
+
+  workspace(id: string): Promise<WorkspaceSummary> {
+    return getJson(`/api/missions/${encodeURIComponent(id)}/workspace`);
   },
 
   events(id: string, since?: number): Promise<MissionEvent[]> {

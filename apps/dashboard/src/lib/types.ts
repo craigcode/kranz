@@ -237,12 +237,21 @@ export interface WorkerRun {
 
 export type AgentBackend = 'claude' | 'codex' | 'droid';
 
+export type SandboxEnforce = 'off' | 'fs' | 'fs+net';
+
+export interface SandboxConfig {
+  enforce: SandboxEnforce;
+  extraWrite: string[];
+  egress: string[];
+}
+
 export interface RoleConfig {
   model: string;
   reasoningEffort: string;
   maxTurns?: number;
   maxBudgetUsd?: number;
   backend?: AgentBackend;
+  sandbox?: SandboxConfig;
 }
 
 export interface MissionConfig {
@@ -261,6 +270,7 @@ export interface MissionConfig {
   dangerouslyAllowAll: boolean;
   allowBelowDefaultWorkerModel: boolean;
   claudeBinary?: string;
+  workerIsolation?: 'worktree' | 'checkout';
 }
 
 export interface MissionState {
@@ -287,6 +297,27 @@ export interface MissionSummary {
   /** Ancestry-probe bit: mission branch tip is an ancestor of the live base
    *  branch tip. `null`/absent when there's no branch or the probe failed. */
   merged?: boolean | null;
+}
+
+export interface RepoActivity {
+  queued: number;
+  running: number;
+  needsInput: number;
+  completeUnmerged: number;
+  failed: number;
+}
+
+/** Operator-owned row from `GET /api/repos`. */
+export interface RepoSummary {
+  id: string;
+  root: string;
+  displayName: string;
+  group?: string;
+  pinned: boolean;
+  isDefault: boolean;
+  status: 'healthy' | 'unavailable';
+  error?: string;
+  activity: RepoActivity;
 }
 
 // ---------------------------------------------------------------------------
@@ -438,6 +469,25 @@ export interface ReadinessReport {
   warnings: string[];
 }
 
+/** `GET /api/missions/:id/workspace` — derived local execution context. */
+export interface WorkspaceSummary {
+  isolation: 'worktree' | 'checkout';
+  cwd: string;
+  lifecycle: 'active' | 'pending' | 'removed' | 'primary-checkout';
+  worktreeActive: boolean;
+  sandboxes: Array<{
+    role: 'worker' | 'scrutiny' | 'functional';
+    enforce: SandboxEnforce;
+    extraWriteCount: number;
+    egressCount: number;
+  }>;
+  preflight: {
+    status: 'pending' | 'clear' | 'issues';
+    summary: string;
+    eventSeq: number | null;
+  };
+}
+
 /** This host's queue-drain tracker (`MissionHost::drain` / `drain_state_json`). */
 export interface DrainState {
   live: boolean;
@@ -452,6 +502,10 @@ export interface QueueState {
   entries: QueueEntry[];
   busyWith: string | null;
   drain: DrainState;
+  /** Run slots left under `host.maxConcurrentRepos` (multi-repo hosts only). */
+  maxConcurrentReposAvailable?: number;
+  /** True when the process-wide run budget is exhausted. */
+  maxConcurrentReposSaturated?: boolean;
 }
 
 /** `GET /api/missions/:id/pr-handoff` — never auto-pushes. */

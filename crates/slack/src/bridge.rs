@@ -20,13 +20,14 @@
 //! Shutdown is any `Future` that resolves when the host wants the bridge to
 //! stop; both loops select on a shared notify fired from it.
 
+use crate::catalog::SlackCatalog;
 use crate::client::SlackClient;
 use crate::config::{NotifyFlags, SlackConfig};
 use crate::health::BridgeHealth;
 use crate::host::{AskOutcome, PlanOutcome, SharedHost};
 use crate::inbound::{route, Action, ThreadLookup};
 use crate::outbound::{classify, NotifyClass, Outbound};
-use crate::threads::ThreadMap;
+use crate::threads::{AffinityMap, RepoMissionId, ThreadMap};
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use kranz_engine::draft::DraftOutcome;
@@ -67,46 +68,257 @@ const HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(60);
 /// reads them) see a single consistent map, persisted on every change.
 #[derive(Clone)]
 pub struct SharedThreads {
-    repo_root: PathBuf,
-    inner: Arc<Mutex<ThreadMap>>,
+    store: ThreadStore,
+}
+
+#[derive(Clone)]
+enum ThreadStore {
+    Legacy {
+        repo_root: PathBuf,
+        inner: Arc<Mutex<ThreadMap>>,
+    },
+    Catalog {
+        path: PathBuf,
+        inner: Arc<Mutex<AffinityMap>>,
+        repo_id: String,
+        team_id: String,
+        channel_id: String,
+    },
+}
+
+/// Shared operator-owned affinity state. Each repository/channel gets a
+/// scoped [`SharedThreads`] view so the existing posting and dispatch code
+/// cannot accidentally address a bare mission id across repositories.
+#[derive(Clone)]
+pub struct SharedAffinities {
+    path: PathBuf,
+    inner: Arc<Mutex<AffinityMap>>,
 }
 
 impl SharedThreads {
     /// Load the persisted thread map for a repo into a shared, thread-safe view.
     pub fn load(repo_root: &Path) -> Result<Self> {
         Ok(Self {
-            repo_root: repo_root.to_path_buf(),
-            inner: Arc::new(Mutex::new(ThreadMap::load(repo_root)?)),
+            store: ThreadStore::Legacy {
+                repo_root: repo_root.to_path_buf(),
+                inner: Arc::new(Mutex::new(ThreadMap::load(repo_root)?)),
+            },
         })
     }
 
+    pub fn catalog(
+        affinities: &SharedAffinities,
+        repo_id: impl Into<String>,
+        team_id: impl Into<String>,
+        channel_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            store: ThreadStore::Catalog {
+                path: affinities.path.clone(),
+                inner: Arc::clone(&affinities.inner),
+                repo_id: repo_id.into(),
+                team_id: team_id.into(),
+                channel_id: channel_id.into(),
+            },
+        }
+    }
+
     fn thread_ts(&self, mission_id: &str) -> Option<String> {
-        self.inner
-            .lock()
-            .unwrap()
-            .thread_ts(mission_id)
-            .map(str::to_string)
+        match &self.store {
+            ThreadStore::Legacy { inner, .. } => inner
+                .lock()
+                .unwrap()
+                .thread_ts(mission_id)
+                .map(str::to_string),
+            ThreadStore::Catalog {
+                inner,
+                repo_id,
+                team_id,
+                channel_id,
+                ..
+            } => inner
+                .lock()
+                .unwrap()
+                .thread_for(repo_id, mission_id, team_id, channel_id)
+                .map(str::to_string),
+        }
     }
 
     /// Record a mission's thread root and persist. A persistence error is
     /// logged, not fatal — losing the map only costs re-threading, and the next
     /// successful save recovers it.
     fn set(&self, mission_id: &str, thread_ts: &str) {
-        let mut guard = self.inner.lock().unwrap();
-        guard.set(mission_id, thread_ts);
-        if let Err(e) = guard.save(&self.repo_root) {
-            tracing::warn!(error = %e, "failed to persist slack thread map");
+        match &self.store {
+            ThreadStore::Legacy { repo_root, inner } => {
+                let mut guard = inner.lock().unwrap();
+                guard.set(mission_id, thread_ts);
+                if let Err(error) = guard.save(repo_root) {
+                    tracing::warn!(%error, "failed to persist slack thread map");
+                }
+            }
+            ThreadStore::Catalog {
+                path,
+                inner,
+                repo_id,
+                team_id,
+                channel_id,
+            } => {
+                let mut guard = inner.lock().unwrap();
+                guard.set(team_id, channel_id, thread_ts, repo_id, mission_id);
+                if let Err(error) = guard.save(path) {
+                    tracing::warn!(%error, "failed to persist slack thread affinity");
+                }
+            }
         }
     }
 }
 
 impl ThreadLookup for SharedThreads {
     fn mission_for_thread(&self, thread_ts: &str) -> Option<String> {
+        match &self.store {
+            ThreadStore::Legacy { inner, .. } => inner
+                .lock()
+                .unwrap()
+                .mission_for_thread(thread_ts)
+                .map(str::to_string),
+            ThreadStore::Catalog {
+                inner,
+                repo_id,
+                team_id,
+                channel_id,
+                ..
+            } => inner
+                .lock()
+                .unwrap()
+                .target_for(team_id, channel_id, thread_ts)
+                .filter(|target| target.repo_id == *repo_id)
+                .map(|target| target.mission_id.clone()),
+        }
+    }
+}
+
+impl SharedAffinities {
+    pub fn load(path: PathBuf) -> Result<Self> {
+        Ok(Self {
+            inner: Arc::new(Mutex::new(AffinityMap::load(&path)?)),
+            path,
+        })
+    }
+
+    pub fn target_for(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        thread_ts: &str,
+    ) -> Option<RepoMissionId> {
         self.inner
             .lock()
             .unwrap()
-            .mission_for_thread(thread_ts)
-            .map(str::to_string)
+            .target_for(team_id, channel_id, thread_ts)
+            .cloned()
+    }
+
+    /// Import the historical repo-local map into one catalog route. Existing
+    /// composite entries win, making migration idempotent across restarts.
+    pub fn migrate_legacy(
+        &self,
+        repo_root: &Path,
+        repo_id: &str,
+        team_id: &str,
+        channel_id: &str,
+    ) -> Result<usize> {
+        let legacy = ThreadMap::load(repo_root)?;
+        let mut guard = self.inner.lock().unwrap();
+        let mut imported = 0;
+        for (mission_id, thread_ts) in legacy.entries() {
+            if guard.target_for(team_id, channel_id, thread_ts).is_none() {
+                guard.set(team_id, channel_id, thread_ts, repo_id, mission_id);
+                imported += 1;
+            }
+        }
+        if imported > 0 {
+            guard.save(&self.path)?;
+        }
+        Ok(imported)
+    }
+}
+
+#[derive(Clone)]
+enum SocketContext {
+    Single {
+        repo_root: PathBuf,
+        threads: SharedThreads,
+        host: Option<SharedHost>,
+    },
+    Catalog(SlackCatalog),
+}
+
+#[derive(Clone)]
+struct DispatchTarget {
+    cfg: SlackConfig,
+    repo_root: PathBuf,
+    threads: SharedThreads,
+    host: Option<SharedHost>,
+    modal_scope: Option<ModalScope>,
+    routed: crate::inbound::Routed,
+}
+
+#[derive(Clone)]
+struct ModalScope {
+    repo_id: String,
+    team_id: String,
+}
+
+impl SocketContext {
+    fn route(&self, cfg: &SlackConfig, envelope: &Value) -> Result<Option<DispatchTarget>> {
+        match self {
+            Self::Single {
+                repo_root,
+                threads,
+                host,
+            } => Ok(Some(DispatchTarget {
+                cfg: cfg.clone(),
+                repo_root: repo_root.clone(),
+                threads: threads.clone(),
+                host: host.clone(),
+                modal_scope: None,
+                routed: route(envelope, threads),
+            })),
+            Self::Catalog(catalog) => {
+                let Some(resolved) = catalog.resolve_envelope(envelope)? else {
+                    return Ok(None);
+                };
+                let threads = catalog.scoped_threads(
+                    &resolved.repo.id,
+                    &resolved.team_id,
+                    &resolved.channel_id,
+                );
+                let mut scoped_cfg = cfg.clone();
+                scoped_cfg.allow_users = SlackConfig::merge_repo_allow_users(
+                    &cfg.allow_users,
+                    &resolved.repo.allow_users,
+                );
+                scoped_cfg.dashboard_url = scoped_cfg
+                    .dashboard_url
+                    .as_deref()
+                    .map(|base| crate::format::dashboard_repo_url(base, &resolved.repo.id));
+                if !resolved.channel_id.is_empty() {
+                    scoped_cfg.channel = resolved.channel_id.clone();
+                }
+                let routed = route(&resolved.envelope, &threads);
+                Ok(Some(DispatchTarget {
+                    cfg: scoped_cfg,
+                    repo_root: resolved.repo.root.clone(),
+                    threads,
+                    host: resolved.repo.host.clone(),
+                    modal_scope: Some(ModalScope {
+                        repo_id: resolved.repo.id.clone(),
+                        team_id: resolved.team_id,
+                    }),
+                    routed,
+                }))
+            }
+        }
     }
 }
 
@@ -561,6 +773,35 @@ pub async fn run_socket(
     host: Option<SharedHost>,
     shutdown: impl std::future::Future<Output = ()>,
 ) {
+    run_socket_context(
+        cfg,
+        client,
+        SocketContext::Single {
+            repo_root,
+            threads,
+            host,
+        },
+        shutdown,
+    )
+    .await;
+}
+
+/// One Socket Mode connection routed across every repository in `catalog`.
+pub async fn run_catalog_socket(
+    cfg: SlackConfig,
+    client: SlackClient,
+    catalog: SlackCatalog,
+    shutdown: impl std::future::Future<Output = ()>,
+) {
+    run_socket_context(cfg, client, SocketContext::Catalog(catalog), shutdown).await;
+}
+
+async fn run_socket_context(
+    cfg: SlackConfig,
+    client: SlackClient,
+    context: SocketContext,
+    shutdown: impl std::future::Future<Output = ()>,
+) {
     // A Notify fired once when shutdown resolves; the per-connection loop selects
     // on it so a mid-connection shutdown is prompt.
     let stop = Arc::new(Notify::new());
@@ -609,7 +850,7 @@ pub async fn run_socket(
                 tracing::info!("slack inbound loop shutting down");
                 return;
             }
-            result = connect_once(&cfg, &client, &repo_root, &threads, &host, &stop, &mut seen, &health) => {
+            result = connect_once(&cfg, &client, &context, &stop, &mut seen, &health) => {
                 health.record_disconnected();
                 match result {
                     // Clean close requested by shutdown: exit.
@@ -664,9 +905,7 @@ pub async fn run_socket(
 async fn connect_once(
     cfg: &SlackConfig,
     client: &SlackClient,
-    repo_root: &Path,
-    threads: &SharedThreads,
-    host: &Option<SharedHost>,
+    context: &SocketContext,
     stop: &Arc<Notify>,
     seen: &mut SeenEnvelopes,
     health: &BridgeHealth,
@@ -685,8 +924,8 @@ async fn connect_once(
     );
     let (mut write, mut read) = ws_stream.split();
 
-    pump_connection(
-        &mut read, &mut write, cfg, client, repo_root, threads, host, stop, seen, health,
+    pump_connection_context(
+        &mut read, &mut write, cfg, client, context, stop, seen, health,
     )
     .await
 }
@@ -716,6 +955,7 @@ fn is_disconnect_frame(text: &str) -> bool {
 /// `Ok(false)` on a clean close, a write-send failure, a disconnect frame, an
 /// idle stall, or a stream error (all reconnect promptly).
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn pump_connection<R, E, W>(
     read: &mut R,
     write: &mut W,
@@ -724,6 +964,30 @@ async fn pump_connection<R, E, W>(
     repo_root: &Path,
     threads: &SharedThreads,
     host: &Option<SharedHost>,
+    stop: &Arc<Notify>,
+    seen: &mut SeenEnvelopes,
+    health: &BridgeHealth,
+) -> Result<bool>
+where
+    R: futures_util::Stream<Item = std::result::Result<Message, E>> + Unpin,
+    W: futures_util::Sink<Message> + Unpin,
+    E: std::fmt::Display,
+{
+    let context = SocketContext::Single {
+        repo_root: repo_root.to_path_buf(),
+        threads: threads.clone(),
+        host: host.clone(),
+    };
+    pump_connection_context(read, write, cfg, client, &context, stop, seen, health).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn pump_connection_context<R, E, W>(
+    read: &mut R,
+    write: &mut W,
+    cfg: &SlackConfig,
+    client: &SlackClient,
+    context: &SocketContext,
     stop: &Arc<Notify>,
     seen: &mut SeenEnvelopes,
     health: &BridgeHealth,
@@ -762,11 +1026,17 @@ where
                             tracing::warn!("slack sent a disconnect frame; reconnecting");
                             return Ok(false);
                         }
-                        let Some(routed) = parse_envelope(&text, threads) else { continue };
+                        let envelope: Value = match serde_json::from_str(&text) {
+                            Ok(envelope) => envelope,
+                            Err(error) => {
+                                tracing::warn!(%error, "unparseable Socket Mode frame; ignoring");
+                                continue;
+                            }
+                        };
                         // Ack FIRST (within Slack's 3 s budget), before any slow
                         // work — otherwise a claude turn would delay the ack and
                         // block ping handling on this same read loop.
-                        if let Some(id) = &routed.envelope_id {
+                        if let Some(id) = envelope.get("envelope_id").and_then(Value::as_str) {
                             if write
                                 .send(Message::Text(json!({ "envelope_id": id }).to_string()))
                                 .await
@@ -780,28 +1050,52 @@ where
                                 continue;
                             }
                         }
+                        let target = match context.route(cfg, &envelope) {
+                            Ok(Some(target)) => target,
+                            Ok(None) => continue,
+                            Err(error) => {
+                                // The refusal itself is correct fail-closed
+                                // behavior; being invisible is not. Log every
+                                // refusal — reply delivery is best-effort.
+                                let envelope_type = envelope
+                                    .get("type")
+                                    .and_then(|value| value.as_str())
+                                    .unwrap_or("unknown");
+                                tracing::warn!(
+                                    error = %error,
+                                    envelope_type,
+                                    "slack envelope routing refused"
+                                );
+                                reply_routing_error(cfg, client, &envelope, &error.to_string()).await;
+                                continue;
+                            }
+                        };
                         // Slow (claude-spawning or engine-touching) actions run
                         // on a spawned task so the read loop keeps answering
                         // pings; fast local actions run inline.
-                        if is_slow_action(&routed.action) {
-                            let (cfg, client, repo, threads, host) = (
-                                cfg.clone(),
-                                client.clone(),
-                                repo_root.to_path_buf(),
-                                threads.clone(),
-                                host.clone(),
-                            );
+                        if is_slow_action(&target.routed.action) {
+                            let client = client.clone();
                             tokio::spawn(async move {
                                 dispatch_action(
-                                    &cfg, &client, &repo, &threads, host.as_ref(),
-                                    &routed.action,
+                                    &target.cfg,
+                                    &client,
+                                    &target.repo_root,
+                                    &target.threads,
+                                    target.host.as_ref(),
+                                    target.modal_scope.as_ref(),
+                                    &target.routed.action,
                                 )
                                 .await;
                             });
                         } else {
                             dispatch_action(
-                                cfg, client, repo_root, threads, host.as_ref(),
-                                &routed.action,
+                                &target.cfg,
+                                client,
+                                &target.repo_root,
+                                &target.threads,
+                                target.host.as_ref(),
+                                target.modal_scope.as_ref(),
+                                &target.routed.action,
                             )
                             .await;
                         }
@@ -824,17 +1118,45 @@ where
     }
 }
 
-/// Parse a Socket Mode text frame into a routed action, resolving thread →
-/// mission via the shared map (needed so a thread reply routes to Guidance).
-/// `None` on an unparseable frame.
-fn parse_envelope(text: &str, threads: &SharedThreads) -> Option<crate::inbound::Routed> {
-    match serde_json::from_str::<Value>(text) {
-        Ok(envelope) => Some(route(&envelope, threads)),
-        Err(e) => {
-            tracing::warn!(error = %e, "unparseable Socket Mode frame; ignoring");
-            None
-        }
+async fn reply_routing_error(
+    cfg: &SlackConfig,
+    client: &SlackClient,
+    envelope: &Value,
+    message: &str,
+) {
+    let payload = envelope.get("payload").unwrap_or(&Value::Null);
+    let response_url = payload.get("response_url").and_then(Value::as_str);
+    let blocks = error_blocks(message);
+    if response_url.is_some() {
+        reply_ephemeral(cfg, client, response_url, &blocks).await;
+        return;
     }
+    match routing_reply_target(payload) {
+        Some((channel, user)) => {
+            user_reply(cfg, client, None, &channel, Some(&user), &blocks).await;
+        }
+        None => tracing::warn!(
+            "slack routing refusal is undeliverable (no response_url/user/channel in payload)"
+        ),
+    }
+}
+
+/// Where a routing refusal can be delivered: `(channel, user)` for an
+/// ephemeral reply. Slash/action payloads carry these at the top level;
+/// Events API payloads (thread guidance messages, app events) carry them
+/// under `payload.event`.
+fn routing_reply_target(payload: &Value) -> Option<(String, String)> {
+    let user = payload
+        .get("user_id")
+        .and_then(Value::as_str)
+        .or_else(|| payload.pointer("/user/id").and_then(Value::as_str))
+        .or_else(|| payload.pointer("/event/user").and_then(Value::as_str))?;
+    let channel = payload
+        .get("channel_id")
+        .and_then(Value::as_str)
+        .or_else(|| payload.pointer("/channel/id").and_then(Value::as_str))
+        .or_else(|| payload.pointer("/event/channel").and_then(Value::as_str))?;
+    Some((channel.to_string(), user.to_string()))
 }
 
 /// Actions that may spawn a claude session (a multi-minute turn) or touch a
@@ -919,7 +1241,7 @@ async fn handle_envelope(
         }
     };
     let routed = route(&envelope, threads);
-    dispatch_action(cfg, client, repo_root, threads, None, &routed.action).await;
+    dispatch_action(cfg, client, repo_root, threads, None, None, &routed.action).await;
     // Ack whatever carried an envelope_id, even Ignore, so Slack stops retrying.
     routed
         .envelope_id
@@ -1335,6 +1657,7 @@ async fn dispatch_action(
     repo_root: &Path,
     threads: &SharedThreads,
     host: Option<&SharedHost>,
+    modal_scope: Option<&ModalScope>,
     action: &Action,
 ) {
     match action {
@@ -1562,7 +1885,14 @@ async fn dispatch_action(
                 .await;
                 return;
             }
-            let view = crate::format::build_config_modal(channel);
+            let view = match modal_scope {
+                Some(scope) => crate::format::build_config_modal_scoped(
+                    channel,
+                    &scope.repo_id,
+                    &scope.team_id,
+                ),
+                None => crate::format::build_config_modal(channel),
+            };
             if let Err(e) = client.open_view(trigger_id, &view).await {
                 tracing::warn!(error = %e, "failed to open config modal");
                 reply_ephemeral(
@@ -1597,7 +1927,14 @@ async fn dispatch_action(
                 .await;
                 return;
             }
-            let view = crate::format::build_new_mission_modal(channel);
+            let view = match modal_scope {
+                Some(scope) => crate::format::build_new_mission_modal_scoped(
+                    channel,
+                    &scope.repo_id,
+                    &scope.team_id,
+                ),
+                None => crate::format::build_new_mission_modal(channel),
+            };
             if let Err(e) = client.open_view(trigger_id, &view).await {
                 tracing::warn!(error = %e, "failed to open new-mission modal");
                 reply_ephemeral(
@@ -1634,7 +1971,16 @@ async fn dispatch_action(
                 .await;
                 return;
             }
-            let view = crate::format::build_new_ticket_modal(slug, title, channel);
+            let view = match modal_scope {
+                Some(scope) => crate::format::build_new_ticket_modal_scoped(
+                    slug,
+                    title,
+                    channel,
+                    &scope.repo_id,
+                    &scope.team_id,
+                ),
+                None => crate::format::build_new_ticket_modal(slug, title, channel),
+            };
             if let Err(e) = client.open_view(trigger_id, &view).await {
                 tracing::warn!(error = %e, "failed to open new-ticket modal");
                 reply_ephemeral(
@@ -4280,6 +4626,26 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn routing_reply_target_reads_slash_and_event_payloads() {
+        // Slash payload: coordinates at the top level.
+        let slash = json!({ "user_id": "U1", "channel_id": "C1" });
+        assert_eq!(
+            routing_reply_target(&slash),
+            Some(("C1".to_string(), "U1".to_string()))
+        );
+        // Events API payload (e.g. thread guidance): coordinates live under
+        // `event` — a refused threaded message must still reach its author.
+        let event = json!({ "event": { "type": "message", "user": "U2", "channel": "C2",
+                                       "thread_ts": "100.1", "text": "guidance" } });
+        assert_eq!(
+            routing_reply_target(&event),
+            Some(("C2".to_string(), "U2".to_string()))
+        );
+        // Nothing extractable: undeliverable (the caller logs it).
+        assert_eq!(routing_reply_target(&json!({ "token": null })), None);
+    }
+
+    #[test]
     fn class_enabled_respects_flags() {
         let flags = NotifyFlags {
             plan_ready: false,
@@ -4358,6 +4724,7 @@ mod tests {
             tmp.path(),
             &threads,
             None,
+            None,
             &Action::NewTicket {
                 title: "Rate-limit the notes API".into(),
                 channel: "C1".into(),
@@ -4393,6 +4760,7 @@ mod tests {
             &client,
             tmp.path(),
             &threads,
+            None,
             None,
             &Action::CreateTicket {
                 slug: "secret-ticket".into(),
@@ -4430,6 +4798,7 @@ mod tests {
             &client,
             tmp.path(),
             &threads,
+            None,
             None,
             &Action::NewTicket {
                 title: "Should Not Exist".into(),
@@ -5159,6 +5528,7 @@ mod tests {
             &client,
             tmp.path(),
             &threads,
+            None,
             None,
             &Action::QueueTicket {
                 slug: "m-a".into(),
@@ -5998,6 +6368,7 @@ mod tests {
             &client,
             tmp.path(),
             &threads,
+            None,
             None,
             &Action::Config {
                 mission_id: Some("m-gated-dispatch".into()),

@@ -32,9 +32,11 @@ function unauthorizedResponse(): Response {
 describe('getJson / postJson non-JSON guard', () => {
   beforeEach(() => {
     vi.stubGlobal('fetch', vi.fn());
+    window.location.hash = '';
   });
 
   afterEach(() => {
+    window.location.hash = '';
     vi.unstubAllGlobals();
     vi.clearAllMocks();
   });
@@ -79,6 +81,7 @@ describe('getJson / postJson non-JSON guard', () => {
 describe('401 token gate', () => {
   beforeEach(() => {
     vi.stubGlobal('fetch', vi.fn());
+    window.location.hash = '';
     vi.mocked(resolveToken).mockReturnValue('stale-token');
     vi.mocked(awaitToken).mockReset().mockImplementation(async () => {
       // Real awaitToken clears the stale token then waits for a paste.
@@ -87,6 +90,7 @@ describe('401 token gate', () => {
   });
 
   afterEach(() => {
+    window.location.hash = '';
     vi.unstubAllGlobals();
     vi.clearAllMocks();
   });
@@ -122,6 +126,22 @@ describe('401 token gate', () => {
     expect(fetch).toHaveBeenCalledTimes(2);
     expect(sentToken(0)).toBe('stale-token');
     expect(sentToken(1)).toBe('fresh-token');
+  });
+
+  it('keeps the original repository scope across a token-gate retry', async () => {
+    window.location.hash = '#/r/alpha';
+    vi.mocked(awaitToken).mockImplementationOnce(async () => {
+      window.location.hash = '#/r/beta';
+      vi.mocked(resolveToken).mockReturnValue('fresh-token');
+    });
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(unauthorizedResponse())
+      .mockResolvedValueOnce(jsonResponse({ ok: true }));
+
+    await postJson('/api/missions', { goal: 'stay scoped' });
+
+    expect(vi.mocked(fetch).mock.calls[0][0]).toBe('/api/repos/alpha/missions');
+    expect(vi.mocked(fetch).mock.calls[1][0]).toBe('/api/repos/alpha/missions');
   });
 
   it('getJson with tokenGate:false rejects the 401 without parking on the gate', async () => {
@@ -162,5 +182,25 @@ describe('401 token gate', () => {
     expect(awaitToken).not.toHaveBeenCalled();
     expect(fetch).toHaveBeenCalledTimes(1);
     expect(isTokenRequired(rejection)).toBe(true);
+  });
+});
+
+describe('repository scope', () => {
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(jsonResponse([]))));
+    window.location.hash = '#/r/alpha';
+  });
+
+  afterEach(() => {
+    window.location.hash = '';
+    vi.unstubAllGlobals();
+  });
+
+  it('prefixes repo operations but leaves the catalog endpoint unscoped', async () => {
+    await getJson('/api/missions');
+    await api.repos();
+
+    expect(vi.mocked(fetch).mock.calls[0][0]).toBe('/api/repos/alpha/missions');
+    expect(vi.mocked(fetch).mock.calls[1][0]).toBe('/api/repos');
   });
 });

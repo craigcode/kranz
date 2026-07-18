@@ -93,13 +93,6 @@ each; approve buttons queue, threaded replies become orchestrator guidance,
 `/kranz ticket <title>` scaffolds a ticket. See
 [docs/backlog-and-slack.md](backlog-and-slack.md).
 
-### 3. First public release (M4 distribution)
-
-crates.io + Homebrew paths are prepared but not live. Follow
-[docs/releasing.md](releasing.md): bump version, tag `vX.Y.Z`, push the tag →
-`release.yml` builds and attaches per-platform binaries; then update the
-Homebrew `sha256` and `cargo publish` in the order engine → server, slack → cli.
-
 ## Try the new surfaces now (no gates needed)
 
 ```sh

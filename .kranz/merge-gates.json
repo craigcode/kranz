@@ -17,7 +17,7 @@
       ]
     },
     {
-      "command": "npx tsc --noEmit",
+      "command": "npx tsc -b",
       "cwd": "apps/dashboard",
       "whenPaths": [
         "apps/dashboard"

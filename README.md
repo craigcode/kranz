@@ -25,13 +25,18 @@ an append-only event log makes every mission `kill -9`-safe.
 
 ## Quick start
 
-Prerequisites: Rust 1.85+, git, and the [Claude Code CLI](https://claude.com/claude-code)
+Prerequisites: Rust 1.88+, git, and the [Claude Code CLI](https://claude.com/claude-code)
 (`claude`) installed and authenticated — Kranz discovers it on PATH and in the
 usual install locations, or set `KRANZ_CLAUDE_BIN` / `claudeBinary` in config.
 
 ```sh
 cargo install --path crates/cli   # puts `kranz` on your PATH (~/.cargo/bin)
 cd /path/to/your/repo             # must be a git repo
+
+# 0. Onboard the repo. This detects common Rust/Node/Python gates, adds the
+#    runtime ignore template, and optionally registers it with multi-repo serve.
+kranz init --register
+# Unfamiliar toolchain: repeat --gate, e.g. kranz init --gate "make verify"
 
 # 1. Plan interactively — contract first, then milestones/features.
 #    /plan renders the proposal + cost estimate; approval commits plan.json
@@ -140,6 +145,12 @@ edit the layers with `kranz config show|set|unset` (`--global` targets the home
 file; edits are validated before writing and only shape *future* missions);
 `kranz config role <role> <model> [effort]` is the mid-mission path — it queues
 a config-change on the running mission, like Slack's `/kranz config`.
+
+`kranz init` is additive and idempotent: it never replaces an existing gate
+suite, and it preserves existing `.gitignore` and global-config keys. Pass
+`--register [--id ID] [--display-name NAME]` to add the canonical root to the
+dashboard/Slack host catalog. Its first-run report calls out the safe
+`worktree` isolation default and a zero-mission calibration cold start.
 
 The human-triggered Merge action uses the tracked
 `.kranz/merge-gates.json` from the live base branch (schema and examples:

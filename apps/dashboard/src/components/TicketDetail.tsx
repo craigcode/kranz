@@ -11,6 +11,7 @@ import { useKranzStore } from '../lib/store';
 import { api } from '../lib/api';
 import { renderMarkdown } from '../lib/markdown';
 import { relTime } from '../lib/format';
+import { repoHash } from '../lib/routes';
 import type { MissionEvent, Ticket } from '../lib/types';
 
 function describeEvent(e: MissionEvent): string {
@@ -121,7 +122,7 @@ export function TicketDetail({ slug }: { slug: string }) {
             type="button"
             className="btn-small new-mission-btn"
             onClick={() => {
-              window.location.hash = '#/backlog';
+              window.location.hash = repoHash('backlog');
             }}
           >
             backlog

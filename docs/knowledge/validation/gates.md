@@ -30,9 +30,10 @@ cargo build --workspace
 ```
 
 `.github/workflows/ci.yml` runs the same fmt/clippy/test gates on
-ubuntu+windows (no standalone `build` job — `cargo test` covers it); its
-dashboard job runs `npm ci`, `npx tsc --noEmit`, `npm run build`,
-`npm run test`, `npm run lint` under `apps/dashboard`.
+ubuntu+windows (no standalone `build` job — `cargo test` covers it), plus an
+Ubuntu `cargo check --workspace --locked` job on the declared Rust 1.88 MSRV.
+Its dashboard job runs `npm ci`, `npx tsc -b`, `npm run build`, `npm run test`,
+`npm run lint` under `apps/dashboard`.
 
 **Why not `-p kranz-engine`?** A crate-scoped pass hides breakage in the
 crate's consumers (cli, server, slack). `--workspace` is the only trustworthy
@@ -135,8 +136,11 @@ entropy-gated pass ≥4.0 bits/char; no external deps).
 - **Merge pre-gate:** step 2 above.
 - **`kranz scan`** ([commands.rs](../../../crates/cli/src/commands.rs) `cmd_scan`):
   `kranz scan --range main..HEAD` (or `--staged`, or default `HEAD`); prints
-  findings and exits `2`, else "secret scan passed" exit `0`. CI runs it as the
-  `secret-scan` job.
+  findings and exits `2`, else "secret scan passed" exit `0`. CI runs it in a
+  dedicated `pull_request_target` workflow as the `secret-scan` job; repository
+  contents stay read-only (the token can only report commit statuses), the
+  workflow, scanner binary, rules, and allowlist all come from the trusted base
+  commit, and proposed commits are fetched only as inert Git data.
 
 Allowlist lives at `.kranz/secret-allowlist` (one fingerprint per line, `#`
 comments); add a line only for a reviewed false positive.
