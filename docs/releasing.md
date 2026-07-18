@@ -4,18 +4,17 @@ Kranz ships three ways: prebuilt binaries attached to a GitHub release
 (automated), a from-source `cargo install`, and — once the project is public —
 crates.io and a Homebrew tap. This runbook is the end-to-end procedure.
 
-## 0. One-time setup (before the very first release)
+## 0. One-time setup (done)
 
-The repo ships with a literal `OWNER` placeholder in several files. Replace it
-with the real GitHub org/user everywhere before the first publish:
-
-- `Cargo.toml` — `[workspace.package] repository = "https://github.com/OWNER/kranz"`
-- `packaging/homebrew/kranz.rb` — `homepage` and `url`
-- `README.md` — the `brew tap OWNER/kranz` line
+The repo slug is `craigcode/kranz`; the one-time `OWNER`-placeholder replacement
+this section used to describe is complete in `Cargo.toml`
+(`[workspace.package] repository`), `packaging/homebrew/kranz.rb` (`homepage`
+and `url`), and `README.md` (`brew tap craigcode/kranz`). Nothing to do here
+for future releases.
 
 `repository`, `keywords`, and `categories` live in `[workspace.package]` and are
 inherited by each publishable crate (`repository.workspace = true`, etc.), so
-you only edit the slug in one place for the Cargo metadata.
+the slug only exists in one place for the Cargo metadata.
 
 ## 1. Bump the version
 
@@ -67,7 +66,7 @@ source tarball and runs `cargo install`. After the tag exists, compute the
 tarball sha256 and fill the placeholder:
 
 ```sh
-curl -sL https://github.com/OWNER/kranz/archive/refs/tags/vX.Y.Z.tar.gz \
+curl -sL https://github.com/craigcode/kranz/archive/refs/tags/vX.Y.Z.tar.gz \
   | shasum -a 256
 ```
 
@@ -116,10 +115,9 @@ Notes:
 
 ## Recap (order of operations)
 
-1. (first release only) replace `OWNER` everywhere.
-2. Bump `version` (root Cargo.toml + tauri.conf.json + src-tauri Cargo.toml +
+1. Bump `version` (root Cargo.toml + tauri.conf.json + src-tauri Cargo.toml +
    formula), commit.
-3. `git tag vX.Y.Z` and push the tag → `release.yml` builds + attaches binaries.
-4. Verify CI green + assets attached; write release notes.
-5. Update the Homebrew formula's `sha256`/`version`/`url`.
-6. (optional) `cargo publish` in order: engine → server, slack → cli.
+2. `git tag vX.Y.Z` and push the tag → `release.yml` builds + attaches binaries.
+3. Verify CI green + assets attached; write release notes.
+4. Update the Homebrew formula's `sha256`/`version`/`url`.
+5. (optional) `cargo publish` in order: engine → server, slack → cli.

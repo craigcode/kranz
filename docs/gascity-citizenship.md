@@ -974,7 +974,10 @@ leaves the kranz-native queue unscheduled — "a flag for Stage 2+ work, not a
 stage in itself" and "not scheduled by this document" — so no Stage 0-5 work
 item names it. Brief 2 is instead the ready-made scoping D5 defers to
 "whenever kranz-side queue work is next scoped"; filing it *is* that scoping
-decision, left to the operator rather than scheduled by this document. Either
+decision, left to the operator rather than scheduled by this document.
+(Update 2026-07-18: Brief 2 is now **moot** — the queue it scopes shipped
+with M2.75 and pipeline-view D-B; see the status note on the brief itself.)
+Either
 way, a fresh worker with no memory of this document's discussion can pick any
 brief up and run it headlessly.
 
@@ -1008,6 +1011,18 @@ added, a test file alongside it — no changes to `kranz-dispatch`'s body,
 `kranz-city-worker`, or `kranz-run-bead`).
 
 #### Brief 2: Build a kranz-native queue to replace the pack's private spool
+
+**Status: MOOT — superseded 2026-07-18.** The kranz-native queue this brief
+scopes already shipped, twice over: the per-repo priority queue landed with
+M2.75 (2026-07-03 — `.kranz/queue/<priority>-<seq>-<id>.json` entries, atomic
+claims, serial drain under a repo-busy guard), and pipeline-view decision D-B
+later hoisted the drain into `kranz serve` (`POST /api/queue/drain`,
+idempotent while live; fair round-robin across repos under the multi-root
+host). All that remains of the original idea is the part this brief
+explicitly deferred — pointing the Gas City pack at the kranz-native queue
+instead of its private spool — and that swap should be re-scoped when City
+Stage 2+ work is actually scheduled (Stage 1 is human-gated and has never
+run). The brief below is kept as the historical record of D5's scoping.
 
 **Goal:** Implement a `kranz work` queue dispatcher inside kranz itself —
 enqueue, dequeue-oldest-first, and single-consumer drain semantics

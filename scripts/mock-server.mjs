@@ -31,9 +31,11 @@
 //     not in planning, or a turn is already in flight.
 //   - POST /:id/planning/request-plan          → first call 200 {ready:false,
 //     reply} (NotReady returns to conversation); later calls 200 {ready:true,
-//     plan, estimate} with a small plan + CostEstimate.
-//   - POST /:id/approve {plan}                 → 200 {branch}; materializes
-//     the plan into state milestones and emits plan.approved.
+//     plan, estimate} with a small plan + CostEstimate, parked for approval.
+//   - POST /:id/approve-pending [{start}]      → 200 {branch, started};
+//     approves the plan parked by the last Ready request-plan (409 when none
+//     parked), materializes it into state milestones, emits plan.approved,
+//     and also starts the run when {start:true}.
 //   - POST /:id/start                          → 202 {running:true}; then
 //     flips the mission through running → complete over a few ticks
 //     (milestone/feature/worker events streaming over the WS feed).
@@ -656,7 +658,8 @@ function createHostedMission(goal, configPatch) {
     events: [],
     seq: 0,
     transcripts: {},
-    plan: null, // set on approve
+    plan: null, // approved plan (set by approve-pending)
+    pendingPlan: null, // parked by a Ready request-plan; consumed by approve-pending
     hostedHere: true,
     planRequests: 0,
     turns: 0,
@@ -786,12 +789,15 @@ function handleRequestPlan(m, res) {
       appendLive(m, 'worker.message', { runId: 'r-orch', tag: 'text', content: NOT_READY_REPLY });
       sendJson(res, 200, { ready: false, reply: NOT_READY_REPLY });
     } else {
-      sendJson(res, 200, { ready: true, plan: mockPlanFor(m.state.mission.goal), estimate: MOCK_ESTIMATE });
+      m.pendingPlan = mockPlanFor(m.state.mission.goal);
+      sendJson(res, 200, { ready: true, plan: m.pendingPlan, estimate: MOCK_ESTIMATE });
     }
   }, 700);
 }
 
-function handleApprove(m, plan, res) {
+/** approve-pending: approve the parked plan; start the run too when asked. */
+function handleApprove(m, plan, res, start) {
+  m.pendingPlan = null;
   m.plan = plan;
   m.state.mission.validationContract = plan.validationContract ?? [];
   m.state.mission.milestones = (plan.milestones ?? []).map((ms, mi) => ({
@@ -812,17 +818,27 @@ function handleApprove(m, plan, res) {
     })),
   }));
   appendLive(m, 'plan.approved', { plan });
-  sendJson(res, 200, { branch: m.state.mission.missionBranch });
+  if (start === true) beginRun(m);
+  sendJson(res, 200, { branch: m.state.mission.missionBranch, started: start === true });
 }
 
 /** start: 202, then walk the mission running → complete over a few ticks. */
 function handleStart(m, res) {
+  beginRun(m);
+  sendJson(res, 202, { running: true });
+}
+
+/** Shared start: flip to running, emit the decision, schedule the walk. */
+function beginRun(m) {
   m.state.mission.status = 'running';
   appendLive(m, 'orchestrator.decision', {
     summary: 'Execution started: walking milestones sequentially.',
   });
-  sendJson(res, 202, { running: true });
+  scheduleRun(m);
+}
 
+/** Walk the mission running → complete over a few ticks. */
+function scheduleRun(m) {
   const steps = [];
   for (const [mi, ms] of m.state.mission.milestones.entries()) {
     steps.push(() => {
@@ -1040,7 +1056,7 @@ const server = createServer((req, res) => {
       handleRequestPlan(m, res);
       return;
     }
-    if (rest === '/approve' && req.method === 'POST') {
+    if (rest === '/approve-pending' && req.method === 'POST') {
       const gate = planningGate(m);
       if (gate !== null) {
         sendJson(res, 409, { error: gate });
@@ -1048,11 +1064,11 @@ const server = createServer((req, res) => {
       }
       readJsonBody(req)
         .then((body) => {
-          if (typeof body.plan !== 'object' || body.plan === null) {
-            sendJson(res, 400, { error: 'plan is required' });
+          if (!m.pendingPlan) {
+            sendJson(res, 409, { error: 'no parked plan — request the plan first' });
             return;
           }
-          handleApprove(m, body.plan, res);
+          handleApprove(m, m.pendingPlan, res, body.start === true);
         })
         .catch(() => sendJson(res, 400, { error: 'bad JSON body' }));
       return;
