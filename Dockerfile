@@ -20,7 +20,7 @@
 # README quick-start). The committed dashboard dist under
 # crates/cli/assets/dashboard/dist is embedded by crates/cli/build.rs, so the
 # release build needs no Node.js — pure cargo.
-FROM rust:1-slim AS builder
+FROM rust:1-slim@sha256:34fb2f168c432d421a09883c663b275b33cbb30f6b18642fbd09a684c6546d0e AS builder
 
 # git is present in the builder for any build script that inspects the repo;
 # the release build itself does not require it.
@@ -36,7 +36,7 @@ RUN cargo build --release --locked -p kranz \
     && strip target/release/kranz
 
 # ---- runtime -----------------------------------------------------------------
-FROM debian:stable-slim AS runtime
+FROM debian:stable-slim@sha256:328d16499860ae6cb9b345e2e4cebca08c2a36e4f7278482c7bd1f39d71e5bfd AS runtime
 
 # git: Kranz shells out to the git binary for every mission ref (git_ops.rs).
 # ca-certificates: TLS trust for the scoped push to a remote and for the

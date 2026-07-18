@@ -46,3 +46,11 @@ updates:
         update-types:
           - minor
           - patch
+
+  # Dockerfile base images are digest-pinned. Dependabot refreshes those
+  # immutable pins without changing the human-readable rolling tags.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 2

@@ -546,11 +546,9 @@ pub fn scrub_json_value(value: &mut serde_json::Value, location: &str) -> Vec<Se
     findings
 }
 
-/// Generated artifacts excluded from diff scanning: minified dashboard
-/// bundles are machine-built from source that is scanned directly, and their
-/// compressed entropy trips the generic rules (a 2026-07-18 dashboard rebuild
-/// failed the CI scan with four false positives in the committed bundle).
-/// Scanning them adds noise, never signal.
+/// Generated dashboard bundles contain machine-generated assignments that
+/// trip the broad generic heuristic. Suppress only that low-confidence rule;
+/// fixed credential patterns and the entropy-gated rules still scan bundles.
 const GENERATED_DIFF_PATH_PREFIXES: &[&str] =
     &["apps/dashboard/dist/", "crates/cli/assets/dashboard/dist/"];
 
@@ -558,13 +556,13 @@ const GENERATED_DIFF_PATH_PREFIXES: &[&str] =
 pub fn scan_unified_diff(diff: &str) -> Vec<SecretFinding> {
     let mut findings = Vec::new();
     let mut path = "<diff>".to_string();
-    let mut skip_generated = false;
+    let mut generated_dashboard_bundle = false;
     let mut new_line: Option<usize> = None;
 
     for line in diff.lines() {
         if let Some(rest) = line.strip_prefix("+++ b/") {
             path = rest.to_string();
-            skip_generated = GENERATED_DIFF_PATH_PREFIXES
+            generated_dashboard_bundle = GENERATED_DIFF_PATH_PREFIXES
                 .iter()
                 .any(|prefix| path.starts_with(prefix));
             continue;
@@ -583,9 +581,11 @@ pub fn scan_unified_diff(diff: &str) -> Vec<SecretFinding> {
             } else {
                 format!("{path}:{line_no}")
             };
-            if !skip_generated {
-                findings.extend(scan_text_at(added, &location));
+            let mut line_findings = scan_text_at(added, &location);
+            if generated_dashboard_bundle {
+                line_findings.retain(|finding| finding.rule_id != "generic-secret-assignment");
             }
+            findings.extend(line_findings);
             if let Some(n) = &mut new_line {
                 *n += 1;
             }
