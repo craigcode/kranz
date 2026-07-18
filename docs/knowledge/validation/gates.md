@@ -112,7 +112,7 @@ in order, refusing early and leaving base untouched on any failure:
    against runs and sibling Merge requests.
 
 Kranz's tracked suite mirrors its CI: fmt/clippy/workspace tests always, plus
-the five dashboard gates when `apps/dashboard` changed. Other repositories
+the six dashboard gates when `apps/dashboard` changed. Other repositories
 define their own language/toolchain commands; see
 [docs/merge-gates.md](../../merge-gates.md).
 

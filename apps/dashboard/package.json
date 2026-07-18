@@ -6,8 +6,10 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "check-embedded": "node scripts/embedded-assets.mjs --check",
     "lint": "oxlint",
     "preview": "vite preview",
+    "sync-embedded": "node scripts/embedded-assets.mjs",
     "test": "vitest run"
   },
   "dependencies": {

@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from '@testing-library/react';
+import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { useKranzStore } from '../lib/store';
 import type { MissionState, WorkspaceSummary } from '../lib/types';
@@ -112,5 +112,41 @@ describe('WorkspacePanel', () => {
 
     expect(await screen.findByText('checkout · primary checkout')).toBeTruthy();
     expect(screen.queryByText(/missing worktree/i)).toBeNull();
+  });
+
+  it('refetches when sandbox grant counts change without an enforcement change', async () => {
+    vi.mocked(api.workspace)
+      .mockResolvedValueOnce(summary())
+      .mockResolvedValueOnce(
+        summary({
+          sandboxes: [
+            { role: 'worker', enforce: 'fs', extraWriteCount: 2, egressCount: 1 },
+            { role: 'scrutiny', enforce: 'off', extraWriteCount: 0, egressCount: 0 },
+            { role: 'functional', enforce: 'off', extraWriteCount: 0, egressCount: 0 },
+          ],
+        }),
+      );
+    const initial = state();
+    initial.config.worker = {
+      ...initial.config.worker,
+      sandbox: { enforce: 'fs', extraWrite: ['/tmp/a'], egress: [] },
+    };
+    useKranzStore.setState({ state: initial });
+    render(<WorkspacePanel />);
+    expect(await screen.findByText('worker fs · +1 write')).toBeTruthy();
+
+    const updated = state();
+    updated.config.worker = {
+      ...updated.config.worker,
+      sandbox: {
+        enforce: 'fs',
+        extraWrite: ['/tmp/a', '/tmp/b'],
+        egress: ['api.example.test'],
+      },
+    };
+    useKranzStore.setState({ state: updated });
+
+    await waitFor(() => expect(api.workspace).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText('worker fs · +2 write · +1 egress')).toBeTruthy();
   });
 });

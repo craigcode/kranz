@@ -46,8 +46,14 @@ export function WorkspacePanel() {
         state.mission.status,
         state.config.workerIsolation ?? 'worktree',
         state.config.worker.sandbox?.enforce ?? 'off',
+        state.config.worker.sandbox?.extraWrite.length ?? 0,
+        state.config.worker.sandbox?.egress.length ?? 0,
         state.config.validatorScrutiny.sandbox?.enforce ?? 'off',
+        state.config.validatorScrutiny.sandbox?.extraWrite.length ?? 0,
+        state.config.validatorScrutiny.sandbox?.egress.length ?? 0,
         state.config.validatorFunctional.sandbox?.enforce ?? 'off',
+        state.config.validatorFunctional.sandbox?.extraWrite.length ?? 0,
+        state.config.validatorFunctional.sandbox?.egress.length ?? 0,
       ].join(':')
     : '';
 

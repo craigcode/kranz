@@ -144,6 +144,24 @@ impl SlackCatalog {
             );
         }
 
+        // App Home is user-scoped: its channel is a Slack DM coordinate, not
+        // a repository route. The read-only render follows `host.defaultRepo`
+        // before channel or healthy-repo fallbacks can select another repo.
+        if app_home_envelope(&envelope) {
+            if let Some(repo) = self.repos.values().find(|repo| repo.default) {
+                let id = repo.id.clone();
+                return self.finish(&id, envelope, coordinates.team_id, coordinates.channel_id);
+            }
+            if self.repos.len() == 1 {
+                let id = self.repos.values().next().unwrap().id.clone();
+                return self.finish(&id, envelope, coordinates.team_id, coordinates.channel_id);
+            }
+            return Err(anyhow!(
+                "App Home cannot pick among several repositories; set host.defaultRepo to choose \
+                 which repository the Home tab shows"
+            ));
+        }
+
         if let (Some(team), Some(channel)) = (
             coordinates.team_id.as_deref(),
             coordinates.channel_id.as_deref(),
@@ -170,22 +188,6 @@ impl SlackCatalog {
                 coordinates.team_id,
                 coordinates.channel_id,
             );
-        }
-
-        // App Home is user-scoped: no channel mapping can ever disambiguate
-        // it, so the read-only render follows `host.defaultRepo` — the same
-        // repo the server's unscoped compatibility routes mean (scoping doc:
-        // "App Home may aggregate read-only status but must ask for a
-        // repository before mutation").
-        if app_home_envelope(&envelope) {
-            if let Some(repo) = self.repos.values().find(|repo| repo.default) {
-                let id = repo.id.clone();
-                return self.finish(&id, envelope, coordinates.team_id, coordinates.channel_id);
-            }
-            return Err(anyhow!(
-                "App Home cannot pick among several repositories; set host.defaultRepo to choose \
-                 which repository the Home tab shows"
-            ));
         }
 
         if envelope.get("envelope_id").is_none() {
@@ -403,6 +405,38 @@ mod tests {
         .unwrap();
         let resolved = catalog.resolve_envelope(&app_home("U1")).unwrap().unwrap();
         assert_eq!(resolved.repo.id, "beta");
+    }
+
+    #[test]
+    fn app_home_default_precedes_channel_and_healthy_repo_fallbacks() {
+        let tmp = tempdir().unwrap();
+        let mut beta = repo("beta", "T1", "CB", false);
+        beta.default = true;
+        let catalog = SlackCatalog::new(
+            vec![repo("alpha", "T1", "D-HOME", true), beta],
+            tmp.path().join("affinity.json"),
+        )
+        .unwrap();
+
+        let error = catalog.resolve_envelope(&app_home("U1")).err().unwrap();
+
+        assert!(error
+            .to_string()
+            .contains("repository 'beta' is unavailable"));
+    }
+
+    #[test]
+    fn app_home_without_default_uses_the_only_repository() {
+        let tmp = tempdir().unwrap();
+        let catalog = SlackCatalog::new(
+            vec![repo("alpha", "T1", "CA", true)],
+            tmp.path().join("affinity.json"),
+        )
+        .unwrap();
+
+        let resolved = catalog.resolve_envelope(&app_home("U1")).unwrap().unwrap();
+
+        assert_eq!(resolved.repo.id, "alpha");
     }
 
     #[test]

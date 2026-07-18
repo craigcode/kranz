@@ -59,6 +59,8 @@ jobs:
         working-directory: apps/dashboard
       - run: npm run build
         working-directory: apps/dashboard
+      - run: npm run check-embedded
+        working-directory: apps/dashboard
       - run: npm run test
         working-directory: apps/dashboard
       - run: npm run lint

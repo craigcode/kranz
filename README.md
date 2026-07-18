@@ -59,7 +59,7 @@ kranz serve --open                # Mission Control dashboard (browser)
 ```
 
 `kranz serve` includes an embedded dashboard bundle. When developing the UI,
-run `cd <kranz checkout>/apps/dashboard && npm install && npm run build`;
+run `cd <kranz checkout>/apps/dashboard && npm install && npm run build && npm run sync-embedded`;
 `kranz serve` will prefer that fresh build automatically (searching
 `--dashboard DIR`, `$KRANZ_DASHBOARD_DIST`, `<repo>/apps/dashboard/dist`,
 installed asset dirs such as `~/.kranz/dashboard/dist`, then the kranz checkout

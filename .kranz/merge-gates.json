@@ -31,6 +31,13 @@
       ]
     },
     {
+      "command": "npm run check-embedded",
+      "cwd": "apps/dashboard",
+      "whenPaths": [
+        "apps/dashboard"
+      ]
+    },
+    {
       "command": "npm run test",
       "cwd": "apps/dashboard",
       "whenPaths": [

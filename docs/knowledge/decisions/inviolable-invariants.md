@@ -102,9 +102,10 @@ code — never pipe it (`... | tail -1` once masked a failure). Run
 `cargo fmt --all` before finishing; CI gates `cargo fmt --check`. The gated-merge
 runner [merge_gate.rs](../../../crates/engine/src/merge_gate.rs) encodes the same
 suite in order — `cargo fmt --all --check`, `cargo clippy --workspace
---all-targets -- -D warnings`, `cargo test --workspace`, plus the five
-`apps/dashboard` gates only when the dashboard is touched — and stops at the
-first failure with the base branch untouched (AGENTS.md rules 1–3).
+--all-targets -- -D warnings`, `cargo test --workspace`, plus six
+`apps/dashboard` gates (including an embedded-bundle freshness check) only when
+the dashboard is touched — and stops at the first failure with the base branch
+untouched (AGENTS.md rules 1–3).
 
 ## Related standing rules
 

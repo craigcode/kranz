@@ -17,6 +17,7 @@ Build the frontend, then let the CLI serve it:
 cd apps/dashboard
 npm install
 npm run build          # emits apps/dashboard/dist
+npm run sync-embedded  # updates the CLI's committed release bundle
 
 kranz serve --open     # serves the API + the dist bundle, opens a browser
 ```

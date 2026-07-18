@@ -610,7 +610,7 @@ fn fallback_repo_id(root: &Path) -> String {
             id.push('-');
         }
     }
-    let id = id.trim_matches('-');
+    let id = id.trim_matches(|ch| matches!(ch, '-' | '_'));
     if id.is_empty() {
         "repo".to_string()
     } else {
@@ -641,6 +641,17 @@ mod tests {
             pinned: false,
             slack: RepoSlackConfig::default(),
         }
+    }
+
+    #[test]
+    fn single_repo_fallback_normalizes_leading_underscores() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("_project");
+        init_git(&root);
+
+        let catalog = MultiRepoHost::single(root).unwrap();
+
+        assert_eq!(catalog.compatibility_context().unwrap().id(), "project");
     }
 
     #[test]
