@@ -24,6 +24,9 @@ pub struct SlackRepo {
     pub available: bool,
     pub host: Option<SharedHost>,
     pub unavailable_reason: Option<String>,
+    /// Mirrors `host.defaultRepo`. Only user-scoped read-only surfaces (App
+    /// Home) route here — commands in channels must stay explicit.
+    pub default: bool,
 }
 
 impl SlackRepo {
@@ -169,6 +172,22 @@ impl SlackCatalog {
             );
         }
 
+        // App Home is user-scoped: no channel mapping can ever disambiguate
+        // it, so the read-only render follows `host.defaultRepo` — the same
+        // repo the server's unscoped compatibility routes mean (scoping doc:
+        // "App Home may aggregate read-only status but must ask for a
+        // repository before mutation").
+        if app_home_envelope(&envelope) {
+            if let Some(repo) = self.repos.values().find(|repo| repo.default) {
+                let id = repo.id.clone();
+                return self.finish(&id, envelope, coordinates.team_id, coordinates.channel_id);
+            }
+            return Err(anyhow!(
+                "App Home cannot pick among several repositories; set host.defaultRepo to choose \
+                 which repository the Home tab shows"
+            ));
+        }
+
         if envelope.get("envelope_id").is_none() {
             return Ok(None);
         }
@@ -294,6 +313,13 @@ fn strip_explicit_repo(envelope: &mut Value) -> Option<String> {
     Some(repo_id)
 }
 
+fn app_home_envelope(envelope: &Value) -> bool {
+    envelope
+        .pointer("/payload/event/type")
+        .and_then(Value::as_str)
+        == Some("app_home_opened")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,6 +339,7 @@ mod tests {
             available: healthy,
             host: None,
             unavailable_reason: (!healthy).then(|| "missing".into()),
+            default: false,
         }
     }
 
@@ -347,6 +374,50 @@ mod tests {
             .unwrap();
         assert_eq!(resolved.repo.id, "beta");
         assert_eq!(resolved.envelope["payload"]["text"], "status");
+    }
+
+    fn app_home(user: &str) -> Value {
+        json!({
+            "type": "events_api",
+            "envelope_id": "e-home",
+            "payload": {
+                "team_id": "T1",
+                "event": {
+                    "type": "app_home_opened",
+                    "user": user,
+                    "channel": "D-HOME",
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn app_home_follows_default_repo_when_several_are_healthy() {
+        let tmp = tempdir().unwrap();
+        let mut beta = repo("beta", "T1", "CB", true);
+        beta.default = true;
+        let catalog = SlackCatalog::new(
+            vec![repo("alpha", "T1", "CA", true), beta],
+            tmp.path().join("affinity.json"),
+        )
+        .unwrap();
+        let resolved = catalog.resolve_envelope(&app_home("U1")).unwrap().unwrap();
+        assert_eq!(resolved.repo.id, "beta");
+    }
+
+    #[test]
+    fn app_home_without_default_refuses_and_names_the_config_key() {
+        let tmp = tempdir().unwrap();
+        let catalog = SlackCatalog::new(
+            vec![
+                repo("alpha", "T1", "CA", true),
+                repo("beta", "T1", "CB", true),
+            ],
+            tmp.path().join("affinity.json"),
+        )
+        .unwrap();
+        let error = catalog.resolve_envelope(&app_home("U1")).err().unwrap();
+        assert!(error.to_string().contains("host.defaultRepo"));
     }
 
     #[test]

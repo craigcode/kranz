@@ -435,6 +435,10 @@ impl MultiRepoHost {
         self.max_concurrent_repos
     }
 
+    pub fn default_repo(&self) -> Option<&str> {
+        self.default_repo.as_deref()
+    }
+
     pub fn uses_operator_catalog(&self) -> bool {
         self.operator_catalog
     }

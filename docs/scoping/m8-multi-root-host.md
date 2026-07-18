@@ -132,7 +132,11 @@ Routing precedence is:
 Thread affinity wins over a later channel-default change. Modal
 `private_metadata` carries `repo_id`; every submit handler resolves it again
 and checks authorization. App Home may aggregate read-only status but must ask
-for a repository before mutation.
+for a repository before mutation; being user-scoped, its render can never be
+disambiguated by a channel, so with several healthy repositories the Home tab
+follows `host.defaultRepo` (and refuses, with the config key named, when none
+is set). Every routing refusal is logged and answered ephemerally when the
+payload carries reply coordinates — fail-closed must never mean fail-silent.
 
 Replace the repo-local mission-only Slack thread map with an operator-owned
 affinity map keyed by team/channel/thread and valued by composite mission

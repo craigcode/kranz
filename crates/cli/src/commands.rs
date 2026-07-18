@@ -1526,6 +1526,7 @@ fn multi_repo_slack_catalog(
                 available: context.is_healthy(),
                 host,
                 unavailable_reason: context.unavailable_reason().map(str::to_string),
+                default: multi_host.default_repo() == Some(context.id()),
             }
         })
         .collect();

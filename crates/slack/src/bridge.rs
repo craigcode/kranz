@@ -1054,6 +1054,18 @@ where
                             Ok(Some(target)) => target,
                             Ok(None) => continue,
                             Err(error) => {
+                                // The refusal itself is correct fail-closed
+                                // behavior; being invisible is not. Log every
+                                // refusal — reply delivery is best-effort.
+                                let envelope_type = envelope
+                                    .get("type")
+                                    .and_then(|value| value.as_str())
+                                    .unwrap_or("unknown");
+                                tracing::warn!(
+                                    error = %error,
+                                    envelope_type,
+                                    "slack envelope routing refused"
+                                );
                                 reply_routing_error(cfg, client, &envelope, &error.to_string()).await;
                                 continue;
                             }
@@ -1119,17 +1131,32 @@ async fn reply_routing_error(
         reply_ephemeral(cfg, client, response_url, &blocks).await;
         return;
     }
+    match routing_reply_target(payload) {
+        Some((channel, user)) => {
+            user_reply(cfg, client, None, &channel, Some(&user), &blocks).await;
+        }
+        None => tracing::warn!(
+            "slack routing refusal is undeliverable (no response_url/user/channel in payload)"
+        ),
+    }
+}
+
+/// Where a routing refusal can be delivered: `(channel, user)` for an
+/// ephemeral reply. Slash/action payloads carry these at the top level;
+/// Events API payloads (thread guidance messages, app events) carry them
+/// under `payload.event`.
+fn routing_reply_target(payload: &Value) -> Option<(String, String)> {
     let user = payload
         .get("user_id")
         .and_then(Value::as_str)
-        .or_else(|| payload.pointer("/user/id").and_then(Value::as_str));
+        .or_else(|| payload.pointer("/user/id").and_then(Value::as_str))
+        .or_else(|| payload.pointer("/event/user").and_then(Value::as_str))?;
     let channel = payload
         .get("channel_id")
         .and_then(Value::as_str)
-        .or_else(|| payload.pointer("/channel/id").and_then(Value::as_str));
-    if let (Some(channel), Some(user)) = (channel, user) {
-        user_reply(cfg, client, None, channel, Some(user), &blocks).await;
-    }
+        .or_else(|| payload.pointer("/channel/id").and_then(Value::as_str))
+        .or_else(|| payload.pointer("/event/channel").and_then(Value::as_str))?;
+    Some((channel.to_string(), user.to_string()))
 }
 
 /// Actions that may spawn a claude session (a multi-minute turn) or touch a
@@ -4597,6 +4624,26 @@ mod tests {
     use kranz_engine::queue;
     use std::sync::Once;
     use tempfile::TempDir;
+
+    #[test]
+    fn routing_reply_target_reads_slash_and_event_payloads() {
+        // Slash payload: coordinates at the top level.
+        let slash = json!({ "user_id": "U1", "channel_id": "C1" });
+        assert_eq!(
+            routing_reply_target(&slash),
+            Some(("C1".to_string(), "U1".to_string()))
+        );
+        // Events API payload (e.g. thread guidance): coordinates live under
+        // `event` — a refused threaded message must still reach its author.
+        let event = json!({ "event": { "type": "message", "user": "U2", "channel": "C2",
+                                       "thread_ts": "100.1", "text": "guidance" } });
+        assert_eq!(
+            routing_reply_target(&event),
+            Some(("C2".to_string(), "U2".to_string()))
+        );
+        // Nothing extractable: undeliverable (the caller logs it).
+        assert_eq!(routing_reply_target(&json!({ "token": null })), None);
+    }
 
     #[test]
     fn class_enabled_respects_flags() {
