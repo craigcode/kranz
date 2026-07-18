@@ -16,6 +16,9 @@ updates:
       actions:
         patterns:
           - "*"
+        update-types:
+          - minor
+          - patch
 
   # Root cargo workspace (crates/*); Cargo.lock is committed, and the msrv CI
   # job catches any dep that quietly raises its floor.
@@ -30,20 +33,9 @@ updates:
           - minor
           - patch
 
-  # The Tauri shell is a standalone cargo workspace — same treatment, capped
-  # lower since it changes rarely.
-  - package-ecosystem: cargo
-    directory: /apps/dashboard/src-tauri
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 2
-    groups:
-      tauri-minor-patch:
-        update-types:
-          - minor
-          - patch
-
   # Dashboard deps are few; group them so the trickle stays one PR.
+  # (The Tauri standalone workspace is intentionally uncovered: it has no
+  # committed lockfile and no CI job compiles it — bot bumps would merge blind.)
   - package-ecosystem: npm
     directory: /apps/dashboard
     schedule:
