@@ -546,15 +546,27 @@ pub fn scrub_json_value(value: &mut serde_json::Value, location: &str) -> Vec<Se
     findings
 }
 
+/// Generated artifacts excluded from diff scanning: minified dashboard
+/// bundles are machine-built from source that is scanned directly, and their
+/// compressed entropy trips the generic rules (a 2026-07-18 dashboard rebuild
+/// failed the CI scan with four false positives in the committed bundle).
+/// Scanning them adds noise, never signal.
+const GENERATED_DIFF_PATH_PREFIXES: &[&str] =
+    &["apps/dashboard/dist/", "crates/cli/assets/dashboard/dist/"];
+
 /// Scan only added lines in a unified git diff.
 pub fn scan_unified_diff(diff: &str) -> Vec<SecretFinding> {
     let mut findings = Vec::new();
     let mut path = "<diff>".to_string();
+    let mut skip_generated = false;
     let mut new_line: Option<usize> = None;
 
     for line in diff.lines() {
         if let Some(rest) = line.strip_prefix("+++ b/") {
             path = rest.to_string();
+            skip_generated = GENERATED_DIFF_PATH_PREFIXES
+                .iter()
+                .any(|prefix| path.starts_with(prefix));
             continue;
         }
         if line.starts_with("@@ ") {
@@ -571,7 +583,9 @@ pub fn scan_unified_diff(diff: &str) -> Vec<SecretFinding> {
             } else {
                 format!("{path}:{line_no}")
             };
-            findings.extend(scan_text_at(added, &location));
+            if !skip_generated {
+                findings.extend(scan_text_at(added, &location));
+            }
             if let Some(n) = &mut new_line {
                 *n += 1;
             }

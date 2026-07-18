@@ -73,6 +73,23 @@ fn unified_diff_scan_only_checks_added_lines() {
 }
 
 #[test]
+fn unified_diff_scan_skips_generated_dashboard_bundles() {
+    // Minified bundles are machine-built from scanned source; their entropy is
+    // noise. The same secret-shaped string must still be caught in real source.
+    let secret = "sk-ant-api03-NewSecret_123456";
+    let bundle = "crates/cli/assets/dashboard/dist/assets/index-abc123.js";
+    let diff = format!(
+        "diff --git a/{bundle} b/{bundle}\n--- a/{bundle}\n+++ b/{bundle}\n@@ -0,0 +1 @@\n+token=\"{secret}\"\ndiff --git a/src/main.ts b/src/main.ts\n--- a/src/main.ts\n+++ b/src/main.ts\n@@ -0,0 +1 @@\n+token=\"{secret}\"\n"
+    );
+
+    let findings = scan_unified_diff(&diff);
+
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].rule_id, "anthropic-api-key");
+    assert_eq!(findings[0].location, "src/main.ts:1");
+}
+
+#[test]
 fn ingest_scanner_leaves_legitimate_high_entropy_operational_text() {
     let text = "\
 commit 4b825dc642cb6eb9a060e54bf8d69288fbee4904
