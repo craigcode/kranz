@@ -135,6 +135,7 @@
     "crates/server/tests/server_test.rs",
     "crates/cli/src/cli.rs",
     "crates/cli/src/commands.rs",
+    "crates/cli/tests/cli_test.rs",
     "apps/dashboard/src/lib/**",
     "docs/deploy.md",
     "docs/operator-gates.md"
