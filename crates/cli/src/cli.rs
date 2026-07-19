@@ -361,6 +361,15 @@ pub enum Command {
         from_start: bool,
     },
 
+    /// Export validation-PASSED worker traces as fine-tuning-ready JSONL.
+    ///
+    /// Derived and regenerable: loads and folds the mission's event log on
+    /// demand (like `status`) and prints one instruction-pair JSON object
+    /// per line to stdout — there is no persisted dataset file, so
+    /// re-running this command over an unchanged event log always yields
+    /// byte-identical output.
+    ExportTraces,
+
     /// Inspect and edit kranz configuration (files + mid-mission changes).
     ///
     /// Config resolves from three layers, later winning: compiled-in defaults

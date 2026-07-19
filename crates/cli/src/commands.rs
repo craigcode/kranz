@@ -20,6 +20,7 @@ use kranz_engine::event_log::{EventLog, LockForce};
 use kranz_engine::orchestrator::{self, MissionEngine, PlanRequest};
 use kranz_engine::paths::MissionPaths;
 use kranz_engine::reducer;
+use kranz_engine::trace_export;
 use kranz_engine::types::{ControlCommand, MissionConfig, MissionState, MissionStatus};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -75,6 +76,12 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             } else {
                 print!("{}", output::render_status(&state));
             }
+            Ok(0)
+        }
+        Command::ExportTraces => {
+            let mission = select_mission(&repo, cli.mission.as_deref())?;
+            let jsonl = cmd_export_traces(&repo, &mission)?;
+            print!("{jsonl}");
             Ok(0)
         }
         Command::Pause => {
@@ -466,6 +473,20 @@ pub fn load_state(repo: &Path, mission_id: &str) -> Result<MissionState> {
     let state = reducer::fold(&events)
         .with_context(|| format!("folding the event log of mission '{mission_id}'"))?;
     Ok(state)
+}
+
+/// Read + fold a mission's event log, then derive the validation-PASSED
+/// instruction-pair dataset and render it as JSONL. Pure function of the
+/// on-disk event log (no persisted dataset file), so consecutive
+/// invocations over an unchanged log are byte-identical.
+pub fn cmd_export_traces(repo: &Path, mission_id: &str) -> Result<String> {
+    let paths = require_mission(repo, mission_id)?;
+    let events = EventLog::read_events(&paths.events_file())
+        .with_context(|| format!("reading the event log of mission '{mission_id}'"))?;
+    let state = reducer::fold(&events)
+        .with_context(|| format!("folding the event log of mission '{mission_id}'"))?;
+    let pairs = trace_export::export_validated_traces(&state, &events);
+    Ok(trace_export::to_jsonl(&pairs))
 }
 
 /// Loud multi-line warning on stderr for `--dangerously-allow-all`.
