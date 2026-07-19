@@ -302,6 +302,15 @@ pub enum Command {
         #[arg(long)]
         insecure_lan: bool,
 
+        /// Force the mutation token to be required on `/api` GETs and the
+        /// WS upgrade (as well as POSTs) on ANY bind class, including
+        /// loopback — the deployment-ready read-auth mode. Off-loopback
+        /// binds already require it; `--read-auth` is orthogonal and simply
+        /// forces read-token enforcement on loopback too. Still requires
+        /// `--insecure-lan` for a non-loopback bind (unchanged).
+        #[arg(long)]
+        read_auth: bool,
+
         /// Open the dashboard in the default browser
         #[arg(long)]
         open: bool,
@@ -502,4 +511,18 @@ pub enum TicketCommand {
         #[arg(long)]
         force: bool,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serve_parses_read_auth_flag() {
+        let cli = Cli::try_parse_from(["kranz", "serve", "--read-auth"]).unwrap();
+        match cli.command {
+            Command::Serve { read_auth, .. } => assert!(read_auth),
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
 }
