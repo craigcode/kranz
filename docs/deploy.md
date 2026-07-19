@@ -124,7 +124,7 @@ Goal: a browser-driven `kranz serve` on rented compute. Concretely:
      -e KRANZ_SLACK_INSTANCE=cloud \
      -v kranz-data:/work \
      kranz-image \
-     serve --port 4560 --token "$KRANZ_MUTATION_TOKEN" --slack
+     serve --port 4560 --token "$KRANZ_MUTATION_TOKEN" --read-auth --slack
    ```
 
    A `--slack` cloud host is a full Kranz instance on the Slack side: give it
@@ -142,10 +142,20 @@ Goal: a browser-driven `kranz serve` on rented compute. Concretely:
    (`crates/server/src/lib.rs`) — it never listens on a public interface. So a
    persistent host needs a reverse proxy (the platform's HTTPS router, Caddy,
    nginx) terminating TLS and forwarding to `127.0.0.1:4560`. There is no raw-
-   public-bind mode, by design.
-5. **Carry the mutation token over TLS.** Every `POST /api/…` must send the
-   token in the `x-kranz-token` header (protocol: "Authority: mutation token").
-   Pin it with `--token` (as above) so the platform's secret store holds a
+   public-bind mode, by design. The proxy must forward a **loopback**
+   `Host`/`Origin` (e.g. `127.0.0.1:4560` / `http://127.0.0.1:4560`) to the
+   upstream: on a loopback bind the server keeps its strict loopback
+   origin/Host allowlist by design and does not trust arbitrary public
+   origins, so a proxy that forwards its own public `Host`/`Origin` unchanged
+   will be rejected.
+5. **Carry the mutation token over TLS, and turn on `--read-auth`.** Every
+   `POST /api/…` must send the token in the `x-kranz-token` header (protocol:
+   "Authority: mutation token"). Since this shape puts a loopback `kranz
+   serve` behind a public-facing proxy, also pass `--read-auth` (§5) so `/api`
+   GETs and the WS upgrade require the same token — via `x-kranz-token`, or
+   `?token=` for the browser WS upgrade, which cannot set headers —
+   with `/api/health` exempted for unauthenticated liveness checks. Pin the
+   token with `--token` (as above) so the platform's secret store holds a
    stable value; otherwise `serve` prints a fresh one per boot.
 
 For the Slack control surface (thread-centric approve / steer, `/kranz`
@@ -164,15 +174,18 @@ Transcripts are source code. Treat the whole surface as sensitive.
   already require the token on reads unconditionally. For a loopback bind that
   is nonetheless reachable through a reverse proxy (the persistent-host shape
   in §4), pass `kranz serve --read-auth` to force the same read-token
-  requirement on loopback: GETs and the WS upgrade then require
-  `x-kranz-token` (or `?token=`) just like mutations do, closing the gap where
-  a leaked dashboard URL could read transcripts, plans, and diffs
-  unauthenticated. `--read-auth` is the deployment-ready mode — pass it any
-  time the process is exposed beyond a single local operator.
+  requirement on loopback: `/api` GETs and the WS upgrade then require the
+  token — via the `x-kranz-token` header, or `?token=` for the browser WS
+  upgrade, which cannot set headers — just like mutations do, closing the gap
+  where a leaked dashboard URL could read transcripts, plans, and diffs
+  unauthenticated. `/api/health` stays exempt (unauthenticated liveness
+  checks). `--read-auth` is the deployment-ready mode — pass it any time the
+  process is exposed beyond a single local operator.
 - **Never expose the raw server.** `kranz serve` has no TLS. It must sit
   **behind a reverse proxy that enforces TLS**, with `--read-auth` set so the
   token is also required on reads. A leaked dashboard URL without the token
-  must reveal nothing and mutate nothing — that is the M6 acceptance bar.
+  must reveal nothing and mutate nothing (aside from `/api/health`) — that is
+  the M6 acceptance bar.
 - **Scope the push credential.** The deploy key / GitHub App must be able to
   push `kranz/*` and nothing else — no `main`, no force, no merges. The
   in-code guard in `push_mission_branch` backs this up but is not a substitute
