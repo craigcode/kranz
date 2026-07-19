@@ -292,6 +292,9 @@ pub fn router_with_multi_repo_host_and_addr(
         require_host,
     ))
     .layer(cors_layer(bind_addr))
+    // Outermost: every response — including gate rejections — carries the
+    // cache policy, so no rejection HTML can poison a browser cache either.
+    .layer(middleware::from_fn(cache_response_headers))
 }
 
 async fn api_not_found() -> impl IntoResponse {
@@ -299,6 +302,35 @@ async fn api_not_found() -> impl IntoResponse {
         StatusCode::NOT_FOUND,
         Json(json!({ "error": "API route not found or repository scope required" })),
     )
+}
+
+/// API answers and the SPA shell must never be cached. A browser that caches
+/// an HTML fallback at an /api URL replays it to `fetch()` long after the
+/// server is fixed (2026-07-19: a stale pre-API-404 serve poisoned the
+/// dashboard behind a heuristic cache entry; only an incognito window
+/// escaped). Hashed /assets/* bundles stay implicitly cacheable; `no-cache`
+/// on the shell revalidates per load rather than forbidding storage.
+async fn cache_response_headers(request: Request, next: Next) -> Response {
+    let is_api = request.uri().path().starts_with("/api");
+    let mut response = next.run(request).await;
+    let cache_control = if is_api {
+        Some("no-store")
+    } else if response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|content_type| content_type.starts_with("text/html"))
+    {
+        Some("no-cache")
+    } else {
+        None
+    };
+    if let Some(value) = cache_control {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static(value));
+    }
+    response
 }
 
 /// `503 {"error":"repository unavailable", ...}` handler for every path under
