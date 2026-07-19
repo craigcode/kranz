@@ -79,6 +79,8 @@ fn spawn(run_id: &str, feature_id: Option<&str>, milestone_id: Option<&str>) -> 
         milestone_id: milestone_id.map(str::to_string),
         sdk_session_id: format!("sess-{run_id}"),
         model: "sonnet".to_string(),
+        quant: "n/a".to_string(),
+        weight_hash: None,
         prompt_hash: "deadbeef".to_string(),
         transcript_path: format!("runs/{run_id}.jsonl"),
     }
@@ -1286,6 +1288,8 @@ fn approved_status_guard_never_overwrites_terminal_status() {
                 milestone_id: None,
                 sdk_session_id: "sess-r-after-failure".to_string(),
                 model: "sonnet".to_string(),
+                quant: "n/a".to_string(),
+                weight_hash: None,
                 prompt_hash: "deadbeef".to_string(),
                 transcript_path: "runs/r-after-failure.jsonl".to_string(),
             },
@@ -2292,4 +2296,84 @@ fn worker_deny_grant_extends_deny_exceptions_only() {
     assert!(state.mission.command_grants.is_empty());
     assert!(state.mission.touch_set.is_empty());
     assert!(state.pending_grant_request.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Model provenance (quant / weight_hash)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn provenance_backcompat_defaults_quant_and_omits_weight_hash() {
+    // An old worker.spawned log line predating provenance fields has no
+    // "quant" or "weightHash" keys at all.
+    let spawned_json = json!({
+        "type": "worker.spawned",
+        "payload": {
+            "runId": "r-1",
+            "role": "worker",
+            "featureId": "f-1-1",
+            "sdkSessionId": "sess-r-1",
+            "model": "sonnet",
+            "promptHash": "deadbeef",
+            "transcriptPath": "runs/r-1.jsonl"
+        }
+    });
+    let kind: EventKind = serde_json::from_value(spawned_json).unwrap();
+    match kind {
+        EventKind::WorkerSpawned {
+            quant, weight_hash, ..
+        } => {
+            assert_eq!(quant, "n/a");
+            assert_eq!(weight_hash, None);
+        }
+        other => panic!("expected worker.spawned, got {other:?}"),
+    }
+}
+
+#[test]
+fn weight_hash_round_trips_through_serde_and_reducer_fold() {
+    let with_provenance = EventKind::WorkerSpawned {
+        run_id: "r-1".to_string(),
+        role: Role::Worker,
+        feature_id: Some("f-1-1".to_string()),
+        milestone_id: None,
+        sdk_session_id: "sess-r-1".to_string(),
+        model: "sonnet".to_string(),
+        quant: "q4_k_m".to_string(),
+        weight_hash: Some("deadbeefcafef00d".to_string()),
+        prompt_hash: "deadbeef".to_string(),
+        transcript_path: "runs/r-1.jsonl".to_string(),
+    };
+
+    // serde round-trip.
+    let json = serde_json::to_value(&with_provenance).unwrap();
+    assert_eq!(json["payload"]["quant"], "q4_k_m");
+    assert_eq!(json["payload"]["weightHash"], "deadbeefcafef00d");
+    let back: EventKind = serde_json::from_value(json).unwrap();
+    match back {
+        EventKind::WorkerSpawned {
+            quant, weight_hash, ..
+        } => {
+            assert_eq!(quant, "q4_k_m");
+            assert_eq!(weight_hash, Some("deadbeefcafef00d".to_string()));
+        }
+        other => panic!("expected worker.spawned, got {other:?}"),
+    }
+
+    // reducer::fold round-trip onto WorkerRun.
+    let state = fold(&[
+        ev(1, created()),
+        ev(
+            2,
+            EventKind::PlanApproved {
+                plan: plan(),
+                base_sha: None,
+            },
+        ),
+        ev(3, with_provenance),
+    ])
+    .unwrap();
+    let run = state.runs.get("r-1").expect("run recorded");
+    assert_eq!(run.quant, "q4_k_m");
+    assert_eq!(run.weight_hash, Some("deadbeefcafef00d".to_string()));
 }

@@ -4869,6 +4869,8 @@ impl MissionEngine {
             milestone_id: None,
             sdk_session_id: sdk_session_id.clone(),
             model: role_cfg.model,
+            quant: "n/a".to_string(),
+            weight_hash: None,
             prompt_hash: prompts::hash(Role::Orchestrator),
             transcript_path: MissionPaths::transcript_rel(&run_id),
         })?;
@@ -8035,6 +8037,8 @@ mod tests {
             milestone_id: None,
             sdk_session_id: "sdk-1".to_string(),
             model: "m".to_string(),
+            quant: "n/a".to_string(),
+            weight_hash: None,
             started_at: chrono::Utc::now(),
             ended_at: None,
             tokens: TokenUsage::default(),

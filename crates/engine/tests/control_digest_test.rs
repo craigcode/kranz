@@ -464,6 +464,8 @@ fn digest_events() -> Vec<Event> {
                 milestone_id: Some("ms-1".to_string()),
                 sdk_session_id: "sess-r-1".to_string(),
                 model: "sonnet".to_string(),
+                quant: "n/a".to_string(),
+                weight_hash: None,
                 prompt_hash: "deadbeef".to_string(),
                 transcript_path: "runs/r-1.jsonl".to_string(),
             },

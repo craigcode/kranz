@@ -578,6 +578,8 @@ mod tests {
                 milestone_id: milestone_id.map(|s| s.to_string()),
                 sdk_session_id: "sdk-1".to_string(),
                 model: model.to_string(),
+                quant: "n/a".to_string(),
+                weight_hash: None,
                 prompt_hash: "hash".to_string(),
                 transcript_path: "path".to_string(),
             },
