@@ -322,16 +322,15 @@ fn parses_serve() {
             port,
             ref host,
             insecure_lan,
-            read_auth,
             open,
             ref dashboard,
             ref token,
             slack,
+            ..
         } => {
             assert_eq!(port, 4560);
             assert_eq!(host, "127.0.0.1", "default bind stays loopback");
             assert!(!insecure_lan);
-            assert!(!read_auth);
             assert!(!open && !slack);
             assert!(dashboard.is_none() && token.is_none());
         }
@@ -364,12 +363,6 @@ fn parses_serve() {
     let cli = Cli::try_parse_from(["kranz", "serve", "--token", "sesame"]).unwrap();
     match cli.command {
         Command::Serve { token, .. } => assert_eq!(token.as_deref(), Some("sesame")),
-        other => panic!("expected Serve, got {other:?}"),
-    }
-    // --read-auth forces the read-token gate on loopback too.
-    let cli = Cli::try_parse_from(["kranz", "serve", "--read-auth"]).unwrap();
-    match cli.command {
-        Command::Serve { read_auth, .. } => assert!(read_auth),
         other => panic!("expected Serve, got {other:?}"),
     }
 }

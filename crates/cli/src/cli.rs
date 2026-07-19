@@ -489,3 +489,17 @@ pub enum TicketCommand {
         force: bool,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serve_parses_read_auth_flag() {
+        let cli = Cli::try_parse_from(["kranz", "serve", "--read-auth"]).unwrap();
+        match cli.command {
+            Command::Serve { read_auth, .. } => assert!(read_auth),
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+}
