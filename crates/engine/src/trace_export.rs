@@ -7,7 +7,9 @@
 //! event log itself.
 
 use crate::events::Event;
-use crate::types::{Feature, FeatureStatus, Milestone, MilestoneStatus, MissionState, Role};
+use crate::types::{
+    Feature, FeatureStatus, Milestone, MilestoneStatus, MissionState, Role, RunResult,
+};
 use serde::{Deserialize, Serialize};
 
 /// One fine-tuning-ready training example derived from a validation-PASSED
@@ -46,8 +48,10 @@ fn feature_and_milestone_status<'a>(
 /// state. Selection is validation-PASSED and DERIVED, never stored: a run
 /// qualifies iff it is a `Role::Worker` run whose feature reached
 /// `FeatureStatus::Complete` inside a milestone that reached
-/// `MilestoneStatus::Complete`. Runs on failed/skipped features, and
-/// non-worker (orchestrator/validator) runs, are excluded.
+/// `MilestoneStatus::Complete`, AND the run's own `result` is
+/// `Some(RunResult::Pass)`. Runs on failed/skipped features, non-worker
+/// (orchestrator/validator) runs, and failed respawn attempts that precede a
+/// later passing run on the same now-Complete feature, are all excluded.
 ///
 /// `events` is accepted (unused today) to keep the signature honest about
 /// what the export is a function of — the event log — should a future
@@ -72,6 +76,9 @@ pub fn export_validated_traces(state: &MissionState, _events: &[Event]) -> Vec<I
         if feature.status != FeatureStatus::Complete
             || milestone_status != MilestoneStatus::Complete
         {
+            continue;
+        }
+        if run.result != Some(RunResult::Pass) {
             continue;
         }
         let Some(report) = &run.report else {
@@ -297,6 +304,79 @@ mod tests {
         assert_eq!(pairs[0].run_id, "r-pass");
         assert_eq!(pairs[0].feature_id, "f-1-1");
         assert!(pairs.iter().all(|p| p.run_id != "r-fail"));
+    }
+
+    #[test]
+    fn passed_only_excludes_failed_respawn_attempt() {
+        // Single feature reaching Complete via TWO worker runs: a first
+        // attempt that fails (report present) and a respawned second
+        // attempt that passes. Only the passing run's pair may be exported.
+        let events = vec![
+            ev(
+                1,
+                crate::events::EventKind::MissionCreated {
+                    goal: "build the thing".to_string(),
+                    base_branch: "main".to_string(),
+                    mission_branch: format!("kranz/mission-{MISSION}"),
+                    config: MissionConfig::default(),
+                },
+            ),
+            ev(
+                2,
+                crate::events::EventKind::PlanApproved {
+                    plan: plan(),
+                    base_sha: None,
+                },
+            ),
+            ev(
+                3,
+                crate::events::EventKind::MilestoneStarted {
+                    milestone_id: "ms-1".to_string(),
+                    start_sha: "abc123".to_string(),
+                },
+            ),
+            ev(
+                4,
+                crate::events::EventKind::FeatureStarted {
+                    feature_id: "f-1-1".to_string(),
+                },
+            ),
+            ev(5, spawn("r-attempt-1", "f-1-1")),
+            ev(
+                6,
+                completed_with_report("r-attempt-1", RunResult::Fail, "first attempt failed"),
+            ),
+            ev(7, spawn("r-attempt-2", "f-1-1")),
+            ev(
+                8,
+                completed_with_report("r-attempt-2", RunResult::Pass, "respawn succeeded"),
+            ),
+            ev(
+                9,
+                crate::events::EventKind::FeatureCompleted {
+                    feature_id: "f-1-1".to_string(),
+                    commits: vec!["deadbeef".to_string()],
+                },
+            ),
+            ev(
+                10,
+                crate::events::EventKind::MilestoneCompleted {
+                    milestone_id: "ms-1".to_string(),
+                    tag: None,
+                },
+            ),
+        ];
+        let state = fold(&events).unwrap();
+
+        let pairs = export_validated_traces(&state, &events);
+
+        assert_eq!(
+            pairs.len(),
+            1,
+            "expected exactly one passed trace, not the failed respawn attempt: {pairs:?}"
+        );
+        assert_eq!(pairs[0].run_id, "r-attempt-2");
+        assert!(pairs.iter().all(|p| p.run_id != "r-attempt-1"));
     }
 
     #[test]
