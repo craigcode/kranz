@@ -917,21 +917,25 @@ pub async fn serve_on_listener(
         listener,
         static_assets,
         token,
+        false,
         shutdown,
     )
     .await
 }
 
 /// Serve a static multi-repository catalog on an already-bound listener.
+/// `read_auth` forces the read-token gate (GETs and the WS upgrade) even on
+/// a loopback bind — off-loopback binds always require it regardless.
 pub async fn serve_multi_on_listener(
     multi_host: Arc<MultiRepoHost>,
     listener: tokio::net::TcpListener,
     static_assets: Option<DashboardStatic>,
     authority: Option<String>,
+    read_auth: bool,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     let local_addr = listener.local_addr()?;
-    let require_read_token = !local_addr.ip().is_loopback();
+    let require_read_token = !local_addr.ip().is_loopback() || read_auth;
     let app = router_with_multi_repo_host_and_addr(
         multi_host,
         static_assets,

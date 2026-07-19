@@ -302,6 +302,15 @@ pub enum Command {
         #[arg(long)]
         insecure_lan: bool,
 
+        /// Force the mutation token to be required on `/api` GETs and the
+        /// WS upgrade (as well as POSTs) on ANY bind class, including
+        /// loopback — the deployment-ready read-auth mode. Off-loopback
+        /// binds already require it; `--read-auth` is orthogonal and simply
+        /// forces read-token enforcement on loopback too. Still requires
+        /// `--insecure-lan` for a non-loopback bind (unchanged).
+        #[arg(long)]
+        read_auth: bool,
+
         /// Open the dashboard in the default browser
         #[arg(long)]
         open: bool,
