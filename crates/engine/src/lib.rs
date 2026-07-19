@@ -37,6 +37,7 @@ pub mod reducer;
 pub mod sandbox;
 pub mod scrub;
 pub mod ticket;
+pub mod trace_export;
 pub mod work;
 
 pub mod backend_claude;

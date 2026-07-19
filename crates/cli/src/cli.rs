@@ -370,6 +370,29 @@ pub enum Command {
         from_start: bool,
     },
 
+    /// Export validation-PASSED worker traces as fine-tuning-ready JSONL.
+    ///
+    /// Derived and regenerable: loads and folds the target mission's event
+    /// log on demand (like `status`) and prints one instruction-pair JSON
+    /// object per line to stdout — there is no persisted dataset file, so
+    /// re-running this command over an unchanged event log always yields
+    /// byte-identical output.
+    ExportTraces {
+        /// The mission id (defaults to the global --mission / auto-selection;
+        /// ignored with --all)
+        mission_id: Option<String>,
+
+        /// Aggregate passed traces across every mission under
+        /// .kranz/missions. A mission whose event log is missing or
+        /// unreadable is skipped, not fatal.
+        #[arg(long)]
+        all: bool,
+
+        /// Write the JSONL output to this path instead of stdout.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+    },
+
     /// Inspect and edit kranz configuration (files + mid-mission changes).
     ///
     /// Config resolves from three layers, later winning: compiled-in defaults

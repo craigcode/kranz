@@ -26,6 +26,11 @@ pub struct Event {
     pub kind: EventKind,
 }
 
+/// Default `quant` for worker.spawned events predating provenance fields.
+fn default_quant() -> String {
+    "n/a".to_string()
+}
+
 /// Serialized as `"type": "<dotted.name>", "payload": { ... }`.
 // large_enum_variant: MissionCreated carries the full MissionConfig (~456B).
 // It occurs once per mission and events are I/O-bound; boxing would ripple
@@ -132,6 +137,16 @@ pub enum EventKind {
         #[serde(rename = "sdkSessionId")]
         sdk_session_id: String,
         model: String,
+        /// Quantization of the model weights used for this run (provenance).
+        #[serde(default = "default_quant")]
+        quant: String,
+        /// Hash of the model weights used for this run, when known (provenance).
+        #[serde(
+            rename = "weightHash",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        weight_hash: Option<String>,
         #[serde(rename = "promptHash")]
         prompt_hash: String,
         #[serde(rename = "transcriptPath")]

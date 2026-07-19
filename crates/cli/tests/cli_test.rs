@@ -197,6 +197,40 @@ fn parses_status() {
 }
 
 #[test]
+fn parses_export_traces() {
+    let cli = Cli::try_parse_from(["kranz", "export-traces"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Command::ExportTraces {
+            mission_id: None,
+            all: false,
+            out: None,
+        }
+    ));
+
+    let cli = Cli::try_parse_from(["kranz", "export-traces", "m-1"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Command::ExportTraces {
+            mission_id: Some(ref id),
+            all: false,
+            out: None,
+        } if id == "m-1"
+    ));
+
+    let cli =
+        Cli::try_parse_from(["kranz", "export-traces", "--all", "--out", "out.jsonl"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Command::ExportTraces {
+            mission_id: None,
+            all: true,
+            out: Some(ref path),
+        } if path == std::path::Path::new("out.jsonl")
+    ));
+}
+
+#[test]
 fn parses_pause_and_resume() {
     assert!(matches!(
         Cli::try_parse_from(["kranz", "pause"]).unwrap().command,
@@ -455,6 +489,8 @@ fn status_renders_tree_icons_totals_messages_and_decisions() {
                 milestone_id: None,
                 sdk_session_id: "sess-1".to_string(),
                 model: "sonnet".to_string(),
+                quant: "n/a".to_string(),
+                weight_hash: None,
                 prompt_hash: "hash".to_string(),
                 transcript_path: "runs/w-1.jsonl".to_string(),
             },
@@ -525,6 +561,199 @@ fn status_renders_tree_icons_totals_messages_and_decisions() {
         rendered.contains("  - looks good"),
         "decision in:\n{rendered}"
     );
+}
+
+#[test]
+fn export_traces_is_regenerable_and_filters_to_validated_passes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+    write_events(
+        repo,
+        "m-export",
+        vec![
+            created_kind("ship it", "m-export"),
+            EventKind::PlanApproved {
+                plan: sample_plan(),
+                base_sha: None,
+            },
+            EventKind::MilestoneStarted {
+                milestone_id: "ms-1".to_string(),
+                start_sha: "abc123".to_string(),
+            },
+            EventKind::FeatureStarted {
+                feature_id: "f-1-1".to_string(),
+            },
+            EventKind::WorkerSpawned {
+                run_id: "w-pass".to_string(),
+                role: Role::Worker,
+                feature_id: Some("f-1-1".to_string()),
+                milestone_id: None,
+                sdk_session_id: "sess-pass".to_string(),
+                model: "sonnet".to_string(),
+                quant: "n/a".to_string(),
+                weight_hash: None,
+                prompt_hash: "hash".to_string(),
+                transcript_path: "runs/w-pass.jsonl".to_string(),
+            },
+            EventKind::WorkerCompleted {
+                run_id: "w-pass".to_string(),
+                result: RunResult::Pass,
+                tokens: TokenUsage::default(),
+                cost_usd: None,
+                report: Some(WorkerReport {
+                    result: RunResult::Pass,
+                    summary: "built feature one".to_string(),
+                    files_touched: vec![],
+                    tests_added: vec![],
+                    test_evidence: "cargo test: ok".to_string(),
+                    dependencies_added: vec![],
+                    known_gaps: vec![],
+                    commits: vec!["abc feature one".to_string()],
+                    commands_run: vec![],
+                }),
+            },
+            EventKind::FeatureCompleted {
+                feature_id: "f-1-1".to_string(),
+                commits: vec!["abc feature one".to_string()],
+            },
+            EventKind::FeatureStarted {
+                feature_id: "f-1-2".to_string(),
+            },
+            EventKind::WorkerSpawned {
+                run_id: "w-fail".to_string(),
+                role: Role::Worker,
+                feature_id: Some("f-1-2".to_string()),
+                milestone_id: None,
+                sdk_session_id: "sess-fail".to_string(),
+                model: "sonnet".to_string(),
+                quant: "n/a".to_string(),
+                weight_hash: None,
+                prompt_hash: "hash".to_string(),
+                transcript_path: "runs/w-fail.jsonl".to_string(),
+            },
+            EventKind::WorkerCompleted {
+                run_id: "w-fail".to_string(),
+                result: RunResult::Fail,
+                tokens: TokenUsage::default(),
+                cost_usd: None,
+                report: Some(WorkerReport {
+                    result: RunResult::Fail,
+                    summary: "could not build feature two".to_string(),
+                    files_touched: vec![],
+                    tests_added: vec![],
+                    test_evidence: String::new(),
+                    dependencies_added: vec![],
+                    known_gaps: vec![],
+                    commits: vec![],
+                    commands_run: vec![],
+                }),
+            },
+            EventKind::FeatureFailed {
+                feature_id: "f-1-2".to_string(),
+                reason: "gave up".to_string(),
+            },
+            EventKind::MilestoneCompleted {
+                milestone_id: "ms-1".to_string(),
+                tag: None,
+            },
+        ],
+    );
+
+    let first = commands::cmd_export_traces(repo, "m-export").unwrap();
+    let second = commands::cmd_export_traces(repo, "m-export").unwrap();
+    assert_eq!(
+        first, second,
+        "export-traces must be byte-identical across consecutive invocations"
+    );
+
+    let lines: Vec<&str> = first.lines().collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "only the validation-PASSED run should be exported: {first}"
+    );
+    let value: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(value["runId"], "w-pass");
+    assert_eq!(value["model"], "sonnet");
+    assert!(
+        !first.contains("w-fail"),
+        "failed feature's run must not appear: {first}"
+    );
+}
+
+#[test]
+fn export_traces_all_aggregates_and_skips_unreadable_missions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+    write_events(
+        repo,
+        "m-a",
+        vec![
+            created_kind("ship a", "m-a"),
+            EventKind::PlanApproved {
+                plan: sample_plan(),
+                base_sha: None,
+            },
+            EventKind::MilestoneStarted {
+                milestone_id: "ms-1".to_string(),
+                start_sha: "abc123".to_string(),
+            },
+            EventKind::FeatureStarted {
+                feature_id: "f-1-1".to_string(),
+            },
+            EventKind::WorkerSpawned {
+                run_id: "w-a-pass".to_string(),
+                role: Role::Worker,
+                feature_id: Some("f-1-1".to_string()),
+                milestone_id: None,
+                sdk_session_id: "sess-a".to_string(),
+                model: "sonnet".to_string(),
+                quant: "n/a".to_string(),
+                weight_hash: None,
+                prompt_hash: "hash".to_string(),
+                transcript_path: "runs/w-a-pass.jsonl".to_string(),
+            },
+            EventKind::WorkerCompleted {
+                run_id: "w-a-pass".to_string(),
+                result: RunResult::Pass,
+                tokens: TokenUsage::default(),
+                cost_usd: None,
+                report: Some(WorkerReport {
+                    result: RunResult::Pass,
+                    summary: "built feature one".to_string(),
+                    files_touched: vec![],
+                    tests_added: vec![],
+                    test_evidence: "cargo test: ok".to_string(),
+                    dependencies_added: vec![],
+                    known_gaps: vec![],
+                    commits: vec!["abc feature one".to_string()],
+                    commands_run: vec![],
+                }),
+            },
+            EventKind::FeatureCompleted {
+                feature_id: "f-1-1".to_string(),
+                commits: vec!["abc feature one".to_string()],
+            },
+            EventKind::MilestoneCompleted {
+                milestone_id: "ms-1".to_string(),
+                tag: None,
+            },
+        ],
+    );
+    // A second mission directory whose event log is missing entirely — must
+    // be skipped, not fatal, for --all.
+    fs::create_dir_all(repo.join(".kranz/missions/m-broken")).unwrap();
+
+    let jsonl = commands::cmd_export_traces_all(repo);
+    let lines: Vec<&str> = jsonl.lines().collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "expected exactly one passed trace across missions, m-broken skipped: {jsonl}"
+    );
+    let value: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(value["runId"], "w-a-pass");
+    assert_eq!(value["missionId"], "m-a");
 }
 
 #[test]
@@ -1200,6 +1429,8 @@ fn renderer_tags_worker_lines_and_truncates() {
             milestone_id: None,
             sdk_session_id: "sess".to_string(),
             model: "sonnet".to_string(),
+            quant: "n/a".to_string(),
+            weight_hash: None,
             prompt_hash: "hash".to_string(),
             transcript_path: "runs/w-1.jsonl".to_string(),
         },

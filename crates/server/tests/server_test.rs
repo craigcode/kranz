@@ -92,6 +92,8 @@ fn seed_mission(repo_root: &Path) -> MissionPaths {
         milestone_id: Some("ms-1".into()),
         sdk_session_id: "00000000-0000-0000-0000-000000000001".into(),
         model: "sonnet".into(),
+        quant: "n/a".into(),
+        weight_hash: None,
         prompt_hash: "deadbeef".into(),
         transcript_path: MissionPaths::transcript_rel("run-1"),
     })

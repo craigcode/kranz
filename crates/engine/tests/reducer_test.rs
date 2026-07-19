@@ -7,6 +7,7 @@ use kranz_engine::reducer::{apply, dry_run_revised_plan, fold, read_snapshot, wr
 use kranz_engine::types::*;
 use proptest::prelude::*;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 const MISSION: &str = "m-1";
 
@@ -79,6 +80,8 @@ fn spawn(run_id: &str, feature_id: Option<&str>, milestone_id: Option<&str>) -> 
         milestone_id: milestone_id.map(str::to_string),
         sdk_session_id: format!("sess-{run_id}"),
         model: "sonnet".to_string(),
+        quant: "n/a".to_string(),
+        weight_hash: None,
         prompt_hash: "deadbeef".to_string(),
         transcript_path: format!("runs/{run_id}.jsonl"),
     }
@@ -1286,6 +1289,8 @@ fn approved_status_guard_never_overwrites_terminal_status() {
                 milestone_id: None,
                 sdk_session_id: "sess-r-after-failure".to_string(),
                 model: "sonnet".to_string(),
+                quant: "n/a".to_string(),
+                weight_hash: None,
                 prompt_hash: "deadbeef".to_string(),
                 transcript_path: "runs/r-after-failure.jsonl".to_string(),
             },
@@ -2292,4 +2297,151 @@ fn worker_deny_grant_extends_deny_exceptions_only() {
     assert!(state.mission.command_grants.is_empty());
     assert!(state.mission.touch_set.is_empty());
     assert!(state.pending_grant_request.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Model provenance (quant / weight_hash)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn provenance_backcompat_defaults_quant_and_omits_weight_hash() {
+    // An old worker.spawned log line predating provenance fields has no
+    // "quant" or "weightHash" keys at all.
+    let spawned_json = json!({
+        "type": "worker.spawned",
+        "payload": {
+            "runId": "r-1",
+            "role": "worker",
+            "featureId": "f-1-1",
+            "sdkSessionId": "sess-r-1",
+            "model": "sonnet",
+            "promptHash": "deadbeef",
+            "transcriptPath": "runs/r-1.jsonl"
+        }
+    });
+    let kind: EventKind = serde_json::from_value(spawned_json).unwrap();
+    match kind {
+        EventKind::WorkerSpawned {
+            quant, weight_hash, ..
+        } => {
+            assert_eq!(quant, "n/a");
+            assert_eq!(weight_hash, None);
+        }
+        other => panic!("expected worker.spawned, got {other:?}"),
+    }
+}
+
+#[test]
+fn weight_hash_round_trips_through_serde_and_reducer_fold() {
+    let with_provenance = EventKind::WorkerSpawned {
+        run_id: "r-1".to_string(),
+        role: Role::Worker,
+        feature_id: Some("f-1-1".to_string()),
+        milestone_id: None,
+        sdk_session_id: "sess-r-1".to_string(),
+        model: "sonnet".to_string(),
+        quant: "q4_k_m".to_string(),
+        weight_hash: Some("deadbeefcafef00d".to_string()),
+        prompt_hash: "deadbeef".to_string(),
+        transcript_path: "runs/r-1.jsonl".to_string(),
+    };
+
+    // serde round-trip.
+    let json = serde_json::to_value(&with_provenance).unwrap();
+    assert_eq!(json["payload"]["quant"], "q4_k_m");
+    assert_eq!(json["payload"]["weightHash"], "deadbeefcafef00d");
+    let back: EventKind = serde_json::from_value(json).unwrap();
+    match back {
+        EventKind::WorkerSpawned {
+            quant, weight_hash, ..
+        } => {
+            assert_eq!(quant, "q4_k_m");
+            assert_eq!(weight_hash, Some("deadbeefcafef00d".to_string()));
+        }
+        other => panic!("expected worker.spawned, got {other:?}"),
+    }
+
+    // reducer::fold round-trip onto WorkerRun.
+    let state = fold(&[
+        ev(1, created()),
+        ev(
+            2,
+            EventKind::PlanApproved {
+                plan: plan(),
+                base_sha: None,
+            },
+        ),
+        ev(3, with_provenance),
+    ])
+    .unwrap();
+    let run = state.runs.get("r-1").expect("run recorded");
+    assert_eq!(run.quant, "q4_k_m");
+    assert_eq!(run.weight_hash, Some("deadbeefcafef00d".to_string()));
+}
+
+/// TEST-ONLY fixture standing in for a future `backend_local` spawn: given
+/// stubbed GGUF file bytes, hash the content (sha256, 64 lowercase hex
+/// chars) and build a `worker.spawned` `EventKind` carrying that hash and a
+/// quantisation label — the shape a real local backend would emit.
+///
+/// This does NOT construct or exercise any real local inference backend; it
+/// only proves the provenance fields fold correctly for the local regime
+/// (frontier's own coverage lives in `mission_test.rs`).
+fn local_worker_spawned_from_stubbed_gguf(run_id: &str, gguf_bytes: &[u8]) -> (String, EventKind) {
+    let mut hasher = Sha256::new();
+    hasher.update(gguf_bytes);
+    let weight_hash = format!("{:x}", hasher.finalize());
+    assert_eq!(weight_hash.len(), 64, "sha256 hex digest is 64 chars");
+
+    let kind = EventKind::WorkerSpawned {
+        run_id: run_id.to_string(),
+        role: Role::Worker,
+        feature_id: Some("f-1-1".to_string()),
+        milestone_id: None,
+        sdk_session_id: format!("sess-{run_id}"),
+        model: "local-llama-3-8b".to_string(),
+        quant: "q4_k_m".to_string(),
+        weight_hash: Some(weight_hash.clone()),
+        prompt_hash: "deadbeef".to_string(),
+        transcript_path: format!("runs/{run_id}.jsonl"),
+    };
+    (weight_hash, kind)
+}
+
+#[test]
+fn local_fixture_weight_hash_pins_stubbed_gguf_content_onto_run() {
+    // Stand-in "GGUF" content — bytes are irrelevant beyond being stable and
+    // non-empty; a real local backend would hash the actual weights file.
+    let stubbed_gguf = b"GGUF\x00\x00\x00\x03fake-local-weights-for-provenance-test";
+    let (weight_hash, spawned) = local_worker_spawned_from_stubbed_gguf("r-local-1", stubbed_gguf);
+
+    let state = fold(&[
+        ev(1, created()),
+        ev(
+            2,
+            EventKind::PlanApproved {
+                plan: plan(),
+                base_sha: None,
+            },
+        ),
+        ev(3, spawned),
+    ])
+    .unwrap();
+
+    let run = state.runs.get("r-local-1").expect("run recorded");
+    assert_eq!(run.quant, "q4_k_m", "quantisation label preserved");
+    assert_eq!(
+        run.weight_hash,
+        Some(weight_hash.clone()),
+        "content hash pins the exact weights used — a bare model name would not be auditable"
+    );
+    assert_eq!(run.weight_hash.as_ref().unwrap().len(), 64);
+
+    // Hashing the SAME content again reproduces the SAME hash (content-
+    // addressed, not incidental) — different content must NOT collide.
+    let (same_hash_again, _) = local_worker_spawned_from_stubbed_gguf("r-local-2", stubbed_gguf);
+    assert_eq!(same_hash_again, weight_hash);
+    let (different_hash, _) =
+        local_worker_spawned_from_stubbed_gguf("r-local-3", b"different stubbed weights");
+    assert_ne!(different_hash, weight_hash);
 }

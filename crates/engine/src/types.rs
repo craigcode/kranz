@@ -228,6 +228,11 @@ impl TokenUsage {
     }
 }
 
+/// Default `quant` for worker runs predating provenance fields.
+fn default_quant() -> String {
+    "n/a".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkerRun {
@@ -241,6 +246,12 @@ pub struct WorkerRun {
     /// Claude Code session id (UUID chosen by the engine, used for --resume).
     pub sdk_session_id: String,
     pub model: String,
+    /// Quantization of the model weights used for this run (provenance).
+    #[serde(default = "default_quant")]
+    pub quant: String,
+    /// Hash of the model weights used for this run, when known (provenance).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weight_hash: Option<String>,
     pub started_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<DateTime<Utc>>,

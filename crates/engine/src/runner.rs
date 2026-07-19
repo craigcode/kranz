@@ -281,6 +281,8 @@ pub async fn run_session_to(
         milestone_id: run_meta.milestone_id.clone(),
         sdk_session_id,
         model: run_meta.model.clone(),
+        quant: "n/a".to_string(),
+        weight_hash: None,
         prompt_hash: run_meta.prompt_hash.clone(),
         transcript_path: MissionPaths::transcript_rel(&run_meta.run_id),
     })?;

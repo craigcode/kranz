@@ -347,6 +347,8 @@ fn spawned(
         milestone_id: milestone_id.map(str::to_string),
         sdk_session_id: format!("sess-{run_id}"),
         model: "sonnet".to_string(),
+        quant: "n/a".to_string(),
+        weight_hash: None,
         prompt_hash: "hash".to_string(),
         transcript_path: format!("runs/{run_id}.jsonl"),
     }
