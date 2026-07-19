@@ -159,16 +159,20 @@ commands), an always-on `serve --slack` is the host — see
 
 Transcripts are source code. Treat the whole surface as sensitive.
 
-- **Token on reads too.** Locally the token gates only mutations because the
-  `127.0.0.1` bind is the real fence. Remotely that fence is gone, so a remote
-  deployment must require the token on **reads** as well — transcripts,
-  plans, and diffs are all confidential (roadmap M6, "Auth grows up"). Until
-  read-auth ships, do not expose a remote server that serves transcripts to
-  unauthenticated GETs.
-- **Never expose the raw server.** `kranz serve` has no TLS and (today) no
-  read-auth. It must sit **behind a reverse proxy that enforces TLS + the
-  token**. A leaked dashboard URL without the token must reveal nothing and
-  mutate nothing — that is the M6 acceptance bar.
+- **Token on reads too — `--read-auth`.** Locally the token gates only
+  mutations because the `127.0.0.1` bind is the real fence. Off-loopback binds
+  already require the token on reads unconditionally. For a loopback bind that
+  is nonetheless reachable through a reverse proxy (the persistent-host shape
+  in §4), pass `kranz serve --read-auth` to force the same read-token
+  requirement on loopback: GETs and the WS upgrade then require
+  `x-kranz-token` (or `?token=`) just like mutations do, closing the gap where
+  a leaked dashboard URL could read transcripts, plans, and diffs
+  unauthenticated. `--read-auth` is the deployment-ready mode — pass it any
+  time the process is exposed beyond a single local operator.
+- **Never expose the raw server.** `kranz serve` has no TLS. It must sit
+  **behind a reverse proxy that enforces TLS**, with `--read-auth` set so the
+  token is also required on reads. A leaked dashboard URL without the token
+  must reveal nothing and mutate nothing — that is the M6 acceptance bar.
 - **Scope the push credential.** The deploy key / GitHub App must be able to
   push `kranz/*` and nothing else — no `main`, no force, no merges. The
   in-code guard in `push_mission_branch` backs this up but is not a substitute
