@@ -1250,6 +1250,61 @@ async fn static_dir_serves_files_with_spa_fallback() {
 }
 
 #[tokio::test]
+async fn api_responses_are_no_store_and_shell_is_no_cache() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_root = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+    let static_dir = tmp.path().join("dist");
+    std::fs::create_dir_all(&static_dir).unwrap();
+    std::fs::write(
+        static_dir.join("index.html"),
+        "<html>kranz dashboard</html>",
+    )
+    .unwrap();
+    std::fs::write(static_dir.join("app.js"), "console.log('hi')").unwrap();
+
+    let app = kranz_server::router(repo_root, Some(static_dir));
+
+    // API answers are never storable: a cached HTML error page at an /api URL
+    // must not be able to replay against fetch() after the server is fixed.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-store"
+    );
+
+    // The SPA shell revalidates every load; hashed bundles stay cacheable.
+    let response = app
+        .clone()
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        response.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-cache"
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/app.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(response.headers().get(header::CACHE_CONTROL).is_none());
+}
+
+#[tokio::test]
 async fn embedded_static_serves_files_with_spa_fallback() {
     static FILES: [kranz_server::EmbeddedFile; 2] = [
         kranz_server::EmbeddedFile {

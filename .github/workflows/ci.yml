@@ -32,6 +32,21 @@ jobs:
       # so a cross-platform break surfaces in one run instead of one per push.
       - run: cargo test --workspace --no-fail-fast
 
+  # Dedicated macOS job (not folded into the matrix above) so the Seatbelt
+  # sandbox and unix process-group/kill paths run in CI. macOS runs tests
+  # only; fmt/clippy stay ubuntu-only to save runner minutes.
+  rust-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Configure git identity (git_ops tests)
+        run: |
+          git config --global user.name kranz-ci
+          git config --global user.email ci@kranz.local
+      - run: cargo test --workspace --no-fail-fast
+
   msrv:
     runs-on: ubuntu-latest
     steps:
