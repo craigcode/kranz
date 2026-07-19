@@ -2758,6 +2758,7 @@ mod tests {
             None,
             Some("catalog-token".to_string()),
             Some(address),
+            true,
             false,
         );
         let server = tokio::spawn(async move {
@@ -2801,6 +2802,7 @@ mod tests {
             None,
             Some("catalog-token".to_string()),
             Some(address),
+            false,
             true,
         );
         let server = tokio::spawn(async move {
