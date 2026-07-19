@@ -809,7 +809,8 @@ async fn non_loopback_bind_requires_token_on_gets() {
         None,
         Some(TOKEN.to_string()),
         Some(4560),
-        true, // require_read_token — as if bind were non-loopback
+        false, // bind_is_loopback — as if bind were non-loopback
+        true,  // require_read_token
     );
 
     // GETs under /api/ now need the token (except /api/health for probes).
@@ -855,7 +856,8 @@ async fn lan_host_header_reaches_token_gate_off_loopback() {
         None,
         Some(TOKEN.to_string()),
         Some(4560),
-        true, // non-loopback bind
+        false, // non-loopback bind
+        true,
     );
 
     let lan_get = |token: Option<&'static str>| {
@@ -888,6 +890,7 @@ async fn lan_host_header_reaches_token_gate_off_loopback() {
         None,
         Some(TOKEN.to_string()),
         Some(4560),
+        true,
         false,
     );
     let response = loopback_app.oneshot(lan_get(Some(TOKEN))).await.unwrap();
@@ -912,6 +915,7 @@ async fn query_token_is_rejected_on_posts() {
         None,
         Some(TOKEN.to_string()),
         Some(4560),
+        false,
         true,
     );
 

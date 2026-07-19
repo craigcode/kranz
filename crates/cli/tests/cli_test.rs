@@ -326,6 +326,7 @@ fn parses_serve() {
             ref dashboard,
             ref token,
             slack,
+            ..
         } => {
             assert_eq!(port, 4560);
             assert_eq!(host, "127.0.0.1", "default bind stays loopback");

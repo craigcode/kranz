@@ -1538,7 +1538,8 @@ async fn ws_lan_mode_accepts_ip_origin_and_native_clients_with_token() {
         None,
         Some(token.to_string()),
         Some(4560),
-        true, // non-loopback bind: read token required, LAN origins allowed
+        false, // non-loopback bind: LAN origins allowed
+        true,  // read token required
     );
     let addr = spawn_server(app).await;
     let url = format!("ws://{addr}/api/missions/{MISSION_ID}/ws?token={token}");
@@ -1582,6 +1583,165 @@ async fn ws_lan_mode_accepts_ip_origin_and_native_clients_with_token() {
     assert!(
         untokened.is_err(),
         "upgrade without the read token must be rejected"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// --read-auth (M6): the token gate arms independently of bind_is_loopback,
+// so `kranz serve --read-auth` on a loopback bind still keeps the strict
+// loopback Host/origin allowlist while requiring the token on reads.
+// ---------------------------------------------------------------------------
+
+const READ_AUTH_TOKEN: &str = "read-auth-token";
+
+fn read_auth_app(
+    bind_is_loopback: bool,
+    require_read_token: bool,
+) -> (tempfile::TempDir, axum::Router) {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_root = tmp.path().to_path_buf();
+    seed_mission(&repo_root);
+    let host = std::sync::Arc::new(kranz_server::MissionHost::new(repo_root));
+    let app = kranz_server::router_with_shared_host_and_bind(
+        host,
+        None,
+        Some(READ_AUTH_TOKEN.to_string()),
+        None,
+        bind_is_loopback,
+        require_read_token,
+    );
+    (tmp, app)
+}
+
+#[tokio::test]
+async fn read_auth_loopback_rejects_tokenless_get() {
+    let (_tmp, app) = read_auth_app(true, true);
+
+    let (status, _) = get_json(&app, &format!("/api/missions/{MISSION_ID}/state")).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "tokenless GET must be rejected"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/missions/{MISSION_ID}/state"))
+                .header(kranz_server::TOKEN_HEADER, READ_AUTH_TOKEN)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "header token must be accepted"
+    );
+
+    let addr = spawn_server(app).await;
+    let tokened_url = format!("ws://{addr}/api/missions/{MISSION_ID}/ws?token={READ_AUTH_TOKEN}");
+    let upgraded = tokio::time::timeout(
+        WAIT,
+        connect_async(ws_request(&tokened_url, Some("http://localhost:5173"))),
+    )
+    .await
+    .unwrap();
+    assert!(
+        upgraded.is_ok(),
+        "valid ?token= must upgrade: {:?}",
+        upgraded.err()
+    );
+
+    let untokened_url = format!("ws://{addr}/api/missions/{MISSION_ID}/ws");
+    let rejected = tokio::time::timeout(
+        WAIT,
+        connect_async(ws_request(&untokened_url, Some("http://localhost:5173"))),
+    )
+    .await
+    .unwrap();
+    assert!(
+        rejected.is_err(),
+        "WS upgrade without the token must be rejected"
+    );
+}
+
+#[tokio::test]
+async fn read_auth_health_exempt_without_token() {
+    let (_tmp, app) = read_auth_app(true, true);
+
+    let (status, _) = get_json(&app, "/api/health").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "health stays unauthenticated under read-auth"
+    );
+}
+
+#[tokio::test]
+async fn read_auth_post_rejects_query_only_token() {
+    let (_tmp, app) = read_auth_app(true, true);
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/missions/{MISSION_ID}/control?token={READ_AUTH_TOKEN}"),
+        None,
+        json!({ "kind": "pause" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "query-only token must not authorize a POST: {body}"
+    );
+}
+
+#[tokio::test]
+async fn read_auth_off_loopback_reads_tokenless() {
+    let (_tmp, app) = read_auth_app(true, false);
+
+    let (status, _) = get_json(&app, &format!("/api/missions/{MISSION_ID}/state")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "reads stay tokenless with read-auth off"
+    );
+
+    let addr = spawn_server(app).await;
+    let url = format!("ws://{addr}/api/missions/{MISSION_ID}/ws");
+    let mut ws = connect_allowed_ws(&url).await;
+    let frame = next_frame(&mut ws).await;
+    assert_eq!(
+        frame["type"], "snapshot",
+        "tokenless loopback WS still upgrades"
+    );
+}
+
+#[tokio::test]
+async fn read_auth_loopback_keeps_strict_loopback_origin() {
+    let (_tmp, app) = read_auth_app(true, true);
+    let addr = spawn_server(app).await;
+    let url = format!("ws://{addr}/api/missions/{MISSION_ID}/ws?token={READ_AUTH_TOKEN}");
+
+    let lan_origin = tokio::time::timeout(
+        WAIT,
+        connect_async(ws_request(&url, Some("http://192.168.1.5:4560"))),
+    )
+    .await
+    .unwrap();
+    assert!(
+        lan_origin.is_err(),
+        "read-auth must not relax the loopback origin allowlist to LAN IP literals"
+    );
+
+    let missing_origin = tokio::time::timeout(WAIT, connect_async(&url))
+        .await
+        .unwrap();
+    assert!(
+        missing_origin.is_err(),
+        "read-auth must not relax the loopback origin allowlist for a missing Origin"
     );
 }
 

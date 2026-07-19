@@ -222,6 +222,7 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             port,
             host,
             insecure_lan,
+            read_auth,
             open,
             dashboard,
             token,
@@ -232,6 +233,7 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
                 host,
                 port,
                 insecure_lan,
+                read_auth,
                 open,
                 dashboard,
                 token,
@@ -1339,6 +1341,15 @@ pub(crate) fn refuse_non_loopback_without_insecure_lan(
     Ok(())
 }
 
+/// Maps `(bind_is_loopback, read_auth_flag)` to the effective
+/// `require_read_token` boolean threaded into the server. Off-loopback binds
+/// always require the read token (unchanged); `--read-auth` additionally
+/// forces it on loopback binds — the deployment-ready read-auth mode.
+/// Extracted so the gate is unit-testable without starting the server.
+pub(crate) fn effective_require_read_token(bind_is_loopback: bool, read_auth: bool) -> bool {
+    !bind_is_loopback || read_auth
+}
+
 /// Every `POST /api/...` requires the mutation token (protocol "Authority:
 /// mutation token"): generated per serve (or pinned via `--token` for
 /// scripting), printed for the operator, and handed to `--open`'s browser as
@@ -1349,6 +1360,7 @@ async fn cmd_serve(
     host: String,
     port: u16,
     insecure_lan: bool,
+    read_auth: bool,
     open: bool,
     dashboard: Option<PathBuf>,
     token: Option<String>,
@@ -1363,6 +1375,12 @@ async fn cmd_serve(
             "WARNING: binding {bind} with --insecure-lan — the API is reachable \
              beyond this machine. Every /api GET, POST, and WS upgrade requires \
              the mutation token (header or ?token=). Use only on a network you trust."
+        );
+    }
+    if read_auth && effective_require_read_token(bind.is_loopback(), read_auth) {
+        eprintln!(
+            "--read-auth: GETs and the WS upgrade now require the mutation token too \
+             (same as POSTs), including on loopback."
         );
     }
     // Bind BEFORE printing anything: `--port 0` picks an ephemeral port, and
@@ -1470,9 +1488,16 @@ async fn cmd_serve(
             tracing::error!(error = %e, "failed to install ctrl-c handler");
         }
     };
-    let result =
-        serve_multi_with_token_cleanup(&repo, multi_host, listener, static_assets, token, shutdown)
-            .await;
+    let result = serve_multi_with_token_cleanup(
+        &repo,
+        multi_host,
+        listener,
+        static_assets,
+        token,
+        read_auth,
+        shutdown,
+    )
+    .await;
     match result {
         Ok(()) => Ok(0),
         Err(e) => Err(anyhow!("server failed: {e}")),
@@ -1533,12 +1558,14 @@ fn multi_repo_slack_catalog(
     kranz_slack::SlackCatalog::new(repos, affinity_path)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_multi_with_token_cleanup(
     repo: &Path,
     multi_host: Arc<kranz_server::MultiRepoHost>,
     listener: tokio::net::TcpListener,
     static_assets: Option<kranz_server::DashboardStatic>,
     token: String,
+    read_auth: bool,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     let token_file = if multi_host.uses_operator_catalog() {
@@ -1555,6 +1582,7 @@ async fn serve_multi_with_token_cleanup(
         listener,
         static_assets,
         Some(token),
+        read_auth,
         shutdown,
     )
     .await;
@@ -2730,6 +2758,7 @@ mod tests {
             None,
             Some("catalog-token".to_string()),
             Some(address),
+            true,
             false,
         );
         let server = tokio::spawn(async move {
@@ -2773,6 +2802,7 @@ mod tests {
             None,
             Some("catalog-token".to_string()),
             Some(address),
+            false,
             true,
         );
         let server = tokio::spawn(async move {
@@ -2981,5 +3011,21 @@ mod tests {
     fn serve_allows_loopback_without_insecure_lan() {
         let bind: std::net::IpAddr = "127.0.0.1".parse().unwrap();
         refuse_non_loopback_without_insecure_lan(bind, false).unwrap();
+    }
+
+    #[test]
+    fn read_auth_on_loopback_requires_read_token() {
+        assert!(effective_require_read_token(true, true));
+    }
+
+    #[test]
+    fn read_auth_off_loopback_bind_does_not_require_read_token() {
+        assert!(!effective_require_read_token(true, false));
+    }
+
+    #[test]
+    fn read_auth_non_loopback_always_requires_read_token() {
+        assert!(effective_require_read_token(false, true));
+        assert!(effective_require_read_token(false, false));
     }
 }
