@@ -78,10 +78,24 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             }
             Ok(0)
         }
-        Command::ExportTraces => {
-            let mission = select_mission(&repo, cli.mission.as_deref())?;
-            let jsonl = cmd_export_traces(&repo, &mission)?;
-            print!("{jsonl}");
+        Command::ExportTraces {
+            mission_id,
+            all,
+            out,
+        } => {
+            let jsonl = if all {
+                cmd_export_traces_all(&repo)
+            } else {
+                let mission =
+                    select_mission(&repo, mission_id.as_deref().or(cli.mission.as_deref()))?;
+                cmd_export_traces(&repo, &mission)?
+            };
+            match out {
+                Some(path) => std::fs::write(&path, &jsonl).with_context(|| {
+                    format!("writing export-traces output to {}", path.display())
+                })?,
+                None => print!("{jsonl}"),
+            }
             Ok(0)
         }
         Command::Pause => {
@@ -487,6 +501,25 @@ pub fn cmd_export_traces(repo: &Path, mission_id: &str) -> Result<String> {
         .with_context(|| format!("folding the event log of mission '{mission_id}'"))?;
     let pairs = trace_export::export_validated_traces(&state, &events);
     Ok(trace_export::to_jsonl(&pairs))
+}
+
+/// `--all`: aggregate validation-PASSED traces across every mission under
+/// .kranz/missions. A mission whose event log is missing or unreadable (e.g.
+/// still Planning, or a corrupt log) is skipped rather than failing the whole
+/// export — one bad mission must not block the rest of the dataset.
+pub fn cmd_export_traces_all(repo: &Path) -> String {
+    let mut pairs = Vec::new();
+    for mission_id in MissionPaths::list_missions(repo) {
+        let paths = MissionPaths::new(repo, &mission_id);
+        let Ok(events) = EventLog::read_events(&paths.events_file()) else {
+            continue;
+        };
+        let Ok(state) = reducer::fold(&events) else {
+            continue;
+        };
+        pairs.extend(trace_export::export_validated_traces(&state, &events));
+    }
+    trace_export::to_jsonl(&pairs)
 }
 
 /// Loud multi-line warning on stderr for `--dangerously-allow-all`.
