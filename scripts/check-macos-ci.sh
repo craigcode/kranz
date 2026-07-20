@@ -73,8 +73,8 @@ collect = lambda do |node|
 end
 collect.call(doc)
 
-sha_re = /@[0-9a-f]{40}(\s|$)/
-unpinned = all_uses.reject { |u| u =~ /@[0-9a-f]{40}/ }
+sha_re = /@[0-9a-f]{40}\z/
+unpinned = all_uses.reject { |u| sha_re.match?(u) }
 unless unpinned.empty?
   warn "FAIL: the following uses: values are not pinned to a 40-hex commit SHA: #{unpinned.inspect}"
   exit 1

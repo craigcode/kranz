@@ -20,23 +20,23 @@ Rejected shapes:
 
 Defined before any feature; gates mission completion.
 
-- **[a1]** With read-auth mode ON on a loopback bind, an `/api` GET without a token returns 401, while the same GET with the token in the `x-kranz-token` header (and a WS upgrade with `?token=`) succeeds. 
+- **[a1]** With read-auth mode ON on a loopback bind, an `/api` GET without a token returns 401, while the same GET with the token in the `x-kranz-token` header (and a WS upgrade with `?token=`) succeeds.
   `cargo test -p kranz-server read_auth_loopback`
-- **[a2]** `/api/health` returns 200 without any token even when read-auth mode is ON. 
+- **[a2]** `/api/health` returns 200 without any token even when read-auth mode is ON.
   `cargo test -p kranz-server read_auth_health_exempt`
-- **[a3]** A POST that presents the token only as a `?token=` query parameter (no `x-kranz-token` header) is still rejected with 401 — mutation authority never rides a URL. 
+- **[a3]** A POST that presents the token only as a `?token=` query parameter (no `x-kranz-token` header) is still rejected with 401 — mutation authority never rides a URL.
   `cargo test -p kranz-server read_auth_post_rejects_query_only_token`
-- **[a4]** With read-auth mode OFF on the default loopback bind, `/api` GETs and the WS upgrade remain tokenless (no localhost UX regression). 
+- **[a4]** With read-auth mode OFF on the default loopback bind, `/api` GETs and the WS upgrade remain tokenless (no localhost UX regression).
   `cargo test -p kranz-server read_auth_off_loopback_reads_tokenless`
-- **[a5]** The Host-gate and WS-origin policy are unchanged: enabling read-auth on a loopback bind keeps the strict loopback origin/Host allowlist (it does not flip into LAN mode), and every existing origin/host/ws test still passes. 
+- **[a5]** The Host-gate and WS-origin policy are unchanged: enabling read-auth on a loopback bind keeps the strict loopback origin/Host allowlist (it does not flip into LAN mode), and every existing origin/host/ws test still passes.
   `cargo test -p kranz-server`
-- **[a6]** In the dashboard, a read (GET) that returns 401 opens the token prompt and, once a valid token is provided, retries and succeeds; the WebSocket URL carries the token as `?token=`. 
+- **[a6]** In the dashboard, a read (GET) that returns 401 opens the token prompt and, once a valid token is provided, retries and succeeds; the WebSocket URL carries the token as `?token=`.
   `npm --prefix apps/dashboard test`
-- **[a7]** `docs/deploy.md` documents the shipped `--read-auth` mode where its "never expose without read-auth" warning previously referenced an unbuilt capability. 
+- **[a7]** `docs/deploy.md` documents the shipped `--read-auth` mode where its "never expose without read-auth" warning previously referenced an unbuilt capability.
   `grep -q -- "--read-auth" docs/deploy.md`
-- **[a8]** The workspace is formatted to the CI standard. 
+- **[a8]** The workspace is formatted to the CI standard.
   `cargo fmt --all --check`
-- **[a9]** The full workspace test suite passes. 
+- **[a9]** The full workspace test suite passes.
   `cargo test --workspace`
 - **[a10]** `kranz serve --read-auth` on a loopback bind actually serves with read-token enforcement (the flag is wired end-to-end, not just parsed): the printed guidance and behaviour reflect that reads now require the token. *(agent judgement)*
 
@@ -122,4 +122,3 @@ Done when:
 - The §5 "Token on reads too" / "Never expose the raw server" bullets no longer state read-auth is unbuilt and instead describe the `--read-auth` mode (reads + WS token, `/api/health` exempt).
 - The persistent-host guidance notes the TLS proxy must forward a loopback Host/Origin, and the `docker run … serve` example includes `--read-auth`.
 - The `M6 live deploy` operator-gate checkbox remains unchecked.
-

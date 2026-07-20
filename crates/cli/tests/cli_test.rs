@@ -682,6 +682,22 @@ fn export_traces_is_regenerable_and_filters_to_validated_passes() {
 }
 
 #[test]
+fn export_traces_rejects_mission_ids_outside_the_repo_namespace() {
+    let repo = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    write_events(
+        outside.path(),
+        "m-external",
+        vec![created_kind("external", "m-external")],
+    );
+    let external_mission = outside.path().join(".kranz/missions/m-external");
+
+    let err = commands::cmd_export_traces(repo.path(), external_mission.to_str().unwrap())
+        .expect_err("an absolute path must not be accepted as a mission id");
+    assert!(err.to_string().contains("invalid mission id"), "got: {err}");
+}
+
+#[test]
 fn export_traces_all_aggregates_and_skips_unreadable_missions() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
