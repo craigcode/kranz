@@ -759,8 +759,14 @@ mod tests {
         assert_eq!(num_turns, Some(1));
     }
 
+    /// Serializes tests that mutate process-global env vars (`KRANZ_KIMI_BIN`,
+    /// `PATH`, `HOME`) consulted by [`discover_kimi_binary`], since `cargo
+    /// test` runs tests in parallel threads within one process.
+    static DISCOVERY_ENV_GUARD: Mutex<()> = Mutex::new(());
+
     #[test]
     fn kimi_discovery_honors_env_override_exclusively() {
+        let _guard = DISCOVERY_ENV_GUARD.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let working = dir.path().join("working-kimi");
         #[cfg(unix)]
@@ -783,6 +789,89 @@ mod tests {
         assert!(
             !error.to_string().contains("working-kimi"),
             "the exclusive override must not fall through to `configured`, got: {error}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn kimi_discovery_falls_through_configured_to_path_then_well_known() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = DISCOVERY_ENV_GUARD.lock().unwrap();
+        let saved_env_override = std::env::var_os("KRANZ_KIMI_BIN");
+        std::env::remove_var("KRANZ_KIMI_BIN");
+        let saved_path = std::env::var_os("PATH");
+        let saved_home = std::env::var_os("HOME");
+
+        let write_stub = |path: &Path| {
+            std::fs::write(path, "#!/bin/sh\necho kimi-code 0.27.0\n").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let bogus_configured = dir.path().join("does-not-exist-kimi");
+
+        // Prepend (never replace) PATH so unrelated tests spawning real
+        // system binaries (`true`, `sh`, ...) concurrently on other threads
+        // keep resolving them.
+        let prepend_path = |extra: &Path| {
+            let mut dirs = vec![extra.to_path_buf()];
+            if let Some(existing) = std::env::var_os("PATH") {
+                dirs.extend(std::env::split_paths(&existing));
+            }
+            std::env::set_var("PATH", std::env::join_paths(dirs).unwrap());
+        };
+
+        // Stage 1: `configured` is broken, but a working `kimi` sits on
+        // PATH. Discovery must fall through configured -> PATH and pick it
+        // up (proving the `configured -> PATH` half of the ordering, not
+        // just the exclusive-env-override branch already covered above).
+        let path_dir = dir.path().join("path-bin");
+        std::fs::create_dir_all(&path_dir).unwrap();
+        let path_stub = path_dir.join("kimi");
+        write_stub(&path_stub);
+        prepend_path(&path_dir);
+
+        let path_result = discover_kimi_binary(Some(bogus_configured.to_str().unwrap()));
+
+        // Stage 2: PATH is pinned to a minimal, known-safe set of standard
+        // dirs (still enough for unrelated concurrent tests to spawn `true`
+        // / `sh`, but guaranteed to carry no `kimi`, unlike the developer's
+        // real PATH which may well have one installed). HOME points at a
+        // dir with a working `~/.kimi-code/bin/kimi`. Discovery must fall
+        // through PATH -> well-known and pick it up.
+        std::env::set_var("PATH", "/usr/bin:/bin");
+        let home_dir = dir.path().join("home");
+        let well_known_dir = home_dir.join(".kimi-code").join("bin");
+        std::fs::create_dir_all(&well_known_dir).unwrap();
+        let well_known_stub = well_known_dir.join("kimi");
+        write_stub(&well_known_stub);
+        std::env::set_var("HOME", &home_dir);
+
+        let well_known_result = discover_kimi_binary(Some(bogus_configured.to_str().unwrap()));
+
+        match saved_path {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+        match saved_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match saved_env_override {
+            Some(v) => std::env::set_var("KRANZ_KIMI_BIN", v),
+            None => std::env::remove_var("KRANZ_KIMI_BIN"),
+        }
+
+        assert_eq!(
+            path_result.expect("PATH fallback candidate should be found"),
+            PathBuf::from("kimi"),
+            "discovery should fall through configured -> PATH (bare name, resolved via PATH)"
+        );
+        assert_eq!(
+            well_known_result.expect("well-known fallback candidate should be found"),
+            well_known_stub,
+            "discovery should fall through PATH -> well-known ~/.kimi-code/bin/kimi"
         );
     }
 
