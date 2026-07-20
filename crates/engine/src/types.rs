@@ -445,11 +445,25 @@ pub struct RoleConfig {
     /// Backend override for this role. `None` or `"claude"` keeps the default
     /// Claude Code backend, `"codex"` selects
     /// [`crate::backend_codex::CodexBackend`], `"droid"` selects
-    /// [`crate::backend_droid::DroidBackend`], and `"kimi"` selects
-    /// [`crate::backend_kimi::KimiBackend`]. `config::validate` checks that
+    /// [`crate::backend_droid::DroidBackend`], `"kimi"` selects
+    /// [`crate::backend_kimi::KimiBackend`], and `"local"` selects an
+    /// OpenAI-compatible HTTP endpoint. `config::validate` checks that
     /// the selected backend/model pair is supported for the role.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
+    /// Base URL of the OpenAI-compatible HTTP endpoint for `backend = "local"`.
+    /// Required and validated when a role selects the local backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Context window budget (tokens) for `backend = "local"`, used to guard
+    /// against KV-cache blowout. Required and validated when a role selects
+    /// the local backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_budget: Option<u32>,
+    /// Sampling temperature for `backend = "local"`. Optional; validated when
+    /// present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
     /// Per-role OS sandbox opt-in.
     #[serde(default)]
     pub sandbox: SandboxConfig,
@@ -486,6 +500,9 @@ pub enum BackendKind {
     Codex,
     Droid,
     Kimi,
+    /// OpenAI-compatible HTTP endpoint, configured via the role's `baseUrl`,
+    /// `contextBudget`, and optional `temperature`.
+    Local,
 }
 
 impl BackendKind {
@@ -495,6 +512,7 @@ impl BackendKind {
             BackendKind::Codex => "codex",
             BackendKind::Droid => "droid",
             BackendKind::Kimi => "kimi",
+            BackendKind::Local => "local",
         }
     }
 }
@@ -568,6 +586,9 @@ impl Default for MissionConfig {
                 max_budget_usd: Some(20.0),
                 tools: vec![],
                 backend: None,
+                base_url: None,
+                context_budget: None,
+                temperature: None,
                 sandbox: SandboxConfig::default(),
             },
             worker: RoleConfig {
@@ -577,6 +598,9 @@ impl Default for MissionConfig {
                 max_budget_usd: Some(10.0),
                 tools: vec![],
                 backend: None,
+                base_url: None,
+                context_budget: None,
+                temperature: None,
                 sandbox: SandboxConfig::default(),
             },
             validator_scrutiny: RoleConfig {
@@ -586,6 +610,9 @@ impl Default for MissionConfig {
                 max_budget_usd: Some(10.0),
                 tools: vec![],
                 backend: None,
+                base_url: None,
+                context_budget: None,
+                temperature: None,
                 sandbox: SandboxConfig::default(),
             },
             validator_functional: RoleConfig {
@@ -595,6 +622,9 @@ impl Default for MissionConfig {
                 max_budget_usd: Some(5.0),
                 tools: vec![],
                 backend: None,
+                base_url: None,
+                context_budget: None,
+                temperature: None,
                 sandbox: SandboxConfig::default(),
             },
             skip_scrutiny: false,
@@ -641,6 +671,7 @@ impl MissionConfig {
             Some("codex") => BackendKind::Codex,
             Some("droid") => BackendKind::Droid,
             Some("kimi") => BackendKind::Kimi,
+            Some("local") => BackendKind::Local,
             _ => BackendKind::Claude,
         }
     }
