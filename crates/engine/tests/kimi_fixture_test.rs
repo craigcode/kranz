@@ -118,3 +118,34 @@ fn kimi_doc_notes_tool_use_and_tool_result_need_a_second_capture() {
         "doc must explicitly disclose that three of five AgentEvent kinds remain unproven"
     );
 }
+
+/// `f-2-1`: now that `backend_kimi` exists, ground its terminal text through
+/// the real parser rather than the raw-JSONL checks above. Unlike the
+/// codex/droid fixtures, this fixture's stitched terminal text is the plain
+/// string "OK" (docs/scoping/kimi-cli-backend.md §3's minimal probe
+/// capture), not a validator-report JSON string — so, mirroring
+/// `droid_fixture_test.rs`'s "no report" fixture case, this deliberately
+/// asserts the non-parsing outcome via
+/// `kranz_engine::runner::parse_validator_report` rather than a success case
+/// this fixture cannot support.
+#[test]
+fn kimi_fixture_terminal_text_does_not_parse_as_a_validator_report() {
+    use kranz_engine::backend::AgentEvent;
+    use kranz_engine::backend_kimi::KimiStreamParser;
+    use kranz_engine::runner::parse_validator_report;
+
+    let mut parser = KimiStreamParser::new();
+    let mut events: Vec<AgentEvent> = Vec::new();
+    for line in fixture_lines("kimi_exec_scrutiny.jsonl") {
+        events.extend(parser.push(&line.to_string(), "kimi-code/k3"));
+    }
+    let terminal_text = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::Result { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .expect("expected a terminal Result event");
+    assert_eq!(terminal_text, "OK");
+    assert!(parse_validator_report(&terminal_text).is_none());
+}
