@@ -21,23 +21,23 @@ Rejected shapes:
 
 Defined before any feature; gates mission completion.
 
-- **[a1]** The worker-spawn/run schema additively carries model provenance (quant and weight-hash) alongside the existing model id, and a log/state written before these fields still deserializes and folds (old logs default quant to "n/a" and weight-hash to absent). 
+- **[a1]** The worker-spawn/run schema additively carries model provenance (quant and weight-hash) alongside the existing model id, and a log/state written before these fields still deserializes and folds (old logs default quant to "n/a" and weight-hash to absent).
   `cargo test --workspace provenance 2>&1 | grep -qE 'test result: ok\. [1-9]'`
-- **[a2]** A frontier turn records quant "n/a" and no weight-hash, while a local turn (fixture) records a populated content weight-hash of the weight file plus its quant, and both fold through onto the run record intact. 
+- **[a2]** A frontier turn records quant "n/a" and no weight-hash, while a local turn (fixture) records a populated content weight-hash of the weight file plus its quant, and both fold through onto the run record intact.
   `cargo test --workspace weight_hash 2>&1 | grep -qE 'test result: ok\. [1-9]'`
-- **[a3]** The trace export includes only validation-PASSED worker traces: a worker run whose feature and milestone reached Complete is exported, while a run on a failed or skipped feature is excluded. 
+- **[a3]** The trace export includes only validation-PASSED worker traces: a worker run whose feature and milestone reached Complete is exported, while a run on a failed or skipped feature is excluded.
   `cargo test --workspace passed_only 2>&1 | grep -qE 'test result: ok\. [1-9]'`
-- **[a4]** The export is a pure function of the event log with no persisted second source of truth: regenerating it from the same log yields byte-identical output across repeated calls. 
+- **[a4]** The export is a pure function of the event log with no persisted second source of truth: regenerating it from the same log yields byte-identical output across repeated calls.
   `cargo test --workspace regenerable 2>&1 | grep -qE 'test result: ok\. [1-9]'`
-- **[a5]** Each exported trace is a well-formed instruction-pair record (instruction, response, and model provenance) serialized as one valid JSON object per JSONL line. 
+- **[a5]** Each exported trace is a well-formed instruction-pair record (instruction, response, and model provenance) serialized as one valid JSON object per JSONL line.
   `cargo test --workspace instruction_pair 2>&1 | grep -qE 'test result: ok\. [1-9]'`
-- **[a6]** The `kranz export-traces` CLI path emits the validation-passed instruction-pair JSONL for a mission by loading and folding its event log on demand (regenerable), and its output is stable across consecutive invocations over an unchanged log. 
+- **[a6]** The `kranz export-traces` CLI path emits the validation-passed instruction-pair JSONL for a mission by loading and folding its event log on demand (regenerable), and its output is stable across consecutive invocations over an unchanged log.
   `cargo test --workspace export_traces 2>&1 | grep -qE 'test result: ok\. [1-9]'`
-- **[a7]** The whole workspace's test suite passes (no regression introduced by the schema or export changes). 
+- **[a7]** The whole workspace's test suite passes (no regression introduced by the schema or export changes).
   `cargo test --workspace 2>&1 | grep -qE 'test result: ok\. [1-9]'`
-- **[a8]** The workspace is clippy-clean across all targets with warnings denied. 
+- **[a8]** The workspace is clippy-clean across all targets with warnings denied.
   `cargo clippy --workspace --all-targets -- -D warnings`
-- **[a9]** All code is rustfmt-formatted (CI gates `cargo fmt --all --check`). 
+- **[a9]** All code is rustfmt-formatted (CI gates `cargo fmt --all --check`).
   `cargo fmt --all --check`
 
 ## Milestone 1 — M1 — Model provenance recorded on every run/turn (frontier-first, additive)
@@ -84,4 +84,3 @@ Done when:
 - Two consecutive invocations over an unchanged log produce byte-identical output, and no tracked dataset file is created (regenerable).
 - `--all` aggregates passed traces across missions under .kranz/missions without error when a mission log is missing/unreadable (skipped, not fatal).
 - cargo test --workspace export_traces reports ≥1 passing test; clippy and fmt gates pass.
-

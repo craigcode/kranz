@@ -2943,6 +2943,14 @@ async fn plan_approval_writes_plan_branch_and_commit() {
     assert!(md.contains("**[a-1]**"), "{md}");
     assert!(md.contains("## Milestone 1 —"), "{md}");
     assert!(md.contains("Done when:"), "{md}");
+    assert!(
+        md.lines().all(|line| !line.ends_with([' ', '\t'])),
+        "plan.md must not contain trailing whitespace:\n{md}"
+    );
+    assert!(
+        md.ends_with('\n') && !md.ends_with("\n\n"),
+        "plan.md must end with exactly one newline:\n{md}"
+    );
     // main itself did not move: it still points at the seed commit.
     let main_subject = raw_git(&root, &["log", "-1", "--format=%s", "main"]);
     assert_eq!(main_subject.trim(), "seed");

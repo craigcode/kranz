@@ -5559,10 +5559,21 @@ pub fn render_plan_markdown(
     for a in &plan.validation_contract {
         match (&a.check, &a.command) {
             (AssertionCheck::Command, Some(cmd)) => {
-                let _ = writeln!(md, "- **[{}]** {} \n  `{}`", a.id, a.statement, cmd);
+                let _ = writeln!(
+                    md,
+                    "- **[{}]** {}\n  `{}`",
+                    a.id.trim(),
+                    a.statement.trim(),
+                    cmd.trim()
+                );
             }
             _ => {
-                let _ = writeln!(md, "- **[{}]** {} *(agent judgement)*", a.id, a.statement);
+                let _ = writeln!(
+                    md,
+                    "- **[{}]** {} *(agent judgement)*",
+                    a.id.trim(),
+                    a.statement.trim()
+                );
             }
         }
     }
@@ -5581,6 +5592,10 @@ pub fn render_plan_markdown(
             }
         }
     }
+    while md.ends_with('\n') {
+        md.pop();
+    }
+    md.push('\n');
     md
 }
 
@@ -6015,6 +6030,10 @@ pub fn render_revised_plan_markdown(
             }
         }
     }
+    while md.ends_with('\n') {
+        md.pop();
+    }
+    md.push('\n');
     md
 }
 

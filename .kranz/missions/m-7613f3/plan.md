@@ -20,11 +20,11 @@ Rejected shapes:
 
 Defined before any feature; gates mission completion.
 
-- **[a1]** The full workspace test suite (including the macOS-gated Seatbelt sandbox tests and unix process-group/kill tests) passes on macOS. 
+- **[a1]** The full workspace test suite (including the macOS-gated Seatbelt sandbox tests and unix process-group/kill tests) passes on macOS.
   `cargo test --workspace --no-fail-fast`
-- **[a2]** .github/workflows/ci.yml is valid YAML, declares a job that runs on macos-latest which invokes 'cargo test --workspace --no-fail-fast', does NOT run cargo fmt or cargo clippy, configures Swatinem/rust-cache, and every 'uses:' in the file is pinned to a 40-hex commit SHA. 
+- **[a2]** .github/workflows/ci.yml is valid YAML, declares a job that runs on macos-latest which invokes 'cargo test --workspace --no-fail-fast', does NOT run cargo fmt or cargo clippy, configures Swatinem/rust-cache, and every 'uses:' in the file is pinned to a 40-hex commit SHA.
   `bash scripts/check-macos-ci.sh`
-- **[a3]** The mission is CI-only: no Rust product code or Tauri/frontend code was changed (nothing under crates/ or apps/). 
+- **[a3]** The mission is CI-only: no Rust product code or Tauri/frontend code was changed (nothing under crates/ or apps/).
   `git diff --quiet $KRANZ_BASE_SHA -- crates apps`
 - **[a4]** The change is additive and correctly scoped: the existing ubuntu+windows rust job (fmt, clippy, test), and the msrv, dashboard, docker, and smoke jobs are unchanged in behaviour; only a new macOS test job and the guard script are added. *(agent judgement)*
 
@@ -54,4 +54,3 @@ Done when:
 - `scripts/check-macos-ci.sh` exists, exits 0 against the edited ci.yml, and exits non-zero if the macOS cargo-test line is removed or any action is unpinned.
 - No files under `crates/` or `apps/` are modified (`git diff --quiet $KRANZ_BASE_SHA -- crates apps` exits 0).
 - `cargo test --workspace --no-fail-fast` passes on this macOS host.
-

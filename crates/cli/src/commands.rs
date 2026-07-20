@@ -470,6 +470,11 @@ pub fn augment_limit_hint(e: anyhow::Error) -> anyhow::Error {
 
 /// A mission exists iff its `events.jsonl` does.
 fn require_mission(repo: &Path, mission_id: &str) -> Result<MissionPaths> {
+    if !MissionPaths::is_safe_id(mission_id) {
+        bail!(
+            "invalid mission id '{mission_id}': ids cannot contain path separators, '..', or drive designators"
+        );
+    }
     let paths = MissionPaths::new(repo, mission_id);
     if !paths.events_file().is_file() {
         bail!(
