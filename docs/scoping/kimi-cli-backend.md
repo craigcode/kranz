@@ -130,6 +130,36 @@ terminal event carrying token usage**:
 | `{"role":"assistant","content":<string>}` | final assistant text; the fixture shows exactly one, but treat as repeatable (narration then final) until a multi-line/tool-using fixture proves otherwise | `Text { text: content, raw }`, and this same text becomes the terminal `Result.text` (see below — there is no separate terminal event to source it from) |
 | `{"role":"meta","type":"session.resume_hint","session_id":...,"command":...,"content":...}` | last line of every run; not a result frame — purely a "how to resume this session" hint | `Result { text: <the last assistant "content" seen this run>, is_error: false, usage: None (not on this wire — see below), cost_usd: None (not on this wire — see below), num_turns: Some(1), raw }` |
 
+### Synthesis seam: no stdout `Init`, no stdout terminal `Result`
+
+Unlike Claude/Codex/Cursor, the `-p --output-format stream-json` wire never
+emits an `init`/`system` line and never emits a terminal frame that is
+itself a `Result`. `backend_kimi` must **synthesize** both `AgentEvent`s
+rather than translate them off the wire:
+
+- **`Init`** — synthesize at stream start, before the first line is even
+  read. `model` is the configured `-m` value (known up front, from
+  `backend_kimi`'s own invocation args). `session_id` is *not* known at
+  this point — it only appears later, on the `role:meta
+  type:session.resume_hint` line (§3 table, row 2). Either (a) emit `Init`
+  with a placeholder/empty `session_id` and backfill/update it in place
+  once the resume_hint line arrives, or (b) buffer emission of `Init` until
+  the resume_hint line is seen and backfill then — either is acceptable,
+  but the session_id cannot be sourced any earlier than the resume_hint
+  line.
+- **`Result`** — synthesize from the `session.resume_hint` line itself
+  (there is no separate result frame to parse): `text` = the last
+  assistant `content` seen this run, `is_error: false`, `num_turns:
+  Some(1)`, `usage: None` (not on the stdout wire — see §5 for the
+  out-of-band usage path).
+
+**End-of-run completion signal:** the session loop's `saw_result` must key
+off the `session.resume_hint` line plus process exit — that line, not a
+dedicated result frame, *is* the sole end-of-run signal on this wire. If
+the process exits without ever emitting a `session.resume_hint` line, no
+`Result` can be synthesized from stdout at all; treat that as an error
+condition rather than silently completing.
+
 Tool-use/tool-result event shapes (`ToolUse`/`ToolResult` per the spec's
 requested table rows) were **not observed** — the smallest read-only prompt
 used for this capture triggered no tool call, and per the "smallest
@@ -264,6 +294,19 @@ landed on for its own non-boundary `--sandbox` flag.
 
 ## Known gaps for whoever picks this up next
 
+- **Three of the five `AgentEvent` kinds are not evidence-backed by
+  captured stdout.** Only `Text` (the `role:assistant` line) and the
+  terminal `Result` (synthesized from the `role:meta
+  type:session.resume_hint` line — see §3 "Synthesis seam") are grounded in
+  what this probe actually observed on the wire. `Init`, `ToolUse`, and
+  `ToolResult` are **not** evidence-backed: `Init` is a pure synthesis (no
+  stdout line corresponds to it at all, per the seam note above), and
+  `ToolUse`/`ToolResult` are inferred placeholders — no tool call was
+  triggered by this probe's single no-tool-use prompt, so their mapping
+  rows in the §3 table remain unconfirmed until a second, tool-using
+  read-only capture is taken (planned for the M2 parser feature `f-2-1`).
+  Interim rule until that capture exists: route any unrecognized `"role"`
+  value straight to `AgentEvent::Other`.
 - Tool-call/tool-result wire shape on `-p --output-format stream-json`
   stdout is unobserved (no tool-using capture was made; see §3).
 - `--plan` combined with `-p` was not live-tested (inferred read-only from
