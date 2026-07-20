@@ -29,3 +29,19 @@ requirement — unify on 0.29.
 - PR #10 merges after the port (close the loop with dependabot, or cherry-
   the manifest bump into the port branch and close #10).
 - cargo clippy --workspace --all-targets -- -D warnings and fmt --check clean.
+
+## Contract-authoring warning (take 2 — read before writing assertions)
+The first attempt (m-0c885b) completed the port but was abandoned over two
+assertion-authoring bugs in its contract; the final gate reads the APPROVED
+plan.json, never plan.md, and revisions cannot alter assertions. Write
+assertions that measure the right thing from the start:
+- For lockfile checks, do NOT grep for a dep-ref like
+  `"tokio-tungstenite 0.29.0"` — that string form only exists while TWO
+  versions coexist (pre-unification); a unified lockfile puts the version on
+  the `[[package]]` entry's own line. Correct shape: assert exactly one
+  `name = "tokio-tungstenite"` entry AND `version = "0.29.0"` on the
+  following line.
+- For "only these files changed" checks, diff the FEATURE commit range
+  (first feature commit..HEAD) or exclude `.kranz/` — `git diff
+  $KRANZ_BASE_SHA` includes the harness's own `[kranz] approved plan`
+  commit (plan.json/plan.md/index.md), which is not feature work.
