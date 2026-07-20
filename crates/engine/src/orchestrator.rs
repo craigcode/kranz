@@ -313,6 +313,10 @@ pub struct MissionEngine {
     /// whose `backend = "droid"`. Mirrors `codex_backend`: `None` until the
     /// first successful probe; a failed probe is never cached.
     droid_backend: Option<Arc<dyn AgentBackend>>,
+    /// Lazily-built [`crate::backend_kimi::KimiBackend`] cache for roles
+    /// whose `backend = "kimi"`. Mirrors `codex_backend`: `None` until the
+    /// first successful probe; a failed probe is never cached.
+    kimi_backend: Option<Arc<dyn AgentBackend>>,
     /// The tree mission-branch work runs in for the current `run()` call
     /// (M7 tier 1). `None` in checkout mode (and before the first `run()`),
     /// where [`Self::active_root`]/[`Self::active_repo`] fall back to
@@ -428,6 +432,7 @@ impl MissionEngine {
             pending_research: None,
             codex_backend: None,
             droid_backend: None,
+            kimi_backend: None,
             active_tree: None,
             primary_branch_at_start: None,
             worker_auth_verdict: None,
@@ -541,6 +546,7 @@ impl MissionEngine {
             pending_research: None,
             codex_backend: None,
             droid_backend: None,
+            kimi_backend: None,
             active_tree: None,
             primary_branch_at_start: None,
             worker_auth_verdict: None,
@@ -690,6 +696,17 @@ impl MissionEngine {
                             severity: "warn",
                             message: format!(
                                 "{role_key}.backend is \"droid\" but no droid binary was found \
+                                 ({err}); that role will fall back to the claude backend"
+                            ),
+                        });
+                    }
+                }
+                BackendKind::Kimi => {
+                    if let Err(err) = crate::backend_kimi::discover_kimi_binary(None) {
+                        issues.push(PreflightIssue {
+                            severity: "warn",
+                            message: format!(
+                                "{role_key}.backend is \"kimi\" but no kimi binary was found \
                                  ({err}); that role will fall back to the claude backend"
                             ),
                         });
@@ -964,6 +981,43 @@ impl MissionEngine {
                             cfg,
                             fallback_reason: Some(format!(
                                 "droid backend requested for the {role_name} but not available \
+                                 ({err}); falling back to the claude {role_name}"
+                            )),
+                        }
+                    }
+                }
+            }
+            BackendKind::Kimi => {
+                if let Some(cached) = &self.kimi_backend {
+                    set_effective_model(&mut cfg, BackendKind::Kimi);
+                    return SelectedBackend {
+                        backend: Arc::clone(cached),
+                        kind: BackendKind::Kimi,
+                        cfg,
+                        fallback_reason: None,
+                    };
+                }
+                match crate::backend_kimi::discover_kimi_binary(None) {
+                    Ok(binary) => {
+                        let backend: Arc<dyn AgentBackend> =
+                            Arc::new(crate::backend_kimi::KimiBackend::new(binary));
+                        self.kimi_backend = Some(Arc::clone(&backend));
+                        set_effective_model(&mut cfg, BackendKind::Kimi);
+                        SelectedBackend {
+                            backend,
+                            kind: BackendKind::Kimi,
+                            cfg,
+                            fallback_reason: None,
+                        }
+                    }
+                    Err(err) => {
+                        set_effective_model(&mut cfg, BackendKind::Claude);
+                        SelectedBackend {
+                            backend: Arc::clone(&self.backend),
+                            kind: BackendKind::Claude,
+                            cfg,
+                            fallback_reason: Some(format!(
+                                "kimi backend requested for the {role_name} but not available \
                                  ({err}); falling back to the claude {role_name}"
                             )),
                         }
