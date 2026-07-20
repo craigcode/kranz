@@ -1038,7 +1038,9 @@ where
                         // block ping handling on this same read loop.
                         if let Some(id) = envelope.get("envelope_id").and_then(Value::as_str) {
                             if write
-                                .send(Message::Text(json!({ "envelope_id": id }).to_string()))
+                                .send(Message::Text(
+                                    json!({ "envelope_id": id }).to_string().into(),
+                                ))
                                 .await
                                 .is_err()
                             {
@@ -7070,7 +7072,7 @@ mod tests {
         let stop = Arc::new(Notify::new());
         let health = BridgeHealth::new();
         let mut read = futures_util::stream::iter(vec![Ok::<Message, std::convert::Infallible>(
-            Message::Text(frame.to_string()),
+            Message::Text(frame.to_string().into()),
         )]);
         let mut write = futures_util::sink::drain::<Message>();
 

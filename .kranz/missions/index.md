@@ -47,3 +47,4 @@ Approved plans, newest last.
 - 2026-07-19 · [m-0f1abd](m-0f1abd/plan.md) — Record model provenance (id, quant, weight-hash) on every run and add a derived, event-log-regenerable export that yield… [truncated] · [report](m-0f1abd/report.md)
 - 2026-07-19 · [m-b66d34](m-b66d34/plan.md) — Add a fourth single-shot agent backend `backend_kimi` driving the headless Kimi Code CLI (validator-first, worker-capabl… [truncated] · [report](m-b66d34/report.md)
 - 2026-07-20 · [m-c6882a](m-c6882a/plan.md) — Add BackendKind::Local — a first-of-its-kind HTTP-in-engine, OpenAI-compatible completion backend plus base_url/contextB… [truncated] · [report](m-c6882a/report.md)
+- 2026-07-20 · [m-8b3ec3](m-8b3ec3/plan.md) — Port crates/slack's socket client from tokio-tungstenite 0.24 to 0.29, regenerate the lockfile, and unify the workspace … [truncated]
