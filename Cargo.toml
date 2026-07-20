@@ -42,7 +42,7 @@ axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["fs", "cors"] }
 futures = "0.3"
 futures-util = "0.3"
-ratatui = "0.29"
+ratatui = "0.30"
 crossterm = "0.28"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
