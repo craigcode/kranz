@@ -38,6 +38,17 @@ pub fn is_droid_model(model: &str) -> bool {
     m.contains("glm") || m.contains("fireworks")
 }
 
+/// Default model id for the Kimi backend (Kimi Code CLI's flagship alias),
+/// importable engine-wide.
+pub const DEFAULT_KIMI_MODEL: &str = "k3";
+
+/// Whether `model` names a kimi-family model (same substring match
+/// [`pricing_for_model`] uses to select kimi pricing).
+pub fn is_kimi_model(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    m.contains("k3") || m.contains("kimi")
+}
+
 /// Per-model token pricing in USD per million tokens.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Pricing {
@@ -77,6 +88,12 @@ pub fn pricing_for_model(model: &str) -> Pricing {
         Pricing {
             input_per_mtok: 0.55,
             output_per_mtok: 2.19,
+        }
+    } else if m.contains("k3") || m.contains("kimi") {
+        // TODO(pricing): confirm kimi $/Mtok before ship
+        Pricing {
+            input_per_mtok: 0.60,
+            output_per_mtok: 2.50,
         }
     } else if m.contains("opus") {
         Pricing {
@@ -725,5 +742,36 @@ mod tests {
         let fable = pricing_for_model("claude-fable-5");
         assert_eq!(fable.input_per_mtok, 10.0);
         assert_eq!(fable.output_per_mtok, 50.0);
+    }
+
+    #[test]
+    fn kimi_pricing_applied() {
+        let kimi = pricing_for_model(DEFAULT_KIMI_MODEL);
+        assert_eq!(kimi.input_per_mtok, 0.60);
+        assert_eq!(kimi.output_per_mtok, 2.50);
+
+        let opus = pricing_for_model("opus");
+        let codex = pricing_for_model(DEFAULT_CODEX_MODEL);
+        let droid = pricing_for_model(DEFAULT_DROID_MODEL);
+        assert_ne!(kimi, opus);
+        assert_ne!(kimi, codex);
+        assert_ne!(kimi, droid);
+
+        assert!(is_kimi_model("kimi-code/k3"));
+        assert!(is_kimi_model("K3"));
+        assert!(!is_kimi_model("opus"));
+
+        let usage = TokenUsage {
+            input: 2_000_000,
+            output: 1_000_000,
+            cache_read: 500_000,
+            cache_write: 200_000,
+        };
+        let expected = 2.0 * 0.60 + 1.0 * 2.50 + 0.5 * (0.1 * 0.60) + 0.2 * (1.25 * 0.60);
+        let got = usage_cost_usd(&usage, DEFAULT_KIMI_MODEL);
+        assert!(
+            (got - expected).abs() < 1e-9,
+            "got {got}, expected {expected}"
+        );
     }
 }
