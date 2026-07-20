@@ -47,6 +47,17 @@ describe('NewMission', () => {
     expect(window.location.hash).toBe('#/m/m-backend');
   });
 
+  it('lists kimi as a selectable worker backend', () => {
+    render(<NewMission />);
+
+    const backendSelect = screen.getByLabelText('Worker backend') as HTMLSelectElement;
+    const optionValues = Array.from(backendSelect.options).map((option) => option.value);
+    expect(optionValues).toContain('kimi');
+
+    fireEvent.change(backendSelect, { target: { value: 'kimi' } });
+    expect(backendSelect.value).toBe('kimi');
+  });
+
   it('renders the server validation message inline', async () => {
     vi.mocked(api.createMission).mockRejectedValue(
       new Error('orchestrator.model "sonnet" is below the frontier-model floor'),

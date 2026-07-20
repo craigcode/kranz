@@ -51,8 +51,8 @@ Project vocabulary. Terms link to the note that explains them in depth.
   tests is a vacuous pass, not a real one (`grep 'result: ok. [1-9]'`).
 - **Lessons** — append-only cross-mission memory in `.kranz/lessons/`, injected
   tightly-capped into planning. See [lessons.md](lessons.md).
-- **Backend** — the headless agent CLI a role runs on: `claude`, `codex`, or
-  `droid`, selectable per role.
+- **Backend** — the headless agent CLI a role runs on: `claude`, `codex`,
+  `droid`, or `kimi`, selectable per role.
 - **`kranz serve`** — the local REST/WS host (127.0.0.1) that can own missions
   for the dashboard and Slack bridge.
 - **Respawn / fix-cycle / fix-feature** — a respawn re-runs a failed worker; a

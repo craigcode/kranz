@@ -292,6 +292,20 @@ rules plus external process/workspace controls (throwaway `--add-dir`
 workspaces, scoped credentials), the same posture `cursor-cli-backend.md`
 landed on for its own non-boundary `--sandbox` flag.
 
+### 6.1 Claude-CLI permission fields are ignored on this backend
+
+On the `kimi` backend, `SessionSpec`'s Claude-CLI permission fields
+(`permission_mode`/`allowed_tools`/`disallowed_tools`/`tools`) are ignored —
+`kimi -p` has no equivalent flag surface (see §6 above: `--yolo`/`--plan`
+plus `config.toml` `[permission]` rules are the only knobs). Enforcement for
+this backend therefore degrades to the writable-path flag
+(`SessionSpec.sandbox`, i.e. the `touch_set` grant surface) plus the OS
+sandbox plus the deterministic out-of-contract-write sweep
+(`crates/engine/src/contract_sweep.rs`), the same posture already documented
+for the `codex` and `droid` backends. See
+`docs/scoping/worker-sandboxing.md` for the sweep's role in the overall
+isolation model.
+
 ## Known gaps for whoever picks this up next
 
 - **Three of the five `AgentEvent` kinds are not evidence-backed by
