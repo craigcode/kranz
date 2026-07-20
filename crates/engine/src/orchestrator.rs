@@ -713,9 +713,20 @@ impl MissionEngine {
                     }
                 }
                 BackendKind::Claude => {}
-                // Local backend wiring (HTTP dispatch, readiness probe) lands
-                // in a later milestone; no preflight probe yet.
-                BackendKind::Local => {}
+                BackendKind::Local => {
+                    if let Some(base_url) = self.state.config.role(role).base_url.as_deref() {
+                        if !probe_local_endpoint_reachable(base_url) {
+                            issues.push(PreflightIssue {
+                                severity: "warn",
+                                message: format!(
+                                    "{role_key}.backend is \"local\" but {base_url} did not \
+                                     respond to a reachability probe; that role's HTTP calls \
+                                     may fail"
+                                ),
+                            });
+                        }
+                    }
+                }
             }
         }
 
@@ -1027,9 +1038,35 @@ impl MissionEngine {
                     }
                 }
             }
-            // The local HTTP backend's dispatch wiring lands in a later
-            // milestone; this feature is config-validation only.
-            BackendKind::Local => unreachable!("local backend wired in a later feature"),
+            BackendKind::Local => {
+                let role_cfg = match role {
+                    Role::Orchestrator => &cfg.orchestrator,
+                    Role::Worker => &cfg.worker,
+                    Role::ValidatorScrutiny => &cfg.validator_scrutiny,
+                    Role::ValidatorFunctional => &cfg.validator_functional,
+                };
+                // `config::validate` has already guaranteed base_url and
+                // context_budget are present for a local-backed role; there
+                // is no binary to probe and therefore no claude fallback.
+                let base_url = role_cfg
+                    .base_url
+                    .clone()
+                    .expect("validate guarantees base_url for backend = local");
+                let temperature = role_cfg.temperature;
+                let context_budget = role_cfg
+                    .context_budget
+                    .expect("validate guarantees context_budget for backend = local");
+                let backend: Arc<dyn AgentBackend> = Arc::new(
+                    crate::backend_local::LocalBackend::new(base_url, temperature, context_budget),
+                );
+                set_effective_model(&mut cfg, BackendKind::Local);
+                SelectedBackend {
+                    backend,
+                    kind: BackendKind::Local,
+                    cfg,
+                    fallback_reason: None,
+                }
+            }
             BackendKind::Claude => {
                 set_effective_model(&mut cfg, BackendKind::Claude);
                 SelectedBackend {
@@ -6759,6 +6796,31 @@ fn path_is_executable(path: &std::path::Path) -> bool {
     }
 }
 
+/// Best-effort, short-timeout (2s) reachability probe for a `backend = local`
+/// role's `base_url`: a bare GET, since an OpenAI-compatible server's root
+/// path need not resolve to anything meaningful — any response (including a
+/// non-2xx status) counts as "reachable"; only a connection-level failure
+/// (refused, DNS, timeout) does not. Never escalated past a `warn`
+/// `PreflightIssue`: this must never block a mission start.
+fn probe_local_endpoint_reachable(base_url: &str) -> bool {
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return true; // can't probe; don't manufacture a false warning
+    };
+    runtime.block_on(async {
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+        {
+            Ok(client) => client,
+            Err(_) => return true,
+        };
+        client.get(base_url).send().await.is_ok()
+    })
+}
+
 /// Run `program args` to completion, polling with a bounded wall-clock
 /// (`timeout`) rather than blocking forever — the sandbox preflight probe
 /// runs operator-authored contract commands and must never hang a mission
@@ -7962,6 +8024,59 @@ mod tests {
                 .iter()
                 .any(|i| i.severity == "warn" && i.message.contains("droid")),
             "expected a droid preflight warning, got {issues:?}"
+        );
+    }
+
+    /// `worker.backend = "local"` with an unreachable `base_url`: preflight
+    /// must surface exactly a `"warn"` issue (never `"error"`, never a
+    /// block) naming the endpoint.
+    #[test]
+    fn local_preflight_warns_when_base_url_unreachable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).unwrap_or_else(|_| dir.path().to_path_buf());
+        let _ = std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&root)
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.name", "test"])
+            .current_dir(&root)
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(&root)
+            .output();
+        std::fs::write(root.join("README.md"), "seed\n").unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&root)
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["commit", "-m", "seed"])
+            .current_dir(&root)
+            .output();
+
+        let mut cfg = MissionConfig::default();
+        cfg.worker.backend = Some("local".to_string());
+        // Port 0 never accepts connections; a fast, reliable "unreachable".
+        cfg.worker.base_url = Some("http://127.0.0.1:0/v1".to_string());
+        cfg.worker.context_budget = Some(8192);
+        cfg.allow_below_default_worker_model = true;
+
+        let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
+        let engine = MissionEngine::create(backend, &root, "goal", cfg).expect("create engine");
+
+        let issues = engine.preflight();
+
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.severity == "warn" && i.message.contains("127.0.0.1:0")),
+            "expected a local preflight warning, got {issues:?}"
+        );
+        assert!(
+            !issues.iter().any(|i| i.severity == "error"),
+            "local reachability must never escalate to an error, got {issues:?}"
         );
     }
 
@@ -9933,6 +10048,35 @@ mod tests {
 
         drop(droid_guard);
         drop(codex_guard);
+    }
+
+    #[test]
+    fn local_select_routes_worker_to_local_backend() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+
+        let mut cfg = MissionConfig::default();
+        cfg.worker.backend = Some("local".to_string());
+        cfg.worker.base_url = Some("http://127.0.0.1:9/v1".to_string());
+        cfg.worker.context_budget = Some(8192);
+        cfg.worker.temperature = Some(0.2);
+        cfg.allow_below_default_worker_model = true;
+
+        let mock: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
+        let mut engine =
+            MissionEngine::create(mock.clone(), &root, "goal", cfg).expect("create engine");
+
+        let worker = engine.select_backend(Role::Worker);
+        assert_eq!(worker.kind, BackendKind::Local);
+        assert!(
+            worker.fallback_reason.is_none(),
+            "local selection must never fall back to claude"
+        );
+        assert!(
+            !Arc::ptr_eq(&worker.backend, &mock),
+            "worker should route to the local backend, not the injected claude backend"
+        );
     }
 
     /// The stub droid's ValidatorReport findings (>=1, per the fixture) fold
