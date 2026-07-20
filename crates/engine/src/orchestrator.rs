@@ -10145,4 +10145,372 @@ mod tests {
             "fix feature from the retry's findings must be folded into mission state"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Kimi scrutiny integration (f-4-1): a stubbed `kimi -p --output-format
+    // stream-json` binary drives real ValidatorReport findings into the
+    // fix-cycle machinery. No real API spend: everything comes from a POSIX
+    // shell stub streaming a committed fixture, mirroring the droid
+    // integration tests above.
+    // -----------------------------------------------------------------------
+
+    /// Writes an executable POSIX shell stub that stands in for the real
+    /// `kimi` CLI closely enough to drive
+    /// [`crate::backend_kimi::KimiBackend`]: `--version` prints a plausible
+    /// version string and any `-p ...` invocation streams the committed
+    /// fixture (stream-json lines terminating in a `session.resume_hint`) to
+    /// stdout, exiting 0. Not portable to windows-latest (no `/bin/sh`),
+    /// hence `cfg(unix)`.
+    #[cfg(unix)]
+    fn write_kimi_stub() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fixture = std::fs::canonicalize(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/kimi_exec_scrutiny_report.jsonl"),
+        )
+        .expect("fixture exists");
+        let script_path = dir.path().join("kimi-stub.sh");
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'kimi-cli 0.0.0-test'\n  exit 0\nfi\ncat '{}'\nexit 0\n",
+                fixture.display()
+            ),
+        )
+        .expect("write stub script");
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat stub script")
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod stub script");
+        (dir, script_path)
+    }
+
+    /// Like [`write_kimi_stub`] but the stub cats
+    /// `kimi_exec_scrutiny_report_no_report.jsonl` — a fixture whose final
+    /// assistant text is plain prose, not JSON — so `parse_validator_report`
+    /// returns `None` even though the stub exits 0. Models a kimi run that
+    /// completed but never emitted a parseable report.
+    #[cfg(unix)]
+    fn write_kimi_stub_no_report() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fixture = std::fs::canonicalize(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/kimi_exec_scrutiny_report_no_report.jsonl"),
+        )
+        .expect("fixture exists");
+        let script_path = dir.path().join("kimi-stub-no-report.sh");
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'kimi-cli 0.0.0-test'\n  exit 0\nfi\ncat '{}'\nexit 0\n",
+                fixture.display()
+            ),
+        )
+        .expect("write stub script");
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat stub script")
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod stub script");
+        (dir, script_path)
+    }
+
+    /// Serializes tests that mutate `KRANZ_KIMI_BIN` so they don't race
+    /// concurrently with each other (mirrors `DROID_ENV_LOCK`; kept on its
+    /// own dedicated mutex since it guards a different env var).
+    #[cfg(unix)]
+    static KIMI_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard: points `KRANZ_KIMI_BIN` at a working stub so
+    /// `discover_kimi_binary` deterministically resolves it as the FIRST
+    /// (exclusive) candidate, regardless of whatever real `kimi` install
+    /// happens to sit on the host running the suite. Serialized on
+    /// [`KIMI_ENV_LOCK`] so these tests never race each other.
+    #[cfg(unix)]
+    struct KimiStubEnvGuard {
+        prev_bin: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    #[cfg(unix)]
+    impl KimiStubEnvGuard {
+        fn engage(stub: &std::path::Path) -> Self {
+            let lock = KIMI_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let prev_bin = std::env::var_os("KRANZ_KIMI_BIN");
+            std::env::set_var("KRANZ_KIMI_BIN", stub);
+            KimiStubEnvGuard {
+                prev_bin,
+                _lock: lock,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for KimiStubEnvGuard {
+        fn drop(&mut self) {
+            match self.prev_bin.take() {
+                Some(v) => std::env::set_var("KRANZ_KIMI_BIN", v),
+                None => std::env::remove_var("KRANZ_KIMI_BIN"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn kimi_scrutiny_cfg() -> MissionConfig {
+        let mut cfg = MissionConfig::default();
+        cfg.validator_scrutiny.backend = Some("kimi".to_string());
+        cfg.skip_functional = true;
+        cfg
+    }
+
+    /// The stub kimi's ValidatorReport findings (>=1, per the fixture) fold
+    /// into the run loop through the normal machinery: `validation.finding`
+    /// events, an orchestrator conversion turn, and a `fixfeature.created`
+    /// event that lands the fix feature in state — exactly like a claude or
+    /// droid scrutiny run's findings would. Also asserts the run actually
+    /// went through kimi (kimi model on the spawn event, no fallback
+    /// decision).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kimi_scrutiny_findings_flow() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let (_stub_dir, stub_path) = write_kimi_stub();
+
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            lesson_orch_script(&codex_fix_features_reply(1)),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock;
+        let mut engine = MissionEngine::create(backend, &root, "goal", kimi_scrutiny_cfg())
+            .expect("create engine");
+        engine
+            .state
+            .mission
+            .milestones
+            .push(codex_scrutiny_milestone());
+
+        let env_guard = KimiStubEnvGuard::engage(&stub_path);
+        engine
+            .validation_round(0)
+            .await
+            .expect("validation round must complete through the stub kimi backend");
+        drop(env_guard);
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events.jsonl");
+
+        assert!(
+            !events.iter().any(|e| matches!(
+                &e.kind,
+                EventKind::OrchestratorDecision { summary, .. }
+                    if summary.contains("kimi") && summary.contains("not available")
+            )),
+            "kimi must not have fallen back to claude: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            !events.iter().any(|e| matches!(
+                &e.kind,
+                EventKind::OrchestratorDecision { summary, .. }
+                    if summary.contains("retrying once")
+            )),
+            "kimi must not have triggered the runtime retry fallback: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.kind,
+                EventKind::WorkerSpawned { role, model, .. }
+                    if *role == Role::ValidatorScrutiny && model == cost::DEFAULT_KIMI_MODEL
+            )),
+            "expected the scrutiny run spawned with the kimi model: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::ValidationFinding { .. })),
+            "expected the stub kimi's findings as validation.finding events: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::FixFeatureCreated { .. })),
+            "expected findings converted into a fix feature: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            engine.state().mission.milestones[0]
+                .features
+                .iter()
+                .any(|f| f.origin == FeatureOrigin::Fix),
+            "fix feature must be folded into mission state"
+        );
+
+        let scrutiny_run = engine
+            .state()
+            .runs
+            .values()
+            .find(|r| r.role == Role::ValidatorScrutiny)
+            .expect("expected a recorded scrutiny run");
+        assert_eq!(
+            scrutiny_run.model,
+            cost::DEFAULT_KIMI_MODEL,
+            "the scrutiny run's recorded model must attribute it to BackendKind::Kimi"
+        );
+    }
+
+    /// The kimi validator run's cost is priced with the kimi table: the run's
+    /// recorded `cost_usd` equals `cost::usage_cost_usd(usage,
+    /// DEFAULT_KIMI_MODEL)` for the fixture's (zero) token usage — kimi has
+    /// no usage field on the wire, so this is effectively the Meterless
+    /// floor, but it must still be priced through the kimi table rather than
+    /// left unset.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kimi_scrutiny_run_priced_with_kimi_table() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let (_stub_dir, stub_path) = write_kimi_stub();
+
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            lesson_orch_script(&codex_fix_features_reply(1)),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock;
+        let mut engine = MissionEngine::create(backend, &root, "goal", kimi_scrutiny_cfg())
+            .expect("create engine");
+        engine
+            .state
+            .mission
+            .milestones
+            .push(codex_scrutiny_milestone());
+
+        let env_guard = KimiStubEnvGuard::engage(&stub_path);
+        engine
+            .validation_round(0)
+            .await
+            .expect("validation round must complete through the stub kimi backend");
+        drop(env_guard);
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events.jsonl");
+        let (usage, cost_usd) = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::WorkerCompleted {
+                    tokens, cost_usd, ..
+                } => Some((tokens.clone(), *cost_usd)),
+                _ => None,
+            })
+            .expect("expected a worker.completed event for the kimi scrutiny run");
+
+        let expected = cost::usage_cost_usd(&usage, cost::DEFAULT_KIMI_MODEL);
+        assert_eq!(
+            cost_usd,
+            Some(expected),
+            "the run's recorded cost_usd must equal kimi pricing for its usage"
+        );
+    }
+
+    /// A kimi scrutiny run that exits 0 but never emits a parseable
+    /// `ValidatorReport` (plain-prose final text) must trigger the bounded
+    /// runtime-retry fallback exactly once: a loud `orchestrator.decision`
+    /// naming the retry, mentioning "kimi" and "retrying once", and that
+    /// retry actually ran on the injected claude (mock) backend.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kimi_runtime_retry_falls_back_to_claude() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let (_stub_dir, stub_path) = write_kimi_stub_no_report();
+
+        let retry_report = serde_json::json!({
+            "findings": [{
+                "subject": "retry-finding",
+                "severity": "major",
+                "evidence": "claude retry scrutiny run found this after kimi produced no report",
+                "suggestedFix": "address it"
+            }],
+            "summary": "one finding from the claude retry run"
+        });
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            crate::backend_mock::MockScript::single_shot_json(&retry_report),
+            lesson_orch_script(&codex_fix_features_reply(1)),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock.clone();
+        let mut engine = MissionEngine::create(backend, &root, "goal", kimi_scrutiny_cfg())
+            .expect("create engine");
+        engine
+            .state
+            .mission
+            .milestones
+            .push(codex_scrutiny_milestone());
+
+        let env_guard = KimiStubEnvGuard::engage(&stub_path);
+        engine
+            .validation_round(0)
+            .await
+            .expect("validation round must complete via the claude retry fallback");
+        drop(env_guard);
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events.jsonl");
+
+        let retry_decisions: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.kind,
+                    EventKind::OrchestratorDecision { summary, .. }
+                        if summary.contains("kimi") && summary.contains("retrying once")
+                )
+            })
+            .collect();
+        assert_eq!(
+            retry_decisions.len(),
+            1,
+            "expected exactly one loud retry decision naming kimi: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+
+        let scrutiny_spawns = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.kind,
+                    EventKind::WorkerSpawned { role, .. } if *role == Role::ValidatorScrutiny
+                )
+            })
+            .count();
+        assert_eq!(
+            scrutiny_spawns,
+            2,
+            "expected the initial kimi run plus one claude retry run: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+
+        assert_eq!(
+            mock.started_specs().len(),
+            2,
+            "the injected claude/mock backend must have started once for the retry \
+             validator run and once for the fix-feature conversion turn"
+        );
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::FixFeatureCreated { .. })),
+            "expected the claude retry's findings converted into a fix feature: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            engine.state().mission.milestones[0]
+                .features
+                .iter()
+                .any(|f| f.origin == FeatureOrigin::Fix),
+            "fix feature from the retry's findings must be folded into mission state"
+        );
+    }
 }
