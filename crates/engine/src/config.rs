@@ -316,7 +316,13 @@ pub fn validate(cfg: &MissionConfig) -> Result<()> {
                         .strip_prefix("http://")
                         .or_else(|| url.strip_prefix("https://"));
                     let has_host = rest.is_some_and(|rest| {
-                        !rest.split(['/', '?', '#']).next().unwrap_or("").is_empty()
+                        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+                        let after_userinfo = match authority.rfind('@') {
+                            Some(idx) => &authority[idx + 1..],
+                            None => authority,
+                        };
+                        let host = after_userinfo.split(':').next().unwrap_or(after_userinfo);
+                        !host.is_empty()
                     });
                     if !has_host {
                         return Err(EngineError::Config(format!(
@@ -839,6 +845,30 @@ mod tests {
         assert!(
             validate(&cfg).is_ok(),
             "valid https baseUrl should be accepted"
+        );
+
+        cfg.worker.base_url = Some("http://127.0.0.1".into());
+        assert!(
+            validate(&cfg).is_ok(),
+            "bare ip host baseUrl should be accepted"
+        );
+
+        cfg.worker.base_url = Some("http://:8080".into());
+        assert!(
+            validate(&cfg).is_err(),
+            "host-less authority with port should be rejected"
+        );
+
+        cfg.worker.base_url = Some("http://@".into());
+        assert!(
+            validate(&cfg).is_err(),
+            "userinfo-only authority should be rejected"
+        );
+
+        cfg.worker.base_url = Some("http://@:8080".into());
+        assert!(
+            validate(&cfg).is_err(),
+            "userinfo with port and no host should be rejected"
         );
     }
 
