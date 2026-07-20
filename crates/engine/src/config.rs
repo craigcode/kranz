@@ -11,7 +11,7 @@
 //! field (e.g. only `worker.model`) without restating the rest. Unknown keys
 //! are ignored on deserialization.
 
-use crate::cost::{DEFAULT_CODEX_MODEL, DEFAULT_DROID_MODEL};
+use crate::cost::{DEFAULT_CODEX_MODEL, DEFAULT_DROID_MODEL, DEFAULT_KIMI_MODEL};
 use crate::error::{EngineError, Result};
 use crate::paths;
 use crate::types::{BackendKind, MissionConfig, Role};
@@ -34,6 +34,7 @@ pub fn parse_backend(raw: Option<&str>) -> std::result::Result<BackendKind, Stri
         None | Some("claude") => Ok(BackendKind::Claude),
         Some("codex") => Ok(BackendKind::Codex),
         Some("droid") => Ok(BackendKind::Droid),
+        Some("kimi") => Ok(BackendKind::Kimi),
         Some(other) => Err(other.to_string()),
     }
 }
@@ -45,6 +46,7 @@ fn backend_default_model(kind: BackendKind) -> Option<&'static str> {
         BackendKind::Claude => None,
         BackendKind::Codex => Some(DEFAULT_CODEX_MODEL),
         BackendKind::Droid => Some(DEFAULT_DROID_MODEL),
+        BackendKind::Kimi => Some(DEFAULT_KIMI_MODEL),
     }
 }
 
@@ -102,6 +104,16 @@ pub fn model_tier(kind: BackendKind, model: &str) -> Option<ModelTier> {
                 Some(ModelTier::BelowDefault)
             } else if m == "fable" || m.contains("fable") {
                 Some(ModelTier::Frontier)
+            } else {
+                None
+            }
+        }
+        BackendKind::Kimi => {
+            if m == DEFAULT_KIMI_MODEL {
+                Some(ModelTier::Frontier)
+            } else if m == "kimi-code/kimi-for-coding" || m == "kimi-code/kimi-for-coding-highspeed"
+            {
+                Some(ModelTier::BelowDefault)
             } else {
                 None
             }
@@ -277,7 +289,7 @@ pub fn validate(cfg: &MissionConfig) -> Result<()> {
         let role_cfg = cfg.role(role);
         let kind = parse_backend(role_cfg.backend.as_deref()).map_err(|other| {
             EngineError::Config(format!(
-                "{name}.backend must be one of None, \"claude\", \"codex\", \"droid\", got {other:?}"
+                "{name}.backend must be one of None, \"claude\", \"codex\", \"droid\", \"kimi\", got {other:?}"
             ))
         })?;
         let effective = effective_model(role, kind, &role_cfg.model);
@@ -288,6 +300,20 @@ pub fn validate(cfg: &MissionConfig) -> Result<()> {
                 kind.as_str()
             ))
         })?;
+
+        // Kimi is the first backend where reasoning effort is model-constrained:
+        // k3 (the thinking-capable flagship) only supports low/high/max, while
+        // kimi-for-coding[-highspeed] (not thinking-capable) impose no effort
+        // constraint.
+        if kind == BackendKind::Kimi
+            && effective == DEFAULT_KIMI_MODEL
+            && !["low", "high", "max"].contains(&role_cfg.reasoning_effort.as_str())
+        {
+            return Err(EngineError::Config(format!(
+                "{name}.reasoningEffort must be one of [\"low\", \"high\", \"max\"] for kimi model {DEFAULT_KIMI_MODEL:?}, got {:?}",
+                role_cfg.reasoning_effort
+            )));
+        }
 
         if role == Role::Worker
             && tier < ModelTier::Default
@@ -576,6 +602,8 @@ mod tests {
             (Some("codex"), DEFAULT_CODEX_MODEL),
             (Some("droid"), DEFAULT_DROID_MODEL),
             (Some("droid"), "claude-fable-5"),
+            (Some("kimi"), DEFAULT_KIMI_MODEL),
+            (Some("kimi"), "kimi-code/kimi-for-coding"),
         ] {
             let mut cfg = MissionConfig::default();
             cfg.validator_scrutiny.backend = backend.map(|s| s.to_string());
@@ -585,6 +613,57 @@ mod tests {
                 "scrutiny should accept {backend:?} / {model}"
             );
         }
+    }
+
+    #[test]
+    fn validate_accepts_kimi_k3_for_supported_efforts() {
+        for effort in ["low", "high", "max"] {
+            let mut cfg = MissionConfig::default();
+            cfg.validator_scrutiny.backend = Some("kimi".into());
+            cfg.validator_scrutiny.model = DEFAULT_KIMI_MODEL.into();
+            cfg.validator_scrutiny.reasoning_effort = effort.into();
+            assert!(
+                validate(&cfg).is_ok(),
+                "kimi k3 should accept effort {effort}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_kimi_k3_for_unsupported_efforts() {
+        for effort in ["medium", "xhigh"] {
+            let mut cfg = MissionConfig::default();
+            cfg.validator_scrutiny.backend = Some("kimi".into());
+            cfg.validator_scrutiny.model = DEFAULT_KIMI_MODEL.into();
+            cfg.validator_scrutiny.reasoning_effort = effort.into();
+            let err = validate(&cfg).unwrap_err().to_string();
+            assert!(
+                err.contains("reasoningEffort"),
+                "kimi k3 should reject effort {effort}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_kimi_for_coding_imposes_no_effort_constraint() {
+        for effort in ["low", "medium", "high", "xhigh", "max"] {
+            let mut cfg = MissionConfig::default();
+            cfg.validator_scrutiny.backend = Some("kimi".into());
+            cfg.validator_scrutiny.model = "kimi-code/kimi-for-coding".into();
+            cfg.validator_scrutiny.reasoning_effort = effort.into();
+            assert!(
+                validate(&cfg).is_ok(),
+                "kimi-for-coding should accept any effort, got {effort} err"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_unsupported_kimi_model() {
+        let mut cfg = MissionConfig::default();
+        cfg.validator_scrutiny.backend = Some("kimi".into());
+        cfg.validator_scrutiny.model = "kimi-unknown-model".into();
+        assert!(validate(&cfg).is_err());
     }
 
     #[test]

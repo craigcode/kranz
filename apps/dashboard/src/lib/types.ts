@@ -235,7 +235,7 @@ export interface WorkerRun {
   promptHash: string;
 }
 
-export type AgentBackend = 'claude' | 'codex' | 'droid';
+export type AgentBackend = 'claude' | 'codex' | 'droid' | 'kimi';
 
 export type SandboxEnforce = 'off' | 'fs' | 'fs+net';
 
