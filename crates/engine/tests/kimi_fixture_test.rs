@@ -27,7 +27,7 @@ fn fixture_lines(name: &str) -> Vec<serde_json::Value> {
 }
 
 #[test]
-fn fixture_has_no_init_or_system_line() {
+fn kimi_fixture_has_no_init_or_system_line() {
     let lines = fixture_lines("kimi_exec_scrutiny.jsonl");
     for line in &lines {
         let role = line["role"].as_str().unwrap_or_default();
@@ -40,7 +40,7 @@ fn fixture_has_no_init_or_system_line() {
 }
 
 #[test]
-fn fixture_does_not_end_in_a_terminal_result_frame() {
+fn kimi_fixture_does_not_end_in_a_terminal_result_frame() {
     let lines = fixture_lines("kimi_exec_scrutiny.jsonl");
     let last = lines.last().expect("fixture has at least one line");
 
@@ -53,7 +53,7 @@ fn fixture_does_not_end_in_a_terminal_result_frame() {
 }
 
 #[test]
-fn doc_explicitly_notes_the_init_and_result_synthesis_seam() {
+fn kimi_doc_explicitly_notes_the_init_and_result_synthesis_seam() {
     let doc_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
@@ -89,7 +89,7 @@ fn doc_explicitly_notes_the_init_and_result_synthesis_seam() {
 /// "route unrecognized role to `AgentEvent::Other`" guidance in the
 /// meantime.
 #[test]
-fn doc_notes_tool_use_and_tool_result_need_a_second_capture() {
+fn kimi_doc_notes_tool_use_and_tool_result_need_a_second_capture() {
     let doc_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
