@@ -111,7 +111,8 @@ pub fn model_tier(kind: BackendKind, model: &str) -> Option<ModelTier> {
         BackendKind::Kimi => {
             if m == DEFAULT_KIMI_MODEL {
                 Some(ModelTier::Frontier)
-            } else if m == "kimi-for-coding" || m == "kimi-for-coding-highspeed" {
+            } else if m == "kimi-code/kimi-for-coding" || m == "kimi-code/kimi-for-coding-highspeed"
+            {
                 Some(ModelTier::BelowDefault)
             } else {
                 None
@@ -602,7 +603,7 @@ mod tests {
             (Some("droid"), DEFAULT_DROID_MODEL),
             (Some("droid"), "claude-fable-5"),
             (Some("kimi"), DEFAULT_KIMI_MODEL),
-            (Some("kimi"), "kimi-for-coding"),
+            (Some("kimi"), "kimi-code/kimi-for-coding"),
         ] {
             let mut cfg = MissionConfig::default();
             cfg.validator_scrutiny.backend = backend.map(|s| s.to_string());
@@ -648,7 +649,7 @@ mod tests {
         for effort in ["low", "medium", "high", "xhigh", "max"] {
             let mut cfg = MissionConfig::default();
             cfg.validator_scrutiny.backend = Some("kimi".into());
-            cfg.validator_scrutiny.model = "kimi-for-coding".into();
+            cfg.validator_scrutiny.model = "kimi-code/kimi-for-coding".into();
             cfg.validator_scrutiny.reasoning_effort = effort.into();
             assert!(
                 validate(&cfg).is_ok(),

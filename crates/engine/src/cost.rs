@@ -40,7 +40,7 @@ pub fn is_droid_model(model: &str) -> bool {
 
 /// Default model id for the Kimi backend (Kimi Code CLI's flagship alias),
 /// importable engine-wide.
-pub const DEFAULT_KIMI_MODEL: &str = "k3";
+pub const DEFAULT_KIMI_MODEL: &str = "kimi-code/k3";
 
 /// Whether `model` names a kimi-family model (same substring match
 /// [`pricing_for_model`] uses to select kimi pricing).
