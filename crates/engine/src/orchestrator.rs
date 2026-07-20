@@ -713,6 +713,9 @@ impl MissionEngine {
                     }
                 }
                 BackendKind::Claude => {}
+                // Local backend wiring (HTTP dispatch, readiness probe) lands
+                // in a later milestone; no preflight probe yet.
+                BackendKind::Local => {}
             }
         }
 
@@ -1024,6 +1027,9 @@ impl MissionEngine {
                     }
                 }
             }
+            // The local HTTP backend's dispatch wiring lands in a later
+            // milestone; this feature is config-validation only.
+            BackendKind::Local => unreachable!("local backend wired in a later feature"),
             BackendKind::Claude => {
                 set_effective_model(&mut cfg, BackendKind::Claude);
                 SelectedBackend {

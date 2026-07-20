@@ -220,11 +220,25 @@ fn probe_role(role: Role, cfg: &MissionConfig) -> RoleReadiness {
     let kind = cfg.backend_kind(role);
     let backend = kind.as_str().to_string();
 
+    // The local HTTP backend has no CLI binary to discover; its readiness
+    // probe (reachability of baseUrl) lands with the HTTP dispatch wiring in
+    // a later milestone.
+    if kind == BackendKind::Local {
+        return RoleReadiness {
+            role: role_key.into(),
+            backend,
+            status: ReadinessStatus::Unknown,
+            detail: "local backend readiness probing not yet implemented".into(),
+            next_action: "none".into(),
+        };
+    }
+
     let discover = match kind {
         BackendKind::Claude => crate::backend_claude::discover_claude_binary(None),
         BackendKind::Codex => crate::backend_codex::discover_codex_binary(None),
         BackendKind::Droid => crate::backend_droid::discover_droid_binary(None),
         BackendKind::Kimi => crate::backend_kimi::discover_kimi_binary(None),
+        BackendKind::Local => unreachable!("handled above"),
     };
 
     match discover {
@@ -286,6 +300,9 @@ fn probe_cli_login(binary: &Path, kind: BackendKind) -> AuthProbe {
         // documented free read-only probe (docs/scoping/kimi-cli-backend.md
         // §2) that shows the OAuth-managed provider when authenticated.
         BackendKind::Kimi => &["provider", "list"],
+        BackendKind::Local => {
+            return AuthProbe::Unknown("local backend has no CLI to probe".into())
+        }
     };
     match run_bounded(binary, args, Duration::from_secs(3)) {
         Ok((code, out)) => {

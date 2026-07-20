@@ -35,18 +35,22 @@ pub fn parse_backend(raw: Option<&str>) -> std::result::Result<BackendKind, Stri
         Some("codex") => Ok(BackendKind::Codex),
         Some("droid") => Ok(BackendKind::Droid),
         Some("kimi") => Ok(BackendKind::Kimi),
+        Some("local") => Ok(BackendKind::Local),
         Some(other) => Err(other.to_string()),
     }
 }
 
 /// The backend-native model used when an older config selected a non-Claude
-/// backend but left the role's Claude default model in place.
+/// backend but left the role's Claude default model in place. `Local` has no
+/// backend default: local model ids are free-form and sent to the endpoint
+/// verbatim, with no Claude→backend rewrite.
 fn backend_default_model(kind: BackendKind) -> Option<&'static str> {
     match kind {
         BackendKind::Claude => None,
         BackendKind::Codex => Some(DEFAULT_CODEX_MODEL),
         BackendKind::Droid => Some(DEFAULT_DROID_MODEL),
         BackendKind::Kimi => Some(DEFAULT_KIMI_MODEL),
+        BackendKind::Local => None,
     }
 }
 
@@ -65,12 +69,11 @@ fn role_default_model(role: Role) -> &'static str {
 /// dispatch. The same rule is now role-wide.
 pub fn effective_model(role: Role, kind: BackendKind, configured: &str) -> String {
     if kind != BackendKind::Claude && configured == role_default_model(role) {
-        backend_default_model(kind)
-            .expect("non-Claude backends have defaults")
-            .to_string()
-    } else {
-        configured.to_string()
+        if let Some(default_model) = backend_default_model(kind) {
+            return default_model.to_string();
+        }
     }
+    configured.to_string()
 }
 
 /// Classify a validated backend/model pair. `None` means this model is not a
@@ -118,6 +121,11 @@ pub fn model_tier(kind: BackendKind, model: &str) -> Option<ModelTier> {
                 None
             }
         }
+        // Local model ids are free-form and cannot be allowlisted, so every
+        // non-empty model classifies uniformly below-default: workers need
+        // the allowBelowDefaultWorkerModel opt-in, and a local orchestrator
+        // always fails the frontier floor.
+        BackendKind::Local => Some(ModelTier::BelowDefault),
     }
 }
 
@@ -289,7 +297,7 @@ pub fn validate(cfg: &MissionConfig) -> Result<()> {
         let role_cfg = cfg.role(role);
         let kind = parse_backend(role_cfg.backend.as_deref()).map_err(|other| {
             EngineError::Config(format!(
-                "{name}.backend must be one of None, \"claude\", \"codex\", \"droid\", \"kimi\", got {other:?}"
+                "{name}.backend must be one of None, \"claude\", \"codex\", \"droid\", \"kimi\", \"local\", got {other:?}"
             ))
         })?;
         let effective = effective_model(role, kind, &role_cfg.model);
@@ -300,6 +308,51 @@ pub fn validate(cfg: &MissionConfig) -> Result<()> {
                 kind.as_str()
             ))
         })?;
+
+        if kind == BackendKind::Local {
+            match role_cfg.base_url.as_deref() {
+                Some(url) if !url.trim().is_empty() => {
+                    let rest = url
+                        .strip_prefix("http://")
+                        .or_else(|| url.strip_prefix("https://"));
+                    let has_host = rest.is_some_and(|rest| {
+                        !rest.split(['/', '?', '#']).next().unwrap_or("").is_empty()
+                    });
+                    if !has_host {
+                        return Err(EngineError::Config(format!(
+                            "{name}.baseUrl {url:?} is not a valid http/https URL"
+                        )));
+                    }
+                }
+                _ => {
+                    return Err(EngineError::Config(format!(
+                        "{name}.baseUrl is required when {name}.backend is \"local\""
+                    )));
+                }
+            }
+
+            match role_cfg.context_budget {
+                Some(budget) if (1024..=200_000).contains(&budget) => {}
+                Some(budget) => {
+                    return Err(EngineError::Config(format!(
+                        "{name}.contextBudget must be in 1024..=200000, got {budget}"
+                    )));
+                }
+                None => {
+                    return Err(EngineError::Config(format!(
+                        "{name}.contextBudget is required when {name}.backend is \"local\""
+                    )));
+                }
+            }
+
+            if let Some(temperature) = role_cfg.temperature {
+                if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
+                    return Err(EngineError::Config(format!(
+                        "{name}.temperature must be finite and in 0.0..=2.0, got {temperature}"
+                    )));
+                }
+            }
+        }
 
         // Kimi is the first backend where reasoning effort is model-constrained:
         // k3 (the thinking-capable flagship) only supports low/high/max, while
@@ -740,6 +793,140 @@ mod tests {
             crate::types::SandboxEnforce::FsNet
         );
         assert_eq!(cfg.worker.sandbox.egress, vec!["crates.io:443"]);
+    }
+
+    fn local_role_cfg() -> crate::types::RoleConfig {
+        crate::types::RoleConfig {
+            backend: Some("local".into()),
+            model: "my-local-model".into(),
+            base_url: Some("http://localhost:8080".into()),
+            context_budget: Some(8192),
+            ..MissionConfig::default().worker
+        }
+    }
+
+    fn local_worker_cfg() -> MissionConfig {
+        MissionConfig {
+            worker: local_role_cfg(),
+            allow_below_default_worker_model: true,
+            ..MissionConfig::default()
+        }
+    }
+
+    #[test]
+    fn local_config_requires_base_url() {
+        let mut cfg = local_worker_cfg();
+
+        cfg.worker.base_url = None;
+        assert!(
+            validate(&cfg).is_err(),
+            "missing baseUrl should be rejected"
+        );
+
+        cfg.worker.base_url = Some("not a url".into());
+        assert!(
+            validate(&cfg).is_err(),
+            "unparseable baseUrl should be rejected"
+        );
+
+        cfg.worker.base_url = Some("http://localhost:8080".into());
+        assert!(
+            validate(&cfg).is_ok(),
+            "valid http baseUrl should be accepted"
+        );
+
+        cfg.worker.base_url = Some("https://models.internal/v1".into());
+        assert!(
+            validate(&cfg).is_ok(),
+            "valid https baseUrl should be accepted"
+        );
+    }
+
+    #[test]
+    fn local_config_requires_context_budget_in_range() {
+        let mut cfg = local_worker_cfg();
+
+        cfg.worker.context_budget = Some(1023);
+        assert!(validate(&cfg).is_err(), "1023 is below the floor");
+
+        cfg.worker.context_budget = Some(200_001);
+        assert!(validate(&cfg).is_err(), "200001 is above the ceiling");
+
+        cfg.worker.context_budget = None;
+        assert!(validate(&cfg).is_err(), "missing contextBudget is rejected");
+
+        cfg.worker.context_budget = Some(8192);
+        assert!(validate(&cfg).is_ok(), "8192 is in range");
+    }
+
+    #[test]
+    fn local_config_rejects_out_of_range_temperature() {
+        let mut cfg = local_worker_cfg();
+
+        cfg.worker.temperature = Some(2.1);
+        assert!(validate(&cfg).is_err(), "2.1 is above the ceiling");
+
+        cfg.worker.temperature = Some(-0.1);
+        assert!(validate(&cfg).is_err(), "-0.1 is below the floor");
+
+        cfg.worker.temperature = Some(0.7);
+        assert!(validate(&cfg).is_ok(), "0.7 is in range");
+
+        cfg.worker.temperature = None;
+        assert!(validate(&cfg).is_ok(), "absent temperature is fine");
+    }
+
+    #[test]
+    fn local_config_worker_below_default_needs_optin() {
+        let mut cfg = local_worker_cfg();
+        cfg.allow_below_default_worker_model = false;
+        assert!(
+            validate(&cfg).is_err(),
+            "local worker below-default tier requires opt-in"
+        );
+
+        cfg.allow_below_default_worker_model = true;
+        assert!(
+            validate(&cfg).is_ok(),
+            "local worker accepted once opted in"
+        );
+    }
+
+    #[test]
+    fn local_config_orchestrator_local_always_rejected() {
+        let cfg = MissionConfig {
+            orchestrator: local_role_cfg(),
+            allow_below_default_worker_model: true,
+            ..MissionConfig::default()
+        };
+        assert!(
+            validate(&cfg).is_err(),
+            "local orchestrator always fails the frontier floor"
+        );
+    }
+
+    #[test]
+    fn local_config_model_tier_below_default_for_any_nonempty() {
+        assert_eq!(
+            model_tier(BackendKind::Local, "any-model-id"),
+            Some(ModelTier::BelowDefault)
+        );
+        assert_eq!(model_tier(BackendKind::Local, ""), None);
+        assert_eq!(model_tier(BackendKind::Local, "   "), None);
+    }
+
+    #[test]
+    fn local_config_effective_model_passes_through_verbatim_and_never_panics() {
+        assert_eq!(
+            effective_model(Role::Worker, BackendKind::Local, "my-local-model"),
+            "my-local-model"
+        );
+        // Even if the configured string happens to equal the Claude role
+        // default, Local has no backend default to rewrite to.
+        assert_eq!(
+            effective_model(Role::Worker, BackendKind::Local, "sonnet"),
+            "sonnet"
+        );
     }
 
     trait RoleConfigTestExt {
