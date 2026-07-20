@@ -138,12 +138,14 @@ pub fn router_with_shared_host(
     static_assets: Option<DashboardStatic>,
     token: Option<String>,
 ) -> Router {
-    router_with_shared_host_and_bind(host, static_assets, token, None, false)
+    router_with_shared_host_and_bind(host, static_assets, token, None, true, false)
 }
 
 /// Router constructor that threads the serve bind port into CORS / WS origin
 /// checks and optionally requires the mutation token on GET + WS upgrade
-/// (`require_read_token`, true when the bind address is not loopback).
+/// (`require_read_token`, independent of `bind_is_loopback` — `--read-auth`
+/// can arm it on a loopback bind without relaxing the loopback Host/origin
+/// allowlist).
 ///
 /// Port-only back-compat wrapper: assumes the canonical loopback bind IP
 /// (127.0.0.1). Real serving goes through [`router_with_shared_host_and_addr`]
@@ -153,6 +155,7 @@ pub fn router_with_shared_host_and_bind(
     static_assets: Option<DashboardStatic>,
     token: Option<String>,
     bind_port: Option<u16>,
+    bind_is_loopback: bool,
     require_read_token: bool,
 ) -> Router {
     router_with_shared_host_and_addr(
@@ -160,18 +163,22 @@ pub fn router_with_shared_host_and_bind(
         static_assets,
         token,
         bind_port.map(|port| SocketAddr::from((Ipv4Addr::LOCALHOST, port))),
+        bind_is_loopback,
         require_read_token,
     )
 }
 
 /// The full router constructor: the REAL bound address (when known) scopes
 /// CORS / WS origin approval to that exact ip:port plus the dev-server
-/// ports, and `require_read_token` arms the read/WS token gate.
+/// ports, `bind_is_loopback` selects the strict loopback Host/origin
+/// allowlist vs the LAN one, and `require_read_token` independently arms the
+/// read/WS token gate.
 pub fn router_with_shared_host_and_addr(
     host: Arc<MissionHost>,
     static_assets: Option<DashboardStatic>,
     token: Option<String>,
     bind_addr: Option<SocketAddr>,
+    bind_is_loopback: bool,
     require_read_token: bool,
 ) -> Router {
     router_with_multi_repo_host_and_addr(
@@ -179,6 +186,7 @@ pub fn router_with_shared_host_and_addr(
         static_assets,
         token,
         bind_addr,
+        bind_is_loopback,
         require_read_token,
     )
 }
@@ -192,9 +200,9 @@ pub fn router_with_multi_repo_host_and_addr(
     static_assets: Option<DashboardStatic>,
     authority: Option<String>,
     bind_addr: Option<SocketAddr>,
+    bind_is_loopback: bool,
     require_read_token: bool,
 ) -> Router {
-    let bind_is_loopback = !require_read_token;
     let catalog = Arc::clone(&multi_host);
     let mut app = Router::new().route("/api/health", get(rest::health)).route(
         "/api/repos",
@@ -292,6 +300,9 @@ pub fn router_with_multi_repo_host_and_addr(
         require_host,
     ))
     .layer(cors_layer(bind_addr))
+    // Outermost: every response — including gate rejections — carries the
+    // cache policy, so no rejection HTML can poison a browser cache either.
+    .layer(middleware::from_fn(cache_response_headers))
 }
 
 async fn api_not_found() -> impl IntoResponse {
@@ -299,6 +310,35 @@ async fn api_not_found() -> impl IntoResponse {
         StatusCode::NOT_FOUND,
         Json(json!({ "error": "API route not found or repository scope required" })),
     )
+}
+
+/// API answers and the SPA shell must never be cached. A browser that caches
+/// an HTML fallback at an /api URL replays it to `fetch()` long after the
+/// server is fixed (2026-07-19: a stale pre-API-404 serve poisoned the
+/// dashboard behind a heuristic cache entry; only an incognito window
+/// escaped). Hashed /assets/* bundles stay implicitly cacheable; `no-cache`
+/// on the shell revalidates per load rather than forbidding storage.
+async fn cache_response_headers(request: Request, next: Next) -> Response {
+    let is_api = request.uri().path().starts_with("/api");
+    let mut response = next.run(request).await;
+    let cache_control = if is_api {
+        Some("no-store")
+    } else if response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|content_type| content_type.starts_with("text/html"))
+    {
+        Some("no-cache")
+    } else {
+        None
+    };
+    if let Some(value) = cache_control {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static(value));
+    }
+    response
 }
 
 /// `503 {"error":"repository unavailable", ...}` handler for every path under
@@ -917,26 +957,32 @@ pub async fn serve_on_listener(
         listener,
         static_assets,
         token,
+        false,
         shutdown,
     )
     .await
 }
 
 /// Serve a static multi-repository catalog on an already-bound listener.
+/// `read_auth` forces the read-token gate (GETs and the WS upgrade) even on
+/// a loopback bind — off-loopback binds always require it regardless.
 pub async fn serve_multi_on_listener(
     multi_host: Arc<MultiRepoHost>,
     listener: tokio::net::TcpListener,
     static_assets: Option<DashboardStatic>,
     authority: Option<String>,
+    read_auth: bool,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     let local_addr = listener.local_addr()?;
-    let require_read_token = !local_addr.ip().is_loopback();
+    let bind_is_loopback = local_addr.ip().is_loopback();
+    let require_read_token = !bind_is_loopback || read_auth;
     let app = router_with_multi_repo_host_and_addr(
         multi_host,
         static_assets,
         authority,
         Some(local_addr),
+        bind_is_loopback,
         require_read_token,
     );
     tracing::info!("kranz server listening on http://{local_addr}");
@@ -1009,8 +1055,14 @@ mod tests {
             })
             .unwrap(),
         );
-        let app =
-            router_with_multi_repo_host_and_addr(multi, None, Some("tok".to_string()), None, false);
+        let app = router_with_multi_repo_host_and_addr(
+            multi,
+            None,
+            Some("tok".to_string()),
+            None,
+            true,
+            false,
+        );
 
         // Bare prefix and deep path both 503 with the reason (explicit routes
         // beat the `/api/{*path}` catch-all; a nested fallback would not).
@@ -1071,8 +1123,14 @@ mod tests {
             })
             .unwrap(),
         );
-        let app =
-            router_with_multi_repo_host_and_addr(multi, None, Some("tok".to_string()), None, false);
+        let app = router_with_multi_repo_host_and_addr(
+            multi,
+            None,
+            Some("tok".to_string()),
+            None,
+            true,
+            false,
+        );
 
         // Every unscoped route addresses the default repo; its unavailability
         // is reported instead of a generic "scope required" 404.
@@ -1142,6 +1200,7 @@ mod tests {
             Some(super::DashboardStatic::Embedded(EMBEDDED)),
             Some("tok".to_string()),
             None,
+            true,
             false,
         );
 

@@ -196,6 +196,8 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             milestone_id,
             sdk_session_id,
             model,
+            quant,
+            weight_hash,
             prompt_hash,
             transcript_path,
         } => {
@@ -224,6 +226,8 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
                     milestone_id: milestone_id.clone(),
                     sdk_session_id: sdk_session_id.clone(),
                     model: model.clone(),
+                    quant: quant.clone(),
+                    weight_hash: weight_hash.clone(),
                     started_at: event.ts,
                     ended_at: None,
                     tokens: TokenUsage::default(),

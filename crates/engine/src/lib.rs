@@ -37,11 +37,13 @@ pub mod reducer;
 pub mod sandbox;
 pub mod scrub;
 pub mod ticket;
+pub mod trace_export;
 pub mod work;
 
 pub mod backend_claude;
 pub mod backend_codex;
 pub mod backend_droid;
+pub mod backend_kimi;
 pub mod backend_mock;
 mod backend_probe;
 pub mod control;

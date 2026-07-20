@@ -51,12 +51,13 @@ export function effortLevel(effort: string): number {
 
 export const EFFORT_OPTIONS: ReasoningEffort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
 
-export const BACKEND_OPTIONS: AgentBackend[] = ['claude', 'codex', 'droid'];
+export const BACKEND_OPTIONS: AgentBackend[] = ['claude', 'codex', 'droid', 'kimi'];
 
 export const MODEL_PLACEHOLDERS: Record<AgentBackend, string> = {
   claude: 'opus · sonnet · haiku',
   codex: 'gpt-5-codex',
   droid: 'fable · accounts/fireworks/models/glm-5p2',
+  kimi: 'k3 (effort low/high/max)',
 };
 
 export function roleLabel(role: Role): string {

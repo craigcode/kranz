@@ -42,3 +42,7 @@ Approved plans, newest last.
 - 2026-07-09 · [m-7820b9](m-7820b9/plan.md) — Probe the Cursor CLI headless surface (agent 2026.04.13) and produce an evidence-backed decision: implement backend_curs… [truncated] · [report](m-7820b9/report.md)
 - 2026-07-09 · [m-73ada5](m-73ada5/plan.md) — Complete the live half of the Cursor CLI (`agent`) probe under authenticated conditions and finalize the `backend_cursor… [truncated] · [report](m-73ada5/report.md)
 - 2026-07-12 · [m-6a20dc](m-6a20dc/plan.md) — Close the M2.9 live-Slack-validation operator gate and record a dated dogfood note of the Slack control loop — docs-only… [truncated] · [report](m-6a20dc/report.md)
+- 2026-07-19 · [m-7613f3](m-7613f3/plan.md) — Add a dedicated macos-latest job to .github/workflows/ci.yml that runs cargo test --workspace --no-fail-fast, so the mac… [truncated] · [report](m-7613f3/report.md)
+- 2026-07-19 · [m-9dc8c1](m-9dc8c1/plan.md) — Make read-side authentication a first-class, config-gated mode of `kranz serve` — GETs and the WS upgrade require the to… [truncated] · [report](m-9dc8c1/report.md)
+- 2026-07-19 · [m-0f1abd](m-0f1abd/plan.md) — Record model provenance (id, quant, weight-hash) on every run and add a derived, event-log-regenerable export that yield… [truncated] · [report](m-0f1abd/report.md)
+- 2026-07-19 · [m-b66d34](m-b66d34/plan.md) — Add a fourth single-shot agent backend `backend_kimi` driving the headless Kimi Code CLI (validator-first, worker-capabl… [truncated] · [report](m-b66d34/report.md)

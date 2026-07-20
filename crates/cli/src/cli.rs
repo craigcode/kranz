@@ -302,6 +302,15 @@ pub enum Command {
         #[arg(long)]
         insecure_lan: bool,
 
+        /// Force the mutation token to be required on `/api` GETs and the
+        /// WS upgrade (as well as POSTs) on ANY bind class, including
+        /// loopback — the deployment-ready read-auth mode. Off-loopback
+        /// binds already require it; `--read-auth` is orthogonal and simply
+        /// forces read-token enforcement on loopback too. Still requires
+        /// `--insecure-lan` for a non-loopback bind (unchanged).
+        #[arg(long)]
+        read_auth: bool,
+
         /// Open the dashboard in the default browser
         #[arg(long)]
         open: bool,
@@ -359,6 +368,29 @@ pub enum Command {
         /// AND closing events arrive during the tail are exported.
         #[arg(long)]
         from_start: bool,
+    },
+
+    /// Export validation-PASSED worker traces as fine-tuning-ready JSONL.
+    ///
+    /// Derived and regenerable: loads and folds the target mission's event
+    /// log on demand (like `status`) and prints one instruction-pair JSON
+    /// object per line to stdout — there is no persisted dataset file, so
+    /// re-running this command over an unchanged event log always yields
+    /// byte-identical output.
+    ExportTraces {
+        /// The mission id (defaults to the global --mission / auto-selection;
+        /// ignored with --all)
+        mission_id: Option<String>,
+
+        /// Aggregate passed traces across every mission under
+        /// .kranz/missions. A mission whose event log is missing or
+        /// unreadable is skipped, not fatal.
+        #[arg(long)]
+        all: bool,
+
+        /// Write the JSONL output to this path instead of stdout.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
     },
 
     /// Inspect and edit kranz configuration (files + mid-mission changes).
@@ -479,4 +511,18 @@ pub enum TicketCommand {
         #[arg(long)]
         force: bool,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serve_parses_read_auth_flag() {
+        let cli = Cli::try_parse_from(["kranz", "serve", "--read-auth"]).unwrap();
+        match cli.command {
+            Command::Serve { read_auth, .. } => assert!(read_auth),
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
 }

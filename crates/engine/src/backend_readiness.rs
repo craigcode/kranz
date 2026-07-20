@@ -224,6 +224,7 @@ fn probe_role(role: Role, cfg: &MissionConfig) -> RoleReadiness {
         BackendKind::Claude => crate::backend_claude::discover_claude_binary(None),
         BackendKind::Codex => crate::backend_codex::discover_codex_binary(None),
         BackendKind::Droid => crate::backend_droid::discover_droid_binary(None),
+        BackendKind::Kimi => crate::backend_kimi::discover_kimi_binary(None),
     };
 
     match discover {
@@ -281,10 +282,17 @@ fn probe_cli_login(binary: &Path, kind: BackendKind) -> AuthProbe {
         BackendKind::Claude => &["auth", "status"],
         BackendKind::Codex => &["login", "status"],
         BackendKind::Droid => return AuthProbe::Unknown("no auth-status subcommand".into()),
+        // No scriptable auth-status subcommand; `provider list` is the
+        // documented free read-only probe (docs/scoping/kimi-cli-backend.md
+        // §2) that shows the OAuth-managed provider when authenticated.
+        BackendKind::Kimi => &["provider", "list"],
     };
     match run_bounded(binary, args, Duration::from_secs(3)) {
         Ok((code, out)) => {
             let lower = out.to_ascii_lowercase();
+            if kind == BackendKind::Kimi && lower.contains("no providers configured") {
+                return AuthProbe::Unauthenticated(out);
+            }
             if lower.contains("not logged")
                 || lower.contains("not authenticated")
                 || lower.contains("unauthenticated")
@@ -422,6 +430,44 @@ mod tests {
         assert!(matches!(
             report.drain_decision(),
             DrainDecision::Park { .. }
+        ));
+    }
+
+    #[test]
+    fn missing_kimi_binary_parks() {
+        let report = ReadinessReport {
+            mission_id: "m-1".into(),
+            roles: vec![RoleReadiness {
+                role: "worker".into(),
+                backend: "kimi".into(),
+                status: ReadinessStatus::Missing,
+                detail: "no kimi binary".into(),
+                next_action: "install kimi".into(),
+            }],
+            overall: ReadinessStatus::Missing,
+            warnings: vec![],
+        };
+        assert!(matches!(
+            report.drain_decision(),
+            DrainDecision::Park { .. }
+        ));
+    }
+
+    #[test]
+    fn probe_role_classifies_kimi_backend() {
+        let mut cfg = MissionConfig::default();
+        cfg.worker.backend = Some("kimi".into());
+        let role = probe_role(crate::types::Role::Worker, &cfg);
+        assert_eq!(role.backend, "kimi");
+        // Discovery either finds the binary (Ok/Unauthenticated/RateLimited)
+        // or reports Missing — never panics, always a real classification.
+        assert!(matches!(
+            role.status,
+            ReadinessStatus::Ok
+                | ReadinessStatus::Missing
+                | ReadinessStatus::Unauthenticated
+                | ReadinessStatus::RateLimited
+                | ReadinessStatus::Meterless
         ));
     }
 

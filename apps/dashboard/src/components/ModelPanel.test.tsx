@@ -153,4 +153,18 @@ describe('ModelPanel', () => {
       expect(screen.queryByLabelText('Worker backend')).toBeNull();
     });
   });
+
+  it('lists kimi as a selectable worker backend', async () => {
+    const sendControl = vi.fn().mockResolvedValue(undefined);
+    useKranzStore.setState({ sendControl });
+    render(<ModelPanel />);
+
+    fireEvent.click(screen.getByRole('button', { name: /Worker/ }));
+    const backendSelect = screen.getByLabelText('Worker backend') as HTMLSelectElement;
+    const optionValues = Array.from(backendSelect.options).map((option) => option.value);
+    expect(optionValues).toContain('kimi');
+
+    fireEvent.change(backendSelect, { target: { value: 'kimi' } });
+    expect(backendSelect.value).toBe('kimi');
+  });
 });

@@ -700,6 +700,78 @@ async fn happy_path_completes_mission_with_tag_and_contract_gate() {
 }
 
 // ---------------------------------------------------------------------------
+// 1b. Frontier provenance: every real worker.spawned emit site (orchestrator
+// self-spawn + runner worker/validator spawns) records the frontier regime —
+// quant "n/a", no weight hash — for the CLI backends (Claude/Codex/Droid are
+// all frontier; the mock backend here stands in for them).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn completed_mission_worker_spawns_record_frontier_provenance() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+    ]));
+
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+
+    let spawns: Vec<_> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::WorkerSpawned {
+                run_id,
+                quant,
+                weight_hash,
+                ..
+            } => Some((run_id.as_str(), quant.as_str(), weight_hash.clone())),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !spawns.is_empty(),
+        "at least one worker.spawned must be on the log"
+    );
+    for (run_id, quant, weight_hash) in &spawns {
+        assert_eq!(
+            *quant, "n/a",
+            "run {run_id} must record the frontier quant sentinel"
+        );
+        assert_eq!(
+            *weight_hash, None,
+            "run {run_id} must record no weight hash (frontier regime)"
+        );
+    }
+
+    // Same holds folded onto state: every WorkerRun agrees with its spawn event.
+    let state = reducer::fold(&events).unwrap();
+    for (run_id, _, _) in &spawns {
+        let run = state.runs.get(*run_id).expect("run recorded");
+        assert_eq!(run.quant, "n/a");
+        assert_eq!(run.weight_hash, None);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 2. Validation round: finding → fix feature → clean round → complete
 // ---------------------------------------------------------------------------
 
@@ -2871,6 +2943,14 @@ async fn plan_approval_writes_plan_branch_and_commit() {
     assert!(md.contains("**[a-1]**"), "{md}");
     assert!(md.contains("## Milestone 1 —"), "{md}");
     assert!(md.contains("Done when:"), "{md}");
+    assert!(
+        md.lines().all(|line| !line.ends_with([' ', '\t'])),
+        "plan.md must not contain trailing whitespace:\n{md}"
+    );
+    assert!(
+        md.ends_with('\n') && !md.ends_with("\n\n"),
+        "plan.md must end with exactly one newline:\n{md}"
+    );
     // main itself did not move: it still points at the seed commit.
     let main_subject = raw_git(&root, &["log", "-1", "--format=%s", "main"]);
     assert_eq!(main_subject.trim(), "seed");
