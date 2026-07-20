@@ -64,6 +64,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::Write;
+use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -6796,29 +6797,34 @@ fn path_is_executable(path: &std::path::Path) -> bool {
     }
 }
 
-/// Best-effort, short-timeout (2s) reachability probe for a `backend = local`
-/// role's `base_url`: a bare GET, since an OpenAI-compatible server's root
-/// path need not resolve to anything meaningful — any response (including a
-/// non-2xx status) counts as "reachable"; only a connection-level failure
-/// (refused, DNS, timeout) does not. Never escalated past a `warn`
-/// `PreflightIssue`: this must never block a mission start.
+/// Best-effort, short-timeout (1.5s) reachability probe for a `backend =
+/// local` role's `base_url`: a raw TCP connect to the URL's host/port, since
+/// an OpenAI-compatible server's root path need not resolve to anything
+/// meaningful — any successful connection counts as "reachable"; only a
+/// connection-level failure (refused, timeout) does not. Never escalated past
+/// a `warn` `PreflightIssue`: this must never block a mission start.
+///
+/// Deliberately runtime-free (no `tokio::runtime::Builder`/`block_on`):
+/// `preflight()` runs synchronously inside the process's own tokio runtime
+/// (see `run_loop()`), and entering a nested runtime here panics
+/// unconditionally with "Cannot start a runtime from within a runtime".
+/// Mirrors the proven-safe pattern in
+/// `backend_readiness::probe_local_reachability`.
 fn probe_local_endpoint_reachable(base_url: &str) -> bool {
-    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    else {
+    let Ok(url) = reqwest::Url::parse(base_url) else {
         return true; // can't probe; don't manufacture a false warning
     };
-    runtime.block_on(async {
-        let client = match reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .build()
-        {
-            Ok(client) => client,
-            Err(_) => return true,
-        };
-        client.get(base_url).send().await.is_ok()
-    })
+    let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default()) else {
+        return true;
+    };
+    let addr = match (host, port).to_socket_addrs() {
+        Ok(mut addrs) => addrs.next(),
+        Err(_) => None,
+    };
+    let Some(addr) = addr else {
+        return true; // unresolvable; don't manufacture a false warning
+    };
+    std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(1500)).is_ok()
 }
 
 /// Run `program args` to completion, polling with a bounded wall-clock
@@ -8066,6 +8072,64 @@ mod tests {
         let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
         let engine = MissionEngine::create(backend, &root, "goal", cfg).expect("create engine");
 
+        let issues = engine.preflight();
+
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.severity == "warn" && i.message.contains("127.0.0.1:0")),
+            "expected a local preflight warning, got {issues:?}"
+        );
+        assert!(
+            !issues.iter().any(|i| i.severity == "error"),
+            "local reachability must never escalate to an error, got {issues:?}"
+        );
+    }
+
+    /// Regression test for the nested-runtime panic: `preflight()` must be
+    /// callable from *within* an already-running tokio runtime (as it is by
+    /// `run_loop()`) without `probe_local_endpoint_reachable` trying to spin
+    /// up its own nested `Runtime::block_on`, which panics unconditionally.
+    /// This test would fail (panic) if a nested `block_on` were ever
+    /// reintroduced.
+    #[tokio::test]
+    async fn local_preflight_warns_inside_runtime_without_panic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).unwrap_or_else(|_| dir.path().to_path_buf());
+        let _ = std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&root)
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.name", "test"])
+            .current_dir(&root)
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(&root)
+            .output();
+        std::fs::write(root.join("README.md"), "seed\n").unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&root)
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["commit", "-m", "seed"])
+            .current_dir(&root)
+            .output();
+
+        let mut cfg = MissionConfig::default();
+        cfg.worker.backend = Some("local".to_string());
+        // Port 0 never accepts connections; a fast, reliable "unreachable".
+        cfg.worker.base_url = Some("http://127.0.0.1:0/v1".to_string());
+        cfg.worker.context_budget = Some(8192);
+        cfg.allow_below_default_worker_model = true;
+
+        let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
+        let engine = MissionEngine::create(backend, &root, "goal", cfg).expect("create engine");
+
+        // Called from within this #[tokio::test]'s active runtime, exactly
+        // as it would be from the async run_loop(): must not panic.
         let issues = engine.preflight();
 
         assert!(
