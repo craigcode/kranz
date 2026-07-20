@@ -14,9 +14,10 @@ a file it merely touches.
 
 ## Context
 2026-07-19: mission m-0f1abd was checkpoint-refused twice by findings in
-UNCHANGED base code — `let token = token?;` (orchestrator.rs), a
-`credential-value` test fixture (runner.rs), `let token = "lan-test-token";`
-and a `token: Option<&str>` param (server_test.rs) — while the mission's own
+UNCHANGED base code — an Option-wrap assignment to a `token` local
+(orchestrator.rs), a credential-flavored literal in a runner.rs test
+fixture, a "lan-test-…" constant and an Option<&str> param of the same name
+(server_test.rs) — while the mission's own
 diff was clean (`kranz scan --range HEAD` passed). Full-file scanning means
 any mission touching a file with a token-shaped pattern can never checkpoint
 until base content is waived or renamed — recurring friction with no security
