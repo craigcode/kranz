@@ -10154,27 +10154,53 @@ mod tests {
     // integration tests above.
     // -----------------------------------------------------------------------
 
+    /// Synthetic kimi stream-json wire payload for a scrutiny run whose
+    /// terminal assistant line is a parseable `ValidatorReport` JSON blob
+    /// (mirrors the shape captured in the committed probe fixture
+    /// `tests/fixtures/kimi_exec_scrutiny.jsonl`). Hand-authored harness
+    /// scaffolding, not a probe capture, so it lives inline rather than as a
+    /// separate fixture file.
+    #[cfg(unix)]
+    const KIMI_STUB_REPORT_JSONL: &str = concat!(
+        r#"{"role":"assistant","content":"{\"findings\":[{\"subject\":\"assertion-3-retry-cap\",\"severity\":\"minor\",\"evidence\":\"MAX_RETRIES is defined as 3 in crates/engine/src/orchestrator.rs:42, matching the claimed retry cap.\",\"suggestedFix\":\"\"},{\"subject\":\"assertion-7-error-logging\",\"severity\":\"major\",\"evidence\":\"No structured log call found around the retry loop in orchestrator.rs; failures are silently swallowed instead of logged.\",\"suggestedFix\":\"Add a warn! log with the attempt number and error before each retry.\"}],\"summary\":\"Retry cap is correctly enforced at 3; missing structured logging on retry is the only material gap found.\"}"}"#,
+        "\n",
+        r#"{"role":"meta","type":"session.resume_hint","session_id":"c3d4e5f6-7a8b-4c9d-8e0f-1a2b3c4d5e6f","command":"kimi -r c3d4e5f6-7a8b-4c9d-8e0f-1a2b3c4d5e6f","content":"To resume this session: kimi -r c3d4e5f6-7a8b-4c9d-8e0f-1a2b3c4d5e6f"}"#,
+        "\n"
+    );
+
+    /// Like [`KIMI_STUB_REPORT_JSONL`] but the terminal assistant text is
+    /// plain prose, not JSON, so `parse_validator_report` returns `None`
+    /// even though the stub exits 0. Models a kimi run that completed but
+    /// never emitted a parseable report.
+    #[cfg(unix)]
+    const KIMI_STUB_NO_REPORT_JSONL: &str = concat!(
+        r#"{"role":"assistant","content":"Done reviewing, nothing structured to report."}"#,
+        "\n",
+        r#"{"role":"meta","type":"session.resume_hint","session_id":"d4e5f6a7-8b9c-4d0e-9f1a-2b3c4d5e6f7a","command":"kimi -r d4e5f6a7-8b9c-4d0e-9f1a-2b3c4d5e6f7a","content":"To resume this session: kimi -r d4e5f6a7-8b9c-4d0e-9f1a-2b3c4d5e6f7a"}"#,
+        "\n"
+    );
+
     /// Writes an executable POSIX shell stub that stands in for the real
     /// `kimi` CLI closely enough to drive
     /// [`crate::backend_kimi::KimiBackend`]: `--version` prints a plausible
-    /// version string and any `-p ...` invocation streams the committed
-    /// fixture (stream-json lines terminating in a `session.resume_hint`) to
+    /// version string and any `-p ...` invocation streams `payload` to
     /// stdout, exiting 0. Not portable to windows-latest (no `/bin/sh`),
     /// hence `cfg(unix)`.
     #[cfg(unix)]
-    fn write_kimi_stub() -> (tempfile::TempDir, PathBuf) {
+    fn write_kimi_stub_with_payload(
+        script_name: &str,
+        payload_name: &str,
+        payload: &str,
+    ) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let fixture = std::fs::canonicalize(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/kimi_exec_scrutiny_report.jsonl"),
-        )
-        .expect("fixture exists");
-        let script_path = dir.path().join("kimi-stub.sh");
+        let payload_path = dir.path().join(payload_name);
+        std::fs::write(&payload_path, payload).expect("write inline payload");
+        let script_path = dir.path().join(script_name);
         std::fs::write(
             &script_path,
             format!(
                 "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'kimi-cli 0.0.0-test'\n  exit 0\nfi\ncat '{}'\nexit 0\n",
-                fixture.display()
+                payload_path.display()
             ),
         )
         .expect("write stub script");
@@ -10186,47 +10212,32 @@ mod tests {
         (dir, script_path)
     }
 
-    /// Like [`write_kimi_stub`] but the stub cats
-    /// `kimi_exec_scrutiny_report_no_report.jsonl` — a fixture whose final
-    /// assistant text is plain prose, not JSON — so `parse_validator_report`
-    /// returns `None` even though the stub exits 0. Models a kimi run that
-    /// completed but never emitted a parseable report.
+    #[cfg(unix)]
+    fn write_kimi_stub() -> (tempfile::TempDir, PathBuf) {
+        write_kimi_stub_with_payload(
+            "kimi-stub.sh",
+            "kimi_exec_scrutiny_report.jsonl",
+            KIMI_STUB_REPORT_JSONL,
+        )
+    }
+
+    /// Like [`write_kimi_stub`] but the stub cats [`KIMI_STUB_NO_REPORT_JSONL`].
     #[cfg(unix)]
     fn write_kimi_stub_no_report() -> (tempfile::TempDir, PathBuf) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let fixture = std::fs::canonicalize(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/kimi_exec_scrutiny_report_no_report.jsonl"),
+        write_kimi_stub_with_payload(
+            "kimi-stub-no-report.sh",
+            "kimi_exec_scrutiny_report_no_report.jsonl",
+            KIMI_STUB_NO_REPORT_JSONL,
         )
-        .expect("fixture exists");
-        let script_path = dir.path().join("kimi-stub-no-report.sh");
-        std::fs::write(
-            &script_path,
-            format!(
-                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'kimi-cli 0.0.0-test'\n  exit 0\nfi\ncat '{}'\nexit 0\n",
-                fixture.display()
-            ),
-        )
-        .expect("write stub script");
-        let mut perms = std::fs::metadata(&script_path)
-            .expect("stat stub script")
-            .permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-        std::fs::set_permissions(&script_path, perms).expect("chmod stub script");
-        (dir, script_path)
     }
-
-    /// Serializes tests that mutate `KRANZ_KIMI_BIN` so they don't race
-    /// concurrently with each other (mirrors `DROID_ENV_LOCK`; kept on its
-    /// own dedicated mutex since it guards a different env var).
-    #[cfg(unix)]
-    static KIMI_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// RAII guard: points `KRANZ_KIMI_BIN` at a working stub so
     /// `discover_kimi_binary` deterministically resolves it as the FIRST
     /// (exclusive) candidate, regardless of whatever real `kimi` install
     /// happens to sit on the host running the suite. Serialized on
-    /// [`KIMI_ENV_LOCK`] so these tests never race each other.
+    /// [`crate::backend_kimi::KIMI_ENV_LOCK`] — the SAME mutex the
+    /// `backend_kimi` discovery tests lock — so these tests never race
+    /// against each other, even though they live in different source files.
     #[cfg(unix)]
     struct KimiStubEnvGuard {
         prev_bin: Option<std::ffi::OsString>,
@@ -10236,7 +10247,9 @@ mod tests {
     #[cfg(unix)]
     impl KimiStubEnvGuard {
         fn engage(stub: &std::path::Path) -> Self {
-            let lock = KIMI_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let lock = crate::backend_kimi::KIMI_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             let prev_bin = std::env::var_os("KRANZ_KIMI_BIN");
             std::env::set_var("KRANZ_KIMI_BIN", stub);
             KimiStubEnvGuard {

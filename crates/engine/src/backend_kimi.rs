@@ -62,6 +62,16 @@ const STDERR_TAIL_CHARS: usize = 500;
 /// §4 — there is no CLI flag for it).
 const KIMI_EFFORT_ENV_VAR: &str = "KIMI_MODEL_THINKING_EFFORT";
 
+/// Serializes every test (in this module and in `orchestrator.rs`) that
+/// mutates the process-global env vars consulted by [`discover_kimi_binary`]
+/// (`KRANZ_KIMI_BIN`, `PATH`, `HOME`), since `cargo test` runs tests in
+/// parallel threads within one process and a second, independent mutex would
+/// not mutually exclude against this one (mirrors `DROID_ENV_LOCK`, but must
+/// be `pub(crate)` — unlike droid, kimi's env-mutating tests are split across
+/// two source files and both must lock the SAME mutex).
+#[cfg(test)]
+pub(crate) static KIMI_ENV_LOCK: Mutex<()> = Mutex::new(());
+
 // ---------------------------------------------------------------------------
 // Binary discovery
 // ---------------------------------------------------------------------------
@@ -759,14 +769,11 @@ mod tests {
         assert_eq!(num_turns, Some(1));
     }
 
-    /// Serializes tests that mutate process-global env vars (`KRANZ_KIMI_BIN`,
-    /// `PATH`, `HOME`) consulted by [`discover_kimi_binary`], since `cargo
-    /// test` runs tests in parallel threads within one process.
-    static DISCOVERY_ENV_GUARD: Mutex<()> = Mutex::new(());
-
     #[test]
     fn kimi_discovery_honors_env_override_exclusively() {
-        let _guard = DISCOVERY_ENV_GUARD.lock().unwrap();
+        let _guard = super::KIMI_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let working = dir.path().join("working-kimi");
         #[cfg(unix)]
@@ -797,7 +804,9 @@ mod tests {
     fn kimi_discovery_falls_through_configured_to_path_then_well_known() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _guard = DISCOVERY_ENV_GUARD.lock().unwrap();
+        let _guard = super::KIMI_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let saved_env_override = std::env::var_os("KRANZ_KIMI_BIN");
         std::env::remove_var("KRANZ_KIMI_BIN");
         let saved_path = std::env::var_os("PATH");
