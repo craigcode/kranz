@@ -10,6 +10,7 @@ use crate::paths::MissionPaths;
 use crate::types::{BackendKind, MissionConfig, MissionState, Role, SandboxEnforce};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -220,11 +221,29 @@ fn probe_role(role: Role, cfg: &MissionConfig) -> RoleReadiness {
     let kind = cfg.backend_kind(role);
     let backend = kind.as_str().to_string();
 
+    // The local HTTP backend has no CLI binary to discover; its readiness
+    // probe is a best-effort, short-timeout reachability check of the role's
+    // baseUrl instead. Never panics and never blocks indefinitely: a bad URL
+    // or an unreachable endpoint downgrades to a not-ready/uncertain status
+    // rather than an error.
+    if kind == BackendKind::Local {
+        let base_url = cfg.role(role).base_url.as_deref();
+        let (status, detail, next_action) = probe_local_reachability(base_url);
+        return RoleReadiness {
+            role: role_key.into(),
+            backend,
+            status,
+            detail,
+            next_action,
+        };
+    }
+
     let discover = match kind {
         BackendKind::Claude => crate::backend_claude::discover_claude_binary(None),
         BackendKind::Codex => crate::backend_codex::discover_codex_binary(None),
         BackendKind::Droid => crate::backend_droid::discover_droid_binary(None),
         BackendKind::Kimi => crate::backend_kimi::discover_kimi_binary(None),
+        BackendKind::Local => unreachable!("handled above"),
     };
 
     match discover {
@@ -268,6 +287,69 @@ fn probe_role(role: Role, cfg: &MissionConfig) -> RoleReadiness {
     }
 }
 
+/// Bound applied to the local backend's TCP reachability check — this is a
+/// preflight hint, not a guarantee, so it must never stall the drain loop.
+const LOCAL_REACHABILITY_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// Best-effort, short-timeout reachability probe for a local role's
+/// `base_url`. Never panics and never blocks past
+/// [`LOCAL_REACHABILITY_TIMEOUT`]: a missing/invalid `base_url` or a
+/// connection failure both downgrade to an indeterminate status rather than
+/// propagating an error.
+fn probe_local_reachability(base_url: Option<&str>) -> (ReadinessStatus, String, String) {
+    let Some(base_url) = base_url else {
+        return (
+            ReadinessStatus::Unknown,
+            "local backend has no baseUrl configured".into(),
+            "set the role's baseUrl and re-queue".into(),
+        );
+    };
+
+    let url = match reqwest::Url::parse(base_url) {
+        Ok(url) => url,
+        Err(e) => {
+            return (
+                ReadinessStatus::Unknown,
+                format!("baseUrl {base_url:?} is not a valid URL: {e}"),
+                "fix the role's baseUrl and re-queue".into(),
+            );
+        }
+    };
+
+    let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default()) else {
+        return (
+            ReadinessStatus::Unknown,
+            format!("baseUrl {base_url:?} has no resolvable host/port"),
+            "fix the role's baseUrl and re-queue".into(),
+        );
+    };
+
+    let addr = match (host, port).to_socket_addrs() {
+        Ok(mut addrs) => addrs.next(),
+        Err(_) => None,
+    };
+    let Some(addr) = addr else {
+        return (
+            ReadinessStatus::Missing,
+            format!("baseUrl host {host:?} did not resolve to an address"),
+            "verify the local endpoint is running and reachable, then re-queue".into(),
+        );
+    };
+
+    match TcpStream::connect_timeout(&addr, LOCAL_REACHABILITY_TIMEOUT) {
+        Ok(_) => (
+            ReadinessStatus::Ok,
+            format!("local endpoint {base_url} reachable"),
+            "none".into(),
+        ),
+        Err(e) => (
+            ReadinessStatus::Missing,
+            format!("local endpoint {base_url} unreachable: {e}"),
+            "start the local endpoint / verify baseUrl, then re-queue".into(),
+        ),
+    }
+}
+
 enum AuthProbe {
     Ok,
     Unauthenticated(String),
@@ -286,6 +368,9 @@ fn probe_cli_login(binary: &Path, kind: BackendKind) -> AuthProbe {
         // documented free read-only probe (docs/scoping/kimi-cli-backend.md
         // §2) that shows the OAuth-managed provider when authenticated.
         BackendKind::Kimi => &["provider", "list"],
+        BackendKind::Local => {
+            return AuthProbe::Unknown("local backend has no CLI to probe".into())
+        }
     };
     match run_bounded(binary, args, Duration::from_secs(3)) {
         Ok((code, out)) => {
@@ -525,5 +610,46 @@ mod tests {
             }
             DrainDecision::RequeueDelay { .. } => panic!("default config should not rate-limit"),
         }
+    }
+
+    #[test]
+    fn local_role_with_missing_base_url_is_unknown_not_panic() {
+        let (status, detail, _next_action) = probe_local_reachability(None);
+        assert_eq!(status, ReadinessStatus::Unknown);
+        assert!(detail.to_ascii_lowercase().contains("baseurl"));
+    }
+
+    #[test]
+    fn local_role_with_unreachable_base_url_is_not_ready_not_panic() {
+        // Port 1 is a reserved/unassigned TCP port — nothing should be
+        // listening there, so this must fail fast (bounded by
+        // LOCAL_REACHABILITY_TIMEOUT) rather than hang or panic.
+        let (status, detail, next_action) = probe_local_reachability(Some("http://127.0.0.1:1/v1"));
+        assert!(
+            matches!(status, ReadinessStatus::Missing | ReadinessStatus::Unknown),
+            "expected a not-ready/uncertain status, got {status:?}"
+        );
+        assert!(!detail.is_empty());
+        assert_ne!(next_action, "none");
+    }
+
+    #[test]
+    fn local_role_with_invalid_base_url_is_unknown_not_panic() {
+        let (status, _detail, _next_action) = probe_local_reachability(Some("not-a-url"));
+        assert_eq!(status, ReadinessStatus::Unknown);
+    }
+
+    #[test]
+    fn local_probe_role_never_panics_and_reports_local_backend() {
+        let mut cfg = MissionConfig::default();
+        cfg.worker.backend = Some("local".into());
+        cfg.worker.base_url = Some("http://127.0.0.1:1/v1".into());
+        cfg.worker.model = "my-local-model".into();
+        let role = probe_role(crate::types::Role::Worker, &cfg);
+        assert_eq!(role.backend, "local");
+        assert!(matches!(
+            role.status,
+            ReadinessStatus::Missing | ReadinessStatus::Unknown
+        ));
     }
 }

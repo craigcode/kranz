@@ -44,6 +44,7 @@ pub mod backend_claude;
 pub mod backend_codex;
 pub mod backend_droid;
 pub mod backend_kimi;
+pub mod backend_local;
 pub mod backend_mock;
 mod backend_probe;
 pub mod control;
