@@ -9,8 +9,8 @@ use crate::event_log::EventLog;
 use crate::paths::MissionPaths;
 use crate::reducer;
 use crate::types::{
-    AssertionCheck, FeatureOrigin, MissionConfig, MissionState, MissionStatus, Plan, PlanFeature,
-    PlanMilestone, Role, TokenUsage, WorkerRun,
+    AssertionCheck, BackendKind, FeatureOrigin, MissionConfig, MissionState, MissionStatus, Plan,
+    PlanFeature, PlanMilestone, Role, TokenUsage, WorkerRun,
 };
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -126,6 +126,19 @@ pub fn usage_cost_usd(usage: &TokenUsage, model: &str) -> f64 {
         + (usage.output as f64 / TOKENS_PER_MTOK) * p.output_per_mtok
         + (usage.cache_read as f64 / TOKENS_PER_MTOK) * p.cache_read_per_mtok()
         + (usage.cache_write as f64 / TOKENS_PER_MTOK) * p.cache_write_per_mtok()
+}
+
+/// [`usage_cost_usd`] fallback that is aware of the local backend: local
+/// model ids are free-form (scoping-doc addendum §5) and cannot be priced by
+/// [`pricing_for_model`]'s family match, so a local run always falls back to
+/// $0 marginal cost rather than the conservative opus-tier default. Every
+/// other backend prices exactly as [`usage_cost_usd`] does.
+pub fn usage_cost_usd_for_backend(usage: &TokenUsage, model: &str, backend: BackendKind) -> f64 {
+    if backend == BackendKind::Local {
+        0.0
+    } else {
+        usage_cost_usd(usage, model)
+    }
 }
 
 /// Tunable assumptions behind [`estimate`]. The defaults encode the plan's
@@ -433,8 +446,9 @@ fn mission_total_cost(state: &MissionState) -> f64 {
         .runs
         .values()
         .map(|r| {
-            r.cost_usd
-                .unwrap_or_else(|| usage_cost_usd(&r.tokens, &r.model))
+            r.cost_usd.unwrap_or_else(|| {
+                usage_cost_usd_for_backend(&r.tokens, &r.model, state.config.backend_kind(r.role))
+            })
         })
         .sum()
 }
@@ -622,8 +636,9 @@ const LOW_CONFIDENCE_HIGH_MULT: f64 = 15.0;
 ///   features.
 fn mission_actuals(state: &MissionState) -> EstimateParams {
     let run_cost = |run: &WorkerRun| {
-        run.cost_usd
-            .unwrap_or_else(|| usage_cost_usd(&run.tokens, &run.model))
+        run.cost_usd.unwrap_or_else(|| {
+            usage_cost_usd_for_backend(&run.tokens, &run.model, state.config.backend_kind(run.role))
+        })
     };
     let mean_run_cost = |roles: &[Role]| -> f64 {
         let costs: Vec<f64> = state
@@ -773,5 +788,48 @@ mod tests {
             (got - expected).abs() < 1e-9,
             "got {got}, expected {expected}"
         );
+    }
+
+    #[test]
+    fn local_usage_cost_is_always_zero() {
+        // Local model ids are free-form (e.g. "my-local-model") and never
+        // match a pricing family, so the local-aware fallback must return $0
+        // regardless of how much usage was reported.
+        let usage = TokenUsage {
+            input: 2_000_000,
+            output: 1_000_000,
+            cache_read: 500_000,
+            cache_write: 200_000,
+        };
+        assert_eq!(
+            usage_cost_usd_for_backend(&usage, "my-local-model", BackendKind::Local),
+            0.0
+        );
+        assert_eq!(
+            usage_cost_usd_for_backend(&usage, "anything-at-all", BackendKind::Local),
+            0.0
+        );
+    }
+
+    #[test]
+    fn local_usage_cost_does_not_change_other_backend_pricing() {
+        let usage = TokenUsage {
+            input: 2_000_000,
+            output: 1_000_000,
+            cache_read: 500_000,
+            cache_write: 200_000,
+        };
+        for (backend, model) in [
+            (BackendKind::Claude, "sonnet"),
+            (BackendKind::Codex, DEFAULT_CODEX_MODEL),
+            (BackendKind::Droid, DEFAULT_DROID_MODEL),
+            (BackendKind::Kimi, DEFAULT_KIMI_MODEL),
+        ] {
+            assert_eq!(
+                usage_cost_usd_for_backend(&usage, model, backend),
+                usage_cost_usd(&usage, model),
+                "backend {backend:?} pricing should be unchanged"
+            );
+        }
     }
 }
