@@ -80,3 +80,41 @@ fn doc_explicitly_notes_the_init_and_result_synthesis_seam() {
         "doc must state the resume_hint line is the sole source of the terminal Result"
     );
 }
+
+/// Guards finding `f-1-1` / contract `a5`: `Init`, `ToolUse`, and
+/// `ToolResult` are the three (of five) `AgentEvent` kinds not backed by
+/// captured stdout. The doc must say in-so-many-words that a second,
+/// tool-using capture is required before the `ToolUse`/`ToolResult` schema
+/// rows can be claimed evidence-backed, and must keep the interim
+/// "route unrecognized role to `AgentEvent::Other`" guidance in the
+/// meantime.
+#[test]
+fn doc_notes_tool_use_and_tool_result_need_a_second_capture() {
+    let doc_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("docs")
+        .join("scoping")
+        .join("kimi-cli-backend.md");
+    let raw = std::fs::read_to_string(&doc_path).expect("read kimi-cli-backend.md");
+    let doc = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    assert!(
+        doc.contains("ToolUse`/`ToolResult` are inferred placeholders")
+            || doc.contains("were **not observed**"),
+        "doc must state ToolUse/ToolResult wire shapes were not observed by this probe"
+    );
+    assert!(
+        doc.contains("until a second, tool-using") && doc.contains("capture is taken"),
+        "doc must say a second, tool-using capture is required before ToolUse/ToolResult \
+         schema rows can be claimed evidence-backed"
+    );
+    assert!(
+        doc.contains("route any unrecognized") && doc.contains("AgentEvent::Other"),
+        "doc must keep the interim 'route unrecognized role to AgentEvent::Other' guidance"
+    );
+    assert!(
+        doc.contains("Three of the five `AgentEvent` kinds are not evidence-backed"),
+        "doc must explicitly disclose that three of five AgentEvent kinds remain unproven"
+    );
+}
