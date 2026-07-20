@@ -334,7 +334,7 @@ mod tests {
     use std::net::SocketAddr;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -382,14 +382,21 @@ mod tests {
     }
 
     /// Spawn an in-process stub `/v1/chat/completions` server that always
-    /// replies with `status_line`/`body`, and hands back its base URL plus a
+    /// replies with `status_line`/`body`, and hands back its base URL, a
     /// counter of requests actually received (so the context-budget test can
-    /// assert zero HTTP traffic).
-    async fn spawn_stub(status_line: &'static str, body: String) -> (String, Arc<AtomicUsize>) {
+    /// assert zero HTTP traffic), and the raw bytes of the last request
+    /// received (so the roundtrip test can assert on wire-level request
+    /// correctness rather than just on the parsed response).
+    async fn spawn_stub(
+        status_line: &'static str,
+        body: String,
+    ) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<u8>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind stub");
         let addr: SocketAddr = listener.local_addr().expect("stub addr");
         let count = Arc::new(AtomicUsize::new(0));
         let count_for_task = Arc::clone(&count);
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_for_task = Arc::clone(&received);
         tokio::spawn(async move {
             loop {
                 let (mut socket, _) = match listener.accept().await {
@@ -397,7 +404,8 @@ mod tests {
                     Err(_) => break,
                 };
                 count_for_task.fetch_add(1, Ordering::SeqCst);
-                let _ = read_http_request(&mut socket).await;
+                let request_bytes = read_http_request(&mut socket).await;
+                *received_for_task.lock().expect("stub request lock") = request_bytes;
                 let response = format!(
                     "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
@@ -407,7 +415,7 @@ mod tests {
                 let _ = socket.shutdown().await;
             }
         });
-        (format!("http://{addr}"), count)
+        (format!("http://{addr}"), count, received)
     }
 
     fn base_spec(session_id: &str, prompt: &str, context_budget_prompt: bool) -> SessionSpec {
@@ -450,7 +458,7 @@ mod tests {
             "usage": {"prompt_tokens": 12, "completion_tokens": 34, "total_tokens": 46}
         })
         .to_string();
-        let (base_url, requests) = spawn_stub("HTTP/1.1 200 OK", stub_body).await;
+        let (base_url, requests, received) = spawn_stub("HTTP/1.1 200 OK", stub_body).await;
 
         let backend = LocalBackend::new(base_url, Some(0.2), 100_000);
         let spec = base_spec("sess-1", "do the thing", false);
@@ -458,6 +466,38 @@ mod tests {
 
         let events = drain(session.as_mut()).await;
         assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+        let raw_request = received.lock().expect("stub request lock").clone();
+        let request_text = String::from_utf8_lossy(&raw_request).to_string();
+        let request_line = request_text.lines().next().expect("request line");
+        assert!(
+            request_line.starts_with("POST "),
+            "expected a POST request, got: {request_line}"
+        );
+        assert!(
+            request_line
+                .split_whitespace()
+                .nth(1)
+                .expect("request target")
+                .ends_with("/v1/chat/completions"),
+            "expected the request target to end with /v1/chat/completions, got: {request_line}"
+        );
+        let header_end = find_subslice(&raw_request, b"\r\n\r\n").expect("request headers");
+        let request_body: Value = serde_json::from_slice(&raw_request[header_end + 4..])
+            .expect("request body should be JSON");
+        assert_eq!(request_body["model"], json!(TEST_MODEL));
+        assert_eq!(request_body["temperature"], json!(0.2));
+        let messages = request_body["messages"].as_array().expect("messages array");
+        assert!(
+            messages
+                .iter()
+                .any(|m| m["role"] == "system" && m["content"] == "be terse"),
+            "expected the system message from append_system_prompt, got: {messages:?}"
+        );
+        assert_eq!(
+            messages.last().expect("at least one message"),
+            &json!({"role": "user", "content": "do the thing"})
+        );
 
         assert!(
             matches!(&events[0], AgentEvent::Init { session_id, model, .. }
@@ -503,7 +543,7 @@ mod tests {
             "usage": {"prompt_tokens": 1, "completion_tokens": 1}
         })
         .to_string();
-        let (base_url, _requests) = spawn_stub("HTTP/1.1 200 OK", stub_body).await;
+        let (base_url, _requests, _received) = spawn_stub("HTTP/1.1 200 OK", stub_body).await;
 
         let backend = LocalBackend::new(base_url, None, 100_000);
         let spec = base_spec("sess-1", "do the thing", false);
@@ -515,7 +555,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_http_500_fails_cleanly() {
-        let (base_url, requests) =
+        let (base_url, requests, _received) =
             spawn_stub("HTTP/1.1 500 Internal Server Error", "boom".to_string()).await;
 
         let backend = LocalBackend::new(base_url, None, 100_000);
@@ -539,7 +579,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_http_context_budget_exceeds_fails_cleanly() {
-        let (base_url, requests) = spawn_stub("HTTP/1.1 200 OK", "{}".to_string()).await;
+        let (base_url, requests, _received) = spawn_stub("HTTP/1.1 200 OK", "{}".to_string()).await;
 
         // context_budget of 1 token; any real prompt blows past it.
         let backend = LocalBackend::new(base_url, None, 1);
