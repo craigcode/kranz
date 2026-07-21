@@ -29,6 +29,12 @@ export function fmtCost(usd: number): string {
   return `$${usd.toFixed(2)}`;
 }
 
+/** Escalation rate as a percentage; em-dash when there's no local-tier denominator. */
+export function fmtPct(numerator: number, denominator: number): string {
+  if (denominator === 0) return '—';
+  return `${Math.round((numerator / denominator) * 100)}%`;
+}
+
 /** 950 -> "950", 12_340 -> "12.3k", 4_200_000 -> "4.2M". */
 export function fmtTokens(n: number): string {
   if (n < 1000) return String(n);

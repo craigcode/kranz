@@ -57,6 +57,8 @@ function makeState(status: MissionStatus, runs: Record<string, WorkerRun>): Miss
     runs,
     totals: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     totalCostUsd: 0,
+    localExecutorMilestones: 0,
+    escalatedMilestones: 0,
     pendingUserMessages: [],
     recentDecisions: [],
     config: makeConfig(),
