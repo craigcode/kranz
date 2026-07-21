@@ -177,6 +177,9 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             milestone_id,
             start_sha,
         } => {
+            if state.executor_tier() == ExecutorTier::Local {
+                state.local_executor_milestones += 1;
+            }
             let ms = milestone_mut(state, milestone_id)?;
             ms.status = MilestoneStatus::Active;
             ms.start_sha = Some(start_sha.clone());
@@ -448,6 +451,7 @@ fn initial_state(event: &Event) -> Result<MissionState> {
         pending_grant_request: None,
         last_seq: event.seq,
         escalated_milestones: 0,
+        local_executor_milestones: 0,
     })
 }
 

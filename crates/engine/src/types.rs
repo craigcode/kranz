@@ -383,9 +383,25 @@ pub struct MissionState {
     /// frontier after repeated failed local validations).
     #[serde(default)]
     pub escalated_milestones: u32,
+    /// Count of milestones whose `milestone.started` folded while the
+    /// executor tier was [`ExecutorTier::Local`] — the denominator for
+    /// [`MissionState::escalation_rate`].
+    #[serde(default)]
+    pub local_executor_milestones: u32,
 }
 
 impl MissionState {
+    /// Share of local-tier milestones that were escalated to Frontier.
+    /// `0.0` when no milestone has ever started under the Local tier (no
+    /// divide-by-zero).
+    pub fn escalation_rate(&self) -> f64 {
+        if self.local_executor_milestones == 0 {
+            0.0
+        } else {
+            self.escalated_milestones as f64 / self.local_executor_milestones as f64
+        }
+    }
+
     /// Which inference tier the Worker executes this mission on, derived
     /// from the current Worker `RoleConfig.backend` rather than stored:
     /// [`ExecutorTier::Local`] when the Worker backend is

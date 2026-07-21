@@ -2549,3 +2549,128 @@ fn tier_escalation_defaults_on_old_logs_without_the_event() {
     assert_eq!(state.executor_tier(), ExecutorTier::Frontier);
     assert_eq!(state.escalated_milestones, 0);
 }
+
+// ---------------------------------------------------------------------------
+// escalation_rate: derived from local_executor_milestones + escalated_milestones
+// ---------------------------------------------------------------------------
+
+/// Plan with 3 milestones so a milestone can start before, at, and after an
+/// escalation: ms-1 { f-1-1 }, ms-2 { f-2-1 }, ms-3 { f-3-1 }.
+fn plan_three_milestones() -> Plan {
+    Plan {
+        goal: "build the thing, planned".to_string(),
+        validation_contract: vec![Assertion {
+            id: "a-1".to_string(),
+            statement: "cargo test passes".to_string(),
+            check: AssertionCheck::Command,
+            command: Some("cargo test".to_string()),
+        }],
+        milestones: vec![
+            PlanMilestone {
+                title: "milestone one".to_string(),
+                features: vec![plan_feature("alpha")],
+            },
+            PlanMilestone {
+                title: "milestone two".to_string(),
+                features: vec![plan_feature("beta")],
+            },
+            PlanMilestone {
+                title: "milestone three".to_string(),
+                features: vec![plan_feature("gamma")],
+            },
+        ],
+        considered_alternatives: None,
+        command_grants: vec![],
+        touch_set: vec![],
+    }
+}
+
+fn created_with_local_worker() -> EventKind {
+    let mut config = MissionConfig::default();
+    config.worker.backend = Some("local".to_string());
+    EventKind::MissionCreated {
+        goal: "build the thing".to_string(),
+        base_branch: "main".to_string(),
+        mission_branch: format!("kranz/mission-{MISSION}"),
+        config,
+    }
+}
+
+#[test]
+fn escalation_rate_counts_local_starts_and_one_escalation() {
+    let state = fold(&[
+        ev(1, created_with_local_worker()),
+        ev(
+            2,
+            EventKind::PlanApproved {
+                plan: plan_three_milestones(),
+                base_sha: None,
+            },
+        ),
+        // ms-1 and ms-2 start while the Worker is still routed to Local.
+        ev(
+            3,
+            EventKind::MilestoneStarted {
+                milestone_id: "ms-1".into(),
+                start_sha: "s1".into(),
+            },
+        ),
+        ev(
+            4,
+            EventKind::MilestoneStarted {
+                milestone_id: "ms-2".into(),
+                start_sha: "s2".into(),
+            },
+        ),
+        // ms-1 gets stuck and escalates after two failed local validations.
+        ev(
+            5,
+            EventKind::TierEscalated {
+                milestone_id: "ms-1".into(),
+                from: ExecutorTier::Local,
+                to: ExecutorTier::Frontier,
+                reason: "two failed local validations".into(),
+            },
+        ),
+        // ms-3 starts AFTER escalation, so the Worker is now Frontier — it
+        // must not be counted in the local-executor denominator.
+        ev(
+            6,
+            EventKind::MilestoneStarted {
+                milestone_id: "ms-3".into(),
+                start_sha: "s3".into(),
+            },
+        ),
+    ])
+    .unwrap();
+
+    assert_eq!(state.local_executor_milestones, 2);
+    assert_eq!(state.escalated_milestones, 1);
+    assert_eq!(state.escalation_rate(), 0.5);
+}
+
+#[test]
+fn escalation_rate_is_zero_when_mission_never_routes_local() {
+    let state = fold(&[
+        ev(1, created()),
+        ev(
+            2,
+            EventKind::PlanApproved {
+                plan: plan(),
+                base_sha: None,
+            },
+        ),
+        ev(
+            3,
+            EventKind::MilestoneStarted {
+                milestone_id: "ms-1".into(),
+                start_sha: "s".into(),
+            },
+        ),
+    ])
+    .unwrap();
+
+    assert_eq!(state.local_executor_milestones, 0);
+    assert_eq!(state.escalated_milestones, 0);
+    assert_eq!(state.escalation_rate(), 0.0);
+}
