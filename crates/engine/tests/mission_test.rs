@@ -2983,7 +2983,7 @@ async fn plan_approval_writes_plan_branch_and_commit() {
 /// the benign already-failing assertion in both plan.md and an
 /// `orchestrator.decision`, and never blocks approval.
 #[tokio::test(flavor = "multi_thread")]
-async fn approve_plan_lints_contract_and_surfaces_suspects() {
+async fn approval_lint_surfaces_suspects_in_plan_md_and_decision() {
     if !setup() {
         return;
     }

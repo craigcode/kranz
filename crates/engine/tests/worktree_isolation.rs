@@ -798,7 +798,7 @@ fn one_feature_plan_with_contract() -> Plan {
 /// the '## Contract lint' section in plan.md on the mission branch (and its
 /// untracked primary twin) — not just in the non-worktree/checkout path.
 #[tokio::test(flavor = "multi_thread")]
-async fn approve_plan_lints_contract_in_worktree_mode() {
+async fn approval_lint_covers_worktree_mode() {
     let Some((_dir, root)) = mission_init_repo() else {
         return;
     };
