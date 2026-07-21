@@ -326,6 +326,39 @@ mod tests {
         assert_eq!(findings[0].severity, "major");
     }
 
+    /// Regression for the ms-1-fix-1-5 finding: commit 3922d63 (checkpoint)
+    /// touched crates/engine/src/pr_handoff.rs, a path outside this mission's
+    /// original declared touch-set. The mission's touchSet was extended with
+    /// an exact-path glob for it; assert that extension actually clears the
+    /// finding via the same `path_findings` sweep the orchestrator uses.
+    #[test]
+    fn pr_handoff_path_no_longer_flagged_after_touch_set_extension() {
+        let touch_set = vec![
+            "crates/engine/src/ticket.rs".to_string(),
+            "crates/engine/src/types.rs".to_string(),
+            "crates/engine/src/events.rs".to_string(),
+            "crates/engine/src/reducer.rs".to_string(),
+            "crates/engine/src/config.rs".to_string(),
+            "crates/engine/src/orchestrator.rs".to_string(),
+            "crates/engine/src/pr_handoff.rs".to_string(),
+            "crates/engine/tests/reducer_test.rs".to_string(),
+        ];
+        let c = commit(
+            "3922d63716f94635c6c343a17cf45198f19be3b1",
+            "[f-1-2] checkpoint (engine commit)",
+        );
+        let changes = [AttributedChange {
+            path: "crates/engine/src/pr_handoff.rs",
+            commit: &c,
+        }];
+        let findings = path_findings(&touch_set, &changes);
+        assert!(
+            findings.is_empty(),
+            "expected no out-of-contract finding once pr_handoff.rs is declared, got {findings:?}"
+        );
+        assert!(touch_set_includes(&touch_set, "crates/engine/src/pr_handoff.rs").unwrap());
+    }
+
     #[test]
     fn grantable_touch_path_only_for_a_real_out_of_contract_path() {
         let touch_set = vec!["src/**".to_string()];
