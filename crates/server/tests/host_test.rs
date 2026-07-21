@@ -21,6 +21,7 @@ use kranz_engine::backend_mock::{mock_init, mock_result_text, mock_text, MockBac
 use kranz_engine::event_log::{EventLog, LockForce};
 use kranz_engine::events::EventKind;
 use kranz_engine::paths::MissionPaths;
+use kranz_engine::ticket::{Ticket, TicketState};
 use kranz_engine::types::{MissionConfig, Plan};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -1702,4 +1703,114 @@ async fn real_gate_executor_hides_server_env_and_passes_whitelisted_vars() {
         main_tip, base_sha,
         "the gated merge must have landed on main"
     );
+}
+
+// ---------------------------------------------------------------------------
+// reconcile-on-terminal: REST /start heals a linked ticket's stale state
+// ---------------------------------------------------------------------------
+
+/// The REST `/start` surface must reconcile the linked ticket's `.status`
+/// sidecar once the background `run_to_end` task drives the mission to a
+/// terminal status — proving the f-1-3 wiring in `host.rs::run_to_end`
+/// (not just the engine-level helper unit tests). Seeds the ticket at
+/// `Running`/`Failed` (a stale mismatch) so the assertion only passes if the
+/// reconcile call actually ran, not merely if the ticket happened to already
+/// be `Done`.
+#[tokio::test(flavor = "multi_thread")]
+async fn reconcile_on_terminal_after_rest_start_marks_ticket_done() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let judgement =
+        json!({ "decision": "complete", "guidance": "", "summary": "worker did the job" });
+    let orch = MockScript::streaming(vec![mock_init("orch-session"), mock_result_text("seed-hi")])
+        .responding(vec![
+            turn("let's scope the demo"),
+            turn(&plan_json().to_string()),
+            turn(&dirty_tree_commit_as_is()),
+            turn(&judgement.to_string()),
+            turn("NONE"),
+        ]);
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        orch,
+        MockScript::single_shot("ack"),
+        worker_pass(),
+    ]));
+    let app = hosted_app(&root, backend);
+
+    let (status, body) = post_json(
+        &app,
+        "/api/missions",
+        Some(TOKEN),
+        json!({
+            "goal": "ship the demo",
+            "config": { "skipScrutiny": true, "skipFunctional": true }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id = body["id"].as_str().expect("created mission id").to_string();
+
+    // Link a ticket to this mission and stamp it Running/Failed — a stale
+    // mismatch the drove-to-Complete run must heal.
+    Ticket::record_mission(&root, "my-ticket", &id).expect("record_mission");
+    Ticket::write_state(&root, "my-ticket", TicketState::Failed, None)
+        .expect("seed stale Failed state");
+    assert_eq!(Ticket::read_state(&root, "my-ticket"), TicketState::Failed);
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/missions/{id}/planning/turn"),
+        Some(TOKEN),
+        json!({ "text": "hello there" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/missions/{id}/planning/request-plan"),
+        Some(TOKEN),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ready"], true);
+    let plan = body["plan"].clone();
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/missions/{id}/approve"),
+        Some(TOKEN),
+        json!({ "plan": plan }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/missions/{id}/start"),
+        Some(TOKEN),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+
+    wait_for_status(&app, &id, "complete").await;
+
+    // The reconcile runs in the background run_to_end task after drop(engine),
+    // so poll for the ticket to heal rather than asserting immediately.
+    let deadline = tokio::time::Instant::now() + RUN_TIMEOUT;
+    loop {
+        if Ticket::read_state(&root, "my-ticket") == TicketState::Done {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "linked ticket never reconciled to Done"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }

@@ -911,6 +911,19 @@ pub(crate) async fn run_mission_loop(
 ) -> Result<i32> {
     let cfg = load_config(&repo, false)?;
     let backend = build_backend(&cfg)?;
+    run_mission_loop_with_backend(repo, mission, force_lock, interactive, backend).await
+}
+
+/// The body of [`run_mission_loop`], parameterized on the backend so tests
+/// can drive it with [`kranz_engine::backend_mock::MockBackend`] instead of
+/// discovering a real `claude` binary.
+async fn run_mission_loop_with_backend(
+    repo: PathBuf,
+    mission: String,
+    force_lock: LockForce,
+    interactive: bool,
+    backend: Arc<dyn AgentBackend>,
+) -> Result<i32> {
     let paths = require_mission(&repo, &mission)?;
 
     loop {
