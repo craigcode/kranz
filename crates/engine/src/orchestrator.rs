@@ -9407,7 +9407,11 @@ mod tests {
             mock_init("orch-session"),
             mock_result_text("ready"),
         ])
-        .responding((0..rounds).map(|_| vec![mock_text(&reply), mock_result_text(&reply)]).collect())
+        .responding(
+            (0..rounds)
+                .map(|_| vec![mock_text(&reply), mock_result_text(&reply)])
+                .collect(),
+        )
     }
 
     /// A cap-exhausted milestone whose executor is on the local tier
@@ -9427,6 +9431,7 @@ mod tests {
         cfg.worker.backend = Some("local".to_string());
         cfg.worker.base_url = Some("http://localhost:8080".to_string());
         cfg.worker.context_budget = Some(8192);
+        cfg.allow_below_default_worker_model = true;
 
         let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
             tier_escalation_finding_script("part 1 works"),
@@ -9454,7 +9459,10 @@ mod tests {
             "escalation must flip the executor tier"
         );
         assert_eq!(engine.state.mission.milestones[0].fix_cycles, 0);
-        assert_ne!(engine.state.mission.milestones[0].status, MilestoneStatus::Blocked);
+        assert_ne!(
+            engine.state.mission.milestones[0].status,
+            MilestoneStatus::Blocked
+        );
         assert_ne!(engine.state.mission.status, MissionStatus::Blocked);
 
         let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
@@ -9466,12 +9474,16 @@ mod tests {
             events.iter().map(|e| &e.kind).collect::<Vec<_>>()
         );
         assert!(
-            !events.iter().any(|e| matches!(&e.kind, EventKind::MilestoneBlocked { .. })),
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::MilestoneBlocked { .. })),
             "must not block when escalating: {:?}",
             events.iter().map(|e| &e.kind).collect::<Vec<_>>()
         );
         assert!(
-            events.iter().any(|e| matches!(&e.kind, EventKind::FixFeatureCreated { .. })),
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::FixFeatureCreated { .. })),
             "escalation must continue on to fix features: {:?}",
             events.iter().map(|e| &e.kind).collect::<Vec<_>>()
         );
@@ -9545,7 +9557,9 @@ mod tests {
 
         let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
         assert!(
-            !events.iter().any(|e| matches!(&e.kind, EventKind::TierEscalated { .. })),
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::TierEscalated { .. })),
             "frontier tier must never escalate: {:?}",
             events.iter().map(|e| &e.kind).collect::<Vec<_>>()
         );
@@ -9572,6 +9586,7 @@ mod tests {
         cfg.worker.backend = Some("local".to_string());
         cfg.worker.base_url = Some("http://localhost:8080".to_string());
         cfg.worker.context_budget = Some(8192);
+        cfg.allow_below_default_worker_model = true;
 
         let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
             tier_escalation_finding_script("part 1 works"),
