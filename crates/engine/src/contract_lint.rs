@@ -454,6 +454,48 @@ mod tests {
         assert!(!a3.outcome.is_author_bug_suspect());
     }
 
+    #[test]
+    fn approval_lint_runner_flags_inverted_lockfile_grep_shape() {
+        // Reproduces the concrete m-0c885b `a6` bug shape (research.md:24,
+        // reconstructed from `git show 65d3201:.kranz/missions/m-8b3ec3/plan.json`):
+        // `grep -L <old-pin> Cargo.lock`, authored to assert "the old
+        // dependency pin is gone (the upgrade landed)". Both GNU and BSD
+        // grep base the exit status on whether the PATTERN matched
+        // anywhere, not on whether a filename was printed by `-L` — so this
+        // command exits 0 (success) exactly when the old pin is STILL
+        // PRESENT, which is the pre-upgrade / untouched-base state. That is
+        // the inverted-polarity bug: it already passes before the work
+        // lands. Run it for real, against this repo's own Cargo.lock,
+        // targeting a dependency ("tokio") that is genuinely present on the
+        // untouched base, to prove the lint flags this exact shape as a
+        // suspect rather than relying on `true`/`false` proxies.
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("crates/engine has a workspace root two levels up")
+            .to_path_buf();
+        assert!(
+            repo_root.join("Cargo.lock").is_file(),
+            "expected {:?} to contain Cargo.lock",
+            repo_root
+        );
+
+        let contract = vec![command_assertion(
+            "a6",
+            r#"grep -L '^name = "tokio"' Cargo.lock"#,
+        )];
+        let report = run_contract_lint(&repo_root, None, &contract, true);
+
+        assert_eq!(report.results.len(), 1);
+        let a6 = &report.results[0];
+        assert_eq!(a6.outcome, AssertionLintOutcome::PassedOnBase);
+        assert!(a6.outcome.is_author_bug_suspect());
+
+        let suspects = report.suspects();
+        assert_eq!(suspects.len(), 1);
+        assert_eq!(suspects[0].id, "a6");
+    }
+
     #[tokio::test]
     async fn approval_lint_runner_safe_under_tokio() {
         let contract = vec![
