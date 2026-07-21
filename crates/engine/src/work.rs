@@ -138,16 +138,6 @@ pub fn reconcile_ticket_for_mission(
     Ok(Some((slug, mapped)))
 }
 
-/// Map a `run_mission` exit code to the ticket's terminal state (0 → Done,
-/// anything else → Failed, matching [`ticket_state_for_mission`]).
-fn mission_state_from_code(code: i32) -> TicketState {
-    if code == 0 {
-        TicketState::Done
-    } else {
-        TicketState::Failed
-    }
-}
-
 // ---------------------------------------------------------------------------
 // drain_queue — the shared drain/claim/skip loop
 // ---------------------------------------------------------------------------
@@ -358,20 +348,8 @@ where
                     Err(_) => queue::release_claim(claim),
                 }
 
-                if let Some(slug) = &ticket_slug {
-                    match &status {
-                        Ok(code) => {
-                            Ticket::write_state(
-                                repo_root,
-                                slug,
-                                mission_state_from_code(*code),
-                                None,
-                            )?;
-                        }
-                        Err(_) => {
-                            Ticket::write_state(repo_root, slug, TicketState::Failed, None)?;
-                        }
-                    }
+                if ticket_slug.is_some() {
+                    reconcile_ticket_for_mission(repo_root, &mission_id)?;
                 } else {
                     status?;
                 }
@@ -901,6 +879,7 @@ mod tests {
             "satisfiable",
             "---\ntitle: satisfiable\npriority: 2\nschedule: once\n---\n\n## Goal\nship\n",
         );
+        Ticket::record_mission(repo, "satisfiable", "mission-ticket").unwrap();
 
         queue::enqueue(
             repo,
@@ -915,14 +894,21 @@ mod tests {
 
         let ran = Arc::new(AtomicUsize::new(0));
         let ran_clone = ran.clone();
+        let repo_path = repo.to_path_buf();
         let report = drain_queue_with_probe(
             repo,
             false,
             move |mission_id| {
                 let ran = ran_clone.clone();
+                let repo_path = repo_path.clone();
                 async move {
                     assert_eq!(mission_id, "mission-ticket");
                     ran.fetch_add(1, Ordering::SeqCst);
+                    write_events(
+                        &repo_path,
+                        &mission_id,
+                        vec![created(), EventKind::MissionCompleted {}],
+                    );
                     Ok(0)
                 }
             },
@@ -990,12 +976,21 @@ mod tests {
         )
         .unwrap();
 
+        let repo_path = repo.to_path_buf();
         let report = drain_queue_with_probe(
             repo,
             false,
-            move |mission_id| async move {
-                assert_eq!(mission_id, "m-linked");
-                Ok(0)
+            move |mission_id| {
+                let repo_path = repo_path.clone();
+                async move {
+                    assert_eq!(mission_id, "m-linked");
+                    write_events(
+                        &repo_path,
+                        &mission_id,
+                        vec![created(), EventKind::MissionCompleted {}],
+                    );
+                    Ok(0)
+                }
             },
             always_proceed,
         )
@@ -1076,6 +1071,7 @@ mod tests {
             "sibling",
             "---\ntitle: sibling\npriority: 2\nschedule: once\n---\n\n## Goal\nb\n",
         );
+        Ticket::record_mission(repo, "sibling", "m-sibling").unwrap();
         queue::enqueue(
             repo,
             QueueEntry {
@@ -1108,14 +1104,21 @@ mod tests {
 
         let ran = Arc::new(AtomicUsize::new(0));
         let ran_clone = ran.clone();
+        let repo_path = repo.to_path_buf();
         let report = drain_queue_with_probe(
             repo,
             false,
             move |mission_id| {
                 let ran = ran_clone.clone();
+                let repo_path = repo_path.clone();
                 async move {
                     assert_eq!(mission_id, "m-sibling");
                     ran.fetch_add(1, Ordering::SeqCst);
+                    write_events(
+                        &repo_path,
+                        &mission_id,
+                        vec![created(), EventKind::MissionCompleted {}],
+                    );
                     Ok(0)
                 }
             },
@@ -1130,5 +1133,96 @@ mod tests {
         assert_eq!(Ticket::read_state(repo, "sibling"), TicketState::Done);
         assert_eq!(Ticket::read_state(repo, "limited"), TicketState::Parked);
         assert!(queue::list(repo).is_empty());
+    }
+
+    /// Pins the drain loop's terminal ticket write to `reconcile_ticket_for_mission`
+    /// (not a local exit-code mapping): a mission that folds to Complete leaves
+    /// its ticket Done, while one that folds to Blocked leaves it NeedsContext —
+    /// never Failed, even though `run_mission` still returns `Ok(0)` in both cases.
+    #[tokio::test]
+    async fn drain_reconciles_terminal_ticket_via_helper() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+
+        write_ticket(
+            repo,
+            "done-ticket",
+            "---\ntitle: done\npriority: 2\nschedule: once\n---\n\n## Goal\nship\n",
+        );
+        write_ticket(
+            repo,
+            "blocked-ticket",
+            "---\ntitle: blocked\npriority: 2\nschedule: once\n---\n\n## Goal\nship\n",
+        );
+        Ticket::record_mission(repo, "done-ticket", "m-done").unwrap();
+        Ticket::record_mission(repo, "blocked-ticket", "m-blocked").unwrap();
+
+        queue::enqueue(
+            repo,
+            QueueEntry {
+                mission_id: "m-done".to_string(),
+                ticket_slug: Some("done-ticket".to_string()),
+                priority: 2,
+                seq: 0,
+            },
+        )
+        .unwrap();
+        queue::enqueue(
+            repo,
+            QueueEntry {
+                mission_id: "m-blocked".to_string(),
+                ticket_slug: Some("blocked-ticket".to_string()),
+                priority: 2,
+                seq: 1,
+            },
+        )
+        .unwrap();
+
+        let repo_path = repo.to_path_buf();
+        let report = drain_queue_with_probe(
+            repo,
+            false,
+            move |mission_id| {
+                let repo_path = repo_path.clone();
+                async move {
+                    if mission_id == "m-done" {
+                        write_events(
+                            &repo_path,
+                            &mission_id,
+                            vec![created(), EventKind::MissionCompleted {}],
+                        );
+                    } else {
+                        write_events(
+                            &repo_path,
+                            &mission_id,
+                            vec![
+                                created(),
+                                EventKind::PlanApproved {
+                                    plan: plan_with_one_milestone(),
+                                    base_sha: None,
+                                },
+                                EventKind::MilestoneBlocked {
+                                    milestone_id: "ms-1".to_string(),
+                                    reason: "needs input".to_string(),
+                                },
+                            ],
+                        );
+                    }
+                    // Both missions return Ok(0): the exit code must not
+                    // determine the ticket's terminal state any more.
+                    Ok(0)
+                }
+            },
+            always_proceed,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.ran.len(), 2);
+        assert_eq!(Ticket::read_state(repo, "done-ticket"), TicketState::Done);
+        assert_eq!(
+            Ticket::read_state(repo, "blocked-ticket"),
+            TicketState::NeedsContext
+        );
     }
 }
