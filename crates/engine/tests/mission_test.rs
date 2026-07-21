@@ -2393,6 +2393,93 @@ fn mission_created_secret_redacts_and_audits() {
     }));
 }
 
+// ---------------------------------------------------------------------------
+// 5c. f-1-2: executor routing on the `MissionEngine::create` integration
+// seam. Every ticket-seeded mission (kranz draft, kranz exec, REST, Slack)
+// creates its mission from `Ticket::mission_goal()`'s folded goal string —
+// this is the one wiring point that must apply routing, so it is exercised
+// here directly rather than only through `route_task_class_executor`'s pure
+// unit tests (which pass regardless of whether any caller ever invokes them).
+// ---------------------------------------------------------------------------
+
+/// A goal folded from an execution-class ticket (mirrors `kranz exec`'s
+/// `read_mission_file` -> `Ticket::mission_goal()` seed path) must land the
+/// Worker on the local tier by the time `mission.created` is emitted.
+#[test]
+fn create_routes_execution_class_ticket_goal_to_local_executor() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::with_scripts(vec![]));
+
+    let ticket = kranz_engine::ticket::Ticket::parse(
+        "bump-dep",
+        "\
+---
+title: Bump a dependency
+task-class: execution-class
+---
+
+## Goal
+Bump the dependency to the latest patch release.
+",
+    )
+    .expect("parse ticket");
+    let goal = ticket.mission_goal();
+
+    let mut cfg = test_cfg();
+    cfg.worker.base_url = Some("http://127.0.0.1:8080".to_string());
+    cfg.worker.context_budget = Some(16_384);
+
+    let engine = MissionEngine::create(backend, &root, &goal, cfg).expect("create routed mission");
+
+    assert_eq!(engine.state().executor_tier(), ExecutorTier::Local);
+    assert_eq!(
+        engine.state().config.worker.backend.as_deref(),
+        Some("local")
+    );
+    // Validator stays frontier throughout, per the mission's D-X decision.
+    assert_ne!(
+        engine.state().config.validator_scrutiny.backend.as_deref(),
+        Some("local")
+    );
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::OrchestratorDecision { summary, .. }
+                if summary.contains("executor routed local")
+        )),
+        "expected a recorded routing decision; events: {:?}",
+        event_types(&events)
+    );
+}
+
+/// A goal with no task class (a plain non-ticket mission, or a ticket with no
+/// `task-class` set) must leave the executor on the frontier default even
+/// when a local endpoint happens to be configured.
+#[test]
+fn create_leaves_executor_frontier_when_goal_carries_no_task_class() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::with_scripts(vec![]));
+
+    let mut cfg = test_cfg();
+    cfg.worker.base_url = Some("http://127.0.0.1:8080".to_string());
+    cfg.worker.context_budget = Some(16_384);
+
+    let engine = MissionEngine::create(backend, &root, GOAL, cfg).expect("create unrouted mission");
+
+    assert_eq!(engine.state().executor_tier(), ExecutorTier::Frontier);
+    assert_eq!(engine.state().config.worker.backend, None);
+}
+
 /// Regression: the orchestrator's raw turn text becomes the
 /// `orchestrator.decision` detail (and its summary feeds the decision
 /// summary). A credential in that model-authored text must be redacted

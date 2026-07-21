@@ -98,7 +98,20 @@ pub fn route_ticket_executor(
     cfg: &mut MissionConfig,
     ticket: &crate::ticket::Ticket,
 ) -> (ExecutorTier, &'static str) {
-    let requested = task_class_to_tier(ticket.task_class.as_deref());
+    route_task_class_executor(cfg, ticket.task_class.as_deref())
+}
+
+/// Core of [`route_ticket_executor`], taking the raw `task-class` string
+/// directly. [`crate::orchestrator::MissionEngine::create`] calls this with
+/// the class recovered from its `goal` argument via
+/// [`crate::ticket::parse_task_class_from_goal`] — `create` only ever sees a
+/// folded goal string, never the originating [`crate::ticket::Ticket`], so
+/// the class has to travel through that one channel.
+pub fn route_task_class_executor(
+    cfg: &mut MissionConfig,
+    task_class: Option<&str>,
+) -> (ExecutorTier, &'static str) {
+    let requested = task_class_to_tier(task_class);
     let local_endpoint = match (&cfg.worker.base_url, cfg.worker.context_budget) {
         (Some(base_url), Some(context_budget)) => Some(LocalEndpoint {
             base_url: base_url.clone(),
@@ -1118,6 +1131,45 @@ mod tests {
 
         assert_eq!(applied, ExecutorTier::Frontier);
         assert_eq!(cfg, before);
+    }
+
+    #[test]
+    fn route_task_class_executor_routes_local_when_endpoint_configured() {
+        // Mirrors what `MissionEngine::create` calls with the class recovered
+        // from a folded goal string (f-1-2: this is the single engine-side
+        // wiring point every seed path — draft, exec, REST, Slack — shares).
+        let mut cfg = MissionConfig::default();
+        cfg.worker.base_url = Some("http://127.0.0.1:8080".to_string());
+        cfg.worker.context_budget = Some(16_384);
+
+        let (applied, summary) = route_task_class_executor(&mut cfg, Some("execution-class"));
+
+        assert_eq!(applied, ExecutorTier::Local);
+        assert_eq!(cfg.worker.backend.as_deref(), Some("local"));
+        assert_eq!(summary, "executor routed local (execution-class)");
+    }
+
+    #[test]
+    fn route_task_class_executor_stays_frontier_without_endpoint() {
+        let mut cfg = MissionConfig::default();
+        let (applied, summary) = route_task_class_executor(&mut cfg, Some("execution-class"));
+
+        assert_eq!(applied, ExecutorTier::Frontier);
+        assert_eq!(cfg.worker.backend, None);
+        assert!(summary.contains("no local endpoint configured"));
+    }
+
+    #[test]
+    fn route_task_class_executor_stays_frontier_for_non_execution_class() {
+        let mut cfg = MissionConfig::default();
+        cfg.worker.base_url = Some("http://127.0.0.1:8080".to_string());
+        cfg.worker.context_budget = Some(16_384);
+
+        let (applied, summary) = route_task_class_executor(&mut cfg, None);
+
+        assert_eq!(applied, ExecutorTier::Frontier);
+        assert_eq!(cfg.worker.backend, None);
+        assert_eq!(summary, "executor stays frontier");
     }
 
     #[test]

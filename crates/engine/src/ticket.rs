@@ -19,6 +19,21 @@ use std::path::{Path, PathBuf};
 /// Default priority when frontmatter omits it (1 high … 3 low).
 const DEFAULT_PRIORITY: u8 = 2;
 
+/// Heading [`Ticket::mission_goal`] appends before a set task class, and
+/// [`parse_task_class_from_goal`] looks for on the way back out.
+const TASK_CLASS_HEADING: &str = "## Task class\n";
+
+/// Recover the task class [`Ticket::mission_goal`] folded in, from a mission
+/// `goal` string. [`crate::orchestrator::MissionEngine::create`] calls this
+/// to route the executor tier for a mission seeded from a ticket, since by
+/// the time `create` runs it only has the folded goal, not the `Ticket`.
+pub fn parse_task_class_from_goal(goal: &str) -> Option<String> {
+    let idx = goal.find(TASK_CLASS_HEADING)?;
+    let rest = &goal[idx + TASK_CLASS_HEADING.len()..];
+    let line = rest.lines().next()?.trim();
+    (!line.is_empty()).then(|| line.to_string())
+}
+
 /// How often a ticket re-instantiates. Recurring schedules are re-drafted by
 /// the scheduler; `Once` is the default one-shot ticket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -315,8 +330,13 @@ impl Ticket {
     }
 
     /// Fold the whole ticket into one readable-markdown message: the goal plus
-    /// a compact appendix carrying scoping answers, acceptance hints, and
-    /// context — enough for a draft driver to seed the orchestrator in one go.
+    /// a compact appendix carrying scoping answers, acceptance hints, context,
+    /// and (when set) the task class — enough for a draft driver to seed the
+    /// orchestrator in one go, and the one channel that carries the task
+    /// class into [`crate::orchestrator::MissionEngine::create`] (which
+    /// recovers it via [`parse_task_class_from_goal`]) since every seed path —
+    /// CLI, REST, Slack — creates the mission from this folded string, not
+    /// the `Ticket` itself.
     pub fn mission_goal(&self) -> String {
         let mut out = String::new();
         if self.goal.trim().is_empty() {
@@ -347,6 +367,15 @@ impl Ticket {
             out.push_str("\n## Context\n");
             out.push_str(self.context.trim());
             out.push('\n');
+        }
+
+        if let Some(task_class) = self.task_class.as_deref().map(str::trim) {
+            if !task_class.is_empty() {
+                out.push('\n');
+                out.push_str(TASK_CLASS_HEADING);
+                out.push_str(task_class);
+                out.push('\n');
+            }
         }
 
         out

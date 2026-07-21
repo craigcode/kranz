@@ -370,13 +370,24 @@ impl MissionEngine {
 
     /// Create a brand-new mission: validate config, open the repo, pick a
     /// mission id, acquire the event log, and emit `mission.created`.
+    ///
+    /// When `goal` carries a task class folded in by [`crate::ticket::Ticket::mission_goal`]
+    /// (execution-class backlog tickets), routes the executor to the local
+    /// tier before the config is stored on `mission.created` and records the
+    /// routing decision — every seed path (`kranz draft`/`exec`, REST, Slack)
+    /// creates missions from that folded goal string, so this is the single
+    /// place ticket→routing wiring needs to live.
     pub fn create(
         backend: Arc<dyn AgentBackend>,
         repo_root: impl Into<PathBuf>,
         goal: &str,
-        cfg: MissionConfig,
+        mut cfg: MissionConfig,
     ) -> Result<Self> {
         config::validate(&cfg)?;
+        let task_class = crate::ticket::parse_task_class_from_goal(goal);
+        let routing_summary = task_class
+            .as_deref()
+            .map(|task_class| config::route_task_class_executor(&mut cfg, Some(task_class)).1);
         let repo_root = canonical_root(repo_root.into());
         let repo = GitRepo::open(&repo_root)?;
         repo.ensure_identity()?;
@@ -419,7 +430,7 @@ impl MissionEngine {
         let state = reducer::fold(&events)?;
         reducer::write_snapshot(&state, &paths.state_file())?;
 
-        Ok(MissionEngine {
+        let mut engine = MissionEngine {
             backend,
             paths,
             log,
@@ -443,7 +454,11 @@ impl MissionEngine {
             grant_requests: HashMap::new(),
             grant_respawns: HashMap::new(),
             grant_request_cap: GRANT_REQUEST_CAP,
-        })
+        };
+        if let Some(summary) = routing_summary {
+            engine.emit_decision(summary, None)?;
+        }
+        Ok(engine)
     }
 
     /// Resume an existing mission from its event log (§4.3 kill-safety).

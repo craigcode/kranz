@@ -122,7 +122,7 @@ pub async fn cmd_exec(
     allow_unvalidated: bool,
 ) -> Result<i32> {
     let ticket = read_mission_file(&file)?;
-    let mut cfg = load_config(&repo, dangerously_allow_all)?;
+    let cfg = load_config(&repo, dangerously_allow_all)?;
 
     let allow_unvalidated =
         allow_unvalidated || std::env::var("KRANZ_ALLOW_UNVALIDATED").ok().as_deref() == Some("1");
@@ -131,13 +131,10 @@ pub async fn cmd_exec(
         return Ok(1);
     }
 
-    let (_applied_tier, routing_summary) =
-        kranz_engine::config::route_ticket_executor(&mut cfg, &ticket);
     let backend = build_backend(&cfg)?;
 
     let goal = ticket.mission_goal();
     let mut engine = MissionEngine::create(backend, repo.clone(), &goal, cfg)?;
-    engine.record_decision(routing_summary, None)?;
     let mission_id = engine.mission_id().to_string();
     eprintln!(
         "kranz exec: mission {mission_id} created from {}",

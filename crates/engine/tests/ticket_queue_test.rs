@@ -4,7 +4,7 @@
 use kranz_engine::deps;
 use kranz_engine::events::{Event, EventKind};
 use kranz_engine::queue::{self, QueueEntry};
-use kranz_engine::ticket::{Schedule, Ticket, TicketState};
+use kranz_engine::ticket::{parse_task_class_from_goal, Schedule, Ticket, TicketState};
 use kranz_engine::types::MissionConfig;
 use std::fs;
 use std::path::Path;
@@ -92,6 +92,44 @@ Bump the dependency.
 fn task_class_routing_absent_key_yields_none() {
     let t = Ticket::parse("rate-limit", FULL).unwrap();
     assert_eq!(t.task_class, None);
+}
+
+// ---------------------------------------------------------------------------
+// task-class travels through the folded mission_goal (f-1-2 integration seam:
+// `kranz exec` only ever sees the folded goal string, not the `Ticket`, so
+// this round-trip is what lets `MissionEngine::create` recover the class).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn mission_goal_folds_in_the_task_class_when_set() {
+    let md = "\
+---
+title: Bump a dependency
+task-class: execution-class
+---
+
+## Goal
+Bump the dependency.
+";
+    let t = Ticket::parse("bump-dep", md).unwrap();
+    let goal = t.mission_goal();
+    assert_eq!(
+        parse_task_class_from_goal(&goal),
+        Some("execution-class".to_string())
+    );
+}
+
+#[test]
+fn mission_goal_omits_task_class_heading_when_unset() {
+    let t = Ticket::parse("rate-limit", FULL).unwrap();
+    let goal = t.mission_goal();
+    assert_eq!(parse_task_class_from_goal(&goal), None);
+    assert!(!goal.contains("## Task class"));
+}
+
+#[test]
+fn parse_task_class_from_goal_ignores_unrelated_text() {
+    assert_eq!(parse_task_class_from_goal("just a plain goal"), None);
 }
 
 #[test]

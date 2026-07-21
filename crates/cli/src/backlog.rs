@@ -319,9 +319,7 @@ pub async fn cmd_draft(
     dangerously_allow_all: bool,
 ) -> Result<i32> {
     let ticket = load_ticket(&repo, slug)?;
-    let mut cfg = config_for_ticket(load_config(&repo, dangerously_allow_all)?, &ticket);
-    let (_applied_tier, routing_summary) =
-        kranz_engine::config::route_ticket_executor(&mut cfg, &ticket);
+    let cfg = config_for_ticket(load_config(&repo, dangerously_allow_all)?, &ticket);
     let backend = build_backend(&cfg)?;
 
     // Remember where the operator was: parking the plan checks out the
@@ -330,7 +328,6 @@ pub async fn cmd_draft(
         .ok()
         .and_then(|g| g.current_branch().ok());
     let mut engine = MissionEngine::create(backend, repo.clone(), &ticket.mission_goal(), cfg)?;
-    engine.record_decision(routing_summary, None)?;
     println!(
         "drafting ticket '{slug}' as mission {}",
         engine.mission_id()
