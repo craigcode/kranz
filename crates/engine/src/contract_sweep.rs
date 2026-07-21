@@ -359,6 +359,42 @@ mod tests {
         assert!(touch_set_includes(&touch_set, "crates/engine/src/pr_handoff.rs").unwrap());
     }
 
+    /// Regression for the ms-1-fix-1-6 finding: commit 34a0b2f
+    /// ([f-1-2] fix workspace build: Mission literal in kranz-slack tests,
+    /// cargo fmt) touched crates/slack/src/outbound.rs, a path outside this
+    /// mission's declared touch-set. The mission's touchSet was extended
+    /// with an exact-path glob for it; assert that extension actually
+    /// clears the finding via the same `path_findings` sweep the
+    /// orchestrator uses.
+    #[test]
+    fn slack_outbound_path_no_longer_flagged_after_touch_set_extension() {
+        let touch_set = vec![
+            "crates/engine/src/ticket.rs".to_string(),
+            "crates/engine/src/types.rs".to_string(),
+            "crates/engine/src/events.rs".to_string(),
+            "crates/engine/src/reducer.rs".to_string(),
+            "crates/engine/src/config.rs".to_string(),
+            "crates/engine/src/orchestrator.rs".to_string(),
+            "crates/engine/src/pr_handoff.rs".to_string(),
+            "crates/slack/src/outbound.rs".to_string(),
+            "crates/engine/tests/reducer_test.rs".to_string(),
+        ];
+        let c = commit(
+            "34a0b2fa0f5b88878693c82182381aaeebe5645b",
+            "[f-1-2] fix workspace build: Mission literal in kranz-slack tests, cargo fmt",
+        );
+        let changes = [AttributedChange {
+            path: "crates/slack/src/outbound.rs",
+            commit: &c,
+        }];
+        let findings = path_findings(&touch_set, &changes);
+        assert!(
+            findings.is_empty(),
+            "expected no out-of-contract finding once outbound.rs is declared, got {findings:?}"
+        );
+        assert!(touch_set_includes(&touch_set, "crates/slack/src/outbound.rs").unwrap());
+    }
+
     #[test]
     fn grantable_touch_path_only_for_a_real_out_of_contract_path() {
         let touch_set = vec!["src/**".to_string()];
