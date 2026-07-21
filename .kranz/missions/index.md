@@ -49,4 +49,4 @@ Approved plans, newest last.
 - 2026-07-20 · [m-c6882a](m-c6882a/plan.md) — Add BackendKind::Local — a first-of-its-kind HTTP-in-engine, OpenAI-compatible completion backend plus base_url/contextB… [truncated] · [report](m-c6882a/report.md)
 - 2026-07-20 · [m-8b3ec3](m-8b3ec3/plan.md) — Port crates/slack's socket client from tokio-tungstenite 0.24 to 0.29, regenerate the lockfile, and unify the workspace … [truncated]
 - 2026-07-21 · [m-2d5583](m-2d5583/plan.md) — At approve_plan, lint each command assertion by running it once against the untouched base tree (bounded, sync, hooks-di… [truncated]
-- 2026-07-21 · [m-781413](m-781413/plan.md) — At the final gate, route a failing contract command assertion the orchestrator judges to be author-broken (a false negat… [truncated]
+- 2026-07-21 · [m-781413](m-781413/plan.md) — At the final gate, route a failing contract command assertion the orchestrator judges to be author-broken (a false negat… [truncated] · [report](m-781413/report.md)
