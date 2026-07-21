@@ -26,7 +26,7 @@ Defined before any feature; gates mission completion.
 - **[a2]** The approval-time contract lint classifies base outcomes correctly: a provably-buggy command that PASSES against the untouched base (the inverted m-0c885b lockfile-grep shape) is flagged as an author-bug suspect; a normal not-yet-landed command that FAILS on base is marked base-expected-to-fail (not a bug); a command that cannot produce a verdict within the bound is recorded distinctly; and over-budget commands are recorded as not-linted. 
   `cargo test -p kranz-engine approval_lint 2>&1 | grep -qE 'test result: ok\. [1-9]'`
 - **[a3]** The lint never blocks approval and never triggers the nested-runtime panic: a #[tokio::test] approves a command-bearing contract from within the process tokio runtime, approval returns Ok, and lint results are recorded. 
-  `cargo test -p kranz-engine approval_lint_never_blocks approval_lint_no_nested_runtime_panic 2>&1 | grep -qE 'test result: ok\. [1-9]'`
+  `cargo test -p kranz-engine -- approval_lint_never_blocks approval_lint_no_nested_runtime_panic 2>&1 | grep -qE 'test result: ok\. [1-9]'`
 - **[a4]** No clippy warnings across the workspace and all targets. 
   `cargo clippy --workspace --all-targets -- -D warnings`
 - **[a5]** All code is rustfmt-clean. 

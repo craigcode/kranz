@@ -3032,6 +3032,59 @@ async fn approve_plan_lints_contract_and_surfaces_suspects() {
     assert!(detail.contains("[a-2] false"), "{detail}");
 }
 
+/// finding a3 / feature f-1-2: approve_plan never returns Err because of
+/// lint outcomes, even when every command assertion in the contract already
+/// passes on the untouched base (the maximal-suspect case) — the lint is
+/// advisory only and must never block approval.
+#[tokio::test(flavor = "multi_thread")]
+async fn approval_lint_never_blocks() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let backend = Arc::new(MockBackend::new());
+    let mut engine = make_engine(&backend, &root, test_cfg());
+
+    // Both assertions already pass on the untouched base: every command is
+    // an author-bug suspect, yet approval must still succeed.
+    let plan = simple_plan(
+        1,
+        vec![
+            assertion("", "vacuous assertion one", Some("true")),
+            assertion("", "vacuous assertion two", Some("test 1 -eq 1")),
+        ],
+    );
+    engine.approve_plan(plan).unwrap();
+    assert_eq!(engine.state().mission.status, MissionStatus::Approved);
+}
+
+/// finding a3 / feature f-1-2: the contract lint runs its command
+/// assertions synchronously (never constructing a nested `tokio::Runtime`),
+/// so driving `approve_plan` from inside a live tokio runtime must not
+/// panic with "Cannot start a runtime from within a runtime" and must
+/// return Ok.
+#[tokio::test(flavor = "multi_thread")]
+async fn approval_lint_no_nested_runtime_panic() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let backend = Arc::new(MockBackend::new());
+    let mut engine = make_engine(&backend, &root, test_cfg());
+
+    let plan = simple_plan(
+        1,
+        vec![
+            assertion("", "passes on base", Some("true")),
+            assertion("", "fails on base", Some("false")),
+        ],
+    );
+    // No panic (and no Err) proves the lint used the synchronous
+    // std::process::Command path rather than spinning up a nested runtime.
+    engine.approve_plan(plan).unwrap();
+    assert_eq!(engine.state().mission.status, MissionStatus::Approved);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn approve_plan_requires_considered_alternatives_for_large_scope() {
     let (_dir, root) = init_repo();

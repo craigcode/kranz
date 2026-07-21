@@ -17,7 +17,7 @@
       "id": "a3",
       "statement": "The lint never blocks approval and never triggers the nested-runtime panic: a #[tokio::test] approves a command-bearing contract from within the process tokio runtime, approval returns Ok, and lint results are recorded.",
       "check": "command",
-      "command": "cargo test -p kranz-engine approval_lint_never_blocks approval_lint_no_nested_runtime_panic 2>&1 | grep -qE 'test result: ok\\. [1-9]'"
+      "command": "cargo test -p kranz-engine -- approval_lint_never_blocks approval_lint_no_nested_runtime_panic 2>&1 | grep -qE 'test result: ok\\. [1-9]'"
     },
     {
       "id": "a4",
