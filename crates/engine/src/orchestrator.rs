@@ -1294,7 +1294,12 @@ impl MissionEngine {
         // branch on the primary) or was just checked out onto a mission
         // branch freshly created FROM `base` above, with nothing committed
         // onto it yet — either way this is the pristine base. Never blocks
-        // approval; only informs the operator and plan.md.
+        // approval; only informs the operator and plan.md. Deliberately the
+        // stricter `is_clean()` rather than `is_clean_tracked()`: this note
+        // is advisory-only and a false positive (flagging an untracked
+        // scratch file as "dirty") costs nothing, whereas `is_clean_tracked`
+        // would silently ignore untracked-but-not-ignored files that could
+        // still leak into a command assertion's output.
         let tree_clean_at_base = self.repo.is_clean()?;
         let contract_lint_report = contract_lint::run_contract_lint(
             &self.paths.repo_root,

@@ -330,6 +330,39 @@ mod tests {
     }
 
     #[test]
+    fn approval_lint_summary_notes_dirty_tree_at_base() {
+        // finding f-1-2: when the lint ran against a working tree that was
+        // not clean at base, `summary()` must prepend a note saying so —
+        // asserted directly on the struct rather than only by inspection.
+        let dirty = ContractLintReport {
+            results: vec![AssertionLint {
+                id: "a1".to_string(),
+                command: "true".to_string(),
+                outcome: AssertionLintOutcome::PassedOnBase,
+                output_tail: String::new(),
+            }],
+            tree_clean_at_base: false,
+        };
+        let summary = dirty.summary();
+        assert!(
+            summary.contains(
+                "note: contract lint ran against a working tree with uncommitted changes"
+            ),
+            "{summary}"
+        );
+
+        let clean = ContractLintReport {
+            tree_clean_at_base: true,
+            ..dirty
+        };
+        assert!(
+            !clean.summary().contains("uncommitted changes"),
+            "{}",
+            clean.summary()
+        );
+    }
+
+    #[test]
     fn approval_lint_classify_polarity() {
         assert_eq!(classify(true, true), AssertionLintOutcome::PassedOnBase);
         assert_eq!(classify(true, false), AssertionLintOutcome::FailedOnBase);

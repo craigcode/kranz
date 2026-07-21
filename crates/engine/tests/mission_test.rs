@@ -3032,6 +3032,56 @@ async fn approval_lint_surfaces_suspects_in_plan_md_and_decision() {
     assert!(detail.contains("[a-2] false"), "{detail}");
 }
 
+/// finding f-1-2: when the working tree is not clean at base (a tracked file
+/// has uncommitted changes when `approve_plan` runs), the lint report must
+/// carry `tree_clean_at_base: false` and its dirty-tree note must show up in
+/// both plan.md and the `orchestrator.decision` detail — while approval
+/// still succeeds, since the lint is advisory only.
+#[tokio::test(flavor = "multi_thread")]
+async fn approval_lint_notes_dirty_tree_at_base() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let backend = Arc::new(MockBackend::new());
+    let mut engine = make_engine(&backend, &root, test_cfg());
+
+    // Dirty a tracked file (README.md, committed by init_repo) without
+    // staging or committing it, so the tree is unclean when approve_plan
+    // resolves `base` and runs the lint.
+    std::fs::write(root.join("README.md"), "dirty\n").unwrap();
+
+    let plan = simple_plan(
+        1,
+        vec![assertion("", "not-yet-landed assertion", Some("false"))],
+    );
+    engine.approve_plan(plan).unwrap();
+
+    let paths = engine.paths().clone();
+    let md = std::fs::read_to_string(paths.plan_md_file()).expect("plan.md written");
+    assert!(
+        md.contains("note: contract lint ran against a working tree with uncommitted changes"),
+        "{md}"
+    );
+
+    drop(engine);
+    let events = read_log(&paths);
+    let decision = events.iter().find_map(|e| match &e.kind {
+        EventKind::OrchestratorDecision { summary, detail }
+            if summary.contains("contract lint") =>
+        {
+            Some((summary.clone(), detail.clone()))
+        }
+        _ => None,
+    });
+    let (_summary, detail) = decision.expect("contract lint orchestrator.decision emitted");
+    let detail = detail.expect("decision carries the full lint summary");
+    assert!(
+        detail.contains("note: contract lint ran against a working tree with uncommitted changes"),
+        "{detail}"
+    );
+}
+
 /// finding a3 / feature f-1-2: approve_plan never returns Err because of
 /// lint outcomes, even when every command assertion in the contract already
 /// passes on the untouched base (the maximal-suspect case) — the lint is
