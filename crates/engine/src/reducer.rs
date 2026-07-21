@@ -784,7 +784,7 @@ mod executor_tier_tests {
 
         let state = fold(&[created_event(config)]).unwrap();
 
-        assert_eq!(state.mission.executor_tier(), ExecutorTier::Local);
+        assert_eq!(state.executor_tier(), ExecutorTier::Local);
     }
 
     #[test]
@@ -794,7 +794,7 @@ mod executor_tier_tests {
 
         let state = fold(&[created_event(config)]).unwrap();
 
-        assert_eq!(state.mission.executor_tier(), ExecutorTier::Frontier);
+        assert_eq!(state.executor_tier(), ExecutorTier::Frontier);
     }
 
     #[test]
