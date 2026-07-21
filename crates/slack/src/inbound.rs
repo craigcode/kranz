@@ -26,6 +26,7 @@
 //!   messages in unknown threads are ignored (else the bridge echoes itself).
 //! - `slash_commands` `/kranz todo` → [`Action::Todo`];
 //!   `/kranz roadmap` → [`Action::Roadmap`];
+//!   `/kranz outcomes` → [`Action::Outcomes`];
 //!   `/kranz ticket <title>` → [`Action::NewTicket`];
 //!   `/kranz ticket new <slug> <title...>` → [`Action::NewTicketModal`] (a
 //!   multiline goal/context modal, carrying the slug/title through);
@@ -167,6 +168,11 @@ pub enum Action {
     /// `/kranz roadmap` → post the deterministic strategic option map from
     /// `docs/roadmap-options.md`. Read-only, so not spend-gated.
     Roadmap { response_url: Option<String> },
+    /// `/kranz outcomes` → post the flight-surgeon outcomes summary card
+    /// (autonomy ratio, grant-latency buckets, escalation count) computed by
+    /// `kranz_engine::outcomes::compute_outcomes`. Read-only, so not
+    /// spend-gated.
+    Outcomes { response_url: Option<String> },
     /// `/kranz ask <question>` → read-only LLM-backed Q&A grounded in mission,
     /// ticket, queue, report, and event state. It spends tokens, so it is
     /// allowlist-gated like other spend actions.
@@ -940,6 +946,15 @@ fn route_slash(payload: &Value) -> Action {
             return Action::Roadmap { response_url };
         }
         // `roadmap <anything>` → help.
+    }
+
+    // `outcomes` → flight-surgeon outcomes summary card. Extra tokens are
+    // typos and fall through to help.
+    if let Some(rest) = strip_ci_prefix(text, "outcomes") {
+        if rest.trim().is_empty() {
+            return Action::Outcomes { response_url };
+        }
+        // `outcomes <anything>` → help.
     }
 
     // `ask <question>` → read-only, LLM-backed Q&A. It still spends tokens,
@@ -2093,6 +2108,33 @@ mod tests {
             route(&env, &lookup_none()).action,
             Action::Todo {
                 response_url: Some("https://hooks.slack/t".into())
+            }
+        );
+    }
+
+    #[test]
+    fn slash_outcomes_routes_to_outcomes_slack() {
+        let env = json!({
+            "type": "slash_commands",
+            "payload": { "command": "/kranz", "text": "outcomes",
+                         "response_url": "https://hooks.slack/o" }
+        });
+        assert_eq!(
+            route(&env, &lookup_none()).action,
+            Action::Outcomes {
+                response_url: Some("https://hooks.slack/o".into())
+            }
+        );
+
+        let env = json!({
+            "type": "slash_commands",
+            "payload": { "command": "/kranz", "text": "OUTCOMES  ",
+                         "response_url": "https://hooks.slack/o" }
+        });
+        assert_eq!(
+            route(&env, &lookup_none()).action,
+            Action::Outcomes {
+                response_url: Some("https://hooks.slack/o".into())
             }
         );
     }

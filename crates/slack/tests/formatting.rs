@@ -2,12 +2,16 @@
 //! boundary — asserts the produced blocks are valid Block Kit shapes and carry
 //! the mission id / reason / branch / questions a reader needs.
 
+use kranz_engine::outcomes::{
+    AutonomyRatio, EscalationKind, EscalationRow, GrantLatency, LatencyBucket, Outcomes,
+};
 use kranz_slack::format::{
     build_blocked, build_complete, build_help, build_home_view, build_needs_context,
-    build_new_mission_ack, build_plan_ready, build_plan_review, build_status, dashboard_button,
-    dashboard_deep_link, Blocked, Complete, HomeMission, HomeQueueItem, HomeTicket, NeedsContext,
-    NewMissionAck, Outcome, PlanAlternativesReview, PlanReady, PlanReview,
-    RejectedAlternativeReview, StatusSummary, APPROVE_ACTION_ID, START_ACTION_ID,
+    build_new_mission_ack, build_outcomes_summary, build_plan_ready, build_plan_review,
+    build_status, dashboard_button, dashboard_deep_link, Blocked, Complete, HomeMission,
+    HomeQueueItem, HomeTicket, NeedsContext, NewMissionAck, Outcome, PlanAlternativesReview,
+    PlanReady, PlanReview, RejectedAlternativeReview, StatusSummary, APPROVE_ACTION_ID,
+    START_ACTION_ID,
 };
 use serde_json::Value;
 
@@ -416,4 +420,106 @@ fn help_lists_the_steering_commands() {
     assert!(text.contains("/kranz work"), "help lists work");
     // work points at the dispatcher, not an inline drain.
     assert!(text.contains("kranz work"), "help names the dispatcher");
+}
+
+#[test]
+fn outcomes_slack_card_shows_ratio_buckets_and_escalation_count() {
+    let outcomes = Outcomes {
+        autonomy_ratio: AutonomyRatio {
+            closed_missions: 4,
+            total_interventions: 6,
+            interventions_per_closed_mission: 1.5,
+            zero_intervention_missions: 1,
+            zero_intervention_share: 0.25,
+        },
+        grant_latency: GrantLatency {
+            buckets: vec![
+                LatencyBucket {
+                    label: "<10s".into(),
+                    count: 3,
+                },
+                LatencyBucket {
+                    label: "<60s".into(),
+                    count: 2,
+                },
+                LatencyBucket {
+                    label: "<10m".into(),
+                    count: 1,
+                },
+                LatencyBucket {
+                    label: ">=10m".into(),
+                    count: 0,
+                },
+            ],
+            total_decided: 6,
+        },
+        escalations: vec![EscalationRow {
+            ts: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+            mission_id: "m-1".into(),
+            kind: EscalationKind::Grant,
+            summary: "cargo test".into(),
+            decision: "approved".into(),
+            latency_ms: Some(5_000),
+        }],
+    };
+
+    let blocks = build_outcomes_summary(&outcomes);
+    assert_valid_blocks(&blocks);
+    let text = all_text(&blocks);
+
+    assert!(text.contains("1.50"), "renders the autonomy ratio: {text}");
+    assert!(text.contains("<10s"), "renders bucket <10s: {text}");
+    assert!(text.contains("<60s"), "renders bucket <60s: {text}");
+    assert!(text.contains("<10m"), "renders bucket <10m: {text}");
+    assert!(text.contains(">=10m"), "renders bucket >=10m: {text}");
+    assert!(text.contains('3'), "renders <10s count: {text}");
+    assert!(text.contains('2'), "renders <60s count: {text}");
+    assert!(
+        text.contains('1'),
+        "renders escalation count or <10m count: {text}"
+    );
+}
+
+#[test]
+fn outcomes_slack_card_empty_history_renders_gracefully() {
+    let outcomes = Outcomes {
+        autonomy_ratio: AutonomyRatio {
+            closed_missions: 0,
+            total_interventions: 0,
+            interventions_per_closed_mission: 0.0,
+            zero_intervention_missions: 0,
+            zero_intervention_share: 0.0,
+        },
+        grant_latency: GrantLatency {
+            buckets: vec![
+                LatencyBucket {
+                    label: "<10s".into(),
+                    count: 0,
+                },
+                LatencyBucket {
+                    label: "<60s".into(),
+                    count: 0,
+                },
+                LatencyBucket {
+                    label: "<10m".into(),
+                    count: 0,
+                },
+                LatencyBucket {
+                    label: ">=10m".into(),
+                    count: 0,
+                },
+            ],
+            total_decided: 0,
+        },
+        escalations: vec![],
+    };
+
+    let blocks = build_outcomes_summary(&outcomes);
+    assert_valid_blocks(&blocks);
+    let text = all_text(&blocks);
+    assert!(text.contains('0'), "renders zero counts: {text}");
+    assert!(
+        text.contains("0 escalation"),
+        "renders zero-escalation summary: {text}"
+    );
 }

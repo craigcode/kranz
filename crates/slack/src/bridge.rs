@@ -1724,6 +1724,16 @@ async fn dispatch_action(
             .await;
         }
 
+        Action::Outcomes { response_url } => {
+            reply_ephemeral(
+                cfg,
+                client,
+                response_url.as_deref(),
+                &build_outcomes_reply(repo_root),
+            )
+            .await;
+        }
+
         Action::Ask {
             question,
             user_id,
@@ -3245,6 +3255,7 @@ fn apply_action(repo_root: &Path, action: &Action) -> Result<()> {
         | Action::Status { .. }
         | Action::Todo { .. }
         | Action::Roadmap { .. }
+        | Action::Outcomes { .. }
         | Action::TicketList { .. }
         | Action::TicketShow { .. }
         | Action::NewMission { .. }
@@ -3386,6 +3397,19 @@ fn build_todo_reply(repo_root: &Path, dashboard_url: Option<&str>) -> Vec<Value>
         gated_items: read_operator_gates(repo_root),
     };
     crate::format::build_operator_todo(&todo)
+}
+
+/// `/kranz outcomes` reply: the flight-surgeon outcomes summary card, folded
+/// by [`kranz_engine::outcomes::compute_outcomes`] and formatted only here —
+/// no metric math happens in Slack code.
+fn build_outcomes_reply(repo_root: &Path) -> Vec<Value> {
+    match kranz_engine::outcomes::compute_outcomes(repo_root) {
+        Ok(outcomes) => crate::format::build_outcomes_summary(&outcomes),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to compute outcomes for Slack card");
+            error_blocks(&format!("Couldn't compute outcomes: {e}"))
+        }
+    }
 }
 
 /// `/kranz roadmap` reply: deterministic strategic option map (no LLM/engine).
