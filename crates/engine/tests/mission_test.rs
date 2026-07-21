@@ -2978,6 +2978,60 @@ async fn plan_approval_writes_plan_branch_and_commit() {
     assert!(err.to_string().contains("Planning"), "got: {err}");
 }
 
+/// finding a6 / feature f-1-2: `approve_plan` runs the contract lint against
+/// the untouched base tree, surfaces the polarity-bug suspect distinctly from
+/// the benign already-failing assertion in both plan.md and an
+/// `orchestrator.decision`, and never blocks approval.
+#[tokio::test(flavor = "multi_thread")]
+async fn approve_plan_lints_contract_and_surfaces_suspects() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let backend = Arc::new(MockBackend::new());
+    let mut engine = make_engine(&backend, &root, test_cfg());
+
+    // "true" already passes on the untouched base — an author-bug suspect.
+    // "false" fails on the untouched base — the usual, benign case.
+    let plan = simple_plan(
+        1,
+        vec![
+            assertion("", "vacuous assertion", Some("true")),
+            assertion("", "not-yet-landed assertion", Some("false")),
+        ],
+    );
+    engine.approve_plan(plan).unwrap();
+
+    let paths = engine.paths().clone();
+    let md = std::fs::read_to_string(paths.plan_md_file()).expect("plan.md written");
+    assert!(md.contains("## Contract lint"), "{md}");
+    assert!(
+        md.contains("author-bug suspects (already pass / no verdict on the untouched base)"),
+        "{md}"
+    );
+    assert!(md.contains("[a-1] true"), "{md}");
+    assert!(
+        md.contains("base-expected-to-fail (benign): [a-2] false"),
+        "{md}"
+    );
+
+    drop(engine);
+    let events = read_log(&paths);
+    let decision = events.iter().find_map(|e| match &e.kind {
+        EventKind::OrchestratorDecision { summary, detail }
+            if summary.contains("contract lint") =>
+        {
+            Some((summary.clone(), detail.clone()))
+        }
+        _ => None,
+    });
+    let (summary, detail) = decision.expect("contract lint orchestrator.decision emitted");
+    assert!(summary.contains("1 author-bug suspect"), "{summary}");
+    let detail = detail.expect("decision carries the full lint summary");
+    assert!(detail.contains("[a-1] true"), "{detail}");
+    assert!(detail.contains("[a-2] false"), "{detail}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn approve_plan_requires_considered_alternatives_for_large_scope() {
     let (_dir, root) = init_repo();

@@ -8,6 +8,7 @@ use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
+use kranz_engine::contract_lint::ContractLintReport;
 use kranz_engine::cost;
 use kranz_engine::event_log::EventLog;
 use kranz_engine::events::{Event, EventKind};
@@ -270,11 +271,18 @@ pub(crate) async fn mission_revision_diff(
         &pending.plan,
         &calibration,
     );
+    // Preview only: this endpoint does not re-lint the contract against the
+    // base (mid-mission, the base tree is no longer necessarily pristine).
+    let no_lint = ContractLintReport {
+        results: Vec::new(),
+        tree_clean_at_base: true,
+    };
     let revised = render_plan_markdown(
         &pending.plan,
         &state.mission,
         &estimate,
         calibration.missions_used,
+        &no_lint,
     );
     Ok(Json(json!({
         "revision": pending.revision,
