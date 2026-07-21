@@ -41,6 +41,7 @@ use crate::backend::{
     AgentBackend, AgentEvent, AgentSession, PromptMode, SessionExit, SessionSpec,
 };
 use crate::config;
+use crate::contract_lint;
 use crate::contract_sweep;
 use crate::control;
 use crate::cost;
@@ -1287,6 +1288,26 @@ impl MissionEngine {
         // branch never moves it.
         let base_sha = self.repo.rev_parse(&base)?;
 
+        // Lint each `check: command` assertion against the untouched base
+        // tree (M8 tier 1, feature f-1-2): at this point the working tree is
+        // either still on `base` (worktree mode never checks out the mission
+        // branch on the primary) or was just checked out onto a mission
+        // branch freshly created FROM `base` above, with nothing committed
+        // onto it yet — either way this is the pristine base. Never blocks
+        // approval; only informs the operator and plan.md. Deliberately the
+        // stricter `is_clean()` rather than `is_clean_tracked()`: this note
+        // is advisory-only and a false positive (flagging an untracked
+        // scratch file as "dirty") costs nothing, whereas `is_clean_tracked`
+        // would silently ignore untracked-but-not-ignored files that could
+        // still leak into a command assertion's output.
+        let tree_clean_at_base = self.repo.is_clean()?;
+        let contract_lint_report = contract_lint::run_contract_lint(
+            &self.paths.repo_root,
+            Some(&base_sha),
+            &plan.validation_contract,
+            tree_clean_at_base,
+        );
+
         // Human-readable twin, committed alongside: reviewable in any git UI
         // and diffable across re-plans (plan.json stays the durable source).
         // The calibrated cost estimate is baked in here so the Reviewable
@@ -1297,6 +1318,7 @@ impl MissionEngine {
             &self.state.mission,
             &estimate,
             calibration.missions_used,
+            &contract_lint_report,
         );
         // research.md (repo-knowledge-store slice 1): the evidence the
         // orchestrator emitted with the plan, committed beside plan.md.
@@ -1402,6 +1424,25 @@ impl MissionEngine {
             plan,
             base_sha: Some(base_sha),
         })?;
+
+        // Fold the contract lint into an operator-facing decision (M8 tier 1,
+        // feature f-1-2): suspects (already pass on the untouched base) get a
+        // headline distinct from the benign base-expected-to-fail case, but
+        // either way this only informs — approval above already succeeded.
+        if !contract_lint_report.is_empty() {
+            let suspect_count = contract_lint_report.suspects().len();
+            let headline = if suspect_count > 0 {
+                format!(
+                    "contract lint: {suspect_count} author-bug suspect assertion(s) already \
+                     pass on the untouched base — see plan.md"
+                )
+            } else {
+                "contract lint: all command assertions correctly fail on the untouched base"
+                    .to_string()
+            };
+            self.emit_decision(&headline, Some(contract_lint_report.summary()))?;
+        }
+
         Ok(())
     }
 
@@ -1898,11 +1939,19 @@ impl MissionEngine {
         let estimate = cost::estimate(plan, &self.state.config, &calibration.params);
         let estimate = cost::apply_shape(estimate, plan, &calibration);
         self.persist_approved_estimate(&estimate)?;
+        // Re-planning does not re-lint the contract against the base (the
+        // base tree may no longer be pristine mid-mission); the section is
+        // simply omitted here since `is_empty()` is true.
+        let no_lint = contract_lint::ContractLintReport {
+            results: Vec::new(),
+            tree_clean_at_base: true,
+        };
         let plan_md_body = render_plan_markdown(
             plan,
             &self.state.mission,
             &estimate,
             calibration.missions_used,
+            &no_lint,
         );
         let revised_md_body = render_revised_plan_markdown(plan, &self.state.mission, &[], &[]);
         let research_md = self
@@ -5594,6 +5643,7 @@ pub fn render_plan_markdown(
     mission: &Mission,
     estimate: &cost::CostEstimate,
     missions_used: usize,
+    contract_lint: &contract_lint::ContractLintReport,
 ) -> String {
     use std::fmt::Write as _;
     let mut md = String::new();
@@ -5674,6 +5724,18 @@ pub fn render_plan_markdown(
                 );
             }
         }
+    }
+
+    if !contract_lint.is_empty() {
+        let _ = writeln!(md, "## Contract lint\n");
+        let _ = writeln!(
+            md,
+            "Each `check: command` assertion above was run once against the untouched base \
+             tree at approval time. Suspects are assertions that already pass (or could not \
+             reach a verdict) before this plan's work lands — a possible polarity/vacuity bug \
+             in the assertion itself. This never blocks approval.\n"
+        );
+        let _ = writeln!(md, "{}\n", contract_lint.summary());
     }
 
     for (mi, m) in plan.milestones.iter().enumerate() {

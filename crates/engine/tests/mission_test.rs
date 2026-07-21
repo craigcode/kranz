@@ -2978,6 +2978,163 @@ async fn plan_approval_writes_plan_branch_and_commit() {
     assert!(err.to_string().contains("Planning"), "got: {err}");
 }
 
+/// finding a6 / feature f-1-2: `approve_plan` runs the contract lint against
+/// the untouched base tree, surfaces the polarity-bug suspect distinctly from
+/// the benign already-failing assertion in both plan.md and an
+/// `orchestrator.decision`, and never blocks approval.
+#[tokio::test(flavor = "multi_thread")]
+async fn approval_lint_surfaces_suspects_in_plan_md_and_decision() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let backend = Arc::new(MockBackend::new());
+    let mut engine = make_engine(&backend, &root, test_cfg());
+
+    // "true" already passes on the untouched base — an author-bug suspect.
+    // "false" fails on the untouched base — the usual, benign case.
+    let plan = simple_plan(
+        1,
+        vec![
+            assertion("", "vacuous assertion", Some("true")),
+            assertion("", "not-yet-landed assertion", Some("false")),
+        ],
+    );
+    engine.approve_plan(plan).unwrap();
+
+    let paths = engine.paths().clone();
+    let md = std::fs::read_to_string(paths.plan_md_file()).expect("plan.md written");
+    assert!(md.contains("## Contract lint"), "{md}");
+    assert!(
+        md.contains("author-bug suspects (already pass / no verdict on the untouched base)"),
+        "{md}"
+    );
+    assert!(md.contains("[a-1] true"), "{md}");
+    assert!(
+        md.contains("base-expected-to-fail (benign): [a-2] false"),
+        "{md}"
+    );
+
+    drop(engine);
+    let events = read_log(&paths);
+    let decision = events.iter().find_map(|e| match &e.kind {
+        EventKind::OrchestratorDecision { summary, detail }
+            if summary.contains("contract lint") =>
+        {
+            Some((summary.clone(), detail.clone()))
+        }
+        _ => None,
+    });
+    let (summary, detail) = decision.expect("contract lint orchestrator.decision emitted");
+    assert!(summary.contains("1 author-bug suspect"), "{summary}");
+    let detail = detail.expect("decision carries the full lint summary");
+    assert!(detail.contains("[a-1] true"), "{detail}");
+    assert!(detail.contains("[a-2] false"), "{detail}");
+}
+
+/// finding f-1-2: when the working tree is not clean at base (a tracked file
+/// has uncommitted changes when `approve_plan` runs), the lint report must
+/// carry `tree_clean_at_base: false` and its dirty-tree note must show up in
+/// both plan.md and the `orchestrator.decision` detail — while approval
+/// still succeeds, since the lint is advisory only.
+#[tokio::test(flavor = "multi_thread")]
+async fn approval_lint_notes_dirty_tree_at_base() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let backend = Arc::new(MockBackend::new());
+    let mut engine = make_engine(&backend, &root, test_cfg());
+
+    // Dirty a tracked file (README.md, committed by init_repo) without
+    // staging or committing it, so the tree is unclean when approve_plan
+    // resolves `base` and runs the lint.
+    std::fs::write(root.join("README.md"), "dirty\n").unwrap();
+
+    let plan = simple_plan(
+        1,
+        vec![assertion("", "not-yet-landed assertion", Some("false"))],
+    );
+    engine.approve_plan(plan).unwrap();
+
+    let paths = engine.paths().clone();
+    let md = std::fs::read_to_string(paths.plan_md_file()).expect("plan.md written");
+    assert!(
+        md.contains("note: contract lint ran against a working tree with uncommitted changes"),
+        "{md}"
+    );
+
+    drop(engine);
+    let events = read_log(&paths);
+    let decision = events.iter().find_map(|e| match &e.kind {
+        EventKind::OrchestratorDecision { summary, detail }
+            if summary.contains("contract lint") =>
+        {
+            Some((summary.clone(), detail.clone()))
+        }
+        _ => None,
+    });
+    let (_summary, detail) = decision.expect("contract lint orchestrator.decision emitted");
+    let detail = detail.expect("decision carries the full lint summary");
+    assert!(
+        detail.contains("note: contract lint ran against a working tree with uncommitted changes"),
+        "{detail}"
+    );
+}
+
+/// finding a3 / feature f-1-2: approve_plan never returns Err because of
+/// lint outcomes, even when every command assertion in the contract already
+/// passes on the untouched base (the maximal-suspect case) — the lint is
+/// advisory only and must never block approval.
+#[tokio::test(flavor = "multi_thread")]
+async fn approval_lint_never_blocks() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let backend = Arc::new(MockBackend::new());
+    let mut engine = make_engine(&backend, &root, test_cfg());
+
+    // Both assertions already pass on the untouched base: every command is
+    // an author-bug suspect, yet approval must still succeed.
+    let plan = simple_plan(
+        1,
+        vec![
+            assertion("", "vacuous assertion one", Some("true")),
+            assertion("", "vacuous assertion two", Some("test 1 -eq 1")),
+        ],
+    );
+    engine.approve_plan(plan).unwrap();
+    assert_eq!(engine.state().mission.status, MissionStatus::Approved);
+}
+
+/// finding a3 / feature f-1-2: the contract lint runs its command
+/// assertions synchronously (never constructing a nested `tokio::Runtime`),
+/// so driving `approve_plan` from inside a live tokio runtime must not
+/// panic with "Cannot start a runtime from within a runtime" and must
+/// return Ok.
+#[tokio::test(flavor = "multi_thread")]
+async fn approval_lint_no_nested_runtime_panic() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let backend = Arc::new(MockBackend::new());
+    let mut engine = make_engine(&backend, &root, test_cfg());
+
+    let plan = simple_plan(
+        1,
+        vec![
+            assertion("", "passes on base", Some("true")),
+            assertion("", "fails on base", Some("false")),
+        ],
+    );
+    // No panic (and no Err) proves the lint used the synchronous
+    // std::process::Command path rather than spinning up a nested runtime.
+    engine.approve_plan(plan).unwrap();
+    assert_eq!(engine.state().mission.status, MissionStatus::Approved);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn approve_plan_requires_considered_alternatives_for_large_scope() {
     let (_dir, root) = init_repo();

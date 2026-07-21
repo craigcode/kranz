@@ -770,6 +770,77 @@ async fn mission_branch_carries_deliverables_in_worktree_mode() {
     );
 }
 
+/// A single-milestone, single-feature plan whose validation contract has one
+/// command assertion that already passes on the untouched base (`true`) and
+/// one that correctly fails there (`false`).
+fn one_feature_plan_with_contract() -> Plan {
+    Plan {
+        validation_contract: vec![
+            Assertion {
+                id: "a-1".to_string(),
+                statement: "vacuous assertion".to_string(),
+                check: AssertionCheck::Command,
+                command: Some("true".to_string()),
+            },
+            Assertion {
+                id: "a-2".to_string(),
+                statement: "not-yet-landed assertion".to_string(),
+                check: AssertionCheck::Command,
+                command: Some("false".to_string()),
+            },
+        ],
+        ..one_feature_plan()
+    }
+}
+
+/// finding a2 / a6 / f-1-2: in worktree mode, `approve_plan` still lints the
+/// contract's command assertions against the untouched base tree and commits
+/// the '## Contract lint' section in plan.md on the mission branch (and its
+/// untracked primary twin) — not just in the non-worktree/checkout path.
+#[tokio::test(flavor = "multi_thread")]
+async fn approval_lint_covers_worktree_mode() {
+    let Some((_dir, root)) = mission_init_repo() else {
+        return;
+    };
+    let backend = Arc::new(MockBackend::new());
+    let backend_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend) as Arc<dyn AgentBackend>;
+    let mut engine =
+        MissionEngine::create(backend_dyn, &root, GOAL, worktree_cfg()).expect("create engine");
+    let mission_branch = engine.state().mission.mission_branch.clone();
+    let mission_id = engine.mission_id().to_string();
+
+    engine
+        .approve_plan(one_feature_plan_with_contract())
+        .unwrap();
+
+    let committed_md = raw_git(
+        &root,
+        &[
+            "show",
+            &format!("{mission_branch}:.kranz/missions/{mission_id}/plan.md"),
+        ],
+    );
+    assert!(committed_md.contains("## Contract lint"), "{committed_md}");
+    assert!(
+        committed_md
+            .contains("author-bug suspects (already pass / no verdict on the untouched base)"),
+        "{committed_md}"
+    );
+    assert!(committed_md.contains("[a-1] true"), "{committed_md}");
+    assert!(
+        committed_md.contains("base-expected-to-fail (benign): [a-2] false"),
+        "{committed_md}"
+    );
+
+    let primary_twin = root
+        .join(".kranz/missions")
+        .join(&mission_id)
+        .join("plan.md");
+    let twin_md = std::fs::read_to_string(&primary_twin).expect("primary plan.md twin readable");
+    assert!(twin_md.contains("## Contract lint"), "{twin_md}");
+    assert!(twin_md.contains("[a-1] true"), "{twin_md}");
+}
+
 // -----------------------------------------------------------------------
 // f-3-1: end-to-end guarantees across a MULTI-feature/MULTI-milestone
 // mission that exercises BOTH the sequential and parallel-batch paths,
