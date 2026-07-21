@@ -1051,12 +1051,14 @@ mod tests {
         let validator_functional_before = cfg.validator_functional.clone();
         let endpoint = test_local_endpoint();
 
-        let applied =
-            apply_executor_routing(&mut cfg, ExecutorTier::Local, Some(&endpoint));
+        let applied = apply_executor_routing(&mut cfg, ExecutorTier::Local, Some(&endpoint));
 
         assert_eq!(applied, ExecutorTier::Local);
         assert_eq!(cfg.worker.backend.as_deref(), Some("local"));
-        assert_eq!(cfg.worker.base_url.as_deref(), Some(endpoint.base_url.as_str()));
+        assert_eq!(
+            cfg.worker.base_url.as_deref(),
+            Some(endpoint.base_url.as_str())
+        );
         assert_eq!(cfg.worker.context_budget, Some(endpoint.context_budget));
         assert_eq!(cfg.worker.temperature, endpoint.temperature);
         assert!(cfg.allow_below_default_worker_model);
@@ -1082,8 +1084,7 @@ mod tests {
         let before = cfg.clone();
         let endpoint = test_local_endpoint();
 
-        let applied =
-            apply_executor_routing(&mut cfg, ExecutorTier::Frontier, Some(&endpoint));
+        let applied = apply_executor_routing(&mut cfg, ExecutorTier::Frontier, Some(&endpoint));
 
         assert_eq!(applied, ExecutorTier::Frontier);
         assert_eq!(cfg, before);
