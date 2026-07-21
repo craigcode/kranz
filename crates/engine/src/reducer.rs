@@ -425,13 +425,6 @@ fn initial_state(event: &Event) -> Result<MissionState> {
             command_grants: Vec::new(),
             touch_set: Vec::new(),
             deny_exceptions: Vec::new(),
-            executor_tier: if config.backend_kind(crate::types::Role::Worker)
-                == crate::types::BackendKind::Local
-            {
-                crate::types::ExecutorTier::Local
-            } else {
-                crate::types::ExecutorTier::Frontier
-            },
         },
         runs: BTreeMap::new(),
         totals: TokenUsage::default(),
@@ -763,4 +756,61 @@ pub fn write_snapshot(state: &MissionState, path: &Path) -> Result<()> {
 pub fn read_snapshot(path: &Path) -> Result<MissionState> {
     let content = std::fs::read_to_string(path)?;
     Ok(serde_json::from_str(&content)?)
+}
+
+#[cfg(test)]
+mod executor_tier_tests {
+    use super::*;
+    use crate::events::EventKind;
+
+    fn created_event(config: MissionConfig) -> Event {
+        Event {
+            seq: 1,
+            ts: chrono::Utc::now(),
+            mission_id: "m-test".to_string(),
+            kind: EventKind::MissionCreated {
+                goal: "ship the thing".to_string(),
+                base_branch: "main".to_string(),
+                mission_branch: "kranz/mission-m-test".to_string(),
+                config,
+            },
+        }
+    }
+
+    #[test]
+    fn executor_routing_applies_local_worker_backend_folds_to_local_tier() {
+        let mut config = MissionConfig::default();
+        config.worker.backend = Some("local".to_string());
+
+        let state = fold(&[created_event(config)]).unwrap();
+
+        assert_eq!(state.mission.executor_tier(), ExecutorTier::Local);
+    }
+
+    #[test]
+    fn executor_routing_applies_non_local_worker_backend_folds_to_frontier_tier() {
+        let mut config = MissionConfig::default();
+        config.worker.backend = Some("codex".to_string());
+
+        let state = fold(&[created_event(config)]).unwrap();
+
+        assert_eq!(state.mission.executor_tier(), ExecutorTier::Frontier);
+    }
+
+    #[test]
+    fn validator_stays_frontier_regardless_of_worker_routing() {
+        let mut config = MissionConfig::default();
+        config.worker.backend = Some("local".to_string());
+
+        let state = fold(&[created_event(config)]).unwrap();
+
+        assert_eq!(
+            state.config.backend_kind(Role::ValidatorScrutiny),
+            BackendKind::Claude
+        );
+        assert_eq!(
+            state.config.backend_kind(Role::ValidatorFunctional),
+            BackendKind::Claude
+        );
+    }
 }

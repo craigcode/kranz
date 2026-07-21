@@ -88,6 +88,36 @@ pub fn apply_executor_routing(
     }
 }
 
+/// Route the executor tier for a mission seeded from `ticket`, so the
+/// resulting `mission.created` config already reflects the routing decision
+/// — the single engine-side entry point both the `kranz draft` and
+/// `kranz exec` seed paths call before [`crate::orchestrator::MissionEngine::create`].
+/// Returns the applied tier and a decision summary to record against the
+/// mission once it exists.
+pub fn route_ticket_executor(
+    cfg: &mut MissionConfig,
+    ticket: &crate::ticket::Ticket,
+) -> (ExecutorTier, &'static str) {
+    let requested = task_class_to_tier(ticket.task_class.as_deref());
+    let local_endpoint = match (&cfg.worker.base_url, cfg.worker.context_budget) {
+        (Some(base_url), Some(context_budget)) => Some(LocalEndpoint {
+            base_url: base_url.clone(),
+            context_budget,
+            temperature: cfg.worker.temperature,
+        }),
+        _ => None,
+    };
+    let applied = apply_executor_routing(cfg, requested, local_endpoint.as_ref());
+    let summary = match (requested, applied) {
+        (ExecutorTier::Local, ExecutorTier::Local) => "executor routed local (execution-class)",
+        (ExecutorTier::Local, ExecutorTier::Frontier) => {
+            "execution-class ticket but no local endpoint configured; executor stays frontier"
+        }
+        _ => "executor stays frontier",
+    };
+    (applied, summary)
+}
+
 /// The backend-native model used when an older config selected a non-Claude
 /// backend but left the role's Claude default model in place. `Local` has no
 /// backend default: local model ids are free-form and sent to the endpoint

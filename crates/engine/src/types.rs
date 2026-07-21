@@ -66,12 +66,6 @@ pub struct Mission {
     /// declared): a deliberate, logged erosion of a safety guardrail.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny_exceptions: Vec<String>,
-    /// Which inference tier the Worker executes this mission on, applied at
-    /// seed time from the ticket's task class (see
-    /// [`crate::config::apply_executor_routing`]). `#[serde(default)]` folds
-    /// pre-existing logs to [`ExecutorTier::Frontier`].
-    #[serde(default)]
-    pub executor_tier: ExecutorTier,
 }
 
 // ---------------------------------------------------------------------------
@@ -385,6 +379,22 @@ pub struct MissionState {
     pub pending_grant_request: Option<PendingGrantRequest>,
     /// Seq of the last event folded in.
     pub last_seq: u64,
+}
+
+impl MissionState {
+    /// Which inference tier the Worker executes this mission on, derived
+    /// from the current Worker `RoleConfig.backend` rather than stored:
+    /// [`ExecutorTier::Local`] when the Worker backend is
+    /// [`BackendKind::Local`] (applied at seed time by
+    /// [`crate::config::apply_executor_routing`] or by any later
+    /// `config.changed`), else [`ExecutorTier::Frontier`].
+    pub fn executor_tier(&self) -> ExecutorTier {
+        if self.config.backend_kind(Role::Worker) == BackendKind::Local {
+            ExecutorTier::Local
+        } else {
+            ExecutorTier::Frontier
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

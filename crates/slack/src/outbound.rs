@@ -226,7 +226,6 @@ mod tests {
                 command_grants: vec![],
                 touch_set: vec![],
                 deny_exceptions: vec![],
-                executor_tier: Default::default(),
             },
             runs: Default::default(),
             totals: TokenUsage::default(),
