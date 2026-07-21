@@ -379,6 +379,10 @@ pub struct MissionState {
     pub pending_grant_request: Option<PendingGrantRequest>,
     /// Seq of the last event folded in.
     pub last_seq: u64,
+    /// Count of `tier.escalated` events folded (executor bumped from local to
+    /// frontier after repeated failed local validations).
+    #[serde(default)]
+    pub escalated_milestones: u32,
 }
 
 impl MissionState {

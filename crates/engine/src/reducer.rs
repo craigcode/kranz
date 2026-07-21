@@ -326,6 +326,17 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             ms.features.push(feature.clone());
         }
 
+        EventKind::TierEscalated { milestone_id, .. } => {
+            state.config.worker.backend = None;
+            state.config.worker.base_url = None;
+            state.config.worker.context_budget = None;
+            state.config.worker.temperature = None;
+            state.escalated_milestones += 1;
+            let ms = milestone_mut(state, milestone_id)?;
+            ms.status = MilestoneStatus::Active;
+            ms.fix_cycles = 0;
+        }
+
         EventKind::MilestoneBlocked { milestone_id, .. } => {
             milestone_mut(state, milestone_id)?.status = MilestoneStatus::Blocked;
             state.mission.status = MissionStatus::Blocked;
@@ -436,6 +447,7 @@ fn initial_state(event: &Event) -> Result<MissionState> {
         pending_revision: None,
         pending_grant_request: None,
         last_seq: event.seq,
+        escalated_milestones: 0,
     })
 }
 
