@@ -161,6 +161,7 @@
     "crates/engine/src/reducer.rs",
     "crates/engine/src/config.rs",
     "crates/engine/src/orchestrator.rs",
+    "crates/engine/src/pr_handoff.rs",
     "crates/engine/tests/reducer_test.rs",
     "crates/cli/src/backlog.rs",
     "apps/dashboard/src/lib/types.ts",
