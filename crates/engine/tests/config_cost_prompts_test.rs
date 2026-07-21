@@ -755,6 +755,22 @@ fn worker_prompt_contains_worker_report_field_names() {
 }
 
 #[test]
+fn prompts_state_contract_lives_in_approved_plan_json() {
+    for (role, name) in [
+        (Role::Worker, "Worker"),
+        (Role::Orchestrator, "Orchestrator"),
+    ] {
+        let text = prompts::text(role).to_lowercase();
+        for needle in ["plan.json", "plan.md", "operator", "escalat"] {
+            assert!(
+                text.contains(needle),
+                "{name} prompt missing required substring {needle:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn prompt_hashes_are_12_hex_chars_and_distinct() {
     let hashes: Vec<String> = ALL_ROLES.iter().map(|&r| prompts::hash(r)).collect();
     for h in &hashes {
