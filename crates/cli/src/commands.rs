@@ -935,7 +935,15 @@ pub(crate) async fn run_mission_loop(
         stop.store(true, Ordering::Relaxed);
         let _ = printer.await;
 
-        match run_result? {
+        let status = run_result?;
+        // Reconcile the linked ticket's .status sidecar to match the mission's
+        // terminal/blocked status. Non-fatal: a reconcile failure must never
+        // change the exit code below.
+        if let Err(e) = kranz_engine::work::reconcile_ticket_for_mission(&repo, &mission) {
+            eprintln!("kranz run: warning: failed to reconcile linked ticket: {e}");
+        }
+
+        match status {
             MissionStatus::Complete => {
                 println!("mission {mission} COMPLETE");
                 return Ok(0);

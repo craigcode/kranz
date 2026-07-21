@@ -225,6 +225,13 @@ pub async fn cmd_exec(
     let status = run_result.map_err(|e| augment_limit_hint(e.into()))?;
     let code = exit_code_for(status);
 
+    // Reconcile the linked ticket's .status sidecar to match the mission's
+    // terminal/blocked status. Non-fatal: a reconcile failure must never
+    // change the exit code or the push behaviour below.
+    if let Err(e) = kranz_engine::work::reconcile_ticket_for_mission(&repo, &mission_id) {
+        eprintln!("kranz exec: warning: failed to reconcile linked ticket: {e}");
+    }
+
     // Cloud handoff: on a COMPLETE run, push the mission's kranz/* branch to the
     // requested remote so a human reviews it and opens the PR. GitRepo enforces
     // the kranz/* guard — this never pushes main or force-pushes. A push failure
