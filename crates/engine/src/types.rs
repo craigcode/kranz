@@ -66,6 +66,12 @@ pub struct Mission {
     /// declared): a deliberate, logged erosion of a safety guardrail.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny_exceptions: Vec<String>,
+    /// Which inference tier the Worker executes this mission on, applied at
+    /// seed time from the ticket's task class (see
+    /// [`crate::config::apply_executor_routing`]). `#[serde(default)]` folds
+    /// pre-existing logs to [`ExecutorTier::Frontier`].
+    #[serde(default)]
+    pub executor_tier: ExecutorTier,
 }
 
 // ---------------------------------------------------------------------------

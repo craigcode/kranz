@@ -425,6 +425,13 @@ fn initial_state(event: &Event) -> Result<MissionState> {
             command_grants: Vec::new(),
             touch_set: Vec::new(),
             deny_exceptions: Vec::new(),
+            executor_tier: if config.backend_kind(crate::types::Role::Worker)
+                == crate::types::BackendKind::Local
+            {
+                crate::types::ExecutorTier::Local
+            } else {
+                crate::types::ExecutorTier::Frontier
+            },
         },
         runs: BTreeMap::new(),
         totals: TokenUsage::default(),

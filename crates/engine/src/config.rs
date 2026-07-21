@@ -51,6 +51,43 @@ pub fn task_class_to_tier(task_class: Option<&str>) -> ExecutorTier {
     }
 }
 
+/// An operator-configured OpenAI-compatible endpoint the Worker can be routed
+/// to for the local tier. Mirrors [`crate::types::RoleConfig`]'s local-backend
+/// fields (`base_url`/`context_budget`/`temperature`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalEndpoint {
+    pub base_url: String,
+    pub context_budget: u32,
+    pub temperature: Option<f64>,
+}
+
+/// Apply executor-tier routing to a mission config at seed time, so a fresh
+/// mission's `mission.created` config already reflects the routing decision.
+/// Pure: never touches `config.validator_scrutiny` or `config.validator_functional`.
+///
+/// Returns the APPLIED tier, which may differ from the requested `tier`: a
+/// `Local` request with no configured endpoint fails safe to `Frontier`
+/// (leaving the Worker on its frontier default) rather than routing to an
+/// endpoint that doesn't exist.
+pub fn apply_executor_routing(
+    config: &mut MissionConfig,
+    tier: ExecutorTier,
+    local_endpoint: Option<&LocalEndpoint>,
+) -> ExecutorTier {
+    match (tier, local_endpoint) {
+        (ExecutorTier::Frontier, _) => ExecutorTier::Frontier,
+        (ExecutorTier::Local, None) => ExecutorTier::Frontier,
+        (ExecutorTier::Local, Some(endpoint)) => {
+            config.worker.backend = Some("local".to_string());
+            config.worker.base_url = Some(endpoint.base_url.clone());
+            config.worker.context_budget = Some(endpoint.context_budget);
+            config.worker.temperature = endpoint.temperature;
+            config.allow_below_default_worker_model = true;
+            ExecutorTier::Local
+        }
+    }
+}
+
 /// The backend-native model used when an older config selected a non-Claude
 /// backend but left the role's Claude default model in place. `Local` has no
 /// backend default: local model ids are free-form and sent to the endpoint
@@ -997,6 +1034,70 @@ mod tests {
             task_class_to_tier(Some("  Execution-Class ")),
             ExecutorTier::Local
         );
+    }
+
+    fn test_local_endpoint() -> LocalEndpoint {
+        LocalEndpoint {
+            base_url: "http://127.0.0.1:8080".to_string(),
+            context_budget: 16_384,
+            temperature: Some(0.2),
+        }
+    }
+
+    #[test]
+    fn executor_routing_applies_local_backend_when_execution_class_and_endpoint_configured() {
+        let mut cfg = MissionConfig::default();
+        let validator_scrutiny_before = cfg.validator_scrutiny.clone();
+        let validator_functional_before = cfg.validator_functional.clone();
+        let endpoint = test_local_endpoint();
+
+        let applied =
+            apply_executor_routing(&mut cfg, ExecutorTier::Local, Some(&endpoint));
+
+        assert_eq!(applied, ExecutorTier::Local);
+        assert_eq!(cfg.worker.backend.as_deref(), Some("local"));
+        assert_eq!(cfg.worker.base_url.as_deref(), Some(endpoint.base_url.as_str()));
+        assert_eq!(cfg.worker.context_budget, Some(endpoint.context_budget));
+        assert_eq!(cfg.worker.temperature, endpoint.temperature);
+        assert!(cfg.allow_below_default_worker_model);
+        assert_eq!(cfg.validator_scrutiny, validator_scrutiny_before);
+        assert_eq!(cfg.validator_functional, validator_functional_before);
+    }
+
+    #[test]
+    fn executor_routing_applies_fail_safe_frontier_when_no_endpoint_configured() {
+        let mut cfg = MissionConfig::default();
+        let worker_backend_before = cfg.worker.backend.clone();
+
+        let applied = apply_executor_routing(&mut cfg, ExecutorTier::Local, None);
+
+        assert_eq!(applied, ExecutorTier::Frontier);
+        assert_eq!(cfg.worker.backend, worker_backend_before);
+        assert!(!cfg.allow_below_default_worker_model);
+    }
+
+    #[test]
+    fn executor_routing_applies_no_change_for_frontier_tier() {
+        let mut cfg = MissionConfig::default();
+        let before = cfg.clone();
+        let endpoint = test_local_endpoint();
+
+        let applied =
+            apply_executor_routing(&mut cfg, ExecutorTier::Frontier, Some(&endpoint));
+
+        assert_eq!(applied, ExecutorTier::Frontier);
+        assert_eq!(cfg, before);
+    }
+
+    #[test]
+    fn validator_stays_frontier_after_local_executor_routing() {
+        let mut cfg = MissionConfig::default();
+        let endpoint = test_local_endpoint();
+
+        apply_executor_routing(&mut cfg, ExecutorTier::Local, Some(&endpoint));
+
+        assert_ne!(cfg.validator_scrutiny.backend.as_deref(), Some("local"));
+        assert_ne!(cfg.validator_functional.backend.as_deref(), Some("local"));
     }
 
     trait RoleConfigTestExt {

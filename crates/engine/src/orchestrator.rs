@@ -907,6 +907,14 @@ impl MissionEngine {
         Ok(())
     }
 
+    /// Public entry point for callers outside this module (e.g. the ticket
+    /// draft seeding path) to record an `orchestrator.decision`, such as the
+    /// executor-tier routing choice made when a mission is created from a
+    /// ticket.
+    pub fn record_decision(&mut self, summary: &str, detail: Option<String>) -> Result<()> {
+        self.emit_decision(summary, detail)
+    }
+
     /// Choose the backend for a role and return a config clone whose role
     /// model has been normalized for the backend actually used.
     ///
@@ -8403,6 +8411,7 @@ mod tests {
                 command_grants: vec![],
                 touch_set: vec![],
                 deny_exceptions: vec![],
+                executor_tier: Default::default(),
             },
             runs,
             totals: TokenUsage::default(),

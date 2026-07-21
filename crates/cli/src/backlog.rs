@@ -301,6 +301,37 @@ fn config_for_ticket(
     cfg
 }
 
+/// Route the executor tier for a mission seeded from `ticket`, so the
+/// resulting `mission.created` config already reflects the routing. Returns
+/// the applied tier and a decision summary to record against the mission
+/// once it exists.
+fn apply_ticket_executor_routing(
+    cfg: &mut kranz_engine::types::MissionConfig,
+    ticket: &Ticket,
+) -> (kranz_engine::types::ExecutorTier, &'static str) {
+    use kranz_engine::config::{apply_executor_routing, task_class_to_tier, LocalEndpoint};
+    use kranz_engine::types::ExecutorTier;
+
+    let requested = task_class_to_tier(ticket.task_class.as_deref());
+    let local_endpoint = match (&cfg.worker.base_url, cfg.worker.context_budget) {
+        (Some(base_url), Some(context_budget)) => Some(LocalEndpoint {
+            base_url: base_url.clone(),
+            context_budget,
+            temperature: cfg.worker.temperature,
+        }),
+        _ => None,
+    };
+    let applied = apply_executor_routing(cfg, requested, local_endpoint.as_ref());
+    let summary = match (requested, applied) {
+        (ExecutorTier::Local, ExecutorTier::Local) => "executor routed local (execution-class)",
+        (ExecutorTier::Local, ExecutorTier::Frontier) => {
+            "execution-class ticket but no local endpoint configured; executor stays frontier"
+        }
+        _ => "executor stays frontier",
+    };
+    (applied, summary)
+}
+
 /// `kranz draft <slug> [--yes]`: non-interactive plan drafting.
 ///
 /// Sets the ticket Drafting, creates a mission seeded with the whole ticket,
@@ -319,7 +350,8 @@ pub async fn cmd_draft(
     dangerously_allow_all: bool,
 ) -> Result<i32> {
     let ticket = load_ticket(&repo, slug)?;
-    let cfg = config_for_ticket(load_config(&repo, dangerously_allow_all)?, &ticket);
+    let mut cfg = config_for_ticket(load_config(&repo, dangerously_allow_all)?, &ticket);
+    let (_applied_tier, routing_summary) = apply_ticket_executor_routing(&mut cfg, &ticket);
     let backend = build_backend(&cfg)?;
 
     // Remember where the operator was: parking the plan checks out the
@@ -328,6 +360,7 @@ pub async fn cmd_draft(
         .ok()
         .and_then(|g| g.current_branch().ok());
     let mut engine = MissionEngine::create(backend, repo.clone(), &ticket.mission_goal(), cfg)?;
+    engine.record_decision(routing_summary, None)?;
     println!(
         "drafting ticket '{slug}' as mission {}",
         engine.mission_id()
