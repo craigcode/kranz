@@ -10,7 +10,10 @@
 
 use crate::backend_readiness::{self, DrainDecision};
 use crate::deps;
+use crate::event_log::EventLog;
+use crate::paths::MissionPaths;
 use crate::queue::{self, QueueEntry};
+use crate::reducer;
 use crate::ticket::{Ticket, TicketState};
 use crate::types::MissionStatus;
 use anyhow::Result;
@@ -67,14 +70,72 @@ pub fn work_skip_for_failed_blocker(repo_root: &Path, slug: &str) -> Result<Opti
     Ok(None)
 }
 
-/// Map a terminal mission status to the ticket state recorded after a run.
+/// Map a terminal (or blocked) mission status to the ticket state recorded
+/// after a run. Only called by [`reconcile_ticket_for_mission`] for
+/// terminal/blocked statuses — live statuses are gated out before this runs.
 pub fn ticket_state_for_mission(status: MissionStatus) -> TicketState {
     match status {
         MissionStatus::Complete => TicketState::Done,
-        // Blocked/Failed/anything-non-complete leaves the ticket Failed so it
-        // resurfaces in `ticket list` for a human to pick back up.
+        MissionStatus::Failed => TicketState::Failed,
+        MissionStatus::Abandoned => TicketState::Failed,
+        // Blocked is needs-input, not a failure: the mission is waiting on a
+        // human, so the ticket should resurface as NeedsContext, not Failed.
+        MissionStatus::Blocked => TicketState::NeedsContext,
         _ => TicketState::Failed,
     }
+}
+
+/// The single authoritative reconcile helper: given a mission id, reverse-
+/// looks-up its linked ticket and, if the mission's folded status is
+/// terminal-or-blocked, writes the mapped [`TicketState`] to the ticket's
+/// `.status` sidecar. LIVE statuses (Running/Validating/Paused/Approved/
+/// Planning) are a no-op — the ticket is still mid-flight and must not be
+/// clobbered. Every path that can drive a mission to a terminal (or blocked)
+/// state — `kranz run`, `kranz exec`, REST `/start`, the drain loop — should
+/// call this instead of writing the ticket state itself, so the stale-
+/// "Failed" heal case and the Blocked-to-NeedsContext mapping live in one
+/// place.
+///
+/// Defensive by design (mirrors [`crate::merged::ticket_merged`]): an
+/// unlinked or unloadable mission is `Ok(None)`, never an error — reconcile
+/// must never fail the caller's terminal-state transition.
+pub fn reconcile_ticket_for_mission(
+    repo_root: &Path,
+    mission_id: &str,
+) -> crate::error::Result<Option<(String, TicketState)>> {
+    let Some(slug) = Ticket::slug_for_mission(repo_root, mission_id) else {
+        return Ok(None);
+    };
+
+    let paths = MissionPaths::new(repo_root, mission_id);
+    if !paths.events_file().is_file() {
+        return Ok(None);
+    }
+    let Ok(events) = EventLog::read_events(&paths.events_file()) else {
+        return Ok(None);
+    };
+    let Ok(state) = reducer::fold(&events) else {
+        return Ok(None);
+    };
+
+    let status = state.mission.status;
+    if !matches!(
+        status,
+        MissionStatus::Complete
+            | MissionStatus::Failed
+            | MissionStatus::Abandoned
+            | MissionStatus::Blocked
+    ) {
+        return Ok(None);
+    }
+
+    let mapped = ticket_state_for_mission(status);
+    let current = Ticket::read_state(repo_root, &slug);
+    if current == mapped {
+        return Ok(None);
+    }
+    Ticket::write_state(repo_root, &slug, mapped, None)?;
+    Ok(Some((slug, mapped)))
 }
 
 /// Map a `run_mission` exit code to the ticket's terminal state (0 → Done,
@@ -344,6 +405,9 @@ fn rotate_entry_to_back(repo_root: &Path, entry: &QueueEntry) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::{Event, EventKind};
+    use crate::types::MissionConfig;
+    use chrono::Utc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -393,10 +457,14 @@ mod tests {
         );
         assert_eq!(
             ticket_state_for_mission(MissionStatus::Blocked),
-            TicketState::Failed
+            TicketState::NeedsContext
         );
         assert_eq!(
             ticket_state_for_mission(MissionStatus::Failed),
+            TicketState::Failed
+        );
+        assert_eq!(
+            ticket_state_for_mission(MissionStatus::Abandoned),
             TicketState::Failed
         );
     }
@@ -405,6 +473,134 @@ mod tests {
         let dir = Ticket::tickets_dir(repo);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(format!("{slug}.md")), body).unwrap();
+    }
+
+    /// Write a hand-built events.jsonl for `mission_id` under `repo_root`
+    /// (mirrors `merged_test.rs::write_events`).
+    fn write_events(repo_root: &Path, mission_id: &str, kinds: Vec<EventKind>) {
+        let dir = repo_root.join(".kranz").join("missions").join(mission_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut lines = String::new();
+        for (i, kind) in kinds.into_iter().enumerate() {
+            let event = Event {
+                seq: (i + 1) as u64,
+                ts: Utc::now(),
+                mission_id: mission_id.to_string(),
+                kind,
+            };
+            lines.push_str(&serde_json::to_string(&event).unwrap());
+            lines.push('\n');
+        }
+        std::fs::write(dir.join("events.jsonl"), lines).unwrap();
+    }
+
+    fn created() -> EventKind {
+        EventKind::MissionCreated {
+            goal: "fixture mission".to_string(),
+            base_branch: "main".to_string(),
+            mission_branch: "kranz/mission-fixture".to_string(),
+            config: MissionConfig::default(),
+        }
+    }
+
+    fn scaffold_ticket(repo_root: &Path, slug: &str, mission_id: &str, state: TicketState) {
+        Ticket::scaffold(repo_root, slug, "fixture ticket", None, None).unwrap();
+        Ticket::record_mission(repo_root, slug, mission_id).unwrap();
+        Ticket::write_state(repo_root, slug, state, None).unwrap();
+    }
+
+    fn plan_with_one_milestone() -> crate::types::Plan {
+        crate::types::Plan {
+            goal: "fixture goal".to_string(),
+            validation_contract: vec![],
+            milestones: vec![crate::types::PlanMilestone {
+                title: "milestone one".to_string(),
+                features: vec![crate::types::PlanFeature {
+                    title: "feature one".to_string(),
+                    spec: "spec".to_string(),
+                    validation_criteria: vec!["works".to_string()],
+                }],
+            }],
+            considered_alternatives: None,
+            command_grants: vec![],
+            touch_set: vec![],
+        }
+    }
+
+    #[test]
+    fn reconcile_on_terminal_maps_complete_to_done() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        scaffold_ticket(repo, "my-ticket", "m1", TicketState::Running);
+        write_events(repo, "m1", vec![created(), EventKind::MissionCompleted {}]);
+
+        let result = reconcile_ticket_for_mission(repo, "m1").unwrap();
+        assert_eq!(result, Some(("my-ticket".to_string(), TicketState::Done)));
+        assert_eq!(Ticket::read_state(repo, "my-ticket"), TicketState::Done);
+    }
+
+    #[test]
+    fn reconcile_heals_failed_to_done() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        scaffold_ticket(repo, "my-ticket", "m1", TicketState::Failed);
+        write_events(repo, "m1", vec![created(), EventKind::MissionCompleted {}]);
+
+        let result = reconcile_ticket_for_mission(repo, "m1").unwrap();
+        assert_eq!(result, Some(("my-ticket".to_string(), TicketState::Done)));
+        assert_eq!(Ticket::read_state(repo, "my-ticket"), TicketState::Done);
+    }
+
+    #[test]
+    fn blocked_reconciles_to_needs_you() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        scaffold_ticket(repo, "my-ticket", "m1", TicketState::Running);
+        write_events(
+            repo,
+            "m1",
+            vec![
+                created(),
+                EventKind::PlanApproved {
+                    plan: plan_with_one_milestone(),
+                    base_sha: None,
+                },
+                EventKind::MilestoneBlocked {
+                    milestone_id: "ms-1".to_string(),
+                    reason: "needs input".to_string(),
+                },
+            ],
+        );
+
+        let result = reconcile_ticket_for_mission(repo, "m1").unwrap();
+        assert_eq!(
+            result,
+            Some(("my-ticket".to_string(), TicketState::NeedsContext))
+        );
+        assert_eq!(
+            Ticket::read_state(repo, "my-ticket"),
+            TicketState::NeedsContext
+        );
+    }
+
+    #[test]
+    fn reconcile_returns_none_when_no_linked_ticket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        write_events(repo, "m1", vec![created(), EventKind::MissionCompleted {}]);
+
+        assert_eq!(reconcile_ticket_for_mission(repo, "m1").unwrap(), None);
+    }
+
+    #[test]
+    fn reconcile_returns_none_when_mission_status_is_live() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        scaffold_ticket(repo, "my-ticket", "m1", TicketState::Running);
+        write_events(repo, "m1", vec![created()]);
+
+        assert_eq!(reconcile_ticket_for_mission(repo, "m1").unwrap(), None);
+        assert_eq!(Ticket::read_state(repo, "my-ticket"), TicketState::Running);
     }
 
     fn proceed_report(mission_id: &str) -> backend_readiness::ReadinessReport {
