@@ -3,6 +3,7 @@
 //! so tests can assert on the exact output.
 
 use kranz_engine::cost::{Confidence, CostEstimate, MIN_CALIBRATION_MISSIONS};
+use kranz_engine::outcomes::Outcomes;
 use kranz_engine::types::{
     AssertionCheck, FeatureStatus, MilestoneStatus, MissionState, MissionStatus, Plan,
 };
@@ -227,6 +228,74 @@ pub fn render_cost_estimate(estimate: &CostEstimate, missions_used: usize) -> St
     }
 }
 
+/// Render `kranz outcomes`'s default text view: an Autonomy section always,
+/// then Grant latency and Escalation ledger sections — unless there is no
+/// history at all (no closed missions, no escalations, no decided grants),
+/// in which case only the Autonomy section (zeros) plus a short note is
+/// printed, per the spec's empty-history rule.
+pub fn render_outcomes(outcomes: &Outcomes) -> String {
+    let ratio = &outcomes.autonomy_ratio;
+    let mut out = String::new();
+
+    out.push_str("Autonomy\n");
+    out.push_str(&format!(
+        "  interventions per closed mission: {:.2}\n",
+        ratio.interventions_per_closed_mission
+    ));
+    out.push_str(&format!(
+        "  zero-intervention share: {:.0}%\n",
+        ratio.zero_intervention_share * 100.0
+    ));
+    out.push_str(&format!("  closed missions: {}\n", ratio.closed_missions));
+
+    let has_history = ratio.closed_missions > 0
+        || !outcomes.escalations.is_empty()
+        || outcomes.grant_latency.total_decided > 0;
+
+    if !has_history {
+        out.push('\n');
+        out.push_str("no grants or escalations recorded yet\n");
+        return out;
+    }
+
+    out.push('\n');
+    out.push_str("Grant latency\n");
+    for bucket in &outcomes.grant_latency.buckets {
+        out.push_str(&format!("  {}: {}\n", bucket.label, bucket.count));
+    }
+    out.push_str(&format!(
+        "  total decided: {}\n",
+        outcomes.grant_latency.total_decided
+    ));
+
+    out.push('\n');
+    out.push_str("Escalation ledger\n");
+    for row in &outcomes.escalations {
+        let latency = row
+            .latency_ms
+            .map(|ms| format!("{ms}ms"))
+            .unwrap_or_else(|| "-".to_string());
+        out.push_str(&format!(
+            "  {}  {}  {:?}  {}  {}  {}\n",
+            row.ts.to_rfc3339(),
+            row.mission_id,
+            row.kind,
+            row.summary,
+            row.decision,
+            latency
+        ));
+    }
+
+    out
+}
+
+/// Serialize `kranz outcomes --json`'s output — the source of truth for the
+/// dashboard/Slack "identical data" claim (see the module doc for the
+/// outcomes fold).
+pub fn render_outcomes_json(outcomes: &Outcomes) -> anyhow::Result<String> {
+    Ok(serde_json::to_string_pretty(outcomes)?)
+}
+
 /// Collapse whitespace/newlines into single spaces and truncate to `max`
 /// characters (char-safe; appends `…` when truncated).
 pub fn one_line(text: &str, max: usize) -> String {
@@ -248,6 +317,103 @@ mod tests {
     use kranz_engine::types::{
         Assertion, AssertionCheck, MissionConfig, Plan, PlanFeature, PlanMilestone,
     };
+
+    mod outcomes_cli {
+        use super::*;
+        use kranz_engine::event_log::{EventLog, LockForce};
+        use kranz_engine::events::EventKind;
+        use kranz_engine::outcomes::compute_outcomes;
+        use kranz_engine::paths::MissionPaths;
+        use kranz_engine::types::{GrantKind, MissionConfig};
+        use std::time::Duration;
+        use tempfile::TempDir;
+
+        fn seed_mission(repo_root: &std::path::Path, id: &str, kinds: Vec<EventKind>) {
+            let paths = MissionPaths::new(repo_root, id);
+            let mut log = EventLog::acquire(&paths, id, Duration::ZERO, LockForce::No).unwrap();
+            for kind in kinds {
+                log.append(kind).unwrap();
+            }
+        }
+
+        fn created(goal: &str) -> EventKind {
+            EventKind::MissionCreated {
+                goal: goal.into(),
+                base_branch: "main".into(),
+                mission_branch: "kranz/mission-x".into(),
+                config: MissionConfig::default(),
+            }
+        }
+
+        #[test]
+        fn outcomes_cli_json_round_trips_to_compute_outcomes_value() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            seed_mission(
+                root,
+                "m-1",
+                vec![
+                    created("goal"),
+                    EventKind::GrantRequested {
+                        milestone_id: "ms-1".into(),
+                        kind: GrantKind::Command,
+                        command: "cargo test".into(),
+                    },
+                    EventKind::GrantApproved {
+                        kind: GrantKind::Command,
+                        command: "cargo test".into(),
+                    },
+                    EventKind::MissionCompleted {},
+                ],
+            );
+
+            let expected = compute_outcomes(root).unwrap();
+            let json = render_outcomes_json(&expected).unwrap();
+            let round_tripped: Outcomes = serde_json::from_str(&json).unwrap();
+            assert_eq!(round_tripped, expected);
+        }
+
+        #[test]
+        fn outcomes_cli_empty_history_text_shows_autonomy_alone() {
+            let tmp = TempDir::new().unwrap();
+            let outcomes = compute_outcomes(tmp.path()).unwrap();
+
+            let text = render_outcomes(&outcomes);
+            assert!(text.contains("Autonomy"));
+            assert!(text.contains("no grants or escalations recorded yet"));
+            assert!(!text.contains("Grant latency"));
+            assert!(!text.contains("Escalation ledger"));
+        }
+
+        #[test]
+        fn outcomes_cli_populated_text_includes_all_three_sections() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            seed_mission(
+                root,
+                "m-1",
+                vec![
+                    created("goal"),
+                    EventKind::GrantRequested {
+                        milestone_id: "ms-1".into(),
+                        kind: GrantKind::Command,
+                        command: "cargo test".into(),
+                    },
+                    EventKind::GrantApproved {
+                        kind: GrantKind::Command,
+                        command: "cargo test".into(),
+                    },
+                    EventKind::MissionCompleted {},
+                ],
+            );
+
+            let outcomes = compute_outcomes(root).unwrap();
+            let text = render_outcomes(&outcomes);
+            assert!(text.contains("Autonomy"));
+            assert!(text.contains("Grant latency"));
+            assert!(text.contains("Escalation ledger"));
+        }
+    }
 
     #[test]
     fn approved_status_label_is_uppercase() {
