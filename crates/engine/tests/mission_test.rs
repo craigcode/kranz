@@ -424,6 +424,18 @@ fn waive_reply(subject: &str, reason: &str) -> String {
     .to_string()
 }
 
+/// Conversion-turn reply that marks the given subject an author-broken
+/// command assertion (escalate-to-operator route).
+fn command_broken_reply(subject: &str, diagnosis: &str) -> String {
+    json!({
+        "fixFeatures": [],
+        "waived": [],
+        "commandBroken": [{ "subject": subject, "diagnosis": diagnosis }],
+        "summary": "escalating a possibly author-broken assertion"
+    })
+    .to_string()
+}
+
 /// Parallelization decision reply (roadmap M3): the listed feature ids are
 /// independent and merge in the given order.
 fn parallel_plan(ids: &[&str]) -> String {
@@ -1212,6 +1224,155 @@ async fn command_assertion_at_final_gate_is_non_waivable() {
                 if summary.contains("refused waive") && summary.contains("a-1")
         )),
         "must surface the refuse-waive decision: {types:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 3d-2. Author-broken command assertions escalate to the operator (f-1-1)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn command_broken_assertion_escalates_to_operator() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    // Portable failing command, same shape as the non-waivable test. This
+    // time the orchestrator judges it author-broken instead of trying to
+    // waive it — the escalation route must block immediately with the
+    // fix-cycle cap left untouched.
+    let contract = vec![assertion(
+        "a-1",
+        "the build succeeds",
+        Some("cd kranz-no-such-dir"),
+    )];
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            command_broken_reply("a-1", "grep can only match pre-change; false negative"),
+        ]),
+    ]));
+
+    let cfg = MissionConfig {
+        max_fix_cycles_per_milestone: 1,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, contract)).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Blocked);
+
+    let ms = &engine.state().mission.milestones[0];
+    assert_eq!(ms.fix_cycles, 0, "escalation must not spend a fix cycle");
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+    let types = event_types(&events);
+    assert!(
+        !types.contains(&"fixfeature.created"),
+        "escalation must not synthesize a fix feature: {types:?}"
+    );
+    assert!(
+        !types.contains(&"mission.completed"),
+        "escalation must not complete the mission: {types:?}"
+    );
+    let blocked = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::MilestoneBlocked { reason, .. } => Some(reason.clone()),
+            _ => None,
+        })
+        .expect("milestone.blocked event present");
+    assert!(
+        blocked.contains("a-1"),
+        "blocked reason names the assertion id: {blocked}"
+    );
+    let lower = blocked.to_lowercase();
+    assert!(
+        lower.contains("evidence"),
+        "blocked reason mentions evidence: {blocked}"
+    );
+    assert!(
+        lower.contains("buggy") || lower.contains("false negative"),
+        "blocked reason indicates the assertion appears broken: {blocked}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn noncommand_finding_marked_command_broken_does_not_escalate() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    // Same shape as validation_round_creates_fix_feature_then_completes,
+    // except the conversion turn (wrongly) marks the validator finding
+    // commandBroken. Validator findings always carry class == "" (never
+    // "command-assertion"), so convert_findings' escape-hatch guard must
+    // drop the mislabelled escalation and route it through the normal fix
+    // path instead.
+    let finding = json!([{
+        "subject": "part 1 works",
+        "severity": "major",
+        "evidence": "the endpoint returns 500 on empty input",
+        "suggestedFix": "guard empty input"
+    }]);
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            command_broken_reply("part 1 works", "wrongly claimed author-broken"),
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+        validator_with(finding),
+        worker_pass(),
+        validator_with(json!([])),
+    ]));
+
+    let cfg = MissionConfig {
+        skip_functional: false,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+
+    let state = engine.state();
+    let ms = &state.mission.milestones[0];
+    assert_eq!(
+        ms.fix_cycles, 1,
+        "mislabelled escalation must be treated as a normal fix"
+    );
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+    let types = event_types(&events);
+    assert!(
+        types.contains(&"fixfeature.created"),
+        "mislabelled escalation must still route to a fix feature: {types:?}"
+    );
+    assert!(
+        !types.contains(&"milestone.blocked"),
+        "mislabelled escalation must not block: {types:?}"
     );
 }
 

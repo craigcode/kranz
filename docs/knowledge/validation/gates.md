@@ -83,7 +83,15 @@ Once all milestones complete, `final_gate()` runs the mission's
 Empty findings → `complete_mission()`. Otherwise findings route through
 `convert_findings`: a waive-all answer completes the mission; a fix answer
 reopens the last milestone with fix features (until the fix-cycle cap, then
-`MilestoneBlocked`).
+`MilestoneBlocked`). A third route exists only for `command-assertion`
+findings: if the orchestrator judges a failing command assertion
+author-broken (a false negative — the requirement is genuinely met, verified
+by the milestones that already passed, but the assertion's own command is
+wrong), it escalates straight to the operator via `MilestoneBlocked` with the
+failing-command evidence attached, spending no fix cycle. The guard in
+`convert_findings` honors this verdict only for findings whose
+`class == "command-assertion"`; a mislabelled non-command finding falls
+through to the normal fix/waive handling.
 
 ## Merge pre-gate
 
