@@ -74,6 +74,27 @@ fn parses_full_frontmatter_and_all_sections() {
 }
 
 #[test]
+fn task_class_routing_parses_task_class_from_frontmatter() {
+    let md = "\
+---
+title: Bump a dependency
+task-class: execution-class
+---
+
+## Goal
+Bump the dependency.
+";
+    let t = Ticket::parse("bump-dep", md).unwrap();
+    assert_eq!(t.task_class, Some("execution-class".to_string()));
+}
+
+#[test]
+fn task_class_routing_absent_key_yields_none() {
+    let t = Ticket::parse("rate-limit", FULL).unwrap();
+    assert_eq!(t.task_class, None);
+}
+
+#[test]
 fn missing_frontmatter_uses_defaults_and_heading_title() {
     let md = "\
 # Improve caching

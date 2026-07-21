@@ -14,7 +14,7 @@
 use crate::cost::{DEFAULT_CODEX_MODEL, DEFAULT_DROID_MODEL, DEFAULT_KIMI_MODEL};
 use crate::error::{EngineError, Result};
 use crate::paths;
-use crate::types::{BackendKind, MissionConfig, Role};
+use crate::types::{BackendKind, ExecutorTier, MissionConfig, Role};
 use std::path::{Path, PathBuf};
 
 /// Reasoning-effort values accepted by `claude --effort`.
@@ -37,6 +37,17 @@ pub fn parse_backend(raw: Option<&str>) -> std::result::Result<BackendKind, Stri
         Some("kimi") => Ok(BackendKind::Kimi),
         Some("local") => Ok(BackendKind::Local),
         Some(other) => Err(other.to_string()),
+    }
+}
+
+/// Deterministically map a ticket's `task-class` frontmatter to an executor
+/// tier. Literal table only — no heuristics: `execution-class` (case- and
+/// whitespace-insensitive) routes to [`ExecutorTier::Local`]; every other
+/// value, including absence, stays on [`ExecutorTier::Frontier`].
+pub fn task_class_to_tier(task_class: Option<&str>) -> ExecutorTier {
+    match task_class.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(ref s) if s == "execution-class" => ExecutorTier::Local,
+        _ => ExecutorTier::Frontier,
     }
 }
 
@@ -956,6 +967,35 @@ mod tests {
         assert_eq!(
             effective_model(Role::Worker, BackendKind::Local, "sonnet"),
             "sonnet"
+        );
+    }
+
+    #[test]
+    fn task_class_routing_maps_execution_class_to_local() {
+        assert_eq!(
+            task_class_to_tier(Some("execution-class")),
+            ExecutorTier::Local
+        );
+    }
+
+    #[test]
+    fn task_class_routing_defaults_to_frontier() {
+        assert_eq!(
+            task_class_to_tier(Some("planning-class")),
+            ExecutorTier::Frontier
+        );
+        assert_eq!(
+            task_class_to_tier(Some("some-arbitrary-value")),
+            ExecutorTier::Frontier
+        );
+        assert_eq!(task_class_to_tier(None), ExecutorTier::Frontier);
+    }
+
+    #[test]
+    fn task_class_routing_is_case_and_whitespace_insensitive() {
+        assert_eq!(
+            task_class_to_tier(Some("  Execution-Class ")),
+            ExecutorTier::Local
         );
     }
 

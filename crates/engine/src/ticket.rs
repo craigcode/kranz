@@ -62,6 +62,9 @@ pub struct Ticket {
     /// Slugs of tickets that must reach a Complete mission before this one
     /// can be approved (`blocked-by: [a, b]` frontmatter).
     pub blocked_by: Vec<String>,
+    /// Backlog task class (`task-class: execution-class` frontmatter), used
+    /// to route the executor to a tier via [`crate::config::task_class_to_tier`].
+    pub task_class: Option<String>,
     /// The full markdown body (everything after the frontmatter block).
     pub raw_body: String,
 }
@@ -209,6 +212,7 @@ impl Ticket {
         let mut schedule = Schedule::Once;
         let mut max_budget_usd: Option<f64> = None;
         let mut blocked_by: Vec<String> = Vec::new();
+        let mut task_class: Option<String> = None;
 
         for (key, value) in front {
             match key.as_str() {
@@ -224,6 +228,10 @@ impl Ticket {
                 // but tolerate the camelCase a hand-editor might type.
                 "repo-refs" | "reporefs" => repo_refs = value.list(),
                 "blocked-by" | "blockedby" => blocked_by = value.list(),
+                "task-class" | "taskclass" => {
+                    let v = value.scalar().trim().to_string();
+                    task_class = if v.is_empty() { None } else { Some(v) };
+                }
                 "schedule" => schedule = Schedule::parse(&value.scalar()),
                 "maxbudgetusd" | "max-budget-usd" => {
                     if let Ok(b) = value.scalar().parse::<f64>() {
@@ -260,6 +268,7 @@ impl Ticket {
             scoping_answers: sections.scoping_answers,
             acceptance_hints: sections.acceptance_hints,
             blocked_by,
+            task_class,
             raw_body: body,
         })
     }

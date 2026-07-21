@@ -517,6 +517,22 @@ impl BackendKind {
     }
 }
 
+/// Which inference tier executes a ticket, derived deterministically from its
+/// `task-class` frontmatter via [`crate::config::task_class_to_tier`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExecutorTier {
+    Local,
+    Frontier,
+}
+
+impl Default for ExecutorTier {
+    /// Frontier is the safe default when no task class is present or recognized.
+    fn default() -> Self {
+        ExecutorTier::Frontier
+    }
+}
+
 /// How worker/validator sessions are isolated from the primary checkout.
 ///
 /// Default is [`Worktree`]: the primary checkout must stay byte-untouched
