@@ -285,6 +285,82 @@ pub fn mission_outcomes(mission_id: &str, events: &[Event]) -> MissionOutcomes {
     }
 }
 
+/// Enumerate every mission under `repo_root` exactly as
+/// [`crate::orchestrator`]'s REST-layer callers do — union
+/// [`crate::paths::MissionPaths::list_missions`] with the ids recorded in
+/// `.kranz/missions/index.md` — fold each mission's outcomes, and aggregate.
+/// A mission with no `events.jsonl` or an unreadable/corrupt log is skipped
+/// (degrade per-row); this never panics or fails the whole aggregate.
+pub fn compute_outcomes(repo_root: &std::path::Path) -> anyhow::Result<Outcomes> {
+    let index_contents = std::fs::read_to_string(
+        crate::paths::MissionPaths::new(repo_root, "_")
+            .missions_dir()
+            .join("index.md"),
+    )
+    .unwrap_or_default();
+
+    let mut ids = crate::paths::MissionPaths::list_missions(repo_root);
+    for id in crate::orchestrator::mission_index_ids(&index_contents) {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids.sort();
+
+    let mut closed_missions: u64 = 0;
+    let mut total_interventions: u64 = 0;
+    let mut zero_intervention_missions: u64 = 0;
+    let mut all_latencies_ms = Vec::new();
+    let mut escalations = Vec::new();
+
+    for id in ids {
+        let paths = crate::paths::MissionPaths::new(repo_root, &id);
+        let events_path = paths.events_file();
+        if !events_path.is_file() {
+            continue;
+        }
+        let events = match crate::event_log::EventLog::read_events(&events_path) {
+            Ok(events) => events,
+            Err(_) => continue,
+        };
+        let out = mission_outcomes(&id, &events);
+        if out.is_closed {
+            closed_missions += 1;
+            total_interventions += out.interventions;
+            if out.interventions == 0 {
+                zero_intervention_missions += 1;
+            }
+        }
+        all_latencies_ms.extend(out.latencies_ms);
+        escalations.extend(out.escalations);
+    }
+
+    let interventions_per_closed_mission = if closed_missions > 0 {
+        total_interventions as f64 / closed_missions as f64
+    } else {
+        0.0
+    };
+    let zero_intervention_share = if closed_missions > 0 {
+        zero_intervention_missions as f64 / closed_missions as f64
+    } else {
+        0.0
+    };
+
+    escalations.sort_by(|a, b| b.ts.cmp(&a.ts));
+
+    Ok(Outcomes {
+        autonomy_ratio: AutonomyRatio {
+            closed_missions,
+            total_interventions,
+            interventions_per_closed_mission,
+            zero_intervention_missions,
+            zero_intervention_share,
+        },
+        grant_latency: bucketize(&all_latencies_ms),
+        escalations,
+    })
+}
+
 /// Bucket grant-decision latencies into the four fixed windows, always
 /// present (count 0 when empty) and in fixed order.
 pub fn bucketize(latencies_ms: &[u64]) -> GrantLatency {
@@ -684,6 +760,228 @@ mod tests {
             considered_alternatives: None,
             command_grants: vec![],
             touch_set: vec![],
+        }
+    }
+
+    mod compute_outcomes_tests {
+        use super::*;
+        use crate::event_log::{EventLog, LockForce};
+        use crate::paths::MissionPaths;
+        use crate::types::{GrantKind, MissionConfig};
+        use std::time::Duration;
+        use tempfile::TempDir;
+
+        /// Seed a mission's `events.jsonl` with the given kinds, in order.
+        fn seed_mission(repo_root: &std::path::Path, id: &str, kinds: Vec<EventKind>) {
+            let paths = MissionPaths::new(repo_root, id);
+            let mut log = EventLog::acquire(&paths, id, Duration::ZERO, LockForce::No).unwrap();
+            for kind in kinds {
+                log.append(kind).unwrap();
+            }
+        }
+
+        fn created(goal: &str) -> EventKind {
+            EventKind::MissionCreated {
+                goal: goal.into(),
+                base_branch: "main".into(),
+                mission_branch: "kranz/mission-x".into(),
+                config: MissionConfig::default(),
+            }
+        }
+
+        #[test]
+        fn outcomes_ratio_denominator_is_closed_missions() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+
+            // Closed mission with two interventions after plan approval.
+            seed_mission(
+                root,
+                "m-closed",
+                vec![
+                    created("closed one"),
+                    EventKind::PlanApproved {
+                        plan: sample_plan(),
+                        base_sha: None,
+                    },
+                    EventKind::GrantApproved {
+                        kind: GrantKind::Command,
+                        command: "cargo test".into(),
+                    },
+                    EventKind::GrantDenied {
+                        kind: GrantKind::Command,
+                        command: "rm -rf".into(),
+                        reason: "no".into(),
+                    },
+                    EventKind::MissionCompleted {},
+                ],
+            );
+
+            // Open mission — must be excluded from the ratio denominator
+            // even though it has interventions recorded.
+            seed_mission(
+                root,
+                "m-open",
+                vec![
+                    created("still running"),
+                    EventKind::PlanApproved {
+                        plan: sample_plan(),
+                        base_sha: None,
+                    },
+                    EventKind::GrantApproved {
+                        kind: GrantKind::Command,
+                        command: "echo hi".into(),
+                    },
+                ],
+            );
+
+            let outcomes = compute_outcomes(root).unwrap();
+            let ratio = outcomes.autonomy_ratio;
+            assert_eq!(ratio.closed_missions, 1);
+            assert_eq!(ratio.total_interventions, 2);
+            assert_eq!(ratio.interventions_per_closed_mission, 2.0);
+            assert_eq!(ratio.zero_intervention_missions, 0);
+            assert_eq!(ratio.zero_intervention_share, 0.0);
+        }
+
+        #[test]
+        fn outcomes_ratio_zero_intervention_share_counts_clean_closed_missions() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+
+            seed_mission(
+                root,
+                "m-clean",
+                vec![
+                    created("clean"),
+                    EventKind::PlanApproved {
+                        plan: sample_plan(),
+                        base_sha: None,
+                    },
+                    EventKind::MissionCompleted {},
+                ],
+            );
+            seed_mission(
+                root,
+                "m-dirty",
+                vec![
+                    created("dirty"),
+                    EventKind::PlanApproved {
+                        plan: sample_plan(),
+                        base_sha: None,
+                    },
+                    EventKind::GrantApproved {
+                        kind: GrantKind::Command,
+                        command: "cargo test".into(),
+                    },
+                    EventKind::MissionCompleted {},
+                ],
+            );
+
+            let outcomes = compute_outcomes(root).unwrap();
+            let ratio = outcomes.autonomy_ratio;
+            assert_eq!(ratio.closed_missions, 2);
+            assert_eq!(ratio.zero_intervention_missions, 1);
+            assert_eq!(ratio.zero_intervention_share, 0.5);
+        }
+
+        #[test]
+        fn outcomes_ledger_newest_first() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+
+            // m-a's grant request/decision happen earliest; m-b's happen later.
+            seed_mission(
+                root,
+                "m-a",
+                vec![
+                    created("a"),
+                    EventKind::GrantRequested {
+                        milestone_id: "ms-1".into(),
+                        kind: GrantKind::Command,
+                        command: "cargo test".into(),
+                    },
+                    EventKind::GrantApproved {
+                        kind: GrantKind::Command,
+                        command: "cargo test".into(),
+                    },
+                ],
+            );
+            seed_mission(
+                root,
+                "m-b",
+                vec![
+                    created("b"),
+                    EventKind::GrantRequested {
+                        milestone_id: "ms-1".into(),
+                        kind: GrantKind::Command,
+                        command: "npm test".into(),
+                    },
+                    EventKind::GrantDenied {
+                        kind: GrantKind::Command,
+                        command: "npm test".into(),
+                        reason: "no".into(),
+                    },
+                ],
+            );
+
+            let outcomes = compute_outcomes(root).unwrap();
+            assert!(outcomes.escalations.len() >= 2);
+            for pair in outcomes.escalations.windows(2) {
+                assert!(pair[0].ts >= pair[1].ts);
+            }
+            // m-b's rows were appended later (later real-time `ts`), so they
+            // must sort ahead of m-a's in the newest-first ledger.
+            let mission_order: Vec<&str> = outcomes
+                .escalations
+                .iter()
+                .map(|r| r.mission_id.as_str())
+                .collect();
+            assert_eq!(mission_order[0], "m-b");
+        }
+
+        #[test]
+        fn outcomes_empty_repo_yields_all_zero_defaults() {
+            let tmp = TempDir::new().unwrap();
+            let outcomes = compute_outcomes(tmp.path()).unwrap();
+
+            let ratio = outcomes.autonomy_ratio;
+            assert_eq!(ratio.closed_missions, 0);
+            assert_eq!(ratio.interventions_per_closed_mission, 0.0);
+            assert_eq!(ratio.zero_intervention_share, 0.0);
+
+            assert_eq!(outcomes.grant_latency.buckets.len(), 4);
+            assert!(outcomes.grant_latency.buckets.iter().all(|b| b.count == 0));
+            assert_eq!(outcomes.grant_latency.total_decided, 0);
+
+            assert!(outcomes.escalations.is_empty());
+        }
+
+        #[test]
+        fn outcomes_skips_mission_with_corrupt_event_log() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+
+            seed_mission(
+                root,
+                "m-good",
+                vec![
+                    created("good"),
+                    EventKind::PlanApproved {
+                        plan: sample_plan(),
+                        base_sha: None,
+                    },
+                    EventKind::MissionCompleted {},
+                ],
+            );
+
+            // Corrupt mission: events.jsonl exists but is not valid JSONL.
+            let bad_paths = MissionPaths::new(root, "m-bad");
+            std::fs::create_dir_all(bad_paths.mission_dir()).unwrap();
+            std::fs::write(bad_paths.events_file(), "not valid json\n").unwrap();
+
+            let outcomes = compute_outcomes(root).unwrap();
+            assert_eq!(outcomes.autonomy_ratio.closed_missions, 1);
         }
     }
 }
