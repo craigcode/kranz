@@ -24,10 +24,11 @@ use crate::commands::{augment_limit_hint, build_backend, load_config};
 use crate::output;
 use crate::tail::{self, EventRenderer};
 use anyhow::{Context, Result};
+use kranz_engine::backend::AgentBackend;
 use kranz_engine::control;
 use kranz_engine::orchestrator::{MissionEngine, PlanRequest};
 use kranz_engine::ticket::Ticket;
-use kranz_engine::types::{ControlCommand, MissionStatus};
+use kranz_engine::types::{ControlCommand, MissionConfig, MissionStatus};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -133,6 +134,21 @@ pub async fn cmd_exec(
 
     let backend = build_backend(&cfg)?;
 
+    cmd_exec_with_backend(repo, file, ticket, max_cycles, push, cfg, backend).await
+}
+
+/// The body of [`cmd_exec`], parameterized on the backend so tests can drive
+/// it with [`kranz_engine::backend_mock::MockBackend`] instead of discovering
+/// a real `claude` binary.
+async fn cmd_exec_with_backend(
+    repo: PathBuf,
+    file: PathBuf,
+    ticket: Ticket,
+    max_cycles: Option<u32>,
+    push: Option<String>,
+    cfg: MissionConfig,
+    backend: Arc<dyn AgentBackend>,
+) -> Result<i32> {
     let goal = ticket.mission_goal();
     let mut engine = MissionEngine::create(backend, repo.clone(), &goal, cfg)?;
     let mission_id = engine.mission_id().to_string();
@@ -202,6 +218,24 @@ pub async fn cmd_exec(
         .with_context(|| format!("queuing the --max-cycles override for mission {mission_id}"))?;
     }
 
+    run_and_reconcile(engine, repo, mission_id, branch, push).await
+}
+
+/// The tail of [`cmd_exec_with_backend`]: run the (already planned and
+/// approved) `engine` to a terminal state, reconcile the linked ticket, then
+/// handle the `--push` handoff and print the machine-readable summary line.
+///
+/// Split out so tests can drive it against an `engine` whose mission id was
+/// already used to link a ticket — proving the `reconcile_ticket_for_mission`
+/// call actually fires from this code path, not merely that the helper works
+/// in isolation.
+async fn run_and_reconcile(
+    mut engine: MissionEngine,
+    repo: PathBuf,
+    mission_id: String,
+    branch: String,
+    push: Option<String>,
+) -> Result<i32> {
     // Live stderr feed for CI logs: tail events.jsonl from the pre-run head seq.
     let color = std::io::stderr().is_terminal();
     let renderer = EventRenderer::seeded(engine.state(), color);
@@ -268,6 +302,7 @@ pub async fn cmd_exec(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kranz_engine::types::MissionConfig;
 
     #[test]
     fn exit_code_maps_terminal_statuses() {
@@ -329,5 +364,153 @@ mod tests {
         let (code, pushed) = exit_after_push(0, false, false);
         assert_eq!(code, 0);
         assert!(!pushed);
+    }
+
+    // -----------------------------------------------------------------------
+    // reconcile-on-terminal: `kranz exec`'s post-run step heals a linked ticket
+    // -----------------------------------------------------------------------
+
+    fn reconcile_turn(reply: &str) -> Vec<kranz_engine::backend::AgentEvent> {
+        vec![
+            kranz_engine::backend_mock::mock_text(reply),
+            kranz_engine::backend_mock::mock_result_text(reply),
+        ]
+    }
+
+    fn reconcile_worker_pass() -> kranz_engine::backend_mock::MockScript {
+        kranz_engine::backend_mock::MockScript::single_shot_json(&serde_json::json!({
+            "result": "pass",
+            "summary": "implemented and tested",
+            "filesTouched": ["delivered.txt"],
+            "testsAdded": [],
+            "testEvidence": "all green",
+            "commits": []
+        }))
+        .writes_file("delivered.txt", "delivered by the mock worker\n")
+    }
+
+    fn reconcile_plan_json() -> serde_json::Value {
+        serde_json::json!({
+            "goal": "ship the demo",
+            "validationContract": [],
+            "milestones": [{
+                "title": "M1",
+                "features": [{
+                    "title": "F1",
+                    "spec": "build the thing",
+                    "validationCriteria": ["it works"]
+                }]
+            }]
+        })
+    }
+
+    /// `run_and_reconcile`'s post-run reconcile call must heal the linked
+    /// ticket's stale `.status` sidecar once the headless mission reaches
+    /// Complete — proving the f-1-3 wiring in `exec.rs` (not just the
+    /// engine-level helper unit tests). Links the ticket to the mission and
+    /// seeds it at Failed (a stale mismatch) before calling the function
+    /// under test, so the assertion only passes if the reconcile call
+    /// actually ran, not merely if the ticket happened to already be Done.
+    /// Fails if the `reconcile_ticket_for_mission` call is removed from
+    /// `run_and_reconcile`.
+    #[tokio::test]
+    async fn reconcile_on_terminal_after_cli_exec_marks_ticket_done() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().to_path_buf();
+        let status = std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::process::Command::new("git")
+            .args(["config", "user.name", "test"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        std::fs::write(repo.join("README.md"), "seed\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "seed"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        let repo = std::fs::canonicalize(&repo).unwrap();
+
+        let judgement = serde_json::json!({
+            "decision": "complete",
+            "guidance": "",
+            "summary": "worker did the job"
+        });
+        // A single continuous orchestrator session: `cmd_exec_with_backend`
+        // never drops/resumes the engine between planning and run, unlike
+        // `kranz run`'s loop.
+        let orch = kranz_engine::backend_mock::MockScript::streaming(vec![
+            kranz_engine::backend_mock::mock_init("orch-session"),
+            kranz_engine::backend_mock::mock_result_text("seed-hi"),
+        ])
+        .responding(vec![
+            reconcile_turn("let's scope the demo"),
+            reconcile_turn(&reconcile_plan_json().to_string()),
+            reconcile_turn("ack"),
+            reconcile_turn(&serde_json::json!({"action": "commit-as-is", "note": "worker delivered files"}).to_string()),
+            reconcile_turn(&judgement.to_string()),
+            reconcile_turn("NONE"),
+        ]);
+        let backend: Arc<dyn AgentBackend> = Arc::new(
+            kranz_engine::backend_mock::MockBackend::with_scripts(vec![
+                orch,
+                reconcile_worker_pass(),
+            ]),
+        );
+
+        let cfg = MissionConfig {
+            skip_scrutiny: true,
+            skip_functional: true,
+            ..Default::default()
+        };
+        let mut engine =
+            MissionEngine::create(Arc::clone(&backend), repo.clone(), "ship the demo", cfg)
+                .unwrap();
+        let mission_id = engine.mission_id().to_string();
+        engine.planning_turn("ship the demo").await.unwrap();
+        let request = engine.request_plan().await.unwrap();
+        let plan = match request {
+            PlanRequest::Ready(plan) => plan,
+            PlanRequest::NotReady(text) => panic!("expected a ready plan, got: {text}"),
+        };
+        engine.approve_plan(plan).unwrap();
+        let branch = engine.state().mission.mission_branch.clone();
+
+        // Link a ticket to this mission and stamp it Failed — a stale
+        // mismatch the drove-to-Complete run must heal.
+        kranz_engine::ticket::Ticket::record_mission(&repo, "my-ticket", &mission_id).unwrap();
+        kranz_engine::ticket::Ticket::write_state(
+            &repo,
+            "my-ticket",
+            kranz_engine::ticket::TicketState::Failed,
+            None,
+        )
+        .unwrap();
+
+        let exit_code = run_and_reconcile(engine, repo.clone(), mission_id, branch, None)
+            .await
+            .unwrap();
+        assert_eq!(exit_code, 0);
+
+        assert_eq!(
+            kranz_engine::ticket::Ticket::read_state(&repo, "my-ticket"),
+            kranz_engine::ticket::TicketState::Done,
+            "run_and_reconcile must reconcile the linked ticket to Done on Complete"
+        );
     }
 }
