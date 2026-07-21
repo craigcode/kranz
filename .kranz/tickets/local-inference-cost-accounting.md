@@ -1,6 +1,6 @@
 ---
 title: Local-run cost accounting so calibration stays clean
-priority: 4
+priority: 3
 schedule: once
 ---
 
