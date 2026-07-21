@@ -21,6 +21,7 @@ pub mod types;
 pub mod auth_verify;
 pub mod backend_readiness;
 pub mod config;
+pub mod contract_lint;
 pub mod contract_sweep;
 pub mod cost;
 pub mod deps;
