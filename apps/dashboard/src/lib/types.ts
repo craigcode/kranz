@@ -508,6 +508,48 @@ export interface QueueState {
   maxConcurrentReposSaturated?: boolean;
 }
 
+// ---------------------------------------------------------------------------
+// Outcomes (crates/engine/src/outcomes.rs) — flight-surgeon fold
+// ---------------------------------------------------------------------------
+
+export interface AutonomyRatio {
+  closedMissions: number;
+  totalInterventions: number;
+  interventionsPerClosedMission: number;
+  zeroInterventionMissions: number;
+  zeroInterventionShare: number;
+}
+
+export interface LatencyBucket {
+  label: string;
+  count: number;
+}
+
+export interface GrantLatency {
+  buckets: LatencyBucket[];
+  totalDecided: number;
+}
+
+export type EscalationKind = 'block' | 'grant' | 'revision';
+
+export interface EscalationRow {
+  ts: string;
+  missionId: string;
+  kind: EscalationKind;
+  summary: string;
+  decision: string;
+  latencyMs: number | null;
+  // DEFERRED (false-green linkage): not wired — see flight-surgeon-console ticket
+  defectOf?: string;
+}
+
+/** `GET /api/missions/outcomes` — flight-surgeon outcomes fold. */
+export interface Outcomes {
+  autonomyRatio: AutonomyRatio;
+  grantLatency: GrantLatency;
+  escalations: EscalationRow[];
+}
+
 /** `GET /api/missions/:id/pr-handoff` — never auto-pushes. */
 export type PrHandoff =
   | { kind: 'needsPush'; command: string; remote: string; branch: string }
