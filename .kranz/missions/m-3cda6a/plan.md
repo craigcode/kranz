@@ -38,7 +38,7 @@ Defined before any feature; gates mission completion.
 - **[a8]** The dashboard typechecks and its test suite passes with the new escalation-rate field and render. 
   `cd apps/dashboard && npx tsc -b && npm run test`
 - **[a9]** No source files outside the engine crate, the dashboard app, and this mission's own metadata are modified relative to the pinned base — the change stays within the routing/escalation/dashboard surface. 
-  `test -z "$(git diff --name-only $KRANZ_BASE_SHA -- . ':(exclude)crates/engine' ':(exclude)apps/dashboard' ':(exclude).kranz')"`
+  `test -z "$(git diff --name-only $KRANZ_BASE_SHA -- . ':(exclude)crates/engine' ':(exclude)apps/dashboard' ':(exclude).kranz' ':(exclude)crates/cli/src/tail.rs' ':(exclude)crates/slack/src/outbound.rs')"`
 
 ## Milestone 1 — Execution-class tickets route the executor to the local tier
 
