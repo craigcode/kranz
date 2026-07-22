@@ -1,41 +1,64 @@
 ---
-title: Validator command discipline — cwd is the worktree, no compound bash, dedicated tools first
+title: Repair the validator execution path (guidance injection, scrutiny/mechanical split, engine-run commands, denial detection, blocked-state repair)
 priority: 2
 schedule: once
 ---
 
 ## Goal
-Stop the dominant validator failure class — aborts and grant-parks on
-commands the allow-set can't match — by teaching validators (in
-validator-scrutiny.md and validator-functional.md) three rules: (1) the
-session cwd IS the integration worktree, so git inspection uses plain forms
-(`git diff <sha>..HEAD -- <path>`, `git status`, `git log`) with no `cd`
-prefix; (2) NO compound bash ever — no pipes, `;`, or `&&` between
-operations; one single-segment command per call; (3) prefer the dedicated
-tools for enumeration and reading (Glob for file lists, Read for content,
-Grep for search) over bash find/awk/sed/head/wc entirely. Backstop: where
-the permission splitter can prove a `cd` targets the session cwd itself,
-allow the compound (documented as a convenience, never widened past it).
+Fix the validator execution path end to end — prompt discipline alone was
+necessary but provably not sufficient (m-9e4ef3, five blocks). Ordered work:
+
+1. **Persist and inject validator guidance.** Add a dedicated
+   `validatorGuidance` field to the unblock decision/event/state and inject
+   it verbatim into the next validator task and its retry. Today the
+   milestone.unblocked reason is recorded but validation_round
+   (orchestrator.rs:3745) never passes it into run_validator_in
+   (runner.rs:1030) — operator guidance literally cannot reach a fresh
+   validator. Must survive process restart (event-sourced, folded).
+2. **Split scrutiny from mechanical validation.** The shared task advertises
+   all Cargo commands to scrutiny (runner.rs:1020) even though
+   validator-scrutiny.md says it need not run software. Scrutiny gets only
+   diff + criteria and works with Read/Grep/Glob + plain git forms (cwd IS
+   the worktree, no cd prefix, no compound bash, dedicated tools first);
+   remove the delegation/background encouragement at validator-scrutiny.md:55.
+3. **Run functional commands in the engine, not via agent-authored bash.**
+   Reuse the existing bounded timeout/process-tree execution for every exact
+   contract/gate command and hand the validator captured results — removing
+   pipes, lost exit codes, accidental backgrounding, Monitors, and
+   permission improvisation from the validator's world.
+4. **Correct denial detection.** The backend only maps ToolResult denials
+   containing "permission" or hook failures; structured refusals like
+   "requires approval", "Contains expansion", and "output redirection …
+   blocked" finish with deniedToolResults=0, so the grant path never fires
+   (observed live in m-9e4ef3/m-3cda6a blocks). Map those refusal shapes to
+   denials so grants activate instead of silent aborts.
+5. **Add a blocked-state repair action.** Today unblock paths only resume
+   validation / skip / stay blocked, so "FMT FIRST" cannot be scheduled. Add
+   an add-fix-feature-style action so the orchestrator can schedule a repair
+   worker (fmt, doc fix) before another validation round.
 
 ## Context
-Five failures in one day from this root cause, each an operator round-trip:
-awk line-numbering compound (m-9e4ef3 block 1), `cd && git diff` grant
-timeout (block 2), `cd && pwd && git diff` abort (m-3cda6a ms-3), `find
-.kranz -type f` grant-cap exhaustion (m-3cda6a again), `head; echo; wc`
-compound (m-9e4ef3 block 3). Every one was a legitimate read-only inspection
-expressed in a shape the permission splitter must deny — the model reaches
-for shell idioms because nothing tells it where it runs or that dedicated
-tools exist. The grant flow then depends on a human approving within the
-hour, which fails silently overnight (deny-default). One prompt section per
-validator removes the class at the source; the allow-set stays exactly as
-strict.
+m-9e4ef3 blocked five times across: awk compound, head+echo+wc compound,
+Monitor stall, and two earlier scan/grant issues — implementation complete
+throughout. An external review (verified against the code 2026-07-22)
+supplied items 1–5 and one correction: there is no validator stall timeout
+in run_session_to (runner.rs:310); it waits on validator events untimed —
+the 10-minute stall timeout applies only to orchestrator turns. The Monitor
+run ended Partial/aborted via backend turn/budget/session mechanics, not a
+timer. The validator-cwd-git-forms prompt discipline (previously this
+ticket) folds into item 2; the allow-set stays exactly as strict throughout.
 
 ## Acceptance hints
-- Both validator prompts carry the three rules with plain-form examples;
-  prompts.rs hash tests updated.
-- A mission_test scenario: a mock validator using only plain git forms and
-  dedicated tools completes validation with zero grant requests and zero
-  denied tool results.
-- (Backstop, if implemented) `cd <session-cwd> && git <read-only-form>` is
-  permitted; the same compound to any other path is still refused.
+- milestone.unblocked carries validatorGuidance; the next validator task
+  and its retry contain it verbatim; a kill-and-resume test proves it
+  survives restart.
+- Scrutiny receives diff+criteria only (no cargo command advertisement);
+  its prompt drops background/delegation encouragement; a mock scrutiny
+  validator completes with Read/Grep/Glob + plain git, zero denied tools.
+- Contract/gate commands execute engine-side with captured output fed to
+  the validator; the "requires approval"/"Contains expansion"/"output
+  redirection blocked" shapes produce deniedToolResults > 0 and park a
+  command grant.
+- The blocked state offers a repair action that schedules a fix worker
+  before re-validation (test: fmt repair then successful validation).
 - cargo test --workspace green.
