@@ -220,6 +220,17 @@ pub enum EventKind {
         feature: Feature,
     },
 
+    /// Orchestrator escalated the executor tier after repeated failed local
+    /// validations, rather than blocking the milestone.
+    #[serde(rename = "tier.escalated")]
+    TierEscalated {
+        #[serde(rename = "milestoneId")]
+        milestone_id: String,
+        from: ExecutorTier,
+        to: ExecutorTier,
+        reason: String,
+    },
+
     #[serde(rename = "milestone.blocked")]
     MilestoneBlocked {
         #[serde(rename = "milestoneId")]
@@ -308,6 +319,7 @@ impl EventKind {
             EventKind::MilestoneValidating { .. } => "milestone.validating",
             EventKind::ValidationFinding { .. } => "validation.finding",
             EventKind::FixFeatureCreated { .. } => "fixfeature.created",
+            EventKind::TierEscalated { .. } => "tier.escalated",
             EventKind::MilestoneBlocked { .. } => "milestone.blocked",
             EventKind::MilestoneUnblocked { .. } => "milestone.unblocked",
             EventKind::MilestoneCompleted { .. } => "milestone.completed",

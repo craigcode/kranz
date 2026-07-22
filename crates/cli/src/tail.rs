@@ -266,6 +266,16 @@ impl EventRenderer {
                 ansi::YELLOW,
                 format!("fix feature {}: {}", feature.id, feature.title),
             ),
+            EventKind::TierEscalated {
+                milestone_id,
+                from,
+                to,
+                reason,
+            } => (
+                format!("milestone {milestone_id}"),
+                ansi::YELLOW,
+                format!("escalated {from:?} -> {to:?}: {reason}"),
+            ),
             EventKind::MilestoneBlocked {
                 milestone_id,
                 reason,

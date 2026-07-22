@@ -14,7 +14,7 @@
 use crate::cost::{DEFAULT_CODEX_MODEL, DEFAULT_DROID_MODEL, DEFAULT_KIMI_MODEL};
 use crate::error::{EngineError, Result};
 use crate::paths;
-use crate::types::{BackendKind, MissionConfig, Role};
+use crate::types::{BackendKind, ExecutorTier, MissionConfig, Role};
 use std::path::{Path, PathBuf};
 
 /// Reasoning-effort values accepted by `claude --effort`.
@@ -38,6 +38,97 @@ pub fn parse_backend(raw: Option<&str>) -> std::result::Result<BackendKind, Stri
         Some("local") => Ok(BackendKind::Local),
         Some(other) => Err(other.to_string()),
     }
+}
+
+/// Deterministically map a ticket's `task-class` frontmatter to an executor
+/// tier. Literal table only — no heuristics: `execution-class` (case- and
+/// whitespace-insensitive) routes to [`ExecutorTier::Local`]; every other
+/// value, including absence, stays on [`ExecutorTier::Frontier`].
+pub fn task_class_to_tier(task_class: Option<&str>) -> ExecutorTier {
+    match task_class.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(ref s) if s == "execution-class" => ExecutorTier::Local,
+        _ => ExecutorTier::Frontier,
+    }
+}
+
+/// An operator-configured OpenAI-compatible endpoint the Worker can be routed
+/// to for the local tier. Mirrors [`crate::types::RoleConfig`]'s local-backend
+/// fields (`base_url`/`context_budget`/`temperature`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalEndpoint {
+    pub base_url: String,
+    pub context_budget: u32,
+    pub temperature: Option<f64>,
+}
+
+/// Apply executor-tier routing to a mission config at seed time, so a fresh
+/// mission's `mission.created` config already reflects the routing decision.
+/// Pure: never touches `config.validator_scrutiny` or `config.validator_functional`.
+///
+/// Returns the APPLIED tier, which may differ from the requested `tier`: a
+/// `Local` request with no configured endpoint fails safe to `Frontier`
+/// (leaving the Worker on its frontier default) rather than routing to an
+/// endpoint that doesn't exist.
+pub fn apply_executor_routing(
+    config: &mut MissionConfig,
+    tier: ExecutorTier,
+    local_endpoint: Option<&LocalEndpoint>,
+) -> ExecutorTier {
+    match (tier, local_endpoint) {
+        (ExecutorTier::Frontier, _) => ExecutorTier::Frontier,
+        (ExecutorTier::Local, None) => ExecutorTier::Frontier,
+        (ExecutorTier::Local, Some(endpoint)) => {
+            config.worker.backend = Some("local".to_string());
+            config.worker.base_url = Some(endpoint.base_url.clone());
+            config.worker.context_budget = Some(endpoint.context_budget);
+            config.worker.temperature = endpoint.temperature;
+            config.allow_below_default_worker_model = true;
+            ExecutorTier::Local
+        }
+    }
+}
+
+/// Route the executor tier for a mission seeded from `ticket`, so the
+/// resulting `mission.created` config already reflects the routing decision
+/// — the single engine-side entry point both the `kranz draft` and
+/// `kranz exec` seed paths call before [`crate::orchestrator::MissionEngine::create`].
+/// Returns the applied tier and a decision summary to record against the
+/// mission once it exists.
+pub fn route_ticket_executor(
+    cfg: &mut MissionConfig,
+    ticket: &crate::ticket::Ticket,
+) -> (ExecutorTier, &'static str) {
+    route_task_class_executor(cfg, ticket.task_class.as_deref())
+}
+
+/// Core of [`route_ticket_executor`], taking the raw `task-class` string
+/// directly. [`crate::orchestrator::MissionEngine::create`] calls this with
+/// the class recovered from its `goal` argument via
+/// [`crate::ticket::parse_task_class_from_goal`] — `create` only ever sees a
+/// folded goal string, never the originating [`crate::ticket::Ticket`], so
+/// the class has to travel through that one channel.
+pub fn route_task_class_executor(
+    cfg: &mut MissionConfig,
+    task_class: Option<&str>,
+) -> (ExecutorTier, &'static str) {
+    let requested = task_class_to_tier(task_class);
+    let local_endpoint = match (&cfg.worker.base_url, cfg.worker.context_budget) {
+        (Some(base_url), Some(context_budget)) => Some(LocalEndpoint {
+            base_url: base_url.clone(),
+            context_budget,
+            temperature: cfg.worker.temperature,
+        }),
+        _ => None,
+    };
+    let applied = apply_executor_routing(cfg, requested, local_endpoint.as_ref());
+    let summary = match (requested, applied) {
+        (ExecutorTier::Local, ExecutorTier::Local) => "executor routed local (execution-class)",
+        (ExecutorTier::Local, ExecutorTier::Frontier) => {
+            "execution-class ticket but no local endpoint configured; executor stays frontier"
+        }
+        _ => "executor stays frontier",
+    };
+    (applied, summary)
 }
 
 /// The backend-native model used when an older config selected a non-Claude
@@ -957,6 +1048,139 @@ mod tests {
             effective_model(Role::Worker, BackendKind::Local, "sonnet"),
             "sonnet"
         );
+    }
+
+    #[test]
+    fn task_class_routing_maps_execution_class_to_local() {
+        assert_eq!(
+            task_class_to_tier(Some("execution-class")),
+            ExecutorTier::Local
+        );
+    }
+
+    #[test]
+    fn task_class_routing_defaults_to_frontier() {
+        assert_eq!(
+            task_class_to_tier(Some("planning-class")),
+            ExecutorTier::Frontier
+        );
+        assert_eq!(
+            task_class_to_tier(Some("some-arbitrary-value")),
+            ExecutorTier::Frontier
+        );
+        assert_eq!(task_class_to_tier(None), ExecutorTier::Frontier);
+    }
+
+    #[test]
+    fn task_class_routing_is_case_and_whitespace_insensitive() {
+        assert_eq!(
+            task_class_to_tier(Some("  Execution-Class ")),
+            ExecutorTier::Local
+        );
+    }
+
+    fn test_local_endpoint() -> LocalEndpoint {
+        LocalEndpoint {
+            base_url: "http://127.0.0.1:8080".to_string(),
+            context_budget: 16_384,
+            temperature: Some(0.2),
+        }
+    }
+
+    #[test]
+    fn executor_routing_applies_local_backend_when_execution_class_and_endpoint_configured() {
+        let mut cfg = MissionConfig::default();
+        let validator_scrutiny_before = cfg.validator_scrutiny.clone();
+        let validator_functional_before = cfg.validator_functional.clone();
+        let endpoint = test_local_endpoint();
+
+        let applied = apply_executor_routing(&mut cfg, ExecutorTier::Local, Some(&endpoint));
+
+        assert_eq!(applied, ExecutorTier::Local);
+        assert_eq!(cfg.worker.backend.as_deref(), Some("local"));
+        assert_eq!(
+            cfg.worker.base_url.as_deref(),
+            Some(endpoint.base_url.as_str())
+        );
+        assert_eq!(cfg.worker.context_budget, Some(endpoint.context_budget));
+        assert_eq!(cfg.worker.temperature, endpoint.temperature);
+        assert!(cfg.allow_below_default_worker_model);
+        assert_eq!(cfg.validator_scrutiny, validator_scrutiny_before);
+        assert_eq!(cfg.validator_functional, validator_functional_before);
+    }
+
+    #[test]
+    fn executor_routing_applies_fail_safe_frontier_when_no_endpoint_configured() {
+        let mut cfg = MissionConfig::default();
+        let worker_backend_before = cfg.worker.backend.clone();
+
+        let applied = apply_executor_routing(&mut cfg, ExecutorTier::Local, None);
+
+        assert_eq!(applied, ExecutorTier::Frontier);
+        assert_eq!(cfg.worker.backend, worker_backend_before);
+        assert!(!cfg.allow_below_default_worker_model);
+    }
+
+    #[test]
+    fn executor_routing_applies_no_change_for_frontier_tier() {
+        let mut cfg = MissionConfig::default();
+        let before = cfg.clone();
+        let endpoint = test_local_endpoint();
+
+        let applied = apply_executor_routing(&mut cfg, ExecutorTier::Frontier, Some(&endpoint));
+
+        assert_eq!(applied, ExecutorTier::Frontier);
+        assert_eq!(cfg, before);
+    }
+
+    #[test]
+    fn route_task_class_executor_routes_local_when_endpoint_configured() {
+        // Mirrors what `MissionEngine::create` calls with the class recovered
+        // from a folded goal string (f-1-2: this is the single engine-side
+        // wiring point every seed path — draft, exec, REST, Slack — shares).
+        let mut cfg = MissionConfig::default();
+        cfg.worker.base_url = Some("http://127.0.0.1:8080".to_string());
+        cfg.worker.context_budget = Some(16_384);
+
+        let (applied, summary) = route_task_class_executor(&mut cfg, Some("execution-class"));
+
+        assert_eq!(applied, ExecutorTier::Local);
+        assert_eq!(cfg.worker.backend.as_deref(), Some("local"));
+        assert_eq!(summary, "executor routed local (execution-class)");
+    }
+
+    #[test]
+    fn route_task_class_executor_stays_frontier_without_endpoint() {
+        let mut cfg = MissionConfig::default();
+        let (applied, summary) = route_task_class_executor(&mut cfg, Some("execution-class"));
+
+        assert_eq!(applied, ExecutorTier::Frontier);
+        assert_eq!(cfg.worker.backend, None);
+        assert!(summary.contains("no local endpoint configured"));
+    }
+
+    #[test]
+    fn route_task_class_executor_stays_frontier_for_non_execution_class() {
+        let mut cfg = MissionConfig::default();
+        cfg.worker.base_url = Some("http://127.0.0.1:8080".to_string());
+        cfg.worker.context_budget = Some(16_384);
+
+        let (applied, summary) = route_task_class_executor(&mut cfg, None);
+
+        assert_eq!(applied, ExecutorTier::Frontier);
+        assert_eq!(cfg.worker.backend, None);
+        assert_eq!(summary, "executor stays frontier");
+    }
+
+    #[test]
+    fn validator_stays_frontier_after_local_executor_routing() {
+        let mut cfg = MissionConfig::default();
+        let endpoint = test_local_endpoint();
+
+        apply_executor_routing(&mut cfg, ExecutorTier::Local, Some(&endpoint));
+
+        assert_ne!(cfg.validator_scrutiny.backend.as_deref(), Some("local"));
+        assert_ne!(cfg.validator_functional.backend.as_deref(), Some("local"));
     }
 
     trait RoleConfigTestExt {

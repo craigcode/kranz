@@ -278,6 +278,8 @@ export interface MissionState {
   runs: Record<string, WorkerRun>;
   totals: TokenUsage;
   totalCostUsd: number;
+  localExecutorMilestones: number;
+  escalatedMilestones: number;
   pendingUserMessages: string[];
   recentDecisions: string[];
   config: MissionConfig;

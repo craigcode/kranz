@@ -34,6 +34,8 @@ function missionState(pending?: PendingGrantRequest): MissionState {
     runs: {},
     totals: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     totalCostUsd: 0,
+    localExecutorMilestones: 0,
+    escalatedMilestones: 0,
     pendingUserMessages: [],
     recentDecisions: [],
     // config is not read by this panel; a bare cast keeps the fixture small.

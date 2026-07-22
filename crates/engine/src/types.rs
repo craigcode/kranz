@@ -379,6 +379,42 @@ pub struct MissionState {
     pub pending_grant_request: Option<PendingGrantRequest>,
     /// Seq of the last event folded in.
     pub last_seq: u64,
+    /// Count of `tier.escalated` events folded (executor bumped from local to
+    /// frontier after repeated failed local validations).
+    #[serde(default)]
+    pub escalated_milestones: u32,
+    /// Count of milestones whose `milestone.started` folded while the
+    /// executor tier was [`ExecutorTier::Local`] — the denominator for
+    /// [`MissionState::escalation_rate`].
+    #[serde(default)]
+    pub local_executor_milestones: u32,
+}
+
+impl MissionState {
+    /// Share of local-tier milestones that were escalated to Frontier.
+    /// `0.0` when no milestone has ever started under the Local tier (no
+    /// divide-by-zero).
+    pub fn escalation_rate(&self) -> f64 {
+        if self.local_executor_milestones == 0 {
+            0.0
+        } else {
+            self.escalated_milestones as f64 / self.local_executor_milestones as f64
+        }
+    }
+
+    /// Which inference tier the Worker executes this mission on, derived
+    /// from the current Worker `RoleConfig.backend` rather than stored:
+    /// [`ExecutorTier::Local`] when the Worker backend is
+    /// [`BackendKind::Local`] (applied at seed time by
+    /// [`crate::config::apply_executor_routing`] or by any later
+    /// `config.changed`), else [`ExecutorTier::Frontier`].
+    pub fn executor_tier(&self) -> ExecutorTier {
+        if self.config.backend_kind(Role::Worker) == BackendKind::Local {
+            ExecutorTier::Local
+        } else {
+            ExecutorTier::Frontier
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -514,6 +550,22 @@ impl BackendKind {
             BackendKind::Kimi => "kimi",
             BackendKind::Local => "local",
         }
+    }
+}
+
+/// Which inference tier executes a ticket, derived deterministically from its
+/// `task-class` frontmatter via [`crate::config::task_class_to_tier`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExecutorTier {
+    Local,
+    Frontier,
+}
+
+impl Default for ExecutorTier {
+    /// Frontier is the safe default when no task class is present or recognized.
+    fn default() -> Self {
+        ExecutorTier::Frontier
     }
 }
 

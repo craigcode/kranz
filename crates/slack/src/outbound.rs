@@ -237,6 +237,8 @@ mod tests {
             pending_revision: None,
             pending_grant_request: None,
             last_seq: 1,
+            escalated_milestones: 0,
+            local_executor_milestones: 0,
         }
     }
 

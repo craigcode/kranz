@@ -177,6 +177,9 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             milestone_id,
             start_sha,
         } => {
+            if state.executor_tier() == ExecutorTier::Local {
+                state.local_executor_milestones += 1;
+            }
             let ms = milestone_mut(state, milestone_id)?;
             ms.status = MilestoneStatus::Active;
             ms.start_sha = Some(start_sha.clone());
@@ -326,6 +329,17 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             ms.features.push(feature.clone());
         }
 
+        EventKind::TierEscalated { milestone_id, .. } => {
+            state.config.worker.backend = None;
+            state.config.worker.base_url = None;
+            state.config.worker.context_budget = None;
+            state.config.worker.temperature = None;
+            state.escalated_milestones += 1;
+            let ms = milestone_mut(state, milestone_id)?;
+            ms.status = MilestoneStatus::Active;
+            ms.fix_cycles = 0;
+        }
+
         EventKind::MilestoneBlocked { milestone_id, .. } => {
             milestone_mut(state, milestone_id)?.status = MilestoneStatus::Blocked;
             state.mission.status = MissionStatus::Blocked;
@@ -436,6 +450,8 @@ fn initial_state(event: &Event) -> Result<MissionState> {
         pending_revision: None,
         pending_grant_request: None,
         last_seq: event.seq,
+        escalated_milestones: 0,
+        local_executor_milestones: 0,
     })
 }
 
@@ -756,4 +772,61 @@ pub fn write_snapshot(state: &MissionState, path: &Path) -> Result<()> {
 pub fn read_snapshot(path: &Path) -> Result<MissionState> {
     let content = std::fs::read_to_string(path)?;
     Ok(serde_json::from_str(&content)?)
+}
+
+#[cfg(test)]
+mod executor_tier_tests {
+    use super::*;
+    use crate::events::EventKind;
+
+    fn created_event(config: MissionConfig) -> Event {
+        Event {
+            seq: 1,
+            ts: chrono::Utc::now(),
+            mission_id: "m-test".to_string(),
+            kind: EventKind::MissionCreated {
+                goal: "ship the thing".to_string(),
+                base_branch: "main".to_string(),
+                mission_branch: "kranz/mission-m-test".to_string(),
+                config,
+            },
+        }
+    }
+
+    #[test]
+    fn executor_routing_applies_local_worker_backend_folds_to_local_tier() {
+        let mut config = MissionConfig::default();
+        config.worker.backend = Some("local".to_string());
+
+        let state = fold(&[created_event(config)]).unwrap();
+
+        assert_eq!(state.executor_tier(), ExecutorTier::Local);
+    }
+
+    #[test]
+    fn executor_routing_applies_non_local_worker_backend_folds_to_frontier_tier() {
+        let mut config = MissionConfig::default();
+        config.worker.backend = Some("codex".to_string());
+
+        let state = fold(&[created_event(config)]).unwrap();
+
+        assert_eq!(state.executor_tier(), ExecutorTier::Frontier);
+    }
+
+    #[test]
+    fn validator_stays_frontier_regardless_of_worker_routing() {
+        let mut config = MissionConfig::default();
+        config.worker.backend = Some("local".to_string());
+
+        let state = fold(&[created_event(config)]).unwrap();
+
+        assert_eq!(
+            state.config.backend_kind(Role::ValidatorScrutiny),
+            BackendKind::Claude
+        );
+        assert_eq!(
+            state.config.backend_kind(Role::ValidatorFunctional),
+            BackendKind::Claude
+        );
+    }
 }

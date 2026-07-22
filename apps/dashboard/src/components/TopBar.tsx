@@ -1,7 +1,7 @@
 // Top bar: home | mission path + goal | TIME | PROGRESS | USAGE | connection.
 
 import { useKranzStore } from '../lib/store';
-import { fmtCost, fmtElapsed, fmtTokens, pausedMs } from '../lib/format';
+import { fmtCost, fmtElapsed, fmtPct, fmtTokens, pausedMs } from '../lib/format';
 import { useNow } from '../lib/useNow';
 import { repoHash } from '../lib/routes';
 
@@ -38,7 +38,7 @@ export function TopBar() {
     );
   }
 
-  const { mission, totals, totalCostUsd } = state;
+  const { mission, totals, totalCostUsd, localExecutorMilestones, escalatedMilestones } = state;
   const features = mission.milestones.flatMap((m) => m.features);
   const done = features.filter((f) => f.status === 'complete').length;
   // Pause spans come from the store's uncapped pauseEvents list — the capped
@@ -69,6 +69,15 @@ export function TopBar() {
         >
           <span className="stat-label">Usage</span>
           <span className="stat-value mono">{fmtCost(totalCostUsd)}</span>
+        </div>
+        <div
+          className="stat"
+          title={`escalated ${escalatedMilestones} of ${localExecutorMilestones} local-tier milestones`}
+        >
+          <span className="stat-label">Escalation</span>
+          <span className="stat-value mono">
+            {fmtPct(escalatedMilestones, localExecutorMilestones)}
+          </span>
         </div>
         <div className={`conn conn-${connection}`} title={`connection: ${connection}`}>
           <span className="conn-dot" aria-hidden="true" />

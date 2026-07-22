@@ -370,13 +370,24 @@ impl MissionEngine {
 
     /// Create a brand-new mission: validate config, open the repo, pick a
     /// mission id, acquire the event log, and emit `mission.created`.
+    ///
+    /// When `goal` carries a task class folded in by [`crate::ticket::Ticket::mission_goal`]
+    /// (execution-class backlog tickets), routes the executor to the local
+    /// tier before the config is stored on `mission.created` and records the
+    /// routing decision — every seed path (`kranz draft`/`exec`, REST, Slack)
+    /// creates missions from that folded goal string, so this is the single
+    /// place ticket→routing wiring needs to live.
     pub fn create(
         backend: Arc<dyn AgentBackend>,
         repo_root: impl Into<PathBuf>,
         goal: &str,
-        cfg: MissionConfig,
+        mut cfg: MissionConfig,
     ) -> Result<Self> {
         config::validate(&cfg)?;
+        let task_class = crate::ticket::parse_task_class_from_goal(goal);
+        let routing_summary = task_class
+            .as_deref()
+            .map(|task_class| config::route_task_class_executor(&mut cfg, Some(task_class)).1);
         let repo_root = canonical_root(repo_root.into());
         let repo = GitRepo::open(&repo_root)?;
         repo.ensure_identity()?;
@@ -419,7 +430,7 @@ impl MissionEngine {
         let state = reducer::fold(&events)?;
         reducer::write_snapshot(&state, &paths.state_file())?;
 
-        Ok(MissionEngine {
+        let mut engine = MissionEngine {
             backend,
             paths,
             log,
@@ -443,7 +454,11 @@ impl MissionEngine {
             grant_requests: HashMap::new(),
             grant_respawns: HashMap::new(),
             grant_request_cap: GRANT_REQUEST_CAP,
-        })
+        };
+        if let Some(summary) = routing_summary {
+            engine.emit_decision(summary, None)?;
+        }
+        Ok(engine)
     }
 
     /// Resume an existing mission from its event log (§4.3 kill-safety).
@@ -905,6 +920,14 @@ impl MissionEngine {
             detail: detail.map(|d| scrub::scrub(&d)),
         })?;
         Ok(())
+    }
+
+    /// Public entry point for callers outside this module (e.g. the ticket
+    /// draft seeding path) to record an `orchestrator.decision`, such as the
+    /// executor-tier routing choice made when a mission is created from a
+    /// ticket.
+    pub fn record_decision(&mut self, summary: &str, detail: Option<String>) -> Result<()> {
+        self.emit_decision(summary, detail)
     }
 
     /// Choose the backend for a role and return a config clone whose role
@@ -3892,6 +3915,10 @@ impl MissionEngine {
                 text,
             } => {
                 if self.fix_cycle_exhausted(mi) {
+                    if self.escalate_or_block(&milestone_id)? {
+                        self.emit_fix_features(mi, specs, &summary, text)?;
+                        return Ok(());
+                    }
                     self.emit_decision(
                         &format!(
                             "fix-cycle cap reached; {} fix feature(s) wanted for {milestone_id}: {summary}",
@@ -3922,6 +3949,34 @@ impl MissionEngine {
     fn fix_cycle_exhausted(&self, mi: usize) -> bool {
         self.state.mission.milestones[mi].fix_cycles + 1
             > self.state.config.max_fix_cycles_per_milestone
+    }
+
+    /// Fix-cycle-cap valve (feature f-2-2): a cap-exhausted milestone whose
+    /// executor is still on the local tier escalates to frontier instead of
+    /// blocking (the reducer's `TierEscalated` fold resets the Worker backend
+    /// and the milestone's `fix_cycles`, so this is naturally one-shot per
+    /// mission — the second time a milestone hits the cap, the tier is
+    /// already `Frontier` and it blocks like today). Returns `true` when the
+    /// caller should proceed to `emit_fix_features` (escalated or never
+    /// exhausted in the first place), `false` when it must block instead.
+    fn escalate_or_block(&mut self, milestone_id: &str) -> Result<bool> {
+        if self.state.executor_tier() != ExecutorTier::Local {
+            return Ok(false);
+        }
+        self.emit_decision(
+            &format!(
+                "fix-cycle cap reached for {milestone_id} while the executor is on the \
+                 local tier; escalating to frontier instead of blocking"
+            ),
+            None,
+        )?;
+        self.emit(EventKind::TierEscalated {
+            milestone_id: milestone_id.to_string(),
+            from: ExecutorTier::Local,
+            to: ExecutorTier::Frontier,
+            reason: "two failed local validations".to_string(),
+        })?;
+        Ok(true)
     }
 
     /// Engine-computed out-of-contract-write sweep (M7 tier 1, feature
@@ -4342,7 +4397,7 @@ impl MissionEngine {
                     .filter(|f| command_subjects.contains(&f.subject))
                     .collect();
                 let specs = synthesize_fix_specs(command_only);
-                if self.fix_cycle_exhausted(li) {
+                if self.fix_cycle_exhausted(li) && !self.escalate_or_block(&last_milestone_id)? {
                     self.emit(EventKind::MilestoneBlocked {
                         milestone_id: last_milestone_id,
                         reason: format!(
@@ -4369,7 +4424,7 @@ impl MissionEngine {
                 summary,
                 text,
             } => {
-                if self.fix_cycle_exhausted(li) {
+                if self.fix_cycle_exhausted(li) && !self.escalate_or_block(&last_milestone_id)? {
                     self.emit_decision(
                         &format!(
                             "fix-cycle cap reached; {} fix feature(s) wanted for {last_milestone_id}: {summary}",
@@ -8414,6 +8469,8 @@ mod tests {
             pending_revision: None,
             pending_grant_request: None,
             last_seq: 0,
+            escalated_milestones: 0,
+            local_executor_milestones: 0,
         };
 
         assert_eq!(
@@ -9309,6 +9366,269 @@ mod tests {
                 .iter()
                 .any(|e| matches!(&e.kind, EventKind::MilestoneCompleted { milestone_id, .. } if milestone_id == "ms-1")),
             "failed validator with no report must not complete the milestone"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // feature f-2-2: fix-cycle-cap escalation valve
+    // ---------------------------------------------------------------------------
+
+    fn tier_escalation_finding_script(subject: &str) -> crate::backend_mock::MockScript {
+        crate::backend_mock::MockScript::single_shot_json(&serde_json::json!({
+            "findings": [{
+                "subject": subject,
+                "severity": "major",
+                "evidence": format!("{subject} evidence"),
+                "suggestedFix": format!("fix {subject}")
+            }],
+            "summary": "found an issue"
+        }))
+    }
+
+    fn tier_escalation_fix_reply() -> String {
+        serde_json::json!({
+            "fixFeatures": [{
+                "title": "fix issue",
+                "spec": "resolve the validation finding",
+                "validationCriteria": ["finding resolved"]
+            }],
+            "waived": [],
+            "summary": "1 fix feature(s)"
+        })
+        .to_string()
+    }
+
+    /// The long-lived streaming orchestrator session: one init/ready pair,
+    /// then one `fixFeatures` reply per validation round (rounds share the
+    /// session — only the very first `start()` call spawns it).
+    fn tier_escalation_orch_script(rounds: usize) -> crate::backend_mock::MockScript {
+        use crate::backend_mock::{mock_init, mock_result_text, mock_text};
+        let reply = tier_escalation_fix_reply();
+        crate::backend_mock::MockScript::streaming(vec![
+            mock_init("orch-session"),
+            mock_result_text("ready"),
+        ])
+        .responding(
+            (0..rounds)
+                .map(|_| vec![mock_text(&reply), mock_result_text(&reply)])
+                .collect(),
+        )
+    }
+
+    /// A cap-exhausted milestone whose executor is on the local tier
+    /// escalates to frontier instead of blocking — and escalation is
+    /// one-shot: the SAME milestone hitting the cap again (now on the
+    /// frontier tier) blocks exactly like the pre-escalation behaviour.
+    #[tokio::test]
+    async fn tier_escalation_replaces_block_and_is_one_shot_per_mission() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let mut cfg = MissionConfig {
+            skip_functional: true,
+            max_fix_cycles_per_milestone: 2,
+            ..MissionConfig::default()
+        };
+        cfg.worker.backend = Some("local".to_string());
+        cfg.worker.base_url = Some("http://localhost:8080".to_string());
+        cfg.worker.context_budget = Some(8192);
+        cfg.allow_below_default_worker_model = true;
+
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            tier_escalation_finding_script("part 1 works"),
+            tier_escalation_orch_script(2),
+            tier_escalation_finding_script("part 1 works again"),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock;
+        let mut engine = MissionEngine::create(backend, &root, "goal", cfg).expect("create engine");
+        engine.state.mission.milestones.push(Milestone {
+            id: "ms-1".to_string(),
+            title: "m".to_string(),
+            features: vec![],
+            status: MilestoneStatus::Active,
+            fix_cycles: 2,
+            start_sha: Some(engine.repo.head_sha().unwrap()),
+        });
+        assert_eq!(engine.state.executor_tier(), ExecutorTier::Local);
+
+        // Round 1: cap already spent (fix_cycles=2, cap=2) → escalate, not block.
+        engine.validation_round(0).await.unwrap();
+
+        assert_eq!(
+            engine.state.executor_tier(),
+            ExecutorTier::Frontier,
+            "escalation must flip the executor tier"
+        );
+        assert_eq!(engine.state.mission.milestones[0].fix_cycles, 0);
+        assert_ne!(
+            engine.state.mission.milestones[0].status,
+            MilestoneStatus::Blocked
+        );
+        assert_ne!(engine.state.mission.status, MissionStatus::Blocked);
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::TierEscalated { milestone_id, .. } if milestone_id == "ms-1")),
+            "expected tier.escalated: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::MilestoneBlocked { .. })),
+            "must not block when escalating: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::FixFeatureCreated { .. })),
+            "escalation must continue on to fix features: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+
+        // Round 2: same milestone hits the cap again, but the tier is now
+        // Frontier — escalation is one-shot, so this must block as before.
+        engine.state.mission.milestones[0].status = MilestoneStatus::Active;
+        engine.state.mission.milestones[0].fix_cycles = 2;
+        engine.validation_round(0).await.unwrap();
+
+        assert_eq!(engine.state.executor_tier(), ExecutorTier::Frontier);
+        assert_eq!(
+            engine.state.mission.milestones[0].status,
+            MilestoneStatus::Blocked
+        );
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(&e.kind, EventKind::TierEscalated { .. }))
+                .count(),
+            1,
+            "escalation must happen at most once per mission: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            events.iter().any(|e| matches!(&e.kind, EventKind::MilestoneBlocked { milestone_id, .. } if milestone_id == "ms-1")),
+            "second cap hit on the (now) frontier tier must block: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+    }
+
+    /// Companion to the escalation test: a mission whose executor is already
+    /// on the frontier tier still blocks at the fix-cycle cap — the guard
+    /// only changes behaviour while the executor is Local.
+    #[tokio::test]
+    async fn frontier_tier_still_blocks_at_fix_cycle_cap() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let cfg = MissionConfig {
+            skip_functional: true,
+            max_fix_cycles_per_milestone: 2,
+            ..MissionConfig::default()
+        };
+
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            tier_escalation_finding_script("part 1 works"),
+            tier_escalation_orch_script(1),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock;
+        let mut engine = MissionEngine::create(backend, &root, "goal", cfg).expect("create engine");
+        engine.state.mission.milestones.push(Milestone {
+            id: "ms-1".to_string(),
+            title: "m".to_string(),
+            features: vec![],
+            status: MilestoneStatus::Active,
+            fix_cycles: 2,
+            start_sha: Some(engine.repo.head_sha().unwrap()),
+        });
+        assert_eq!(engine.state.executor_tier(), ExecutorTier::Frontier);
+
+        engine.validation_round(0).await.unwrap();
+
+        assert_eq!(engine.state.executor_tier(), ExecutorTier::Frontier);
+        assert_eq!(
+            engine.state.mission.milestones[0].status,
+            MilestoneStatus::Blocked
+        );
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::TierEscalated { .. })),
+            "frontier tier must never escalate: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            events.iter().any(|e| matches!(&e.kind, EventKind::MilestoneBlocked { milestone_id, .. } if milestone_id == "ms-1")),
+            "frontier tier must still block at the cap: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+    }
+
+    /// Escalating the executor must never touch the validator role configs —
+    /// validators stay on the frontier tier throughout, per the mission's
+    /// D-X decision.
+    #[tokio::test]
+    async fn validator_stays_frontier_after_worker_tier_escalates() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let mut cfg = MissionConfig {
+            skip_functional: true,
+            max_fix_cycles_per_milestone: 2,
+            ..MissionConfig::default()
+        };
+        cfg.worker.backend = Some("local".to_string());
+        cfg.worker.base_url = Some("http://localhost:8080".to_string());
+        cfg.worker.context_budget = Some(8192);
+        cfg.allow_below_default_worker_model = true;
+
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            tier_escalation_finding_script("part 1 works"),
+            tier_escalation_orch_script(1),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock;
+        let mut engine = MissionEngine::create(backend, &root, "goal", cfg).expect("create engine");
+        engine.state.mission.milestones.push(Milestone {
+            id: "ms-1".to_string(),
+            title: "m".to_string(),
+            features: vec![],
+            status: MilestoneStatus::Active,
+            fix_cycles: 2,
+            start_sha: Some(engine.repo.head_sha().unwrap()),
+        });
+
+        assert_ne!(
+            engine.state.config.validator_scrutiny.backend.as_deref(),
+            Some("local")
+        );
+        assert_ne!(
+            engine.state.config.validator_functional.backend.as_deref(),
+            Some("local")
+        );
+
+        engine.validation_round(0).await.unwrap();
+
+        assert_eq!(engine.state.executor_tier(), ExecutorTier::Frontier);
+        assert_ne!(
+            engine.state.config.validator_scrutiny.backend.as_deref(),
+            Some("local"),
+            "validator scrutiny must stay off the local backend after escalation"
+        );
+        assert_ne!(
+            engine.state.config.validator_functional.backend.as_deref(),
+            Some("local"),
+            "validator functional must stay off the local backend after escalation"
+        );
+        assert_eq!(
+            engine.state.config.backend_kind(Role::ValidatorScrutiny),
+            BackendKind::Claude
         );
     }
 
