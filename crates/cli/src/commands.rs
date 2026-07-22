@@ -3210,17 +3210,19 @@ mod tests {
         ])
         .responding(vec![
             reconcile_turn("ack"),
-            reconcile_turn(&serde_json::json!({"action": "commit-as-is", "note": "worker delivered files"}).to_string()),
+            reconcile_turn(
+                &serde_json::json!({"action": "commit-as-is", "note": "worker delivered files"})
+                    .to_string(),
+            ),
             reconcile_turn(&judgement.to_string()),
             reconcile_turn("NONE"),
         ]);
-        let backend: Arc<dyn AgentBackend> = Arc::new(
-            kranz_engine::backend_mock::MockBackend::with_scripts(vec![
+        let backend: Arc<dyn AgentBackend> =
+            Arc::new(kranz_engine::backend_mock::MockBackend::with_scripts(vec![
                 orch_setup,
                 orch_run,
                 reconcile_worker_pass(),
-            ]),
-        );
+            ]));
 
         let cfg = MissionConfig {
             skip_scrutiny: true,
@@ -3255,15 +3257,10 @@ mod tests {
             kranz_engine::ticket::TicketState::Failed
         );
 
-        let exit_code = run_mission_loop_with_backend(
-            repo.clone(),
-            mission_id,
-            LockForce::No,
-            false,
-            backend,
-        )
-        .await
-        .unwrap();
+        let exit_code =
+            run_mission_loop_with_backend(repo.clone(), mission_id, LockForce::No, false, backend)
+                .await
+                .unwrap();
         assert_eq!(exit_code, 0);
 
         assert_eq!(

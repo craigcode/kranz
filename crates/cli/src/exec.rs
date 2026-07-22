@@ -462,16 +462,18 @@ mod tests {
             reconcile_turn("let's scope the demo"),
             reconcile_turn(&reconcile_plan_json().to_string()),
             reconcile_turn("ack"),
-            reconcile_turn(&serde_json::json!({"action": "commit-as-is", "note": "worker delivered files"}).to_string()),
+            reconcile_turn(
+                &serde_json::json!({"action": "commit-as-is", "note": "worker delivered files"})
+                    .to_string(),
+            ),
             reconcile_turn(&judgement.to_string()),
             reconcile_turn("NONE"),
         ]);
-        let backend: Arc<dyn AgentBackend> = Arc::new(
-            kranz_engine::backend_mock::MockBackend::with_scripts(vec![
+        let backend: Arc<dyn AgentBackend> =
+            Arc::new(kranz_engine::backend_mock::MockBackend::with_scripts(vec![
                 orch,
                 reconcile_worker_pass(),
-            ]),
-        );
+            ]));
 
         let cfg = MissionConfig {
             skip_scrutiny: true,
