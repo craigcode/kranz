@@ -287,6 +287,7 @@ impl EventRenderer {
             EventKind::MilestoneUnblocked {
                 milestone_id,
                 reason,
+                ..
             } => (
                 format!("milestone {milestone_id}"),
                 ansi::YELLOW,

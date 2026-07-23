@@ -217,6 +217,7 @@ mod tests {
                     status: MilestoneStatus::Complete,
                     fix_cycles: 0,
                     start_sha: None,
+                    validator_guidance: None,
                 }],
                 status: MissionStatus::Running,
                 created_at: Utc::now(),
