@@ -899,14 +899,36 @@ fn program_available(program: &str) -> bool {
     if path.components().count() > 1 {
         return path.exists();
     }
+    let names = executable_names(program);
     std::env::var_os("PATH")
         .map(|paths| {
             std::env::split_paths(&paths).any(|dir| {
-                let candidate: PathBuf = dir.join(program);
-                candidate.is_file()
+                names.iter().any(|name| {
+                    let candidate: PathBuf = dir.join(name);
+                    candidate.is_file()
+                })
             })
         })
         .unwrap_or(false)
+}
+
+/// The bare name on unix; the bare name plus PATHEXT variants on Windows,
+/// where `cargo` itself is never a file — `cargo.exe`/`cargo.cmd` is.
+/// Without this every PATH probe reports unavailable on Windows and
+/// `kranz ready` calls every program missing.
+fn executable_names(program: &str) -> Vec<String> {
+    if !cfg!(windows) {
+        return vec![program.to_string()];
+    }
+    let mut names = vec![program.to_string()];
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+    for ext in pathext.split(';').filter(|e| !e.is_empty()) {
+        names.push(format!("{program}{ext}"));
+        // Case-insensitive volumes make `cargo.EXE` find `cargo.exe`, but a
+        // case-sensitive one needs the lowercase spelling too.
+        names.push(format!("{program}{}", ext.to_ascii_lowercase()));
+    }
+    names
 }
 
 fn dim(
