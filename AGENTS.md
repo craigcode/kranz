@@ -55,7 +55,12 @@ kranz work                      # drain the queue (run missions)
 5. **Anti-vacuity in contract commands:** write test-gate checks as
    `cargo test --workspace <filter> 2>&1 | grep -qE 'test result: ok\. [1-9]'`.
    The `[1-9]` guards against a filter that matches **zero** tests passing
-   vacuously ("0 passed").
+   vacuously ("0 passed"). A nonzero count can ALSO be vacuous: a filter
+   substring that collides with a pre-existing passing test (m-66aff8's a3 —
+   `refus` matched `dirty_tracked_tree_is_refused_...`, gating green with
+   zero implementation). Grep existing test names for your substring before
+   shipping the contract; match ONLY the not-yet-written test (or use
+   `--exact`).
 6. **Contract files are additive-only:** `crates/engine/src/events.rs` and
    `types.rs` define the event schema and persisted state. Add fields
    (`#[serde(default)]`); never break old logs/configs. Schema changes are a
