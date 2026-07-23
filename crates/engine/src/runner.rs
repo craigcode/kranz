@@ -910,6 +910,14 @@ fn build_worker_spec(
 /// Contract `command` strings (plus config `allow_validator_commands`,
 /// `grants`, and the milestone's worker-executed `worker_commands`) become
 /// `Bash(<command>*)` allows via [`permissions::for_role`].
+/// Run one validator session for a milestone (plan §4.4/§4.6).
+///
+/// `kind` must be [`Role::ValidatorScrutiny`] or [`Role::ValidatorFunctional`].
+/// Contract `command` strings (plus config `allow_validator_commands`,
+/// `grants`, and the milestone's worker-executed `worker_commands`) become
+/// `Bash(<command>*)` allows via [`permissions::for_role`]. Engine-run
+/// contract results are a `validation_round` concern — this wrapper passes
+/// none; callers with captured results use [`run_validator_in`] directly.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_validator(
     backend: &dyn AgentBackend,
@@ -942,6 +950,7 @@ pub async fn run_validator(
         grants,
         worker_commands,
         guidance,
+        None,
     )
     .await
 }
@@ -970,6 +979,7 @@ pub async fn run_validator_in(
     grants: &[String],
     worker_commands: &[String],
     guidance: Option<&str>,
+    contract_results: Option<&str>,
 ) -> Result<RunOutcome> {
     if !matches!(kind, Role::ValidatorScrutiny | Role::ValidatorFunctional) {
         return Err(EngineError::InvalidState(format!(
@@ -1064,6 +1074,19 @@ pub async fn run_validator_in(
         task.push_str(&format!(
             "\nOperator guidance (applies to this validation):\n{g}\n"
         ));
+    }
+
+    // Engine-run contract results (validator repair 3/5): the functional
+    // validator judges captured PASS/FAIL evidence instead of authoring
+    // shell. Functional only — scrutiny's split task stays diff+criteria.
+    if kind == Role::ValidatorFunctional {
+        if let Some(results) = contract_results {
+            task.push_str(&format!(
+                "\nContract command results (executed engine-side with a bounded timeout; \
+                 verbatim output tails — authoritative evidence, do NOT re-run these):\n\
+                 {results}"
+            ));
+        }
     }
 
     let mut spec = SessionSpec {

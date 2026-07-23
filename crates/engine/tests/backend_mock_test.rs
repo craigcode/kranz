@@ -10,7 +10,7 @@ use kranz_engine::backend_mock::{
 use kranz_engine::error::EngineError;
 use kranz_engine::event_log::{EventLog, LockForce};
 use kranz_engine::paths::MissionPaths;
-use kranz_engine::runner::{run_validator, run_worker};
+use kranz_engine::runner::{run_validator, run_validator_in, run_worker};
 use kranz_engine::types::{
     Assertion, AssertionCheck, Feature, FeatureOrigin, FeatureStatus, Milestone, MilestoneStatus,
     MissionConfig, Role,
@@ -636,6 +636,60 @@ async fn scrutiny_task_and_permissions_carry_no_contract_commands() {
             "{role:?} lost git-inspect access: {:?}",
             specs[0].allowed_tools
         );
+    }
+}
+
+#[tokio::test]
+async fn engine_run_contract_results_reach_functional_task_only() {
+    // Validator repair 3/5: captured contract results ride the functional
+    // validator's task; scrutiny's split task stays diff+criteria only.
+    let dir = tempfile::tempdir().unwrap();
+    let p = MissionPaths::new(dir.path(), "m-test");
+    let mut log = EventLog::acquire(&p, "m-test", Duration::from_millis(0), LockForce::No).unwrap();
+    let cfg = MissionConfig::default();
+    let results = "- [a-1] `cargo test` → FAIL\nerror[E0308]: mismatched types\n";
+
+    for role in [Role::ValidatorScrutiny, Role::ValidatorFunctional] {
+        let backend =
+            MockBackend::with_scripts(vec![MockScript::single_shot_json(&validator_report_json())]);
+        run_validator_in(
+            &backend,
+            &mut log,
+            &p,
+            &cfg,
+            role,
+            &milestone(),
+            &[],
+            "start-sha",
+            None,
+            dir.path(),
+            None,
+            &[],
+            &[],
+            None,
+            Some(results),
+        )
+        .await
+        .unwrap();
+
+        let specs = backend.started_specs();
+        assert_eq!(specs.len(), 1);
+        let PromptMode::SingleShot(task) = &specs[0].prompt else {
+            panic!("validator task must be single-shot");
+        };
+        if role == Role::ValidatorScrutiny {
+            assert!(
+                !task.contains("Contract command results"),
+                "scrutiny must not see engine-run results: {task}"
+            );
+        } else {
+            assert!(
+                task.contains("Contract command results"),
+                "functional must see engine-run results: {task}"
+            );
+            assert!(task.contains("[a-1] `cargo test` → FAIL"), "{task}");
+            assert!(task.contains("do NOT re-run"), "{task}");
+        }
     }
 }
 

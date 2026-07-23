@@ -1182,6 +1182,61 @@ async fn unblock_add_fix_schedules_repair_before_revalidation() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn contract_commands_run_engine_side_and_reach_validator_task() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    // A portable contract command that passes everywhere (git repo present):
+    // the engine must run it during the validation round and hand the
+    // captured PASS to the functional validator — the validator never has to
+    // run it. (A failing command would trip the final gate's non-waivable
+    // command-assertion finding later; that path has its own tests.)
+    let contract = vec![assertion("a-1", "the build succeeds", Some("git status"))];
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+        validator_with(json!([])),
+    ]));
+    let cfg = MissionConfig {
+        skip_functional: false,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, contract)).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    // The mock validator judges pass on the evidence; the mission completes.
+    assert_eq!(status, MissionStatus::Complete);
+    drop(engine);
+
+    let specs = backend.started_specs();
+    let validator_task = specs
+        .iter()
+        .find_map(|s| match &s.prompt {
+            PromptMode::SingleShot(task) if task.contains("Validate milestone") => Some(task),
+            _ => None,
+        })
+        .expect("a validator session ran");
+    assert!(
+        validator_task.contains("[a-1] `git status` → PASS"),
+        "engine-captured PASS must ride the validator task: {validator_task}"
+    );
+    assert!(
+        validator_task.contains("do NOT re-run"),
+        "the results block must forbid re-running: {validator_task}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 3b. Waive: all findings waived → milestone completes, no fix cycle
 // ---------------------------------------------------------------------------

@@ -8,8 +8,8 @@ Your task message contains the milestone spec, the contract assertions mapped to
 
 ## Protocol
 
-1. Run **every mapped contract command** for this milestone, one at a time.
-2. Run the **configured test, build, and lint scripts** for the project.
+1. **Judge the engine-captured contract results.** The engine has already run every mapped contract command for this milestone — your task carries each command's verdict and verbatim output tail, captured with a bounded timeout. That evidence is authoritative: report pass/fail from it, paste from it, and do **not** re-run those commands or author variants of them (no pipes, `;`-chains, or redirection to "confirm" — if a captured result looks wrong, that doubt is itself a finding).
+2. Run the **configured test, build, and lint scripts** for the project (the allowed commands that are not mapped contract assertions).
 3. For each command, record: the exact command, whether it passed or failed (exit code), and the observed output that proves it — paste the relevant output verbatim, do not paraphrase or summarize it away.
 4. A command that fails to start (missing script, missing tool) is a failure — report it with the error output; do not improvise a substitute command.
 

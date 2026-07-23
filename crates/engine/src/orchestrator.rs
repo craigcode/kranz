@@ -3794,6 +3794,48 @@ impl MissionEngine {
     // Validation round (g)
     // -----------------------------------------------------------------------
 
+    /// Run the contract's command assertions engine-side and render the
+    /// captured results for the functional validator's task (validator
+    /// repair 3/5): the validator judges verbatim PASS/FAIL evidence instead
+    /// of authoring shell — the m-9e4ef3 failure mode (improvised compounds,
+    /// pipes, lost exit codes, accidental backgrounding, Monitors). Returns
+    /// None when the contract has no command assertions.
+    ///
+    /// Deliberately an associated function WITHOUT a self receiver: a `&self`
+    /// receiver is captured by the async future for its whole lifetime, and
+    /// `&MissionEngine` is not Send (MissionEngine is not Sync), which would
+    /// make run()'s future non-Send for spawn-based drivers.
+    async fn run_contract_commands_for_validation(
+        contract: &[Assertion],
+        base_sha: Option<&str>,
+        root: &std::path::Path,
+    ) -> Option<String> {
+        let command_assertions: Vec<(String, Option<String>)> = contract
+            .iter()
+            .filter(|a| a.check == AssertionCheck::Command)
+            .map(|a| (a.id.clone(), a.command.clone()))
+            .collect();
+        if command_assertions.is_empty() {
+            return None;
+        }
+        let env = runner::contract_env(base_sha);
+        let mut rendered = String::new();
+        for (id, command) in command_assertions {
+            match command.as_deref() {
+                Some(command) => {
+                    let (ok, output) = run_shell_command(root, command, &env).await;
+                    let verdict = if ok { "PASS" } else { "FAIL" };
+                    let tail = scrub::scrub(&output);
+                    rendered.push_str(&format!("- [{id}] `{command}` → {verdict}\n{tail}\n"));
+                }
+                None => rendered.push_str(&format!(
+                    "- [{id}] (check=command but no command — cannot run)\n"
+                )),
+            }
+        }
+        Some(rendered)
+    }
+
     /// Milestone validation: scrutiny then functional validators (v1:
     /// sequential; each skippable by config). Findings go to the conversion
     /// turn, where the orchestrator turns each into a fix feature or waives
@@ -3822,6 +3864,19 @@ impl MissionEngine {
         }
 
         let mut findings: Vec<(String, Finding)> = Vec::new();
+
+        // Engine-run contract commands (validator repair 3/5): executed once
+        // here — bounded, process-tree-killed, scrubbed — and handed to the
+        // functional validator as authoritative evidence.
+        let contract_results = if roles.contains(&Role::ValidatorFunctional) {
+            let contract = self.state.mission.validation_contract.clone();
+            let base_sha = self.state.mission.base_sha.clone();
+            let root = self.active_root().to_path_buf();
+            Self::run_contract_commands_for_validation(&contract, base_sha.as_deref(), &root).await
+        } else {
+            None
+        };
+
         for role in roles {
             let milestone = self.state.mission.milestones[mi].clone();
             let contract = self.state.mission.validation_contract.clone();
@@ -3853,6 +3908,7 @@ impl MissionEngine {
                 &grants,
                 &worker_commands,
                 milestone.validator_guidance.as_deref(),
+                contract_results.as_deref(),
             )
             .await;
             let caught = self.catch_up();
@@ -3908,6 +3964,7 @@ impl MissionEngine {
                     &grants,
                     &worker_commands,
                     milestone.validator_guidance.as_deref(),
+                    contract_results.as_deref(),
                 )
                 .await;
                 let caught = self.catch_up();
