@@ -1062,6 +1062,126 @@ async fn unblock_guidance_survives_restart_and_reaches_validator() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn unblock_add_fix_schedules_repair_before_revalidation() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    // Phase 1: block at the fix-cycle cap (same shape as the guidance test).
+    let finding = json!([{
+        "subject": "part 1 works",
+        "severity": "major",
+        "evidence": "fmt check fails",
+        "suggestedFix": ""
+    }]);
+    let backend1 = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            fix_features(1),
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            fix_features(1),
+        ]),
+        validator_with(finding.clone()),
+        worker_pass(),
+        validator_with(finding),
+    ]));
+    let cfg = MissionConfig {
+        skip_functional: false,
+        max_fix_cycles_per_milestone: 1,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend1, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Blocked);
+    let mission_id = engine.mission_id().to_string();
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    control::enqueue(
+        &paths,
+        &ControlCommand::Msg {
+            text: "it is just rustfmt — repair then re-validate".into(),
+            interrupt: false,
+        },
+    )
+    .unwrap();
+
+    // Phase 2: the orchestrator chooses unblock-add-fix. Script ORDER is the
+    // assertion that the repair worker runs before the re-validation: the
+    // orch decision, then a worker, then the (passing) validator.
+    let decision = json!({
+        "action": "unblock-add-fix",
+        "note": "schedule a fmt repair",
+        "fix": {
+            "title": "run cargo fmt --all",
+            "spec": "run cargo fmt --all and commit the result",
+            "validationCriteria": ["cargo fmt --all --check exits clean"]
+        }
+    })
+    .to_string();
+    let backend2 = Arc::new(MockBackend::with_scripts(vec![
+        orch_script(vec![
+            decision,
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+        worker_pass(),
+        validator_with(json!([])),
+    ]));
+    let backend2_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend2) as Arc<dyn AgentBackend>;
+    let mut engine = MissionEngine::resume(backend2_dyn, &root, &mission_id, LockForce::No)
+        .expect("resume mission");
+    engine.seed_worker_auth_verdict_for_test(AuthVerdict::Inconclusive);
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+
+    let state = engine.state();
+    assert_eq!(
+        state.mission.milestones[0].fix_cycles, 1,
+        "a blocked-state repair must not spend a fix cycle"
+    );
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    let unblock_seq = events
+        .iter()
+        .find(|e| matches!(&e.kind, EventKind::MilestoneUnblocked { .. }))
+        .expect("unblock event")
+        .seq;
+    // Phase 1 created one fix feature of its own; the repair is the one
+    // created AFTER the unblock.
+    let post_unblock_fixes: Vec<_> = events
+        .iter()
+        .filter(|e| e.seq > unblock_seq && matches!(&e.kind, EventKind::FixFeatureCreated { .. }))
+        .collect();
+    assert_eq!(
+        post_unblock_fixes.len(),
+        1,
+        "exactly one repair feature follows the unblock"
+    );
+    match &post_unblock_fixes[0].kind {
+        EventKind::FixFeatureCreated { feature, .. } => {
+            assert_eq!(feature.title, "run cargo fmt --all");
+            assert_eq!(feature.origin, FeatureOrigin::Fix);
+        }
+        _ => unreachable!(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 3b. Waive: all findings waived → milestone completes, no fix cycle
 // ---------------------------------------------------------------------------

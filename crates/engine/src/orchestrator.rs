@@ -145,6 +145,11 @@ struct UnblockDecision {
     /// reach a fresh validator session.
     #[serde(default)]
     validator_guidance: Option<String>,
+    /// For action "unblock-add-fix": the repair feature to schedule before
+    /// re-validation (a fmt pass, a doc fix, …). Missing fields are
+    /// synthesized from the note.
+    #[serde(default)]
+    fix: Option<FixFeatureSpec>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2661,29 +2666,35 @@ impl MissionEngine {
         let message = format!(
             "Milestone {milestone_id} is BLOCKED. The user sent:\n- {messages}\n\n\
              Decide how to proceed. Respond with ONLY this JSON:\n\
-             {{\"action\":\"unblock-raise-cap\"|\"unblock-skip-findings\"|\"skip-milestone\"|\"stay-blocked\",\"note\":\"string\",\"validatorGuidance\":\"string (optional)\"}}\n\
-             When unblocking you may set validatorGuidance to verbatim instructions for the \
-             next validator session (e.g. \"run cargo fmt before the gate\", \"the a3 grep \
-             pattern is the problem\") — it is folded into mission state and injected into \
-             the next validator task and its retry, even across a process restart."
+             {{\"action\":\"unblock-raise-cap\"|\"unblock-skip-findings\"|\"unblock-add-fix\"|\"skip-milestone\"|\"stay-blocked\",\"note\":\"string\",\"validatorGuidance\":\"string (optional)\",\"fix\":{{\"title\":\"string\",\"spec\":\"string\",\"validationCriteria\":[\"string\"]}} (optional)}}\n\
+             Use \"unblock-add-fix\" when validation fails for a mechanical reason a repair \
+             worker should fix BEFORE re-validating (run cargo fmt, fix a doc/test lint) — \
+             resuming validation unchanged would just fail again; include the fix object \
+             describing the repair. When unblocking you may set validatorGuidance to \
+             verbatim instructions for the next validator session (e.g. \"run cargo fmt \
+             before the gate\", \"the a3 grep pattern is the problem\") — it is folded into \
+             mission state and injected into the next validator task and its retry, even \
+             across a process restart."
         );
         let (decision, text) = self.json_decision::<UnblockDecision>(&message).await?;
         // Conservative default (documented): stay blocked.
-        let (action, note, validator_guidance) = match decision {
+        let (action, note, validator_guidance, fix) = match decision {
             Some(d) => (
                 d.action.trim().to_ascii_lowercase(),
                 d.note,
                 d.validator_guidance,
+                d.fix,
             ),
             None => (
                 "stay-blocked".to_string(),
                 "unparseable unblock decision".to_string(),
                 None,
+                None,
             ),
         };
         self.emit_decision(
             &format!("unblock decision for {milestone_id}: {action}"),
-            Some(text),
+            Some(text.clone()),
         )?;
 
         match action.as_str() {
@@ -2693,6 +2704,33 @@ impl MissionEngine {
                     reason: if note.is_empty() { action } else { note },
                     validator_guidance,
                 })?;
+                Ok(None)
+            }
+            "unblock-add-fix" => {
+                // Operator-directed repair (a fmt pass, a doc/test lint): a
+                // fresh repair feature runs BEFORE the next validation round
+                // — resuming validation unchanged would just fail again. The
+                // reducer's fix-cycle guard only increments from Validating
+                // status, so this repair does not spend a fix cycle; it is
+                // not validator-finding loop churn.
+                let reason = if note.is_empty() {
+                    action.clone()
+                } else {
+                    note.clone()
+                };
+                let fix = fix.unwrap_or_else(|| FixFeatureSpec {
+                    title: format!("repair blocked {milestone_id}"),
+                    spec: format!(
+                        "Repair what blocks validation of {milestone_id} (operator-directed): {reason}"
+                    ),
+                    validation_criteria: Vec::new(),
+                });
+                self.emit(EventKind::MilestoneUnblocked {
+                    milestone_id: milestone_id.clone(),
+                    reason,
+                    validator_guidance,
+                })?;
+                self.emit_fix_features(mi, vec![fix], "blocked-state repair", text)?;
                 Ok(None)
             }
             "skip-milestone" => {
