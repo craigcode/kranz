@@ -50,3 +50,4 @@ Approved plans, newest last.
 - 2026-07-20 · [m-8b3ec3](m-8b3ec3/plan.md) — Port crates/slack's socket client from tokio-tungstenite 0.24 to 0.29, regenerate the lockfile, and unify the workspace … [truncated]
 - 2026-07-21 · [m-2d5583](m-2d5583/plan.md) — At approve_plan, lint each command assertion by running it once against the untouched base tree (bounded, sync, hooks-di… [truncated]
 - 2026-07-21 · [m-3cda6a](m-3cda6a/plan.md) — Deterministically route the executor (Worker role) to the local inference tier for execution-class backlog tickets, esca… [truncated]
+- 2026-07-21 · [m-9e4ef3](m-9e4ef3/plan.md) — Any path that drives a mission to a terminal (or blocked) state — `kranz run`, `kranz exec`, REST `/start`, and the drai… [truncated]

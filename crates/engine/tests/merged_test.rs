@@ -10,6 +10,7 @@ use kranz_engine::git_ops::GitRepo;
 use kranz_engine::merged::ticket_merged;
 use kranz_engine::ticket::{Ticket, TicketState};
 use kranz_engine::types::MissionConfig;
+use kranz_engine::work::reconcile_ticket_for_mission;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Once;
@@ -290,5 +291,41 @@ fn ticket_projection_merged_none_when_ticket_not_done() {
         ticket_merged(dir.path(), "my-ticket"),
         None,
         "non-Done ticket => split not applicable"
+    );
+}
+
+#[test]
+fn reconcile_preserves_delivered_landed_split() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, seed) = seeded_repo();
+    let mission_branch = "kranz/mission-m5";
+    seed_mission_branch(
+        &dir,
+        &repo,
+        &seed,
+        mission_branch,
+        "src/e.rs",
+        "fn e() {}\n",
+    );
+
+    Ticket::scaffold(dir.path(), "my-ticket", "fixture ticket", None, None).unwrap();
+    Ticket::write_state(dir.path(), "my-ticket", TicketState::Running, None).unwrap();
+    Ticket::record_mission(dir.path(), "my-ticket", "m5").unwrap();
+    write_events(
+        dir.path(),
+        "m5",
+        vec![created(mission_branch), EventKind::MissionCompleted {}],
+    );
+
+    let result = reconcile_ticket_for_mission(dir.path(), "m5").unwrap();
+    assert_eq!(result, Some(("my-ticket".to_string(), TicketState::Done)));
+
+    assert_eq!(
+        ticket_merged(dir.path(), "my-ticket"),
+        Some(false),
+        "reconcile writing Done must not disturb the Delivered/Landed split \
+         (branch not merged => Delivered)"
     );
 }

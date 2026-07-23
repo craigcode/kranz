@@ -1392,6 +1392,7 @@ async fn run_to_end(
     mission_id: String,
     missions: Arc<Mutex<HashMap<String, HostedMission>>>,
 ) {
+    let repo_root = engine.paths().repo_root.clone();
     let result = engine.run().await;
     match &result {
         Ok(status) => {
@@ -1402,6 +1403,12 @@ async fn run_to_end(
         }
     }
     drop(engine);
+    // Reconcile the linked ticket's .status sidecar to match the mission's
+    // terminal/blocked status. Non-fatal: a reconcile failure must never
+    // affect the registry cleanup below.
+    if let Err(e) = kranz_engine::work::reconcile_ticket_for_mission(&repo_root, &mission_id) {
+        tracing::warn!(mission = %mission_id, error = %e, "failed to reconcile linked ticket");
+    }
     missions
         .lock()
         .expect("missions registry lock")

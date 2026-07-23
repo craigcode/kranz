@@ -911,6 +911,19 @@ pub(crate) async fn run_mission_loop(
 ) -> Result<i32> {
     let cfg = load_config(&repo, false)?;
     let backend = build_backend(&cfg)?;
+    run_mission_loop_with_backend(repo, mission, force_lock, interactive, backend).await
+}
+
+/// The body of [`run_mission_loop`], parameterized on the backend so tests
+/// can drive it with [`kranz_engine::backend_mock::MockBackend`] instead of
+/// discovering a real `claude` binary.
+async fn run_mission_loop_with_backend(
+    repo: PathBuf,
+    mission: String,
+    force_lock: LockForce,
+    interactive: bool,
+    backend: Arc<dyn AgentBackend>,
+) -> Result<i32> {
     let paths = require_mission(&repo, &mission)?;
 
     loop {
@@ -935,7 +948,15 @@ pub(crate) async fn run_mission_loop(
         stop.store(true, Ordering::Relaxed);
         let _ = printer.await;
 
-        match run_result? {
+        let status = run_result?;
+        // Reconcile the linked ticket's .status sidecar to match the mission's
+        // terminal/blocked status. Non-fatal: a reconcile failure must never
+        // change the exit code below.
+        if let Err(e) = kranz_engine::work::reconcile_ticket_for_mission(&repo, &mission) {
+            eprintln!("kranz run: warning: failed to reconcile linked ticket: {e}");
+        }
+
+        match status {
             MissionStatus::Complete => {
                 println!("mission {mission} COMPLETE");
                 return Ok(0);
@@ -3086,5 +3107,179 @@ mod tests {
     fn read_auth_non_loopback_always_requires_read_token() {
         assert!(effective_require_read_token(false, true));
         assert!(effective_require_read_token(false, false));
+    }
+
+    // -----------------------------------------------------------------------
+    // reconcile-on-terminal: `kranz run`'s loop heals a linked ticket
+    // -----------------------------------------------------------------------
+
+    fn reconcile_turn(reply: &str) -> Vec<kranz_engine::backend::AgentEvent> {
+        vec![
+            kranz_engine::backend_mock::mock_text(reply),
+            kranz_engine::backend_mock::mock_result_text(reply),
+        ]
+    }
+
+    fn reconcile_worker_pass() -> kranz_engine::backend_mock::MockScript {
+        kranz_engine::backend_mock::MockScript::single_shot_json(&serde_json::json!({
+            "result": "pass",
+            "summary": "implemented and tested",
+            "filesTouched": ["delivered.txt"],
+            "testsAdded": [],
+            "testEvidence": "all green",
+            "commits": []
+        }))
+        .writes_file("delivered.txt", "delivered by the mock worker\n")
+    }
+
+    fn reconcile_plan_json() -> serde_json::Value {
+        serde_json::json!({
+            "goal": "ship the demo",
+            "validationContract": [],
+            "milestones": [{
+                "title": "M1",
+                "features": [{
+                    "title": "F1",
+                    "spec": "build the thing",
+                    "validationCriteria": ["it works"]
+                }]
+            }]
+        })
+    }
+
+    /// `run_mission_loop`'s post-run reconcile call must heal the linked
+    /// ticket's stale `.status` sidecar once the mission reaches Complete —
+    /// proving the f-1-3 wiring in `commands.rs` (not just the engine-level
+    /// helper unit tests). Seeds the ticket at Running/Failed (a stale
+    /// mismatch) so the assertion only passes if the reconcile call actually
+    /// ran, not merely if the ticket happened to already be Done. Fails if
+    /// the `reconcile_ticket_for_mission` call is removed from
+    /// `run_mission_loop_with_backend`.
+    #[tokio::test]
+    async fn reconcile_on_terminal_after_cli_run_marks_ticket_done() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().to_path_buf();
+        let status = std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::process::Command::new("git")
+            .args(["config", "user.name", "test"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        std::fs::write(repo.join("README.md"), "seed\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "seed"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        let repo = std::fs::canonicalize(&repo).unwrap();
+
+        let judgement = serde_json::json!({
+            "decision": "complete",
+            "guidance": "",
+            "summary": "worker did the job"
+        });
+        // Two orchestrator sessions: `drop(engine)` + `resume()` between the
+        // plan-approval phase and the run phase means the run phase gets a
+        // fresh orchestrator session, not a continuation of the first.
+        let orch_setup = kranz_engine::backend_mock::MockScript::streaming(vec![
+            kranz_engine::backend_mock::mock_init("orch-session"),
+            kranz_engine::backend_mock::mock_result_text("seed-hi"),
+        ])
+        .responding(vec![
+            reconcile_turn("let's scope the demo"),
+            reconcile_turn(&reconcile_plan_json().to_string()),
+        ]);
+        let orch_run = kranz_engine::backend_mock::MockScript::streaming(vec![
+            kranz_engine::backend_mock::mock_init("orch-session-2"),
+            kranz_engine::backend_mock::mock_result_text("ack"),
+        ])
+        .responding(vec![
+            reconcile_turn("ack"),
+            reconcile_turn(
+                &serde_json::json!({"action": "commit-as-is", "note": "worker delivered files"})
+                    .to_string(),
+            ),
+            reconcile_turn(&judgement.to_string()),
+            reconcile_turn("NONE"),
+            // Padding: extra decision turns the run loop may make (report,
+            // milestone-complete, second judgement). Unused responses are
+            // harmless; under-provisioning parks the streaming mock forever.
+            reconcile_turn("NONE"),
+            reconcile_turn("NONE"),
+            reconcile_turn("NONE"),
+        ]);
+        let backend: Arc<dyn AgentBackend> =
+            Arc::new(kranz_engine::backend_mock::MockBackend::with_scripts(vec![
+                orch_setup,
+                // The run-phase auth probe (orchestrator.rs:2711) fires BEFORE
+                // the run's first orchestrator turn in this resumed-approved
+                // flow, so it consumes the second script. It must be a
+                // single-shot — a streaming script parks the probe forever.
+                kranz_engine::backend_mock::MockScript::single_shot("ok"),
+                // Consumption order in this flow: planning-orch, probe, worker,
+                // run-orchestrator (its session starts at the judgement turn).
+                reconcile_worker_pass(),
+                orch_run,
+            ]));
+
+        let cfg = MissionConfig {
+            skip_scrutiny: true,
+            skip_functional: true,
+            ..Default::default()
+        };
+        let mut engine =
+            MissionEngine::create(Arc::clone(&backend), repo.clone(), "ship the demo", cfg)
+                .unwrap();
+        let mission_id = engine.mission_id().to_string();
+        engine.planning_turn("ship the demo").await.unwrap();
+        let request = engine.request_plan().await.unwrap();
+        let plan = match request {
+            PlanRequest::Ready(plan) => plan,
+            PlanRequest::NotReady(text) => panic!("expected a ready plan, got: {text}"),
+        };
+        engine.approve_plan(plan).unwrap();
+        drop(engine);
+
+        // Link a ticket to this mission and stamp it Running/Failed — a
+        // stale mismatch the drove-to-Complete run must heal.
+        kranz_engine::ticket::Ticket::record_mission(&repo, "my-ticket", &mission_id).unwrap();
+        kranz_engine::ticket::Ticket::write_state(
+            &repo,
+            "my-ticket",
+            kranz_engine::ticket::TicketState::Failed,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            kranz_engine::ticket::Ticket::read_state(&repo, "my-ticket"),
+            kranz_engine::ticket::TicketState::Failed
+        );
+
+        let exit_code =
+            run_mission_loop_with_backend(repo.clone(), mission_id, LockForce::No, false, backend)
+                .await
+                .unwrap();
+        assert_eq!(exit_code, 0);
+
+        assert_eq!(
+            kranz_engine::ticket::Ticket::read_state(&repo, "my-ticket"),
+            kranz_engine::ticket::TicketState::Done,
+            "run_mission_loop must reconcile the linked ticket to Done on Complete"
+        );
     }
 }

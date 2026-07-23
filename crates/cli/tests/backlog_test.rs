@@ -499,7 +499,7 @@ fn ticket_state_for_mission_maps_terminal_status() {
     );
     assert_eq!(
         ticket_state_for_mission(MissionStatus::Blocked),
-        TicketState::Failed
+        TicketState::NeedsContext
     );
     assert_eq!(
         ticket_state_for_mission(MissionStatus::Failed),
