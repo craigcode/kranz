@@ -3,9 +3,12 @@
 //! The single-writer rule (§4.3) means only the engine appends `events.jsonl`.
 //! Other processes (CLI `kranz msg/pause/resume`, the server) talk to a
 //! running engine by dropping [`ControlCommand`] JSON files into
-//! `paths.control_dir()`. File names are `<zero-padded-millis>-<8-hex>.json`
+//! `paths.control_dir()`. File names are `<zero-padded-nanos>-<8-hex>.json`
 //! so lexicographic order == chronological order; writes go through a tmp
-//! file + rename so a draining engine never observes a partial file.
+//! file + rename so a draining engine never observes a partial file. The
+//! nanosecond prefix keeps back-to-back enqueues (e.g. `pause` immediately
+//! followed by `resume`) in issue order — a millisecond prefix left same-ms
+//! enqueues to be ordered by the random suffix.
 //!
 //! The engine [`drain`]s the inbox between worker runs, and a
 //! [`ControlWatcher`] polls [`peek_interrupt`] so an `interrupt` message can
@@ -18,9 +21,9 @@ use chrono::Utc;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
-/// Width of the zero-padded millisecond prefix — the full `u64` decimal
+/// Width of the zero-padded nanosecond prefix — the full `u64` decimal
 /// width, so names sort lexicographically for any conceivable timestamp.
-const MILLIS_WIDTH: usize = 20;
+const TIMESTAMP_WIDTH: usize = 20;
 
 /// Length of the random hex suffix (a `uuid` v4 `simple()` prefix).
 const RAND_LEN: usize = 8;
@@ -28,18 +31,18 @@ const RAND_LEN: usize = 8;
 /// Enqueue one command into the mission's control inbox.
 ///
 /// Creates the control directory if needed, writes the JSON to a sibling tmp
-/// file, then atomically renames it to `<zero-padded-millis>-<8-hex>.json` —
+/// file, then atomically renames it to `<zero-padded-nanos>-<8-hex>.json` —
 /// readers never see partial files. Returns the final file path.
 pub fn enqueue(paths: &MissionPaths, cmd: &ControlCommand) -> Result<PathBuf> {
     let dir = paths.control_dir();
     std::fs::create_dir_all(&dir)?;
 
-    let millis = Utc::now().timestamp_millis().max(0) as u64;
+    let nanos = Utc::now().timestamp_nanos_opt().unwrap_or(0).max(0) as u64;
     let rand = uuid::Uuid::new_v4().simple().to_string();
     let name = format!(
-        "{millis:0width$}-{}.json",
+        "{nanos:0width$}-{}.json",
         &rand[..RAND_LEN],
-        width = MILLIS_WIDTH
+        width = TIMESTAMP_WIDTH
     );
 
     let final_path = dir.join(&name);

@@ -23,6 +23,17 @@ priced $0, or amortized (hardware $ / expected-lifetime-tokens + watts)? Start
 with a distinct "$0 marginal (local)" tag that the calibrator EXCLUDES from
 frontier-cost calibration; amortized accounting is a later refinement.
 
+Cache-miss discipline (from cursor.com/blog/router): switching models
+mid-conversation forfeits the prompt cache, and cached-prefix tokens are
+typically ~10x cheaper than uncached — so an escalation that looks free on
+per-token price can cost more than staying put once the full prefix is
+re-priced uncached at the new tier. Two consequences for this ticket: the
+cost model must price a tier switch as a cache-miss event (full prefix at
+uncached rate), not just diff per-token rates; and the router/escalation
+policy should switch tiers ONLY at feature/milestone edges, where kranz's
+fresh-context-per-feature design means there is no warm cache to lose —
+mid-feature switches pay the miss for nothing.
+
 ## Acceptance hints
 - A local-backed mission's cost is tagged local/marginal-zero and is excluded
   from (or bucketed separately in) the frontier-cost calibration corpus.
