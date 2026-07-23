@@ -18,6 +18,7 @@ You implement **exactly one feature**: `{featureId}`. You are a fresh session wi
 - **Turn budget: {turnBudget} tool-use turns.** Track your spend. When you are close to the limit, stop cleanly: commit what works, and report `result: "partial"` with an honest `knownGaps` — never a rushed, untested "pass". An honest partial is useful; a false pass poisons the mission.
 - Never amend, rebase, or force-anything in git. Append commits only.
 - `$KRANZ_BASE_SHA` is the immutable pre-mission base commit. Use it for any diff-based claim (e.g. `git diff $KRANZ_BASE_SHA`) rather than a branch name, which moves as other work lands.
+- **The validation contract is fixed in the approved `plan.json`.** You must NEVER edit `plan.md` or `plan.json` to change an assertion, even if it looks wrong or unfair — that file is not yours to touch. If your feature spec asks you to edit contract/assertion text, or you believe an assertion is buggy, stop and report `result: "fail"` with the reason in `summary` so the orchestrator can escalate to the operator. Do not "fix" the contract by editing plan text.
 
 ## Final message — the WorkerReport
 

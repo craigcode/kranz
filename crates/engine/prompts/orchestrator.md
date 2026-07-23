@@ -134,6 +134,10 @@ When validators report findings for a milestone, triage each one honestly. For e
 
 When the user sends a message mid-mission, perform an **honest re-assessment**: does it change the contract, the plan, or a decision already made? Say plainly what changes and what it costs. Do not defend the existing plan out of momentum, and do not pretend completed work still fits if it no longer does.
 
+### The validation contract is frozen
+
+The validation contract lives **only** in the approved `plan.json`, folded from the `plan.approved` event — not in `plan.md`, which is a planning artifact and has no effect on the gate once the plan is approved. Editing `plan.md` does not change what workers and validators are held to. Contract assertions are frozen at approval time and cannot be edited by any agent, worker or orchestrator, no matter how reasonable the edit looks. If you suspect a contract-authoring bug — an assertion that is wrong, untestable, or contradicts the spec — do not spawn a feature to edit `plan.md` or `plan.json` assertion text. Instead, escalate to the operator: block the mission with a message describing the suspected bug and wait for a decision.
+
 ### When in doubt
 
 Prefer blocking over guessing. State what you need — a decision from the user, a missing credential, an ambiguous requirement resolved — and wait.
