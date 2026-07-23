@@ -3216,12 +3216,25 @@ mod tests {
             ),
             reconcile_turn(&judgement.to_string()),
             reconcile_turn("NONE"),
+            // Padding: extra decision turns the run loop may make (report,
+            // milestone-complete, second judgement). Unused responses are
+            // harmless; under-provisioning parks the streaming mock forever.
+            reconcile_turn("NONE"),
+            reconcile_turn("NONE"),
+            reconcile_turn("NONE"),
         ]);
         let backend: Arc<dyn AgentBackend> =
             Arc::new(kranz_engine::backend_mock::MockBackend::with_scripts(vec![
                 orch_setup,
-                orch_run,
+                // The run-phase auth probe (orchestrator.rs:2711) fires BEFORE
+                // the run's first orchestrator turn in this resumed-approved
+                // flow, so it consumes the second script. It must be a
+                // single-shot — a streaming script parks the probe forever.
+                kranz_engine::backend_mock::MockScript::single_shot("ok"),
+                // Consumption order in this flow: planning-orch, probe, worker,
+                // run-orchestrator (its session starts at the judgement turn).
                 reconcile_worker_pass(),
+                orch_run,
             ]));
 
         let cfg = MissionConfig {

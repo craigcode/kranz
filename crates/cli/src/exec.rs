@@ -472,6 +472,11 @@ mod tests {
         let backend: Arc<dyn AgentBackend> =
             Arc::new(kranz_engine::backend_mock::MockBackend::with_scripts(vec![
                 orch,
+                // The run-phase auth probe (orchestrator.rs:2711) fires on the
+                // first worker spawn and consumes a script of its own — a
+                // single-shot, or the worker's script is eaten and the worker
+                // errors on an empty queue.
+                kranz_engine::backend_mock::MockScript::single_shot("ok"),
                 reconcile_worker_pass(),
             ]));
 
