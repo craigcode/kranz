@@ -319,6 +319,39 @@ fn tool_result_denied_heuristic() {
 }
 
 #[test]
+fn tool_result_structured_refusals_are_denials() {
+    // The m-9e4ef3/m-3cda6a block shapes: refusal text that carries neither
+    // "permission" nor "hook" must still count as a denial, or the grant
+    // path never fires and the session aborts silently.
+    for text in [
+        "Bash(cargo test 2>&1 | tail -1) requires approval",
+        "Command rejected: Contains expansion (`$HOME`), which the allow-rule cannot verify",
+        "output redirection (`>`) is blocked for this session",
+    ] {
+        let events = parse_stream_line(&tool_result_line(text, true));
+        let AgentEvent::ToolResult { denied, .. } = &events[0] else {
+            panic!("expected ToolResult for {text:?}");
+        };
+        assert!(denied, "refusal shape must count as denial: {text:?}");
+    }
+
+    // Near-miss text is not a denial: "approved" alone is not "requires
+    // approval", and a bare "expansion"/"redirection" without the refusal
+    // shape stays negative even on an error result.
+    for (text, is_error) in [
+        ("build approved and completed", false),
+        ("macro expansion failed", true),
+        ("redirection of output succeeded", true),
+    ] {
+        let events = parse_stream_line(&tool_result_line(text, is_error));
+        let AgentEvent::ToolResult { denied, .. } = &events[0] else {
+            panic!("expected ToolResult for {text:?}");
+        };
+        assert!(!denied, "near-miss must not count as denial: {text:?}");
+    }
+}
+
+#[test]
 fn tool_result_content_array_form_is_flattened() {
     let line = json!({
         "type": "user",

@@ -554,7 +554,13 @@ fn tool_use_summary(tool: &str, input: Option<&Value>) -> String {
 
 /// `type: "user"` lines carry tool results echoed back to the model. Each
 /// `tool_result` block becomes a `ToolResult`; the `denied` heuristic flags
-/// permission-rule and hook blocks (§4.7 guardrail surfacing).
+/// permission-rule and hook blocks (§4.7 guardrail surfacing) plus the
+/// structured refusal shapes observed in the m-9e4ef3/m-3cda6a blocks that
+/// carry neither word — "requires approval", "Contains expansion", and
+/// "output redirection … blocked". Those are matched unconditionally (as
+/// "hook" already was): a false positive parks an operator-visible,
+/// deny-by-default grant request, while a false negative silently aborts
+/// the session with deniedToolResults=0 — the miss is the expensive one.
 fn parse_user(value: Value) -> Vec<AgentEvent> {
     let blocks = value
         .pointer("/message/content")
@@ -572,7 +578,11 @@ fn parse_user(value: Value) -> Vec<AgentEvent> {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let lower = text.to_lowercase();
-        let denied = (is_error && lower.contains("permission")) || lower.contains("hook");
+        let denied = (is_error && lower.contains("permission"))
+            || lower.contains("hook")
+            || lower.contains("requires approval")
+            || lower.contains("contains expansion")
+            || (lower.contains("output redirection") && lower.contains("blocked"));
         events.push(AgentEvent::ToolResult {
             tool: None,
             denied,
