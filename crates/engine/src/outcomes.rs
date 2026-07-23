@@ -361,7 +361,7 @@ pub fn compute_outcomes(repo_root: &std::path::Path) -> anyhow::Result<Outcomes>
         0.0
     };
 
-    escalations.sort_by(|a, b| b.ts.cmp(&a.ts));
+    escalations.sort_by_key(|e| std::cmp::Reverse(e.ts));
 
     Ok(Outcomes {
         autonomy_ratio: AutonomyRatio {
