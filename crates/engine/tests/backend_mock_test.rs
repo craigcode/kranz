@@ -12,7 +12,8 @@ use kranz_engine::event_log::{EventLog, LockForce};
 use kranz_engine::paths::MissionPaths;
 use kranz_engine::runner::{run_validator, run_worker};
 use kranz_engine::types::{
-    Feature, FeatureOrigin, FeatureStatus, Milestone, MilestoneStatus, MissionConfig, Role,
+    Assertion, AssertionCheck, Feature, FeatureOrigin, FeatureStatus, Milestone, MilestoneStatus,
+    MissionConfig, Role,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -552,6 +553,86 @@ async fn scrutiny_validator_does_not_get_extra_tools_folded_into_allowed() {
     assert!(!specs[0]
         .allowed_tools
         .contains(&"FakeBrowserTool".to_string()));
+}
+
+#[tokio::test]
+async fn scrutiny_task_and_permissions_carry_no_contract_commands() {
+    // Scrutiny/mechanical split: the scrutiny validator inspects the range
+    // read-only — its task advertises no commands and its permission
+    // profile permits none; the functional validator keeps both.
+    let dir = tempfile::tempdir().unwrap();
+    let p = MissionPaths::new(dir.path(), "m-test");
+    let mut log = EventLog::acquire(&p, "m-test", Duration::from_millis(0), LockForce::No).unwrap();
+    let cfg = MissionConfig::default();
+    let contract = vec![Assertion {
+        id: "a-1".into(),
+        statement: "the build succeeds".into(),
+        check: AssertionCheck::Command,
+        command: Some("cargo test --workspace".into()),
+    }];
+
+    for role in [Role::ValidatorScrutiny, Role::ValidatorFunctional] {
+        let backend =
+            MockBackend::with_scripts(vec![MockScript::single_shot_json(&validator_report_json())]);
+        run_validator(
+            &backend,
+            &mut log,
+            &p,
+            &cfg,
+            role,
+            &milestone(),
+            &contract,
+            "start-sha",
+            None,
+            None,
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let specs = backend.started_specs();
+        assert_eq!(specs.len(), 1);
+        let PromptMode::SingleShot(task) = &specs[0].prompt else {
+            panic!("validator task must be single-shot: {:?}", specs[0].prompt);
+        };
+        if role == Role::ValidatorScrutiny {
+            assert!(
+                !task.contains("Allowed commands"),
+                "scrutiny task must not advertise commands: {task}"
+            );
+            assert!(
+                !specs[0]
+                    .allowed_tools
+                    .iter()
+                    .any(|a| a.starts_with("Bash(cargo")),
+                "scrutiny must not be permitted the cargo gate: {:?}",
+                specs[0].allowed_tools
+            );
+        } else {
+            assert!(
+                task.contains("Allowed commands"),
+                "functional task must advertise commands: {task}"
+            );
+            assert!(
+                specs[0]
+                    .allowed_tools
+                    .iter()
+                    .any(|a| a == "Bash(cargo test --workspace*)"),
+                "functional must be permitted the cargo gate: {:?}",
+                specs[0].allowed_tools
+            );
+        }
+        // Both roles keep plain-git inspect access.
+        assert!(
+            specs[0]
+                .allowed_tools
+                .iter()
+                .any(|a| a == "Bash(git diff*)"),
+            "{role:?} lost git-inspect access: {:?}",
+            specs[0].allowed_tools
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

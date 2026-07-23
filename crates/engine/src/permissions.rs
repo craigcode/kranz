@@ -183,11 +183,21 @@ pub fn for_role(
         Role::ValidatorScrutiny | Role::ValidatorFunctional => {
             let mut allowed = to_strings(&["Read", "Glob", "Grep"]);
             allowed.extend(to_strings(GIT_INSPECT));
-            for command in validator_commands
-                .iter()
-                .chain(cfg.allow_validator_commands.iter())
-                .chain(grants.iter())
-            {
+            // Scrutiny/mechanical split: only the functional validator runs
+            // the contract/validator commands. Scrutiny inspects the range
+            // read-only (Read/Grep/Glob + plain git) and is neither
+            // advertised nor permitted the cargo gates — see the per-role
+            // task in runner::run_validator_in. Operator grants still apply
+            // to both roles (a grant is an explicit operator decision).
+            if role == Role::ValidatorFunctional {
+                for command in validator_commands
+                    .iter()
+                    .chain(cfg.allow_validator_commands.iter())
+                {
+                    allowed.extend(command_allow_patterns(command));
+                }
+            }
+            for command in grants {
                 allowed.extend(command_allow_patterns(command));
             }
             if role == Role::ValidatorFunctional {
@@ -410,11 +420,21 @@ mod tests {
             }
         }
 
-        let validator = for_role(Role::ValidatorScrutiny, &cfg, &combined, &[], &[]);
-        assert!(validator
+        // Scrutiny/mechanical split: contract/worker commands fold into the
+        // functional validator's allow-list only; scrutiny stays read-only.
+        let functional = for_role(Role::ValidatorFunctional, &cfg, &combined, &[], &[]);
+        assert!(functional
             .allowed_tools
             .contains(&"Bash(cargo test*)".to_string()));
-        assert!(validator
+        assert!(functional
+            .allowed_tools
+            .contains(&"Bash(gc lint*)".to_string()));
+
+        let scrutiny = for_role(Role::ValidatorScrutiny, &cfg, &combined, &[], &[]);
+        assert!(!scrutiny
+            .allowed_tools
+            .contains(&"Bash(cargo test*)".to_string()));
+        assert!(!scrutiny
             .allowed_tools
             .contains(&"Bash(gc lint*)".to_string()));
     }

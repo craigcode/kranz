@@ -1027,15 +1027,31 @@ pub async fn run_validator_in(
     vars.insert("commands", commands.clone());
     let role_prompt = prompts::render(prompts::text(kind), &vars);
 
-    let task = format!(
-        "Validate milestone `{id}`: {title}\n\n\
-         Commit range under review: {start_sha}..HEAD\n\n\
-         Validation contract:\n{contract_rendered}\n\n\
-         Feature validation criteria:\n{criteria}\n\n\
-         Allowed commands:\n{commands}\n",
-        id = milestone.id,
-        title = milestone.title,
-    );
+    let task = if kind == Role::ValidatorScrutiny {
+        // Scrutiny/mechanical split: scrutiny reviews the range read-only
+        // (Read/Grep/Glob + plain git) and is never advertised the contract
+        // commands — running them is the functional validator's job.
+        format!(
+            "Validate milestone `{id}`: {title}\n\n\
+             Commit range under review: {start_sha}..HEAD\n\n\
+             Validation contract:\n{contract_rendered}\n\n\
+             Feature validation criteria:\n{criteria}\n\n\
+             You run no commands for this review — inspect the range with \
+             Read/Grep/Glob and plain git (your cwd IS the worktree).\n",
+            id = milestone.id,
+            title = milestone.title,
+        )
+    } else {
+        format!(
+            "Validate milestone `{id}`: {title}\n\n\
+             Commit range under review: {start_sha}..HEAD\n\n\
+             Validation contract:\n{contract_rendered}\n\n\
+             Feature validation criteria:\n{criteria}\n\n\
+             Allowed commands:\n{commands}\n",
+            id = milestone.id,
+            title = milestone.title,
+        )
+    };
 
     let mut spec = SessionSpec {
         cwd: session_cwd.to_path_buf(),

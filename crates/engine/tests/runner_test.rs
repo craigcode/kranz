@@ -334,12 +334,7 @@ fn validator_profile_allows_contract_commands_as_bash_patterns() {
     for role in [Role::ValidatorScrutiny, Role::ValidatorFunctional] {
         let profile = permissions::for_role(role, &cfg, &commands, &[], &[]);
         assert_eq!(profile.permission_mode.as_deref(), Some("default"));
-        for expected in [
-            "Bash(cargo test --all*)", // contract command
-            "Bash(npm run lint*)",     // config extra
-            "Read",
-            "Bash(git diff*)",
-        ] {
+        for expected in ["Read", "Bash(git diff*)"] {
             assert!(
                 profile.allowed_tools.iter().any(|a| a == expected),
                 "{role:?} allow list missing {expected:?}: {:?}",
@@ -359,6 +354,36 @@ fn validator_profile_allows_contract_commands_as_bash_patterns() {
                 "{role:?} deny list missing {expected:?}"
             );
         }
+    }
+
+    // Scrutiny/mechanical split: only the functional validator is permitted
+    // the contract/config commands; scrutiny stays read-only + plain git.
+    let functional = permissions::for_role(Role::ValidatorFunctional, &cfg, &commands, &[], &[]);
+    for expected in ["Bash(cargo test --all*)", "Bash(npm run lint*)"] {
+        assert!(
+            functional.allowed_tools.iter().any(|a| a == expected),
+            "functional allow list missing {expected:?}"
+        );
+    }
+    let scrutiny = permissions::for_role(Role::ValidatorScrutiny, &cfg, &commands, &[], &[]);
+    for forbidden in ["Bash(cargo test --all*)", "Bash(npm run lint*)"] {
+        assert!(
+            !scrutiny.allowed_tools.iter().any(|a| a == forbidden),
+            "scrutiny must not permit {forbidden:?}: {:?}",
+            scrutiny.allowed_tools
+        );
+    }
+    // Operator grants still fold into both roles.
+    for role in [Role::ValidatorScrutiny, Role::ValidatorFunctional] {
+        let granted = permissions::for_role(role, &cfg, &[], &["cargo fmt".to_string()], &[]);
+        assert!(
+            granted
+                .allowed_tools
+                .iter()
+                .any(|a| a == "Bash(cargo fmt*)"),
+            "{role:?} lost an operator grant: {:?}",
+            granted.allowed_tools
+        );
     }
 }
 
@@ -1152,7 +1177,7 @@ async fn run_validator_builds_spec_permissions_and_parses_report() {
         &mut log,
         &p,
         &cfg,
-        Role::ValidatorScrutiny,
+        Role::ValidatorFunctional,
         &milestone(),
         &contract,
         "abc123",
@@ -1184,7 +1209,7 @@ async fn run_validator_builds_spec_permissions_and_parses_report() {
         "worker_env_hygiene scratch env is worker-role only — validator env must be unchanged: {:?}",
         spec.env
     );
-    assert_eq!(spec.model, cfg.validator_scrutiny.model);
+    assert_eq!(spec.model, cfg.validator_functional.model);
     assert_eq!(spec.permission_mode.as_deref(), Some("default"));
     assert!(spec
         .allowed_tools
@@ -1219,7 +1244,7 @@ async fn run_validator_builds_spec_permissions_and_parses_report() {
         EventKind::WorkerSpawned {
             milestone_id: Some(m),
             feature_id: None,
-            role: Role::ValidatorScrutiny,
+            role: Role::ValidatorFunctional,
             ..
         } if m == "ms-1"
     )));
