@@ -53,3 +53,4 @@ Approved plans, newest last.
 - 2026-07-21 · [m-9e4ef3](m-9e4ef3/plan.md) — Any path that drives a mission to a terminal (or blocked) state — `kranz run`, `kranz exec`, REST `/start`, and the drai… [truncated]
 - 2026-07-21 · [m-fe212a](m-fe212a/plan.md) — State explicitly in the worker and orchestrator role prompts that the validation contract lives only in the approved pla… [truncated] · [report](m-fe212a/report.md)
 - 2026-07-21 · [m-781413](m-781413/plan.md) — At the final gate, route a failing contract command assertion the orchestrator judges to be author-broken (a false negat… [truncated] · [report](m-781413/report.md)
+- 2026-07-21 · [m-d1e3c3](m-d1e3c3/plan.md) — Add a flight-surgeon outcomes fold (autonomy ratio, grant-latency distribution, escalation ledger) computed per-request … [truncated] · [report](m-d1e3c3/report.md)

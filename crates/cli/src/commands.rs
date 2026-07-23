@@ -78,6 +78,15 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             }
             Ok(0)
         }
+        Command::Outcomes { json } => {
+            let outcomes = kranz_engine::outcomes::compute_outcomes(&repo)?;
+            if json {
+                println!("{}", output::render_outcomes_json(&outcomes)?);
+            } else {
+                print!("{}", output::render_outcomes(&outcomes));
+            }
+            Ok(0)
+        }
         Command::ExportTraces {
             mission_id,
             all,

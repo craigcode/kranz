@@ -31,6 +31,7 @@ pub mod knowledge;
 pub mod lessons;
 pub mod merge;
 pub mod merged;
+pub mod outcomes;
 pub mod pr_handoff;
 pub mod prompts;
 pub mod queue;

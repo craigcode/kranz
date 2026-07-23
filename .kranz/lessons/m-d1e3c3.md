@@ -1,0 +1,3 @@
+When a feature may add or extend Rust integration tests, include `crates/<crate>/tests/**` in the touchSet — not just `crates/<crate>/src/*…
+
+When a feature may add or extend Rust integration tests, include `crates/<crate>/tests/**` in the touchSet — not just `crates/<crate>/src/**`. Rust integration tests live in the crate's `tests/` dir (sibling of `src/`), so a `src/**`-only touchSet parks them for an operator grant (as happened here with `crates/slack/tests/formatting.rs`). Scope both `src/**` and `tests/**` for any crate whose feature encodes its validation criteria as tests.

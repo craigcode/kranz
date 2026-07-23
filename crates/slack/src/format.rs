@@ -1224,6 +1224,58 @@ pub fn build_operator_todo(todo: &OperatorTodo) -> Vec<Value> {
     blocks
 }
 
+/// `/kranz outcomes`: the flight-surgeon summary card — autonomy ratio,
+/// grant-latency buckets, and the escalation count. All numbers come from
+/// `kranz_engine::outcomes::compute_outcomes`; this only formats them. The
+/// full ledger table is web-only (dashboard), never rendered here.
+pub fn build_outcomes_summary(outcomes: &kranz_engine::outcomes::Outcomes) -> Vec<Value> {
+    let mut blocks = vec![header(":stethoscope: Kranz outcomes")];
+
+    let ratio = &outcomes.autonomy_ratio;
+    blocks.push(section(&format!(
+        "*AUTONOMY RATIO*\n{:.2} intervention{} per closed mission · {:.0}% zero-intervention \
+         ({} of {} closed)",
+        ratio.interventions_per_closed_mission,
+        plural_f64(ratio.interventions_per_closed_mission),
+        ratio.zero_intervention_share * 100.0,
+        ratio.zero_intervention_missions,
+        ratio.closed_missions,
+    )));
+
+    let mut latency_body = String::new();
+    for bucket in &outcomes.grant_latency.buckets {
+        // Bucket labels (`<10s`, `>=10m`) carry angle brackets that mrkdwn
+        // reads as link syntax — escape them or the bucket lines collapse
+        // into a bogus link spanning the card.
+        let label = bucket
+            .label
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+        latency_body.push_str(&format!("• *{}* — {}\n", label, bucket.count));
+    }
+    blocks.push(section(&format!(
+        "*GRANT LATENCY*\n{}",
+        clip(latency_body.trim_end())
+    )));
+
+    blocks.push(context(&format!(
+        "{} escalation{} logged (block/grant/revision) — full ledger on the dashboard.",
+        outcomes.escalations.len(),
+        plural(outcomes.escalations.len()),
+    )));
+
+    blocks
+}
+
+fn plural_f64(n: f64) -> &'static str {
+    if n == 1.0 {
+        ""
+    } else {
+        "s"
+    }
+}
+
 /// `/kranz roadmap`: strategic options grouped by immediacy/trigger. Inputs
 /// are fixed state from `docs/roadmap-options.md`; no repo reads here.
 pub fn build_roadmap(snapshot: &RoadmapSnapshot) -> Vec<Value> {
@@ -1453,6 +1505,7 @@ pub fn build_help() -> Vec<Value> {
              • `/kranz status` — show the pipeline snapshot; `/kranz status <id>` shows one mission\n\
              • `/kranz todo` — show operator pipeline actions and human-only gates\n\
              • `/kranz roadmap` — show strategic options grouped by trigger/status\n\
+             • `/kranz outcomes` — show the flight-surgeon outcomes summary card\n\
              • `/kranz ask <question>` — ask a grounded, read-only question about mission/ticket state\n\
              • `/kranz ticket <title>` — file a new backlog ticket\n\
              • `/kranz ticket list` — list backlog tickets\n\

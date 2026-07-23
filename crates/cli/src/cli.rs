@@ -112,6 +112,14 @@ pub enum Command {
         json: bool,
     },
 
+    /// Show the flight-surgeon outcomes fold: autonomy ratio, grant-latency
+    /// distribution, and escalation ledger (read-only, no lock)
+    Outcomes {
+        /// Dump the full Outcomes struct as JSON instead of the text report
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Pause the mission (takes effect between worker runs)
     Pause,
 

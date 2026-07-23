@@ -80,6 +80,18 @@ pub(crate) async fn list_missions(State(server): State<Arc<ServerState>>) -> Jso
     Json(Value::Array(rows))
 }
 
+/// `GET /api/missions/outcomes` — flight-surgeon outcomes fold (autonomy
+/// ratio, grant-latency distribution, escalation ledger), computed
+/// per-request from the event logs by [`kranz_engine::outcomes::compute_outcomes`].
+/// No caching, no second source of truth.
+pub(crate) async fn mission_outcomes(
+    State(server): State<Arc<ServerState>>,
+) -> Result<Json<kranz_engine::outcomes::Outcomes>, ApiError> {
+    let outcomes = kranz_engine::outcomes::compute_outcomes(&server.repo_root)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(outcomes))
+}
+
 /// `<repo>/.kranz/missions/index.md` contents, or `""` if the file is absent
 /// (never created here — callers only read the catalog).
 fn read_missions_index(repo_root: &Path) -> String {
@@ -715,5 +727,152 @@ fn read_file_or_404(
             "failed to read {}: {e}",
             path.display()
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use kranz_engine::event_log::{EventLog, LockForce};
+    use kranz_engine::events::EventKind;
+    use kranz_engine::paths::MissionPaths;
+    use kranz_engine::types::{GrantKind, MissionConfig};
+    use serde_json::Value;
+    use std::time::Duration;
+    use tempfile::TempDir;
+    use tower::ServiceExt;
+
+    async fn body_json(response: axum::response::Response) -> Value {
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn get(uri: &str) -> Request<Body> {
+        Request::builder().uri(uri).body(Body::empty()).unwrap()
+    }
+
+    fn seed_mission(repo_root: &std::path::Path, id: &str, kinds: Vec<EventKind>) {
+        let paths = MissionPaths::new(repo_root, id);
+        let mut log = EventLog::acquire(&paths, id, Duration::ZERO, LockForce::No).unwrap();
+        for kind in kinds {
+            log.append(kind).unwrap();
+        }
+    }
+
+    fn created(goal: &str) -> EventKind {
+        EventKind::MissionCreated {
+            goal: goal.into(),
+            base_branch: "main".into(),
+            mission_branch: "kranz/mission-x".into(),
+            config: MissionConfig::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn outcomes_endpoint_empty_repo_returns_zeroed_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let app = crate::router(tmp.path().to_path_buf(), None);
+
+        let response = app.oneshot(get("/api/missions/outcomes")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+
+        assert_eq!(body["autonomyRatio"]["closedMissions"], 0);
+        let buckets = body["grantLatency"]["buckets"].as_array().unwrap();
+        assert_eq!(buckets.len(), 4);
+        assert!(buckets.iter().all(|b| b["count"] == 0));
+        assert_eq!(body["escalations"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn outcomes_endpoint_route_is_not_swallowed_by_mission_id_routes() {
+        let tmp = TempDir::new().unwrap();
+        let app = crate::router(tmp.path().to_path_buf(), None);
+
+        // If `outcomes` were captured as a mission id by `/missions/:id/state`
+        // style routes, this would 404 as an unknown mission instead of
+        // resolving to the outcomes handler.
+        let response = app.oneshot(get("/api/missions/outcomes")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert!(body.get("autonomyRatio").is_some());
+        assert!(body.get("error").is_none());
+    }
+
+    #[tokio::test]
+    async fn outcomes_endpoint_seeded_repo_populates_buckets_and_escalations() {
+        let tmp = TempDir::new().unwrap();
+        seed_mission(
+            tmp.path(),
+            "m-1",
+            vec![
+                created("seeded"),
+                EventKind::GrantRequested {
+                    milestone_id: "ms-1".into(),
+                    kind: GrantKind::Command,
+                    command: "cargo test".into(),
+                },
+                EventKind::GrantApproved {
+                    kind: GrantKind::Command,
+                    command: "cargo test".into(),
+                },
+                EventKind::PlanRevisionProposed {
+                    revision: 1,
+                    plan: sample_plan(),
+                    instructions: "add tests".into(),
+                },
+                EventKind::PlanRevised {
+                    revision: 1,
+                    plan: sample_plan(),
+                },
+                EventKind::MissionCompleted {},
+            ],
+        );
+
+        let app = crate::router(tmp.path().to_path_buf(), None);
+        let response = app.oneshot(get("/api/missions/outcomes")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+
+        assert_eq!(body["autonomyRatio"]["closedMissions"], 1);
+        assert_eq!(body["autonomyRatio"]["totalInterventions"], 2);
+
+        let buckets = body["grantLatency"]["buckets"].as_array().unwrap();
+        assert_eq!(buckets.len(), 4);
+        let total_bucketed: i64 = buckets.iter().map(|b| b["count"].as_i64().unwrap()).sum();
+        assert_eq!(total_bucketed, 1);
+        assert_eq!(body["grantLatency"]["totalDecided"], 1);
+
+        let escalations = body["escalations"].as_array().unwrap();
+        assert!(!escalations.is_empty());
+        let grant_row = escalations
+            .iter()
+            .find(|e| e["kind"] == "grant")
+            .expect("grant escalation row present");
+        assert_eq!(grant_row["missionId"], "m-1");
+        assert_eq!(grant_row["summary"], "cargo test");
+        assert_eq!(grant_row["decision"], "approved");
+        assert!(grant_row["latencyMs"].is_number());
+
+        let revision_row = escalations
+            .iter()
+            .find(|e| e["kind"] == "revision")
+            .expect("revision escalation row present");
+        assert_eq!(revision_row["missionId"], "m-1");
+        assert_eq!(revision_row["summary"], "add tests");
+        assert_eq!(revision_row["decision"], "accepted (rev 1)");
+    }
+
+    fn sample_plan() -> kranz_engine::types::Plan {
+        kranz_engine::types::Plan {
+            goal: "g".into(),
+            validation_contract: vec![],
+            milestones: vec![],
+            considered_alternatives: None,
+            command_grants: vec![],
+            touch_set: vec![],
+        }
     }
 }
