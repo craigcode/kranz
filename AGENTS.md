@@ -30,6 +30,9 @@ cargo install --path crates/cli --force   # rebuild+install the kranz binary
 
 # Dashboard (run all gates and sync the embedded bundle when apps/dashboard changed):
 cd apps/dashboard && npx tsc -b && npm run test && npm run build && npm run sync-embedded && npm run check-embedded && npm run lint
+# check-embedded compares your bundle against CI's clean `npm ci` build — if
+# node_modules may be stale, run `npm ci` BEFORE `npm run build`, or the local
+# hash can pass here and still fail in CI.
 
 # Operate:
 kranz serve                     # dashboard + REST/WS on 127.0.0.1:4560
