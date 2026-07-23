@@ -1281,10 +1281,19 @@ mod tests {
     // Org view (kranz ready --all)
     // -----------------------------------------------------------------------
 
-    fn host_config(dir: &Path, repos: &str) -> PathBuf {
+    fn host_config(dir: &Path, repos: serde_json::Value) -> PathBuf {
         let path = dir.join("config.json");
-        write(&path, &format!(r#"{{"host": {{"repos": [{repos}]}}}}"#));
+        // serde_json, never string interpolation: Windows roots contain
+        // backslashes, which become invalid JSON escapes when pasted raw.
+        write(
+            &path,
+            &serde_json::json!({ "host": { "repos": repos } }).to_string(),
+        );
         path
+    }
+
+    fn repo_entry(id: &str, root: &Path) -> serde_json::Value {
+        serde_json::json!({ "id": id, "root": root })
     }
 
     fn git_repo(dir: &Path) {
@@ -1319,11 +1328,7 @@ mod tests {
 
         let config = host_config(
             dir.path(),
-            &format!(
-                r#"{{"id":"strong","root":"{}"}},{{"id":"weak","root":"{}"}}"#,
-                strong.display(),
-                weak.display()
-            ),
+            serde_json::json!([repo_entry("strong", &strong), repo_entry("weak", &weak)]),
         );
         let report = assess_all(&config);
 
@@ -1356,14 +1361,15 @@ mod tests {
         let not_git = dir.path().join("not-git");
         fs::create_dir_all(&not_git).unwrap();
 
+        let mut notgit = repo_entry("notgit", &not_git);
+        notgit["displayName"] = serde_json::Value::String("Not Git".to_string());
         let config = host_config(
             dir.path(),
-            &format!(
-                r#"{{"id":"present","root":"{}"}},{{"id":"missing","root":"{}"}},{{"id":"notgit","root":"{}","displayName":"Not Git"}}"#,
-                present.display(),
-                missing.display(),
-                not_git.display()
-            ),
+            serde_json::json!([
+                repo_entry("present", &present),
+                repo_entry("missing", &missing),
+                notgit,
+            ]),
         );
         let report = assess_all(&config);
 
