@@ -19,6 +19,13 @@ pub struct ReadyReport {
     pub level: ReadyLevel,
     pub highest_leverage_fix: String,
     pub dimensions: Vec<ReadyDimension>,
+    /// AMM-compatible projection (derived view over the native dimensions;
+    /// crates/cli/src/amm.rs owns the mapping table).
+    pub amm: crate::amm::AmmProjection,
+    /// The second readiness axis — present only for repos with mission
+    /// history (omitted from JSON otherwise, never a vacuous zero).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contract_health: Option<kranz_engine::contract_health::ContractHealth>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -40,7 +47,7 @@ pub struct ReadyDimension {
     pub remedy: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ReadyStatus {
     Pass,
@@ -86,11 +93,19 @@ pub fn assess(repo: &Path) -> ReadyReport {
         .unwrap_or_else(|| {
             "No obvious fix: this repo exposes the main signals kranz needs.".into()
         });
+    // The two-axis view: AMM projection over the native dimensions, and the
+    // contract/consent axis from mission event logs (absent without history).
+    let contract_health = kranz_engine::contract_health::compute_contract_health(repo)
+        .ok()
+        .flatten();
+    let amm = crate::amm::project(&dimensions, contract_health.as_ref());
     ReadyReport {
         score,
         level,
         highest_leverage_fix,
         dimensions,
+        amm,
+        contract_health,
     }
 }
 
@@ -113,6 +128,194 @@ pub fn render(report: &ReadyReport) -> String {
         ));
         if !dim.remedy.is_empty() && dim.status != ReadyStatus::Pass {
             out.push_str(&format!("          remedy: {}\n", dim.remedy));
+        }
+    }
+    out.push_str(&format!(
+        "\namm: {} (projection v{})",
+        crate::amm::level_label(report.amm.level),
+        report.amm.mapping_version
+    ));
+    if !report.amm.missing_signals.is_empty() {
+        out.push_str(&format!(
+            " — missing for next level: {}",
+            report.amm.missing_signals.join(", ")
+        ));
+    }
+    out.push('\n');
+    if let Some(health) = &report.contract_health {
+        let lint = health
+            .lint_pass_rate
+            .map(|r| {
+                format!(
+                    "{:.0}% ({} of {} linted)",
+                    r * 100.0,
+                    health.lint_clean,
+                    health.lint_linted
+                )
+            })
+            .unwrap_or_else(|| "n/a (no linted missions)".to_string());
+        out.push_str(&format!(
+            "contract health ({} missions): lint pass {lint}, waivers/mission {:.2}, blocked [{}]\n",
+            health.missions,
+            health.waivers_per_mission.unwrap_or(0.0),
+            [
+                ("grant", health.blocked.grant),
+                ("scan", health.blocked.secret_scan),
+                ("contract-bug", health.blocked.contract_bug),
+                ("cap", health.blocked.fix_cycle_cap),
+                ("untrusted", health.blocked.untrusted_validator),
+                ("other", health.blocked.other),
+            ]
+            .into_iter()
+            .filter(|(_, n)| *n > 0)
+            .map(|(k, n)| format!("{k}:{n}"))
+            .collect::<Vec<_>>()
+            .join(" "),
+        ));
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Org view (`kranz ready --all`) — the M8 catalog scored per repo
+// ---------------------------------------------------------------------------
+
+/// One catalog repo's row in the org report. Unavailable repos degrade with
+/// a reason, never silently (and are excluded from the L3+ numerator).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrgRepoReport {
+    pub id: String,
+    pub name: String,
+    pub root: PathBuf,
+    pub score: Option<u8>,
+    pub level: Option<crate::amm::AmmLevel>,
+    pub missing_for_next_level: Vec<String>,
+    pub unavailable: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrgReport {
+    pub repos: Vec<OrgRepoReport>,
+    /// The org headline: repos at AMM L3 or better.
+    pub at_l3_plus: usize,
+    pub total: usize,
+    /// Set when the catalog itself is missing or malformed (the repos vec is
+    /// empty then — the headline must explain rather than show 0-of-0).
+    pub note: Option<String>,
+}
+
+/// Score every repo in the host catalog at `config_path`
+/// (`~/.kranz/config.json` for the CLI; injected for tests).
+pub fn assess_all(config_path: &Path) -> OrgReport {
+    let host = match kranz_server::load_host_config(config_path) {
+        Ok(host) => host,
+        Err(error) => {
+            return OrgReport {
+                repos: Vec::new(),
+                at_l3_plus: 0,
+                total: 0,
+                note: Some(format!(
+                    "cannot read host catalog {}: {error:#}",
+                    config_path.display()
+                )),
+            }
+        }
+    };
+    if host.repos.is_empty() {
+        return OrgReport {
+            repos: Vec::new(),
+            at_l3_plus: 0,
+            total: 0,
+            note: Some(format!(
+                "no host catalog at {} — register repos with `kranz init --register`",
+                config_path.display()
+            )),
+        };
+    }
+
+    let mut repos = Vec::new();
+    for repo in &host.repos {
+        let name = repo.display_name.clone().unwrap_or_else(|| repo.id.clone());
+        let unavailable = if !repo.root.is_dir() {
+            Some("root missing".to_string())
+        } else if !repo.root.join(".git").exists() {
+            Some("not a git repository".to_string())
+        } else {
+            None
+        };
+        if let Some(reason) = unavailable {
+            repos.push(OrgRepoReport {
+                id: repo.id.clone(),
+                name,
+                root: repo.root.clone(),
+                score: None,
+                level: None,
+                missing_for_next_level: Vec::new(),
+                unavailable: Some(reason),
+            });
+            continue;
+        }
+        let report = assess(&repo.root);
+        repos.push(OrgRepoReport {
+            id: repo.id.clone(),
+            name,
+            root: repo.root.clone(),
+            score: Some(report.score),
+            level: Some(report.amm.level),
+            missing_for_next_level: report.amm.missing_signals.clone(),
+            unavailable: None,
+        });
+    }
+    let at_l3_plus = repos
+        .iter()
+        .filter(|r| {
+            r.level
+                .map(|l| l >= crate::amm::AmmLevel::L3)
+                .unwrap_or(false)
+        })
+        .count();
+    OrgReport {
+        total: repos.len(),
+        repos,
+        at_l3_plus,
+        note: None,
+    }
+}
+
+pub fn render_org(report: &OrgReport) -> String {
+    let mut out = String::new();
+    if let Some(note) = &report.note {
+        out.push_str(&format!("kranz ready --all: {note}\n"));
+        return out;
+    }
+    out.push_str(&format!(
+        "kranz ready --all: {} of {} repos at L3+\n",
+        report.at_l3_plus, report.total
+    ));
+    for repo in &report.repos {
+        if let Some(reason) = &repo.unavailable {
+            out.push_str(&format!(
+                "  {:<20} —   unavailable: {reason} ({})\n",
+                repo.name,
+                repo.root.display()
+            ));
+        } else {
+            out.push_str(&format!(
+                "  {:<20} {:<3} {:>3}/100  ({})\n",
+                repo.name,
+                crate::amm::level_label(repo.level.expect("available repos have a level")),
+                repo.score.unwrap_or(0),
+                repo.root.display()
+            ));
+            if !repo.missing_for_next_level.is_empty() {
+                out.push_str(&format!(
+                    "  {:<20}     missing for next level: {}\n",
+                    "",
+                    repo.missing_for_next_level.join(", ")
+                ));
+            }
         }
     }
     out
@@ -1072,5 +1275,132 @@ mod tests {
         assert!(lanes.evidence.contains("codex=skipped"), "{lanes:?}");
         assert!(lanes.evidence.contains("droid=skipped"), "{lanes:?}");
         assert!(lanes.evidence.contains("kimi=skipped"), "{lanes:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Org view (kranz ready --all)
+    // -----------------------------------------------------------------------
+
+    fn host_config(dir: &Path, repos: &str) -> PathBuf {
+        let path = dir.join("config.json");
+        write(&path, &format!(r#"{{"host": {{"repos": [{repos}]}}}}"#));
+        path
+    }
+
+    fn git_repo(dir: &Path) {
+        git(dir, &["init"]);
+        write(&dir.join("README.md"), "readme");
+        commit_all(dir);
+    }
+
+    #[test]
+    fn org_view_scores_catalog_and_counts_l3_plus() {
+        let dir = TempDir::new().unwrap();
+        let strong = dir.path().join("strong");
+        let weak = dir.path().join("weak");
+        fs::create_dir_all(&strong).unwrap();
+        fs::create_dir_all(&weak).unwrap();
+        // A fully-shaped repo (mirrors this_shape_scores_high_with_core_signals).
+        write(&strong.join("AGENTS.md"), "rules");
+        write(&strong.join("README.md"), "readme");
+        write(&strong.join("Cargo.toml"), "[workspace]\n");
+        write(&strong.join(".github/workflows/ci.yml"), "name: ci\n");
+        git(&strong, &["init"]);
+        write(
+            &strong.join(".kranz/.gitignore"),
+            "missions/*/events.jsonl\nmissions/*/events.jsonl.lock\nmissions/*/state.json\nmissions/*/runs/\nmissions/*/control/\nconfig.json\nserve.token\ntickets/*.status\n",
+        );
+        write(
+            &strong.join(".kranz/merge-gates.json"),
+            r#"{"gates":[{"command":"cargo test --workspace"}]}"#,
+        );
+        commit_all(&strong);
+        git_repo(&weak);
+
+        let config = host_config(
+            dir.path(),
+            &format!(
+                r#"{{"id":"strong","root":"{}"}},{{"id":"weak","root":"{}"}}"#,
+                strong.display(),
+                weak.display()
+            ),
+        );
+        let report = assess_all(&config);
+
+        assert_eq!(report.total, 2);
+        assert!(report.note.is_none());
+        let strong_row = report.repos.iter().find(|r| r.id == "strong").unwrap();
+        let weak_row = report.repos.iter().find(|r| r.id == "weak").unwrap();
+        assert!(
+            strong_row.level.unwrap() >= crate::amm::AmmLevel::L3,
+            "{strong_row:?}"
+        );
+        assert_eq!(
+            weak_row.level,
+            Some(crate::amm::AmmLevel::L1),
+            "{weak_row:?}"
+        );
+        assert_eq!(report.at_l3_plus, 1, "{report:?}");
+        // The headline renders the N-of-M line.
+        let text = render_org(&report);
+        assert!(text.contains("1 of 2 repos at L3+"), "{text}");
+    }
+
+    #[test]
+    fn org_view_degrades_unavailable_repos_with_a_reason() {
+        let dir = TempDir::new().unwrap();
+        let present = dir.path().join("present");
+        fs::create_dir_all(&present).unwrap();
+        git_repo(&present);
+        let missing = dir.path().join("missing");
+        let not_git = dir.path().join("not-git");
+        fs::create_dir_all(&not_git).unwrap();
+
+        let config = host_config(
+            dir.path(),
+            &format!(
+                r#"{{"id":"present","root":"{}"}},{{"id":"missing","root":"{}"}},{{"id":"notgit","root":"{}","displayName":"Not Git"}}"#,
+                present.display(),
+                missing.display(),
+                not_git.display()
+            ),
+        );
+        let report = assess_all(&config);
+
+        assert_eq!(report.total, 3);
+        let missing_row = report.repos.iter().find(|r| r.id == "missing").unwrap();
+        assert_eq!(missing_row.unavailable.as_deref(), Some("root missing"));
+        assert!(missing_row.level.is_none());
+        let notgit_row = report.repos.iter().find(|r| r.id == "notgit").unwrap();
+        assert_eq!(
+            notgit_row.unavailable.as_deref(),
+            Some("not a git repository")
+        );
+        assert_eq!(notgit_row.name, "Not Git");
+        // Unavailable repos never enter the L3+ numerator.
+        assert_eq!(report.at_l3_plus, 0, "{report:?}");
+        let text = render_org(&report);
+        assert!(text.contains("unavailable: root missing"), "{text}");
+    }
+
+    #[test]
+    fn org_view_explains_empty_and_malformed_catalogs() {
+        let dir = TempDir::new().unwrap();
+        // Missing file → empty catalog with guidance, not a 0-of-0 shrug.
+        let missing = assess_all(&dir.path().join("nope.json"));
+        assert_eq!(missing.total, 0);
+        assert!(missing.note.as_deref().unwrap().contains("no host catalog"));
+        assert!(render_org(&missing).contains("kranz init --register"));
+
+        // Malformed → explicit error, never silent.
+        let bad = dir.path().join("bad.json");
+        write(&bad, "{not json");
+        let malformed = assess_all(&bad);
+        assert_eq!(malformed.total, 0);
+        assert!(malformed
+            .note
+            .as_deref()
+            .unwrap()
+            .contains("cannot read host catalog"));
     }
 }

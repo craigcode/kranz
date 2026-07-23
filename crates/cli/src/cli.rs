@@ -278,6 +278,10 @@ pub enum Command {
         /// Print the serializable scorecard JSON.
         #[arg(long)]
         json: bool,
+        /// Score every repo in the host catalog (~/.kranz/config.json) and
+        /// report the N-of-M-at-L3+ org headline.
+        #[arg(long)]
+        all: bool,
     },
 
     /// Drain the execution queue: run queued missions one at a time per repo

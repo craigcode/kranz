@@ -338,13 +338,28 @@ fn parses_scan_modes() {
 fn parses_ready() {
     assert!(matches!(
         Cli::try_parse_from(["kranz", "ready"]).unwrap().command,
-        Command::Ready { json: false }
+        Command::Ready {
+            json: false,
+            all: false
+        }
     ));
     assert!(matches!(
         Cli::try_parse_from(["kranz", "ready", "--json"])
             .unwrap()
             .command,
-        Command::Ready { json: true }
+        Command::Ready {
+            json: true,
+            all: false
+        }
+    ));
+    assert!(matches!(
+        Cli::try_parse_from(["kranz", "ready", "--all"])
+            .unwrap()
+            .command,
+        Command::Ready {
+            json: false,
+            all: true
+        }
     ));
 }
 

@@ -236,12 +236,23 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             Ok(0)
         }
         Command::Scan { staged, range } => cmd_scan(&repo, staged, range.as_deref()),
-        Command::Ready { json } => {
-            let report = crate::ready::assess(&repo);
-            if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+        Command::Ready { json, all } => {
+            if all {
+                let config = kranz_engine::paths::global_config()
+                    .ok_or_else(|| anyhow::anyhow!("cannot locate the home directory"))?;
+                let report = crate::ready::assess_all(&config);
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print!("{}", crate::ready::render_org(&report));
+                }
             } else {
-                print!("{}", crate::ready::render(&report));
+                let report = crate::ready::assess(&repo);
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print!("{}", crate::ready::render(&report));
+                }
             }
             Ok(0)
         }

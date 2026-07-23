@@ -29,6 +29,9 @@ The gates a mission must pass.
 - [Validation and merge gates](validation/gates.md) — the full-workspace gate
   recipes, the anti-vacuity contract, the empty-deliverable safety net, the
   merge pre-gate, and secret scanning.
+- [The two readiness axes](validation/readiness-axes.md) — the AMM projection
+  (mapped, never adopted) and contract/consent health: why the second axis
+  exists and the mapping rules.
 
 ### surfaces/
 Operator surfaces.
