@@ -675,6 +675,7 @@ mod tests {
                 EventKind::MilestoneUnblocked {
                     milestone_id: "ms-1".into(),
                     reason: "cap raised".into(),
+                    validator_guidance: None,
                 },
             ),
             ev(

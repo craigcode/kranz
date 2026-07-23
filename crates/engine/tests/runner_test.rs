@@ -76,6 +76,7 @@ fn milestone() -> Milestone {
         status: MilestoneStatus::Validating,
         fix_cycles: 0,
         start_sha: Some("abc123".to_string()),
+        validator_guidance: None,
     }
 }
 
@@ -1185,6 +1186,7 @@ async fn run_validator_builds_spec_permissions_and_parses_report() {
         None,
         &[],
         &[],
+        None,
     )
     .await
     .unwrap();
@@ -1271,6 +1273,7 @@ async fn run_validator_rejects_non_validator_roles() {
         None,
         &[],
         &[],
+        None,
     )
     .await
     .unwrap_err();
@@ -1302,6 +1305,7 @@ async fn run_validator_refuses_unsupported_macos_fs_net_sandbox() {
         None,
         &[],
         &[],
+        None,
     )
     .await
     .unwrap_err();

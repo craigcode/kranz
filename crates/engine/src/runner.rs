@@ -924,6 +924,7 @@ pub async fn run_validator(
     base_sha: Option<&str>,
     grants: &[String],
     worker_commands: &[String],
+    guidance: Option<&str>,
 ) -> Result<RunOutcome> {
     let cwd = paths.repo_root.clone();
     run_validator_in(
@@ -940,6 +941,7 @@ pub async fn run_validator(
         base_sha,
         grants,
         worker_commands,
+        guidance,
     )
     .await
 }
@@ -967,6 +969,7 @@ pub async fn run_validator_in(
     base_sha: Option<&str>,
     grants: &[String],
     worker_commands: &[String],
+    guidance: Option<&str>,
 ) -> Result<RunOutcome> {
     if !matches!(kind, Role::ValidatorScrutiny | Role::ValidatorFunctional) {
         return Err(EngineError::InvalidState(format!(
@@ -1027,7 +1030,7 @@ pub async fn run_validator_in(
     vars.insert("commands", commands.clone());
     let role_prompt = prompts::render(prompts::text(kind), &vars);
 
-    let task = if kind == Role::ValidatorScrutiny {
+    let mut task = if kind == Role::ValidatorScrutiny {
         // Scrutiny/mechanical split: scrutiny reviews the range read-only
         // (Read/Grep/Glob + plain git) and is never advertised the contract
         // commands — running them is the functional validator's job.
@@ -1052,6 +1055,16 @@ pub async fn run_validator_in(
             title = milestone.title,
         )
     };
+
+    // Operator unblock guidance is injected verbatim into whichever validator
+    // runs (and its retry) — the only channel by which an operator's unblock
+    // note reaches a fresh validator session. Carried in folded state, so it
+    // survives a process restart; cleared when the milestone completes.
+    if let Some(g) = guidance {
+        task.push_str(&format!(
+            "\nOperator guidance (applies to this validation):\n{g}\n"
+        ));
+    }
 
     let mut spec = SessionSpec {
         cwd: session_cwd.to_path_buf(),

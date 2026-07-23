@@ -77,6 +77,7 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
                     status: MilestoneStatus::Pending,
                     fix_cycles: 0,
                     start_sha: None,
+                    validator_guidance: None,
                 })
                 .collect();
             state.mission.command_grants = plan.command_grants.clone();
@@ -345,13 +346,25 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             state.mission.status = MissionStatus::Blocked;
         }
 
-        EventKind::MilestoneUnblocked { milestone_id, .. } => {
-            milestone_mut(state, milestone_id)?.status = MilestoneStatus::Active;
+        EventKind::MilestoneUnblocked {
+            milestone_id,
+            validator_guidance,
+            ..
+        } => {
+            let ms = milestone_mut(state, milestone_id)?;
+            ms.status = MilestoneStatus::Active;
+            // Latest unblock wins (including None — a bare unblock clears
+            // guidance left by an earlier one).
+            ms.validator_guidance = validator_guidance.clone();
             state.mission.status = MissionStatus::Running;
         }
 
         EventKind::MilestoneCompleted { milestone_id, .. } => {
-            milestone_mut(state, milestone_id)?.status = MilestoneStatus::Complete;
+            let ms = milestone_mut(state, milestone_id)?;
+            ms.status = MilestoneStatus::Complete;
+            // Guidance served its purpose; never leak it into a later
+            // milestone's (or a re-run's) validators.
+            ms.validator_guidance = None;
         }
 
         EventKind::MissionValidating {} => {
@@ -666,6 +679,9 @@ fn merge_revised_milestone(
         status: existing.status,
         fix_cycles: existing.fix_cycles,
         start_sha: existing.start_sha.clone(),
+        // A revision rebuilds the milestone but does not unblock it — folded
+        // operator guidance survives, exactly like fix_cycles and start_sha.
+        validator_guidance: existing.validator_guidance.clone(),
     }
 }
 
@@ -692,6 +708,7 @@ fn new_plan_milestone(idx: usize, plan_milestone: &PlanMilestone) -> Milestone {
         status: MilestoneStatus::Pending,
         fix_cycles: 0,
         start_sha: None,
+        validator_guidance: None,
     }
 }
 

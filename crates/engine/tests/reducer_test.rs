@@ -679,12 +679,96 @@ fn blocked_and_unblocked_transition_milestone_and_mission() {
             EventKind::MilestoneUnblocked {
                 milestone_id: "ms-1".into(),
                 reason: "user raised cap".into(),
+                validator_guidance: None,
             },
         ),
     )
     .unwrap();
     assert_eq!(milestone(&state, "ms-1").status, MilestoneStatus::Active);
     assert_eq!(state.mission.status, MissionStatus::Running);
+}
+
+#[test]
+fn unblock_guidance_folds_replaces_and_clears_on_completion() {
+    let mut state = fold(&[
+        ev(1, created()),
+        ev(
+            2,
+            EventKind::PlanApproved {
+                plan: plan(),
+                base_sha: None,
+            },
+        ),
+        ev(
+            3,
+            EventKind::MilestoneStarted {
+                milestone_id: "ms-1".into(),
+                start_sha: "s".into(),
+            },
+        ),
+    ])
+    .unwrap();
+
+    // Guidance folds into milestone state on unblock.
+    apply(
+        &mut state,
+        &ev(
+            4,
+            EventKind::MilestoneUnblocked {
+                milestone_id: "ms-1".into(),
+                reason: "try again".into(),
+                validator_guidance: Some("FMT FIRST".into()),
+            },
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        milestone(&state, "ms-1").validator_guidance.as_deref(),
+        Some("FMT FIRST"),
+        "guidance must fold so a resumed engine can inject it"
+    );
+
+    // A later bare unblock replaces (clears) it — latest unblock wins.
+    apply(
+        &mut state,
+        &ev(
+            5,
+            EventKind::MilestoneUnblocked {
+                milestone_id: "ms-1".into(),
+                reason: "and again".into(),
+                validator_guidance: None,
+            },
+        ),
+    )
+    .unwrap();
+    assert_eq!(milestone(&state, "ms-1").validator_guidance, None);
+
+    // Set once more, then completion clears it so it can never leak into a
+    // later re-run.
+    apply(
+        &mut state,
+        &ev(
+            6,
+            EventKind::MilestoneUnblocked {
+                milestone_id: "ms-1".into(),
+                reason: "third".into(),
+                validator_guidance: Some("check a3".into()),
+            },
+        ),
+    )
+    .unwrap();
+    apply(
+        &mut state,
+        &ev(
+            7,
+            EventKind::MilestoneCompleted {
+                milestone_id: "ms-1".into(),
+                tag: None,
+            },
+        ),
+    )
+    .unwrap();
+    assert_eq!(milestone(&state, "ms-1").validator_guidance, None);
 }
 
 // ---------------------------------------------------------------------------
@@ -732,6 +816,7 @@ fn every_status_value_is_reachable() {
         EventKind::MilestoneUnblocked {
             milestone_id: "ms-1".into(),
             reason: "r".into(),
+            validator_guidance: None,
         },
         EventKind::MilestoneCompleted {
             milestone_id: "ms-1".into(),
@@ -1744,6 +1829,7 @@ fn interpret(actions: &[Action]) -> Vec<Event> {
             Action::Unblocked(m) => EventKind::MilestoneUnblocked {
                 milestone_id: ms(*m),
                 reason: "r".into(),
+                validator_guidance: None,
             },
             Action::MilestoneCompleted(m) => EventKind::MilestoneCompleted {
                 milestone_id: ms(*m),

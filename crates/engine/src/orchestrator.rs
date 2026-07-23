@@ -140,6 +140,11 @@ struct UnblockDecision {
     action: String,
     #[serde(default)]
     note: String,
+    /// Optional operator guidance injected verbatim into the next validator
+    /// task (and its retry) — the only channel by which unblock text can
+    /// reach a fresh validator session.
+    #[serde(default)]
+    validator_guidance: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1677,6 +1682,7 @@ impl MissionEngine {
                 self.emit(EventKind::MilestoneUnblocked {
                     milestone_id,
                     reason: format!("revision {revision} approved"),
+                    validator_guidance: None,
                 })?;
             }
         }
@@ -2655,15 +2661,24 @@ impl MissionEngine {
         let message = format!(
             "Milestone {milestone_id} is BLOCKED. The user sent:\n- {messages}\n\n\
              Decide how to proceed. Respond with ONLY this JSON:\n\
-             {{\"action\":\"unblock-raise-cap\"|\"unblock-skip-findings\"|\"skip-milestone\"|\"stay-blocked\",\"note\":\"string\"}}"
+             {{\"action\":\"unblock-raise-cap\"|\"unblock-skip-findings\"|\"skip-milestone\"|\"stay-blocked\",\"note\":\"string\",\"validatorGuidance\":\"string (optional)\"}}\n\
+             When unblocking you may set validatorGuidance to verbatim instructions for the \
+             next validator session (e.g. \"run cargo fmt before the gate\", \"the a3 grep \
+             pattern is the problem\") — it is folded into mission state and injected into \
+             the next validator task and its retry, even across a process restart."
         );
         let (decision, text) = self.json_decision::<UnblockDecision>(&message).await?;
         // Conservative default (documented): stay blocked.
-        let (action, note) = match decision {
-            Some(d) => (d.action.trim().to_ascii_lowercase(), d.note),
+        let (action, note, validator_guidance) = match decision {
+            Some(d) => (
+                d.action.trim().to_ascii_lowercase(),
+                d.note,
+                d.validator_guidance,
+            ),
             None => (
                 "stay-blocked".to_string(),
                 "unparseable unblock decision".to_string(),
+                None,
             ),
         };
         self.emit_decision(
@@ -2676,6 +2691,7 @@ impl MissionEngine {
                 self.emit(EventKind::MilestoneUnblocked {
                     milestone_id,
                     reason: if note.is_empty() { action } else { note },
+                    validator_guidance,
                 })?;
                 Ok(None)
             }
@@ -2687,6 +2703,7 @@ impl MissionEngine {
                 self.emit(EventKind::MilestoneUnblocked {
                     milestone_id: milestone_id.clone(),
                     reason: "milestone skipped by orchestrator decision".to_string(),
+                    validator_guidance: None,
                 })?;
                 let to_skip: Vec<String> = self.state.mission.milestones[mi]
                     .features
@@ -3797,6 +3814,7 @@ impl MissionEngine {
                 base_sha.as_deref(),
                 &grants,
                 &worker_commands,
+                milestone.validator_guidance.as_deref(),
             )
             .await;
             let caught = self.catch_up();
@@ -3851,6 +3869,7 @@ impl MissionEngine {
                     base_sha.as_deref(),
                     &grants,
                     &worker_commands,
+                    milestone.validator_guidance.as_deref(),
                 )
                 .await;
                 let caught = self.catch_up();
@@ -8131,6 +8150,7 @@ mod tests {
             status: MilestoneStatus::Active,
             fix_cycles: 0,
             start_sha: Some("HEAD".to_string()),
+            validator_guidance: None,
         });
 
         let env_guard = CodexEnvGuard::engage();
@@ -8392,6 +8412,7 @@ mod tests {
             status: MilestoneStatus::Active,
             fix_cycles: 0,
             start_sha: Some("HEAD".to_string()),
+            validator_guidance: None,
         });
 
         let env_guard = DroidEnvGuard::engage();
@@ -8482,6 +8503,7 @@ mod tests {
             status: MilestoneStatus::Active,
             fix_cycles: 0,
             start_sha: None,
+            validator_guidance: None,
         };
         assert_eq!(
             next_feature(&ms),
@@ -8543,6 +8565,7 @@ mod tests {
             status: MilestoneStatus::Active,
             fix_cycles: 0,
             start_sha: None,
+            validator_guidance: None,
         };
         let mut runs = std::collections::BTreeMap::new();
         runs.insert("run-1".to_string(), run);
@@ -9395,6 +9418,7 @@ mod tests {
             status: MilestoneStatus::Active,
             fix_cycles: 0,
             start_sha: Some(engine.repo.head_sha().unwrap()),
+            validator_guidance: None,
         });
 
         engine.run_feature(0, 0).await.unwrap();
@@ -9445,6 +9469,7 @@ mod tests {
             status: MilestoneStatus::Active,
             fix_cycles: 0,
             start_sha: Some(engine.repo.head_sha().unwrap()),
+            validator_guidance: None,
         });
 
         engine.validation_round(0).await.unwrap();
@@ -9554,6 +9579,7 @@ mod tests {
             status: MilestoneStatus::Active,
             fix_cycles: 2,
             start_sha: Some(engine.repo.head_sha().unwrap()),
+            validator_guidance: None,
         });
         assert_eq!(engine.state.executor_tier(), ExecutorTier::Local);
 
@@ -9651,6 +9677,7 @@ mod tests {
             status: MilestoneStatus::Active,
             fix_cycles: 2,
             start_sha: Some(engine.repo.head_sha().unwrap()),
+            validator_guidance: None,
         });
         assert_eq!(engine.state.executor_tier(), ExecutorTier::Frontier);
 
@@ -9708,6 +9735,7 @@ mod tests {
             status: MilestoneStatus::Active,
             fix_cycles: 2,
             start_sha: Some(engine.repo.head_sha().unwrap()),
+            validator_guidance: None,
         });
 
         assert_ne!(
@@ -10191,6 +10219,7 @@ mod tests {
             status: MilestoneStatus::Active,
             fix_cycles: 0,
             start_sha: Some("HEAD".to_string()),
+            validator_guidance: None,
         }
     }
 

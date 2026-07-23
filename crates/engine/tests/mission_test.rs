@@ -943,6 +943,125 @@ async fn loop_guard_blocks_milestone_after_max_fix_cycles() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn unblock_guidance_survives_restart_and_reaches_validator() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    // Phase 1: drive the milestone to Blocked exactly like the cap test
+    // above (cap=1, findings in both rounds).
+    let finding = json!([{
+        "subject": "part 1 works",
+        "severity": "major",
+        "evidence": "still failing",
+        "suggestedFix": ""
+    }]);
+    let backend1 = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            fix_features(1),
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            fix_features(1),
+        ]),
+        validator_with(finding.clone()),
+        worker_pass(),
+        validator_with(finding),
+    ]));
+    let cfg = MissionConfig {
+        skip_functional: false,
+        max_fix_cycles_per_milestone: 1,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend1, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Blocked);
+    let mission_id = engine.mission_id().to_string();
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    // The operator asks for an unblock; the guidance text must travel.
+    control::enqueue(
+        &paths,
+        &ControlCommand::Msg {
+            text: "unblock and guide the validator".into(),
+            interrupt: false,
+        },
+    )
+    .unwrap();
+
+    // Phase 2: a FRESH engine resumes from the event log (process-restart
+    // equivalent — state is folded, not carried). The orchestrator's unblock
+    // decision carries validatorGuidance; validation then passes.
+    let guidance = "FMT FIRST: run cargo fmt before the contract gate";
+    let unblock = json!({
+        "action": "unblock-raise-cap",
+        "note": "cap raised with guidance",
+        "validatorGuidance": guidance,
+    })
+    .to_string();
+    let backend2 = Arc::new(MockBackend::with_scripts(vec![
+        orch_script(vec![unblock, no_lesson()]),
+        validator_with(json!([])),
+    ]));
+    let backend2_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend2) as Arc<dyn AgentBackend>;
+    let mut engine = MissionEngine::resume(backend2_dyn, &root, &mission_id, LockForce::No)
+        .expect("resume mission");
+    engine.seed_worker_auth_verdict_for_test(AuthVerdict::Inconclusive);
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+    drop(engine);
+
+    // (a) The event log carries the guidance verbatim (restart durability).
+    let events = read_log(&paths);
+    let unblock_idx = events
+        .iter()
+        .position(|e| matches!(&e.kind, EventKind::MilestoneUnblocked { .. }))
+        .expect("unblock event present");
+    match &events[unblock_idx].kind {
+        EventKind::MilestoneUnblocked {
+            validator_guidance, ..
+        } => assert_eq!(validator_guidance.as_deref(), Some(guidance)),
+        _ => unreachable!(),
+    }
+
+    // (b) Folding the log prefix up to the unblock reconstructs the guidance
+    // — this is exactly what MissionEngine::resume injects from.
+    let prefix_state = reducer::fold(&events[..=unblock_idx]).unwrap();
+    assert_eq!(
+        prefix_state.mission.milestones[0]
+            .validator_guidance
+            .as_deref(),
+        Some(guidance),
+        "folded state must carry the guidance across a restart"
+    );
+
+    // (c) The fresh validator session's task contains the guidance verbatim.
+    let specs = backend2.started_specs();
+    let validator_task = specs
+        .iter()
+        .find_map(|s| match &s.prompt {
+            PromptMode::SingleShot(task) if task.contains("Validate milestone") => Some(task),
+            _ => None,
+        })
+        .expect("a validator session ran in phase 2");
+    assert!(
+        validator_task.contains(guidance),
+        "validator task must carry the operator guidance verbatim: {validator_task}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 3b. Waive: all findings waived → milestone completes, no fix cycle
 // ---------------------------------------------------------------------------

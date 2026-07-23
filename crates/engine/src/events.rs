@@ -244,6 +244,16 @@ pub enum EventKind {
         milestone_id: String,
         /// e.g. "raised fix-cycle cap", "user skipped findings"
         reason: String,
+        /// Operator guidance carried verbatim into the next validator task
+        /// (and its retry). Folded into milestone state so it survives a
+        /// process restart; replaced by each new unblock, cleared on
+        /// milestone completion. Absent in pre-field logs.
+        #[serde(
+            rename = "validatorGuidance",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        validator_guidance: Option<String>,
     },
 
     #[serde(rename = "milestone.completed")]
@@ -392,6 +402,43 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn milestone_unblocked_guidance_backcompat_and_round_trip() {
+        // Pre-field wire shape (logs written before validatorGuidance
+        // existed) must still parse, defaulting to None.
+        let old_json = r#"{
+            "seq": 4,
+            "ts": "2026-01-02T03:04:05Z",
+            "missionId": "m-1",
+            "type": "milestone.unblocked",
+            "payload": { "milestoneId": "ms-1", "reason": "cap raised" }
+        }"#;
+        let event: Event = serde_json::from_str(old_json).unwrap();
+        match event.kind {
+            EventKind::MilestoneUnblocked {
+                validator_guidance, ..
+            } => assert_eq!(validator_guidance, None),
+            _ => panic!("wrong variant"),
+        }
+
+        // The new field serializes when present (camelCase wire name) and is
+        // omitted when absent (byte-identical to old logs).
+        let with = EventKind::MilestoneUnblocked {
+            milestone_id: "ms-1".into(),
+            reason: "r".into(),
+            validator_guidance: Some("FMT FIRST".into()),
+        };
+        let json = serde_json::to_value(&with).unwrap();
+        assert_eq!(json["payload"]["validatorGuidance"], "FMT FIRST");
+        let without = EventKind::MilestoneUnblocked {
+            milestone_id: "ms-1".into(),
+            reason: "r".into(),
+            validator_guidance: None,
+        };
+        let json = serde_json::to_value(&without).unwrap();
+        assert!(json["payload"].get("validatorGuidance").is_none());
     }
 
     #[test]

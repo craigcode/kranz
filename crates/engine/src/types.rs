@@ -152,6 +152,10 @@ pub struct Milestone {
     /// Recorded at milestone.started so validators diff start..HEAD (§4.4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_sha: Option<String>,
+    /// Operator guidance folded from the latest milestone.unblocked event;
+    /// injected verbatim into validator tasks until the milestone completes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validator_guidance: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

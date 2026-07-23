@@ -466,6 +466,7 @@ fn milestone() -> Milestone {
         status: MilestoneStatus::Validating,
         fix_cycles: 0,
         start_sha: None,
+        validator_guidance: None,
     }
 }
 
@@ -499,6 +500,7 @@ async fn functional_validator_tools_are_carried_and_allowed() {
         None,
         &[],
         &[],
+        None,
     )
     .await
     .unwrap();
@@ -544,6 +546,7 @@ async fn scrutiny_validator_does_not_get_extra_tools_folded_into_allowed() {
         None,
         &[],
         &[],
+        None,
     )
     .await
     .unwrap();
@@ -587,6 +590,7 @@ async fn scrutiny_task_and_permissions_carry_no_contract_commands() {
             None,
             &[],
             &[],
+            None,
         )
         .await
         .unwrap();
