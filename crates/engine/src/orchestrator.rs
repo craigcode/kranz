@@ -161,6 +161,19 @@ struct WaivedFinding {
     reason: String,
 }
 
+/// One finding the orchestrator judged to be an author-broken command
+/// assertion (a false negative: the requirement is genuinely met but the
+/// assertion's own command is wrong) — escalated to the operator instead of
+/// spent as a fix cycle. Only honored for `class == "command-assertion"`
+/// findings; see [`MissionEngine::convert_findings`]'s escape-hatch guard.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommandBrokenFinding {
+    subject: String,
+    #[serde(default)]
+    diagnosis: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct FixFeaturesDecision {
@@ -170,6 +183,10 @@ struct FixFeaturesDecision {
     /// old-shape answers (fixFeatures + summary only) still parse.
     #[serde(default)]
     waived: Vec<WaivedFinding>,
+    /// Findings judged author-broken command assertions. Defaulted so
+    /// old-shape answers still parse.
+    #[serde(default)]
+    command_broken: Vec<CommandBrokenFinding>,
     #[serde(default)]
     summary: String,
 }
@@ -210,6 +227,13 @@ enum FindingsConversion {
     },
     /// Every finding waived, each with a one-line justification.
     Waive { waived: Vec<WaivedFinding> },
+    /// At least one finding judged an author-broken command assertion
+    /// (false negative). Supersedes fix/waive for the round — the milestone
+    /// blocks for operator review instead.
+    Escalate {
+        escalations: Vec<CommandBrokenFinding>,
+        text: String,
+    },
 }
 
 /// The parallelization decision for one milestone (roadmap M3): which of the
@@ -3904,6 +3928,24 @@ impl MissionEngine {
         // old flow would have blocked on trivia.
         let findings: Vec<Finding> = findings.into_iter().map(|(_, f)| f).collect();
         match self.convert_findings(&milestone_id, &findings).await? {
+            // validation_round findings never carry class=="command-assertion",
+            // so convert_findings' escape-hatch guard makes this practically
+            // unreachable here; handle it defensively rather than panic.
+            FindingsConversion::Escalate { escalations, .. } => {
+                let subjects = escalations
+                    .iter()
+                    .map(|e| e.subject.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.emit(EventKind::MilestoneBlocked {
+                    milestone_id,
+                    reason: format!(
+                        "orchestrator marked finding(s) {subjects} as author-broken command \
+                         assertions, but this validation round has none — escalating to \
+                         operator rather than fixing or waiving."
+                    ),
+                })?;
+            }
             FindingsConversion::Waive { waived } => {
                 self.emit_waive_decision(&waived)?;
                 let tag = self.tag_milestone(&milestone_id);
@@ -4101,21 +4143,45 @@ impl MissionEngine {
             "Validation of milestone {milestone_id} produced these findings:\n{findings_json}\n\n\
              For each finding decide: convert it to a fix-feature (it violates or endangers \
              the validation contract / feature criteria; fresh worker sessions will implement \
-             fix features) or WAIVE it with a one-line justification (cosmetic, \
-             out-of-contract, or not worth a fresh worker session). The contract is the bar; \
-             minor severity is not automatically waivable and major severity is not \
-             automatically fixable — judge. Respond with ONLY this JSON:\n\
-             {{\"fixFeatures\":[{{\"title\":\"string\",\"spec\":\"string\",\"validationCriteria\":[\"string\"]}}],\"waived\":[{{\"subject\":\"string\",\"reason\":\"string\"}}],\"summary\":\"string\"}}"
+             fix features), WAIVE it with a one-line justification (cosmetic, \
+             out-of-contract, or not worth a fresh worker session), or — ONLY for a finding \
+             whose class is \"command-assertion\" — mark it commandBroken when you judge the \
+             underlying requirement is genuinely met (the milestone validators already passed \
+             it) but the assertion's own command is wrong, e.g. it can only pass pre-change or \
+             it counts the harness's own commits. commandBroken escalates the finding to a \
+             HUMAN operator (the mission blocks) with the evidence attached; it is not a way \
+             to dodge a real product defect, and it is ignored for any finding that is not a \
+             command assertion. The contract is the bar; minor severity is not automatically \
+             waivable and major severity is not automatically fixable — judge. Respond with \
+             ONLY this JSON:\n\
+             {{\"fixFeatures\":[{{\"title\":\"string\",\"spec\":\"string\",\"validationCriteria\":[\"string\"]}}],\"waived\":[{{\"subject\":\"string\",\"reason\":\"string\"}}],\"commandBroken\":[{{\"subject\":\"string\",\"diagnosis\":\"string\"}}],\"summary\":\"string\"}}"
         );
         let (decision, text) = self.json_decision::<FixFeaturesDecision>(&message).await?;
-        let (specs, waived, summary) = match decision {
-            Some(d) => (d.fix_features, d.waived, d.summary),
+        let (specs, waived, command_broken, summary) = match decision {
+            Some(d) => (d.fix_features, d.waived, d.command_broken, d.summary),
             None => (
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 "unparseable fix-features decision; synthesized from findings".to_string(),
             ),
         };
+        // Escape hatch: commandBroken is honored ONLY for findings whose
+        // class is "command-assertion" — a mislabelled agent-judgement or
+        // validator finding (class == "") must never escalate, it falls
+        // through to the normal fix/waive handling below.
+        let command_assertion_subjects: std::collections::HashSet<&str> = findings
+            .iter()
+            .filter(|f| f.class == "command-assertion")
+            .map(|f| f.subject.as_str())
+            .collect();
+        let escalations: Vec<CommandBrokenFinding> = command_broken
+            .into_iter()
+            .filter(|c| command_assertion_subjects.contains(c.subject.as_str()))
+            .collect();
+        if !escalations.is_empty() {
+            return Ok(FindingsConversion::Escalate { escalations, text });
+        }
         let waived_subjects: std::collections::HashSet<&str> =
             waived.iter().map(|w| w.subject.as_str()).collect();
         let unwaived_findings: Vec<&Finding> = findings
@@ -4357,6 +4423,42 @@ impl MissionEngine {
             .convert_findings(&last_milestone_id, &all_findings)
             .await?
         {
+            FindingsConversion::Escalate { escalations, text } => {
+                let subjects = escalations
+                    .iter()
+                    .map(|e| e.subject.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let detail = escalations
+                    .iter()
+                    .map(|e| {
+                        let evidence = all_findings
+                            .iter()
+                            .find(|f| f.subject == e.subject)
+                            .map(|f| f.evidence.as_str())
+                            .unwrap_or("");
+                        format!("- {}: {}\n  evidence: {}", e.subject, e.diagnosis, evidence)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.emit_decision(
+                    &format!(
+                        "final-gate command assertion(s) {subjects} appear author-broken \
+                         (false negative); escalating to the operator with evidence attached"
+                    ),
+                    Some(format!("{detail}\n\n{text}")),
+                )?;
+                self.emit(EventKind::MilestoneBlocked {
+                    milestone_id: last_milestone_id,
+                    reason: format!(
+                        "contract command assertion(s) {subjects} appear buggy (false \
+                         negative) — command still fails but the requirement is verified met; \
+                         evidence attached. Escalating to operator (gate-repair is a human \
+                         decision, not a fix cycle)."
+                    ),
+                })?;
+                Ok(None)
+            }
             FindingsConversion::Waive { waived }
                 if waived
                     .iter()
@@ -9124,6 +9226,7 @@ mod tests {
             FindingsConversion::Waive { .. } => {
                 panic!("a partial waiver must not waive the whole finding set")
             }
+            FindingsConversion::Escalate { .. } => panic!("no command-assertion finding here"),
         }
     }
 
@@ -9171,6 +9274,7 @@ mod tests {
             FindingsConversion::Waive { .. } => {
                 panic!("partial fixFeatures must not waive")
             }
+            FindingsConversion::Escalate { .. } => panic!("no command-assertion finding here"),
         }
     }
 
@@ -9209,6 +9313,7 @@ mod tests {
                 assert_eq!(specs[0].title, "fix issue 1");
             }
             FindingsConversion::Waive { .. } => panic!("expected Fix"),
+            FindingsConversion::Escalate { .. } => panic!("no command-assertion finding here"),
         }
     }
 
@@ -9241,6 +9346,7 @@ mod tests {
         match conversion {
             FindingsConversion::Waive { waived } => assert_eq!(waived.len(), 2),
             FindingsConversion::Fix { .. } => panic!("a full waiver should still waive"),
+            FindingsConversion::Escalate { .. } => panic!("no command-assertion finding here"),
         }
     }
 
