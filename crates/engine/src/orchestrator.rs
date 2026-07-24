@@ -6601,9 +6601,22 @@ pub fn render_mission_report(
         "**Tokens:** {} in / {} out / {} cache read / {} cache write",
         t.input, t.output, t.cache_read, t.cache_write
     );
+    // Distinguish local/mixed spend from paid frontier spend rather than
+    // reporting a misleading bare $0 (local-inference-cost-accounting).
+    let cost_note = match crate::cost::mission_cost_class(&state) {
+        crate::cost::MissionCostClass::Frontier => "",
+        crate::cost::MissionCostClass::Local => {
+            " — local tier: $0 marginal (fixed hardware + electricity, not \
+             per-token); excluded from frontier-cost calibration"
+        }
+        crate::cost::MissionCostClass::Mixed => {
+            " — mixed local→frontier (escalated mid-mission); excluded from \
+             frontier-cost calibration"
+        }
+    };
     let _ = writeln!(
         md,
-        "**Cost:** ${:.2} actual vs ${:.2}–${:.2} estimated (expected ${:.2})",
+        "**Cost:** ${:.2} actual{cost_note} vs ${:.2}–${:.2} estimated (expected ${:.2})",
         state.total_cost_usd, estimate.low_usd, estimate.high_usd, estimate.expected_usd
     );
 

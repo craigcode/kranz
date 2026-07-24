@@ -345,6 +345,12 @@ pub struct Calibration {
     /// below [`MIN_CALIBRATION_MISSIONS`].
     pub low_mult: f64,
     pub high_mult: f64,
+    /// Completed missions EXCLUDED from the corpus for not being frontier
+    /// spend ([`MissionCostClass::Local`] or [`MissionCostClass::Mixed`]) —
+    /// their $0-marginal or blended actuals would distort the frontier
+    /// calibration. Visibility for the corpus-size readouts (ready.rs shows
+    /// `missions_used`).
+    pub excluded_non_frontier: usize,
 }
 
 /// Minimum completed missions before the corpus fit ([`expected_mult`] etc.)
@@ -353,6 +359,38 @@ pub struct Calibration {
 ///
 /// [`expected_mult`]: Calibration::expected_mult
 pub const MIN_CALIBRATION_MISSIONS: usize = 5;
+
+/// Whether a completed mission's spend is frontier-priced, local-marginal, or
+/// a blend — the calibration corpus is frontier-only, because a $0-marginal
+/// local mission next to $30–160 frontier missions would drag the corpus mean
+/// toward zero and pollute every future estimate (the
+/// local-inference-cost-accounting ticket).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissionCostClass {
+    /// Every run priced per-token at a frontier backend.
+    Frontier,
+    /// Routed to the local tier for the entire mission (`worker.backend ==
+    /// "local"`, never escalated): ~$0 marginal (fixed hardware +
+    /// electricity, not per-token).
+    Local,
+    /// Started local and escalated to frontier mid-mission: actuals blend
+    /// both tiers and are representative of neither corpus.
+    Mixed,
+}
+
+/// Classify a folded mission. After a `tier.escalated` fold the reducer
+/// resets `config.worker.backend` to None, so `still_local` reads true only
+/// for never-escalated local missions; the (still_local, escalated) cell is
+/// unreachable today and classified Mixed defensively.
+pub fn mission_cost_class(state: &MissionState) -> MissionCostClass {
+    let still_local = state.config.worker.backend.as_deref() == Some("local");
+    let escalated = state.escalated_milestones > 0;
+    match (still_local, escalated) {
+        (true, false) => MissionCostClass::Local,
+        (false, false) => MissionCostClass::Frontier,
+        _ => MissionCostClass::Mixed,
+    }
+}
 
 /// Derive [`EstimateParams`] from the actuals recorded in this repo's
 /// COMPLETED missions (live estimates ran ~10x above actuals on the built-in
@@ -371,6 +409,7 @@ pub const MIN_CALIBRATION_MISSIONS: usize = 5;
 pub fn calibrate(repo_root: &Path) -> Calibration {
     let mut per_mission: Vec<EstimateParams> = Vec::new();
     let mut doc_heavy_missions_used = 0usize;
+    let mut excluded_non_frontier = 0usize;
     // (milestones, planned features, config, actual total cost) per completed
     // mission — the inputs needed to re-predict each mission and measure the
     // estimate's bias (see `fit_estimate_to_corpus`).
@@ -384,6 +423,14 @@ pub fn calibrate(repo_root: &Path) -> Calibration {
             continue; // corrupt / empty log: skip, never fail the estimate
         };
         if state.mission.status != MissionStatus::Complete {
+            continue;
+        }
+        // Frontier-only corpus (local-inference-cost-accounting): a
+        // $0-marginal local run next to $30–160 frontier missions would drag
+        // the corpus mean toward zero; a mixed (escalated) mission is
+        // representative of neither tier.
+        if mission_cost_class(&state) != MissionCostClass::Frontier {
+            excluded_non_frontier += 1;
             continue;
         }
         if classify_shape(&mission_plan(&state)) == MissionShape::DocHeavy {
@@ -414,6 +461,7 @@ pub fn calibrate(repo_root: &Path) -> Calibration {
             expected_mult: 1.0,
             low_mult: 0.5,
             high_mult: 2.5,
+            excluded_non_frontier,
         };
     }
 
@@ -436,6 +484,7 @@ pub fn calibrate(repo_root: &Path) -> Calibration {
         expected_mult,
         low_mult,
         high_mult,
+        excluded_non_frontier,
     }
 }
 
@@ -831,5 +880,134 @@ mod tests {
                 "backend {backend:?} pricing should be unchanged"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Local-inference cost accounting: classification + calibration exclusion
+    // -----------------------------------------------------------------------
+
+    use crate::event_log::{EventLog, LockForce};
+    use crate::events::{Event, EventKind};
+    use crate::paths::MissionPaths;
+    use std::time::Duration;
+
+    fn seed_mission(repo_root: &Path, id: &str, kinds: Vec<EventKind>) {
+        let paths = MissionPaths::new(repo_root, id);
+        let mut log = EventLog::acquire(&paths, id, Duration::ZERO, LockForce::No).unwrap();
+        for kind in kinds {
+            log.append(kind).unwrap();
+        }
+    }
+
+    fn created_with(config: MissionConfig) -> EventKind {
+        EventKind::MissionCreated {
+            goal: "g".into(),
+            base_branch: "main".into(),
+            mission_branch: "kranz/mission-x".into(),
+            config,
+        }
+    }
+
+    fn local_config() -> MissionConfig {
+        let mut cfg = MissionConfig::default();
+        cfg.worker.backend = Some("local".to_string());
+        cfg
+    }
+
+    fn approved_and_completed() -> Vec<EventKind> {
+        vec![
+            EventKind::PlanApproved {
+                plan: crate::types::Plan {
+                    goal: "g".into(),
+                    validation_contract: vec![],
+                    // One milestone so tier.escalated has a real ms-1 to
+                    // reference (the reducer rejects unknown milestones).
+                    milestones: vec![crate::types::PlanMilestone {
+                        title: "milestone one".into(),
+                        features: vec![crate::types::PlanFeature {
+                            title: "alpha".into(),
+                            spec: "build alpha".into(),
+                            validation_criteria: vec![],
+                        }],
+                    }],
+                    considered_alternatives: None,
+                    command_grants: vec![],
+                    touch_set: vec![],
+                },
+                base_sha: None,
+            },
+            EventKind::MissionCompleted {},
+        ]
+    }
+
+    #[test]
+    fn mission_cost_class_maps_local_mixed_and_frontier() {
+        let cases = [
+            (MissionConfig::default(), false, MissionCostClass::Frontier),
+            (local_config(), false, MissionCostClass::Local),
+            (local_config(), true, MissionCostClass::Mixed),
+        ];
+        for (config, escalate, expected) in cases {
+            let mut kinds = vec![created_with(config)];
+            kinds.extend(approved_and_completed());
+            if escalate {
+                kinds.insert(
+                    kinds.len() - 1,
+                    EventKind::TierEscalated {
+                        milestone_id: "ms-1".into(),
+                        from: crate::types::ExecutorTier::Local,
+                        to: crate::types::ExecutorTier::Frontier,
+                        reason: "two failed local validations".into(),
+                    },
+                );
+            }
+            let events: Vec<Event> = kinds
+                .into_iter()
+                .enumerate()
+                .map(|(i, kind)| Event {
+                    seq: (i + 1) as u64,
+                    ts: chrono::Utc::now(),
+                    mission_id: "m-1".into(),
+                    kind,
+                })
+                .collect();
+            let state = crate::reducer::fold(&events).unwrap();
+            assert_eq!(mission_cost_class(&state), expected, "escalate={escalate}");
+        }
+    }
+
+    #[test]
+    fn calibrate_excludes_local_and_mixed_from_the_frontier_corpus() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // One frontier mission + one local + one escalated, all Complete.
+        let mut frontier = vec![created_with(MissionConfig::default())];
+        frontier.extend(approved_and_completed());
+        seed_mission(root, "m-frontier", frontier);
+
+        let mut local = vec![created_with(local_config())];
+        local.extend(approved_and_completed());
+        seed_mission(root, "m-local", local);
+
+        let mut mixed = vec![created_with(local_config())];
+        mixed.extend(approved_and_completed());
+        // Escalate before completion: started local, ended frontier.
+        mixed.insert(
+            mixed.len() - 1,
+            EventKind::TierEscalated {
+                milestone_id: "ms-1".into(),
+                from: crate::types::ExecutorTier::Local,
+                to: crate::types::ExecutorTier::Frontier,
+                reason: "two failed local validations".into(),
+            },
+        );
+        seed_mission(root, "m-mixed", mixed);
+
+        let calibration = calibrate(root);
+        // The pin from the ticket: a local (or mixed) run does NOT enter the
+        // frontier calibration set.
+        assert_eq!(calibration.missions_used, 1, "frontier missions only");
+        assert_eq!(calibration.excluded_non_frontier, 2);
     }
 }
