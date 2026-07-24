@@ -6,8 +6,6 @@
 //! (process group on unix, Job Object on Windows), output tailing, and
 //! environment sanitization live here as one unit.
 
-#[cfg(windows)]
-use crate::backend_claude::win_job;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -312,6 +310,7 @@ pub(crate) fn tail_chars(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::runner;
 
     #[test]
