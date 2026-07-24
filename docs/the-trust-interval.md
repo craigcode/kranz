@@ -102,9 +102,12 @@ from the same event logs that drive everything else:
   proposed and what was decided. It doubles as the consent corpus for
   fine-tuning work: labeled human judgment, not just execution traces.
 
-(Status note, 2026-07-21: the console is mission m-d1e3c3, queued. The
-metrics are defined and the data has existed in every event log since the
-first mission.)
+(Status note, 2026-07-23: the console SHIPPED as mission m-d1e3c3 —
+`kranz outcomes`, the dashboard panel, and the `/kranz outcomes` Slack
+card all fold the same engine module. Live numbers on this repo: 0.60
+interventions per closed mission, 85% of 53 closed missions
+zero-intervention, and 18 of 18 grant decisions ≥10m — slow,
+evidence-backed judgment made visible, zero rubber-stamp buckets.)
 
 ## Demo runbook
 
@@ -129,8 +132,9 @@ kranz work        # or the Run queue button in the dashboard
 #    secret scan, scratch-worktree gate suite, fast-forward of exactly
 #    the tested commit.
 
-# 5. The metric (PENDING — mission m-d1e3c3)
+# 5. The metric (DELIVERED — m-d1e3c3: CLI + dashboard panel + Slack card)
 kranz outcomes    # autonomy ratio, grant-latency buckets, escalation ledger
+#    Dashboard: OutcomesPanel. Slack: `/kranz outcomes` summary card.
 ```
 
 Capture: asciinema + `agg` for the CLI beats; screen capture of the
