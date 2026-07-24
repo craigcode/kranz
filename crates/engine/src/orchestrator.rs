@@ -6603,7 +6603,7 @@ pub fn render_mission_report(
     );
     // Distinguish local/mixed spend from paid frontier spend rather than
     // reporting a misleading bare $0 (local-inference-cost-accounting).
-    let cost_note = match crate::cost::mission_cost_class(&state) {
+    let cost_note = match crate::cost::mission_cost_class(state) {
         crate::cost::MissionCostClass::Frontier => "",
         crate::cost::MissionCostClass::Local => {
             " — local tier: $0 marginal (fixed hardware + electricity, not \
