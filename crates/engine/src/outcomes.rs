@@ -67,6 +67,33 @@ pub struct Outcomes {
     pub autonomy_ratio: AutonomyRatio,
     pub grant_latency: GrantLatency,
     pub escalations: Vec<EscalationRow>,
+    /// costUsd per merged non-meta commit (outcomes-view lagging metric).
+    pub cost_per_change: CostPerChange,
+    /// mission.created → terminal, minus paused spans (dashboard rule).
+    pub cycle_time: CycleTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CostPerChange {
+    pub total_cost_usd: f64,
+    /// Commits recorded on feature.completed whose subject is not an
+    /// engine/meta template (contract_sweep::is_meta_commit, subject-level —
+    /// the fold reads events only, never git).
+    pub non_meta_commits: u64,
+    /// total_cost_usd / non_meta_commits (None when no non-meta commits —
+    /// the ratio is meaningless, not zero).
+    pub usd_per_commit: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CycleTime {
+    /// Closed missions with a computable cycle (terminal event present).
+    pub closed_missions: u64,
+    pub total_ms: u64,
+    /// total_ms / closed_missions (None when nothing closed yet).
+    pub mean_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -76,6 +103,12 @@ pub struct MissionOutcomes {
     pub is_closed: bool,
     pub latencies_ms: Vec<u64>,
     pub escalations: Vec<EscalationRow>,
+    /// Σ worker.completed costUsd, with token-priced fallback for runs that
+    /// record none (mirrors cost::mission_total_cost's rule).
+    pub cost_usd: f64,
+    pub non_meta_commits: u64,
+    /// created → terminal minus paused spans; None while no terminal event.
+    pub cycle_time_ms: Option<u64>,
 }
 
 /// The four fixed grant-latency bucket labels, in display order.
@@ -369,11 +402,109 @@ pub fn mission_outcomes(mission_id: &str, events: &[Event]) -> MissionOutcomes {
         });
     }
 
+    // --- cost per change + cycle time (outcomes-view lagging metrics) ------
+    // Non-meta commits: feature.completed commit strings are "<sha> <subject>";
+    // classify by subject only — the fold reads events, never git.
+    let mut non_meta_commits: u64 = 0;
+    for e in &mission_events {
+        if let EventKind::FeatureCompleted { commits, .. } = &e.kind {
+            for commit in commits {
+                let subject = commit.split_once(' ').map(|(_, s)| s).unwrap_or("");
+                if !crate::contract_sweep::is_meta_commit(subject) {
+                    non_meta_commits += 1;
+                }
+            }
+        }
+    }
+
+    // Cost: Σ recorded costUsd, falling back to token pricing with the
+    // spawned run's model and the config's backend for that role (mirrors
+    // cost::mission_total_cost — including $0 for the local tier).
+    let config = mission_events.iter().find_map(|e| match &e.kind {
+        EventKind::MissionCreated { config, .. } => Some(config),
+        _ => None,
+    });
+    let mut run_models: std::collections::HashMap<&str, (&str, crate::types::Role)> =
+        std::collections::HashMap::new();
+    for e in &mission_events {
+        if let EventKind::WorkerSpawned {
+            run_id,
+            role,
+            model,
+            ..
+        } = &e.kind
+        {
+            run_models.insert(run_id.as_str(), (model.as_str(), *role));
+        }
+    }
+    let mut cost_usd = 0.0;
+    for e in &mission_events {
+        if let EventKind::WorkerCompleted {
+            run_id,
+            tokens,
+            cost_usd: recorded,
+            ..
+        } = &e.kind
+        {
+            cost_usd += recorded.unwrap_or_else(|| {
+                let (model, role) = run_models
+                    .get(run_id.as_str())
+                    .copied()
+                    .unwrap_or(("", crate::types::Role::Worker));
+                let backend = config
+                    .map(|c| c.backend_kind(role))
+                    .unwrap_or(crate::types::BackendKind::Claude);
+                crate::cost::usage_cost_usd_for_backend(tokens, model, backend)
+            });
+        }
+    }
+
+    // Cycle time: created → terminal minus paused spans (a pause never
+    // resumed runs to the terminal timestamp — the dashboard's rule).
+    let created_ts = mission_events
+        .iter()
+        .find(|e| matches!(e.kind, EventKind::MissionCreated { .. }))
+        .map(|e| e.ts);
+    let terminal_ts = mission_events.iter().find_map(|e| {
+        matches!(
+            e.kind,
+            EventKind::MissionCompleted {}
+                | EventKind::MissionFailed { .. }
+                | EventKind::MissionAbandoned { .. }
+        )
+        .then_some(e.ts)
+    });
+    let cycle_time_ms = match (created_ts, terminal_ts) {
+        (Some(start), Some(end)) => {
+            let mut paused_ms: i64 = 0;
+            let mut pause_start: Option<DateTime<Utc>> = None;
+            for e in &mission_events {
+                match &e.kind {
+                    EventKind::MissionPaused {} => pause_start = Some(e.ts),
+                    EventKind::MissionResumed {} => {
+                        if let Some(p) = pause_start.take() {
+                            paused_ms += (e.ts - p).num_milliseconds().max(0);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(p) = pause_start {
+                paused_ms += (end - p).num_milliseconds().max(0);
+            }
+            Some(((end - start).num_milliseconds() - paused_ms).max(0) as u64)
+        }
+        _ => None,
+    };
+
     MissionOutcomes {
         interventions,
         is_closed,
         latencies_ms,
         escalations,
+        cost_usd,
+        non_meta_commits,
+        cycle_time_ms,
     }
 }
 
@@ -404,6 +535,10 @@ pub fn compute_outcomes(repo_root: &std::path::Path) -> anyhow::Result<Outcomes>
     let mut zero_intervention_missions: u64 = 0;
     let mut all_latencies_ms = Vec::new();
     let mut escalations = Vec::new();
+    let mut total_cost_usd = 0.0;
+    let mut total_non_meta_commits: u64 = 0;
+    let mut cycle_closed: u64 = 0;
+    let mut cycle_total_ms: u64 = 0;
 
     for id in ids {
         let paths = crate::paths::MissionPaths::new(repo_root, &id);
@@ -426,6 +561,12 @@ pub fn compute_outcomes(repo_root: &std::path::Path) -> anyhow::Result<Outcomes>
         }
         all_latencies_ms.extend(out.latencies_ms);
         escalations.extend(out.escalations);
+        total_cost_usd += out.cost_usd;
+        total_non_meta_commits += out.non_meta_commits;
+        if let Some(ms) = out.cycle_time_ms {
+            cycle_closed += 1;
+            cycle_total_ms += ms;
+        }
     }
 
     let interventions_per_closed_mission = if closed_missions > 0 {
@@ -451,6 +592,17 @@ pub fn compute_outcomes(repo_root: &std::path::Path) -> anyhow::Result<Outcomes>
         },
         grant_latency: bucketize(&all_latencies_ms),
         escalations,
+        cost_per_change: CostPerChange {
+            total_cost_usd,
+            non_meta_commits: total_non_meta_commits,
+            usd_per_commit: (total_non_meta_commits > 0)
+                .then(|| total_cost_usd / total_non_meta_commits as f64),
+        },
+        cycle_time: CycleTime {
+            closed_missions: cycle_closed,
+            total_ms: cycle_total_ms,
+            mean_ms: (cycle_closed > 0).then(|| cycle_total_ms as f64 / cycle_closed as f64),
+        },
     })
 }
 
@@ -872,6 +1024,177 @@ mod tests {
             for kind in kinds {
                 log.append(kind).unwrap();
             }
+        }
+
+        /// Write events.jsonl lines by hand (fixed timestamps) — seed_mission
+        /// stamps Utc::now(), which can't test pause-span subtraction.
+        fn write_timed_log(repo_root: &std::path::Path, id: &str, events: Vec<Event>) {
+            let paths = MissionPaths::new(repo_root, id);
+            std::fs::create_dir_all(paths.mission_dir()).unwrap();
+            let lines: Vec<String> = events
+                .iter()
+                .map(|e| serde_json::to_string(e).unwrap())
+                .collect();
+            std::fs::write(paths.events_file(), lines.join("\n") + "\n").unwrap();
+        }
+
+        fn timed(seq: u64, secs: i64, kind: EventKind) -> Event {
+            Event {
+                seq,
+                ts: chrono::DateTime::from_timestamp(secs, 0).unwrap(),
+                mission_id: "m-cost".into(),
+                kind,
+            }
+        }
+
+        #[test]
+        fn cost_per_change_and_cycle_time_fold_from_events() {
+            use crate::types::{Role, RunResult, TokenUsage};
+
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            write_timed_log(
+                root,
+                "m-cost",
+                vec![
+                    timed(1, 0, created("g")),
+                    timed(
+                        2,
+                        10,
+                        EventKind::PlanApproved {
+                            plan: sample_plan(),
+                            base_sha: None,
+                        },
+                    ),
+                    timed(
+                        3,
+                        20,
+                        EventKind::WorkerSpawned {
+                            run_id: "r-1".into(),
+                            role: Role::Worker,
+                            feature_id: Some("f-1-1".into()),
+                            milestone_id: Some("ms-1".into()),
+                            sdk_session_id: "s".into(),
+                            model: "sonnet".into(),
+                            quant: "n/a".into(),
+                            weight_hash: None,
+                            prompt_hash: "h".into(),
+                            transcript_path: "t".into(),
+                        },
+                    ),
+                    timed(
+                        4,
+                        100,
+                        EventKind::WorkerCompleted {
+                            run_id: "r-1".into(),
+                            result: RunResult::Pass,
+                            tokens: TokenUsage {
+                                input: 1,
+                                output: 1,
+                                cache_read: 0,
+                                cache_write: 0,
+                            },
+                            cost_usd: Some(12.50),
+                            report: None,
+                        },
+                    ),
+                    timed(
+                        5,
+                        110,
+                        EventKind::FeatureCompleted {
+                            feature_id: "f-1-1".into(),
+                            commits: vec![
+                                "aaa [f-1-1] add the thing".to_string(),
+                                "bbb [kranz] mission report for m-cost".to_string(),
+                            ],
+                        },
+                    ),
+                    timed(6, 120, EventKind::MissionPaused {}),
+                    timed(7, 130, EventKind::MissionResumed {}),
+                    timed(8, 160, EventKind::MissionCompleted {}),
+                ],
+            );
+
+            let outcomes = compute_outcomes(root).unwrap();
+            let cost = &outcomes.cost_per_change;
+            assert_eq!(cost.total_cost_usd, 12.50);
+            // Two commits recorded; the "[kranz]" engine-meta one is excluded.
+            assert_eq!(cost.non_meta_commits, 1);
+            assert_eq!(cost.usd_per_commit, Some(12.50));
+
+            let cycle = &outcomes.cycle_time;
+            assert_eq!(cycle.closed_missions, 1);
+            // created@0s → completed@160s = 160s, minus the 10s paused span.
+            assert_eq!(cycle.total_ms, 150_000);
+            assert_eq!(cycle.mean_ms, Some(150_000.0));
+        }
+
+        #[test]
+        fn cost_fallback_prices_tokens_with_spawned_model_and_local_is_zero() {
+            use crate::types::{Role, RunResult, TokenUsage};
+
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            // Local-tier mission: no recorded costUsd, and the local backend
+            // prices every token at $0 — never the opus fallback.
+            let mut local_cfg = MissionConfig::default();
+            local_cfg.worker.backend = Some("local".into());
+            let tokens = TokenUsage {
+                input: 2_000_000,
+                output: 100_000,
+                cache_read: 0,
+                cache_write: 0,
+            };
+            write_timed_log(
+                root,
+                "m-cost",
+                vec![
+                    timed(
+                        1,
+                        0,
+                        EventKind::MissionCreated {
+                            goal: "g".into(),
+                            base_branch: "main".into(),
+                            mission_branch: "kranz/mission-x".into(),
+                            config: local_cfg,
+                        },
+                    ),
+                    timed(
+                        2,
+                        10,
+                        EventKind::WorkerSpawned {
+                            run_id: "r-1".into(),
+                            role: Role::Worker,
+                            feature_id: None,
+                            milestone_id: Some("ms-1".into()),
+                            sdk_session_id: "s".into(),
+                            model: "my-local-model".into(),
+                            quant: "n/a".into(),
+                            weight_hash: None,
+                            prompt_hash: "h".into(),
+                            transcript_path: "t".into(),
+                        },
+                    ),
+                    timed(
+                        3,
+                        20,
+                        EventKind::WorkerCompleted {
+                            run_id: "r-1".into(),
+                            result: RunResult::Pass,
+                            tokens,
+                            cost_usd: None,
+                            report: None,
+                        },
+                    ),
+                    timed(4, 30, EventKind::MissionCompleted {}),
+                ],
+            );
+
+            let outcomes = compute_outcomes(root).unwrap();
+            assert_eq!(
+                outcomes.cost_per_change.total_cost_usd, 0.0,
+                "the local tier must price at $0, never the frontier fallback"
+            );
         }
 
         #[test]

@@ -32,6 +32,16 @@ function emptyOutcomes(): Outcomes {
       totalDecided: 0,
     },
     escalations: [],
+    costPerChange: {
+      totalCostUsd: 0,
+      nonMetaCommits: 0,
+      usdPerCommit: null,
+    },
+    cycleTime: {
+      closedMissions: 0,
+      totalMs: 0,
+      meanMs: null,
+    },
   };
 }
 
@@ -106,5 +116,22 @@ describe('OutcomesPanel', () => {
     });
     expect(screen.getByText('No decided grants yet')).toBeTruthy();
     expect(screen.getByText('No escalations recorded')).toBeTruthy();
+    expect(screen.getByText('No non-meta commits recorded yet')).toBeTruthy();
+  });
+
+  it('renders cost per change and cycle time from the fold', async () => {
+    const outcomes = emptyOutcomes();
+    outcomes.costPerChange = { totalCostUsd: 42.5, nonMetaCommits: 5, usdPerCommit: 8.5 };
+    outcomes.cycleTime = { closedMissions: 3, totalMs: 7_200_000, meanMs: 2_400_000 };
+    vi.mocked(getOutcomes).mockResolvedValue(outcomes);
+
+    render(<OutcomesPanel />);
+
+    await waitFor(() => {
+      expect(screen.getByText('$8.50')).toBeTruthy();
+      expect(screen.getByText('40m')).toBeTruthy();
+    });
+    expect(screen.getByText('$42.50')).toBeTruthy();
+    expect(screen.getByText('5')).toBeTruthy();
   });
 });

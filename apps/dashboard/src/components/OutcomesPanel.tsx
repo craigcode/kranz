@@ -12,6 +12,18 @@ function pct(share: number): string {
   return `${Math.round(share * 100)}%`;
 }
 
+/** Milliseconds as a compact duration ("12s", "47m", "2.3h", "3.1d"). */
+function formatDurationMs(ms: number): string {
+  const S = 1000;
+  const M = 60 * S;
+  const H = 60 * M;
+  const D = 24 * H;
+  if (ms >= D) return `${(ms / D).toFixed(1)}d`;
+  if (ms >= H) return `${(ms / H).toFixed(1)}h`;
+  if (ms >= M) return `${Math.floor(ms / M)}m`;
+  return `${Math.floor(ms / S)}s`;
+}
+
 export function OutcomesPanel() {
   const [outcomes, setOutcomes] = useState<Outcomes | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -46,7 +58,7 @@ export function OutcomesPanel() {
     );
   }
 
-  const { autonomyRatio, grantLatency, escalations } = outcomes;
+  const { autonomyRatio, grantLatency, escalations, costPerChange, cycleTime } = outcomes;
 
   return (
     <section className="panel outcomes-panel">
@@ -95,6 +107,50 @@ export function OutcomesPanel() {
               ))}
             </tbody>
           </table>
+        )}
+      </div>
+
+      <div className="outcomes-section outcomes-cost">
+        <h3 className="outcomes-heading">Cost per change</h3>
+        {costPerChange.usdPerCommit === null ? (
+          <div className="dim panel-empty" role="status">
+            No non-meta commits recorded yet
+          </div>
+        ) : (
+          <ul className="outcomes-stat-list">
+            <li>
+              <span className="outcomes-stat-label">$ / non-meta commit</span>
+              <span className="outcomes-stat-value mono">${costPerChange.usdPerCommit.toFixed(2)}</span>
+            </li>
+            <li>
+              <span className="outcomes-stat-label">non-meta commits</span>
+              <span className="outcomes-stat-value mono">{costPerChange.nonMetaCommits}</span>
+            </li>
+            <li>
+              <span className="outcomes-stat-label">total recorded cost</span>
+              <span className="outcomes-stat-value mono">${costPerChange.totalCostUsd.toFixed(2)}</span>
+            </li>
+          </ul>
+        )}
+      </div>
+
+      <div className="outcomes-section outcomes-cycle">
+        <h3 className="outcomes-heading">Cycle time</h3>
+        {cycleTime.meanMs === null ? (
+          <div className="dim panel-empty" role="status">
+            No closed missions to time yet
+          </div>
+        ) : (
+          <ul className="outcomes-stat-list">
+            <li>
+              <span className="outcomes-stat-label">mean (paused spans excluded)</span>
+              <span className="outcomes-stat-value mono">{formatDurationMs(cycleTime.meanMs)}</span>
+            </li>
+            <li>
+              <span className="outcomes-stat-label">closed missions</span>
+              <span className="outcomes-stat-value mono">{cycleTime.closedMissions}</span>
+            </li>
+          </ul>
         )}
       </div>
 

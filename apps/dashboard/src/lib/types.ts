@@ -550,6 +550,24 @@ export interface Outcomes {
   autonomyRatio: AutonomyRatio;
   grantLatency: GrantLatency;
   escalations: EscalationRow[];
+  costPerChange: CostPerChange;
+  cycleTime: CycleTime;
+}
+
+/** costUsd per merged non-meta commit (outcomes-view lagging metric). */
+export interface CostPerChange {
+  totalCostUsd: number;
+  nonMetaCommits: number;
+  /** totalCostUsd / nonMetaCommits; null when no non-meta commits. */
+  usdPerCommit: number | null;
+}
+
+/** mission.created → terminal, minus paused spans. */
+export interface CycleTime {
+  closedMissions: number;
+  totalMs: number;
+  /** totalMs / closedMissions; null when nothing closed yet. */
+  meanMs: number | null;
 }
 
 /** `GET /api/missions/:id/pr-handoff` — never auto-pushes. */

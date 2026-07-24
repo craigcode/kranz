@@ -461,6 +461,16 @@ fn outcomes_slack_card_shows_ratio_buckets_and_escalation_count() {
             decision: "approved".into(),
             latency_ms: Some(5_000),
         }],
+        cost_per_change: kranz_engine::outcomes::CostPerChange {
+            total_cost_usd: 42.50,
+            non_meta_commits: 5,
+            usd_per_commit: Some(8.50),
+        },
+        cycle_time: kranz_engine::outcomes::CycleTime {
+            closed_missions: 4,
+            total_ms: 14_400_000,
+            mean_ms: Some(3_600_000.0),
+        },
     };
 
     let blocks = build_outcomes_summary(&outcomes);
@@ -493,6 +503,10 @@ fn outcomes_slack_card_shows_ratio_buckets_and_escalation_count() {
     );
     assert!(text.contains('3'), "renders <10s count: {text}");
     assert!(text.contains('2'), "renders <60s count: {text}");
+    assert!(text.contains("COST PER CHANGE"), "{text}");
+    assert!(text.contains("$8.50"), "renders per-commit cost: {text}");
+    assert!(text.contains("CYCLE TIME"), "{text}");
+    assert!(text.contains("1.0h"), "renders mean cycle time: {text}");
     assert!(
         text.contains('1'),
         "renders escalation count or <10m count: {text}"
@@ -531,6 +545,16 @@ fn outcomes_slack_card_empty_history_renders_gracefully() {
             total_decided: 0,
         },
         escalations: vec![],
+        cost_per_change: kranz_engine::outcomes::CostPerChange {
+            total_cost_usd: 0.0,
+            non_meta_commits: 0,
+            usd_per_commit: None,
+        },
+        cycle_time: kranz_engine::outcomes::CycleTime {
+            closed_missions: 0,
+            total_ms: 0,
+            mean_ms: None,
+        },
     };
 
     let blocks = build_outcomes_summary(&outcomes);

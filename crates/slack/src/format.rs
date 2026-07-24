@@ -1259,6 +1259,28 @@ pub fn build_outcomes_summary(outcomes: &kranz_engine::outcomes::Outcomes) -> Ve
         clip(latency_body.trim_end())
     )));
 
+    let cost = &outcomes.cost_per_change;
+    let cost_line = match cost.usd_per_commit {
+        Some(per) => format!(
+            "*COST PER CHANGE*\n${per:.2} per non-meta commit · ${:.2} across {} commits",
+            cost.total_cost_usd, cost.non_meta_commits
+        ),
+        None => "*COST PER CHANGE*\nno non-meta commits recorded yet".to_string(),
+    };
+    blocks.push(section(&cost_line));
+
+    let cycle = &outcomes.cycle_time;
+    let cycle_line = match cycle.mean_ms {
+        Some(mean) => format!(
+            "*CYCLE TIME*\nmean {} across {} closed mission{} (paused spans excluded)",
+            format_duration_ms_slack(mean as u64),
+            cycle.closed_missions,
+            plural(cycle.closed_missions as usize)
+        ),
+        None => "*CYCLE TIME*\nno closed missions yet".to_string(),
+    };
+    blocks.push(section(&cycle_line));
+
     blocks.push(context(&format!(
         "{} escalation{} logged (block/grant/revision) — full ledger on the dashboard.",
         outcomes.escalations.len(),
@@ -1266,6 +1288,24 @@ pub fn build_outcomes_summary(outcomes: &kranz_engine::outcomes::Outcomes) -> Ve
     )));
 
     blocks
+}
+
+/// Milliseconds as a compact duration ("12s", "47m", "2.3h", "3.1d") for
+/// the cycle-time line on the outcomes card.
+fn format_duration_ms_slack(ms: u64) -> String {
+    const S: u64 = 1_000;
+    const M: u64 = 60 * S;
+    const H: u64 = 60 * M;
+    const D: u64 = 24 * H;
+    if ms >= D {
+        format!("{:.1}d", ms as f64 / D as f64)
+    } else if ms >= H {
+        format!("{:.1}h", ms as f64 / H as f64)
+    } else if ms >= M {
+        format!("{}m", ms / M)
+    } else {
+        format!("{}s", ms / S)
+    }
 }
 
 fn plural_f64(n: f64) -> &'static str {

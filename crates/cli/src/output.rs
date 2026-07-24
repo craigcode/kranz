@@ -268,6 +268,30 @@ pub fn render_outcomes(outcomes: &Outcomes) -> String {
         outcomes.grant_latency.total_decided
     ));
 
+    let cost = &outcomes.cost_per_change;
+    out.push('\n');
+    out.push_str("Cost per change\n");
+    match cost.usd_per_commit {
+        Some(per) => out.push_str(&format!(
+            "  ${per:.2} per non-meta commit ({} commits, ${:.2} total)\n",
+            cost.non_meta_commits, cost.total_cost_usd
+        )),
+        None => out.push_str("  no non-meta commits recorded yet\n"),
+    }
+
+    let cycle = &outcomes.cycle_time;
+    out.push('\n');
+    out.push_str("Cycle time\n");
+    match cycle.mean_ms {
+        Some(mean) => out.push_str(&format!(
+            "  mean {} across {} closed mission{} (paused spans excluded)\n",
+            format_duration_ms(mean as u64),
+            cycle.closed_missions,
+            if cycle.closed_missions == 1 { "" } else { "s" }
+        )),
+        None => out.push_str("  no closed missions yet\n"),
+    }
+
     out.push('\n');
     out.push_str("Escalation ledger\n");
     for row in &outcomes.escalations {
@@ -294,6 +318,24 @@ pub fn render_outcomes(outcomes: &Outcomes) -> String {
 /// outcomes fold).
 pub fn render_outcomes_json(outcomes: &Outcomes) -> anyhow::Result<String> {
     Ok(serde_json::to_string_pretty(outcomes)?)
+}
+
+/// Milliseconds as a compact duration ("12s", "47m", "2.3h", "3.1d") for
+/// the cycle-time readout.
+fn format_duration_ms(ms: u64) -> String {
+    const S: u64 = 1_000;
+    const M: u64 = 60 * S;
+    const H: u64 = 60 * M;
+    const D: u64 = 24 * H;
+    if ms >= D {
+        format!("{:.1}d", ms as f64 / D as f64)
+    } else if ms >= H {
+        format!("{:.1}h", ms as f64 / H as f64)
+    } else if ms >= M {
+        format!("{}m", ms / M)
+    } else {
+        format!("{}s", ms / S)
+    }
 }
 
 /// Collapse whitespace/newlines into single spaces and truncate to `max`
@@ -386,7 +428,7 @@ mod tests {
         }
 
         #[test]
-        fn outcomes_cli_populated_text_includes_all_three_sections() {
+        fn outcomes_cli_populated_text_includes_all_sections() {
             let tmp = TempDir::new().unwrap();
             let root = tmp.path();
             seed_mission(
@@ -411,6 +453,8 @@ mod tests {
             let text = render_outcomes(&outcomes);
             assert!(text.contains("Autonomy"));
             assert!(text.contains("Grant latency"));
+            assert!(text.contains("Cost per change"));
+            assert!(text.contains("Cycle time"));
             assert!(text.contains("Escalation ledger"));
         }
     }
