@@ -81,6 +81,83 @@ pub struct MissionOutcomes {
 /// The four fixed grant-latency bucket labels, in display order.
 const BUCKET_LABELS: [&str; 4] = ["<10s", "<60s", "<10m", ">=10m"];
 
+// ---------------------------------------------------------------------------
+// Per-mission memoization (outcomes-fold-scaling ticket)
+// ---------------------------------------------------------------------------
+
+/// A cached fold keyed by the log's (len, mtime): events.jsonl is append-only
+/// by design, so new events always grow `len` and invalidate deterministically.
+/// A rewrite that preserves length and lands in the same mtime tick could
+/// stale-hit — accepted for a display fold (and impossible via the engine's
+/// append path). One entry per mission; trivially bounded. The computes/hits
+/// counters let the invalidation test prove per-path behavior — global
+/// counters would race across parallel tests.
+#[derive(Clone)]
+struct CachedMission {
+    len: u64,
+    mtime: std::time::SystemTime,
+    outcomes: MissionOutcomes,
+    computes: u64,
+    hits: u64,
+}
+
+static MISSION_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, CachedMission>>,
+> = std::sync::OnceLock::new();
+
+/// Per-entry (computes, hits) for the memoization test.
+#[cfg(test)]
+fn cache_entry_stats(events_path: &std::path::Path) -> Option<(u64, u64)> {
+    MISSION_CACHE
+        .get()?
+        .lock()
+        .ok()?
+        .get(events_path)
+        .map(|c| (c.computes, c.hits))
+}
+
+/// Fold one mission with per-(path, len, mtime) memoization. Returns None
+/// when the log is missing or unreadable — the caller degrades per-row
+/// exactly as before; the cache never changes the skip semantics.
+fn cached_mission_outcomes(
+    mission_id: &str,
+    events_path: &std::path::Path,
+) -> Option<MissionOutcomes> {
+    let meta = std::fs::metadata(events_path).ok()?;
+    let (len, mtime) = (meta.len(), meta.modified().ok()?);
+    let cache =
+        MISSION_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    {
+        let mut guard = cache.lock().ok()?;
+        if let Some(hit) = guard.get_mut(events_path) {
+            if hit.len == len && hit.mtime == mtime {
+                hit.hits += 1;
+                return Some(hit.outcomes.clone());
+            }
+        }
+    }
+    let events = crate::event_log::EventLog::read_events(events_path).ok()?;
+    let outcomes = mission_outcomes(mission_id, &events);
+    if let Ok(mut guard) = cache.lock() {
+        guard
+            .entry(events_path.to_path_buf())
+            .and_modify(|entry| {
+                entry.len = len;
+                entry.mtime = mtime;
+                entry.outcomes = outcomes.clone();
+                entry.computes += 1;
+            })
+            .or_insert_with(|| CachedMission {
+                len,
+                mtime,
+                outcomes: outcomes.clone(),
+                computes: 1,
+                hits: 0,
+            });
+    }
+    Some(outcomes)
+}
+
 /// Fold a single mission's outcomes from its event slice. `events` may
 /// contain events for other missions too (they are filtered out) but must be
 /// in ascending `seq` order for the "earliest later" grant/unblock/revision
@@ -334,11 +411,12 @@ pub fn compute_outcomes(repo_root: &std::path::Path) -> anyhow::Result<Outcomes>
         if !events_path.is_file() {
             continue;
         }
-        let events = match crate::event_log::EventLog::read_events(&events_path) {
-            Ok(events) => events,
-            Err(_) => continue,
+        // Memoized fold (outcomes-fold-scaling): unchanged logs are not
+        // re-parsed on repeated requests; new events grow the file and
+        // invalidate deterministically.
+        let Some(out) = cached_mission_outcomes(&id, &events_path) else {
+            continue;
         };
-        let out = mission_outcomes(&id, &events);
         if out.is_closed {
             closed_missions += 1;
             total_interventions += out.interventions;
@@ -794,6 +872,65 @@ mod tests {
             for kind in kinds {
                 log.append(kind).unwrap();
             }
+        }
+
+        #[test]
+        fn memoized_fold_skips_unchanged_logs_and_invalidates_on_new_events() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            let events_path = MissionPaths::new(root, "m-cache").events_file();
+
+            seed_mission(
+                root,
+                "m-cache",
+                vec![
+                    created("g"),
+                    EventKind::PlanApproved {
+                        plan: sample_plan(),
+                        base_sha: None,
+                    },
+                    EventKind::MissionCompleted {},
+                ],
+            );
+            let first = compute_outcomes(root).unwrap();
+            assert_eq!(
+                cache_entry_stats(&events_path),
+                Some((1, 0)),
+                "first fold computes once, no hits"
+            );
+
+            let second = compute_outcomes(root).unwrap();
+            assert_eq!(
+                cache_entry_stats(&events_path),
+                Some((1, 1)),
+                "an unchanged log is served from the cache — no re-parse"
+            );
+            assert_eq!(first, second);
+
+            // New events appended (events.jsonl is append-only, so len
+            // grows) must invalidate the memo entry deterministically.
+            seed_mission(
+                root,
+                "m-cache",
+                vec![
+                    EventKind::GrantRequested {
+                        milestone_id: "ms-1".into(),
+                        kind: GrantKind::Command,
+                        command: "cargo test".into(),
+                    },
+                    EventKind::GrantApproved {
+                        kind: GrantKind::Command,
+                        command: "cargo test".into(),
+                    },
+                ],
+            );
+            let third = compute_outcomes(root).unwrap();
+            assert_eq!(
+                cache_entry_stats(&events_path),
+                Some((2, 1)),
+                "appended events invalidate the memo entry"
+            );
+            assert_ne!(third, second);
         }
 
         fn created(goal: &str) -> EventKind {
