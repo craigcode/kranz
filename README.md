@@ -7,6 +7,12 @@ orchestrator plans, fresh-context workers implement one feature at a time,
 independent validators judge each milestone, and a human steers as project
 manager. The harness never touches the spacecraft; it runs the room.
 
+The product is the few seconds between an agent wanting to act and a human
+trusting it. The consent surface — plan approval, command grants, the merge
+gate — is kranz's answer to that interval, and the flight-surgeon console
+(`kranz outcomes`) measures it: grant-latency buckets turn "do you actually
+review?" into data.
+
 Built in Rust with Claude Code as the default runtime and optional Codex/Droid
 role backends. Claude sessions inherit your repo's CLAUDE.md,
 `.claude/skills`, `.mcp.json`, and hooks for free. Git is the source of truth;

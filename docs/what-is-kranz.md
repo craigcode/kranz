@@ -11,6 +11,13 @@ auditable, human-gated state machine.** The CLI does the thinking; kranz owns
 when it's allowed to think, what it's allowed to touch, who checks its work,
 and what happened, forever, in a log you can replay.
 
+The hard part was never the work — it is the few seconds between the agent
+wanting to do something and you deciding to trust it. That interval is the
+product: the plan approval, the grants, and the merge gate are kranz's answer
+to it, and the flight-surgeon console (`kranz outcomes`) measures it —
+grant-latency buckets make "did you actually review?" a number instead of a
+vibe.
+
 ## What it does
 
 - **Plan interactively, cheaply.** `kranz plan "goal"` opens a conversation
