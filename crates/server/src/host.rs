@@ -140,7 +140,7 @@ type GateExecutor = Arc<dyn Fn(&str, &Path) -> (bool, String) + Send + Sync>;
 /// bounded shell runner with a sanitized environment. It runs only from
 /// inside `tokio::task::spawn_blocking` (see [`MissionHost::merge`]).
 fn real_gate_executor() -> GateExecutor {
-    Arc::new(|command, cwd| kranz_engine::orchestrator::run_bounded_gate_command(cwd, command))
+    Arc::new(|command, cwd| kranz_engine::command_exec::run_bounded_gate_command(cwd, command))
 }
 
 /// The autoWork watcher's decision function, factored out so it's testable
