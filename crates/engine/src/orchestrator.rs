@@ -7234,23 +7234,12 @@ fn write_kranz_gitignore(paths: &MissionPaths) -> Result<()> {
     std::fs::create_dir_all(&dir)?;
     let file = dir.join(".gitignore");
     if !file.exists() {
-        std::fs::write(
-            &file,
-            "# kranz engine bookkeeping — never part of mission commits\n\
-             .gitignore\n\
-             config.json\n\
-             missions/*/events.jsonl\n\
-             missions/*/events.jsonl.lock\n\
-             missions/*/state.json\n\
-             missions/*/state.json.tmp\n\
-             missions/*/estimate.json\n\
-             missions/*/control/\n\
-             missions/*/runs/\n\
-             slack-threads.json\n\
-             queue/\n\
-             tickets/*.status\n\
-             serve.token\n",
-        )?;
+        let mut text = "# kranz engine bookkeeping — never part of mission commits\n".to_string();
+        for rule in crate::paths::KRANZ_GITIGNORE_RULES {
+            text.push_str(rule);
+            text.push('\n');
+        }
+        std::fs::write(&file, text)?;
     }
     Ok(())
 }

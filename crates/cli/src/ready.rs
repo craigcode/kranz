@@ -615,6 +615,26 @@ fn git_ignores(repo: &Path, relative_path: &str) -> bool {
     if relative_source.file_name().and_then(|name| name.to_str()) != Some(".gitignore") {
         return false;
     }
+    // Engine-canonical exception (gitignore-self-ignore ticket, option b):
+    // `.kranz/.gitignore` is materialized by the engine on init and ignores
+    // ITSELF by design, so it can never satisfy the committed-bytes rule
+    // below — yet it is the canonical runtime hygiene for every repo kranz
+    // initializes. Its rules travel with the tool, not the repo. Accept it
+    // only when the on-disk file carries the full canonical rule set —
+    // operator additions are fine; anything else falls through to the
+    // committed-bytes standard below.
+    if relative_source == Path::new(".kranz/.gitignore") {
+        let canonical = std::fs::read_to_string(repo.join(relative_source))
+            .map(|text| {
+                kranz_engine::paths::KRANZ_GITIGNORE_RULES
+                    .iter()
+                    .all(|rule| text.lines().any(|line| line.trim() == *rule))
+            })
+            .unwrap_or(false);
+        if canonical {
+            return true;
+        }
+    }
     // The decisive rule must come from the committed .gitignore bytes, not an
     // uncommitted edit to a file that merely also exists in HEAD.
     let source_spec = relative_source
@@ -1158,6 +1178,45 @@ mod tests {
             !git_ignores(dir.path(), ".kranz/config.json"),
             "readiness must evaluate the committed .gitignore bytes"
         );
+    }
+
+    #[test]
+    fn gitignore_hygiene_accepts_engine_materialized_kranz_gitignore() {
+        let dir = TempDir::new().unwrap();
+        git(dir.path(), &["init"]);
+        write(&dir.path().join("README.md"), "readme");
+        commit_all(dir.path());
+        // The engine-canonical file: the full canonical rule set, UNTRACKED
+        // (it ignores itself by design) — exactly what kranz init
+        // materializes. Its rules travel with the tool, so the probe credits
+        // it without a commit.
+        let mut text = "# kranz engine bookkeeping — never part of mission commits\n".to_string();
+        for rule in kranz_engine::paths::KRANZ_GITIGNORE_RULES {
+            text.push_str(rule);
+            text.push('\n');
+        }
+        write(&dir.path().join(".kranz/.gitignore"), &text);
+
+        assert!(git_ignores(dir.path(), ".kranz/config.json"));
+        let hygiene = gitignore_hygiene(dir.path());
+        assert_eq!(hygiene.status, ReadyStatus::Pass, "{hygiene:?}");
+    }
+
+    #[test]
+    fn gitignore_hygiene_rejects_gutted_kranz_gitignore_when_uncommitted() {
+        // A hand-rolled .kranz/.gitignore without the full canonical set is
+        // NOT the engine artifact — it falls back to the committed-bytes
+        // standard and loses (untracked).
+        let dir = TempDir::new().unwrap();
+        git(dir.path(), &["init"]);
+        write(&dir.path().join("README.md"), "readme");
+        commit_all(dir.path());
+        write(
+            &dir.path().join(".kranz/.gitignore"),
+            "missions/\nconfig.json\nserve.token\ntickets/*.status\n",
+        );
+
+        assert!(!git_ignores(dir.path(), ".kranz/config.json"));
     }
 
     #[test]

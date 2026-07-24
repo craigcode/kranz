@@ -16,6 +16,27 @@
 
 use std::path::{Path, PathBuf};
 
+/// The canonical `.kranz/.gitignore` rules the engine materializes on init
+/// (`orchestrator::write_kranz_gitignore`). Single source for the engine's
+/// writer and for ready.rs's engine-materialized exception: the file ignores
+/// ITSELF (first rule), so it can never be a committed artifact — its rules
+/// travel with the tool, not the repo.
+pub const KRANZ_GITIGNORE_RULES: &[&str] = &[
+    ".gitignore",
+    "config.json",
+    "missions/*/events.jsonl",
+    "missions/*/events.jsonl.lock",
+    "missions/*/state.json",
+    "missions/*/state.json.tmp",
+    "missions/*/estimate.json",
+    "missions/*/control/",
+    "missions/*/runs/",
+    "slack-threads.json",
+    "queue/",
+    "tickets/*.status",
+    "serve.token",
+];
+
 #[derive(Debug, Clone)]
 pub struct MissionPaths {
     pub repo_root: PathBuf,
