@@ -6597,6 +6597,46 @@ pub fn render_mission_report(
         mission.mission_branch, mission.base_branch
     );
 
+    // Background before details (the explain-diff shape): what the mission
+    // intended, in the plan's own words, before any numbers.
+    let _ = writeln!(md, "## The plan\n");
+    let feature_total: usize = mission.milestones.iter().map(|m| m.features.len()).sum();
+    let command_assertions = plan
+        .validation_contract
+        .iter()
+        .filter(|a| a.check == AssertionCheck::Command)
+        .count();
+    let judgement_assertions = plan.validation_contract.len() - command_assertions;
+    let _ = writeln!(
+        md,
+        "{} milestone{}, {} feature{}, gated by {} contract assertion{} ({} command, {} judgement).\n",
+        mission.milestones.len(),
+        if mission.milestones.len() == 1 { "" } else { "s" },
+        feature_total,
+        if feature_total == 1 { "" } else { "s" },
+        plan.validation_contract.len(),
+        if plan.validation_contract.len() == 1 { "" } else { "s" },
+        command_assertions,
+        judgement_assertions,
+    );
+    for (mi, m) in plan.milestones.iter().enumerate() {
+        let _ = writeln!(md, "{}. **{}**", mi + 1, m.title);
+        for f in &m.features {
+            let intent = first_sentence(&f.spec);
+            if intent.is_empty() {
+                let _ = writeln!(md, "   - {}", f.title);
+            } else {
+                let _ = writeln!(md, "   - {} — {intent}", f.title);
+            }
+        }
+    }
+    if let Some(alternatives) = &plan.considered_alternatives {
+        let chosen = first_sentence(&alternatives.chosen);
+        if !chosen.is_empty() {
+            let _ = writeln!(md, "\n**Chosen approach:** {chosen}");
+        }
+    }
+
     // Elapsed wall clock: created → completed, minus paused spans.
     let completed_ts = events
         .iter()
@@ -6707,8 +6747,18 @@ pub fn render_mission_report(
                 );
             }
             let _ = writeln!(md);
+            // The explain-diff walkthrough: intent before evidence, inline.
+            let intent = first_sentence(&f.spec);
+            if !intent.is_empty() {
+                let _ = writeln!(md, "  {intent}");
+            }
             for commit in &f.commits {
                 let _ = writeln!(md, "  - {}", short_commit(commit));
+            }
+            if f.status == FeatureStatus::Complete {
+                for criterion in &f.validation_criteria {
+                    let _ = writeln!(md, "  - ✓ {criterion}");
+                }
             }
         }
     }
@@ -6957,6 +7007,35 @@ fn short_commit(entry: &str) -> String {
         (true, false) => format!("`{}` {}", &sha[..7], subject),
         (true, true) => format!("`{}`", &sha[..7]),
         _ => entry.to_string(),
+    }
+}
+
+/// The first sentence (or first line, whichever is shorter) of a spec/prose
+/// block, trimmed and capped — the explain-diff "intent" line for a feature
+/// or approach. Returns "" for empty input so callers can omit the line.
+fn first_sentence(text: &str) -> String {
+    const MAX: usize = 140;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let first_line = trimmed.lines().next().unwrap_or("").trim();
+    let sentence_end = first_line
+        .find(". ")
+        .map(|i| i + 1)
+        .unwrap_or(first_line.len());
+    let candidate = first_line[..sentence_end].trim();
+    let candidate = if candidate.is_empty() {
+        first_line
+    } else {
+        candidate
+    };
+    if candidate.chars().count() <= MAX {
+        candidate.to_string()
+    } else {
+        let mut out: String = candidate.chars().take(MAX - 1).collect();
+        out.push('…');
+        out
     }
 }
 
