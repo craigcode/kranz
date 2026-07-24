@@ -571,6 +571,89 @@ fn commit_dirty_paths_surfaces_secret_scan_refusal_as_outcome() {
     );
 }
 
+/// The checkpoint scans the mission's ADDED lines, not the full dirty files
+/// (m-0f1abd was refused twice by unchanged base content): a base-shaped
+/// pattern in an unchanged region must never refuse, while a secret in an
+/// added line must.
+#[test]
+fn checkpoint_scan_judges_added_lines_not_base_content() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, _seed) = seeded_repo();
+    // Base content carries a secret-shaped pattern in an UNCHANGED region.
+    let base_pattern = "sk-ant-api03-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    write(
+        &dir,
+        "src.txt",
+        &format!("fn main() {{}}\n// ANTHROPIC_API_KEY={base_pattern}\n"),
+    );
+    repo.add_all_and_commit("base with a pattern").unwrap();
+
+    // Case 1: an unrelated added line — the base pattern must NOT refuse.
+    write(
+        &dir,
+        "src.txt",
+        &format!("fn helper() {{}}\n// ANTHROPIC_API_KEY={base_pattern}\n"),
+    );
+    let outcome = repo
+        .commit_dirty_paths("checkpoint an innocent edit")
+        .expect("checkpoint ran");
+    match outcome {
+        CheckpointOutcome::Committed(_) => {}
+        other => panic!("base-region pattern must not refuse a clean added diff, got: {other:?}"),
+    }
+
+    // Case 2: an added line carries a NEW secret — refused for that line.
+    let after_case1 = repo.head_sha().unwrap();
+    let added_secret = "sk-ant-api03-cccccccccccccccccccccccccccccccccccccccc";
+    write(
+        &dir,
+        "src.txt",
+        &format!(
+            "fn main() {{}}\n// ANTHROPIC_API_KEY={base_pattern}\nlet k = \"{added_secret}\";\n"
+        ),
+    );
+    let outcome = repo
+        .commit_dirty_paths("checkpoint the added secret")
+        .expect("checkpoint ran");
+    match outcome {
+        CheckpointOutcome::RefusedBySecretScan { detail } => {
+            assert!(detail.contains("anthropic-api-key"), "{detail}");
+            assert!(
+                !detail.contains(added_secret),
+                "secret value leaked through the refusal: {detail}"
+            );
+        }
+        other => panic!("added-line secret must refuse, got: {other:?}"),
+    }
+    assert_eq!(
+        repo.head_sha().unwrap(),
+        after_case1,
+        "refused checkpoint must not advance"
+    );
+}
+
+/// Untracked NEW files still scan full-file: `git diff HEAD` never sees
+/// them, and their whole content is added lines.
+#[test]
+fn checkpoint_scan_still_covers_new_untracked_files() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, _base) = seeded_repo();
+    let secret = "sk-ant-api03-dddddddddddddddddddddddddddddddddddddddd";
+    write(&dir, "newfile.txt", &format!("token={secret}\n"));
+
+    let outcome = repo
+        .commit_dirty_paths("checkpoint the new file")
+        .expect("checkpoint ran");
+    match outcome {
+        CheckpointOutcome::RefusedBySecretScan { .. } => {}
+        other => panic!("a new untracked file with a secret must refuse, got: {other:?}"),
+    }
+}
+
 #[test]
 fn commits_between_is_oldest_first() {
     if !setup() {

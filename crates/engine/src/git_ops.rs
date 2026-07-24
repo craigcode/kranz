@@ -404,7 +404,38 @@ impl GitRepo {
             .ok()
             .map(|text| scrub::read_allowlist_text(&text))
             .unwrap_or_default();
-        let findings = scrub::filter_allowed(scrub::scan_paths(&self.root, paths), &allowed);
+        // Split the dirty paths: TRACKED files scan only the mission's added
+        // lines (git diff HEAD) — a mission must not be refused for
+        // pre-existing base content in a file it merely touches (m-0f1abd,
+        // checkpoint-refused twice by unchanged base code). NEW (untracked)
+        // files still scan full-file — `git diff HEAD` never sees them and
+        // their whole content is added lines anyway.
+        let (mut tracked, mut new_files) = (Vec::new(), Vec::new());
+        for path in paths {
+            let in_index = self
+                .run_os(&[
+                    "ls-files".into(),
+                    "--error-unmatch".into(),
+                    "--".into(),
+                    path.as_os_str().to_os_string(),
+                ])
+                .is_ok();
+            if in_index {
+                tracked.push(*path);
+            } else {
+                new_files.push(*path);
+            }
+        }
+
+        let mut findings = Vec::new();
+        if !tracked.is_empty() {
+            let diff = self.diff_head_paths(&tracked).unwrap_or_default();
+            findings.extend(scrub::scan_unified_diff(&diff));
+        }
+        if !new_files.is_empty() {
+            findings.extend(scrub::scan_paths(&self.root, &new_files));
+        }
+        let findings = scrub::filter_allowed(findings, &allowed);
         if findings.is_empty() {
             None
         } else {
@@ -566,6 +597,15 @@ impl GitRepo {
     /// Full staged diff (`git diff --cached`) output.
     pub fn diff_staged(&self) -> Result<String> {
         self.run(&["diff", "--cached"])
+    }
+
+    /// Full `git diff HEAD -- <paths>` output (index + working tree vs HEAD),
+    /// verbatim — the checkpoint scan's "what this mission actually changed",
+    /// never the pre-existing base content of files it merely touches.
+    pub fn diff_head_paths(&self, paths: &[&Path]) -> Result<String> {
+        let mut args: Vec<OsString> = vec!["diff".into(), "HEAD".into(), "--".into()];
+        args.extend(paths.iter().map(|p| p.as_os_str().to_os_string()));
+        self.run_os(&args)
     }
 
     /// Paths changed in `from..to` (`git diff --name-only <from>..<to>`),

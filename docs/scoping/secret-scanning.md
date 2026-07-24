@@ -198,3 +198,26 @@ a bound agreed at slice-1 review (target single-digit percent — measure, don't
 3. Committed-allowlist location vs the `.kranz/.gitignore` template (orchestrator.rs:4345-4360) —
    probe before D-D's waiver file lands.
 4. Whether model-authored ticket appends (`append_needs_context`, ticket.rs:429-446) can reuse the event-ingest gate — verify, don't assume.
+
+## Decision (2026-07-24): the checkpoint scan judges the dirty DIFF, not full dirty files
+
+`git_ops::secret_scan_refusal` previously ran `scrub::scan_paths` over the
+full contents of dirty paths, so a mission touching any file that carried a
+token-shaped pattern in UNCHANGED base content was refused until the base
+was waived or renamed (m-0f1abd, refused twice by pre-existing code while
+its own diff was clean). The checkpoint now partitions dirty paths:
+
+- **Tracked files** scan only the mission's added lines (`git diff HEAD --
+  <paths>` → `scrub::scan_unified_diff`) — aligning the commit-side gate
+  with the merge pre-gate and `kranz scan`, which already judge the
+  mission's changes, not the base's history. Base content remains covered
+  by CI range scans and the pre-public history scrub.
+- **New (untracked) files** still scan full-file — `git diff HEAD` never
+  sees them and their whole content is added lines anyway.
+
+The trade is explicit: the write-side gate is intentionally strict (D-A),
+and it stays strict about anything the mission ADDS — what changed is the
+target, not the strength. Regression tests:
+`checkpoint_scan_judges_added_lines_not_base_content` (base-region pattern
+ignored, added-line secret refused) and
+`checkpoint_scan_still_covers_new_untracked_files` (git_ops_test.rs).
