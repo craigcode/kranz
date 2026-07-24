@@ -5,8 +5,8 @@
 
 use chrono::{TimeZone, Utc};
 use kranz_engine::events::{Event, EventKind};
-use kranz_engine::orchestrator::render_mission_report;
 use kranz_engine::reducer;
+use kranz_engine::report_render::render_mission_report;
 use kranz_engine::types::{
     Assertion, AssertionCheck, MissionConfig, Plan, PlanFeature, PlanMilestone,
 };

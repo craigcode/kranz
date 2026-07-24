@@ -39,6 +39,7 @@ pub mod pr_handoff;
 pub mod prompts;
 pub mod queue;
 pub mod reducer;
+pub mod report_render;
 pub mod sandbox;
 pub mod scrub;
 pub mod ticket;

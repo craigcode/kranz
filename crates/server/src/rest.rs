@@ -13,11 +13,10 @@ use kranz_engine::cost;
 use kranz_engine::event_log::EventLog;
 use kranz_engine::events::{Event, EventKind};
 use kranz_engine::merged::merged_bit;
-use kranz_engine::orchestrator::{
-    mission_worktree_path, render_plan_markdown, PREFLIGHT_CLEAR_SUMMARY,
-};
+use kranz_engine::orchestrator::{mission_worktree_path, PREFLIGHT_CLEAR_SUMMARY};
 use kranz_engine::paths::MissionPaths;
 use kranz_engine::reducer;
+use kranz_engine::report_render::render_plan_markdown;
 use kranz_engine::types::{
     ControlCommand, MissionState, MissionStatus, RoleConfig, SandboxEnforce, WorkerIsolation,
 };
