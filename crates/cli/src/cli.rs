@@ -220,6 +220,25 @@ pub enum Command {
         yes: bool,
     },
 
+    /// Decompose a complex goal into a ticket DAG (blocked-by edges).
+    ///
+    /// One planner turn proposes 1..=8 tickets as JSON; the proposed DAG
+    /// (slugs, titles, priorities, edges) is printed for review. Without
+    /// --yes nothing is written (dry-run preview). With --yes all tickets are
+    /// written at once: slug rules, unknown blockers, a missing root, or a
+    /// blocked-by cycle each refuse the whole write loudly — no partial
+    /// writes. Every emitted ticket is an ordinary ticket: draft it with
+    /// `kranz draft <slug>`, queue it with `kranz ticket queue <slug>`; deps
+    /// gating keeps a node from running before its blockers Complete.
+    Decompose {
+        /// The complex goal, in plain language
+        goal: String,
+
+        /// Write the proposed tickets (without this flag it is a dry-run preview)
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+
     /// Run a mission fully headlessly from a plan file (CI: plan in, exit code out).
     ///
     /// The file is a ticket-shaped markdown (`## Goal`, `## Context`, `##
@@ -535,6 +554,31 @@ mod tests {
         match cli.command {
             Command::Serve { read_auth, .. } => assert!(read_auth),
             other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decompose_parses_goal_and_yes_flag() {
+        let cli = Cli::try_parse_from(["kranz", "decompose", "build the thing", "--yes"]).unwrap();
+        match cli.command {
+            Command::Decompose { goal, yes } => {
+                assert_eq!(goal, "build the thing");
+                assert!(yes);
+            }
+            other => panic!("expected Decompose, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["kranz", "decompose", "g", "-y"]).unwrap();
+        match cli.command {
+            Command::Decompose { yes, .. } => assert!(yes),
+            other => panic!("expected Decompose, got {other:?}"),
+        }
+
+        // Dry-run is the default: no flag, no write.
+        let cli = Cli::try_parse_from(["kranz", "decompose", "g"]).unwrap();
+        match cli.command {
+            Command::Decompose { yes, .. } => assert!(!yes),
+            other => panic!("expected Decompose, got {other:?}"),
         }
     }
 }

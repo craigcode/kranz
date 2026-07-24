@@ -214,6 +214,11 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
                 .await
                 .map_err(augment_limit_hint)
         }
+        Command::Decompose { goal, yes } => {
+            backlog::cmd_decompose(repo, &goal, yes, cli.dangerously_allow_all)
+                .await
+                .map_err(augment_limit_hint)
+        }
         Command::Exec {
             file,
             yes,

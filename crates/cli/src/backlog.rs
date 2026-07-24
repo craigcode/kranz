@@ -141,6 +141,9 @@ pub fn render_ticket_show(ticket: &Ticket, label: &str) -> String {
     if !ticket.repo_refs.is_empty() {
         out.push_str(&format!("  refs:     {}\n", ticket.repo_refs.join(", ")));
     }
+    if !ticket.blocked_by.is_empty() {
+        out.push_str(&format!("  blocked-by: {}\n", ticket.blocked_by.join(", ")));
+    }
 
     if !ticket.goal.trim().is_empty() {
         out.push_str("\n## Goal\n");
@@ -394,6 +397,47 @@ pub async fn cmd_draft(
                 "plan committed on {mission_branch} for review; mission {mission_id} parked. \
                  Review it, then run `kranz ticket approve {slug}` to queue it \
                  (or `kranz plan --mission {mission_id}` to reshape)."
+            );
+        }
+    }
+    Ok(0)
+}
+
+/// `kranz decompose <goal> [--yes]`: one planner turn decomposes a complex
+/// goal into a blocked-by ticket DAG (design: .kranz/tickets/
+/// ticket-dag-decomposition.md). The proposed DAG is always printed; tickets
+/// are written only with `--yes` (dry-run preview otherwise), all-or-none —
+/// any validation refusal (slug rules, unknown blocker, missing root, cycle)
+/// writes nothing.
+///
+/// The sequencing core (planner turn, validation, staged write) lives in
+/// [`kranz_engine::decompose`]; this wrapper keeps the CLI-only concerns —
+/// config/backend resolution (the same call path as [`cmd_draft`]) and
+/// printing. Emitted tickets flow through the normal draft/queue pipeline.
+pub async fn cmd_decompose(
+    repo: PathBuf,
+    goal: &str,
+    yes: bool,
+    dangerously_allow_all: bool,
+) -> Result<i32> {
+    let cfg = load_config(&repo, dangerously_allow_all)?;
+    let backend = build_backend(&cfg)?;
+    let drive =
+        kranz_engine::decompose::drive_decompose(backend.as_ref(), &repo, goal, &cfg, yes).await?;
+
+    print!("{}", kranz_engine::decompose::render_preview(&drive.nodes));
+    match &drive.written {
+        None => println!(
+            "dry run — nothing written; re-run with --yes to write these {} ticket(s).",
+            drive.nodes.len()
+        ),
+        Some(paths) => {
+            for path in paths {
+                println!("wrote {}", path.display());
+            }
+            println!(
+                "draft each node with `kranz draft <slug>` — deps gating runs the DAG in \
+                 dependency order."
             );
         }
     }

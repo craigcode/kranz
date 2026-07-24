@@ -25,6 +25,7 @@ pub mod contract_health;
 pub mod contract_lint;
 pub mod contract_sweep;
 pub mod cost;
+pub mod decompose;
 pub mod deps;
 pub mod event_log;
 pub mod git_ops;
