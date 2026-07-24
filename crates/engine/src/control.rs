@@ -379,4 +379,34 @@ mod tests {
             "candidates listed: {err}"
         );
     }
+
+    #[test]
+    fn rapid_back_to_back_enqueues_drain_in_issue_order() {
+        // Failure-mode fixture for the 2026-07-23 CI flake: with a
+        // millisecond filename prefix, two commands enqueued in the same
+        // millisecond were drained in random-suffix order (resume sorted
+        // before pause and red the run). The nanosecond prefix must keep
+        // rapid back-to-back enqueues in issue order.
+        let tmp = TempDir::new().unwrap();
+        let paths = MissionPaths::new(tmp.path(), "m-1");
+        for cmd in [
+            ControlCommand::Pause,
+            ControlCommand::Resume,
+            ControlCommand::Pause,
+            ControlCommand::Resume,
+            ControlCommand::Pause,
+        ] {
+            enqueue(&paths, &cmd).unwrap();
+        }
+        let order: Vec<bool> = drain(&paths)
+            .unwrap()
+            .iter()
+            .map(|(_, cmd)| matches!(cmd, ControlCommand::Pause))
+            .collect();
+        assert_eq!(
+            order,
+            vec![true, false, true, false, true],
+            "rapid enqueues must drain in issue order, never random-suffix order"
+        );
+    }
 }
