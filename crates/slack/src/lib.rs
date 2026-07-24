@@ -32,6 +32,7 @@
 //! bridge is unconfigured), so spawn it on its own task and fire `shutdown` when
 //! the server stops.
 
+pub(crate) mod approve_flow;
 pub mod bridge;
 pub mod catalog;
 pub mod client;
