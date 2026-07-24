@@ -402,10 +402,11 @@ pub struct Calibration {
     /// calibration. Visibility for the corpus-size readouts (ready.rs shows
     /// `missions_used`).
     pub excluded_non_frontier: usize,
-    /// Pearson r between per-mission gate activity (blocked + grant requests
-    /// + fix features + resumes) and the actual÷predicted ratio — the
-    /// calibrate-block-resume-cycles measurement. None below
-    /// [`MIN_CALIBRATION_MISSIONS`] or when either series is constant.
+    /// Pearson r between per-mission gate activity and the actual÷predicted
+    /// ratio (gate activity = blocked + grant requests + fix features +
+    /// resumes). This is the calibrate-block-resume-cycles measurement;
+    /// `None` below [`MIN_CALIBRATION_MISSIONS`] or when either series is
+    /// constant.
     pub gate_correlation: Option<f64>,
 }
 
