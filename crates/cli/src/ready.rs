@@ -75,6 +75,7 @@ pub fn assess(repo: &Path) -> ReadyReport {
         contract_prerequisites(&validation_commands),
         clean_git_state(repo),
         calibration_corpus(repo),
+        context_not_credentials(repo),
     ];
     let total: u16 = dimensions.iter().map(|d| d.score as u16).sum();
     let score = total.min(100) as u8;
@@ -833,6 +834,98 @@ fn clean_git_state(repo: &Path) -> ReadyDimension {
     }
 }
 
+/// Context-rich WITHOUT credential-rich (the ready-context-vs-credentials
+/// ticket): agents should get context from git artifacts — a knowledge
+/// vault, docs, and a secret-scan gate keeping the tree clean — not from
+/// live secrets. Four signals: knowledge vault present, merge-gate suite
+/// committed (the scan gate lives there), no tracked .env-shaped file, and
+/// worker-readable setup docs.
+fn context_not_credentials(repo: &Path) -> ReadyDimension {
+    let mut signals: Vec<(&str, bool, &str)> = Vec::new();
+
+    let vault = repo.join("docs/knowledge").is_dir();
+    signals.push((
+        "knowledge vault",
+        vault,
+        "create docs/knowledge/ (or an equivalent committed vault) so agent context lives in git",
+    ));
+
+    let gate = repo.join(".kranz/merge-gates.json").is_file();
+    signals.push((
+        "secret-scan gate",
+        gate,
+        "commit a .kranz/merge-gates.json suite so the secret-scan gate runs before every merge",
+    ));
+
+    // Tracked .env-shaped files: context-as-secret is the anti-signal. Read
+    // the index (never the working tree) so untracked local .env files don't
+    // count against the repo.
+    let tracked_env: Vec<String> = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["ls-files"])
+        .output()
+        .map(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|line| {
+                    let name = line.rsplit('/').next().unwrap_or(line);
+                    name == ".env" || name.starts_with(".env.") || name.ends_with(".env")
+                })
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let no_env = tracked_env.is_empty();
+    signals.push((
+        "no tracked .env",
+        no_env,
+        "untrack env files and move secrets to the credential store — tracked .env: see evidence",
+    ));
+
+    let docs = repo.join("README.md").is_file();
+    signals.push((
+        "worker-readable docs",
+        docs,
+        "document setup/build/test in the README so workers don't need tribal (or credential-gated) knowledge",
+    ));
+
+    let passed = signals.iter().filter(|(_, ok, _)| *ok).count();
+    let score = ((passed * 10) / signals.len()) as u8;
+    let status = match passed {
+        n if n == signals.len() => ReadyStatus::Pass,
+        0 | 1 => ReadyStatus::Fail,
+        _ => ReadyStatus::Warn,
+    };
+    let evidence = if passed == signals.len() {
+        "context lives in git, not credentials".to_string()
+    } else {
+        let mut parts: Vec<String> = signals
+            .iter()
+            .filter(|(_, ok, _)| !ok)
+            .map(|(name, _, _)| format!("{name} missing"))
+            .collect();
+        if !tracked_env.is_empty() {
+            parts.push(format!("tracked env files: {}", tracked_env.join(", ")));
+        }
+        parts.join("; ")
+    };
+    let remedy = signals
+        .iter()
+        .filter(|(_, ok, _)| !ok)
+        .map(|(_, _, hint)| *hint)
+        .collect::<Vec<_>>()
+        .join("; ");
+    dim(
+        "context over credentials",
+        score,
+        10,
+        status,
+        evidence,
+        remedy,
+    )
+}
+
 fn calibration_corpus(repo: &Path) -> ReadyDimension {
     let missions = cost::calibrate(repo).missions_used;
     match missions {
@@ -1381,6 +1474,60 @@ mod tests {
         git(dir, &["init"]);
         write(&dir.join("README.md"), "readme");
         commit_all(dir);
+    }
+
+    #[test]
+    fn context_dimension_passes_when_context_lives_in_git() {
+        let dir = TempDir::new().unwrap();
+        git(dir.path(), &["init"]);
+        write(&dir.path().join("README.md"), "readme");
+        write(&dir.path().join("docs/knowledge/index.md"), "# vault");
+        write(
+            &dir.path().join(".kranz/merge-gates.json"),
+            r#"{"gates":[{"command":"cargo test"}]}"#,
+        );
+        commit_all(dir.path());
+
+        let dimension = context_not_credentials(dir.path());
+        assert_eq!(dimension.status, ReadyStatus::Pass, "{dimension:?}");
+        assert_eq!(dimension.score, 10);
+    }
+
+    #[test]
+    fn context_dimension_flags_tracked_env_and_missing_vault() {
+        let dir = TempDir::new().unwrap();
+        git(dir.path(), &["init"]);
+        write(&dir.path().join("README.md"), "readme");
+        write(&dir.path().join(".env.production"), "SECRET=hunter2");
+        write(
+            &dir.path().join(".kranz/merge-gates.json"),
+            r#"{"gates":[{"command":"cargo test"}]}"#,
+        );
+        commit_all(dir.path());
+
+        let dimension = context_not_credentials(dir.path());
+        assert_eq!(dimension.status, ReadyStatus::Warn, "{dimension:?}");
+        assert!(
+            dimension.evidence.contains("knowledge vault missing"),
+            "vault gap named: {dimension:?}"
+        );
+        assert!(
+            dimension.evidence.contains(".env.production"),
+            "the tracked env file is named in evidence: {dimension:?}"
+        );
+        assert!(dimension.remedy.contains("untrack"), "{dimension:?}");
+    }
+
+    #[test]
+    fn context_dimension_fails_when_nothing_is_in_place() {
+        let dir = TempDir::new().unwrap();
+        git(dir.path(), &["init"]);
+        write(&dir.path().join("x.txt"), "x");
+        commit_all(dir.path());
+
+        let dimension = context_not_credentials(dir.path());
+        assert_eq!(dimension.status, ReadyStatus::Fail, "{dimension:?}");
+        assert_eq!(dimension.score, 2, "only the env-absence signal scores");
     }
 
     #[test]
