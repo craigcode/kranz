@@ -1370,10 +1370,12 @@ impl MissionEngine {
         // The calibrated cost estimate is baked in here so the Reviewable
         // human queue gate (and any future surface reading plan.md) sees it
         // without recomputing it — `calibrate` never fails.
+        let two_path = cost::estimate_two_path(estimate, &self.state.config, &calibration.params);
         let plan_md_body = render_plan_markdown(
             &plan,
             &self.state.mission,
             &estimate,
+            two_path.as_ref(),
             calibration.missions_used,
             &contract_lint_report,
         );
@@ -2004,10 +2006,12 @@ impl MissionEngine {
             results: Vec::new(),
             tree_clean_at_base: true,
         };
+        let two_path = cost::estimate_two_path(estimate, &self.state.config, &calibration.params);
         let plan_md_body = render_plan_markdown(
             plan,
             &self.state.mission,
             &estimate,
+            two_path.as_ref(),
             calibration.missions_used,
             &no_lint,
         );
@@ -5913,6 +5917,7 @@ pub fn render_plan_markdown(
     plan: &Plan,
     mission: &Mission,
     estimate: &cost::CostEstimate,
+    two_path: Option<&cost::TwoPathEstimate>,
     missions_used: usize,
     contract_lint: &contract_lint::ContractLintReport,
 ) -> String {
@@ -5951,6 +5956,24 @@ pub fn render_plan_markdown(
                 estimate.low_usd, estimate.high_usd, estimate.expected_usd, estimate.high_usd
             );
         }
+    }
+
+    // Local-tier routing shows both paths (cache-miss-tier-switch-pricing):
+    // a single number is wrong in both directions when a mission can
+    // complete at $0 marginal or escalate to frontier.
+    if let Some(two_path) = two_path {
+        let _ = writeln!(
+            md,
+            "This plan routes to the **local tier**: **$0 marginal** (fixed hardware + \
+             electricity, not per-token) if it completes locally. If it escalates to frontier: \
+             **${:.2} – ${:.2}** (expected ~${:.2}), which prices the tier switch's cache-miss \
+             once (${:.2} — the first post-escalation turn re-reads the full prefix uncached; \
+             escalation happens at feature/milestone edges, where no warm cache exists to lose).\n",
+            two_path.escalated.low_usd,
+            two_path.escalated.high_usd,
+            two_path.escalated.expected_usd,
+            two_path.cache_miss_usd,
+        );
     }
 
     if let Some(alternatives) = &plan.considered_alternatives {

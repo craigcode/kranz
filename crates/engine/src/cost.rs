@@ -246,6 +246,56 @@ pub fn estimate(plan: &Plan, cfg: &MissionConfig, p: &EstimateParams) -> CostEst
     }
 }
 
+/// Multiplier on one worker-run cost for the cache-miss a tier switch pays:
+/// the first post-escalation frontier turn re-reads the whole conversation
+/// prefix UNCACHED, and cached-prefix tokens run ~10x cheaper (Cursor's
+/// Router post, cursor.com/blog/router). Priced ONCE per escalation — kranz
+/// escalates only at feature/milestone edges, where its fresh-context-per-
+/// feature design means there is no warm cache left to lose. Kranz-native
+/// number, ours to tune; not Factory's and not Cursor's gospel.
+pub const CACHE_MISS_MULT: f64 = 9.0;
+
+/// The two-path estimate for a plan routed to the local tier: what it costs
+/// if it completes locally (≈$0 marginal) vs if it escalates to frontier
+/// (frontier estimate + one cache-miss). Reported as a pair — a single
+/// number would be wrong in both directions.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TwoPathEstimate {
+    /// The completes-locally path: $0 marginal (fixed hardware, not per-token).
+    pub local_usd: f64,
+    /// The escalates-to-frontier path (frontier estimate + one cache-miss).
+    pub escalated: CostEstimate,
+    /// The priced cache-miss, once per escalation (see [`CACHE_MISS_MULT`]).
+    pub cache_miss_usd: f64,
+}
+
+/// Two-path estimate from the (shape-adjusted) frontier estimate when `cfg`
+/// routes the executor to the local tier; None for frontier-routed plans
+/// (their single frontier estimate is honest).
+pub fn estimate_two_path(
+    frontier: CostEstimate,
+    cfg: &MissionConfig,
+    p: &EstimateParams,
+) -> Option<TwoPathEstimate> {
+    if cfg.worker.backend.as_deref() != Some("local") {
+        return None;
+    }
+    // The miss is paid once per escalation, never per turn: the first
+    // post-escalation turn re-reads the full prefix uncached; later turns
+    // rebuild a warm cache at the new tier.
+    let cache_miss_usd = p.avg_worker_run_usd * CACHE_MISS_MULT;
+    let mut escalated = frontier;
+    escalated.expected_usd += cache_miss_usd;
+    escalated.low_usd += cache_miss_usd;
+    escalated.high_usd += cache_miss_usd;
+    Some(TwoPathEstimate {
+        local_usd: 0.0,
+        escalated,
+        cache_miss_usd,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Mission shape classification (observable at plan time)
 // ---------------------------------------------------------------------------
@@ -1009,5 +1059,37 @@ mod tests {
         // frontier calibration set.
         assert_eq!(calibration.missions_used, 1, "frontier missions only");
         assert_eq!(calibration.excluded_non_frontier, 2);
+    }
+
+    #[test]
+    fn two_path_prices_the_miss_once_and_only_for_local_routes() {
+        let p = EstimateParams::default();
+        let base = CostEstimate {
+            worker_runs: 4.0,
+            validator_runs: 2.0,
+            low_usd: 5.0,
+            expected_usd: 10.0,
+            high_usd: 25.0,
+            shape: MissionShape::Unknown,
+            confidence: Confidence::High,
+        };
+
+        // Frontier routes keep the single honest estimate.
+        assert!(estimate_two_path(base, &MissionConfig::default(), &p).is_none());
+
+        // Local routes get both paths, with the cache-miss priced ONCE —
+        // never multiplied by runs or turns.
+        let local_cfg = local_config();
+        let two = estimate_two_path(base, &local_cfg, &p).unwrap();
+        let miss = p.avg_worker_run_usd * CACHE_MISS_MULT;
+        assert_eq!(two.local_usd, 0.0, "completes-locally is $0 marginal");
+        assert_eq!(two.cache_miss_usd, miss);
+        assert_eq!(
+            two.escalated.expected_usd,
+            10.0 + miss,
+            "the miss is priced once per escalation, never per turn"
+        );
+        assert_eq!(two.escalated.low_usd, 5.0 + miss);
+        assert_eq!(two.escalated.high_usd, 25.0 + miss);
     }
 }

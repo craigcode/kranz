@@ -293,6 +293,8 @@ pub(crate) async fn mission_revision_diff(
         &pending.plan,
         &state.mission,
         &estimate,
+        kranz_engine::cost::estimate_two_path(estimate, &state.config, &calibration.params)
+            .as_ref(),
         calibration.missions_used,
         &no_lint,
     );
