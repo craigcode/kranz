@@ -6,6 +6,7 @@
 //! authoritative; nothing in this module gates or bills anything.
 
 use crate::event_log::EventLog;
+use crate::events::{Event, EventKind};
 use crate::paths::MissionPaths;
 use crate::reducer;
 use crate::types::{
@@ -401,6 +402,11 @@ pub struct Calibration {
     /// calibration. Visibility for the corpus-size readouts (ready.rs shows
     /// `missions_used`).
     pub excluded_non_frontier: usize,
+    /// Pearson r between per-mission gate activity (blocked + grant requests
+    /// + fix features + resumes) and the actual÷predicted ratio — the
+    /// calibrate-block-resume-cycles measurement. None below
+    /// [`MIN_CALIBRATION_MISSIONS`] or when either series is constant.
+    pub gate_correlation: Option<f64>,
 }
 
 /// Minimum completed missions before the corpus fit ([`expected_mult`] etc.)
@@ -442,6 +448,61 @@ pub fn mission_cost_class(state: &MissionState) -> MissionCostClass {
     }
 }
 
+/// Gate-activity features of one mission's event log (the
+/// calibrate-block-resume-cycles ticket): the plumbing that blows estimates
+/// — checkpoint refusals, grant parks, validation fix cycles, resumes.
+/// Counted from events, never inferred from gaps.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct GateActivity {
+    pub blocked: u32,
+    pub grant_requests: u32,
+    pub fix_features: u32,
+    pub resumes: u32,
+}
+
+impl GateActivity {
+    /// One scalar for correlation work. Fix features dominate because each
+    /// one is a full worker+validation cycle the count model under-prices.
+    pub fn score(&self) -> f64 {
+        (self.blocked + self.grant_requests + self.fix_features + self.resumes) as f64
+    }
+}
+
+/// Count one mission's gate activity from its event slice.
+pub fn gate_activity(events: &[Event]) -> GateActivity {
+    let mut activity = GateActivity::default();
+    for event in events {
+        match &event.kind {
+            EventKind::MilestoneBlocked { .. } => activity.blocked += 1,
+            EventKind::GrantRequested { .. } => activity.grant_requests += 1,
+            EventKind::FixFeatureCreated { .. } => activity.fix_features += 1,
+            EventKind::MissionResumed {} => activity.resumes += 1,
+            _ => {}
+        }
+    }
+    activity
+}
+
+/// Pearson r between two equal-length series; None when either is constant
+/// (correlation is undefined, not zero — small corpora must not read as
+/// "no relationship").
+fn pearson(xs: &[f64], ys: &[f64]) -> Option<f64> {
+    if xs.len() != ys.len() || xs.len() < 2 {
+        return None;
+    }
+    let n = xs.len() as f64;
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / n;
+    let (mx, my) = (mean(xs), mean(ys));
+    let mut cov = 0.0;
+    let (mut vx, mut vy) = (0.0, 0.0);
+    for i in 0..xs.len() {
+        cov += (xs[i] - mx) * (ys[i] - my);
+        vx += (xs[i] - mx) * (xs[i] - mx);
+        vy += (ys[i] - my) * (ys[i] - my);
+    }
+    (vx > 0.0 && vy > 0.0).then(|| cov / vx.sqrt() / vy.sqrt())
+}
+
 /// Derive [`EstimateParams`] from the actuals recorded in this repo's
 /// COMPLETED missions (live estimates ran ~10x above actuals on the built-in
 /// defaults — real per-run costs are the fix).
@@ -460,10 +521,10 @@ pub fn calibrate(repo_root: &Path) -> Calibration {
     let mut per_mission: Vec<EstimateParams> = Vec::new();
     let mut doc_heavy_missions_used = 0usize;
     let mut excluded_non_frontier = 0usize;
-    // (milestones, planned features, config, actual total cost) per completed
-    // mission — the inputs needed to re-predict each mission and measure the
-    // estimate's bias (see `fit_estimate_to_corpus`).
-    let mut corpus: Vec<(usize, usize, MissionConfig, f64)> = Vec::new();
+    // (milestones, planned features, config, actual total cost, gate-activity
+    // score) per completed mission — the inputs needed to re-predict each
+    // mission and measure the estimate's bias (see `fit_estimate_to_corpus`).
+    let mut corpus: Vec<(usize, usize, MissionConfig, f64, f64)> = Vec::new();
     for mission_id in MissionPaths::list_missions(repo_root) {
         let paths = MissionPaths::new(repo_root, &mission_id);
         let Ok(events) = EventLog::read_events(&paths.events_file()) else {
@@ -500,6 +561,7 @@ pub fn calibrate(repo_root: &Path) -> Calibration {
             planned_features,
             state.config.clone(),
             mission_total_cost(&state),
+            gate_activity(&events).score(),
         ));
     }
 
@@ -512,6 +574,7 @@ pub fn calibrate(repo_root: &Path) -> Calibration {
             low_mult: 0.5,
             high_mult: 2.5,
             excluded_non_frontier,
+            gate_correlation: None,
         };
     }
 
@@ -526,7 +589,8 @@ pub fn calibrate(repo_root: &Path) -> Calibration {
         orchestrator_overhead_usd_per_feature: mean(|p| p.orchestrator_overhead_usd_per_feature)
             .max(0.01),
     };
-    let (expected_mult, low_mult, high_mult) = fit_estimate_to_corpus(&params, &corpus);
+    let (expected_mult, low_mult, high_mult, gate_correlation) =
+        fit_estimate_to_corpus(&params, &corpus);
     Calibration {
         params,
         missions_used: per_mission.len(),
@@ -535,6 +599,7 @@ pub fn calibrate(repo_root: &Path) -> Calibration {
         low_mult,
         high_mult,
         excluded_non_frontier,
+        gate_correlation,
     }
 }
 
@@ -569,26 +634,29 @@ fn mission_total_cost(state: &MissionState) -> f64 {
 /// the estimate up or collapse it.
 fn fit_estimate_to_corpus(
     params: &EstimateParams,
-    corpus: &[(usize, usize, MissionConfig, f64)],
-) -> (f64, f64, f64) {
-    const DEFAULT: (f64, f64, f64) = (1.0, 0.5, 2.5);
+    corpus: &[(usize, usize, MissionConfig, f64, f64)],
+) -> (f64, f64, f64, Option<f64>) {
+    const DEFAULT: (f64, f64, f64, Option<f64>) = (1.0, 0.5, 2.5, None);
     if corpus.len() < MIN_CALIBRATION_MISSIONS {
         return DEFAULT;
     }
     let mut sum_pred = 0.0;
     let mut sum_actual = 0.0;
     let mut ratios: Vec<f64> = Vec::new();
-    for (milestones, features, cfg, actual) in corpus {
+    let mut gate_scores: Vec<f64> = Vec::new();
+    for (milestones, features, cfg, actual, gate_score) in corpus {
         let pred = estimate(&counts_plan(*milestones, *features), cfg, params).expected_usd;
         if pred > 0.0 && *actual > 0.0 {
             sum_pred += pred;
             sum_actual += *actual;
             ratios.push(*actual / pred);
+            gate_scores.push(*gate_score);
         }
     }
     if ratios.len() < MIN_CALIBRATION_MISSIONS || sum_pred <= 0.0 {
         return DEFAULT;
     }
+    let gate_correlation = pearson(&gate_scores, &ratios);
     ratios.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let center = (sum_actual / sum_pred).clamp(0.1, 20.0);
     // The band only ever WIDENS the built-in 0.5×/2.5× guess, never narrows it:
@@ -601,7 +669,7 @@ fn fit_estimate_to_corpus(
         .max(2.5)
         .max(center)
         .min(center.max(1.0) * 8.0);
-    (center, low, high)
+    (center, low, high, gate_correlation)
 }
 
 /// A synthetic [`Plan`] carrying only the counts [`estimate`] reads (milestone
@@ -1059,6 +1127,93 @@ mod tests {
         // frontier calibration set.
         assert_eq!(calibration.missions_used, 1, "frontier missions only");
         assert_eq!(calibration.excluded_non_frontier, 2);
+    }
+
+    #[test]
+    fn gate_activity_counts_blocked_grants_fixes_and_resumes() {
+        let events = vec![
+            Event {
+                seq: 1,
+                ts: chrono::Utc::now(),
+                mission_id: "m-1".into(),
+                kind: EventKind::MilestoneBlocked {
+                    milestone_id: "ms-1".into(),
+                    reason: "r".into(),
+                },
+            },
+            Event {
+                seq: 2,
+                ts: chrono::Utc::now(),
+                mission_id: "m-1".into(),
+                kind: EventKind::GrantRequested {
+                    milestone_id: "ms-1".into(),
+                    kind: crate::types::GrantKind::Command,
+                    command: "cargo test".into(),
+                },
+            },
+            Event {
+                seq: 3,
+                ts: chrono::Utc::now(),
+                mission_id: "m-1".into(),
+                kind: EventKind::FixFeatureCreated {
+                    milestone_id: "ms-1".into(),
+                    feature: crate::types::Feature {
+                        id: "ms-1-fix-1-1".into(),
+                        title: "fix".into(),
+                        spec: "s".into(),
+                        validation_criteria: vec![],
+                        origin: crate::types::FeatureOrigin::Fix,
+                        status: crate::types::FeatureStatus::Pending,
+                        worker_runs: vec![],
+                        commits: vec![],
+                        respawns: 0,
+                    },
+                },
+            },
+            Event {
+                seq: 4,
+                ts: chrono::Utc::now(),
+                mission_id: "m-1".into(),
+                kind: EventKind::MissionResumed {},
+            },
+            Event {
+                seq: 5,
+                ts: chrono::Utc::now(),
+                mission_id: "m-1".into(),
+                kind: EventKind::MissionCompleted {},
+            },
+        ];
+        let activity = gate_activity(&events);
+        assert_eq!(activity.blocked, 1);
+        assert_eq!(activity.grant_requests, 1);
+        assert_eq!(activity.fix_features, 1);
+        assert_eq!(activity.resumes, 1);
+        assert_eq!(activity.score(), 4.0);
+    }
+
+    #[test]
+    fn fit_widens_to_cover_a_gate_heavy_outlier_and_reports_correlation() {
+        // Five missions: four on-estimate, one gate-heavy outlier at 4x.
+        // The p90 band must cover the outlier without the center chasing it,
+        // and the gate-activity series must correlate with the overrun.
+        let params = EstimateParams::default();
+        let cfg = MissionConfig::default();
+        let mut corpus: Vec<(usize, usize, MissionConfig, f64, f64)> = Vec::new();
+        for _ in 0..4 {
+            let pred = estimate(&counts_plan(1, 2), &cfg, &params).expected_usd;
+            corpus.push((1, 2, cfg.clone(), pred, 1.0)); // ratio 1.0, quiet
+        }
+        let pred = estimate(&counts_plan(1, 2), &cfg, &params).expected_usd;
+        corpus.push((1, 2, cfg.clone(), pred * 4.0, 13.0)); // the m-b66d34 shape
+
+        let (center, _low, high, gate_correlation) = fit_estimate_to_corpus(&params, &corpus);
+        assert!(high >= 4.0, "p90 must cover the 4x outlier: high={high}");
+        assert!(
+            center < 2.0,
+            "the recentered middle must not chase the outlier: {center}"
+        );
+        let r = gate_correlation.expect("correlation defined with variance");
+        assert!(r > 0.9, "gate activity tracks the overrun: r={r}");
     }
 
     #[test]

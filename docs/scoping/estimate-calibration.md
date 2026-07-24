@@ -160,3 +160,32 @@ becomes a range.
 2026-07-08). The full model lives in `crates/engine/src/cost.rs`; display in
 `crates/cli/src/output.rs::render_cost_estimate`. Related: [worker cost
 recording] `WorkerCompleted.cost_usd` / `usage_cost_usd`.
+
+
+## Gate-activity signal (measured 2026-07-24, calibrate-block-resume-cycles)
+
+The three named outliers from 2026-07-19, re-read through the new
+`cost::gate_activity` fold (blocked + grant.requested + fixfeature.created
++ resumed, from the event logs):
+
+| Mission | actual vs expected | blocked | grants | fix features | resumes | gate score |
+|---------|--------------------|---------|--------|--------------|---------|------------|
+| m-9dc8c1 | $93.41 vs $16.39 (2.5×) | 1 | 1 | 6 | 0 | 8 |
+| m-0f1abd | $75.17 vs $16.39 (2×) | 3 | 1 | 7 | 0 | 11 |
+| m-b66d34 | $248.13 vs $28.51 (≈4×) | 1 | 2 | 10 | 0 | 13 |
+
+The pattern is what the ticket suspected: the overruns are plumbing, not
+scope. Fix features dominate — each one is a full worker+validation cycle
+the count model under-prices — and the gate score tracks the ratio in
+order (2× → 8–11, 4× → 13).
+
+What shipped: `cost::gate_activity` (per-mission counts from events) and
+`Calibration.gate_correlation` (Pearson r between gate score and
+actual÷predicted over the corpus, surfaced for reporting). The band
+itself was left unchanged on the evidence: the empirical p90 with the
+`8×center` cap already covers the m-b66d34 shape (a 4× outlier in a
+5-mission corpus lifts p90 to ≥4× while center stays below 2× — pinned in
+`fit_widens_to_cover_a_gate_heavy_outlier_and_reports_correlation`), so a
+prevalence term would only make every estimate wider without adding
+information. If a future corpus shows gate-heavy missions clustering
+*below* p90 coverage, the harvested features are in place to drive one.
