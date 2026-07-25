@@ -1,6 +1,6 @@
 //! `kranz otel` runtime loop: poll mission event logs, fold spans, export.
 //!
-//! Mirrors [`crate::tail::tail_events`] and `kranz_slack::bridge::run_bridge`
+//! Mirrors [`crate::tail::tail_events`] and `kranz_slack::outbound_engine::run_bridge`
 //! — a read-only poll over `events.jsonl`, self-healing on read errors (log
 //! and retry next tick, never wedge the loop). No engine changes: everything
 //! here consumes `kranz_engine::event_log`/`paths` read-side APIs only.

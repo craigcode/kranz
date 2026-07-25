@@ -43,6 +43,7 @@ pub mod health;
 pub mod host;
 pub mod inbound;
 pub mod outbound;
+pub mod outbound_engine;
 pub mod threads;
 
 pub use catalog::{SlackCatalog, SlackRepo, SlackRoute};
@@ -97,7 +98,8 @@ pub async fn serve_slack(
     let threads_out = threads.clone();
     let threads_in = threads;
 
-    let outbound = bridge::run_bridge(cfg_out, client_out, repo_out, threads_out, out_shutdown);
+    let outbound =
+        outbound_engine::run_bridge(cfg_out, client_out, repo_out, threads_out, out_shutdown);
     let inbound = bridge::run_socket(cfg_in, client_in, repo_in, threads_in, host, in_shutdown);
 
     // Wait for the external shutdown, then fire the notify so both loops stop.
@@ -150,7 +152,7 @@ pub async fn serve_slack_catalog(
             .map(|base| format::dashboard_repo_url(base, &repo.id));
         let threads = catalog.scoped_threads(&repo.id, &route.team_id, &route.channel_id);
         let task_stop = stop.clone();
-        tasks.push(tokio::spawn(bridge::run_bridge(
+        tasks.push(tokio::spawn(outbound_engine::run_bridge(
             cfg,
             client.clone(),
             repo.root.clone(),
