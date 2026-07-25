@@ -370,9 +370,9 @@ fn normalize_lesson_body(text: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// One streaming orchestrator script: session init + one turn reply. Lives
-/// outside `mod tests` because `orchestrator.rs`'s convert_findings /
-/// planning-seed / codex-fallback tests script their orchestrator turns with
-/// it too.
+/// outside `mod tests` because `findings.rs`'s convert_findings and
+/// `orchestrator.rs`'s planning-seed / codex-fallback tests script their
+/// orchestrator turns with it too.
 #[cfg(test)]
 pub(crate) fn lesson_orch_script(reply: &str) -> crate::backend_mock::MockScript {
     use crate::backend_mock::{mock_init, mock_result_text, mock_text};
