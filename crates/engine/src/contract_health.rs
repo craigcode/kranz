@@ -130,7 +130,7 @@ pub fn compute_contract_health(
     .unwrap_or_default();
 
     let mut ids = crate::paths::MissionPaths::list_missions(repo_root);
-    for id in crate::orchestrator::mission_index_ids(&index_contents) {
+    for id in crate::mission_catalog::mission_index_ids(&index_contents) {
         if !ids.contains(&id) {
             ids.push(id);
         }

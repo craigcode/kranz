@@ -35,6 +35,7 @@ pub mod knowledge;
 pub mod lessons;
 pub mod merge;
 pub mod merged;
+pub mod mission_catalog;
 pub mod outcomes;
 pub mod pr_handoff;
 pub mod preflight;

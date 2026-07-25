@@ -40,7 +40,7 @@ pub(crate) async fn health() -> Json<Value> {
 pub(crate) async fn list_missions(State(server): State<Arc<ServerState>>) -> Json<Value> {
     let index_contents = read_missions_index(&server.repo_root);
     let mut ids = MissionPaths::list_missions(&server.repo_root);
-    for id in kranz_engine::orchestrator::mission_index_ids(&index_contents) {
+    for id in kranz_engine::mission_catalog::mission_index_ids(&index_contents) {
         if !ids.contains(&id) {
             ids.push(id);
         }
@@ -632,7 +632,7 @@ fn require_revisable_mission(server: &ServerState, id: &str) -> Result<MissionPa
             "mission '{id}' has no approved plan to revise yet"
         )));
     }
-    if kranz_engine::orchestrator::is_terminal_status(state.mission.status) {
+    if kranz_engine::mission_catalog::is_terminal_status(state.mission.status) {
         return Err(ApiError::conflict(format!(
             "mission '{id}' is {:?}; revision commands apply only to active missions",
             state.mission.status

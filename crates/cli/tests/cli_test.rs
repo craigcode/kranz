@@ -1718,7 +1718,7 @@ fn parses_clean() {
 /// set for each combination of folded status and plan.json presence.
 #[test]
 fn cleanable_class_selects_the_right_missions() {
-    use kranz_engine::orchestrator::{cleanable_class, CleanClass};
+    use kranz_engine::mission_catalog::{cleanable_class, CleanClass};
 
     // Terminal-not-complete is always stale.
     assert_eq!(

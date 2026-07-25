@@ -973,7 +973,7 @@ impl MissionHost {
                 drop(_repo_busy);
             }
         }
-        kranz_engine::orchestrator::abandon_mission(
+        kranz_engine::mission_catalog::abandon_mission(
             self.repo_root.clone(),
             id,
             reason,
@@ -992,7 +992,7 @@ impl MissionHost {
     /// branches, tags, and every other mission's index line are left intact
     /// (same contract as the CLI).
     pub fn clean(&self, id: &str, all: bool) -> Result<(), ApiError> {
-        use kranz_engine::orchestrator::{
+        use kranz_engine::mission_catalog::{
             cleanable_class, mission_lock_is_live, prune_mission_index_file, CleanClass,
         };
         if self

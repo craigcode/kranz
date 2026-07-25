@@ -4013,7 +4013,8 @@ fn mission_index_upserts_by_id() {
 /// idempotently, without disturbing the line format.
 #[test]
 fn mission_index_report_link_appends_once() {
-    use kranz_engine::orchestrator::{mark_mission_index_report, upsert_mission_index};
+    use kranz_engine::mission_catalog::mark_mission_index_report;
+    use kranz_engine::orchestrator::upsert_mission_index;
     let d = chrono::NaiveDate::from_ymd_opt(2026, 7, 3).unwrap();
     let index = upsert_mission_index("", "m-aaa", "goal", d);
     let index = upsert_mission_index(&index, "m-bbb", "other goal", d);
@@ -4038,7 +4039,8 @@ fn mission_index_report_link_appends_once() {
 /// every other line byte-for-byte, and is a no-op for an id with no line.
 #[test]
 fn mission_index_prune_removes_only_named_line() {
-    use kranz_engine::orchestrator::{prune_mission_index, upsert_mission_index};
+    use kranz_engine::mission_catalog::prune_mission_index;
+    use kranz_engine::orchestrator::upsert_mission_index;
     let d = chrono::NaiveDate::from_ymd_opt(2026, 7, 3).unwrap();
     let index = upsert_mission_index("", "m-aaa", "first goal", d);
     let index = upsert_mission_index(&index, "m-bbb", "second goal", d);
@@ -4063,9 +4065,8 @@ fn mission_index_prune_removes_only_named_line() {
 /// taking the plan.md bracket (not the trailing `[report]` link) as the id.
 #[test]
 fn mission_index_ids_lists_ids_in_order() {
-    use kranz_engine::orchestrator::{
-        mark_mission_index_report, mission_index_ids, upsert_mission_index,
-    };
+    use kranz_engine::mission_catalog::{mark_mission_index_report, mission_index_ids};
+    use kranz_engine::orchestrator::upsert_mission_index;
     let d = chrono::NaiveDate::from_ymd_opt(2026, 7, 3).unwrap();
     let index = upsert_mission_index("", "m-aaa", "first goal", d);
     let index = upsert_mission_index(&index, "m-bbb", "second goal", d);
@@ -4081,7 +4082,8 @@ fn mission_index_ids_lists_ids_in_order() {
 /// other mission's line intact.
 #[test]
 fn delete_prunes_missions_index() {
-    use kranz_engine::orchestrator::{prune_mission_index_file, upsert_mission_index};
+    use kranz_engine::mission_catalog::prune_mission_index_file;
+    use kranz_engine::orchestrator::upsert_mission_index;
     let dir = tempfile::tempdir().expect("create tempdir");
     let root = std::fs::canonicalize(dir.path()).expect("canonicalize repo root");
     let d = chrono::NaiveDate::from_ymd_opt(2026, 7, 3).unwrap();
@@ -4104,7 +4106,7 @@ fn delete_prunes_missions_index() {
 /// create one.
 #[test]
 fn delete_prunes_missions_index_missing_file_is_noop() {
-    use kranz_engine::orchestrator::prune_mission_index_file;
+    use kranz_engine::mission_catalog::prune_mission_index_file;
     let dir = tempfile::tempdir().expect("create tempdir");
     let root = std::fs::canonicalize(dir.path()).expect("canonicalize repo root");
 
@@ -4144,7 +4146,7 @@ async fn abandon_planning_mission_sets_abandoned_status() {
         MissionStatus::Planning
     );
 
-    kranz_engine::orchestrator::abandon_mission(
+    kranz_engine::mission_catalog::abandon_mission(
         &root,
         &mission_id,
         "no longer needed",
@@ -4191,7 +4193,7 @@ async fn running_an_abandoned_mission_is_rejected() {
     let paths = engine.paths().clone();
     drop(engine);
 
-    kranz_engine::orchestrator::abandon_mission(&root, &mission_id, "stop", LockForce::No)
+    kranz_engine::mission_catalog::abandon_mission(&root, &mission_id, "stop", LockForce::No)
         .expect("abandon");
 
     let backend2: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
@@ -4230,13 +4232,13 @@ async fn abandon_already_terminal_mission_errors() {
     drop(engine);
 
     // First abandon succeeds and makes the mission terminal.
-    kranz_engine::orchestrator::abandon_mission(&root, &mission_id, "first", LockForce::No)
+    kranz_engine::mission_catalog::abandon_mission(&root, &mission_id, "first", LockForce::No)
         .unwrap();
     let after_first = read_log(&paths);
 
     // A second abandon is rejected: the mission is already terminal.
     let err =
-        kranz_engine::orchestrator::abandon_mission(&root, &mission_id, "again", LockForce::No)
+        kranz_engine::mission_catalog::abandon_mission(&root, &mission_id, "again", LockForce::No)
             .expect_err("abandoning a terminal mission must error");
     assert!(
         err.to_string().contains("already terminal"),
@@ -4266,8 +4268,9 @@ async fn abandon_fails_while_engine_holds_lock() {
     let engine = make_engine(&backend, &root, test_cfg());
     let mission_id = engine.mission_id().to_string();
 
-    let err = kranz_engine::orchestrator::abandon_mission(&root, &mission_id, "x", LockForce::No)
-        .expect_err("abandon must fail while the lock is held");
+    let err =
+        kranz_engine::mission_catalog::abandon_mission(&root, &mission_id, "x", LockForce::No)
+            .expect_err("abandon must fail while the lock is held");
     assert!(
         matches!(err, kranz_engine::error::EngineError::LockHeld(_)),
         "expected LockHeld, got: {err}"

@@ -17,7 +17,8 @@ use kranz_engine::config;
 use kranz_engine::control;
 use kranz_engine::cost;
 use kranz_engine::event_log::{EventLog, LockForce};
-use kranz_engine::orchestrator::{self, MissionEngine, PlanRequest};
+use kranz_engine::mission_catalog;
+use kranz_engine::orchestrator::{MissionEngine, PlanRequest};
 use kranz_engine::paths::MissionPaths;
 use kranz_engine::reducer;
 use kranz_engine::trace_export;
@@ -412,7 +413,7 @@ pub fn select_control_mission(repo: &Path, explicit: Option<&str>) -> Result<Str
     }
     let mission = select_mission(repo, None)?;
     let status = load_state(repo, &mission)?.mission.status;
-    if orchestrator::is_terminal_status(status) {
+    if mission_catalog::is_terminal_status(status) {
         bail!(
             "mission {mission} is {status:?}; control commands apply only to active \
              missions (a terminal mission's inbox is never drained — see \
@@ -428,7 +429,7 @@ pub fn select_control_mission(repo: &Path, explicit: Option<&str>) -> Result<Str
 /// actually running (a live lock holder will drain the inbox shortly).
 pub fn control_queue_hint(repo: &Path, mission_id: &str) -> Option<String> {
     let paths = MissionPaths::new(repo, mission_id);
-    (!orchestrator::mission_lock_is_live(&paths)).then(|| {
+    (!mission_catalog::mission_lock_is_live(&paths)).then(|| {
         format!(
             "note: mission {mission_id} is not currently running — the command is \
              queued and applies when the mission next runs"
@@ -1211,7 +1212,7 @@ pub fn cmd_missions(repo: &Path) -> Result<String> {
         std::fs::read_to_string(MissionPaths::new(repo, "_").missions_dir().join("index.md"))
             .unwrap_or_default();
     let mut ids = MissionPaths::list_missions(repo);
-    for id in kranz_engine::orchestrator::mission_index_ids(&index_contents) {
+    for id in mission_catalog::mission_index_ids(&index_contents) {
         if !ids.contains(&id) {
             ids.push(id);
         }
@@ -1268,7 +1269,7 @@ pub fn cmd_abandon(
     force_lock: LockForce,
 ) -> Result<()> {
     require_mission(repo, mission_id)?;
-    orchestrator::abandon_mission(repo, mission_id, reason, force_lock).map_err(|e| {
+    mission_catalog::abandon_mission(repo, mission_id, reason, force_lock).map_err(|e| {
         if matches!(e, kranz_engine::error::EngineError::LockHeld(_)) {
             anyhow!(
                 "cannot abandon mission '{mission_id}' — an engine still holds its lock. \
@@ -1296,21 +1297,21 @@ pub struct CleanEntry {
 /// Never selects a mission whose lock is held by a live engine, nor one whose
 /// log is unreadable (a corrupt log is left for the operator to inspect, not
 /// silently deleted). The pure status→class decision lives in
-/// [`orchestrator::cleanable_class`]; this function layers the filesystem facts
+/// [`mission_catalog::cleanable_class`]; this function layers the filesystem facts
 /// (plan.json presence, lock liveness) on top.
 pub fn select_cleanable(repo: &Path, all: bool) -> Vec<CleanEntry> {
     let mut out = Vec::new();
     for id in MissionPaths::list_missions(repo) {
         let paths = MissionPaths::new(repo, &id);
         // A live engine owns this directory: never touch it.
-        if orchestrator::mission_lock_is_live(&paths) {
+        if mission_catalog::mission_lock_is_live(&paths) {
             continue;
         }
         let Ok(state) = load_state(repo, &id) else {
             continue; // unreadable/corrupt log: leave it for inspection
         };
         let has_plan = paths.plan_file().is_file();
-        if orchestrator::cleanable_class(state.mission.status, has_plan).is_cleaned(all) {
+        if mission_catalog::cleanable_class(state.mission.status, has_plan).is_cleaned(all) {
             out.push(CleanEntry {
                 id,
                 status_label: output::mission_status_label(state.mission.status).to_string(),
@@ -1386,7 +1387,7 @@ pub fn remove_missions(repo: &Path, entries: &[CleanEntry], verbose: bool) -> Ve
         // before its session runs), and deleting a mission dir out from under a
         // running engine would corrupt it. This closes the unbounded
         // human-prompt window (a sub-ms race remains but is bounded).
-        if orchestrator::mission_lock_is_live(&paths) {
+        if mission_catalog::mission_lock_is_live(&paths) {
             eprintln!("kranz: skipping {} — became live since listing", e.id);
             continue;
         }
@@ -1396,7 +1397,7 @@ pub fn remove_missions(repo: &Path, entries: &[CleanEntry], verbose: bool) -> Ve
                 if verbose {
                     println!("removed {}", dir.display());
                 }
-                orchestrator::prune_mission_index_file(repo, &e.id);
+                mission_catalog::prune_mission_index_file(repo, &e.id);
                 removed.push(e.id.clone());
             }
             Err(err) => eprintln!("kranz: could not remove {}: {err}", dir.display()),

@@ -1133,7 +1133,7 @@ fn lock_holder_is_alive_understands_every_lock_format() {
 /// format, including dead holders.
 #[test]
 fn mission_lock_is_live_delegates_to_the_canonical_probe() {
-    use kranz_engine::orchestrator::mission_lock_is_live;
+    use kranz_engine::mission_catalog::mission_lock_is_live;
     let tmp = tempfile::tempdir().unwrap();
     let p = MissionPaths::new(tmp.path(), "m-lock");
     std::fs::create_dir_all(p.mission_dir()).unwrap();

@@ -131,7 +131,7 @@ fn mission_status(repo_root: &Path, id: &str) -> Option<MissionStatus> {
 ///   error listing the candidates and asking for an explicit id (an
 ///   mtime-based guess could hijack the wrong running mission).
 pub fn resolve_active_mission(repo_root: &Path, explicit: Option<&str>) -> Result<String> {
-    let is_terminal = crate::orchestrator::is_terminal_status;
+    let is_terminal = crate::mission_catalog::is_terminal_status;
     if let Some(id) = explicit {
         if !MissionPaths::is_safe_id(id) {
             return Err(EngineError::Other(format!("unknown mission `{id}`")));
@@ -325,7 +325,7 @@ mod tests {
         // mission, so a reverted `is_safe_id` guard would ACCEPT it.
         assert!(
             mission_status(&repo_root, traversal_id)
-                .is_some_and(|status| !crate::orchestrator::is_terminal_status(status)),
+                .is_some_and(|status| !crate::mission_catalog::is_terminal_status(status)),
             "fixture: traversal target must fold as an active mission"
         );
 
