@@ -542,7 +542,7 @@ async fn workspace_summary_surfaces_isolation_sandbox_and_preflight_without_gran
     {
         let mut log = EventLog::acquire(&paths, MISSION_ID, Duration::ZERO, LockForce::No).unwrap();
         log.append(EventKind::OrchestratorDecision {
-            summary: kranz_engine::orchestrator::PREFLIGHT_CLEAR_SUMMARY.into(),
+            summary: kranz_engine::preflight::PREFLIGHT_CLEAR_SUMMARY.into(),
             detail: None,
         })
         .unwrap();
@@ -552,7 +552,7 @@ async fn workspace_summary_surfaces_isolation_sandbox_and_preflight_without_gran
     assert_eq!(body["preflight"]["status"], "clear");
     assert_eq!(
         body["preflight"]["summary"],
-        kranz_engine::orchestrator::PREFLIGHT_CLEAR_SUMMARY
+        kranz_engine::preflight::PREFLIGHT_CLEAR_SUMMARY
     );
 }
 
