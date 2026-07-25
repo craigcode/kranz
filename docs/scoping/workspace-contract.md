@@ -1,9 +1,20 @@
 # M6 scoping — Workspace contract and provider seam
 
-Status: **proposed** 2026-07-25 (from Monaco agent-developer-workspaces
-review). Accept or defer the D-X decisions via ticket
-`workspace-contract-design`, then implement the blocked-by chain in
-`.kranz/tickets/`.
+Status: **accepted** 2026-07-25 — D-A…D-H accepted as proposed, with two
+implementation notes recorded below and one delivery re-sequence
+(`workspace-provider-pin-at-approval` ahead of `local-container-workspace`).
+Implement the blocked-by chain in `.kranz/tickets/`.
+
+Implementation notes (recorded with acceptance):
+1. **Egress scoping.** Bootstrap/readiness is local-worktree-first. Tier-3
+   fails closed on fs+net missions with non-empty egress, and bootstrap
+   needs registry egress — so `local-container-workspace` waits for the
+   egress proxy OR ships scoped to fs-tier (bridge network) with the
+   limitation documented in its ticket.
+2. **Mount/cache-dir convention.** The schema must cover service/bootstrap
+   writes outside the worktree (package caches, DB dirs) via `extra_write`
+   or named volumes — without it every container bootstrap fails on first
+   fetch. Design into `workspace-contract-schema`, not later.
 
 Companion: `docs/roadmap.md` M6, `docs/scoping/worker-sandboxing.md` Tier 3,
 Monaco post https://www.monaco.com/blog/agent-developer-workspaces
@@ -161,8 +172,8 @@ it does not.
 | 2 | `workspace-contract-schema` | 1 | Contract without provider still documents intent + validates at approve |
 | 3 | `workspace-bootstrap-preflight` | 1 | **Highest local ROI** — fixes flimsy worktrees today |
 | 4 | `workspace-provider-seam` | 1 | Trait + local-worktree impl + events; no cloud required |
-| 5 | `local-container-workspace` | 2 | Ports/Docker isolation for parallel missions |
-| 6 | `workspace-provider-pin-at-approval` | 2 | Consent-time pin + artifact surfacing |
+| 5 | `workspace-provider-pin-at-approval` | 2 | Consent-time pin + artifact surfacing (re-sequenced ahead of local-container at acceptance: pinning the local-worktree provider needs no containers) |
+| 6 | `local-container-workspace` | 2 | Ports/Docker isolation for parallel missions (gated on the egress story — see acceptance note 1) |
 | 7 | `golden-data-hooks` | 2 | Monaco's efficacy lever for DB repos |
 | 8 | `trigger-ci-pr-fix-mission` | 3 | AFK quality loop without surrendering gates |
 | 9 | `workspace-remote-coder-provider` | 3 | Thin buy-substrate adapter |
