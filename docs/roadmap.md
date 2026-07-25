@@ -180,6 +180,8 @@ Design changes required (eyes open):
   Provisioning is separate from `AgentBackend`: start with the existing local
   worktree provider, then add container and remote/Coder-style providers. Pin
   the effective provider and template/image version in the mission record.
+  Proposed decisions and impact-ordered tickets:
+  [`docs/scoping/workspace-contract.md`](scoping/workspace-contract.md).
 - **Runnable data plane**: worktrees isolate source, not ports, Docker state,
   caches, or databases. A cloud/parallel workspace must be able to receive an
   isolated application runtime and, when configured, a de-identified golden
@@ -276,7 +278,7 @@ follow-up backlog (rewritten after adversarial review) is sequenced as:
 - **Later / gated (P3):** `structured-human-question-events` (unify with
   grants/NeedsContext), `agent-hooks-status-signals` (blocked on Cursor
   backend lane), `multi-repo-project-picker` (blocked on multi-root host
-  design), `workspace-provider-pin-at-approval` (M6 provider pin).
+  design).
 
 - **A worktree is not a workspace.** Monaco's failed local-worktree phase
   exposed the shared runtime problems source isolation does not solve: port
@@ -295,6 +297,28 @@ follow-up backlog (rewritten after adversarial review) is sequenced as:
   and preview links, readiness, provider/template identity, and lifecycle in
   the event trail. GitHub PR-comment/CI-failure triggers should create audited
   fix-features or follow-up missions rather than hide polling loops in prompts.
+
+### M6 workspace backlog (impact order, 2026-07-25)
+
+Scoping: [`docs/scoping/workspace-contract.md`](scoping/workspace-contract.md)
+(proposed D-A…D-H). Priority `1` = highest impact / do first.
+
+| Order | Pri | Ticket | Why this order |
+|------:|----:|--------|----------------|
+| 1 | 1 | `workspace-contract-design` | Accept D-A…D-H; unblock honest drafts |
+| 2 | 1 | `workspace-contract-schema` | Contract artifact without needing cloud |
+| 3 | 1 | `workspace-bootstrap-preflight` | **Best local ROI** — flimsy worktree fix |
+| 4 | 1 | `workspace-provider-seam` | Trait + local-worktree; parallelizable after design |
+| 5 | 2 | `local-container-workspace` | Ports/Docker isolation (≠ Tier-3 sandbox) |
+| 6 | 2 | `workspace-provider-pin-at-approval` | Consent-time pin + artifact surfacing |
+| 7 | 2 | `golden-data-hooks` | Seeded data for functional validation |
+| 8 | 3 | `trigger-ci-pr-fix-mission` | AFK CI/PR loop as audited missions |
+| 9 | 3 | `workspace-remote-coder-provider` | Thin buy-substrate adapter |
+| 10 | 3 | `workspace-idle-hibernate` | Remote cost lifecycle |
+
+Related but separate: `tier3-container-sandbox` remains the **sandbox**
+containment ticket; share runtime code with `local-container-workspace` when
+useful, keep product APIs distinct.
 
 - **Cursor CLI / Grok 4.5 backend.** Treat Cursor as a runtime/backend to
   absorb, not an IDE lane to chase: add a `backend_cursor` (or ACP-backed
