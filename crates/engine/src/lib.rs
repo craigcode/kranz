@@ -30,6 +30,7 @@ pub mod decompose;
 pub mod deps;
 pub mod event_log;
 pub mod git_ops;
+pub mod judgement;
 pub mod knowledge;
 pub mod lessons;
 pub mod merge;
