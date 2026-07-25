@@ -16,6 +16,7 @@ pub mod backend;
 pub mod error;
 pub mod events;
 pub mod paths;
+pub mod plan_fit;
 pub mod types;
 
 pub mod auth_verify;

@@ -22,6 +22,7 @@ pub fn render_plan_markdown(
     mission: &Mission,
     estimate: &cost::CostEstimate,
     two_path: Option<&cost::TwoPathEstimate>,
+    fit_note: Option<&str>,
     missions_used: usize,
     contract_lint: &contract_lint::ContractLintReport,
 ) -> String {
@@ -78,6 +79,10 @@ pub fn render_plan_markdown(
             two_path.escalated.expected_usd,
             two_path.cache_miss_usd,
         );
+    }
+
+    if let Some(note) = fit_note {
+        let _ = writeln!(md, "{note}\n");
     }
 
     if let Some(alternatives) = &plan.considered_alternatives {

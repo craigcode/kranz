@@ -931,6 +931,26 @@ impl MissionEngine {
         let estimate = cost::estimate(&plan, &self.state.config, &calibration.params);
         let estimate = cost::apply_shape(estimate, &plan, &calibration);
         validate_considered_alternatives(&plan, &estimate, &self.state.config)?;
+
+        // Context-fit check (plan-feature-context-fit-check ticket): warn
+        // when a feature looks bigger than one worker session — advisory
+        // only (a decision event + the plan.md note rendered from it), never
+        // a gate. Splitting is cheap here; respawns are expensive later.
+        let fit_anchor = crate::plan_fit::corpus_fit_anchor(&self.paths.repo_root);
+        let fit_warnings = crate::plan_fit::feature_fit_warnings(&plan, &fit_anchor);
+        let fit_note = if fit_warnings.is_empty() {
+            None
+        } else {
+            let note = crate::plan_fit::render_fit_note(&fit_warnings, &fit_anchor);
+            self.emit_decision(
+                &format!(
+                    "context-fit check: {} feature(s) look bigger than one worker session",
+                    fit_warnings.len()
+                ),
+                Some(note.clone()),
+            )?;
+            Some(note)
+        };
         // repo-knowledge-store slice 1: research.md is soft-prompted over the
         // considered-alternatives threshold, not gated. Surface the gap in
         // telemetry so we can see (before hardening) how often over-threshold
@@ -996,6 +1016,7 @@ impl MissionEngine {
             &self.state.mission,
             &estimate,
             two_path.as_ref(),
+            fit_note.as_deref(),
             calibration.missions_used,
             &contract_lint_report,
         );
@@ -1563,11 +1584,16 @@ impl MissionEngine {
             tree_clean_at_base: true,
         };
         let two_path = cost::estimate_two_path(estimate, &self.state.config, &calibration.params);
+        let fit_anchor = crate::plan_fit::corpus_fit_anchor(&self.paths.repo_root);
+        let fit_warnings = crate::plan_fit::feature_fit_warnings(plan, &fit_anchor);
+        let fit_note = (!fit_warnings.is_empty())
+            .then(|| crate::plan_fit::render_fit_note(&fit_warnings, &fit_anchor));
         let plan_md_body = render_plan_markdown(
             plan,
             &self.state.mission,
             &estimate,
             two_path.as_ref(),
+            fit_note.as_deref(),
             calibration.missions_used,
             &no_lint,
         );
