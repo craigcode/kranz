@@ -91,6 +91,16 @@ pub struct ContainerSpec {
 /// egress list before this point, so FsNet here always means "no network");
 /// `fs` passes no network flag, keeping the runtime's default bridge/NAT —
 /// the same permissiveness as the tier-2 fs tier.
+/// One mount spec `host:host[:ro]` — the single format both the builder and
+/// the tests use (POSIX and Windows path forms differ; tests derive
+/// expectations through this helper rather than hardcoding POSIX literals).
+fn mount_arg(host_abs: &str, read_only: bool) -> String {
+    format!(
+        "{host_abs}:{host_abs}{}",
+        if read_only { ":ro" } else { "" }
+    )
+}
+
 pub fn container_run_args(
     inputs: &SandboxInputs,
     spec: &ContainerSpec,
@@ -122,9 +132,8 @@ pub fn container_run_args(
         add_mount(extra, false);
     }
     for (host, ro) in mounts {
-        let spec_suffix = if ro { ":ro" } else { "" };
         out.push("-v".to_string());
-        out.push(format!("{host}:{host}{spec_suffix}"));
+        out.push(mount_arg(&host, ro));
     }
     out.push("-w".to_string());
     out.push(
@@ -226,22 +235,39 @@ mod tests {
 
     #[test]
     fn container_run_args_mounts_policy_and_runs_image() {
+        // Platform-native fixture paths: /work literals absolutize to
+        // drive-lettered/backslashed forms on Windows, so expectations are
+        // derived through the same absolutize + mount_arg the builder uses.
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("session");
+        let mission = dir.path().join("mission");
+        let scratch = dir.path().join("scratch");
+        let cargo = dir.path().join("cargo");
+        let inputs = SandboxInputs {
+            enforce: SandboxEnforce::Fs,
+            session_cwd: session.clone(),
+            mission_dir: mission.clone(),
+            tmpdir: scratch.clone(),
+            extra_write: vec![cargo.clone()],
+            egress: Vec::new(),
+        };
         let args = container_run_args(
-            &inputs(SandboxEnforce::Fs),
+            &inputs,
             &spec(),
             Path::new("claude"),
             &["--print".to_string()],
         );
         let joined = args.join(" ");
+        let abs = |p: &std::path::Path| crate::sandbox::absolutize(p).display().to_string();
 
         assert!(args.contains(&"--rm".to_string()));
         assert!(args.contains(&"--read-only".to_string()));
-        assert!(joined.contains("-v /work/session:/work/session"));
-        assert!(joined.contains("-v /work/mission:/work/mission:ro"));
-        assert!(joined.contains("-v /work/scratch:/work/scratch"));
-        assert!(joined.contains("-v /home/op/.cargo:/home/op/.cargo"));
-        assert!(joined.contains("-w /work/session"));
-        assert!(joined.contains("-e HOME=/work/scratch"));
+        assert!(joined.contains(&mount_arg(&abs(&session), false)));
+        assert!(joined.contains(&mount_arg(&abs(&mission), true)));
+        assert!(joined.contains(&mount_arg(&abs(&scratch), false)));
+        assert!(joined.contains(&mount_arg(&abs(&cargo), false)));
+        assert!(joined.contains(&format!("-w {}", abs(&session))));
+        assert!(joined.contains(&format!("-e HOME={}", abs(&scratch))));
         assert!(
             joined.ends_with(&format!("{DEFAULT_IMAGE} claude --print")),
             "image then binary then args: {args:?}"
