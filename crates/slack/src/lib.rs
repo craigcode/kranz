@@ -37,6 +37,7 @@ pub mod bridge;
 pub mod catalog;
 pub mod client;
 pub mod config;
+pub(crate) mod dispatch;
 pub mod format;
 pub mod health;
 pub mod host;
