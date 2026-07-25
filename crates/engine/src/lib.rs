@@ -37,6 +37,7 @@ pub mod merge;
 pub mod merged;
 pub mod mission_catalog;
 pub mod outcomes;
+pub mod planning;
 pub mod pr_handoff;
 pub mod preflight;
 pub mod prompts;

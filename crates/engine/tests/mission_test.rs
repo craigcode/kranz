@@ -3978,7 +3978,7 @@ async fn worker_file_write_lands_a_non_meta_commit_and_mission_completes() {
 /// last, replaces on re-approval, never duplicates.
 #[test]
 fn mission_index_upserts_by_id() {
-    use kranz_engine::orchestrator::upsert_mission_index;
+    use kranz_engine::planning::upsert_mission_index;
     let d1 = chrono::NaiveDate::from_ymd_opt(2026, 7, 2).unwrap();
     let d2 = chrono::NaiveDate::from_ymd_opt(2026, 7, 3).unwrap();
 
@@ -4014,7 +4014,7 @@ fn mission_index_upserts_by_id() {
 #[test]
 fn mission_index_report_link_appends_once() {
     use kranz_engine::mission_catalog::mark_mission_index_report;
-    use kranz_engine::orchestrator::upsert_mission_index;
+    use kranz_engine::planning::upsert_mission_index;
     let d = chrono::NaiveDate::from_ymd_opt(2026, 7, 3).unwrap();
     let index = upsert_mission_index("", "m-aaa", "goal", d);
     let index = upsert_mission_index(&index, "m-bbb", "other goal", d);
@@ -4040,7 +4040,7 @@ fn mission_index_report_link_appends_once() {
 #[test]
 fn mission_index_prune_removes_only_named_line() {
     use kranz_engine::mission_catalog::prune_mission_index;
-    use kranz_engine::orchestrator::upsert_mission_index;
+    use kranz_engine::planning::upsert_mission_index;
     let d = chrono::NaiveDate::from_ymd_opt(2026, 7, 3).unwrap();
     let index = upsert_mission_index("", "m-aaa", "first goal", d);
     let index = upsert_mission_index(&index, "m-bbb", "second goal", d);
@@ -4066,7 +4066,7 @@ fn mission_index_prune_removes_only_named_line() {
 #[test]
 fn mission_index_ids_lists_ids_in_order() {
     use kranz_engine::mission_catalog::{mark_mission_index_report, mission_index_ids};
-    use kranz_engine::orchestrator::upsert_mission_index;
+    use kranz_engine::planning::upsert_mission_index;
     let d = chrono::NaiveDate::from_ymd_opt(2026, 7, 3).unwrap();
     let index = upsert_mission_index("", "m-aaa", "first goal", d);
     let index = upsert_mission_index(&index, "m-bbb", "second goal", d);
@@ -4083,7 +4083,7 @@ fn mission_index_ids_lists_ids_in_order() {
 #[test]
 fn delete_prunes_missions_index() {
     use kranz_engine::mission_catalog::prune_mission_index_file;
-    use kranz_engine::orchestrator::upsert_mission_index;
+    use kranz_engine::planning::upsert_mission_index;
     let dir = tempfile::tempdir().expect("create tempdir");
     let root = std::fs::canonicalize(dir.path()).expect("canonicalize repo root");
     let d = chrono::NaiveDate::from_ymd_opt(2026, 7, 3).unwrap();

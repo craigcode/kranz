@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 /// Remove a single mission's line from the missions catalog (deletion
-/// counterpart to [`crate::orchestrator::upsert_mission_index`]), matched by
+/// counterpart to [`crate::planning::upsert_mission_index`]), matched by
 /// the same `[<id>](` marker. Every other line and the header stay
 /// byte-for-byte; pruning an id with no line is a no-op (modulo
 /// trailing-newline normalization, same as [`mark_mission_index_report`]).
