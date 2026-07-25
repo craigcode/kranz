@@ -7,14 +7,16 @@ use crate::bridge::{
     apply_action, ask_answer_blocks, build_home_view, build_outcomes_reply,
     build_pipeline_status_reply, build_roadmap_reply, build_status_reply, build_ticket_list_reply,
     build_ticket_show_reply, build_todo_reply, build_work_reply, change_config, create_ticket,
-    error_blocks, gate_draft_command, gate_merge_command, gate_work_run_command, grant_control,
-    guidance, is_ticket_slug, looks_like_mission_id, looks_like_plan_json, mission_dir_exists,
-    mission_status, new_mission, no_host_blocks, not_authorized_blocks, post_thread_note,
-    post_to_mission_thread, reply_ephemeral, revision_control, run_approve_ticket_command,
-    run_draft, run_merge, run_work_run, scaffold_ticket, slugify, steer, user_reply, DraftGate,
-    MergeGate, ModalScope, SharedThreads, WorkRunGate,
+    error_blocks, grant_control, guidance, is_ticket_slug, looks_like_mission_id,
+    looks_like_plan_json, mission_dir_exists, mission_status, new_mission, no_host_blocks,
+    not_authorized_blocks, post_thread_note, post_to_mission_thread, reply_ephemeral,
+    revision_control, scaffold_ticket, slugify, steer, user_reply, ModalScope, SharedThreads,
 };
 use crate::client::SlackClient;
+use crate::commands::{
+    gate_draft_command, gate_merge_command, gate_work_run_command, run_approve_ticket_command,
+    run_draft, run_merge, run_work_run, DraftGate, MergeGate, WorkRunGate,
+};
 use crate::config::SlackConfig;
 use crate::host::{PlanOutcome, SharedHost};
 use crate::inbound::Action;

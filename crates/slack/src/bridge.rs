@@ -11,6 +11,76 @@
 //!
 //! Shutdown is any `Future` that resolves when the host wants the bridge to
 //! stop; both loops select on a shared notify fired from it.
+//!
+//! Route one inbound action to its handler. The async actions (help, status,
+//! new-mission, request-plan, approve-from-slash) reply over the slash
+//! `response_url`, so they can't go through the sync [`apply_action`] path;
+//! the button/thread actions (approve button, guidance, ticket) are pure local
+//! filesystem writes and go through [`apply_action`].
+//!
+//! ## The hosted lifecycle (M2.9 planning-conversation slice)
+//! With a [`SharedHost`] wired in (`kranz serve --slack` passes an adapter
+//! over the SAME `MissionHost` registry the web UI uses), the full lifecycle
+//! runs from Slack:
+//! - **Status** — folds the mission's event log and posts a status block.
+//!   Read-only, so no allowlist gate. Unit-tested end-to-end.
+//! - **NewMission** (`/kranz new <goal>`) — allowlist-gated; creates THROUGH
+//!   the host so the planning engine stays live across turns.
+//! - **Guidance** on a PLANNING mission's thread — allowlist-gated hosted
+//!   planning turn, acked in-thread first (the turn takes minutes); on a
+//!   running mission it stays the control-inbox guidance write.
+//! - **RequestPlan** (`/kranz plan <id>`) — allowlist-gated; immediate
+//!   ephemeral ack, then `host.request_plan`. Ready → a plan-review block
+//!   (goal, milestones, estimate, approve buttons) posted to the mission
+//!   thread; the HOST parked the reviewed plan (one cache, every surface). NotReady →
+//!   the orchestrator's prose posted threaded.
+//! - **Approve / ApproveStart / ApproveMission** — allowlist-gated
+//!   [`crate::approve_flow::approve_flow`]: commit the pending plan through the
+//!   host, then queue (`Approve`/slash) or start execution through the host
+//!   (`ApproveStart`). State-aware without a pending plan (see
+//!   [`crate::approve_flow::approve_flow`]).
+//! - **QueueTicket** (`/kranz queue <slug>`, D-A) — the ticket-queueing verb;
+//!   allowlist-gated identically to the ticket-slug path of `/kranz approve`,
+//!   but resolves ONLY through [`crate::commands::run_approve_ticket_command`] — it never
+//!   falls back to [`crate::approve_flow::approve_flow`], so it can never trigger plan approval.
+//!
+//! Without a host every engine-needing surface degrades to an honest
+//! ephemeral refusal pointing at the CLI ([`no_host_blocks`]).
+//!
+//! ## M2.9 slices 2 & 3 additions
+//! - **Config** (`/kranz config [<id>] <role> [backend] <model> [effort]`) — spend-adjacent,
+//!   so allowlist-gated like `new`; on authorization enqueues a
+//!   `config-change` control command with the camelCase patch ([`config_change`]).
+//!   A pure local write, so it stays inline (fast ack).
+//! - **AppHome** (`app_home_opened`) — read-only: folds the repo and publishes
+//!   the Home view via `views.publish` ([`build_home_view`]). One Web API call,
+//!   no allowlist gate; a publish failure is logged, never surfaced.
+//!
+//! ## M2.9 slice — steering (pause / resume / work)
+//! - **Pause** / **Resume** (`/kranz pause|resume [<id>]`) — STEERING, not
+//!   spend, but they disrupt a running mission, so they are gated on the
+//!   allowlist exactly like `config`. On authorization the bridge enqueues
+//!   `ControlCommand::Pause` / `Resume` on the target mission's control inbox
+//!   (the same mechanism `kranz pause`/`kranz resume` use), resolved via
+//!   [`resolve_active_config_target`] so a terminal/ambiguous target is an honest
+//!   ephemeral error that enqueues NOTHING. A pure local write ([`steer`]), so
+//!   it stays inline (fast ack).
+//! - **Work** (`/kranz work`) — REPORT-ONLY: the bridge must never spawn a
+//!   mission on the socket read loop, so it reports the queue state
+//!   (`queue::list` + `is_repo_busy`, [`build_work_reply`]) and points at the
+//!   `kranz work` CLI / dispatcher for actually draining it. Read-only, no gate.
+//! - **Work run** (`/kranz work run`) — SPEND action, gated EXACTLY like
+//!   `draft` ([`crate::commands::gate_work_run_command`] / [`crate::commands::run_work_run`]). On authorization
+//!   it triggers the drain THROUGH the host ([`crate::host::PlanningHost::drain`]) —
+//!   the seam that spawns the background drain on the serve process — never
+//!   by resuming/running a mission on the socket read loop.
+//!
+//! ## Ack budget (docs must-have #3)
+//! `connect_once` acks every envelope FIRST and runs the slow actions
+//! ([`is_slow_action`]: claude-spawning or engine-touching) on spawned tasks,
+//! deduped by envelope id ([`SeenEnvelopes`]) so a Slack redelivery can't
+//! double-create or double-approve. Only pure-local actions run inline on the
+//! read loop.
 
 use crate::catalog::SlackCatalog;
 use crate::client::SlackClient;
@@ -22,7 +92,6 @@ use crate::inbound::{route, Action, ThreadLookup};
 use crate::threads::{AffinityMap, RepoMissionId, ThreadMap};
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
-use kranz_engine::draft::DraftOutcome;
 use kranz_engine::event_log::EventLog;
 use kranz_engine::paths::MissionPaths;
 use kranz_engine::reducer;
@@ -34,6 +103,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tokio_tungstenite::tungstenite::Message;
+
+// The slash-command gate+runner layer lives in [`crate::commands`]; re-exported
+// here so the crate's external surface (`kranz_slack::bridge::*`, used by
+// tests/tickets.rs) is unchanged by the split.
+pub use crate::commands::{
+    gate_draft_command, gate_merge_command, gate_work_run_command, run_approve_ticket_command,
+    run_draft, run_merge, run_work_run, ApproveTicketInvocation, DraftGate, MergeGate, WorkRunGate,
+};
 
 /// Backoff bounds for reconnecting the Socket Mode websocket.
 const BACKOFF_MIN: Duration = Duration::from_millis(500);
@@ -860,271 +937,9 @@ pub fn not_authorized_blocks() -> Vec<Value> {
     })]
 }
 
-/// Route one inbound action to its handler. The async actions (help, status,
-/// new-mission, request-plan, approve-from-slash) reply over the slash
-/// `response_url`, so they can't go through the sync [`apply_action`] path;
-/// the button/thread actions (approve button, guidance, ticket) are pure local
-/// filesystem writes and go through [`apply_action`].
-///
-/// ## The hosted lifecycle (M2.9 planning-conversation slice)
-/// With a [`SharedHost`] wired in (`kranz serve --slack` passes an adapter
-/// over the SAME `MissionHost` registry the web UI uses), the full lifecycle
-/// runs from Slack:
-/// - **Status** — folds the mission's event log and posts a status block.
-///   Read-only, so no allowlist gate. Unit-tested end-to-end.
-/// - **NewMission** (`/kranz new <goal>`) — allowlist-gated; creates THROUGH
-///   the host so the planning engine stays live across turns.
-/// - **Guidance** on a PLANNING mission's thread — allowlist-gated hosted
-///   planning turn, acked in-thread first (the turn takes minutes); on a
-///   running mission it stays the control-inbox guidance write.
-/// - **RequestPlan** (`/kranz plan <id>`) — allowlist-gated; immediate
-///   ephemeral ack, then `host.request_plan`. Ready → a plan-review block
-///   (goal, milestones, estimate, approve buttons) posted to the mission
-///   thread; the HOST parked the reviewed plan (one cache, every surface). NotReady →
-///   the orchestrator's prose posted threaded.
-/// - **Approve / ApproveStart / ApproveMission** — allowlist-gated
-///   [`crate::approve_flow::approve_flow`]: commit the pending plan through the
-///   host, then queue (`Approve`/slash) or start execution through the host
-///   (`ApproveStart`). State-aware without a pending plan (see
-///   [`crate::approve_flow::approve_flow`]).
-/// - **QueueTicket** (`/kranz queue <slug>`, D-A) — the ticket-queueing verb;
-///   allowlist-gated identically to the ticket-slug path of `/kranz approve`,
-///   but resolves ONLY through [`run_approve_ticket_command`] — it never
-///   falls back to [`crate::approve_flow::approve_flow`], so it can never trigger plan approval.
-///
-/// Without a host every engine-needing surface degrades to an honest
-/// ephemeral refusal pointing at the CLI ([`no_host_blocks`]).
-///
-/// ## M2.9 slices 2 & 3 additions
-/// - **Config** (`/kranz config [<id>] <role> [backend] <model> [effort]`) — spend-adjacent,
-///   so allowlist-gated like `new`; on authorization enqueues a
-///   `config-change` control command with the camelCase patch ([`config_change`]).
-///   A pure local write, so it stays inline (fast ack).
-/// - **AppHome** (`app_home_opened`) — read-only: folds the repo and publishes
-///   the Home view via `views.publish` ([`build_home_view`]). One Web API call,
-///   no allowlist gate; a publish failure is logged, never surfaced.
-///
-/// ## M2.9 slice — steering (pause / resume / work)
-/// - **Pause** / **Resume** (`/kranz pause|resume [<id>]`) — STEERING, not
-///   spend, but they disrupt a running mission, so they are gated on the
-///   allowlist exactly like `config`. On authorization the bridge enqueues
-///   `ControlCommand::Pause` / `Resume` on the target mission's control inbox
-///   (the same mechanism `kranz pause`/`kranz resume` use), resolved via
-///   [`resolve_active_config_target`] so a terminal/ambiguous target is an honest
-///   ephemeral error that enqueues NOTHING. A pure local write ([`steer`]), so
-///   it stays inline (fast ack).
-/// - **Work** (`/kranz work`) — REPORT-ONLY: the bridge must never spawn a
-///   mission on the socket read loop, so it reports the queue state
-///   (`queue::list` + `is_repo_busy`, [`build_work_reply`]) and points at the
-///   `kranz work` CLI / dispatcher for actually draining it. Read-only, no gate.
-/// - **Work run** (`/kranz work run`) — SPEND action, gated EXACTLY like
-///   `draft` ([`gate_work_run_command`] / [`run_work_run`]). On authorization
-///   it triggers the drain THROUGH the host ([`crate::host::PlanningHost::drain`]) —
-///   the seam that spawns the background drain on the serve process — never
-///   by resuming/running a mission on the socket read loop.
-///
-/// ## Ack budget (docs must-have #3)
-/// `connect_once` acks every envelope FIRST and runs the slow actions
-/// ([`is_slow_action`]: claude-spawning or engine-touching) on spawned tasks,
-/// deduped by envelope id ([`SeenEnvelopes`]) so a Slack redelivery can't
-/// double-create or double-approve. Only pure-local actions run inline on the
-/// read loop.
-/// The outcome of the SYNCHRONOUS `gate_draft_command` phase — no
-/// `PlanningHost::draft` call has happened by the time any of these variants
-/// is returned. `Ready` carries the immediate hourglass ack (posted first,
-/// mirroring [`Action::NewMission`]) that the caller must post BEFORE
-/// awaiting [`run_draft`], so the invoker sees the ack immediately rather
-/// than only once the multi-minute draft turn completes.
-pub enum DraftGate {
-    Unauthorized,
-    NoHost(Vec<Value>),
-    InvalidSlug(Vec<Value>),
-    Ready(Vec<Value>),
-}
-
-/// `/kranz draft <slug>` gate/ack phase — SPEND action, gated EXACTLY like
-/// `/kranz new` (same gate, same standard refusal). Runs
-/// `cfg.is_authorized`, [`kranz_engine::ticket::Ticket::ensure_valid_slug`],
-/// and the host-presence check, and builds the hourglass ack for the `Ready`
-/// case. Makes NO `PlanningHost::draft` call — that is the caller's job via
-/// [`run_draft`], AFTER posting the `Ready` ack — so this phase stays
-/// synchronous and unit-testable without a live `SlackClient`.
-pub fn gate_draft_command(
-    cfg: &SlackConfig,
-    host: Option<&SharedHost>,
-    slug: &str,
-    user_id: Option<&str>,
-) -> DraftGate {
-    if !cfg.is_authorized(user_id) {
-        return DraftGate::Unauthorized;
-    }
-    if let Err(e) = kranz_engine::ticket::Ticket::ensure_valid_slug(slug) {
-        return DraftGate::InvalidSlug(error_blocks(&format!("Couldn't draft `{slug}`: {e}")));
-    }
-    if host.is_none() {
-        return DraftGate::NoHost(error_blocks(&format!(
-            "This bridge has no hosted planning engine (it was started without \
-             `kranz serve`). Use `kranz ticket draft {slug}` in a terminal, or the \
-             web UI via `kranz serve --open`."
-        )));
-    }
-    // Ack IMMEDIATELY: the draft turn (create + seed + drive to a terminal
-    // outcome) takes minutes, same reasoning as NewMission/RequestPlan. The
-    // caller must post this BEFORE calling `run_draft`.
-    DraftGate::Ready(error_blocks(&format!(
-        ":hourglass_flowing_sand: Drafting `{slug}` — the seeding planning turn \
-         usually takes a minute or two; the result will post here."
-    )))
-}
-
-/// The async run phase of `/kranz draft <slug>`, called ONLY after the
-/// caller has posted the `DraftGate::Ready` ack. Drives [`PlanningHost::draft`]
-/// to a terminal [`DraftOutcome`] and maps it to the terminal result blocks,
-/// posting the orchestrator's clarifying questions back to the invoker on
-/// `NeedsContext`.
-pub async fn run_draft(host: &SharedHost, slug: &str) -> Vec<Value> {
-    match host.draft(slug).await {
-        Ok(DraftOutcome::ParkedForReview {
-            mission_id,
-            mission_branch,
-        }) => error_blocks(&format!(
-            ":white_check_mark: Draft ready for review — mission `{mission_id}`, \
-             branch `{mission_branch}`. Ticket `{slug}` is now in review."
-        )),
-        Ok(DraftOutcome::PlanAsProse { mission_id }) => error_blocks(&format!(
-            ":warning: Draft for `{slug}` NOT queued — mission `{mission_id}`'s orchestrator \
-             produced a plan but emitted it as prose instead of through the plan channel, so \
-             nothing was queued. Run `/kranz draft {slug}` again."
-        )),
-        Ok(DraftOutcome::Enqueued { mission_id }) => error_blocks(&format!(
-            ":white_check_mark: Draft approved and queued — mission `{mission_id}`. \
-             Ticket `{slug}` is now queued."
-        )),
-        Ok(DraftOutcome::NeedsContext {
-            mission_id,
-            questions,
-        }) => {
-            let mut text = format!(
-                ":question: Mission `{mission_id}` needs more context before drafting \
-                 `{slug}` can continue:\n"
-            );
-            for q in &questions {
-                text.push_str(&format!("• {q}\n"));
-            }
-            error_blocks(text.trim_end())
-        }
-        Err(e) => error_blocks(&format!("Couldn't draft `{slug}`: {e}")),
-    }
-}
-
-/// The outcome of the SYNCHRONOUS `gate_work_run_command` phase — mirrors
-/// [`DraftGate`]. No [`crate::host::PlanningHost::drain`] call has happened
-/// by the time any of these variants is returned; `Ready` carries the
-/// immediate ack the caller must post BEFORE awaiting [`run_work_run`].
-pub enum WorkRunGate {
-    Unauthorized,
-    NoHost(Vec<Value>),
-    Ready(Vec<Value>),
-}
-
-/// `/kranz work run` gate/ack phase — SPEND action, gated EXACTLY like
-/// `/kranz new` / `/kranz draft` (same gate, same standard refusal). Makes NO
-/// `PlanningHost::drain` call — that is the caller's job via
-/// [`run_work_run`], AFTER posting the `Ready` ack — so this phase stays
-/// synchronous and unit-testable without a live `SlackClient`.
-pub fn gate_work_run_command(
-    cfg: &SlackConfig,
-    host: Option<&SharedHost>,
-    user_id: Option<&str>,
-) -> WorkRunGate {
-    if !cfg.is_authorized(user_id) {
-        return WorkRunGate::Unauthorized;
-    }
-    if host.is_none() {
-        return WorkRunGate::NoHost(error_blocks(
-            "This bridge has no hosted planning engine (it was started without \
-             `kranz serve`). Use `kranz work` in a terminal to drain the queue.",
-        ));
-    }
-    WorkRunGate::Ready(error_blocks(
-        ":hourglass_flowing_sand: Running the queue — draining now; progress posts per mission. \
-         Backend readiness (ok/missing/unauthenticated/rate_limited/unsupported/meterless) is on \
-         the Mission Control queue; hard failures park with a ticket note instead of a doomed start.",
-    ))
-}
-
-/// The async run phase of `/kranz work run`, called ONLY after the caller has
-/// posted the `WorkRunGate::Ready` ack. Drives [`crate::host::PlanningHost::drain`]
-/// — the bridge itself never resumes/runs a mission on the socket read loop;
-/// the host spawns the drain as a background task on the serve process.
-pub async fn run_work_run(host: &SharedHost) -> Vec<Value> {
-    match host.drain().await {
-        Ok(()) => error_blocks(":white_check_mark: Queue drain triggered."),
-        Err(e) => error_blocks(&format!("Couldn't drain the queue: {e}")),
-    }
-}
-
-/// The outcome of the SYNCHRONOUS `gate_merge_command` phase — mirrors
-/// [`WorkRunGate`]. No [`crate::host::PlanningHost::merge`] call has happened
-/// by the time any of these variants is returned; `Ready` carries the
-/// immediate ack the caller must post BEFORE awaiting [`run_merge`].
-pub enum MergeGate {
-    Unauthorized,
-    NoHost(Vec<Value>),
-    Ready(Vec<Value>),
-}
-
-/// `/kranz merge <slug|id>` / Delivered-card Merge button gate/ack phase —
-/// spend-adjacent, gated EXACTLY like [`gate_work_run_command`]. Makes NO
-/// `PlanningHost::merge` call — that is the caller's job via [`run_merge`],
-/// AFTER posting the `Ready` ack — so this phase stays synchronous and
-/// unit-testable without a live `SlackClient`.
-pub fn gate_merge_command(
-    cfg: &SlackConfig,
-    host: Option<&SharedHost>,
-    user_id: Option<&str>,
-) -> MergeGate {
-    if !cfg.is_authorized(user_id) {
-        return MergeGate::Unauthorized;
-    }
-    if host.is_none() {
-        return MergeGate::NoHost(error_blocks(
-            "This bridge has no hosted planning engine (it was started without \
-             `kranz serve`). Use `kranz merge <id>` in a terminal.",
-        ));
-    }
-    MergeGate::Ready(error_blocks(
-        ":hourglass_flowing_sand: Merging — running the gate suite now; the result posts here.",
-    ))
-}
-
-/// The async run phase of `/kranz merge <slug|id>`, called ONLY after the
-/// caller has posted the `MergeGate::Ready` ack. Drives
-/// [`crate::host::PlanningHost::merge`] and forwards its outcome — merged
-/// commit, or the refusal (dirty tree / failing gate / conflict). Long gate
-/// failures preserve their useful tail within Slack's Block Kit limit.
-pub async fn run_merge(host: &SharedHost, mission_id: &str) -> Vec<Value> {
-    match host.merge(mission_id).await {
-        Ok(value) => {
-            let commit = value.get("commit").and_then(Value::as_str).unwrap_or("?");
-            let mut message =
-                format!(":white_check_mark: Merged `{mission_id}` — commit `{commit}`.");
-            if let Some(warning) = value
-                .get("staleBase")
-                .and_then(|v| v.get("message"))
-                .and_then(Value::as_str)
-            {
-                message.push_str(&format!("\n:warning: {warning}"));
-            }
-            error_blocks(&message)
-        }
-        Err(e) => merge_error_blocks(mission_id, &e.to_string()),
-    }
-}
-
 /// Does `arg` name an on-disk backlog ticket? `/kranz approve <arg>` uses this
 /// to decide whether `arg` is a ticket slug (resolve through
-/// [`run_approve_ticket_command`]) or a mission id (the original
+/// [`crate::commands::run_approve_ticket_command`]) or a mission id (the original
 /// pending-plan `approve_flow`). A syntactically invalid slug never matches
 /// (no filesystem access for path-traversal attempts).
 pub(crate) fn is_ticket_slug(repo_root: &Path, arg: &str) -> bool {
@@ -1153,59 +968,6 @@ pub(crate) fn mission_dir_exists(repo_root: &Path, mission_id: &str) -> bool {
             .is_dir()
 }
 
-/// The outcome of `run_approve_ticket_command`: whether the invoker was
-/// authorized, and the reply blocks to post (`None` only when unauthorized,
-/// mirroring [`DraftGate`]).
-pub struct ApproveTicketInvocation {
-    pub authorized: bool,
-    pub result: Option<Vec<Value>>,
-}
-
-/// `/kranz approve <slug>` — the slug-resolving twin of `/kranz approve
-/// <mission-id>`, gated EXACTLY like it (same allowlist, same standard
-/// refusal). Holds the gate + host-call logic so it is unit-testable without
-/// a live `SlackClient`. Runs [`crate::host::PlanningHost::approve_ticket`] —
-/// the SAME `kranz_engine::deps::approve_ticket` gate the REST/CLI approve
-/// path runs — and forwards a blocked-by / not-REVIEW / cycle refusal
-/// VERBATIM (never paraphrased).
-pub async fn run_approve_ticket_command(
-    cfg: &SlackConfig,
-    host: Option<&SharedHost>,
-    slug: &str,
-    user_id: Option<&str>,
-) -> ApproveTicketInvocation {
-    if !cfg.is_authorized(user_id) {
-        return ApproveTicketInvocation {
-            authorized: false,
-            result: None,
-        };
-    }
-    let Some(host) = host else {
-        return ApproveTicketInvocation {
-            authorized: true,
-            result: Some(error_blocks(&format!(
-                "This bridge has no hosted planning engine (it was started without \
-                 `kranz serve`). Use `kranz ticket approve {slug}` in a terminal, or the \
-                 web UI via `kranz serve --open`."
-            ))),
-        };
-    };
-    let result = match host.approve_ticket(slug).await {
-        Ok(mission_id) => error_blocks(&format!(
-            ":white_check_mark: Approved and queued — ticket `{slug}` \u{2192} mission \
-             `{mission_id}`. The `kranz work` dispatcher runs it next."
-        )),
-        // VERBATIM: `e` is the engine's own refusal message (blocked-by,
-        // not-REVIEW, or a blocked-by cycle) — forwarded unchanged, never
-        // wrapped in extra prose that would obscure it.
-        Err(e) => error_blocks(&e.to_string()),
-    };
-    ApproveTicketInvocation {
-        authorized: true,
-        result: Some(result),
-    }
-}
-
 /// A single mrkdwn section block for a short status / error / confirmation
 /// ephemeral. (Not every reply warrants the full header/section/context frame.)
 /// Clipped with a trailing ellipsis safely below Slack's 3,000-char section
@@ -1216,25 +978,8 @@ pub(crate) fn error_blocks(msg: &str) -> Vec<Value> {
     vec![json!({ "type": "section", "text": { "type": "mrkdwn", "text": text } })]
 }
 
-fn merge_error_blocks(mission_id: &str, detail: &str) -> Vec<Value> {
-    // Gate runners put the useful assertion summary at the end. Preserve that
-    // tail while keeping the complete Block Kit field safely below Slack's
-    // 3,000-character limit (and leave room for instance labeling).
-    const MAX_DETAIL: usize = 2300;
-    let chars: Vec<char> = detail.chars().collect();
-    let clipped = if chars.len() > MAX_DETAIL {
-        format!(
-            "…{}",
-            chars[chars.len() - MAX_DETAIL..].iter().collect::<String>()
-        )
-    } else {
-        detail.to_string()
-    };
-    error_blocks(&format!("Couldn't merge `{mission_id}`:\n{clipped}"))
-}
-
 /// The `/kranz ask` answer reply. `pub` so tests can pin the overflow clipping
-/// without a live host (mirrors [`run_merge`] / [`not_authorized_blocks`]).
+/// without a live host (mirrors [`crate::commands::run_merge`] / [`not_authorized_blocks`]).
 pub fn ask_answer_blocks(question: &str, outcome: &AskOutcome) -> Vec<Value> {
     // Clip AFTER escaping (escape_mrkdwn lengthens `&<>`), keeping the HEAD:
     // answers front-load their conclusion, unlike merge output, which

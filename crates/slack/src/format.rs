@@ -554,7 +554,7 @@ fn push_dashboard_button(blocks: &mut Vec<Value>, dashboard_url: Option<&str>, m
 /// it. Carries **Approve & start** / **Approve & queue** so the draft path
 /// has the same affordances as [`build_plan_review`]. Re-queue is a no-op
 /// ([`kranz_engine::queue::enqueue`]); stale second taps after interactive
-/// approve are refused by [`approve_flow`]'s state guards. When
+/// approve are refused by [`crate::approve_flow::approve_flow`]'s state guards. When
 /// `dashboard_url` is set, an "Open in dashboard" deep-link is appended.
 pub fn build_plan_ready(p: &PlanReady, dashboard_url: Option<&str>) -> Vec<Value> {
     let milestones = milestone_bullets(&p.milestone_titles);

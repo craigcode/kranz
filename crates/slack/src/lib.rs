@@ -36,6 +36,7 @@ pub(crate) mod approve_flow;
 pub mod bridge;
 pub mod catalog;
 pub mod client;
+pub(crate) mod commands;
 pub mod config;
 pub(crate) mod dispatch;
 pub mod format;
