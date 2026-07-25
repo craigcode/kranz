@@ -732,6 +732,21 @@ impl AgentBackend for ClaudeBackend {
                 ));
                 command
             }
+            Some(resolved) if resolved.backend == crate::sandbox::SandboxBackend::Container => {
+                let container = resolved.container.as_ref().ok_or_else(|| {
+                    EngineError::Backend(
+                        "resolved container sandbox is missing its runtime/image spec".to_string(),
+                    )
+                })?;
+                let mut command = tokio::process::Command::new(container.runtime.binary());
+                command.args(crate::sandbox_container::container_run_args(
+                    &resolved.inputs,
+                    container,
+                    &self.binary,
+                    &args,
+                ));
+                command
+            }
             Some(resolved) => {
                 return Err(EngineError::Backend(format!(
                     "resolved sandbox backend {:?} is unavailable on target_os={}",

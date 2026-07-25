@@ -110,6 +110,32 @@ All of it asks the agent nicely. None of it constrains the process.
   execution (the "heterogeneous fleet" future docs/gascity.md says is one of
   the three that make City integration earn its keep). Provisioning remains a
   separate seam from model/CLI selection.
+- **Shipped (v1)**: per-role `sandbox.provider: "container"` (default
+  `"process"`) plus optional `sandbox.image`. With `enforce: "off"` nothing
+  changes; with `"fs"`/`"fs+net"` the session spawn is wrapped in
+  `<runtime> run` (`crates/engine/src/sandbox_container.rs`). Runtime
+  detection walks PATH in preference order docker → podman → nerdctl →
+  Apple `container`; `provider: "container"` with no runtime on PATH fails
+  closed, same contract as tiers 1–2.
+- Write policy: the container root fs is `--read-only`; the writable set is
+  exactly the declared mounts — session worktree (rw), mission dir (ro),
+  the scratch tmpdir (rw, also `HOME`/`TMPDIR` inside), and each
+  `extraWrite` entry (rw). The container analogue of the tier-2 write
+  allowlist.
+- **Network policy, honest v1**: `fs` keeps the runtime default bridge/NAT
+  (same permissiveness as the tier-2 fs tier). `fs+net` with an EMPTY
+  egress list maps to `--network none` — the first real egress boundary on
+  macOS, which Seatbelt cannot express. The tradeoff is honest: `none` also
+  blocks the agent's API egress, so `fs+net` suits offline gates/validation
+  while API-driven workers use `fs`. `fs+net` with a NON-EMPTY egress list
+  is REFUSED at resolve time: per-host egress needs the filtering proxy
+  from the egress-grant ticket, and silently widening to a full bridge is
+  worse than failing closed.
+- Worker image: the default `alpine:3` proves the isolation boundary but
+  cannot run an agent. A production worker image needs the agent CLI + Node
+  on PATH plus the mission toolchain — the same layering the repo's
+  `Dockerfile` comment block spells out ("What this image intentionally
+  does NOT bundle"). Point `sandbox.image` at such an image for real runs.
 
 ## Sequencing (kranz missions, one feature per brief)
 

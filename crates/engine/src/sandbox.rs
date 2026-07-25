@@ -29,6 +29,9 @@ pub struct SandboxInputs {
 pub enum SandboxBackend {
     Seatbelt,
     Bubblewrap,
+    /// Tier-3: run the session inside a container (see
+    /// [`crate::sandbox_container`]); `ResolvedSandbox::container` is `Some`.
+    Container,
 }
 
 /// How a role's `enforce` setting maps onto the current platform.
@@ -80,6 +83,8 @@ pub fn platform_support(enforce: crate::types::SandboxEnforce, target_os: &str) 
 pub struct ResolvedSandbox {
     pub backend: SandboxBackend,
     pub inputs: SandboxInputs,
+    /// Container runtime + image; `Some` iff `backend == Container`.
+    pub container: Option<crate::sandbox_container::ContainerSpec>,
 }
 
 /// Expand a leading `~/` in `raw` using the `HOME` env var; otherwise return
@@ -111,6 +116,7 @@ pub fn resolve_for_session(
         mission_dir,
         std::env::consts::OS,
         command_available("bwrap"),
+        crate::sandbox_container::detect(),
     )
 }
 
@@ -120,7 +126,11 @@ fn resolve_for_session_target(
     mission_dir: &Path,
     target_os: &str,
     bwrap_available: bool,
+    container_runtime: Option<crate::sandbox_container::ContainerRuntime>,
 ) -> (Option<ResolvedSandbox>, Option<String>) {
+    if role_sandbox.provider == crate::types::SandboxProvider::Container {
+        return resolve_container_target(role_sandbox, session_cwd, mission_dir, container_runtime);
+    }
     match platform_support(role_sandbox.enforce, target_os) {
         SandboxDecision::Off => (None, None),
         SandboxDecision::UnsupportedWarn => (
@@ -137,34 +147,90 @@ fn resolve_for_session_target(
                 enforce_label(role_sandbox.enforce)
             )),
         ),
-        SandboxDecision::Enforce(backend) => {
-            let tmpdir = std::env::var_os("TMPDIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(std::env::temp_dir);
-            let extra_write = role_sandbox
-                .extra_write
-                .iter()
-                .map(|s| expand_tilde(s))
-                .collect();
-            (
-                Some(ResolvedSandbox {
-                    backend,
-                    inputs: SandboxInputs {
-                        enforce: role_sandbox.enforce,
-                        session_cwd: session_cwd.to_path_buf(),
-                        mission_dir: mission_dir.to_path_buf(),
-                        tmpdir,
-                        extra_write,
-                        egress: role_sandbox.egress.clone(),
-                    },
-                }),
-                None,
-            )
-        }
+        SandboxDecision::Enforce(backend) => (
+            Some(ResolvedSandbox {
+                backend,
+                inputs: build_inputs(role_sandbox, session_cwd, mission_dir),
+                container: None,
+            }),
+            None,
+        ),
     }
 }
 
-fn command_available(name: &str) -> bool {
+/// Resolve the tier-3 container provider: `enforce: off` stays unsandboxed;
+/// `fs+net` with a non-empty egress list is refused (per-host egress needs
+/// the filtering proxy from the egress-grant ticket — fail closed, never
+/// silently widen); a requested container with no runtime on PATH is refused.
+fn resolve_container_target(
+    role_sandbox: &crate::types::SandboxConfig,
+    session_cwd: &Path,
+    mission_dir: &Path,
+    runtime: Option<crate::sandbox_container::ContainerRuntime>,
+) -> (Option<ResolvedSandbox>, Option<String>) {
+    if role_sandbox.enforce == crate::types::SandboxEnforce::Off {
+        return (None, None);
+    }
+    if role_sandbox.enforce == crate::types::SandboxEnforce::FsNet
+        && !role_sandbox.egress.is_empty()
+    {
+        return (
+            None,
+            Some(
+                "sandbox provider:container with enforce:fs+net does not support a per-host egress allowlist yet (that needs the filtering proxy from the egress-grant ticket); refusing to run unsandboxed"
+                    .to_string(),
+            ),
+        );
+    }
+    let Some(runtime) = runtime else {
+        return (
+            None,
+            Some(
+                "sandbox provider:container requested but no container runtime (docker/podman/nerdctl/container) found on PATH; refusing to run unsandboxed"
+                    .to_string(),
+            ),
+        );
+    };
+    (
+        Some(ResolvedSandbox {
+            backend: SandboxBackend::Container,
+            inputs: build_inputs(role_sandbox, session_cwd, mission_dir),
+            container: Some(crate::sandbox_container::ContainerSpec {
+                runtime,
+                image: role_sandbox
+                    .image
+                    .clone()
+                    .unwrap_or_else(|| crate::sandbox_container::DEFAULT_IMAGE.to_string()),
+            }),
+        }),
+        None,
+    )
+}
+
+fn build_inputs(
+    role_sandbox: &crate::types::SandboxConfig,
+    session_cwd: &Path,
+    mission_dir: &Path,
+) -> SandboxInputs {
+    let tmpdir = std::env::var_os("TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let extra_write = role_sandbox
+        .extra_write
+        .iter()
+        .map(|s| expand_tilde(s))
+        .collect();
+    SandboxInputs {
+        enforce: role_sandbox.enforce,
+        session_cwd: session_cwd.to_path_buf(),
+        mission_dir: mission_dir.to_path_buf(),
+        tmpdir,
+        extra_write,
+        egress: role_sandbox.egress.clone(),
+    }
+}
+
+pub(crate) fn command_available(name: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;
     };
@@ -173,7 +239,7 @@ fn command_available(name: &str) -> bool {
 
 /// Absolutize a path without requiring it to exist: canonicalize if possible,
 /// otherwise join it onto the current directory when relative.
-fn absolutize(path: &Path) -> PathBuf {
+pub(crate) fn absolutize(path: &Path) -> PathBuf {
     if let Ok(canon) = path.canonicalize() {
         return canon;
     }
@@ -578,6 +644,8 @@ mod tests {
     fn sandbox_resolve_off_yields_none() {
         let cfg = crate::types::SandboxConfig {
             enforce: crate::types::SandboxEnforce::Off,
+            provider: crate::types::SandboxProvider::Process,
+            image: None,
             extra_write: vec![],
             egress: vec![],
         };
@@ -593,6 +661,8 @@ mod tests {
     fn sandbox_resolve_linux_requires_bwrap() {
         let cfg = crate::types::SandboxConfig {
             enforce: crate::types::SandboxEnforce::Fs,
+            provider: crate::types::SandboxProvider::Process,
+            image: None,
             extra_write: vec![],
             egress: vec![],
         };
@@ -600,7 +670,7 @@ mod tests {
         let mission = tempfile::tempdir().unwrap();
 
         let (resolved, warn) =
-            resolve_for_session_target(&cfg, session.path(), mission.path(), "linux", false);
+            resolve_for_session_target(&cfg, session.path(), mission.path(), "linux", false, None);
         assert!(resolved.is_none());
         assert!(
             warn.unwrap().contains("bwrap"),
@@ -608,11 +678,123 @@ mod tests {
         );
 
         let (resolved, warn) =
-            resolve_for_session_target(&cfg, session.path(), mission.path(), "linux", true);
+            resolve_for_session_target(&cfg, session.path(), mission.path(), "linux", true, None);
         assert!(warn.is_none());
         assert_eq!(
             resolved.expect("bwrap present").backend,
             SandboxBackend::Bubblewrap
+        );
+    }
+
+    fn container_cfg(
+        enforce: crate::types::SandboxEnforce,
+        egress: Vec<String>,
+    ) -> crate::types::SandboxConfig {
+        crate::types::SandboxConfig {
+            enforce,
+            provider: crate::types::SandboxProvider::Container,
+            image: None,
+            extra_write: vec![],
+            egress,
+        }
+    }
+
+    #[test]
+    fn container_provider_off_stays_unsandboxed() {
+        let cfg = container_cfg(crate::types::SandboxEnforce::Off, vec![]);
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+
+        let (resolved, warn) =
+            resolve_for_session_target(&cfg, session.path(), mission.path(), "macos", false, None);
+        assert!(resolved.is_none());
+        assert!(warn.is_none());
+    }
+
+    #[test]
+    fn container_provider_without_runtime_fails_closed() {
+        let cfg = container_cfg(crate::types::SandboxEnforce::Fs, vec![]);
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+
+        let (resolved, warn) =
+            resolve_for_session_target(&cfg, session.path(), mission.path(), "linux", false, None);
+        assert!(resolved.is_none());
+        let warn = warn.expect("missing runtime must produce a warning");
+        assert!(warn.contains("provider:container"), "{warn}");
+        assert!(warn.contains("docker/podman/nerdctl/container"), "{warn}");
+        assert!(warn.contains("refusing to run unsandboxed"), "{warn}");
+    }
+
+    #[test]
+    fn container_provider_fs_net_with_egress_list_is_refused() {
+        let cfg = container_cfg(
+            crate::types::SandboxEnforce::FsNet,
+            vec!["crates.io:443".to_string()],
+        );
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+
+        // Refusal happens before runtime detection: it must hold even where a
+        // runtime IS available, so inject one.
+        let (resolved, warn) = resolve_for_session_target(
+            &cfg,
+            session.path(),
+            mission.path(),
+            "linux",
+            false,
+            Some(crate::sandbox_container::ContainerRuntime::Docker),
+        );
+        assert!(resolved.is_none());
+        let warn = warn.expect("per-host egress under provider:container must be refused");
+        assert!(warn.contains("egress"), "{warn}");
+        assert!(warn.contains("refusing to run unsandboxed"), "{warn}");
+    }
+
+    #[test]
+    fn container_provider_resolves_runtime_and_image() {
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+
+        // Default image when config names none.
+        let cfg = container_cfg(crate::types::SandboxEnforce::FsNet, vec![]);
+        let (resolved, warn) = resolve_for_session_target(
+            &cfg,
+            session.path(),
+            mission.path(),
+            "macos",
+            false,
+            Some(crate::sandbox_container::ContainerRuntime::Podman),
+        );
+        assert!(warn.is_none());
+        let resolved = resolved.expect("runtime present and policy supportable");
+        assert_eq!(resolved.backend, SandboxBackend::Container);
+        let container = resolved.container.expect("container spec must be set");
+        assert_eq!(
+            container.runtime,
+            crate::sandbox_container::ContainerRuntime::Podman
+        );
+        assert_eq!(container.image, crate::sandbox_container::DEFAULT_IMAGE);
+
+        // Configured image overrides the default.
+        let mut cfg = container_cfg(crate::types::SandboxEnforce::Fs, vec![]);
+        cfg.image = Some("ghcr.io/example/kranz-worker:1".to_string());
+        let (resolved, warn) = resolve_for_session_target(
+            &cfg,
+            session.path(),
+            mission.path(),
+            "macos",
+            false,
+            Some(crate::sandbox_container::ContainerRuntime::Docker),
+        );
+        assert!(warn.is_none());
+        assert_eq!(
+            resolved
+                .expect("runtime present")
+                .container
+                .expect("container spec")
+                .image,
+            "ghcr.io/example/kranz-worker:1"
         );
     }
 
@@ -621,6 +803,8 @@ mod tests {
     fn sandbox_resolve_fs_on_macos_yields_resolved_sandbox() {
         let cfg = crate::types::SandboxConfig {
             enforce: crate::types::SandboxEnforce::Fs,
+            provider: crate::types::SandboxProvider::Process,
+            image: None,
             extra_write: vec![],
             egress: vec![],
         };
@@ -641,6 +825,8 @@ mod tests {
     fn sandbox_resolve_expands_tilde_extra_write_via_home() {
         let cfg = crate::types::SandboxConfig {
             enforce: crate::types::SandboxEnforce::Fs,
+            provider: crate::types::SandboxProvider::Process,
+            image: None,
             extra_write: vec!["~/.cargo".to_string()],
             egress: vec![],
         };
@@ -661,6 +847,8 @@ mod tests {
     fn sandbox_resolve_fs_net_on_macos_refuses_hostname_egress() {
         let cfg = crate::types::SandboxConfig {
             enforce: crate::types::SandboxEnforce::FsNet,
+            provider: crate::types::SandboxProvider::Process,
+            image: None,
             extra_write: vec![],
             egress: vec![],
         };

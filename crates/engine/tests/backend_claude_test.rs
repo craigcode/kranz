@@ -1116,6 +1116,7 @@ mod sandbox_wrap {
         let resolved = ResolvedSandbox {
             backend: SandboxBackend::Seatbelt,
             inputs,
+            container: None,
         };
 
         let profile = generate_profile(&resolved.inputs);
@@ -1210,6 +1211,7 @@ mod sandbox_wrap {
         let resolved = ResolvedSandbox {
             backend: SandboxBackend::Seatbelt,
             inputs,
+            container: None,
         };
 
         let backend = ClaudeBackend::new(script);

@@ -46,6 +46,7 @@ pub mod queue;
 pub mod reducer;
 pub mod report_render;
 pub mod sandbox;
+pub mod sandbox_container;
 pub mod scrub;
 pub mod ticket;
 pub mod trace_export;

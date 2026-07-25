@@ -520,11 +520,30 @@ pub enum SandboxEnforce {
     FsNet,
 }
 
+/// Which sandbox mechanism wraps a role's sessions when `enforce` is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SandboxProvider {
+    /// Tier-2 process sandboxing (Seatbelt on macOS, bubblewrap on Linux).
+    #[default]
+    Process,
+    /// Tier-3 container sandboxing (see `crate::sandbox_container`).
+    Container,
+}
+
 /// Per-role OS sandbox config.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct SandboxConfig {
     pub enforce: SandboxEnforce,
+    /// Sandbox provider: `process` (default, tier 2) or `container` (tier 3).
+    /// `container` with `enforce = "off"` means no sandboxing, same as today.
+    #[serde(default)]
+    pub provider: SandboxProvider,
+    /// Container image used when `provider = "container"`. Defaults to
+    /// `sandbox_container::DEFAULT_IMAGE` when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
     /// Extra paths the operator opts into as writable (e.g. "~/.cargo").
     /// Stored as raw strings; not expanded or canonicalized here.
     pub extra_write: Vec<String>,

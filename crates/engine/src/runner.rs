@@ -1165,6 +1165,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn container_provider_refusal_propagates_through_resolve_sandbox_or_refuse() {
+        // provider:container + fs+net + a per-host egress list is refused at
+        // resolve time on every host (the refusal precedes runtime detection,
+        // so this is independent of whether docker/podman is installed), and
+        // the runner layer must turn that refusal into a hard error rather
+        // than run unsandboxed.
+        let role_cfg = RoleConfig {
+            sandbox: crate::types::SandboxConfig {
+                enforce: crate::types::SandboxEnforce::FsNet,
+                provider: crate::types::SandboxProvider::Container,
+                image: None,
+                extra_write: vec![],
+                egress: vec!["crates.io:443".to_string()],
+            },
+            ..MissionConfig::default().worker
+        };
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+
+        let err = resolve_sandbox_or_refuse(&role_cfg, session.path(), mission.path())
+            .expect_err("a refused container sandbox must error, never run unsandboxed");
+        let message = err.to_string();
+        assert!(message.contains("provider:container"), "{message}");
+        assert!(message.contains("egress"), "{message}");
+    }
+
+    #[test]
     fn validator_report_schema_marks_finding_class_optional() {
         let schema = validator_report_schema();
         let finding_props = &schema["properties"]["findings"]["items"]["properties"];
