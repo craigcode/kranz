@@ -1534,12 +1534,21 @@ async fn workspace_gate_block_lifts_once_environment_is_fixed() {
         .await
         .expect("run must not hang")
         .unwrap();
+    let paths2 = engine.paths().clone();
+    drop(engine);
+    let last_block_reason = read_log(&paths2)
+        .iter()
+        .rev()
+        .find_map(|e| match &e.kind {
+            EventKind::MilestoneBlocked { reason, .. } => Some(reason.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "(none)".to_string());
     assert_eq!(
         status,
         MissionStatus::Complete,
-        "a fixed environment must resume without an unblock consultation"
+        "a fixed environment must resume without an unblock consultation (last block reason: {last_block_reason})"
     );
-    drop(engine);
 
     let events = read_log(&paths);
     assert!(events.iter().any(|e| matches!(
