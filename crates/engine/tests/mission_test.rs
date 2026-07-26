@@ -890,6 +890,161 @@ async fn valid_workspace_contract_approves() {
 }
 
 // ---------------------------------------------------------------------------
+// 1b2. Workspace provider pin at approval (D-B, ticket
+// workspace-provider-pin-at-approval): the EFFECTIVE provider identity —
+// kind + template + version — is pinned into the log and state at approval,
+// immediately before plan.approved. Unknown provider names refuse approval
+// BEFORE any side effect (owner: operator). Local-worktree-only missions pin
+// too: the default made explicit (D-H).
+// ---------------------------------------------------------------------------
+
+/// The pin event fires at approval, immediately before plan.approved, and
+/// folds into state — without a contract the version is the honest "none"
+/// (never an implied schema).
+#[tokio::test(flavor = "multi_thread")]
+async fn workspace_provider_pin_recorded_at_approval() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    assert!(!root.join(".kranz/workspace.json").exists());
+
+    let backend = Arc::new(MockBackend::new());
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine
+        .approve_plan(simple_plan(1, vec![]))
+        .expect("approve pins the provider");
+
+    // Folded into state (checkout isolation, no contract ⇒ "none").
+    let pin = engine
+        .state()
+        .workspace_pin
+        .as_ref()
+        .expect("the pin folded into mission state");
+    assert_eq!(pin.provider, "local-worktree");
+    assert_eq!(pin.template, "checkout");
+    assert_eq!(pin.version, "none");
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    let pin_pos = events
+        .iter()
+        .position(|e| matches!(e.kind, EventKind::WorkspaceProviderPinned { .. }))
+        .expect("workspace.provider.pinned on the log");
+    let approved_pos = events
+        .iter()
+        .position(|e| matches!(e.kind, EventKind::PlanApproved { .. }))
+        .expect("plan.approved on the log");
+    assert_eq!(
+        approved_pos,
+        pin_pos + 1,
+        "the log reads: provider pinned → plan approved"
+    );
+    match &events[pin_pos].kind {
+        EventKind::WorkspaceProviderPinned {
+            provider,
+            template,
+            version,
+        } => {
+            assert_eq!(provider, "local-worktree");
+            assert_eq!(template, "checkout");
+            assert_eq!(version, "none");
+        }
+        other => panic!("wrong variant: {other:?}"),
+    }
+}
+
+/// With a base-branch workspace contract, the pin records the contract's
+/// schemaVersion as its version.
+#[tokio::test(flavor = "multi_thread")]
+async fn workspace_provider_pin_with_contract_records_schema_version() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let kranz_dir = root.join(".kranz");
+    std::fs::create_dir_all(&kranz_dir).unwrap();
+    std::fs::write(
+        kranz_dir.join("workspace.json"),
+        br#"{"schemaVersion": 1, "readiness": ["pg_isready"]}"#,
+    )
+    .unwrap();
+
+    let backend = Arc::new(MockBackend::new());
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine
+        .approve_plan(simple_plan(1, vec![]))
+        .expect("approve with a contract pins the provider");
+    let pin = engine
+        .state()
+        .workspace_pin
+        .as_ref()
+        .expect("the pin folded into mission state");
+    assert_eq!(pin.provider, "local-worktree");
+    assert_eq!(pin.template, "checkout");
+    assert_eq!(
+        pin.version, "1",
+        "the contract's schemaVersion is the pin version"
+    );
+}
+
+/// An unknown `workspace.provider` name refuses approval — the same
+/// fail-closed resolution the seam applies at run start, but at APPROVAL
+/// time, before any branch/commit side effect. Mirrors
+/// `invalid_workspace_contract_refused_at_approve`'s zero-side-effect
+/// assertions. Owner: operator, with the config key named.
+#[tokio::test(flavor = "multi_thread")]
+async fn unknown_workspace_provider_refused_at_approve() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let backend = Arc::new(MockBackend::new());
+    let cfg = MissionConfig {
+        workspace: WorkspaceConfig {
+            provider: Some("codr".to_string()), // misspelled — never silently defaults
+        },
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    let err = engine
+        .approve_plan(simple_plan(1, vec![]))
+        .expect_err("an unknown workspace provider must refuse approval");
+    let msg = err.to_string();
+    assert!(msg.contains("workspace.provider"), "{msg}");
+    assert!(msg.contains("\"codr\""), "{msg}");
+    assert!(msg.contains("owner: operator"), "{msg}");
+
+    // Fail-closed means no side effects: no mission branch, no approval
+    // event, no pin event.
+    let branches = raw_git(&root, &["branch", "--list"]);
+    assert!(
+        !branches.contains("kranz/mission-"),
+        "refused approve must not create the mission branch: {branches}"
+    );
+    assert_eq!(
+        raw_git(&root, &["branch", "--show-current"]).trim(),
+        "main",
+        "refused approve must not move the primary checkout"
+    );
+    let events = read_log(&engine.paths().clone());
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::PlanApproved { .. })),
+        "refused approve must not emit plan.approved"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::WorkspaceProviderPinned { .. })),
+        "refused approve must not emit workspace.provider.pinned"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 1c. Workspace bootstrap + readiness gate (D-C, ticket
 // workspace-bootstrap-preflight): with a committed contract the gate runs in
 // the execution cwd before any worker spawns; failures BLOCK with owner
@@ -1334,20 +1489,16 @@ async fn workspace_gate_block_lifts_once_environment_is_fixed() {
     }
     let (_dir, root) = init_repo();
     let ext = tempfile::tempdir().expect("external tempdir");
-    let ready_flag = ext.path().join("env-ready");
+    let ready_dir = ext.path().join("env-ready");
     // serde_json, not string interpolation: Windows temp paths carry
     // backslashes that land as invalid JSON escapes when pasted raw. The
-    // readiness command itself must also be portable: command_exec uses
-    // `cmd /C` on Windows (no `test -f`), `sh -c` elsewhere.
-    let flag_path = ready_flag.display().to_string().replace('\\', "/");
-    let readiness_command = if cfg!(windows) {
-        format!("if exist \"{flag_path}\" (exit 0) else (exit 1)")
-    } else {
-        format!("test -f \"{flag_path}\"")
-    };
+    // readiness check is `cd <dir>`: a builtin in BOTH sh and cmd that fails
+    // on a missing directory and passes once it exists — no test -f / if
+    // exist shell-splitting.
+    let ready_path = ready_dir.display().to_string().replace('\\', "/");
     let contract = serde_json::json!({
         "schemaVersion": 1,
-        "readiness": [readiness_command],
+        "readiness": [format!("cd \"{ready_path}\"")],
     })
     .to_string();
     commit_workspace_contract(&root, &contract);
@@ -1366,7 +1517,7 @@ async fn workspace_gate_block_lifts_once_environment_is_fixed() {
     drop(engine);
 
     // The operator fixes the environment; a plain resume must proceed.
-    std::fs::write(&ready_flag, b"ready\n").unwrap();
+    std::fs::create_dir_all(&ready_dir).unwrap();
     let backend2 = Arc::new(MockBackend::with_scripts(vec![
         worker_pass(),
         orch_script(vec![
@@ -1677,6 +1828,13 @@ async fn workspace_provider_readiness_failure_blocks_with_failed_report() {
 /// Unknown `workspace.provider` names fail closed at run start — a clear
 /// error naming the bad value, no workspace lifecycle events, no worker, no
 /// spend — never a silent fallback to local.
+///
+/// Approval refuses an unknown provider first (see
+/// `unknown_workspace_provider_refused_at_approve`), so the bad name here
+/// arrives the only way it still can: a `config.changed` patch AFTER
+/// approval (the pin records what was consented to; the seam's run-start
+/// resolution stays the fail-closed backstop for post-approval config
+/// drift).
 #[tokio::test(flavor = "multi_thread")]
 async fn workspace_provider_unknown_name_fails_closed_at_run_start() {
     if !setup() {
@@ -1684,18 +1842,31 @@ async fn workspace_provider_unknown_name_fails_closed_at_run_start() {
     }
     let (_dir, root) = init_repo();
 
-    // No scripts queued: ANY session start would error the run anyway — the
-    // empty backend itself proves no spawn.
+    // Approve clean — the pin fires (local-worktree). No scripts queued: ANY
+    // session start would error the run anyway — the empty backend itself
+    // proves no spawn.
     let backend = Arc::new(MockBackend::new());
-    let cfg = MissionConfig {
-        workspace: kranz_engine::types::WorkspaceConfig {
-            provider: Some("coder".to_string()),
-        },
-        ..test_cfg()
-    };
-    let mut engine = make_engine(&backend, &root, cfg);
+    let mut engine = make_engine(&backend, &root, test_cfg());
     engine.approve_plan(simple_plan(1, vec![])).unwrap();
+    let mission_id = engine.mission_id().to_string();
     let paths = engine.paths().clone();
+    drop(engine);
+
+    // Post-approval config drift: flip workspace.provider to an unknown name
+    // via the config.changed patch channel.
+    {
+        let mut log = EventLog::acquire(&paths, &mission_id, Duration::ZERO, LockForce::No)
+            .expect("acquire log");
+        log.append(EventKind::ConfigChanged {
+            patch: json!({"workspace": {"provider": "coder"}}),
+        })
+        .expect("append config.changed");
+    }
+
+    let backend: Arc<dyn AgentBackend> = backend;
+    let mut engine =
+        MissionEngine::resume(backend, &root, &mission_id, LockForce::No).expect("resume mission");
+    engine.seed_worker_auth_verdict_for_test(AuthVerdict::Inconclusive);
 
     let err = timeout(TEST_TIMEOUT, engine.run())
         .await
