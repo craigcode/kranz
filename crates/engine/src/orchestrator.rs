@@ -206,9 +206,9 @@ struct ParallelDecision {
 pub struct MissionEngine {
     backend: Arc<dyn AgentBackend>,
     pub(crate) paths: MissionPaths,
-    log: EventLog,
+    pub(crate) log: EventLog,
     pub(crate) state: MissionState,
-    repo: GitRepo,
+    pub(crate) repo: GitRepo,
     /// Long-lived streaming orchestrator session (lazy; None until needed).
     orch: Option<Box<dyn AgentSession>>,
     /// Sdk session id of the current/most recent orchestrator session, used
@@ -523,7 +523,7 @@ impl MissionEngine {
     /// (M7 tier 1). Checkout mode (or before the first `run()` in worktree
     /// mode): the primary repo root. Worktree mode mid-run: the mission
     /// integration worktree set up by `run()`.
-    fn active_root(&self) -> &Path {
+    pub(crate) fn active_root(&self) -> &Path {
         match &self.active_tree {
             Some((root, _)) => root.as_path(),
             None => self.paths.repo_root.as_path(),
@@ -2043,6 +2043,17 @@ impl MissionEngine {
             )
         };
         self.emit_decision(&summary, None)?;
+
+        // Workspace bootstrap + readiness gate (design D-C; ticket
+        // workspace-bootstrap-preflight): with a workspace contract, run
+        // bootstrap then readiness in the execution cwd BEFORE any worker/
+        // validator spawns — a failure BLOCKS the mission (owner:
+        // repo-setup) instead of starting spend on a half-ready app. Once
+        // per run() invocation; resume re-runs it (idempotent-by-contract,
+        // see workspace_gate docs). No contract ⇒ byte-identical behavior.
+        if let Some(status) = self.workspace_gate().await? {
+            return Ok(status);
+        }
 
         loop {
             // (a) drain the control inbox.
@@ -4950,7 +4961,7 @@ fn role_label(role: Role) -> &'static str {
 }
 
 /// Index of the first milestone (in plan order) that is not Complete.
-fn first_incomplete(state: &MissionState) -> Option<usize> {
+pub(crate) fn first_incomplete(state: &MissionState) -> Option<usize> {
     state
         .mission
         .milestones

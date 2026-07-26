@@ -219,8 +219,12 @@ fn report_workspace_section_states_contract_presence() {
         None,
     );
     assert!(
-        without.contains("- **Workspace contract:** no workspace contract"),
+        without.contains("- **Workspace contract:** no workspace contract (source isolation only)"),
         "{without}"
+    );
+    assert!(
+        !without.contains("- **Bootstrap:**") && !without.contains("- **Readiness:**"),
+        "no contract ⇒ no gate outcome lines (never imply a runnable environment): {without}"
     );
 
     let contract = kranz_engine::workspace_contract::parse_workspace_contract(
@@ -245,5 +249,83 @@ fn report_workspace_section_states_contract_presence() {
     assert!(
         with.contains("- **Workspace contract:** present (2 services, 1 previews)"),
         "{with}"
+    );
+    // Contract present but the gate never ran (no decisions on the log):
+    // say so honestly rather than implying readiness.
+    assert!(with.contains("- **Bootstrap:** not run yet"), "{with}");
+    assert!(with.contains("- **Readiness:** not run yet"), "{with}");
+}
+
+/// D-C/D-H: with a contract, the Workspace section renders the gate's
+/// outcomes from its `orchestrator.decision` events — pass and failure
+/// shapes alike, latest run wins.
+#[test]
+fn report_workspace_section_renders_bootstrap_readiness_outcomes() {
+    let state = completed_state();
+    let contract = kranz_engine::workspace_contract::parse_workspace_contract(
+        br#"{"schemaVersion": 1, "bootstrap": ["cargo fetch"], "readiness": ["pg_isready"]}"#,
+    )
+    .expect("valid contract");
+    let decision = |seq, summary: &str| {
+        ev(
+            seq,
+            EventKind::OrchestratorDecision {
+                summary: summary.into(),
+                detail: None,
+            },
+        )
+    };
+
+    // Passing run: both phases report ok.
+    let events = vec![
+        decision(10, "workspace bootstrap: running 1 commands"),
+        decision(11, "workspace bootstrap: 1/1 commands ok"),
+        decision(12, "workspace readiness: running 1 checks"),
+        decision(13, "workspace readiness: 1/1 checks ok"),
+    ];
+    let report = render_mission_report(
+        &state,
+        &events,
+        &plan(),
+        &estimate(),
+        std::path::Path::new("/tmp"),
+        Some(&contract),
+    );
+    assert!(
+        report.contains("- **Bootstrap:** 1/1 commands ok"),
+        "{report}"
+    );
+    assert!(
+        report.contains("- **Readiness:** 1/1 checks ok"),
+        "{report}"
+    );
+
+    // A later failing run supersedes the earlier pass (latest-wins), and
+    // the failure copy names the phase and owner.
+    let events = vec![
+        decision(10, "workspace bootstrap: 1/1 commands ok"),
+        decision(
+            20,
+            "workspace bootstrap: FAILED at command 1/1 — blocking mission (owner: repo-setup)",
+        ),
+        decision(21, "workspace readiness: 1/1 checks ok"),
+    ];
+    let report = render_mission_report(
+        &state,
+        &events,
+        &plan(),
+        &estimate(),
+        std::path::Path::new("/tmp"),
+        Some(&contract),
+    );
+    assert!(
+        report.contains(
+            "- **Bootstrap:** FAILED at command 1/1 — blocking mission (owner: repo-setup)"
+        ),
+        "{report}"
+    );
+    assert!(
+        report.contains("- **Readiness:** 1/1 checks ok"),
+        "{report}"
     );
 }

@@ -327,6 +327,19 @@ pub fn render_revised_plan_markdown(
     md
 }
 
+/// Latest `orchestrator.decision` summary carrying `prefix`, with the prefix
+/// stripped (the workspace gate's bootstrap/readiness outcome lines). The
+/// LATEST matching decision wins — a later run's outcome supersedes an
+/// earlier one, mirroring the preflight line below.
+fn latest_decision_summary<'a>(events: &'a [Event], prefix: &str) -> Option<&'a str> {
+    events.iter().rev().find_map(|event| match &event.kind {
+        EventKind::OrchestratorDecision { summary, .. } => {
+            summary.strip_prefix(prefix).map(str::trim)
+        }
+        _ => None,
+    })
+}
+
 /// Render the mission completion report (roadmap M1): elapsed time and cost
 /// vs the pre-mission estimate, what shipped per feature, the validation
 /// history including waived findings with their justifications, and the
@@ -458,8 +471,9 @@ pub fn render_mission_report(
         sandbox_enforce_label(state.config.validator_functional.sandbox.enforce),
     );
     // D-H operator language: say when only source isolation is active versus
-    // a workspace contract being present (full readiness UI is the bootstrap
-    // ticket's job).
+    // a workspace contract being present — and, when present, how the
+    // bootstrap/readiness gate went (derived from the gate's decision
+    // events; workspace_gate owns the summary shapes).
     match workspace_contract {
         Some(contract) => {
             let _ = writeln!(
@@ -468,9 +482,25 @@ pub fn render_mission_report(
                 contract.services.len(),
                 contract.previews.len()
             );
+            for (label, prefix) in [
+                ("Bootstrap", crate::workspace_gate::BOOTSTRAP_SUMMARY_PREFIX),
+                ("Readiness", crate::workspace_gate::READINESS_SUMMARY_PREFIX),
+            ] {
+                match latest_decision_summary(events, prefix) {
+                    Some(outcome) => {
+                        let _ = writeln!(md, "- **{label}:** {outcome}");
+                    }
+                    None => {
+                        let _ = writeln!(md, "- **{label}:** not run yet");
+                    }
+                }
+            }
         }
         None => {
-            let _ = writeln!(md, "- **Workspace contract:** no workspace contract");
+            let _ = writeln!(
+                md,
+                "- **Workspace contract:** no workspace contract (source isolation only)"
+            );
         }
     }
     let preflight = events.iter().rev().find_map(|event| match &event.kind {

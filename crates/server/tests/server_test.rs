@@ -555,10 +555,13 @@ async fn workspace_summary_surfaces_isolation_sandbox_and_preflight_without_gran
         kranz_engine::preflight::PREFLIGHT_CLEAR_SUMMARY
     );
 
-    // No workspace contract in the fixture repo ⇒ presence flag false (D-H).
+    // No workspace contract in the fixture repo ⇒ presence flag false (D-H),
+    // and the gate outcome fields degrade to null.
     assert_eq!(body["contract"]["present"], false);
     assert_eq!(body["contract"]["services"], 0);
     assert_eq!(body["contract"]["previews"], 0);
+    assert_eq!(body["contract"]["bootstrap"], serde_json::Value::Null);
+    assert_eq!(body["contract"]["readiness"], serde_json::Value::Null);
 
     // A valid contract flips the flag and counts services/previews.
     let kranz_dir = repo_root.join(".kranz");
@@ -577,6 +580,38 @@ async fn workspace_summary_surfaces_isolation_sandbox_and_preflight_without_gran
     assert_eq!(body["contract"]["present"], true);
     assert_eq!(body["contract"]["services"], 1);
     assert_eq!(body["contract"]["previews"], 1);
+    // Contract present but the gate has not run yet ⇒ still null.
+    assert_eq!(body["contract"]["bootstrap"], serde_json::Value::Null);
+    assert_eq!(body["contract"]["readiness"], serde_json::Value::Null);
+
+    // The gate's decision events surface as the additive outcome fields
+    // (D-C/D-H), latest-wins like `preflight`.
+    {
+        let mut log = EventLog::acquire(&paths, MISSION_ID, Duration::ZERO, LockForce::No).unwrap();
+        log.append(EventKind::OrchestratorDecision {
+            summary: "workspace bootstrap: 3/3 commands ok".into(),
+            detail: None,
+        })
+        .unwrap();
+        log.append(EventKind::OrchestratorDecision {
+            summary:
+                "workspace readiness: FAILED at check 1/2 — blocking mission (owner: repo-setup)"
+                    .into(),
+            detail: None,
+        })
+        .unwrap();
+    }
+    let (status, body) = get_json(&app, &format!("/api/missions/{MISSION_ID}/workspace")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["contract"]["bootstrap"]["summary"],
+        "workspace bootstrap: 3/3 commands ok"
+    );
+    assert!(body["contract"]["bootstrap"]["eventSeq"].is_u64());
+    assert_eq!(
+        body["contract"]["readiness"]["summary"],
+        "workspace readiness: FAILED at check 1/2 — blocking mission (owner: repo-setup)"
+    );
 }
 
 #[tokio::test]

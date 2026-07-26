@@ -422,6 +422,71 @@ async fn checkout_mode_runs_worker_in_primary_root() {
     );
 }
 
+/// Workspace bootstrap + readiness gate (D-C) in worktree mode: the gate's
+/// commands run in the mission INTEGRATION WORKTREE — the execution cwd
+/// workers get — never in the primary checkout. The primary stays
+/// byte-untouched, and the mission completes only because the marker landed
+/// in the worktree (the final gate's command assertion re-checks it there,
+/// engine-side, in the same cwd).
+#[tokio::test(flavor = "multi_thread")]
+async fn workspace_gate_runs_bootstrap_in_the_integration_worktree() {
+    let Some((_dir, root)) = mission_init_repo() else {
+        return;
+    };
+    // Base-branch-owned contract (D-A), committed before approve — the
+    // run-time gate reads the committed base-branch copy.
+    std::fs::create_dir_all(root.join(".kranz")).unwrap();
+    std::fs::write(
+        root.join(".kranz").join("workspace.json"),
+        r#"{
+            "schemaVersion": 1,
+            "bootstrap": ["echo boot > .boot-marker"],
+            "readiness": ["test -f .boot-marker"]
+        }"#,
+    )
+    .unwrap();
+    std::fs::write(root.join(".gitignore"), ".boot-marker\n").unwrap();
+    raw_git(&root, &["add", ".kranz/workspace.json", ".gitignore"]);
+    raw_git(&root, &["commit", "-m", "workspace contract"]);
+
+    let mut plan = one_feature_plan();
+    plan.validation_contract = vec![Assertion {
+        id: "a-1".into(),
+        statement: "the workspace marker exists".into(),
+        check: AssertionCheck::Command,
+        command: Some("test -f .boot-marker".into()),
+    }];
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script_complete_no_lesson(),
+    ]));
+    let backend_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend) as Arc<dyn AgentBackend>;
+    let mut engine =
+        MissionEngine::create(backend_dyn, &root, GOAL, worktree_cfg()).expect("create engine");
+    engine.seed_worker_auth_verdict_for_test(AuthVerdict::Inconclusive);
+    engine.approve_plan(plan).unwrap();
+
+    let status = timeout(TokioDuration::from_secs(60), engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(
+        status,
+        MissionStatus::Complete,
+        "completion PROVES bootstrap ran in the worktree: the final gate's \
+         `test -f .boot-marker` ran in the same execution cwd"
+    );
+
+    // The marker never touched the primary checkout (the worktree holding it
+    // is torn down at completion), and the primary never left main.
+    assert!(
+        !root.join(".boot-marker").exists(),
+        "bootstrap must not write into the primary checkout"
+    );
+    assert_eq!(raw_git(&root, &["branch", "--show-current"]).trim(), "main");
+}
+
 // -----------------------------------------------------------------------
 // f-2-2: validators, parallel merge-back, milestone tags, and the final
 // gate routed through the integration worktree in worktree mode.

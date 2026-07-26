@@ -890,6 +890,571 @@ async fn valid_workspace_contract_approves() {
 }
 
 // ---------------------------------------------------------------------------
+// 1c. Workspace bootstrap + readiness gate (D-C, ticket
+// workspace-bootstrap-preflight): with a committed contract the gate runs in
+// the execution cwd before any worker spawns; failures BLOCK with owner
+// repo-setup; without a contract nothing changes.
+//
+// Shell lines stay `sh`/`cmd` portable (CI runs this suite on windows):
+// `echo`, `>`, `&&`, `exit`, `cd`, and `test -f` only.
+// ---------------------------------------------------------------------------
+
+/// Commit a workspace contract (plus a .gitignore for the gate's marker
+/// files, so bootstrap output never dirties the worker's tree) onto the BASE
+/// branch BEFORE approve — D-A: the contract is base-branch-owned, and the
+/// run-time gate reads the committed base-branch copy
+/// (`load_workspace_contract_at_ref`), not the working tree.
+fn commit_workspace_contract(root: &Path, contract_json: &str) {
+    std::fs::create_dir_all(root.join(".kranz")).unwrap();
+    std::fs::write(root.join(".kranz").join("workspace.json"), contract_json).unwrap();
+    std::fs::write(root.join(".gitignore"), ".boot-marker\n.boot-count\n").unwrap();
+    raw_git(root, &["add", ".kranz/workspace.json", ".gitignore"]);
+    raw_git(root, &["commit", "-m", "workspace contract"]);
+}
+
+/// Decision summaries carrying `prefix`, in log order.
+fn gate_decisions<'a>(events: &'a [Event], prefix: &str) -> Vec<&'a str> {
+    events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::OrchestratorDecision { summary, .. } if summary.starts_with(prefix) => {
+                Some(summary.as_str())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The latest `milestone.blocked` reason for `milestone_id`.
+fn gate_block_reason(events: &[Event], milestone_id: &str) -> String {
+    events
+        .iter()
+        .rev()
+        .find_map(|e| match &e.kind {
+            EventKind::MilestoneBlocked {
+                milestone_id: id,
+                reason,
+            } if id == milestone_id => Some(reason.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no milestone.blocked for {milestone_id} on the log"))
+}
+
+/// Happy path (D-C): bootstrap echoes into a marker, readiness checks it,
+/// and ONLY THEN does the first worker spawn — proven by the decision events
+/// preceding the first `worker.spawned`, by the marker the final gate's own
+/// command assertion re-checks in the execution cwd, and by the report's
+/// Workspace lines.
+#[tokio::test(flavor = "multi_thread")]
+async fn workspace_bootstrap_readiness_gate_runs_before_workers() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    commit_workspace_contract(
+        &root,
+        r#"{
+            "schemaVersion": 1,
+            "bootstrap": ["echo boot > .boot-marker"],
+            "readiness": ["test -f .boot-marker"]
+        }"#,
+    );
+
+    // The final gate's command assertion re-proves the marker is visible in
+    // the mission execution cwd (it runs engine-side in the same cwd).
+    let contract = vec![assertion(
+        "a-1",
+        "the workspace marker exists",
+        Some("test -f .boot-marker"),
+    )];
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+    ]));
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(simple_plan(1, contract)).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+
+    let mission_id = engine.mission_id().to_string();
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    // Bootstrap ran in the execution cwd (the relative marker landed at the
+    // workspace root).
+    let marker = std::fs::read_to_string(root.join(".boot-marker"))
+        .expect("bootstrap wrote the marker into the workspace cwd");
+    assert!(marker.contains("boot"), "{marker}");
+
+    let events = read_log(&paths);
+    // Start/pass decisions for both phases, in order, and ALL of them before
+    // the first worker.spawned — readiness is a gate, not an afterthought.
+    assert_eq!(
+        gate_decisions(&events, "workspace bootstrap:"),
+        vec![
+            "workspace bootstrap: running 1 commands",
+            "workspace bootstrap: 1/1 commands ok"
+        ]
+    );
+    assert_eq!(
+        gate_decisions(&events, "workspace readiness:"),
+        vec![
+            "workspace readiness: running 1 checks",
+            "workspace readiness: 1/1 checks ok"
+        ]
+    );
+    let readiness_ok_seq = events
+        .iter()
+        .find(|e| matches!(&e.kind, EventKind::OrchestratorDecision { summary, .. } if summary == "workspace readiness: 1/1 checks ok"))
+        .map(|e| e.seq)
+        .unwrap();
+    assert!(
+        readiness_ok_seq < seq_of(&events, "worker.spawned"),
+        "readiness must pass before the first worker spawns"
+    );
+
+    // report.md's Workspace section carries the gate outcomes (D-H).
+    let report = std::fs::read_to_string(
+        root.join(".kranz")
+            .join("missions")
+            .join(&mission_id)
+            .join("report.md"),
+    )
+    .expect("report.md written at completion");
+    assert!(
+        report.contains("- **Bootstrap:** 1/1 commands ok"),
+        "{report}"
+    );
+    assert!(
+        report.contains("- **Readiness:** 1/1 checks ok"),
+        "{report}"
+    );
+}
+
+/// Bootstrap command failure ⇒ the mission BLOCKS honestly (owner
+/// repo-setup), naming the failing command and its exit code with a scrubbed
+/// output tail — and no worker ever spawns (no spend on a half-ready app).
+#[tokio::test(flavor = "multi_thread")]
+async fn workspace_bootstrap_failure_blocks_before_any_worker() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    commit_workspace_contract(
+        &root,
+        r#"{
+            "schemaVersion": 1,
+            "bootstrap": [
+                "echo boot > .boot-marker",
+                "echo leaking sk-ant-api03-a1b2c3d4e5f6 1>&2 && exit 42"
+            ],
+            "readiness": ["test -f .boot-marker"]
+        }"#,
+    );
+
+    // No scripts queued: ANY session start (worker/validator/orchestrator)
+    // would error the run — the empty backend itself proves no spawn.
+    let backend = Arc::new(MockBackend::new());
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Blocked);
+    assert_eq!(engine.state().mission.status, MissionStatus::Blocked);
+    assert_eq!(
+        engine.state().mission.milestones[0].status,
+        MilestoneStatus::Blocked
+    );
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    // Ordered execution: the FIRST bootstrap command ran before the failure.
+    assert!(root.join(".boot-marker").exists());
+
+    let events = read_log(&paths);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::WorkerSpawned { .. })),
+        "no worker may spawn on a failed bootstrap: {:?}",
+        event_types(&events)
+    );
+    // The never-started milestone is started first, then blocked, so the
+    // started → blocked → (later) unblocked event invariant holds.
+    assert!(seq_of(&events, "milestone.started") < seq_of(&events, "milestone.blocked"));
+    assert_eq!(
+        gate_decisions(&events, "workspace bootstrap:"),
+        vec![
+            "workspace bootstrap: running 2 commands",
+            "workspace bootstrap: FAILED at command 2/2 — blocking mission (owner: repo-setup)"
+        ]
+    );
+    // Bootstrap stopped at the first failure: readiness never ran.
+    assert!(gate_decisions(&events, "workspace readiness:").is_empty());
+
+    let reason = gate_block_reason(&events, "ms-1");
+    assert!(
+        reason.contains("workspace gate: bootstrap command 2/2 failed"),
+        "{reason}"
+    );
+    assert!(reason.contains("owner: repo-setup"), "{reason}");
+    assert!(reason.contains("exit code 42"), "{reason}");
+    assert!(reason.contains("echo leaking"), "{reason}");
+    assert!(
+        !reason.contains("sk-ant-api03-a1b2c3d4e5f6"),
+        "the output tail must be scrubbed: {reason}"
+    );
+    assert!(reason.contains("[REDACTED]"), "{reason}");
+}
+
+/// Readiness failure ⇒ the mission BLOCKS naming the check; bootstrap ran to
+/// completion first (its marker exists).
+#[tokio::test(flavor = "multi_thread")]
+async fn workspace_readiness_failure_blocks_after_bootstrap() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    commit_workspace_contract(
+        &root,
+        r#"{
+            "schemaVersion": 1,
+            "bootstrap": ["echo boot > .boot-marker"],
+            "readiness": ["test -f .no-such-readiness-file"]
+        }"#,
+    );
+
+    let backend = Arc::new(MockBackend::new());
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Blocked);
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    // Bootstrap ran (marker exists) before the readiness gate blocked.
+    assert!(root.join(".boot-marker").exists());
+
+    let events = read_log(&paths);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::WorkerSpawned { .. })),
+        "no worker may spawn on a failed readiness check"
+    );
+    assert_eq!(
+        gate_decisions(&events, "workspace bootstrap:"),
+        vec![
+            "workspace bootstrap: running 1 commands",
+            "workspace bootstrap: 1/1 commands ok"
+        ]
+    );
+    assert_eq!(
+        gate_decisions(&events, "workspace readiness:"),
+        vec![
+            "workspace readiness: running 1 checks",
+            "workspace readiness: FAILED at check 1/1 — blocking mission (owner: repo-setup)"
+        ]
+    );
+    let reason = gate_block_reason(&events, "ms-1");
+    assert!(
+        reason.contains("workspace gate: readiness check 1/1 failed"),
+        "{reason}"
+    );
+    assert!(reason.contains("owner: repo-setup"), "{reason}");
+    assert!(
+        reason.contains("test -f .no-such-readiness-file"),
+        "the reason names the failing check: {reason}"
+    );
+}
+
+/// No contract ⇒ byte-identical pre-gate behavior: no gate decisions on the
+/// log, and the report says "source isolation only" (D-H — never imply a
+/// runnable environment exists when it does not).
+#[tokio::test(flavor = "multi_thread")]
+async fn no_contract_run_has_no_workspace_gate_events() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    assert!(
+        !root.join(".kranz/workspace.json").exists(),
+        "fixture must start without a contract"
+    );
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+    ]));
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+
+    let mission_id = engine.mission_id().to_string();
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    assert!(gate_decisions(&events, "workspace bootstrap:").is_empty());
+    assert!(gate_decisions(&events, "workspace readiness:").is_empty());
+
+    let report = std::fs::read_to_string(
+        root.join(".kranz")
+            .join("missions")
+            .join(&mission_id)
+            .join("report.md"),
+    )
+    .expect("report.md written at completion");
+    assert!(
+        report.contains("- **Workspace contract:** no workspace contract (source isolation only)"),
+        "{report}"
+    );
+    assert!(!report.contains("- **Bootstrap:**"), "{report}");
+    assert!(!report.contains("- **Readiness:**"), "{report}");
+}
+
+/// v1 documented behavior: bootstrap runs ONCE PER run() invocation and is
+/// idempotent-by-contract — a resume after crash RE-RUNS it. Proven with the
+/// kill/resume idiom: the appending bootstrap command leaves one line per
+/// run, so two engine lifetimes leave two lines.
+#[tokio::test(flavor = "multi_thread")]
+async fn workspace_bootstrap_reruns_on_resume_after_crash() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    commit_workspace_contract(
+        &root,
+        r#"{
+            "schemaVersion": 1,
+            "bootstrap": ["echo run >> .boot-count"],
+            "readiness": ["test -f .boot-count"]
+        }"#,
+    );
+
+    // --- Phase 1: the "crash" (same idiom as kill_and_resume): the worker
+    // passes writing nothing, then the judgement turn starves (no on_message
+    // batches), the short stall timeout declares the orchestrator dead, and
+    // the retry finds no script left — run() errors out mid-feature.
+    let backend1 = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass_no_write(),
+        orch_script(vec![]),
+    ]));
+    let mut engine = make_engine(&backend1, &root, test_cfg());
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+    engine.set_orch_stall_timeout(Duration::from_millis(400));
+    let mission_id = engine.mission_id().to_string();
+    let paths = engine.paths().clone();
+
+    timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .expect_err("phase 1 must error out (simulated crash)");
+    drop(engine);
+
+    let count = std::fs::read_to_string(root.join(".boot-count"))
+        .expect("phase 1 bootstrap wrote the count file");
+    assert_eq!(
+        count.lines().count(),
+        1,
+        "phase 1 ran bootstrap once: {count:?}"
+    );
+
+    // --- Phase 2: resume. The gate runs again BEFORE the respawned worker —
+    // bootstrap is re-run, not remembered (durable readiness state is the
+    // provider seam's job, not v1's).
+    let backend2 = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+    ]));
+    let backend2_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend2) as Arc<dyn AgentBackend>;
+    let mut engine = MissionEngine::resume(backend2_dyn, &root, &mission_id, LockForce::No)
+        .expect("resume mission");
+    engine.seed_worker_auth_verdict_for_test(AuthVerdict::Inconclusive);
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+    drop(engine);
+
+    let count = std::fs::read_to_string(root.join(".boot-count"))
+        .expect("count file persists across the resume");
+    assert_eq!(
+        count.lines().count(),
+        2,
+        "resume re-ran bootstrap (once per run() invocation): {count:?}"
+    );
+    let events = read_log(&paths);
+    assert_eq!(
+        gate_decisions(&events, "workspace bootstrap: running").len(),
+        2,
+        "one bootstrap start decision per run() invocation"
+    );
+}
+
+/// A gate-owned block lifts automatically once the environment is fixed and
+/// the gate passes again — resume must not wedge on a block whose
+/// precondition is gone (no orchestrator unblock consultation for a
+/// repo-setup problem). The "environment fix" here is an operator-created
+/// file OUTSIDE the repo, so nothing about the mission/plan changes.
+#[tokio::test(flavor = "multi_thread")]
+async fn workspace_gate_block_lifts_once_environment_is_fixed() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let ext = tempfile::tempdir().expect("external tempdir");
+    let ready_flag = ext.path().join("env-ready");
+    commit_workspace_contract(
+        &root,
+        &format!(
+            r#"{{
+                "schemaVersion": 1,
+                "readiness": ["test -f \"{}\""]
+            }}"#,
+            ready_flag.display()
+        ),
+    );
+
+    // Phase 1: readiness fails (flag absent) → Blocked before any spend.
+    let backend = Arc::new(MockBackend::new());
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+    let mission_id = engine.mission_id().to_string();
+    let paths = engine.paths().clone();
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Blocked);
+    drop(engine);
+
+    // The operator fixes the environment; a plain resume must proceed.
+    std::fs::write(&ready_flag, b"ready\n").unwrap();
+    let backend2 = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+    ]));
+    let backend2_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend2) as Arc<dyn AgentBackend>;
+    let mut engine = MissionEngine::resume(backend2_dyn, &root, &mission_id, LockForce::No)
+        .expect("resume mission");
+    engine.seed_worker_auth_verdict_for_test(AuthVerdict::Inconclusive);
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(
+        status,
+        MissionStatus::Complete,
+        "a fixed environment must resume without an unblock consultation"
+    );
+    drop(engine);
+
+    let events = read_log(&paths);
+    assert!(events.iter().any(|e| matches!(
+        &e.kind,
+        EventKind::MilestoneUnblocked { milestone_id, reason, .. }
+            if milestone_id == "ms-1" && reason.contains("workspace gate now passing")
+    )));
+    assert!(seq_of(&events, "milestone.unblocked") < seq_of(&events, "worker.spawned"));
+}
+
+/// D-A at run time: the gate reads the contract COMMITTED ON THE BASE
+/// BRANCH — a mission branch cannot weaken the contract that gates its own
+/// spend (checkout mode's working tree IS the mission branch mid-run, so a
+/// working-tree read would see the weakened copy and let the mission run).
+#[tokio::test(flavor = "multi_thread")]
+async fn workspace_gate_reads_contract_from_base_branch_not_mission_branch() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    commit_workspace_contract(
+        &root,
+        r#"{
+            "schemaVersion": 1,
+            "readiness": ["test -f .base-required-marker"]
+        }"#,
+    );
+
+    let backend = Arc::new(MockBackend::new());
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine
+        .approve_plan(simple_plan(1, vec![]))
+        .expect("base contract is valid");
+
+    // The mission branch "weakens" the contract: approve (checkout mode)
+    // left the primary checkout ON the mission branch, so this commit lands
+    // there — the working tree now holds a contract with NO readiness gate.
+    std::fs::write(
+        root.join(".kranz").join("workspace.json"),
+        br#"{"schemaVersion": 1}"#,
+    )
+    .unwrap();
+    raw_git(&root, &["add", ".kranz/workspace.json"]);
+    raw_git(&root, &["commit", "-m", "weaken the workspace contract"]);
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(
+        status,
+        MissionStatus::Blocked,
+        "the gate must apply the BASE branch's contract, not the weakened mission-branch copy"
+    );
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    let reason = gate_block_reason(&events, "ms-1");
+    assert!(
+        reason.contains("test -f .base-required-marker"),
+        "the base branch's readiness check gated the run: {reason}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::WorkerSpawned { .. })),
+        "the weakened contract must never let a worker spawn"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 2. Validation round: finding → fix feature → clean round → complete
 // ---------------------------------------------------------------------------
 

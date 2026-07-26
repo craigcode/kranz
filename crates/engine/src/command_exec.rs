@@ -78,6 +78,20 @@ pub(crate) async fn run_shell_command(
     run_shell_command_with_timeout(cwd, command, COMMAND_TIMEOUT, env).await
 }
 
+/// [`run_shell_command`] plus the process exit code: `Some(0)` is success,
+/// `Some(n)` a real failure code, and `None` when the command never produced
+/// one (spawn failure, the timeout/group-kill path, or signal termination —
+/// in those cases the output string says which). The workspace bootstrap/
+/// readiness gate names the code in its block reasons so a blocked mission
+/// reads "exit code 3", not just "failed".
+pub(crate) async fn run_shell_command_with_code(
+    cwd: &std::path::Path,
+    command: &str,
+    env: &HashMap<String, String>,
+) -> (Option<i32>, String) {
+    run_shell_command_with_timeout_env(cwd, command, COMMAND_TIMEOUT, env, false).await
+}
+
 /// [`run_shell_command`] with an explicit timeout (separated so tests can
 /// exercise the timeout path without waiting ten minutes).
 ///
@@ -100,7 +114,9 @@ async fn run_shell_command_with_timeout(
     timeout: Duration,
     env: &HashMap<String, String>,
 ) -> (bool, String) {
-    run_shell_command_with_timeout_env(cwd, command, timeout, env, false).await
+    let (code, output) =
+        run_shell_command_with_timeout_env(cwd, command, timeout, env, false).await;
+    (code == Some(0), output)
 }
 
 async fn run_shell_command_with_timeout_env(
@@ -109,7 +125,7 @@ async fn run_shell_command_with_timeout_env(
     timeout: Duration,
     env: &HashMap<String, String>,
     clear_env: bool,
-) -> (bool, String) {
+) -> (Option<i32>, String) {
     #[cfg(windows)]
     let mut cmd = {
         let mut c = tokio::process::Command::new("cmd");
@@ -138,7 +154,7 @@ async fn run_shell_command_with_timeout_env(
 
     let mut child = match cmd.spawn() {
         Ok(child) => child,
-        Err(e) => return (false, format!("failed to spawn shell: {e}")),
+        Err(e) => return (None, format!("failed to spawn shell: {e}")),
     };
     let stdout = child.stdout.take().expect("stdout was configured as piped");
     let stderr = child.stderr.take().expect("stderr was configured as piped");
@@ -195,17 +211,19 @@ async fn run_shell_command_with_timeout_env(
             }
             let _ = child.kill().await;
             let _ = child.wait().await;
-            (false, format!("timed out after {}s", timeout.as_secs()))
+            (None, format!("timed out after {}s", timeout.as_secs()))
         }
-        Ok(Err(error)) => (false, error),
+        Ok(Err(error)) => (None, error),
         Ok(Ok((status, stdout, stderr))) => {
             let mut combined = stdout;
             if !stderr.trim().is_empty() {
                 combined.push_str("\n--- stderr ---\n");
                 combined.push_str(stderr.trim_end());
             }
+            // `status.code()` is None on signal termination; the bool shape
+            // (`success()`) is recovered by callers as `code == Some(0)`.
             (
-                status.success(),
+                status.code(),
                 tail_chars(combined.trim_end(), COMMAND_OUTPUT_TAIL),
             )
         }
@@ -255,13 +273,14 @@ pub fn run_bounded_gate_command(cwd: &std::path::Path, command: &str) -> (bool, 
         Ok(runtime) => runtime,
         Err(error) => return (false, format!("failed to create gate runtime: {error}")),
     };
-    runtime.block_on(run_shell_command_with_timeout_env(
+    let (code, output) = runtime.block_on(run_shell_command_with_timeout_env(
         cwd,
         command,
         COMMAND_TIMEOUT,
         &env,
         true,
-    ))
+    ));
+    (code == Some(0), output)
 }
 
 fn sanitized_gate_env() -> HashMap<String, String> {
@@ -445,5 +464,22 @@ mod tests {
         )
         .await;
         assert!(ok, "expected command to succeed: {output}");
+    }
+
+    /// The exit-code variant surfaces the real failure code (`Some(n)`) and
+    /// keeps `Some(0)` as the only success — the workspace gate's block
+    /// reasons name it (`exit code 3`), and a nonzero code must never map to
+    /// success. Commands stay `sh`/`cmd` portable (`echo`, `exit`).
+    #[tokio::test]
+    async fn shell_command_with_code_reports_the_real_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = std::collections::HashMap::new();
+
+        let (code, output) = run_shell_command_with_code(dir.path(), "echo hi", &env).await;
+        assert_eq!(code, Some(0), "{output}");
+        assert!(output.contains("hi"), "{output}");
+
+        let (code, output) = run_shell_command_with_code(dir.path(), "exit 3", &env).await;
+        assert_eq!(code, Some(3), "{output}");
     }
 }

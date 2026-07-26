@@ -185,6 +185,35 @@ pub(crate) async fn mission_workspace(
             .ok()
             .flatten();
 
+    // Bootstrap/readiness gate outcomes (D-C/D-H), derived from the gate's
+    // orchestrator.decision events — ADDITIVE fields: null when there is no
+    // contract or the gate has not run yet, and consumers must degrade on
+    // null/absent. A later run's outcome supersedes an earlier one (same
+    // latest-wins derivation as `preflight` above).
+    let gate_outcome = |prefix: &str| {
+        events
+            .iter()
+            .rev()
+            .find_map(|event| match &event.kind {
+                EventKind::OrchestratorDecision { summary, .. } if summary.starts_with(prefix) => {
+                    Some(json!({
+                        "summary": summary,
+                        "eventSeq": event.seq,
+                    }))
+                }
+                _ => None,
+            })
+            .unwrap_or(Value::Null)
+    };
+    let (bootstrap, readiness) = if workspace_contract.is_some() {
+        (
+            gate_outcome(kranz_engine::workspace_gate::BOOTSTRAP_SUMMARY_PREFIX),
+            gate_outcome(kranz_engine::workspace_gate::READINESS_SUMMARY_PREFIX),
+        )
+    } else {
+        (Value::Null, Value::Null)
+    };
+
     Ok(Json(json!({
         "isolation": isolation,
         "cwd": cwd.to_string_lossy(),
@@ -200,6 +229,8 @@ pub(crate) async fn mission_workspace(
             "present": workspace_contract.is_some(),
             "services": workspace_contract.as_ref().map_or(0, |c| c.services.len()),
             "previews": workspace_contract.as_ref().map_or(0, |c| c.previews.len()),
+            "bootstrap": bootstrap,
+            "readiness": readiness,
         },
     })))
 }

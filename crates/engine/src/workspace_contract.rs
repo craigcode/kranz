@@ -26,6 +26,7 @@
 //! sandboxed runs, so they must be absolute paths without parent components.
 
 use crate::error::{EngineError, Result};
+use crate::git_ops::GitRepo;
 use serde::Deserialize;
 use std::path::Path;
 
@@ -138,6 +139,31 @@ pub fn load_workspace_contract(repo_root: &Path) -> Result<Option<WorkspaceContr
                 "workspace contract {WORKSPACE_CONTRACT_PATH} is invalid (owner: repo-setup): {violation}"
             ))
         })
+}
+
+/// Load the contract as COMMITTED on `ref_name` (the run-time read — design
+/// D-C/D-A): the workspace bootstrap/readiness gate reads the LIVE BASE
+/// BRANCH, mirroring merge.rs's `live_base_sha` idiom, so the contract
+/// holds in BOTH isolation modes (a mission branch cannot weaken the
+/// contract that gates its own spend — checkout mode's working tree IS the
+/// mission branch mid-run), and an operator's committed contract fix on the
+/// base branch is picked up on resume. Missing ⇒ `Ok(None)`;
+/// present-but-invalid ⇒ the same fail-closed [`EngineError`] shape as
+/// [`load_workspace_contract`].
+pub fn load_workspace_contract_at_ref(
+    repo: &GitRepo,
+    ref_name: &str,
+) -> Result<Option<WorkspaceContract>> {
+    match repo.show_file(ref_name, WORKSPACE_CONTRACT_PATH)? {
+        None => Ok(None),
+        Some(bytes) => parse_workspace_contract(&bytes)
+            .map(Some)
+            .map_err(|violation| {
+                EngineError::Config(format!(
+                    "workspace contract {WORKSPACE_CONTRACT_PATH} at {ref_name} is invalid (owner: repo-setup): {violation}"
+                ))
+            }),
+    }
 }
 
 /// Parse and validate contract bytes. Every validation failure names the
@@ -494,6 +520,112 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("workspace contract"), "{msg}");
         assert!(msg.contains(WORKSPACE_CONTRACT_PATH), "{msg}");
+        assert!(msg.contains("repo-setup"), "{msg}");
+        assert!(msg.contains("unsupported schemaVersion 9"), "{msg}");
+    }
+
+    /// The run-time read comes from the COMMITTED ref (the live base
+    /// branch), not the working tree: an uncommitted working-tree edit is
+    /// invisible, and another branch's copy is never read (D-A).
+    #[test]
+    fn workspace_contract_at_ref_reads_the_committed_ref_not_the_tree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("spawn git");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping test: git is not on PATH");
+            return;
+        }
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.name", "test"]);
+        git(&["config", "user.email", "test@example.com"]);
+        let kranz = root.join(".kranz");
+        std::fs::create_dir_all(&kranz).unwrap();
+        std::fs::write(
+            kranz.join("workspace.json"),
+            br#"{"schemaVersion": 1, "readiness": ["pg_isready"]}"#,
+        )
+        .unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-m", "contract"]);
+
+        let repo = GitRepo::open(root).expect("open repo");
+        let loaded = load_workspace_contract_at_ref(&repo, "main")
+            .expect("load")
+            .expect("present on main");
+        assert_eq!(loaded.readiness, ["pg_isready"]);
+
+        // Uncommitted working-tree edits do not leak into the ref read.
+        std::fs::write(kranz.join("workspace.json"), br#"{"schemaVersion": 1}"#).unwrap();
+        let loaded = load_workspace_contract_at_ref(&repo, "main")
+            .expect("load")
+            .expect("still the committed contract");
+        assert_eq!(loaded.readiness, ["pg_isready"]);
+
+        // A ref without the file is `None` (missing, never an error). The
+        // orphan checkout keeps the index, so clear it before committing —
+        // otherwise the "empty" branch would still carry the contract.
+        git(&["checkout", "--orphan", "empty"]);
+        git(&["rm", "-rf", "."]);
+        git(&["commit", "--allow-empty", "-m", "empty"]);
+        assert!(load_workspace_contract_at_ref(&repo, "empty")
+            .expect("load")
+            .is_none());
+    }
+
+    /// Present-but-invalid at the ref fails closed, naming the owner.
+    #[test]
+    fn workspace_contract_at_ref_invalid_fails_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("spawn git");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping test: git is not on PATH");
+            return;
+        }
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.name", "test"]);
+        git(&["config", "user.email", "test@example.com"]);
+        let kranz = root.join(".kranz");
+        std::fs::create_dir_all(&kranz).unwrap();
+        std::fs::write(kranz.join("workspace.json"), br#"{"schemaVersion": 9}"#).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-m", "broken contract"]);
+
+        let repo = GitRepo::open(root).expect("open repo");
+        let err = load_workspace_contract_at_ref(&repo, "main").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("workspace contract"), "{msg}");
         assert!(msg.contains("repo-setup"), "{msg}");
         assert!(msg.contains("unsupported schemaVersion 9"), "{msg}");
     }
