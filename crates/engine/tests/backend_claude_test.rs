@@ -1228,17 +1228,21 @@ mod sandbox_wrap {
         {}
 
         let outside_exists = outside_path.exists();
+        let inside_exists = session.path().join("inside.txt").exists();
         if outside_exists {
             std::fs::remove_file(&outside_path).ok();
         }
 
         assert!(
-            session.path().join("inside.txt").exists(),
-            "write inside session_cwd (allowlisted by start()'s sandbox wrapping) must succeed"
+            inside_exists,
+            "write inside session_cwd (allowlisted by start()'s sandbox wrapping) must succeed \
+             (outside_exists: {outside_exists} — the probe ran at all?)"
         );
         assert!(
             !outside_exists,
-            "write outside the allowlist (under $HOME) must be denied by start()'s sandbox-exec wrapping"
+            "write outside the allowlist (under $HOME) must be denied by start()'s sandbox-exec \
+             wrapping (inside_exists: {inside_exists} — if true, the spawn ran UNSANDBOXED; \
+             if false, the probe never completed)"
         );
     }
 }
