@@ -356,6 +356,28 @@ impl EventRenderer {
                 ansi::DIM,
                 format!("ABANDONED: {reason}"),
             ),
+            EventKind::WorkspaceProvisioned { provider, cwd } => (
+                "workspace".to_string(),
+                ansi::BLUE,
+                format!("provisioned ({provider}): {cwd}"),
+            ),
+            EventKind::WorkspaceReadinessReport { outcome, detail } => (
+                "workspace".to_string(),
+                if outcome == "ready" {
+                    ansi::GREEN
+                } else {
+                    ansi::RED
+                },
+                match detail {
+                    Some(detail) => format!("readiness {outcome}: {detail}"),
+                    None => format!("readiness {outcome}"),
+                },
+            ),
+            EventKind::WorkspaceTeardown { mode } => (
+                "workspace".to_string(),
+                ansi::DIM,
+                format!("teardown ({mode})"),
+            ),
         };
 
         // Budget: "[tag] body" must fit LINE_MAX visible chars.

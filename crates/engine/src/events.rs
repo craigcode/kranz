@@ -304,6 +304,42 @@ pub enum EventKind {
     /// Operator retired the mission (`kranz abandon`) — terminal, not a failure.
     #[serde(rename = "mission.abandoned")]
     MissionAbandoned { reason: String },
+
+    /// A [`crate::workspace_provider::WorkspaceProvider`] provisioned the
+    /// mission workspace (design D-B/D-E): records the provider kind and the
+    /// execution cwd so the audit trail names the environment workers ran
+    /// in. Emitted once per `run()` invocation, before readiness.
+    #[serde(rename = "workspace.provisioned")]
+    WorkspaceProvisioned {
+        #[serde(default)]
+        provider: String,
+        #[serde(default)]
+        cwd: String,
+    },
+
+    /// The provider's readiness outcome (D-E: readiness status is a mission
+    /// artifact). Emitted only when a workspace contract drove a real
+    /// bootstrap/readiness execution — never with `outcome = "ready"` for a
+    /// contract-less run, which would imply a runnable environment that does
+    /// not exist (D-H). `detail` carries the scrubbed block reason on
+    /// failure.
+    #[serde(rename = "workspace.readiness")]
+    WorkspaceReadinessReport {
+        #[serde(default)]
+        outcome: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+
+    /// Workspace teardown recorded (D-E). v1 local-worktree only ever calls
+    /// `keep` — `hibernate`/`destroy` are accepted and recorded but no-ops
+    /// for the local provider; the integration worktree's filesystem
+    /// lifecycle stays with the existing mission-branch/merge machinery.
+    #[serde(rename = "workspace.teardown")]
+    WorkspaceTeardown {
+        #[serde(default)]
+        mode: String,
+    },
 }
 
 impl EventKind {
@@ -343,6 +379,9 @@ impl EventKind {
             EventKind::MissionCompleted {} => "mission.completed",
             EventKind::MissionFailed { .. } => "mission.failed",
             EventKind::MissionAbandoned { .. } => "mission.abandoned",
+            EventKind::WorkspaceProvisioned { .. } => "workspace.provisioned",
+            EventKind::WorkspaceReadinessReport { .. } => "workspace.readiness",
+            EventKind::WorkspaceTeardown { .. } => "workspace.teardown",
         }
     }
 
@@ -367,6 +406,48 @@ mod tests {
             command_grants: vec![],
             touch_set: vec![],
         }
+    }
+
+    #[test]
+    fn workspace_lifecycle_events_wire_names_and_payloads_round_trip() {
+        let provisioned = EventKind::WorkspaceProvisioned {
+            provider: "local-worktree".into(),
+            cwd: "/tmp/m-1_integration".into(),
+        };
+        let json = serde_json::to_value(&provisioned).unwrap();
+        assert_eq!(json["type"], "workspace.provisioned");
+        assert_eq!(json["payload"]["provider"], "local-worktree");
+        assert_eq!(json["payload"]["cwd"], "/tmp/m-1_integration");
+        assert_eq!(provisioned.type_name(), "workspace.provisioned");
+        let back: EventKind = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, EventKind::WorkspaceProvisioned { .. }));
+
+        let readiness = EventKind::WorkspaceReadinessReport {
+            outcome: "failed".into(),
+            detail: Some("workspace gate: readiness check 1/1 failed".into()),
+        };
+        let json = serde_json::to_value(&readiness).unwrap();
+        assert_eq!(json["type"], "workspace.readiness");
+        assert_eq!(json["payload"]["outcome"], "failed");
+        assert_eq!(readiness.type_name(), "workspace.readiness");
+        // detail is omitted from the wire when None.
+        let no_detail = EventKind::WorkspaceReadinessReport {
+            outcome: "ready".into(),
+            detail: None,
+        };
+        let json = serde_json::to_value(&no_detail).unwrap();
+        assert!(
+            !json["payload"].as_object().unwrap().contains_key("detail"),
+            "payload must not contain detail when None: {json}"
+        );
+
+        let teardown = EventKind::WorkspaceTeardown {
+            mode: "keep".into(),
+        };
+        let json = serde_json::to_value(&teardown).unwrap();
+        assert_eq!(json["type"], "workspace.teardown");
+        assert_eq!(json["payload"]["mode"], "keep");
+        assert_eq!(teardown.type_name(), "workspace.teardown");
     }
 
     #[test]

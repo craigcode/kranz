@@ -286,6 +286,12 @@ pub struct MissionEngine {
     /// Ceiling on grant requests per milestone per run (default
     /// [`GRANT_REQUEST_CAP`]; shrunk by tests to exercise the cap boundary).
     grant_request_cap: u32,
+    /// The workspace provisioned by the WorkspaceProvider seam for the
+    /// current `run()` call (design D-B). Set by
+    /// [`Self::provision_workspace`], consumed by
+    /// [`Self::teardown_workspace`] at the end of the run. Ephemeral: a new
+    /// `run()` (e.g. after resume) re-provisions.
+    pub(crate) workspace_handle: Option<crate::workspace_provider::WorkspaceHandle>,
 }
 
 impl MissionEngine {
@@ -379,6 +385,7 @@ impl MissionEngine {
             grant_requests: HashMap::new(),
             grant_respawns: HashMap::new(),
             grant_request_cap: GRANT_REQUEST_CAP,
+            workspace_handle: None,
         };
         if let Some(summary) = routing_summary {
             engine.emit_decision(summary, None)?;
@@ -497,6 +504,7 @@ impl MissionEngine {
             grant_requests: HashMap::new(),
             grant_respawns: HashMap::new(),
             grant_request_cap: GRANT_REQUEST_CAP,
+            workspace_handle: None,
         })
     }
 
@@ -1957,6 +1965,13 @@ impl MissionEngine {
             )));
         }
 
+        // WorkspaceProvider seam (design D-B, ticket workspace-provider-seam):
+        // resolve the configured workspace.provider BEFORE any side effects —
+        // an unknown provider name fails closed here, at run start, rather
+        // than silently falling back to local.
+        let provider =
+            crate::workspace_provider::resolve(self.state.config.workspace.provider.as_deref())?;
+
         // Branch isolation: workers commit on the mission branch, never on
         // whatever branch the operator (or a previous mission/draft) left
         // checked out. Approval created and checked out the branch, but
@@ -1998,7 +2013,15 @@ impl MissionEngine {
             }
         }
 
-        let result = self.run_loop().await;
+        let result = self.run_loop(&*provider).await;
+
+        // Provider teardown seam (design D-E): v1 records `Keep` — the local
+        // provider never destroys, and the machinery below stays the owner of
+        // the actual worktree lifecycle. Skipped when the run errored:
+        // crash semantics, with the resume sweep owning leftovers.
+        if result.is_ok() {
+            self.teardown_workspace(&*provider).await;
+        }
 
         // Integration worktree lifetime: torn down once the mission reaches
         // a status the resume/reconcile path already accounts for (terminal,
@@ -2022,7 +2045,10 @@ impl MissionEngine {
     /// The §4.5 preflight + loop body of [`Self::run`], factored out so the
     /// caller can wrap it with integration-worktree setup/teardown (M7 tier 1)
     /// without duplicating every early-return site inside the loop.
-    async fn run_loop(&mut self) -> Result<MissionStatus> {
+    async fn run_loop(
+        &mut self,
+        provider: &dyn crate::workspace_provider::WorkspaceProvider,
+    ) -> Result<MissionStatus> {
         // Environment preflight (roadmap M2): surface obvious missing
         // prerequisites of the contract commands as ONE advisory decision
         // before the first worker spawns. Never blocks — the contract gate at
@@ -2044,14 +2070,17 @@ impl MissionEngine {
         };
         self.emit_decision(&summary, None)?;
 
-        // Workspace bootstrap + readiness gate (design D-C; ticket
-        // workspace-bootstrap-preflight): with a workspace contract, run
-        // bootstrap then readiness in the execution cwd BEFORE any worker/
-        // validator spawns — a failure BLOCKS the mission (owner:
-        // repo-setup) instead of starting spend on a half-ready app. Once
-        // per run() invocation; resume re-runs it (idempotent-by-contract,
-        // see workspace_gate docs). No contract ⇒ byte-identical behavior.
-        if let Some(status) = self.workspace_gate().await? {
+        // WorkspaceProvider seam drive (design D-B/D-C; ticket
+        // workspace-provider-seam): provider.provision → provider.readiness
+        // (= the workspace bootstrap + readiness gate) → workers. With a
+        // workspace contract, bootstrap then readiness run in the execution
+        // cwd BEFORE any worker/validator spawns — a failure BLOCKS the
+        // mission (owner: repo-setup) instead of starting spend on a
+        // half-ready app. Once per run() invocation; resume re-runs it
+        // (idempotent-by-contract, see workspace_provider docs). No contract
+        // ⇒ byte-identical behavior plus the additive workspace.provisioned
+        // lifecycle event.
+        if let Some(status) = self.provision_workspace(provider).await? {
             return Ok(status);
         }
 
@@ -5804,6 +5833,7 @@ pub(crate) mod tests {
             last_seq: 0,
             escalated_milestones: 0,
             local_executor_milestones: 0,
+            workspace_provider: None,
         };
 
         assert_eq!(

@@ -54,6 +54,7 @@ pub mod trace_export;
 pub mod work;
 pub mod workspace_contract;
 pub mod workspace_gate;
+pub mod workspace_provider;
 
 pub mod backend_claude;
 pub mod backend_codex;

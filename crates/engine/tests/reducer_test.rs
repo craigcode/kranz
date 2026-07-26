@@ -2760,3 +2760,76 @@ fn escalation_rate_is_zero_when_mission_never_routes_local() {
     assert_eq!(state.escalated_milestones, 0);
     assert_eq!(state.escalation_rate(), 0.0);
 }
+
+// ---------------------------------------------------------------------------
+// WorkspaceProvider seam lifecycle events (design D-B/D-E, ticket
+// workspace-provider-seam)
+// ---------------------------------------------------------------------------
+
+/// The three additive workspace.* events fold: provisioned records the
+/// provider kind on state (last provision wins), readiness/teardown are
+/// audit-only and leave the mission status machine untouched.
+#[test]
+fn workspace_provider_events_fold_into_state() {
+    let state = fold_kinds(vec![
+        created(),
+        EventKind::PlanApproved {
+            plan: plan(),
+            base_sha: None,
+        },
+        EventKind::WorkspaceProvisioned {
+            provider: "local-worktree".to_string(),
+            cwd: "/tmp/m-1_integration".to_string(),
+        },
+        EventKind::WorkspaceReadinessReport {
+            outcome: "ready".to_string(),
+            detail: None,
+        },
+        EventKind::WorkspaceTeardown {
+            mode: "keep".to_string(),
+        },
+        // A resume re-provisions: the last provisioned provider kind wins.
+        EventKind::WorkspaceProvisioned {
+            provider: "local-worktree".to_string(),
+            cwd: "/tmp/m-1_integration".to_string(),
+        },
+        EventKind::WorkspaceReadinessReport {
+            outcome: "failed".to_string(),
+            detail: Some("workspace gate: readiness check 1/1 failed".to_string()),
+        },
+    ]);
+
+    assert_eq!(state.workspace_provider.as_deref(), Some("local-worktree"));
+    // Audit-only: the readiness failure report does NOT block anything by
+    // itself (the milestone.blocked event does that, as before).
+    assert_eq!(state.mission.status, MissionStatus::Approved);
+    assert_eq!(milestone(&state, "ms-1").status, MilestoneStatus::Pending);
+}
+
+/// Old logs/state snapshots (written before the provider seam) still fold:
+/// `workspaceProvider` absent from state.json deserializes to None, and a
+/// folded state never carries a provider until the first
+/// workspace.provisioned.
+#[test]
+fn workspace_provider_state_field_backcompat_with_pre_seam_snapshots() {
+    let state = fold_kinds(vec![
+        created(),
+        EventKind::PlanApproved {
+            plan: plan(),
+            base_sha: None,
+        },
+    ]);
+    assert_eq!(state.workspace_provider, None);
+
+    // A pre-seam state.json has no workspaceProvider key at all; it must
+    // still deserialize (additive #[serde(default)] field) — and the new
+    // binary omits the key again while the value is None, so snapshots stay
+    // byte-identical until the seam first fires.
+    let value = serde_json::to_value(&state).unwrap();
+    assert!(
+        !value.as_object().unwrap().contains_key("workspaceProvider"),
+        "absent while None: {value}"
+    );
+    let parsed: MissionState = serde_json::from_value(value).unwrap();
+    assert_eq!(parsed.workspace_provider, None);
+}

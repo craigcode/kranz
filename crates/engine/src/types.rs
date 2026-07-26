@@ -392,6 +392,11 @@ pub struct MissionState {
     /// [`MissionState::escalation_rate`].
     #[serde(default)]
     pub local_executor_milestones: u32,
+    /// Kind of the workspace provider that last provisioned this mission's
+    /// workspace, folded from `workspace.provisioned` (design D-B/D-E).
+    /// `None` in logs predating the provider seam.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_provider: Option<String>,
 }
 
 impl MissionState {
@@ -605,6 +610,23 @@ pub enum WorkerIsolation {
     Checkout,
 }
 
+/// Workspace provider seam config (design D-B, ticket
+/// `workspace-provider-seam`): which
+/// [`crate::workspace_provider::WorkspaceProvider`] supplies the mission's
+/// runnable environment. A DIFFERENT config surface from
+/// [`SandboxConfig`] — sandbox = process containment, workspace = the
+/// runnable environment — and the two stay separate even where runtime code
+/// could later be shared.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct WorkspaceConfig {
+    /// Workspace provider name. Absent (or `"local-worktree"`) selects
+    /// today's isolation cwd (the default). Unknown names fail closed at run
+    /// start — never a silent fallback to local.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct MissionConfig {
@@ -649,6 +671,10 @@ pub struct MissionConfig {
     pub claude_binary: Option<String>,
     /// How worker/validator sessions are isolated (§M7 tier 1).
     pub worker_isolation: WorkerIsolation,
+    /// Workspace provider seam (design D-B). `provider` absent =
+    /// local-worktree; unknown names fail closed at run start.
+    #[serde(default)]
+    pub workspace: WorkspaceConfig,
 }
 
 impl Default for MissionConfig {
@@ -719,6 +745,7 @@ impl Default for MissionConfig {
             allow_below_default_worker_model: false,
             claude_binary: None,
             worker_isolation: WorkerIsolation::Worktree,
+            workspace: WorkspaceConfig::default(),
         }
     }
 }

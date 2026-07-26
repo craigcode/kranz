@@ -416,6 +416,18 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
         EventKind::MissionAbandoned { .. } => {
             state.mission.status = MissionStatus::Abandoned;
         }
+
+        EventKind::WorkspaceProvisioned { provider, .. } => {
+            // The last provisioned provider kind is the durable record (D-E);
+            // a resume re-provisions and supersedes it with the same value.
+            state.workspace_provider = Some(provider.clone());
+        }
+
+        EventKind::WorkspaceReadinessReport { .. } | EventKind::WorkspaceTeardown { .. } => {
+            // Audit-only artifacts (D-E): the readiness outcome and teardown
+            // mode live on the event trail; state shape intentionally does
+            // not grow beyond the provider kind above.
+        }
     }
 
     state.last_seq = event.seq;
@@ -465,6 +477,7 @@ fn initial_state(event: &Event) -> Result<MissionState> {
         last_seq: event.seq,
         escalated_milestones: 0,
         local_executor_milestones: 0,
+        workspace_provider: None,
     })
 }
 

@@ -15,6 +15,8 @@ use kranz_engine::backend_mock::{
     mock_init, mock_result_error, mock_result_text, mock_text, MockBackend, MockScript,
 };
 use kranz_engine::config::load_layers;
+use kranz_engine::event_log::EventLog;
+use kranz_engine::events::EventKind;
 use kranz_engine::git_ops::GitRepo;
 use kranz_engine::orchestrator::MissionEngine;
 use kranz_engine::types::{
@@ -169,6 +171,65 @@ fn worker_isolation_config_rejects_unknown() {
 
     let result = load_layers(&[layer]);
     assert!(result.is_err());
+}
+
+#[test]
+fn workspace_provider_config_defaults_to_absent() {
+    // Absent = local-worktree (the provider seam's default; resolution lives
+    // in workspace_provider::resolve).
+    assert_eq!(MissionConfig::default().workspace.provider, None);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let layer = write_layer(&dir, "config.json", r#"{"maxRespawns":3}"#);
+
+    let cfg = load_layers(&[layer]).expect("load layers");
+    assert_eq!(cfg.workspace.provider, None);
+}
+
+#[test]
+fn workspace_provider_config_parses_explicit_provider() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let layer = write_layer(
+        &dir,
+        "config.json",
+        r#"{"workspace":{"provider":"local-worktree"}}"#,
+    );
+
+    let cfg = load_layers(&[layer]).expect("load layers");
+    assert_eq!(cfg.workspace.provider.as_deref(), Some("local-worktree"));
+}
+
+#[test]
+fn workspace_provider_config_serializes_camel_case_omitting_absent() {
+    // Absent provider ⇒ an empty workspace object (additive to old readers);
+    // present ⇒ camelCase wire name.
+    let value = serde_json::to_value(MissionConfig::default()).expect("serialize");
+    assert_eq!(value["workspace"], json!({}));
+
+    let cfg = MissionConfig {
+        workspace: kranz_engine::types::WorkspaceConfig {
+            provider: Some("local-worktree".to_string()),
+        },
+        ..MissionConfig::default()
+    };
+    let value = serde_json::to_value(cfg).expect("serialize");
+    assert_eq!(value["workspace"]["provider"], "local-worktree");
+}
+
+#[test]
+fn workspace_provider_config_unknown_names_parse_but_fail_at_run_start() {
+    // The provider name is a forward-compat STRING: an unknown name must
+    // still deserialize here (a newer binary's config remains readable) and
+    // fails closed at run start instead (workspace_provider::resolve).
+    let dir = tempfile::tempdir().expect("tempdir");
+    let layer = write_layer(&dir, "config.json", r#"{"workspace":{"provider":"coder"}}"#);
+
+    let cfg = load_layers(&[layer]).expect("unknown names still parse");
+    assert_eq!(cfg.workspace.provider.as_deref(), Some("coder"));
+    let err = kranz_engine::workspace_provider::resolve(cfg.workspace.provider.as_deref())
+        .err()
+        .expect("unknown provider fails closed");
+    assert!(err.to_string().contains("\"coder\""), "{err}");
 }
 
 // -----------------------------------------------------------------------
@@ -485,6 +546,101 @@ async fn workspace_gate_runs_bootstrap_in_the_integration_worktree() {
         "bootstrap must not write into the primary checkout"
     );
     assert_eq!(raw_git(&root, &["branch", "--show-current"]).trim(), "main");
+}
+
+/// The local-worktree WorkspaceProvider provisions the mission INTEGRATION
+/// WORKTREE (design D-B): `workspace.provisioned` records the provider kind
+/// and the provisioned cwd — the same cwd the worker session spawns into,
+/// proving provision reuses run()'s existing worktree machinery rather than
+/// rebuilding it. The primary checkout stays on `main`, byte-untouched, for
+/// the whole mission.
+#[tokio::test(flavor = "multi_thread")]
+async fn workspace_provider_provisions_the_integration_worktree() {
+    let Some((_dir, root)) = mission_init_repo() else {
+        return;
+    };
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script_complete_no_lesson(),
+    ]));
+    let backend_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend) as Arc<dyn AgentBackend>;
+    let mut engine =
+        MissionEngine::create(backend_dyn, &root, GOAL, worktree_cfg()).expect("create engine");
+    engine.seed_worker_auth_verdict_for_test(AuthVerdict::Inconclusive);
+    engine.approve_plan(one_feature_plan()).unwrap();
+    raw_git(&root, &["checkout", "main"]);
+    let paths = engine.paths().clone();
+    // Byte-untouched baseline (same idiom as
+    // primary_checkout_untouched_in_worktree_mode).
+    let repo = GitRepo::open(&root).expect("open repo");
+    let head_before = repo.head_sha().unwrap();
+    let status_before = raw_git(&root, &["status", "--porcelain", "--untracked-files=no"]);
+
+    let status = timeout(TokioDuration::from_secs(60), engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+    assert_eq!(
+        engine.state().workspace_provider.as_deref(),
+        Some("local-worktree"),
+        "the provisioned provider kind folded into state (D-E)"
+    );
+    drop(engine);
+
+    let events = EventLog::read_events(&paths.events_file()).expect("read events");
+    let (provider, provisioned_cwd) = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::WorkspaceProvisioned { provider, cwd } => {
+                Some((provider.clone(), cwd.clone()))
+            }
+            _ => None,
+        })
+        .expect("workspace.provisioned on the log");
+    assert_eq!(provider, "local-worktree");
+
+    // The provisioned cwd IS the integration worktree the worker spawned
+    // into (the provider resolved the cwd run()'s machinery created; the
+    // worktree itself is torn down at completion, so compare against the
+    // worker's recorded session cwd).
+    let specs = backend.started_specs();
+    let worker_spec = specs
+        .iter()
+        .find(|s| matches!(s.prompt, PromptMode::SingleShot(ref t) if t.contains("Implement feature")))
+        .expect("a worker spec was started");
+    assert_eq!(
+        provisioned_cwd,
+        worker_spec.cwd.display().to_string(),
+        "the provisioned workspace cwd is the worker's execution cwd"
+    );
+    assert!(
+        provisioned_cwd.contains("_integration"),
+        "the provisioned cwd is the mission integration worktree: {provisioned_cwd}"
+    );
+    assert_ne!(provisioned_cwd, root.display().to_string());
+
+    // v1 teardown records `keep` — the provider never destroys; the
+    // integration worktree's removal at completion stays with the existing
+    // mission machinery (merge semantics unchanged).
+    assert!(events.iter().any(|e| matches!(
+        &e.kind,
+        EventKind::WorkspaceTeardown { mode } if mode == "keep"
+    )));
+
+    // The primary checkout stayed on main, byte-untouched, throughout.
+    assert_eq!(raw_git(&root, &["branch", "--show-current"]).trim(), "main");
+    assert_eq!(
+        repo.head_sha().unwrap(),
+        head_before,
+        "primary HEAD sha must be unchanged across the whole mission"
+    );
+    assert_eq!(
+        raw_git(&root, &["status", "--porcelain", "--untracked-files=no"]),
+        status_before,
+        "the primary checkout's tracked tree must stay byte-untouched in worktree mode"
+    );
 }
 
 // -----------------------------------------------------------------------

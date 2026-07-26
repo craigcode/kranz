@@ -1,23 +1,32 @@
 //! Workspace bootstrap + readiness gate (design D-C/D-H, ticket
-//! `.kranz/tickets/workspace-bootstrap-preflight.md`).
+//! `.kranz/tickets/workspace-bootstrap-preflight.md`) — gate helpers plus
+//! the block/lift policy. The gate's EXECUTION moved under the
+//! [`crate::workspace_provider`] seam (ticket `workspace-provider-seam`):
+//! `LocalWorktreeProvider::readiness` runs the phases below via
+//! [`run_gate_commands`], and the run loop drives provider.provision →
+//! provider.readiness (= this gate) → workers. This module remains the
+//! single owner of the phase shapes, the decision-summary prefixes the
+//! report and workspace endpoint derive outcome lines from, and the
+//! milestone block/lift machinery.
 //!
-//! When a valid workspace contract exists, `run()` runs the contract's
-//! `bootstrap[]` (ordered, stop at first failure) and then `readiness[]`
-//! (every check runs; all must pass) in the mission's execution cwd BEFORE
-//! the first worker/validator spawns — never start spend on a half-ready
-//! app. Without a contract the gate is a no-op and behavior is
-//! byte-identical to before.
+//! Behavior (unchanged from the pre-seam gate): when a valid workspace
+//! contract exists, the contract's `bootstrap[]` (ordered, stop at first
+//! failure) and then `readiness[]` (every check runs; all must pass) run in
+//! the mission's execution cwd BEFORE the first worker/validator spawns —
+//! never start spend on a half-ready app. Without a contract the gate is a
+//! no-op and behavior is byte-identical to before (the seam still records
+//! `workspace.provisioned`; see the provider module).
 //!
 //! v1 scope notes (deliberate):
 //! - **Once per `run()` invocation, idempotent-by-contract.** Setup scripts
 //!   are assumed re-runnable; a resume after crash re-runs them. Durable
-//!   readiness state (skip-when-already-ready) is the provider seam's job
-//!   (`workspace-provider-seam`), not v1's.
-//! - **No new `EventKind`s.** Start/pass/fail land on the established
-//!   `orchestrator.decision` audit channel (with per-command results in the
-//!   detail); failures block via the existing `milestone.blocked` machinery
-//!   with owner `repo-setup`. The `workspace.*` event taxonomy belongs to
-//!   the provider-seam ticket.
+//!   readiness state (skip-when-already-ready) is a later provider-seam
+//!   concern, not v1's.
+//! - **Start/pass/fail land on the established `orchestrator.decision`
+//!   audit channel** (with per-command results in the detail); failures
+//!   block via the existing `milestone.blocked` machinery with owner
+//!   `repo-setup`. The provider seam adds the `workspace.*` lifecycle events
+//!   alongside (D-E).
 //! - **The contract is read from the live BASE branch** (merge.rs's
 //!   `live_base_sha` idiom): base-branch-owned in BOTH isolation modes (a
 //!   mission branch cannot weaken the contract that gates its own spend —
@@ -34,7 +43,6 @@ use crate::error::{EngineError, Result};
 use crate::event_log::EventLog;
 use crate::events::{Event, EventKind};
 use crate::orchestrator::{first_incomplete, MissionEngine};
-use crate::runner;
 use crate::types::{MilestoneStatus, MissionStatus};
 use std::collections::HashMap;
 
@@ -51,24 +59,24 @@ const GATE_REASON_PREFIX: &str = "workspace gate:";
 
 /// Outcome of one bootstrap command / readiness check.
 #[derive(Debug, Clone)]
-struct CommandOutcome {
+pub struct CommandOutcome {
     /// 1-based position within its contract list (for "2/3" reporting).
-    ordinal: usize,
-    total: usize,
-    command: String,
+    pub(crate) ordinal: usize,
+    pub(crate) total: usize,
+    pub(crate) command: String,
     /// `None` when the command never produced an exit code (spawn failure,
     /// the timeout/group-kill path, or signal termination — the output tail
     /// then says which).
-    code: Option<i32>,
-    output_tail: String,
+    pub(crate) code: Option<i32>,
+    pub(crate) output_tail: String,
 }
 
 impl CommandOutcome {
-    fn ok(&self) -> bool {
+    pub(crate) fn ok(&self) -> bool {
         self.code == Some(0)
     }
 
-    fn exit_phrase(&self) -> String {
+    pub(crate) fn exit_phrase(&self) -> String {
         match self.code {
             Some(code) => format!("exit code {code}"),
             None => "no exit code (spawn failure, timeout, or signal)".to_string(),
@@ -77,126 +85,21 @@ impl CommandOutcome {
 }
 
 /// One gate phase's static shape (bootstrap or readiness).
-struct GatePhase<'a> {
+pub(crate) struct GatePhase<'a> {
     /// "bootstrap command" / "readiness check" — the block-reason kind.
-    kind: &'static str,
+    pub(crate) kind: &'static str,
     /// "command" / "check" — singular, for "FAILED at {unit} i/n".
-    unit: &'static str,
+    pub(crate) unit: &'static str,
     /// "commands" / "checks" — for "running n {plural}" / "n/n {plural} ok".
-    plural: &'static str,
+    pub(crate) plural: &'static str,
     /// Decision-summary prefix the report/endpoint derive outcomes from.
-    prefix: &'static str,
-    commands: &'a [String],
+    pub(crate) prefix: &'static str,
+    pub(crate) commands: &'a [String],
     /// bootstrap stops at the first failure; readiness runs every check.
-    stop_at_first_failure: bool,
+    pub(crate) stop_at_first_failure: bool,
 }
 
 impl MissionEngine {
-    /// The workspace bootstrap + readiness gate (design D-C), run once at
-    /// the start of `run_loop` before any worker/validator spawns.
-    /// Returns `Ok(None)` when the run may proceed (no contract, or
-    /// bootstrap + readiness passed); `Ok(Some(Blocked))` when a failure
-    /// blocked the first incomplete milestone with owner `repo-setup`.
-    pub(crate) async fn workspace_gate(&mut self) -> Result<Option<MissionStatus>> {
-        let base_branch = self.state.mission.base_branch.clone();
-        let contract =
-            crate::workspace_contract::load_workspace_contract_at_ref(&self.repo, &base_branch)?;
-        let Some(contract) = contract else {
-            return Ok(None); // no contract: byte-identical pre-gate behavior
-        };
-
-        // The mission's execution cwd — the integration worktree in worktree
-        // mode, the repo root in checkout mode — mirroring how workers get
-        // their cwd (`active_root`; run()'s `session_cwd`). Commands run
-        // with the same env discipline as validation-contract commands:
-        // inherited env plus `KRANZ_BASE_SHA` (bootstrap needs real
-        // toolchain/registry env; the merge gates' stripped env is
-        // deliberately NOT used here). Secret VALUES still never reach the
-        // log: reasons/details are scrubbed, and event-append scrubs again.
-        let cwd = self.active_root().to_path_buf();
-        let env = runner::contract_env(self.state.mission.base_sha.as_deref());
-
-        // 1. bootstrap — ordered, stop at first failure.
-        if let Some(failed) = self
-            .run_gate_phase(
-                &GatePhase {
-                    kind: "bootstrap command",
-                    unit: "command",
-                    plural: "commands",
-                    prefix: BOOTSTRAP_SUMMARY_PREFIX,
-                    commands: &contract.bootstrap,
-                    stop_at_first_failure: true,
-                },
-                &cwd,
-                &env,
-            )
-            .await?
-        {
-            return self.block_on_gate_failure("bootstrap command", &failed);
-        }
-
-        // 2. readiness — every check runs; all must pass.
-        if let Some(failed) = self
-            .run_gate_phase(
-                &GatePhase {
-                    kind: "readiness check",
-                    unit: "check",
-                    plural: "checks",
-                    prefix: READINESS_SUMMARY_PREFIX,
-                    commands: &contract.readiness,
-                    stop_at_first_failure: false,
-                },
-                &cwd,
-                &env,
-            )
-            .await?
-        {
-            return self.block_on_gate_failure("readiness check", &failed);
-        }
-
-        // 3. Gate passed: lift a gate-owned block left by a previous run()
-        // (the operator fixed the environment; resume must not wedge on a
-        // block whose precondition is gone).
-        self.lift_gate_block()?;
-        Ok(None)
-    }
-
-    /// Run one gate phase and emit its start + pass/fail decisions. Returns
-    /// the first failing [`CommandOutcome`] (bootstrap: also the last one
-    /// run; readiness: the first of possibly several, all of which ran).
-    async fn run_gate_phase(
-        &mut self,
-        phase: &GatePhase<'_>,
-        cwd: &std::path::Path,
-        env: &HashMap<String, String>,
-    ) -> Result<Option<CommandOutcome>> {
-        let n = phase.commands.len();
-        self.emit_decision(
-            &format!("{} running {n} {}", phase.prefix, phase.plural),
-            None,
-        )?;
-        let outcomes = run_gate_commands(cwd, phase, env).await;
-        match outcomes.iter().find(|o| !o.ok()) {
-            None => {
-                self.emit_decision(
-                    &format!("{} {n}/{n} {} ok", phase.prefix, phase.plural),
-                    Some(outcomes_detail(phase.kind, &outcomes)),
-                )?;
-                Ok(None)
-            }
-            Some(failed) => {
-                self.emit_decision(
-                    &format!(
-                        "{} FAILED at {} {}/{n} — blocking mission (owner: repo-setup)",
-                        phase.prefix, phase.unit, failed.ordinal
-                    ),
-                    Some(outcomes_detail(phase.kind, &outcomes)),
-                )?;
-                Ok(Some(failed.clone()))
-            }
-        }
-    }
-
     /// Block the first incomplete milestone on a gate failure and return
     /// `Blocked` (D-C: failures are Blocked, not preflight-warnings). When
     /// that milestone was never started (a fresh run blocked pre-loop),
@@ -204,7 +107,7 @@ impl MissionEngine {
     /// `milestone.started` precedes any block/unblock cycle — validation
     /// reads `start_sha`, and a later unblock folds the milestone back to
     /// Active, skipping the loop's Pending-only start emit.
-    fn block_on_gate_failure(
+    pub(crate) fn block_on_gate_failure(
         &mut self,
         kind: &str,
         failed: &CommandOutcome,
@@ -240,7 +143,7 @@ impl MissionEngine {
     /// the gate passes. Reads the (flushed) event log rather than ephemeral
     /// memory, so it works across process restarts; a block from any other
     /// cause (validation, grants, …) is left to the normal operator flow.
-    fn lift_gate_block(&mut self) -> Result<()> {
+    pub(crate) fn lift_gate_block(&mut self) -> Result<()> {
         if self.state.mission.status != MissionStatus::Blocked {
             return Ok(());
         }
@@ -267,7 +170,7 @@ impl MissionEngine {
 /// Run one phase's command lines in the workspace cwd — bounded,
 /// process-tree-killed, output-tailed (the shared `command_exec` runner
 /// used by validation-contract commands).
-async fn run_gate_commands(
+pub(crate) async fn run_gate_commands(
     cwd: &std::path::Path,
     phase: &GatePhase<'_>,
     env: &HashMap<String, String>,
@@ -295,7 +198,7 @@ async fn run_gate_commands(
 /// Per-command lines for the decision's `detail` (the audit trail): one
 /// status line per command that ran, plus the failing command's output
 /// tail. Bounded — tails are already capped by the runner.
-fn outcomes_detail(kind: &str, outcomes: &[CommandOutcome]) -> String {
+pub(crate) fn outcomes_detail(kind: &str, outcomes: &[CommandOutcome]) -> String {
     use std::fmt::Write as _;
     let mut detail = String::new();
     for o in outcomes {
@@ -323,7 +226,7 @@ fn outcomes_detail(kind: &str, outcomes: &[CommandOutcome]) -> String {
 /// scrubbed, bounded output tail. Credential-scrubbed here AND again at
 /// event-append (defense in depth) — a bootstrap log line must never put a
 /// registry token into events.jsonl.
-fn gate_block_reason(kind: &str, failed: &CommandOutcome) -> String {
+pub(crate) fn gate_block_reason(kind: &str, failed: &CommandOutcome) -> String {
     crate::scrub::scrub(&format!(
         "{GATE_REASON_PREFIX} {kind} {}/{} failed (owner: repo-setup): `{}` {}: {}",
         failed.ordinal,
