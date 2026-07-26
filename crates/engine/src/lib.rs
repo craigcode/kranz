@@ -52,6 +52,7 @@ pub mod scrub;
 pub mod ticket;
 pub mod trace_export;
 pub mod work;
+pub mod workspace_container;
 pub mod workspace_contract;
 pub mod workspace_gate;
 pub mod workspace_provider;

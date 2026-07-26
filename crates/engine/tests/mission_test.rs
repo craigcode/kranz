@@ -1677,13 +1677,18 @@ async fn workspace_provider_events_land_and_fold_into_state() {
     let provisioned = workspace_lifecycle_events(&events, "workspace.provisioned");
     assert_eq!(provisioned.len(), 1, "one provision per run()");
     match &provisioned[0].kind {
-        EventKind::WorkspaceProvisioned { provider, cwd } => {
+        EventKind::WorkspaceProvisioned {
+            provider,
+            cwd,
+            detail,
+        } => {
             assert_eq!(provider, "local-worktree");
             assert_eq!(
                 cwd,
                 &root.display().to_string(),
                 "checkout mode provisions the repo root as the workspace cwd"
             );
+            assert_eq!(detail, &None, "local-worktree carries no detail");
         }
         other => panic!("wrong variant: {other:?}"),
     }

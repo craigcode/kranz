@@ -18,6 +18,7 @@ dist/
 .kranz/missions/*/estimate.json
 .kranz/missions/*/runs/
 .kranz/missions/*/control/
+.kranz/missions/*/workspace/
 .kranz/slack-threads.json
 .kranz/slack/
 .kranz/queue/

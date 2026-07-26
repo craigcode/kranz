@@ -25,6 +25,7 @@ const RUNTIME_IGNORE_PATTERNS: &[&str] = &[
     ".kranz/missions/*/estimate.json",
     ".kranz/missions/*/control/",
     ".kranz/missions/*/runs/",
+    ".kranz/missions/*/workspace/",
     ".kranz/slack-threads.json",
     ".kranz/slack/",
     ".kranz/queue/",

@@ -15,6 +15,19 @@ Implementation notes (recorded with acceptance):
    writes outside the worktree (package caches, DB dirs) via `extra_write`
    or named volumes — without it every container bootstrap fails on first
    fetch. Design into `workspace-contract-schema`, not later.
+3. **Local-container network model (shipped).** `local-container-workspace`
+   implements D-B implementation #2 scoped to the fs-tier bridge (the
+   runtime's default NAT): registry egress works for bootstrap, and the
+   tier-3 `--network none` egress boundary stays in the sandbox layer (the
+   APIs stay separate). The isolation unit is one compose project per
+   mission (`kranz-ws-<sanitized-mission-id>`, never shared); `dynamic`
+   ports publish host port 0 (OS-assigned) and are read back from the
+   runtime for previews (substituted only when actually assigned, never
+   fabricated); `fixed: N` refuses at provision when N is already bound on
+   the host (naming service and port, never silently rebinding). Contract
+   bootstrap/readiness run INSIDE the container network via
+   `compose exec -T workspace`. All containers run the shared default image
+   in v1 — per-service images are a later additive contract field.
 
 Companion: `docs/roadmap.md` M6, `docs/scoping/worker-sandboxing.md` Tier 3,
 Monaco post https://www.monaco.com/blog/agent-developer-workspaces

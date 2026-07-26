@@ -17,36 +17,50 @@
 //! provider.teardown(handle, mode)                  (workspace.teardown)
 //! ```
 //!
-//! v1 ships exactly one implementation, [`LocalWorktreeProvider`]:
+//! This build ships two implementations:
 //!
-//! - **Provision REUSES the existing isolation machinery — it does not
-//!   rebuild it.** In worktree mode `run()` has already created the mission
-//!   integration worktree (`setup_mission_worktree`) before the seam drive
-//!   runs; in checkout mode the repo root is the execution cwd. Provision
-//!   resolves that cwd into the handle and stamps the env sessions already
-//!   get (`KRANZ_BASE_SHA` via the [`crate::runner::contract_env`] idiom —
-//!   never secret values). Preview placeholders come from the contract's
-//!   `previews[]` with their URL templates UNFILLED (D-E: previews are
-//!   artifacts once the services behind them are ready; v1 records the
-//!   placeholder, never a fabricated URL).
-//! - **Readiness IS the workspace bootstrap + readiness gate** (design D-C):
-//!   the gate's phase execution moved under this seam
-//!   ([`crate::workspace_gate`] keeps the helpers and the block/lift
-//!   policy), so the provision path has a single owner. Behavior is
-//!   byte-identical to the pre-seam gate: same block reasons, same
-//!   `orchestrator.decision` start/pass/fail events, plus the additive
-//!   `workspace.*` lifecycle events alongside.
-//! - **Teardown: [`TeardownMode::Keep`] is the only real mode v1.**
-//!   `Hibernate`/`Destroy` are accepted and recorded but are no-ops for the
-//!   local provider — the integration worktree's filesystem lifecycle stays
-//!   with the existing mission-branch/merge machinery (merge semantics
-//!   unchanged). A `workspace.teardown` event records the provider call, not
-//!   the filesystem outcome.
+//! - [`LocalWorktreeProvider`] (v1):
+//!   - **Provision REUSES the existing isolation machinery — it does not
+//!     rebuild it.** In worktree mode `run()` has already created the mission
+//!     integration worktree (`setup_mission_worktree`) before the seam drive
+//!     runs; in checkout mode the repo root is the execution cwd. Provision
+//!     resolves that cwd into the handle and stamps the env sessions already
+//!     get (`KRANZ_BASE_SHA` via the [`crate::runner::contract_env`] idiom —
+//!     never secret values). Preview placeholders come from the contract's
+//!     `previews[]` with their URL templates UNFILLED (D-E: previews are
+//!     artifacts once the services behind them are ready; v1 records the
+//!     placeholder, never a fabricated URL).
+//!   - **Readiness IS the workspace bootstrap + readiness gate** (design D-C):
+//!     the gate's phase execution moved under this seam
+//!     ([`crate::workspace_gate`] keeps the helpers and the block/lift
+//!     policy), so the provision path has a single owner. Behavior is
+//!     byte-identical to the pre-seam gate: same block reasons, same
+//!     `orchestrator.decision` start/pass/fail events, plus the additive
+//!     `workspace.*` lifecycle events alongside.
+//!   - **Teardown: [`TeardownMode::Keep`] is the only real mode.**
+//!     `Hibernate`/`Destroy` are accepted and recorded but are no-ops for the
+//!     local provider — the integration worktree's filesystem lifecycle stays
+//!     with the existing mission-branch/merge machinery (merge semantics
+//!     unchanged). A `workspace.teardown` event records the provider call, not
+//!     the filesystem outcome.
+//! - [`crate::workspace_container::LocalContainerProvider`] (ticket
+//!   `local-container-workspace`): a per-mission compose project with
+//!   dynamic ports and contract health/readiness inside the container
+//!   network. See that module's docs for the network model, port policy,
+//!   and real Hibernate/Destroy teardown semantics.
+//!
+//! Both providers share the gate phase shapes below: `run_gate_phase` (host
+//! execution) and [`report_gate_outcomes`] (the pass/fail decision lines the
+//! container provider reuses after running the same commands via
+//! `compose exec`).
 //!
 //! Provider selection: additive mission config `workspace.provider`
 //! (absent = `local-worktree`). Unknown names FAIL CLOSED via [`resolve`] —
 //! at plan approval (the [`pin`] consent artifact) AND again at run start —
-//! never a silent fallback to local.
+//! never a silent fallback to local. Runtime detection for `"container"`
+//! happens at PROVISION (run start, before any spend), keeping approval-time
+//! resolution/pinning pure: a runtime-less host fails closed at run start
+//! with the reason named.
 
 use crate::error::{EngineError, Result};
 use crate::events::EventKind;
@@ -59,14 +73,17 @@ use crate::workspace_gate::{
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// The provider kinds this build knows. v1: local-worktree only; remote/
-/// container providers are their own tickets (`local-container-workspace`,
-/// `workspace-remote-coder-provider`).
+/// The provider kinds this build knows: local-worktree and the
+/// local-container provider (ticket `local-container-workspace`); remote
+/// providers are their own ticket (`workspace-remote-coder-provider`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceProviderKind {
     /// Today's isolation cwd: the mission integration worktree (worktree
     /// mode) or the repo root (checkout mode).
     LocalWorktree,
+    /// Per-mission compose project (dynamic ports, in-network readiness) —
+    /// [`crate::workspace_container::LocalContainerProvider`].
+    Container,
 }
 
 impl WorkspaceProviderKind {
@@ -74,6 +91,7 @@ impl WorkspaceProviderKind {
     pub fn as_str(self) -> &'static str {
         match self {
             WorkspaceProviderKind::LocalWorktree => "local-worktree",
+            WorkspaceProviderKind::Container => "container",
         }
     }
 }
@@ -111,6 +129,11 @@ pub struct ProvisionSpec {
     /// isolation machinery (the local provider reuses it, never recreates
     /// it).
     pub repo_root: PathBuf,
+    /// The mission-owned runtime dir (`.kranz/missions/<id>/` on the primary
+    /// side, gitignored): container providers write their compose project
+    /// files under it — never inside the worktree, whose lifecycle belongs
+    /// to the mission-branch machinery. Unused by the local provider.
+    pub runtime_dir: PathBuf,
     /// Base SHA pinned at approval; the handle env carries it as
     /// `KRANZ_BASE_SHA` (the `contract_env` idiom every contract-command
     /// execution context shares).
@@ -140,12 +163,20 @@ pub struct WorkspaceHandle {
     /// base SHA was pinned, exactly what validation-contract commands get
     /// today. Never secret values.
     pub env: HashMap<String, String>,
-    /// Contract previews with unfilled URL templates (empty without a
-    /// contract or a `previews[]` block).
+    /// Contract previews. Local-worktree keeps the URL templates UNFILLED
+    /// (D-E); the container provider substitutes `{port}` ONLY with an
+    /// actually-assigned dynamic host port (never fabricated).
     pub previews: Vec<PreviewPlaceholder>,
     /// The contract this workspace was provisioned against, so `readiness`
     /// executes exactly what `provision` saw.
     pub contract: Option<WorkspaceContract>,
+    /// Provider-specific detail recorded on `workspace.provisioned` — the
+    /// container provider's compose project name. `None` for local-worktree
+    /// and for contract-less provisions.
+    pub detail: Option<String>,
+    /// Container-provider state (compose project/file, assigned ports);
+    /// `None` for local-worktree and contract-less provisions.
+    pub container: Option<crate::workspace_container::ContainerWorkspace>,
 }
 
 /// What `readiness` concluded. `Ready` = spend may start (no contract, or
@@ -192,22 +223,29 @@ pub trait WorkspaceProvider: Send + Sync {
 }
 
 /// Resolve the configured `workspace.provider` into a provider instance.
-/// Absent (or `"local-worktree"`) selects today's local worktree. Unknown
-/// names FAIL CLOSED with a clear error naming the `workspace.provider`
-/// config key and its operator owner — an unprovisioned run must never
-/// silently fall back to a provider the operator did not ask for.
+/// Absent (or `"local-worktree"`) selects today's local worktree;
+/// `"container"` selects the local-container provider. Unknown names FAIL
+/// CLOSED with a clear error naming the `workspace.provider` config key and
+/// its operator owner — an unprovisioned run must never silently fall back
+/// to a provider the operator did not ask for. Resolution stays pure (no
+/// host detection): a runtime-less host selecting `"container"` fails closed
+/// at provision, at run start before any spend.
 pub fn resolve(provider: Option<&str>) -> Result<Box<dyn WorkspaceProvider>> {
     match provider {
         None => Ok(Box::new(LocalWorktreeProvider)),
         Some(name) if name == WorkspaceProviderKind::LocalWorktree.as_str() => {
             Ok(Box::new(LocalWorktreeProvider))
         }
+        Some(name) if name == WorkspaceProviderKind::Container.as_str() => Ok(Box::new(
+            crate::workspace_container::LocalContainerProvider::new(),
+        )),
         Some(other) => Err(EngineError::Config(format!(
             "workspace.provider {other:?} is not a known workspace provider \
-             (this build provides {:?} only; owner: operator — fix the \
+             (this build provides {:?} and {:?} only; owner: operator — fix the \
              workspace.provider config key); refusing rather than silently \
              falling back",
-            WorkspaceProviderKind::LocalWorktree.as_str()
+            WorkspaceProviderKind::LocalWorktree.as_str(),
+            WorkspaceProviderKind::Container.as_str()
         ))),
     }
 }
@@ -280,6 +318,8 @@ impl WorkspaceProvider for LocalWorktreeProvider {
             env,
             previews,
             contract: spec.contract.clone(),
+            detail: None,
+            container: None,
         })
     }
 
@@ -362,12 +402,29 @@ async fn run_gate_phase(
     handle: &WorkspaceHandle,
     progress: &mut ProgressSink<'_>,
 ) -> Result<Option<CommandOutcome>> {
-    let n = phase.commands.len();
     progress(
-        &format!("{} running {n} {}", phase.prefix, phase.plural),
+        &format!(
+            "{} running {} {}",
+            phase.prefix,
+            phase.commands.len(),
+            phase.plural
+        ),
         None,
     )?;
     let outcomes = workspace_gate::run_gate_commands(&handle.cwd, phase, &handle.env).await;
+    report_gate_outcomes(phase, outcomes, progress)
+}
+
+/// The pass/fail half of a gate phase, split from execution so the
+/// container provider — which runs the same phases via `compose exec`
+/// instead of on the host — reports byte-identical decision lines. Takes
+/// the phase's already-computed outcomes; returns the first failing one.
+pub(crate) fn report_gate_outcomes(
+    phase: &GatePhase<'_>,
+    outcomes: Vec<CommandOutcome>,
+    progress: &mut ProgressSink<'_>,
+) -> Result<Option<CommandOutcome>> {
+    let n = phase.commands.len();
     match outcomes.iter().find(|o| !o.ok()) {
         None => {
             progress(
@@ -418,6 +475,7 @@ impl MissionEngine {
         let spec = ProvisionSpec {
             mission_id: self.state.mission.id.clone(),
             repo_root: self.active_root().to_path_buf(),
+            runtime_dir: self.paths.mission_dir(),
             base_sha: self.state.mission.base_sha.clone(),
             contract,
         };
@@ -425,6 +483,7 @@ impl MissionEngine {
         self.emit(EventKind::WorkspaceProvisioned {
             provider: provider.kind().as_str().to_string(),
             cwd: handle.cwd.display().to_string(),
+            detail: handle.detail.clone(),
         })?;
         let has_contract = handle.contract.is_some();
         let outcome = {
@@ -502,6 +561,7 @@ mod tests {
     ) -> ProvisionSpec {
         ProvisionSpec {
             mission_id: "m-test".to_string(),
+            runtime_dir: root.join(".kranz").join("missions").join("m-test"),
             repo_root: root,
             base_sha: base_sha.map(|s| s.to_string()),
             contract,
@@ -548,9 +608,26 @@ mod tests {
             let msg = err.to_string();
             assert!(msg.contains("workspace.provider"), "{msg}");
             assert!(msg.contains(&format!("{unknown:?}")), "{msg}");
-            assert!(msg.contains("\"local-worktree\" only"), "{msg}");
+            assert!(msg.contains("\"local-worktree\""), "{msg}");
+            assert!(msg.contains("\"container\""), "{msg}");
+            assert!(msg.contains("only"), "{msg}");
             assert!(msg.contains("owner: operator"), "{msg}");
         }
+    }
+
+    /// `"container"` resolves to the local-container provider (ticket
+    /// `local-container-workspace`) — purely, with no host runtime
+    /// detection, so approval-time pinning works on runtime-less hosts and
+    /// the no-runtime refusal lands at provision (run start, before spend).
+    #[test]
+    fn resolve_container_picks_the_local_container_provider() {
+        assert_eq!(
+            resolve(Some("container"))
+                .expect("container is a known provider")
+                .kind(),
+            WorkspaceProviderKind::Container
+        );
+        assert_eq!(WorkspaceProviderKind::Container.as_str(), "container");
     }
 
     /// The approval-time pin (D-B): local-worktree pins the isolation mode as
@@ -586,6 +663,15 @@ mod tests {
         let pinned = pin(None, WorkerIsolation::Worktree, None).expect("pin without contract");
         assert_eq!(pinned.provider, "local-worktree");
         assert_eq!(pinned.version, "none");
+
+        let pinned = pin(
+            Some("container"),
+            WorkerIsolation::Worktree,
+            Some(&contract),
+        )
+        .expect("container pins at approval (pure resolution)");
+        assert_eq!(pinned.provider, "container");
+        assert_eq!(pinned.version, "1");
 
         let err = pin(Some("coder"), WorkerIsolation::Worktree, None)
             .expect_err("a misspelled provider never silently defaults");
@@ -631,6 +717,10 @@ mod tests {
             }]
         );
         assert!(handle.contract.is_some());
+        assert!(
+            handle.detail.is_none() && handle.container.is_none(),
+            "local-worktree records no provider detail or container state"
+        );
     }
 
     #[tokio::test]

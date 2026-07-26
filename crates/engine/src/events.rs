@@ -315,6 +315,11 @@ pub enum EventKind {
         provider: String,
         #[serde(default)]
         cwd: String,
+        /// Additive (ticket `local-container-workspace`): provider-specific
+        /// detail — the container provider records its compose project name.
+        /// Absent on old logs and for providers without extra detail.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
     },
 
     /// The provider's readiness outcome (D-E: readiness status is a mission
@@ -433,6 +438,7 @@ mod tests {
         let provisioned = EventKind::WorkspaceProvisioned {
             provider: "local-worktree".into(),
             cwd: "/tmp/m-1_integration".into(),
+            detail: None,
         };
         let json = serde_json::to_value(&provisioned).unwrap();
         assert_eq!(json["type"], "workspace.provisioned");
@@ -502,6 +508,55 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    /// The additive `detail` on `workspace.provisioned` (ticket
+    /// `local-container-workspace`): the container provider records its
+    /// compose project name there; old log lines without it still fold with
+    /// `detail = None`, and `None` never hits the wire.
+    #[test]
+    fn workspace_provisioned_detail_is_additive_and_old_logs_still_fold() {
+        let with_detail = EventKind::WorkspaceProvisioned {
+            provider: "container".into(),
+            cwd: "/tmp/m-1_integration".into(),
+            detail: Some("compose project kranz-ws-m-1".into()),
+        };
+        let json = serde_json::to_value(&with_detail).unwrap();
+        assert_eq!(json["payload"]["provider"], "container");
+        assert_eq!(json["payload"]["detail"], "compose project kranz-ws-m-1");
+        let back: EventKind = serde_json::from_value(json).unwrap();
+        match back {
+            EventKind::WorkspaceProvisioned {
+                provider, detail, ..
+            } => {
+                assert_eq!(provider, "container");
+                assert_eq!(detail.as_deref(), Some("compose project kranz-ws-m-1"));
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // Old log line (pre-detail): folds with detail = None.
+        let old: EventKind = serde_json::from_str(
+            r#"{"type":"workspace.provisioned","payload":{"provider":"local-worktree","cwd":"/tmp/wt"}}"#,
+        )
+        .unwrap();
+        match old {
+            EventKind::WorkspaceProvisioned { detail, .. } => assert_eq!(detail, None),
+            _ => panic!("wrong variant"),
+        }
+
+        // detail = None is omitted from the wire (additive, never breaks old
+        // readers comparing payloads).
+        let no_detail = EventKind::WorkspaceProvisioned {
+            provider: "local-worktree".into(),
+            cwd: "/tmp/wt".into(),
+            detail: None,
+        };
+        let json = serde_json::to_value(&no_detail).unwrap();
+        assert!(
+            !json["payload"].as_object().unwrap().contains_key("detail"),
+            "payload must not contain detail when None: {json}"
+        );
     }
 
     #[test]

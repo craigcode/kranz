@@ -2780,6 +2780,7 @@ fn workspace_provider_events_fold_into_state() {
         EventKind::WorkspaceProvisioned {
             provider: "local-worktree".to_string(),
             cwd: "/tmp/m-1_integration".to_string(),
+            detail: None,
         },
         EventKind::WorkspaceReadinessReport {
             outcome: "ready".to_string(),
@@ -2792,6 +2793,7 @@ fn workspace_provider_events_fold_into_state() {
         EventKind::WorkspaceProvisioned {
             provider: "local-worktree".to_string(),
             cwd: "/tmp/m-1_integration".to_string(),
+            detail: None,
         },
         EventKind::WorkspaceReadinessReport {
             outcome: "failed".to_string(),

@@ -356,10 +356,17 @@ impl EventRenderer {
                 ansi::DIM,
                 format!("ABANDONED: {reason}"),
             ),
-            EventKind::WorkspaceProvisioned { provider, cwd } => (
+            EventKind::WorkspaceProvisioned {
+                provider,
+                cwd,
+                detail,
+            } => (
                 "workspace".to_string(),
                 ansi::BLUE,
-                format!("provisioned ({provider}): {cwd}"),
+                match detail {
+                    Some(detail) => format!("provisioned ({provider}): {cwd} — {detail}"),
+                    None => format!("provisioned ({provider}): {cwd}"),
+                },
             ),
             EventKind::WorkspaceReadinessReport { outcome, detail } => (
                 "workspace".to_string(),

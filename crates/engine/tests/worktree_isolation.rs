@@ -593,7 +593,7 @@ async fn workspace_provider_provisions_the_integration_worktree() {
     let (provider, provisioned_cwd) = events
         .iter()
         .find_map(|e| match &e.kind {
-            EventKind::WorkspaceProvisioned { provider, cwd } => {
+            EventKind::WorkspaceProvisioned { provider, cwd, .. } => {
                 Some((provider.clone(), cwd.clone()))
             }
             _ => None,
@@ -640,6 +640,142 @@ async fn workspace_provider_provisions_the_integration_worktree() {
         raw_git(&root, &["status", "--porcelain", "--untracked-files=no"]),
         status_before,
         "the primary checkout's tracked tree must stay byte-untouched in worktree mode"
+    );
+}
+
+/// The local-container WorkspaceProvider (ticket `local-container-workspace`)
+/// drives the same workspace.* lifecycle: `workspace.provisioned` carries
+/// provider "container" plus the compose project in the additive `detail`,
+/// `workspace.readiness` reports ready after bootstrap/readiness pass
+/// INSIDE the container network, and `workspace.teardown` records keep
+/// (v1's run loop never destroys — the test cleans the project up itself).
+/// Runtime-gated: skips on hosts with no container runtime (the macOS dev
+/// host); CI ubuntu-latest has docker.
+#[tokio::test(flavor = "multi_thread")]
+async fn container_workspace_events_land_for_a_full_mission_run() {
+    let Some(runtime) = kranz_engine::sandbox_container::detect() else {
+        eprintln!(
+            "no container runtime (docker/podman/nerdctl/container) on PATH; \
+             skipping container workspace engine test"
+        );
+        return;
+    };
+    let compose_ok = Command::new(runtime.binary())
+        .args(["compose", "version"])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    if !compose_ok {
+        eprintln!("`{} compose` unavailable; skipping", runtime.binary());
+        return;
+    }
+    let Some((_dir, root)) = mission_init_repo() else {
+        return;
+    };
+    // Base-branch-owned contract (D-A): an alpine-based service with a
+    // health check, bootstrap + readiness that run inside the container
+    // network (the marker round-trips through the worktree mount).
+    std::fs::create_dir_all(root.join(".kranz")).unwrap();
+    std::fs::write(
+        root.join(".kranz").join("workspace.json"),
+        r#"{
+            "schemaVersion": 1,
+            "bootstrap": ["echo boot > .boot-marker"],
+            "services": [
+                { "name": "web", "start": "sleep infinity", "healthCheck": "true", "port": { "policy": "dynamic" } }
+            ],
+            "readiness": ["test -f .boot-marker"]
+        }"#,
+    )
+    .unwrap();
+    std::fs::write(root.join(".gitignore"), ".boot-marker\n").unwrap();
+    raw_git(&root, &["add", ".kranz/workspace.json", ".gitignore"]);
+    raw_git(&root, &["commit", "-m", "workspace contract"]);
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script_complete_no_lesson(),
+    ]));
+    let backend_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend) as Arc<dyn AgentBackend>;
+    let cfg = MissionConfig {
+        workspace: kranz_engine::types::WorkspaceConfig {
+            provider: Some("container".to_string()),
+        },
+        ..worktree_cfg()
+    };
+    let mut engine = MissionEngine::create(backend_dyn, &root, GOAL, cfg).expect("create engine");
+    engine.seed_worker_auth_verdict_for_test(AuthVerdict::Inconclusive);
+    engine.approve_plan(one_feature_plan()).unwrap();
+    let paths = engine.paths().clone();
+    let mission_id = engine.state().mission.id.clone();
+    let project = format!("kranz-ws-{mission_id}");
+
+    let status = timeout(TokioDuration::from_secs(300), engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+    assert_eq!(
+        engine.state().workspace_provider.as_deref(),
+        Some("container")
+    );
+
+    let events = EventLog::read_events(&paths.events_file()).expect("read events");
+    let (provider, detail) = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::WorkspaceProvisioned {
+                provider, detail, ..
+            } => Some((provider.clone(), detail.clone())),
+            _ => None,
+        })
+        .expect("workspace.provisioned on the log");
+    assert_eq!(provider, "container");
+    assert_eq!(
+        detail.as_deref(),
+        Some(format!("compose project {project}").as_str()),
+        "the provisioned detail carries the mission-owned compose project"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::WorkspaceReadinessReport { outcome, .. } if outcome == "ready"
+        )),
+        "readiness passed inside the container network"
+    );
+    assert!(events.iter().any(|e| matches!(
+        &e.kind,
+        EventKind::WorkspaceTeardown { mode } if mode == "keep"
+    )));
+
+    // The compose file is mission-owned runtime data (gitignored), never in
+    // the worktree; the primary checkout stayed on main throughout.
+    let compose_file = paths.mission_dir().join("workspace").join("compose.json");
+    assert!(
+        compose_file.exists(),
+        "compose file: {}",
+        compose_file.display()
+    );
+    assert_eq!(raw_git(&root, &["branch", "--show-current"]).trim(), "main");
+
+    // v1's run loop records Keep (previews stay live), so the test destroys
+    // the project itself — the CI runner must not leak it.
+    let out = Command::new(runtime.binary())
+        .args([
+            "compose",
+            "-p",
+            &project,
+            "-f",
+            &compose_file.display().to_string(),
+            "down",
+            "-v",
+        ])
+        .output()
+        .expect("spawn compose down");
+    assert!(
+        out.status.success(),
+        "test cleanup must destroy the compose project: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 

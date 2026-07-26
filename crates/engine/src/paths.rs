@@ -9,7 +9,8 @@
 //!     ├── events.jsonl.lock       # exclusive engine lock
 //!     ├── state.json              # derived snapshot (cache; rebuildable)
 //!     ├── control/                # inbox: CLI/server -> engine ControlCommand files
-//!     └── runs/<runId>.jsonl      # full per-run transcripts
+//!     ├── runs/<runId>.jsonl      # full per-run transcripts
+//!     └── workspace/              # container-provider compose files (gitignored runtime)
 //! ```
 //!
 //! All paths built with std::path so Windows stays first-class (§9).
@@ -31,6 +32,7 @@ pub const KRANZ_GITIGNORE_RULES: &[&str] = &[
     "missions/*/estimate.json",
     "missions/*/control/",
     "missions/*/runs/",
+    "missions/*/workspace/",
     "slack-threads.json",
     "queue/",
     "tickets/*.status",
