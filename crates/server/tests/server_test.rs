@@ -614,6 +614,82 @@ async fn workspace_summary_surfaces_isolation_sandbox_and_preflight_without_gran
     );
 }
 
+/// D-B/D-E provider pin surfacing: `pin` mirrors folded state (null before
+/// pinning existed), `previews` carries the contract's UNFILLED urlTemplates
+/// only once a readiness pass is on the log, and `takeover` is the plain
+/// local-worktree truth (no SSH fiction).
+#[tokio::test]
+async fn workspace_summary_surfaces_provider_pin_previews_and_takeover() {
+    let (_tmp, repo_root, paths, app) = fixture();
+
+    // Fixture mission predates the pin event: every pin-derived field
+    // degrades to null without failing.
+    let (status, body) = get_json(&app, &format!("/api/missions/{MISSION_ID}/workspace")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["pin"], serde_json::Value::Null);
+    assert_eq!(body["previews"], serde_json::Value::Null);
+    assert_eq!(body["takeover"], serde_json::Value::Null);
+
+    // The approval-time pin lands: mirrored into the endpoint, and the
+    // local-worktree takeover line is the plain truth about the cwd.
+    {
+        let mut log = EventLog::acquire(&paths, MISSION_ID, Duration::ZERO, LockForce::No).unwrap();
+        log.append(EventKind::WorkspaceProviderPinned {
+            provider: "local-worktree".into(),
+            template: "worktree".into(),
+            version: "1".into(),
+        })
+        .unwrap();
+    }
+    let (status, body) = get_json(&app, &format!("/api/missions/{MISSION_ID}/workspace")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["pin"],
+        json!({"provider": "local-worktree", "template": "worktree", "version": "1"})
+    );
+    let takeover = body["takeover"].as_str().expect("takeover line");
+    assert!(
+        takeover.starts_with("work locally in the workspace cwd"),
+        "plain-truth local takeover, no SSH fiction: {takeover}"
+    );
+
+    // A contract with previews[] alone does NOT surface URLs — the services
+    // behind them are unproven until a readiness pass is on the log.
+    let kranz_dir = repo_root.join(".kranz");
+    std::fs::create_dir_all(&kranz_dir).unwrap();
+    std::fs::write(
+        kranz_dir.join("workspace.json"),
+        br#"{
+            "schemaVersion": 1,
+            "previews": [{"name": "app", "urlTemplate": "http://localhost:{port}/"}]
+        }"#,
+    )
+    .unwrap();
+    let (status, body) = get_json(&app, &format!("/api/missions/{MISSION_ID}/workspace")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["previews"],
+        serde_json::Value::Null,
+        "no readiness pass ⇒ no preview URLs (never fabricated)"
+    );
+
+    {
+        let mut log = EventLog::acquire(&paths, MISSION_ID, Duration::ZERO, LockForce::No).unwrap();
+        log.append(EventKind::WorkspaceReadinessReport {
+            outcome: "ready".into(),
+            detail: None,
+        })
+        .unwrap();
+    }
+    let (status, body) = get_json(&app, &format!("/api/missions/{MISSION_ID}/workspace")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["previews"],
+        json!([{"name": "app", "urlTemplate": "http://localhost:{port}/"}]),
+        "readiness pass ⇒ the placeholder urlTemplates surface UNFILLED"
+    );
+}
+
 #[tokio::test]
 async fn diff_stat_returns_stat_baseline_and_tip_when_diffable() {
     if !setup() {

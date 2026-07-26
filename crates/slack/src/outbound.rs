@@ -241,6 +241,7 @@ mod tests {
             escalated_milestones: 0,
             local_executor_milestones: 0,
             workspace_provider: None,
+            workspace_pin: None,
         }
     }
 

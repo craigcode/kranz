@@ -428,6 +428,21 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             // mode live on the event trail; state shape intentionally does
             // not grow beyond the provider kind above.
         }
+
+        EventKind::WorkspaceProviderPinned {
+            provider,
+            template,
+            version,
+        } => {
+            // The approval-time consent pin (D-B). Emitted once per
+            // approve_plan; a retried approval after a failed attempt re-pins
+            // (last pin wins).
+            state.workspace_pin = Some(WorkspacePin {
+                provider: provider.clone(),
+                template: template.clone(),
+                version: version.clone(),
+            });
+        }
     }
 
     state.last_seq = event.seq;
@@ -478,6 +493,7 @@ fn initial_state(event: &Event) -> Result<MissionState> {
         escalated_milestones: 0,
         local_executor_milestones: 0,
         workspace_provider: None,
+        workspace_pin: None,
     })
 }
 

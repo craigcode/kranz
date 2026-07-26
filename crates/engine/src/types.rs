@@ -352,6 +352,24 @@ pub struct ValidatorReport {
 // Derived state (pure fold over the event log; state.json is a cache of this)
 // ---------------------------------------------------------------------------
 
+/// The workspace provider identity pinned at plan approval (design D-B,
+/// ticket `workspace-provider-pin-at-approval`) — the consent artifact naming
+/// the environment the operator approved running against. Free-form strings
+/// on purpose: the shape must not assume a provider kind. Per-kind meanings:
+/// - `local-worktree`: `provider` = `"local-worktree"`, `template` = the
+///   isolation mode (`"worktree"` | `"checkout"` — source isolation, not a
+///   runnable workspace, D-H), `version` = the workspace contract's
+///   schemaVersion when a contract exists, else `"none"`.
+/// - Future container/remote providers: `template` = image name+tag,
+///   `version` = adapter version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct WorkspacePin {
+    pub provider: String,
+    pub template: String,
+    pub version: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MissionState {
@@ -397,6 +415,11 @@ pub struct MissionState {
     /// `None` in logs predating the provider seam.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_provider: Option<String>,
+    /// The workspace provider identity pinned at plan approval, folded from
+    /// `workspace.provider.pinned` (design D-B). `None` in logs predating
+    /// the pin event (missions approved before pinning existed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_pin: Option<WorkspacePin>,
 }
 
 impl MissionState {

@@ -378,6 +378,22 @@ impl EventRenderer {
                 ansi::DIM,
                 format!("teardown ({mode})"),
             ),
+            EventKind::WorkspaceProviderPinned {
+                provider,
+                template,
+                version,
+            } => (
+                "workspace".to_string(),
+                ansi::BLUE,
+                format!(
+                    "provider pinned: {provider} · {template} · {}",
+                    if version == "none" {
+                        "no contract".to_string()
+                    } else {
+                        format!("contract v{version}")
+                    }
+                ),
+            ),
         };
 
         // Budget: "[tag] body" must fit LINE_MAX visible chars.

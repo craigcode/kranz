@@ -2833,3 +2833,101 @@ fn workspace_provider_state_field_backcompat_with_pre_seam_snapshots() {
     let parsed: MissionState = serde_json::from_value(value).unwrap();
     assert_eq!(parsed.workspace_provider, None);
 }
+
+// ---------------------------------------------------------------------------
+// Workspace provider pin at approval (design D-B, ticket
+// workspace-provider-pin-at-approval)
+// ---------------------------------------------------------------------------
+
+/// `workspace.provider.pinned` folds into `state.workspace_pin`; a retried
+/// approval re-pins (last pin wins).
+#[test]
+fn workspace_provider_pin_folds_into_state() {
+    let state = fold_kinds(vec![
+        created(),
+        EventKind::WorkspaceProviderPinned {
+            provider: "local-worktree".to_string(),
+            template: "worktree".to_string(),
+            version: "1".to_string(),
+        },
+        EventKind::PlanApproved {
+            plan: plan(),
+            base_sha: None,
+        },
+    ]);
+
+    assert_eq!(
+        state.workspace_pin,
+        Some(WorkspacePin {
+            provider: "local-worktree".to_string(),
+            template: "worktree".to_string(),
+            version: "1".to_string(),
+        })
+    );
+    assert_eq!(state.mission.status, MissionStatus::Approved);
+
+    // A retried approval (first attempt failed after emitting the pin)
+    // re-pins: last pin wins.
+    let state = fold_kinds(vec![
+        created(),
+        EventKind::WorkspaceProviderPinned {
+            provider: "local-worktree".to_string(),
+            template: "worktree".to_string(),
+            version: "none".to_string(),
+        },
+        EventKind::WorkspaceProviderPinned {
+            provider: "local-worktree".to_string(),
+            template: "worktree".to_string(),
+            version: "1".to_string(),
+        },
+        EventKind::PlanApproved {
+            plan: plan(),
+            base_sha: None,
+        },
+    ]);
+    assert_eq!(
+        state.workspace_pin.map(|p| p.version),
+        Some("1".to_string())
+    );
+}
+
+/// Old logs (written before the pin event existed) fold to
+/// `workspace_pin: None`, and a pre-pin state.json has no `workspacePin` key
+/// at all — the additive serde-default field deserializes to None and the new
+/// binary omits the key again while the value is None, so snapshots stay
+/// byte-identical until the pin first fires.
+#[test]
+fn workspace_provider_pin_backcompat_with_pre_pin_logs_and_snapshots() {
+    let state = fold_kinds(vec![
+        created(),
+        EventKind::PlanApproved {
+            plan: plan(),
+            base_sha: None,
+        },
+    ]);
+    assert_eq!(state.workspace_pin, None);
+
+    let value = serde_json::to_value(&state).unwrap();
+    assert!(
+        !value.as_object().unwrap().contains_key("workspacePin"),
+        "absent while None: {value}"
+    );
+    let parsed: MissionState = serde_json::from_value(value).unwrap();
+    assert_eq!(parsed.workspace_pin, None);
+
+    // A present pin serializes under the camelCase wire name.
+    let state = fold_kinds(vec![
+        created(),
+        EventKind::WorkspaceProviderPinned {
+            provider: "local-worktree".to_string(),
+            template: "checkout".to_string(),
+            version: "none".to_string(),
+        },
+    ]);
+    let value = serde_json::to_value(&state).unwrap();
+    assert_eq!(
+        value["workspacePin"],
+        json!({"provider": "local-worktree", "template": "checkout", "version": "none"}),
+        "{value}"
+    );
+}

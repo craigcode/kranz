@@ -121,6 +121,19 @@ pub(crate) async fn mission_state(
 /// `GET /api/missions/:id/workspace` — effective local execution workspace,
 /// sandbox tiers, and the latest already-recorded environment-preflight
 /// outcome. This is a derived read model: no new durable state or events.
+///
+/// Additive workspace-provider fields (design D-B/D-E, ticket
+/// workspace-provider-pin-at-approval):
+/// - `pin` — the provider identity pinned at plan approval, mirroring
+///   `MissionState.workspace_pin` (`{provider, template, version}`); `null`
+///   on missions approved before pinning existed.
+/// - `previews` — the contract's preview URL templates `[{name,
+///   urlTemplate}]`, placeholders UNFILLED, and only once a readiness pass is
+///   on the log (never a fabricated URL for unproven services); `null`
+///   otherwise.
+/// - `takeover` — how a human takes over the workspace. For local-worktree
+///   this is the plain truth (work locally in the workspace cwd) — no SSH/
+///   remote fiction; `null` when no pin names the provider.
 pub(crate) async fn mission_workspace(
     State(server): State<Arc<ServerState>>,
     UrlPath(id): UrlPath<String>,
@@ -214,6 +227,49 @@ pub(crate) async fn mission_workspace(
         (Value::Null, Value::Null)
     };
 
+    // Approval-time provider pin (D-B), mirrored from folded state; null on
+    // missions approved before pinning existed — consumers must degrade on
+    // null, same as the gate outcome fields above.
+    let pin = match &state.workspace_pin {
+        Some(pin) => json!(pin),
+        None => Value::Null,
+    };
+
+    // Preview placeholders (D-E): the contract's URL templates, UNFILLED —
+    // surfaced only once a readiness PASS is on the log, never implying a
+    // reachable URL while the services behind it are unproven.
+    let readiness_passed = events.iter().any(|event| {
+        matches!(
+            &event.kind,
+            EventKind::WorkspaceReadinessReport { outcome, .. } if outcome == "ready"
+        )
+    });
+    let previews = match (&workspace_contract, readiness_passed) {
+        (Some(contract), true) if !contract.previews.is_empty() => {
+            json!(contract
+                .previews
+                .iter()
+                .map(|p| json!({
+                    "name": p.name,
+                    "urlTemplate": p.url_template,
+                }))
+                .collect::<Vec<_>>())
+        }
+        _ => Value::Null,
+    };
+
+    // Human takeover (D-E): for local-worktree the plain truth — work locally
+    // in the workspace cwd, no SSH/remote fiction (the provider isolates
+    // source only, D-H). Keyed to the pin; null when no pin names the
+    // provider (older missions) or a future provider has no line yet.
+    let takeover = match &state.workspace_pin {
+        Some(pin) if pin.provider == "local-worktree" => json!(format!(
+            "work locally in the workspace cwd ({})",
+            cwd.to_string_lossy()
+        )),
+        _ => Value::Null,
+    };
+
     Ok(Json(json!({
         "isolation": isolation,
         "cwd": cwd.to_string_lossy(),
@@ -225,6 +281,9 @@ pub(crate) async fn mission_workspace(
             sandbox_summary("functional", &state.config.validator_functional),
         ],
         "preflight": preflight,
+        "pin": pin,
+        "previews": previews,
+        "takeover": takeover,
         "contract": {
             "present": workspace_contract.is_some(),
             "services": workspace_contract.as_ref().map_or(0, |c| c.services.len()),

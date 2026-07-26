@@ -44,13 +44,14 @@
 //!   the filesystem outcome.
 //!
 //! Provider selection: additive mission config `workspace.provider`
-//! (absent = `local-worktree`). Unknown names FAIL CLOSED at run start via
-//! [`resolve`] — never a silent fallback to local.
+//! (absent = `local-worktree`). Unknown names FAIL CLOSED via [`resolve`] —
+//! at plan approval (the [`pin`] consent artifact) AND again at run start —
+//! never a silent fallback to local.
 
 use crate::error::{EngineError, Result};
 use crate::events::EventKind;
 use crate::orchestrator::MissionEngine;
-use crate::types::MissionStatus;
+use crate::types::{MissionStatus, WorkerIsolation, WorkspacePin};
 use crate::workspace_contract::WorkspaceContract;
 use crate::workspace_gate::{
     self, CommandOutcome, GatePhase, BOOTSTRAP_SUMMARY_PREFIX, READINESS_SUMMARY_PREFIX,
@@ -192,7 +193,8 @@ pub trait WorkspaceProvider: Send + Sync {
 
 /// Resolve the configured `workspace.provider` into a provider instance.
 /// Absent (or `"local-worktree"`) selects today's local worktree. Unknown
-/// names FAIL CLOSED with a clear error — an unprovisioned run must never
+/// names FAIL CLOSED with a clear error naming the `workspace.provider`
+/// config key and its operator owner — an unprovisioned run must never
 /// silently fall back to a provider the operator did not ask for.
 pub fn resolve(provider: Option<&str>) -> Result<Box<dyn WorkspaceProvider>> {
     match provider {
@@ -202,11 +204,45 @@ pub fn resolve(provider: Option<&str>) -> Result<Box<dyn WorkspaceProvider>> {
         }
         Some(other) => Err(EngineError::Config(format!(
             "workspace.provider {other:?} is not a known workspace provider \
-             (this build provides {:?} only); refusing to run rather than \
-             silently falling back",
+             (this build provides {:?} only; owner: operator — fix the \
+             workspace.provider config key); refusing rather than silently \
+             falling back",
             WorkspaceProviderKind::LocalWorktree.as_str()
         ))),
     }
+}
+
+/// Pin the effective workspace provider identity at plan approval (design
+/// D-B, ticket `workspace-provider-pin-at-approval`) — the consent artifact
+/// `approve_plan` emits as `workspace.provider.pinned` immediately before
+/// `plan.approved`. Resolution IS the seam's fail-closed [`resolve`], so an
+/// unknown `workspace.provider` name refuses here, at approval time, BEFORE
+/// any branch/commit side effect — a misspelled name never silently defaults
+/// (owner: operator). Local-worktree-only missions pin too: the pin makes
+/// the default explicit and honest (D-H: source isolation, not a runnable
+/// workspace).
+///
+/// The shape stays free-form (see [`WorkspacePin`]) so future container/
+/// remote providers pin image name+tag and adapter version instead.
+pub fn pin(
+    provider: Option<&str>,
+    isolation: WorkerIsolation,
+    contract: Option<&WorkspaceContract>,
+) -> Result<WorkspacePin> {
+    let resolved = resolve(provider)?;
+    let template = match isolation {
+        WorkerIsolation::Worktree => "worktree",
+        WorkerIsolation::Checkout => "checkout",
+    };
+    let version = match contract {
+        Some(contract) => contract.schema_version.to_string(),
+        None => "none".to_string(),
+    };
+    Ok(WorkspacePin {
+        provider: resolved.kind().as_str().to_string(),
+        template: template.to_string(),
+        version,
+    })
 }
 
 /// The local-worktree provider (v1's only implementation): provisions
@@ -513,7 +549,50 @@ mod tests {
             assert!(msg.contains("workspace.provider"), "{msg}");
             assert!(msg.contains(&format!("{unknown:?}")), "{msg}");
             assert!(msg.contains("\"local-worktree\" only"), "{msg}");
+            assert!(msg.contains("owner: operator"), "{msg}");
         }
+    }
+
+    /// The approval-time pin (D-B): local-worktree pins the isolation mode as
+    /// its template and the contract's schemaVersion as its version (`"none"`
+    /// without a contract) — the default made explicit and honest (D-H).
+    /// Unknown provider names fail closed with the config key + owner named,
+    /// exactly like run-start resolution.
+    #[test]
+    fn pin_records_isolation_mode_and_contract_version() {
+        let contract = contract(br#"{"schemaVersion": 1, "readiness": ["true"]}"#);
+
+        let pinned = pin(None, WorkerIsolation::Worktree, Some(&contract)).expect("pin");
+        assert_eq!(
+            pinned,
+            WorkspacePin {
+                provider: "local-worktree".to_string(),
+                template: "worktree".to_string(),
+                version: "1".to_string(),
+            }
+        );
+
+        let pinned = pin(
+            Some("local-worktree"),
+            WorkerIsolation::Checkout,
+            Some(&contract),
+        )
+        .expect("explicit local-worktree pins too");
+        assert_eq!(pinned.template, "checkout");
+        assert_eq!(pinned.version, "1");
+
+        // No contract ⇒ the honest "none" version — never imply a contract
+        // schema that does not exist.
+        let pinned = pin(None, WorkerIsolation::Worktree, None).expect("pin without contract");
+        assert_eq!(pinned.provider, "local-worktree");
+        assert_eq!(pinned.version, "none");
+
+        let err = pin(Some("coder"), WorkerIsolation::Worktree, None)
+            .expect_err("a misspelled provider never silently defaults");
+        let msg = err.to_string();
+        assert!(msg.contains("workspace.provider"), "{msg}");
+        assert!(msg.contains("\"coder\""), "{msg}");
+        assert!(msg.contains("owner: operator"), "{msg}");
     }
 
     #[tokio::test]

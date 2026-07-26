@@ -470,6 +470,29 @@ pub fn render_mission_report(
         sandbox_enforce_label(state.config.validator_scrutiny.sandbox.enforce),
         sandbox_enforce_label(state.config.validator_functional.sandbox.enforce),
     );
+    // D-B/D-E consent pin: the provider identity the operator approved,
+    // folded from `workspace.provider.pinned`. Omitted on missions approved
+    // before pinning existed (never fabricated). For local-worktree the pin
+    // says "source isolation" out loud — never implying a runnable workspace
+    // (D-H); the no-contract variant says "no workspace contract" rather than
+    // inventing a schema version.
+    if let Some(pin) = &state.workspace_pin {
+        let provider_note = if pin.provider == "local-worktree" {
+            " (source isolation)"
+        } else {
+            ""
+        };
+        let version_label = if pin.version == "none" {
+            "no workspace contract".to_string()
+        } else {
+            format!("contract schema v{}", pin.version)
+        };
+        let _ = writeln!(
+            md,
+            "- **Provider:** {}{provider_note} · template: {} · {version_label}",
+            pin.provider, pin.template
+        );
+    }
     // D-H operator language: say when only source isolation is active versus
     // a workspace contract being present — and, when present, how the
     // bootstrap/readiness gate went (derived from the gate's decision

@@ -946,7 +946,22 @@ impl MissionEngine {
         // (merge-gates ownership, same spirit). Missing ⇒ today's behavior
         // unchanged; present-but-invalid ⇒ fail closed, owner repo-setup,
         // before any branch/commit side effects below.
-        crate::workspace_contract::load_workspace_contract(&self.paths.repo_root)?;
+        let approval_contract =
+            crate::workspace_contract::load_workspace_contract(&self.paths.repo_root)?;
+
+        // Provider pin (D-B, ticket workspace-provider-pin-at-approval):
+        // resolve the EFFECTIVE provider now — an unknown `workspace.provider`
+        // name refuses approval HERE, before any branch/commit side effects
+        // below (owner: operator), never a silent default on a misspelled
+        // name. The pin event itself is emitted beside `plan.approved` —
+        // AFTER the fallible git/commit steps, so a failed approve stays
+        // event-free and retryable, and the log reads: contract validated →
+        // provider pinned → plan approved.
+        let workspace_pin = crate::workspace_provider::pin(
+            self.state.config.workspace.provider.as_deref(),
+            self.state.config.isolation(),
+            approval_contract.as_ref(),
+        )?;
 
         assign_assertion_ids(&mut plan.validation_contract);
 
@@ -1142,6 +1157,14 @@ impl MissionEngine {
         // this exact number (M1): recomputing it later would compare actual
         // cost against a value recalibrated on a since-changed corpus/config.
         self.persist_approved_estimate(&estimate)?;
+
+        // The consent pin lands immediately before plan.approved (D-B/D-E):
+        // contract validated → provider pinned → plan approved.
+        self.emit(EventKind::WorkspaceProviderPinned {
+            provider: workspace_pin.provider,
+            template: workspace_pin.template,
+            version: workspace_pin.version,
+        })?;
 
         self.emit(EventKind::PlanApproved {
             plan,
@@ -5834,6 +5857,7 @@ pub(crate) mod tests {
             escalated_milestones: 0,
             local_executor_milestones: 0,
             workspace_provider: None,
+            workspace_pin: None,
         };
 
         assert_eq!(

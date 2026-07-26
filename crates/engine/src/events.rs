@@ -340,6 +340,25 @@ pub enum EventKind {
         #[serde(default)]
         mode: String,
     },
+
+    /// The effective workspace provider identity pinned at plan approval
+    /// (design D-B, ticket `workspace-provider-pin-at-approval`) — the consent
+    /// artifact recording WHAT was approved: provider kind, template
+    /// (isolation mode for local-worktree; image name+tag for future
+    /// container/remote providers), and version (the workspace contract's
+    /// schemaVersion, or `"none"` without a contract). Emitted in
+    /// `approve_plan` immediately before `plan.approved`, so the log reads:
+    /// contract validated → provider pinned → plan approved. See
+    /// [`crate::types::WorkspacePin`] for the per-kind field meanings.
+    #[serde(rename = "workspace.provider.pinned")]
+    WorkspaceProviderPinned {
+        #[serde(default)]
+        provider: String,
+        #[serde(default)]
+        template: String,
+        #[serde(default)]
+        version: String,
+    },
 }
 
 impl EventKind {
@@ -382,6 +401,7 @@ impl EventKind {
             EventKind::WorkspaceProvisioned { .. } => "workspace.provisioned",
             EventKind::WorkspaceReadinessReport { .. } => "workspace.readiness",
             EventKind::WorkspaceTeardown { .. } => "workspace.teardown",
+            EventKind::WorkspaceProviderPinned { .. } => "workspace.provider.pinned",
         }
     }
 
@@ -448,6 +468,40 @@ mod tests {
         assert_eq!(json["type"], "workspace.teardown");
         assert_eq!(json["payload"]["mode"], "keep");
         assert_eq!(teardown.type_name(), "workspace.teardown");
+
+        let pinned = EventKind::WorkspaceProviderPinned {
+            provider: "local-worktree".into(),
+            template: "worktree".into(),
+            version: "1".into(),
+        };
+        let json = serde_json::to_value(&pinned).unwrap();
+        assert_eq!(json["type"], "workspace.provider.pinned");
+        assert_eq!(json["payload"]["provider"], "local-worktree");
+        assert_eq!(json["payload"]["template"], "worktree");
+        assert_eq!(json["payload"]["version"], "1");
+        assert_eq!(pinned.type_name(), "workspace.provider.pinned");
+        let back: EventKind = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, EventKind::WorkspaceProviderPinned { .. }));
+
+        // Backcompat: a payload missing fields (or the whole payload, as a
+        // hand-written or future-trimmed log line might) folds with serde
+        // defaults instead of failing the log read.
+        let sparse: EventKind = serde_json::from_str(
+            r#"{"type":"workspace.provider.pinned","payload":{"provider":"local-worktree"}}"#,
+        )
+        .unwrap();
+        match sparse {
+            EventKind::WorkspaceProviderPinned {
+                provider,
+                template,
+                version,
+            } => {
+                assert_eq!(provider, "local-worktree");
+                assert_eq!(template, "");
+                assert_eq!(version, "");
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 
     #[test]

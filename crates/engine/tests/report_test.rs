@@ -329,3 +329,74 @@ fn report_workspace_section_renders_bootstrap_readiness_outcomes() {
         "{report}"
     );
 }
+
+/// D-B/D-E: the Workspace section renders the approval-time provider pin —
+/// local-worktree named as source isolation (never a runnable workspace,
+/// D-H), the contract's schema version when a contract exists, and the
+/// honest no-contract variant otherwise. Missions approved before pinning
+/// existed render no Provider line at all (never fabricated).
+#[test]
+fn report_workspace_section_renders_provider_pin() {
+    use kranz_engine::types::WorkspacePin;
+
+    // Pin with a contract: schema version named.
+    let mut state = completed_state();
+    state.workspace_pin = Some(WorkspacePin {
+        provider: "local-worktree".into(),
+        template: "worktree".into(),
+        version: "1".into(),
+    });
+    let report = render_mission_report(
+        &state,
+        &[],
+        &plan(),
+        &estimate(),
+        std::path::Path::new("/tmp"),
+        None,
+    );
+    assert!(
+        report.contains(
+            "- **Provider:** local-worktree (source isolation) · template: worktree · contract schema v1"
+        ),
+        "{report}"
+    );
+
+    // Pin without a contract: the honest no-contract variant.
+    let mut state = completed_state();
+    state.workspace_pin = Some(WorkspacePin {
+        provider: "local-worktree".into(),
+        template: "checkout".into(),
+        version: "none".into(),
+    });
+    let report = render_mission_report(
+        &state,
+        &[],
+        &plan(),
+        &estimate(),
+        std::path::Path::new("/tmp"),
+        None,
+    );
+    assert!(
+        report.contains(
+            "- **Provider:** local-worktree (source isolation) · template: checkout · no workspace contract"
+        ),
+        "{report}"
+    );
+
+    // No pin (mission approved before pinning existed): no Provider line —
+    // the report never fails and never fabricates one.
+    let state = completed_state();
+    assert_eq!(state.workspace_pin, None);
+    let report = render_mission_report(
+        &state,
+        &[],
+        &plan(),
+        &estimate(),
+        std::path::Path::new("/tmp"),
+        None,
+    );
+    assert!(
+        !report.contains("- **Provider:**"),
+        "absent pin ⇒ no Provider line: {report}"
+    );
+}
