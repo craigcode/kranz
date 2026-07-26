@@ -1335,16 +1335,14 @@ async fn workspace_gate_block_lifts_once_environment_is_fixed() {
     let (_dir, root) = init_repo();
     let ext = tempfile::tempdir().expect("external tempdir");
     let ready_flag = ext.path().join("env-ready");
-    commit_workspace_contract(
-        &root,
-        &format!(
-            r#"{{
-                "schemaVersion": 1,
-                "readiness": ["test -f \"{}\""]
-            }}"#,
-            ready_flag.display()
-        ),
-    );
+    // serde_json, not string interpolation: Windows temp paths carry
+    // backslashes that land as invalid JSON escapes when pasted raw.
+    let contract = serde_json::json!({
+        "schemaVersion": 1,
+        "readiness": [format!("test -f {:?}", ready_flag.display().to_string().replace('\\', "/"))],
+    })
+    .to_string();
+    commit_workspace_contract(&root, &contract);
 
     // Phase 1: readiness fails (flag absent) → Blocked before any spend.
     let backend = Arc::new(MockBackend::new());
@@ -1451,6 +1449,364 @@ async fn workspace_gate_reads_contract_from_base_branch_not_mission_branch() {
             .iter()
             .any(|e| matches!(e.kind, EventKind::WorkerSpawned { .. })),
         "the weakened contract must never let a worker spawn"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// WorkspaceProvider seam (design D-B/D-E, ticket workspace-provider-seam)
+// ---------------------------------------------------------------------------
+
+/// All events carrying one of the D-E workspace lifecycle wire names.
+fn workspace_lifecycle_events<'a>(events: &'a [Event], wire_name: &str) -> Vec<&'a Event> {
+    events
+        .iter()
+        .filter(|e| e.kind.type_name() == wire_name)
+        .collect()
+}
+
+/// The seam's lifecycle events land on the log with the D-E wire names and
+/// fold into state: `workspace.provisioned` (provider kind + cwd) precedes
+/// the gate's decision events, `workspace.readiness` follows them (still
+/// before the first worker spawn), and `workspace.teardown` closes the run.
+#[tokio::test(flavor = "multi_thread")]
+async fn workspace_provider_events_land_and_fold_into_state() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    commit_workspace_contract(
+        &root,
+        r#"{
+            "schemaVersion": 1,
+            "bootstrap": ["echo boot > .boot-marker"],
+            "readiness": ["test -f .boot-marker"]
+        }"#,
+    );
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+    ]));
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+    // The last provisioned provider kind folded into state (D-E).
+    assert_eq!(
+        engine.state().workspace_provider.as_deref(),
+        Some("local-worktree")
+    );
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    let provisioned = workspace_lifecycle_events(&events, "workspace.provisioned");
+    assert_eq!(provisioned.len(), 1, "one provision per run()");
+    match &provisioned[0].kind {
+        EventKind::WorkspaceProvisioned { provider, cwd } => {
+            assert_eq!(provider, "local-worktree");
+            assert_eq!(
+                cwd,
+                &root.display().to_string(),
+                "checkout mode provisions the repo root as the workspace cwd"
+            );
+        }
+        other => panic!("wrong variant: {other:?}"),
+    }
+
+    let readiness = workspace_lifecycle_events(&events, "workspace.readiness");
+    assert_eq!(readiness.len(), 1);
+    match &readiness[0].kind {
+        EventKind::WorkspaceReadinessReport { outcome, detail } => {
+            assert_eq!(outcome, "ready");
+            assert_eq!(detail, &None);
+        }
+        other => panic!("wrong variant: {other:?}"),
+    }
+
+    let teardown = workspace_lifecycle_events(&events, "workspace.teardown");
+    assert_eq!(teardown.len(), 1);
+    match &teardown[0].kind {
+        EventKind::WorkspaceTeardown { mode } => assert_eq!(mode, "keep"),
+        other => panic!("wrong variant: {other:?}"),
+    }
+
+    // Ordering: provisioned before the gate's first decision line, readiness
+    // after it, both before the first worker spawn; teardown closes the run.
+    let first_gate_seq = events
+        .iter()
+        .find(|e| matches!(&e.kind, EventKind::OrchestratorDecision { summary, .. } if summary.starts_with("workspace bootstrap:")))
+        .map(|e| e.seq)
+        .expect("a gate decision on the log");
+    assert!(provisioned[0].seq < first_gate_seq);
+    assert!(readiness[0].seq > first_gate_seq);
+    assert!(readiness[0].seq < seq_of(&events, "worker.spawned"));
+    assert!(teardown[0].seq > readiness[0].seq);
+}
+
+/// A contract-less run still records `workspace.provisioned` (the workspace
+/// exists — today's isolation cwd), but NO readiness report: never imply a
+/// runnable environment exists when it does not (D-H).
+#[tokio::test(flavor = "multi_thread")]
+async fn workspace_provider_no_contract_provisions_without_readiness_report() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    assert!(!root.join(".kranz/workspace.json").exists());
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+    ]));
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+    assert_eq!(
+        engine.state().workspace_provider.as_deref(),
+        Some("local-worktree")
+    );
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    assert_eq!(
+        workspace_lifecycle_events(&events, "workspace.provisioned").len(),
+        1
+    );
+    assert!(
+        workspace_lifecycle_events(&events, "workspace.readiness").is_empty(),
+        "no readiness artifact without a contract (D-H): {:?}",
+        event_types(&events)
+    );
+    assert_eq!(
+        workspace_lifecycle_events(&events, "workspace.teardown").len(),
+        1
+    );
+}
+
+/// Readiness failure blocks with the gate's established reason (byte-
+/// identical to the pre-seam gate) AND the `workspace.readiness` report
+/// records outcome `failed` carrying the same scrubbed reason (D-E).
+#[tokio::test(flavor = "multi_thread")]
+async fn workspace_provider_readiness_failure_blocks_with_failed_report() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    commit_workspace_contract(
+        &root,
+        r#"{
+            "schemaVersion": 1,
+            "bootstrap": ["echo boot > .boot-marker"],
+            "readiness": ["test -f .no-such-readiness-file"]
+        }"#,
+    );
+
+    let backend = Arc::new(MockBackend::new());
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Blocked);
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    let reason = gate_block_reason(&events, "ms-1");
+    assert!(
+        reason.contains("workspace gate: readiness check 1/1 failed"),
+        "{reason}"
+    );
+
+    let readiness = workspace_lifecycle_events(&events, "workspace.readiness");
+    assert_eq!(readiness.len(), 1);
+    match &readiness[0].kind {
+        EventKind::WorkspaceReadinessReport { outcome, detail } => {
+            assert_eq!(outcome, "failed");
+            assert_eq!(
+                detail.as_deref(),
+                Some(reason.as_str()),
+                "the report carries the same scrubbed reason the block records"
+            );
+        }
+        other => panic!("wrong variant: {other:?}"),
+    }
+    assert!(readiness[0].seq < seq_of(&events, "milestone.blocked"));
+    // The blocked run keeps its workspace for resume — teardown records keep.
+    assert_eq!(
+        workspace_lifecycle_events(&events, "workspace.teardown").len(),
+        1
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::WorkerSpawned { .. })),
+        "no worker may spawn on a failed readiness check"
+    );
+}
+
+/// Unknown `workspace.provider` names fail closed at run start — a clear
+/// error naming the bad value, no workspace lifecycle events, no worker, no
+/// spend — never a silent fallback to local.
+#[tokio::test(flavor = "multi_thread")]
+async fn workspace_provider_unknown_name_fails_closed_at_run_start() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    // No scripts queued: ANY session start would error the run anyway — the
+    // empty backend itself proves no spawn.
+    let backend = Arc::new(MockBackend::new());
+    let cfg = MissionConfig {
+        workspace: kranz_engine::types::WorkspaceConfig {
+            provider: Some("coder".to_string()),
+        },
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+    let paths = engine.paths().clone();
+
+    let err = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .expect_err("an unknown workspace provider must fail closed");
+    let msg = err.to_string();
+    assert!(msg.contains("workspace.provider"), "{msg}");
+    assert!(msg.contains("\"coder\""), "{msg}");
+    assert!(msg.contains("local-worktree"), "{msg}");
+    assert_eq!(engine.state().workspace_provider, None);
+    drop(engine);
+
+    let events = read_log(&paths);
+    for wire_name in [
+        "workspace.provisioned",
+        "workspace.readiness",
+        "workspace.teardown",
+    ] {
+        assert!(
+            workspace_lifecycle_events(&events, wire_name).is_empty(),
+            "no {wire_name} event on a run that failed closed"
+        );
+    }
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::WorkerSpawned { .. })),
+        "no worker may spawn when the provider fails closed"
+    );
+}
+
+/// Resume re-provisions (idempotent, mirroring the gate's
+/// reruns-on-resume idiom): two engine lifetimes ⇒ two
+/// `workspace.provisioned` events recording the same provider kind; the
+/// crashed run records no teardown (crash semantics), the completing run
+/// records `keep`.
+#[tokio::test(flavor = "multi_thread")]
+async fn workspace_provider_resume_reprovisions_idempotently() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    // --- Phase 1: the "crash" (same idiom as kill_and_resume /
+    // workspace_bootstrap_reruns_on_resume_after_crash): the worker passes
+    // writing nothing, the judgement turn starves, the short stall timeout
+    // declares the orchestrator dead, and the retry finds no script left.
+    let backend1 = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass_no_write(),
+        orch_script(vec![]),
+    ]));
+    let mut engine = make_engine(&backend1, &root, test_cfg());
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+    engine.set_orch_stall_timeout(Duration::from_millis(400));
+    let mission_id = engine.mission_id().to_string();
+    let paths = engine.paths().clone();
+
+    timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .expect_err("phase 1 must error out (simulated crash)");
+    drop(engine);
+
+    let events = read_log(&paths);
+    assert_eq!(
+        workspace_lifecycle_events(&events, "workspace.provisioned").len(),
+        1,
+        "the crashed run provisioned exactly once"
+    );
+    assert!(
+        workspace_lifecycle_events(&events, "workspace.teardown").is_empty(),
+        "a crashed run records no teardown (the resume sweep owns leftovers)"
+    );
+
+    // --- Phase 2: resume. Provision runs again — re-resolving the same
+    // workspace, not remembering a durable one.
+    let backend2 = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+    ]));
+    let backend2_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend2) as Arc<dyn AgentBackend>;
+    let mut engine = MissionEngine::resume(backend2_dyn, &root, &mission_id, LockForce::No)
+        .expect("resume mission");
+    engine.seed_worker_auth_verdict_for_test(AuthVerdict::Inconclusive);
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+    assert_eq!(
+        engine.state().workspace_provider.as_deref(),
+        Some("local-worktree")
+    );
+    drop(engine);
+
+    let events = read_log(&paths);
+    let provisioned = workspace_lifecycle_events(&events, "workspace.provisioned");
+    assert_eq!(
+        provisioned.len(),
+        2,
+        "resume re-provisions: one workspace.provisioned per run() invocation"
+    );
+    for event in provisioned {
+        match &event.kind {
+            EventKind::WorkspaceProvisioned { provider, .. } => {
+                assert_eq!(provider, "local-worktree")
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+    assert_eq!(
+        workspace_lifecycle_events(&events, "workspace.teardown").len(),
+        1,
+        "only the completing run records teardown"
     );
 }
 
