@@ -49,7 +49,10 @@
 //! `workspace` service holds the worktree mount — reporting through the same
 //! gate phase shapes as the local-worktree provider
 //! ([`crate::workspace_provider::report_gate_outcomes`]), so block reasons
-//! and decision lines are byte-identical to the host path.
+//! and decision lines are byte-identical to the host path. The golden-data
+//! hooks (design D-D: clone/migrate/skewCheck at readiness, reset between
+//! validation rounds) exec through the same path — a container workspace
+//! never runs data hooks on the host.
 //!
 //! Teardown: [`TeardownMode::Keep`] leaves the project running (documented:
 //! previews stay live); `Hibernate` is `compose stop` (containers paused,
@@ -392,7 +395,7 @@ pub(crate) fn render_compose_file(
         def["ports"] = json!(ports);
         if let Some(health_check) = &service.health_check {
             def["healthcheck"] = json!({
-                "test": ["CMD-SH", health_check],
+                "test": ["CMD-SHELL", health_check],
                 "interval": "2s",
                 "timeout": "10s",
                 "retries": 30,
@@ -640,6 +643,27 @@ impl WorkspaceProvider for LocalContainerProvider {
             ));
         };
 
+        // 0. golden data clone/migrate (design D-D) — after provision,
+        //    before bootstrap, exec'd INSIDE the container network (never
+        //    on the host). Undeclared hooks skip silently.
+        if let Some(data) = &contract.data {
+            for (hook, command) in [
+                (crate::workspace_data::DataHookKind::Clone, &data.clone),
+                (crate::workspace_data::DataHookKind::Migrate, &data.migrate),
+            ] {
+                if let Some(command) = command {
+                    if let Some(failed) =
+                        self.run_data_hook(handle, hook, command, progress).await?
+                    {
+                        return Ok(ReadinessOutcome::Failed {
+                            kind: hook.gate_kind(),
+                            failed,
+                        });
+                    }
+                }
+            }
+        }
+
         // 1. bootstrap — ordered, stop at first failure. Same gate semantics
         //    as the host path, but exec'd INSIDE the container network (the
         //    `workspace` service holds the worktree mount), so checks reach
@@ -675,7 +699,56 @@ impl WorkspaceProvider for LocalContainerProvider {
             });
         }
 
+        // 3. golden data skewCheck (design D-D) — the last readiness step;
+        //    its failure is the distinct SKEW outcome, never a readiness
+        //    flake.
+        if let Some(command) = contract
+            .data
+            .as_ref()
+            .and_then(|data| data.skew_check.as_ref())
+        {
+            if let Some(failed) = self
+                .run_data_hook(
+                    handle,
+                    crate::workspace_data::DataHookKind::SkewCheck,
+                    command,
+                    progress,
+                )
+                .await?
+            {
+                return Ok(ReadinessOutcome::DataSkew { failed });
+            }
+        }
+
         Ok(ReadinessOutcome::Ready)
+    }
+
+    /// Golden-data hooks exec INSIDE the workspace container (design D-D) —
+    /// the same `compose exec -T workspace sh -c …` path the gate phases
+    /// use, so a container workspace never runs data hooks on the host.
+    async fn run_data_hook(
+        &self,
+        handle: &WorkspaceHandle,
+        hook: crate::workspace_data::DataHookKind,
+        command: &str,
+        progress: &mut ProgressSink<'_>,
+    ) -> Result<Option<CommandOutcome>> {
+        let Some(workspace) = &handle.container else {
+            return Err(EngineError::InvalidState(
+                "container data hook: the handle carries no compose project — provision did \
+                 not complete"
+                    .to_string(),
+            ));
+        };
+        let argv = exec_argv(
+            workspace.runtime,
+            &workspace.project,
+            &workspace.compose_file,
+            WORKSPACE_SERVICE,
+            command,
+        );
+        let (code, output_tail) = self.run_argv(&argv, EXEC_TIMEOUT).await;
+        crate::workspace_data::hook_outcome(hook, command, code, output_tail, progress)
     }
 
     async fn teardown(&self, handle: WorkspaceHandle, mode: TeardownMode) -> Result<()> {
@@ -1019,7 +1092,7 @@ mod tests {
         // without one gets none.
         assert_eq!(
             doc["services"]["api"]["healthcheck"]["test"],
-            json!(["CMD-SH", "curl -sf localhost:8080/health"])
+            json!(["CMD-SHELL", "curl -sf localhost:8080/health"])
         );
         assert!(doc["services"]["db"].get("healthcheck").is_none());
 
@@ -1247,6 +1320,138 @@ mod tests {
                 "workspace readiness: running 1 checks",
                 "workspace readiness: FAILED at check 1/1 — blocking mission (owner: repo-setup)",
             ]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Golden-data hooks (design D-D, ticket golden-data-hooks): exec'd
+    // INSIDE the container network, never on the host.
+    // -----------------------------------------------------------------------
+
+    /// A data-block contract (bare hook names — the fake runtime records
+    /// argv verbatim and never really executes).
+    fn fake_data_contract() -> WorkspaceContract {
+        contract(
+            br#"{
+                "schemaVersion": 1,
+                "bootstrap": ["echo boot > .boot-marker"],
+                "readiness": ["test -f .boot-marker"],
+                "data": {
+                    "clone": "clone-golden",
+                    "migrate": "migrate-golden",
+                    "reset": "reseed-golden",
+                    "skewCheck": "check-skew",
+                    "resetBetweenRounds": true
+                }
+            }"#,
+        )
+    }
+
+    /// The index of the first recorded argv exec'ing `command` inside
+    /// `service` (for lifecycle-order assertions).
+    fn exec_index(fake: &FakeRuntime, service: &str, command: &str) -> usize {
+        fake.calls()
+            .iter()
+            .position(|argv| {
+                let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+                args.windows(6)
+                    .any(|w| w == ["exec", "-T", service, "sh", "-c", command])
+            })
+            .unwrap_or_else(|| panic!("no exec of {command:?} in {service}: {:?}", fake.calls()))
+    }
+
+    #[tokio::test]
+    async fn data_hooks_exec_inside_the_container_network_in_lifecycle_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = Arc::new(FakeRuntime::default());
+        let provider = LocalContainerProvider::with_hooks(fake.hooks());
+        let handle = provider
+            .provision(&spec(dir.path(), "m-fakedata", Some(fake_data_contract())))
+            .await
+            .expect("provision");
+        let mut progress = Progress::default();
+        let outcome = provider
+            .readiness(&handle, &mut progress.sink())
+            .await
+            .expect("readiness");
+
+        assert!(matches!(outcome, ReadinessOutcome::Ready), "{outcome:?}");
+        // clone → migrate → bootstrap → readiness → skewCheck, all exec'd
+        // inside the workspace container (the `compose exec` argv shape).
+        let clone = exec_index(&fake, WORKSPACE_SERVICE, "clone-golden");
+        let migrate = exec_index(&fake, WORKSPACE_SERVICE, "migrate-golden");
+        let bootstrap = exec_index(&fake, WORKSPACE_SERVICE, "echo boot > .boot-marker");
+        let readiness = exec_index(&fake, WORKSPACE_SERVICE, "test -f .boot-marker");
+        let skew = exec_index(&fake, WORKSPACE_SERVICE, "check-skew");
+        assert!(
+            clone < migrate && migrate < bootstrap && bootstrap < readiness && readiness < skew,
+            "lifecycle order (clone<{clone} migrate<{migrate} bootstrap<{bootstrap} readiness<{readiness} skew<{skew})"
+        );
+        assert_eq!(
+            progress.summaries(),
+            vec![
+                "workspace data: clone `clone-golden` → ok (exit code 0)",
+                "workspace data: migrate `migrate-golden` → ok (exit code 0)",
+                "workspace bootstrap: running 1 commands",
+                "workspace bootstrap: 1/1 commands ok",
+                "workspace readiness: running 1 checks",
+                "workspace readiness: 1/1 checks ok",
+                "workspace data: skewCheck `check-skew` → ok (exit code 0)",
+            ],
+            "the data decision lines are byte-identical to the host path"
+        );
+
+        // The reset-between-rounds drive routes through the same compose
+        // exec path (the engine calls run_data_hook from validation_round).
+        let mut progress = Progress::default();
+        let failed = provider
+            .run_data_hook(
+                &handle,
+                crate::workspace_data::DataHookKind::Reset,
+                "reseed-golden",
+                &mut progress.sink(),
+            )
+            .await
+            .expect("run_data_hook");
+        assert!(failed.is_none(), "{failed:?}");
+        assert!(
+            fake.execed(WORKSPACE_SERVICE, "reseed-golden"),
+            "reset exec'd inside the workspace container: {:?}",
+            fake.calls()
+        );
+        assert_eq!(
+            progress.summaries(),
+            vec!["workspace data: reset `reseed-golden` → ok (exit code 0)"]
+        );
+    }
+
+    #[tokio::test]
+    async fn container_skew_failure_is_the_distinct_skew_outcome() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = Arc::new(FakeRuntime {
+            fail_exec_containing: Some("check-skew".to_string()),
+            ..FakeRuntime::default()
+        });
+        let provider = LocalContainerProvider::with_hooks(fake.hooks());
+        let handle = provider
+            .provision(&spec(dir.path(), "m-fakeskew", Some(fake_data_contract())))
+            .await
+            .expect("provision");
+        let mut progress = Progress::default();
+        let outcome = provider
+            .readiness(&handle, &mut progress.sink())
+            .await
+            .expect("readiness");
+
+        let ReadinessOutcome::DataSkew { failed } = outcome else {
+            panic!("a skewCheck failure must be DataSkew, got {outcome:?}");
+        };
+        assert_eq!(failed.code, Some(3));
+        let summaries = progress.summaries();
+        let last = summaries.last().expect("a skew decision line");
+        assert_eq!(
+            *last,
+            "workspace data: skewCheck `check-skew` → FAILED (exit code 3) — blocking mission (owner: repo-setup)"
         );
     }
 
