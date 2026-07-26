@@ -1488,17 +1488,15 @@ async fn workspace_gate_block_lifts_once_environment_is_fixed() {
         return;
     }
     let (_dir, root) = init_repo();
-    let ext = tempfile::tempdir().expect("external tempdir");
-    let ready_dir = ext.path().join("env-ready");
-    // serde_json, not string interpolation: Windows temp paths carry
-    // backslashes that land as invalid JSON escapes when pasted raw. The
-    // readiness check is `cd <dir>`: a builtin in BOTH sh and cmd that fails
-    // on a missing directory and passes once it exists — no test -f / if
-    // exist shell-splitting.
-    let ready_path = ready_dir.display().to_string().replace('\\', "/");
+    // The readiness flag is a directory INSIDE the workspace: `cd env-ready`
+    // is a relative, drive-letter-free check that both sh and cmd evaluate
+    // identically (an absolute Windows path hits cmd's ERROR_INVALID_NAME on
+    // the runner's RUNNER~1 temp paths). `cd` fails on a missing dir in both
+    // shells and passes once it exists.
+    let ready_dir = root.join("env-ready");
     let contract = serde_json::json!({
         "schemaVersion": 1,
-        "readiness": [format!("cd \"{ready_path}\"")],
+        "readiness": ["cd env-ready"],
     })
     .to_string();
     commit_workspace_contract(&root, &contract);
