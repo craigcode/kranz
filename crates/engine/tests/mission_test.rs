@@ -1336,10 +1336,18 @@ async fn workspace_gate_block_lifts_once_environment_is_fixed() {
     let ext = tempfile::tempdir().expect("external tempdir");
     let ready_flag = ext.path().join("env-ready");
     // serde_json, not string interpolation: Windows temp paths carry
-    // backslashes that land as invalid JSON escapes when pasted raw.
+    // backslashes that land as invalid JSON escapes when pasted raw. The
+    // readiness command itself must also be portable: command_exec uses
+    // `cmd /C` on Windows (no `test -f`), `sh -c` elsewhere.
+    let flag_path = ready_flag.display().to_string().replace('\\', "/");
+    let readiness_command = if cfg!(windows) {
+        format!("if exist \"{flag_path}\" (exit 0) else (exit 1)")
+    } else {
+        format!("test -f \"{flag_path}\"")
+    };
     let contract = serde_json::json!({
         "schemaVersion": 1,
-        "readiness": [format!("test -f {:?}", ready_flag.display().to_string().replace('\\', "/"))],
+        "readiness": [readiness_command],
     })
     .to_string();
     commit_workspace_contract(&root, &contract);
