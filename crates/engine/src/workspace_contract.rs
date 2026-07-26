@@ -27,7 +27,7 @@
 
 use crate::error::{EngineError, Result};
 use serde::Deserialize;
-use std::path::{Component, Path};
+use std::path::Path;
 
 pub const WORKSPACE_CONTRACT_PATH: &str = ".kranz/workspace.json";
 pub const SCHEMA_VERSION: u32 = 1;
@@ -178,8 +178,12 @@ fn validate_workspace_contract(contract: &WorkspaceContract) -> std::result::Res
     }
 
     for (i, mount) in contract.mounts.iter().enumerate() {
-        let path = Path::new(mount);
-        if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
+        // Mount paths describe the TARGET runtime (a Linux container or the
+        // host), not the validation host: a POSIX-absolute path is valid even
+        // when kranz itself runs on Windows, where Path::is_absolute would
+        // reject it for lacking a drive letter. Accept both forms, and check
+        // '..' across both separators.
+        if !is_contract_absolute(mount) || has_parent_components(mount) {
             return Err(format!(
                 "mounts[{i}] {mount:?} must be an absolute path without '..' components"
             ));
@@ -226,6 +230,29 @@ fn is_secret_name(name: &str) -> bool {
         _ => return false,
     }
     chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// True when a mount path is absolute in EITHER the POSIX form (`/var/…`)
+/// or the Windows form (`C:\…`, `C:/…`, or a UNC `\\host\…`). Contract paths
+/// describe the target runtime, not the validation host, so both forms are
+/// valid on every platform.
+fn is_contract_absolute(mount: &str) -> bool {
+    if mount.starts_with('/') {
+        return true;
+    }
+    if mount.starts_with("\\\\") {
+        return true;
+    }
+    let bytes = mount.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+}
+
+/// True when any path component is `..` (either separator).
+fn has_parent_components(mount: &str) -> bool {
+    mount.split(['/', '\\']).any(|component| component == "..")
 }
 
 #[cfg(test)]
@@ -448,6 +475,13 @@ mod tests {
         }
         parse_workspace_contract(br#"{"schemaVersion": 1, "mounts": ["/var/cache/cargo"]}"#)
             .expect("absolute mount without '..' is valid");
+        // Contract paths describe the target runtime, so BOTH absolute forms
+        // validate on every host platform (Path::is_absolute is host-biased).
+        for good in ["/var/cache/cargo", "C:\\cache\\cargo", "C:/cache/cargo"] {
+            let json = serde_json::json!({ "schemaVersion": 1, "mounts": [good] }).to_string();
+            parse_workspace_contract(json.as_bytes())
+                .unwrap_or_else(|e| panic!("{good:?} must validate on every platform: {e}"));
+        }
     }
 
     #[test]
