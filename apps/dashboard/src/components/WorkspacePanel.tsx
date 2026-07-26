@@ -119,6 +119,14 @@ export function WorkspacePanel() {
               {summary.preflight.summary}
             </span>
           </div>
+          <div className="workspace-row">
+            <span className="dim">contract</span>
+            <span className="workspace-value">
+              {summary.contract.present
+                ? `contract present (${summary.contract.services} services, ${summary.contract.previews} previews)`
+                : 'no workspace contract — source isolation only'}
+            </span>
+          </div>
         </div>
       ) : error !== null ? (
         <div className="panel-error" role="alert">

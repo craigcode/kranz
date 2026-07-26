@@ -344,6 +344,7 @@ pub fn render_mission_report(
     plan: &Plan,
     estimate: &cost::CostEstimate,
     execution_root: &Path,
+    workspace_contract: Option<&crate::workspace_contract::WorkspaceContract>,
 ) -> String {
     use std::fmt::Write as _;
     let mission = &state.mission;
@@ -456,6 +457,22 @@ pub fn render_mission_report(
         sandbox_enforce_label(state.config.validator_scrutiny.sandbox.enforce),
         sandbox_enforce_label(state.config.validator_functional.sandbox.enforce),
     );
+    // D-H operator language: say when only source isolation is active versus
+    // a workspace contract being present (full readiness UI is the bootstrap
+    // ticket's job).
+    match workspace_contract {
+        Some(contract) => {
+            let _ = writeln!(
+                md,
+                "- **Workspace contract:** present ({} services, {} previews)",
+                contract.services.len(),
+                contract.previews.len()
+            );
+        }
+        None => {
+            let _ = writeln!(md, "- **Workspace contract:** no workspace contract");
+        }
+    }
     let preflight = events.iter().rev().find_map(|event| match &event.kind {
         EventKind::OrchestratorDecision { summary, .. } if summary.starts_with("preflight:") => {
             Some(summary.as_str())

@@ -554,6 +554,29 @@ async fn workspace_summary_surfaces_isolation_sandbox_and_preflight_without_gran
         body["preflight"]["summary"],
         kranz_engine::preflight::PREFLIGHT_CLEAR_SUMMARY
     );
+
+    // No workspace contract in the fixture repo ⇒ presence flag false (D-H).
+    assert_eq!(body["contract"]["present"], false);
+    assert_eq!(body["contract"]["services"], 0);
+    assert_eq!(body["contract"]["previews"], 0);
+
+    // A valid contract flips the flag and counts services/previews.
+    let kranz_dir = repo_root.join(".kranz");
+    std::fs::create_dir_all(&kranz_dir).unwrap();
+    std::fs::write(
+        kranz_dir.join("workspace.json"),
+        br#"{
+            "schemaVersion": 1,
+            "services": [{"name": "db", "start": "docker compose up db", "port": {"policy": "dynamic"}}],
+            "previews": [{"name": "app", "urlTemplate": "http://localhost:{port}/"}]
+        }"#,
+    )
+    .unwrap();
+    let (status, body) = get_json(&app, &format!("/api/missions/{MISSION_ID}/workspace")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["contract"]["present"], true);
+    assert_eq!(body["contract"]["services"], 1);
+    assert_eq!(body["contract"]["previews"], 1);
 }
 
 #[tokio::test]

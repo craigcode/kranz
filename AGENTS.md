@@ -77,7 +77,9 @@ kranz work                      # drain the queue (run missions)
 
 ## Tracked vs runtime
 
-Committed: `.kranz/merge-gates.json`, `.kranz/tickets/<slug>.md`, and each
+Committed: `.kranz/merge-gates.json`, `.kranz/workspace.json` (workspace
+contract, validated at draft/approve; `crates/engine/src/workspace_contract.rs`),
+`.kranz/tickets/<slug>.md`, and each
 mission's `plan.md` / `plan.json` / `report.md` (on the mission branch). Gitignored runtime
 (never commit): `events.jsonl`, `state.json`, `runs/`, `control/`,
 `.kranz/config.json`, `serve.token`, `.kranz/tickets/*.status`.

@@ -176,6 +176,15 @@ pub(crate) async fn mission_workspace(
         })
     });
 
+    // Workspace contract presence (D-H): base-branch-owned `.kranz/
+    // workspace.json` read from the repo root — a derived read like the rest
+    // of this projection; an unreadable/invalid contract degrades to absent
+    // here (draft/approve is the fail-closed surface).
+    let workspace_contract =
+        kranz_engine::workspace_contract::load_workspace_contract(&server.repo_root)
+            .ok()
+            .flatten();
+
     Ok(Json(json!({
         "isolation": isolation,
         "cwd": cwd.to_string_lossy(),
@@ -187,6 +196,11 @@ pub(crate) async fn mission_workspace(
             sandbox_summary("functional", &state.config.validator_functional),
         ],
         "preflight": preflight,
+        "contract": {
+            "present": workspace_contract.is_some(),
+            "services": workspace_contract.as_ref().map_or(0, |c| c.services.len()),
+            "previews": workspace_contract.as_ref().map_or(0, |c| c.previews.len()),
+        },
     })))
 }
 

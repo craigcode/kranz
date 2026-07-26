@@ -492,6 +492,13 @@ export interface WorkspaceSummary {
     summary: string;
     eventSeq: number | null;
   };
+  /** `.kranz/workspace.json` presence (D-H): services/previews are 0 when
+   *  no contract is present. */
+  contract: {
+    present: boolean;
+    services: number;
+    previews: number;
+  };
 }
 
 /** This host's queue-drain tracker (`MissionHost::drain` / `drain_state_json`). */

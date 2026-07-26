@@ -144,6 +144,7 @@ fn report_opens_with_goal_and_plan_summary_before_statistics() {
         &plan(),
         &estimate(),
         std::path::Path::new("/tmp"),
+        None,
     );
 
     // Section order: goal → plan summary → statistics → shipped → validation
@@ -182,6 +183,7 @@ fn report_narrates_features_with_intent_and_evidence_inline() {
         &plan(),
         &estimate(),
         std::path::Path::new("/tmp"),
+        None,
     );
 
     // Intent prose (the spec's first sentence) follows the feature headline.
@@ -199,5 +201,49 @@ fn report_narrates_features_with_intent_and_evidence_inline() {
     assert!(
         report.contains("- ✅ **[a-1]** the build succeeds *(command: `cargo test --workspace`)*"),
         "{report}"
+    );
+}
+
+/// D-H operator language: the Workspace section must say when only source
+/// isolation is active versus a workspace contract being present.
+#[test]
+fn report_workspace_section_states_contract_presence() {
+    let state = completed_state();
+
+    let without = render_mission_report(
+        &state,
+        &[],
+        &plan(),
+        &estimate(),
+        std::path::Path::new("/tmp"),
+        None,
+    );
+    assert!(
+        without.contains("- **Workspace contract:** no workspace contract"),
+        "{without}"
+    );
+
+    let contract = kranz_engine::workspace_contract::parse_workspace_contract(
+        br#"{
+            "schemaVersion": 1,
+            "services": [
+                {"name": "api", "start": "cargo run", "port": {"policy": "dynamic"}},
+                {"name": "db", "start": "docker compose up db", "port": {"policy": {"fixed": 5432}}}
+            ],
+            "previews": [{"name": "app", "urlTemplate": "http://localhost:{port}/"}]
+        }"#,
+    )
+    .expect("valid contract");
+    let with = render_mission_report(
+        &state,
+        &[],
+        &plan(),
+        &estimate(),
+        std::path::Path::new("/tmp"),
+        Some(&contract),
+    );
+    assert!(
+        with.contains("- **Workspace contract:** present (2 services, 1 previews)"),
+        "{with}"
     );
 }

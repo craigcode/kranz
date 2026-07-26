@@ -74,6 +74,7 @@ function summary(overrides: Partial<WorkspaceSummary> = {}): WorkspaceSummary {
       summary: 'preflight: 1 issue(s): [warn] cargo missing',
       eventSeq: 2,
     },
+    contract: { present: false, services: 0, previews: 0 },
     ...overrides,
   };
 }
@@ -114,6 +115,21 @@ describe('WorkspacePanel', () => {
 
     expect(await screen.findByText('checkout · primary checkout')).toBeTruthy();
     expect(screen.queryByText(/missing worktree/i)).toBeNull();
+  });
+
+  it('says when only source isolation is active versus a contract being present', async () => {
+    vi.mocked(api.workspace).mockResolvedValueOnce(summary());
+    const { unmount } = render(<WorkspacePanel />);
+    expect(
+      await screen.findByText('no workspace contract — source isolation only'),
+    ).toBeTruthy();
+    unmount();
+
+    vi.mocked(api.workspace).mockResolvedValueOnce(
+      summary({ contract: { present: true, services: 2, previews: 1 } }),
+    );
+    render(<WorkspacePanel />);
+    expect(await screen.findByText('contract present (2 services, 1 previews)')).toBeTruthy();
   });
 
   it('refetches when sandbox grant counts change without an enforcement change', async () => {

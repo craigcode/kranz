@@ -931,6 +931,15 @@ impl MissionEngine {
                 empty.title
             )));
         }
+
+        // Workspace contract (D-A): validate the base-branch-owned
+        // `.kranz/workspace.json` from the repo ROOT — never the mission
+        // branch, so a mission cannot weaken the contract that judges it
+        // (merge-gates ownership, same spirit). Missing ⇒ today's behavior
+        // unchanged; present-but-invalid ⇒ fail closed, owner repo-setup,
+        // before any branch/commit side effects below.
+        crate::workspace_contract::load_workspace_contract(&self.paths.repo_root)?;
+
         assign_assertion_ids(&mut plan.validation_contract);
 
         let calibration = cost::calibrate(&self.paths.repo_root);
@@ -4058,8 +4067,22 @@ impl MissionEngine {
                     &calibration,
                 )
             });
-        let report =
-            render_mission_report(&self.state, &events, &plan, &estimate, self.active_root());
+        // Workspace contract presence line (D-H): read from the repo root
+        // (base-branch-owned). Approval already validated it, so a load or
+        // parse failure here (e.g. edited invalid mid-mission) must not fail
+        // report writing — degrade to the "no workspace contract" line.
+        let workspace_contract =
+            crate::workspace_contract::load_workspace_contract(&self.paths.repo_root)
+                .ok()
+                .flatten();
+        let report = render_mission_report(
+            &self.state,
+            &events,
+            &plan,
+            &estimate,
+            self.active_root(),
+            workspace_contract.as_ref(),
+        );
 
         let active_paths = self.active_paths();
         let report_file = active_paths.mission_dir().join("report.md");

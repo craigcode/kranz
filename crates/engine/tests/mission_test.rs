@@ -784,6 +784,112 @@ async fn completed_mission_worker_spawns_record_frontier_provenance() {
 }
 
 // ---------------------------------------------------------------------------
+// 1b. Workspace contract (D-A): approve fails closed on an invalid contract
+// ---------------------------------------------------------------------------
+
+/// Present-but-invalid `.kranz/workspace.json` refuses approval with the
+/// repo-setup owner named, BEFORE any branch/commit side effects.
+#[tokio::test(flavor = "multi_thread")]
+async fn invalid_workspace_contract_refused_at_approve() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let kranz_dir = root.join(".kranz");
+    std::fs::create_dir_all(&kranz_dir).unwrap();
+    std::fs::write(
+        kranz_dir.join("workspace.json"),
+        br#"{"schemaVersion": 1, "secrets": ["sk-live-value-not-a-name"]}"#,
+    )
+    .unwrap();
+
+    let backend = Arc::new(MockBackend::new());
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    let err = engine
+        .approve_plan(simple_plan(1, vec![]))
+        .expect_err("invalid workspace contract must refuse approval");
+    let msg = err.to_string();
+    assert!(msg.contains("workspace contract"), "{msg}");
+    assert!(msg.contains("repo-setup"), "{msg}");
+    assert!(msg.contains("not a secret NAME"), "{msg}");
+
+    // Fail-closed means no side effects: no mission branch, no approval event.
+    let branches = raw_git(&root, &["branch", "--list"]);
+    assert!(
+        !branches.contains("kranz/mission-"),
+        "refused approve must not create the mission branch: {branches}"
+    );
+    assert_eq!(
+        raw_git(&root, &["branch", "--show-current"]).trim(),
+        "main",
+        "refused approve must not move the primary checkout"
+    );
+    let events = read_log(&engine.paths().clone());
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::PlanApproved { .. })),
+        "refused approve must not emit plan.approved"
+    );
+}
+
+/// Missing contract ⇒ today's behavior exactly: approval proceeds.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_workspace_contract_approves_unchanged() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    assert!(
+        !root.join(".kranz/workspace.json").exists(),
+        "fixture must start without a contract"
+    );
+
+    let backend = Arc::new(MockBackend::new());
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine
+        .approve_plan(simple_plan(1, vec![]))
+        .expect("approve without a contract behaves as today");
+    let events = read_log(&engine.paths().clone());
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::PlanApproved { .. })),
+        "plan.approved must land on the log"
+    );
+}
+
+/// A valid contract is accepted at approve (validation is not over-eager).
+#[tokio::test(flavor = "multi_thread")]
+async fn valid_workspace_contract_approves() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let kranz_dir = root.join(".kranz");
+    std::fs::create_dir_all(&kranz_dir).unwrap();
+    std::fs::write(
+        kranz_dir.join("workspace.json"),
+        br#"{
+            "schemaVersion": 1,
+            "bootstrap": ["cargo fetch"],
+            "services": [{"name": "db", "start": "docker compose up db", "port": {"policy": {"fixed": 5432}}}],
+            "readiness": ["pg_isready"],
+            "previews": [{"name": "app", "urlTemplate": "http://localhost:{port}/"}],
+            "secrets": ["DATABASE_URL"],
+            "mounts": ["/var/cache/cargo"]
+        }"#,
+    )
+    .unwrap();
+
+    let backend = Arc::new(MockBackend::new());
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine
+        .approve_plan(simple_plan(1, vec![]))
+        .expect("valid workspace contract must approve");
+}
+
+// ---------------------------------------------------------------------------
 // 2. Validation round: finding → fix feature → clean round → complete
 // ---------------------------------------------------------------------------
 

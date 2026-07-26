@@ -52,6 +52,7 @@ pub mod scrub;
 pub mod ticket;
 pub mod trace_export;
 pub mod work;
+pub mod workspace_contract;
 
 pub mod backend_claude;
 pub mod backend_codex;
