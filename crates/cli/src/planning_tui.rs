@@ -479,6 +479,13 @@ pub const DETACHED_MARKER: &str = "▼ new output below — End to follow";
 /// state, rendered as a plain notice (no error styling, no approval mode).
 pub const PLAN_NOT_READY_NOTICE: &str = "not ready to emit — answer above, then /plan again";
 
+/// Notice shown when `/plan` resolves to [`PlanRequest::WrongPlan`]: the
+/// planner CAN plan but judges the plan likely wrong — a planner-initiated
+/// escalation, rendered like the not-ready notice (no error styling, no
+/// approval mode).
+pub const PLAN_WRONG_PLAN_NOTICE: &str =
+    "planner escalated: the plan is likely wrong — reframe the goal above, then /plan again";
+
 /// Busy status line: spinner frame + activity + elapsed + queue depth.
 pub fn busy_status_line(
     kind: BusyKind,
@@ -1189,6 +1196,14 @@ impl TuiRun {
                 self.app.push(TranscriptEntry::Orch(text));
                 self.app
                     .push(TranscriptEntry::Notice(PLAN_NOT_READY_NOTICE.to_string()));
+                self.phase = Phase::Idle(engine);
+            }
+            TurnOutput::Plan(Ok(PlanRequest::WrongPlan { reason })) => {
+                // Planner-initiated escalation, also not an error: show the
+                // reason and return to idle — no approval mode, no red.
+                self.app.push(TranscriptEntry::Orch(reason));
+                self.app
+                    .push(TranscriptEntry::Notice(PLAN_WRONG_PLAN_NOTICE.to_string()));
                 self.phase = Phase::Idle(engine);
             }
             TurnOutput::Plan(Ok(PlanRequest::Ready(plan))) => {

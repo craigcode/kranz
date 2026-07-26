@@ -54,7 +54,11 @@ maxBudgetUsd: 15
    then `request_plan`. `Ready` → plan.json/plan.md/index.md committed as
    usual, mission parked in `review` (= today's Planning-with-proposed-plan);
    `NotReady` → ticket flagged **needs-context** with the orchestrator's
-   verbatim questions appended to the ticket file (and Slack-pinged). Nothing
+   verbatim questions appended to the ticket file (and Slack-pinged);
+   `WrongPlan` (planner-initiated `{"wrongPlan": "…"}` — "I can plan this,
+   but the plan is likely wrong") → ticket flagged **wrong-plan** with the
+   reason appended and a `WRONG-PLAN: ` status note, parked for the operator
+   exactly like needs-context but rendered distinctly. Nothing
    new in the engine — this is `planning_turn`/`request_plan` driven by a
    scheduler instead of a keyboard. Draft cost is bounded (orchestrator
    budget cap applies; no workers spawn).

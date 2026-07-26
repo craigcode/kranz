@@ -25,8 +25,9 @@ pub(crate) async fn list_tickets(State(server): State<Arc<ServerState>>) -> Json
 }
 
 /// `GET /api/tickets/:slug` — the full parsed ticket plus `needsContext`
-/// (the orchestrator's clarifying questions, if any were appended). 400 for
-/// an invalid/traversal slug (checked at the route boundary before any
+/// (the orchestrator's clarifying questions, if any were appended) and
+/// `wrongPlan` (the planner's escalation reason, likewise). 400 for an
+/// invalid/traversal slug (checked at the route boundary before any
 /// filesystem access), 404 for a slug with no ticket file.
 pub(crate) async fn get_ticket(
     State(server): State<Arc<ServerState>>,
@@ -144,7 +145,7 @@ fn ticket_summary_json(repo_root: &std::path::Path, ticket: &Ticket) -> Value {
 }
 
 /// Full projection for the show route: every parsed field plus the derived
-/// `needsContext` question list.
+/// `needsContext` question list and the `wrongPlan` escalation reason.
 fn ticket_full_json(repo_root: &std::path::Path, ticket: &Ticket) -> Value {
     let state = Ticket::read_state(repo_root, &ticket.slug);
     json!({
@@ -159,13 +160,14 @@ fn ticket_full_json(repo_root: &std::path::Path, ticket: &Ticket) -> Value {
         "acceptanceHints": ticket.acceptance_hints,
         "state": state,
         "needsContext": needs_context_questions(&ticket.raw_body),
+        "wrongPlan": wrong_plan_reason(&ticket.raw_body),
         "isBlocked": kranz_engine::deps::is_blocked(repo_root, &ticket.slug).unwrap_or(false),
         "missionId": Ticket::mission_for(repo_root, &ticket.slug),
         "merged": kranz_engine::merged::ticket_merged(repo_root, &ticket.slug),
     })
 }
 
-/// Port of `kranz_cli::backlog::needs_context_block`'s heading scan, but
+/// Port of `kranz_cli::backlog::section_block`'s heading scan, but
 /// returning the bare question strings (bullet items, marker stripped)
 /// instead of the raw markdown block — a REST consumer wants data, not
 /// text to re-render.
@@ -194,6 +196,40 @@ fn needs_context_questions(raw_body: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// The planner's wrong-plan escalation reason: the text of the `## Wrong
+/// plan (from orchestrator)` section (verbatim paragraph, not bullets), if
+/// one was appended. Same heading-scan port family as
+/// [`needs_context_questions`].
+fn wrong_plan_reason(raw_body: &str) -> Option<String> {
+    let mut collecting = false;
+    let mut out: Vec<&str> = Vec::new();
+    for line in raw_body.lines() {
+        let is_section = line.trim_start().starts_with("##");
+        if collecting && is_section {
+            break; // next section ends the block
+        }
+        if is_section
+            && line
+                .trim_start_matches('#')
+                .trim()
+                .to_ascii_lowercase()
+                .starts_with("wrong plan")
+        {
+            collecting = true;
+            continue;
+        }
+        if collecting {
+            out.push(line);
+        }
+    }
+    let text = out.join("\n").trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 /// The content of a dash bullet (`- item`), trimmed, else None. Mirrors

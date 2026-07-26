@@ -1,5 +1,6 @@
 // #/backlog/<slug> — one ticket in full: goal/context (rendered as markdown),
-// scoping answers / acceptance hints / needs-context questions as lists, a
+// scoping answers / acceptance hints / needs-context questions as lists, any
+// wrong-plan escalation reason, a
 // Draft button with live progress from the drafted mission's WS feed
 // (draftTicket already calls connectMission — this pane just renders
 // s.events/s.state the same way ProgressLog does), and a blocked-by-aware
@@ -144,6 +145,12 @@ export function TicketDetail({ slug }: { slug: string }) {
         <ListSection title="Scoping answers" items={ticket.scopingAnswers} />
         <ListSection title="Acceptance hints" items={ticket.acceptanceHints} />
         <ListSection title="Needs context" items={ticket.needsContext} />
+        {ticket.wrongPlan !== null && (
+          <div className="ticket-section">
+            <div className="section-label">Wrong plan (planner escalation)</div>
+            <p>{ticket.wrongPlan}</p>
+          </div>
+        )}
 
         {ticketError !== null && (
           <div className="picker-error" role="alert">

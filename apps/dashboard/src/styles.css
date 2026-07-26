@@ -337,6 +337,13 @@ button {
   background: var(--amber-soft);
 }
 
+/* Wrong-plan escalation: a red flag raised at draft time — red-soft, distinct
+   from needs-context's amber and from failed's solid red. */
+.pill-wrong-plan {
+  color: var(--red);
+  background: var(--red-soft);
+}
+
 .pill-review {
   color: var(--accent);
   background: var(--accent-soft);

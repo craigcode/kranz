@@ -93,6 +93,11 @@ pub enum TicketState {
     New,
     Drafting,
     NeedsContext,
+    /// The planner escalated at draft time: it CAN plan, but believes the
+    /// plan is likely wrong (goal misframed, premise broken). Parks like
+    /// [`NeedsContext`] — re-draftable, never schedulable/queueable — but is
+    /// distinct from it everywhere the state surfaces.
+    WrongPlan,
     Review,
     Queued,
     Running,
@@ -548,6 +553,32 @@ impl Ticket {
         Self::write_state(repo_root, slug, TicketState::NeedsContext, None)?;
         Ok(())
     }
+
+    /// Append the planner's wrong-plan escalation reason to the ticket `.md`
+    /// under a `## Wrong plan (from orchestrator)` heading, and set the state
+    /// to [`TicketState::WrongPlan`] with the `.status` note carrying the
+    /// reason prefixed `WRONG-PLAN: `. Mirrors [`Self::append_needs_context`]'s
+    /// shape (bounded, scrubbed, atomic).
+    pub fn append_wrong_plan(repo_root: &Path, slug: &str, reason: &str) -> Result<()> {
+        Self::ensure_valid_slug(slug)?;
+        let reason = bound_reason(reason);
+        let md = Self::md_path(repo_root, slug);
+        let mut text = std::fs::read_to_string(&md)?;
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str("\n## Wrong plan (from orchestrator)\n");
+        text.push_str(&crate::scrub::scrub(&reason));
+        text.push('\n');
+        atomic_write(&md, text.as_bytes())?;
+        Self::write_state(
+            repo_root,
+            slug,
+            TicketState::WrongPlan,
+            Some(format!("WRONG-PLAN: {reason}")),
+        )?;
+        Ok(())
+    }
 }
 
 /// Per-question length cap (in chars) and total-count cap applied before
@@ -556,27 +587,35 @@ impl Ticket {
 const MAX_QUESTION_CHARS: usize = 500;
 const MAX_QUESTION_COUNT: usize = 20;
 
+/// Truncate one question (or the wrong-plan reason) to [`MAX_QUESTION_CHARS`]
+/// characters, char-boundary safe.
+fn truncate_one(q: &str) -> String {
+    if q.chars().count() > MAX_QUESTION_CHARS {
+        let mut truncated: String = q.chars().take(MAX_QUESTION_CHARS).collect();
+        truncated.push_str(" … (truncated)");
+        truncated
+    } else {
+        q.to_string()
+    }
+}
+
+/// Bound the wrong-plan reason before it lands in the ticket body and the
+/// `.status` note: trimmed, single-paragraph, length-capped like a question.
+fn bound_reason(reason: &str) -> String {
+    truncate_one(reason.trim())
+}
+
 /// Truncate each question to [`MAX_QUESTION_CHARS`] characters (char-boundary
 /// safe) and cap the total number of questions to [`MAX_QUESTION_COUNT`],
 /// appending a single "N more omitted" marker when truncated.
 fn bound_questions(questions: &[String]) -> Vec<String> {
-    let truncate_one = |q: &String| -> String {
-        if q.chars().count() > MAX_QUESTION_CHARS {
-            let mut truncated: String = q.chars().take(MAX_QUESTION_CHARS).collect();
-            truncated.push_str(" … (truncated)");
-            truncated
-        } else {
-            q.clone()
-        }
-    };
-
     if questions.len() <= MAX_QUESTION_COUNT {
-        return questions.iter().map(truncate_one).collect();
+        return questions.iter().map(|q| truncate_one(q)).collect();
     }
 
     let mut out: Vec<String> = questions[..MAX_QUESTION_COUNT]
         .iter()
-        .map(truncate_one)
+        .map(|q| truncate_one(q))
         .collect();
     let omitted = questions.len() - MAX_QUESTION_COUNT;
     out.push(format!("… ({omitted} more omitted)"));

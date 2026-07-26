@@ -161,6 +161,12 @@ pub enum PlanRequest {
     /// turn's text, or the first turn's when the retry's is empty — so the
     /// caller can show the user what the model actually said.
     NotReady(String),
+    /// The orchestrator CAN plan but believes the plan is likely WRONG — the
+    /// goal is misframed, the premise is broken, the spec is confidently
+    /// off. A planner-initiated escalation only: it arrives exclusively as an
+    /// explicit `{"wrongPlan": "…"}` JSON reply and is never inferred from
+    /// prose. Carries the one-paragraph reason.
+    WrongPlan { reason: String },
 }
 
 struct SelectedBackend {
@@ -1237,6 +1243,16 @@ impl MissionEngine {
                     } else {
                         reply
                     }),
+                )?;
+            }
+            // The wrong-plan escalation is a DRAFT-stage channel: the revised
+            // plan prompt never offers it and its parser never produces it.
+            // Degrade to the not-ready path rather than panic if that ever
+            // changes — the reason text is exactly what the operator needs.
+            PlanRequest::WrongPlan { reason } => {
+                self.emit_decision(
+                    "revision request escalated: plan likely wrong",
+                    Some(reason),
                 )?;
             }
         }

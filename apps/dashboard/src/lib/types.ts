@@ -60,6 +60,7 @@ export type TicketState =
   | 'new'
   | 'drafting'
   | 'needs-context'
+  | 'wrong-plan'
   | 'review'
   | 'queued'
   | 'running'
@@ -98,6 +99,9 @@ export interface Ticket {
   acceptanceHints: string[];
   state: TicketState;
   needsContext: string[];
+  /** Planner's draft-stage wrong-plan escalation reason (server always emits
+   *  the key): null when the ticket carries no `## Wrong plan` section. */
+  wrongPlan: string | null;
   /** Joined mission id. The server always emits the key (Rust
    *  `Option<String>`): null when the ticket has never been drafted. */
   missionId: string | null;

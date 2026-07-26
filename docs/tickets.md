@@ -45,6 +45,7 @@ depend on other tickets — see §Dependencies (`blocked-by`) below.
 ```sh
 kranz ticket list          # slug, priority, state, title
 kranz ticket show <slug>   # one ticket in full, incl. needs-context questions
+                           # or a wrong-plan escalation reason
 kranz queue                # the execution queue (approved, awaiting a run)
 ```
 
@@ -172,7 +173,7 @@ alternative to the CLI pipeline above:
 
 ```
 GET  /api/tickets              # list: slug, priority, state, title, blockedBy
-GET  /api/tickets/:slug        # full ticket + needsContext
+GET  /api/tickets/:slug        # full ticket + needsContext + wrongPlan
 POST /api/tickets/:slug/draft  # kick off a draft (202, long-running)
 POST /api/tickets/:slug/approve  # {"force": bool} -> approve into the queue
 ```

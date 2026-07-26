@@ -3164,6 +3164,9 @@ async fn force_reseed_reseeds_with_digest_and_plan() {
     {
         PlanRequest::Ready(plan) => plan,
         PlanRequest::NotReady(text) => panic!("scripted plan JSON must parse, got: {text}"),
+        PlanRequest::WrongPlan { reason } => {
+            panic!("scripted plan JSON must parse, got a wrong-plan escalation: {reason}")
+        }
     };
     assert_eq!(plan.milestones.len(), 1);
     engine.approve_plan(plan).unwrap();
@@ -3279,6 +3282,9 @@ async fn plan_not_ready_returns_prose() {
             "NotReady carries the retry turn's prose: {text}"
         ),
         PlanRequest::Ready(plan) => panic!("prose must not parse as a plan: {plan:?}"),
+        PlanRequest::WrongPlan { reason } => {
+            panic!("prose must not parse as a wrong-plan escalation: {reason}")
+        }
     }
     assert_eq!(
         engine.state().mission.status,
@@ -3295,6 +3301,9 @@ async fn plan_not_ready_returns_prose() {
     match request {
         PlanRequest::Ready(plan) => assert_eq!(plan.milestones.len(), 1),
         PlanRequest::NotReady(text) => panic!("scripted plan JSON must parse, got: {text}"),
+        PlanRequest::WrongPlan { reason } => {
+            panic!("scripted plan JSON must parse, got a wrong-plan escalation: {reason}")
+        }
     }
 }
 
@@ -4593,6 +4602,9 @@ async fn request_and_approve_revised_plan_drops_and_adds_features() {
     let plan = match request {
         PlanRequest::Ready(plan) => plan,
         PlanRequest::NotReady(text) => panic!("scripted revised plan must parse: {text}"),
+        PlanRequest::WrongPlan { reason } => {
+            panic!("scripted revised plan must parse, got a wrong-plan escalation: {reason}")
+        }
     };
     assert_eq!(plan.milestones[0].features.len(), 2);
 

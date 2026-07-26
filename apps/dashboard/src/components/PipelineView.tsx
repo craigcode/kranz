@@ -367,7 +367,7 @@ export function PipelineView({ initialLens = 'actionable' }: { initialLens?: Len
       );
     }
 
-    if (stage === 'needs-you' && row.slug !== undefined) {
+    if ((stage === 'needs-you' || stage === 'wrong-plan') && row.slug !== undefined) {
       return (
         <a
           className="btn-small pipeline-primary-action"

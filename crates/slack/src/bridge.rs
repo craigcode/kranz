@@ -1383,6 +1383,19 @@ fn pipeline_todo_actions(
                     target: open_ticket_target(dashboard_url, &slug),
                 });
             }
+            PipelineStage::WrongPlan if row.slug.is_some() => {
+                let slug = row.slug.clone().expect("checked above");
+                actions.push(TodoAction {
+                    kind: TodoActionKind::NeedsYou,
+                    id: slug.clone(),
+                    title: row.title.clone(),
+                    note: Some(
+                        "Planner says the plan is likely wrong — edit or re-scope, then redraft."
+                            .to_string(),
+                    ),
+                    target: open_ticket_target(dashboard_url, &slug),
+                });
+            }
             _ => {}
         }
     }
@@ -1575,6 +1588,7 @@ fn pipeline_stage_for_ticket(
         TicketState::New => PipelineStage::Captured,
         TicketState::Drafting => PipelineStage::Drafting,
         TicketState::NeedsContext => PipelineStage::NeedsYou,
+        TicketState::WrongPlan => PipelineStage::WrongPlan,
         TicketState::Review => PipelineStage::Reviewable,
         TicketState::Queued => PipelineStage::Queued,
         TicketState::Running => PipelineStage::Running,
@@ -1808,6 +1822,7 @@ pub fn build_ticket_show_reply(repo_root: &Path, slug: &str) -> Vec<Value> {
         state,
         blocked_by: ticket.blocked_by.clone(),
         needs_context: needs_context_questions(&ticket.raw_body),
+        wrong_plan: wrong_plan_reason(&ticket.raw_body),
     };
     crate::format::build_ticket_show(&detail)
 }
@@ -1815,7 +1830,7 @@ pub fn build_ticket_show_reply(repo_root: &Path, slug: &str) -> Vec<Value> {
 /// The orchestrator's clarifying questions appended under a `## Needs
 /// context` heading in a ticket's raw body. Mirrors
 /// `kranz_server::tickets::needs_context_questions` (itself a port of
-/// `kranz_cli::backlog::needs_context_block`'s heading scan) — a small
+/// `kranz_cli::backlog::section_block`'s heading scan) — a small
 /// derived-data extraction, not ticket parsing, so it stays a thin per-crate
 /// copy rather than a shared engine primitive.
 fn needs_context_questions(raw_body: &str) -> Vec<String> {
@@ -1843,6 +1858,39 @@ fn needs_context_questions(raw_body: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// The planner's wrong-plan escalation reason: the text of the `## Wrong
+/// plan (from orchestrator)` section (verbatim paragraph, not bullets), if
+/// one was appended. Same per-crate port family as [`needs_context_questions`].
+fn wrong_plan_reason(raw_body: &str) -> Option<String> {
+    let mut collecting = false;
+    let mut out: Vec<&str> = Vec::new();
+    for line in raw_body.lines() {
+        let is_section = line.trim_start().starts_with("##");
+        if collecting && is_section {
+            break;
+        }
+        if is_section
+            && line
+                .trim_start_matches('#')
+                .trim()
+                .to_ascii_lowercase()
+                .starts_with("wrong plan")
+        {
+            collecting = true;
+            continue;
+        }
+        if collecting {
+            out.push(line);
+        }
+    }
+    let text = out.join("\n").trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 /// The content of a dash bullet (`- item`), trimmed, else `None`.
@@ -3028,6 +3076,12 @@ mod tests {
             pipeline_stage_for_ticket(TicketState::NeedsContext, None),
             PipelineStage::NeedsYou
         );
+        assert_eq!(
+            pipeline_stage_for_ticket(TicketState::WrongPlan, None),
+            PipelineStage::WrongPlan,
+            "the draft-stage escalation is a distinct stage, not needs-you"
+        );
+        assert_eq!(PipelineStage::WrongPlan.label(), "wrong-plan");
         assert_eq!(
             pipeline_stage_for_ticket(TicketState::Review, None),
             PipelineStage::Reviewable

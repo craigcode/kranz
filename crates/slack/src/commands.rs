@@ -66,7 +66,7 @@ pub fn gate_draft_command(
 /// caller has posted the `DraftGate::Ready` ack. Drives [`crate::host::PlanningHost::draft`]
 /// to a terminal [`DraftOutcome`] and maps it to the terminal result blocks,
 /// posting the orchestrator's clarifying questions back to the invoker on
-/// `NeedsContext`.
+/// `NeedsContext` and the escalation reason on `WrongPlan`.
 pub async fn run_draft(host: &SharedHost, slug: &str) -> Vec<Value> {
     match host.draft(slug).await {
         Ok(DraftOutcome::ParkedForReview {
@@ -98,6 +98,11 @@ pub async fn run_draft(host: &SharedHost, slug: &str) -> Vec<Value> {
             }
             error_blocks(text.trim_end())
         }
+        Ok(DraftOutcome::WrongPlan { mission_id, reason }) => error_blocks(&format!(
+            ":warning: Mission `{mission_id}` escalated while drafting `{slug}` — the planner \
+             can produce a plan but believes it is likely WRONG:\n{reason}\nEdit or re-scope \
+             the ticket, then run `/kranz draft {slug}` again."
+        )),
         Err(e) => error_blocks(&format!("Couldn't draft `{slug}`: {e}")),
     }
 }

@@ -167,6 +167,40 @@ fn ticket_show_reply_renders_goal_state_blocked_by_and_needs_context() {
 }
 
 #[test]
+fn ticket_show_reply_renders_the_wrong_plan_escalation() {
+    let tmp = TempDir::new().unwrap();
+    write_ticket(
+        tmp.path(),
+        "postgres-migration",
+        "---\ntitle: Migrate the store\n---\n\
+         ## Goal\nMigrate the store to Postgres.\n\n\
+         ## Wrong plan (from orchestrator)\nThe store is SQLite, not Postgres.\n",
+    );
+    Ticket::write_state(
+        tmp.path(),
+        "postgres-migration",
+        TicketState::WrongPlan,
+        None,
+    )
+    .unwrap();
+
+    let blocks = build_ticket_show_reply(tmp.path(), "postgres-migration");
+    let text = all_text(&blocks);
+    assert!(
+        text.contains("WrongPlan"),
+        "the state word is distinct from NeedsContext: {text}"
+    );
+    assert!(
+        text.contains("Wrong plan (planner escalation)"),
+        "labels the escalation section: {text}"
+    );
+    assert!(
+        text.contains("The store is SQLite, not Postgres."),
+        "shows the escalation reason: {text}"
+    );
+}
+
+#[test]
 fn ticket_show_unknown_slug_is_a_graceful_ephemeral_error_no_panic() {
     let tmp = TempDir::new().unwrap();
     let blocks = build_ticket_show_reply(tmp.path(), "does-not-exist");
@@ -290,6 +324,7 @@ enum DraftOutcomeKind {
     ParkedForReview,
     NeedsContext,
     PlanAsProse,
+    WrongPlan,
 }
 
 impl FakeHost {
@@ -372,6 +407,10 @@ impl PlanningHost for FakeHost {
             },
             DraftOutcomeKind::PlanAsProse => DraftOutcome::PlanAsProse {
                 mission_id: "m-draft".into(),
+            },
+            DraftOutcomeKind::WrongPlan => DraftOutcome::WrongPlan {
+                mission_id: "m-draft".into(),
+                reason: "The goal assumes a Postgres migration, but the store is SQLite.".into(),
             },
         };
         let slug = slug.to_string();
@@ -521,6 +560,32 @@ async fn draft_needs_context_posts_the_orchestrators_questions_back() {
         "posts the orchestrator's clarifying questions back to the invoker: {result_text}"
     );
     assert!(result_text.contains("Per-user or per-token?"));
+    assert_eq!(fake.draft_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn draft_wrong_plan_posts_the_escalation_reason_back() {
+    let cfg = gated_cfg(vec!["U-allowed".into()]);
+    let fake = Arc::new(FakeHost::new(DraftOutcomeKind::WrongPlan));
+    let host: SharedHost = fake.clone();
+
+    let gate = gate_draft_command(&cfg, Some(&host), "rate-limit-notes", Some("U-allowed"));
+    assert!(matches!(gate, DraftGate::Ready(_)));
+
+    let result_text = serde_json::to_string(&run_draft(&host, "rate-limit-notes").await).unwrap();
+    assert!(
+        result_text.contains("likely WRONG"),
+        "conveys the planner's wrong-plan escalation: {result_text}"
+    );
+    assert!(
+        result_text.contains("the store is SQLite"),
+        "posts the escalation reason back to the invoker: {result_text}"
+    );
+    assert!(
+        !result_text.contains("approved and queued")
+            && !result_text.contains("Draft ready for review"),
+        "never claims success: {result_text}"
+    );
     assert_eq!(fake.draft_calls.load(Ordering::SeqCst), 1);
 }
 

@@ -202,6 +202,50 @@ async fn get_ticket_returns_full_ticket_with_needs_context() {
             "Should sessions survive the migration?"
         ])
     );
+    // The wrongPlan key is always emitted — null without an escalation.
+    assert_eq!(json["wrongPlan"], serde_json::Value::Null);
+}
+
+const WRONG_PLAN_BODY: &str = "\
+---
+title: Postgres migration
+priority: 2
+---
+
+## Goal
+Migrate the store to Postgres.
+
+## Wrong plan (from orchestrator)
+The store is SQLite, not Postgres — any plan on that premise is confidently wrong.
+";
+
+#[tokio::test]
+async fn get_ticket_returns_full_ticket_with_wrong_plan() {
+    let tmp = TempDir::new().unwrap();
+    write_ticket(tmp.path(), "misframed", WRONG_PLAN_BODY);
+    write_status(tmp.path(), "misframed", "wrong-plan");
+
+    let app = kranz_server::router(tmp.path().to_path_buf(), None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/tickets/misframed")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let json = body_json(response).await;
+    // The state wire is kebab-case and distinct from needs-context…
+    assert_eq!(json["state"], "wrong-plan");
+    // …and the escalation reason rides along, also distinct from needsContext.
+    assert_eq!(
+        json["wrongPlan"],
+        "The store is SQLite, not Postgres — any plan on that premise is confidently wrong."
+    );
+    assert_eq!(json["needsContext"], serde_json::json!([]));
 }
 
 #[tokio::test]

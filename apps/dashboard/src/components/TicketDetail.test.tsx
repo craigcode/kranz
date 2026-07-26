@@ -42,6 +42,7 @@ function makeTicket(overrides: Partial<Ticket> = {}): Ticket {
     acceptanceHints: [],
     state: 'review',
     needsContext: [],
+    wrongPlan: null,
     // Real wire shape: the server always emits the key, null when undrafted.
     missionId: null,
     ...overrides,
@@ -140,6 +141,26 @@ describe('TicketDetail', () => {
     expect(screen.getByText('What auth scheme?')).toBeTruthy();
     // needs-context tickets are not yet in review — no Approve button.
     expect(screen.queryByRole('button', { name: /Approve/ })).toBeFalsy();
+  });
+
+  it('renders the wrong-plan escalation reason and no Queue button', async () => {
+    vi.mocked(api.ticket).mockResolvedValueOnce(
+      makeTicket({
+        state: 'wrong-plan',
+        wrongPlan: 'The store is SQLite — any plan on the Postgres premise is wrong.',
+      }),
+    );
+
+    render(<TicketDetail slug="fix-b" />);
+
+    expect(
+      await screen.findByText('The store is SQLite — any plan on the Postgres premise is wrong.'),
+    ).toBeTruthy();
+    expect(screen.getByText('wrong-plan')).toBeTruthy();
+    // wrong-plan tickets are parked, not reviewable — no Queue button.
+    expect(screen.queryByRole('button', { name: 'Queue for run' })).toBeFalsy();
+    // …but re-drafting stays available, exactly like needs-context.
+    expect(screen.getByRole('button', { name: 'Draft' })).toBeTruthy();
   });
 
   it('shows draft progress after Draft is clicked on an undrafted ticket (missionId null)', async () => {

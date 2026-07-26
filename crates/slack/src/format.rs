@@ -208,6 +208,8 @@ pub struct TicketDetail {
     pub blocked_by: Vec<String>,
     /// Clarifying questions the orchestrator appended (empty when none).
     pub needs_context: Vec<String>,
+    /// The planner's wrong-plan escalation reason (`None` when none).
+    pub wrong_plan: Option<String>,
 }
 
 /// Canonical pipeline stages, mirrored from
@@ -218,6 +220,9 @@ pub enum PipelineStage {
     Captured,
     Drafting,
     NeedsYou,
+    /// Draft-stage wrong-plan escalation: parked for the operator like
+    /// [`NeedsYou`], but a distinct stage everywhere it renders.
+    WrongPlan,
     Reviewable,
     Queued,
     Running,
@@ -228,10 +233,11 @@ pub enum PipelineStage {
 }
 
 impl PipelineStage {
-    pub const ALL: [PipelineStage; 10] = [
+    pub const ALL: [PipelineStage; 11] = [
         PipelineStage::Captured,
         PipelineStage::Drafting,
         PipelineStage::NeedsYou,
+        PipelineStage::WrongPlan,
         PipelineStage::Reviewable,
         PipelineStage::Queued,
         PipelineStage::Running,
@@ -246,6 +252,7 @@ impl PipelineStage {
             PipelineStage::Captured => "captured",
             PipelineStage::Drafting => "drafting",
             PipelineStage::NeedsYou => "needs-you",
+            PipelineStage::WrongPlan => "wrong-plan",
             PipelineStage::Reviewable => "reviewable",
             PipelineStage::Queued => "queued",
             PipelineStage::Running => "running",
@@ -1162,7 +1169,7 @@ pub fn build_ticket_list(rows: &[TicketRow]) -> Vec<Value> {
 }
 
 /// `/kranz ticket show <slug>` reply: title/goal/state/blocked-by plus any
-/// needs-context questions.
+/// needs-context questions and any wrong-plan escalation reason.
 pub fn build_ticket_show(t: &TicketDetail) -> Vec<Value> {
     let mut body = format!("*State:* {}\n", t.state);
     if !t.blocked_by.is_empty() {
@@ -1184,6 +1191,16 @@ pub fn build_ticket_show(t: &TicketDetail) -> Vec<Value> {
             q.push('\n');
         }
         blocks.push(section(&clip(q.trim_end())));
+    }
+    if let Some(reason) = t
+        .wrong_plan
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+    {
+        blocks.push(section(&clip(&format!(
+            "*Wrong plan (planner escalation)*\n{reason}"
+        ))));
     }
     blocks
 }

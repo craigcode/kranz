@@ -16,37 +16,45 @@ use crate::types::*;
 impl MissionEngine {
     /// Demand the plan JSON (types::Plan, camelCase). Lenient parse with one
     /// retry demanding bare JSON; a plan parses to [`PlanRequest::Ready`]
-    /// (unapproved). When the retry ALSO answers with prose, the orchestrator
-    /// is simply not ready to emit (it wants answers first) — that text comes
-    /// back as [`PlanRequest::NotReady`], never as an error.
+    /// (unapproved). Beside the plan, the planner has two more voices: an
+    /// explicit `{"wrongPlan": "…"}` reply maps to [`PlanRequest::WrongPlan`]
+    /// (planner-initiated only, never inferred from prose), and when the
+    /// retry ALSO answers with prose, the orchestrator is simply not ready to
+    /// emit (it wants answers first) — that text comes back as
+    /// [`PlanRequest::NotReady`], never as an error.
     pub async fn request_plan(&mut self) -> Result<PlanRequest> {
         let message = format!(
             "Emit the plan now. Output ONLY a JSON object conforming exactly to this JSON \
-             Schema — no prose before or after:\n{}\n\n{}\n\n{}",
+             Schema — no prose before or after:\n{}\n\n{}\n\n{}\n\n{}",
             plan_schema(),
             considered_alternatives_prompt_policy(&self.state.config),
-            research_prompt_policy(&self.state.config)
+            research_prompt_policy(&self.state.config),
+            WRONG_PLAN_PROMPT_CHANNEL
         );
         let text = self.orch_turn(&message).await?;
         if let Some(plan) = runner::parse_report::<Plan>(&text) {
             self.pending_research = extract_research(&text);
             return Ok(PlanRequest::Ready(plan));
         }
-        let retry = self.orch_turn(JSON_RETRY_MSG).await?;
-        match runner::parse_report::<Plan>(&retry) {
-            Some(plan) => {
-                self.pending_research = extract_research(&retry);
-                Ok(PlanRequest::Ready(plan))
-            }
-            // Prefer the retry's text (the model's latest word); fall back to
-            // the first turn's when the retry came back empty. Both are
-            // already scrubbed by pump_turn.
-            None => Ok(PlanRequest::NotReady(if retry.trim().is_empty() {
-                text
-            } else {
-                retry
-            })),
+        if let Some(reason) = parse_wrong_plan(&text) {
+            return Ok(PlanRequest::WrongPlan { reason });
         }
+        let retry = self.orch_turn(JSON_RETRY_MSG).await?;
+        if let Some(plan) = runner::parse_report::<Plan>(&retry) {
+            self.pending_research = extract_research(&retry);
+            return Ok(PlanRequest::Ready(plan));
+        }
+        if let Some(reason) = parse_wrong_plan(&retry) {
+            return Ok(PlanRequest::WrongPlan { reason });
+        }
+        // Prefer the retry's text (the model's latest word); fall back to
+        // the first turn's when the retry came back empty. Both are
+        // already scrubbed by pump_turn.
+        Ok(PlanRequest::NotReady(if retry.trim().is_empty() {
+            text
+        } else {
+            retry
+        }))
     }
 
     /// Propose a REVISED plan for the not-yet-complete work of a running or
@@ -56,7 +64,9 @@ impl MissionEngine {
     /// then the revised remainder). Reuses the streaming orchestrator, the
     /// lenient JSON parse, and the [`PlanRequest`] `Ready`/`NotReady` enum
     /// exactly like [`Self::request_plan`]; prose (the orchestrator wants to
-    /// discuss first) comes back as `NotReady`, never an error.
+    /// discuss first) comes back as `NotReady`, never an error. The draft-stage
+    /// wrong-plan escalation is NOT offered on this prompt: a `wrongPlan` reply
+    /// here just fails plan parsing and degrades to `NotReady`.
     ///
     /// This only PROPOSES; [`Self::approve_revised_plan`] validates and applies
     /// the subset the event vocabulary can express (see the contract note
@@ -111,6 +121,35 @@ impl MissionEngine {
                 retry
             })),
         }
+    }
+}
+
+/// The third planner voice offered on the plan-request turn's prompt, one
+/// sentence: beside plan JSON and prose questions, the planner may escalate
+/// "I can produce a plan, but it is likely WRONG". Always planner-initiated
+/// via this exact JSON shape — never inferred from prose.
+const WRONG_PLAN_PROMPT_CHANNEL: &str = "If you can produce a plan but believe it is likely \
+     WRONG — the goal is misframed, the premise is broken, the spec is confidently off — \
+     respond with ONLY {\"wrongPlan\": \"<one-paragraph reason>\"}.";
+
+/// Wire shape of the planner-initiated wrong-plan escalation reply.
+#[derive(serde::Deserialize)]
+struct WrongPlanReply {
+    #[serde(rename = "wrongPlan")]
+    wrong_plan: String,
+}
+
+/// The wrong-plan escalation, iff `text` parses (leniently, exactly like a
+/// plan reply) as JSON carrying a non-empty `wrongPlan` string. Prose that
+/// merely TALKS about the plan being wrong is never an escalation: no JSON
+/// `wrongPlan` key, no variant.
+fn parse_wrong_plan(text: &str) -> Option<String> {
+    let reply = runner::parse_report::<WrongPlanReply>(text)?;
+    let reason = reply.wrong_plan.trim();
+    if reason.is_empty() {
+        None
+    } else {
+        Some(reason.to_string())
     }
 }
 

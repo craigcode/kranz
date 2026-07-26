@@ -196,6 +196,21 @@ async fn cmd_exec_with_backend(
             );
             return Ok(EXIT_UNDERSPECIFIED);
         }
+        PlanRequest::WrongPlan { reason } => {
+            // The planner CAN plan but judges the plan likely wrong — the same
+            // "cannot proceed headlessly" class as underspecified (exit 3),
+            // with the escalation reason on stderr for the CI log.
+            eprintln!(
+                "kranz exec: the planner escalated — it can produce a plan but believes it \
+                 is likely WRONG. Reframe {} and re-run:\n  {reason}",
+                file.display()
+            );
+            println!(
+                "kranz exec {mission_id} WRONG-PLAN cost=${:.2} branch=-",
+                engine.state().total_cost_usd
+            );
+            return Ok(EXIT_UNDERSPECIFIED);
+        }
     };
 
     // Auto-approve: commits plan.json/plan.md on the mission branch.
@@ -494,6 +509,9 @@ mod tests {
         let plan = match request {
             PlanRequest::Ready(plan) => plan,
             PlanRequest::NotReady(text) => panic!("expected a ready plan, got: {text}"),
+            PlanRequest::WrongPlan { reason } => {
+                panic!("expected a ready plan, got a wrong-plan escalation: {reason}")
+            }
         };
         engine.approve_plan(plan).unwrap();
         let branch = engine.state().mission.mission_branch.clone();

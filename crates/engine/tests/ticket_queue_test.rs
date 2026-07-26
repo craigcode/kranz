@@ -376,6 +376,89 @@ fn append_needs_context_truncates_multibyte_on_char_boundary() {
 }
 
 // ---------------------------------------------------------------------------
+// Wrong-plan escalation state (draft-stage "this plan is likely wrong")
+// ---------------------------------------------------------------------------
+
+#[test]
+fn append_wrong_plan_mutates_md_and_status() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let dir = Ticket::tickets_dir(root);
+    fs::create_dir_all(&dir).unwrap();
+    let md = dir.join("feat.md");
+    fs::write(&md, "---\ntitle: Feature\n---\n\n## Goal\nDo the thing.\n").unwrap();
+
+    let reason = "The goal assumes a Postgres migration, but the store is SQLite.";
+    Ticket::append_wrong_plan(root, "feat", reason).unwrap();
+
+    // The markdown gained the escalation block, original content preserved.
+    let after = fs::read_to_string(&md).unwrap();
+    assert!(after.contains("## Wrong plan (from orchestrator)"));
+    assert!(after.contains(reason));
+    assert!(after.contains("## Goal"));
+    assert!(!after.contains("## Needs context (from orchestrator)"));
+
+    // The appended block re-parses as an ordinary (unknown) section.
+    let reparsed = Ticket::load(&md).unwrap();
+    assert_eq!(reparsed.goal, "Do the thing.");
+
+    // State flipped to WrongPlan and round-trips on the kebab-case wire.
+    assert_eq!(Ticket::read_state(root, "feat"), TicketState::WrongPlan);
+    let status = fs::read_to_string(dir.join("feat.status")).unwrap();
+    assert!(status.contains("\"wrong-plan\""), "kebab wire: {status}");
+    assert!(
+        status.contains(&format!("WRONG-PLAN: {reason}")),
+        "the note carries the prefixed reason: {status}"
+    );
+}
+
+#[test]
+fn append_wrong_plan_truncates_long_reason() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let dir = Ticket::tickets_dir(root);
+    fs::create_dir_all(&dir).unwrap();
+    let md = dir.join("feat.md");
+    fs::write(&md, "---\ntitle: Feature\n---\n\n## Goal\nDo the thing.\n").unwrap();
+
+    let long_reason = "a".repeat(5000);
+    Ticket::append_wrong_plan(root, "feat", &long_reason).unwrap();
+
+    let expected = format!("{} … (truncated)", "a".repeat(500));
+    let after = fs::read_to_string(&md).unwrap();
+    assert!(!after.contains(&long_reason));
+    assert!(after.contains(&expected));
+    // The .status note is bounded too.
+    let status = fs::read_to_string(dir.join("feat.status")).unwrap();
+    assert!(status.contains("WRONG-PLAN: "));
+    assert!(!status.contains(&long_reason));
+}
+
+#[test]
+fn wrong_plan_ticket_is_not_queueable() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let dir = Ticket::tickets_dir(root);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("wp.md"),
+        "---\ntitle: Feature\n---\n\n## Goal\nDo it.\n",
+    )
+    .unwrap();
+    Ticket::write_state(root, "wp", TicketState::WrongPlan, None).unwrap();
+
+    // The approve gate is a Review/Parked whitelist: a parked wrong-plan
+    // ticket names itself in the refusal, exactly like NeedsContext would.
+    let err = deps::approve_ticket(root, "wp", Some("m-x"), false).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("WRONG-PLAN"), "names the state: {msg}");
+    assert!(
+        msg.contains("only a REVIEW or PARKED ticket"),
+        "refuses queueing: {msg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Ticket listing
 // ---------------------------------------------------------------------------
 

@@ -65,6 +65,7 @@ pub fn ticket_state_label(state: TicketState) -> &'static str {
         TicketState::New => "NEW",
         TicketState::Drafting => "DRAFTING",
         TicketState::NeedsContext => "NEEDS-CONTEXT",
+        TicketState::WrongPlan => "WRONG-PLAN",
         TicketState::Review => "REVIEW",
         TicketState::Queued => "QUEUED",
         TicketState::Running => "RUNNING",
@@ -128,7 +129,8 @@ pub fn render_ticket_list(rows: &[TicketRow<'_>]) -> String {
 }
 
 /// Render `kranz ticket show <slug>`: the parsed ticket, its resolved
-/// terminal label, and any "needs context" block appended to the ticket body.
+/// terminal label, and any "needs context" / "wrong plan" block appended to
+/// the ticket body.
 pub fn render_ticket_show(ticket: &Ticket, label: &str) -> String {
     let mut out = String::new();
     out.push_str(&format!("ticket {} [{}]\n", ticket.slug, label));
@@ -170,7 +172,16 @@ pub fn render_ticket_show(ticket: &Ticket, label: &str) -> String {
 
     // The "needs context" questions are appended to the raw body by the engine;
     // surface them verbatim so `show` is enough to answer the ticket.
-    if let Some(block) = needs_context_block(&ticket.raw_body) {
+    if let Some(block) = section_block(&ticket.raw_body, "needs context") {
+        out.push('\n');
+        out.push_str(&block);
+        if !block.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    // Same for a draft-stage wrong-plan escalation: the planner's reason,
+    // verbatim, so `show` is enough to reframe or re-scope the ticket.
+    if let Some(block) = section_block(&ticket.raw_body, "wrong plan") {
         out.push('\n');
         out.push_str(&block);
         if !block.ends_with('\n') {
@@ -180,10 +191,11 @@ pub fn render_ticket_show(ticket: &Ticket, label: &str) -> String {
     out
 }
 
-/// Extract the `## Needs context (from orchestrator)` section (heading +
-/// following lines) from a ticket body, if present. Returns everything from
-/// that heading to the next `##` heading (or end of body).
-fn needs_context_block(body: &str) -> Option<String> {
+/// Extract a `## <heading>` section (heading + following lines) from a ticket
+/// body, matched case-insensitively by heading prefix (`"needs context"`,
+/// `"wrong plan"`). Returns everything from that heading to the next `##`
+/// heading (or end of body).
+fn section_block(body: &str, heading_prefix: &str) -> Option<String> {
     let mut lines = body.lines().peekable();
     let mut collecting = false;
     let mut out: Vec<&str> = Vec::new();
@@ -197,7 +209,7 @@ fn needs_context_block(body: &str) -> Option<String> {
                 .trim_start_matches('#')
                 .trim()
                 .to_ascii_lowercase()
-                .starts_with("needs context")
+                .starts_with(heading_prefix)
         {
             collecting = true;
         }
@@ -312,6 +324,8 @@ fn config_for_ticket(
 ///   Review (parked) or, with `--yes`, enqueue + set Queued.
 /// - NotReady → append the orchestrator's questions to the ticket and set
 ///   NeedsContext.
+/// - WrongPlan → append the planner's escalation reason to the ticket and set
+///   WrongPlan (parked for the operator; never queued).
 ///
 /// Only the orchestrator runs (no workers); spend is bounded by the
 /// orchestrator budget cap (per-ticket override applied).
@@ -349,9 +363,9 @@ pub async fn cmd_draft(
 
     let mission_branch = engine.state().mission.mission_branch.clone();
     // The checkout only ever moves in the Approve path (`approve_plan` checks
-    // out the mission branch to commit plan.md); NeedsContext never touches
-    // it, so — matching pre-hoist `cmd_draft` — only restore when a plan was
-    // produced. Drop the engine (flush + release the mission lock) first.
+    // out the mission branch to commit plan.md); NeedsContext/WrongPlan never
+    // touch it, so — matching pre-hoist `cmd_draft` — only restore when a plan
+    // was produced. Drop the engine (flush + release the mission lock) first.
     if let Some(plan) = &drive.plan {
         println!("{}", output::render_plan(plan));
         drop(engine);
@@ -371,6 +385,19 @@ pub async fn cmd_draft(
             }
             println!(
                 "answer them in {} then run `kranz draft {slug}` again.",
+                Ticket::tickets_dir(&repo)
+                    .join(format!("{slug}.md"))
+                    .display()
+            );
+        }
+        DraftOutcome::WrongPlan { mission_id, reason } => {
+            println!(
+                "ticket '{slug}' WRONG-PLAN escalation (mission {mission_id}) — the planner \
+                 can produce a plan but believes it is likely wrong:"
+            );
+            println!("  {reason}");
+            println!(
+                "edit or re-scope {} then run `kranz draft {slug}` again.",
                 Ticket::tickets_dir(&repo)
                     .join(format!("{slug}.md"))
                     .display()
@@ -827,6 +854,7 @@ mod tests {
             TicketState::New,
             TicketState::Drafting,
             TicketState::NeedsContext,
+            TicketState::WrongPlan,
             TicketState::Review,
             TicketState::Running,
             TicketState::Failed,

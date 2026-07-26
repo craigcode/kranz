@@ -492,6 +492,20 @@ fn draft_not_ready_single_line_becomes_one_question() {
 }
 
 #[test]
+fn draft_wrong_plan_maps_to_escalation_decision() {
+    let req = PlanRequest::WrongPlan {
+        reason: "the premise is broken".to_string(),
+    };
+    // The `--yes` flag never overrides a WrongPlan short-circuit either.
+    assert_eq!(
+        draft_decision(&req, true),
+        DraftDecision::WrongPlan {
+            reason: "the premise is broken".to_string()
+        }
+    );
+}
+
+#[test]
 fn ticket_state_for_mission_maps_terminal_status() {
     assert_eq!(
         ticket_state_for_mission(MissionStatus::Complete),
@@ -587,6 +601,44 @@ fn state_transitions_needs_context_appends_and_flags() {
         backlog::ticket_state_label(TicketState::NeedsContext),
     );
     assert!(shown.contains("what deps?"));
+}
+
+#[test]
+fn state_transitions_wrong_plan_appends_and_flags() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+    backlog::cmd_ticket_new(repo, "wrong", "Misframed", None).unwrap();
+
+    let DraftDecision::WrongPlan { reason } = draft_decision(
+        &PlanRequest::WrongPlan {
+            reason: "the goal is misframed".to_string(),
+        },
+        false,
+    ) else {
+        panic!("expected WrongPlan");
+    };
+    Ticket::append_wrong_plan(repo, "wrong", &reason).unwrap();
+
+    assert_eq!(Ticket::read_state(repo, "wrong"), TicketState::WrongPlan);
+    // The label is distinct from NEEDS-CONTEXT.
+    assert_eq!(
+        backlog::ticket_state_label(TicketState::WrongPlan),
+        "WRONG-PLAN"
+    );
+    // The reason was appended verbatim to the ticket body…
+    let reloaded = Ticket::load(&Ticket::tickets_dir(repo).join("wrong.md")).unwrap();
+    assert!(reloaded
+        .raw_body
+        .contains("## Wrong plan (from orchestrator)"));
+    assert!(reloaded.raw_body.contains("the goal is misframed"));
+    // …and `show` surfaces both the label and the reason.
+    let shown = render_ticket_show(
+        &reloaded,
+        backlog::ticket_state_label(TicketState::WrongPlan),
+    );
+    assert!(shown.contains("[WRONG-PLAN]"));
+    assert!(shown.contains("## Wrong plan (from orchestrator)"));
+    assert!(shown.contains("the goal is misframed"));
 }
 
 #[test]

@@ -5,9 +5,10 @@
 //! [`drive_draft`] owns the engine call order — `write_state(Drafting)` →
 //! `record_mission` → `planning_turn` (seeded with the whole ticket) →
 //! `request_plan` → branch on the result — and the terminal filesystem/queue
-//! side effects ([`Ticket::append_needs_context`], `approve_plan`,
-//! `queue::enqueue`). It does not print anything and does not touch the
-//! operator's git checkout; both stay with the caller.
+//! side effects ([`Ticket::append_needs_context`],
+//! [`Ticket::append_wrong_plan`], `approve_plan`, `queue::enqueue`). It does
+//! not print anything and does not touch the operator's git checkout; both
+//! stay with the caller.
 
 use crate::error::Result;
 use crate::orchestrator::{MissionEngine, PlanRequest};
@@ -34,6 +35,10 @@ pub enum DraftDecision {
     /// Orchestrator wants answers first: append its questions to the ticket
     /// and set `NeedsContext`. Short-circuits before any approval.
     NeedsContext { questions: Vec<String> },
+    /// Planner-initiated escalation: it CAN plan but believes the plan is
+    /// likely wrong. Append the reason to the ticket and set `WrongPlan`.
+    /// Short-circuits before any approval; `--yes` never overrides it.
+    WrongPlan { reason: String },
 }
 
 /// Map a completed plan request + the `--yes` flag to the next action. Pure:
@@ -50,6 +55,9 @@ pub fn draft_decision(request: &PlanRequest, yes: bool) -> DraftDecision {
         },
         PlanRequest::NotReady(text) => DraftDecision::NeedsContext {
             questions: split_questions(text),
+        },
+        PlanRequest::WrongPlan { reason } => DraftDecision::WrongPlan {
+            reason: reason.clone(),
         },
     }
 }
@@ -124,6 +132,10 @@ pub enum DraftOutcome {
         mission_id: String,
         questions: Vec<String>,
     },
+    /// The planner escalated: it can produce a plan but believes it is
+    /// likely wrong (ticket set to [`TicketState::WrongPlan`], reason
+    /// appended to the ticket body, `.status` note prefixed `WRONG-PLAN: `).
+    WrongPlan { mission_id: String, reason: String },
     /// The orchestrator produced a plan but emitted it as prose instead of
     /// through the plan channel, and a bounded retry did not recover it. No
     /// plan JSON is filed to the ticket body; the ticket is parked in
@@ -142,7 +154,7 @@ pub struct DraftDrive {
     /// The orchestrator's session-start reply, captured before `request_plan`.
     pub seed_reply: Option<String>,
     /// The approved plan, cloned before it was moved into `approve_plan`.
-    /// `None` on the `NeedsContext` path.
+    /// `None` on the `NeedsContext`, `WrongPlan`, and `PlanAsProse` paths.
     pub plan: Option<Plan>,
 }
 
@@ -230,6 +242,14 @@ pub async fn drive_draft(
                     mission_id,
                     questions,
                 },
+                seed_reply,
+                plan: None,
+            })
+        }
+        DraftDecision::WrongPlan { reason } => {
+            Ticket::append_wrong_plan(repo, slug, &reason)?;
+            Ok(DraftDrive {
+                outcome: DraftOutcome::WrongPlan { mission_id, reason },
                 seed_reply,
                 plan: None,
             })

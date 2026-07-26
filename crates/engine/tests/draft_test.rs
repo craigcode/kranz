@@ -6,7 +6,7 @@
 use kranz_engine::backend::AgentBackend;
 use kranz_engine::backend_mock::{mock_init, mock_result_text, mock_text, MockScript};
 use kranz_engine::draft::{drive_draft, looks_like_plan_json, DraftOutcome};
-use kranz_engine::orchestrator::MissionEngine;
+use kranz_engine::orchestrator::{MissionEngine, PlanRequest};
 use kranz_engine::queue;
 use kranz_engine::ticket::{Ticket, TicketState};
 use kranz_engine::types::{MissionConfig, WorkerIsolation};
@@ -453,4 +453,238 @@ async fn plan_as_prose_persists_through_retry_yields_honest_outcome() {
     let status_path = Ticket::tickets_dir(&root).join("rl6.status");
     let status = std::fs::read_to_string(&status_path).unwrap();
     assert!(status.contains("emitted it as prose"));
+}
+
+// ---------------------------------------------------------------------------
+// WrongPlan escalation — the planner's third voice (planner-initiated only)
+// ---------------------------------------------------------------------------
+
+fn wrong_plan_json(reason: &str) -> String {
+    json!({ "wrongPlan": reason }).to_string()
+}
+
+const WRONG_PLAN_REASON: &str = "The goal assumes a Postgres migration, but the store is \
+SQLite — any plan built on that premise is confidently wrong.";
+
+#[tokio::test]
+async fn wrong_plan_reply_parks_ticket_with_reason() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let ticket = write_ticket(&root, "wp", TICKET_BODY);
+
+    let goal = ticket.mission_goal();
+    // The escalation lands on the FIRST plan-request attempt — no JSON retry.
+    let backend: Arc<dyn AgentBackend> =
+        Arc::new(MockBackend::with_scripts(vec![orch_script(vec![
+            "seeded, thinking...".to_string(),
+            wrong_plan_json(WRONG_PLAN_REASON),
+        ])]));
+    let mut engine = MissionEngine::create(backend, root.clone(), &goal, test_cfg()).unwrap();
+    let mission_id = engine.mission_id().to_string();
+
+    let drive = drive_draft(&mut engine, &root, &ticket, false)
+        .await
+        .unwrap();
+
+    match &drive.outcome {
+        DraftOutcome::WrongPlan {
+            mission_id: out_id,
+            reason,
+        } => {
+            assert_eq!(out_id, &mission_id);
+            assert_eq!(reason, WRONG_PLAN_REASON);
+        }
+        other => panic!("expected WrongPlan, got {other:?}"),
+    }
+    assert_eq!(Ticket::read_state(&root, "wp"), TicketState::WrongPlan);
+    assert!(
+        drive.plan.is_none(),
+        "WrongPlan path must not surface a plan"
+    );
+    assert!(
+        !queue::contains(&root, &mission_id),
+        "a wrong-plan escalation never enqueues"
+    );
+
+    // The ticket body carries the escalation section…
+    let path = Ticket::tickets_dir(&root).join("wp.md");
+    let body = std::fs::read_to_string(&path).unwrap();
+    assert!(body.contains("## Wrong plan (from orchestrator)"));
+    assert!(body.contains(WRONG_PLAN_REASON));
+    assert!(
+        !body.contains("## Needs context (from orchestrator)"),
+        "a wrong-plan escalation is not a needs-context park"
+    );
+
+    // …and the .status note carries the reason with the WRONG-PLAN prefix,
+    // under the kebab-case wire state.
+    let status = std::fs::read_to_string(Ticket::tickets_dir(&root).join("wp.status")).unwrap();
+    assert!(
+        status.contains("\"wrong-plan\""),
+        "kebab wire state: {status}"
+    );
+    assert!(
+        status.contains(&format!("WRONG-PLAN: {WRONG_PLAN_REASON}")),
+        "note carries the prefixed reason: {status}"
+    );
+}
+
+#[tokio::test]
+async fn wrong_plan_on_the_json_retry_also_escalates() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let ticket = write_ticket(&root, "wp2", TICKET_BODY);
+
+    let goal = ticket.mission_goal();
+    // First attempt is prose (triggers the JSON-only retry); the retry carries
+    // the escalation JSON.
+    let backend: Arc<dyn AgentBackend> =
+        Arc::new(MockBackend::with_scripts(vec![orch_script(vec![
+            "seeded, thinking...".to_string(),
+            "hmm, something is off here".to_string(),
+            wrong_plan_json(WRONG_PLAN_REASON),
+        ])]));
+    let mut engine = MissionEngine::create(backend, root.clone(), &goal, test_cfg()).unwrap();
+
+    let drive = drive_draft(&mut engine, &root, &ticket, false)
+        .await
+        .unwrap();
+
+    match &drive.outcome {
+        DraftOutcome::WrongPlan { reason, .. } => assert_eq!(reason, WRONG_PLAN_REASON),
+        other => panic!("expected WrongPlan, got {other:?}"),
+    }
+    assert_eq!(Ticket::read_state(&root, "wp2"), TicketState::WrongPlan);
+}
+
+#[tokio::test]
+async fn wrong_plan_is_never_inferred_from_prose() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let ticket = write_ticket(&root, "wp3", TICKET_BODY);
+
+    let goal = ticket.mission_goal();
+    // Prose that TALKS about the plan being wrong — no {"wrongPlan": …} JSON —
+    // stays a plain not-ready reply: the escalation is planner-initiated via
+    // the JSON channel only.
+    let backend: Arc<dyn AgentBackend> =
+        Arc::new(MockBackend::with_scripts(vec![orch_script(vec![
+            "seeded, thinking...".to_string(),
+            "I can draft this, but honestly the goal seems misframed — the premise may be \
+             broken."
+                .to_string(),
+            "still concerned the spec is confidently off".to_string(),
+        ])]));
+    let mut engine = MissionEngine::create(backend, root.clone(), &goal, test_cfg()).unwrap();
+
+    let drive = drive_draft(&mut engine, &root, &ticket, false)
+        .await
+        .unwrap();
+
+    match &drive.outcome {
+        DraftOutcome::NeedsContext { .. } => {}
+        other => panic!("prose must degrade to NeedsContext, never WrongPlan: {other:?}"),
+    }
+    assert_eq!(Ticket::read_state(&root, "wp3"), TicketState::NeedsContext);
+}
+
+#[tokio::test]
+async fn request_plan_maps_wrong_plan_json_to_the_variant() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let ticket = write_ticket(&root, "wp4", TICKET_BODY);
+
+    let goal = ticket.mission_goal();
+    let backend: Arc<dyn AgentBackend> =
+        Arc::new(MockBackend::with_scripts(vec![orch_script(vec![
+            "seeded, thinking...".to_string(),
+            wrong_plan_json(WRONG_PLAN_REASON),
+        ])]));
+    let mut engine = MissionEngine::create(backend, root.clone(), &goal, test_cfg()).unwrap();
+    engine.planning_turn(&goal).await.unwrap();
+
+    match engine.request_plan().await.unwrap() {
+        PlanRequest::WrongPlan { reason } => assert_eq!(reason, WRONG_PLAN_REASON),
+        PlanRequest::Ready(plan) => panic!("escalation JSON must not parse as a plan: {plan:?}"),
+        PlanRequest::NotReady(text) => panic!("escalation JSON must not degrade to prose: {text}"),
+    }
+}
+
+#[tokio::test]
+async fn request_plan_still_parses_plan_json_as_ready() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let ticket = write_ticket(&root, "wp5", TICKET_BODY);
+
+    let goal = ticket.mission_goal();
+    let backend: Arc<dyn AgentBackend> =
+        Arc::new(MockBackend::with_scripts(vec![orch_script(vec![
+            "seeded, thinking...".to_string(),
+            plan_json(&goal),
+        ])]));
+    let mut engine = MissionEngine::create(backend, root.clone(), &goal, test_cfg()).unwrap();
+    engine.planning_turn(&goal).await.unwrap();
+
+    match engine.request_plan().await.unwrap() {
+        PlanRequest::Ready(plan) => assert_eq!(plan.goal, goal),
+        PlanRequest::WrongPlan { reason } => {
+            panic!("plan JSON must never map to the escalation: {reason}")
+        }
+        PlanRequest::NotReady(text) => panic!("scripted plan JSON must parse, got: {text}"),
+    }
+}
+
+#[tokio::test]
+async fn redraft_after_wrong_plan_is_accepted() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let ticket = write_ticket(&root, "wp6", TICKET_BODY);
+
+    // First draft: the planner escalates.
+    let goal = ticket.mission_goal();
+    let backend: Arc<dyn AgentBackend> =
+        Arc::new(MockBackend::with_scripts(vec![orch_script(vec![
+            "seeded, thinking...".to_string(),
+            wrong_plan_json(WRONG_PLAN_REASON),
+        ])]));
+    let mut engine = MissionEngine::create(backend, root.clone(), &goal, test_cfg()).unwrap();
+    let drive = drive_draft(&mut engine, &root, &ticket, false)
+        .await
+        .unwrap();
+    assert!(matches!(drive.outcome, DraftOutcome::WrongPlan { .. }));
+    assert_eq!(Ticket::read_state(&root, "wp6"), TicketState::WrongPlan);
+    drop(engine);
+
+    // Re-draft (a fresh mission, exactly like re-drafting a needs-context
+    // ticket): the ticket body now carries the escalation section, and the new
+    // planner returns a plan — parked in Review like any ready draft.
+    let ticket = Ticket::load(&Ticket::tickets_dir(&root).join("wp6.md")).unwrap();
+    let goal = ticket.mission_goal();
+    let backend: Arc<dyn AgentBackend> =
+        Arc::new(MockBackend::with_scripts(vec![orch_script(vec![
+            "seeded, thinking...".to_string(),
+            plan_json(&goal),
+        ])]));
+    let mut engine = MissionEngine::create(backend, root.clone(), &goal, test_cfg()).unwrap();
+    let drive = drive_draft(&mut engine, &root, &ticket, false)
+        .await
+        .unwrap();
+    assert!(
+        matches!(drive.outcome, DraftOutcome::ParkedForReview { .. }),
+        "re-draft of a wrong-plan ticket is accepted: {:?}",
+        drive.outcome
+    );
+    assert_eq!(Ticket::read_state(&root, "wp6"), TicketState::Review);
 }

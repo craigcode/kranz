@@ -488,7 +488,10 @@ impl MissionHost {
                     "calibration": { "missionsUsed": calibration.missions_used },
                 }))
             }
-            PlanRequest::NotReady(reply) => {
+            PlanRequest::NotReady(reply) | PlanRequest::WrongPlan { reason: reply } => {
+                // A wrong-plan escalation reaches this interactive surface as
+                // the planner's reason text, exactly like a not-ready reply —
+                // the ticket-parking side effect is the draft flow's job.
                 Ok(json!({ "ready": false, "reply": prepend_seed(seed, reply) }))
             }
         }
@@ -1784,6 +1787,11 @@ fn draft_outcome_json(outcome: &DraftOutcome) -> Value {
             "outcome": "needsContext",
             "missionId": mission_id,
             "questions": questions,
+        }),
+        DraftOutcome::WrongPlan { mission_id, reason } => json!({
+            "outcome": "wrongPlan",
+            "missionId": mission_id,
+            "reason": reason,
         }),
     }
 }

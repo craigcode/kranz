@@ -197,7 +197,9 @@ fn repo_activity(repo_root: &Path) -> RepoActivity {
         match Ticket::read_state(repo_root, &ticket.slug) {
             TicketState::Queued => activity.queued += 1,
             TicketState::Running => activity.running += 1,
-            TicketState::NeedsContext => activity.needs_input += 1,
+            // NeedsContext and the wrong-plan escalation are both parked
+            // awaiting the operator — one "needs input" count.
+            TicketState::NeedsContext | TicketState::WrongPlan => activity.needs_input += 1,
             TicketState::Failed => activity.failed += 1,
             TicketState::Done
                 if mission_id.is_some()

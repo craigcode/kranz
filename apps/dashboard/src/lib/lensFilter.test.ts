@@ -3,7 +3,7 @@ import { filterLensRows, landedCount, LENSES, type LensRow } from './lensFilter'
 import type { WorkItem } from './pipelineStage';
 
 function ticketRow(
-  state: 'new' | 'drafting' | 'needs-context' | 'review' | 'queued' | 'running' | 'done' | 'failed',
+  state: 'new' | 'drafting' | 'needs-context' | 'wrong-plan' | 'review' | 'queued' | 'running' | 'done' | 'failed',
   opts?: { mission?: { status: any; merged: boolean | null }; missionCreatedAt?: string },
 ): LensRow {
   const item: WorkItem = { kind: 'ticket', ticket: { slug: 't-1', state }, mission: opts?.mission };
@@ -42,16 +42,17 @@ describe('filterLensRows - actionable', () => {
   it('actionable excludes landed and abandoned', () => {
     const captured = ticketRow('new');
     const needsYou = ticketRow('needs-context');
+    const wrongPlan = ticketRow('wrong-plan');
     const reviewable = ticketRow('review');
     const delivered = ticketRow('done', { mission: { status: 'complete', merged: false } });
     const failed = ticketRow('failed');
     const landed = ticketRow('done');
     const abandoned = missionRow('abandoned');
 
-    const rows = [captured, needsYou, reviewable, delivered, failed, landed, abandoned];
+    const rows = [captured, needsYou, wrongPlan, reviewable, delivered, failed, landed, abandoned];
     const result = filterLensRows(rows, 'actionable');
 
-    expect(result).toEqual([captured, needsYou, reviewable, delivered, failed]);
+    expect(result).toEqual([captured, needsYou, wrongPlan, reviewable, delivered, failed]);
   });
 });
 

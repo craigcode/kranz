@@ -766,6 +766,16 @@ async fn cmd_plan(
                         );
                         continue;
                     }
+                    Ok(PlanRequest::WrongPlan { reason }) => {
+                        // Planner-initiated escalation, not an error: it can
+                        // plan but believes the plan is likely wrong.
+                        print_orchestrator_reply(&reason, tty);
+                        println!(
+                            "the orchestrator believes a plan here is likely WRONG — reframe \
+                             the goal or fix the premise above, then /plan again."
+                        );
+                        continue;
+                    }
                     Err(e) => {
                         eprintln!(
                             "kranz: plan request failed: {:#}",
@@ -3277,6 +3287,9 @@ mod tests {
         let plan = match request {
             PlanRequest::Ready(plan) => plan,
             PlanRequest::NotReady(text) => panic!("expected a ready plan, got: {text}"),
+            PlanRequest::WrongPlan { reason } => {
+                panic!("expected a ready plan, got a wrong-plan escalation: {reason}")
+            }
         };
         engine.approve_plan(plan).unwrap();
         drop(engine);

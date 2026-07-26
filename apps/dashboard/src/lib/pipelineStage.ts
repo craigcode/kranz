@@ -1,6 +1,6 @@
 // Stage-derivation model for the pipeline view — docs/scoping/pipeline-view.md
 // "The stage model". One row of the pipeline table always reduces to exactly
-// one of these nine stages, derived from ticket + (optionally joined) mission
+// one of these stages, derived from ticket + (optionally joined) mission
 // state. Surfaces render this model, never raw ticket/mission states.
 
 import type { MissionStatus, TicketState } from './types';
@@ -9,6 +9,7 @@ export type PipelineStage =
   | 'captured'
   | 'drafting'
   | 'needs-you'
+  | 'wrong-plan'
   | 'reviewable'
   | 'queued'
   | 'running'
@@ -62,7 +63,7 @@ function stageFromMission(mission: WorkItemMission): PipelineStage {
   return 'abandoned';
 }
 
-/** Pure derivation: WorkItem -> one of the nine canonical pipeline stages. */
+/** Pure derivation: WorkItem -> one of the canonical pipeline stages. */
 export function pipelineStage(item: WorkItem): PipelineStage {
   if (item.kind === 'mission') {
     return stageFromMission(item.mission);
@@ -78,6 +79,10 @@ export function pipelineStage(item: WorkItem): PipelineStage {
       return 'drafting';
     case 'needs-context':
       return 'needs-you';
+    case 'wrong-plan':
+      // Planner's draft-stage escalation: parked for the operator like
+      // needs-you, but a distinct stage everywhere it renders.
+      return 'wrong-plan';
     case 'review':
       return 'reviewable';
     case 'queued':
@@ -113,6 +118,7 @@ const PRIMARY_ACTIONS: Record<PipelineStage, ActionDescriptor | null> = {
   captured: { label: 'Draft' },
   drafting: null,
   'needs-you': { label: 'Answer + redraft' },
+  'wrong-plan': { label: 'Edit + redraft' },
   reviewable: { label: 'Queue', secondary: 'Reshape' },
   queued: null,
   running: null,

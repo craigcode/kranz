@@ -1145,6 +1145,9 @@ async fn approve_revised_plan_untouched_primary_in_worktree_mode() {
         kranz_engine::orchestrator::PlanRequest::NotReady(text) => {
             panic!("scripted revised plan must parse: {text}")
         }
+        kranz_engine::orchestrator::PlanRequest::WrongPlan { reason } => {
+            panic!("scripted revised plan must parse, got a wrong-plan escalation: {reason}")
+        }
     };
 
     // Snapshot the primary checkout right before the call under test.

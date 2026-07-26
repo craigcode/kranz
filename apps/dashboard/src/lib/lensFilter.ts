@@ -21,6 +21,7 @@ export interface LensRow {
 const ACTIONABLE_STAGES: ReadonlySet<PipelineStage> = new Set([
   'captured',
   'needs-you',
+  'wrong-plan',
   'reviewable',
   'delivered',
   'failed',

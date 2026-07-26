@@ -1,12 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { pipelineStage, primaryAction, type WorkItem, type PipelineStage } from './pipelineStage';
 
-function ticket(state: 'new' | 'drafting' | 'needs-context' | 'review' | 'queued' | 'running' | 'done' | 'failed' | 'parked'): WorkItem {
+function ticket(state: 'new' | 'drafting' | 'needs-context' | 'wrong-plan' | 'review' | 'queued' | 'running' | 'done' | 'failed' | 'parked'): WorkItem {
   return { kind: 'ticket', ticket: { slug: 't-1', state } };
 }
 
 function ticketWithMission(
-  state: 'new' | 'drafting' | 'needs-context' | 'review' | 'queued' | 'running' | 'done' | 'failed' | 'parked',
+  state: 'new' | 'drafting' | 'needs-context' | 'wrong-plan' | 'review' | 'queued' | 'running' | 'done' | 'failed' | 'parked',
   mission: { status: any; merged: boolean | null },
 ): WorkItem {
   return { kind: 'ticket', ticket: { slug: 't-1', state }, mission };
@@ -21,6 +21,7 @@ describe('pipelineStage', () => {
     expect(pipelineStage(ticket('new'))).toBe('captured');
     expect(pipelineStage(ticket('drafting'))).toBe('drafting');
     expect(pipelineStage(ticket('needs-context'))).toBe('needs-you');
+    expect(pipelineStage(ticket('wrong-plan'))).toBe('wrong-plan');
     expect(pipelineStage(ticket('review'))).toBe('reviewable');
     expect(pipelineStage(ticket('queued'))).toBe('queued');
   });
@@ -115,12 +116,19 @@ describe('pipelineStage', () => {
       'needs-you',
     );
   });
+
+  it('a wrong-plan ticket with a joined planning mission stays wrong-plan', () => {
+    expect(pipelineStage(ticketWithMission('wrong-plan', { status: 'planning', merged: null }))).toBe(
+      'wrong-plan',
+    );
+  });
 });
 
 describe('primaryAction', () => {
   const cases: Array<[PipelineStage, string, string | undefined]> = [
     ['captured', 'Draft', undefined],
     ['needs-you', 'Answer + redraft', undefined],
+    ['wrong-plan', 'Edit + redraft', undefined],
     ['reviewable', 'Queue', 'Reshape'],
     ['delivered', 'Merge', 'Iterate'],
     ['landed', 'Iterate', undefined],

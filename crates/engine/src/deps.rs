@@ -197,6 +197,7 @@ fn ticket_state_label(state: TicketState) -> &'static str {
         TicketState::New => "NEW",
         TicketState::Drafting => "DRAFTING",
         TicketState::NeedsContext => "NEEDS-CONTEXT",
+        TicketState::WrongPlan => "WRONG-PLAN",
         TicketState::Review => "REVIEW",
         TicketState::Queued => "QUEUED",
         TicketState::Running => "RUNNING",
