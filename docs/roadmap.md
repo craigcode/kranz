@@ -173,7 +173,11 @@ Design changes required (eyes open):
   only" via a deploy key/GitHub App — never main, never merges; the human
   still reviews. Locally the rule stands unchanged.
 - **Auth grows up**: token required on reads too (transcripts are source
-  code), TLS via platform, `ANTHROPIC_API_KEY` instead of local OAuth.
+  code), TLS via platform, `ANTHROPIC_API_KEY` instead of local OAuth; a
+  hosted serve adds step-up (passkey/WebAuthn) re-auth on spend-adjacent
+  verbs (approve/start/queue) — a compromised token must not be enough to
+  drive autonomous spend (Amp "Proof of Human" precedent,
+  docs/reviews/ampcode.md §4).
 - **Workspace contract + provider seam**: a tracked, base-branch-owned
   workspace contract describes bootstrap, services, health checks, dynamic
   ports, data clone/reset, previews, and secret *names* (never values).
@@ -197,13 +201,15 @@ from browser conversation to COMPLETE with no local Kranz install; a human
 can open declared previews or take over the same workspace; and a leaked
 dashboard URL without the token reveals nothing and mutates nothing.
 
-## M7 — Worker sandboxing ◑ (tiers 1–2 shipped; container provider and live cross-platform proof remain)
+## M7 — Worker sandboxing ◑ (tiers 1–3 shipped; live cross-platform proof remains)
 
 Containment now includes dedicated worktrees, out-of-contract write auditing,
-environment hygiene, macOS Seatbelt `enforce: "fs"`, and Linux bubblewrap
-`enforce: "fs" | "fs+net"` with fail-closed platform/preflight behavior.
-macOS hostname egress cannot be honestly enforced by Seatbelt, Windows parity
-and the container workspace provider remain open. The sandbox still
+environment hygiene, macOS Seatbelt `enforce: "fs"`, Linux bubblewrap
+`enforce: "fs" | "fs+net"` with fail-closed platform/preflight behavior, the
+tier-3 container provider, and per-host egress enforcement via the filtering
+egress proxy (`fs+net` on macOS routes loopback-only Seatbelt egress through
+it; structured denials surface on `RunOutcome` for the 3.3b grant flow).
+Windows parity and live cross-platform proof remain open. The sandbox still
 complements scrutiny: it bounds what CAN happen; validators judge what DID.
 
 Done when: a deliberately hostile brief under `enforce: "fs+net"` leaves zero
@@ -254,7 +260,7 @@ repos operate from one Slack workspace with unambiguous routing; and a
 brand-new repo's first mission runs with no hand-editing beyond
 `kranz init` answers.
 
-## Product pattern notes from Warp/Oz/Factory (2026-07-08), Cursor (2026-07-09), Monaco (2026-07-10), and Mission Control (2026-07-13)
+## Product pattern notes from Warp/Oz/Factory (2026-07-08), Cursor (2026-07-09), Monaco (2026-07-10), Mission Control (2026-07-13), and Amp (2026-07-27)
 
 External scan: Warp Agent/Oz and Factory's Droid/AutoWiki surfaces are useful
 as UX/product benchmarks, not architecture targets. Cursor is now a stronger
@@ -265,6 +271,22 @@ The broad "agentic IDE" lane (terminal replacement, built-in editor/LSP,
 voice, general local coding environment) still belongs to the sgian side
 product, not kranz. The kranz-compatible lessons are narrower and should
 reinforce the mission/audit/gate model:
+
+Amp (ampcode.com, reviewed 2026-07-27 — full verdicts in
+docs/reviews/ampcode.md) sharpens the boundary from the frontier side.
+Post-Sourcegraph spin-out it sells hosted unsupervised agents ("orbs"),
+event-driven wake-ups, agent-to-agent spawning, and a Slack surface — with
+default-allow tools, direct-to-main shipping, and no plan gate, all by
+stated policy. It contests the autonomous-platform lane alongside Cursor
+and Factory while vacating the consent/audit/validation lane kranz holds;
+its own walk-backs (public thread sharing killed over leak-review risk,
+passkey step-up added against compromised accounts driving agents) confirm
+that lane is real. The borrow list is small and concrete: cross-provider
+scrutiny defaults, repo-owned `.kranz/checks/` review checks, a
+runaway-rate calibration metric, OIDC workload identity + authenticated
+previews for M6 remote workspaces, and passkey step-up on hosted spend
+verbs. Its orb lifecycle validates the accepted workspace-contract D-A…D-H
+nearly field-for-field.
 
 AgentSystemLabs Mission Control reinforces the same boundary from the other
 side: it is a polished desktop PTY/session manager, not a mission-validation
@@ -327,7 +349,12 @@ useful, keep product APIs distinct.
   Composer under the existing kranz mission contract. The backend must prove
   terminal report text parsing, model/cost capture, worktree cwd discipline,
   permission mapping, and the no-push/no-main-write invariants before it is a
-  default option.
+  default option. The Amp CLI (headless `-x` execute mode, newline-JSON
+  streaming with usage fields incl. cache tokens) is a second candidate
+  behind the same proof bar, with two extra cautions recorded in
+  docs/reviews/ampcode.md §5: a trust-by-default permission surface that
+  maps thinly onto kranz policy, and a weekly feature-deletion policy that
+  makes any integration seam unstable.
 - **Positioning correction.** Cursor now credibly owns much of the polished
   agentic development-platform story. Kranz should describe itself as the
   git-native mission recorder, consent gate, and validation harness around

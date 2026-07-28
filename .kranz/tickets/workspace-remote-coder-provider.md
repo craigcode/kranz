@@ -14,7 +14,10 @@ without building a VM scheduler or cloud IDE inside kranz.
 ## Context
 Monaco bought Coder in ~2 engineer-weeks; design D-B / D-G. Prefer baked
 images over nested Devcontainers for v1. Local missions remain valid
-without this provider.
+without this provider. Where the substrate supports it, prefer OIDC
+workload identity (short-lived tokens with mission-scoped claims) over
+injecting secret values, and front preview URLs with auth by default —
+both recorded in the D-A/D-E updates and docs/reviews/ampcode.md §3/§8.
 
 ## Acceptance hints
 - Remote provider selectable when configured; missing creds/template fail
