@@ -2002,6 +2002,403 @@ async fn workspace_provider_resume_reprovisions_idempotently() {
 }
 
 // ---------------------------------------------------------------------------
+// Golden-data hooks (design D-D, ticket golden-data-hooks): the contract's
+// optional `data` block provisions a de-identified golden dataset into the
+// workspace before agents run; skew Blocks owned + actionable, never flake.
+//
+// Shell lines stay `sh`/`cmd` portable (echo / > / >> / && / test -f / exit
+// only) and markers are relative paths in the workspace cwd — no
+// JSON-interpolated absolute paths.
+// ---------------------------------------------------------------------------
+
+/// Commit a workspace contract carrying a `data` block (plus a .gitignore
+/// for every marker the hooks write, so hook output never dirties the
+/// worker's tree) onto the BASE branch BEFORE approve — D-A: the run-time
+/// gate reads the committed base-branch copy.
+fn commit_data_contract(root: &Path, contract_json: &str) {
+    std::fs::create_dir_all(root.join(".kranz")).unwrap();
+    std::fs::write(root.join(".kranz").join("workspace.json"), contract_json).unwrap();
+    std::fs::write(
+        root.join(".gitignore"),
+        ".boot-marker\n.data-clone-marker\n.data-migrate-marker\n.data-skew-marker\n.data-reset-count\n",
+    )
+    .unwrap();
+    raw_git(root, &["add", ".kranz/workspace.json", ".gitignore"]);
+    raw_git(root, &["commit", "-m", "workspace contract"]);
+}
+
+/// The seq of the first `orchestrator.decision` whose summary starts with
+/// `prefix` (for lifecycle-order assertions between decision lines).
+fn decision_seq(events: &[Event], prefix: &str) -> u64 {
+    events
+        .iter()
+        .find(|e| matches!(&e.kind, EventKind::OrchestratorDecision { summary, .. } if summary.starts_with(prefix)))
+        .map(|e| e.seq)
+        .unwrap_or_else(|| panic!("no decision starting with {prefix:?}"))
+}
+
+/// Provision order (D-D), proven by markers: clone writes a marker, migrate
+/// reads it, bootstrap runs later, readiness after that, skewCheck last —
+/// everything before the first worker spawn.
+#[tokio::test(flavor = "multi_thread")]
+async fn golden_data_hooks_run_in_provision_order_before_workers() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    commit_data_contract(
+        &root,
+        r#"{
+            "schemaVersion": 1,
+            "data": {
+                "clone": "echo cloned > .data-clone-marker",
+                "migrate": "test -f .data-clone-marker && echo mig > .data-migrate-marker",
+                "skewCheck": "test -f .boot-marker && echo checked > .data-skew-marker"
+            },
+            "bootstrap": ["test -f .data-migrate-marker && echo boot > .boot-marker"],
+            "readiness": ["test -f .boot-marker"]
+        }"#,
+    );
+
+    // The final gate's command assertion re-proves the skew marker is
+    // visible in the mission execution cwd (it runs engine-side there).
+    let contract = vec![assertion(
+        "a-1",
+        "the skew check ran",
+        Some("test -f .data-skew-marker"),
+    )];
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+    ]));
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(simple_plan(1, contract)).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    assert_eq!(
+        gate_decisions(&events, "workspace data:"),
+        vec![
+            "workspace data: clone `echo cloned > .data-clone-marker` → ok (exit code 0)",
+            "workspace data: migrate `test -f .data-clone-marker && echo mig > .data-migrate-marker` → ok (exit code 0)",
+            "workspace data: skewCheck `test -f .boot-marker && echo checked > .data-skew-marker` → ok (exit code 0)",
+        ]
+    );
+    // Lifecycle order: migrate before bootstrap, skewCheck after readiness,
+    // all of it before the first worker spawns.
+    assert!(
+        decision_seq(&events, "workspace data: migrate")
+            < decision_seq(&events, "workspace bootstrap:")
+    );
+    assert!(
+        decision_seq(&events, "workspace readiness: 1/1")
+            < decision_seq(&events, "workspace data: skewCheck")
+    );
+    assert!(decision_seq(&events, "workspace data: skewCheck") < seq_of(&events, "worker.spawned"));
+    // Skew passing leaves the ordinary ready report (no skew artifact).
+    let readiness = workspace_lifecycle_events(&events, "workspace.readiness");
+    assert_eq!(readiness.len(), 1);
+    match &readiness[0].kind {
+        EventKind::WorkspaceReadinessReport { outcome, .. } => assert_eq!(outcome, "ready"),
+        other => panic!("wrong variant: {other:?}"),
+    }
+}
+
+/// skewCheck exit 1 ⇒ the SKEW case (D-D): Blocked with owner repo-setup,
+/// the migrate hook named as the action, a scrubbed tail, the distinct
+/// `skew` readiness outcome — never a readiness flake and never a validator
+/// finding.
+#[tokio::test(flavor = "multi_thread")]
+async fn golden_data_skew_blocks_owned_actionable_and_never_a_finding() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    commit_data_contract(
+        &root,
+        r#"{
+            "schemaVersion": 1,
+            "data": {
+                "migrate": "echo mig > .data-migrate-marker",
+                "skewCheck": "echo skewed sk-ant-api03-a1b2c3d4e5f6 1>&2 && exit 1"
+            },
+            "bootstrap": ["echo boot > .boot-marker"],
+            "readiness": ["test -f .boot-marker"]
+        }"#,
+    );
+
+    // No scripts queued: ANY session start (worker/validator/orchestrator)
+    // would error the run — the empty backend itself proves no spawn.
+    let backend = Arc::new(MockBackend::new());
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Blocked);
+    assert_eq!(
+        engine.state().mission.milestones[0].status,
+        MilestoneStatus::Blocked
+    );
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    // Bootstrap and readiness passed first — skew is the LAST readiness
+    // step, distinct from a readiness flake.
+    assert_eq!(
+        gate_decisions(&events, "workspace bootstrap:"),
+        vec![
+            "workspace bootstrap: running 1 commands",
+            "workspace bootstrap: 1/1 commands ok"
+        ]
+    );
+    assert_eq!(
+        gate_decisions(&events, "workspace readiness:"),
+        vec![
+            "workspace readiness: running 1 checks",
+            "workspace readiness: 1/1 checks ok"
+        ]
+    );
+
+    let reason = gate_block_reason(&events, "ms-1");
+    assert!(
+        reason.contains("workspace gate: data skewCheck failed"),
+        "{reason}"
+    );
+    assert!(reason.contains("owner: repo-setup"), "{reason}");
+    assert!(reason.contains("exit code 1"), "{reason}");
+    assert!(
+        reason
+            .contains("run the data migrate hook (`echo mig > .data-migrate-marker`), then resume"),
+        "the action names the declared migrate hook: {reason}"
+    );
+    assert!(
+        !reason.contains("readiness check"),
+        "the skew reason never presents as a readiness flake: {reason}"
+    );
+    assert!(
+        !reason.contains("sk-ant-api03-a1b2c3d4e5f6"),
+        "the output tail must be scrubbed: {reason}"
+    );
+    assert!(reason.contains("[REDACTED]"), "{reason}");
+
+    // The workspace.readiness report records the distinct skew outcome
+    // carrying the same reason (D-E) — additive alongside ready/failed.
+    let readiness = workspace_lifecycle_events(&events, "workspace.readiness");
+    assert_eq!(readiness.len(), 1);
+    match &readiness[0].kind {
+        EventKind::WorkspaceReadinessReport { outcome, detail } => {
+            assert_eq!(outcome, "skew");
+            assert_eq!(detail.as_deref(), Some(reason.as_str()));
+        }
+        other => panic!("wrong variant: {other:?}"),
+    }
+
+    // Never a validator finding, never any spend.
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::ValidationFinding { .. })),
+        "skew must not present as a validator finding: {:?}",
+        event_types(&events)
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::WorkerSpawned { .. })),
+        "no worker may spawn on a skewed dataset"
+    );
+}
+
+/// resetBetweenRounds (D-D): the reset hook runs BEFORE each validation
+/// round's validator spawn — counted via an append-marker across two rounds
+/// (finding → fix → clean round).
+#[tokio::test(flavor = "multi_thread")]
+async fn golden_data_reset_runs_before_each_validation_round() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    commit_data_contract(
+        &root,
+        r#"{
+            "schemaVersion": 1,
+            "data": {
+                "reset": "echo reset >> .data-reset-count",
+                "resetBetweenRounds": true
+            }
+        }"#,
+    );
+
+    let finding = json!([{
+        "subject": "part 1 works",
+        "severity": "major",
+        "evidence": "the endpoint returns 500 on empty input",
+        "suggestedFix": "guard empty input"
+    }]);
+    // Session order: worker f-1-1, orchestrator, functional validator #1
+    // (one finding), fix worker, functional validator #2 (clean) — two
+    // validation rounds, hence two resets.
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            fix_features(1),
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+        validator_with(finding),
+        worker_pass(),
+        validator_with(json!([])),
+    ]));
+    let cfg = MissionConfig {
+        skip_functional: false,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    // One appended line per validation round (portable across sh and cmd —
+    // only the line COUNT is asserted, never the bytes).
+    let count = std::fs::read_to_string(root.join(".data-reset-count"))
+        .expect("the reset hook appended into the workspace cwd");
+    assert_eq!(
+        count.lines().count(),
+        2,
+        "one reset per validation round: {count:?}"
+    );
+
+    let events = read_log(&paths);
+    let resets = gate_decisions(&events, "workspace data: reset");
+    assert_eq!(
+        resets,
+        vec!["workspace data: reset `echo reset >> .data-reset-count` → ok (exit code 0)"; 2],
+        "one reset decision per round"
+    );
+    // Each reset fires after its round's milestone.validating and before
+    // the next one — i.e. before that round's validators spawn.
+    let validating_seqs: Vec<u64> = events
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::MilestoneValidating { .. }))
+        .map(|e| e.seq)
+        .collect();
+    assert_eq!(validating_seqs.len(), 2, "two validation rounds");
+    let reset_seqs: Vec<u64> = events
+        .iter()
+        .filter(|e| matches!(&e.kind, EventKind::OrchestratorDecision { summary, .. } if summary.starts_with("workspace data: reset")))
+        .map(|e| e.seq)
+        .collect();
+    assert_eq!(reset_seqs.len(), 2, "one reset decision per round");
+    assert!(
+        validating_seqs[0] < reset_seqs[0] && reset_seqs[0] < validating_seqs[1],
+        "round 1's reset precedes round 2: {validating_seqs:?} vs {reset_seqs:?}"
+    );
+    assert!(
+        validating_seqs[1] < reset_seqs[1],
+        "round 2's reset follows its validating event: {validating_seqs:?} vs {reset_seqs:?}"
+    );
+}
+
+/// A reset failure Blocks with the same owned shape as skew (hook, exit,
+/// scrubbed tail, owner, action) BEFORE any validator spawns — never a
+/// validator finding.
+#[tokio::test(flavor = "multi_thread")]
+async fn golden_data_reset_failure_blocks_owned_before_any_validator() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    commit_data_contract(
+        &root,
+        r#"{
+            "schemaVersion": 1,
+            "data": {
+                "reset": "exit 7",
+                "resetBetweenRounds": true
+            }
+        }"#,
+    );
+
+    // NO validator script queued: the reset must block before any validator
+    // spawn — a consumed validator session would error the run, proving the
+    // ordering from the backend side too.
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![dirty_tree_commit_as_is(), judgement("complete", "")]),
+    ]));
+    let cfg = MissionConfig {
+        skip_functional: false,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Blocked);
+    assert_eq!(
+        engine.state().mission.milestones[0].status,
+        MilestoneStatus::Blocked
+    );
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    assert!(
+        seq_of(&events, "milestone.validating") < seq_of(&events, "milestone.blocked"),
+        "the block lands inside the validation round"
+    );
+    assert_eq!(
+        gate_decisions(&events, "workspace data: reset"),
+        vec![
+            "workspace data: reset `exit 7` → FAILED (exit code 7) — blocking mission (owner: repo-setup)"
+        ]
+    );
+    let reason = gate_block_reason(&events, "ms-1");
+    assert!(
+        reason.contains("workspace gate: data reset hook failed"),
+        "{reason}"
+    );
+    assert!(reason.contains("owner: repo-setup"), "{reason}");
+    assert!(reason.contains("exit code 7"), "{reason}");
+    assert!(reason.contains("`exit 7`"), "{reason}");
+    assert!(reason.contains("then resume"), "{reason}");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::ValidationFinding { .. })),
+        "a reset failure must not present as a validator finding: {:?}",
+        event_types(&events)
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 2. Validation round: finding → fix feature → clean round → complete
 // ---------------------------------------------------------------------------
 

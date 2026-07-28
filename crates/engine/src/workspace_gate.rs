@@ -54,8 +54,9 @@ pub const READINESS_SUMMARY_PREFIX: &str = "workspace readiness:";
 
 /// Every block reason this gate emits starts here; the pass path lifts
 /// gate-owned blocks by matching it (a block from ANY other cause is left
-/// to the normal unblock flow).
-const GATE_REASON_PREFIX: &str = "workspace gate:";
+/// to the normal unblock flow). `pub(crate)` so the golden-data skew/reset
+/// reasons (workspace_data.rs) provably share the prefix the lift matches.
+pub(crate) const GATE_REASON_PREFIX: &str = "workspace gate:";
 
 /// Outcome of one bootstrap command / readiness check.
 #[derive(Debug, Clone)]
@@ -101,18 +102,30 @@ pub(crate) struct GatePhase<'a> {
 
 impl MissionEngine {
     /// Block the first incomplete milestone on a gate failure and return
-    /// `Blocked` (D-C: failures are Blocked, not preflight-warnings). When
-    /// that milestone was never started (a fresh run blocked pre-loop),
-    /// start it first so the event stream keeps the invariant that
-    /// `milestone.started` precedes any block/unblock cycle — validation
-    /// reads `start_sha`, and a later unblock folds the milestone back to
-    /// Active, skipping the loop's Pending-only start emit.
+    /// `Blocked` (D-C: failures are Blocked, not preflight-warnings).
     pub(crate) fn block_on_gate_failure(
         &mut self,
         kind: &str,
         failed: &CommandOutcome,
     ) -> Result<Option<MissionStatus>> {
-        let reason = gate_block_reason(kind, failed);
+        self.block_with_gate_reason(gate_block_reason(kind, failed))
+    }
+
+    /// Block the first incomplete milestone with a pre-built gate-owned
+    /// reason (the `workspace gate:` prefix is what the pass path's
+    /// [`Self::lift_gate_block`] matches). Shared by the bootstrap/readiness
+    /// gate and the golden-data hooks (design D-D: skew and reset failures
+    /// block with their own actionable reason shapes).
+    ///
+    /// When that milestone was never started (a fresh run blocked pre-loop),
+    /// start it first so the event stream keeps the invariant that
+    /// `milestone.started` precedes any block/unblock cycle — validation
+    /// reads `start_sha`, and a later unblock folds the milestone back to
+    /// Active, skipping the loop's Pending-only start emit.
+    pub(crate) fn block_with_gate_reason(
+        &mut self,
+        reason: String,
+    ) -> Result<Option<MissionStatus>> {
         let Some(mi) = first_incomplete(&self.state) else {
             // Nothing left to block (all milestones complete; only the final
             // gate remained). Still loud and honest: the decisions above are

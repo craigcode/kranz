@@ -13,7 +13,10 @@
 //! ```text
 //! provider.provision(spec) -> WorkspaceHandle      (workspace.provisioned)
 //! provider.readiness(handle) -> ReadinessOutcome   (the workspace gate; workspace.readiness)
+//!     … golden-data clone → migrate → bootstrap → readiness → skewCheck …
 //! … workers/validators run in handle.cwd …
+//!     … validation_round re-seeds via provider.run_data_hook(reset) when
+//!       the data block opts in (resetBetweenRounds) …
 //! provider.teardown(handle, mode)                  (workspace.teardown)
 //! ```
 //!
@@ -181,13 +184,22 @@ pub struct WorkspaceHandle {
 
 /// What `readiness` concluded. `Ready` = spend may start (no contract, or
 /// bootstrap + readiness all passed). `Failed` carries the failing phase's
-/// kind ("bootstrap command" / "readiness check") and first failing command
-/// outcome, so the engine can block with the gate's established reason shape.
+/// kind ("bootstrap command" / "readiness check" / "data clone hook" /
+/// "data migrate hook") and first failing command outcome, so the engine can
+/// block with the gate's established reason shape.
 #[derive(Debug)]
 pub enum ReadinessOutcome {
     Ready,
     Failed {
         kind: &'static str,
+        failed: CommandOutcome,
+    },
+    /// The data block's `skewCheck` failed: migration/version skew between
+    /// the golden dataset and the workspace code (design D-D). A DISTINCT
+    /// outcome from a readiness flake — the engine Blocks with the skew
+    /// reason (the migrate/reset hook named as the action), never with the
+    /// generic readiness shape.
+    DataSkew {
         failed: CommandOutcome,
     },
 }
@@ -220,6 +232,31 @@ pub trait WorkspaceProvider: Send + Sync {
     /// Tear the workspace down per `mode` (see [`TeardownMode`] for v1
     /// local-worktree semantics).
     async fn teardown(&self, handle: WorkspaceHandle, mode: TeardownMode) -> Result<()>;
+
+    /// Run one declared golden-data hook (design D-D) inside this workspace
+    /// and report its `workspace data:` decision line through `progress`.
+    /// Used by `readiness` (clone/migrate/skewCheck) and by the engine's
+    /// reset-between-rounds drive from `validation_round` — one method so
+    /// the reset fires through the same execution path as the provision-time
+    /// hooks. Returns the failing [`CommandOutcome`] only on failure.
+    ///
+    /// The default runs the command with the gate's env discipline (the
+    /// shared bounded shell runner in the handle's cwd, inherited env plus
+    /// the handle's env — never a new secrets channel). The container
+    /// provider overrides to exec INSIDE the container network, so data
+    /// hooks never run on the host when a container workspace exists.
+    async fn run_data_hook(
+        &self,
+        handle: &WorkspaceHandle,
+        hook: crate::workspace_data::DataHookKind,
+        command: &str,
+        progress: &mut ProgressSink<'_>,
+    ) -> Result<Option<CommandOutcome>> {
+        let (code, output_tail) =
+            crate::command_exec::run_shell_command_with_code(&handle.cwd, command, &handle.env)
+                .await;
+        crate::workspace_data::hook_outcome(hook, command, code, output_tail, progress)
+    }
 }
 
 /// Resolve the configured `workspace.provider` into a provider instance.
@@ -334,6 +371,27 @@ impl WorkspaceProvider for LocalWorktreeProvider {
             return Ok(ReadinessOutcome::Ready);
         };
 
+        // 0. golden data clone/migrate (design D-D) — after provision,
+        //    before bootstrap. Undeclared hooks skip silently. A failure
+        //    folds into the gate's block shape with a data-hook kind.
+        if let Some(data) = &contract.data {
+            for (hook, command) in [
+                (crate::workspace_data::DataHookKind::Clone, &data.clone),
+                (crate::workspace_data::DataHookKind::Migrate, &data.migrate),
+            ] {
+                if let Some(command) = command {
+                    if let Some(failed) =
+                        self.run_data_hook(handle, hook, command, progress).await?
+                    {
+                        return Ok(ReadinessOutcome::Failed {
+                            kind: hook.gate_kind(),
+                            failed,
+                        });
+                    }
+                }
+            }
+        }
+
         // 1. bootstrap — ordered, stop at first failure. Commands run with
         //    the same env discipline as validation-contract commands:
         //    inherited env plus the handle's `KRANZ_BASE_SHA` (bootstrap
@@ -378,6 +436,28 @@ impl WorkspaceProvider for LocalWorktreeProvider {
                 kind: "readiness check",
                 failed,
             });
+        }
+
+        // 3. golden data skewCheck (design D-D) — the last readiness step.
+        //    Its failure is the SKEW case: a distinct outcome the engine
+        //    Blocks on with the migrate/reset action named, never a generic
+        //    readiness failure.
+        if let Some(command) = contract
+            .data
+            .as_ref()
+            .and_then(|data| data.skew_check.as_ref())
+        {
+            if let Some(failed) = self
+                .run_data_hook(
+                    handle,
+                    crate::workspace_data::DataHookKind::SkewCheck,
+                    command,
+                    progress,
+                )
+                .await?
+            {
+                return Ok(ReadinessOutcome::DataSkew { failed });
+            }
         }
 
         Ok(ReadinessOutcome::Ready)
@@ -521,6 +601,26 @@ impl MissionEngine {
                     detail: Some(workspace_gate::gate_block_reason(kind, &failed)),
                 })?;
                 self.block_on_gate_failure(kind, &failed)
+            }
+            ReadinessOutcome::DataSkew { failed } => {
+                // The SKEW case (design D-D): a distinct, owned Block — the
+                // reason names the data block's skewCheck, its exit, a
+                // scrubbed tail, the repo-setup owner, and the action (run
+                // the declared migrate/reset hook, then resume). Never a
+                // generic readiness failure and never a validator finding.
+                // The gate prefix keeps the block liftable on resume once
+                // the environment is fixed.
+                let data = self
+                    .workspace_handle
+                    .as_ref()
+                    .and_then(|handle| handle.contract.as_ref())
+                    .and_then(|contract| contract.data.clone());
+                let reason = crate::workspace_data::skew_block_reason(data.as_ref(), &failed);
+                self.emit(EventKind::WorkspaceReadinessReport {
+                    outcome: "skew".to_string(),
+                    detail: Some(reason.clone()),
+                })?;
+                self.block_with_gate_reason(reason)
             }
         }
     }
@@ -903,6 +1003,191 @@ mod tests {
                 "workspace readiness: running 1 checks",
                 "workspace readiness: FAILED at check 1/1 — blocking mission (owner: repo-setup)",
             ]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Golden-data hooks (design D-D, ticket golden-data-hooks)
+    // -----------------------------------------------------------------------
+
+    /// Lifecycle order (D-D), proven by markers each step asserts before
+    /// writing its own: clone → migrate → bootstrap → readiness → skewCheck.
+    /// Shell lines stay sh/cmd portable (echo / > / && / test -f only).
+    #[tokio::test]
+    async fn readiness_runs_data_hooks_in_lifecycle_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let contract = contract(
+            br#"{
+                "schemaVersion": 1,
+                "data": {
+                    "clone": "echo cloned > .clone-marker",
+                    "migrate": "test -f .clone-marker && echo mig > .migrate-marker",
+                    "skewCheck": "test -f .boot-marker && echo checked > .skew-marker"
+                },
+                "bootstrap": ["test -f .migrate-marker && echo boot > .boot-marker"],
+                "readiness": ["test -f .boot-marker"]
+            }"#,
+        );
+        let handle = LocalWorktreeProvider
+            .provision(&spec(dir.path().to_path_buf(), None, Some(contract)))
+            .await
+            .expect("provision");
+        let mut progress = Progress::default();
+        let outcome = LocalWorktreeProvider
+            .readiness(&handle, &mut progress.sink())
+            .await
+            .expect("readiness");
+
+        assert!(
+            matches!(outcome, ReadinessOutcome::Ready),
+            "every marker assertion passed ⇒ the hooks ran in order: {outcome:?}"
+        );
+        for marker in [".clone-marker", ".migrate-marker", ".skew-marker"] {
+            assert!(dir.path().join(marker).exists(), "{marker} written");
+        }
+        assert_eq!(
+            progress.summaries(),
+            vec![
+                "workspace data: clone `echo cloned > .clone-marker` → ok (exit code 0)",
+                "workspace data: migrate `test -f .clone-marker && echo mig > .migrate-marker` → ok (exit code 0)",
+                "workspace bootstrap: running 1 commands",
+                "workspace bootstrap: 1/1 commands ok",
+                "workspace readiness: running 1 checks",
+                "workspace readiness: 1/1 checks ok",
+                "workspace data: skewCheck `test -f .boot-marker && echo checked > .skew-marker` → ok (exit code 0)",
+            ]
+        );
+    }
+
+    /// A clone/migrate failure folds into the gate's block shape with a
+    /// data-hook kind, stopping before every later phase.
+    #[tokio::test]
+    async fn readiness_data_clone_failure_stops_before_migrate_and_bootstrap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let contract = contract(
+            br#"{
+                "schemaVersion": 1,
+                "data": {
+                    "clone": "exit 42",
+                    "migrate": "echo mig > .migrate-marker"
+                },
+                "bootstrap": ["echo boot > .boot-marker"],
+                "readiness": ["test -f .boot-marker"]
+            }"#,
+        );
+        let handle = LocalWorktreeProvider
+            .provision(&spec(dir.path().to_path_buf(), None, Some(contract)))
+            .await
+            .expect("provision");
+        let mut progress = Progress::default();
+        let outcome = LocalWorktreeProvider
+            .readiness(&handle, &mut progress.sink())
+            .await
+            .expect("readiness");
+
+        let ReadinessOutcome::Failed { kind, failed } = outcome else {
+            panic!("a clone failure must be Failed, got {outcome:?}");
+        };
+        assert_eq!(kind, "data clone hook");
+        assert_eq!(failed.code, Some(42));
+        assert!(
+            !dir.path().join(".migrate-marker").exists(),
+            "the data phase stops at the first failure: migrate never ran"
+        );
+        assert!(
+            !dir.path().join(".boot-marker").exists(),
+            "bootstrap never ran after a data-hook failure"
+        );
+        assert_eq!(
+            progress.summaries(),
+            vec![
+                "workspace data: clone `exit 42` → FAILED (exit code 42) — blocking mission (owner: repo-setup)",
+            ]
+        );
+    }
+
+    /// skewCheck failure AFTER bootstrap+readiness passed is the distinct
+    /// DataSkew outcome (D-D) — never a generic readiness failure.
+    #[tokio::test]
+    async fn readiness_skew_failure_is_the_distinct_skew_outcome() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let contract = contract(
+            br#"{
+                "schemaVersion": 1,
+                "data": {
+                    "migrate": "echo mig > .migrate-marker",
+                    "skewCheck": "exit 1"
+                },
+                "bootstrap": ["echo boot > .boot-marker"],
+                "readiness": ["test -f .boot-marker"]
+            }"#,
+        );
+        let handle = LocalWorktreeProvider
+            .provision(&spec(dir.path().to_path_buf(), None, Some(contract)))
+            .await
+            .expect("provision");
+        let mut progress = Progress::default();
+        let outcome = LocalWorktreeProvider
+            .readiness(&handle, &mut progress.sink())
+            .await
+            .expect("readiness");
+
+        let ReadinessOutcome::DataSkew { failed } = outcome else {
+            panic!("a skewCheck failure must be DataSkew, got {outcome:?}");
+        };
+        assert_eq!(failed.code, Some(1));
+        assert!(
+            dir.path().join(".boot-marker").exists(),
+            "bootstrap and readiness passed before the skew check ran"
+        );
+        assert_eq!(
+            progress.summaries(),
+            vec![
+                "workspace data: migrate `echo mig > .migrate-marker` → ok (exit code 0)",
+                "workspace bootstrap: running 1 commands",
+                "workspace bootstrap: 1/1 commands ok",
+                "workspace readiness: running 1 checks",
+                "workspace readiness: 1/1 checks ok",
+                "workspace data: skewCheck `exit 1` → FAILED (exit code 1) — blocking mission (owner: repo-setup)",
+            ]
+        );
+    }
+
+    /// The default `run_data_hook` (the reset-between-rounds path) runs in
+    /// the handle's cwd with the handle's env.
+    #[tokio::test]
+    async fn run_data_hook_executes_in_the_workspace_with_handle_env() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let contract = contract(
+            br#"{"schemaVersion": 1, "data": {"reset": "seed", "resetBetweenRounds": true}}"#,
+        );
+        let handle = LocalWorktreeProvider
+            .provision(&spec(
+                dir.path().to_path_buf(),
+                Some("deadbeefcafe"),
+                Some(contract),
+            ))
+            .await
+            .expect("provision");
+        let mut progress = Progress::default();
+        let failed = LocalWorktreeProvider
+            .run_data_hook(
+                &handle,
+                crate::workspace_data::DataHookKind::Reset,
+                &base_sha_assertion_command("deadbeefcafe"),
+                &mut progress.sink(),
+            )
+            .await
+            .expect("run_data_hook");
+        assert!(
+            failed.is_none(),
+            "the KRANZ_BASE_SHA assertion saw the handle env: {failed:?}"
+        );
+        assert_eq!(progress.summaries().len(), 1);
+        assert!(
+            progress.summaries()[0].starts_with("workspace data: reset `"),
+            "{:?}",
+            progress.summaries()
         );
     }
 

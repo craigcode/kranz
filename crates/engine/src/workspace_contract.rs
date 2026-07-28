@@ -98,6 +98,13 @@ pub struct PreviewSpec {
 
 /// Optional golden-data hooks (commands). Free-form strings; secret *names*
 /// only inside them, never values.
+///
+/// Execution order (design D-D, ticket `golden-data-hooks`): `clone` runs
+/// after provision, before bootstrap; `migrate` after clone; `skewCheck` is
+/// the last readiness step — its failure is the SKEW case (Blocked, owner
+/// repo-setup, the action naming the declared migrate/reset hook), never a
+/// readiness flake. `reset` runs before each validation round when
+/// `resetBetweenRounds` opts in.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DataHooks {
@@ -109,6 +116,11 @@ pub struct DataHooks {
     pub reset: Option<String>,
     #[serde(default)]
     pub skew_check: Option<String>,
+    /// Opt-in to re-seeding the golden dataset before every validation
+    /// round. Requires a declared `reset` hook (validated below) — the flag
+    /// without the hook would be dead config.
+    #[serde(default)]
+    pub reset_between_rounds: bool,
 }
 
 /// Optional provider cleanup hints.
@@ -191,6 +203,36 @@ fn validate_workspace_contract(contract: &WorkspaceContract) -> std::result::Res
     for (i, command) in contract.readiness.iter().enumerate() {
         if command.trim().is_empty() {
             return Err(format!("readiness[{i}] has an empty command string"));
+        }
+    }
+
+    if let Some(data) = &contract.data {
+        for (field, hook) in [
+            ("clone", &data.clone),
+            ("migrate", &data.migrate),
+            ("reset", &data.reset),
+            ("skewCheck", &data.skew_check),
+        ] {
+            if let Some(command) = hook {
+                if command.trim().is_empty() {
+                    return Err(format!("data.{field} has an empty command string"));
+                }
+            }
+        }
+        // The flag without the hook is dead config — fail closed rather
+        // than silently never resetting.
+        if data.reset_between_rounds && data.reset.is_none() {
+            return Err("data.resetBetweenRounds requires a declared data.reset hook".to_string());
+        }
+        // The skew Block's action names the migrate/reset hook to run
+        // (design D-D) — a skewCheck with neither declared could not carry
+        // that actionable message.
+        if data.skew_check.is_some() && data.migrate.is_none() && data.reset.is_none() {
+            return Err(
+                "data.skewCheck requires a declared data.migrate or data.reset hook \
+                 (the skew Block action names it)"
+                    .to_string(),
+            );
         }
     }
 
@@ -307,7 +349,8 @@ mod tests {
                 "clone": "pg_dump golden | psql workspace",
                 "migrate": "sqlx migrate run",
                 "reset": "dropdb workspace && createdb workspace",
-                "skewCheck": "sqlx migrate info --check"
+                "skewCheck": "sqlx migrate info --check",
+                "resetBetweenRounds": true
             },
             "previews": [
                 { "name": "app", "urlTemplate": "http://localhost:{port}/" }
@@ -338,6 +381,7 @@ mod tests {
             data.skew_check.as_deref(),
             Some("sqlx migrate info --check")
         );
+        assert!(data.reset_between_rounds);
         assert_eq!(contract.previews.len(), 1);
         assert_eq!(
             contract.previews[0].url_template,
@@ -459,6 +503,74 @@ mod tests {
             err.contains("readiness[0] has an empty command string"),
             "{err}"
         );
+    }
+
+    /// Data-hook validation (design D-D, ticket golden-data-hooks): empty
+    /// hook commands are refused field by field; `resetBetweenRounds`
+    /// requires the reset hook it gates; `skewCheck` requires a declared
+    /// migrate or reset hook so the skew Block's action can name it.
+    #[test]
+    fn workspace_contract_data_hooks_validate_shape_and_cross_references() {
+        for (field, json) in [
+            ("clone", r#"{"schemaVersion": 1, "data": {"clone": "  "}}"#),
+            (
+                "migrate",
+                r#"{"schemaVersion": 1, "data": {"migrate": "  "}}"#,
+            ),
+            ("reset", r#"{"schemaVersion": 1, "data": {"reset": "  "}}"#),
+            // migrate satisfies the skewCheck cross-reference so the empty
+            // command is the rule that fires.
+            (
+                "skewCheck",
+                r#"{"schemaVersion": 1, "data": {"migrate": "m", "skewCheck": "  "}}"#,
+            ),
+        ] {
+            let err = parse_workspace_contract(json.as_bytes()).unwrap_err();
+            assert!(
+                err.contains(&format!("data.{field} has an empty command string")),
+                "{field}: {err}"
+            );
+        }
+
+        // resetBetweenRounds without a reset hook is dead config — refused.
+        let err = parse_workspace_contract(
+            br#"{"schemaVersion": 1, "data": {"resetBetweenRounds": true}}"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("data.resetBetweenRounds requires a declared data.reset hook"),
+            "{err}"
+        );
+        parse_workspace_contract(
+            br#"{"schemaVersion": 1, "data": {"reset": "seed", "resetBetweenRounds": true}}"#,
+        )
+        .expect("resetBetweenRounds with a reset hook is valid");
+
+        // skewCheck with neither migrate nor reset could not name the
+        // remedy in its Block action — refused; either hook suffices.
+        let err =
+            parse_workspace_contract(br#"{"schemaVersion": 1, "data": {"skewCheck": "check"}}"#)
+                .unwrap_err();
+        assert!(
+            err.contains("data.skewCheck requires a declared data.migrate or data.reset hook"),
+            "{err}"
+        );
+        parse_workspace_contract(
+            br#"{"schemaVersion": 1, "data": {"skewCheck": "check", "migrate": "m"}}"#,
+        )
+        .expect("skewCheck with migrate is valid");
+        parse_workspace_contract(
+            br#"{"schemaVersion": 1, "data": {"skewCheck": "check", "reset": "r"}}"#,
+        )
+        .expect("skewCheck with reset is valid");
+
+        // A data block may declare any subset of hooks without the flag;
+        // resetBetweenRounds defaults to false (additive serde-default).
+        let contract =
+            parse_workspace_contract(br#"{"schemaVersion": 1, "data": {"clone": "seed"}}"#)
+                .expect("clone-only data block is valid");
+        let data = contract.data.expect("data hooks");
+        assert!(!data.reset_between_rounds);
     }
 
     #[test]

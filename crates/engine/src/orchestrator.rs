@@ -292,6 +292,12 @@ pub struct MissionEngine {
     /// [`Self::teardown_workspace`] at the end of the run. Ephemeral: a new
     /// `run()` (e.g. after resume) re-provisions.
     pub(crate) workspace_handle: Option<crate::workspace_provider::WorkspaceHandle>,
+    /// The provider `run()` resolved for this run (design D-B), Arc-shared
+    /// so `validation_round` can drive the golden-data reset-between-rounds
+    /// hook (design D-D) through the same seam without borrowing `self`.
+    /// `None` outside `run()` (unit tests calling `validation_round`
+    /// directly skip the reset).
+    pub(crate) workspace_provider: Option<Arc<dyn crate::workspace_provider::WorkspaceProvider>>,
 }
 
 impl MissionEngine {
@@ -386,6 +392,7 @@ impl MissionEngine {
             grant_respawns: HashMap::new(),
             grant_request_cap: GRANT_REQUEST_CAP,
             workspace_handle: None,
+            workspace_provider: None,
         };
         if let Some(summary) = routing_summary {
             engine.emit_decision(summary, None)?;
@@ -505,6 +512,7 @@ impl MissionEngine {
             grant_respawns: HashMap::new(),
             grant_request_cap: GRANT_REQUEST_CAP,
             workspace_handle: None,
+            workspace_provider: None,
         })
     }
 
@@ -1991,9 +1999,13 @@ impl MissionEngine {
         // WorkspaceProvider seam (design D-B, ticket workspace-provider-seam):
         // resolve the configured workspace.provider BEFORE any side effects —
         // an unknown provider name fails closed here, at run start, rather
-        // than silently falling back to local.
-        let provider =
-            crate::workspace_provider::resolve(self.state.config.workspace.provider.as_deref())?;
+        // than silently falling back to local. Arc-shared onto the engine so
+        // validation_round can drive the golden-data reset-between-rounds
+        // hook (design D-D) through the same seam.
+        let provider: Arc<dyn crate::workspace_provider::WorkspaceProvider> =
+            crate::workspace_provider::resolve(self.state.config.workspace.provider.as_deref())?
+                .into();
+        self.workspace_provider = Some(Arc::clone(&provider));
 
         // Branch isolation: workers commit on the mission branch, never on
         // whatever branch the operator (or a previous mission/draft) left
@@ -3438,6 +3450,15 @@ impl MissionEngine {
         self.emit(EventKind::MilestoneValidating {
             milestone_id: milestone_id.clone(),
         })?;
+
+        // Golden-data reset between rounds (design D-D): when the workspace
+        // contract's data block opts in (`resetBetweenRounds`) and declares
+        // a reset hook, re-seed the dataset BEFORE any validator spawn so
+        // every round judges the same baseline. A reset failure Blocks with
+        // the owned gate shape — never a validator finding.
+        if self.run_data_reset_between_rounds().await? {
+            return Ok(());
+        }
 
         let start_sha = self.state.mission.milestones[mi]
             .start_sha
