@@ -28,6 +28,27 @@ Implementation notes (recorded with acceptance):
    bootstrap/readiness run INSIDE the container network via
    `compose exec -T workspace`. All containers run the shared default image
    in v1 — per-service images are a later additive contract field.
+4. **Remote adapter shape (shipped).** `workspace-remote-coder-provider`
+   implements D-B implementation #3 as a thin adapter over an injectable
+   `SubstrateClient` (create/status/delete/stop — the minimal Coder-shaped
+   surface; no VM scheduling inside kranz). `workspace.provider: "remote"`
+   resolves ONLY with complete `workspace.remote.{baseUrl,template,
+   tokenEnv}` config — a missing key fails closed at approval AND run start
+   with the key named; the token comes from the env var NAMED by `tokenEnv`
+   (read lazily at provision, never a value in config/logs/events). The pin
+   records the configured template id + adapter version (`coder-v1`).
+   Contract `secrets[]` cross as NAMES only (recorded as injected names);
+   per D-A, **OIDC workload identity with mission-scoped claims remains the
+   preferred direction** where the substrate supports it (recorded, not
+   built — ampcode.md §3). Substrate URLs name-match onto `previews[]` and
+   ride `workspace.provisioned` with the substrate's auth-fronting report
+   (never disabled — ampcode.md §8); the takeover URL surfaces in the
+   workspace endpoint. Substrate failures block with owner `provider`
+   (distinct from repo-setup/operator, not gate-auto-lifted). v1 honesty:
+   readiness is substrate-reported only (contract commands do not execute
+   remotely — no exec channel yet), agent sessions still run in the local
+   worktree, and there is NO public-IP requirement (VPN/SSH reachability is
+   an operator/network concern, noted on the config keys).
 
 Companion: `docs/roadmap.md` M6, `docs/scoping/worker-sandboxing.md` Tier 3,
 Monaco post https://www.monaco.com/blog/agent-developer-workspaces

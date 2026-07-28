@@ -20,7 +20,7 @@
 //! provider.teardown(handle, mode)                  (workspace.teardown)
 //! ```
 //!
-//! This build ships two implementations:
+//! This build ships three implementations:
 //!
 //! - [`LocalWorktreeProvider`] (v1):
 //!   - **Provision REUSES the existing isolation machinery — it does not
@@ -51,8 +51,15 @@
 //!   dynamic ports and contract health/readiness inside the container
 //!   network. See that module's docs for the network model, port policy,
 //!   and real Hibernate/Destroy teardown semantics.
+//! - [`crate::workspace_remote::RemoteWorkspaceProvider`] (ticket
+//!   `workspace-remote-coder-provider`): a thin adapter over a Coder-shaped
+//!   substrate (injectable [`crate::workspace_remote::SubstrateClient`]) —
+//!   provision from a pinned template, substrate-reported readiness,
+//!   preview/takeover URLs, secret NAMES injected by the substrate. See that
+//!   module's docs for the config gate, owner taxonomy, and v1 honesty
+//!   notes.
 //!
-//! Both providers share the gate phase shapes below: `run_gate_phase` (host
+//! The two local providers share the gate phase shapes below: `run_gate_phase` (host
 //! execution) and [`report_gate_outcomes`] (the pass/fail decision lines the
 //! container provider reuses after running the same commands via
 //! `compose exec`).
@@ -60,7 +67,9 @@
 //! Provider selection: additive mission config `workspace.provider`
 //! (absent = `local-worktree`). Unknown names FAIL CLOSED via [`resolve`] —
 //! at plan approval (the [`pin`] consent artifact) AND again at run start —
-//! never a silent fallback to local. Runtime detection for `"container"`
+//! never a silent fallback to local. `"remote"` additionally requires its
+//! `workspace.remote.*` config block complete, failing closed with the
+//! missing key named. Runtime detection for `"container"`
 //! happens at PROVISION (run start, before any spend), keeping approval-time
 //! resolution/pinning pure: a runtime-less host fails closed at run start
 //! with the reason named.
@@ -68,7 +77,7 @@
 use crate::error::{EngineError, Result};
 use crate::events::EventKind;
 use crate::orchestrator::MissionEngine;
-use crate::types::{MissionStatus, WorkerIsolation, WorkspacePin};
+use crate::types::{MissionStatus, WorkerIsolation, WorkspaceConfig, WorkspacePin};
 use crate::workspace_contract::WorkspaceContract;
 use crate::workspace_gate::{
     self, CommandOutcome, GatePhase, BOOTSTRAP_SUMMARY_PREFIX, READINESS_SUMMARY_PREFIX,
@@ -76,9 +85,9 @@ use crate::workspace_gate::{
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// The provider kinds this build knows: local-worktree and the
-/// local-container provider (ticket `local-container-workspace`); remote
-/// providers are their own ticket (`workspace-remote-coder-provider`).
+/// The provider kinds this build knows: local-worktree, the local-container
+/// provider (ticket `local-container-workspace`), and the remote
+/// Coder-shaped substrate adapter (ticket `workspace-remote-coder-provider`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceProviderKind {
     /// Today's isolation cwd: the mission integration worktree (worktree
@@ -87,6 +96,9 @@ pub enum WorkspaceProviderKind {
     /// Per-mission compose project (dynamic ports, in-network readiness) —
     /// [`crate::workspace_container::LocalContainerProvider`].
     Container,
+    /// Thin Coder-shaped substrate adapter —
+    /// [`crate::workspace_remote::RemoteWorkspaceProvider`].
+    Remote,
 }
 
 impl WorkspaceProviderKind {
@@ -95,6 +107,7 @@ impl WorkspaceProviderKind {
         match self {
             WorkspaceProviderKind::LocalWorktree => "local-worktree",
             WorkspaceProviderKind::Container => "container",
+            WorkspaceProviderKind::Remote => "remote",
         }
     }
 }
@@ -180,6 +193,10 @@ pub struct WorkspaceHandle {
     /// Container-provider state (compose project/file, assigned ports);
     /// `None` for local-worktree and contract-less provisions.
     pub container: Option<crate::workspace_container::ContainerWorkspace>,
+    /// Remote-provider state (substrate workspace id/name, takeover URL,
+    /// name-matched previews, poll outcome); `None` for local kinds and
+    /// contract-less provisions.
+    pub remote: Option<crate::workspace_remote::RemoteWorkspace>,
 }
 
 /// What `readiness` concluded. `Ready` = spend may start (no contract, or
@@ -201,6 +218,16 @@ pub enum ReadinessOutcome {
     /// generic readiness shape.
     DataSkew {
         failed: CommandOutcome,
+    },
+    /// The provider/substrate itself failed (remote substrate reported the
+    /// workspace failed or never became ready inside the poll bound). A
+    /// DISTINCT outcome from a contract-command failure: the engine Blocks
+    /// with owner `provider` (never `repo-setup`), and the block is NOT
+    /// gate-prefixed — a later gate pass does not auto-lift it; the operator
+    /// unblocks after the substrate recovers.
+    ProviderFailed {
+        /// The provider's scrubbed failure detail (workspace name + reason).
+        detail: String,
     },
 }
 
@@ -261,14 +288,18 @@ pub trait WorkspaceProvider: Send + Sync {
 
 /// Resolve the configured `workspace.provider` into a provider instance.
 /// Absent (or `"local-worktree"`) selects today's local worktree;
-/// `"container"` selects the local-container provider. Unknown names FAIL
-/// CLOSED with a clear error naming the `workspace.provider` config key and
-/// its operator owner — an unprovisioned run must never silently fall back
-/// to a provider the operator did not ask for. Resolution stays pure (no
-/// host detection): a runtime-less host selecting `"container"` fails closed
-/// at provision, at run start before any spend.
-pub fn resolve(provider: Option<&str>) -> Result<Box<dyn WorkspaceProvider>> {
-    match provider {
+/// `"container"` selects the local-container provider; `"remote"` selects
+/// the Coder-shaped substrate adapter — ONLY with complete
+/// `workspace.remote.*` config, failing closed with the missing key named.
+/// Unknown names FAIL CLOSED with a clear error naming the
+/// `workspace.provider` config key and its operator owner — an unprovisioned
+/// run must never silently fall back to a provider the operator did not ask
+/// for. Resolution stays pure (no host detection, no env reads, no network):
+/// a runtime-less host selecting `"container"`, or a token-less environment
+/// selecting `"remote"`, fails closed at provision (run start, before any
+/// spend).
+pub fn resolve(config: &WorkspaceConfig) -> Result<Box<dyn WorkspaceProvider>> {
+    match config.provider.as_deref() {
         None => Ok(Box::new(LocalWorktreeProvider)),
         Some(name) if name == WorkspaceProviderKind::LocalWorktree.as_str() => {
             Ok(Box::new(LocalWorktreeProvider))
@@ -276,13 +307,17 @@ pub fn resolve(provider: Option<&str>) -> Result<Box<dyn WorkspaceProvider>> {
         Some(name) if name == WorkspaceProviderKind::Container.as_str() => Ok(Box::new(
             crate::workspace_container::LocalContainerProvider::new(),
         )),
+        Some(name) if name == WorkspaceProviderKind::Remote.as_str() => Ok(Box::new(
+            crate::workspace_remote::RemoteWorkspaceProvider::from_config(config.remote.as_ref())?,
+        )),
         Some(other) => Err(EngineError::Config(format!(
             "workspace.provider {other:?} is not a known workspace provider \
-             (this build provides {:?} and {:?} only; owner: operator — fix the \
+             (this build provides {:?}, {:?}, and {:?} only; owner: operator — fix the \
              workspace.provider config key); refusing rather than silently \
              falling back",
             WorkspaceProviderKind::LocalWorktree.as_str(),
-            WorkspaceProviderKind::Container.as_str()
+            WorkspaceProviderKind::Container.as_str(),
+            WorkspaceProviderKind::Remote.as_str()
         ))),
     }
 }
@@ -291,20 +326,32 @@ pub fn resolve(provider: Option<&str>) -> Result<Box<dyn WorkspaceProvider>> {
 /// D-B, ticket `workspace-provider-pin-at-approval`) — the consent artifact
 /// `approve_plan` emits as `workspace.provider.pinned` immediately before
 /// `plan.approved`. Resolution IS the seam's fail-closed [`resolve`], so an
-/// unknown `workspace.provider` name refuses here, at approval time, BEFORE
-/// any branch/commit side effect — a misspelled name never silently defaults
-/// (owner: operator). Local-worktree-only missions pin too: the pin makes
-/// the default explicit and honest (D-H: source isolation, not a runnable
-/// workspace).
+/// unknown `workspace.provider` name (or incomplete `workspace.remote.*`
+/// config) refuses here, at approval time, BEFORE any branch/commit side
+/// effect — a misspelled name never silently defaults (owner: operator).
+/// Local-worktree-only missions pin too: the pin makes the default explicit
+/// and honest (D-H: source isolation, not a runnable workspace).
 ///
-/// The shape stays free-form (see [`WorkspacePin`]) so future container/
-/// remote providers pin image name+tag and adapter version instead.
+/// Per-kind field meanings (see [`WorkspacePin`]): local kinds pin the
+/// isolation mode + contract schemaVersion; the remote kind pins the
+/// CONFIGURED substrate template/image id and the ADAPTER version — the pin
+/// stays pure, with no substrate contact at approval.
 pub fn pin(
-    provider: Option<&str>,
+    config: &WorkspaceConfig,
     isolation: WorkerIsolation,
     contract: Option<&WorkspaceContract>,
 ) -> Result<WorkspacePin> {
-    let resolved = resolve(provider)?;
+    let resolved = resolve(config)?;
+    if resolved.kind() == WorkspaceProviderKind::Remote {
+        // resolve() already failed closed on incomplete remote config; the
+        // re-validation here is the same pure check.
+        let remote = crate::workspace_remote::RemoteConfig::require(config.remote.as_ref())?;
+        return Ok(WorkspacePin {
+            provider: resolved.kind().as_str().to_string(),
+            template: remote.template,
+            version: crate::workspace_remote::ADAPTER_VERSION.to_string(),
+        });
+    }
     let template = match isolation {
         WorkerIsolation::Worktree => "worktree",
         WorkerIsolation::Checkout => "checkout",
@@ -357,6 +404,7 @@ impl WorkspaceProvider for LocalWorktreeProvider {
             contract: spec.contract.clone(),
             detail: None,
             container: None,
+            remote: None,
         })
     }
 
@@ -564,6 +612,15 @@ impl MissionEngine {
             provider: provider.kind().as_str().to_string(),
             cwd: handle.cwd.display().to_string(),
             detail: handle.detail.clone(),
+            // Remote kind (ticket workspace-remote-coder-provider): the
+            // substrate's takeover URL and name-matched previews ride the
+            // provisioned event so the endpoint/report can surface them;
+            // absent for local kinds.
+            takeover: handle
+                .remote
+                .as_ref()
+                .and_then(|remote| remote.takeover.clone()),
+            previews: handle.remote.as_ref().map(|remote| remote.previews.clone()),
         })?;
         let has_contract = handle.contract.is_some();
         let outcome = {
@@ -622,6 +679,20 @@ impl MissionEngine {
                 })?;
                 self.block_with_gate_reason(reason)
             }
+            ReadinessOutcome::ProviderFailed { detail } => {
+                // The PROVIDER-owned case (design D-C's owner taxonomy): the
+                // substrate itself failed — never a contract-command
+                // (repo-setup) failure and never a config (operator) one.
+                // The reason's distinct prefix keeps the block OUT of the
+                // gate's auto-lift path: the operator unblocks once the
+                // substrate recovers.
+                let reason = crate::workspace_remote::provider_block_reason(&detail);
+                self.emit(EventKind::WorkspaceReadinessReport {
+                    outcome: "failed".to_string(),
+                    detail: Some(reason.clone()),
+                })?;
+                self.block_with_gate_reason(reason)
+            }
         }
     }
 
@@ -653,6 +724,21 @@ impl MissionEngine {
 mod tests {
     use super::*;
     use crate::workspace_contract::parse_workspace_contract;
+
+    fn ws_config(provider: Option<&str>) -> WorkspaceConfig {
+        WorkspaceConfig {
+            provider: provider.map(str::to_string),
+            remote: None,
+        }
+    }
+
+    fn remote_block() -> crate::types::RemoteWorkspaceConfig {
+        crate::types::RemoteWorkspaceConfig {
+            base_url: Some("https://coder.internal.example.com".to_string()),
+            template: Some("tmpl-baked-ami".to_string()),
+            token_env: Some("CODER_SESSION_TOKEN".to_string()),
+        }
+    }
 
     fn spec(
         root: PathBuf,
@@ -692,17 +778,19 @@ mod tests {
     #[test]
     fn resolve_defaults_to_local_worktree_and_fails_closed_on_unknown_names() {
         assert_eq!(
-            resolve(None).expect("absent = local-worktree").kind(),
+            resolve(&ws_config(None))
+                .expect("absent = local-worktree")
+                .kind(),
             WorkspaceProviderKind::LocalWorktree
         );
         assert_eq!(
-            resolve(Some("local-worktree"))
+            resolve(&ws_config(Some("local-worktree")))
                 .expect("explicit local-worktree")
                 .kind(),
             WorkspaceProviderKind::LocalWorktree
         );
-        for unknown in ["coder", "local-container", "remote", "Local-Worktree"] {
-            let err = resolve(Some(unknown))
+        for unknown in ["coder", "local-container", "Local-Worktree"] {
+            let err = resolve(&ws_config(Some(unknown)))
                 .err()
                 .expect("unknown providers fail closed");
             let msg = err.to_string();
@@ -710,6 +798,7 @@ mod tests {
             assert!(msg.contains(&format!("{unknown:?}")), "{msg}");
             assert!(msg.contains("\"local-worktree\""), "{msg}");
             assert!(msg.contains("\"container\""), "{msg}");
+            assert!(msg.contains("\"remote\""), "{msg}");
             assert!(msg.contains("only"), "{msg}");
             assert!(msg.contains("owner: operator"), "{msg}");
         }
@@ -722,12 +811,75 @@ mod tests {
     #[test]
     fn resolve_container_picks_the_local_container_provider() {
         assert_eq!(
-            resolve(Some("container"))
+            resolve(&ws_config(Some("container")))
                 .expect("container is a known provider")
                 .kind(),
             WorkspaceProviderKind::Container
         );
         assert_eq!(WorkspaceProviderKind::Container.as_str(), "container");
+    }
+
+    /// `"remote"` resolves to the substrate adapter ONLY with complete
+    /// `workspace.remote.*` config; each missing key (or an absent `remote`
+    /// block) fails CLOSED with the key named and the operator owner —
+    /// never a silent fallback to local (ticket
+    /// `workspace-remote-coder-provider`).
+    #[test]
+    fn remote_workspace_resolve_picks_the_adapter_only_with_complete_config() {
+        let complete = WorkspaceConfig {
+            provider: Some("remote".to_string()),
+            remote: Some(remote_block()),
+        };
+        assert_eq!(
+            resolve(&complete)
+                .expect("complete remote config resolves")
+                .kind(),
+            WorkspaceProviderKind::Remote
+        );
+        assert_eq!(WorkspaceProviderKind::Remote.as_str(), "remote");
+
+        for (remote, missing_key) in [
+            (None, "workspace.remote.baseUrl"),
+            (
+                Some(crate::types::RemoteWorkspaceConfig {
+                    template: Some("tmpl".to_string()),
+                    token_env: Some("CODER_SESSION_TOKEN".to_string()),
+                    ..Default::default()
+                }),
+                "workspace.remote.baseUrl",
+            ),
+            (
+                Some(crate::types::RemoteWorkspaceConfig {
+                    base_url: Some("https://coder.internal.example.com".to_string()),
+                    token_env: Some("CODER_SESSION_TOKEN".to_string()),
+                    ..Default::default()
+                }),
+                "workspace.remote.template",
+            ),
+            (
+                Some(crate::types::RemoteWorkspaceConfig {
+                    base_url: Some("https://coder.internal.example.com".to_string()),
+                    template: Some("tmpl".to_string()),
+                    ..Default::default()
+                }),
+                "workspace.remote.tokenEnv",
+            ),
+        ] {
+            let config = WorkspaceConfig {
+                provider: Some("remote".to_string()),
+                remote,
+            };
+            let err = resolve(&config)
+                .err()
+                .expect("incomplete remote config fails closed");
+            let msg = err.to_string();
+            assert!(msg.contains(missing_key), "names the missing key: {msg}");
+            assert!(msg.contains("owner: operator"), "{msg}");
+            assert!(
+                msg.contains("refusing rather than silently falling back"),
+                "{msg}"
+            );
+        }
     }
 
     /// The approval-time pin (D-B): local-worktree pins the isolation mode as
@@ -739,7 +891,8 @@ mod tests {
     fn pin_records_isolation_mode_and_contract_version() {
         let contract = contract(br#"{"schemaVersion": 1, "readiness": ["true"]}"#);
 
-        let pinned = pin(None, WorkerIsolation::Worktree, Some(&contract)).expect("pin");
+        let pinned =
+            pin(&ws_config(None), WorkerIsolation::Worktree, Some(&contract)).expect("pin");
         assert_eq!(
             pinned,
             WorkspacePin {
@@ -750,7 +903,7 @@ mod tests {
         );
 
         let pinned = pin(
-            Some("local-worktree"),
+            &ws_config(Some("local-worktree")),
             WorkerIsolation::Checkout,
             Some(&contract),
         )
@@ -760,12 +913,13 @@ mod tests {
 
         // No contract ⇒ the honest "none" version — never imply a contract
         // schema that does not exist.
-        let pinned = pin(None, WorkerIsolation::Worktree, None).expect("pin without contract");
+        let pinned =
+            pin(&ws_config(None), WorkerIsolation::Worktree, None).expect("pin without contract");
         assert_eq!(pinned.provider, "local-worktree");
         assert_eq!(pinned.version, "none");
 
         let pinned = pin(
-            Some("container"),
+            &ws_config(Some("container")),
             WorkerIsolation::Worktree,
             Some(&contract),
         )
@@ -773,12 +927,52 @@ mod tests {
         assert_eq!(pinned.provider, "container");
         assert_eq!(pinned.version, "1");
 
-        let err = pin(Some("coder"), WorkerIsolation::Worktree, None)
+        let err = pin(&ws_config(Some("coder")), WorkerIsolation::Worktree, None)
             .expect_err("a misspelled provider never silently defaults");
         let msg = err.to_string();
         assert!(msg.contains("workspace.provider"), "{msg}");
         assert!(msg.contains("\"coder\""), "{msg}");
         assert!(msg.contains("owner: operator"), "{msg}");
+    }
+
+    /// The remote pin (D-B, ticket `workspace-remote-coder-provider`):
+    /// provider `"remote"`, template = the CONFIGURED substrate
+    /// template/image id, version = the adapter version — all populated at
+    /// approval, purely (no substrate contact). Incomplete remote config
+    /// refuses approval with the missing key named.
+    #[test]
+    fn remote_workspace_pin_populates_provider_template_and_adapter_version() {
+        let contract = contract(br#"{"schemaVersion": 1, "readiness": ["true"]}"#);
+        let config = WorkspaceConfig {
+            provider: Some("remote".to_string()),
+            remote: Some(remote_block()),
+        };
+        let pinned = pin(&config, WorkerIsolation::Worktree, Some(&contract))
+            .expect("remote pins at approval");
+        assert_eq!(
+            pinned,
+            WorkspacePin {
+                provider: "remote".to_string(),
+                template: "tmpl-baked-ami".to_string(),
+                version: "coder-v1".to_string(),
+            },
+            "configured template + adapter version, not the contract schema"
+        );
+
+        let incomplete = WorkspaceConfig {
+            provider: Some("remote".to_string()),
+            remote: Some(crate::types::RemoteWorkspaceConfig {
+                template: Some("tmpl".to_string()),
+                token_env: Some("CODER_SESSION_TOKEN".to_string()),
+                ..Default::default()
+            }),
+        };
+        let err = pin(&incomplete, WorkerIsolation::Worktree, Some(&contract))
+            .expect_err("incomplete remote config refuses approval");
+        assert!(
+            err.to_string().contains("workspace.remote.baseUrl"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

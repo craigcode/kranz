@@ -323,6 +323,18 @@ pub enum EventKind {
         /// Absent on old logs and for providers without extra detail.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
+        /// Additive (ticket `workspace-remote-coder-provider`): the
+        /// substrate-reported takeover URL (SSH/web) for remote providers.
+        /// Absent on old logs and for local kinds (their takeover truth is
+        /// the workspace cwd — no SSH/remote fiction).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        takeover: Option<String>,
+        /// Additive (ticket `workspace-remote-coder-provider`): previews as
+        /// provisioned — the substrate-reported URLs name-matched to the
+        /// contract's `previews[]`. Absent on old logs and for local kinds
+        /// (their placeholders derive from the contract itself).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previews: Option<Vec<crate::types::ProvisionedPreview>>,
     },
 
     /// The provider's readiness outcome (D-E: readiness status is a mission
@@ -352,9 +364,10 @@ pub enum EventKind {
     /// The effective workspace provider identity pinned at plan approval
     /// (design D-B, ticket `workspace-provider-pin-at-approval`) — the consent
     /// artifact recording WHAT was approved: provider kind, template
-    /// (isolation mode for local-worktree; image name+tag for future
-    /// container/remote providers), and version (the workspace contract's
-    /// schemaVersion, or `"none"` without a contract). Emitted in
+    /// (isolation mode for local kinds; the configured substrate
+    /// template/image id for `remote`), and version (the workspace contract's
+    /// schemaVersion, `"none"` without a contract, or the remote adapter
+    /// version). Emitted in
     /// `approve_plan` immediately before `plan.approved`, so the log reads:
     /// contract validated → provider pinned → plan approved. See
     /// [`crate::types::WorkspacePin`] for the per-kind field meanings.
@@ -442,6 +455,8 @@ mod tests {
             provider: "local-worktree".into(),
             cwd: "/tmp/m-1_integration".into(),
             detail: None,
+            takeover: None,
+            previews: None,
         };
         let json = serde_json::to_value(&provisioned).unwrap();
         assert_eq!(json["type"], "workspace.provisioned");
@@ -523,6 +538,8 @@ mod tests {
             provider: "container".into(),
             cwd: "/tmp/m-1_integration".into(),
             detail: Some("compose project kranz-ws-m-1".into()),
+            takeover: None,
+            previews: None,
         };
         let json = serde_json::to_value(&with_detail).unwrap();
         assert_eq!(json["payload"]["provider"], "container");
@@ -554,11 +571,104 @@ mod tests {
             provider: "local-worktree".into(),
             cwd: "/tmp/wt".into(),
             detail: None,
+            takeover: None,
+            previews: None,
         };
         let json = serde_json::to_value(&no_detail).unwrap();
         assert!(
             !json["payload"].as_object().unwrap().contains_key("detail"),
             "payload must not contain detail when None: {json}"
+        );
+    }
+
+    /// The additive remote-kind fields on `workspace.provisioned` (ticket
+    /// `workspace-remote-coder-provider`): takeover + name-matched previews
+    /// (with the substrate's auth report) round-trip, old log lines without
+    /// them fold to None, and None never hits the wire.
+    #[test]
+    fn remote_workspace_provisioned_fields_are_additive_and_old_logs_still_fold() {
+        let remote = EventKind::WorkspaceProvisioned {
+            provider: "remote".into(),
+            cwd: "/tmp/m-1_integration".into(),
+            detail: Some("substrate workspace kranz-remote-m-1 (id ws-1)".into()),
+            takeover: Some("https://coder.example.com/@me/ws-1".into()),
+            previews: Some(vec![crate::types::ProvisionedPreview {
+                name: "app".into(),
+                url: "https://app.example.com".into(),
+                auth: Some(true),
+            }]),
+        };
+        let json = serde_json::to_value(&remote).unwrap();
+        assert_eq!(
+            json["payload"]["takeover"],
+            "https://coder.example.com/@me/ws-1"
+        );
+        assert_eq!(
+            json["payload"]["previews"],
+            serde_json::json!([{"name": "app", "url": "https://app.example.com", "auth": true}])
+        );
+        let back: EventKind = serde_json::from_value(json).unwrap();
+        match back {
+            EventKind::WorkspaceProvisioned {
+                takeover, previews, ..
+            } => {
+                assert_eq!(
+                    takeover.as_deref(),
+                    Some("https://coder.example.com/@me/ws-1")
+                );
+                assert_eq!(
+                    previews,
+                    Some(vec![crate::types::ProvisionedPreview {
+                        name: "app".into(),
+                        url: "https://app.example.com".into(),
+                        auth: Some(true),
+                    }])
+                );
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // Old log line (pre-remote): folds with takeover/previews = None…
+        let old: EventKind = serde_json::from_str(
+            r#"{"type":"workspace.provisioned","payload":{"provider":"local-worktree","cwd":"/tmp/wt"}}"#,
+        )
+        .unwrap();
+        match old {
+            EventKind::WorkspaceProvisioned {
+                takeover, previews, ..
+            } => {
+                assert_eq!(takeover, None);
+                assert_eq!(previews, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // …and None stays off the wire (additive, never breaks old readers).
+        let local = EventKind::WorkspaceProvisioned {
+            provider: "local-worktree".into(),
+            cwd: "/tmp/wt".into(),
+            detail: None,
+            takeover: None,
+            previews: None,
+        };
+        let json = serde_json::to_value(&local).unwrap();
+        let payload = json["payload"].as_object().unwrap();
+        assert!(
+            !payload.contains_key("takeover") && !payload.contains_key("previews"),
+            "local kinds must not carry the remote fields: {json}"
+        );
+
+        // A preview whose substrate did not report auth omits the key (never
+        // read as "no auth").
+        let preview = serde_json::to_value(crate::types::ProvisionedPreview {
+            name: "app".into(),
+            url: "https://app.example.com".into(),
+            auth: None,
+        })
+        .unwrap();
+        assert!(
+            !preview.as_object().unwrap().contains_key("auth"),
+            "auth absent from the wire when the substrate did not say: {preview}"
         );
     }
 

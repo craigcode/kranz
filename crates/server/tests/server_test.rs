@@ -690,6 +690,90 @@ async fn workspace_summary_surfaces_provider_pin_previews_and_takeover() {
     );
 }
 
+/// D-E remote-kind surfacing (ticket `workspace-remote-coder-provider`):
+/// `takeover` is the substrate-reported URL from the latest
+/// `workspace.provisioned` (null until a provision lands — no fiction), and
+/// `previews` carries the substrate-reported `[{name,url,auth}]` shape,
+/// gated on a readiness pass exactly like the local kinds.
+#[tokio::test]
+async fn workspace_summary_surfaces_remote_takeover_and_previews() {
+    let (_tmp, _repo_root, paths, app) = fixture();
+
+    // A remote pin alone: no provision yet ⇒ takeover and previews null.
+    {
+        let mut log = EventLog::acquire(&paths, MISSION_ID, Duration::ZERO, LockForce::No).unwrap();
+        log.append(EventKind::WorkspaceProviderPinned {
+            provider: "remote".into(),
+            template: "tmpl-baked-ami".into(),
+            version: "coder-v1".into(),
+        })
+        .unwrap();
+    }
+    let (status, body) = get_json(&app, &format!("/api/missions/{MISSION_ID}/workspace")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["pin"],
+        json!({"provider": "remote", "template": "tmpl-baked-ami", "version": "coder-v1"})
+    );
+    assert_eq!(
+        body["takeover"],
+        serde_json::Value::Null,
+        "no provision yet ⇒ no takeover fiction"
+    );
+    assert_eq!(body["previews"], serde_json::Value::Null);
+
+    // Provision lands with substrate-reported URLs: takeover surfaces
+    // immediately; previews still gate on a readiness pass (never imply a
+    // reachable URL while the services behind it are unproven).
+    {
+        let mut log = EventLog::acquire(&paths, MISSION_ID, Duration::ZERO, LockForce::No).unwrap();
+        log.append(EventKind::WorkspaceProvisioned {
+            provider: "remote".into(),
+            cwd: "/tmp/m-01_integration".into(),
+            detail: Some(
+                "substrate workspace kranz-remote-m-01 (id ws-1); injected env names: DATABASE_URL"
+                    .into(),
+            ),
+            takeover: Some("https://coder.example.com/@me/ws-1".into()),
+            previews: Some(vec![kranz_engine::types::ProvisionedPreview {
+                name: "app".into(),
+                url: "https://app--m-01.coder.example.com".into(),
+                auth: Some(true),
+            }]),
+        })
+        .unwrap();
+    }
+    let (status, body) = get_json(&app, &format!("/api/missions/{MISSION_ID}/workspace")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["takeover"], "https://coder.example.com/@me/ws-1");
+    assert_eq!(
+        body["previews"],
+        serde_json::Value::Null,
+        "no readiness pass ⇒ previews stay gated"
+    );
+
+    {
+        let mut log = EventLog::acquire(&paths, MISSION_ID, Duration::ZERO, LockForce::No).unwrap();
+        log.append(EventKind::WorkspaceReadinessReport {
+            outcome: "ready".into(),
+            detail: None,
+        })
+        .unwrap();
+    }
+    let (status, body) = get_json(&app, &format!("/api/missions/{MISSION_ID}/workspace")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["previews"],
+        json!([{"name": "app", "url": "https://app--m-01.coder.example.com", "auth": true}]),
+        "the remote-kind shape: substrate-reported name/url/auth, never the contract template"
+    );
+    let takeover = body["takeover"].as_str().expect("takeover line");
+    assert!(
+        !takeover.starts_with("work locally"),
+        "the local-kind takeover line never leaks into a remote mission: {takeover}"
+    );
+}
+
 #[tokio::test]
 async fn diff_stat_returns_stat_baseline_and_tip_when_diffable() {
     if !setup() {

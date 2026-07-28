@@ -59,6 +59,7 @@ pub mod workspace_contract;
 pub mod workspace_data;
 pub mod workspace_gate;
 pub mod workspace_provider;
+pub mod workspace_remote;
 
 pub mod backend_claude;
 pub mod backend_codex;

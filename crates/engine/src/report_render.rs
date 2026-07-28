@@ -482,7 +482,11 @@ pub fn render_mission_report(
         } else {
             ""
         };
-        let version_label = if pin.version == "none" {
+        let version_label = if pin.provider == "remote" {
+            // The remote kind pins the ADAPTER version, not a contract
+            // schema (ticket workspace-remote-coder-provider).
+            format!("adapter {}", pin.version)
+        } else if pin.version == "none" {
             "no workspace contract".to_string()
         } else {
             format!("contract schema v{}", pin.version)

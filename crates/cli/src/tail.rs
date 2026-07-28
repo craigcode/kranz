@@ -360,6 +360,7 @@ impl EventRenderer {
                 provider,
                 cwd,
                 detail,
+                ..
             } => (
                 "workspace".to_string(),
                 ansi::BLUE,
@@ -394,7 +395,11 @@ impl EventRenderer {
                 ansi::BLUE,
                 format!(
                     "provider pinned: {provider} · {template} · {}",
-                    if version == "none" {
+                    if provider == "remote" {
+                        // The remote kind pins the ADAPTER version, not a
+                        // contract schema (workspace-remote-coder-provider).
+                        format!("adapter {version}")
+                    } else if version == "none" {
                         "no contract".to_string()
                     } else {
                         format!("contract v{version}")

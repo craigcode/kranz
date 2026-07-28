@@ -1027,6 +1027,7 @@ async fn unknown_workspace_provider_refused_at_approve() {
     let cfg = MissionConfig {
         workspace: WorkspaceConfig {
             provider: Some("codr".to_string()), // misspelled — never silently defaults
+            ..Default::default()
         },
         ..test_cfg()
     };
@@ -1063,6 +1064,491 @@ async fn unknown_workspace_provider_refused_at_approve() {
             .iter()
             .any(|e| matches!(e.kind, EventKind::WorkspaceProviderPinned { .. })),
         "refused approve must not emit workspace.provider.pinned"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 1b3. Remote workspace provider (D-B implementation #3, ticket
+// workspace-remote-coder-provider): pin fields at approval, fail-closed
+// config/creds, and the full provision → poll → block/complete flow against
+// a loopback Coder-shaped mock (127.0.0.1 only — no live substrate).
+// ---------------------------------------------------------------------------
+
+/// Remote mission config pointing at a loopback mock substrate.
+fn remote_workspace_cfg(base_url: &str, token_env: &str) -> MissionConfig {
+    MissionConfig {
+        workspace: WorkspaceConfig {
+            provider: Some("remote".to_string()),
+            remote: Some(RemoteWorkspaceConfig {
+                base_url: Some(base_url.to_string()),
+                template: Some("tmpl-baked-ami".to_string()),
+                token_env: Some(token_env.to_string()),
+            }),
+        },
+        ..test_cfg()
+    }
+}
+
+/// A loopback Coder-shaped substrate mock: answers create/status/transition
+/// calls per the documented wire shape, recording every raw request.
+struct MockSubstrate {
+    base_url: String,
+    requests: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl MockSubstrate {
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+/// Read one HTTP/1.1 request (headers + content-length body) verbatim.
+async fn read_request(socket: &mut tokio::net::TcpStream) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = socket.read(&mut chunk).await.expect("read request");
+        assert!(n > 0, "connection closed before the full request arrived");
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
+            let headers = String::from_utf8_lossy(&buf[..pos]).to_string();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            if buf.len() >= pos + 4 + content_length {
+                break;
+            }
+        }
+    }
+    String::from_utf8_lossy(&buf).to_string()
+}
+
+/// Spawn the mock on 127.0.0.1, answering `workspace_status` with `status`
+/// forever. The task is aborted when the test's runtime shuts down.
+fn spawn_mock_substrate(status: &str) -> MockSubstrate {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let base_url = format!("http://{}", listener.local_addr().expect("addr"));
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let task_requests = Arc::clone(&requests);
+    let status = status.to_string();
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let request = read_request(&mut socket).await;
+            task_requests.lock().unwrap().push(request.clone());
+            let body = if request.starts_with("POST /api/v2/users/me/workspaces ") {
+                r#"{"id":"ws-m1","urls":[{"name":"app","url":"https://app--m-1.coder.example.com","auth":true}],"takeover":"https://coder.example.com/@me/ws-m1"}"#.to_string()
+            } else if request.starts_with("GET /api/v2/workspaces/") {
+                format!(r#"{{"latest_build":{{"status":"{status}"}}}}"#)
+            } else if request.starts_with("POST /api/v2/workspaces/")
+                && request.contains("/builds ")
+            {
+                "{}".to_string()
+            } else {
+                task_requests
+                    .lock()
+                    .unwrap()
+                    .push(format!("UNEXPECTED: {request}"));
+                "{}".to_string()
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            if socket.write_all(response.as_bytes()).await.is_err() {
+                return;
+            }
+        }
+    });
+    MockSubstrate { base_url, requests }
+}
+
+/// The remote pin lands at approval with all three fields — provider
+/// `"remote"`, the CONFIGURED template/image id, the adapter version —
+/// immediately before plan.approved, with NO substrate contact and NO token
+/// env var needed (approval-time pinning stays pure).
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_workspace_provider_pin_recorded_at_approval() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    commit_workspace_contract(&root, r#"{"schemaVersion": 1, "readiness": ["true"]}"#);
+
+    let backend = Arc::new(MockBackend::new());
+    let cfg = remote_workspace_cfg(
+        "https://coder.internal.example.com",
+        "KRANZ_TEST_REMOTE_TOKEN_PIN_NEVER_READ",
+    );
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine
+        .approve_plan(simple_plan(1, vec![]))
+        .expect("approve pins the remote provider without contacting a substrate");
+
+    let pin = engine
+        .state()
+        .workspace_pin
+        .as_ref()
+        .expect("the pin folded into mission state");
+    assert_eq!(pin.provider, "remote");
+    assert_eq!(pin.template, "tmpl-baked-ami", "the configured template id");
+    assert_eq!(
+        pin.version, "coder-v1",
+        "the adapter version, not a contract schema"
+    );
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    let pin_pos = events
+        .iter()
+        .position(|e| matches!(e.kind, EventKind::WorkspaceProviderPinned { .. }))
+        .expect("workspace.provider.pinned on the log");
+    let approved_pos = events
+        .iter()
+        .position(|e| matches!(e.kind, EventKind::PlanApproved { .. }))
+        .expect("plan.approved on the log");
+    assert_eq!(
+        approved_pos,
+        pin_pos + 1,
+        "the log reads: provider pinned → plan approved"
+    );
+    match &events[pin_pos].kind {
+        EventKind::WorkspaceProviderPinned {
+            provider,
+            template,
+            version,
+        } => {
+            assert_eq!(provider, "remote");
+            assert_eq!(template, "tmpl-baked-ami");
+            assert_eq!(version, "coder-v1");
+        }
+        other => panic!("wrong variant: {other:?}"),
+    }
+}
+
+/// Incomplete `workspace.remote.*` config refuses APPROVAL — the missing key
+/// named, owner operator — before any branch/commit/event side effect
+/// (mirrors `unknown_workspace_provider_refused_at_approve`).
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_workspace_incomplete_config_refused_at_approve() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let backend = Arc::new(MockBackend::new());
+    let cfg = MissionConfig {
+        workspace: WorkspaceConfig {
+            provider: Some("remote".to_string()),
+            remote: Some(RemoteWorkspaceConfig {
+                base_url: None, // missing — must be named in the refusal
+                template: Some("tmpl-baked-ami".to_string()),
+                token_env: Some("CODER_SESSION_TOKEN".to_string()),
+            }),
+        },
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    let err = engine
+        .approve_plan(simple_plan(1, vec![]))
+        .expect_err("incomplete remote config must refuse approval");
+    let msg = err.to_string();
+    assert!(msg.contains("workspace.remote.baseUrl"), "{msg}");
+    assert!(msg.contains("owner: operator"), "{msg}");
+    assert!(
+        msg.contains("refusing rather than silently falling back"),
+        "{msg}"
+    );
+
+    // Fail-closed means no side effects: no mission branch, no approval
+    // event, no pin event.
+    let branches = raw_git(&root, &["branch", "--list"]);
+    assert!(
+        !branches.contains("kranz/mission-"),
+        "refused approve must not create the mission branch: {branches}"
+    );
+    let events = read_log(&engine.paths().clone());
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::PlanApproved { .. })),
+        "refused approve must not emit plan.approved"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::WorkspaceProviderPinned { .. })),
+        "refused approve must not emit workspace.provider.pinned"
+    );
+}
+
+/// A substrate that reports ready: the mission runs to completion; the
+/// provisioned event carries the takeover URL and name-matched previews
+/// (with the substrate's auth report); readiness is honestly recorded as
+/// substrate-reported only — the contract's bootstrap/readiness commands
+/// NEVER execute (proven by the marker and the absent gate decisions).
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_workspace_ready_mission_completes_and_records_substrate_urls() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    commit_workspace_contract(
+        &root,
+        r#"{
+            "schemaVersion": 1,
+            "bootstrap": ["echo must-not-run > .remote-bootstrap-marker"],
+            "readiness": ["exit 99"],
+            "previews": [{"name": "app", "urlTemplate": "http://localhost:{port}/"}],
+            "secrets": ["DATABASE_URL"]
+        }"#,
+    );
+
+    std::env::set_var("KRANZ_TEST_REMOTE_TOKEN_READY", "test-token-ready");
+    let substrate = spawn_mock_substrate("running");
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+    ]));
+    let cfg = remote_workspace_cfg(&substrate.base_url, "KRANZ_TEST_REMOTE_TOKEN_READY");
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+    assert!(
+        !root.join(".remote-bootstrap-marker").exists(),
+        "contract bootstrap/readiness never executes on the remote substrate in v1"
+    );
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    let (takeover, previews, detail) = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::WorkspaceProvisioned {
+                provider,
+                takeover,
+                previews,
+                detail,
+                ..
+            } if provider == "remote" => Some((takeover.clone(), previews.clone(), detail.clone())),
+            _ => None,
+        })
+        .expect("workspace.provisioned (remote) on the log");
+    assert_eq!(
+        takeover.as_deref(),
+        Some("https://coder.example.com/@me/ws-m1"),
+        "the substrate's takeover URL rides the provisioned event"
+    );
+    assert_eq!(
+        previews,
+        Some(vec![ProvisionedPreview {
+            name: "app".to_string(),
+            url: "https://app--m-1.coder.example.com".to_string(),
+            auth: Some(true),
+        }]),
+        "the substrate-reported preview URL, name-matched, with its auth report"
+    );
+    assert!(
+        detail.as_deref().unwrap().contains("DATABASE_URL"),
+        "the injected secret NAMES are recorded (never values): {detail:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::WorkspaceReadinessReport { outcome, .. } if outcome == "ready"
+        )),
+        "substrate-reported readiness recorded"
+    );
+    let remote_lines = gate_decisions(&events, "workspace remote:");
+    assert_eq!(remote_lines.len(), 1);
+    assert!(
+        remote_lines[0].contains("substrate-reported readiness only"),
+        "honest wording — no implied contract gate: {}",
+        remote_lines[0]
+    );
+    assert!(
+        gate_decisions(&events, "workspace bootstrap:").is_empty()
+            && gate_decisions(&events, "workspace readiness:").is_empty(),
+        "no gate phase lines on the remote path (the commands never ran)"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::WorkspaceTeardown { mode } if mode == "keep"
+        )),
+        "Keep teardown recorded (the workspace stays live for takeover)"
+    );
+
+    // The wire calls: create with the pinned template + secret NAMES, one
+    // status poll, and NO stop/delete (Keep).
+    let requests = substrate.requests();
+    let create = requests
+        .iter()
+        .find(|r| r.starts_with("POST /api/v2/users/me/workspaces "))
+        .expect("the create call");
+    assert!(
+        create.contains(r#""template_id":"tmpl-baked-ami""#),
+        "{create}"
+    );
+    assert!(
+        create.contains(r#""env_names":["DATABASE_URL"]"#),
+        "{create}"
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|r| r.starts_with("GET /api/v2/workspaces/ws-m1 ")),
+        "the readiness poll: {requests:?}"
+    );
+    assert!(
+        !requests.iter().any(|r| r.contains("/builds ")),
+        "Keep ⇒ no stop/delete transition: {requests:?}"
+    );
+    assert!(
+        !requests.iter().any(|r| r.starts_with("UNEXPECTED:")),
+        "no unexpected substrate calls: {requests:?}"
+    );
+}
+
+/// A substrate that reports FAILED: the mission BLOCKS with the
+/// provider-owned shape — `workspace provider:` + owner `provider`, never
+/// `repo-setup` — and no worker ever spawns (no spend on a failed
+/// workspace).
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_workspace_failed_status_blocks_with_provider_owner() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    commit_workspace_contract(
+        &root,
+        r#"{
+            "schemaVersion": 1,
+            "previews": [{"name": "app", "urlTemplate": "http://localhost:{port}/"}],
+            "secrets": ["DATABASE_URL"]
+        }"#,
+    );
+
+    std::env::set_var("KRANZ_TEST_REMOTE_TOKEN_FAILED", "test-token-failed");
+    let substrate = spawn_mock_substrate("failed");
+    // No scripts queued: ANY session start would error the run — the empty
+    // backend itself proves no spend.
+    let backend = Arc::new(MockBackend::new());
+    let cfg = remote_workspace_cfg(&substrate.base_url, "KRANZ_TEST_REMOTE_TOKEN_FAILED");
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Blocked);
+    assert_eq!(
+        engine.state().mission.milestones[0].status,
+        MilestoneStatus::Blocked
+    );
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    let reason = gate_block_reason(&events, "ms-1");
+    assert!(
+        reason.starts_with("workspace provider:"),
+        "the provider-owned block shape: {reason}"
+    );
+    assert!(reason.contains("owner: provider"), "{reason}");
+    assert!(
+        reason.contains("kranz-remote-"),
+        "names the workspace: {reason}"
+    );
+    assert!(
+        !reason.contains("repo-setup") && !reason.contains("owner: operator"),
+        "distinct from the contract and config owners: {reason}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::WorkspaceReadinessReport { outcome, .. } if outcome == "failed"
+        )),
+        "the readiness report records the provider failure"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::WorkerSpawned { .. })),
+        "no spend on a failed workspace"
+    );
+    assert!(
+        substrate
+            .requests()
+            .iter()
+            .any(|r| r.starts_with("POST /api/v2/users/me/workspaces ")),
+        "the substrate was asked to create the workspace"
+    );
+}
+
+/// Complete config but an UNSET token env var: provision fails closed at run
+/// start (before spend) naming the env var NAME and the config key — never a
+/// silent fallback to local.
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_workspace_missing_token_fails_closed_at_run_start() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    commit_workspace_contract(&root, r#"{"schemaVersion": 1, "readiness": ["true"]}"#);
+
+    let var = "KRANZ_TEST_REMOTE_TOKEN_NEVER_SET";
+    std::env::remove_var(var); // defensive: prove unset
+    let backend = Arc::new(MockBackend::new());
+    let cfg = remote_workspace_cfg("http://127.0.0.1:1", var);
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let err = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .expect_err("missing creds fail closed at provision");
+    let msg = err.to_string();
+    assert!(msg.contains(var), "names the env var NAME: {msg}");
+    assert!(msg.contains("workspace.remote.tokenEnv"), "{msg}");
+    assert!(msg.contains("owner: operator"), "{msg}");
+    let events = read_log(&engine.paths().clone());
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::WorkspaceProvisioned { .. })),
+        "no workspace was provisioned"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::WorkerSpawned { .. })),
+        "no spend"
     );
 }
 
@@ -1703,6 +2189,7 @@ async fn workspace_provider_events_land_and_fold_into_state() {
             provider,
             cwd,
             detail,
+            ..
         } => {
             assert_eq!(provider, "local-worktree");
             assert_eq!(

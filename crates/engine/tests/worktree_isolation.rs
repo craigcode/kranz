@@ -209,6 +209,7 @@ fn workspace_provider_config_serializes_camel_case_omitting_absent() {
     let cfg = MissionConfig {
         workspace: kranz_engine::types::WorkspaceConfig {
             provider: Some("local-worktree".to_string()),
+            ..Default::default()
         },
         ..MissionConfig::default()
     };
@@ -226,10 +227,46 @@ fn workspace_provider_config_unknown_names_parse_but_fail_at_run_start() {
 
     let cfg = load_layers(&[layer]).expect("unknown names still parse");
     assert_eq!(cfg.workspace.provider.as_deref(), Some("coder"));
-    let err = kranz_engine::workspace_provider::resolve(cfg.workspace.provider.as_deref())
+    let err = kranz_engine::workspace_provider::resolve(&cfg.workspace)
         .err()
         .expect("unknown provider fails closed");
     assert!(err.to_string().contains("\"coder\""), "{err}");
+}
+
+/// The additive `workspace.remote.*` block (ticket
+/// `workspace-remote-coder-provider`): camelCase on the wire, omitted when
+/// absent, and `tokenEnv` carries a secret NAME — never a value.
+#[test]
+fn remote_workspace_config_parses_camel_case_and_omits_when_absent() {
+    // Absent remote ⇒ an empty workspace object (additive to old readers).
+    let value = serde_json::to_value(MissionConfig::default()).expect("serialize");
+    assert_eq!(value["workspace"], json!({}));
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let layer = write_layer(
+        &dir,
+        "config.json",
+        r#"{"workspace":{"provider":"remote","remote":{"baseUrl":"https://coder.internal.example.com","template":"tmpl-1","tokenEnv":"CODER_SESSION_TOKEN"}}}"#,
+    );
+    let cfg = load_layers(&[layer]).expect("load layers");
+    let remote = cfg.workspace.remote.as_ref().expect("remote block parsed");
+    assert_eq!(
+        remote.base_url.as_deref(),
+        Some("https://coder.internal.example.com")
+    );
+    assert_eq!(remote.template.as_deref(), Some("tmpl-1"));
+    assert_eq!(remote.token_env.as_deref(), Some("CODER_SESSION_TOKEN"));
+
+    let value = serde_json::to_value(&cfg).expect("serialize");
+    assert_eq!(
+        value["workspace"]["remote"]["baseUrl"],
+        "https://coder.internal.example.com"
+    );
+    assert_eq!(value["workspace"]["remote"]["template"], "tmpl-1");
+    assert_eq!(
+        value["workspace"]["remote"]["tokenEnv"],
+        "CODER_SESSION_TOKEN"
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -700,6 +737,7 @@ async fn container_workspace_events_land_for_a_full_mission_run() {
     let cfg = MissionConfig {
         workspace: kranz_engine::types::WorkspaceConfig {
             provider: Some("container".to_string()),
+            ..Default::default()
         },
         ..worktree_cfg()
     };

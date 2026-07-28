@@ -133,7 +133,9 @@ pub(crate) async fn mission_state(
 ///   otherwise.
 /// - `takeover` — how a human takes over the workspace. For local-worktree
 ///   this is the plain truth (work locally in the workspace cwd) — no SSH/
-///   remote fiction; `null` when no pin names the provider.
+///   remote fiction; for `remote` it is the substrate-reported takeover URL
+///   (SSH/web) from the latest `workspace.provisioned` event; `null` when no
+///   pin names the provider or a remote mission has not provisioned yet.
 pub(crate) async fn mission_workspace(
     State(server): State<Arc<ServerState>>,
     UrlPath(id): UrlPath<String>,
@@ -237,36 +239,67 @@ pub(crate) async fn mission_workspace(
 
     // Preview placeholders (D-E): the contract's URL templates, UNFILLED —
     // surfaced only once a readiness PASS is on the log, never implying a
-    // reachable URL while the services behind it are unproven.
+    // reachable URL while the services behind it are unproven. The REMOTE
+    // kind instead surfaces the substrate-reported URLs recorded on
+    // `workspace.provisioned` (name-matched, with the substrate's auth
+    // report) — same readiness-pass gate, never a fabricated URL.
     let readiness_passed = events.iter().any(|event| {
         matches!(
             &event.kind,
             EventKind::WorkspaceReadinessReport { outcome, .. } if outcome == "ready"
         )
     });
-    let previews = match (&workspace_contract, readiness_passed) {
-        (Some(contract), true) if !contract.previews.is_empty() => {
-            json!(contract
-                .previews
-                .iter()
-                .map(|p| json!({
-                    "name": p.name,
-                    "urlTemplate": p.url_template,
-                }))
-                .collect::<Vec<_>>())
+    // The latest remote-kind provisioned event (latest-wins, the same
+    // derivation idiom as preflight/gate outcomes above).
+    let remote_provision = events.iter().rev().find_map(|event| match &event.kind {
+        EventKind::WorkspaceProvisioned {
+            provider,
+            takeover,
+            previews,
+            ..
+        } if provider == "remote" => Some((takeover.clone(), previews.clone())),
+        _ => None,
+    });
+    let remote_pinned = matches!(
+        &state.workspace_pin,
+        Some(pin) if pin.provider == "remote"
+    );
+    let previews = if remote_pinned {
+        match (&remote_provision, readiness_passed) {
+            (Some((_, Some(previews))), true) if !previews.is_empty() => json!(previews),
+            _ => Value::Null,
         }
-        _ => Value::Null,
+    } else {
+        match (&workspace_contract, readiness_passed) {
+            (Some(contract), true) if !contract.previews.is_empty() => {
+                json!(contract
+                    .previews
+                    .iter()
+                    .map(|p| json!({
+                        "name": p.name,
+                        "urlTemplate": p.url_template,
+                    }))
+                    .collect::<Vec<_>>())
+            }
+            _ => Value::Null,
+        }
     };
 
     // Human takeover (D-E): for local-worktree the plain truth — work locally
     // in the workspace cwd, no SSH/remote fiction (the provider isolates
-    // source only, D-H). Keyed to the pin; null when no pin names the
-    // provider (older missions) or a future provider has no line yet.
+    // source only, D-H). For remote, the substrate's reported SSH/web URL —
+    // honest and substrate-sourced — null until a remote provision lands.
+    // Keyed to the pin; null when no pin names the provider (older missions)
+    // or a future provider has no line yet.
     let takeover = match &state.workspace_pin {
         Some(pin) if pin.provider == "local-worktree" => json!(format!(
             "work locally in the workspace cwd ({})",
             cwd.to_string_lossy()
         )),
+        Some(pin) if pin.provider == "remote" => match &remote_provision {
+            Some((Some(takeover), _)) => json!(takeover),
+            _ => Value::Null,
+        },
         _ => Value::Null,
     };
 

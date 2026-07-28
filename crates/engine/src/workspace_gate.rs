@@ -115,7 +115,10 @@ impl MissionEngine {
     /// reason (the `workspace gate:` prefix is what the pass path's
     /// [`Self::lift_gate_block`] matches). Shared by the bootstrap/readiness
     /// gate and the golden-data hooks (design D-D: skew and reset failures
-    /// block with their own actionable reason shapes).
+    /// block with their own actionable reason shapes) — and by provider-owned
+    /// failures (`workspace_remote::provider_block_reason`), whose DISTINCT
+    /// `workspace provider:` prefix deliberately keeps them OUT of the
+    /// gate's auto-lift path.
     ///
     /// When that milestone was never started (a fresh run blocked pre-loop),
     /// start it first so the event stream keeps the invariant that

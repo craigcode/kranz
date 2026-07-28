@@ -966,7 +966,7 @@ impl MissionEngine {
         // event-free and retryable, and the log reads: contract validated →
         // provider pinned → plan approved.
         let workspace_pin = crate::workspace_provider::pin(
-            self.state.config.workspace.provider.as_deref(),
+            &self.state.config.workspace,
             self.state.config.isolation(),
             approval_contract.as_ref(),
         )?;
@@ -2037,8 +2037,7 @@ impl MissionEngine {
         // validation_round can drive the golden-data reset-between-rounds
         // hook (design D-D) through the same seam.
         let provider: Arc<dyn crate::workspace_provider::WorkspaceProvider> =
-            crate::workspace_provider::resolve(self.state.config.workspace.provider.as_deref())?
-                .into();
+            crate::workspace_provider::resolve(&self.state.config.workspace)?.into();
         self.workspace_provider = Some(Arc::clone(&provider));
 
         // Branch isolation: workers commit on the mission branch, never on

@@ -364,18 +364,37 @@ pub struct ValidatorReport {
 /// ticket `workspace-provider-pin-at-approval`) — the consent artifact naming
 /// the environment the operator approved running against. Free-form strings
 /// on purpose: the shape must not assume a provider kind. Per-kind meanings:
-/// - `local-worktree`: `provider` = `"local-worktree"`, `template` = the
-///   isolation mode (`"worktree"` | `"checkout"` — source isolation, not a
-///   runnable workspace, D-H), `version` = the workspace contract's
-///   schemaVersion when a contract exists, else `"none"`.
-/// - Future container/remote providers: `template` = image name+tag,
-///   `version` = adapter version.
+/// - `local-worktree` / `container`: `template` = the isolation mode
+///   (`"worktree"` | `"checkout"` — source isolation, not a runnable
+///   workspace, D-H), `version` = the workspace contract's schemaVersion
+///   when a contract exists, else `"none"`.
+/// - `remote` (ticket `workspace-remote-coder-provider`): `template` = the
+///   configured substrate template/image id (as configured at approval —
+///   the pin stays pure, no substrate contact), `version` = the adapter
+///   version string (`"coder-v1"`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct WorkspacePin {
     pub provider: String,
     pub template: String,
     pub version: String,
+}
+
+/// A preview as provisioned by a remote workspace provider (ticket
+/// `workspace-remote-coder-provider`), recorded on `workspace.provisioned`:
+/// the URL the SUBSTRATE reported for a contract `previews[]` entry
+/// (name-matched — never fabricated), plus whether the substrate reports
+/// the URL is fronted with auth (design D-E: previews authenticated by
+/// default — recorded, never disabled by the adapter).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ProvisionedPreview {
+    pub name: String,
+    pub url: String,
+    /// Substrate-reported auth fronting; absent when the substrate did not
+    /// say (never read as "no auth" — consumers must degrade on absent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -660,6 +679,36 @@ pub struct WorkspaceConfig {
     /// start — never a silent fallback to local.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// Remote-substrate settings (ticket `workspace-remote-coder-provider`),
+    /// consulted only when `provider = "remote"`: `"remote"` resolves ONLY
+    /// with these complete — a missing key fails closed at resolve (plan
+    /// approval AND run start) with the key named, never a silent fallback
+    /// to local.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteWorkspaceConfig>,
+}
+
+/// Remote substrate (Coder-shaped) connection config (ticket
+/// `workspace-remote-coder-provider`). Additive and serde-defaulted like the
+/// rest of the config contract. The substrate token comes from the
+/// environment variable NAMED by `tokenEnv`, read lazily at provision —
+/// never a value in config, logs, or events. VPN/SSH reachability of the
+/// substrate is an operator/network concern: no public IP is required, and
+/// the adapter never opens one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RemoteWorkspaceConfig {
+    /// Substrate API base URL (e.g. `"https://coder.internal.example.com"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// The template/image id workspaces are provisioned from (pinned at
+    /// approval into `workspace.provider.pinned` as the remote `template`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    /// NAME of the environment variable holding the substrate API token
+    /// (e.g. `"CODER_SESSION_TOKEN"`) — the name only, never the value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_env: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

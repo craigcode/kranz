@@ -475,6 +475,7 @@ impl WorkspaceProvider for LocalContainerProvider {
                 contract: None,
                 detail: None,
                 container: None,
+                remote: None,
             });
         };
 
@@ -622,6 +623,7 @@ impl WorkspaceProvider for LocalContainerProvider {
                 compose_file,
                 assigned_ports,
             }),
+            remote: None,
         })
     }
 
