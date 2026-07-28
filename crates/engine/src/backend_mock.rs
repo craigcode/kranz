@@ -60,6 +60,12 @@ pub struct MockScript {
     /// created as needed. Empty by default (byte-for-byte unchanged
     /// behaviour).
     pub writes: Vec<(String, String)>,
+    /// Commit messages to record in the session's working directory
+    /// (`spec.cwd`) when the session starts, applied AFTER `writes`: each
+    /// becomes `git add -A && git commit -m <message>` — the seam that lets a
+    /// scripted validator MOVE HEAD, as a real `git commit`-capable validator
+    /// could (validator-immutability-proof tests). Empty by default.
+    pub commits: Vec<String>,
     /// CONNECTs this session issues through the egress proxy named by
     /// `spec.env[HTTPS_PROXY]` at start (3.3b): the seam that lets a scripted
     /// `fs+net` session be REFUSED a destination so the run's outcome carries
@@ -79,6 +85,7 @@ impl Default for MockScript {
             session_id: None,
             hold_result_until_started: None,
             writes: Vec::new(),
+            commits: Vec::new(),
             proxy_connects: Vec::new(),
         }
     }
@@ -155,6 +162,16 @@ impl MockScript {
     /// leave a dirty tree for the engine's §4.4 checkpoint to commit.
     pub fn writes_file(mut self, path: impl Into<String>, contents: impl Into<String>) -> Self {
         self.writes.push((path.into(), contents.into()));
+        self
+    }
+
+    /// `git add -A && git commit -m <message>` in the session's working
+    /// directory when the session starts (applied after any `writes_file`)
+    /// — lets a scripted validator move HEAD inside its "read-only" session,
+    /// as a real Bash-capable validator could (validator-immutability-proof
+    /// tests).
+    pub fn commits_all(mut self, message: impl Into<String>) -> Self {
+        self.commits.push(message.into());
         self
     }
 
@@ -449,6 +466,17 @@ impl AgentBackend for MockBackend {
             std::fs::write(&target, contents).map_err(|e| {
                 EngineError::Backend(format!("mock: failed to write {}: {e}", target.display()))
             })?;
+        }
+
+        // Head-move seam (see [`MockScript::commits`]): record each scripted
+        // commit in the session cwd AFTER the scripted writes, so a validator
+        // script can turn a dirty tree into a moved HEAD inside its session.
+        if !script.commits.is_empty() {
+            let repo = crate::git_ops::GitRepo::open(&spec.cwd)?;
+            repo.ensure_identity()?;
+            for message in &script.commits {
+                repo.add_all_and_commit(message)?;
+            }
         }
 
         // Egress-denial seam (see [`MockScript::proxy_connects`]): issue each

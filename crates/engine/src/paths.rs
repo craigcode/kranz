@@ -16,6 +16,11 @@
 //!
 //! All paths built with std::path so Windows stays first-class (§9).
 
+use crate::error::{EngineError, Result};
+use cap_fs_ext::DirExt as _;
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 /// The canonical `.kranz/.gitignore` rules the engine materializes on init
@@ -38,6 +43,7 @@ pub const KRANZ_GITIGNORE_RULES: &[&str] = &[
     "queue/",
     "tickets/*.status",
     "serve.token",
+    "serve.read.token",
 ];
 
 #[derive(Debug, Clone)]
@@ -155,14 +161,23 @@ impl MissionPaths {
     /// "no missions". Use [`Self::try_list_missions`] when the caller must
     /// distinguish "no missions" from "could not list missions" (e.g. before
     /// pruning per-mission bookkeeping keyed on this listing).
+    ///
+    /// Symlinks are never followed: a symlinked `.kranz` or `missions` dir
+    /// lists as empty (the fallible variant refuses with an error), and a
+    /// symlinked mission-dir entry is excluded rather than resolved into
+    /// another repository's tree.
     pub fn list_missions(repo_root: &Path) -> Vec<String> {
-        let dir = repo_root.join(".kranz").join("missions");
+        let Ok(Some(dir)) = missions_dir_no_follow(repo_root) else {
+            return Vec::new();
+        };
         let Ok(rd) = std::fs::read_dir(dir) else {
             return Vec::new();
         };
         let mut out: Vec<String> = rd
             .flatten()
-            .filter(|entry| entry.path().is_dir())
+            // `file_type` does not follow symlinks: a symlinked mission dir
+            // is not a mission — exclude it, never resolve through it.
+            .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
             .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
             .collect();
         out.sort();
@@ -176,17 +191,17 @@ impl MissionPaths {
     /// missions yet. Any other `read_dir` failure, or an erroring directory
     /// entry (fd exhaustion, mid-deletion races, permission flaps), is `Err`:
     /// a transient error must not masquerade as "every mission was deleted".
+    /// A symlinked `.kranz`/`missions` dir is `Err` too — it must refuse,
+    /// never be followed into another repository's tree.
     pub fn try_list_missions(repo_root: &Path) -> std::io::Result<Vec<String>> {
-        let dir = repo_root.join(".kranz").join("missions");
-        let rd = match std::fs::read_dir(dir) {
-            Ok(rd) => rd,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(e),
+        let Some(dir) = missions_dir_no_follow(repo_root)? else {
+            return Ok(Vec::new());
         };
+        let rd = std::fs::read_dir(dir)?;
         let mut out = Vec::new();
         for entry in rd {
             let entry = entry?;
-            if entry.path().is_dir() {
+            if entry.file_type()?.is_dir() {
                 if let Some(name) = entry.file_name().to_str() {
                     out.push(name.to_string());
                 }
@@ -195,6 +210,151 @@ impl MissionPaths {
         out.sort();
         Ok(out)
     }
+
+    // -----------------------------------------------------------------------
+    // No-follow mission path resolution (P1 mission-path-no-follow)
+    //
+    // The same capability-based no-follow idiom as the lessons provenance
+    // guard (`crate::lessons`): every component of `.kranz/missions/<id>` is
+    // inspected with `symlink_metadata` (the link itself, never its target)
+    // and then opened with `open_dir_nofollow`, so a symlinked component is
+    // REFUSED with a clear `EngineError::InvalidState` — never followed into
+    // another repository's state, transcripts, or control inbox.
+    // -----------------------------------------------------------------------
+
+    /// Refuse when any component of `<repo>/.kranz/missions/<id>` is a
+    /// symlink (or otherwise not a real directory). An ABSENT component is
+    /// not a refusal — callers keep their own missing-mission handling
+    /// (404s, "unknown mission" errors); only a symlinked component — one
+    /// that would be followed into another tree — must fail here.
+    pub fn require_no_follow(&self) -> Result<()> {
+        match self.open_mission_dir_nofollow(false) {
+            Ok(_) => Ok(()),
+            Err(EngineError::Io(e)) if e.kind() == ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Open `<repo>/.kranz/missions/<id>` as a capability pinned beneath
+    /// components that are provably NOT symlinks. With `create`, missing
+    /// components are created as plain directories (the no-follow counterpart
+    /// of `create_dir_all` for the mission tree); without it, a missing
+    /// component is an `io` `NotFound` error. A symlinked component is always
+    /// [`unsafe_mission_dir_path`], never a follow.
+    pub(crate) fn open_mission_dir_nofollow(&self, create: bool) -> Result<Dir> {
+        if !Self::is_safe_id(&self.mission_id) {
+            return Err(unsafe_mission_dir_path(&self.mission_dir()));
+        }
+        let mut dir = Dir::open_ambient_dir(&self.repo_root, ambient_authority())?;
+        let mut walked = self.repo_root.clone();
+        for segment in [".kranz", "missions", self.mission_id.as_str()] {
+            walked.push(segment);
+            dir = open_child_dir_nofollow(&dir, segment, &walked, create)?;
+        }
+        Ok(dir)
+    }
+}
+
+/// One [`MissionPaths::open_mission_dir_nofollow`] step: refuse a `name` that
+/// exists but is not a real directory (a symlink most of all), create it when
+/// permitted and missing, then open it with `open_dir_nofollow` — the open is
+/// the authoritative no-follow check, the metadata pass only shapes the error.
+fn open_child_dir_nofollow(parent: &Dir, name: &str, walked: &Path, create: bool) -> Result<Dir> {
+    match parent.symlink_metadata(name) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => return Err(unsafe_mission_dir_path(walked)),
+        Err(e) if e.kind() == ErrorKind::NotFound && create => {
+            match parent.create_dir(name) {
+                Ok(()) => {}
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e.into()),
+            }
+            // Lost a race or an attacker planted the name: re-verify.
+            match parent.symlink_metadata(name) {
+                Ok(metadata) if metadata.file_type().is_dir() => {}
+                Ok(_) => return Err(unsafe_mission_dir_path(walked)),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(e) => return Err(e.into()),
+    }
+    parent
+        .open_dir_nofollow(name)
+        .map_err(|_| unsafe_mission_dir_path(walked))
+}
+
+/// Create `name` beneath `dir` (a capability already opened no-follow) when
+/// missing, and verify the result is a REAL directory — a symlinked entry
+/// (`control/`, `runs/` planted inside a genuine mission dir) is refused,
+/// never followed.
+pub(crate) fn create_real_subdir(dir: &Dir, name: &str, full_path: &Path) -> Result<()> {
+    match dir.symlink_metadata(name) {
+        Ok(metadata) if metadata.file_type().is_dir() => return Ok(()),
+        Ok(_) => return Err(unsafe_mission_dir_path(full_path)),
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    match dir.create_dir(name) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => match dir.symlink_metadata(name) {
+            Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+            Ok(_) => Err(unsafe_mission_dir_path(full_path)),
+            Err(e) => Err(e.into()),
+        },
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Refuse `path` when it exists and is anything but a regular file — a
+/// symlink most of all. `symlink_metadata` (never `metadata`) inspects the
+/// link itself, so a symlinked runtime file (events.jsonl, state.json, the
+/// lock file) is rejected at open time instead of being read or written
+/// through into another tree. An absent path is `Ok`: the caller's own
+/// open/read produces its usual `NotFound`.
+pub(crate) fn ensure_absent_or_regular_file(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(_) => Err(EngineError::InvalidState(format!(
+            "refusing mission runtime file that is not a regular file: {}",
+            path.display()
+        ))),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The `<repo>/.kranz/missions` dir for LISTING: `Ok(None)` when a component
+/// is absent (no missions yet), `Err` when a present component is not a real
+/// directory — a symlinked `.kranz`/`missions` must refuse, never be followed
+/// into another repository's tree.
+fn missions_dir_no_follow(repo_root: &Path) -> std::io::Result<Option<PathBuf>> {
+    let kranz = repo_root.join(".kranz");
+    let missions = kranz.join("missions");
+    for path in [&kranz, &missions] {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => {
+                return Err(std::io::Error::other(format!(
+                    "refusing to list missions through a symlinked or non-directory path: {}",
+                    path.display()
+                )));
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(Some(missions))
+}
+
+/// The refusal surfaced when a mission path component is a symlink (or
+/// otherwise not a real directory) — the same refusal family as the lessons
+/// provenance guard: a clear `EngineError::InvalidState`, never a panic and
+/// never a silent follow.
+fn unsafe_mission_dir_path(path: &Path) -> EngineError {
+    EngineError::InvalidState(format!(
+        "refusing mission path with a symlinked or non-directory component: {}",
+        path.display()
+    ))
 }
 
 /// Project config file path.
@@ -282,5 +442,128 @@ mod tests {
         for id in ["m-abc123", "m-2026-07-08", "m_ticket.linked"] {
             assert!(MissionPaths::is_safe_id(id), "{id:?} should be safe");
         }
+    }
+
+    // Symlink-creating tests are unix-only, exactly like the lessons guard's
+    // tests (`std::os::unix::fs::symlink`); Windows needs privileges to
+    // create symlinks, so CI coverage there comes from the no-symlink cases.
+
+    #[cfg(unix)]
+    #[test]
+    fn list_missions_excludes_symlinked_mission_dirs() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missions = tmp.path().join(".kranz").join("missions");
+        std::fs::create_dir_all(missions.join("m-real")).unwrap();
+        // A mission dir that is a symlink into another tree is not a mission:
+        // excluded, never followed.
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        symlink(&elsewhere, missions.join("m-evil")).unwrap();
+        assert_eq!(
+            MissionPaths::list_missions(tmp.path()),
+            vec!["m-real".to_string()]
+        );
+        assert_eq!(
+            MissionPaths::try_list_missions(tmp.path()).unwrap(),
+            vec!["m-real".to_string()]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_missions_refuses_a_symlinked_missions_dir() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".kranz")).unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join("m-evil")).unwrap();
+        symlink(&elsewhere, tmp.path().join(".kranz").join("missions")).unwrap();
+        // The lenient listing stays lenient: empty, not another repo's ids.
+        assert_eq!(
+            MissionPaths::list_missions(tmp.path()),
+            Vec::<String>::new()
+        );
+        // The fallible listing refuses with a clear error.
+        let err = MissionPaths::try_list_missions(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("refusing"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn require_no_follow_refuses_symlinked_components() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missions = tmp.path().join(".kranz").join("missions");
+        std::fs::create_dir_all(missions.join("m-real")).unwrap();
+        // A real mission dir passes; an absent one is not a refusal (the
+        // caller's own missing-mission handling decides).
+        assert!(MissionPaths::new(tmp.path(), "m-real")
+            .require_no_follow()
+            .is_ok());
+        assert!(MissionPaths::new(tmp.path(), "m-absent")
+            .require_no_follow()
+            .is_ok());
+        // A symlinked mission dir is refused with a clear error.
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        symlink(&elsewhere, missions.join("m-evil")).unwrap();
+        let err = MissionPaths::new(tmp.path(), "m-evil")
+            .require_no_follow()
+            .unwrap_err();
+        assert!(err.to_string().contains("refusing"), "{err}");
+        // Unsafe ids never reach the filesystem.
+        assert!(MissionPaths::new(tmp.path(), "../x")
+            .require_no_follow()
+            .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn require_no_follow_refuses_a_symlinked_kranz_dir() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join("missions").join("m-evil")).unwrap();
+        symlink(&elsewhere, tmp.path().join(".kranz")).unwrap();
+        assert!(MissionPaths::new(tmp.path(), "m-evil")
+            .require_no_follow()
+            .is_err());
+        assert_eq!(
+            MissionPaths::list_missions(tmp.path()),
+            Vec::<String>::new()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_mission_dir_nofollow_creates_missing_dirs_but_refuses_symlinks() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Fresh repo: the whole chain is created, mirroring create_dir_all.
+        let paths = MissionPaths::new(tmp.path(), "m-new");
+        paths.open_mission_dir_nofollow(true).unwrap();
+        assert!(paths.mission_dir().is_dir());
+        // A planted symlink in place of the mission dir is refused.
+        std::fs::remove_dir(paths.mission_dir()).unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        symlink(&elsewhere, paths.mission_dir()).unwrap();
+        assert!(paths.open_mission_dir_nofollow(true).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_absent_or_regular_file_refuses_symlinks() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("target.jsonl");
+        std::fs::write(&target, b"secret").unwrap();
+        let link = tmp.path().join("link.jsonl");
+        symlink(&target, &link).unwrap();
+        let err = ensure_absent_or_regular_file(&link).unwrap_err();
+        assert!(err.to_string().contains("refusing"), "{err}");
+        assert!(ensure_absent_or_regular_file(&target).is_ok());
+        assert!(ensure_absent_or_regular_file(&tmp.path().join("missing.jsonl")).is_ok());
     }
 }

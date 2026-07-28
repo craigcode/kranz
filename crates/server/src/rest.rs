@@ -60,6 +60,14 @@ pub(crate) async fn list_missions(State(server): State<Arc<ServerState>>) -> Jso
             }));
             continue;
         }
+        // The events file exists — but trust it only when no path component
+        // is a symlink (P1 mission-path-no-follow): a symlinked mission dir
+        // surfaces as a clear error row, never a read into another
+        // repository's tree.
+        if let Err(error) = paths.require_no_follow() {
+            rows.push(json!({ "id": id, "status": "failed", "error": error.to_string() }));
+            continue;
+        }
         let row = match fold_log(&paths) {
             Ok(state) => {
                 let merged = repo
@@ -758,7 +766,15 @@ pub(crate) fn mission_paths(server: &ServerState, id: &str) -> Result<MissionPat
     if !safe_id(id) {
         return Err(unknown_mission(id));
     }
-    Ok(MissionPaths::new(&server.repo_root, id))
+    let paths = MissionPaths::new(&server.repo_root, id);
+    // A symlinked component in the mission path is refused (P1
+    // mission-path-no-follow), never followed into another repository's
+    // tree. An absent component is NOT a refusal here — handlers keep their
+    // own unknown-mission behavior for missions that do not exist.
+    if paths.require_no_follow().is_err() {
+        return Err(unknown_mission(id));
+    }
+    Ok(paths)
 }
 
 /// Ids from the URL are joined into filesystem paths, so separators, `..`
@@ -1087,5 +1103,119 @@ mod tests {
             command_grants: vec![],
             touch_set: vec![],
         }
+    }
+
+    /// P1 mission-path-no-follow: a catalog line whose id traverses out of
+    /// the missions dir is rejected before any filesystem access — it never
+    /// becomes a row (and never resolves a path).
+    #[tokio::test]
+    async fn list_missions_rejects_catalog_ids_with_traversal() {
+        let tmp = TempDir::new().unwrap();
+        let missions_dir = tmp.path().join(".kranz").join("missions");
+        std::fs::create_dir_all(&missions_dir).unwrap();
+        std::fs::write(
+            missions_dir.join("index.md"),
+            "# Kranz missions\n\n\
+             - 2026-07-28 · [../../../tmp/evil](../../../tmp/evil/plan.md) — traversal\n\
+             - 2026-07-28 · [m-ghost](m-ghost/plan.md) — ghost\n",
+        )
+        .unwrap();
+        let app = crate::router(tmp.path().to_path_buf(), None);
+        let response = app.oneshot(get("/api/missions")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        let ids: Vec<&str> = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|row| row["id"].as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["m-ghost"],
+            "traversal catalog id rejected, legit ghost kept: {ids:?}"
+        );
+    }
+
+    // Symlink-creating tests are unix-only, exactly like the lessons guard's
+    // tests in the engine; Windows needs privileges to create symlinks.
+
+    /// P1 mission-path-no-follow: a symlinked `.kranz/missions/<id>` is a
+    /// clear error row on enumerate — never a read into the target's tree.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_missions_surfaces_a_symlinked_mission_dir_as_an_error_row() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        // The symlink target is another tree's real mission, with data that
+        // must not leak into this repo's listing.
+        let elsewhere = TempDir::new().unwrap();
+        seed_mission(elsewhere.path(), "m-evil", vec![created("other repo goal")]);
+        let missions_dir = tmp.path().join(".kranz").join("missions");
+        std::fs::create_dir_all(&missions_dir).unwrap();
+        symlink(
+            elsewhere
+                .path()
+                .join(".kranz")
+                .join("missions")
+                .join("m-evil"),
+            missions_dir.join("m-evil"),
+        )
+        .unwrap();
+        // A catalog line keeps the symlinked id in the union (the on-disk
+        // scan already excludes it as not-a-real-dir).
+        std::fs::write(
+            missions_dir.join("index.md"),
+            "# Kranz missions\n\n- 2026-07-28 · [m-evil](m-evil/plan.md) — evil\n",
+        )
+        .unwrap();
+        let app = crate::router(tmp.path().to_path_buf(), None);
+        let response = app.oneshot(get("/api/missions")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        let row = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == "m-evil")
+            .expect("the symlinked mission surfaces as an error row");
+        assert_eq!(row["status"], "failed", "{row}");
+        assert!(
+            row["error"].as_str().unwrap().contains("refusing"),
+            "clear refusal: {row}"
+        );
+        assert!(
+            row.get("goal").is_none(),
+            "nothing read through the symlink: {row}"
+        );
+    }
+
+    /// P1 mission-path-no-follow: direct mission-path resolution (every
+    /// `/api/missions/:id/...` handler goes through `mission_paths`) refuses
+    /// a symlinked mission dir as an unknown mission.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mission_state_refuses_a_symlinked_mission_dir() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        seed_mission(elsewhere.path(), "m-evil", vec![created("other repo goal")]);
+        let missions_dir = tmp.path().join(".kranz").join("missions");
+        std::fs::create_dir_all(&missions_dir).unwrap();
+        symlink(
+            elsewhere
+                .path()
+                .join(".kranz")
+                .join("missions")
+                .join("m-evil"),
+            missions_dir.join("m-evil"),
+        )
+        .unwrap();
+        let app = crate::router(tmp.path().to_path_buf(), None);
+        let response = app
+            .oneshot(get("/api/missions/m-evil/state"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

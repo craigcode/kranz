@@ -242,6 +242,16 @@ impl GitRepo {
         Ok(self.run(&["status", "--porcelain"])?.trim().is_empty())
     }
 
+    /// Full `git status --porcelain` (v1) output: index + worktree status of
+    /// tracked files plus untracked non-ignored paths, respecting .gitignore
+    /// (so build-artifact churn like `target/` and the gitignored `.kranz`
+    /// runtime never appears). The validator immutability fingerprint
+    /// ([`crate::validator_integrity`]) compares this verbatim across a
+    /// session; v1's C-quoting keeps even exotic paths to one line per entry.
+    pub fn porcelain_status(&self) -> Result<String> {
+        self.run(&["status", "--porcelain"])
+    }
+
     /// Like [`Self::is_clean`] but ignoring untracked files: `true` when no
     /// TRACKED file is modified, staged, or deleted. Untracked files never
     /// block a branch switch (git carries them across), so restore-checkout

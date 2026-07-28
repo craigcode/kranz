@@ -54,6 +54,7 @@ pub mod sandbox_container;
 pub mod scrub;
 pub mod ticket;
 pub mod trace_export;
+pub mod validator_integrity;
 pub mod work;
 pub mod workspace_container;
 pub mod workspace_contract;

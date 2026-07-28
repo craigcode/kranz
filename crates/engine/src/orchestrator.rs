@@ -73,6 +73,7 @@ use crate::runner;
 use crate::scrub;
 use crate::ticket::Ticket;
 use crate::types::*;
+use crate::validator_integrity;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -3593,6 +3594,11 @@ impl MissionEngine {
             let cfg = selected.cfg;
 
             let session_cwd = self.active_root().to_path_buf();
+            // Validator immutability proof (ticket validator-immutability-proof):
+            // fingerprint HEAD + index + worktree BEFORE the spawn; compared
+            // against a fresh capture right after the session ends.
+            let fingerprint =
+                validator_integrity::CheckoutFingerprint::capture(self.active_repo())?;
             let outcome = runner::run_validator_in(
                 backend.as_ref(),
                 &mut self.log,
@@ -3615,6 +3621,13 @@ impl MissionEngine {
             let caught = self.catch_up();
             let mut outcome = outcome?;
             caught?;
+
+            // Any checkout drift across the session fails the round honestly —
+            // before the grant-park/retry machinery, which must never launder
+            // a write into a second chance.
+            if self.fail_on_validator_tamper(&milestone_id, role, &outcome.run_id, &fingerprint)? {
+                return Ok(());
+            }
 
             // Bounded (exactly one retry) runtime fallback: a validator run
             // that did not produce a trusted pass is retried once with the
@@ -3659,6 +3672,11 @@ impl MissionEngine {
                 let retry_cfg = self.claude_fallback_cfg_for_role(role);
                 let retry_backend = Arc::clone(&self.backend);
                 let retry_session_cwd = self.active_root().to_path_buf();
+                // The retry is a fresh validator session: its own before/after
+                // identity assertion (the baseline is the tree the first
+                // session provably left untouched).
+                let retry_fingerprint =
+                    validator_integrity::CheckoutFingerprint::capture(self.active_repo())?;
                 let retry_outcome = runner::run_validator_in(
                     retry_backend.as_ref(),
                     &mut self.log,
@@ -3681,6 +3699,15 @@ impl MissionEngine {
                 let caught = self.catch_up();
                 outcome = retry_outcome?;
                 caught?;
+
+                if self.fail_on_validator_tamper(
+                    &milestone_id,
+                    role,
+                    &outcome.run_id,
+                    &retry_fingerprint,
+                )? {
+                    return Ok(());
+                }
 
                 // A denial the runner could only read on the Claude retry (a
                 // Codex/Droid primary whose events don't map to a command, or a
@@ -3812,6 +3839,48 @@ impl MissionEngine {
             }
         }
         Ok(())
+    }
+
+    /// The after-side of the validator immutability proof (module
+    /// [`validator_integrity`]): re-fingerprint the session checkout and, on
+    /// any drift since `before`, fail the round honestly — emit
+    /// `validator.tamper` (recording WHAT changed) and block the milestone.
+    /// Never a retry, never a finding the orchestrator's conversion turn could
+    /// waive: a validator that wrote to its "read-only" checkout has
+    /// invalidated every judgement it made. Returns `true` when the round
+    /// failed (caller returns immediately).
+    fn fail_on_validator_tamper(
+        &mut self,
+        milestone_id: &str,
+        role: Role,
+        run_id: &str,
+        before: &validator_integrity::CheckoutFingerprint,
+    ) -> Result<bool> {
+        let after = validator_integrity::CheckoutFingerprint::capture(self.active_repo())?;
+        let Some(drift) = before.drift(&after) else {
+            return Ok(false);
+        };
+        self.emit(EventKind::ValidatorTamper {
+            milestone_id: milestone_id.to_string(),
+            run_id: run_id.to_string(),
+            role,
+            head_before: drift.head_before.clone(),
+            head_after: drift.head_after.clone(),
+            appeared: drift.appeared.clone(),
+            resolved: drift.resolved.clone(),
+        })?;
+        let reason = format!(
+            "{} session altered the checkout ({}); validators are \
+             read-only, so the round fails honestly",
+            role_label(role),
+            drift.summary()
+        );
+        self.emit_decision(&reason, None)?;
+        self.emit(EventKind::MilestoneBlocked {
+            milestone_id: milestone_id.to_string(),
+            reason,
+        })?;
+        Ok(true)
     }
 
     /// Engine-computed out-of-contract-write sweep (M7 tier 1, feature
@@ -6334,6 +6403,240 @@ pub(crate) mod tests {
                 .iter()
                 .any(|e| matches!(&e.kind, EventKind::MilestoneCompleted { milestone_id, .. } if milestone_id == "ms-1")),
             "failed validator with no report must not complete the milestone"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // validator immutability proof (ticket validator-immutability-proof)
+    // ---------------------------------------------------------------------------
+
+    /// A validator report claiming a clean pass.
+    fn clean_validator_script() -> crate::backend_mock::MockScript {
+        crate::backend_mock::MockScript::single_shot_json(&serde_json::json!({
+            "findings": [],
+            "summary": "no findings"
+        }))
+    }
+
+    fn single_milestone_engine(
+        backend: Arc<dyn AgentBackend>,
+        root: &std::path::Path,
+    ) -> MissionEngine {
+        let cfg = MissionConfig {
+            skip_functional: true,
+            worker_isolation: WorkerIsolation::Checkout,
+            ..MissionConfig::default()
+        };
+        let mut engine = MissionEngine::create(backend, root, "goal", cfg).unwrap();
+        engine.state.mission.milestones.push(Milestone {
+            id: "ms-1".to_string(),
+            title: "m".to_string(),
+            features: vec![],
+            status: MilestoneStatus::Active,
+            fix_cycles: 0,
+            start_sha: Some(engine.repo.head_sha().unwrap()),
+            validator_guidance: None,
+        });
+        engine
+    }
+
+    /// A clean validator round passes the identity assertion: no
+    /// `validator.tamper` event, the milestone completes.
+    #[tokio::test]
+    async fn clean_validator_round_passes_immutability_assertion() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            clean_validator_script(),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock;
+        let mut engine = single_milestone_engine(backend, &root);
+
+        engine.validation_round(0).await.unwrap();
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::ValidatorTamper { .. })),
+            "clean round must not emit validator.tamper: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::MilestoneCompleted { milestone_id, .. } if milestone_id == "ms-1")),
+            "clean round completes the milestone: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+    }
+
+    /// A validator that touches a TRACKED file fails the round with a
+    /// `validator.tamper` event naming the path — no retry, no completion.
+    #[tokio::test]
+    async fn validator_touching_tracked_file_fails_round_with_tamper() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        // The script claims a clean pass WHILE editing the tracked README —
+        // exactly the "alter tests to manufacture a pass" shape.
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            clean_validator_script().writes_file("README.md", "tampered\n"),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock.clone();
+        let mut engine = single_milestone_engine(backend, &root);
+
+        engine.validation_round(0).await.unwrap();
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        let tamper = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::ValidatorTamper {
+                    milestone_id,
+                    appeared,
+                    head_before,
+                    head_after,
+                    ..
+                } if milestone_id == "ms-1" => {
+                    Some((appeared.clone(), head_before.clone(), head_after.clone()))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected validator.tamper on the log: {:?}",
+                    events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            tamper.0.iter().any(|entry| entry.contains("README.md")),
+            "tamper event names the touched file: {:?}",
+            tamper.0
+        );
+        assert_eq!(tamper.1, tamper.2, "a bare edit must not move HEAD");
+        assert!(
+            events.iter().any(|e| matches!(&e.kind, EventKind::MilestoneBlocked { milestone_id, reason } if milestone_id == "ms-1" && reason.contains("altered the checkout"))),
+            "tamper blocks the milestone honestly: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::MilestoneCompleted { milestone_id, .. } if milestone_id == "ms-1")),
+            "a tampering validator must not complete the milestone"
+        );
+        let validator_spawns = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.kind,
+                    EventKind::WorkerSpawned { role, .. } if *role == Role::ValidatorScrutiny
+                )
+            })
+            .count();
+        assert_eq!(
+            validator_spawns, 1,
+            "tamper is not retried — the round fails on the first session"
+        );
+        assert_eq!(mock.started_specs().len(), 1);
+    }
+
+    /// A validator that commits inside its session moves HEAD: the round
+    /// fails with `validator.tamper` recording the before/after SHAs.
+    #[tokio::test]
+    async fn validator_moving_head_fails_round_with_tamper() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            clean_validator_script()
+                .writes_file("sneaky.rs", "fn sneaky() {}\n")
+                .commits_all("validator's unreviewed commit"),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock;
+        let mut engine = single_milestone_engine(backend, &root);
+        let head_before = engine.repo.head_sha().unwrap();
+
+        engine.validation_round(0).await.unwrap();
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        let tamper = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::ValidatorTamper {
+                    milestone_id,
+                    head_before,
+                    head_after,
+                    ..
+                } if milestone_id == "ms-1" => Some((head_before.clone(), head_after.clone())),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected validator.tamper on the log: {:?}",
+                    events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(tamper.0, head_before, "tamper records the pre-session HEAD");
+        assert_ne!(tamper.0, tamper.1, "the validator's commit moved HEAD");
+        assert!(
+            events.iter().any(|e| matches!(&e.kind, EventKind::MilestoneBlocked { milestone_id, reason } if milestone_id == "ms-1" && reason.contains("HEAD moved"))),
+            "head-move block reason names the drift: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::MilestoneCompleted { milestone_id, .. } if milestone_id == "ms-1")),
+            "a committing validator must not complete the milestone"
+        );
+    }
+
+    /// Gate artifact churn is not tampering: writes under a gitignored path
+    /// (target/) never reach the porcelain fingerprint, so the round passes.
+    #[tokio::test]
+    async fn validator_ignored_artifact_churn_passes_round() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        // gitignore target/ (as every Rust checkout does) before the engine
+        // pins the milestone start sha.
+        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&root)
+            .output()
+            .expect("git add");
+        std::process::Command::new("git")
+            .args(["commit", "-m", "gitignore target"])
+            .current_dir(&root)
+            .output()
+            .expect("git commit");
+
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            clean_validator_script().writes_file("target/debug/build-output.txt", "obj"),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock;
+        let mut engine = single_milestone_engine(backend, &root);
+
+        engine.validation_round(0).await.unwrap();
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::ValidatorTamper { .. })),
+            "ignored-artifact churn must not trip the assertion: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::MilestoneCompleted { milestone_id, .. } if milestone_id == "ms-1")),
+            "round with only ignored churn completes: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
         );
     }
 

@@ -30,12 +30,17 @@ const RAND_LEN: usize = 8;
 
 /// Enqueue one command into the mission's control inbox.
 ///
-/// Creates the control directory if needed, writes the JSON to a sibling tmp
-/// file, then atomically renames it to `<zero-padded-nanos>-<8-hex>.json` —
-/// readers never see partial files. Returns the final file path.
+/// Creates the mission tree and control directory if needed — no-follow (P1
+/// mission-path-no-follow): a symlinked `.kranz`/`missions`/mission dir or
+/// `control/` entry is refused, never followed, since an enqueue through a
+/// symlink would route control commands into another repository's mission.
+/// The JSON goes to a sibling tmp file, then atomically renames to
+/// `<zero-padded-nanos>-<8-hex>.json` — readers never see partial files.
+/// Returns the final file path.
 pub fn enqueue(paths: &MissionPaths, cmd: &ControlCommand) -> Result<PathBuf> {
+    let mission_dir = paths.open_mission_dir_nofollow(true)?;
     let dir = paths.control_dir();
-    std::fs::create_dir_all(&dir)?;
+    crate::paths::create_real_subdir(&mission_dir, "control", &dir)?;
 
     let nanos = Utc::now().timestamp_nanos_opt().unwrap_or(0).max(0) as u64;
     let rand = uuid::Uuid::new_v4().simple().to_string();
@@ -134,6 +139,14 @@ pub fn resolve_active_mission(repo_root: &Path, explicit: Option<&str>) -> Resul
     let is_terminal = crate::mission_catalog::is_terminal_status;
     if let Some(id) = explicit {
         if !MissionPaths::is_safe_id(id) {
+            return Err(EngineError::Other(format!("unknown mission `{id}`")));
+        }
+        // A symlinked mission dir is refused (P1 mission-path-no-follow),
+        // never followed into another repository's mission.
+        if MissionPaths::new(repo_root, id)
+            .require_no_follow()
+            .is_err()
+        {
             return Err(EngineError::Other(format!("unknown mission `{id}`")));
         }
         match mission_status(repo_root, id) {
@@ -378,6 +391,69 @@ mod tests {
             err.contains("m-a") && err.contains("m-b"),
             "candidates listed: {err}"
         );
+    }
+
+    // Symlink-creating tests are unix-only, exactly like the lessons guard's
+    // tests; Windows needs privileges to create symlinks.
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_explicit_mission_refuses_a_symlinked_mission_dir() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        // The symlink target holds a foldable ACTIVE mission, so a reverted
+        // guard would ACCEPT the id instead of refusing it.
+        seed_mission(elsewhere.path(), "m-evil", false);
+        let missions = tmp.path().join(".kranz").join("missions");
+        std::fs::create_dir_all(&missions).unwrap();
+        symlink(
+            elsewhere
+                .path()
+                .join(".kranz")
+                .join("missions")
+                .join("m-evil"),
+            missions.join("m-evil"),
+        )
+        .unwrap();
+        let err = resolve_active_mission(tmp.path(), Some("m-evil"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown mission"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enqueue_refuses_a_symlinked_mission_dir_without_touching_the_target() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        let missions = tmp.path().join(".kranz").join("missions");
+        std::fs::create_dir_all(&missions).unwrap();
+        symlink(elsewhere.path(), missions.join("m-evil")).unwrap();
+        let paths = MissionPaths::new(tmp.path(), "m-evil");
+        let err = enqueue(&paths, &ControlCommand::Pause).unwrap_err();
+        assert!(err.to_string().contains("refusing"), "{err}");
+        // Nothing was routed into the target tree.
+        assert!(!elsewhere.path().join("control").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enqueue_refuses_a_symlinked_control_dir_without_touching_the_target() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-1", false);
+        let paths = MissionPaths::new(tmp.path(), "m-1");
+        let elsewhere = TempDir::new().unwrap();
+        symlink(elsewhere.path(), paths.control_dir()).unwrap();
+        let err = enqueue(&paths, &ControlCommand::Pause).unwrap_err();
+        assert!(err.to_string().contains("refusing"), "{err}");
+        // Nothing was written into the target dir.
+        assert!(std::fs::read_dir(elsewhere.path())
+            .unwrap()
+            .next()
+            .is_none());
     }
 
     #[test]

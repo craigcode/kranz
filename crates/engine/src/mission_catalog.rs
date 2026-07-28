@@ -40,6 +40,11 @@ pub fn prune_mission_index(existing: &str, mission_id: &str) -> String {
 /// Every mission id appearing as `[<id>](` in the catalog body, in file
 /// order, de-duplicated. Tolerant of the trailing ` · [report](<id>/report.md)`
 /// link: the FIRST bracket on a line (the plan.md link) is taken as the id.
+///
+/// The catalog is repo-controlled data that every consumer joins into
+/// filesystem paths, so an id that is not path-safe (separators, `..`, drive
+/// designators — see [`MissionPaths::is_safe_id`]) is rejected here, before
+/// any filesystem access (P1 mission-path-no-follow).
 pub fn mission_index_ids(existing: &str) -> Vec<String> {
     let mut ids = Vec::new();
     for l in existing.lines() {
@@ -54,6 +59,9 @@ pub fn mission_index_ids(existing: &str) -> Vec<String> {
             continue;
         };
         let id = &rest[..end];
+        if !MissionPaths::is_safe_id(id) {
+            continue;
+        }
         if !ids.iter().any(|existing_id: &String| existing_id == id) {
             ids.push(id.to_string());
         }
@@ -226,4 +234,25 @@ pub fn cleanable_class(status: MissionStatus, has_plan: bool) -> CleanClass {
 /// Non-unix platforms cannot probe, so an existing lock reads as live.
 pub fn mission_lock_is_live(paths: &MissionPaths) -> bool {
     crate::event_log::lock_holder_is_alive(&paths.lock_file())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mission_index_ids_rejects_ids_that_are_not_path_safe() {
+        let index = "\
+# Kranz missions
+
+Approved plans, newest last.
+
+- 2026-07-28 · [m-real](m-real/plan.md) — real
+- 2026-07-28 · [../../../tmp/evil](../../../tmp/evil/plan.md) — traversal
+- 2026-07-28 · [a/b](a/b/plan.md) — separator
+- 2026-07-28 · [C:evil](C:evil/plan.md) — drive designator
+- 2026-07-28 · [m-..](m-../plan.md) — dot-dot substring
+";
+        assert_eq!(mission_index_ids(index), vec!["m-real".to_string()]);
+    }
 }

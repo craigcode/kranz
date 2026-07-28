@@ -24,3 +24,37 @@ post-hoc; this turns detection into prevention per session.
 - python3 -* is no longer in any validator allow-set; existing contracts
   using heredoc forms get a documented engine-run path.
 - cargo test --workspace green.
+
+## Resolution notes (shipped)
+
+- **Identity assertion** (`crates/engine/src/validator_integrity.rs`, wired
+  into `orchestrator.rs::validation_round` around BOTH the primary validator
+  session and its one retry): capture `git rev-parse HEAD` +
+  `git status --porcelain` before the spawn, re-capture after, any drift
+  emits `validator.tamper` (milestoneId, runId, role, headBefore/headAfter,
+  gained/lost porcelain entries) and blocks the milestone — no retry, no
+  waivable finding. The assertion is "no tracked file changed, HEAD
+  unchanged, index unchanged", plus no new non-ignored file (a dropped test
+  file manufactures a pass as easily as an edit). Porcelain respects
+  .gitignore, so gate artifact churn (`target/`, the gitignored `.kranz`
+  engine runtime) never trips it.
+- **Narrowed allow patterns** (`permissions.rs::command_allow_patterns`):
+  only the verbatim contract command and its exact `&&`/`||`/`;`/`|`
+  segments become `Bash(<form>*)` rules. The leading-two-token catch-alls
+  (`python3 -*`, `python3 -m*`, `cargo test*` from `cargo test --workspace
+  x`) are gone from every validator allow-set. Heredoc contract commands
+  need no validator Bash rule: contract commands are executed engine-side
+  (`validation_round`'s captured PASS/FAIL evidence, validator repair 3/5) —
+  that engine-run path is the documented route for heredoc-shaped checks.
+
+## Remaining gap (honest interim, not containment)
+
+Validators CAN still write to the session checkout — the permission
+patterns and sandbox do not make the tree read-only. What shipped is
+detection with teeth: any write is caught before the round can pass and is
+recorded in the append-only event log. The follow-up for true immutability
+is an **immutable-snapshot validator**: run each validator in a
+copy-on-write worktree (or read-only mount of the checkout) that is
+discarded after the round, so writes are structurally impossible rather
+than caught. The `writable: false` spec field is separately being made
+fail-closed by the parallel backend-sandbox work.

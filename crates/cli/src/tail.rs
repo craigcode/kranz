@@ -258,6 +258,27 @@ impl EventRenderer {
                     finding.severity, finding.subject, finding.evidence
                 ),
             ),
+            EventKind::ValidatorTamper {
+                milestone_id,
+                head_before,
+                head_after,
+                appeared,
+                resolved,
+                ..
+            } => {
+                let mut what: Vec<String> = appeared.iter().take(3).cloned().collect();
+                if head_before != head_after {
+                    what.push("HEAD moved".to_string());
+                }
+                if !resolved.is_empty() {
+                    what.push(format!("{} entr(ies) hidden", resolved.len()));
+                }
+                (
+                    format!("milestone {milestone_id}"),
+                    ansi::RED,
+                    format!("validator TAMPER: {}", what.join("; ")),
+                )
+            }
             EventKind::FixFeatureCreated {
                 milestone_id,
                 feature,

@@ -215,6 +215,35 @@ pub enum EventKind {
         finding: Finding,
     },
 
+    /// A validator session altered its checkout (validator immutability
+    /// proof, ticket `validator-immutability-proof`): the HEAD/index/worktree
+    /// identity assertion around every validator session found drift, so the
+    /// round failed honestly — the milestone blocks, with no retry and no
+    /// waivable finding. The payload records WHAT changed: HEAD before/after
+    /// and the `git status --porcelain` entries gained/lost across the
+    /// session. Additive event; absent in pre-field logs.
+    #[serde(rename = "validator.tamper")]
+    ValidatorTamper {
+        #[serde(rename = "milestoneId")]
+        milestone_id: String,
+        #[serde(rename = "runId")]
+        run_id: String,
+        role: Role,
+        /// HEAD when the session started.
+        #[serde(rename = "headBefore")]
+        head_before: String,
+        /// HEAD when the session ended (== headBefore unless the session
+        /// moved it, e.g. a validator-run `git commit`).
+        #[serde(rename = "headAfter")]
+        head_after: String,
+        /// Porcelain entries present after but not before (the session's
+        /// writes: ` M <path>`, `A  <path>`, `?? <path>`, …).
+        appeared: Vec<String>,
+        /// Porcelain entries present before but not after (the session
+        /// reverted or hid a pre-existing dirty state — equally a mutation).
+        resolved: Vec<String>,
+    },
+
     /// Orchestrator converted findings into a fix-feature (origin: fix).
     #[serde(rename = "fixfeature.created")]
     FixFeatureCreated {
@@ -416,6 +445,7 @@ impl EventKind {
             EventKind::FeatureSkipped { .. } => "feature.skipped",
             EventKind::MilestoneValidating { .. } => "milestone.validating",
             EventKind::ValidationFinding { .. } => "validation.finding",
+            EventKind::ValidatorTamper { .. } => "validator.tamper",
             EventKind::FixFeatureCreated { .. } => "fixfeature.created",
             EventKind::TierEscalated { .. } => "tier.escalated",
             EventKind::MilestoneBlocked { .. } => "milestone.blocked",
@@ -867,6 +897,48 @@ mod tests {
         let event: EventKind = serde_json::from_str(old_log).unwrap();
         match event {
             EventKind::PlanApproved { base_sha, .. } => assert_eq!(base_sha, None),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// The additive `validator.tamper` event (ticket
+    /// `validator-immutability-proof`): wire name, payload shape, and
+    /// round-trip — the audit record of a failed immutability assertion.
+    #[test]
+    fn validator_tamper_round_trips() {
+        let tamper = EventKind::ValidatorTamper {
+            milestone_id: "ms-1".to_string(),
+            run_id: "r-1".to_string(),
+            role: Role::ValidatorScrutiny,
+            head_before: "abc1234".to_string(),
+            head_after: "def5678".to_string(),
+            appeared: vec![" M README.md".to_string(), "?? sneaky.rs".to_string()],
+            resolved: vec![],
+        };
+        let json = serde_json::to_value(&tamper).unwrap();
+        assert_eq!(json["type"], "validator.tamper");
+        assert_eq!(json["payload"]["milestoneId"], "ms-1");
+        assert_eq!(json["payload"]["headBefore"], "abc1234");
+        assert_eq!(json["payload"]["headAfter"], "def5678");
+        assert_eq!(
+            json["payload"]["appeared"],
+            serde_json::json!([" M README.md", "?? sneaky.rs"])
+        );
+        assert_eq!(tamper.type_name(), "validator.tamper");
+        let back: EventKind = serde_json::from_value(json).unwrap();
+        match back {
+            EventKind::ValidatorTamper {
+                milestone_id,
+                role,
+                appeared,
+                resolved,
+                ..
+            } => {
+                assert_eq!(milestone_id, "ms-1");
+                assert_eq!(role, Role::ValidatorScrutiny);
+                assert_eq!(appeared.len(), 2);
+                assert!(resolved.is_empty());
+            }
             _ => panic!("wrong variant"),
         }
     }

@@ -1356,9 +1356,13 @@ async fn run_validator_routes_macos_fs_net_through_egress_proxy() {
     assert!(outcome.denied_egress.is_empty());
 }
 
-/// Contract commands must admit their natural reinvocations (observed live:
+/// Contract commands admit their natural reinvocations (observed live:
 /// verbatim-only prefixes denied the validator its own checks and blocked a
-/// milestone on a permissions artifact).
+/// milestone on a permissions artifact) through exact declared-form rules —
+/// and NOTHING wider (ticket validator-immutability-proof): the old
+/// leading-two-token catch-alls (`python3 -*`, `python3 -m*`) are gone, and
+/// heredoc contracts run through the engine-side contract execution path
+/// instead of a validator Bash rule.
 #[test]
 fn validator_command_patterns_cover_natural_variations() {
     use kranz_engine::permissions::command_allow_patterns;
@@ -1376,21 +1380,28 @@ fn validator_command_patterns_cover_natural_variations() {
             }
         })
     };
-    // Verbatim, bare segment, and heredoc-ish/arg-extended reinvocations.
+    // Verbatim, bare segment, and arg-extended reinvocations of a segment.
     assert!(covers("python3 extract_links.py && echo EXIT_OK"));
     assert!(covers("python3 extract_links.py"));
     assert!(covers(
         "python3 extract_links.py operator@example.com out.txt"
     ));
     assert!(covers("echo EXIT_OK"));
-    // Heredoc contract command: leading-two-token rule admits `python3 -`.
-    let heredoc = command_allow_patterns("python3 - <<'PY'\nprint('ok')\nPY");
-    assert!(heredoc.iter().any(|p| p == "Bash(python3 -*)"));
-    // Unrelated programs stay uncovered.
+    // Unrelated programs stay uncovered — including other uses of the same
+    // interpreter (no `python3 -*` catch-all).
+    assert!(!covers("python3 -c 'import sys'"));
+    assert!(!covers("python3 other_script.py"));
     assert!(!covers("curl https://example.com"));
     assert!(!covers("rm -rf /"));
 
-    // And the profile carries them through for validators.
+    // Heredoc contract commands get no validator Bash rule at all: the
+    // engine runs contract commands itself and hands the validator the
+    // captured PASS/FAIL evidence (validator repair 3/5).
+    let heredoc = command_allow_patterns("python3 - <<'PY'\nprint('ok')\nPY");
+    assert!(!heredoc.iter().any(|p| p == "Bash(python3 -*)"));
+
+    // And the profile carries the exact declared form only — a `-m` contract
+    // no longer widens to arbitrary interpreter/module use.
     let cfg = MissionConfig::default();
     let profile = kranz_engine::permissions::for_role(
         Role::ValidatorFunctional,
@@ -1402,7 +1413,12 @@ fn validator_command_patterns_cover_natural_variations() {
     assert!(profile
         .allowed_tools
         .iter()
+        .any(|p| p == "Bash(python3 -m pytest test_x.py -v*)"));
+    assert!(!profile
+        .allowed_tools
+        .iter()
         .any(|p| p == "Bash(python3 -m*)"));
+    assert!(!profile.allowed_tools.iter().any(|p| p == "Bash(python3*)"));
 }
 
 // ---------------------------------------------------------------------------

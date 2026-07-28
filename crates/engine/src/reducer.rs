@@ -305,6 +305,20 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             }
         }
 
+        EventKind::ValidatorTamper {
+            milestone_id,
+            run_id,
+            ..
+        } => {
+            // Audit record of the failed immutability assertion; the
+            // accompanying milestone.blocked drives status. Validate
+            // references as a corruption guard (mirrors validation.finding).
+            milestone_mut(state, milestone_id)?;
+            if run_id != ENGINE_RUN_ID {
+                run_mut(state, run_id)?;
+            }
+        }
+
         EventKind::FixFeatureCreated {
             milestone_id,
             feature,
@@ -830,8 +844,10 @@ pub fn write_snapshot(state: &MissionState, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Read a snapshot previously written by [`write_snapshot`].
+/// Read a snapshot previously written by [`write_snapshot`]. A symlinked
+/// `state.json` is refused (P1 mission-path-no-follow), never read through.
 pub fn read_snapshot(path: &Path) -> Result<MissionState> {
+    crate::paths::ensure_absent_or_regular_file(path)?;
     let content = std::fs::read_to_string(path)?;
     Ok(serde_json::from_str(&content)?)
 }

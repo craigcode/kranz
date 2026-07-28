@@ -82,6 +82,14 @@ function describe(e: MissionEvent, state: MissionState | null): { text: string; 
         text: `Finding [${e.payload.finding.severity}]: ${truncate(e.payload.finding.evidence, 80)}`,
         tone: 'warn',
       };
+    case 'validator.tamper': {
+      const p = e.payload;
+      const what =
+        p.headBefore !== p.headAfter
+          ? `HEAD moved, ${p.appeared.length + p.resolved.length} path(s) changed`
+          : truncate(p.appeared.join(', ') || 'checkout altered', 70);
+      return { text: `VALIDATOR TAMPER on ${p.milestoneId}: ${what} — round failed`, tone: 'bad' };
+    }
     case 'fixfeature.created':
       return {
         text: `Fix feature ${e.payload.feature.id}: ${truncate(e.payload.feature.title, 70)}`,

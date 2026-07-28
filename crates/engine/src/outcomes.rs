@@ -546,6 +546,11 @@ pub fn compute_outcomes(repo_root: &std::path::Path) -> anyhow::Result<Outcomes>
         if !events_path.is_file() {
             continue;
         }
+        // Never fold a mission reached through a symlinked path component
+        // (P1 mission-path-no-follow).
+        if paths.require_no_follow().is_err() {
+            continue;
+        }
         // Memoized fold (outcomes-fold-scaling): unchanged logs are not
         // re-parsed on repeated requests; new events grow the file and
         // invalidate deterministically.

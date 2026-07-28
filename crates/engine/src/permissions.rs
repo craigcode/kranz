@@ -4,12 +4,16 @@
 //! Deny rules take precedence over allows in Claude Code, and in `-p` mode a
 //! tool call outside the allowed set simply fails with an error the model can
 //! read — that failure IS the read-only guarantee for orchestrator and
-//! validators. The profiles here express every restriction through
-//! `permission_mode` + `allowed_tools` + `disallowed_tools`: the CLI `--tools`
-//! built-in restriction is recorded on the profile for future wiring, but
-//! [`apply`] does not map it — [`SessionSpec`] carries a separate `tools`
-//! field populated straight from per-role config (see [`MissionConfig`]),
-//! by design left disconnected from this read-only profile field.
+//! validators, backstopped for validators by the `validator.tamper`
+//! HEAD/index/worktree identity assertion around every session
+//! ([`crate::validator_integrity`]): a validator that slips a write past the
+//! patterns fails its round honestly. The profiles here express every
+//! restriction through `permission_mode` + `allowed_tools` +
+//! `disallowed_tools`: the CLI `--tools` built-in restriction is recorded on
+//! the profile for future wiring, but [`apply`] does not map it —
+//! [`SessionSpec`] carries a separate `tools` field populated straight from
+//! per-role config (see [`MissionConfig`]), by design left disconnected from
+//! this read-only profile field.
 
 use crate::backend::SessionSpec;
 use crate::types::{MissionConfig, Role};
@@ -234,26 +238,25 @@ pub fn apply(profile: PermissionProfile, spec: &mut SessionSpec) {
     spec.disallowed_tools = profile.disallowed_tools;
 }
 
-/// Allow patterns for one contract/validator command.
+/// Allow patterns for one contract/validator command: the exact command forms
+/// the contract declares — the verbatim command and each of its
+/// `&&` / `||` / `;` / `|` segments, each as a `Bash(<form>*)` prefix rule.
+/// Prefix-suffix matching still admits the natural reinvocations that made
+/// verbatim-only rules untenable (observed live): `python3 extract_links.py`
+/// matches the segment rule from `python3 extract_links.py && echo EXIT_OK`,
+/// and a trailing extra flag matches the declared prefix.
 ///
-/// A verbatim `Bash(<full command>*)` alone is far too brittle in practice
-/// (observed live): a contract command `python3 extract_links.py && echo
-/// EXIT_OK` never matches the validator's natural `python3 extract_links.py`,
-/// and heredoc commands never re-match at all — the validator gets denied its
-/// own checks, denials surface as findings, and the fix-cycle guard blocks
-/// the milestone on what is really a permissions artifact.
-///
-/// So each command yields, besides the verbatim prefix rule:
-/// - one rule per `&&` / `||` / `;` / `|` segment (trimmed, `*`-suffixed);
-/// - for every segment, a leading-two-token prefix rule (`python3
-///   extract_links.py*`, `python3 -m*`) so natural reinvocations and heredoc
-///   forms (`python3 -`) match.
-///
-/// This deliberately widens what a validator may execute (e.g. `python3 -*`
-/// admits arbitrary interpreter use when the contract itself runs the
-/// interpreter). That is the §4.7 intent — validators run the mapped checks —
-/// and the read-only guarantee continues to rest on the denied Write/Edit
-/// tools and the deny list, not on Bash pattern precision.
+/// Nothing wider (ticket `validator-immutability-proof`, review P1 #5). The
+/// old leading-two-token rule widened `python3 -m pytest` to
+/// `Bash(python3 -m*)` and heredoc contracts to `Bash(python3 -*)` —
+/// arbitrary interpreter use (`python3 -c '<any write>'`) under a "read-only"
+/// role. A validator needs to RUN the declared commands, nothing else, and
+/// engine-run contract commands (validation_round's captured PASS/FAIL
+/// evidence) mean heredoc forms need no validator Bash rule at all. The
+/// read-only guarantee now rests on the denied Write/Edit tools, the deny
+/// list, and the `validator.tamper` identity assertion
+/// ([`crate::validator_integrity`]) — with Bash precision no longer working
+/// against it.
 pub fn command_allow_patterns(command: &str) -> Vec<String> {
     let command = command.trim();
     if command.is_empty() {
@@ -271,10 +274,6 @@ pub fn command_allow_patterns(command: &str) -> Vec<String> {
             continue;
         }
         patterns.push(format!("Bash({segment}*)"));
-        let head: Vec<&str> = segment.split_whitespace().take(2).collect();
-        if !head.is_empty() {
-            patterns.push(format!("Bash({}*)", head.join(" ")));
-        }
     }
     patterns
 }
@@ -405,6 +404,48 @@ mod tests {
         assert!(validator
             .allowed_tools
             .contains(&"Bash(gc lint*)".to_string()));
+    }
+
+    /// Narrowed widening (ticket `validator-immutability-proof`): only the
+    /// verbatim command and its exact shell segments become allow rules — no
+    /// leading-two-token catch-alls like `python3 -*` / `python3 -m*`.
+    #[test]
+    fn command_allow_patterns_stick_to_the_declared_command_forms() {
+        // Verbatim + exact segments, nothing wider.
+        assert_eq!(
+            command_allow_patterns("python3 extract_links.py && echo EXIT_OK"),
+            vec![
+                "Bash(python3 extract_links.py && echo EXIT_OK*)".to_string(),
+                "Bash(python3 extract_links.py*)".to_string(),
+                "Bash(echo EXIT_OK*)".to_string(),
+            ]
+        );
+        // No binary/flag catch-alls: neither the heredoc form's `python3 -*`
+        // nor a `-m` widening survives.
+        let heredoc = command_allow_patterns("python3 - <<'PY'\nprint('ok')\nPY");
+        assert!(!heredoc.iter().any(|p| p == "Bash(python3 -*)"));
+        let module = command_allow_patterns("python3 -m pytest test_x.py -v");
+        assert!(!module.iter().any(|p| p == "Bash(python3 -m*)"));
+        assert!(module.contains(&"Bash(python3 -m pytest test_x.py -v*)".to_string()));
+
+        // And the functional validator's profile carries the exact form only:
+        // `cargo test --workspace x` must not widen to `cargo test*`.
+        let cfg = MissionConfig::default();
+        let profile = for_role(
+            Role::ValidatorFunctional,
+            &cfg,
+            &["cargo test --workspace x".to_string()],
+            &[],
+            &[],
+        );
+        assert!(profile
+            .allowed_tools
+            .contains(&"Bash(cargo test --workspace x*)".to_string()));
+        assert!(!profile
+            .allowed_tools
+            .iter()
+            .any(|p| p == "Bash(cargo test*)"));
+        assert!(!profile.allowed_tools.iter().any(|p| p == "Bash(cargo*)"));
     }
 
     #[test]

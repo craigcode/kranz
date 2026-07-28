@@ -115,8 +115,11 @@ impl EventLog {
     /// Acquire the single-writer lock for a mission and open its event log.
     ///
     /// Creates the mission directory tree (mission dir, `runs/`, `control/`)
-    /// if missing. If the lock file already exists, the holder's liveness
-    /// decides against the [`LockForce`] tier (see its matrix): a provably
+    /// if missing — no-follow: a symlinked `.kranz`/`missions`/mission dir or
+    /// runtime file is refused (P1 mission-path-no-follow), never followed
+    /// into another repository's tree. If the lock file already exists, the
+    /// holder's liveness decides against the [`LockForce`] tier (see its
+    /// matrix): a provably
     /// dead holder is always stolen; a live or indeterminate one fails with
     /// [`EngineError::LockHeld`] naming the holder's pid unless the tier
     /// permits the steal. Existing events are loaded to resume the seq
@@ -139,9 +142,14 @@ impl EventLog {
         throttle: Duration,
         force: LockForce,
     ) -> Result<EventLog> {
-        std::fs::create_dir_all(paths.mission_dir())?;
-        std::fs::create_dir_all(paths.runs_dir())?;
-        std::fs::create_dir_all(paths.control_dir())?;
+        // Resolve the mission tree no-follow (P1 mission-path-no-follow): a
+        // symlinked component or runtime file is refused before any create or
+        // open — an append through a symlink would write another repo's tree.
+        let mission_dir = paths.open_mission_dir_nofollow(true)?;
+        crate::paths::create_real_subdir(&mission_dir, "runs", &paths.runs_dir())?;
+        crate::paths::create_real_subdir(&mission_dir, "control", &paths.control_dir())?;
+        crate::paths::ensure_absent_or_regular_file(&paths.lock_file())?;
+        crate::paths::ensure_absent_or_regular_file(&paths.events_file())?;
 
         let lock_path = paths.lock_file();
         let (mut lock_file, lock_generation) = match OpenOptions::new()
@@ -380,6 +388,9 @@ impl EventLog {
     /// can split a multi-byte UTF-8 character, which must not render the
     /// whole log unreadable.
     fn parse_log(path: &Path) -> Result<ParsedLog> {
+        // A symlinked log file is refused (never read through into another
+        // tree); an absent one errors NotFound from the read below, as before.
+        crate::paths::ensure_absent_or_regular_file(path)?;
         let bytes = std::fs::read(path)?;
 
         let mut events = Vec::new();
@@ -466,6 +477,8 @@ impl EventLog {
     /// inside the window.
     pub fn read_tail_events(path: &Path, max_bytes: u64) -> Result<Vec<Event>> {
         use std::io::{Read, Seek, SeekFrom};
+        // Same no-follow refusal as `parse_log`: never tail through a symlink.
+        crate::paths::ensure_absent_or_regular_file(path)?;
         let mut file = std::fs::File::open(path)?;
         let len = file.metadata()?.len();
         let window_start = len.saturating_sub(max_bytes);
@@ -1063,6 +1076,68 @@ mod tests {
     fn non_unix_liveness_fallback_is_never_dead() {
         assert_eq!(non_unix_liveness_fallback(), LockLiveness::Unknown);
         assert_ne!(non_unix_liveness_fallback(), LockLiveness::Dead);
+    }
+
+    /// A valid one-event log body for a not-yet-acquired mission.
+    fn one_event_line() -> String {
+        let event = Event {
+            seq: 1,
+            ts: Utc::now(),
+            mission_id: "m-1".to_string(),
+            kind: EventKind::MissionCreated {
+                goal: "goal".into(),
+                base_branch: "main".into(),
+                mission_branch: "kranz/mission-m-1".into(),
+                config: crate::types::MissionConfig::default(),
+            },
+        };
+        let mut line = serde_json::to_string(&event).unwrap();
+        line.push('\n');
+        line
+    }
+
+    // Symlink-creating tests are unix-only, exactly like the lessons guard's
+    // tests; Windows needs privileges to create symlinks.
+
+    #[cfg(unix)]
+    #[test]
+    fn read_events_refuses_a_symlinked_log() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        // A valid log at the symlink TARGET: the read must refuse, not
+        // return the target's events.
+        let target = dir.path().join("target.jsonl");
+        std::fs::write(&target, one_event_line()).unwrap();
+        let link = dir.path().join("events.jsonl");
+        symlink(&target, &link).unwrap();
+        let err = EventLog::read_events(&link).unwrap_err();
+        assert!(err.to_string().contains("refusing"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acquire_refuses_symlinked_runtime_files_without_writing_through() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = MissionPaths::new(dir.path(), "m-1");
+        std::fs::create_dir_all(paths.mission_dir()).unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let target = elsewhere.path().join("elsewhere.jsonl");
+        std::fs::write(&target, b"").unwrap();
+
+        // A symlinked events.jsonl is refused before the lock is taken.
+        symlink(&target, paths.events_file()).unwrap();
+        let err = EventLog::acquire(&paths, "m-1", Duration::ZERO, LockForce::No).unwrap_err();
+        assert!(err.to_string().contains("refusing"), "{err}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"");
+        assert!(!paths.lock_file().exists(), "no lock taken on refusal");
+
+        // A symlinked lock file is refused before any steal logic.
+        std::fs::remove_file(paths.events_file()).unwrap();
+        symlink(&target, paths.lock_file()).unwrap();
+        let err = EventLog::acquire(&paths, "m-1", Duration::ZERO, LockForce::No).unwrap_err();
+        assert!(err.to_string().contains("refusing"), "{err}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"");
     }
 
     #[test]

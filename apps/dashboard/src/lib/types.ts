@@ -367,6 +367,7 @@ export type EventKind =
   | { type: 'feature.skipped'; payload: { featureId: string; reason: string } }
   | { type: 'milestone.validating'; payload: { milestoneId: string } }
   | { type: 'validation.finding'; payload: { milestoneId: string; runId: string; finding: Finding } }
+  | { type: 'validator.tamper'; payload: { milestoneId: string; runId: string; role: Role; headBefore: string; headAfter: string; appeared: string[]; resolved: string[] } }
   | { type: 'fixfeature.created'; payload: { milestoneId: string; feature: Feature } }
   | { type: 'milestone.blocked'; payload: { milestoneId: string; reason: string } }
   | { type: 'milestone.unblocked'; payload: { milestoneId: string; reason: string } }

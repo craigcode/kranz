@@ -54,6 +54,9 @@ pub struct BlockedCauses {
     pub fix_cycle_cap: u64,
     /// Validator "did not produce a trusted report" after retry.
     pub untrusted_validator: u64,
+    /// Validator "altered the checkout" (the validator.tamper immutability
+    /// assertion — ticket validator-immutability-proof).
+    pub validator_tamper: u64,
     /// Anything else (operator blocks, legacy reasons).
     pub other: u64,
 }
@@ -71,6 +74,8 @@ fn classify_block(reason: &str) -> &'static str {
         "fix-cycle-cap"
     } else if reason.contains("did not produce a trusted report") {
         "untrusted-validator"
+    } else if reason.contains("validator session altered the checkout") {
+        "validator-tamper"
     } else {
         "other"
     }
@@ -106,6 +111,7 @@ fn fold_mission(health: &mut ContractHealth, events: &[Event]) {
                 "contract-bug" => health.blocked.contract_bug += 1,
                 "fix-cycle-cap" => health.blocked.fix_cycle_cap += 1,
                 "untrusted-validator" => health.blocked.untrusted_validator += 1,
+                "validator-tamper" => health.blocked.validator_tamper += 1,
                 _ => health.blocked.other += 1,
             },
             _ => {}
@@ -143,6 +149,11 @@ pub fn compute_contract_health(
         let paths = crate::paths::MissionPaths::new(repo_root, &id);
         let events_path = paths.events_file();
         if !events_path.is_file() {
+            continue;
+        }
+        // Never fold a mission reached through a symlinked path component
+        // (P1 mission-path-no-follow).
+        if paths.require_no_follow().is_err() {
             continue;
         }
         let events = match crate::event_log::EventLog::read_events(&events_path) {
@@ -251,6 +262,7 @@ mod tests {
                 decision("contract lint: 1 author-bug suspect assertion(s) already pass on the untouched base — see plan.md"),
                 blocked("2 validation finding(s) but the fix-cycle cap (1) is reached"),
                 blocked("claude functional validation did not produce a trusted report after retry: crashed"),
+                blocked("scrutiny validator session altered the checkout (HEAD moved abc1234 -> def5678); validators are read-only, so the round fails honestly"),
                 blocked("an operator mystery"),
             ],
         );
@@ -268,6 +280,7 @@ mod tests {
         assert_eq!(health.blocked.contract_bug, 1);
         assert_eq!(health.blocked.fix_cycle_cap, 1);
         assert_eq!(health.blocked.untrusted_validator, 1);
+        assert_eq!(health.blocked.validator_tamper, 1);
         assert_eq!(health.blocked.other, 1);
     }
 
