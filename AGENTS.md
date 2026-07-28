@@ -52,6 +52,14 @@ kranz work                      # drain the queue (run missions)
    respawns; CI gates `cargo fmt --check`.
 4. **kranz never pushes.** The engine only advances refs locally / merges
    `--no-ff`. A human runs `git push`. This is inviolable.
+5. **When committing alongside in-flight subagents, stage by exact file
+   list.** Three times in one week a scoped fix swept a subagent's
+   uncommitted edits into a commit WITHOUT the rest of its feature
+   (4115a9b, 475ecb8, 5c30396) — CI red on every platform until the
+   completing commit. Before `git add`, check `git status` for files the
+   agent also touched, and either include its whole change set or leave
+   its files alone. Never `git add` a file an in-flight agent has also
+   edited on its own.
 5. **Anti-vacuity in contract commands:** write test-gate checks as
    `cargo test --workspace <filter> 2>&1 | grep -qE 'test result: ok\. [1-9]'`.
    The `[1-9]` guards against a filter that matches **zero** tests passing
