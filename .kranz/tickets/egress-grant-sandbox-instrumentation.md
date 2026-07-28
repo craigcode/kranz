@@ -70,3 +70,21 @@ Sources for the macOS findings:
 Deferred from the grant-request-decision-flow work (see
 `grant-request-decision-flow.md`), where command + touch-set grants shipped and
 egress was scoped out as blocked-on-infra.
+
+## Progress (2026-07-28) — step 1 (3.3a) shipped
+
+The filtering egress proxy + denial signal landed
+(`crates/engine/src/egress_proxy.rs`): one CONNECT-only tokio proxy per
+`fs+net` run, per-host allowlist enforced at CONNECT time (DEFAULT_EGRESS +
+configured `egress[]` + the mission's `egress_grants`, a new additive
+`Mission` field read where grant extension will write it), structured
+`{"ts","host","port"}` denials fsynced to `runs/egress-denials.jsonl`, and
+`RunOutcome.denied_egress` surfacing them. macOS `fs+net` now resolves to
+Seatbelt with a loopback-only egress profile (the proxy is the only way
+out); container `fs+net` with a non-empty egress list routes the bridge
+through the host-side proxy (`--network none` kept for an empty list).
+Explicitly still OUT: bwrap (netns cannot reach a host proxy without veth
+plumbing), the macOS unified-log tail (proxy makes it unnecessary),
+plain-HTTP forward, per-run attribution via Proxy-Authorization, and the
+grant flow itself — steps 2–3 of the sequence (a fourth `GrantKind` that
+extends `egress_grants` on approval) are 3.3b.

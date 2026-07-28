@@ -1,10 +1,12 @@
 # M7 scoping — Worker sandboxing (containment, not just detection)
 
-Status: tiers 1–2 shipped. Dedicated worktrees, write auditing, env hygiene,
-macOS Seatbelt filesystem enforcement, Linux bubblewrap filesystem/network
-isolation, and fail-closed preflight behavior are implemented. Remaining:
-Windows parity, a macOS-capable network boundary, container provider, and live
-cross-platform overhead/hostile-brief proof.
+Status: tiers 1–2 shipped, tier 3 shipped (v1). Dedicated worktrees, write
+auditing, env hygiene, macOS Seatbelt filesystem enforcement, Linux bubblewrap
+filesystem/network isolation, fail-closed preflight behavior, the container
+provider, and a macOS-capable network boundary (the filtering egress proxy,
+3.3a) are implemented. Remaining: Windows parity, a hard per-host container
+egress boundary, live cross-platform overhead/hostile-brief proof, and the
+egress grant flow that consumes the proxy's denial signal (3.3b).
 
 ## Why
 
@@ -69,16 +71,22 @@ All of it asks the agent nicely. None of it constrains the process.
 - **macOS**: generate a Seatbelt profile per session (`sandbox-exec`):
   write allowlist = worktree + mission control dir + `TMPDIR` (+ opt-in
   toolchain caches: `~/.cargo`, npm cache). `enforce: "fs"` is supported.
-  `enforce: "fs+net"` is now explicitly refused: live verification showed
-  Seatbelt rejects hostname egress rules such as
-  `(remote tcp "api.anthropic.com:443")` with `host must be * or localhost`.
-  A broad `*:443` rule is not a useful containment boundary, so macOS network
-  allowlisting needs a different backend (container/proxy/pf) before it can be
-  claimed.
+  `enforce: "fs+net"` is supported via the filtering egress proxy
+  (`crates/engine/src/egress_proxy.rs`): live verification showed Seatbelt
+  rejects hostname egress rules such as
+  `(remote tcp "api.anthropic.com:443")` with `host must be * or localhost`,
+  so the SBPL instead restricts outbound TCP to loopback and the per-run
+  proxy — the only reachable way out — enforces the per-host allowlist
+  (default Anthropic endpoints + configured `egress[]` + operator egress
+  grants) at CONNECT time and appends structured denials to
+  `runs/egress-denials.jsonl`.
 - **Linux**: bubblewrap equivalent for the same filesystem allowlists.
   `enforce: "fs+net"` fails closed with `--unshare-net` because bwrap alone
   cannot express a hostname allowlist; if `bwrap` is missing, kranz refuses
   requested enforcement rather than falling back to unsandboxed execution.
+  The egress proxy does NOT cover bwrap in v1: its all-or-nothing netns
+  cannot reach a host-side proxy without veth plumbing, so process-provider
+  `fs+net` on Linux stays `--unshare-net` with no denial signal.
 - **Windows**: explicitly out of scope for the first pass (restricted
   tokens/AppContainer are a different project); documented, not silent.
 - Config per role:
@@ -99,8 +107,13 @@ All of it asks the agent nicely. None of it constrains the process.
   assertion under the generated worker profile and surfaces a `warn`
   `PreflightIssue` for any that fail under it — advisory only, never
   blocking). Requested enforcement that cannot resolve to an OS sandbox now
-  fails closed before launching a worker or validator. macOS `fs+net` hostname
-  egress allowlisting and Windows support remain open (see Sequencing below).
+  fails closed before launching a worker or validator. macOS `fs+net`
+  per-host egress allowlisting shipped as the filtering egress proxy
+  (`crate::egress_proxy`, ticket 3.3a): Seatbelt restricts outbound TCP to
+  loopback, the proxy enforces the hostname allowlist at CONNECT time, and
+  denials surface as structured records (`runs/egress-denials.jsonl` →
+  `RunOutcome.denied_egress`). The grant flow that consumes the signal is
+  3.3b. Windows support remains open (see Sequencing below).
 
 ### Tier 3 — container workspace provider (the Gas City / fleet stepping stone)
 
@@ -124,13 +137,18 @@ All of it asks the agent nicely. None of it constrains the process.
   allowlist.
 - **Network policy, honest v1**: `fs` keeps the runtime default bridge/NAT
   (same permissiveness as the tier-2 fs tier). `fs+net` with an EMPTY
-  egress list maps to `--network none` — the first real egress boundary on
-  macOS, which Seatbelt cannot express. The tradeoff is honest: `none` also
+  egress list maps to `--network none` — a hard egress boundary that works
+  identically on macOS and Linux. The tradeoff is honest: `none` also
   blocks the agent's API egress, so `fs+net` suits offline gates/validation
   while API-driven workers use `fs`. `fs+net` with a NON-EMPTY egress list
-  is REFUSED at resolve time: per-host egress needs the filtering proxy
-  from the egress-grant ticket, and silently widening to a full bridge is
-  worse than failing closed.
+  keeps the bridge and points the session env at the run's host-side
+  filtering egress proxy (`host.docker.internal`, forwarded with `-e`; the
+  `--add-host … host-gateway` entry is added on Linux docker): the proxy
+  enforces the per-host allowlist and records denials. Env-based routing is
+  advisory on the bridge — a process that ignores the proxy vars bypasses
+  the filter — so a hard per-host container boundary (internal-network
+  sidecar) remains follow-up work; Seatbelt is the hard boundary on macOS
+  hosts.
 - Worker image: the default `alpine:3` proves the isolation boundary but
   cannot run an agent. A production worker image needs the agent CLI + Node
   on PATH plus the mission toolchain — the same layering the repo's
@@ -143,9 +161,10 @@ All of it asks the agent nicely. None of it constrains the process.
 2. Out-of-contract write audit + finding class (Tier 1).
 3. Seatbelt profile generation + `sandbox` config surface, `enforce: "fs"`
    (Tier 2, macOS).
-4. Egress allowlist → `enforce: "fs+net"` (Tier 2, macOS): blocked for the
-   Seatbelt backend by the hostname-egress limitation above; current behavior
-   is fail-closed refusal, not partial enforcement.
+4. Egress allowlist → `enforce: "fs+net"` (Tier 2, macOS): SHIPPED (ticket
+   3.3a) as loopback-only Seatbelt egress + the filtering egress proxy —
+   per-host enforcement at CONNECT time with a structured denial signal on
+   `RunOutcome`. The egress grant flow that consumes the signal is 3.3b.
 5. Linux bwrap parity (Tier 2): implemented as filesystem allowlists plus
    `--unshare-net` for `fs+net`; a live ubuntu runner remains the preferred
    external proof.
@@ -162,8 +181,8 @@ leaves **zero writes outside its worktree + mission dir**, its blocked attempts
 surface as `out-of-contract-write` / preflight findings; a normal mission's
 contract commands (cargo test, npm build) still pass under the sandbox at
 under ~10% wall-clock overhead; and the primary checkout never changes branch
-during any mission, sequential included. On macOS, `fs+net` does not satisfy
-this until a non-Seatbelt network backend exists.
+during any mission, sequential included. On macOS the `fs+net` boundary is
+the loopback-only Seatbelt profile plus the egress proxy (3.3a).
 
 ## Open questions
 

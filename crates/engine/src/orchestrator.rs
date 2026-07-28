@@ -2473,6 +2473,7 @@ impl MissionEngine {
             let milestone_title = self.state.mission.milestones[mi].title.clone();
             let base_sha = self.state.mission.base_sha.clone();
             let grants = self.state.mission.command_grants.clone();
+            let egress_grants = self.state.mission.egress_grants.clone();
             let deny_exceptions = self.state.mission.deny_exceptions.clone();
             let pre_run_sha = self.active_repo().head_sha()?;
 
@@ -2519,6 +2520,7 @@ impl MissionEngine {
                     &session_cwd,
                     base_sha.as_deref(),
                     &grants,
+                    &egress_grants,
                     &deny_exceptions,
                     auth_verdict,
                 )
@@ -2536,6 +2538,7 @@ impl MissionEngine {
                     Some(cancel),
                     base_sha.as_deref(),
                     &grants,
+                    &egress_grants,
                     &deny_exceptions,
                     auth_verdict,
                 )
@@ -3066,6 +3069,7 @@ impl MissionEngine {
         let milestone_title = self.state.mission.milestones[mi].title.clone();
         let base_sha = self.state.mission.base_sha.clone();
         let grants = self.state.mission.command_grants.clone();
+        let egress_grants = self.state.mission.egress_grants.clone();
         let deny_exceptions = self.state.mission.deny_exceptions.clone();
         let tracker = ConcurrencyTracker::new();
         let selected = self.select_backend(Role::Worker);
@@ -3098,6 +3102,7 @@ impl MissionEngine {
             let guard = tracker.clone();
             let base_sha = base_sha.clone();
             let grants = grants.clone();
+            let egress_grants = egress_grants.clone();
             let deny_exceptions = deny_exceptions.clone();
             set.spawn(async move {
                 let _live = guard.enter(); // count this session as live
@@ -3112,6 +3117,7 @@ impl MissionEngine {
                     &ws_path,
                     base_sha.as_deref(),
                     &grants,
+                    &egress_grants,
                     &deny_exceptions,
                     auth_verdict,
                 )
@@ -3496,6 +3502,7 @@ impl MissionEngine {
             let contract = self.state.mission.validation_contract.clone();
             let base_sha = self.state.mission.base_sha.clone();
             let grants = self.state.mission.command_grants.clone();
+            let egress_grants = self.state.mission.egress_grants.clone();
             let worker_commands = worker_commands_for_milestone(&self.state, &milestone);
 
             let selected = self.select_backend(role);
@@ -3520,6 +3527,7 @@ impl MissionEngine {
                 &session_cwd,
                 base_sha.as_deref(),
                 &grants,
+                &egress_grants,
                 &worker_commands,
                 milestone.validator_guidance.as_deref(),
                 contract_results.as_deref(),
@@ -3576,6 +3584,7 @@ impl MissionEngine {
                     &retry_session_cwd,
                     base_sha.as_deref(),
                     &grants,
+                    &egress_grants,
                     &worker_commands,
                     milestone.validator_guidance.as_deref(),
                     contract_results.as_deref(),
@@ -5864,6 +5873,7 @@ pub(crate) mod tests {
                 command_grants: vec![],
                 touch_set: vec![],
                 deny_exceptions: vec![],
+                egress_grants: vec![],
             },
             runs,
             totals: TokenUsage::default(),

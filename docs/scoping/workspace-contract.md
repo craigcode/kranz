@@ -31,8 +31,11 @@ Implementation notes (recorded with acceptance):
 
 Companion: `docs/roadmap.md` M6, `docs/scoping/worker-sandboxing.md` Tier 3,
 Monaco post https://www.monaco.com/blog/agent-developer-workspaces
-(2026-07-09). Product notes already absorbed the headline ("a worktree is
-not a workspace"); this doc turns that into a shippable contract.
+(2026-07-09), Amp orbs cross-check `docs/reviews/ampcode.md` §3/§8
+(2026-07-27 — an independent shipping product converged on this contract
+shape nearly field-for-field). Product notes already absorbed the headline
+("a worktree is not a workspace"); this doc turns that into a shippable
+contract.
 
 ## Why
 
@@ -91,8 +94,18 @@ Add a base-branch-owned tracked artifact (proposed path
 - `data` — optional `{ clone, migrate, reset, skewCheck }` hooks (commands
   or provider ops); secret **names** only
 - `previews[]` — name → URL template or path once ready
-- `secrets[]` — names the provider must inject; never values
+- `secrets[]` — names the provider must inject; never values. For remote
+  providers that support it, prefer **workload identity** over injection:
+  short-lived OIDC tokens minted per workspace with mission-scoped claims
+  (repo, mission id, profile), so services trust the issuer and no secret
+  exists to leak — "names, never values" completed as "prefer no secret at
+  all" (Amp orb precedent, docs/reviews/ampcode.md §3)
 - `disk` — optional prune/retain hints for provider cleanup
+
+Command hooks (`bootstrap[]`, `readiness[]`, `data`) carry bounded timeouts
+(explicit or schema-defaulted) so a hung hook fails loud at preflight
+instead of stalling provision; a future resume hook (idle-hibernate)
+inherits the same rule (docs/reviews/ampcode.md §8).
 
 Missing contract ⇒ local worktree-only missions keep working (today's
 behavior). Present-but-invalid contract fails closed at draft/approve/
@@ -150,7 +163,10 @@ Repos without a `data` block are unaffected.
 
 Preview URLs, readiness status, provider/template identity, and takeover
 instructions (SSH/Coder URL/dashboard link) are append-only event fields and
-appear in `report.md` / WorkspacePanel. Secrets never logged.
+appear in `report.md` / WorkspacePanel. Secrets never logged. On remote
+providers, preview URLs are **authenticated by default** — M6's "leaked URL
+reveals nothing" applies to workspace previews, not just the dashboard
+(docs/reviews/ampcode.md §8).
 
 ### D-F — External triggers create audited missions, not prompt loops
 

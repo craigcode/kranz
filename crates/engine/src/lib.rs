@@ -29,6 +29,7 @@ pub mod contract_sweep;
 pub mod cost;
 pub mod decompose;
 pub mod deps;
+pub mod egress_proxy;
 pub mod event_log;
 pub mod findings;
 pub mod git_ops;

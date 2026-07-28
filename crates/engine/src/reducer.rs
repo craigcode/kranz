@@ -479,6 +479,7 @@ fn initial_state(event: &Event) -> Result<MissionState> {
             command_grants: Vec::new(),
             touch_set: Vec::new(),
             deny_exceptions: Vec::new(),
+            egress_grants: Vec::new(),
         },
         runs: BTreeMap::new(),
         totals: TokenUsage::default(),

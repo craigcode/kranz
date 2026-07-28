@@ -3,10 +3,12 @@
 //!
 //! macOS uses Seatbelt (`sandbox-exec`) for filesystem isolation. Seatbelt
 //! cannot express hostname egress allowlists (it accepts only `*`/`localhost`
-//! network hosts), so `fs+net` is refused on macOS rather than pretending to
-//! contain network access. Linux uses bubblewrap for filesystem isolation;
-//! `fs+net` fails closed with `--unshare-net` because bwrap alone cannot
-//! express a hostname egress allowlist.
+//! network hosts), so `fs+net` on macOS restricts outbound TCP to loopback
+//! and the run routes through the userspace filtering egress proxy
+//! (`crate::egress_proxy`), which enforces the per-host allowlist at CONNECT
+//! time. Linux uses bubblewrap for filesystem isolation; `fs+net` fails closed
+//! with `--unshare-net` because bwrap alone cannot express a hostname egress
+//! allowlist (and its netns cannot reach a host proxy — out of scope for v1).
 
 use std::path::{Path, PathBuf};
 
@@ -65,7 +67,10 @@ pub fn platform_support(enforce: crate::types::SandboxEnforce, target_os: &str) 
             SandboxDecision::Enforce(SandboxBackend::Seatbelt)
         }
         crate::types::SandboxEnforce::FsNet if target_os == "macos" => {
-            SandboxDecision::UnsupportedWarn
+            // Seatbelt's loopback-only egress profile plus the egress proxy's
+            // per-host allowlist (crate::egress_proxy): the hostname rules the
+            // SBPL cannot express live in the proxy, not the profile.
+            SandboxDecision::Enforce(SandboxBackend::Seatbelt)
         }
         crate::types::SandboxEnforce::Fs | crate::types::SandboxEnforce::FsNet
             if target_os == "linux" =>
@@ -159,9 +164,10 @@ fn resolve_for_session_target(
 }
 
 /// Resolve the tier-3 container provider: `enforce: off` stays unsandboxed;
-/// `fs+net` with a non-empty egress list is refused (per-host egress needs
-/// the filtering proxy from the egress-grant ticket — fail closed, never
-/// silently widen); a requested container with no runtime on PATH is refused.
+/// `fs+net` with an empty egress list keeps the `--network none` hard egress
+/// boundary; `fs+net` with a non-empty egress list resolves — the run routes
+/// the session through the filtering egress proxy (`crate::egress_proxy`) over
+/// the runtime bridge. A requested container with no runtime on PATH is refused.
 fn resolve_container_target(
     role_sandbox: &crate::types::SandboxConfig,
     session_cwd: &Path,
@@ -170,17 +176,6 @@ fn resolve_container_target(
 ) -> (Option<ResolvedSandbox>, Option<String>) {
     if role_sandbox.enforce == crate::types::SandboxEnforce::Off {
         return (None, None);
-    }
-    if role_sandbox.enforce == crate::types::SandboxEnforce::FsNet
-        && !role_sandbox.egress.is_empty()
-    {
-        return (
-            None,
-            Some(
-                "sandbox provider:container with enforce:fs+net does not support a per-host egress allowlist yet (that needs the filtering proxy from the egress-grant ticket); refusing to run unsandboxed"
-                    .to_string(),
-            ),
-        );
     }
     let Some(runtime) = runtime else {
         return (
@@ -292,10 +287,9 @@ pub fn effective_egress(configured: &[String]) -> Vec<String> {
 /// `extra_write` entry. `fs` allows network — the profile wraps the agent
 /// binary itself, so denying egress bricks Anthropic/API sessions; write
 /// containment is the fs-tier promise. `fs+net` restricts outbound TCP to
-/// the configured egress list plus the default Anthropic endpoints. macOS
-/// no longer resolves `fs+net` to Seatbelt because `sandbox-exec` rejects
-/// those hostname rules; this generator remains covered so the fail-closed
-/// proof can exercise the rejected profile shape.
+/// loopback: Seatbelt rejects hostname egress rules (`host must be * or
+/// localhost`), so the per-host allowlist is enforced by the run's egress
+/// proxy (`crate::egress_proxy`) — the only reachable way out.
 pub fn generate_profile(inputs: &SandboxInputs) -> String {
     let write_paths = write_allowlist(inputs);
 
@@ -317,18 +311,15 @@ pub fn generate_profile(inputs: &SandboxInputs) -> String {
     profile.push('\n');
     match inputs.enforce {
         crate::types::SandboxEnforce::FsNet => {
-            profile.push_str("(allow network-outbound\n");
-            for dest in effective_egress(&inputs.egress) {
-                profile.push_str(&format!(
-                    "  (remote tcp \"{}\")\n",
-                    escape_sbpl_string(&dest)
-                ));
-            }
-            profile.push_str(")\n");
+            // Loopback-only egress: the session's proxy hops (CONNECT to
+            // 127.0.0.1) are legal, and every non-localhost destination is
+            // denied here at the kernel boundary — the egress proxy is the
+            // only way out and applies the hostname allowlist.
+            profile.push_str("(allow network-outbound (remote tcp \"localhost:*\"))\n");
         }
         // `fs` (and Off) must allow network: this profile wraps the agent
         // binary, so `deny network*` bricks API egress. Egress restriction
-        // is an `fs+net` concern (and currently unsupported-warn on macOS).
+        // is an `fs+net` concern.
         crate::types::SandboxEnforce::Fs | crate::types::SandboxEnforce::Off => {
             profile.push_str("(allow network*)\n");
         }
@@ -545,7 +536,7 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_profile_fs_net_uses_egress_allowlist() {
+    fn sandbox_profile_fs_net_restricts_egress_to_loopback() {
         let session = tempfile::tempdir().unwrap();
         let mission = tempfile::tempdir().unwrap();
         let tmp = tempfile::tempdir().unwrap();
@@ -555,15 +546,14 @@ mod tests {
 
         let profile = generate_profile(&inputs);
 
+        // Seatbelt rejects hostname egress rules, so the profile cuts outbound
+        // TCP to loopback only; the per-host allowlist (including the
+        // configured entries above) is the egress proxy's job, not the SBPL's.
         assert!(!profile.contains("(allow network*)"));
-        assert!(profile.contains("(allow network-outbound"));
-        assert!(profile.contains("(remote tcp \"api.anthropic.com:443\")"));
-        assert!(profile.contains("(remote tcp \"*.anthropic.com:443\")"));
-        assert!(profile.contains("(remote tcp \"crates.io:443\")"));
-        assert_eq!(
-            profile.matches("api.anthropic.com:443").count(),
-            1,
-            "configured egress must not duplicate the default"
+        assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:*\"))"));
+        assert!(
+            !profile.contains("crates.io") && !profile.contains("anthropic.com"),
+            "no per-host egress rules in the profile:\n{profile}"
         );
     }
 
@@ -628,7 +618,7 @@ mod tests {
         );
         assert_eq!(
             platform_support(SandboxEnforce::FsNet, "macos"),
-            SandboxDecision::UnsupportedWarn
+            SandboxDecision::Enforce(SandboxBackend::Seatbelt)
         );
         assert_eq!(
             platform_support(SandboxEnforce::FsNet, "linux"),
@@ -727,7 +717,7 @@ mod tests {
     }
 
     #[test]
-    fn container_provider_fs_net_with_egress_list_is_refused() {
+    fn container_provider_fs_net_with_egress_list_resolves_for_the_proxy() {
         let cfg = container_cfg(
             crate::types::SandboxEnforce::FsNet,
             vec!["crates.io:443".to_string()],
@@ -735,8 +725,9 @@ mod tests {
         let session = tempfile::tempdir().unwrap();
         let mission = tempfile::tempdir().unwrap();
 
-        // Refusal happens before runtime detection: it must hold even where a
-        // runtime IS available, so inject one.
+        // fs+net with a per-host egress list is no longer refused: the run
+        // routes the session through the filtering egress proxy over the
+        // runtime bridge (crate::egress_proxy), so the container resolves.
         let (resolved, warn) = resolve_for_session_target(
             &cfg,
             session.path(),
@@ -745,10 +736,10 @@ mod tests {
             false,
             Some(crate::sandbox_container::ContainerRuntime::Docker),
         );
-        assert!(resolved.is_none());
-        let warn = warn.expect("per-host egress under provider:container must be refused");
-        assert!(warn.contains("egress"), "{warn}");
-        assert!(warn.contains("refusing to run unsandboxed"), "{warn}");
+        assert!(warn.is_none(), "{warn:?}");
+        let resolved = resolved.expect("container fs+net with egress must resolve");
+        assert_eq!(resolved.backend, SandboxBackend::Container);
+        assert_eq!(resolved.inputs.egress, vec!["crates.io:443".to_string()]);
     }
 
     #[test]
@@ -844,7 +835,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn sandbox_resolve_fs_net_on_macos_refuses_hostname_egress() {
+    fn sandbox_resolve_fs_net_on_macos_yields_seatbelt_with_loopback_profile() {
         let cfg = crate::types::SandboxConfig {
             enforce: crate::types::SandboxEnforce::FsNet,
             provider: crate::types::SandboxProvider::Process,
@@ -857,11 +848,14 @@ mod tests {
 
         let (resolved, warn) = resolve_for_session(&cfg, session.path(), mission.path());
 
-        assert!(resolved.is_none());
-        let warn = warn.expect("fs+net on macOS should produce a warning");
-        assert!(warn.contains("fs+net"), "{warn}");
-        assert!(warn.contains("unsupported"), "{warn}");
-        assert!(warn.contains("refusing"), "{warn}");
+        assert!(warn.is_none(), "fs+net on macOS resolves: {warn:?}");
+        let resolved = resolved.expect("fs+net on macOS resolves to Seatbelt");
+        assert_eq!(resolved.backend, SandboxBackend::Seatbelt);
+        let profile = generate_profile(&resolved.inputs);
+        assert!(
+            profile.contains("(allow network-outbound (remote tcp \"localhost:*\"))"),
+            "fs+net profile must restrict egress to loopback so only the egress proxy is reachable:\n{profile}"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -923,8 +917,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    #[ignore = "run alone: an invalid hostname profile can poison later sandbox-exec calls in this test binary"]
-    fn sandbox_enforcement_macos_fs_net_hostname_profile_fails_closed() {
+    fn sandbox_enforcement_macos_fs_net_loopback_profile_applies() {
         use std::process::Command;
 
         let _guard = SANDBOX_EXEC_TEST_LOCK.lock().unwrap();
@@ -939,24 +932,23 @@ mod tests {
         let mut inputs = inputs(session.path(), mission.path(), tmp.path(), vec![]);
         inputs.enforce = crate::types::SandboxEnforce::FsNet;
 
+        // The fs+net profile (loopback-only egress) must be ACCEPTED by
+        // sandbox-exec — unlike the hostname-rule shape Seatbelt rejects with
+        // "host must be * or localhost" — or fs+net sessions could not run.
         let profile = generate_profile(&inputs);
         let profile_dir = tempfile::tempdir().unwrap();
         let profile_path = write_profile_file(profile_dir.path(), &profile).unwrap();
 
-        let denied = Command::new("sandbox-exec")
+        let applied = Command::new("sandbox-exec")
             .arg("-f")
             .arg(&profile_path)
             .arg("/usr/bin/true")
             .output()
             .expect("failed to run sandbox-exec");
         assert!(
-            !denied.status.success(),
-            "hostname-based fs+net profile must fail closed on macOS rather than run with invalid egress rules"
-        );
-        let stderr = String::from_utf8_lossy(&denied.stderr);
-        assert!(
-            stderr.contains("host must be * or localhost"),
-            "unexpected sandbox-exec error for hostname egress limitation: {stderr}"
+            applied.status.success(),
+            "loopback-only fs+net profile must apply cleanly on macOS: {}",
+            String::from_utf8_lossy(&applied.stderr)
         );
     }
 

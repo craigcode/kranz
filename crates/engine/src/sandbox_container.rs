@@ -2,16 +2,19 @@
 //! a container with the declared write/egress policy. See
 //! docs/scoping/worker-sandboxing.md tier 3.
 //!
-//! This is the macOS `fs+net` answer tier 2 could not give: Seatbelt cannot
-//! express hostname egress rules, but a container runtime can cut the network
-//! outright. With `enforce = "fs+net"` and an empty `egress` list the session
-//! runs with `--network none` — a hard egress boundary that works identically
-//! on macOS and Linux. Note the honest tradeoff: `none` also blocks the
-//! agent's API egress, so `fs+net` suits offline gates/validation; API-driven
-//! workers use `fs` (runtime default bridge/NAT, the same permissiveness as
-//! the tier-2 fs tier). A non-empty `egress` list is REFUSED at resolve time:
-//! per-host egress needs the filtering proxy from the egress-grant ticket,
-//! and silently widening to a full bridge would be worse than failing closed.
+//! Two network postures for `enforce = "fs+net"`, chosen by the egress list.
+//! An EMPTY `egress` list runs `--network none` — a hard egress boundary that
+//! works identically on macOS and Linux. Note the honest tradeoff: `none`
+//! also blocks the agent's API egress, so it suits offline gates/validation.
+//! A NON-EMPTY `egress` list keeps the runtime default bridge and points the
+//! session env at the run's host-side filtering egress proxy
+//! (`crate::egress_proxy`) via `host.docker.internal` — the proxy enforces
+//! the per-host allowlist at CONNECT time and records structured denials.
+//! The proxy hop is env-based (advisory on the bridge: a process that ignores
+//! the proxy vars bypasses the filter); a hard per-host container boundary
+//! (internal-network sidecar) is follow-up work. API-driven workers that need
+//! no egress list use `fs` (runtime default bridge/NAT, the same
+//! permissiveness as the tier-2 fs tier).
 //!
 //! Write policy: the container's root filesystem is read-only; the writable
 //! set is exactly the declared mounts — `session_cwd` (rw), `mission_dir`
@@ -87,10 +90,16 @@ pub struct ContainerSpec {
 /// Build the `<runtime> run` argv (excluding the runtime binary itself) for
 /// running `binary args` under the resolved container sandbox.
 ///
-/// Network: `fs+net` maps to `--network none` (resolve refuses a non-empty
-/// egress list before this point, so FsNet here always means "no network");
-/// `fs` passes no network flag, keeping the runtime's default bridge/NAT —
-/// the same permissiveness as the tier-2 fs tier.
+/// Network: `fs+net` with an empty egress list maps to `--network none` (the
+/// hard boundary); `fs+net` with a non-empty egress list keeps the runtime
+/// default bridge and forwards the run's egress-proxy endpoint into the
+/// container env (`proxy_url`, reaching the host-side proxy via
+/// `host.docker.internal`; Linux docker additionally gets the `host-gateway`
+/// hosts entry). The runner guarantees `proxy_url` is `Some` whenever a
+/// proxy-routed container session spawns — a proxy start failure fails the
+/// run closed before this point. `fs` passes no network flag, keeping the
+/// runtime's default bridge/NAT — the same permissiveness as the tier-2 fs
+/// tier.
 /// One mount spec `host:host[:ro]` — the single format both the builder and
 /// the tests use (POSIX and Windows path forms differ; tests derive
 /// expectations through this helper rather than hardcoding POSIX literals).
@@ -106,6 +115,7 @@ pub fn container_run_args(
     spec: &ContainerSpec,
     binary: &Path,
     args: &[String],
+    proxy_url: Option<&str>,
 ) -> Vec<String> {
     let mut out: Vec<String> = vec![
         "run".to_string(),
@@ -149,8 +159,35 @@ pub fn container_run_args(
     out.push("-e".to_string());
     out.push(format!("TMPDIR={scratch}"));
     if inputs.enforce == crate::types::SandboxEnforce::FsNet {
-        out.push("--network".to_string());
-        out.push("none".to_string());
+        if inputs.egress.is_empty() {
+            out.push("--network".to_string());
+            out.push("none".to_string());
+        } else if let Some(proxy_url) = proxy_url {
+            // Proxy-routed fs+net: the session's HTTPS egress goes to the
+            // host-side filtering proxy. Linux docker has no built-in
+            // host.docker.internal mapping, so give it the gateway entry.
+            #[cfg(target_os = "linux")]
+            {
+                out.push("--add-host".to_string());
+                out.push("host.docker.internal:host-gateway".to_string());
+            }
+            out.push("-e".to_string());
+            out.push(format!(
+                "{}={proxy_url}",
+                crate::egress_proxy::HTTPS_PROXY_ENV
+            ));
+            out.push("-e".to_string());
+            out.push(format!(
+                "{}={proxy_url}",
+                crate::egress_proxy::HTTP_PROXY_ENV
+            ));
+            out.push("-e".to_string());
+            out.push(format!(
+                "{}={}",
+                crate::egress_proxy::NO_PROXY_ENV,
+                crate::egress_proxy::NO_PROXY_VALUE
+            ));
+        }
     }
     out.push(spec.image.clone());
     out.push(binary.display().to_string());
@@ -211,6 +248,7 @@ mod tests {
             &spec(),
             Path::new("claude"),
             &["-p".to_string(), "hi".to_string()],
+            None,
         );
         let network = args
             .windows(2)
@@ -220,12 +258,50 @@ mod tests {
     }
 
     #[test]
+    fn container_run_args_fs_net_with_egress_bridges_and_forwards_proxy_env() {
+        let mut inputs = inputs(SandboxEnforce::FsNet);
+        inputs.egress = vec!["crates.io:443".to_string()];
+        let args = container_run_args(
+            &inputs,
+            &spec(),
+            Path::new("claude"),
+            &["-p".to_string(), "hi".to_string()],
+            Some("http://host.docker.internal:8123"),
+        );
+
+        assert!(
+            !args.iter().any(|a| a == "--network"),
+            "proxy-routed fs+net keeps the runtime default bridge: {args:?}"
+        );
+        for var in ["HTTPS_PROXY", "HTTP_PROXY"] {
+            assert!(
+                args.windows(2)
+                    .any(|w| w[0] == "-e"
+                        && w[1] == format!("{var}=http://host.docker.internal:8123")),
+                "missing -e {var}=…: {args:?}"
+            );
+        }
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-e" && w[1] == "NO_PROXY=localhost,127.0.0.1"),
+            "missing -e NO_PROXY…: {args:?}"
+        );
+        #[cfg(target_os = "linux")]
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--add-host" && w[1] == "host.docker.internal:host-gateway"),
+            "linux docker needs the host-gateway entry: {args:?}"
+        );
+    }
+
+    #[test]
     fn container_run_args_fs_keeps_runtime_default_network() {
         let args = container_run_args(
             &inputs(SandboxEnforce::Fs),
             &spec(),
             Path::new("claude"),
             &[],
+            None,
         );
         assert!(
             !args.iter().any(|a| a == "--network"),
@@ -256,6 +332,7 @@ mod tests {
             &spec(),
             Path::new("claude"),
             &["--print".to_string()],
+            None,
         );
         let joined = args.join(" ");
         let abs = |p: &std::path::Path| crate::sandbox::absolutize(p).display().to_string();
@@ -280,7 +357,13 @@ mod tests {
             runtime: ContainerRuntime::Podman,
             image: "ghcr.io/example/kranz-worker:1".to_string(),
         };
-        let args = container_run_args(&inputs(SandboxEnforce::Fs), &spec, Path::new("claude"), &[]);
+        let args = container_run_args(
+            &inputs(SandboxEnforce::Fs),
+            &spec,
+            Path::new("claude"),
+            &[],
+            None,
+        );
         assert!(
             args.iter().any(|a| a == "ghcr.io/example/kranz-worker:1"),
             "configured image must be used: {args:?}"
@@ -328,6 +411,7 @@ mod tests {
                     ok_file.display()
                 ),
             ],
+            None,
         );
         let output = std::process::Command::new(runtime.binary())
             .args(&args)

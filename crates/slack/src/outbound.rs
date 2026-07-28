@@ -227,6 +227,7 @@ mod tests {
                 command_grants: vec![],
                 touch_set: vec![],
                 deny_exceptions: vec![],
+                egress_grants: vec![],
             },
             runs: Default::default(),
             totals: TokenUsage::default(),

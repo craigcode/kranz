@@ -10,6 +10,7 @@
 //!     ├── state.json              # derived snapshot (cache; rebuildable)
 //!     ├── control/                # inbox: CLI/server -> engine ControlCommand files
 //!     ├── runs/<runId>.jsonl      # full per-run transcripts
+//!     ├── runs/egress-denials.jsonl # fs+net proxy denial records (gitignored runtime)
 //!     └── workspace/              # container-provider compose files (gitignored runtime)
 //! ```
 //!
@@ -133,6 +134,13 @@ impl MissionPaths {
 
     pub fn transcript_file(&self, run_id: &str) -> PathBuf {
         self.runs_dir().join(format!("{run_id}.jsonl"))
+    }
+
+    /// Mission-shared egress-denial JSONL the per-run egress proxy appends to
+    /// (`fs+net` sessions; see `crate::egress_proxy`). Runtime path under the
+    /// gitignored `runs/` dir; v1 correlation is mission-level.
+    pub fn egress_denials_file(&self) -> PathBuf {
+        self.runs_dir().join("egress-denials.jsonl")
     }
 
     /// Relative transcript path recorded in events/state (stable across hosts).

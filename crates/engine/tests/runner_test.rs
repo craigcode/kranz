@@ -987,6 +987,7 @@ async fn run_worker_builds_spec_and_uses_report_result() {
         None,
         &[],
         &[],
+        &[],
         AuthVerdict::Inconclusive,
     )
     .await
@@ -1081,6 +1082,7 @@ async fn run_worker_seeds_scratch_home_and_config_dir_worker_env_hygiene() {
         Some(base_sha),
         &[],
         &[],
+        &[],
         AuthVerdict::Authenticated,
     )
     .await
@@ -1119,7 +1121,7 @@ async fn run_worker_seeds_scratch_home_and_config_dir_worker_env_hygiene() {
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
-async fn run_worker_refuses_unsupported_macos_fs_net_sandbox() {
+async fn run_worker_routes_macos_fs_net_through_egress_proxy() {
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
     let mut log = seeded_log(&p);
@@ -1128,7 +1130,7 @@ async fn run_worker_refuses_unsupported_macos_fs_net_sandbox() {
 
     let backend =
         MockBackend::with_scripts(vec![MockScript::single_shot_json(&worker_report_json())]);
-    let err = run_worker(
+    let outcome = run_worker(
         &backend,
         &mut log,
         &p,
@@ -1141,18 +1143,42 @@ async fn run_worker_refuses_unsupported_macos_fs_net_sandbox() {
         None,
         &[],
         &[],
+        &[],
         AuthVerdict::Inconclusive,
     )
     .await
-    .unwrap_err();
+    .unwrap();
 
-    let message = err.to_string();
-    assert!(message.contains("fs+net"), "{message}");
-    assert!(message.contains("unsupported"), "{message}");
-    assert!(message.contains("refusing"), "{message}");
+    // macOS fs+net resolves to Seatbelt (loopback-only egress) plus the
+    // filtering egress proxy: the session's env points at the spawned proxy.
+    let specs = backend.started_specs();
+    assert_eq!(specs.len(), 1, "fs+net no longer refuses on macOS");
+    let spec = &specs[0];
+    let sandbox = spec.sandbox.as_ref().expect("sandbox resolved");
+    assert_eq!(
+        sandbox.backend,
+        kranz_engine::sandbox::SandboxBackend::Seatbelt
+    );
+    let proxy = spec
+        .env
+        .get(kranz_engine::egress_proxy::HTTPS_PROXY_ENV)
+        .expect("fs+net session carries proxy env");
     assert!(
-        backend.started_specs().is_empty(),
-        "unsupported sandbox enforcement must fail before launching a backend session"
+        proxy.starts_with("http://127.0.0.1:"),
+        "seatbelt sessions reach the proxy on loopback: {proxy}"
+    );
+    assert_eq!(
+        spec.env.get(kranz_engine::egress_proxy::HTTP_PROXY_ENV),
+        Some(proxy)
+    );
+    assert_eq!(
+        spec.env.get(kranz_engine::egress_proxy::NO_PROXY_ENV),
+        Some(&kranz_engine::egress_proxy::NO_PROXY_VALUE.to_string())
+    );
+    assert!(
+        outcome.denied_egress.is_empty(),
+        "no CONNECTs in a mock session: {:?}",
+        outcome.denied_egress
     );
 }
 
@@ -1184,6 +1210,7 @@ async fn run_validator_builds_spec_permissions_and_parses_report() {
         "abc123",
         None,
         None,
+        &[],
         &[],
         &[],
         None,
@@ -1273,6 +1300,7 @@ async fn run_validator_rejects_non_validator_roles() {
         None,
         &[],
         &[],
+        &[],
         None,
     )
     .await
@@ -1282,17 +1310,17 @@ async fn run_validator_rejects_non_validator_roles() {
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
-async fn run_validator_refuses_unsupported_macos_fs_net_sandbox() {
+async fn run_validator_routes_macos_fs_net_through_egress_proxy() {
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
     let mut log = seeded_log(&p);
     let mut cfg = MissionConfig::default();
     cfg.validator_scrutiny.sandbox.enforce = kranz_engine::types::SandboxEnforce::FsNet;
     let backend = MockBackend::with_scripts(vec![MockScript::single_shot_json(
-        &json!({ "findings": [], "summary": "not reached" }),
+        &json!({ "findings": [], "summary": "all good" }),
     )]);
 
-    let err = run_validator(
+    let outcome = run_validator(
         &backend,
         &mut log,
         &p,
@@ -1305,19 +1333,27 @@ async fn run_validator_refuses_unsupported_macos_fs_net_sandbox() {
         None,
         &[],
         &[],
+        &[],
         None,
     )
     .await
-    .unwrap_err();
+    .unwrap();
 
-    let message = err.to_string();
-    assert!(message.contains("fs+net"), "{message}");
-    assert!(message.contains("unsupported"), "{message}");
-    assert!(message.contains("refusing"), "{message}");
-    assert!(
-        backend.started_specs().is_empty(),
-        "unsupported sandbox enforcement must fail before launching a validator session"
+    // Validator sessions get the same proxy wiring as workers on macOS fs+net.
+    let specs = backend.started_specs();
+    assert_eq!(specs.len(), 1, "fs+net no longer refuses on macOS");
+    assert_eq!(
+        specs[0].sandbox.as_ref().map(|s| s.backend),
+        Some(kranz_engine::sandbox::SandboxBackend::Seatbelt)
     );
+    assert!(
+        specs[0]
+            .env
+            .contains_key(kranz_engine::egress_proxy::HTTPS_PROXY_ENV),
+        "validator fs+net session carries proxy env: {:?}",
+        specs[0].env
+    );
+    assert!(outcome.denied_egress.is_empty());
 }
 
 /// Contract commands must admit their natural reinvocations (observed live:
@@ -1412,6 +1448,7 @@ async fn run_worker_in_buffered_collects_kinds_without_touching_the_log() {
         None,
         &[],
         &[],
+        &[],
         AuthVerdict::Inconclusive,
     )
     .await
@@ -1467,5 +1504,304 @@ async fn run_worker_in_buffered_collects_kinds_without_touching_the_log() {
         transcript.lines().count(),
         4,
         "init + tool-use + text + result"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Egress proxy (3.3a): fs+net sessions route through the filtering proxy
+// ---------------------------------------------------------------------------
+
+use kranz_engine::egress_proxy::{
+    EgressDenial, HTTPS_PROXY_ENV, HTTP_PROXY_ENV, NO_PROXY_ENV, NO_PROXY_VALUE,
+};
+use kranz_engine::sandbox::{ResolvedSandbox, SandboxBackend, SandboxInputs};
+use kranz_engine::types::SandboxEnforce;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
+
+fn fs_net_sandbox(
+    backend: SandboxBackend,
+    egress: Vec<String>,
+    dir: &std::path::Path,
+) -> ResolvedSandbox {
+    ResolvedSandbox {
+        backend,
+        inputs: SandboxInputs {
+            enforce: SandboxEnforce::FsNet,
+            session_cwd: dir.to_path_buf(),
+            mission_dir: dir.to_path_buf(),
+            tmpdir: std::env::temp_dir(),
+            extra_write: Vec::new(),
+            egress,
+        },
+        container: None,
+    }
+}
+
+/// Read one proxy response head (through the CRLF terminator).
+async fn read_proxy_response_head(stream: &mut TcpStream) -> String {
+    let mut reader = BufReader::new(stream);
+    let mut head = String::new();
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let done = line == "\r\n";
+        head.push_str(&line);
+        if done {
+            return head;
+        }
+    }
+}
+
+/// Poll until the backend has recorded its first started spec (the proxy is
+/// spawned before `backend.start`, so a recorded spec means the proxy env is
+/// readable and the proxy is serving).
+async fn first_started_spec(backend: &MockBackend) -> SessionSpec {
+    let deadline = std::time::Instant::now() + HANG_PROOF;
+    loop {
+        if let Some(spec) = backend.started_specs().into_iter().next() {
+            return spec;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "session never started"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// A parked fs+net (Seatbelt) session's env points at the run's spawned
+/// proxy; an allowed CONNECT tunnels, a denied CONNECT gets a 403 and lands
+// in `RunOutcome.denied_egress` and the mission JSONL — all over loopback.
+#[tokio::test]
+async fn run_session_fs_net_wires_proxy_env_and_surfaces_denials() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    let mut log = seeded_log(&p);
+
+    // Loopback echo server: the allowed CONNECT target.
+    let echo = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let echo_port = echo.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut socket, _) = echo.accept().await.unwrap();
+        let mut buf = [0u8; 64];
+        let n = socket.read(&mut buf).await.unwrap();
+        socket.write_all(&buf[..n]).await.unwrap();
+    });
+
+    // A streaming script with no events parks the session in next_event until
+    // the test's cancel aborts it — holding the proxy's lifetime open.
+    let backend = Arc::new(MockBackend::with_scripts(vec![MockScript::streaming(
+        vec![],
+    )]));
+    let mut spec = session_spec(PromptMode::Streaming("held".to_string()));
+    spec.sandbox = Some(fs_net_sandbox(
+        SandboxBackend::Seatbelt,
+        vec![format!("127.0.0.1:{echo_port}")],
+        dir.path(),
+    ));
+
+    let cancel = Arc::new(Notify::new());
+    let run = {
+        let backend = Arc::clone(&backend);
+        let cancel = Arc::clone(&cancel);
+        let p = p.clone();
+        tokio::spawn(async move {
+            run_session(
+                backend.as_ref(),
+                spec,
+                &mut log,
+                &p,
+                worker_meta("run-egress"),
+                Some(cancel),
+            )
+            .await
+        })
+    };
+
+    let started = first_started_spec(backend.as_ref()).await;
+    let proxy_url = started
+        .env
+        .get(HTTPS_PROXY_ENV)
+        .expect("fs+net session carries HTTPS_PROXY")
+        .clone();
+    let proxy_addr = proxy_url
+        .strip_prefix("http://")
+        .expect("proxy url is http://host:port");
+    assert!(
+        proxy_addr.starts_with("127.0.0.1:"),
+        "seatbelt sessions reach the proxy on loopback: {proxy_url}"
+    );
+    assert_eq!(
+        started.env.get(HTTP_PROXY_ENV).map(String::as_str),
+        Some(proxy_url.as_str())
+    );
+    assert_eq!(
+        started.env.get(NO_PROXY_ENV).map(String::as_str),
+        Some(NO_PROXY_VALUE)
+    );
+
+    // Allowed host (the echo server is on the allowlist): 200 + tunnel bytes.
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    client
+        .write_all(format!("CONNECT 127.0.0.1:{echo_port} HTTP/1.1\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let head = read_proxy_response_head(&mut client).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "allowed CONNECT: {head}");
+    client.write_all(b"tunneled").await.unwrap();
+    let mut buf = vec![0u8; b"tunneled".len()];
+    client.read_exact(&mut buf).await.unwrap();
+    assert_eq!(buf, b"tunneled", "bytes tunnel through the run's proxy");
+
+    // Denied host: 403, never a silent timeout, and a structured record.
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    client
+        .write_all(b"CONNECT denied.example:443 HTTP/1.1\r\n\r\n")
+        .await
+        .unwrap();
+    let head = read_proxy_response_head(&mut client).await;
+    assert!(head.starts_with("HTTP/1.1 403"), "denied CONNECT: {head}");
+
+    cancel.notify_one();
+    let outcome = timeout(HANG_PROOF, run)
+        .await
+        .expect("run must not hang")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        outcome.denied_egress,
+        vec![EgressDenial {
+            host: "denied.example".to_string(),
+            port: 443,
+        }],
+        "the run surfaces exactly its own proxy's denials"
+    );
+
+    // The mission JSONL holds the fsynced record with a timestamp.
+    let content = std::fs::read_to_string(p.egress_denials_file()).unwrap();
+    let record: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+    assert_eq!(record["host"], "denied.example");
+    assert_eq!(record["port"], 443);
+    assert!(record["ts"].is_string(), "record carries ts: {content}");
+}
+
+/// No fs+net ⇒ no proxy at all: no env, no denials, no denial file. Covers
+/// unsandboxed, fs-only, and bwrap fs+net (netns cannot reach a host proxy —
+/// v1 out of scope), plus container fs+net with an empty egress list
+/// (--network none).
+#[tokio::test]
+async fn run_session_without_proxy_route_spawns_no_proxy() {
+    for (name, sandbox) in [
+        ("unsandboxed", None),
+        (
+            "fs-only",
+            Some(fs_net_sandbox(
+                SandboxBackend::Seatbelt,
+                vec![],
+                std::env::temp_dir().as_path(),
+            )),
+        ),
+        (
+            "bwrap fs+net",
+            Some(fs_net_sandbox(
+                SandboxBackend::Bubblewrap,
+                vec![],
+                std::env::temp_dir().as_path(),
+            )),
+        ),
+        (
+            "container fs+net empty egress",
+            Some(fs_net_sandbox(
+                SandboxBackend::Container,
+                vec![],
+                std::env::temp_dir().as_path(),
+            )),
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        let mut log = seeded_log(&p);
+        let backend =
+            MockBackend::with_scripts(vec![MockScript::single_shot_json(&worker_report_json())]);
+        let mut spec = session_spec(PromptMode::SingleShot("task".to_string()));
+        spec.sandbox = sandbox.map(|mut s| {
+            // The fs-only case exercises the Fs tier; the rest keep FsNet.
+            if name == "fs-only" {
+                s.inputs.enforce = SandboxEnforce::Fs;
+            }
+            s
+        });
+
+        let outcome = run_session(
+            &backend,
+            spec,
+            &mut log,
+            &p,
+            worker_meta("run-noproxy"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let started = &backend.started_specs()[0];
+        assert!(
+            !started.env.contains_key(HTTPS_PROXY_ENV)
+                && !started.env.contains_key(HTTP_PROXY_ENV)
+                && !started.env.contains_key(NO_PROXY_ENV),
+            "{name}: no proxy env: {:?}",
+            started.env
+        );
+        assert!(outcome.denied_egress.is_empty(), "{name}: no denials");
+        assert!(
+            !p.egress_denials_file().exists(),
+            "{name}: no denial file is created"
+        );
+    }
+}
+
+/// A proxy that cannot start (its denial file path is blocked by a directory)
+/// fails the run CLOSED — before any session spawn.
+#[tokio::test]
+async fn run_session_fs_net_proxy_start_failure_fails_closed_before_spawn() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    let mut log = seeded_log(&p);
+    std::fs::create_dir_all(p.runs_dir()).unwrap();
+    // Block the denial file path with a directory: opening it for append
+    // fails, so the proxy start fails.
+    std::fs::create_dir(p.egress_denials_file()).unwrap();
+
+    // A script IS queued: if the run wrongly proceeded to spawn, it would
+    // succeed — so reaching backend.start is distinguishable from failing
+    // closed.
+    let backend =
+        MockBackend::with_scripts(vec![MockScript::single_shot_json(&worker_report_json())]);
+    let mut spec = session_spec(PromptMode::SingleShot("task".to_string()));
+    spec.sandbox = Some(fs_net_sandbox(SandboxBackend::Seatbelt, vec![], dir.path()));
+
+    let err = run_session(
+        &backend,
+        spec,
+        &mut log,
+        &p,
+        worker_meta("run-closed"),
+        None,
+    )
+    .await
+    .expect_err("a proxy start failure must error the run");
+
+    let message = err.to_string();
+    assert!(message.contains("egress proxy"), "{message}");
+    assert!(
+        message.contains("refusing to run without enforcement"),
+        "{message}"
+    );
+    assert!(
+        backend.started_specs().is_empty(),
+        "fail-closed means the session never spawns"
     );
 }

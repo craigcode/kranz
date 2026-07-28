@@ -66,6 +66,14 @@ pub struct Mission {
     /// declared): a deliberate, logged erosion of a safety guardrail.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny_exceptions: Vec<String>,
+    /// Egress destinations (`host:port`) an operator has GRANTED for this
+    /// mission — folded into the egress proxy's allowlist for `fs+net`
+    /// sessions (`crate::egress_proxy`). Extend-only, runtime-only (never
+    /// plan-declared): the fold target a future `GrantKind::Egress` approval
+    /// extends; read into the proxy allowlist at spec build so that approval
+    /// needs no plumbing change.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub egress_grants: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------

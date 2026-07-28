@@ -9,7 +9,8 @@ here — read it before making changes.
 
 - `crates/engine` — the mission engine: orchestrator, agent backends
   (`backend_claude`, `backend_codex`, `backend_droid`), runner, config,
-  gates, append-only event log, worktree isolation.
+  gates, append-only event log, worktree isolation, filtering egress proxy
+  (`egress_proxy`, the `fs+net` boundary + denial signal).
 - `crates/cli` — the `kranz` binary (draft/queue/work/serve/exec/abandon).
 - `crates/server` — REST + WebSocket host (`kranz serve`), the MissionHost.
 - `crates/slack` — the Slack bridge (socket-mode).

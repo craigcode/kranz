@@ -444,6 +444,7 @@ async fn worker_session_carries_configured_tools_onto_the_spec() {
         None,
         &[],
         &[],
+        &[],
         AuthVerdict::Inconclusive,
     )
     .await
@@ -500,6 +501,7 @@ async fn functional_validator_tools_are_carried_and_allowed() {
         None,
         &[],
         &[],
+        &[],
         None,
     )
     .await
@@ -546,6 +548,7 @@ async fn scrutiny_validator_does_not_get_extra_tools_folded_into_allowed() {
         None,
         &[],
         &[],
+        &[],
         None,
     )
     .await
@@ -588,6 +591,7 @@ async fn scrutiny_task_and_permissions_carry_no_contract_commands() {
             "start-sha",
             None,
             None,
+            &[],
             &[],
             &[],
             None,
@@ -664,6 +668,7 @@ async fn engine_run_contract_results_reach_functional_task_only() {
             None,
             dir.path(),
             None,
+            &[],
             &[],
             &[],
             None,

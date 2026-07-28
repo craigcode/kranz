@@ -193,6 +193,13 @@ pub struct RunOutcome {
     /// on the Claude backend, so this is the command from the immediately
     /// preceding `ToolUse` (a denied result follows its call in the stream).
     pub denied_commands: Vec<String>,
+    /// Egress destinations the run's filtering proxy refused (`fs+net`
+    /// sessions only; see `crate::egress_proxy`), in first-seen order — the
+    /// trigger a later egress grant flow (3.3b) parks on. Empty when the run
+    /// routed through no proxy (unsandboxed, `fs`/`off`, bubblewrap, or
+    /// container `--network none`). Consumed by nothing yet; mirrors
+    /// `denied_commands`' shape.
+    pub denied_egress: Vec<crate::egress_proxy::EgressDenial>,
 }
 
 /// Whether `tool` names a shell whose `ToolUse` summary is a runnable command a
@@ -258,7 +265,7 @@ pub async fn run_session(
 /// modes (it is not the single-writer log).
 pub async fn run_session_to(
     backend: &dyn AgentBackend,
-    spec: SessionSpec,
+    mut spec: SessionSpec,
     log: &mut LogTarget<'_>,
     paths: &MissionPaths,
     run_meta: RunMeta,
@@ -286,6 +293,13 @@ pub async fn run_session_to(
         prompt_hash: run_meta.prompt_hash.clone(),
         transcript_path: MissionPaths::transcript_rel(&run_meta.run_id),
     })?;
+
+    // Egress proxy (3.3a): an fs+net session whose sandbox routes through the
+    // filtering proxy gets its env pointed at the proxy BEFORE spawn. A proxy
+    // that cannot start fails the run closed here — the session never
+    // launches without its enforcement (same discipline as
+    // resolve_sandbox_or_refuse).
+    let egress_proxy = crate::egress_proxy::maybe_start_for_session(&mut spec, paths).await?;
 
     let mut session = backend.start(spec).await?;
     let session_id = session.session_id();
@@ -372,6 +386,15 @@ pub async fn run_session_to(
     }
     transcript.flush()?;
 
+    // The proxy lifecycle is tied to the run: shut it down now that the
+    // session stream has closed and collect the denials THIS proxy recorded
+    // (the shared mission JSONL may interleave concurrent M3 runs; the
+    // in-memory records attribute exactly).
+    let denied_egress = match egress_proxy {
+        Some(proxy) => proxy.shutdown().await,
+        None => Vec::new(),
+    };
+
     let exit = session.exit_status().unwrap_or_else(|| {
         if cancelled {
             SessionExit::Aborted
@@ -441,6 +464,7 @@ pub async fn run_session_to(
         exit,
         denied_count,
         denied_commands,
+        denied_egress,
     })
 }
 
@@ -584,6 +608,7 @@ pub async fn run_worker(
     cancel: Option<Arc<Notify>>,
     base_sha: Option<&str>,
     grants: &[String],
+    egress_grants: &[String],
     deny_exceptions: &[String],
     auth_verdict: AuthVerdict,
 ) -> Result<RunOutcome> {
@@ -601,6 +626,7 @@ pub async fn run_worker(
         &cwd,
         base_sha,
         grants,
+        egress_grants,
         deny_exceptions,
         auth_verdict,
     )
@@ -629,6 +655,7 @@ pub async fn run_worker_in(
     session_cwd: &std::path::Path,
     base_sha: Option<&str>,
     grants: &[String],
+    egress_grants: &[String],
     deny_exceptions: &[String],
     auth_verdict: AuthVerdict,
 ) -> Result<RunOutcome> {
@@ -641,6 +668,7 @@ pub async fn run_worker_in(
         session_cwd,
         base_sha,
         grants,
+        egress_grants,
         deny_exceptions,
         paths.mission_dir(),
         auth_verdict,
@@ -678,6 +706,7 @@ pub async fn run_worker_in_buffered(
     session_cwd: &std::path::Path,
     base_sha: Option<&str>,
     grants: &[String],
+    egress_grants: &[String],
     deny_exceptions: &[String],
     auth_verdict: AuthVerdict,
 ) -> Result<(Vec<EventKind>, RunOutcome)> {
@@ -690,6 +719,7 @@ pub async fn run_worker_in_buffered(
         session_cwd,
         base_sha,
         grants,
+        egress_grants,
         deny_exceptions,
         paths.mission_dir(),
         auth_verdict,
@@ -816,6 +846,7 @@ fn build_worker_spec(
     session_cwd: &std::path::Path,
     base_sha: Option<&str>,
     grants: &[String],
+    egress_grants: &[String],
     deny_exceptions: &[String],
     mission_dir: std::path::PathBuf,
     auth_verdict: AuthVerdict,
@@ -888,6 +919,7 @@ fn build_worker_spec(
         real_config_dir.as_deref(),
     );
     spec.sandbox = resolve_sandbox_or_refuse(role_cfg, session_cwd, &mission_dir)?;
+    apply_egress_grants(&mut spec.sandbox, egress_grants);
     permissions::apply(
         permissions::for_role(role, cfg, &[], grants, deny_exceptions),
         &mut spec,
@@ -931,6 +963,7 @@ pub async fn run_validator(
     cancel: Option<Arc<Notify>>,
     base_sha: Option<&str>,
     grants: &[String],
+    egress_grants: &[String],
     worker_commands: &[String],
     guidance: Option<&str>,
 ) -> Result<RunOutcome> {
@@ -948,6 +981,7 @@ pub async fn run_validator(
         &cwd,
         base_sha,
         grants,
+        egress_grants,
         worker_commands,
         guidance,
         None,
@@ -977,6 +1011,7 @@ pub async fn run_validator_in(
     session_cwd: &std::path::Path,
     base_sha: Option<&str>,
     grants: &[String],
+    egress_grants: &[String],
     worker_commands: &[String],
     guidance: Option<&str>,
     contract_results: Option<&str>,
@@ -1111,6 +1146,7 @@ pub async fn run_validator_in(
     };
     spec.env = contract_env(base_sha);
     spec.sandbox = resolve_sandbox_or_refuse(role_cfg, session_cwd, &paths.mission_dir())?;
+    apply_egress_grants(&mut spec.sandbox, egress_grants);
     permissions::apply(
         permissions::for_role(kind, cfg, &combined_commands, grants, &[]),
         &mut spec,
@@ -1160,35 +1196,85 @@ fn resolve_sandbox_or_refuse(
     Ok(sandbox)
 }
 
+/// Fold the mission's operator-granted egress list into a resolved `fs+net`
+/// sandbox's inputs, so the run's egress proxy allowlist covers the granted
+/// destinations alongside the configured `egress[]` (and a container sandbox
+/// sees a non-empty list → bridge+proxy rather than `--network none`). Reads
+/// the same mission list a future `GrantKind::Egress` approval extends, so
+/// the grant flow (3.3b) folds in with no plumbing change.
+fn apply_egress_grants(
+    sandbox: &mut Option<crate::sandbox::ResolvedSandbox>,
+    egress_grants: &[String],
+) {
+    let Some(sandbox) = sandbox else {
+        return;
+    };
+    if sandbox.inputs.enforce != SandboxEnforce::FsNet {
+        return;
+    }
+    for grant in egress_grants {
+        if !sandbox.inputs.egress.contains(grant) {
+            sandbox.inputs.egress.push(grant.clone());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn container_provider_refusal_propagates_through_resolve_sandbox_or_refuse() {
-        // provider:container + fs+net + a per-host egress list is refused at
-        // resolve time on every host (the refusal precedes runtime detection,
-        // so this is independent of whether docker/podman is installed), and
-        // the runner layer must turn that refusal into a hard error rather
-        // than run unsandboxed.
-        let role_cfg = RoleConfig {
-            sandbox: crate::types::SandboxConfig {
-                enforce: crate::types::SandboxEnforce::FsNet,
-                provider: crate::types::SandboxProvider::Container,
-                image: None,
-                extra_write: vec![],
-                egress: vec!["crates.io:443".to_string()],
-            },
-            ..MissionConfig::default().worker
-        };
-        let session = tempfile::tempdir().unwrap();
-        let mission = tempfile::tempdir().unwrap();
+    fn apply_egress_grants_merges_into_fs_net_sandbox_inputs() {
+        fn fs_net_sandbox(egress: Vec<String>) -> crate::sandbox::ResolvedSandbox {
+            crate::sandbox::ResolvedSandbox {
+                backend: crate::sandbox::SandboxBackend::Seatbelt,
+                inputs: crate::sandbox::SandboxInputs {
+                    enforce: crate::types::SandboxEnforce::FsNet,
+                    session_cwd: std::path::PathBuf::from("/s"),
+                    mission_dir: std::path::PathBuf::from("/m"),
+                    tmpdir: std::path::PathBuf::from("/t"),
+                    extra_write: vec![],
+                    egress,
+                },
+                container: None,
+            }
+        }
 
-        let err = resolve_sandbox_or_refuse(&role_cfg, session.path(), mission.path())
-            .expect_err("a refused container sandbox must error, never run unsandboxed");
-        let message = err.to_string();
-        assert!(message.contains("provider:container"), "{message}");
-        assert!(message.contains("egress"), "{message}");
+        // Grants append to the configured egress, de-duplicated.
+        let mut sandbox = Some(fs_net_sandbox(vec!["crates.io:443".to_string()]));
+        apply_egress_grants(
+            &mut sandbox,
+            &[
+                "registry.npmjs.org:443".to_string(),
+                "crates.io:443".to_string(),
+            ],
+        );
+        assert_eq!(
+            sandbox.as_ref().unwrap().inputs.egress,
+            vec![
+                "crates.io:443".to_string(),
+                "registry.npmjs.org:443".to_string()
+            ]
+        );
+
+        // A grant alone flips an empty configured list to non-empty (the
+        // container --network-none-vs-proxy-routed decision reads this).
+        let mut sandbox = Some(fs_net_sandbox(vec![]));
+        apply_egress_grants(&mut sandbox, &["registry.npmjs.org:443".to_string()]);
+        assert_eq!(
+            sandbox.as_ref().unwrap().inputs.egress,
+            vec!["registry.npmjs.org:443".to_string()]
+        );
+
+        // fs (not fs+net) and unsandboxed specs are untouched.
+        let mut sandbox = Some(fs_net_sandbox(vec![]));
+        sandbox.as_mut().unwrap().inputs.enforce = crate::types::SandboxEnforce::Fs;
+        apply_egress_grants(&mut sandbox, &["x.example:443".to_string()]);
+        assert!(sandbox.as_ref().unwrap().inputs.egress.is_empty());
+
+        let mut no_sandbox = None;
+        apply_egress_grants(&mut no_sandbox, &["x.example:443".to_string()]);
+        assert!(no_sandbox.is_none());
     }
 
     #[test]

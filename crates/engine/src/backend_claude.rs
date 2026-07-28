@@ -739,11 +739,17 @@ impl AgentBackend for ClaudeBackend {
                     )
                 })?;
                 let mut command = tokio::process::Command::new(container.runtime.binary());
+                // A proxy-routed fs+net session (runner wired spec.env) needs
+                // the proxy endpoint INSIDE the container — `docker run` does
+                // not forward client env, so the builder emits -e flags.
                 command.args(crate::sandbox_container::container_run_args(
                     &resolved.inputs,
                     container,
                     &self.binary,
                     &args,
+                    spec.env
+                        .get(crate::egress_proxy::HTTPS_PROXY_ENV)
+                        .map(String::as_str),
                 ));
                 command
             }

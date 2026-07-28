@@ -114,5 +114,9 @@ untouched (AGENTS.md rules 1–3).
   why `base_sha` is `Option` (types.rs).
 - **Sandbox fails closed**: a requested `enforce` the platform cannot honor
   refuses to run rather than run unsandboxed;
-  [sandbox.rs](../../../crates/engine/src/sandbox.rs) `fs+net` is refused on
-  macOS and `--unshare-net` on Linux rather than fake a hostname egress allowlist.
+  [sandbox.rs](../../../crates/engine/src/sandbox.rs) `fs+net` on macOS runs
+  loopback-only Seatbelt egress + the filtering egress proxy
+  ([egress_proxy.rs](../../../crates/engine/src/egress_proxy.rs)), and
+  `--unshare-net` on Linux (bwrap cannot reach a host proxy), rather than
+  fake a hostname egress allowlist. A proxy that cannot start fails the run
+  before the session spawns.
