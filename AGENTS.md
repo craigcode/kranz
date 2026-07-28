@@ -83,6 +83,16 @@ kranz work                      # drain the queue (run missions)
    deliverable. Don't defeat that gate.
 9. **Match the surrounding code** — comment density, naming, idiom. New
    abstractions earn their keep only on the third use.
+10. **Children are hostile by default (2026-07-28 hardening):** every
+    prompt-injectable child spawns `env_clear`d (`agent_env.rs`) — never
+    reintroduce ambient inheritance; the sanctioned credential channels are
+    `contractEnvPassthrough` (contract commands) and the workspace contract's
+    `secrets` (bootstrap/data hooks). Enforced sandboxes are honored only by
+    the claude backend (validation rejects other pairs — don't widen without
+    a real spawn wrapper). `serve.token` is mutation authority, `serve.read.token`
+    reads only; both must stay unreadable inside sandboxes
+    (`authority_read_deny_paths`). Validators may not mutate the checkout —
+    the `validator.tamper` fingerprint gate is what makes "read-only" real.
 
 ## Tracked vs runtime
 
