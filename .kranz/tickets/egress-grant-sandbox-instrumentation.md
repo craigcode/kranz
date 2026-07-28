@@ -88,3 +88,29 @@ plumbing), the macOS unified-log tail (proxy makes it unnecessary),
 plain-HTTP forward, per-run attribution via Proxy-Authorization, and the
 grant flow itself — steps 2–3 of the sequence (a fourth `GrantKind` that
 extends `egress_grants` on approval) are 3.3b.
+
+## Progress (2026-07-28) — steps 2–3 (3.3b) shipped
+
+The grant flow landed, completing this ticket. A fourth `GrantKind`
+(`egress`, serde `"egress"`; `#[default]` stays `command` so old logs
+parse) parks a sandboxed run whose untrusted outcome carries
+`denied_egress`: the orchestrator's validator path offers a grant naming
+the first refused `host:port` BEFORE burning the retry, reusing the same
+park/approve/deny/timeout/cap machinery verbatim. Approval extends
+`Mission.egress_grants` (extend-only, logged — never `command_grants`,
+`touch_set`, or `deny_exceptions`), which the re-run's proxy allowlist
+already reads (3.3a's `apply_egress_grants` fold); denial blocks the
+milestone with the egress reason, same refusal semantics as a command
+grant. All four decision surfaces render the kind distinctly: CLI tail
+(`egress grant requested/approved/denied`), REST (kind flows through the
+snapshot serde; approve/deny endpoints are kind-agnostic), the dashboard
+grant panel (its own blurb + `GrantKind` union arm), and the Slack grant
+card (egress blurb + field label). The mock backend grew a
+`connects_via_proxy` seam so the macOS e2e drives the REAL proxy path:
+scripted CONNECT → 403 + denial record → park → approve → re-run's spec
+carries the granted host in its allowlist. The block-reason classifier
+(`contract_health`) counts an egress-denied block as a grant denial.
+Still OUT (unchanged from 3.3a): bwrap denial signal, unified-log tail,
+plain-HTTP forward, per-run attribution, and a worker-path egress park
+(validators only — the worker's `result != pass` gating and respawn
+budget coupling are a deliberate separate decision if ever needed).

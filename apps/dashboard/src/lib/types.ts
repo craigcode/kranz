@@ -186,13 +186,13 @@ export interface PendingRevision {
   instructions: string;
 }
 
-export type GrantKind = 'command' | 'touch-path' | 'worker-deny';
+export type GrantKind = 'command' | 'touch-path' | 'worker-deny' | 'egress';
 
 export interface PendingGrantRequest {
   milestoneId: string;
   /** Defaults to 'command' for pre-`kind` snapshots. */
   kind?: GrantKind;
-  /** The granted target: a command string, or a path glob for a touch grant. */
+  /** The granted target: a command string, a path glob, a deny rule, or a host:port egress destination. */
   command: string;
 }
 

@@ -420,6 +420,7 @@ fn grant_kind_label(kind: &GrantKind) -> &'static str {
         GrantKind::Command => "command",
         GrantKind::TouchPath => "touch-set",
         GrantKind::WorkerDeny => "deny-lift",
+        GrantKind::Egress => "egress",
     }
 }
 

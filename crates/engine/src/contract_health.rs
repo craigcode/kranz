@@ -42,7 +42,8 @@ pub struct ContractHealth {
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BlockedCauses {
-    /// Command-kind grant denied/timed out ("validator command denied: …").
+    /// Command/egress grant denied/timed out ("validator command denied: …" /
+    /// "egress denied: …").
     pub grant: u64,
     /// Dirty-tree checkpoint "refused by secret scan".
     pub secret_scan: u64,
@@ -60,7 +61,7 @@ pub struct BlockedCauses {
 /// Classify one `milestone.blocked` reason string. Order matters only for
 /// defense; the emit-site templates are mutually exclusive in practice.
 fn classify_block(reason: &str) -> &'static str {
-    if reason.starts_with("validator command denied:") {
+    if reason.starts_with("validator command denied:") || reason.starts_with("egress denied:") {
         "grant"
     } else if reason.contains("refused by secret scan") {
         "secret-scan"
@@ -237,6 +238,7 @@ mod tests {
                 decision("contract lint: all command assertions correctly fail on the untouched base"),
                 decision("waived 2 finding(s): a-1, a-2"),
                 blocked("validator command denied: `cargo test` — operator denied"),
+                blocked("egress denied: `registry.npmjs.org:443` — operator denied"),
                 blocked("dirty-tree checkpoint for f-1-1 refused by secret scan; the working tree still holds the refused content"),
                 blocked("contract command assertion(s) a-3 appear buggy (false negative) — command still fails but the requirement is verified met"),
             ],
@@ -261,7 +263,7 @@ mod tests {
         assert_eq!(health.finding_waivers, 2);
         assert_eq!(health.missions_with_waivers, 1);
         assert_eq!(health.waivers_per_mission, Some(1.0));
-        assert_eq!(health.blocked.grant, 1);
+        assert_eq!(health.blocked.grant, 2);
         assert_eq!(health.blocked.secret_scan, 1);
         assert_eq!(health.blocked.contract_bug, 1);
         assert_eq!(health.blocked.fix_cycle_cap, 1);

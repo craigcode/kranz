@@ -74,12 +74,14 @@ pub enum EventKind {
     /// A run was stopped by a capability boundary and parks the milestone's
     /// validation for an operator approve/deny decision — the capability-denial
     /// analogue of `plan.revision.proposed`. `kind` selects the boundary: a
-    /// `command` (validator command outside its allow-set → `command_grants`) or
-    /// a `touch-path` (worker write outside the `touch_set` → `touch_set`).
-    /// Validators/sweeps are keyed to a milestone (they diff its start..HEAD),
-    /// so this is too. Deny is the default; an unanswered request times out to
-    /// `grant.denied`. `command` holds the target (a command, or a path glob
-    /// for `touch-path`).
+    /// `command` (validator command outside its allow-set → `command_grants`),
+    /// a `touch-path` (worker write outside the `touch_set` → `touch_set`), a
+    /// `worker-deny` (worker command blocked by a deny rule → `deny_exceptions`),
+    /// or an `egress` (sandboxed run refused a destination by the egress proxy
+    /// → `egress_grants`). Validators/sweeps are keyed to a milestone (they
+    /// diff its start..HEAD), so this is too. Deny is the default; an
+    /// unanswered request times out to `grant.denied`. `command` holds the
+    /// target (a command, a path glob, a deny rule, or `host:port`).
     #[serde(rename = "grant.requested")]
     GrantRequested {
         #[serde(rename = "milestoneId")]
@@ -90,8 +92,8 @@ pub enum EventKind {
     },
 
     /// Operator approved the parked grant. The reducer extends the list `kind`
-    /// selects (`command_grants` or `touch_set`), extend-only, so the retried
-    /// run clears the boundary.
+    /// selects (`command_grants`, `touch_set`, `deny_exceptions`, or
+    /// `egress_grants`), extend-only, so the retried run clears the boundary.
     #[serde(rename = "grant.approved")]
     GrantApproved {
         #[serde(default)]
@@ -100,8 +102,9 @@ pub enum EventKind {
     },
 
     /// Operator denied the parked grant, or it timed out (deny-default). A
-    /// denied command-grant blocks the milestone (refusal); a denied touch-path
-    /// grant lets the out-of-contract write flow to the normal fix/waive path.
+    /// denied command or egress grant blocks the milestone (refusal); a denied
+    /// touch-path grant lets the out-of-contract write flow to the normal
+    /// fix/waive path.
     #[serde(rename = "grant.denied")]
     GrantDenied {
         #[serde(default)]

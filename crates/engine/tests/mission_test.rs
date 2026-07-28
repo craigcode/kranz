@@ -354,6 +354,28 @@ fn validator_untrusted_no_denial() -> MockScript {
     }
 }
 
+/// Validator script whose `fs+net` session is REFUSED `host:port` by the run's
+/// egress proxy and, blocked on it, fails to produce a trusted report (result
+/// error, no parseable report) — the egress analogue of [`validator_denied`],
+/// gated on the same `!validator_outcome_trusted`. The CONNECT goes through
+/// the real proxy the runner wires into the session env (`connects_via_proxy`),
+/// so the denial reaches `RunOutcome.denied_egress` via the actual 3.3a signal
+/// path, not a fabricated outcome field. macOS-only: only macOS resolves
+/// `fs+net` to Seatbelt + proxy (Linux bwrap spawns no proxy — 3.3a).
+#[cfg(target_os = "macos")]
+fn validator_egress_denied(host: &str, port: u16) -> MockScript {
+    MockScript {
+        events: vec![
+            mock_init("mock-session"),
+            mock_result_error(&format!(
+                "stopped: egress to `{host}:{port}` was denied and the checks could not run"
+            )),
+        ],
+        ..Default::default()
+    }
+    .connects_via_proxy(host, port)
+}
+
 /// Poll the state snapshot until a grant request is parked (mirrors the
 /// pause/resume test's snapshot poll — `emit` keeps state.json in lockstep).
 async fn wait_for_pending_grant(paths: &MissionPaths) {
@@ -4424,6 +4446,210 @@ async fn worker_deny_grant_respawn_does_not_eat_the_respawn_budget() {
             EventKind::FeatureFailed { reason, .. } if reason.contains("respawn budget"))),
         "the grant respawn must not exhaust the budget"
     );
+}
+
+/// Egress grant (3.3b): a sandboxed (`fs+net`) validator refused a destination
+/// by its egress proxy parks an EGRESS grant naming `host:port`; approving
+/// extends `egress_grants` (and ONLY egress_grants), the re-run's proxy
+/// allowlist covers the granted host, and the milestone completes. Mirrors
+/// `validator_denial_grant_approved_extends_grants_and_completes`.
+///
+/// macOS-only: the per-host denial signal exists only where `fs+net` resolves
+/// to Seatbelt + the filtering proxy (Linux bwrap spawns no proxy — 3.3a).
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn egress_denial_grant_approved_extends_egress_grants_and_completes() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let denied_host = "registry.npmjs.org";
+    let target = format!("{denied_host}:443");
+
+    // FIFO by session start: worker f-1-1, orchestrator (dirty-tree, judgement,
+    // capture), egress-denied validator (round 1 → park), clean validator
+    // (round 2 after approve → milestone tag).
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+        validator_egress_denied(denied_host, 443),
+        validator_with(json!([])),
+    ]));
+
+    let mut cfg = MissionConfig {
+        skip_functional: false,
+        ..test_cfg()
+    };
+    cfg.validator_functional.sandbox.enforce = SandboxEnforce::FsNet;
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+    let paths = engine.paths().clone();
+
+    let handle = tokio::spawn(async move {
+        let result = engine.run().await;
+        (engine, result)
+    });
+
+    // Wait for the parked request: it must name the refused destination and
+    // carry the Egress kind — never silently lumped with command grants.
+    wait_for_pending_grant(&paths).await;
+    let snap = reducer::read_snapshot(&paths.state_file()).unwrap();
+    let pending = snap.pending_grant_request.expect("parked grant request");
+    assert_eq!(pending.kind, GrantKind::Egress);
+    assert_eq!(pending.command, target);
+    assert_eq!(pending.milestone_id, "ms-1");
+    control::enqueue(
+        &paths,
+        &ControlCommand::ApproveGrant {
+            command: target.clone(),
+        },
+    )
+    .unwrap();
+
+    let (engine, result) = timeout(TEST_TIMEOUT, handle)
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(result.unwrap(), MissionStatus::Complete);
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    let types = event_types(&events);
+    for expected in [
+        "grant.requested",
+        "grant.approved",
+        "milestone.completed",
+        "mission.completed",
+    ] {
+        assert!(types.contains(&expected), "missing {expected}: {types:?}");
+    }
+    assert!(events.iter().any(|e| matches!(&e.kind,
+        EventKind::GrantRequested { kind: GrantKind::Egress, command, milestone_id }
+            if command == &target && milestone_id == "ms-1")));
+    assert!(seq_of(&events, "grant.requested") < seq_of(&events, "grant.approved"));
+    assert!(seq_of(&events, "grant.approved") < seq_of(&events, "milestone.completed"));
+
+    let state = reducer::fold(&events).unwrap();
+    assert_eq!(state.mission.status, MissionStatus::Complete);
+    // Capability honesty: the destination joined egress_grants and ONLY
+    // egress_grants — command_grants and touch_set are untouched.
+    assert!(
+        state.mission.egress_grants.contains(&target),
+        "approved destination must join egress_grants: {:?}",
+        state.mission.egress_grants
+    );
+    assert!(state.mission.command_grants.is_empty());
+    assert!(state.mission.touch_set.is_empty());
+    assert!(state.pending_grant_request.is_none());
+
+    // The re-run's proxy allowlist covers the granted host: the round-2
+    // validator's spec folded the grant into its sandbox egress inputs — the
+    // exact list `effective_egress` extends into the proxy allowlist at start.
+    let revalidated = backend
+        .started_specs()
+        .last()
+        .expect("a re-run validator session started")
+        .clone();
+    let sandbox = revalidated.sandbox.expect("fs+net sandbox on the re-run");
+    assert!(
+        sandbox.inputs.egress.contains(&target),
+        "the re-run's proxy allowlist must contain the granted host: {:?}",
+        sandbox.inputs.egress
+    );
+
+    // And the denial JSONL holds exactly the round-1 denial: the re-run was
+    // not refused again (its outcome carried no denied_egress, or the grant
+    // flow would have re-parked instead of completing).
+    let content = std::fs::read_to_string(paths.egress_denials_file()).unwrap();
+    assert_eq!(
+        content.lines().count(),
+        1,
+        "only the pre-grant denial is recorded: {content}"
+    );
+}
+
+/// Denying a parked egress grant blocks the milestone with the egress reason
+/// (the same refusal semantics as a command grant) and never widens
+/// `egress_grants`. Mirrors `validator_denial_grant_denied_blocks_the_milestone`.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn egress_denial_grant_denied_blocks_the_milestone() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let denied_host = "registry.npmjs.org";
+    let target = format!("{denied_host}:443");
+
+    // FIFO: worker f-1-1, orchestrator (dirty-tree, judgement), egress-denied
+    // validator. Deny blocks the milestone before any final gate, so no
+    // capture turn / second validator is scripted.
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![dirty_tree_commit_as_is(), judgement("complete", "")]),
+        validator_egress_denied(denied_host, 443),
+    ]));
+
+    let mut cfg = MissionConfig {
+        skip_functional: false,
+        ..test_cfg()
+    };
+    cfg.validator_functional.sandbox.enforce = SandboxEnforce::FsNet;
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+    let paths = engine.paths().clone();
+
+    let handle = tokio::spawn(async move {
+        let result = engine.run().await;
+        (engine, result)
+    });
+
+    wait_for_pending_grant(&paths).await;
+    control::enqueue(
+        &paths,
+        &ControlCommand::DenyGrant {
+            command: target.clone(),
+            reason: "not authorized this run".to_string(),
+        },
+    )
+    .unwrap();
+
+    let (engine, result) = timeout(TEST_TIMEOUT, handle)
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(result.unwrap(), MissionStatus::Blocked);
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    let types = event_types(&events);
+    for expected in ["grant.requested", "grant.denied", "milestone.blocked"] {
+        assert!(types.contains(&expected), "missing {expected}: {types:?}");
+    }
+    assert!(seq_of(&events, "grant.denied") < seq_of(&events, "milestone.blocked"));
+    // The block honestly names the egress boundary, the refused destination,
+    // and the operator's reason.
+    assert!(
+        events.iter().any(|e| matches!(&e.kind,
+            EventKind::MilestoneBlocked { reason, .. }
+                if reason.starts_with("egress denied:")
+                    && reason.contains(&target)
+                    && reason.contains("not authorized this run"))),
+        "the block must carry the egress denial reason"
+    );
+    let state = reducer::fold(&events).unwrap();
+    assert!(
+        state.mission.egress_grants.is_empty(),
+        "deny must never widen egress_grants: {:?}",
+        state.mission.egress_grants
+    );
+    assert!(state.pending_grant_request.is_none());
 }
 
 // ---------------------------------------------------------------------------

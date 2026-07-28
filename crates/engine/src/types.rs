@@ -69,9 +69,9 @@ pub struct Mission {
     /// Egress destinations (`host:port`) an operator has GRANTED for this
     /// mission — folded into the egress proxy's allowlist for `fs+net`
     /// sessions (`crate::egress_proxy`). Extend-only, runtime-only (never
-    /// plan-declared): the fold target a future `GrantKind::Egress` approval
-    /// extends; read into the proxy allowlist at spec build so that approval
-    /// needs no plumbing change.
+    /// plan-declared): the fold target a `GrantKind::Egress` approval extends;
+    /// read into the proxy allowlist at spec build so that approval needs no
+    /// plumbing change.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egress_grants: Vec<String>,
 }
@@ -482,6 +482,9 @@ pub enum GrantKind {
     /// adding it to `deny_exceptions`. Unlike the others this SUBTRACTS from a
     /// safety guardrail, so it is per-mission, explicit, and logged.
     WorkerDeny,
+    /// A sandboxed (`fs+net`) run whose egress proxy refused a destination →
+    /// extend `egress_grants`, so the re-run's proxy allowlist covers it.
+    Egress,
 }
 
 /// A parked capability-grant request (see [`MissionState::pending_grant_request`]).
@@ -495,8 +498,9 @@ pub struct PendingGrantRequest {
     pub milestone_id: String,
     #[serde(default)]
     pub kind: GrantKind,
-    /// The granted target: a command string (`Command`) or a repo-relative path
-    /// glob (`TouchPath`). Named `command` for wire back-compat with the
+    /// The granted target: a command string (`Command`), a repo-relative path
+    /// glob (`TouchPath`), a deny rule (`WorkerDeny`), or a `host:port`
+    /// destination (`Egress`). Named `command` for wire back-compat with the
     /// original command-only grant events.
     pub command: String,
 }

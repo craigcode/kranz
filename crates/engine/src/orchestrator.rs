@@ -1399,6 +1399,10 @@ impl MissionEngine {
                 "worker deny exceptions",
                 "the worker respawns with the deny rule lifted",
             ),
+            GrantKind::Egress => (
+                "egress grants",
+                "the re-run's egress proxy allows the granted destination",
+            ),
         };
         self.emit_decision(
             &format!(
@@ -1414,15 +1418,15 @@ impl MissionEngine {
     /// Deny the parked grant for `command`: append `grant.denied` (clears the
     /// pending request), then apply the kind's refusal semantics.
     ///
-    /// - `Command`: block the milestone. The block is what stops the run loop
-    ///   re-entering validation forever; without it, clearing the pending
-    ///   request alone would let the next round re-request the same grant.
-    /// - `TouchPath`: do NOT block — the out-of-contract write is a normal
-    ///   finding, so let it flow to the fix/waive path exactly as it did before
-    ///   touch grants existed. Instead, saturate the per-milestone grant counter
-    ///   so the next validation round doesn't re-offer the same touch grant (the
-    ///   sweep re-produces the finding, but the cap-reached branch then falls
-    ///   through to `convert_findings`).
+    /// - `Command` / `Egress`: block the milestone. The block is what stops the
+    ///   run loop re-entering validation forever; without it, clearing the
+    ///   pending request alone would let the next round re-request the same
+    ///   grant.
+    /// - `TouchPath` / `WorkerDeny`: do NOT block — the out-of-contract write
+    ///   is a normal finding (and the still-denied worker command a normal
+    ///   judgement), so let it flow on exactly as it did before those grants
+    ///   existed. Instead, saturate the per-milestone grant counter so the next
+    ///   round doesn't re-offer the same grant.
     ///
     /// The `Command` `MilestoneBlocked` emit is guarded on the milestone still
     /// existing: a concurrent plan revision can drop the parked (in-flight)
@@ -1448,7 +1452,7 @@ impl MissionEngine {
             reason: reason.to_string(),
         })?;
         match pending.kind {
-            GrantKind::Command => {
+            GrantKind::Command | GrantKind::Egress => {
                 let milestone_exists = self
                     .state
                     .mission
@@ -1456,12 +1460,13 @@ impl MissionEngine {
                     .iter()
                     .any(|m| m.id == pending.milestone_id);
                 if milestone_exists {
+                    let boundary = match pending.kind {
+                        GrantKind::Egress => "egress",
+                        _ => "validator command",
+                    };
                     self.emit(EventKind::MilestoneBlocked {
                         milestone_id: pending.milestone_id.clone(),
-                        reason: format!(
-                            "validator command denied: `{}` — {reason}",
-                            pending.command
-                        ),
+                        reason: format!("{boundary} denied: `{}` — {reason}", pending.command),
                     })?;
                 }
             }
@@ -1550,6 +1555,35 @@ impl MissionEngine {
         };
         let desc = format!("{} validation blocked on `{command}`", role_label(role));
         self.park_for_grant(milestone_id, GrantKind::Command, &command, &desc)
+    }
+
+    /// If `outcome` was stopped by an egress-proxy denial, offer the operator
+    /// an egress grant naming the refused destination and park, returning
+    /// `true`. Mirrors [`Self::maybe_park_for_grant`]: only the FIRST denied
+    /// destination is offered (a re-run surfaces the next), and callers gate
+    /// this on an UNTRUSTED outcome. Approving extends `egress_grants`, which
+    /// `runner::apply_egress_grants` folds into the re-run's proxy allowlist;
+    /// denying blocks the milestone, same as a denied command grant. The
+    /// target is scrubbed like a denied command before it is parked (the host
+    /// string is model-influenced via what the run chose to connect to).
+    fn maybe_park_for_egress_grant(
+        &mut self,
+        milestone_id: &str,
+        role: Role,
+        outcome: &runner::RunOutcome,
+    ) -> Result<bool> {
+        let Some(denial) = outcome.denied_egress.first() else {
+            return Ok(false);
+        };
+        let target = scrub::scrub_and_truncate(
+            &format!("{}:{}", denial.host, denial.port),
+            MESSAGE_CONTENT_MAX,
+        );
+        let desc = format!(
+            "{} validation blocked on egress to `{target}`",
+            role_label(role)
+        );
+        self.park_for_grant(milestone_id, GrantKind::Egress, &target, &desc)
     }
 
     /// If the milestone's findings include a genuine out-of-contract write,
@@ -3557,6 +3591,15 @@ impl MissionEngine {
                 if self.maybe_park_for_grant(&milestone_id, role, &outcome)? {
                     return Ok(());
                 }
+                // Egress grant (3.3b): same boundary, network side — a sandboxed
+                // validator whose proxy refused a destination parks for an
+                // egress grant BEFORE the retry (approve extends `egress_grants`,
+                // which the re-run's proxy allowlist picks up). Checked after the
+                // command grant: one boundary per park, the re-run surfaces the
+                // next.
+                if self.maybe_park_for_egress_grant(&milestone_id, role, &outcome)? {
+                    return Ok(());
+                }
                 self.emit_decision(
                     &format!(
                         "{} {} run did not produce a trusted validator report ({}); retrying once with \
@@ -3600,6 +3643,11 @@ impl MissionEngine {
                 // so those backends aren't silently un-grantable.
                 if !validator_outcome_trusted(&outcome)
                     && self.maybe_park_for_grant(&milestone_id, role, &outcome)?
+                {
+                    return Ok(());
+                }
+                if !validator_outcome_trusted(&outcome)
+                    && self.maybe_park_for_egress_grant(&milestone_id, role, &outcome)?
                 {
                     return Ok(());
                 }

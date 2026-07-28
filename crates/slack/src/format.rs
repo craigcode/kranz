@@ -114,7 +114,8 @@ pub struct GrantReady {
     pub mission_id: String,
     pub milestone_id: String,
     pub kind: kranz_engine::types::GrantKind,
-    /// The granted target: a command string, or a path glob for a touch grant.
+    /// The granted target: a command string, a path glob, a deny rule, or a
+    /// `host:port` egress destination, per `kind`.
     pub command: String,
 }
 
@@ -651,9 +652,11 @@ pub fn build_revision_ready(r: &RevisionReady, dashboard_url: Option<&str>) -> V
     blocks
 }
 
-/// Parked-grant announcement: names the exact command a validator was denied
-/// and offers approve/deny buttons carrying `<mission-id>:<command>`. Approving
-/// extends `command_grants` and re-validates; denying blocks the milestone.
+/// Parked-grant announcement: names the exact target a run was denied and
+/// offers approve/deny buttons carrying `<mission-id>:<command>`. Approving
+/// extends the list the grant's kind selects (`command_grants`, `touch_set`,
+/// `deny_exceptions`, or `egress_grants`) and re-runs; denying applies the
+/// kind's refusal semantics.
 pub fn build_grant_ready(g: &GrantReady, dashboard_url: Option<&str>) -> Vec<Value> {
     let value = format!("{}:{}", g.mission_id, g.command);
     let (blurb, field_label) = match g.kind {
@@ -669,6 +672,12 @@ pub fn build_grant_ready(g: &GrantReady, dashboard_url: Option<&str>) -> Vec<Val
             "A worker command was blocked by a deny rule. Approving LIFTS that \
              rule for this mission (a deliberate erosion of a safety guardrail).",
             "*Deny rule to lift*",
+        ),
+        kranz_engine::types::GrantKind::Egress => (
+            "A sandboxed run was refused egress to a destination outside the \
+             mission's egress allowlist. Approving extends the allowlist for \
+             this mission.",
+            "*Denied egress destination*",
         ),
     };
     let mut blocks = vec![
@@ -1881,6 +1890,40 @@ mod tests {
         assert!(
             text.contains("touch-set"),
             "card frames it as a touch-set write, not a command: {text}"
+        );
+        // Same approve/deny affordances as a command grant.
+        let buttons = all_buttons(&blocks);
+        let ids: Vec<&str> = buttons
+            .iter()
+            .filter_map(|b| b["action_id"].as_str())
+            .collect();
+        assert!(ids.contains(&APPROVE_GRANT_ACTION_ID));
+        assert!(ids.contains(&DENY_GRANT_ACTION_ID));
+    }
+
+    #[test]
+    fn grant_ready_labels_an_egress_grant() {
+        let blocks = build_grant_ready(
+            &GrantReady {
+                mission_id: "m-10".into(),
+                milestone_id: "ms-1".into(),
+                kind: kranz_engine::types::GrantKind::Egress,
+                command: "registry.npmjs.org:443".into(),
+            },
+            None,
+        );
+        let text = all_text(&blocks);
+        assert!(
+            text.contains("registry.npmjs.org:443"),
+            "the refused destination is named"
+        );
+        assert!(
+            text.contains("egress"),
+            "card frames it as an egress refusal, not a command: {text}"
+        );
+        assert!(
+            !text.contains("allow-set"),
+            "never silently lumped with command grants: {text}"
         );
         // Same approve/deny affordances as a command grant.
         let buttons = all_buttons(&blocks);

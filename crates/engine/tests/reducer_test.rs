@@ -2385,6 +2385,90 @@ fn worker_deny_grant_extends_deny_exceptions_only() {
     assert!(state.pending_grant_request.is_none());
 }
 
+#[test]
+fn egress_grant_extends_egress_grants_only() {
+    let mut state = state_at_active_milestone();
+    let next = state.last_seq + 1;
+    apply(
+        &mut state,
+        &ev(
+            next,
+            EventKind::GrantRequested {
+                milestone_id: "ms-1".to_string(),
+                kind: GrantKind::Egress,
+                command: "registry.npmjs.org:443".to_string(),
+            },
+        ),
+    )
+    .expect("egress grant parked");
+    assert_eq!(
+        state.pending_grant_request.as_ref().map(|p| p.kind),
+        Some(GrantKind::Egress)
+    );
+
+    apply(
+        &mut state,
+        &ev(
+            next + 1,
+            EventKind::GrantApproved {
+                kind: GrantKind::Egress,
+                command: "registry.npmjs.org:443".to_string(),
+            },
+        ),
+    )
+    .expect("egress grant approved");
+    // Capability honesty: the approved destination joins egress_grants — and
+    // ONLY egress_grants (never command_grants, touch_set, deny_exceptions).
+    assert_eq!(
+        state.mission.egress_grants,
+        vec!["registry.npmjs.org:443".to_string()]
+    );
+    assert!(state.mission.command_grants.is_empty());
+    assert!(state.mission.touch_set.is_empty());
+    assert!(state.mission.deny_exceptions.is_empty());
+    assert!(state.pending_grant_request.is_none());
+}
+
+#[test]
+fn egress_grant_kind_serde_round_trip_and_pre_kind_events_default_to_command() {
+    // The new kind serializes as "egress" (kebab-case) and round-trips.
+    let requested = EventKind::GrantRequested {
+        milestone_id: "ms-1".to_string(),
+        kind: GrantKind::Egress,
+        command: "registry.npmjs.org:443".to_string(),
+    };
+    let json = serde_json::to_value(&requested).unwrap();
+    assert_eq!(json["payload"]["kind"], "egress");
+    let back: EventKind = serde_json::from_value(json).unwrap();
+    match back {
+        EventKind::GrantRequested {
+            kind,
+            command,
+            milestone_id,
+        } => {
+            assert_eq!(kind, GrantKind::Egress);
+            assert_eq!(command, "registry.npmjs.org:443");
+            assert_eq!(milestone_id, "ms-1");
+        }
+        other => panic!("expected grant.requested, got {other:?}"),
+    }
+
+    // Old-shape grant events (no "kind" key at all) still parse and fold as
+    // the original command-grant behaviour — the additive-only contract rule.
+    let old_shape = json!({
+        "type": "grant.requested",
+        "payload": {
+            "milestoneId": "ms-1",
+            "command": "gc audit --deep"
+        }
+    });
+    let parsed: EventKind = serde_json::from_value(old_shape).unwrap();
+    match parsed {
+        EventKind::GrantRequested { kind, .. } => assert_eq!(kind, GrantKind::Command),
+        other => panic!("expected grant.requested, got {other:?}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Model provenance (quant / weight_hash)
 // ---------------------------------------------------------------------------

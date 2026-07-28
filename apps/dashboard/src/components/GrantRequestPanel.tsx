@@ -1,10 +1,12 @@
 // Right column: parked capability-grant decision (approve/deny).
 //
-// A validator stopped by a command outside its allow-set parks the milestone
-// and sets `pendingGrantRequest`. This panel appears exactly then, naming the
-// command, and lets the operator approve (extend command_grants + re-validate)
-// or deny (block, fail closed) in one click — the dashboard half of the
-// grant-request decision flow.
+// A run stopped by a capability boundary (validator command outside its
+// allow-set, worker write outside the touch-set, worker deny rule, or an
+// fs+net egress refusal) parks the milestone and sets `pendingGrantRequest`.
+// This panel appears exactly then, naming the target, and lets the operator
+// approve (extend the list the kind selects + re-run) or deny (the kind's
+// refusal semantics) in one click — the dashboard half of the grant-request
+// decision flow.
 
 import { useState } from 'react';
 import { api } from '../lib/api';
@@ -25,7 +27,9 @@ export function GrantRequestPanel() {
       ? 'A worker wrote a path outside the mission’s touch-set:'
       : pending.kind === 'worker-deny'
         ? 'A worker command was blocked by a deny rule. Approving LIFTS that rule for this mission:'
-        : 'A validator is blocked on a command outside its allow-set:';
+        : pending.kind === 'egress'
+          ? 'A sandboxed run was refused egress to a destination outside the mission’s egress allowlist. Approving extends the allowlist for this mission:'
+          : 'A validator is blocked on a command outside its allow-set:';
 
   const decide = async (kind: 'approve' | 'deny') => {
     setBusy(kind);

@@ -89,6 +89,26 @@ describe('GrantRequestPanel', () => {
     expect(api.approveGrant).not.toHaveBeenCalled();
   });
 
+  it('renders an egress grant distinctly and approves the host:port target', async () => {
+    useKranzStore.setState({
+      state: missionState({
+        milestoneId: 'ms-1',
+        kind: 'egress',
+        command: 'registry.npmjs.org:443',
+      }),
+    });
+    render(<GrantRequestPanel />);
+
+    expect(screen.getByText('registry.npmjs.org:443')).toBeTruthy();
+    expect(screen.getByText(/egress allowlist/)).toBeTruthy();
+    expect(screen.queryByText(/outside its allow-set/)).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Approve grant' }));
+    await waitFor(() =>
+      expect(api.approveGrant).toHaveBeenCalledWith('m-1', 'registry.npmjs.org:443'),
+    );
+  });
+
   it('surfaces an error verbatim in a role="alert" block', async () => {
     vi.mocked(api.approveGrant).mockRejectedValueOnce(new ApiError(409, 'no pending grant request'));
     useKranzStore.setState({

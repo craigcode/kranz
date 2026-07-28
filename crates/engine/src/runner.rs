@@ -195,10 +195,9 @@ pub struct RunOutcome {
     pub denied_commands: Vec<String>,
     /// Egress destinations the run's filtering proxy refused (`fs+net`
     /// sessions only; see `crate::egress_proxy`), in first-seen order — the
-    /// trigger a later egress grant flow (3.3b) parks on. Empty when the run
-    /// routed through no proxy (unsandboxed, `fs`/`off`, bubblewrap, or
-    /// container `--network none`). Consumed by nothing yet; mirrors
-    /// `denied_commands`' shape.
+    /// trigger the egress grant flow parks on. Empty when the run routed
+    /// through no proxy (unsandboxed, `fs`/`off`, bubblewrap, or container
+    /// `--network none`). Mirrors `denied_commands`' shape.
     pub denied_egress: Vec<crate::egress_proxy::EgressDenial>,
 }
 
@@ -1200,8 +1199,8 @@ fn resolve_sandbox_or_refuse(
 /// sandbox's inputs, so the run's egress proxy allowlist covers the granted
 /// destinations alongside the configured `egress[]` (and a container sandbox
 /// sees a non-empty list → bridge+proxy rather than `--network none`). Reads
-/// the same mission list a future `GrantKind::Egress` approval extends, so
-/// the grant flow (3.3b) folds in with no plumbing change.
+/// the same mission list a `GrantKind::Egress` approval extends, so an
+/// approved grant takes effect on the re-run with no plumbing change.
 fn apply_egress_grants(
     sandbox: &mut Option<crate::sandbox::ResolvedSandbox>,
     egress_grants: &[String],

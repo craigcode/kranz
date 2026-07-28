@@ -162,6 +162,7 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
                 GrantKind::Command => &mut state.mission.command_grants,
                 GrantKind::TouchPath => &mut state.mission.touch_set,
                 GrantKind::WorkerDeny => &mut state.mission.deny_exceptions,
+                GrantKind::Egress => &mut state.mission.egress_grants,
             };
             if !list.iter().any(|c| c == command) {
                 list.push(command.clone());

@@ -60,6 +60,13 @@ pub struct MockScript {
     /// created as needed. Empty by default (byte-for-byte unchanged
     /// behaviour).
     pub writes: Vec<(String, String)>,
+    /// CONNECTs this session issues through the egress proxy named by
+    /// `spec.env[HTTPS_PROXY]` at start (3.3b): the seam that lets a scripted
+    /// `fs+net` session be REFUSED a destination so the run's outcome carries
+    /// `denied_egress`, exactly as a real sandboxed agent's blocked connection
+    /// would. Each `(host, port)` is attempted in order before the session's
+    /// events replay. Empty by default (no proxy traffic).
+    pub proxy_connects: Vec<(String, u16)>,
 }
 
 impl Default for MockScript {
@@ -72,6 +79,7 @@ impl Default for MockScript {
             session_id: None,
             hold_result_until_started: None,
             writes: Vec::new(),
+            proxy_connects: Vec::new(),
         }
     }
 }
@@ -147,6 +155,17 @@ impl MockScript {
     /// leave a dirty tree for the engine's §4.4 checkpoint to commit.
     pub fn writes_file(mut self, path: impl Into<String>, contents: impl Into<String>) -> Self {
         self.writes.push((path.into(), contents.into()));
+        self
+    }
+
+    /// Attempt `CONNECT host:port` through the session's egress proxy (the
+    /// `HTTPS_PROXY` env the runner wires for an `fs+net` session) when the
+    /// session starts — the stand-in for a real sandboxed agent's blocked
+    /// connection, so the run's outcome carries the denial the grant flow
+    /// parks on. Errors the start (loud, never vacuous) when the spec carries
+    /// no proxy env.
+    pub fn connects_via_proxy(mut self, host: impl Into<String>, port: u16) -> Self {
+        self.proxy_connects.push((host.into(), port));
         self
     }
 }
@@ -430,6 +449,58 @@ impl AgentBackend for MockBackend {
             std::fs::write(&target, contents).map_err(|e| {
                 EngineError::Backend(format!("mock: failed to write {}: {e}", target.display()))
             })?;
+        }
+
+        // Egress-denial seam (see [`MockScript::proxy_connects`]): issue each
+        // scripted CONNECT through the proxy the runner wired into the spec
+        // BEFORE the session's events replay, so the proxy records the denial
+        // before the run's outcome is built. A scripted connect with no proxy
+        // env is a misconfigured test — fail loudly rather than vacuously
+        // produce zero denials.
+        for (host, port) in &script.proxy_connects {
+            let url = spec
+                .env
+                .get(crate::egress_proxy::HTTPS_PROXY_ENV)
+                .ok_or_else(|| {
+                    EngineError::Backend(format!(
+                        "mock: scripted CONNECT to {host}:{port} but the session spec carries no HTTPS_PROXY env"
+                    ))
+                })?;
+            let addr = url.strip_prefix("http://").ok_or_else(|| {
+                EngineError::Backend(format!("mock: HTTPS_PROXY {url:?} is not http://host:port"))
+            })?;
+            let mut stream = tokio::net::TcpStream::connect(addr).await.map_err(|e| {
+                EngineError::Backend(format!(
+                    "mock: failed to reach the egress proxy at {addr}: {e}"
+                ))
+            })?;
+            tokio::io::AsyncWriteExt::write_all(
+                &mut stream,
+                format!("CONNECT {host}:{port} HTTP/1.1\r\n\r\n").as_bytes(),
+            )
+            .await
+            .map_err(|e| {
+                EngineError::Backend(format!("mock: CONNECT {host}:{port} write failed: {e}"))
+            })?;
+            // Read the response head to its CRLF terminator: the proxy records
+            // a denial BEFORE answering 403, so awaiting the head guarantees
+            // the record exists once start() returns. (Read to the terminator,
+            // not EOF: an ALLOWED connect gets a 200 and the tunnel stays open.)
+            let mut head: Vec<u8> = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") && head.len() < 8192 {
+                let n = tokio::io::AsyncReadExt::read(&mut stream, &mut byte)
+                    .await
+                    .map_err(|e| {
+                        EngineError::Backend(format!(
+                            "mock: CONNECT {host}:{port} read failed: {e}"
+                        ))
+                    })?;
+                if n == 0 {
+                    break;
+                }
+                head.push(byte[0]);
+            }
         }
 
         let session_id = script
