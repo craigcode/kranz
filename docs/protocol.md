@@ -137,6 +137,24 @@ when no endpoint-scoped file matches, discovery also accepts a legacy
 `.kranz/serve.token` takes precedence over this legacy-only fallback so a
 credential left by an ungraceful older serve cannot mask the current token.
 
+## Authority: read-only token
+
+Alongside the mutation token, every `kranz serve` mints a second, READ-ONLY
+token (`--read-token` / `$KRANZ_READ_TOKEN` to pin it; generated otherwise)
+and stores it next to the mutation token with the same `0600` discipline:
+`<repo>/.kranz/serve.read.token` single-repo, or
+`~/.kranz/serve/<bound-endpoint>.read.token` for an operator-catalog serve.
+Wherever the read gate is armed (`--read-auth`, or any non-loopback bind),
+GET/HEAD `/api/...` and the WS upgrade accept EITHER token via
+`x-kranz-token` or `?token=`; mutating routes accept ONLY the mutation token
+(presenting the read token there is the same `401` as any wrong token). The
+read token is therefore the one safe to hand to dashboards and agents — and
+the one a deployment should prefer for anything that only observes. Sandboxed
+workers can reach neither file: the tier-2 Seatbelt/bwrap profiles explicitly
+deny reads of `.kranz/serve.token`, `.kranz/serve.read.token`, and
+`.kranz/config.json`, and the tier-3 container masks any such file under the
+session root with a `/dev/null` bind.
+
 ## WebSocket `GET /api/missions/:id/ws?since=<seq>`
 
 Server → client messages (JSON text frames):

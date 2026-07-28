@@ -944,6 +944,105 @@ async fn query_token_is_rejected_on_posts() {
     assert_eq!(status, StatusCode::OK);
 }
 
+/// The read-only token (`.kranz/serve.read.token`) authenticates gated GETs
+/// — header and `?token=` query — but is rejected on every mutation, where
+/// only the operator's mutation token clears the gate. This is the authority
+/// split that makes the read token safe to hand to dashboards and agents.
+#[tokio::test]
+async fn read_token_authenticates_reads_but_never_mutations() {
+    const READ_TOKEN: &str = "read-only-5678";
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    seed_mission_log(&root, "m-01");
+    let host = Arc::new(kranz_server::MissionHost::new(root));
+    let app = kranz_server::router_with_read_authority_and_addr(
+        Arc::new(kranz_server::MultiRepoHost::with_host(host)),
+        None,
+        Some(TOKEN.to_string()),
+        Some(READ_TOKEN.to_string()),
+        None,
+        true, // bind_is_loopback
+        true, // require_read_token (the --read-auth / off-loopback posture)
+    );
+
+    let get_with = |token: Option<&str>| {
+        let mut builder = Request::builder().uri("/api/missions/m-01/state");
+        if let Some(token) = token {
+            builder = builder.header("x-kranz-token", token);
+        }
+        builder.body(Body::empty()).unwrap()
+    };
+
+    // Reads are gated: tokenless 401s; EITHER token clears them.
+    let response = app.clone().oneshot(get_with(None)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let response = app.clone().oneshot(get_with(Some(TOKEN))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .clone()
+        .oneshot(get_with(Some(READ_TOKEN)))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the read token must authenticate a gated GET"
+    );
+    let (status, _) = get_json(
+        &app,
+        &format!("/api/missions/m-01/state?token={READ_TOKEN}"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the read token must work in the WS-style query form"
+    );
+
+    // Mutations: the read token is just another wrong token.
+    let control = "/api/missions/m-01/control";
+    let pause = json!({ "kind": "pause" });
+    let (status, body) = post_json(&app, control, Some(READ_TOKEN), pause.clone()).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the read token must never mutate: {body}"
+    );
+    let (status, body) = post_json(&app, control, Some(TOKEN), pause).await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "the mutation token is unchanged: {body}"
+    );
+
+    // A DELETE riding the read token gains nothing either (no such route —
+    // the gate must not turn it into anything but an API miss).
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/missions/m-01/state")
+                .header("x-kranz-token", READ_TOKEN)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            response.status(),
+            StatusCode::UNAUTHORIZED
+                | StatusCode::FORBIDDEN
+                | StatusCode::METHOD_NOT_ALLOWED
+                | StatusCode::NOT_FOUND
+        ),
+        "DELETE with the read token must not succeed: {}",
+        response.status()
+    );
+}
+
 #[tokio::test]
 async fn revision_routes_expose_diff_and_enqueue_decisions() {
     let tmp = tempfile::tempdir().unwrap();

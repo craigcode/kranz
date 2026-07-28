@@ -24,4 +24,5 @@ dist/
 .kranz/queue/
 .kranz/tickets/*.status
 .kranz/serve.token
+.kranz/serve.read.token
 /notes.txt

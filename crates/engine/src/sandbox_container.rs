@@ -18,8 +18,12 @@
 //!
 //! Write policy: the container's root filesystem is read-only; the writable
 //! set is exactly the declared mounts — `session_cwd` (rw), `mission_dir`
-//! (ro), the scratch `tmpdir` (rw, also `HOME`/`TMPDIR` inside the container),
-//! and each `extra_write` entry (rw). Everything else is denied by the
+//! (ro, so the engine-owned audit log / state / control inbox / transcripts
+//! stay read-only inside the container even when the mission dir sits under
+//! an rw-mounted `session_cwd`), the session-private scratch `tmpdir` (rw,
+//! also `HOME`/`TMPDIR` inside the container — NOT the shared system temp
+//! root, which would expose sibling missions' worktrees), and each
+//! `extra_write` entry (rw). Everything else is denied by the
 //! runtime, the container analogue of the tier-2 write allowlist.
 //!
 //! Worker image: the default `DEFAULT_IMAGE` proves the isolation boundary
@@ -134,9 +138,13 @@ pub fn container_run_args(
         }
     };
     add_mount(&inputs.session_cwd, false);
+    // Read-only: the engine writes mission metadata from outside the
+    // sandbox, and this ro mount stacks over the rw session_cwd mount when
+    // checkout mode makes the mission dir its descendant — the container
+    // analogue of the tier-2 mission-metadata write deny.
     add_mount(&inputs.mission_dir, true);
-    // The scratch dir doubles as the container's HOME/TMPDIR, so it must be
-    // writable and mounted at the identical host path.
+    // The session-private scratch doubles as the container's HOME/TMPDIR, so
+    // it must be writable and mounted at the identical host path.
     add_mount(&inputs.tmpdir, false);
     for extra in &inputs.extra_write {
         add_mount(extra, false);
@@ -144,6 +152,23 @@ pub fn container_run_args(
     for (host, ro) in mounts {
         out.push("-v".to_string());
         out.push(mount_arg(&host, ro));
+    }
+    // Authority material must stay unreadable inside the container: the
+    // session_cwd mount otherwise carries the repo's `.kranz/serve.token`
+    // (mutation authority over `kranz serve` on loopback) and `config.json`
+    // (Slack/remote-workspace credentials) in with it. Mask each file that
+    // exists at spawn time with a /dev/null bind — the container analogue of
+    // the tier-2 read deny (crate::sandbox::authority_read_deny_paths derives
+    // the same set from the mission dir for the process sandboxes; here the
+    // session mount is the only path that can carry them). A token file
+    // created AFTER spawn is a residual gap the Seatbelt profile lacks.
+    let session_root = crate::sandbox::absolutize(&inputs.session_cwd);
+    for name in ["serve.token", "serve.read.token", "config.json"] {
+        let authority = session_root.join(".kranz").join(name);
+        if authority.exists() {
+            out.push("-v".to_string());
+            out.push(format!("/dev/null:{}:ro", authority.display()));
+        }
     }
     out.push("-w".to_string());
     out.push(
@@ -352,6 +377,43 @@ mod tests {
     }
 
     #[test]
+    fn container_run_args_mask_authority_material_under_session_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("session");
+        let kranz_dir = session.join(".kranz");
+        std::fs::create_dir_all(&kranz_dir).unwrap();
+        let serve_token = kranz_dir.join("serve.token");
+        let config = kranz_dir.join("config.json");
+        std::fs::write(&serve_token, "secret").unwrap();
+        std::fs::write(&config, "{}").unwrap();
+        let mut inputs = inputs(SandboxEnforce::Fs);
+        inputs.session_cwd = session;
+
+        let args = container_run_args(
+            &inputs,
+            &spec(),
+            Path::new("claude"),
+            &["--print".to_string()],
+            None,
+        );
+        let joined = args.join(" ");
+        let abs = |p: &std::path::Path| crate::sandbox::absolutize(p).display().to_string();
+
+        for masked in [&serve_token, &config] {
+            assert!(
+                joined.contains(&format!("/dev/null:{}:ro", abs(masked))),
+                "missing /dev/null mask for {}: {args:?}",
+                masked.display()
+            );
+        }
+        // Absent files are not masked — a bind target must exist.
+        assert!(
+            !joined.contains("serve.read.token"),
+            "absent authority files must not be masked: {args:?}"
+        );
+    }
+
+    #[test]
     fn container_run_args_respects_image_override() {
         let spec = ContainerSpec {
             runtime: ContainerRuntime::Podman,
@@ -372,9 +434,11 @@ mod tests {
     }
 
     /// Smoke: a trivial worker inside the provider lands a write inside the
-    /// mounted session dir on the host, and a write outside the declared
-    /// policy (`/etc`, read-only root fs) is denied. Skips on hosts with no
-    /// container runtime (this macOS dev host); CI ubuntu-latest has docker.
+    /// mounted session dir on the host, a write outside the declared policy
+    /// (`/etc`, read-only root fs) is denied, and authority material under the
+    /// session root (`.kranz/serve.token`) is masked by its /dev/null bind.
+    /// Skips on hosts with no container runtime (this macOS dev host); CI
+    /// ubuntu-latest has docker.
     #[test]
     fn container_provider_runs_a_trivial_worker_and_enforces_the_write_boundary() {
         let Some(runtime) = detect() else {
@@ -387,6 +451,9 @@ mod tests {
         let session = tempfile::tempdir().unwrap();
         let mission = tempfile::tempdir().unwrap();
         let scratch = tempfile::tempdir().unwrap();
+        let kranz_dir = session.path().join(".kranz");
+        std::fs::create_dir_all(&kranz_dir).unwrap();
+        std::fs::write(kranz_dir.join("serve.token"), "secret").unwrap();
         let inputs = SandboxInputs {
             enforce: SandboxEnforce::FsNet,
             session_cwd: session.path().to_path_buf(),
@@ -407,8 +474,9 @@ mod tests {
             &[
                 "-c".to_string(),
                 format!(
-                    "echo ok > {} && echo nope > /etc/nope.txt",
-                    ok_file.display()
+                    "echo ok > {} && cat {} && echo nope > /etc/nope.txt",
+                    ok_file.display(),
+                    kranz_dir.join("serve.token").display()
                 ),
             ],
             None,
@@ -428,6 +496,10 @@ mod tests {
             !output.status.success(),
             "write outside the declared policy (/etc) must be denied, failing the worker: {}",
             String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains("secret"),
+            "the /dev/null mask must hide serve.token content inside the container"
         );
     }
 }

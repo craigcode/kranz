@@ -17,9 +17,13 @@ const COMMAND_OUTPUT_TAIL: usize = 1500;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Run `program args` to completion, polling with a bounded wall-clock
-/// (`timeout`) rather than blocking forever — the sandbox preflight probe
-/// runs operator-authored contract commands and must never hang a mission
-/// start. Returns `None` on spawn failure or on timeout (the child is killed).
+/// (`timeout`) rather than blocking forever — the container provider's
+/// runtime probes (`workspace_container::spawn_bounded`) must never hang a
+/// readiness check. Returns `None` on spawn failure or on timeout (the child
+/// is killed). Synchronous and runtime-free so it is callable from inside the
+/// ambient tokio runtime; short-lived runtime probes only — anything that can
+/// spawn a tree of children or emit large output belongs on
+/// [`run_command_bounded`] (concurrent pipe drain + process-tree kill).
 pub(crate) fn run_with_timeout(
     program: &std::path::Path,
     args: &[String],
@@ -108,19 +112,8 @@ pub(crate) async fn run_shell_command_with_code(
 /// (`workspace.json`'s `secrets`) fed from ambient — never a contract
 /// command path.
 ///
-/// Timeout kill semantics: on unix the shell is started as the leader of a
-/// new process group and the WHOLE group gets SIGKILL — killing only the
-/// wrapper (kill_on_drop) would leave `sleep 300 &`-style descendants running
-/// (and holding the output pipes) long after the gate gave up. The killed
-/// shell itself is reaped by tokio's background orphan reaper (kill_on_drop);
-/// group members are re-parented to init and reaped there.
-///
-/// Windows has no process groups; the equivalent is a Job Object with
-/// `KILL_ON_JOB_CLOSE` (see [`crate::backend_claude::win_job`]). The `cmd /C`
-/// wrapper is assigned to such a job right after spawn, so on timeout
-/// `TerminateJobObject` takes the whole `cmd` tree down — not just the
-/// wrapper. That path compiles and is validated only on windows-latest CI,
-/// never on the dev host.
+/// Pipe draining and the process-tree timeout kill (unix process group,
+/// Windows Job Object) live in the one shared core, [`run_command_bounded`].
 async fn run_shell_command_with_timeout(
     cwd: &std::path::Path,
     command: &str,
@@ -153,17 +146,73 @@ async fn run_shell_command_with_timeout_env(
     if clear_env {
         cmd.env_clear();
     }
+    run_command_bounded(configure_bounded_child(cmd, cwd, env), timeout).await
+}
+
+/// Bounded run of an arbitrary program argv with the same pipe-draining /
+/// process-tree-kill discipline as contract shell commands — the sandbox
+/// preflight probe (`sandbox-exec -f <profile> /bin/sh -c <command>`) runs
+/// here rather than through a spawner of its own. `env` is the child's
+/// COMPLETE environment (the process env is cleared first): probes are
+/// operator-authored contract commands, so they get exactly the contract env
+/// the final gate would give them — never ambient secrets.
+pub(crate) async fn run_bounded_argv(
+    cwd: &std::path::Path,
+    program: &std::path::Path,
+    args: &[String],
+    timeout: Duration,
+    env: &HashMap<String, String>,
+) -> (Option<i32>, String) {
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args);
+    cmd.env_clear();
+    run_command_bounded(configure_bounded_child(cmd, cwd, env), timeout).await
+}
+
+/// Child setup shared by every bounded run: piped stdout/stderr (drained
+/// concurrently by [`run_command_bounded`]), stdin null, kill_on_drop, and —
+/// on unix — the child as leader of a NEW process group, so the timeout path
+/// can kill the entire command tree, not just the direct child.
+fn configure_bounded_child(
+    mut cmd: tokio::process::Command,
+    cwd: &std::path::Path,
+    env: &HashMap<String, String>,
+) -> tokio::process::Command {
     cmd.current_dir(cwd)
         .envs(env)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    // Unix: new process group with the shell as leader, so the timeout path
-    // can kill the entire command tree, not just the `sh -c` wrapper.
     #[cfg(unix)]
     cmd.process_group(0);
+    cmd
+}
 
+/// Bounded-execution core: spawn an already-configured command, drain both
+/// pipes CONCURRENTLY with the wait (a full pipe never deadlocks the child),
+/// keep only the tailed combined output, and on timeout kill the whole
+/// process tree.
+///
+/// Timeout kill semantics: on unix the child leads its own process group
+/// ([`configure_bounded_child`]) and the WHOLE group gets SIGKILL — killing
+/// only the wrapper (kill_on_drop) would leave `sleep 300 &`-style
+/// descendants running (and holding the output pipes) long after the gate
+/// gave up. The killed wrapper itself is reaped by tokio's background orphan
+/// reaper (kill_on_drop); group members are re-parented to init and reaped
+/// there.
+///
+/// Windows has no process groups; the equivalent is a Job Object with
+/// `KILL_ON_JOB_CLOSE` (see [`crate::backend_claude::win_job`]). The spawned
+/// child is assigned to such a job right after spawn, so on timeout
+/// `TerminateJobObject` takes the whole tree down — not just the wrapper.
+/// That path compiles and is validated only on windows-latest CI, never on
+/// the dev host.
+async fn run_command_bounded(
+    cmd: tokio::process::Command,
+    timeout: Duration,
+) -> (Option<i32>, String) {
+    let mut cmd = cmd;
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => return (None, format!("failed to spawn shell: {e}")),
@@ -173,18 +222,18 @@ async fn run_shell_command_with_timeout_env(
     #[cfg(unix)]
     let group_pid = child.id();
 
-    // Windows: assign the `cmd /C` wrapper to a kill-on-close Job Object so the
+    // Windows: assign the spawned child to a kill-on-close Job Object so the
     // timeout path can kill the whole command tree. Held across the await; on
     // timeout it is killed explicitly and, either way, dropped at scope end
     // (CloseHandle → KILL_ON_JOB_CLOSE). Job setup failure is non-fatal — the
-    // command still runs, timeout just falls back to killing the wrapper only.
+    // command still runs, timeout just falls back to killing the child only.
     // Compiled and validated only on windows-latest CI.
     #[cfg(windows)]
     let job = match child.raw_handle() {
         Some(handle) => crate::backend_claude::win_job::JobHandle::create_and_assign(handle)
             .map_err(|e| {
                 tracing::warn!(error = %e, "failed to create Job Object for shell command; \
-                    timeout will kill only the cmd wrapper");
+                    timeout will kill only the spawned child");
             })
             .ok(),
         None => None,
@@ -214,9 +263,9 @@ async fn run_shell_command_with_timeout_env(
                     libc::kill(-(pid as i32), libc::SIGKILL);
                 }
             }
-            // Windows: TerminateJobObject kills the whole `cmd` tree now
-            // (dropping `job` at scope end would also do it via
-            // KILL_ON_JOB_CLOSE, but the explicit kill is deterministic).
+            // Windows: TerminateJobObject kills the whole tree now (dropping
+            // `job` at scope end would also do it via KILL_ON_JOB_CLOSE, but
+            // the explicit kill is deterministic).
             #[cfg(windows)]
             if let Some(job) = &job {
                 job.kill();
@@ -591,6 +640,97 @@ mod tests {
         assert!(output.contains("hi"), "{output}");
 
         let (code, output) = run_shell_command_with_code(dir.path(), "exit 3", &env).await;
+        assert_eq!(code, Some(3), "{output}");
+    }
+
+    /// The preflight argv runner shares the bounded core: a timeout SIGKILLs
+    /// the whole process GROUP, not just the direct child — a backgrounded
+    /// grandchild must not survive. Unix-only (`kill(-pgid)`); the Windows
+    /// equivalent goes through the kill-on-close Job Object in
+    /// `run_command_bounded`, validated by windows-latest CI.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bounded_argv_timeout_kills_the_whole_process_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("child.pid");
+        let script = format!("sleep 300 & echo $! > '{}'; wait", pidfile.display());
+        let env = std::collections::HashMap::new();
+
+        let (code, output) = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_bounded_argv(
+                dir.path(),
+                std::path::Path::new("/bin/sh"),
+                &["-c".to_string(), script],
+                Duration::from_millis(500),
+                &env,
+            ),
+        )
+        .await
+        .expect("timed-out command must return promptly");
+        assert_eq!(code, None, "a timeout yields no exit code: {output}");
+        assert!(output.contains("timed out"), "got: {output}");
+
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .expect("shell wrote the background pid before the timeout")
+            .trim()
+            .parse()
+            .expect("pidfile contains a pid");
+
+        // The group SIGKILL must take the background child down: poll until
+        // kill(pid, 0) no longer reports it (dead + reaped by init), bounded.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background child {pid} survived the group kill"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// The preflight argv runner drains both pipes CONCURRENTLY with the
+    /// wait: a command emitting far more than the 64KB pipe buffer completes
+    /// instead of deadlocking, and only the capped tail is retained. Real
+    /// exit codes pass through (`Some(3)`), `Some(0)` stays the only success.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bounded_argv_drains_large_output_and_reports_exit_codes() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = std::collections::HashMap::new();
+        let big = "i=0; while [ \"$i\" -lt 20000 ]; do \
+                   printf '0123456789abcdef0123456789abcdef\\n'; \
+                   i=$((i + 1)); done; printf 'OUTPUT-END'";
+
+        let (code, output) = run_bounded_argv(
+            dir.path(),
+            std::path::Path::new("/bin/sh"),
+            &["-c".to_string(), big.to_string()],
+            Duration::from_secs(10),
+            &env,
+        )
+        .await;
+
+        assert_eq!(
+            code,
+            Some(0),
+            "large-output command must complete: {output}"
+        );
+        assert!(output.ends_with("OUTPUT-END"), "{output}");
+        assert!(
+            output.chars().count() <= COMMAND_OUTPUT_TAIL,
+            "retained output exceeded the cap: {} chars",
+            output.chars().count()
+        );
+
+        let (code, output) = run_bounded_argv(
+            dir.path(),
+            std::path::Path::new("/bin/sh"),
+            &["-c".to_string(), "exit 3".to_string()],
+            Duration::from_secs(10),
+            &env,
+        )
+        .await;
         assert_eq!(code, Some(3), "{output}");
     }
 }

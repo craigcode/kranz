@@ -273,6 +273,7 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             open,
             dashboard,
             token,
+            read_token,
             slack,
         } => {
             cmd_serve(
@@ -284,6 +285,7 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
                 open,
                 dashboard,
                 token,
+                read_token,
                 slack,
             )
             .await
@@ -1246,11 +1248,18 @@ pub fn cmd_missions(repo: &Path) -> Result<String> {
             .get(&id)
             .map(|s| format!("  [ticket: {s}]"))
             .unwrap_or_default();
-        if !MissionPaths::new(repo, &id).events_file().is_file() {
+        let paths = MissionPaths::new(repo, &id);
+        if !paths.events_file().is_file() {
             out.push_str(&format!(
                 "{id}  {:<10}  deleted mission (no data recorded)\n",
                 "DELETED"
             ));
+            continue;
+        }
+        // A symlinked mission dir is refused (P1 mission-path-no-follow),
+        // never read into another repository's tree.
+        if let Err(error) = paths.require_no_follow() {
+            out.push_str(&format!("{id}  {:<10}  (unreadable: {error})\n", "FAILED"));
             continue;
         }
         match load_state(repo, &id) {
@@ -1469,7 +1478,10 @@ pub(crate) fn effective_require_read_token(bind_is_loopback: bool, read_auth: bo
 /// Every `POST /api/...` requires the mutation token (protocol "Authority:
 /// mutation token"): generated per serve (or pinned via `--token` for
 /// scripting), printed for the operator, and handed to `--open`'s browser as
-/// a `#token=<t>` fragment the dashboard stores.
+/// a `#token=<t>` fragment the dashboard stores. The read-only token
+/// (`--read-token` / `$KRANZ_READ_TOKEN`) is generated alongside and stored
+/// in its own file — it authenticates gated GETs and the WS upgrade but
+/// never a mutation, so it is the one safe to hand to dashboards and agents.
 #[allow(clippy::too_many_arguments)]
 async fn cmd_serve(
     repo: PathBuf,
@@ -1480,6 +1492,7 @@ async fn cmd_serve(
     open: bool,
     dashboard: Option<PathBuf>,
     token: Option<String>,
+    read_token: Option<String>,
     slack: bool,
 ) -> Result<i32> {
     let bind: std::net::IpAddr = host
@@ -1564,10 +1577,16 @@ async fn cmd_serve(
         std::net::IpAddr::V4(v4) => v4.to_string(),
     };
     let url = format!("http://{display_host}:{}/", local_addr.port());
-    let token = token.unwrap_or_else(kranz_server::generate_token);
+    let token = token
+        .or_else(|| std::env::var("KRANZ_TOKEN").ok())
+        .unwrap_or_else(kranz_server::generate_token);
+    let read_token = read_token
+        .or_else(|| std::env::var("KRANZ_READ_TOKEN").ok())
+        .unwrap_or_else(kranz_server::generate_token);
 
     println!("kranz server on {url}");
     println!("mutation token: {token}");
+    println!("read token: {read_token} (GETs/WS only — safe for dashboards and agents)");
     match &dashboard_assets {
         Some(DashboardAssets::Embedded) => println!(
             "serving embedded dashboard ({})",
@@ -1610,6 +1629,7 @@ async fn cmd_serve(
         listener,
         static_assets,
         token,
+        read_token,
         read_auth,
         shutdown,
     )
@@ -1681,28 +1701,38 @@ async fn serve_multi_with_token_cleanup(
     listener: tokio::net::TcpListener,
     static_assets: Option<kranz_server::DashboardStatic>,
     token: String,
+    read_token: String,
     read_auth: bool,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    let token_file = if multi_host.uses_operator_catalog() {
+    let (token_file, read_token_file) = if multi_host.uses_operator_catalog() {
         let address = listener
             .local_addr()
             .context("cannot resolve the bound address for operator token storage")?;
-        write_operator_serve_token(address, &token)
-            .context("cannot securely store the operator serve token")?
+        let token_file = write_operator_serve_token(address, &token)
+            .context("cannot securely store the operator serve token")?;
+        let read_token_file = write_operator_serve_read_token(address, &read_token)
+            .context("cannot securely store the operator serve read token")?;
+        (token_file, read_token_file)
     } else {
-        write_serve_token(repo, &token).context("cannot securely store the serve token")?
+        let token_file =
+            write_serve_token(repo, &token).context("cannot securely store the serve token")?;
+        let read_token_file = write_serve_read_token(repo, &read_token)
+            .context("cannot securely store the serve read token")?;
+        (token_file, read_token_file)
     };
     let result = kranz_server::serve_multi_on_listener(
         multi_host,
         listener,
         static_assets,
         Some(token),
+        Some(read_token),
         read_auth,
         shutdown,
     )
     .await;
     remove_token_file(&token_file);
+    remove_token_file(&read_token_file);
     result
 }
 
@@ -1718,17 +1748,20 @@ async fn serve_with_token_cleanup(
     listener: tokio::net::TcpListener,
     static_assets: Option<kranz_server::DashboardStatic>,
     token: String,
+    read_token: String,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     // Filesystem read access to .kranz/serve.token confers mutation
     // authority — the same trust boundary as the .kranz/ directory itself,
     // so this file must never be written world- or group-readable.
     let token_file = write_serve_token(repo, &token)?;
+    let read_token_file = write_serve_read_token(repo, &read_token)?;
 
     let result =
         kranz_server::serve_on_listener(host, listener, static_assets, Some(token), shutdown).await;
 
     remove_token_file(&token_file);
+    remove_token_file(&read_token_file);
 
     result
 }
@@ -1740,6 +1773,15 @@ async fn serve_with_token_cleanup(
 /// `.kranz/` directory itself, so it is written owner-only (0600 on Unix).
 fn write_serve_token(repo: &Path, token: &str) -> std::io::Result<PathBuf> {
     write_token_file(&repo.join(".kranz").join("serve.token"), token)
+}
+
+/// Write the per-serve READ-ONLY token to `<repo>/.kranz/serve.read.token`.
+/// Same storage discipline as the mutation token: it authenticates gated
+/// GETs (mission state, transcripts), so it stays owner-only — but unlike
+/// `serve.token` it never carries mutation authority, which is what makes it
+/// safe to hand to dashboards and agents.
+fn write_serve_read_token(repo: &Path, read_token: &str) -> std::io::Result<PathBuf> {
+    write_token_file(&repo.join(".kranz").join("serve.read.token"), read_token)
 }
 
 /// Multi-root token location: `~/.kranz/serve/<endpoint>.token`. The complete
@@ -1758,6 +1800,26 @@ fn write_operator_serve_token(
     })?;
     let path = operator_serve_token_path(&global, address);
     write_token_file(&path, token)
+}
+
+/// The read-only sibling of the operator token: `~/.kranz/serve/<endpoint>.read.token`.
+fn write_operator_serve_read_token(
+    address: std::net::SocketAddr,
+    read_token: &str,
+) -> std::io::Result<PathBuf> {
+    let global = kranz_engine::paths::global_config().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "cannot resolve operator config directory",
+        )
+    })?;
+    let path = operator_serve_read_token_path(&global, address);
+    write_token_file(&path, read_token)
+}
+
+/// `<endpoint>.token` → `<endpoint>.read.token` beside the operator token.
+fn operator_serve_read_token_path(global_config: &Path, address: std::net::SocketAddr) -> PathBuf {
+    operator_serve_token_path(global_config, address).with_extension("read.token")
 }
 
 fn operator_serve_token_path(global_config: &Path, address: std::net::SocketAddr) -> PathBuf {
@@ -2957,6 +3019,28 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn serve_read_token_file_is_written_with_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().to_path_buf();
+        let path = write_serve_read_token(&repo, "read-secret").unwrap();
+        assert!(path.ends_with(".kranz/serve.read.token"));
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn operator_read_token_path_sits_beside_the_operator_token() {
+        let global = Path::new("/home/op/.kranz/config.json");
+        let address = std::net::SocketAddr::from(([127, 0, 0, 1], 4560));
+        let mutation = operator_serve_token_path(global, address);
+        let read = operator_serve_read_token_path(global, address);
+        assert_eq!(read, mutation.with_extension("read.token"));
+        assert!(read.to_string_lossy().ends_with(".read.token"));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn existing_token_permissions_are_hardened_before_replacement() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
@@ -2976,6 +3060,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().to_path_buf();
         let path = repo.join(".kranz").join("serve.token");
+        let read_path = repo.join(".kranz").join("serve.read.token");
 
         let host = std::sync::Arc::new(kranz_server::MissionHost::new(repo.clone()));
         let listener =
@@ -2988,12 +3073,14 @@ mod tests {
             listener,
             None,
             "tok".to_string(),
+            "read-tok".to_string(),
             std::future::ready(()),
         )
         .await
         .unwrap();
 
         assert!(!path.exists());
+        assert!(!read_path.exists());
     }
 
     fn dashboard_at(path: PathBuf) -> PathBuf {

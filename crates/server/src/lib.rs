@@ -204,6 +204,32 @@ pub fn router_with_multi_repo_host_and_addr(
     bind_is_loopback: bool,
     require_read_token: bool,
 ) -> Router {
+    router_with_read_authority_and_addr(
+        multi_host,
+        static_assets,
+        authority,
+        None,
+        bind_addr,
+        bind_is_loopback,
+        require_read_token,
+    )
+}
+
+/// [`router_with_multi_repo_host_and_addr`] plus a distinct READ-ONLY token
+/// (docs/protocol.md "Authority: mutation token"). `read_authority`
+/// authenticates GET/HEAD (and the WS upgrade) wherever the read gate is
+/// armed, but is never accepted on a mutating route — it is the token safe
+/// to hand to dashboards and agents. `None` keeps the single-token posture:
+/// gated reads then present the operator's mutation token, as before.
+pub fn router_with_read_authority_and_addr(
+    multi_host: Arc<MultiRepoHost>,
+    static_assets: Option<DashboardStatic>,
+    authority: Option<String>,
+    read_authority: Option<String>,
+    bind_addr: Option<SocketAddr>,
+    bind_is_loopback: bool,
+    require_read_token: bool,
+) -> Router {
     let catalog = Arc::clone(&multi_host);
     let mut app = Router::new().route("/api/health", get(rest::health)).route(
         "/api/repos",
@@ -291,6 +317,7 @@ pub fn router_with_multi_repo_host_and_addr(
     app.layer(middleware::from_fn_with_state(
         TokenGate {
             authority,
+            read_authority,
             require_read_token,
         },
         require_mutation_token,
@@ -754,10 +781,12 @@ async fn require_json_api_posts(request: Request, next: Next) -> Response {
 }
 
 /// Token gate state: the optional mutation token plus whether non-loopback
-/// binds also require it on GET / WS upgrade.
+/// binds also require it on GET / WS upgrade, and the optional read-only
+/// token accepted on gated reads only.
 #[derive(Clone)]
 struct TokenGate {
     authority: Option<String>,
+    read_authority: Option<String>,
     require_read_token: bool,
 }
 
@@ -771,13 +800,18 @@ struct HostGate {
 /// Require the per-serve mutation token on every `POST /api/...` (protocol
 /// "Authority: mutation token"). When [`TokenGate::require_read_token`] is
 /// set (non-loopback bind), GETs / HEADs under `/api/` (except `/api/health`)
-/// require the token too — via the `x-kranz-token` header or a `?token=`
+/// require a token too — via the `x-kranz-token` header or a `?token=`
 /// query. The query form exists ONLY for the browser WS upgrade (no way to
 /// set headers on `new WebSocket`) and is honored solely on token-gated
 /// reads: POSTs are header-only, so mutation authority never rides in a URL
 /// that can land in shell history or an intermediary's access log.
 /// `token: None` (back-compat test wrappers only) disables the gate
 /// entirely.
+///
+/// A configured [`TokenGate::read_authority`] authenticates those same gated
+/// READS (header or query) but is never accepted on a mutating route: it is
+/// the token safe to hand to dashboards and agents, while the mutation token
+/// stays the operator's alone.
 ///
 /// Rationale: the 127.0.0.1 bind + CORS allowlist stop the network and the
 /// browser; the token stops other local processes and link-borne CSRF from
@@ -801,11 +835,19 @@ async fn require_mutation_token(
             && !is_github_hook
             && (request.method() == Method::POST || (gate.require_read_token && is_read));
         if needs_token {
+            // The read-only token authenticates reads ONLY — never a mutation.
+            let read_ok = |presented: &str| {
+                is_read
+                    && gate
+                        .read_authority
+                        .as_deref()
+                        .is_some_and(|read| token_matches(presented, read))
+            };
             let header_ok = request
                 .headers()
                 .get(TOKEN_HEADER)
                 .and_then(|value| value.to_str().ok())
-                .is_some_and(|presented| token_matches(presented, expected));
+                .is_some_and(|presented| token_matches(presented, expected) || read_ok(presented));
             let query_ok = gate.require_read_token
                 && is_read
                 && request
@@ -816,7 +858,8 @@ async fn require_mutation_token(
                             let mut parts = pair.splitn(2, '=');
                             matches!(parts.next(), Some("token"))
                                 && parts.next().is_some_and(|v| {
-                                    token_matches(&percent_decode_token(v), expected)
+                                    let decoded = percent_decode_token(v);
+                                    token_matches(&decoded, expected) || read_ok(&decoded)
                                 })
                         })
                     })
@@ -965,6 +1008,7 @@ pub async fn serve_on_listener(
         listener,
         static_assets,
         token,
+        None,
         false,
         shutdown,
     )
@@ -974,21 +1018,26 @@ pub async fn serve_on_listener(
 /// Serve a static multi-repository catalog on an already-bound listener.
 /// `read_auth` forces the read-token gate (GETs and the WS upgrade) even on
 /// a loopback bind — off-loopback binds always require it regardless.
+/// `read_authority`, when set, is the read-only token accepted on those
+/// gated reads (never on mutations); the mutation `authority` keeps working
+/// for reads too.
 pub async fn serve_multi_on_listener(
     multi_host: Arc<MultiRepoHost>,
     listener: tokio::net::TcpListener,
     static_assets: Option<DashboardStatic>,
     authority: Option<String>,
+    read_authority: Option<String>,
     read_auth: bool,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     let local_addr = listener.local_addr()?;
     let bind_is_loopback = local_addr.ip().is_loopback();
     let require_read_token = !bind_is_loopback || read_auth;
-    let app = router_with_multi_repo_host_and_addr(
+    let app = router_with_read_authority_and_addr(
         multi_host,
         static_assets,
         authority,
+        read_authority,
         Some(local_addr),
         bind_is_loopback,
         require_read_token,

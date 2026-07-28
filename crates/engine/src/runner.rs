@@ -918,7 +918,8 @@ fn build_worker_spec(
         real_home.as_deref(),
         real_config_dir.as_deref(),
     );
-    spec.sandbox = resolve_sandbox_or_refuse(role_cfg, session_cwd, &mission_dir)?;
+    spec.sandbox =
+        resolve_sandbox_or_refuse(role_cfg, session_cwd, &mission_dir, &spec.session_id)?;
     apply_egress_grants(&mut spec.sandbox, egress_grants);
     permissions::apply(
         permissions::for_role(role, cfg, &[], grants, deny_exceptions),
@@ -1145,7 +1146,12 @@ pub async fn run_validator_in(
         sandbox: None,
     };
     spec.env = contract_env(base_sha);
-    spec.sandbox = resolve_sandbox_or_refuse(role_cfg, session_cwd, &paths.mission_dir())?;
+    spec.sandbox = resolve_sandbox_or_refuse(
+        role_cfg,
+        session_cwd,
+        &paths.mission_dir(),
+        &spec.session_id,
+    )?;
     apply_egress_grants(&mut spec.sandbox, egress_grants);
     permissions::apply(
         permissions::for_role(kind, cfg, &combined_commands, grants, &[]),
@@ -1175,10 +1181,18 @@ fn bullet_list(items: &[String]) -> String {
         .join("\n")
 }
 
+/// Resolve the role's sandbox for one session, refusing the run when
+/// enforcement was requested but cannot be honored. On a successful resolve
+/// the inputs' scratch root is pinned to THIS session's private scratch
+/// (`crate::backend_claude::scratch_home_root`) — the same root the cleared
+/// child env points `HOME`/`TMPDIR`/`CLAUDE_CONFIG_DIR` under — replacing
+/// `build_inputs`' probe-shaped default, so the writable set never widens to
+/// the shared system temp root (ticket sandbox-writable-scope).
 fn resolve_sandbox_or_refuse(
     role_cfg: &RoleConfig,
     session_cwd: &std::path::Path,
     mission_dir: &std::path::Path,
+    session_id: &str,
 ) -> Result<Option<crate::sandbox::ResolvedSandbox>> {
     let (sandbox, warn) =
         crate::sandbox::resolve_for_session(&role_cfg.sandbox, session_cwd, mission_dir);
@@ -1192,6 +1206,10 @@ fn resolve_sandbox_or_refuse(
                 role_cfg.sandbox.enforce
             )
         })));
+    }
+    let mut sandbox = sandbox;
+    if let Some(resolved) = sandbox.as_mut() {
+        resolved.inputs.tmpdir = crate::backend_claude::scratch_home_root(session_id);
     }
     Ok(sandbox)
 }
@@ -1222,6 +1240,34 @@ fn apply_egress_grants(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The resolved sandbox must never widen its writable set to the shared
+    /// system temp root (ticket sandbox-writable-scope): the runner pins the
+    /// inputs' scratch root to THIS session's private scratch, replacing
+    /// `build_inputs`' probe-shaped default.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resolve_sandbox_or_refuse_pins_the_sessions_private_scratch_root() {
+        let mut cfg = MissionConfig::default();
+        cfg.worker.sandbox.enforce = SandboxEnforce::Fs;
+        let dir = tempfile::tempdir().unwrap();
+        let mission = dir.path().join("mission");
+
+        let sandbox = resolve_sandbox_or_refuse(&cfg.worker, dir.path(), &mission, "sess-42")
+            .expect("fs resolve must not refuse on macos")
+            .expect("fs resolves to a sandbox on macos");
+
+        assert_eq!(
+            sandbox.inputs.tmpdir,
+            crate::backend_claude::scratch_home_root("sess-42"),
+            "the writable scratch must be the session-private root, not TMPDIR"
+        );
+        assert_ne!(
+            sandbox.inputs.tmpdir,
+            std::env::temp_dir(),
+            "the shared system temp root must never be the session scratch"
+        );
+    }
 
     #[test]
     fn apply_egress_grants_merges_into_fs_net_sandbox_inputs() {

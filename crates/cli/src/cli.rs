@@ -355,8 +355,18 @@ pub enum Command {
 
         /// Pin the mutation token instead of generating one (scripting).
         /// Every POST /api/... must carry it in the x-kranz-token header.
+        /// Falls back to $KRANZ_TOKEN when unset.
         #[arg(long, value_name = "TOKEN")]
         token: Option<String>,
+
+        /// Pin the read-only token instead of generating one (falls back to
+        /// $KRANZ_READ_TOKEN). Authenticates /api GETs and the WS upgrade
+        /// only — never mutations — so it is the token safe to hand to
+        /// dashboards and agents. Stored next to serve.token at
+        /// .kranz/serve.read.token (operator catalog:
+        /// ~/.kranz/serve/<endpoint>.read.token).
+        #[arg(long, value_name = "TOKEN")]
+        read_token: Option<String>,
 
         /// Also run the Slack bridge (Socket Mode). Requires bot/app tokens +
         /// channel in ~/.kranz/config.json or KRANZ_SLACK_* env vars; a no-op
@@ -553,6 +563,17 @@ mod tests {
         let cli = Cli::try_parse_from(["kranz", "serve", "--read-auth"]).unwrap();
         match cli.command {
             Command::Serve { read_auth, .. } => assert!(read_auth),
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_parses_read_token_flag() {
+        let cli = Cli::try_parse_from(["kranz", "serve", "--read-token", "ro-123"]).unwrap();
+        match cli.command {
+            Command::Serve { read_token, .. } => {
+                assert_eq!(read_token.as_deref(), Some("ro-123"))
+            }
             other => panic!("expected Serve, got {other:?}"),
         }
     }

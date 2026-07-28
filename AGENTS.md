@@ -92,7 +92,7 @@ contract, validated at draft/approve; `crates/engine/src/workspace_contract.rs`)
 mission's `plan.md` / `plan.json` / `report.md` (on the mission branch). Gitignored runtime
 (never commit): `events.jsonl`, `state.json`, `runs/`, `control/`,
 `missions/*/workspace/` (container-provider compose files),
-`.kranz/config.json`, `serve.token`, `.kranz/tickets/*.status`.
+`.kranz/config.json`, `serve.token`, `serve.read.token`, `.kranz/tickets/*.status`.
 
 ## Change discipline
 

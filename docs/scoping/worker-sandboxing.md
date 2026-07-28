@@ -69,8 +69,15 @@ All of it asks the agent nicely. None of it constrains the process.
 ### Tier 2 — OS-enforced filesystem + network (per-platform, config-gated)
 
 - **macOS**: generate a Seatbelt profile per session (`sandbox-exec`):
-  write allowlist = worktree + mission control dir + `TMPDIR` (+ opt-in
-  toolchain caches: `~/.cargo`, npm cache). `enforce: "fs"` is supported.
+  write allowlist = session worktree + a per-session private scratch root
+  (`kranz-worker-home-<session_id>`; NOT the shared `TMPDIR`, which would
+  expose every sibling mission's worktrees) + opt-in toolchain caches
+  (`extraWrite`: `~/.cargo`, npm cache). The mission dir is not writable;
+  its engine-owned metadata (`events.jsonl`, `state.json`, the lock file,
+  `control/`, `runs/*.jsonl` transcripts) carries explicit write denies so
+  it stays read-only even in checkout mode, where the writable session cwd
+  is an ancestor of the mission dir (P1, ticket `sandbox-writable-scope`).
+  `enforce: "fs"` is supported.
   `enforce: "fs+net"` is supported via the filtering egress proxy
   (`crates/engine/src/egress_proxy.rs`): live verification showed Seatbelt
   rejects hostname egress rules such as
@@ -80,7 +87,11 @@ All of it asks the agent nicely. None of it constrains the process.
   (default Anthropic endpoints + configured `egress[]` + operator egress
   grants) at CONNECT time and appends structured denials to
   `runs/egress-denials.jsonl`.
-- **Linux**: bubblewrap equivalent for the same filesystem allowlists.
+- **Linux**: bubblewrap equivalent for the same filesystem allowlists (the
+  mission-metadata write denies become spawn-time `/dev/null` masks over the
+  metadata files + each existing transcript, and an empty `--tmpfs` shadow
+  over `control/` — bwrap has no per-path write deny to stack over an rw
+  bind).
   `enforce: "fs+net"` fails closed with `--unshare-net` because bwrap alone
   cannot express a hostname allowlist; if `bwrap` is missing, kranz refuses
   requested enforcement rather than falling back to unsandboxed execution.
@@ -177,7 +188,7 @@ meta-lesson). Briefs 3–5 need macOS/Linux runners to validate for real.
 
 A deliberately hostile brief (instructed to write outside its scope and to
 call out to the network) run under a supported `enforce: "fs+net"` backend
-leaves **zero writes outside its worktree + mission dir**, its blocked attempts
+leaves **zero writes outside its worktree + private scratch**, its blocked attempts
 surface as `out-of-contract-write` / preflight findings; a normal mission's
 contract commands (cargo test, npm build) still pass under the sandbox at
 under ~10% wall-clock overhead; and the primary checkout never changes branch

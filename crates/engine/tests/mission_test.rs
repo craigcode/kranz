@@ -7277,11 +7277,15 @@ async fn sandbox_preflight_flags_command_that_writes_outside_allowlist() {
     cfg.worker.sandbox.enforce = kranz_engine::types::SandboxEnforce::Fs;
 
     let marker = format!("kranz_pf_{}", uuid::Uuid::new_v4());
+    // The REAL home is outside the generated allowlist (session cwd /
+    // mission dir / tmpdir): bake it in literally — the probe's contract env
+    // deliberately redefines $HOME to the writable mission scratch.
+    let real_home = std::env::var("HOME").expect("HOME must be set for this test");
     let contract = vec![
         assertion(
             "a-outside",
             "writes outside the allowlist",
-            Some(&format!("echo x > $HOME/{marker}")),
+            Some(&format!("echo x > '{real_home}/{marker}'")),
         ),
         assertion("a-benign", "trivially true", Some("true")),
     ];

@@ -5,7 +5,7 @@
 //! `orchestrator.decision` at run start, and [`PREFLIGHT_CLEAR_SUMMARY`]
 //! durably supersedes an earlier warning once a run's probes come back clean.
 
-use crate::command_exec::{is_git_repo, last_chars_local, run_with_timeout};
+use crate::command_exec::{is_git_repo, tail_chars};
 use crate::contract_sweep;
 use crate::orchestrator::MissionEngine;
 use crate::paths::MissionPaths;
@@ -48,6 +48,16 @@ impl MissionEngine {
     /// `.kranz` not being writable. The probe is intentionally lenient — only
     /// programs that plainly do not resolve are flagged, so a shell builtin or
     /// an odd-but-valid command never produces a false warning.
+    ///
+    /// Synchronous by design: `run_loop` futures are spawned (`tokio::spawn`,
+    /// so `Send`-bound), and an `async fn(&self)` here would hold
+    /// `&MissionEngine` — not `Sync`, via `Box<dyn AgentSession>` — across an
+    /// await, poisoning the whole `run()` future's `Send`. The sandbox
+    /// command probes still use the shared ASYNC bounded runner: they run it
+    /// on a dedicated thread owning a current-thread runtime (the
+    /// [`crate::command_exec::run_bounded_gate_command`] pattern), which also
+    /// keeps this callable from inside the ambient runtime without a nested
+    /// `block_on` panic.
     pub fn preflight(&self) -> Vec<PreflightIssue> {
         let mut issues = Vec::new();
 
@@ -166,9 +176,10 @@ impl MissionEngine {
         // sandbox tooling as a warning, and on macOS run each distinct
         // contract `command` assertion under the generated worker Seatbelt
         // profile. Best-effort and advisory only: never an `error`, never a
-        // block. `session_cwd` uses `self.paths.repo_root` (the primary
-        // checkout) as a cheap stand-in for the actual per-session worktree
-        // root, which does not exist yet at preflight time.
+        // block. The warn-only resolve below never executes anything, so a
+        // stand-in `session_cwd` is fine there; the command probes in
+        // `sandbox_command_preflight` resolve and run against a DISPOSABLE
+        // detached worktree, never the primary checkout (AGENTS.md rule 7).
         if self.state.config.worker.sandbox.enforce != crate::types::SandboxEnforce::Off {
             let mission_dir = self.paths.mission_dir();
             let (_resolved, warn) = crate::sandbox::resolve_for_session(
@@ -200,11 +211,29 @@ impl MissionEngine {
     /// to resolve the sandbox or write the profile file is silently skipped
     /// (never escalated) rather than reported, since this probe must never
     /// block or mislabel an environment problem as a sandbox problem.
+    ///
+    /// Probes run in a DISPOSABLE detached worktree at the mission's pinned
+    /// base (under the mission's gitignored `runs/` scratch), resolved as the
+    /// profile's `session_cwd` and used as the probe cwd — never the primary
+    /// checkout, which must stay byte-untouched across a run (AGENTS.md rule
+    /// 7). A worktree-creation failure is the one new failure mode here and
+    /// surfaces as a `warn` (the probes are then skipped).
+    ///
+    /// Execution goes through [`crate::command_exec::run_bounded_argv`], the
+    /// shared bounded runner (concurrent pipe drain, process-tree kill on
+    /// timeout), driven on a DEDICATED thread that owns a current-thread
+    /// runtime — the [`crate::command_exec::run_bounded_gate_command`]
+    /// pattern. `preflight()` is sync and called on the ambient tokio
+    /// runtime, where a nested `block_on` would panic; a raw
+    /// `std::thread::spawn` carries no runtime context, so the runner's
+    /// runtime is safe there. The disposable worktree outlives the thread
+    /// (joined before the guard drops).
     fn sandbox_command_preflight(&self) -> Vec<PreflightIssue> {
         let mission_dir = self.paths.mission_dir();
+        let worktree_path = self.paths.runs_dir().join("preflight-worktree");
         let (resolved, _warn) = crate::sandbox::resolve_for_session(
             &self.state.config.worker.sandbox,
-            self.paths.repo_root.as_path(),
+            &worktree_path,
             &mission_dir,
         );
         let Some(resolved) = resolved else {
@@ -213,20 +242,59 @@ impl MissionEngine {
         if resolved.backend != crate::sandbox::SandboxBackend::Seatbelt {
             return Vec::new();
         }
-        let profile = crate::sandbox::generate_profile(&resolved.inputs);
-        let profile_path = match crate::sandbox::write_profile_file(&mission_dir, &profile)
-            .or_else(|_| crate::sandbox::write_profile_file(&resolved.inputs.tmpdir, &profile))
-        {
-            Ok(path) => path,
-            Err(_) => return Vec::new(),
+
+        // The throwaway probe tree: detached at the pinned base (approval
+        // base_sha, falling back to the base branch for pre-pin missions),
+        // removed on guard drop however the probes end.
+        let base = self
+            .state
+            .mission
+            .base_sha
+            .clone()
+            .unwrap_or_else(|| self.state.mission.base_branch.clone());
+        let _worktree = match DisposableWorktree::create(&self.repo, &worktree_path, &base) {
+            Ok(guard) => guard,
+            Err(err) => {
+                return vec![PreflightIssue {
+                    severity: "warn",
+                    message: format!(
+                        "sandbox command preflight skipped: could not create disposable \
+                         worktree at {base}: {err}"
+                    ),
+                }];
+            }
         };
 
-        let mut issues = Vec::new();
-        let mut probed: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let profile = crate::sandbox::generate_profile(&resolved.inputs);
+        // The profile file is runtime scratch: keep it under the gitignored
+        // `runs/` dir (never the mission dir, whose unignored files would
+        // show up as untracked in the primary checkout's `git status`).
+        let profile_path =
+            match crate::sandbox::write_profile_file(&self.paths.runs_dir(), &profile)
+                .or_else(|_| crate::sandbox::write_profile_file(&resolved.inputs.tmpdir, &profile))
+            {
+                Ok(path) => path,
+                Err(_) => return Vec::new(),
+            };
+
+        // The same COMPLETE environment the final contract gate gives command
+        // assertions (minimal allowlist + scratch HOME + toolchain caches +
+        // any contractEnvPassthrough names): the probe measures what the gate
+        // will see, and ambient secrets never reach a contract command.
+        let env = crate::agent_env::contract_command_env(
+            &self.paths.runs_dir().join("contract-home"),
+            self.state.mission.base_sha.as_deref(),
+            &self.state.config.contract_env_passthrough,
+        );
+
+        // Probe selection (dedup, capped) happens here; execution moves to
+        // the probe thread below.
         const MAX_PROBES: usize = 20;
         const TIMEOUT: Duration = Duration::from_secs(5);
+        let mut probes: Vec<(String, std::path::PathBuf, Vec<String>)> = Vec::new();
+        let mut probed: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for assertion in &self.state.mission.validation_contract {
-            if issues.len() >= MAX_PROBES || probed.len() >= MAX_PROBES {
+            if probes.len() >= MAX_PROBES {
                 break;
             }
             if assertion.check != AssertionCheck::Command {
@@ -243,28 +311,104 @@ impl MissionEngine {
                 std::path::Path::new("/bin/sh"),
                 &["-c".to_string(), command.to_string()],
             );
-            match run_with_timeout(&program, &args, TIMEOUT) {
-                Some(output) if !output.status.success() => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    let tail = last_chars_local(&stderr, 200);
-                    issues.push(PreflightIssue {
-                        severity: "warn",
-                        message: format!(
-                            "command assertion [{}] fails under the fs sandbox profile: {tail}",
-                            assertion.id
-                        ),
-                    });
-                }
-                _ => {}
-            }
+            probes.push((assertion.id.clone(), program, args));
         }
-        issues
+        if probes.is_empty() {
+            return Vec::new();
+        }
+
+        let probe_cwd = worktree_path.clone();
+        let worker = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            let Ok(runtime) = runtime else {
+                return Vec::new(); // best-effort: no runtime, no probes
+            };
+            runtime.block_on(async move {
+                let mut issues = Vec::new();
+                for (id, program, args) in probes {
+                    match crate::command_exec::run_bounded_argv(
+                        &probe_cwd, &program, &args, TIMEOUT, &env,
+                    )
+                    .await
+                    {
+                        // Only a real non-zero exit warns; a timeout/spawn
+                        // failure (`None`) stays silent — the probe is
+                        // advisory and a slow command is not a sandbox problem.
+                        (Some(0), _) | (None, _) => {}
+                        (Some(_), output) => {
+                            let tail = tail_chars(&output, 200);
+                            issues.push(PreflightIssue {
+                                severity: "warn",
+                                message: format!(
+                                    "command assertion [{id}] fails under the fs sandbox \
+                                     profile: {tail}"
+                                ),
+                            });
+                        }
+                    }
+                }
+                issues
+            })
+        });
+        // A panicked probe thread must never take preflight down with it.
+        worker.join().unwrap_or_default()
     }
 }
 
 // ---------------------------------------------------------------------------
 // Preflight helpers (roadmap M2) — all pure/best-effort, no engine state
 // ---------------------------------------------------------------------------
+
+/// RAII guard for the disposable preflight worktree (P1, ticket
+/// preflight-in-disposable-worktree): a throwaway detached worktree the
+/// sandbox command probes run in so contract commands never execute against
+/// the primary checkout (AGENTS.md rule 7 — the primary must stay
+/// byte-untouched across a run). The worktree lives under the mission's own
+/// gitignored `runs/` scratch, not global temp.
+///
+/// Drop removes it best-effort — `git worktree remove --force` (which also
+/// deletes the directory), a dir sweep for anything git declined, and a
+/// prune of stale administrative entries — so even a probe failure or early
+/// return cannot leak it.
+struct DisposableWorktree {
+    repo: crate::git_ops::GitRepo,
+    path: std::path::PathBuf,
+}
+
+impl DisposableWorktree {
+    /// Create a detached worktree at `path` pinned to `base` (`git worktree
+    /// add --detach`). Idempotent against a stale leftover from a crashed
+    /// run: any prior worktree/dir at `path` is cleared first, mirroring
+    /// `setup_mission_worktree`'s crash sweep.
+    fn create(
+        repo: &crate::git_ops::GitRepo,
+        path: &std::path::Path,
+        base: &str,
+    ) -> crate::error::Result<Self> {
+        let _ = repo.remove_worktree(path);
+        let _ = std::fs::remove_dir_all(path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                crate::error::EngineError::Git(format!("create {}: {e}", parent.display()))
+            })?;
+        }
+        repo.add_detached_worktree(path, base)?;
+        Ok(Self {
+            repo: repo.clone(),
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+impl Drop for DisposableWorktree {
+    fn drop(&mut self) {
+        let _ = self.repo.remove_worktree(&self.path);
+        let _ = std::fs::remove_dir_all(&self.path);
+        let _ = self.repo.prune_worktrees();
+    }
+}
 
 fn role_config_key(role: Role) -> &'static str {
     match role {
@@ -402,9 +546,10 @@ fn path_is_executable(path: &std::path::Path) -> bool {
 /// Deliberately runtime-free (no `tokio::runtime::Builder`/`block_on`):
 /// `preflight()` runs synchronously inside the process's own tokio runtime
 /// (see `run_loop()`), and entering a nested runtime here panics
-/// unconditionally with "Cannot start a runtime from within a runtime".
-/// Mirrors the proven-safe pattern in
-/// `backend_readiness::probe_local_reachability`.
+/// unconditionally with "Cannot start a runtime from within a runtime". (The
+/// sandbox command probes avoid the same trap by owning a runtime on a
+/// DEDICATED thread — see `sandbox_command_preflight`.) Mirrors the
+/// proven-safe pattern in `backend_readiness::probe_local_reachability`.
 fn probe_local_endpoint_reachable(base_url: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(base_url) else {
         return true; // can't probe; don't manufacture a false warning
@@ -648,6 +793,208 @@ mod tests {
         assert!(
             !issues.iter().any(|i| i.severity == "error"),
             "local reachability must never escalate to an error, got {issues:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Disposable-worktree sandbox probes (P1, ticket
+    // preflight-in-disposable-worktree). macOS-only: the Seatbelt probe path
+    // is the only one that executes contract commands.
+    // -----------------------------------------------------------------------
+
+    /// Init a throwaway repo with one seed commit; returns (tempdir guard,
+    /// canonical root, seed commit sha).
+    #[cfg(target_os = "macos")]
+    fn seeded_git_repo() -> (tempfile::TempDir, std::path::PathBuf, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).unwrap_or_else(|_| dir.path().to_path_buf());
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.name", "test"],
+            vec!["config", "user.email", "test@example.com"],
+        ] {
+            let _ = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&root)
+                .output();
+        }
+        std::fs::write(root.join("README.md"), "seed\n").unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&root)
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["commit", "-m", "seed"])
+            .current_dir(&root)
+            .output();
+        let sha = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&root)
+            .output()
+            .expect("rev-parse HEAD");
+        let sha = String::from_utf8_lossy(&sha.stdout).trim().to_string();
+        (dir, root, sha)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn command_assertion(id: &str, command: &str) -> Assertion {
+        Assertion {
+            id: id.to_string(),
+            statement: "the check passes".to_string(),
+            check: AssertionCheck::Command,
+            command: Some(command.to_string()),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn git_status_porcelain(root: &std::path::Path) -> String {
+        let out = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(root)
+            .output()
+            .expect("git status");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn sandbox_exec_available() -> bool {
+        std::process::Command::new("which")
+            .arg("sandbox-exec")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// The P1 regression test: with `worker.sandbox.enforce = fs`, the
+    /// contract-command probes must run in a DISPOSABLE worktree — proven by
+    /// a `pwd -P` assertion inside the probe — and the primary checkout must
+    /// be byte-identical (`git status --porcelain` unchanged, no marker file)
+    /// across a preflight whose contract command writes a file. The
+    /// disposable worktree is removed afterwards (success AND failing probe
+    /// alike; this run has both).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_preflight_probes_disposable_worktree_not_primary() {
+        if !sandbox_exec_available() {
+            eprintln!("sandbox-exec not found on this host; skipping");
+            return;
+        }
+        let (_dir, root, sha) = seeded_git_repo();
+
+        let mut cfg = MissionConfig::default();
+        cfg.worker.sandbox.enforce = crate::types::SandboxEnforce::Fs;
+
+        let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
+        let mut engine = MissionEngine::create(backend, &root, "goal", cfg).expect("create engine");
+        engine.state.mission.base_sha = Some(sha);
+
+        let worktree_path = engine.paths.runs_dir().join("preflight-worktree");
+        let home_marker = format!("kranz_pf_{}", uuid::Uuid::new_v4());
+        // The REAL home is outside the generated allowlist (worktree /
+        // mission dir / tmpdir): bake it in literally, because the probe's
+        // contract env deliberately redefines $HOME to the writable scratch.
+        let real_home = std::env::var("HOME").expect("HOME must be set for this test");
+        engine.state.mission.validation_contract = vec![
+            // cwd-relative write: lands in the probe's cwd, must NOT warn…
+            command_assertion("a-rel-write", "echo x > preflight-marker.txt"),
+            // …and the probe's cwd must BE the disposable worktree.
+            command_assertion(
+                "a-cwd",
+                &format!("[ \"$(pwd -P)\" = '{}' ]", worktree_path.display()),
+            ),
+            // A write outside the sandbox allowlist: must fail and warn —
+            // also proves the probes really executed (anti-vacuity).
+            command_assertion(
+                "a-outside",
+                &format!("echo x > '{real_home}/{home_marker}'"),
+            ),
+        ];
+
+        let status_before = git_status_porcelain(&root);
+        let issues = engine.preflight();
+
+        // The failing probe warned; the in-worktree probes did not.
+        assert!(
+            issues.iter().any(|i| i.severity == "warn"
+                && i.message.contains("[a-outside]")
+                && i.message.contains("fs sandbox profile")),
+            "expected a sandbox warn for the out-of-allowlist write: {issues:?}"
+        );
+        for id in ["a-rel-write", "a-cwd"] {
+            let needle = format!("[{id}]");
+            assert!(
+                !issues.iter().any(|i| i.message.contains(&needle)),
+                "{id} must not warn — probes run with cwd = the disposable worktree: {issues:?}"
+            );
+        }
+        assert!(
+            !issues.iter().any(|i| i.severity == "error"),
+            "sandbox preflight must never escalate to error: {issues:?}"
+        );
+
+        // AGENTS.md rule 7: the primary checkout is byte-untouched.
+        assert_eq!(
+            status_before,
+            git_status_porcelain(&root),
+            "primary checkout changed across preflight"
+        );
+        assert!(
+            !root.join("preflight-marker.txt").exists(),
+            "the probe's cwd-relative write landed in the primary checkout"
+        );
+
+        // The disposable worktree is gone after the run (both the succeeding
+        // and the failing probe used it).
+        assert!(
+            !worktree_path.exists(),
+            "disposable preflight worktree leaked at {}",
+            worktree_path.display()
+        );
+
+        // Clean up in case the sandbox somehow did not block the $HOME write.
+        if let Ok(home) = std::env::var("HOME") {
+            let _ = std::fs::remove_file(std::path::Path::new(&home).join(&home_marker));
+        }
+    }
+
+    /// The new failure mode: a disposable worktree that cannot be created
+    /// (here: a pinned base that does not resolve) becomes one advisory
+    /// `warn` — never an error, never a panic, and no leftover tree.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_preflight_worktree_creation_failure_is_advisory() {
+        if !sandbox_exec_available() {
+            eprintln!("sandbox-exec not found on this host; skipping");
+            return;
+        }
+        let (_dir, root, _sha) = seeded_git_repo();
+
+        let mut cfg = MissionConfig::default();
+        cfg.worker.sandbox.enforce = crate::types::SandboxEnforce::Fs;
+
+        let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
+        let mut engine = MissionEngine::create(backend, &root, "goal", cfg).expect("create engine");
+        engine.state.mission.base_sha = Some("0".repeat(40));
+        engine.state.mission.validation_contract = vec![command_assertion("a-1", "true")];
+
+        let issues = engine.sandbox_command_preflight();
+
+        assert_eq!(
+            issues.len(),
+            1,
+            "exactly one advisory issue for the worktree failure: {issues:?}"
+        );
+        assert_eq!(issues[0].severity, "warn");
+        assert!(
+            issues[0]
+                .message
+                .contains("could not create disposable worktree"),
+            "the warn names the worktree failure: {}",
+            issues[0].message
+        );
+        assert!(
+            !engine.paths.runs_dir().join("preflight-worktree").exists(),
+            "a failed worktree creation must not leave a tree behind"
         );
     }
 }

@@ -511,6 +511,7 @@ fn gitignore_hygiene(repo: &Path) -> ReadyDimension {
         ".kranz/missions/m-ready/control/0001.json",
         ".kranz/config.json",
         ".kranz/serve.token",
+        ".kranz/serve.read.token",
         ".kranz/tickets/ready.status",
     ];
     let present = sentinels
@@ -1136,6 +1137,7 @@ mod tests {
              missions/*/control/\n\
              config.json\n\
              serve.token\n\
+             serve.read.token\n\
              tickets/*.status\n",
         );
         write(
@@ -1168,7 +1170,7 @@ mod tests {
         git(dir.path(), &["init"]);
         write(
             &dir.path().join(".kranz/.gitignore"),
-            "missions/\nconfig.json\nserve.token\ntickets/*.status\n",
+            "missions/\nconfig.json\nserve.token\nserve.read.token\ntickets/*.status\n",
         );
         write(
             &dir.path().join(".kranz/serve.token"),
@@ -1182,7 +1184,7 @@ mod tests {
 
         let hygiene = gitignore_hygiene(dir.path());
         assert_ne!(hygiene.status, ReadyStatus::Pass, "{hygiene:?}");
-        assert!(hygiene.evidence.contains("7/8"), "{hygiene:?}");
+        assert!(hygiene.evidence.contains("8/9"), "{hygiene:?}");
     }
 
     #[test]
@@ -1217,7 +1219,7 @@ mod tests {
         assert!(!git_ignores(dir.path(), ".kranz/config.json"));
         let hygiene = gitignore_hygiene(dir.path());
         assert_ne!(hygiene.status, ReadyStatus::Pass, "{hygiene:?}");
-        assert!(hygiene.evidence.contains("7/8"), "{hygiene:?}");
+        assert!(hygiene.evidence.contains("8/9"), "{hygiene:?}");
     }
 
     #[test]
@@ -1545,7 +1547,7 @@ mod tests {
         git(&strong, &["init"]);
         write(
             &strong.join(".kranz/.gitignore"),
-            "missions/*/events.jsonl\nmissions/*/events.jsonl.lock\nmissions/*/state.json\nmissions/*/runs/\nmissions/*/control/\nconfig.json\nserve.token\ntickets/*.status\n",
+            "missions/*/events.jsonl\nmissions/*/events.jsonl.lock\nmissions/*/state.json\nmissions/*/runs/\nmissions/*/control/\nconfig.json\nserve.token\nserve.read.token\ntickets/*.status\n",
         );
         write(
             &strong.join(".kranz/merge-gates.json"),
