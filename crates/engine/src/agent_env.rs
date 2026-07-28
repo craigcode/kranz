@@ -35,13 +35,28 @@ use std::path::{Path, PathBuf};
 /// routinely have no `TERM`).
 const AMBIENT_LOCALE_VARS: &[&str] = &["TERM", "LANG", "LC_ALL", "TZ"];
 
-/// Windows process requirements passed through from ambient (`SYSTEMROOT`/
-/// `COMSPEC`/`PATHEXT` — without them `cmd` and process creation break).
-/// `USERPROFILE` is NOT in this list: like `HOME`, it is set to the scratch
-/// dir, never the operator's real profile.
+/// Windows process requirements passed through from ambient: without
+/// `SystemRoot`/`ComSpec`/`PATHEXT` `cmd` and process creation break; the
+/// remaining names are machine-descriptive (not credentials) that `cmd`,
+/// PowerShell, and the .NET CLR consult on startup — a child missing them
+/// hangs or misbehaves in opaque ways (Windows CI, 89f05a1). Names are
+/// matched CASE-INSENSITIVELY (`SystemRoot` vs `SYSTEMROOT`) and emitted
+/// under the canonical casing below so the child env block never carries
+/// duplicate-case entries (Windows env lookup is case-insensitive; a block
+/// with both casings is undefined which wins). `USERPROFILE`/`APPDATA`/
+/// `LOCALAPPDATA`/`TEMP`/`TMP` are NOT passed through: like `HOME` they
+/// are redirected to the scratch dir, never the operator's real profile.
 #[cfg(windows)]
-const AMBIENT_WINDOWS_VARS: &[&str] =
-    &["SYSTEMROOT", "SystemRoot", "COMSPEC", "ComSpec", "PATHEXT"];
+const AMBIENT_WINDOWS_VARS: &[&str] = &[
+    "SystemRoot",
+    "ComSpec",
+    "PATHEXT",
+    "SystemDrive",
+    "windir",
+    "OS",
+    "PROCESSOR_ARCHITECTURE",
+    "PSModulePath",
+];
 
 /// Toolchain cache locations contract commands may inherit from ambient
 /// (design decision 3 of the ticket): they speed up `cargo`/`npm` contract
@@ -61,6 +76,15 @@ fn managed_contract_keys() -> &'static [&'static str] {
         "HOME",
         "USERPROFILE",
         "TMPDIR",
+        "TEMP",
+        "TMP",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "SystemRoot",
+        "SYSTEMROOT",
+        "ComSpec",
+        "COMSPEC",
+        "PATHEXT",
         "TERM",
         "LANG",
         "LC_ALL",
@@ -76,14 +100,17 @@ fn managed_contract_keys() -> &'static [&'static str] {
 /// ambient — binaries must resolve), `HOME = base_home` (the scratch dir the
 /// session/command already gets, never the operator's real home),
 /// `TMPDIR = base_home/tmp`, the ambient locale vars when present, and on
-/// Windows the process-required `SYSTEMROOT`/`COMSPEC`/`PATHEXT` plus
-/// `USERPROFILE = base_home`. Then `extra` is applied verbatim, in order —
+/// Windows the process-required passthroughs ([`AMBIENT_WINDOWS_VARS`])
+/// plus `USERPROFILE = base_home`, `TEMP`/`TMP = base_home/tmp`, and
+/// `APPDATA`/`LOCALAPPDATA = base_home/AppData/{Roaming,Local}`. Then
+/// `extra` is applied verbatim, in order —
 /// that is where `KRANZ_BASE_SHA`, proxy wiring, git identity, and
 /// backend-specific auth go. NOTHING else crosses from ambient.
 ///
-/// Creates `base_home` and `base_home/tmp` best-effort (a child pointing at
-/// a nonexistent HOME/TMPDIR fails in opaque ways); a creation failure is
-/// not fatal to env construction — the child surfaces it on its own.
+/// Creates `base_home`, `base_home/tmp` (and on Windows the AppData dirs)
+/// best-effort (a child pointing at a nonexistent HOME/TMPDIR fails in
+/// opaque ways); a creation failure is not fatal to env construction — the
+/// child surfaces it on its own.
 pub fn sanitized_child_env(
     base_home: &Path,
     extra: &[(String, String)],
@@ -107,11 +134,34 @@ pub fn sanitized_child_env(
     #[cfg(windows)]
     {
         for key in AMBIENT_WINDOWS_VARS {
-            if let Some(value) = std::env::var_os(key) {
+            // Case-insensitive ambient lookup, canonical-cased emission:
+            // Windows env names are case-insensitive, but the child block is
+            // a Rust HashMap keyed case-SENSITIVELY — without this, ambient
+            // `SYSTEMROOT` + canonical `SystemRoot` produce duplicate-case
+            // entries and which one the child sees is undefined.
+            if let Some((_, value)) =
+                std::env::vars_os().find(|(k, _)| k.to_string_lossy().eq_ignore_ascii_case(key))
+            {
                 env.insert((*key).to_string(), value.to_string_lossy().into_owned());
             }
         }
+        // Profile/temp locations redirect to scratch (like HOME), never the
+        // operator's real profile. `cmd` stages pipe temp files in %TEMP%
+        // and PowerShell/CLR consult APPDATA/LOCALAPPDATA on startup —
+        // leaving them unset hangs children in opaque ways (89f05a1 CI).
+        let tmp = base_home.join("tmp");
+        let appdata_roaming = base_home.join("AppData").join("Roaming");
+        let appdata_local = base_home.join("AppData").join("Local");
+        let _ = std::fs::create_dir_all(&appdata_roaming);
+        let _ = std::fs::create_dir_all(&appdata_local);
         env.insert("USERPROFILE".to_string(), base_home.display().to_string());
+        env.insert("TEMP".to_string(), tmp.display().to_string());
+        env.insert("TMP".to_string(), tmp.display().to_string());
+        env.insert("APPDATA".to_string(), appdata_roaming.display().to_string());
+        env.insert(
+            "LOCALAPPDATA".to_string(),
+            appdata_local.display().to_string(),
+        );
     }
     for (key, value) in extra {
         env.insert(key.clone(), value.clone());
@@ -379,6 +429,59 @@ mod tests {
                 "unexpected key in child env: {key}"
             );
         }
+    }
+
+    /// Windows shape: temp/profile dirs redirect into scratch (never the
+    /// operator's), machine passthroughs cross case-deduped, and ambient
+    /// APPDATA/LOCALAPPDATA/TEMP/TMP do NOT pass through.
+    #[cfg(windows)]
+    #[test]
+    fn sanitized_child_env_windows_redirects_profile_and_temp_to_scratch() {
+        let _poison = EnvTestGuard::engage(&[
+            ("TEMP", r"C:\operator-temp"),
+            ("TMP", r"C:\operator-tmp"),
+            ("APPDATA", r"C:\operator-roaming"),
+            ("LOCALAPPDATA", r"C:\operator-local"),
+        ]);
+        let home = tempfile::tempdir().unwrap();
+
+        let env = sanitized_child_env(home.path(), &extra(&[]));
+
+        let tmp = home.path().join("tmp").display().to_string();
+        assert_eq!(env.get("TEMP").map(String::as_str), Some(tmp.as_str()));
+        assert_eq!(env.get("TMP").map(String::as_str), Some(tmp.as_str()));
+        assert_eq!(
+            env.get("USERPROFILE").map(String::as_str),
+            Some(home.path().to_string_lossy().as_ref())
+        );
+        assert!(
+            env.get("APPDATA")
+                .is_some_and(|v| v.starts_with(&home.path().display().to_string())),
+            "APPDATA must redirect under scratch, not the operator profile"
+        );
+        assert!(
+            env.get("LOCALAPPDATA")
+                .is_some_and(|v| v.starts_with(&home.path().display().to_string())),
+            "LOCALAPPDATA must redirect under scratch"
+        );
+        // Machine passthroughs cross under canonical casing only (the
+        // duplicate-case check below is the strict property).
+        if env.keys().any(|k| k.eq_ignore_ascii_case("systemroot")) {
+            assert!(
+                env.contains_key("SystemRoot"),
+                "SystemRoot must be emitted under canonical casing"
+            );
+        }
+        // No duplicate-case keys in the emitted block.
+        let mut lowered: Vec<String> = env.keys().map(|k| k.to_ascii_lowercase()).collect();
+        lowered.sort();
+        lowered.dedup();
+        assert_eq!(
+            lowered.len(),
+            env.len(),
+            "child env block carries duplicate-case entries: {:?}",
+            env.keys().collect::<Vec<_>>()
+        );
     }
 
     /// Backend auth (design decision 2): exactly the one named key the
