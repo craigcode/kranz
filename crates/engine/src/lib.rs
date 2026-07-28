@@ -33,6 +33,7 @@ pub mod egress_proxy;
 pub mod event_log;
 pub mod findings;
 pub mod git_ops;
+pub mod hooks;
 pub mod judgement;
 pub mod knowledge;
 pub mod lessons;

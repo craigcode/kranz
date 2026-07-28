@@ -37,6 +37,23 @@ impl ApiError {
         }
     }
 
+    /// Authentication failed or was not presented (the webhook HMAC).
+    pub fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: message.into(),
+        }
+    }
+
+    /// Authenticated or not, this route refuses the request (webhook for the
+    /// wrong repository, or hooks not configured — refused closed).
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: message.into(),
+        }
+    }
+
     pub fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,

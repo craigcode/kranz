@@ -80,6 +80,10 @@ pub struct Ticket {
     /// Backlog task class (`task-class: execution-class` frontmatter), used
     /// to route the executor to a tier via [`crate::config::task_class_to_tier`].
     pub task_class: Option<String>,
+    /// External trigger provenance (`trigger: ci-failure|pr-comment`
+    /// frontmatter) — set on webhook-drafted tickets (design D-F,
+    /// [`crate::hooks`]); `None` on human-authored tickets.
+    pub trigger: Option<String>,
     /// The full markdown body (everything after the frontmatter block).
     pub raw_body: String,
 }
@@ -233,6 +237,7 @@ impl Ticket {
         let mut max_budget_usd: Option<f64> = None;
         let mut blocked_by: Vec<String> = Vec::new();
         let mut task_class: Option<String> = None;
+        let mut trigger: Option<String> = None;
 
         for (key, value) in front {
             match key.as_str() {
@@ -251,6 +256,12 @@ impl Ticket {
                 "task-class" | "taskclass" => {
                     let v = value.scalar().trim().to_string();
                     task_class = if v.is_empty() { None } else { Some(v) };
+                }
+                // External trigger provenance (design D-F); additive — older
+                // readers ignore it via the unknown-key arm below.
+                "trigger" => {
+                    let v = value.scalar().trim().to_string();
+                    trigger = if v.is_empty() { None } else { Some(v) };
                 }
                 "schedule" => schedule = Schedule::parse(&value.scalar()),
                 "maxbudgetusd" | "max-budget-usd" => {
@@ -289,6 +300,7 @@ impl Ticket {
             acceptance_hints: sections.acceptance_hints,
             blocked_by,
             task_class,
+            trigger,
             raw_body: body,
         })
     }

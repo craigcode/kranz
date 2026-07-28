@@ -57,14 +57,32 @@ filesystem error.
 
 | Method/Path | Behavior |
 |---|---|
-| `GET /api/tickets` | `[{ "slug", "priority", "state", "title", "blockedBy" }]` — one summary row per parseable ticket under `.kranz/tickets/`, matching what `kranz ticket list` renders |
-| `GET /api/tickets/:slug` | the full parsed ticket — `slug`, `title`, `priority`, `schedule`, `blockedBy`, `goal`, `context`, `scopingAnswers`, `acceptanceHints`, `state` — plus `needsContext`, the orchestrator's clarifying questions if a prior draft came back NEEDS-CONTEXT, and `wrongPlan`, the planner's escalation reason if it came back WRONG-PLAN (`null` otherwise). `400` for an invalid slug, `404` when no ticket file exists for it |
+| `GET /api/tickets` | `[{ "slug", "priority", "state", "title", "blockedBy" }]` — one summary row per parseable ticket under `.kranz/tickets/`, matching what `kranz ticket list` renders; rows also carry the additive `trigger` field (webhook provenance, `null` for human-authored tickets) |
+| `GET /api/tickets/:slug` | the full parsed ticket — `slug`, `title`, `priority`, `schedule`, `blockedBy`, `goal`, `context`, `scopingAnswers`, `acceptanceHints`, `trigger`, `state` — plus `needsContext`, the orchestrator's clarifying questions if a prior draft came back NEEDS-CONTEXT, and `wrongPlan`, the planner's escalation reason if it came back WRONG-PLAN (`null` otherwise). `400` for an invalid slug, `404` when no ticket file exists for it |
 | `POST /api/tickets/:slug/draft` | long-running: mirrors `POST /api/missions/:id/start` by creating the planning mission synchronously (so a real mission id exists for the response) and spawning the draft turns as a background task. `202 {"missionId":"m-…"}`. Draft progress is observable over that mission's existing `GET /api/missions/:id/ws` WebSocket feed — **not** an SSE feed, since this server has no SSE transport. The terminal outcome (drafted into Review vs NEEDS-CONTEXT) shows up back on `GET /api/tickets/:slug`. `400` for an invalid slug, `404` for an unknown ticket — both checked synchronously before anything spawns |
 | `POST /api/tickets/:slug/approve` | body `{"force": bool}` (default `false`) → `200 {"approved":true,"missionId":"m-…"}`. Runs the same gate as `kranz ticket approve`: `409` when the ticket is not in REVIEW; `409` naming the unsatisfied blocker(s) when a `blocked-by` entry has not reached mission-Complete and `force` is false; `409` with the cycle path (e.g. `a -> b -> a`) when a `blocked-by` cycle is reachable from `:slug` — a cycle is never overridable by `force`. `400` for an invalid slug |
 
 See docs/tickets.md for the `blocked-by` dependency primitive itself
 (satisfaction semantics, cycle detection, the CLI's `--force`, and the
 work-time skip-with-warning) — this section covers only the REST shapes.
+
+## Webhooks (external triggers; design D-F)
+
+`POST /api/hooks/github` accepts GitHub webhooks for CI failures and PR
+review comments and drafts ONE audited ticket per trigger through the normal
+ticket pipeline — never a prompt loop, never a run, never a land (ticket
+`trigger-ci-pr-fix-mission`). The route authenticates with the per-repo
+`hooks.secret` HMAC (`X-Hub-Signature-256`: hex HMAC-SHA256 of the raw body),
+NOT the mutation token, and refuses CLOSED when no secret is configured.
+Config (additive, `.kranz/config.json` — gitignored, so the secret is never
+committed): `hooks.secret`, `hooks.fixLabel` (default `kranz:fix`),
+`hooks.queueLabel` (default `kranz:fix-and-queue`). In a multi-repository
+serve the repo-scoped twin `/api/repos/:repoId/hooks/github` verifies against
+THAT repository's config and identity.
+
+| Method/Path | Behavior |
+|---|---|
+| `POST /api/hooks/github` | Headers `X-GitHub-Event`, `X-Hub-Signature-256`, JSON body. `401` on a bad/missing signature; `403` when no `hooks.secret` is configured (refused closed), when the payload's `repository.full_name` does not match the served repo's origin identity, or when that identity cannot be established (no origin / non-github.com URL); `202 {"outcome":"ignored"}` for non-allowlisted event kinds (anything but `workflow_run`, `issue_comment`, `pull_request_review_comment`) and for allowlisted events matching no trigger rule (non-`completed`/`failure` run, run off the default and `kranz/mission-*` branches, comment without the trigger label, comment not on a PR, non-`created` action); `202 {"outcome":"duplicate","ticketSlug"}` when a ticket already exists for that workflow run id / PR number (dedup — never a second ticket); `202 {"outcome":"drafted","ticketSlug","missionId","queued"}` otherwise. The ticket (`trigger-ci-<run id>` / `trigger-pr-<n>`) carries `trigger: ci-failure\|pr-comment` frontmatter and a provenance block in its Context (source url, actor, consent state, bounded + scrubbed excerpt), then goes through the exact `POST /api/tickets/:slug/draft` pipeline. `queued` is true ONLY when the comment carried the queue label — operator pre-consent to auto-queue on an approved plan; plan approval itself is never skipped, and a queued mission still starts only via `kranz work` / queue drain. Every accepted/ignored/refused request emits one decision log line (source, actor, event kind, consent state, outcome); the secret, the signature, and the raw body are never logged |
 
 ## Mission lifecycle (server-hosted engine; M2.5)
 
@@ -98,6 +116,9 @@ observable/resumable from anywhere.
 
 Every `POST /api/...` requires the per-serve session token via the
 `x-kranz-token` header (WS and GETs stay tokenless — read-only observation).
+ONE exemption: `POST /api/hooks/github` (and its repo-scoped twin) — GitHub
+cannot present the token, so that route authenticates with its own per-repo
+HMAC signature and refuses closed when unconfigured (see §Webhooks).
 The token is generated at serve start (or passed in by the embedding Tauri
 shell), printed to the operator, and appended by `--open` as `#token=<t>` in
 the launched URL; the dashboard stores it (sessionStorage) and shows a

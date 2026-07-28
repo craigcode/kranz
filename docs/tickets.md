@@ -38,7 +38,10 @@ state file, not the markdown — editing a ticket never corrupts its state.
 Slugs are validated (ascii alphanumerics, `-`, `_`, `.`; no traversal).
 
 A ticket can also declare `blocked-by: [slug, ...]` in its frontmatter to
-depend on other tickets — see §Dependencies (`blocked-by`) below.
+depend on other tickets — see §Dependencies (`blocked-by`) below. Tickets
+drafted by the GitHub webhook trigger (`POST /api/hooks/github`, see
+docs/protocol.md §Webhooks) additionally carry `trigger: ci-failure|pr-comment`
+provenance; human-authored tickets omit it.
 
 ## Listing the backlog
 

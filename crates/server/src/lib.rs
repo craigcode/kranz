@@ -14,6 +14,7 @@
 //! engine writing `events.jsonl`. See [`host`].
 
 mod error;
+mod hooks;
 mod host;
 mod multi;
 mod rest;
@@ -448,6 +449,7 @@ fn repo_api_routes() -> Router<Arc<ServerState>> {
         .route("/tickets/{slug}/approve", post(tickets::approve_ticket))
         .route("/queue", get(host::queue_state_route))
         .route("/queue/drain", post(host::drain_queue_route))
+        .route("/hooks/github", post(hooks::github_hook))
 }
 
 fn embedded_static_response(uri: Uri, files: &'static [EmbeddedFile]) -> Response {
@@ -789,9 +791,14 @@ async fn require_mutation_token(
     if let Some(expected) = gate.authority.as_deref() {
         let path = request.uri().path();
         let is_health = path == "/api/health";
+        // The GitHub webhook route authenticates with its own per-repo HMAC
+        // (`X-Hub-Signature-256` against `hooks.secret`) and refuses closed
+        // when unconfigured — GitHub cannot present the mutation token.
+        let is_github_hook = path.ends_with("/hooks/github");
         let is_read = request.method() == Method::GET || request.method() == Method::HEAD;
         let needs_token = path.starts_with("/api/")
             && !is_health
+            && !is_github_hook
             && (request.method() == Method::POST || (gate.require_read_token && is_read));
         if needs_token {
             let header_ok = request
