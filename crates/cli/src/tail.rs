@@ -381,10 +381,16 @@ impl EventRenderer {
                     None => format!("readiness {outcome}"),
                 },
             ),
-            EventKind::WorkspaceTeardown { mode } => (
+            EventKind::WorkspaceTeardown { mode, state } => (
                 "workspace".to_string(),
                 ansi::DIM,
-                format!("teardown ({mode})"),
+                // The outcome rides along when present (ticket
+                // workspace-idle-hibernate); old stateless lines render as
+                // before.
+                match state {
+                    Some(state) => format!("teardown ({mode}): {state}"),
+                    None => format!("teardown ({mode})"),
+                },
             ),
             EventKind::WorkspaceProviderPinned {
                 provider,

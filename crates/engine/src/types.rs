@@ -380,6 +380,22 @@ pub struct WorkspacePin {
     pub version: String,
 }
 
+/// The last known workspace lifecycle transition (ticket
+/// `workspace-idle-hibernate`), folded from `workspace.teardown` events
+/// carrying a `state`: `"kept"` (mode keep), `"stopped"` (hibernate),
+/// `"destroyed"` (destroy), or `"failed"` (the provider call failed — the
+/// workspace may still be live). `state` is free-form on purpose so a
+/// future substrate-reported transition (e.g. an idle hibernate the
+/// substrate owns) folds into the same field without a schema change.
+/// `ts` is the transition event's own timestamp — the workspace-hours
+/// anchor for cost tooling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct WorkspaceLifecycle {
+    pub state: String,
+    pub ts: DateTime<Utc>,
+}
+
 /// A preview as provisioned by a remote workspace provider (ticket
 /// `workspace-remote-coder-provider`), recorded on `workspace.provisioned`:
 /// the URL the SUBSTRATE reported for a contract `previews[]` entry
@@ -447,6 +463,12 @@ pub struct MissionState {
     /// the pin event (missions approved before pinning existed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_pin: Option<WorkspacePin>,
+    /// The last known workspace lifecycle transition (state + ts), folded
+    /// from `workspace.teardown` events carrying a `state` (ticket
+    /// `workspace-idle-hibernate`). `None` in logs predating the state
+    /// field — v1 keep-only teardowns carried no outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_lifecycle: Option<WorkspaceLifecycle>,
 }
 
 impl MissionState {
@@ -686,6 +708,16 @@ pub struct WorkspaceConfig {
     /// to local.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<RemoteWorkspaceConfig>,
+    /// The teardown mode the engine drives when a run reaches a TERMINAL
+    /// state — Complete/Failed/Abandoned (ticket
+    /// `workspace-idle-hibernate`): `"keep"` (the default) | `"hibernate"`
+    /// | `"destroy"`. A non-terminal run end (Blocked/Paused) always Keeps
+    /// so the mission can resume; local-worktree is always Keep regardless
+    /// (its filesystem lifecycle belongs to the mission-branch/merge
+    /// machinery). Unknown modes fail closed at run start with this key
+    /// named — never a silent default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub teardown_mode: Option<String>,
 }
 
 /// Remote substrate (Coder-shaped) connection config (ticket
@@ -709,6 +741,14 @@ pub struct RemoteWorkspaceConfig {
     /// (e.g. `"CODER_SESSION_TOKEN"`) — the name only, never the value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_env: Option<String>,
+    /// Substrate-side idle policy VALUE (ticket `workspace-idle-hibernate`):
+    /// hours of inactivity after which the SUBSTRATE hibernates the
+    /// workspace. kranz never schedules: the value is passed through to the
+    /// substrate at provision (when the substrate accepts an idle policy)
+    /// and recorded in `workspace.provisioned`'s detail; the substrate owns
+    /// the policy's execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_after_hours: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

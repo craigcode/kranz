@@ -663,7 +663,7 @@ async fn workspace_provider_provisions_the_integration_worktree() {
     // mission machinery (merge semantics unchanged).
     assert!(events.iter().any(|e| matches!(
         &e.kind,
-        EventKind::WorkspaceTeardown { mode } if mode == "keep"
+        EventKind::WorkspaceTeardown { mode, .. } if mode == "keep"
     )));
 
     // The primary checkout stayed on main, byte-untouched, throughout.
@@ -685,7 +685,8 @@ async fn workspace_provider_provisions_the_integration_worktree() {
 /// provider "container" plus the compose project in the additive `detail`,
 /// `workspace.readiness` reports ready after bootstrap/readiness pass
 /// INSIDE the container network, and `workspace.teardown` records keep
-/// (v1's run loop never destroys — the test cleans the project up itself).
+/// (no teardownMode configured — the run loop's default; the test cleans
+/// the project up itself).
 /// Runtime-gated: skips on hosts with no container runtime (the macOS dev
 /// host); CI ubuntu-latest has docker.
 #[tokio::test(flavor = "multi_thread")]
@@ -783,7 +784,7 @@ async fn container_workspace_events_land_for_a_full_mission_run() {
     );
     assert!(events.iter().any(|e| matches!(
         &e.kind,
-        EventKind::WorkspaceTeardown { mode } if mode == "keep"
+        EventKind::WorkspaceTeardown { mode, .. } if mode == "keep"
     )));
 
     // The compose file is mission-owned runtime data (gitignored), never in
@@ -796,8 +797,8 @@ async fn container_workspace_events_land_for_a_full_mission_run() {
     );
     assert_eq!(raw_git(&root, &["branch", "--show-current"]).trim(), "main");
 
-    // v1's run loop records Keep (previews stay live), so the test destroys
-    // the project itself — the CI runner must not leak it.
+    // The default teardown mode records Keep (previews stay live), so the
+    // test destroys the project itself — the CI runner must not leak it.
     let out = Command::new(runtime.binary())
         .args([
             "compose",
@@ -815,6 +816,173 @@ async fn container_workspace_events_land_for_a_full_mission_run() {
         "test cleanup must destroy the compose project: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// Terminal teardown on the container provider (ticket
+/// workspace-idle-hibernate): with `workspace.teardownMode: "hibernate"` a
+/// COMPLETE run stops the compose project (`compose stop` — containers
+/// stopped, the project kept) recording mode `hibernate` + state
+/// `stopped`; with `"destroy"` the project is removed (`compose down -v`)
+/// recording `destroyed`. Runtime-gated like the provision test above
+/// (skips without a runtime; CI ubuntu-latest has docker).
+#[tokio::test(flavor = "multi_thread")]
+async fn container_workspace_terminal_teardown_hibernates_and_destroys() {
+    let Some(runtime) = kranz_engine::sandbox_container::detect() else {
+        eprintln!(
+            "no container runtime (docker/podman/nerdctl/container) on PATH; \
+             skipping container terminal-teardown test"
+        );
+        return;
+    };
+    let compose_ok = Command::new(runtime.binary())
+        .args(["compose", "version"])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    if !compose_ok {
+        eprintln!("`{} compose` unavailable; skipping", runtime.binary());
+        return;
+    }
+
+    for (teardown_mode, expected_state) in [("hibernate", "stopped"), ("destroy", "destroyed")] {
+        let Some((_dir, root)) = mission_init_repo() else {
+            return;
+        };
+        std::fs::create_dir_all(root.join(".kranz")).unwrap();
+        std::fs::write(
+            root.join(".kranz").join("workspace.json"),
+            r#"{
+                "schemaVersion": 1,
+                "bootstrap": ["echo boot > .boot-marker"],
+                "services": [
+                    { "name": "web", "start": "sleep infinity", "healthCheck": "true", "port": { "policy": "dynamic" } }
+                ],
+                "readiness": ["test -f .boot-marker"]
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(root.join(".gitignore"), ".boot-marker\n").unwrap();
+        raw_git(&root, &["add", ".kranz/workspace.json", ".gitignore"]);
+        raw_git(&root, &["commit", "-m", "workspace contract"]);
+
+        let backend = Arc::new(MockBackend::with_scripts(vec![
+            worker_pass(),
+            orch_script_complete_no_lesson(),
+        ]));
+        let backend_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend) as Arc<dyn AgentBackend>;
+        let cfg = MissionConfig {
+            workspace: kranz_engine::types::WorkspaceConfig {
+                provider: Some("container".to_string()),
+                teardown_mode: Some(teardown_mode.to_string()),
+                ..Default::default()
+            },
+            ..worktree_cfg()
+        };
+        let mut engine =
+            MissionEngine::create(backend_dyn, &root, GOAL, cfg).expect("create engine");
+        engine.seed_worker_auth_verdict_for_test(AuthVerdict::Inconclusive);
+        engine.approve_plan(one_feature_plan()).unwrap();
+        let paths = engine.paths().clone();
+        let mission_id = engine.state().mission.id.clone();
+        let project = format!("kranz-ws-{mission_id}");
+
+        let status = timeout(TokioDuration::from_secs(300), engine.run())
+            .await
+            .expect("run must not hang")
+            .unwrap();
+        assert_eq!(status, MissionStatus::Complete, "mode {teardown_mode}");
+        let lifecycle = engine
+            .state()
+            .workspace_lifecycle
+            .clone()
+            .expect("the teardown outcome folded into state");
+        assert_eq!(lifecycle.state, expected_state, "mode {teardown_mode}");
+        drop(engine);
+
+        let events = EventLog::read_events(&paths.events_file()).expect("read events");
+        let teardown = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::WorkspaceTeardown { mode, state } => Some((mode.clone(), state.clone())),
+                _ => None,
+            })
+            .expect("workspace.teardown on the log");
+        assert_eq!(teardown.0, teardown_mode, "the ACTUAL mode driven");
+        assert_eq!(teardown.1.as_deref(), Some(expected_state));
+
+        let compose_file = paths.mission_dir().join("workspace").join("compose.json");
+        if teardown_mode == "hibernate" {
+            // The project still EXISTS but its containers are stopped.
+            let ps = Command::new(runtime.binary())
+                .args([
+                    "compose",
+                    "-p",
+                    &project,
+                    "-f",
+                    &compose_file.display().to_string(),
+                    "ps",
+                    "-a",
+                    "-q",
+                ])
+                .output()
+                .expect("spawn compose ps");
+            let ids = String::from_utf8_lossy(&ps.stdout).into_owned();
+            let ids: Vec<&str> = ids.lines().filter(|l| !l.trim().is_empty()).collect();
+            assert!(
+                !ids.is_empty(),
+                "hibernate keeps the project (containers stopped, not removed): {}",
+                String::from_utf8_lossy(&ps.stderr)
+            );
+            let inspect = Command::new(runtime.binary())
+                .args(["inspect", "--format", "{{.State.Running}}", ids[0]])
+                .output()
+                .expect("spawn inspect");
+            assert_eq!(
+                String::from_utf8_lossy(&inspect.stdout).trim(),
+                "false",
+                "the workspace container is stopped: {}",
+                String::from_utf8_lossy(&inspect.stderr)
+            );
+            // Cleanup: the CI runner must not leak the stopped project.
+            let out = Command::new(runtime.binary())
+                .args([
+                    "compose",
+                    "-p",
+                    &project,
+                    "-f",
+                    &compose_file.display().to_string(),
+                    "down",
+                    "-v",
+                ])
+                .output()
+                .expect("spawn compose down");
+            assert!(
+                out.status.success(),
+                "test cleanup must destroy the compose project: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        } else {
+            // Destroy: the project is gone (no containers at all).
+            let ps = Command::new(runtime.binary())
+                .args([
+                    "compose",
+                    "-p",
+                    &project,
+                    "-f",
+                    &compose_file.display().to_string(),
+                    "ps",
+                    "-a",
+                    "-q",
+                ])
+                .output()
+                .expect("spawn compose ps");
+            assert!(
+                ps.status.success() && String::from_utf8_lossy(&ps.stdout).trim().is_empty(),
+                "destroy removes the project {project}: {}",
+                String::from_utf8_lossy(&ps.stderr)
+            );
+        }
+    }
 }
 
 // -----------------------------------------------------------------------

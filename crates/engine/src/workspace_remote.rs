@@ -14,7 +14,7 @@
 //! minimal Coder-shaped surface:
 //!
 //! ```text
-//! create_workspace { template, name, env_names } -> { id, urls, takeover }
+//! create_workspace { template, name, env_names, idle_after_hours? } -> { id, urls, takeover }
 //! workspace_status(id) -> ready | pending | failed
 //! delete_workspace(id)        // TeardownMode::Destroy
 //! stop_workspace(id)          // TeardownMode::Hibernate
@@ -56,7 +56,13 @@
 //! deliberately does NOT carry the workspace-gate prefix, so a later gate
 //! pass does not auto-lift it — the operator unblocks once the substrate
 //! recovers. Config/credential failures are `Err` at provision (fail closed
-//! before spend, owner: operator).
+//! before spend, owner: operator). Teardown: the engine drives the
+//! configured `workspace.teardownMode` at terminal states (ticket
+//! `workspace-idle-hibernate`) — hibernate → `stop_workspace`, destroy →
+//! `delete_workspace`, keep → no call. The optional
+//! `workspace.remote.idleAfterHours` VALUE is passed through at create and
+//! recorded in the provisioned detail; the SUBSTRATE owns the idle policy's
+//! scheduling/execution (kranz never schedules VMs).
 //!
 //! v1 honesty notes (deliberate):
 //! - **Readiness is substrate-reported only.** Contract bootstrap/readiness
@@ -129,7 +135,7 @@ pub(crate) fn provider_block_reason(detail: &str) -> String {
 /// What one provision asks the substrate to create. `env_names` are secret
 /// NAMES (the contract's validated `secrets[]`) — values never cross this
 /// boundary.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SubstrateWorkspaceSpec {
     /// The pinned template/image id (from `workspace.remote.template`).
     pub template: String,
@@ -137,6 +143,13 @@ pub struct SubstrateWorkspaceSpec {
     pub name: String,
     /// Secret NAMES the substrate injects from its own secret store.
     pub env_names: Vec<String>,
+    /// Substrate-side idle policy VALUE (`workspace.remote.idleAfterHours`,
+    /// ticket `workspace-idle-hibernate`): hours of inactivity after which
+    /// the SUBSTRATE hibernates the workspace. Passed through verbatim when
+    /// the substrate accepts an idle policy — the substrate owns
+    /// scheduling/execution; kranz never schedules. `None` = no idle
+    /// policy requested.
+    pub idle_after_hours: Option<f64>,
 }
 
 /// A URL the substrate reported for one workspace endpoint.
@@ -186,12 +199,17 @@ pub trait SubstrateClient: Send + Sync {
 /// The validated, complete remote config — every field required. Produced
 /// ONLY by [`RemoteConfig::require`], so a `RemoteWorkspaceProvider` can
 /// never exist with partial remote config.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RemoteConfig {
     pub base_url: String,
     pub template: String,
     /// NAME of the env var holding the substrate token — never the value.
     pub token_env: String,
+    /// Substrate-side idle policy VALUE (`workspace.remote.idleAfterHours`,
+    /// ticket `workspace-idle-hibernate`) — passed through to the substrate
+    /// at provision when set; the SUBSTRATE owns scheduling/execution of the
+    /// policy (kranz never schedules VMs).
+    pub idle_after_hours: Option<f64>,
 }
 
 impl RemoteConfig {
@@ -221,6 +239,9 @@ impl RemoteConfig {
                 .token_env
                 .clone()
                 .ok_or_else(|| missing("workspace.remote.tokenEnv"))?,
+            // Optional — the only non-required remote key (absent = no idle
+            // policy passed to the substrate).
+            idle_after_hours: config.idle_after_hours,
         })
     }
 }
@@ -410,18 +431,29 @@ fn map_previews(previews: &[PreviewSpec], urls: &[SubstrateUrl]) -> Vec<Provisio
 }
 
 /// The `workspace.provisioned` detail string: names the substrate workspace
-/// and WHICH secret names were injected (never values). Empty id = create
-/// failed before the substrate assigned one.
-fn provision_detail(name: &str, id: &str, env_names: &[String]) -> String {
+/// and WHICH secret names were injected (never values), plus the configured
+/// substrate-owned idle policy when one was passed through (ticket
+/// `workspace-idle-hibernate` — recorded, never scheduled by kranz). Empty
+/// id = create failed before the substrate assigned one.
+fn provision_detail(
+    name: &str,
+    id: &str,
+    env_names: &[String],
+    idle_after_hours: Option<f64>,
+) -> String {
     let injected = if env_names.is_empty() {
         "none".to_string()
     } else {
         env_names.join(",")
     };
+    let idle = match idle_after_hours {
+        Some(hours) => format!("; idle policy: hibernate after {hours}h (substrate-owned)"),
+        None => String::new(),
+    };
     if id.is_empty() {
-        format!("substrate workspace {name}: create failed (injected env names: {injected})")
+        format!("substrate workspace {name}: create failed (injected env names: {injected}){idle}")
     } else {
-        format!("substrate workspace {name} (id {id}); injected env names: {injected}")
+        format!("substrate workspace {name} (id {id}); injected env names: {injected}{idle}")
     }
 }
 
@@ -469,6 +501,7 @@ impl WorkspaceProvider for RemoteWorkspaceProvider {
                 template: self.config.template.clone(),
                 name: name.clone(),
                 env_names: env_names.clone(),
+                idle_after_hours: self.config.idle_after_hours,
             })
             .await
         {
@@ -491,7 +524,12 @@ impl WorkspaceProvider for RemoteWorkspaceProvider {
             env,
             previews: preview_placeholders(&contract.previews, &urls),
             contract: Some(contract.clone()),
-            detail: Some(provision_detail(&name, &id, &env_names)),
+            detail: Some(provision_detail(
+                &name,
+                &id,
+                &env_names,
+                self.config.idle_after_hours,
+            )),
             container: None,
             remote: Some(RemoteWorkspace {
                 name,
@@ -584,7 +622,10 @@ impl WorkspaceProvider for RemoteWorkspaceProvider {
 ///
 /// - `create_workspace` → `POST {base}/api/v2/users/me/workspaces` with body
 ///   `{"template_id", "name", "env_names"}` (names only — the substrate
-///   injects the named secrets from its own store). Response: `{"id",
+///   injects the named secrets from its own store), plus `"idle_after_hours"`
+///   when `workspace.remote.idleAfterHours` is configured (the substrate
+///   owns the idle policy; a substrate without support ignores the key).
+///   Response: `{"id",
 ///   "urls"?, "takeover"?}` — `urls`/`takeover` optional so a stock Coder
 ///   create response (which carries the id but not flattened app URLs)
 ///   degrades honestly to "no previews reported."
@@ -715,17 +756,22 @@ fn parse_status(value: &serde_json::Value) -> SubstrateStatus {
 impl SubstrateClient for CoderHttpClient {
     async fn create_workspace(&self, spec: &SubstrateWorkspaceSpec) -> Result<SubstrateWorkspace> {
         let url = format!("{}/api/v2/users/me/workspaces", self.base_url);
+        let mut body = serde_json::json!({
+            "template_id": spec.template,
+            "name": spec.name,
+            // Secret NAMES only — the substrate injects values from
+            // its own store; values never cross this wire.
+            "env_names": spec.env_names,
+        });
+        if let Some(hours) = spec.idle_after_hours {
+            // The substrate-side idle policy VALUE (ticket
+            // workspace-idle-hibernate): passed through verbatim — the
+            // substrate owns scheduling/execution of the policy (a
+            // substrate without idle-policy support ignores the key).
+            body["idle_after_hours"] = serde_json::json!(hours);
+        }
         let response = self
-            .send(
-                self.client.post(&url).json(&serde_json::json!({
-                    "template_id": spec.template,
-                    "name": spec.name,
-                    // Secret NAMES only — the substrate injects values from
-                    // its own store; values never cross this wire.
-                    "env_names": spec.env_names,
-                })),
-                "create_workspace",
-            )
+            .send(self.client.post(&url).json(&body), "create_workspace")
             .await?;
         let value = Self::json(response, "create_workspace").await?;
         let id = value
@@ -784,6 +830,7 @@ mod tests {
             base_url: "https://coder.internal.example.com".to_string(),
             template: "tmpl-baked-ami".to_string(),
             token_env: "CODER_SESSION_TOKEN".to_string(),
+            idle_after_hours: None,
         }
     }
 
@@ -1199,6 +1246,57 @@ mod tests {
         );
     }
 
+    /// `workspace.remote.idleAfterHours` (ticket `workspace-idle-hibernate`):
+    /// the VALUE passes through require → provision → `create_workspace`
+    /// verbatim and is recorded in the provisioned detail as substrate-owned
+    /// policy — kranz records and passes through, never schedules.
+    #[tokio::test]
+    async fn idle_after_hours_passes_through_to_create_and_the_provisioned_detail() {
+        // require() carries the optional value through (the only
+        // non-required remote key); absent config leaves it None.
+        let validated = RemoteConfig::require(Some(&RemoteWorkspaceConfig {
+            base_url: Some("https://coder.internal.example.com".to_string()),
+            template: Some("tmpl-baked-ami".to_string()),
+            token_env: Some("CODER_SESSION_TOKEN".to_string()),
+            idle_after_hours: Some(24.0),
+        }))
+        .expect("complete remote config validates with an idle policy");
+        assert_eq!(validated.idle_after_hours, Some(24.0));
+        let without = RemoteConfig::require(Some(&RemoteWorkspaceConfig {
+            base_url: Some("https://coder.internal.example.com".to_string()),
+            template: Some("tmpl-baked-ami".to_string()),
+            token_env: Some("CODER_SESSION_TOKEN".to_string()),
+            idle_after_hours: None,
+        }))
+        .expect("complete remote config validates without an idle policy");
+        assert_eq!(without.idle_after_hours, None);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let client = FakeSubstrateClient::new(vec![SubstrateStatus::Ready]);
+        let provider = RemoteWorkspaceProvider::with_client(
+            validated,
+            Arc::clone(&client) as Arc<dyn SubstrateClient>,
+        );
+        let handle = provisioned(&provider, dir.path()).await;
+
+        let created = client.created.lock().unwrap().clone();
+        assert_eq!(created.len(), 1);
+        assert_eq!(
+            created[0].idle_after_hours,
+            Some(24.0),
+            "the idle policy VALUE crosses to the substrate verbatim"
+        );
+        assert!(
+            handle
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("idle policy: hibernate after 24h (substrate-owned)"),
+            "the provisioned event records the substrate-owned policy: {:?}",
+            handle.detail
+        );
+    }
+
     /// No contract ⇒ nothing provisioned remotely (D-H): no substrate call,
     /// no credentials consulted, and readiness is trivially ready + silent.
     #[tokio::test]
@@ -1389,6 +1487,7 @@ mod tests {
             template: "tmpl-1".to_string(),
             name: "kranz-remote-m-1".to_string(),
             env_names: vec!["DATABASE_URL".to_string()],
+            idle_after_hours: None,
         };
         let ((), workspace) = tokio::join!(
             serve_once(listener, &create_body, Arc::clone(&recorded)),
@@ -1434,6 +1533,43 @@ mod tests {
             serde_json::json!(["DATABASE_URL"]),
             "secret NAMES on the wire — never values"
         );
+    }
+
+    /// The create body carries `idle_after_hours` only when configured
+    /// (ticket `workspace-idle-hibernate`) — additive on the wire, so a
+    /// substrate without idle-policy support is never sent a key it must
+    /// understand. The substrate owns the policy's execution.
+    #[tokio::test]
+    async fn coder_http_create_body_carries_idle_after_hours_only_when_configured() {
+        for (idle_after_hours, expected) in
+            [(Some(24.0), Some(serde_json::json!(24.0))), (None, None)]
+        {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind loopback");
+            let base_url = format!("http://{}", listener.local_addr().expect("addr"));
+            let recorded = Arc::new(Mutex::new(Vec::new()));
+            let client = CoderHttpClient::new(&base_url, "tok").expect("client");
+            let spec = SubstrateWorkspaceSpec {
+                template: "tmpl-1".to_string(),
+                name: "kranz-remote-m-1".to_string(),
+                env_names: vec![],
+                idle_after_hours,
+            };
+            let ((), created) = tokio::join!(
+                serve_once(listener, r#"{"id":"ws-1"}"#, Arc::clone(&recorded)),
+                tokio::time::timeout(Duration::from_secs(10), client.create_workspace(&spec))
+            );
+            created.expect("bounded").expect("create_workspace");
+            let request = recorded.lock().unwrap()[0].clone();
+            let body = request.split("\r\n\r\n").nth(1).expect("a JSON body");
+            let body: serde_json::Value = serde_json::from_str(body).expect("body is JSON");
+            assert_eq!(
+                body.get("idle_after_hours").cloned(),
+                expected,
+                "idle_after_hours rides the wire only when configured: {body}"
+            );
+        }
     }
 
     /// Status + transitions over the same loopback: nested `latest_build`

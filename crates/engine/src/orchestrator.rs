@@ -2035,9 +2035,13 @@ impl MissionEngine {
         // an unknown provider name fails closed here, at run start, rather
         // than silently falling back to local. Arc-shared onto the engine so
         // validation_round can drive the golden-data reset-between-rounds
-        // hook (design D-D) through the same seam.
+        // hook (design D-D) through the same seam. The additive
+        // workspace.teardownMode (ticket workspace-idle-hibernate) validates
+        // here too — an unknown mode fails closed before any spend, the same
+        // backstop as provider resolution.
         let provider: Arc<dyn crate::workspace_provider::WorkspaceProvider> =
             crate::workspace_provider::resolve(&self.state.config.workspace)?.into();
+        let teardown_mode = crate::workspace_provider::teardown_mode(&self.state.config.workspace)?;
         self.workspace_provider = Some(Arc::clone(&provider));
 
         // Branch isolation: workers commit on the mission branch, never on
@@ -2083,12 +2087,22 @@ impl MissionEngine {
 
         let result = self.run_loop(&*provider).await;
 
-        // Provider teardown seam (design D-E): v1 records `Keep` — the local
-        // provider never destroys, and the machinery below stays the owner of
-        // the actual worktree lifecycle. Skipped when the run errored:
-        // crash semantics, with the resume sweep owning leftovers.
+        // Provider teardown seam (design D-E, ticket
+        // workspace-idle-hibernate): a TERMINAL run (Complete/Failed/
+        // Abandoned) drives the configured workspace.teardownMode; a
+        // non-terminal end (Blocked/Paused) Keeps so the mission can
+        // resume; local-worktree is always Keep (effective_teardown_mode).
+        // The event records the actual mode + outcome. Skipped when the
+        // run errored: crash semantics, with the resume sweep owning
+        // leftovers.
         if result.is_ok() {
-            self.teardown_workspace(&*provider).await;
+            let run_terminal = matches!(&result, Ok(status) if is_terminal_status(*status));
+            let mode = crate::workspace_provider::effective_teardown_mode(
+                provider.kind(),
+                run_terminal,
+                teardown_mode,
+            );
+            self.teardown_workspace(&*provider, mode).await;
         }
 
         // Integration worktree lifetime: torn down once the mission reaches
@@ -5936,6 +5950,7 @@ pub(crate) mod tests {
             local_executor_milestones: 0,
             workspace_provider: None,
             workspace_pin: None,
+            workspace_lifecycle: None,
         };
 
         assert_eq!(

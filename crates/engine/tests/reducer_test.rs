@@ -2874,6 +2874,7 @@ fn workspace_provider_events_fold_into_state() {
         },
         EventKind::WorkspaceTeardown {
             mode: "keep".to_string(),
+            state: None,
         },
         // A resume re-provisions: the last provisioned provider kind wins.
         EventKind::WorkspaceProvisioned {
@@ -2922,6 +2923,104 @@ fn workspace_provider_state_field_backcompat_with_pre_seam_snapshots() {
     );
     let parsed: MissionState = serde_json::from_value(value).unwrap();
     assert_eq!(parsed.workspace_provider, None);
+}
+
+/// The additive `state` on `workspace.teardown` (ticket
+/// `workspace-idle-hibernate`) folds into `state.workspace_lifecycle` with
+/// the transition event's own ts; the latest state-carrying teardown wins,
+/// and teardown events WITHOUT an outcome (v1 keep-only logs) leave the
+/// field untouched.
+#[test]
+fn workspace_teardown_state_folds_lifecycle_with_event_ts() {
+    // Old logs (keep-only teardown, no outcome): lifecycle stays None…
+    let state = fold_kinds(vec![
+        created(),
+        EventKind::PlanApproved {
+            plan: plan(),
+            base_sha: None,
+        },
+        EventKind::WorkspaceTeardown {
+            mode: "keep".to_string(),
+            state: None,
+        },
+    ]);
+    assert_eq!(state.workspace_lifecycle, None);
+    // …and the folded snapshot carries no workspaceLifecycle key at all
+    // (additive serde-default; old snapshots keep deserializing to None).
+    let value = serde_json::to_value(&state).unwrap();
+    assert!(
+        !value
+            .as_object()
+            .unwrap()
+            .contains_key("workspaceLifecycle"),
+        "absent while None: {value}"
+    );
+    let parsed: MissionState = serde_json::from_value(value).unwrap();
+    assert_eq!(parsed.workspace_lifecycle, None);
+
+    // State-carrying teardowns fold (state + the event's own ts); a later
+    // stateless teardown does not erase the last known transition.
+    let events = vec![
+        ev(1, created()),
+        ev(
+            2,
+            EventKind::PlanApproved {
+                plan: plan(),
+                base_sha: None,
+            },
+        ),
+        ev(
+            3,
+            EventKind::WorkspaceTeardown {
+                mode: "hibernate".to_string(),
+                state: Some("stopped".to_string()),
+            },
+        ),
+        ev(
+            4,
+            EventKind::WorkspaceTeardown {
+                mode: "keep".to_string(),
+                state: None,
+            },
+        ),
+    ];
+    let state = fold(&events).unwrap();
+    assert_eq!(
+        state.workspace_lifecycle,
+        Some(WorkspaceLifecycle {
+            state: "stopped".to_string(),
+            ts: events[2].ts,
+        }),
+        "the lifecycle carries the transition event's ts (the workspace-hours anchor)"
+    );
+
+    // The latest state-carrying transition wins (append-only order) — a
+    // resume's teardown supersedes the earlier one.
+    let events = vec![
+        ev(1, created()),
+        ev(
+            2,
+            EventKind::WorkspaceTeardown {
+                mode: "hibernate".to_string(),
+                state: Some("stopped".to_string()),
+            },
+        ),
+        ev(
+            3,
+            EventKind::WorkspaceTeardown {
+                mode: "destroy".to_string(),
+                state: Some("destroyed".to_string()),
+            },
+        ),
+    ];
+    let state = fold(&events).unwrap();
+    assert_eq!(
+        state.workspace_lifecycle,
+        Some(WorkspaceLifecycle {
+            state: "destroyed".to_string(),
+            ts: events[2].ts,
+        })
+    );
 }
 
 // ---------------------------------------------------------------------------

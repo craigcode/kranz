@@ -424,10 +424,23 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             state.workspace_provider = Some(provider.clone());
         }
 
-        EventKind::WorkspaceReadinessReport { .. } | EventKind::WorkspaceTeardown { .. } => {
-            // Audit-only artifacts (D-E): the readiness outcome and teardown
-            // mode live on the event trail; state shape intentionally does
-            // not grow beyond the provider kind above.
+        EventKind::WorkspaceReadinessReport { .. } => {
+            // Audit-only artifact (D-E): the readiness outcome lives on the
+            // event trail; state shape intentionally does not grow from it.
+        }
+
+        EventKind::WorkspaceTeardown { state: outcome, .. } => {
+            // The teardown outcome (ticket workspace-idle-hibernate) folds
+            // into the last-known workspace lifecycle — latest transition
+            // wins (append-only order), with the event's own ts as the
+            // workspace-hours anchor for cost tooling. Teardown events
+            // without an outcome (old keep-only logs) leave it untouched.
+            if let Some(outcome) = outcome {
+                state.workspace_lifecycle = Some(WorkspaceLifecycle {
+                    state: outcome.clone(),
+                    ts: event.ts,
+                });
+            }
         }
 
         EventKind::WorkspaceProviderPinned {
@@ -496,6 +509,7 @@ fn initial_state(event: &Event) -> Result<MissionState> {
         local_executor_milestones: 0,
         workspace_provider: None,
         workspace_pin: None,
+        workspace_lifecycle: None,
     })
 }
 

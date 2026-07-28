@@ -351,14 +351,26 @@ pub enum EventKind {
         detail: Option<String>,
     },
 
-    /// Workspace teardown recorded (D-E). v1 local-worktree only ever calls
-    /// `keep` — `hibernate`/`destroy` are accepted and recorded but no-ops
-    /// for the local provider; the integration worktree's filesystem
-    /// lifecycle stays with the existing mission-branch/merge machinery.
+    /// Workspace teardown recorded (D-E). The engine drives the configured
+    /// `workspace.teardownMode` when a run reaches a terminal state
+    /// (ticket `workspace-idle-hibernate`) and `keep` otherwise;
+    /// local-worktree is always `keep` — the integration worktree's
+    /// filesystem lifecycle stays with the existing mission-branch/merge
+    /// machinery.
     #[serde(rename = "workspace.teardown")]
     WorkspaceTeardown {
         #[serde(default)]
         mode: String,
+        /// Additive (ticket `workspace-idle-hibernate`): the teardown
+        /// OUTCOME — `"kept"` (mode keep), `"stopped"` (hibernate),
+        /// `"destroyed"` (destroy), `"failed"` (the provider call failed;
+        /// the run's outcome stands — see the accompanying
+        /// `orchestrator.decision`). Absent on old logs (v1 keep-only
+        /// teardowns recorded no outcome); folds into
+        /// [`crate::types::MissionState::workspace_lifecycle`] with the
+        /// event's own `ts` as the workspace-hours anchor.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<String>,
     },
 
     /// The effective workspace provider identity pinned at plan approval
@@ -487,6 +499,7 @@ mod tests {
 
         let teardown = EventKind::WorkspaceTeardown {
             mode: "keep".into(),
+            state: None,
         };
         let json = serde_json::to_value(&teardown).unwrap();
         assert_eq!(json["type"], "workspace.teardown");
@@ -669,6 +682,52 @@ mod tests {
         assert!(
             !preview.as_object().unwrap().contains_key("auth"),
             "auth absent from the wire when the substrate did not say: {preview}"
+        );
+    }
+
+    /// The additive `state` on `workspace.teardown` (ticket
+    /// `workspace-idle-hibernate`): the outcome round-trips, old log lines
+    /// without it fold to None, and None never hits the wire.
+    #[test]
+    fn workspace_teardown_state_is_additive_and_old_logs_still_fold() {
+        let stopped = EventKind::WorkspaceTeardown {
+            mode: "hibernate".into(),
+            state: Some("stopped".into()),
+        };
+        let json = serde_json::to_value(&stopped).unwrap();
+        assert_eq!(json["payload"]["mode"], "hibernate");
+        assert_eq!(json["payload"]["state"], "stopped");
+        let back: EventKind = serde_json::from_value(json).unwrap();
+        match back {
+            EventKind::WorkspaceTeardown { mode, state } => {
+                assert_eq!(mode, "hibernate");
+                assert_eq!(state.as_deref(), Some("stopped"));
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // Old log line (v1 keep-only, no outcome): folds with state = None.
+        let old: EventKind =
+            serde_json::from_str(r#"{"type":"workspace.teardown","payload":{"mode":"keep"}}"#)
+                .unwrap();
+        match old {
+            EventKind::WorkspaceTeardown { mode, state } => {
+                assert_eq!(mode, "keep");
+                assert_eq!(state, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // state = None is omitted from the wire (additive, never breaks old
+        // readers comparing payloads).
+        let no_state = EventKind::WorkspaceTeardown {
+            mode: "keep".into(),
+            state: None,
+        };
+        let json = serde_json::to_value(&no_state).unwrap();
+        assert!(
+            !json["payload"].as_object().unwrap().contains_key("state"),
+            "payload must not contain state when None: {json}"
         );
     }
 

@@ -243,6 +243,7 @@ mod tests {
             local_executor_milestones: 0,
             workspace_provider: None,
             workspace_pin: None,
+            workspace_lifecycle: None,
         }
     }
 

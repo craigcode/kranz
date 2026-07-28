@@ -58,9 +58,10 @@
 //! previews stay live); `Hibernate` is `compose stop` (containers paused,
 //! project kept); `Destroy` is `compose down -v` (project + volumes
 //! removed), then the contract's `disk.prune` hint runs on the host when
-//! declared. v1's run loop still only ever drives `Keep`; the other modes
-//! are live provider semantics for the idle-hibernate ticket and are
-//! exercised directly by tests.
+//! declared. The run loop drives `Keep` at non-terminal ends (a
+//! blocked/paused mission keeps its project for resume) and the configured
+//! `workspace.teardownMode` when a run reaches a terminal state (ticket
+//! `workspace-idle-hibernate`).
 //!
 //! v1 honesty notes: every container runs the shared default image
 //! ([`crate::sandbox_container::DEFAULT_IMAGE`]) with its declared

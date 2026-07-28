@@ -1083,7 +1083,9 @@ fn remote_workspace_cfg(base_url: &str, token_env: &str) -> MissionConfig {
                 base_url: Some(base_url.to_string()),
                 template: Some("tmpl-baked-ami".to_string()),
                 token_env: Some(token_env.to_string()),
+                idle_after_hours: None,
             }),
+            teardown_mode: None,
         },
         ..test_cfg()
     }
@@ -1132,6 +1134,13 @@ async fn read_request(socket: &mut tokio::net::TcpStream) -> String {
 /// Spawn the mock on 127.0.0.1, answering `workspace_status` with `status`
 /// forever. The task is aborted when the test's runtime shuts down.
 fn spawn_mock_substrate(status: &str) -> MockSubstrate {
+    spawn_mock_substrate_impl(status, false)
+}
+
+/// `fail_transitions`: the stop/delete (`/builds`) transition answers HTTP
+/// 500 — the substrate-side teardown failure path (ticket
+/// workspace-idle-hibernate).
+fn spawn_mock_substrate_impl(status: &str, fail_transitions: bool) -> MockSubstrate {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     listener
         .set_nonblocking(true)
@@ -1149,23 +1158,33 @@ fn spawn_mock_substrate(status: &str) -> MockSubstrate {
             };
             let request = read_request(&mut socket).await;
             task_requests.lock().unwrap().push(request.clone());
-            let body = if request.starts_with("POST /api/v2/users/me/workspaces ") {
-                r#"{"id":"ws-m1","urls":[{"name":"app","url":"https://app--m-1.coder.example.com","auth":true}],"takeover":"https://coder.example.com/@me/ws-m1"}"#.to_string()
+            let (status_line, body) = if request.starts_with("POST /api/v2/users/me/workspaces ") {
+                ("200 OK", r#"{"id":"ws-m1","urls":[{"name":"app","url":"https://app--m-1.coder.example.com","auth":true}],"takeover":"https://coder.example.com/@me/ws-m1"}"#.to_string())
             } else if request.starts_with("GET /api/v2/workspaces/") {
-                format!(r#"{{"latest_build":{{"status":"{status}"}}}}"#)
+                (
+                    "200 OK",
+                    format!(r#"{{"latest_build":{{"status":"{status}"}}}}"#),
+                )
             } else if request.starts_with("POST /api/v2/workspaces/")
                 && request.contains("/builds ")
             {
-                "{}".to_string()
+                if fail_transitions {
+                    (
+                        "500 Internal Server Error",
+                        r#"{"error":"substrate transition failed"}"#.to_string(),
+                    )
+                } else {
+                    ("200 OK", "{}".to_string())
+                }
             } else {
                 task_requests
                     .lock()
                     .unwrap()
                     .push(format!("UNEXPECTED: {request}"));
-                "{}".to_string()
+                ("200 OK", "{}".to_string())
             };
             let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                 body.len()
             );
             if socket.write_all(response.as_bytes()).await.is_err() {
@@ -1258,7 +1277,9 @@ async fn remote_workspace_incomplete_config_refused_at_approve() {
                 base_url: None, // missing — must be named in the refusal
                 template: Some("tmpl-baked-ami".to_string()),
                 token_env: Some("CODER_SESSION_TOKEN".to_string()),
+                idle_after_hours: None,
             }),
+            teardown_mode: None,
         },
         ..test_cfg()
     };
@@ -1398,7 +1419,7 @@ async fn remote_workspace_ready_mission_completes_and_records_substrate_urls() {
     assert!(
         events.iter().any(|e| matches!(
             &e.kind,
-            EventKind::WorkspaceTeardown { mode } if mode == "keep"
+            EventKind::WorkspaceTeardown { mode, .. } if mode == "keep"
         )),
         "Keep teardown recorded (the workspace stays live for takeover)"
     );
@@ -1549,6 +1570,424 @@ async fn remote_workspace_missing_token_fails_closed_at_run_start() {
             .iter()
             .any(|e| matches!(e.kind, EventKind::WorkerSpawned { .. })),
         "no spend"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 1b4. Workspace idle-hibernate / destroy lifecycle (ticket
+// workspace-idle-hibernate): the engine drives the configured
+// `workspace.teardownMode` at TERMINAL states (keep default; local-worktree
+// always keep), records the outcome on `workspace.teardown.state`, folds it
+// into `state.workspace_lifecycle` with the event ts, and passes a
+// configured `workspace.remote.idleAfterHours` VALUE through to the
+// substrate at create (the substrate owns idle scheduling — kranz never
+// schedules VMs).
+// ---------------------------------------------------------------------------
+
+/// Remote mission config with a terminal teardown mode and/or a
+/// substrate-side idle policy (ticket workspace-idle-hibernate).
+fn remote_workspace_cfg_teardown(
+    base_url: &str,
+    token_env: &str,
+    teardown_mode: Option<&str>,
+    idle_after_hours: Option<f64>,
+) -> MissionConfig {
+    MissionConfig {
+        workspace: WorkspaceConfig {
+            provider: Some("remote".to_string()),
+            remote: Some(RemoteWorkspaceConfig {
+                base_url: Some(base_url.to_string()),
+                template: Some("tmpl-baked-ami".to_string()),
+                token_env: Some(token_env.to_string()),
+                idle_after_hours,
+            }),
+            teardown_mode: teardown_mode.map(str::to_string),
+        },
+        ..test_cfg()
+    }
+}
+
+/// The latest `workspace.teardown` on the log as (mode, state, ts).
+fn teardown_outcome(events: &[Event]) -> (String, Option<String>, chrono::DateTime<chrono::Utc>) {
+    let teardown = workspace_lifecycle_events(events, "workspace.teardown");
+    assert_eq!(teardown.len(), 1, "exactly one teardown per run()");
+    match &teardown[0].kind {
+        EventKind::WorkspaceTeardown { mode, state } => {
+            (mode.clone(), state.clone(), teardown[0].ts)
+        }
+        other => panic!("wrong variant: {other:?}"),
+    }
+}
+
+/// Terminal hibernate on the remote provider: the engine stops the
+/// substrate workspace, records mode+state on the event, folds the
+/// lifecycle with the event's own ts, and passes the configured
+/// idleAfterHours VALUE through at create (recorded, substrate-owned).
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_workspace_terminal_hibernate_stops_the_workspace_and_records_lifecycle() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    commit_workspace_contract(
+        &root,
+        r#"{
+            "schemaVersion": 1,
+            "readiness": ["true"],
+            "secrets": ["DATABASE_URL"]
+        }"#,
+    );
+
+    std::env::set_var("KRANZ_TEST_REMOTE_TOKEN_HIBERNATE", "test-token-hibernate");
+    let substrate = spawn_mock_substrate("running");
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+    ]));
+    let cfg = remote_workspace_cfg_teardown(
+        &substrate.base_url,
+        "KRANZ_TEST_REMOTE_TOKEN_HIBERNATE",
+        Some("hibernate"),
+        Some(24.0),
+    );
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+    let lifecycle = engine
+        .state()
+        .workspace_lifecycle
+        .clone()
+        .expect("the teardown outcome folded into state");
+    assert_eq!(lifecycle.state, "stopped");
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    let (mode, state, ts) = teardown_outcome(&events);
+    assert_eq!(mode, "hibernate");
+    assert_eq!(state.as_deref(), Some("stopped"));
+    assert_eq!(
+        lifecycle.ts, ts,
+        "the folded lifecycle ts IS the transition event's own ts (workspace-hours anchor)"
+    );
+    let detail = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::WorkspaceProvisioned {
+                provider, detail, ..
+            } if provider == "remote" => detail.clone(),
+            _ => None,
+        })
+        .expect("workspace.provisioned (remote) on the log");
+    assert!(
+        detail.contains("idle policy: hibernate after 24h (substrate-owned)"),
+        "the provisioned event records the substrate-owned idle policy: {detail:?}"
+    );
+
+    // The wire: create carried the idle policy VALUE; exactly one
+    // transition — stop (hibernate), never delete.
+    let requests = substrate.requests();
+    let create = requests
+        .iter()
+        .find(|r| r.starts_with("POST /api/v2/users/me/workspaces "))
+        .expect("the create call");
+    assert!(
+        create.contains(r#""idle_after_hours":24.0"#),
+        "the idle policy VALUE rides the create call: {create}"
+    );
+    let transitions: Vec<&String> = requests.iter().filter(|r| r.contains("/builds ")).collect();
+    assert_eq!(transitions.len(), 1, "exactly one transition: {requests:?}");
+    assert!(
+        transitions[0].contains(r#""transition":"stop""#),
+        "hibernate is the stop transition: {transitions:?}"
+    );
+    assert!(
+        !requests.iter().any(|r| r.starts_with("UNEXPECTED:")),
+        "no unexpected substrate calls: {requests:?}"
+    );
+}
+
+/// Terminal destroy on the remote provider: the substrate workspace is
+/// deleted and the outcome recorded/folded as destroyed.
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_workspace_terminal_destroy_deletes_the_workspace_and_records_lifecycle() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    commit_workspace_contract(&root, r#"{"schemaVersion": 1, "readiness": ["true"]}"#);
+
+    std::env::set_var("KRANZ_TEST_REMOTE_TOKEN_DESTROY", "test-token-destroy");
+    let substrate = spawn_mock_substrate("running");
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+    ]));
+    let cfg = remote_workspace_cfg_teardown(
+        &substrate.base_url,
+        "KRANZ_TEST_REMOTE_TOKEN_DESTROY",
+        Some("destroy"),
+        None,
+    );
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+    let lifecycle = engine
+        .state()
+        .workspace_lifecycle
+        .clone()
+        .expect("the teardown outcome folded into state");
+    assert_eq!(lifecycle.state, "destroyed");
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    let (mode, state, _) = teardown_outcome(&events);
+    assert_eq!(mode, "destroy");
+    assert_eq!(state.as_deref(), Some("destroyed"));
+
+    let requests = substrate.requests();
+    let transitions: Vec<&String> = requests.iter().filter(|r| r.contains("/builds ")).collect();
+    assert_eq!(transitions.len(), 1, "exactly one transition: {requests:?}");
+    assert!(
+        transitions[0].contains(r#""transition":"delete""#),
+        "destroy is the delete transition: {transitions:?}"
+    );
+    assert!(
+        !requests.iter().any(|r| r.starts_with("UNEXPECTED:")),
+        "no unexpected substrate calls: {requests:?}"
+    );
+}
+
+/// A substrate-side teardown failure NEVER masks the mission's terminal
+/// outcome: the run still completes, the failure is logged as a decision
+/// (reason in the detail), and the outcome folds as `failed` — the
+/// workspace may still be live, which cost tooling must see.
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_workspace_teardown_failure_keeps_the_terminal_outcome() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    commit_workspace_contract(&root, r#"{"schemaVersion": 1, "readiness": ["true"]}"#);
+
+    std::env::set_var(
+        "KRANZ_TEST_REMOTE_TOKEN_TEARDOWN_FAIL",
+        "test-token-teardown-fail",
+    );
+    let substrate = spawn_mock_substrate_impl("running", true);
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+    ]));
+    let cfg = remote_workspace_cfg_teardown(
+        &substrate.base_url,
+        "KRANZ_TEST_REMOTE_TOKEN_TEARDOWN_FAIL",
+        Some("destroy"),
+        None,
+    );
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(
+        status,
+        MissionStatus::Complete,
+        "the teardown failure must not change the mission's terminal outcome"
+    );
+    let lifecycle = engine
+        .state()
+        .workspace_lifecycle
+        .clone()
+        .expect("the failed outcome still folds");
+    assert_eq!(lifecycle.state, "failed");
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    let (mode, state, _) = teardown_outcome(&events);
+    assert_eq!(mode, "destroy");
+    assert_eq!(state.as_deref(), Some("failed"));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::MissionCompleted {})),
+        "mission.completed still on the log"
+    );
+
+    // The failure is logged as a decision with the scrubbed reason in the
+    // detail — never silently swallowed.
+    let decision = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::OrchestratorDecision { summary, detail }
+                if summary.starts_with("workspace teardown (destroy) failed") =>
+            {
+                Some((summary.clone(), detail.clone()))
+            }
+            _ => None,
+        })
+        .expect("the teardown failure decision: {events:?}");
+    assert!(
+        decision.0.contains("the mission outcome stands"),
+        "{}",
+        decision.0
+    );
+    assert!(decision.0.contains("owner: operator"), "{}", decision.0);
+    let detail = decision.1.expect("the reason rides the decision detail");
+    assert!(
+        detail.contains("delete_workspace") && detail.contains("HTTP 500"),
+        "the scrubbed provider reason: {detail}"
+    );
+
+    // The substrate WAS asked to delete (and refused) — no silent skip.
+    let requests = substrate.requests();
+    assert!(
+        requests
+            .iter()
+            .any(|r| r.contains("/builds ") && r.contains(r#""transition":"delete""#)),
+        "the delete transition was attempted: {requests:?}"
+    );
+}
+
+/// Local-worktree is ALWAYS keep, even with a configured teardown mode —
+/// the integration worktree's filesystem lifecycle belongs to the
+/// mission-branch/merge machinery, so a configured destroy records an
+/// honest keep (local-worktree semantics unchanged).
+#[tokio::test(flavor = "multi_thread")]
+async fn workspace_teardown_mode_local_worktree_is_always_keep() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+    ]));
+    let cfg = MissionConfig {
+        workspace: WorkspaceConfig {
+            teardown_mode: Some("destroy".to_string()),
+            ..Default::default()
+        },
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+    let lifecycle = engine
+        .state()
+        .workspace_lifecycle
+        .clone()
+        .expect("the keep outcome folds");
+    assert_eq!(lifecycle.state, "kept");
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    let (mode, state, _) = teardown_outcome(&events);
+    assert_eq!(
+        mode, "keep",
+        "local-worktree NEVER destroys: a configured destroy records an honest keep"
+    );
+    assert_eq!(state.as_deref(), Some("kept"));
+}
+
+/// An unknown `workspace.teardownMode` fails closed at run start — naming
+/// the config key and the bad value, before any workspace event or spend
+/// (mirrors `workspace_provider_unknown_name_fails_closed_at_run_start`:
+/// the bad value arrives via a post-approval config.changed patch).
+#[tokio::test(flavor = "multi_thread")]
+async fn workspace_teardown_mode_unknown_fails_closed_at_run_start() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    // Approve clean. No scripts queued: ANY session start would error the
+    // run anyway — the empty backend itself proves no spawn.
+    let backend = Arc::new(MockBackend::new());
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+    let mission_id = engine.mission_id().to_string();
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    // Post-approval config drift: set an unknown teardown mode.
+    {
+        let mut log = EventLog::acquire(&paths, &mission_id, Duration::ZERO, LockForce::No)
+            .expect("acquire log");
+        log.append(EventKind::ConfigChanged {
+            patch: json!({"workspace": {"teardownMode": "purge"}}),
+        })
+        .expect("append config.changed");
+    }
+
+    let backend: Arc<dyn AgentBackend> = backend;
+    let mut engine =
+        MissionEngine::resume(backend, &root, &mission_id, LockForce::No).expect("resume mission");
+    engine.seed_worker_auth_verdict_for_test(AuthVerdict::Inconclusive);
+
+    let err = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .expect_err("an unknown teardown mode must fail closed");
+    let msg = err.to_string();
+    assert!(msg.contains("workspace.teardownMode"), "{msg}");
+    assert!(msg.contains("\"purge\""), "{msg}");
+    assert!(msg.contains("owner: operator"), "{msg}");
+    drop(engine);
+
+    let events = read_log(&paths);
+    for wire_name in [
+        "workspace.provisioned",
+        "workspace.readiness",
+        "workspace.teardown",
+    ] {
+        assert!(
+            workspace_lifecycle_events(&events, wire_name).is_empty(),
+            "no {wire_name} event on a run that failed closed"
+        );
+    }
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::WorkerSpawned { .. })),
+        "no worker may spawn when the teardown mode fails closed"
     );
 }
 
@@ -2215,7 +2654,7 @@ async fn workspace_provider_events_land_and_fold_into_state() {
     let teardown = workspace_lifecycle_events(&events, "workspace.teardown");
     assert_eq!(teardown.len(), 1);
     match &teardown[0].kind {
-        EventKind::WorkspaceTeardown { mode } => assert_eq!(mode, "keep"),
+        EventKind::WorkspaceTeardown { mode, .. } => assert_eq!(mode, "keep"),
         other => panic!("wrong variant: {other:?}"),
     }
 

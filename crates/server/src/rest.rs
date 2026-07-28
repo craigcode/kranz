@@ -136,6 +136,14 @@ pub(crate) async fn mission_state(
 ///   remote fiction; for `remote` it is the substrate-reported takeover URL
 ///   (SSH/web) from the latest `workspace.provisioned` event; `null` when no
 ///   pin names the provider or a remote mission has not provisioned yet.
+/// - `workspaceLifecycle` — the last known PROVIDER lifecycle transition
+///   (ticket `workspace-idle-hibernate`), folded from `workspace.teardown`
+///   events carrying a `state`: `{state: "kept"|"stopped"|"destroyed"|
+///   "failed", ts}` with the transition event's own timestamp — the
+///   workspace-hours anchor for cost tooling. `null` on logs without a
+///   state-carrying teardown (consumers must degrade on null). DISTINCT
+///   from the top-level `lifecycle`, which describes the local execution
+///   cwd (worktree active/pending/removed), not the provider workspace.
 pub(crate) async fn mission_workspace(
     State(server): State<Arc<ServerState>>,
     UrlPath(id): UrlPath<String>,
@@ -303,6 +311,15 @@ pub(crate) async fn mission_workspace(
         _ => Value::Null,
     };
 
+    // The last known provider lifecycle transition (ticket
+    // workspace-idle-hibernate), folded from `workspace.teardown` state —
+    // additive: null when no teardown carried an outcome; consumers must
+    // degrade on null, same as the fields above.
+    let workspace_lifecycle = match &state.workspace_lifecycle {
+        Some(lifecycle) => json!(lifecycle),
+        None => Value::Null,
+    };
+
     Ok(Json(json!({
         "isolation": isolation,
         "cwd": cwd.to_string_lossy(),
@@ -317,6 +334,7 @@ pub(crate) async fn mission_workspace(
         "pin": pin,
         "previews": previews,
         "takeover": takeover,
+        "workspaceLifecycle": workspace_lifecycle,
         "contract": {
             "present": workspace_contract.is_some(),
             "services": workspace_contract.as_ref().map_or(0, |c| c.services.len()),
@@ -1003,6 +1021,61 @@ mod tests {
         assert_eq!(revision_row["missionId"], "m-1");
         assert_eq!(revision_row["summary"], "add tests");
         assert_eq!(revision_row["decision"], "accepted (rev 1)");
+    }
+
+    /// `workspaceLifecycle` (ticket workspace-idle-hibernate): present with
+    /// the folded transition state + its event ts when a teardown carried an
+    /// outcome, null when none did (v1 keep-only logs) — consumers degrade
+    /// on null.
+    #[tokio::test]
+    async fn workspace_endpoint_surfaces_workspace_lifecycle_present_and_absent() {
+        let tmp = TempDir::new().unwrap();
+        seed_mission(
+            tmp.path(),
+            "m-1",
+            vec![
+                created("lifecycle"),
+                EventKind::WorkspaceTeardown {
+                    mode: "hibernate".into(),
+                    state: Some("stopped".into()),
+                },
+            ],
+        );
+        let app = crate::router(tmp.path().to_path_buf(), None);
+        let response = app
+            .oneshot(get("/api/missions/m-1/workspace"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["workspaceLifecycle"]["state"], "stopped");
+        assert!(
+            body["workspaceLifecycle"]["ts"].as_str().is_some(),
+            "the transition ts rides the field (the workspace-hours anchor): {body}"
+        );
+
+        seed_mission(
+            tmp.path(),
+            "m-2",
+            vec![
+                created("no-lifecycle"),
+                EventKind::WorkspaceTeardown {
+                    mode: "keep".into(),
+                    state: None,
+                },
+            ],
+        );
+        let app = crate::router(tmp.path().to_path_buf(), None);
+        let response = app
+            .oneshot(get("/api/missions/m-2/workspace"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert!(
+            body["workspaceLifecycle"].is_null(),
+            "null when no teardown carried an outcome: {body}"
+        );
     }
 
     fn sample_plan() -> kranz_engine::types::Plan {

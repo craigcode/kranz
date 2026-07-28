@@ -40,12 +40,12 @@
 //!     byte-identical to the pre-seam gate: same block reasons, same
 //!     `orchestrator.decision` start/pass/fail events, plus the additive
 //!     `workspace.*` lifecycle events alongside.
-//!   - **Teardown: [`TeardownMode::Keep`] is the only real mode.**
-//!     `Hibernate`/`Destroy` are accepted and recorded but are no-ops for the
-//!     local provider — the integration worktree's filesystem lifecycle stays
-//!     with the existing mission-branch/merge machinery (merge semantics
-//!     unchanged). A `workspace.teardown` event records the provider call, not
-//!     the filesystem outcome.
+//!   - **Teardown: local-worktree is ALWAYS [`TeardownMode::Keep`],**
+//!     even when `workspace.teardownMode` configures hibernate/destroy —
+//!     the integration worktree's filesystem lifecycle stays with the
+//!     existing mission-branch/merge machinery (merge semantics
+//!     unchanged). A `workspace.teardown` event records the provider call
+//!     and its outcome, not the filesystem outcome.
 //! - [`crate::workspace_container::LocalContainerProvider`] (ticket
 //!   `local-container-workspace`): a per-mission compose project with
 //!   dynamic ports and contract health/readiness inside the container
@@ -112,9 +112,12 @@ impl WorkspaceProviderKind {
     }
 }
 
-/// What `teardown` should do with the workspace. v1 local-worktree: only
-/// [`TeardownMode::Keep`] has real semantics (trivially — keeping is doing
-/// nothing); the other modes are accepted and recorded as no-ops.
+/// What `teardown` should do with the workspace. The engine drives the
+/// configured `workspace.teardownMode` (see [`teardown_mode`]) when a run
+/// reaches a TERMINAL state and [`TeardownMode::Keep`] otherwise — a
+/// blocked/paused mission keeps its workspace for resume. Local-worktree
+/// is always Keep regardless of the configured mode (see
+/// [`effective_teardown_mode`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TeardownMode {
     /// Leave the workspace in place (resume, inspection, takeover).
@@ -133,6 +136,64 @@ impl TeardownMode {
             TeardownMode::Hibernate => "hibernate",
             TeardownMode::Destroy => "destroy",
         }
+    }
+
+    /// The `workspace.teardown` outcome `state` recorded when the provider
+    /// call SUCCEEDS with this mode (ticket `workspace-idle-hibernate`).
+    pub fn success_state(self) -> &'static str {
+        match self {
+            TeardownMode::Keep => "kept",
+            TeardownMode::Hibernate => "stopped",
+            TeardownMode::Destroy => "destroyed",
+        }
+    }
+}
+
+/// Parse the additive `workspace.teardownMode` mission config (ticket
+/// `workspace-idle-hibernate`) into the mode the engine drives when a run
+/// reaches a TERMINAL state. Absent = [`TeardownMode::Keep`] (today's
+/// behavior). Unknown modes FAIL CLOSED with the config key and its
+/// operator owner named — never a silent default to keep (which would leak
+/// a workspace the operator meant destroyed, nor destroy one they meant
+/// kept). Validated at run start, before any side effect — the same
+/// fail-closed backstop [`resolve`] is for `workspace.provider`.
+pub fn teardown_mode(config: &WorkspaceConfig) -> Result<TeardownMode> {
+    match config.teardown_mode.as_deref() {
+        None => Ok(TeardownMode::Keep),
+        Some(name) if name == TeardownMode::Keep.as_str() => Ok(TeardownMode::Keep),
+        Some(name) if name == TeardownMode::Hibernate.as_str() => Ok(TeardownMode::Hibernate),
+        Some(name) if name == TeardownMode::Destroy.as_str() => Ok(TeardownMode::Destroy),
+        Some(other) => Err(EngineError::Config(format!(
+            "workspace.teardownMode {other:?} is not a known teardown mode \
+             (this build provides {:?}, {:?}, and {:?} only; owner: operator — fix the \
+             workspace.teardownMode config key); refusing rather than silently \
+             defaulting to {:?}",
+            TeardownMode::Keep.as_str(),
+            TeardownMode::Hibernate.as_str(),
+            TeardownMode::Destroy.as_str(),
+            TeardownMode::Keep.as_str()
+        ))),
+    }
+}
+
+/// The mode the engine actually drives at the end of a run (ticket
+/// `workspace-idle-hibernate`): the configured `workspace.teardownMode`
+/// when the run ended TERMINAL (Complete/Failed/Abandoned), else Keep —
+/// a blocked/paused mission keeps its workspace for resume.
+/// Local-worktree is ALWAYS Keep regardless of the configured mode: its
+/// filesystem lifecycle belongs to the mission-branch/merge machinery,
+/// so a configured hibernate/destroy records an honest `keep`.
+pub(crate) fn effective_teardown_mode(
+    kind: WorkspaceProviderKind,
+    run_terminal: bool,
+    configured: TeardownMode,
+) -> TeardownMode {
+    match kind {
+        WorkspaceProviderKind::LocalWorktree => TeardownMode::Keep,
+        WorkspaceProviderKind::Container | WorkspaceProviderKind::Remote if run_terminal => {
+            configured
+        }
+        WorkspaceProviderKind::Container | WorkspaceProviderKind::Remote => TeardownMode::Keep,
     }
 }
 
@@ -512,9 +573,9 @@ impl WorkspaceProvider for LocalWorktreeProvider {
     }
 
     async fn teardown(&self, _handle: WorkspaceHandle, _mode: TeardownMode) -> Result<()> {
-        // v1: Keep is the only real mode; Hibernate/Destroy are accepted and
-        // recorded (by the engine's workspace.teardown event) but are no-ops
-        // here — the integration worktree's lifecycle stays with the
+        // The engine only ever drives Keep here (effective_teardown_mode:
+        // local-worktree is always Keep); any mode is a recorded no-op
+        // regardless — the integration worktree's lifecycle stays with the
         // existing mission-branch/merge machinery.
         Ok(())
     }
@@ -696,22 +757,55 @@ impl MissionEngine {
         }
     }
 
-    /// Record provider teardown at the end of a `run()` — v1 always
-    /// [`TeardownMode::Keep`] (the local provider never destroys; the
-    /// integration worktree's filesystem lifecycle stays with the existing
-    /// mission machinery). Best-effort and never fatal, mirroring
+    /// Record provider teardown at the end of a `run()`, driving `mode` —
+    /// the [`effective_teardown_mode`] the caller selected (the configured
+    /// `workspace.teardownMode` on terminal runs, Keep otherwise;
+    /// local-worktree always Keep). The `workspace.teardown` event records
+    /// the ACTUAL mode driven and its outcome `state` (`kept`/`stopped`/
+    /// `destroyed`, or `failed`). Best-effort and never fatal, mirroring
     /// `teardown_mission_worktree`: the run's result is already decided, so
-    /// a teardown/append failure is logged, not propagated.
-    pub(crate) async fn teardown_workspace(&mut self, provider: &dyn WorkspaceProvider) {
+    /// a teardown failure is logged as a scrubbed decision (the workspace
+    /// may still be live — the operator is told to release it manually) and
+    /// recorded as `state: "failed"`, never propagated and never masking
+    /// the mission's outcome; an append failure is logged, not propagated.
+    ///
+    /// Note on Abandoned: an out-of-engine `kranz abandon` appends
+    /// `mission.abandoned` without a live provider handle, so no teardown
+    /// is driven there — a residual remote/container workspace's lifecycle
+    /// is the substrate's idle policy (`workspace.remote.idleAfterHours`)
+    /// or manual cleanup, never kranz-scheduled.
+    pub(crate) async fn teardown_workspace(
+        &mut self,
+        provider: &dyn WorkspaceProvider,
+        mode: TeardownMode,
+    ) {
         let Some(handle) = self.workspace_handle.take() else {
             return; // never provisioned this run (e.g. resolve/provision failed)
         };
-        if let Err(e) = provider.teardown(handle, TeardownMode::Keep).await {
-            tracing::warn!(error = %e, "workspace provider teardown failed");
-            return;
-        }
+        let state = match provider.teardown(handle, mode).await {
+            Ok(()) => mode.success_state(),
+            Err(e) => {
+                // The failure NEVER masks the run's outcome: record the
+                // reason as a decision (summary stable, the scrubbed
+                // provider error in the untruncated detail — the workspace
+                // may still be live, which cost tooling and the operator
+                // must see) and fold the outcome as failed below.
+                if let Err(append) = self.emit_decision(
+                    &format!(
+                        "workspace teardown ({}) failed — the mission outcome stands; the \
+                         workspace may still be live (owner: operator — release it manually)",
+                        mode.as_str()
+                    ),
+                    Some(e.to_string()),
+                ) {
+                    tracing::warn!(error = %append, "workspace teardown failure decision append failed");
+                }
+                "failed"
+            }
+        };
         if let Err(e) = self.emit(EventKind::WorkspaceTeardown {
-            mode: TeardownMode::Keep.as_str().to_string(),
+            mode: mode.as_str().to_string(),
+            state: Some(state.to_string()),
         }) {
             tracing::warn!(error = %e, "workspace.teardown append failed");
         }
@@ -729,6 +823,7 @@ mod tests {
         WorkspaceConfig {
             provider: provider.map(str::to_string),
             remote: None,
+            teardown_mode: None,
         }
     }
 
@@ -737,6 +832,7 @@ mod tests {
             base_url: Some("https://coder.internal.example.com".to_string()),
             template: Some("tmpl-baked-ami".to_string()),
             token_env: Some("CODER_SESSION_TOKEN".to_string()),
+            idle_after_hours: None,
         }
     }
 
@@ -829,6 +925,7 @@ mod tests {
         let complete = WorkspaceConfig {
             provider: Some("remote".to_string()),
             remote: Some(remote_block()),
+            teardown_mode: None,
         };
         assert_eq!(
             resolve(&complete)
@@ -868,6 +965,7 @@ mod tests {
             let config = WorkspaceConfig {
                 provider: Some("remote".to_string()),
                 remote,
+                teardown_mode: None,
             };
             let err = resolve(&config)
                 .err()
@@ -879,6 +977,109 @@ mod tests {
                 msg.contains("refusing rather than silently falling back"),
                 "{msg}"
             );
+        }
+    }
+
+    /// `workspace.teardownMode` (ticket `workspace-idle-hibernate`): absent
+    /// and the three known modes parse; unknown modes fail closed naming the
+    /// config key, the bad value, the known modes, and the operator owner —
+    /// never a silent default.
+    #[test]
+    fn teardown_mode_config_parses_modes_and_refuses_unknown_names() {
+        assert_eq!(
+            teardown_mode(&ws_config(None)).expect("absent = keep"),
+            TeardownMode::Keep
+        );
+        for (name, expected) in [
+            ("keep", TeardownMode::Keep),
+            ("hibernate", TeardownMode::Hibernate),
+            ("destroy", TeardownMode::Destroy),
+        ] {
+            let config = WorkspaceConfig {
+                teardown_mode: Some(name.to_string()),
+                ..ws_config(None)
+            };
+            assert_eq!(teardown_mode(&config).expect("known mode parses"), expected);
+        }
+        // The wire shape (camelCase) parses from mission config JSON.
+        let config: WorkspaceConfig =
+            serde_json::from_str(r#"{"teardownMode": "hibernate"}"#).expect("config JSON parses");
+        assert_eq!(
+            teardown_mode(&config).expect("wire mode parses"),
+            TeardownMode::Hibernate
+        );
+
+        for unknown in ["stop", "Hibernate", "down", "pause"] {
+            let config = WorkspaceConfig {
+                teardown_mode: Some(unknown.to_string()),
+                ..ws_config(None)
+            };
+            let err = teardown_mode(&config).expect_err("unknown teardown modes fail closed");
+            let msg = err.to_string();
+            assert!(msg.contains("workspace.teardownMode"), "{msg}");
+            assert!(msg.contains(&format!("{unknown:?}")), "{msg}");
+            assert!(msg.contains("\"keep\""), "{msg}");
+            assert!(msg.contains("\"hibernate\""), "{msg}");
+            assert!(msg.contains("\"destroy\""), "{msg}");
+            assert!(msg.contains("only"), "{msg}");
+            assert!(msg.contains("owner: operator"), "{msg}");
+        }
+    }
+
+    /// The mode the engine actually drives (ticket `workspace-idle-hibernate`):
+    /// the configured mode ONLY at terminal run ends, Keep otherwise — and
+    /// local-worktree ALWAYS Keep regardless of the configured mode, because
+    /// the integration worktree's filesystem lifecycle belongs to the
+    /// mission-branch/merge machinery (a configured hibernate/destroy on a
+    /// local-worktree mission records an honest `keep`).
+    #[test]
+    fn effective_teardown_mode_is_terminal_gated_and_local_is_always_keep() {
+        for kind in [
+            WorkspaceProviderKind::Container,
+            WorkspaceProviderKind::Remote,
+        ] {
+            assert_eq!(
+                effective_teardown_mode(kind, true, TeardownMode::Hibernate),
+                TeardownMode::Hibernate,
+                "terminal drives the configured mode for {kind:?}"
+            );
+            assert_eq!(
+                effective_teardown_mode(kind, true, TeardownMode::Destroy),
+                TeardownMode::Destroy
+            );
+            assert_eq!(
+                effective_teardown_mode(kind, true, TeardownMode::Keep),
+                TeardownMode::Keep
+            );
+            for configured in [
+                TeardownMode::Keep,
+                TeardownMode::Hibernate,
+                TeardownMode::Destroy,
+            ] {
+                assert_eq!(
+                    effective_teardown_mode(kind, false, configured),
+                    TeardownMode::Keep,
+                    "a non-terminal end keeps the workspace for resume ({kind:?}, {configured:?})"
+                );
+            }
+        }
+        // Local-worktree: always Keep — terminal or not, configured or not.
+        for run_terminal in [true, false] {
+            for configured in [
+                TeardownMode::Keep,
+                TeardownMode::Hibernate,
+                TeardownMode::Destroy,
+            ] {
+                assert_eq!(
+                    effective_teardown_mode(
+                        WorkspaceProviderKind::LocalWorktree,
+                        run_terminal,
+                        configured
+                    ),
+                    TeardownMode::Keep,
+                    "local-worktree is always Keep (terminal={run_terminal}, {configured:?})"
+                );
+            }
         }
     }
 
@@ -946,6 +1147,7 @@ mod tests {
         let config = WorkspaceConfig {
             provider: Some("remote".to_string()),
             remote: Some(remote_block()),
+            teardown_mode: None,
         };
         let pinned = pin(&config, WorkerIsolation::Worktree, Some(&contract))
             .expect("remote pins at approval");
@@ -966,6 +1168,7 @@ mod tests {
                 token_env: Some("CODER_SESSION_TOKEN".to_string()),
                 ..Default::default()
             }),
+            teardown_mode: None,
         };
         let err = pin(&incomplete, WorkerIsolation::Worktree, Some(&contract))
             .expect_err("incomplete remote config refuses approval");
