@@ -437,13 +437,16 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn sanitized_child_env_windows_redirects_profile_and_temp_to_scratch() {
+        // Create the scratch home BEFORE poisoning TEMP/TMP — tempfile
+        // resolves its parent from ambient TMP/TEMP, so engaging the guard
+        // first would break tempdir creation itself (CI, b4beb75).
+        let home = tempfile::tempdir().unwrap();
         let _poison = EnvTestGuard::engage(&[
             ("TEMP", r"C:\operator-temp"),
             ("TMP", r"C:\operator-tmp"),
             ("APPDATA", r"C:\operator-roaming"),
             ("LOCALAPPDATA", r"C:\operator-local"),
         ]);
-        let home = tempfile::tempdir().unwrap();
 
         let env = sanitized_child_env(home.path(), &extra(&[]));
 
