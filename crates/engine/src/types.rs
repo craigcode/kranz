@@ -601,6 +601,18 @@ pub enum SandboxEnforce {
     FsNet,
 }
 
+impl SandboxEnforce {
+    /// The config-file spelling of this mode (`"off"` / `"fs"` / `"fs+net"`),
+    /// for errors and reports that name the requested enforcement.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SandboxEnforce::Off => "off",
+            SandboxEnforce::Fs => "fs",
+            SandboxEnforce::FsNet => "fs+net",
+        }
+    }
+}
+
 /// Which sandbox mechanism wraps a role's sessions when `enforce` is on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -653,6 +665,23 @@ impl BackendKind {
             BackendKind::Droid => "droid",
             BackendKind::Kimi => "kimi",
             BackendKind::Local => "local",
+        }
+    }
+
+    /// Whether this backend applies the engine-resolved OS sandbox
+    /// ([`crate::backend::SessionSpec::sandbox`]) to its sessions. Only the
+    /// claude backend wraps its spawned CLI in the resolved sandbox today;
+    /// the other CLI backends spawn their binaries directly (and `local`
+    /// runs in the engine process), so an enforced sandbox on them would be
+    /// silently unenforced — `config::validate` rejects that pair (fail
+    /// closed). The match is deliberately exhaustive: a future backend must
+    /// declare itself here.
+    pub fn supports_sandbox_enforcement(self) -> bool {
+        match self {
+            BackendKind::Claude => true,
+            BackendKind::Codex | BackendKind::Droid | BackendKind::Kimi | BackendKind::Local => {
+                false
+            }
         }
     }
 }

@@ -591,6 +591,54 @@ mod tests {
     }
 
     #[test]
+    fn enforced_sandbox_on_non_claude_backend_parks_via_validate() {
+        // The fail-closed sandbox/backend check in config::validate flows
+        // through the readiness probe's config-validation-first block, so a
+        // queued mission with the bad pair parks before it ever runs.
+        let mut cfg = MissionConfig::default();
+        cfg.worker.backend = Some("codex".into());
+        cfg.worker.sandbox.enforce = SandboxEnforce::FsNet;
+        let report = probe_config("m-sandbox", Path::new("/tmp"), &cfg);
+        assert_eq!(report.overall, ReadinessStatus::Unsupported);
+        let config_row = report
+            .roles
+            .iter()
+            .find(|r| r.role == "config")
+            .expect("config validation row");
+        assert!(
+            config_row.detail.contains("codex"),
+            "detail must name the backend: {}",
+            config_row.detail
+        );
+        assert!(
+            config_row.detail.contains("fs+net"),
+            "detail must name the enforce mode: {}",
+            config_row.detail
+        );
+        match report.drain_decision() {
+            DrainDecision::Park { reason } => {
+                assert!(reason.contains("codex"), "{reason}");
+            }
+            other => panic!("expected Park, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enforced_sandbox_on_claude_backend_does_not_park_on_config() {
+        let mut cfg = MissionConfig::default();
+        cfg.worker.sandbox.enforce = SandboxEnforce::FsNet;
+        let report = probe_config("m-sandbox-ok", Path::new("/tmp"), &cfg);
+        assert!(
+            !report
+                .roles
+                .iter()
+                .any(|r| r.role == "config" && r.status == ReadinessStatus::Unsupported),
+            "claude + enforced sandbox must not produce a config rejection: {:?}",
+            report.roles
+        );
+    }
+
+    #[test]
     fn passing_default_config_does_not_park_on_quota() {
         let cfg = MissionConfig::default();
         // May be Missing if claude absent in CI — either Proceed or Park(missing),

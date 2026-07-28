@@ -14,7 +14,7 @@
 use crate::cost::{DEFAULT_CODEX_MODEL, DEFAULT_DROID_MODEL, DEFAULT_KIMI_MODEL};
 use crate::error::{EngineError, Result};
 use crate::paths;
-use crate::types::{BackendKind, ExecutorTier, MissionConfig, Role};
+use crate::types::{BackendKind, ExecutorTier, MissionConfig, Role, SandboxEnforce};
 use std::path::{Path, PathBuf};
 
 /// Reasoning-effort values accepted by `claude --effort`.
@@ -391,6 +391,21 @@ pub fn validate(cfg: &MissionConfig) -> Result<()> {
                 "{name}.backend must be one of None, \"claude\", \"codex\", \"droid\", \"kimi\", \"local\", got {other:?}"
             ))
         })?;
+        // Fail closed on a silently-unenforced sandbox: only the claude
+        // backend wraps its sessions in the engine-resolved OS sandbox
+        // (fs/extraWrite/egress policy, container provider); every other
+        // backend spawns unsandboxed and discards the requested enforcement.
+        // Reject the pair at validation so a mission never runs with the
+        // operator believing workers are contained when they are not.
+        if role_cfg.sandbox.enforce != SandboxEnforce::Off && !kind.supports_sandbox_enforcement() {
+            return Err(EngineError::Config(format!(
+                "{name}.backend {:?} cannot honor sandbox.enforce={:?}: only the claude backend \
+                 applies the resolved OS sandbox; run with sandbox.enforce=off to proceed \
+                 unsandboxed, or use the claude backend",
+                kind.as_str(),
+                role_cfg.sandbox.enforce.as_str()
+            )));
+        }
         let effective = effective_model(role, kind, &role_cfg.model);
         let tier = model_tier(kind, &effective).ok_or_else(|| {
             EngineError::Config(format!(
@@ -918,6 +933,116 @@ mod tests {
             crate::types::SandboxEnforce::FsNet
         );
         assert_eq!(cfg.worker.sandbox.egress, vec!["crates.io:443"]);
+    }
+
+    #[test]
+    fn only_claude_declares_sandbox_enforcement_support() {
+        assert!(BackendKind::Claude.supports_sandbox_enforcement());
+        for kind in [
+            BackendKind::Codex,
+            BackendKind::Droid,
+            BackendKind::Kimi,
+            BackendKind::Local,
+        ] {
+            assert!(
+                !kind.supports_sandbox_enforcement(),
+                "{kind:?} must not claim sandbox enforcement support"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_enforced_sandbox_on_non_claude_backends() {
+        for backend in ["codex", "droid", "kimi"] {
+            for enforce in [
+                crate::types::SandboxEnforce::Fs,
+                crate::types::SandboxEnforce::FsNet,
+            ] {
+                let mut cfg = MissionConfig::default();
+                cfg.validator_scrutiny.backend = Some(backend.into());
+                cfg.validator_scrutiny.sandbox.enforce = enforce;
+                let err = validate(&cfg).unwrap_err().to_string();
+                // The error must name the backend, the requested enforce
+                // mode, and the remedy.
+                assert!(err.contains("validatorScrutiny"), "{err}");
+                assert!(err.contains(backend), "{err}");
+                assert!(err.contains(enforce.as_str()), "{err}");
+                assert!(err.contains("sandbox.enforce=off"), "{err}");
+                assert!(err.contains("claude"), "{err}");
+            }
+        }
+    }
+
+    #[test]
+    fn validate_rejects_enforced_sandbox_on_codex_worker() {
+        let mut cfg = MissionConfig::default();
+        cfg.worker.backend = Some("codex".into());
+        cfg.worker.sandbox.enforce = crate::types::SandboxEnforce::Fs;
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("worker.backend"), "{err}");
+        assert!(err.contains("codex"), "{err}");
+        assert!(err.contains("sandbox.enforce=off"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_enforced_sandbox_on_local_backend() {
+        // The local backend makes its HTTP call in the engine process — no
+        // child to wrap — so an enforced sandbox would be silently ignored.
+        let mut cfg = local_worker_cfg();
+        cfg.worker.sandbox.enforce = crate::types::SandboxEnforce::FsNet;
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("local"), "{err}");
+        assert!(err.contains("fs+net"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_container_provider_on_non_claude_backend() {
+        // `provider = "container"` with an enforced mode is still an enforced
+        // sandbox the backend cannot honor.
+        let mut cfg = MissionConfig::default();
+        cfg.validator_scrutiny.backend = Some("droid".into());
+        cfg.validator_scrutiny.sandbox.enforce = crate::types::SandboxEnforce::Fs;
+        cfg.validator_scrutiny.sandbox.provider = crate::types::SandboxProvider::Container;
+        assert!(validate(&cfg).is_err());
+    }
+
+    #[test]
+    fn validate_accepts_enforced_sandbox_on_claude_backend() {
+        for backend in [None, Some("claude")] {
+            for enforce in [
+                crate::types::SandboxEnforce::Fs,
+                crate::types::SandboxEnforce::FsNet,
+            ] {
+                let mut cfg = MissionConfig::default();
+                cfg.worker.backend = backend.map(|s| s.to_string());
+                cfg.worker.sandbox.enforce = enforce;
+                assert!(
+                    validate(&cfg).is_ok(),
+                    "claude worker with sandbox.enforce={} must validate",
+                    enforce.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn validate_accepts_sandbox_off_on_every_backend() {
+        for backend in ["codex", "droid", "kimi"] {
+            let mut cfg = MissionConfig::default();
+            cfg.validator_scrutiny.backend = Some(backend.into());
+            assert_eq!(
+                cfg.validator_scrutiny.sandbox.enforce,
+                crate::types::SandboxEnforce::Off
+            );
+            assert!(
+                validate(&cfg).is_ok(),
+                "{backend} with sandbox.enforce=off must validate"
+            );
+        }
+        assert!(
+            validate(&local_worker_cfg()).is_ok(),
+            "local with sandbox.enforce=off must validate"
+        );
     }
 
     fn local_role_cfg() -> crate::types::RoleConfig {
