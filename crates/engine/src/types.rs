@@ -795,6 +795,18 @@ pub struct MissionConfig {
     pub claude_binary: Option<String>,
     /// How worker/validator sessions are isolated (§M7 tier 1).
     pub worker_isolation: WorkerIsolation,
+    /// Escape hatch for the cleared contract-command environment (ticket
+    /// `agent-env-clear`): NAMES of ambient env vars copied verbatim into
+    /// the env of contract `command` assertions (validation round, final
+    /// gate, approval-time lint). This is the sanctioned way to give a
+    /// contract command one credential (e.g. a private-registry token the
+    /// toolchain-cache passthrough does not cover). Values are never
+    /// logged — decision records list names only. Names colliding with the
+    /// contract env's own managed keys (`PATH`/`HOME`/`TMPDIR`/
+    /// `KRANZ_BASE_SHA`/toolchain caches) are refused. Everything else
+    /// ambient is cleared before the command runs.
+    #[serde(default)]
+    pub contract_env_passthrough: Vec<String>,
     /// Workspace provider seam (design D-B). `provider` absent =
     /// local-worktree; unknown names fail closed at run start.
     #[serde(default)]
@@ -869,6 +881,7 @@ impl Default for MissionConfig {
             allow_below_default_worker_model: false,
             claude_binary: None,
             worker_isolation: WorkerIsolation::Worktree,
+            contract_env_passthrough: vec![],
             workspace: WorkspaceConfig::default(),
         }
     }

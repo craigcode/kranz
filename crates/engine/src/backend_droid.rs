@@ -326,7 +326,15 @@ impl AgentBackend for DroidBackend {
         command
             .args(&args)
             .current_dir(&spec.cwd)
-            .envs(&spec.env)
+            // agent-env-clear: CLEARED env from the minimal allowlist; the
+            // one ambient var a droid session may authenticate with is
+            // injected explicitly, never the whole ambient set.
+            .env_clear()
+            .envs(crate::agent_env::agent_session_env(
+                &spec.env,
+                &spec.session_id,
+                Some("FACTORY_API_KEY"),
+            ))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

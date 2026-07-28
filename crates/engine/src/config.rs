@@ -580,6 +580,34 @@ mod tests {
     }
 
     #[test]
+    fn contract_env_passthrough_defaults_empty_and_parses_camel_case() {
+        // Additive contract change: absent key (every pre-existing config and
+        // every old mission.created event payload) deserializes to empty.
+        assert!(MissionConfig::default().contract_env_passthrough.is_empty());
+        let value = serde_json::to_value(MissionConfig::default()).unwrap();
+        assert_eq!(value["contractEnvPassthrough"], serde_json::json!([]));
+
+        let dir = tempfile::tempdir().unwrap();
+        let layer_path = dir.path().join("config.json");
+        std::fs::write(
+            &layer_path,
+            r#"{"contractEnvPassthrough": ["NPM_TOKEN", "REGISTRY_BASIC_AUTH"]}"#,
+        )
+        .unwrap();
+        let cfg = load_layers(&[layer_path]).unwrap();
+        assert_eq!(
+            cfg.contract_env_passthrough,
+            vec!["NPM_TOKEN".to_string(), "REGISTRY_BASIC_AUTH".to_string()]
+        );
+        // A layer naming unrelated keys only (the old-config shape) leaves
+        // the passthrough empty.
+        let layer_path = dir.path().join("config-old.json");
+        std::fs::write(&layer_path, r#"{"maxRespawns": 3}"#).unwrap();
+        let cfg = load_layers(&[layer_path]).unwrap();
+        assert!(cfg.contract_env_passthrough.is_empty());
+    }
+
+    #[test]
     fn absent_auto_work_key_keeps_default() {
         let dir = tempfile::tempdir().unwrap();
         let layer_path = dir.path().join("config.json");

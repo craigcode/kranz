@@ -1049,6 +1049,7 @@ impl MissionEngine {
             Some(&base_sha),
             &plan.validation_contract,
             tree_clean_at_base,
+            &self.state.config.contract_env_passthrough,
         );
 
         // Human-readable twin, committed alongside: reviewable in any git UI
@@ -3452,6 +3453,33 @@ impl MissionEngine {
     // Validation round (g)
     // -----------------------------------------------------------------------
 
+    /// The cleared env contract `command` assertions run with
+    /// (agent-env-clear): a per-mission scratch HOME under the gitignored
+    /// `runs/` dir, the minimal allowlist, toolchain caches, and exactly the
+    /// operator's `contractEnvPassthrough` names — ambient secrets never
+    /// reach a contract command. The passthrough application is recorded as
+    /// a decision (names only, never values) so the escape hatch is always
+    /// audible in the event log.
+    fn contract_command_env(&mut self, base_sha: Option<&str>) -> Result<HashMap<String, String>> {
+        let passthrough = self.state.config.contract_env_passthrough.clone();
+        if !passthrough.is_empty() {
+            self.emit_decision(
+                "contract env passthrough applied",
+                Some(format!(
+                    "contractEnvPassthrough names copied from ambient into the contract \
+                     command env (values never logged): {}",
+                    passthrough.join(", ")
+                )),
+            )?;
+        }
+        let scratch = self.paths.runs_dir().join("contract-home");
+        Ok(crate::agent_env::contract_command_env(
+            &scratch,
+            base_sha,
+            &passthrough,
+        ))
+    }
+
     /// Run the contract's command assertions engine-side and render the
     /// captured results for the functional validator's task (validator
     /// repair 3/5): the validator judges verbatim PASS/FAIL evidence instead
@@ -3459,14 +3487,17 @@ impl MissionEngine {
     /// pipes, lost exit codes, accidental backgrounding, Monitors). Returns
     /// None when the contract has no command assertions.
     ///
+    /// `env` is the commands' COMPLETE (cleared) environment, built by the
+    /// caller via [`Self::contract_command_env`].
+    ///
     /// Deliberately an associated function WITHOUT a self receiver: a `&self`
     /// receiver is captured by the async future for its whole lifetime, and
     /// `&MissionEngine` is not Send (MissionEngine is not Sync), which would
     /// make run()'s future non-Send for spawn-based drivers.
     async fn run_contract_commands_for_validation(
         contract: &[Assertion],
-        base_sha: Option<&str>,
         root: &std::path::Path,
+        env: &HashMap<String, String>,
     ) -> Option<String> {
         let command_assertions: Vec<(String, Option<String>)> = contract
             .iter()
@@ -3476,12 +3507,11 @@ impl MissionEngine {
         if command_assertions.is_empty() {
             return None;
         }
-        let env = runner::contract_env(base_sha);
         let mut rendered = String::new();
         for (id, command) in command_assertions {
             match command.as_deref() {
                 Some(command) => {
-                    let (ok, output) = run_shell_command(root, command, &env).await;
+                    let (ok, output) = run_shell_command(root, command, env).await;
                     let verdict = if ok { "PASS" } else { "FAIL" };
                     let tail = scrub::scrub(&output);
                     rendered.push_str(&format!("- [{id}] `{command}` → {verdict}\n{tail}\n"));
@@ -3533,13 +3563,15 @@ impl MissionEngine {
         let mut findings: Vec<(String, Finding)> = Vec::new();
 
         // Engine-run contract commands (validator repair 3/5): executed once
-        // here — bounded, process-tree-killed, scrubbed — and handed to the
-        // functional validator as authoritative evidence.
+        // here — bounded, process-tree-killed, scrubbed, in the cleared
+        // contract env — and handed to the functional validator as
+        // authoritative evidence.
         let contract_results = if roles.contains(&Role::ValidatorFunctional) {
             let contract = self.state.mission.validation_contract.clone();
             let base_sha = self.state.mission.base_sha.clone();
             let root = self.active_root().to_path_buf();
-            Self::run_contract_commands_for_validation(&contract, base_sha.as_deref(), &root).await
+            let env = self.contract_command_env(base_sha.as_deref())?;
+            Self::run_contract_commands_for_validation(&contract, &root, &env).await
         } else {
             None
         };
@@ -3944,7 +3976,11 @@ impl MissionEngine {
 
         let contract = self.state.mission.validation_contract.clone();
         let mut findings: Vec<Finding> = Vec::new();
-        let env = runner::contract_env(self.state.mission.base_sha.as_deref());
+        // agent-env-clear: command assertions run with a CLEARED environment
+        // (minimal allowlist + scratch HOME + toolchain caches + any
+        // contractEnvPassthrough names) — ambient secrets never reach them.
+        let gate_base_sha = self.state.mission.base_sha.clone();
+        let env = self.contract_command_env(gate_base_sha.as_deref())?;
 
         // command assertions — engine-run (design.md: the hard gate).
         for assertion in contract

@@ -70,6 +70,12 @@ pub(crate) fn is_git_repo(root: &std::path::Path) -> bool {
 /// are user-authored shell lines ("npm test -- --grep auth") that need real
 /// shell semantics — argument splitting here would corrupt them. `cmd /C` on
 /// Windows, `sh -c` elsewhere; cwd = repo root; 10-minute cap.
+///
+/// agent-env-clear: the shell spawns with a CLEARED environment — `env` is
+/// the child's COMPLETE environment, built by callers via
+/// [`crate::agent_env::contract_command_env`] (minimal allowlist +
+/// `KRANZ_BASE_SHA` + toolchain caches + any `contractEnvPassthrough`
+/// names). Ambient secrets never reach a contract command.
 pub(crate) async fn run_shell_command(
     cwd: &std::path::Path,
     command: &str,
@@ -95,6 +101,13 @@ pub(crate) async fn run_shell_command_with_code(
 /// [`run_shell_command`] with an explicit timeout (separated so tests can
 /// exercise the timeout path without waiting ten minutes).
 ///
+/// `clear_env` selects the trust channel: `true` for validation-contract
+/// commands (the `env` map is the child's COMPLETE environment — see
+/// [`run_shell_command`]); `false` for workspace-gate/bootstrap/data-hook
+/// commands, whose workspace contract declares its own secrets channel
+/// (`workspace.json`'s `secrets`) fed from ambient — never a contract
+/// command path.
+///
 /// Timeout kill semantics: on unix the shell is started as the leader of a
 /// new process group and the WHOLE group gets SIGKILL — killing only the
 /// wrapper (kill_on_drop) would leave `sleep 300 &`-style descendants running
@@ -114,8 +127,7 @@ async fn run_shell_command_with_timeout(
     timeout: Duration,
     env: &HashMap<String, String>,
 ) -> (bool, String) {
-    let (code, output) =
-        run_shell_command_with_timeout_env(cwd, command, timeout, env, false).await;
+    let (code, output) = run_shell_command_with_timeout_env(cwd, command, timeout, env, true).await;
     (code == Some(0), output)
 }
 
@@ -447,6 +459,105 @@ mod tests {
                 | "TZ"
         )));
     }
+    /// agent-env-clear: a contract command run through the final-gate path
+    /// (`run_shell_command`, env built by `contract_command_env`) cannot see
+    /// poisoned ambient secrets — but does see PATH, the per-mission scratch
+    /// HOME, KRANZ_BASE_SHA, and ambient toolchain caches.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn contract_command_cannot_see_ambient_secrets() {
+        let _poison = crate::agent_env::EnvTestGuard::engage(&[
+            ("GH_TOKEN", "hunter2"),
+            ("SLACK_BOT_TOKEN", "x"),
+            ("AWS_SECRET_ACCESS_KEY", "y"),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let env = crate::agent_env::contract_command_env(scratch.path(), Some("deadbeef"), &[]);
+
+        // Probed by name: the poisoned vars are really unset in the child.
+        let (ok, output) = run_shell_command(
+            dir.path(),
+            "test -z \"$GH_TOKEN\" && test -z \"$SLACK_BOT_TOKEN\" && test -z \"$AWS_SECRET_ACCESS_KEY\"",
+            &env,
+        )
+        .await;
+        assert!(
+            ok,
+            "poisoned ambient vars reached the contract command: {output}"
+        );
+
+        // A full env dump shows exactly the contract boundary.
+        let (ok, dump) = run_shell_command(dir.path(), "env", &env).await;
+        assert!(ok, "{dump}");
+        for leaked in [
+            "GH_TOKEN",
+            "SLACK_BOT_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+            "hunter2",
+        ] {
+            assert!(
+                !dump.contains(leaked),
+                "contract env leaked {leaked}:\n{dump}"
+            );
+        }
+        assert!(dump.contains("PATH="), "PATH must cross:\n{dump}");
+        assert!(
+            dump.contains(&format!("HOME={}", scratch.path().display())),
+            "HOME must be the per-mission scratch:\n{dump}"
+        );
+        assert!(
+            dump.contains("KRANZ_BASE_SHA=deadbeef"),
+            "base sha must reach the contract env:\n{dump}"
+        );
+        if let Some(cargo_home) = std::env::var_os("CARGO_HOME") {
+            assert!(
+                dump.contains(&format!("CARGO_HOME={}", cargo_home.to_string_lossy())),
+                "toolchain caches cross from ambient when set:\n{dump}"
+            );
+        }
+    }
+
+    /// agent-env-clear design 4: `contractEnvPassthrough` admits EXACTLY the
+    /// named ambient var — and only when configured.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn contract_env_passthrough_admits_only_the_named_var() {
+        let _guard = crate::agent_env::EnvTestGuard::engage(&[
+            ("KRANZ_CONTRACT_TEST_CRED", "cred-value"),
+            ("GH_TOKEN", "hunter2"),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+
+        // Not configured: the var does NOT cross.
+        let env = crate::agent_env::contract_command_env(scratch.path(), None, &[]);
+        let (ok, output) =
+            run_shell_command(dir.path(), "test -z \"$KRANZ_CONTRACT_TEST_CRED\"", &env).await;
+        assert!(
+            ok,
+            "an unconfigured var must not reach the contract env: {output}"
+        );
+
+        // Configured: exactly that var crosses, with its value; GH_TOKEN
+        // still does not.
+        let env = crate::agent_env::contract_command_env(
+            scratch.path(),
+            None,
+            &["KRANZ_CONTRACT_TEST_CRED".to_string()],
+        );
+        let (ok, output) = run_shell_command(
+            dir.path(),
+            "test \"$KRANZ_CONTRACT_TEST_CRED\" = cred-value && test -z \"$GH_TOKEN\"",
+            &env,
+        )
+        .await;
+        assert!(
+            ok,
+            "the passthrough-named var must cross, nothing else: {output}"
+        );
+    }
+
     /// The final gate's command executor must carry the same
     /// KRANZ_BASE_SHA env that worker/validator sessions get, via the one
     /// shared `runner::contract_env` constructor (mission m-d341a7's false

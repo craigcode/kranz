@@ -751,22 +751,21 @@ pub async fn run_worker_in_buffered(
 /// override (falling back to `$HOME/.claude`) — the same resolution order
 /// `claude` itself uses.
 ///
-/// Best-effort: if seeding the scratch dir fails (e.g. an unwritable temp
-/// dir), the worker falls back to inheriting the real `HOME`/`CLAUDE_CONFIG_DIR`
-/// (i.e. the scratch-HOME half of this function is a no-op) rather than
-/// failing spec construction.
-///
 /// Relocation is GATED on `auth_verdict` (mission m-165b6f, f-1-2): a worker
 /// only launches into the scratch HOME when it has been proven — via
 /// [`crate::auth_verify::verify_worker_auth`] driving a real trivial session
 /// under the candidate scratch env — able to authenticate there
 /// ([`AuthVerdict::Authenticated`]). Any other verdict
-/// ([`AuthVerdict::Unauthenticated`] or [`AuthVerdict::Inconclusive`]) is a
-/// loud fail-safe: the worker inherits the real `HOME`/`CLAUDE_CONFIG_DIR`
-/// rather than risk launching unauthenticated and silently producing no
-/// output (observed 2026-07-06, m-66aff8: "no report, no commits, empty
-/// diff" — see fix-worker-env-hygiene-starves-auth). Git identity injection
-/// below is independent of this gate and always applies.
+/// ([`AuthVerdict::Unauthenticated`] or [`AuthVerdict::Inconclusive`]) leaves
+/// HOME out of the spec — and since agent-env-clear that no longer means
+/// "inherit the operator's real HOME": the backend spawn seam
+/// (`backend_claude::claude_child_env`) starts every session from a CLEARED
+/// env and gives a HOME-less spec a freshly seeded per-session scratch HOME
+/// instead, so the real HOME never reaches the child (an unproven worker
+/// fails auth loudly there rather than silently producing no output —
+/// observed 2026-07-06, m-66aff8: "no report, no commits, empty diff" — see
+/// fix-worker-env-hygiene-starves-auth). Git identity injection below is
+/// independent of this gate and always applies.
 fn seed_worker_env(
     spec: &mut SessionSpec,
     auth_verdict: AuthVerdict,
@@ -792,8 +791,8 @@ fn seed_worker_env(
     }
 
     // Loud decision record (mission m-165b6f, f-1-3): every worker spec build
-    // logs which HOME branch was taken and the non-sensitive reason, so a
-    // fallback to the real HOME is never silent. Never logs secret/credential
+    // logs which HOME branch was taken and the non-sensitive reason, so an
+    // unproven-auth launch is never silent. Never logs secret/credential
     // values — only the verdict and the decision.
     let (decision, reason) = if relocated {
         (
@@ -802,11 +801,13 @@ fn seed_worker_env(
         )
     } else {
         let reason = if auth_verdict == AuthVerdict::Authenticated {
-            "scratch HOME seeding failed after a successful auth preflight"
+            "scratch HOME seeding failed after a successful auth preflight; \
+             spawn will fall back to a fresh per-session scratch HOME"
         } else {
-            "auth preflight did not confirm authentication in the scratch env"
+            "auth preflight did not confirm authentication in the scratch env; \
+             spawn will fall back to a fresh per-session scratch HOME"
         };
-        ("inherited", reason)
+        ("isolated-fallback", reason)
     };
     // One callsite for both decisions keeps this operational event consistent
     // and makes subscriber behavior independent of which branch registered
@@ -1349,10 +1350,11 @@ mod tests {
     /// Finding 1: a worker in a HOME with no `.gitconfig` must still be able
     /// to `git commit` — proving the injected `GIT_AUTHOR_*` / `GIT_COMMITTER_*`
     /// env vars actually carry the identity through, not merely that the keys
-    /// are present. Uses an `Unauthenticated` preflight verdict (the fail-safe
-    /// inherit branch — see [`worker_auth_preflight_failure_inherits_home`]),
-    /// with HOME pointed at an empty dir, to prove the identity injection
-    /// alone suffices when relocation does not happen.
+    /// are present. Uses an `Unauthenticated` preflight verdict (the
+    /// fail-safe no-relocation branch — see
+    /// [`worker_auth_preflight_failure_leaves_home_unset`]), with HOME
+    /// pointed at an empty dir, to prove the identity injection alone
+    /// suffices when relocation does not happen.
     #[test]
     fn worker_env_hygiene_scratch_home_worker_can_commit() {
         let repo_dir = tempfile::tempdir().unwrap();
@@ -1367,8 +1369,8 @@ mod tests {
             Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
         );
 
-        // An Unauthenticated preflight verdict is the fail-safe inherit
-        // branch: seed_worker_env must NOT relocate HOME.
+        // An Unauthenticated preflight verdict is the fail-safe no-relocation
+        // branch: seed_worker_env must NOT relocate HOME into the spec.
         assert!(
             !spec.env.contains_key("HOME"),
             "an Unauthenticated preflight verdict must not relocate HOME"
@@ -1469,10 +1471,12 @@ mod tests {
 
     /// mission m-165b6f, f-1-2: an unproven preflight verdict
     /// (`Unauthenticated` or `Inconclusive`) is the loud fail-safe — no HOME/
-    /// CLAUDE_CONFIG_DIR key at all, so the worker inherits the real HOME,
-    /// while git identity injection still applies.
+    /// CLAUDE_CONFIG_DIR key in the spec at all (since agent-env-clear the
+    /// spawn seam turns that into a fresh per-session scratch HOME, never
+    /// the operator's real HOME), while git identity injection still
+    /// applies.
     #[test]
-    fn worker_auth_preflight_failure_inherits_home() {
+    fn worker_auth_preflight_failure_leaves_home_unset() {
         let repo_dir = tempfile::tempdir().unwrap();
         assert!(git(repo_dir.path(), &["init", "-q"]).status.success());
         let real_home = tempfile::tempdir().unwrap();
@@ -1628,8 +1632,8 @@ mod tests {
             );
         }
 
-        // Unauthenticated/Inconclusive branch: must record "inherited" with a
-        // non-sensitive reason.
+        // Unauthenticated/Inconclusive branch: must record
+        // "isolated-fallback" with a non-sensitive reason.
         for verdict in [AuthVerdict::Unauthenticated, AuthVerdict::Inconclusive] {
             events.lock().unwrap().clear();
             let mut spec = minimal_worker_spec(repo_dir.path().to_path_buf());
@@ -1645,8 +1649,8 @@ mod tests {
             );
             let record = recorded.last().unwrap();
             assert!(
-                record.contains("decision=\"inherited\""),
-                "expected an inherited decision record for {verdict:?}, got: {record}"
+                record.contains("decision=\"isolated-fallback\""),
+                "expected an isolated-fallback decision record for {verdict:?}, got: {record}"
             );
             assert!(
                 record.contains("reason="),

@@ -19,6 +19,7 @@ pub mod paths;
 pub mod plan_fit;
 pub mod types;
 
+pub mod agent_env;
 pub mod auth_verify;
 pub mod backend_readiness;
 pub mod command_exec;

@@ -17,7 +17,7 @@ use crate::backend::{
 use crate::error::{EngineError, Result};
 use crate::types::TokenUsage;
 use serde_json::{json, Value};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -695,6 +695,72 @@ impl ClaudeBackend {
     }
 }
 
+/// The ambient env var a `claude` session may legitimately authenticate
+/// with (API-key deploys, docs/deploy.md); injected by [`claude_child_env`]
+/// only when the operator actually has it set. OAuth instead flows through
+/// the scratch-HOME seeding below, never through ambient inheritance.
+const CLAUDE_AUTH_ENV: &str = "ANTHROPIC_API_KEY";
+
+/// The cleared environment one `claude` session spawns with (ticket
+/// `agent-env-clear`; see [`crate::agent_env`]).
+///
+/// When the spec carries a relocated scratch `HOME` (worker relocation —
+/// the env the auth preflight proved out), that HOME is used verbatim.
+/// Otherwise (orchestrator/validator sessions, and the preflight fail-safe
+/// branch that USED TO mean "inherit the operator's real HOME") a fresh
+/// per-session scratch HOME is seeded with the minimal credential set — the
+/// same [`seed_worker_scratch_home`] recipe — so OAuth file-based auth
+/// keeps working without the child ever seeing the operator's real HOME.
+/// Seeding failure degrades to an empty scratch home: the session then
+/// fails auth loudly rather than silently inheriting. `ANTHROPIC_API_KEY`
+/// is injected explicitly when set (logged name-only in `agent_env`).
+fn claude_child_env(spec: &SessionSpec) -> HashMap<String, String> {
+    if spec.env.contains_key("HOME") {
+        return crate::agent_env::agent_session_env(
+            &spec.env,
+            &spec.session_id,
+            Some(CLAUDE_AUTH_ENV),
+        );
+    }
+    let real_home = std::env::var_os("HOME").map(PathBuf::from);
+    let real_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from);
+    let scratch_root = scratch_home_root(&spec.session_id);
+    match seed_worker_scratch_home(
+        &scratch_root,
+        real_home.as_deref(),
+        real_config_dir.as_deref(),
+    ) {
+        Ok((home, config_dir)) => {
+            let mut spec_env = spec.env.clone();
+            spec_env.insert(
+                "CLAUDE_CONFIG_DIR".to_string(),
+                config_dir.display().to_string(),
+            );
+            tracing::info!(
+                session_id = %spec.session_id,
+                decision = "scratch-seeded",
+                "session spec carried no relocated HOME; spawning into a freshly seeded \
+                 scratch HOME (agent-env-clear)"
+            );
+            crate::agent_env::session_env_with_home(
+                &spec_env,
+                &spec.session_id,
+                Some(CLAUDE_AUTH_ENV),
+                &home,
+            )
+        }
+        Err(e) => {
+            tracing::warn!(
+                session_id = %spec.session_id,
+                error = %e,
+                "scratch HOME seeding failed; session spawns into an empty scratch HOME \
+                 and will fail auth loudly if no API key is injected"
+            );
+            crate::agent_env::agent_session_env(&spec.env, &spec.session_id, Some(CLAUDE_AUTH_ENV))
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl AgentBackend for ClaudeBackend {
     async fn start(&self, spec: SessionSpec) -> Result<Box<dyn AgentSession>> {
@@ -766,9 +832,15 @@ impl AgentBackend for ClaudeBackend {
                 command
             }
         };
+        // agent-env-clear: the child spawns with a CLEARED environment
+        // rebuilt from the minimal allowlist (PATH, a scratch HOME, locale)
+        // — never the full ambient set, so server secrets (GH_TOKEN,
+        // SLACK_*, AWS_*) cannot reach this prompt-injectable child.
+        let child_env = claude_child_env(&spec);
         command
             .current_dir(&spec.cwd)
-            .envs(&spec.env)
+            .env_clear()
+            .envs(child_env)
             .stdin(if streaming {
                 Stdio::piped()
             } else {
@@ -1165,6 +1237,189 @@ mod tests {
         assert!(
             start.elapsed() < std::time::Duration::from_secs(10),
             "probe returned within the deadline, not after the stub's sleep"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // agent-env-clear: exfiltration-shaped spawn tests
+    // -----------------------------------------------------------------------
+
+    /// A `claude` stub that dumps its FULL environment to `capture` and then
+    /// emits the minimal stream-json (init + success result) a session needs
+    /// to complete cleanly.
+    fn write_env_dump_stub(dir: &Path, capture: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let stub = dir.join("claude-env-dump-stub.sh");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\n\
+                 env > '{}'\n\
+                 printf '%s\\n' \\\n\
+                 '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"stub\",\"model\":\"stub\"}}' \\\n\
+                 '{{\"type\":\"result\",\"is_error\":false,\"result\":\"done\",\"total_cost_usd\":0.0,\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}},\"num_turns\":1}}'\n\
+                 exit 0\n",
+                capture.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        stub
+    }
+
+    fn env_dump_spec(cwd: &Path, session_id: &str, env: HashMap<String, String>) -> SessionSpec {
+        SessionSpec {
+            cwd: cwd.to_path_buf(),
+            prompt: PromptMode::SingleShot("hi".to_string()),
+            append_system_prompt: None,
+            model: "stub".to_string(),
+            effort: "low".to_string(),
+            session_id: session_id.to_string(),
+            resume: None,
+            permission_mode: None,
+            allowed_tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+            tools: Vec::new(),
+            writable: false,
+            settings_json: None,
+            json_schema: None,
+            max_budget_usd: None,
+            max_turns: None,
+            env,
+            sandbox: None,
+        }
+    }
+
+    async fn spawn_and_capture_env(binary: &Path, spec: SessionSpec, capture: &Path) -> String {
+        let backend = ClaudeBackend::new(binary);
+        let mut session = backend.start(spec).await.expect("stub session spawns");
+        while session
+            .next_event()
+            .await
+            .expect("stub stream parses")
+            .is_some()
+        {}
+        std::fs::read_to_string(capture).expect("stub dumped the child env")
+    }
+
+    /// The ticket's acceptance test, worker shape (spec carries a relocated
+    /// scratch HOME — the exact env shape the auth probe proves and worker
+    /// relocation produces): a poisoned ambient env must NOT reach the
+    /// spawned session, while PATH/scratch-HOME/TMPDIR and the backend's own
+    /// auth key do.
+    #[tokio::test]
+    async fn spawned_session_env_is_cleared_of_ambient_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let capture = dir.path().join("child.env");
+        let stub = write_env_dump_stub(dir.path(), &capture);
+        let scratch = tempfile::tempdir().unwrap();
+
+        let _poison = crate::agent_env::EnvTestGuard::engage(&[
+            ("GH_TOKEN", "hunter2"),
+            ("SLACK_BOT_TOKEN", "x"),
+            ("AWS_SECRET_ACCESS_KEY", "y"),
+            ("ANTHROPIC_API_KEY", "sk-ant-poison"),
+        ]);
+
+        let mut spec_env = HashMap::new();
+        spec_env.insert("HOME".to_string(), scratch.path().display().to_string());
+        spec_env.insert(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            scratch.path().join(".claude").display().to_string(),
+        );
+        spec_env.insert("KRANZ_BASE_SHA".to_string(), "deadbeef".to_string());
+        let spec = env_dump_spec(dir.path(), "env-clear-worker", spec_env);
+
+        let child_env = spawn_and_capture_env(&stub, spec, &capture).await;
+
+        for leaked in ["GH_TOKEN", "SLACK_BOT_TOKEN", "AWS_SECRET_ACCESS_KEY"] {
+            assert!(
+                !child_env.contains(leaked),
+                "spawned session env leaked {leaked}:\n{child_env}"
+            );
+        }
+        for leaked_value in ["hunter2", "xoxb", "aws-poison"] {
+            assert!(
+                !child_env.contains(leaked_value),
+                "spawned session env leaked a poisoned value ({leaked_value}):\n{child_env}"
+            );
+        }
+        assert!(
+            child_env.contains("ANTHROPIC_API_KEY=sk-ant-poison"),
+            "the claude backend's own auth key must be injected explicitly:\n{child_env}"
+        );
+        assert!(
+            child_env.contains(&format!("HOME={}", scratch.path().display())),
+            "HOME must be the session's scratch dir:\n{child_env}"
+        );
+        assert!(
+            child_env.contains(&format!(
+                "CLAUDE_CONFIG_DIR={}",
+                scratch.path().join(".claude").display()
+            )),
+            "the seeded config dir must survive clearing (auth probe shape):\n{child_env}"
+        );
+        assert!(
+            child_env.contains(&format!("TMPDIR={}", scratch.path().join("tmp").display())),
+            "TMPDIR must be <scratch>/tmp:\n{child_env}"
+        );
+        assert!(child_env.contains("PATH="), "PATH must cross:\n{child_env}");
+        assert!(
+            child_env.contains("KRANZ_BASE_SHA=deadbeef"),
+            "spec env must cross verbatim:\n{child_env}"
+        );
+    }
+
+    /// Orchestrator/validator shape (spec carries NO relocated HOME): the
+    /// session must spawn into a FRESHLY SEEDED per-session scratch HOME —
+    /// never the operator's real home — with the OAuth credentials copy in
+    /// place, so file-based auth keeps working through the cleared env.
+    #[tokio::test]
+    async fn home_less_spec_spawns_into_a_freshly_seeded_scratch_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let capture = dir.path().join("child.env");
+        let stub = write_env_dump_stub(dir.path(), &capture);
+        // The operator's "real" config dir, holding the file-based OAuth
+        // credential the seeding recipe copies.
+        let real_config = tempfile::tempdir().unwrap();
+        std::fs::write(
+            real_config.path().join(".credentials.json"),
+            "{\"token\":\"oauth\"}",
+        )
+        .unwrap();
+        let real_config_str = real_config.path().display().to_string();
+
+        let _poison = crate::agent_env::EnvTestGuard::engage(&[
+            ("GH_TOKEN", "hunter2"),
+            ("CLAUDE_CONFIG_DIR", &real_config_str),
+        ]);
+
+        let session_id = "env-clear-orchestrator";
+        let spec = env_dump_spec(dir.path(), session_id, HashMap::new());
+
+        let child_env = spawn_and_capture_env(&stub, spec, &capture).await;
+
+        let expected_home = scratch_home_root(session_id).join("home");
+        assert!(
+            child_env.contains(&format!("HOME={}", expected_home.display())),
+            "a HOME-less spec must spawn into the per-session scratch HOME:\n{child_env}"
+        );
+        assert!(
+            child_env.contains(&format!(
+                "CLAUDE_CONFIG_DIR={}",
+                expected_home.join(".claude").display()
+            )),
+            "the scratch config dir must be wired:\n{child_env}"
+        );
+        assert!(
+            !child_env.contains("GH_TOKEN") && !child_env.contains("hunter2"),
+            "ambient secrets must not cross:\n{child_env}"
+        );
+        let seeded = expected_home.join(".claude").join(CLAUDE_CREDENTIALS_ENTRY);
+        assert_eq!(
+            std::fs::read_to_string(&seeded).expect("scratch HOME was seeded"),
+            "{\"token\":\"oauth\"}",
+            "the OAuth credential copy must land in the seeded scratch config dir"
         );
     }
 }
