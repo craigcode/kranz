@@ -410,12 +410,9 @@ pub fn repo_full_name_from_payload(payload: &Value) -> Option<String> {
 pub fn github_full_name_from_remote(url: &str) -> Option<String> {
     let path = if let Some(scp) = url.strip_prefix("git@github.com:") {
         scp
-    } else if let Some(rest) = url.strip_prefix("https://github.com/") {
-        rest
-    } else if let Some(rest) = url.strip_prefix("ssh://git@github.com/") {
-        rest
     } else {
-        return None;
+        url.strip_prefix("https://github.com/")
+            .or_else(|| url.strip_prefix("ssh://git@github.com/"))?
     };
     let path = path.trim_end_matches('/');
     let path = path.strip_suffix(".git").unwrap_or(path);
