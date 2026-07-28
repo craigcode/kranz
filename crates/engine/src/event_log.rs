@@ -1079,6 +1079,9 @@ mod tests {
     }
 
     /// A valid one-event log body for a not-yet-acquired mission.
+    // Only the unix symlink tests use this; silence dead_code off-unix
+    // without masking it on unix (windows-latest clippy gates -D warnings).
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn one_event_line() -> String {
         let event = Event {
             seq: 1,
