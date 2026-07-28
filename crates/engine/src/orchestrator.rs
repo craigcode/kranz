@@ -6093,14 +6093,24 @@ pub(crate) mod tests {
         // idle ticks are more than enough for flush_if_due to drain it.
         // Checked BEFORE aborting the task: EventLog's Drop also flushes, so
         // reading only after abort would pass even without the fix under test.
-        tokio::time::sleep(Duration::from_millis(700)).await;
-        let after = EventLog::read_events(&paths.events_file()).expect("read events.jsonl");
+        // Poll to a deadline instead of a fixed sleep: loaded CI runners
+        // (windows-latest) slip fixed delays and flaked this at 700ms.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut flushed = false;
+        while std::time::Instant::now() < deadline {
+            let events = EventLog::read_events(&paths.events_file()).expect("read events.jsonl");
+            if events.iter().any(|e| {
+                matches!(&e.kind, EventKind::WorkerMessage { content, .. } if content == "buffered delta")
+            }) {
+                flushed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         handle.abort();
 
         assert!(
-            after.iter().any(
-                |e| matches!(&e.kind, EventKind::WorkerMessage { content, .. } if content == "buffered delta")
-            ),
+            flushed,
             "idle Paused loop must age-flush the buffered delta to disk without a lifecycle event"
         );
     }
