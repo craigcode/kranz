@@ -106,7 +106,7 @@ scale it up.
 
 ### D-BW-1 — Stay-native substrate; beads remains an interface
 
-kranz's ticket/queue system stays kranz-owned. Beads is an *interface*
+**ACCEPTED 2026-07-29** (operator). kranz's ticket/queue system stays kranz-owned. Beads is an *interface*
 kranz interoperates with (the Gas City direction the citizenship work
 already needs), never the store of record for `.kranz/tickets`. Rationale:
 Q3's claim machinery is mission-safety infrastructure with semantics we
@@ -115,6 +115,10 @@ does not already do; Q5's risk lands on the single worst component to
 destabilize. This confirms the ticket's working hypothesis with evidence.
 
 ### D-BW-2 — Harden the bridge, sized as two mission briefs
+
+**ACCEPTED 2026-07-29, ticketed** (operator wants beads/Gas City interop
+this week): `.kranz/tickets/beads-bridge-translator-correctness.md` and
+`.kranz/tickets/beads-bridge-provenance-return-path.md`.
 
 The spike (`packaging/gascity/bin/kranz-dispatch`, `kranz-run-bead`)
 hardens into the supported translation layer:
@@ -132,6 +136,10 @@ hardens into the supported translation layer:
 
 ### D-BW-3 — Adopt beads' ideas natively, not its store
 
+**ACCEPTED 2026-07-29** (operator), ticketed:
+`.kranz/tickets/ticket-discussion-primitive.md` and
+`.kranz/tickets/ticket-defer-until.md`.
+
 What beads has that is genuinely worth having, adopted kranz-side:
 
 - **A ticket discussion primitive.** Beads' flat comment model
@@ -148,7 +156,7 @@ their topology, not ours to import.
 
 ### D-BW-4 — Revisit triggers
 
-Re-open this question only if: (a) beads' per-mode claim semantics are
+**ACCEPTED 2026-07-29** (operator). Re-open this question only if: (a) beads' per-mode claim semantics are
 mechanically documented AND stable across two minor releases; (b) the
 native queue shows a concrete bead-shaped deficiency (multi-agent claim
 contention the rename protocol cannot express); or (c) the Gas City
