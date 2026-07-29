@@ -510,6 +510,9 @@ impl Drop for Claim {
 /// Same INVARIANT as the event-log lock probe: anything uncertain must never
 /// report [`ClaimPidLiveness::Dead`] — a false "dead" requeues a mission a
 /// live dispatcher is still running, executing it twice (review P2).
+// Alive/Dead are constructed only by the unix probe arm; silence dead_code
+// off-unix without masking it on unix (windows-latest clippy gates -D warnings).
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClaimPidLiveness {
     /// `kill(pid, 0)` succeeded: the claiming process exists.
