@@ -245,10 +245,8 @@ pub fn mission_escalation(mission_id: &str, events: &[Event]) -> MissionEscalati
             | EventKind::PlanRevisionRejected { .. } => {
                 interventions += 1;
             }
-            EventKind::MilestoneUnblocked { reason, .. } => {
-                if !is_engine_lift(reason) {
-                    interventions += 1;
-                }
+            EventKind::MilestoneUnblocked { reason, .. } if !is_engine_lift(reason) => {
+                interventions += 1;
             }
             _ => {}
         }
