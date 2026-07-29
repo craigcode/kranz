@@ -953,7 +953,7 @@ fn alive_or_reused(pid: i32, info: &LockInfo) -> LockLiveness {
 /// (field 2) is parenthesized and may itself contain spaces or ')', so
 /// fields 3.. are indexed from after the LAST ')'.
 #[cfg(target_os = "linux")]
-fn process_identity_token(pid: i32) -> Option<String> {
+pub(crate) fn process_identity_token(pid: i32) -> Option<String> {
     let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
     let boot_id = boot_id.trim();
     if boot_id.is_empty() {
@@ -1044,7 +1044,7 @@ static IDENTITY_TOKEN_CACHE: std::sync::OnceLock<IdentityTokenCache> = std::sync
 /// the raw token lookup is memoized; [`alive_or_reused`] still compares
 /// `recorded == current` on every call, using whatever token this returns.
 #[cfg(target_os = "macos")]
-fn process_identity_token(pid: i32) -> Option<String> {
+pub(crate) fn process_identity_token(pid: i32) -> Option<String> {
     let cache = IDENTITY_TOKEN_CACHE
         .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let now = Instant::now();
@@ -1061,7 +1061,7 @@ fn process_identity_token(pid: i32) -> Option<String> {
 /// Everywhere else (windows, exotic unix): no identity token, so pid reuse
 /// cannot be proven and an alive holder stays Alive.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn process_identity_token(_pid: i32) -> Option<String> {
+pub(crate) fn process_identity_token(_pid: i32) -> Option<String> {
     None
 }
 

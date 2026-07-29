@@ -404,10 +404,19 @@ pub fn claim_front(repo_root: &Path) -> Option<Claim> {
     for _ in 0..16 {
         let entry = peek(repo_root)?;
         let original = queue_dir(repo_root).join(entry.file_name());
+        // The claim name carries the claimant's process IDENTITY TOKEN (the
+        // event-log lock idiom) when the platform can compute one: after a
+        // crash, a recycled pid then proves itself different from the
+        // recorded claimant and the age backstop can fire (4th-pass review —
+        // "alive pid stands the claim" alone stranded claims forever behind
+        // unrelated long-lived processes). No token available: the legacy
+        // pid-only name, which forgoes reuse detection exactly like the
+        // legacy lock-file formats.
         let claimed = queue_dir(repo_root).join(format!(
-            "{}.claimed.{}",
+            "{}.claimed.{}{}",
             entry.file_name(),
-            std::process::id()
+            std::process::id(),
+            claim_identity_suffix()
         ));
         match std::fs::rename(&original, &claimed) {
             Ok(()) => {
@@ -553,16 +562,38 @@ fn probe_claim_pid(pid: i32) -> ClaimPidLiveness {
     }
 }
 
-/// Recover claims left by dead dispatchers. A `*.claimed.<pid>` file is
-/// renamed back to its entry name when its pid is provably DEAD, whatever its
-/// age — or, when liveness cannot be determined, when the file is over an
-/// hour old (the pid-REUSE backstop: a recycled pid reads alive forever,
-/// which would strand the claim).
+/// The `.TOKENHASH` claim-name suffix for the current process (empty when
+/// the platform cannot compute an identity token — the legacy pid-only
+/// claim name, which forgoes reuse detection like the legacy lock formats).
+fn claim_identity_suffix() -> String {
+    crate::event_log::process_identity_token(std::process::id() as i32)
+        .map(|token| format!(".{:016x}", identity_token_hash(&token)))
+        .unwrap_or_default()
+}
+
+/// DefaultHasher over the identity token: equality is all that matters
+/// (matching the lock idiom's raw-equality compare), and the hex hash keeps
+/// spaces and punctuation out of the claim filename.
+fn identity_token_hash(token: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    token.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Recover claims left by dead dispatchers. A `*.claimed.<pid>[.<token>]`
+/// file is renamed back to its entry name when its claimant is provably
+/// gone — or, when liveness cannot be determined, when the file is over an
+/// hour old (the pid-REUSE backstop).
 ///
-/// A pid probed ALIVE keeps its claim no matter how old the file is: age
-/// resolves ONLY the ambiguous cases (unprobeable platform, inconclusive
-/// errno), never confirmed liveness — otherwise a second dispatcher would
-/// requeue a genuinely long-running mission and run it twice (review P2).
+/// A pid probed ALIVE keeps its claim only while it is provably the SAME
+/// process that claimed: the claim name carries the claimant's identity
+/// token (the event-log lock idiom), so a recycled pid — alive but a
+/// different token — is NOT the claimant and the age backstop decides
+/// (4th-pass review: "alive stands the claim" alone stranded claims forever
+/// behind unrelated long-lived processes). Legacy tokenless claims keep the
+/// pre-token rule (alive stands at any age): a false stand delays work, a
+/// false requeue runs a mission twice.
 pub fn recover_dead_claims(repo_root: &Path) -> usize {
     let dir = queue_dir(repo_root);
     let Ok(rd) = std::fs::read_dir(&dir) else {
@@ -574,8 +605,13 @@ pub fn recover_dead_claims(repo_root: &Path) -> usize {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        let Some((entry_name, pid_str)) = name.split_once(".claimed.") else {
+        let Some((entry_name, claim_suffix)) = name.split_once(".claimed.") else {
             continue;
+        };
+        // Suffix shape: `<pid>` (legacy) or `<pid>.<token-hash>`.
+        let (pid_str, recorded_token) = match claim_suffix.split_once('.') {
+            Some((pid, token)) => (pid, Some(token.to_string())),
+            None => (claim_suffix, None),
         };
         let aged_out = std::fs::metadata(&path)
             .and_then(|m| m.modified())
@@ -584,10 +620,26 @@ pub fn recover_dead_claims(repo_root: &Path) -> usize {
             .is_some_and(|age| age > Duration::from_secs(3600));
         let dead = match pid_str.parse::<i32>() {
             Ok(pid) => match probe_claim_pid(pid) {
-                // Confirmed liveness STANDS the claim regardless of age —
-                // this is the reorder: age must never requeue a mission a
-                // live dispatcher is still running.
-                ClaimPidLiveness::Alive => false,
+                ClaimPidLiveness::Alive => match recorded_token {
+                    // Alive AND provably the claimant: stands regardless of
+                    // age (the reorder: age must never requeue a mission a
+                    // live dispatcher is still running).
+                    None => false,
+                    Some(recorded) => match crate::event_log::process_identity_token(pid) {
+                        // Alive but a DIFFERENT process than the claimant:
+                        // the pid was recycled after a crash — the age
+                        // backstop decides, or the claim strands forever
+                        // behind an unrelated long-lived process.
+                        Some(current)
+                            if format!("{:016x}", identity_token_hash(&current)) != recorded =>
+                        {
+                            aged_out
+                        }
+                        // Token matches (provably the claimant), or the
+                        // token is unprobeable right now: alive stands.
+                        _ => false,
+                    },
+                },
                 ClaimPidLiveness::Dead => true,
                 // Ambiguous (unprobeable platform, EPERM, bad errno): age
                 // breaks the tie, as the pid-reuse backstop.

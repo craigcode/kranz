@@ -27,15 +27,23 @@ pub(crate) const STDOUT_LINE_CAP: usize = 8 * 1024 * 1024;
 /// generous headroom while bounding a hostile stream.
 pub(crate) const STDERR_TAIL_CAP: usize = 64 * 1024;
 
-/// Bounded tail-keeping window over a byte stream: memory stays ≤ `cap` no
-/// matter how much is pushed, and once anything is dropped the window is
+/// Bounded tail-keeping window over a byte stream: memory stays ≤ 2×`cap`
+/// no matter how much is pushed, and once anything is dropped the window is
 /// marked truncated so the rendered string carries [`TRUNCATION_MARKER`].
 /// `cap` must be non-zero (all call sites use the constants above).
+///
+/// Ring-by-offset, not front-drain: dropping the head advances `start` and
+/// the dead prefix is compacted only once it exceeds `cap` — amortized
+/// O(1) per pushed byte. The naive `drain(..excess)` per chunk shifted the
+/// whole window on every push (~1 TiB of memcpy for a 1 GiB hostile line —
+/// 4th-pass review).
 pub(crate) struct TailWindow {
     // Lazy growth, NOT `Vec::with_capacity(cap)`: a `BoundedLines` window is
     // allocated per line, and pre-allocating STDOUT_LINE_CAP per line would
     // waste 8 MiB on every KiB-scale line.
     buf: Vec<u8>,
+    /// The retained tail begins here; the logical content is `buf[start..]`.
+    start: usize,
     cap: usize,
     truncated: bool,
 }
@@ -45,6 +53,7 @@ impl TailWindow {
         debug_assert!(cap > 0, "a zero-cap tail window retains nothing");
         TailWindow {
             buf: Vec::new(),
+            start: 0,
             cap,
             truncated: false,
         }
@@ -54,19 +63,31 @@ impl TailWindow {
         if bytes.len() >= self.cap {
             self.buf.clear();
             self.buf.extend_from_slice(&bytes[bytes.len() - self.cap..]);
+            self.start = 0;
             self.truncated = true;
             return;
         }
-        let excess = (self.buf.len() + bytes.len()).saturating_sub(self.cap);
-        if excess > 0 {
-            self.buf.drain(..excess);
-            self.truncated = true;
-        }
         self.buf.extend_from_slice(bytes);
+        let excess = (self.buf.len() - self.start).saturating_sub(self.cap);
+        if excess > 0 {
+            self.start += excess;
+            self.truncated = true;
+            // Amortized compaction: drop the dead prefix only once it alone
+            // exceeds the cap, so steady-state cost is O(1) per byte.
+            if self.start > self.cap {
+                self.buf.drain(..self.start);
+                self.start = 0;
+            }
+        }
+    }
+
+    /// The retained tail bytes (`buf[start..]`).
+    fn tail(&self) -> &[u8] {
+        &self.buf[self.start..]
     }
 
     fn is_empty(&self) -> bool {
-        self.buf.is_empty() && !self.truncated
+        self.tail().is_empty() && !self.truncated
     }
 
     /// The retained tail as text (`from_utf8_lossy` keeps a leading partial
@@ -74,7 +95,7 @@ impl TailWindow {
     /// dropped. Marker on its own trailing line, so `.trim_end()` +
     /// last-N-chars surfacing keeps it visible.
     pub(crate) fn render(&self) -> String {
-        let tail = String::from_utf8_lossy(&self.buf);
+        let tail = String::from_utf8_lossy(self.tail());
         if self.truncated {
             format!("{tail}\n{TRUNCATION_MARKER}")
         } else {
@@ -86,7 +107,7 @@ impl TailWindow {
     /// is stripped first — the same shape `tokio::io::Lines::next_line`
     /// returns — and the marker stays on the line itself.
     fn render_line(&self) -> String {
-        let mut bytes: &[u8] = &self.buf;
+        let mut bytes: &[u8] = self.tail();
         if bytes.last() == Some(&b'\n') {
             bytes = &bytes[..bytes.len() - 1];
         }
@@ -193,6 +214,32 @@ mod tests {
         window.push(b"hello ");
         window.push(b"world");
         assert_eq!(window.render(), "hello world");
+    }
+
+    /// 4th-pass review: many small pushes over a saturated window must not
+    /// grow memory unboundedly (≤ 2×cap before amortized compaction) and
+    /// must keep the exact tail — the shape that made front-drain
+    /// quadratic.
+    #[test]
+    fn tail_window_stays_bounded_and_exact_over_many_small_pushes() {
+        let mut window = TailWindow::new(64);
+        // 10k 8-byte pushes = 80 KiB through a 64-byte window.
+        for i in 0..10_000u32 {
+            window.push(format!("{i:08}").as_bytes());
+        }
+        assert!(
+            window.buf.len() <= 128,
+            "compaction must bound the buffer at 2x cap, got {}",
+            window.buf.len()
+        );
+        assert!(window.start <= window.buf.len());
+        assert_eq!(window.tail().len(), 64);
+        assert!(
+            window.tail().ends_with(b"00009999"),
+            "the exact last bytes are retained: {:?}",
+            window.tail()
+        );
+        assert!(window.truncated);
     }
 
     #[test]

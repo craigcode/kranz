@@ -62,6 +62,109 @@ const STDERR_TAIL_CHARS: usize = 500;
 /// §4 — there is no CLI flag for it).
 const KIMI_EFFORT_ENV_VAR: &str = "KIMI_MODEL_THINKING_EFFORT";
 
+/// The ambient var a kimi session may authenticate with (injected
+/// explicitly, never via ambient inheritance).
+const KIMI_AUTH_ENV: &str = "KIMI_API_KEY";
+
+/// The minimal `.kimi-code` state seeded into a session's scratch HOME
+/// (4th-pass review): auth does NOT survive a relocated `$HOME`
+/// (docs/scoping/kimi-cli-backend.md) — the OAuth credential cache, device
+/// id, oauth state, and provider/model config all live under `~/.kimi-code`,
+/// and `KIMI_API_KEY` only authenticates an ALREADY-configured custom
+/// provider (which lives in `config.toml`). An unseeded scratch HOME leaves
+/// every kimi session with no provider at all. `sessions/` transcripts are
+/// deliberately excluded (unbounded, and per-session state).
+const KIMI_SEED_ENTRIES: &[&str] = &["credentials", "device_id", "oauth", "config.toml"];
+
+/// The cleared environment one `kimi` session spawns with (ticket
+/// `agent-env-clear`), mirroring [`crate::backend_claude`]'s seeding
+/// contract: a spec carrying a relocated scratch `HOME` (worker relocation)
+/// is used verbatim; otherwise a fresh per-session scratch HOME is seeded
+/// with [`KIMI_SEED_ENTRIES`] so provider/model/OAuth state survives.
+/// Seeding failure degrades to an empty scratch home — the session then
+/// fails auth loudly rather than silently inheriting the operator's real
+/// HOME. `KIMI_API_KEY` is injected explicitly when set (logged name-only).
+fn kimi_child_env(spec: &SessionSpec) -> std::collections::HashMap<String, String> {
+    if spec.env.contains_key("HOME") {
+        return crate::agent_env::agent_session_env(
+            &spec.env,
+            &spec.session_id,
+            Some(KIMI_AUTH_ENV),
+        );
+    }
+    let real_home = std::env::var_os("HOME").map(PathBuf::from);
+    let scratch_root = crate::backend_claude::scratch_home_root(&spec.session_id);
+    match seed_kimi_scratch_home(&scratch_root, real_home.as_deref()) {
+        Ok(home) => {
+            tracing::info!(
+                session_id = %spec.session_id,
+                decision = "scratch-seeded",
+                "session spec carried no relocated HOME; spawning into a seeded scratch \
+                 HOME (.kimi-code minimal auth/config set)"
+            );
+            crate::agent_env::session_env_with_home(
+                &spec.env,
+                &spec.session_id,
+                Some(KIMI_AUTH_ENV),
+                &home,
+            )
+        }
+        Err(e) => {
+            tracing::warn!(
+                session_id = %spec.session_id,
+                error = %e,
+                "kimi scratch HOME seeding failed; session spawns into an empty scratch \
+                 HOME and will fail auth loudly if KIMI_API_KEY is not injected"
+            );
+            crate::agent_env::agent_session_env(&spec.env, &spec.session_id, Some(KIMI_AUTH_ENV))
+        }
+    }
+}
+
+/// Seed `<scratch_root>/home/.kimi-code` with [`KIMI_SEED_ENTRIES`], copied
+/// opaquely (bytes only, no parsing/logging of contents) from the real
+/// home's `.kimi-code` when present; a missing source yields an
+/// empty-but-present `.kimi-code`. Returns the home dir the child should
+/// get as `HOME`.
+fn seed_kimi_scratch_home(
+    scratch_root: &Path,
+    real_home: Option<&Path>,
+) -> std::io::Result<PathBuf> {
+    let home = scratch_root.join("home");
+    let kimi_dir = home.join(".kimi-code");
+    std::fs::create_dir_all(&kimi_dir)?;
+    if let Some(real_home) = real_home {
+        let source = real_home.join(".kimi-code");
+        for entry in KIMI_SEED_ENTRIES {
+            let src = source.join(entry);
+            let dst = kimi_dir.join(entry);
+            if src.is_file() {
+                std::fs::copy(&src, &dst)?;
+            } else if src.is_dir() {
+                copy_dir_recursive(&src, &dst)?;
+            }
+        }
+    }
+    Ok(home)
+}
+
+/// Opaque recursive copy (files only; symlinks and other special entries
+/// are skipped rather than followed).
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let target = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&entry.path(), &target)?;
+        } else if file_type.is_file() {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
 /// Serializes every test (in this module and in `orchestrator.rs`) that
 /// mutates the process-global env vars consulted by [`discover_kimi_binary`]
 /// (`KRANZ_KIMI_BIN`, `PATH`, `HOME`), since `cargo test` runs tests in
@@ -435,14 +538,12 @@ impl AgentBackend for KimiBackend {
             .args(&args)
             .current_dir(&spec.cwd)
             // agent-env-clear: CLEARED env from the minimal allowlist; the
-            // one ambient var a kimi session may authenticate with is
-            // injected explicitly, never the whole ambient set.
+            // scratch HOME is SEEDED with the minimal .kimi-code auth/config
+            // set (auth does not survive a relocated HOME), and the one
+            // ambient var a kimi session may authenticate with is injected
+            // explicitly, never the whole ambient set.
             .env_clear()
-            .envs(crate::agent_env::agent_session_env(
-                &spec.env,
-                &spec.session_id,
-                Some("KIMI_API_KEY"),
-            ))
+            .envs(kimi_child_env(&spec))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -700,6 +801,50 @@ mod tests {
     use super::*;
 
     const TEST_MODEL: &str = "kimi-code/k3";
+
+    /// 4th-pass review: the scratch seed carries the minimal `.kimi-code`
+    /// auth/config set (auth does not survive a relocated HOME) and never
+    /// the unbounded per-session transcripts.
+    #[test]
+    fn seed_kimi_scratch_home_copies_the_minimal_auth_config_set() {
+        let real_home = tempfile::tempdir().unwrap();
+        let kimi = real_home.path().join(".kimi-code");
+        std::fs::create_dir_all(kimi.join("credentials")).unwrap();
+        std::fs::write(kimi.join("credentials").join("kimi-code.json"), "{}").unwrap();
+        std::fs::write(kimi.join("device_id"), "dev-1").unwrap();
+        std::fs::create_dir_all(kimi.join("oauth")).unwrap();
+        std::fs::write(kimi.join("oauth").join("state"), "state").unwrap();
+        std::fs::write(kimi.join("config.toml"), "model = \"kimi-code/k3\"\n").unwrap();
+        std::fs::create_dir_all(kimi.join("sessions")).unwrap();
+        std::fs::write(kimi.join("sessions").join("big.jsonl"), "transcript").unwrap();
+
+        let scratch = tempfile::tempdir().unwrap();
+        let home = seed_kimi_scratch_home(scratch.path(), Some(real_home.path())).unwrap();
+
+        let seeded = home.join(".kimi-code");
+        assert!(seeded.join("credentials").join("kimi-code.json").is_file());
+        assert!(seeded.join("device_id").is_file());
+        assert!(seeded.join("oauth").join("state").is_file());
+        assert!(seeded.join("config.toml").is_file());
+        assert!(
+            !seeded.join("sessions").exists(),
+            "per-session transcripts are never seeded"
+        );
+    }
+
+    /// A missing real `.kimi-code` yields an empty-but-present seed (the
+    /// session then fails auth loudly rather than inheriting).
+    #[test]
+    fn seed_kimi_scratch_home_without_a_source_yields_an_empty_seed() {
+        let real_home = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+
+        let home = seed_kimi_scratch_home(scratch.path(), Some(real_home.path())).unwrap();
+
+        let seeded = home.join(".kimi-code");
+        assert!(seeded.is_dir());
+        assert_eq!(std::fs::read_dir(&seeded).unwrap().count(), 0);
+    }
 
     fn fixture_lines() -> Vec<String> {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
