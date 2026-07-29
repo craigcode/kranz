@@ -1052,6 +1052,9 @@ fn forge_claim(root: &Path, mission_id: &str, pid: &str) -> std::path::PathBuf {
 
 /// [`forge_claim`] with an identity-token suffix (`<pid>.<token>`), the
 /// shape `claim_front` writes when the platform provides tokens.
+// Only the unix recycle tests use this; gate it the same as its callers
+// (windows-latest clippy gates -D warnings).
+#[cfg(unix)]
 fn forge_claim_with_token(
     root: &Path,
     mission_id: &str,
