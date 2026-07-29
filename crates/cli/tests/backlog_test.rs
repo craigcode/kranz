@@ -433,6 +433,89 @@ fn cmd_ticket_show_errors_on_missing() {
 }
 
 // ---------------------------------------------------------------------------
+// ticket ready — defer-until listing (D-BW-3)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn defer_until_parses_ticket_ready_flag() {
+    let cli = Cli::try_parse_from(["kranz", "ticket", "ready"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Command::Ticket {
+            command: TicketCommand::Ready {
+                include_deferred: false
+            }
+        }
+    ));
+    let cli = Cli::try_parse_from(["kranz", "ticket", "ready", "--include-deferred"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Command::Ticket {
+            command: TicketCommand::Ready {
+                include_deferred: true
+            }
+        }
+    ));
+}
+
+#[test]
+fn defer_until_ready_listing_excludes_future_and_shows_past() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+    write_ticket(
+        repo,
+        "ripened",
+        "---\ntitle: Ripened\ndefer-until: 2000-01-01T00:00:00Z\n---\n## Goal\nnow\n",
+    );
+    write_ticket(
+        repo,
+        "parked",
+        "---\ntitle: Parked\ndefer-until: 2999-01-01T00:00:00Z\n---\n## Goal\nlater\n",
+    );
+    write_ticket(repo, "plain", "---\ntitle: Plain\n---\n## Goal\nanytime\n");
+    // In-flight / terminal states are never "ready", deferred or not.
+    write_ticket(
+        repo,
+        "queued",
+        "---\ntitle: Queued\n---\n## Goal\nrunning\n",
+    );
+    Ticket::write_state(repo, "queued", TicketState::Queued, None).unwrap();
+
+    let out = backlog::cmd_ticket_ready(repo, false);
+    assert!(out.contains("ripened"), "past deferral is ready:\n{out}");
+    assert!(out.contains("plain"), "no deferral is ready:\n{out}");
+    assert!(
+        !out.contains("parked"),
+        "future deferral is excluded from the default listing:\n{out}"
+    );
+    assert!(
+        !out.contains("queued"),
+        "in-flight states are not ready:\n{out}"
+    );
+}
+
+#[test]
+fn defer_until_include_deferred_lists_with_time() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+    write_ticket(
+        repo,
+        "parked",
+        "---\ntitle: Parked\ndefer-until: 2999-01-01T00:00:00Z\n---\n## Goal\nlater\n",
+    );
+
+    let out = backlog::cmd_ticket_ready(repo, true);
+    assert!(
+        out.contains("parked"),
+        "--include-deferred shows it:\n{out}"
+    );
+    assert!(
+        out.contains("2999-01-01T00:00:00Z"),
+        "shown with its defer time:\n{out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // queue rendering
 // ---------------------------------------------------------------------------
 

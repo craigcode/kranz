@@ -173,12 +173,22 @@ pub async fn drive_draft(
     then_enqueue: bool,
 ) -> Result<DraftDrive> {
     let slug = ticket.slug.as_str();
+    // Notes load BEFORE any state flip: a corrupt notes file fails the draft
+    // with the ticket untouched, never stranded in Drafting.
+    let notes_context = crate::ticket_notes::draft_context(repo, slug)?;
     Ticket::write_state(repo, slug, TicketState::Drafting, None)?;
 
     let mission_id = engine.mission_id().to_string();
     Ticket::record_mission(repo, slug, &mission_id)?;
 
-    let goal = ticket.mission_goal();
+    // The RECORDED mission goal stays `ticket.mission_goal()` (approve's
+    // goal-matching and `parse_task_class_from_goal` read it back); the notes
+    // ride along in the SEED MESSAGE only — the drafter sees the ticket's
+    // "why" (D-BW-3) without forking the goal the queue later matches on.
+    let mut goal = ticket.mission_goal();
+    if let Some(section) = notes_context {
+        goal.push_str(&section);
+    }
     if let Err(e) = engine.planning_turn(&goal).await {
         Ticket::write_state(repo, slug, TicketState::New, None)?;
         return Err(e);

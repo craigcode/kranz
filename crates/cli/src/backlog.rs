@@ -128,6 +128,58 @@ pub fn render_ticket_list(rows: &[TicketRow<'_>]) -> String {
     out
 }
 
+/// Render the `kranz ticket ready` table: the ready rows in the same shape as
+/// [`render_ticket_list`], then — only when `include_deferred` asked for it —
+/// a second table of the not-yet-ready deferred tickets with their defer
+/// times (D-BW-3: operator visibility without polluting the default listing).
+pub fn render_ticket_ready(
+    ready: &[TicketRow<'_>],
+    deferred: &[TicketRow<'_>],
+    include_deferred: bool,
+) -> String {
+    let mut out = String::new();
+    if ready.is_empty() {
+        out.push_str("no ready tickets\n");
+    } else {
+        out.push_str(&render_ticket_list(ready));
+    }
+    if include_deferred && !deferred.is_empty() {
+        let slug_w = deferred
+            .iter()
+            .map(|r| r.ticket.slug.len())
+            .max()
+            .unwrap_or(4)
+            .max(4);
+        let state_w = deferred
+            .iter()
+            .map(|r| r.label.len())
+            .max()
+            .unwrap_or(5)
+            .max(5);
+        out.push_str("\ndeferred (not ready yet):\n");
+        out.push_str(&format!(
+            "{:<slug_w$}  {:<3}  {:<state_w$}  {:<25}  {}\n",
+            "SLUG", "PRI", "STATE", "DEFER-UNTIL", "TITLE",
+        ));
+        for row in deferred {
+            let until = row
+                .ticket
+                .defer_until
+                .map(|ts| ts.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "{:<slug_w$}  {:<3}  {:<state_w$}  {:<25}  {}\n",
+                row.ticket.slug,
+                row.ticket.priority,
+                row.label,
+                until,
+                output::one_line(&row.ticket.title, 60),
+            ));
+        }
+    }
+    out
+}
+
 /// Render `kranz ticket show <slug>`: the parsed ticket, its resolved
 /// terminal label, and any "needs context" / "wrong plan" block appended to
 /// the ticket body.
@@ -274,6 +326,42 @@ pub fn cmd_ticket_list(repo: &Path) -> String {
         })
         .collect();
     render_ticket_list(&rows)
+}
+
+/// `kranz ticket ready [--include-deferred]`: the pick-up-now listing
+/// (D-BW-3). Ready = an actionable pipeline state (not in flight, not
+/// terminal) AND no `defer-until` still in the future — a deferred ticket
+/// simply becomes listable on its day; the clock at listing time is the only
+/// arbiter, there is no scheduler. `--include-deferred` appends the parked
+/// deferred tickets with their defer times for operator visibility.
+pub fn cmd_ticket_ready(repo: &Path, include_deferred: bool) -> String {
+    let now = chrono::Utc::now();
+    let tickets = Ticket::list(repo);
+    let mut ready: Vec<TicketRow<'_>> = Vec::new();
+    let mut deferred: Vec<TicketRow<'_>> = Vec::new();
+    for t in &tickets {
+        let state = Ticket::read_state(repo, &t.slug);
+        if !matches!(
+            state,
+            TicketState::New
+                | TicketState::NeedsContext
+                | TicketState::WrongPlan
+                | TicketState::Review
+                | TicketState::Parked
+        ) {
+            continue;
+        }
+        let row = TicketRow {
+            ticket: t,
+            label: ticket_terminal_label(repo, &t.slug, state),
+        };
+        if t.is_ready_at(now) {
+            ready.push(row);
+        } else {
+            deferred.push(row);
+        }
+    }
+    render_ticket_ready(&ready, &deferred, include_deferred)
 }
 
 /// `kranz ticket show <slug>`.

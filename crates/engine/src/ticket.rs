@@ -90,6 +90,11 @@ pub struct Ticket {
     /// that shipped it. Seeded by `kranz draft --from-mission` or added by
     /// hand; absent means "not a traced defect" (no false positives).
     pub traced_from_mission: Option<String>,
+    /// Deferral (`defer-until: <RFC 3339>` frontmatter, D-BW-3 adopted from
+    /// beads): present but NOT ready until the timestamp passes. Evaluated
+    /// against the clock at listing/admission time — no scheduler machinery;
+    /// `None` means ready now.
+    pub defer_until: Option<chrono::DateTime<chrono::Utc>>,
     /// The full markdown body (everything after the frontmatter block).
     pub raw_body: String,
 }
@@ -245,6 +250,7 @@ impl Ticket {
         let mut task_class: Option<String> = None;
         let mut trigger: Option<String> = None;
         let mut traced_from_mission: Option<String> = None;
+        let mut defer_until: Option<chrono::DateTime<chrono::Utc>> = None;
 
         for (key, value) in front {
             match key.as_str() {
@@ -275,6 +281,16 @@ impl Ticket {
                 "traced-from-mission" | "tracedfrommission" => {
                     let v = value.scalar().trim().to_string();
                     traced_from_mission = if v.is_empty() { None } else { Some(v) };
+                }
+                // Deferral (D-BW-3); additive. Unlike the warn-and-default
+                // scalar fields, a malformed timestamp is a hard parse error
+                // naming the ticket: silently dropping a deferral would queue
+                // work its author explicitly parked.
+                "defer-until" | "deferuntil" => {
+                    let v = value.scalar().trim().to_string();
+                    if !v.is_empty() {
+                        defer_until = Some(parse_defer_until(slug, &v)?);
+                    }
                 }
                 "schedule" => schedule = Schedule::parse(&value.scalar()),
                 "maxbudgetusd" | "max-budget-usd" => {
@@ -315,6 +331,7 @@ impl Ticket {
             task_class,
             trigger,
             traced_from_mission,
+            defer_until,
             raw_body: body,
         })
     }
@@ -358,6 +375,14 @@ impl Ticket {
                 .then_with(|| a.slug.cmp(&b.slug))
         });
         out
+    }
+
+    /// Whether the ticket is ready at `now`: a `defer-until` timestamp in the
+    /// future parks it (D-BW-3); anything else — absent, or past — is ready.
+    /// Callers supply the clock so the check is explicit at each listing /
+    /// admission site (there is no scheduler flipping state).
+    pub fn is_ready_at(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        self.defer_until.is_none_or(|until| until <= now)
     }
 
     /// Fold the whole ticket into one readable-markdown message: the goal plus
@@ -867,6 +892,20 @@ fn parse_front_value(raw: &str) -> FrontValue {
     } else {
         FrontValue::Scalar(unquote(raw))
     }
+}
+
+/// Parse a `defer-until` frontmatter value as RFC 3339. A malformed value is
+/// a hard [`EngineError::Config`] naming the ticket (a silently-dropped
+/// deferral would queue parked work), unlike the warn-and-default scalars.
+fn parse_defer_until(slug: &str, raw: &str) -> Result<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|ts| ts.with_timezone(&chrono::Utc))
+        .map_err(|e| {
+            EngineError::Config(format!(
+                "ticket {slug}: invalid defer-until '{raw}' (expected an RFC 3339 \
+                 timestamp, e.g. 2026-08-01T09:00:00Z): {e}"
+            ))
+        })
 }
 
 /// Strip a single pair of matching surrounding quotes, if present.

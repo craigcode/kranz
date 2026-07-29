@@ -1384,3 +1384,128 @@ fn slug_for_mission_reverse_lookup() {
     );
     assert_eq!(Ticket::slug_for_mission(root, "m-other"), None);
 }
+
+// ---------------------------------------------------------------------------
+// defer-until (D-BW-3, adopted from beads): parse, readiness, queue admission
+// ---------------------------------------------------------------------------
+
+const DEFER_PAST: &str = "2000-01-01T00:00:00Z";
+const DEFER_FUTURE: &str = "2999-01-01T00:00:00Z";
+
+#[test]
+fn defer_until_parses_and_absent_means_ready_now() {
+    let t = Ticket::parse(
+        "parked",
+        "---\ntitle: Parked\ndefer-until: 2026-08-01T09:00:00Z\n---\n\n## Goal\nlater\n",
+    )
+    .unwrap();
+    assert_eq!(
+        t.defer_until,
+        Some(
+            chrono::DateTime::parse_from_rfc3339("2026-08-01T09:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        )
+    );
+    // A non-Z offset normalizes to UTC.
+    assert_eq!(
+        t.defer_until.unwrap().to_rfc3339(),
+        "2026-08-01T09:00:00+00:00"
+    );
+
+    // Absent (and empty) means ready now.
+    let plain = Ticket::parse("plain", "---\ntitle: Plain\n---\n\n## Goal\nnow\n").unwrap();
+    assert_eq!(plain.defer_until, None);
+    let empty = Ticket::parse(
+        "empty",
+        "---\ntitle: Empty\ndefer-until:\n---\n\n## Goal\nnow\n",
+    )
+    .unwrap();
+    assert_eq!(empty.defer_until, None);
+}
+
+#[test]
+fn defer_until_malformed_rejected_naming_ticket() {
+    let err = Ticket::parse(
+        "bad-defer",
+        "---\ntitle: Bad\ndefer-until: next tuesday\n---\n\n## Goal\nlater\n",
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("bad-defer"), "names the ticket: {msg}");
+    assert!(msg.contains("defer-until"), "names the field: {msg}");
+    assert!(msg.contains("next tuesday"), "echoes the value: {msg}");
+}
+
+#[test]
+fn defer_until_readiness_past_ready_future_not() {
+    let now = chrono::Utc::now();
+    let mk = |ts: &str| {
+        Ticket::parse(
+            "t",
+            &format!("---\ntitle: T\ndefer-until: {ts}\n---\n\n## Goal\ng\n"),
+        )
+        .unwrap()
+    };
+    assert!(mk(DEFER_PAST).is_ready_at(now), "past timestamp is ready");
+    assert!(
+        !mk(DEFER_FUTURE).is_ready_at(now),
+        "future timestamp is not ready"
+    );
+    let plain = Ticket::parse("t", "---\ntitle: T\n---\n\n## Goal\ng\n").unwrap();
+    assert!(plain.is_ready_at(now), "absent defer-until is ready");
+}
+
+#[test]
+fn defer_until_queue_refuses_future_naming_time() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let dir = Ticket::tickets_dir(root);
+    fs::create_dir_all(&dir).unwrap();
+    write_ticket(
+        &dir,
+        "deferred",
+        &format!("---\ntitle: Deferred\ndefer-until: {DEFER_FUTURE}\n---\n\n## Goal\nlater\n"),
+    );
+    Ticket::write_state(root, "deferred", TicketState::Review, None).unwrap();
+
+    let err = deps::approve_ticket(root, "deferred", Some("m-x"), false).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("deferred until"), "fail-closed reason: {msg}");
+    assert!(
+        msg.contains("2999-01-01T00:00:00"),
+        "names the defer time: {msg}"
+    );
+    // Refused means refused: nothing enqueued, ticket not flipped.
+    assert!(!queue::contains(root, "m-x"));
+    assert_eq!(Ticket::read_state(root, "deferred"), TicketState::Review);
+
+    // A past deferral is ready: admission proceeds normally.
+    write_ticket(
+        &dir,
+        "ripened",
+        &format!("---\ntitle: Ripened\ndefer-until: {DEFER_PAST}\n---\n\n## Goal\nnow\n"),
+    );
+    Ticket::write_state(root, "ripened", TicketState::Review, None).unwrap();
+    deps::approve_ticket(root, "ripened", Some("m-ripe"), false).unwrap();
+    assert!(queue::contains(root, "m-ripe"));
+}
+
+#[test]
+fn defer_until_queue_force_overrides() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let dir = Ticket::tickets_dir(root);
+    fs::create_dir_all(&dir).unwrap();
+    write_ticket(
+        &dir,
+        "forced",
+        &format!("---\ntitle: Forced\ndefer-until: {DEFER_FUTURE}\n---\n\n## Goal\nnow anyway\n"),
+    );
+    Ticket::write_state(root, "forced", TicketState::Review, None).unwrap();
+
+    let approved = deps::approve_ticket(root, "forced", Some("m-f"), true).unwrap();
+    assert_eq!(approved.mission_id, "m-f");
+    assert!(queue::contains(root, "m-f"));
+    assert_eq!(Ticket::read_state(root, "forced"), TicketState::Queued);
+}

@@ -206,6 +206,58 @@ async fn ready_plan_parks_in_review_with_mission_recorded() {
 }
 
 // ---------------------------------------------------------------------------
+// Ticket notes (D-BW-3): the discussion rides the drafter's seed message
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn ticket_note_discussion_rides_the_draft_seed_without_forking_the_goal() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let ticket = write_ticket(&root, "rl-notes", TICKET_BODY);
+    kranz_engine::ticket_notes::append_note(&root, "rl-notes", "alice", "why priority changed")
+        .unwrap();
+    kranz_engine::ticket_notes::append_note(&root, "rl-notes", "bob", "review: keep it small")
+        .unwrap();
+
+    let goal = ticket.mission_goal();
+    let backend = Arc::new(MockBackend::with_scripts(vec![orch_script(vec![
+        "seeded, thinking...".to_string(),
+        plan_json(&goal),
+    ])]));
+    let mut engine =
+        MissionEngine::create(backend.clone(), root.clone(), &goal, test_cfg()).unwrap();
+    let drive = drive_draft(&mut engine, &root, &ticket, false)
+        .await
+        .unwrap();
+    assert!(matches!(
+        drive.outcome,
+        DraftOutcome::ParkedForReview { .. }
+    ));
+
+    // The orchestrator's seed message carries the folded ticket AND the notes.
+    let injected = backend.injected_messages();
+    assert_eq!(injected.len(), 1, "only the orchestrator session ran");
+    let seed = &injected[0][0];
+    assert!(seed.contains("Add rate limiting."), "ticket goal: {seed}");
+    assert!(seed.contains("## Ticket notes"), "notes section: {seed}");
+    assert!(
+        seed.contains("alice: why priority changed"),
+        "note 1: {seed}"
+    );
+    assert!(
+        seed.contains("bob: review: keep it small"),
+        "note 2: {seed}"
+    );
+
+    // …but the RECORDED mission goal is not forked: approve's goal-matching
+    // and parse_task_class_from_goal read back exactly mission_goal().
+    assert_eq!(engine.state().mission.goal, goal);
+    assert!(!engine.state().mission.goal.contains("Ticket notes"));
+}
+
+// ---------------------------------------------------------------------------
 // Ready plan + then_enqueue=true → Queued + queue entry
 // ---------------------------------------------------------------------------
 

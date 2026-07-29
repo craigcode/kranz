@@ -518,6 +518,16 @@ pub enum TicketCommand {
     /// List tickets with slug, priority, pipeline state, and title
     List,
 
+    /// List tickets ready to pick up now: actionable states whose
+    /// `defer-until` (if any) has passed — deferred tickets stay hidden until
+    /// their time (D-BW-3; the clock decides at listing time, no scheduler)
+    Ready {
+        /// Also list the not-yet-ready deferred tickets, with their defer
+        /// times (operator visibility; the default listing stays clean)
+        #[arg(long)]
+        include_deferred: bool,
+    },
+
     /// Show one ticket: parsed fields, its state, and any needs-context block
     Show {
         /// The ticket slug (file stem under .kranz/tickets/)
@@ -536,6 +546,25 @@ pub enum TicketCommand {
         /// An optional one-paragraph goal to pre-fill the `## Goal` section
         #[arg(long)]
         goal: Option<String>,
+    },
+
+    /// Append a note to a ticket's discussion
+    /// (.kranz/tickets/<slug>.notes.jsonl — append-only, committed with the
+    /// ticket; D-BW-3). Author is $KRANZ_NOTE_AUTHOR, else "operator"
+    Note {
+        /// The ticket slug
+        slug: String,
+
+        /// The note text (multiple words are joined with spaces)
+        #[arg(required = true)]
+        text: Vec<String>,
+    },
+
+    /// Print a ticket's discussion notes chronologically (append-only — there
+    /// is no edit or delete, mirroring the event log's honesty posture)
+    Notes {
+        /// The ticket slug
+        slug: String,
     },
 
     /// Queue a drafted (REVIEW) ticket: enqueue its mission and mark it QUEUED

@@ -101,7 +101,8 @@ kranz work                      # drain the queue (run missions)
 
 Committed: `.kranz/merge-gates.json`, `.kranz/workspace.json` (workspace
 contract, validated at draft/approve; `crates/engine/src/workspace_contract.rs`),
-`.kranz/tickets/<slug>.md`, and each
+`.kranz/tickets/<slug>.md`, `.kranz/tickets/<slug>.notes.jsonl` (append-only
+discussion sidecar, D-BW-3; `crates/engine/src/ticket_notes.rs`), and each
 mission's `plan.md` / `plan.json` / `report.md` (on the mission branch). Gitignored runtime
 (never commit): `events.jsonl`, `state.json`, `runs/`, `control/`,
 `missions/*/workspace/` (container-provider compose files),

@@ -116,12 +116,14 @@ pub struct ApprovedTicket {
 /// ticket approve`) and the REST `POST /api/tickets/:slug/approve` handler,
 /// so the two surfaces can never drift apart on what "approvable" means.
 ///
-/// Refuses (via [`EngineError::InvalidState`]) when: the ticket is not
-/// [`TicketState::Review`] or [`TicketState::Parked`]; a `blocked-by` cycle
-/// is reachable from `slug` (never overridable by `force`); or an
-/// unsatisfied blocker exists and `force` is false. On success, enqueues the
-/// ticket's drafted mission (`explicit_mission`, else the recorded/discovered
-/// one) and sets the ticket [`TicketState::Queued`].
+/// Refuses (via [`EngineError::InvalidState`]) when: the ticket's
+/// `defer-until` is still in the future and `force` is false (D-BW-3 — the
+/// refusal names the defer time); the ticket is not [`TicketState::Review`]
+/// or [`TicketState::Parked`]; a `blocked-by` cycle is reachable from `slug`
+/// (never overridable by `force`); or an unsatisfied blocker exists and
+/// `force` is false. On success, enqueues the ticket's drafted mission
+/// (`explicit_mission`, else the recorded/discovered one) and sets the ticket
+/// [`TicketState::Queued`].
 ///
 /// [`TicketState::Parked`] is accepted so a readiness park can be re-queued
 /// after the operator fixes auth/binaries — the plan is already committed.
@@ -134,6 +136,19 @@ pub fn approve_ticket(
     Ticket::ensure_valid_slug(slug)?;
     let ticket_path = Ticket::tickets_dir(repo_root).join(format!("{slug}.md"));
     let ticket = Ticket::load(&ticket_path)?;
+
+    // Deferral (D-BW-3): a ticket whose `defer-until` is still in the future
+    // is fail-closed refused, naming the time — never silently skipped. The
+    // clock is the only arbiter (no scheduler); `--force` overrides.
+    if let Some(defer_until) = ticket.defer_until {
+        if defer_until > chrono::Utc::now() && !force {
+            return Err(EngineError::InvalidState(format!(
+                "cannot approve {slug}: deferred until {} (re-run with --force \
+                 to queue it anyway)",
+                defer_until.to_rfc3339()
+            )));
+        }
+    }
 
     let state = Ticket::read_state(repo_root, slug);
     if !matches!(state, TicketState::Review | TicketState::Parked) {

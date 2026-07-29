@@ -34,3 +34,4 @@ pub mod output;
 pub mod planning_tui;
 pub mod ready;
 pub mod tail;
+pub mod ticket_notes;

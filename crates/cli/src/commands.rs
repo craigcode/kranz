@@ -330,6 +330,10 @@ fn dispatch_ticket(repo: &Path, command: TicketCommand, mission: Option<&str>) -
             print!("{}", backlog::cmd_ticket_list(repo));
             Ok(0)
         }
+        TicketCommand::Ready { include_deferred } => {
+            print!("{}", backlog::cmd_ticket_ready(repo, include_deferred));
+            Ok(0)
+        }
         TicketCommand::Show { slug } => {
             print!("{}", backlog::cmd_ticket_show(repo, &slug)?);
             Ok(0)
@@ -337,6 +341,17 @@ fn dispatch_ticket(repo: &Path, command: TicketCommand, mission: Option<&str>) -
         TicketCommand::New { slug, title, goal } => {
             let path = backlog::cmd_ticket_new(repo, &slug, &title, goal.as_deref())?;
             println!("created ticket '{slug}' at {}", path.display());
+            Ok(0)
+        }
+        TicketCommand::Note { slug, text } => {
+            print!(
+                "{}",
+                crate::ticket_notes::cmd_ticket_note(repo, &slug, &text.join(" "))?
+            );
+            Ok(0)
+        }
+        TicketCommand::Notes { slug } => {
+            print!("{}", crate::ticket_notes::cmd_ticket_notes(repo, &slug)?);
             Ok(0)
         }
         TicketCommand::Queue {
