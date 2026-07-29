@@ -3635,6 +3635,17 @@ impl MissionEngine {
             if self.fail_on_validator_tamper(&milestone_id, role, &outcome.run_id, &fingerprint)? {
                 return Ok(());
             }
+            // Validator-set index flags inside the snapshot (4th-pass
+            // review): any flag present was set by the validator.
+            if self.fail_on_snapshot_index_flags(
+                &milestone_id,
+                role,
+                &outcome.run_id,
+                &snapshot,
+                &fingerprint.head,
+            )? {
+                return Ok(());
+            }
             // Discard the primary snapshot before any retry builds its own:
             // one warm target/ copy at a time.
             drop(snapshot);
@@ -3719,6 +3730,15 @@ impl MissionEngine {
                     role,
                     &outcome.run_id,
                     &retry_fingerprint,
+                )? {
+                    return Ok(());
+                }
+                if self.fail_on_snapshot_index_flags(
+                    &milestone_id,
+                    role,
+                    &outcome.run_id,
+                    &retry_snapshot,
+                    &retry_fingerprint.head,
                 )? {
                     return Ok(());
                 }
@@ -3948,6 +3968,50 @@ impl MissionEngine {
              so the round fails honestly",
             role_label(role),
             drift.summary()
+        );
+        self.emit_decision(&reason, None)?;
+        self.emit(EventKind::MilestoneBlocked {
+            milestone_id: milestone_id.to_string(),
+            reason,
+        })?;
+        Ok(true)
+    }
+
+    /// The snapshot-side half of the tamper gate (4th-pass review):
+    /// `skip-worktree`/`assume-unchanged` flags hide modifications from git
+    /// while the files on disk still drive the verdict — and the snapshot's
+    /// teardown erases the evidence. The snapshot builds with a fresh,
+    /// flag-free index, so any flag present after the session was set by
+    /// the validator: emit `validator.tamper` and block, same as a real-
+    /// checkout tripwire drift. Returns `true` when the round failed.
+    fn fail_on_snapshot_index_flags(
+        &mut self,
+        milestone_id: &str,
+        role: Role,
+        run_id: &str,
+        snapshot: &validator_snapshot::ValidatorSnapshot,
+        head: &str,
+    ) -> Result<bool> {
+        let validator_flags = snapshot.validator_set_index_flags()?;
+        if validator_flags.is_empty() {
+            return Ok(false);
+        }
+        self.emit(EventKind::ValidatorTamper {
+            milestone_id: milestone_id.to_string(),
+            run_id: run_id.to_string(),
+            role,
+            head_before: head.to_string(),
+            head_after: head.to_string(),
+            appeared: validator_flags.clone(),
+            resolved: Vec::new(),
+            git_metadata_changed: false,
+        })?;
+        let reason = format!(
+            "{} session set skip-worktree/assume-unchanged flags in its \
+             snapshot ({}); hidden modifications would corrupt the verdict, \
+             so the round fails honestly",
+            role_label(role),
+            validator_flags.join(", ")
         );
         self.emit_decision(&reason, None)?;
         self.emit(EventKind::MilestoneBlocked {

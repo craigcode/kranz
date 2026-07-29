@@ -141,15 +141,22 @@ impl GitRepo {
     }
 
     /// A handle to the same repository whose every git invocation runs with
-    /// hooks disabled (`git -c core.hooksPath=` — the empty value resolves
-    /// every hook lookup to nothing, so no hook file is ever executed).
+    /// executable configuration disabled (`git -c core.hooksPath= -c
+    /// core.fsmonitor=` — the empty values resolve every hook lookup to
+    /// nothing and turn the fsmonitor hook off, so no attacker-written
+    /// config value is ever executed).
     ///
     /// The gated merge path uses this: its scratch worktree's gitdir points
     /// into the primary `.git`, so mission-authored gate/test code can plant
     /// `.git/hooks/*` — which the merge's own checkout / merge / worktree
     /// commands would then execute with the server's full inherited
     /// environment, exactly the tokens the sanitized gate executor withholds.
-    /// Opt-in per handle: worker-side git behavior is deliberately unchanged.
+    /// The validator-integrity fingerprint runs on a verification handle for
+    /// the same reason: a validator that poisons `core.fsmonitor` must not
+    /// get its payload executed by the detection itself (4th-pass review —
+    /// detection previously ran `git status` BEFORE comparing config, so the
+    /// payload ran first). Opt-in per handle: worker-side git behavior is
+    /// deliberately unchanged.
     pub fn with_hooks_disabled(&self) -> GitRepo {
         GitRepo {
             root: self.root.clone(),
@@ -273,6 +280,15 @@ impl GitRepo {
         // (`?? dir/`), so files added inside an already-untracked dir would
         // be invisible to the validator-integrity fingerprint (review 2 pass).
         self.run(&["status", "--porcelain", "--untracked-files=all"])
+    }
+
+    /// `git ls-files -v`: every index entry with its flag column (`S` =
+    /// skip-worktree, lowercase = assume-unchanged). A `skip-worktree` flag
+    /// hides worktree modifications from `git status` entirely (4th-pass
+    /// review: set the flag, overwrite the file, HEAD and porcelain both
+    /// unchanged), so the immutability fingerprint covers the flags too.
+    pub fn ls_files_v(&self) -> Result<String> {
+        self.run(&["ls-files", "-v"])
     }
 
     /// Like [`Self::is_clean`] but ignoring untracked files: `true` when no
@@ -1222,9 +1238,11 @@ impl GitRepo {
     fn probe_os(&self, args: &[OsString]) -> Result<Output> {
         let mut cmd = Command::new("git");
         if self.hooks_disabled {
-            // `-c` must precede the subcommand; the empty value makes every
-            // hook lookup resolve to nothing (see with_hooks_disabled).
-            cmd.args(["-c", "core.hooksPath="]);
+            // `-c` must precede the subcommand; the empty values disable
+            // every executable config surface git consults on read paths
+            // (see with_hooks_disabled): hook lookup and the fsmonitor hook
+            // `git status` would otherwise run.
+            cmd.args(["-c", "core.hooksPath=", "-c", "core.fsmonitor="]);
         }
         cmd.args(args)
             .current_dir(&self.root)

@@ -116,6 +116,29 @@ pub struct ValidatorSnapshot {
 }
 
 impl ValidatorSnapshot {
+    /// `git ls-files -v` inside the snapshot, filtered to the flag tags
+    /// (`S` = skip-worktree, lowercase = assume-unchanged). The snapshot
+    /// starts with a fresh, flag-free index, so any flag present after the
+    /// session was set BY THE VALIDATOR — hidden modifications that would
+    /// corrupt the verdict while leaving no trace once the snapshot is
+    /// discarded (4th-pass review). Returns the offending lines (capped)
+    /// when any flag is set.
+    pub fn validator_set_index_flags(&self) -> Result<Vec<String>> {
+        let repo = GitRepo::open(&self.path)?;
+        let flags = repo.ls_files_v()?;
+        Ok(flags
+            .lines()
+            .filter(|line| {
+                let Some(tag) = line.chars().next() else {
+                    return false;
+                };
+                tag == 'S' || tag.is_ascii_lowercase()
+            })
+            .take(5)
+            .map(str::to_string)
+            .collect())
+    }
+
     /// Snapshot `repo`'s checkout (HEAD + uncommitted diff + untracked
     /// files + warmed `target/`) into a detached worktree at `path`.
     /// Idempotent against a stale leftover from a crashed round: any prior
@@ -135,6 +158,36 @@ impl ValidatorSnapshot {
         let head = repo.head_sha()?;
         let diff = repo.diff_head()?;
         let untracked = repo.untracked_files()?;
+        // Fail closed on skip-worktree/assume-unchanged index flags
+        // (4th-pass review): `git diff HEAD` and `git status` are BLIND to
+        // flagged files, so a flagged modification can neither be replayed
+        // here nor seen by the validator — a worker could hide source or
+        // test edits from validation entirely. The snapshot cannot
+        // faithfully represent a flagged checkout, so refuse to build one.
+        let flags = repo.ls_files_v()?;
+        let flagged: Vec<&str> = flags
+            .lines()
+            .filter(|line| {
+                let Some(tag) = line.chars().next() else {
+                    return false;
+                };
+                // 'S' = skip-worktree; any lowercase tag = assume-unchanged
+                // (ls-files -v lowercases the tag for flagged entries).
+                tag == 'S' || tag.is_ascii_lowercase()
+            })
+            .collect();
+        if !flagged.is_empty() {
+            return Err(EngineError::InvalidState(format!(
+                "refusing validator snapshot over skip-worktree/assume-unchanged \
+                 index flags (modifications hidden from git): {}",
+                flagged
+                    .iter()
+                    .take(5)
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
         repo.add_detached_worktree(path, &head)?;
 
         // From here a failure must not leak the worktree: build the guard
@@ -409,6 +462,68 @@ mod tests {
             pick_plain_or_fresh(PLAIN_COPY_MAX_BYTES + 1),
             TargetCopyTier::Fresh
         );
+    }
+
+    /// 4th-pass review: a checkout with skip-worktree/assume-unchanged
+    /// flags cannot be faithfully snapshotted (`git diff` and `git status`
+    /// are blind to flagged files), so creation refuses fail-closed.
+    #[test]
+    fn create_refuses_skip_worktree_flags() {
+        let Some((dir, root)) = test_repo() else {
+            return;
+        };
+        let repo = GitRepo::open(&root).unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .expect("spawn git");
+            assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        };
+        // A flagged modification is invisible to git diff/status: the
+        // snapshot would silently validate the WRONG content.
+        run(&["update-index", "--skip-worktree", "README.md"]);
+        std::fs::write(root.join("README.md"), "hidden modification\n").unwrap();
+
+        let err = match ValidatorSnapshot::create(&repo, &root.join("snap")) {
+            Ok(_) => panic!("a flagged checkout must not build a snapshot"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("skip-worktree"),
+            "error must name the flag class: {err}"
+        );
+        drop(dir);
+    }
+
+    /// The snapshot starts flag-free, so any flag afterwards was set by the
+    /// session: validator_set_index_flags detects exactly that.
+    #[test]
+    fn validator_set_index_flags_detects_flags_set_inside_the_snapshot() {
+        let Some((_dir, root)) = test_repo() else {
+            return;
+        };
+        let repo = GitRepo::open(&root).unwrap();
+        let snapshot =
+            ValidatorSnapshot::create(&repo, &root.join("snap")).expect("clean checkout builds");
+        assert!(
+            snapshot.validator_set_index_flags().unwrap().is_empty(),
+            "a fresh snapshot has no flags"
+        );
+
+        // Simulate the validator's move INSIDE the snapshot.
+        let out = std::process::Command::new("git")
+            .args(["update-index", "--skip-worktree", "README.md"])
+            .current_dir(snapshot.path())
+            .output()
+            .expect("spawn git");
+        assert!(out.status.success(), "git update-index failed: {out:?}");
+
+        let flags = snapshot.validator_set_index_flags().unwrap();
+        assert_eq!(flags.len(), 1, "{flags:?}");
+        assert!(flags[0].starts_with('S'), "{flags:?}");
+        assert!(flags[0].contains("README.md"), "{flags:?}");
     }
 
     /// The snapshot sees exactly what the worker left: the committed tree,

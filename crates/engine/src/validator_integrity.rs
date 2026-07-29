@@ -58,18 +58,36 @@ pub struct CheckoutFingerprint {
     /// `git for-each-ref` output: moving a ref retargets later merges
     /// without touching HEAD or the worktree.
     pub git_refs: String,
+    /// `git ls-files -v` output: `skip-worktree`/`assume-unchanged` flags
+    /// hide worktree modifications from `git status` (4th-pass review) —
+    /// the flags are part of the identity, so setting one is drift.
+    pub index_flags: String,
+    /// Contents of `<git-common-dir>/info/exclude`: the local exclude file
+    /// hides untracked files from `git status` without touching the tree.
+    pub info_exclude: String,
 }
 
 impl CheckoutFingerprint {
     /// Capture the identity of `repo`'s checkout right now.
+    ///
+    /// All git invocations run on a VERIFICATION handle (hooks + fsmonitor
+    /// disabled): a poisoned `core.fsmonitor` in the checkout's config must
+    /// never get its payload executed by the detection itself (4th-pass
+    /// review — detection previously ran `git status` before comparing
+    /// config, so the payload ran first). The `.git` metadata itself is
+    /// read via the filesystem, never through git.
     pub fn capture(repo: &GitRepo) -> Result<Self> {
-        let common = repo.git_common_dir()?;
+        let verification = repo.with_hooks_disabled();
+        let common = verification.git_common_dir()?;
         Ok(CheckoutFingerprint {
-            head: repo.head_sha()?,
-            status: repo.porcelain_status()?,
+            head: verification.head_sha()?,
+            status: verification.porcelain_status()?,
             git_config: std::fs::read_to_string(common.join("config")).unwrap_or_default(),
             git_hooks: hook_listing(&common.join("hooks")),
-            git_refs: repo.for_each_ref()?,
+            git_refs: verification.for_each_ref()?,
+            index_flags: verification.ls_files_v()?,
+            info_exclude: std::fs::read_to_string(common.join("info").join("exclude"))
+                .unwrap_or_default(),
         })
     }
 
@@ -88,17 +106,26 @@ impl CheckoutFingerprint {
             resolved: before.difference(&later).map(|s| s.to_string()).collect(),
             git_metadata_changed: self.git_config != after.git_config
                 || self.git_hooks != after.git_hooks
-                || self.git_refs != after.git_refs,
+                || self.git_refs != after.git_refs
+                || self.index_flags != after.index_flags
+                || self.info_exclude != after.info_exclude,
         })
     }
 }
 
 /// Sorted `name HASH` lines for the non-`.sample` hooks in `hooks_dir`
-/// (content-hashed: a same-length rewrite must not slip past). Absent or
-/// unreadable dirs list as empty — an absent hooks dir and an empty one
-/// are equivalent for tamper purposes.
+/// (content-hashed: a same-length rewrite must not slip past). Reads are
+/// BOUNDED and never followed (4th-pass review): only regular files, hashed
+/// as first-32 KiB + last-32 KiB + length (a same-length edit anywhere in
+/// the file still changes the line; reads never exceed 64 KiB). A symlink,
+/// FIFO, device, or other special entry is NEVER opened — a FIFO would
+/// block forever, a `/dev/zero` symlink would allocate without bound — and
+/// records a stable `name SUSPECT:<kind>` marker instead: the same marker
+/// on the next capture, so an unchanged oddity is not itself drift, but any
+/// change to it is. Absent or unreadable dirs list as empty.
 fn hook_listing(hooks_dir: &std::path::Path) -> String {
     use std::hash::{Hash, Hasher};
+    const HOOK_WINDOW: u64 = 32 * 1024;
     let mut lines: Vec<String> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(hooks_dir) {
         for entry in entries.flatten() {
@@ -106,10 +133,42 @@ fn hook_listing(hooks_dir: &std::path::Path) -> String {
             if name.ends_with(".sample") {
                 continue;
             }
-            if let Ok(contents) = std::fs::read(entry.path()) {
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                contents.hash(&mut hasher);
-                lines.push(format!("{name} {:016x}", hasher.finish()));
+            let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
+                lines.push(format!("{name} SUSPECT:unreadable"));
+                continue;
+            };
+            let file_type = metadata.file_type();
+            if !file_type.is_file() {
+                let kind = if file_type.is_symlink() {
+                    "symlink"
+                } else if file_type.is_dir() {
+                    "dir"
+                } else {
+                    "special"
+                };
+                lines.push(format!("{name} SUSPECT:{kind}"));
+                continue;
+            }
+            match std::fs::File::open(entry.path()) {
+                Ok(mut file) => {
+                    use std::io::{Read as _, Seek as _, SeekFrom};
+                    let len = metadata.len();
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    let mut head = vec![0u8; HOOK_WINDOW as usize];
+                    let head_read = file.read(&mut head).unwrap_or(0);
+                    head[..head_read].hash(&mut hasher);
+                    if len > HOOK_WINDOW {
+                        let tail_start = len.saturating_sub(HOOK_WINDOW);
+                        if file.seek(SeekFrom::Start(tail_start)).is_ok() {
+                            let mut tail = vec![0u8; HOOK_WINDOW as usize];
+                            let tail_read = file.read(&mut tail).unwrap_or(0);
+                            tail[..tail_read].hash(&mut hasher);
+                        }
+                    }
+                    len.hash(&mut hasher);
+                    lines.push(format!("{name} {:016x}", hasher.finish()));
+                }
+                Err(_) => lines.push(format!("{name} SUSPECT:unreadable")),
             }
         }
     }
@@ -187,6 +246,8 @@ mod tests {
             git_config: String::new(),
             git_hooks: String::new(),
             git_refs: String::new(),
+            index_flags: String::new(),
+            info_exclude: String::new(),
         }
     }
 
@@ -227,6 +288,77 @@ mod tests {
         let summary = drift.summary();
         assert!(summary.contains("20 status entries changed"), "{summary}");
         assert!(summary.contains('…'), "{summary}");
+    }
+
+    /// 4th-pass review: skip-worktree/assume-unchanged flags and the local
+    /// exclude file hide modifications from porcelain — changing either is
+    /// metadata drift even with HEAD and status byte-identical.
+    #[test]
+    fn index_flags_and_info_exclude_changes_are_drift() {
+        let before = fp("abc1234", "");
+
+        let mut flagged = before.clone();
+        flagged.index_flags = "S src/hidden_test.rs\n".to_string();
+        let drift = before
+            .drift(&flagged)
+            .expect("a skip-worktree flag must be drift");
+        assert!(drift.git_metadata_changed);
+
+        let mut excluded = before.clone();
+        excluded.info_exclude = "secret-test.sh\n".to_string();
+        let drift = before
+            .drift(&excluded)
+            .expect("an info/exclude change must be drift");
+        assert!(drift.git_metadata_changed);
+    }
+
+    /// 4th-pass review: special entries (FIFO/symlink/dir) are never opened
+    /// — they record a stable SUSPECT marker instead, so the listing cannot
+    /// block or exhaust memory, and an unchanged oddity is not drift.
+    #[cfg(unix)]
+    #[test]
+    fn hook_listing_marks_special_entries_without_opening_them() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let hooks = dir.path().join("hooks");
+        std::fs::create_dir(&hooks).unwrap();
+        // A FIFO: opening it for read would block forever.
+        let fifo_path = std::ffi::CString::new(hooks.join("evil-fifo").to_str().unwrap()).unwrap();
+        let rc = unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o700) };
+        assert_eq!(rc, 0, "mkfifo failed");
+        // A symlink to an unbounded device: reading it would never fill.
+        symlink("/dev/zero", hooks.join("evil-link")).unwrap();
+        std::fs::create_dir(hooks.join("nested")).unwrap();
+        std::fs::write(hooks.join("good-hook"), b"echo ok").unwrap();
+
+        let listing = hook_listing(&hooks);
+        assert!(listing.contains("evil-fifo SUSPECT:special"), "{listing}");
+        assert!(listing.contains("evil-link SUSPECT:symlink"), "{listing}");
+        assert!(listing.contains("nested SUSPECT:dir"), "{listing}");
+        assert!(listing.contains("good-hook "), "{listing}");
+        // Stable: the same oddities list identically (no false drift).
+        assert_eq!(listing, hook_listing(&hooks));
+    }
+
+    /// An over-cap hook still hashes deterministically, and a tail change
+    /// beyond the read cap still changes the line via the recorded length.
+    #[test]
+    fn hook_listing_bounds_large_hooks_but_still_notices_tail_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let hooks = dir.path().join("hooks");
+        std::fs::create_dir(&hooks).unwrap();
+        std::fs::write(hooks.join("big"), vec![b'a'; 128 * 1024]).unwrap();
+
+        let first = hook_listing(&hooks);
+        assert!(first.starts_with("big "), "{first}");
+        assert_eq!(first, hook_listing(&hooks), "listing is deterministic");
+
+        // Change ONLY bytes beyond the 64 KiB read cap: the length half of
+        // the hash still notices.
+        let mut contents = vec![b'a'; 128 * 1024];
+        contents[127 * 1024] = b'b';
+        std::fs::write(hooks.join("big"), &contents).unwrap();
+        assert_ne!(first, hook_listing(&hooks));
     }
 
     /// 3rd-pass review: the worktree can look identical while `.git` was
