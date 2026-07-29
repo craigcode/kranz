@@ -185,7 +185,10 @@ fn resolve_for_session_target(
 /// `fs+net` with an empty egress list keeps the `--network none` hard egress
 /// boundary; `fs+net` with a non-empty egress list resolves — the run routes
 /// the session through the filtering egress proxy (`crate::egress_proxy`) over
-/// the runtime bridge. A requested container with no runtime on PATH is refused.
+/// the runtime bridge. That proxy-routed posture is advisory-only, so
+/// `config::validate` refuses it (fail closed) before a mission can reach
+/// this point; the resolution remains for the internal-network sidecar
+/// follow-up. A requested container with no runtime on PATH is refused.
 fn resolve_container_target(
     role_sandbox: &crate::types::SandboxConfig,
     session_cwd: &Path,
@@ -1197,9 +1200,12 @@ mod tests {
         let session = tempfile::tempdir().unwrap();
         let mission = tempfile::tempdir().unwrap();
 
-        // fs+net with a per-host egress list is no longer refused: the run
-        // routes the session through the filtering egress proxy over the
-        // runtime bridge (crate::egress_proxy), so the container resolves.
+        // fs+net with a per-host egress list still RESOLVES — the run routes
+        // the session through the filtering egress proxy over the runtime
+        // bridge (crate::egress_proxy) — but that posture is advisory-only,
+        // so `config::validate` refuses it (fail closed) before a mission can
+        // reach this point. The resolution remains for the internal-network
+        // sidecar follow-up.
         let (resolved, warn) = resolve_for_session_target(
             &cfg,
             session.path(),

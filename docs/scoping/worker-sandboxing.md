@@ -157,8 +157,11 @@ All of it asks the agent nicely. None of it constrains the process.
   `--add-host … host-gateway` entry is added on Linux docker): the proxy
   enforces the per-host allowlist and records denials. Env-based routing is
   advisory on the bridge — a process that ignores the proxy vars bypasses
-  the filter — so a hard per-host container boundary (internal-network
-  sidecar) remains follow-up work; Seatbelt is the hard boundary on macOS
+  the filter — so `config::validate` REFUSES `provider: "container"` with
+  `enforce: "fs+net"` and a non-empty egress list (fail closed, same
+  posture as the non-claude-backend sandbox rejection; ticket
+  container-fsnet-advisory-label) until a hard per-host container boundary
+  (internal-network sidecar) lands; Seatbelt is the hard boundary on macOS
   hosts.
 - Worker image: the default `alpine:3` proves the isolation boundary but
   cannot run an agent. A production worker image needs the agent CLI + Node

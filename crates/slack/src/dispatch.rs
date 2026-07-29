@@ -9,8 +9,9 @@ use crate::bridge::{
     build_ticket_show_reply, build_todo_reply, build_work_reply, change_config, create_ticket,
     error_blocks, grant_control, guidance, is_ticket_slug, looks_like_mission_id,
     looks_like_plan_json, mission_dir_exists, mission_status, new_mission, no_host_blocks,
-    not_authorized_blocks, post_thread_note, post_to_mission_thread, reply_ephemeral,
-    revision_control, scaffold_ticket, slugify, steer, user_reply, ModalScope, SharedThreads,
+    not_authorized_blocks_for, not_authorized_text_for, post_thread_note, post_to_mission_thread,
+    reply_ephemeral, revision_control, scaffold_ticket, slugify, steer, user_reply, ModalScope,
+    SharedThreads,
 };
 use crate::client::SlackClient;
 use crate::commands::{
@@ -117,7 +118,7 @@ pub(crate) async fn dispatch_action(
                     cfg,
                     client,
                     response_url.as_deref(),
-                    &not_authorized_blocks(),
+                    &not_authorized_blocks_for(cfg),
                 )
                 .await;
                 return;
@@ -203,7 +204,7 @@ pub(crate) async fn dispatch_action(
                     response_url.as_deref(),
                     channel,
                     user_id.as_deref(),
-                    &not_authorized_blocks(),
+                    &not_authorized_blocks_for(cfg),
                 )
                 .await;
                 return;
@@ -263,7 +264,7 @@ pub(crate) async fn dispatch_action(
                     cfg,
                     client,
                     response_url.as_deref(),
-                    &not_authorized_blocks(),
+                    &not_authorized_blocks_for(cfg),
                 )
                 .await;
                 return;
@@ -305,7 +306,7 @@ pub(crate) async fn dispatch_action(
                     cfg,
                     client,
                     response_url.as_deref(),
-                    &not_authorized_blocks(),
+                    &not_authorized_blocks_for(cfg),
                 )
                 .await;
                 return;
@@ -349,7 +350,7 @@ pub(crate) async fn dispatch_action(
                     cfg,
                     client,
                     response_url.as_deref(),
-                    &not_authorized_blocks(),
+                    &not_authorized_blocks_for(cfg),
                 )
                 .await;
                 return;
@@ -400,7 +401,7 @@ pub(crate) async fn dispatch_action(
                     None,
                     channel,
                     user_id.as_deref(),
-                    &not_authorized_blocks(),
+                    &not_authorized_blocks_for(cfg),
                 )
                 .await;
                 return;
@@ -456,7 +457,7 @@ pub(crate) async fn dispatch_action(
                     response_url.as_deref(),
                     channel,
                     user_id.as_deref(),
-                    &not_authorized_blocks(),
+                    &not_authorized_blocks_for(cfg),
                 )
                 .await;
                 return;
@@ -510,7 +511,7 @@ pub(crate) async fn dispatch_action(
                     cfg,
                     client,
                     response_url.as_deref(),
-                    &not_authorized_blocks(),
+                    &not_authorized_blocks_for(cfg),
                 )
                 .await;
                 return;
@@ -634,7 +635,7 @@ pub(crate) async fn dispatch_action(
                         cfg,
                         client,
                         response_url.as_deref(),
-                        &not_authorized_blocks(),
+                        &not_authorized_blocks_for(cfg),
                     )
                     .await;
                 } else if let Some(result) = &invocation.result {
@@ -685,7 +686,7 @@ pub(crate) async fn dispatch_action(
                     cfg,
                     client,
                     response_url.as_deref(),
-                    &not_authorized_blocks(),
+                    &not_authorized_blocks_for(cfg),
                 )
                 .await;
             } else if let Some(result) = &invocation.result {
@@ -709,7 +710,7 @@ pub(crate) async fn dispatch_action(
                     cfg,
                     client,
                     response_url.as_deref(),
-                    &not_authorized_blocks(),
+                    &not_authorized_blocks_for(cfg),
                 )
                 .await;
             }
@@ -921,7 +922,7 @@ pub(crate) async fn dispatch_action(
                     cfg,
                     client,
                     response_url.as_deref(),
-                    &not_authorized_blocks(),
+                    &not_authorized_blocks_for(cfg),
                 )
                 .await;
             }
@@ -950,7 +951,7 @@ pub(crate) async fn dispatch_action(
                     cfg,
                     client,
                     response_url.as_deref(),
-                    &not_authorized_blocks(),
+                    &not_authorized_blocks_for(cfg),
                 )
                 .await;
             }
@@ -1053,8 +1054,10 @@ pub(crate) async fn dispatch_action(
                             client,
                             threads,
                             mission_id,
-                            "Planning turns spend money and are limited to the \
-                             `slack.allowUsers` allowlist — ask an admin to add you.",
+                            &format!(
+                                "Planning turns spend money. {}",
+                                not_authorized_text_for(cfg)
+                            ),
                         )
                         .await;
                         return;
@@ -1106,8 +1109,10 @@ pub(crate) async fn dispatch_action(
                             client,
                             threads,
                             mission_id,
-                            "Steering a running mission spends money and is limited to the \
-                             `slack.allowUsers` allowlist — ask an admin to add you.",
+                            &format!(
+                                "Steering a running mission spends money. {}",
+                                not_authorized_text_for(cfg)
+                            ),
                         )
                         .await;
                         return;
@@ -1146,6 +1151,9 @@ mod tests {
             channel: "C1".into(),
             notify: NotifyFlags::default(),
             allow_users: vec![],
+            // The tests using this cfg exercise ungated behavior, so they
+            // deliberately acknowledge the open posture.
+            allow_all_users: true,
             dashboard_url: None,
             instance_name: None,
         }
@@ -1214,6 +1222,7 @@ mod tests {
             channel: "C1".into(),
             notify: NotifyFlags::default(),
             allow_users: vec!["U-allowed".into()],
+            allow_all_users: false,
             dashboard_url: None,
             instance_name: None,
         };
@@ -1252,6 +1261,7 @@ mod tests {
             channel: "C1".into(),
             notify: NotifyFlags::default(),
             allow_users: vec!["U-allowed".into()],
+            allow_all_users: false,
             dashboard_url: None,
             instance_name: None,
         };
@@ -1375,6 +1385,7 @@ mod tests {
             channel: "C1".into(),
             notify: NotifyFlags::default(),
             allow_users: vec!["U-allowed".into()],
+            allow_all_users: false,
             dashboard_url: None,
             instance_name: None,
         };

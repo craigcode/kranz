@@ -65,7 +65,9 @@ Slack; forensics one tap away in the browser.
 1. **Spend authorization.** Web mutation is token-gated; Slack isn't. A
    `slack.allowUsers: [Uxxxx]` allowlist (Slack user ids) must gate every
    money-spending action (new/draft/start). Unlisted users get an ephemeral
-   "not authorized" reply. Solo-workspace default can allow the installer.
+   "not authorized" reply. An EMPTY list fails closed for privileged actions
+   unless the operator deliberately opens spend with
+   `slack.allowAllUsers: true`.
 2. **Always-on host.** Slack management needs `kranz serve --slack` running and
    hosting engines (the M2.5 registry). Same as web hosting; exactly what an
    M6 Railway deployment provides.

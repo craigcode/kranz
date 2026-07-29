@@ -4,30 +4,50 @@
 
 use kranz_slack::{NotifyFlags, SlackConfig};
 
-/// A config with the given allowlist; the tokens/channel are irrelevant to the
-/// gate but must be present to build a `SlackConfig`.
+/// A config with the given allowlist and no open-posture acknowledgement; the
+/// tokens/channel are irrelevant to the gate but must be present to build a
+/// `SlackConfig`.
 fn cfg(allow_users: Vec<&str>) -> SlackConfig {
+    cfg_with(allow_users, false)
+}
+
+/// A config with the given allowlist and `allowAllUsers` acknowledgement.
+fn cfg_with(allow_users: Vec<&str>, allow_all_users: bool) -> SlackConfig {
     SlackConfig {
         bot_token: "xoxb".into(),
         app_token: "xapp".into(),
         channel: "C1".into(),
         notify: NotifyFlags::default(),
         allow_users: allow_users.into_iter().map(String::from).collect(),
+        allow_all_users,
         dashboard_url: None,
         instance_name: None,
     }
 }
 
 #[test]
-fn empty_allowlist_is_the_solo_default_allow_anyone() {
+fn empty_allowlist_fails_closed_without_allow_all_users() {
     let c = cfg(vec![]);
     assert!(
+        !c.is_authorized(Some("U-anyone")),
+        "empty list without allowAllUsers denies everyone"
+    );
+    assert!(
+        !c.is_authorized(None),
+        "empty list without allowAllUsers denies even a missing user id"
+    );
+}
+
+#[test]
+fn empty_allowlist_with_allow_all_users_keeps_the_open_posture() {
+    let c = cfg_with(vec![], true);
+    assert!(
         c.is_authorized(Some("U-anyone")),
-        "no list → anyone may spend"
+        "allowAllUsers: true deliberately opens spend to anyone"
     );
     assert!(
         c.is_authorized(None),
-        "no list → even a missing user id is allowed"
+        "allowAllUsers: true allows even a missing user id"
     );
 }
 

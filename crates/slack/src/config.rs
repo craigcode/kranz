@@ -60,9 +60,16 @@ pub struct SlackConfig {
     pub notify: NotifyFlags,
     /// Slack user ids (`Uxxxx`) allowed to run money-spending actions
     /// (new / approve / start). See docs/slack-management.md must-have #1.
-    /// Empty = solo default: allow anyone (the plumbing exists regardless so
-    /// a workspace can lock spend down by listing its operators).
+    /// Empty = FAIL CLOSED for privileged actions unless the operator has
+    /// explicitly acknowledged the open posture with
+    /// [`SlackConfig::allow_all_users`] (the plumbing exists regardless so a
+    /// workspace can lock spend down by listing its operators).
     pub allow_users: Vec<String>,
+    /// Explicit acknowledgement that an EMPTY `allow_users` list should
+    /// authorize everyone for privileged actions (the old solo default).
+    /// Resolved from `slack.allowAllUsers` in the config file; ignored when
+    /// `allow_users` is non-empty (the list then gates on its own).
+    pub allow_all_users: bool,
     /// Base URL of the web dashboard (e.g. `http://127.0.0.1:4600/`). When set,
     /// mission notifications carry an "Open in dashboard" deep link pointing at
     /// `<dashboard_url>#/m/<mission_id>`; when `None`, no link is added (no
@@ -84,13 +91,17 @@ pub struct SlackConfig {
 impl SlackConfig {
     /// Whether `user_id` may run a money-spending action (new / approve /
     /// start). Pure gate so the authorization policy is unit-tested without a
-    /// socket. An empty allowlist is the solo default — anyone is authorized;
-    /// a non-empty allowlist authorizes only its listed users. A blank/absent
-    /// `user_id` (Slack omitted it) is denied whenever an allowlist is set, so
-    /// a spoofed-empty user can't slip past a configured gate.
+    /// socket. A non-empty allowlist authorizes only its listed users. An
+    /// EMPTY allowlist FAILS CLOSED — nobody is authorized, including an
+    /// absent `user_id` — unless the operator deliberately opened spend with
+    /// `allowAllUsers: true`; read-only/status actions never consult this
+    /// gate (their actions carry no `user_id`), so they stay open regardless.
+    /// A blank/absent `user_id` (Slack omitted it) is denied whenever an
+    /// allowlist is set, so a spoofed-empty user can't slip past a configured
+    /// gate.
     pub fn is_authorized(&self, user_id: Option<&str>) -> bool {
         if self.allow_users.is_empty() {
-            return true;
+            return self.allow_all_users;
         }
         match user_id.map(str::trim).filter(|u| !u.is_empty()) {
             Some(u) => self.allow_users.iter().any(|allowed| allowed == u),
@@ -129,6 +140,11 @@ struct SlackFileConfig {
     /// Optional spend allowlist (`allowUsers: ["Uxxxx"]`). Absent = empty.
     #[serde(default)]
     allow_users: Vec<String>,
+    /// Explicit `allowAllUsers: true` acknowledgement that an empty
+    /// `allowUsers` list should authorize everyone for privileged actions.
+    /// Absent/false = an empty list fails closed.
+    #[serde(default)]
+    allow_all_users: bool,
     /// Optional web-dashboard base URL (`dashboardUrl`) for deep-link buttons.
     #[serde(default)]
     dashboard_url: Option<String>,
@@ -269,6 +285,7 @@ fn resolve(file: SlackFileConfig, env: EnvVars) -> Option<SlackConfig> {
                 .map(|u| u.trim().to_string())
                 .filter(|u| !u.is_empty())
                 .collect(),
+            allow_all_users: file.allow_all_users,
             dashboard_url,
             instance_name,
         }),
@@ -415,7 +432,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_allowlist_authorizes_anyone() {
+    fn empty_allowlist_fails_closed_without_allow_all_users() {
+        // P2 (slack-allowusers-fail-closed): an empty allowUsers list must NOT
+        // authorize everyone for spend-adjacent actions — the open posture
+        // needs an explicit `allowAllUsers: true`.
         let cfg = resolve(
             SlackFileConfig {
                 bot_token: Some("xoxb".into()),
@@ -429,13 +449,63 @@ mod tests {
         )
         .unwrap();
         assert!(
+            !cfg.is_authorized(Some("U999")),
+            "empty list without allowAllUsers denies any user"
+        );
+        assert!(
+            !cfg.is_authorized(None),
+            "empty list without allowAllUsers denies a missing user id"
+        );
+    }
+
+    #[test]
+    fn empty_allowlist_with_allow_all_users_authorizes_anyone() {
+        // The deliberate open posture: `allowAllUsers: true` keeps the old
+        // solo default for an empty allowUsers list.
+        let cfg = resolve(
+            SlackFileConfig {
+                bot_token: Some("xoxb".into()),
+                app_token: Some("xapp".into()),
+                channel: Some("C1".into()),
+                notify: None,
+                allow_users: vec![],
+                allow_all_users: true,
+                ..SlackFileConfig::default()
+            },
+            EnvVars::default(),
+        )
+        .unwrap();
+        assert!(
             cfg.is_authorized(Some("U999")),
-            "solo default: anyone allowed"
+            "allowAllUsers: true opens spend to anyone"
         );
         assert!(
             cfg.is_authorized(None),
-            "even a missing user id is allowed with no list"
+            "allowAllUsers: true allows even a missing user id"
         );
+    }
+
+    #[test]
+    fn allow_all_users_parses_from_file_json_camel_case_and_defaults_false() {
+        // The on-disk key is camelCase `allowAllUsers`, like every other field.
+        let root: RootConfig = serde_json::from_str(
+            r#"{ "slack": { "botToken": "xoxb", "appToken": "xapp",
+                 "channel": "C1", "allowAllUsers": true } }"#,
+        )
+        .unwrap();
+        let cfg = resolve(root.slack.unwrap(), EnvVars::default()).unwrap();
+        assert!(cfg.allow_all_users, "resolved from the file");
+        assert!(cfg.is_authorized(Some("U999")));
+
+        // A file WITHOUT the key still parses and fails closed (older configs
+        // keep working — the open posture must be re-acknowledged).
+        let root: RootConfig = serde_json::from_str(
+            r#"{ "slack": { "botToken": "xoxb", "appToken": "xapp", "channel": "C1" } }"#,
+        )
+        .unwrap();
+        let cfg = resolve(root.slack.unwrap(), EnvVars::default()).unwrap();
+        assert!(!cfg.allow_all_users);
+        assert!(!cfg.is_authorized(Some("U999")));
     }
 
     #[test]
@@ -514,6 +584,7 @@ mod tests {
                 channel: "C1".into(),
                 notify: NotifyFlags::default(),
                 allow_users: vec![],
+                allow_all_users: false,
                 dashboard_url: None,
                 instance_name: None,
             }

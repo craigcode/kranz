@@ -4,7 +4,7 @@
 //! dispatch side of this flow hangs off.
 
 use crate::bridge::{
-    approve_mission, error_blocks, mission_status, no_host_blocks, not_authorized_blocks,
+    approve_mission, error_blocks, mission_status, no_host_blocks, not_authorized_blocks_for,
     post_thread_note, reply_ephemeral, retire_plan_card, SharedThreads,
 };
 use crate::client::SlackClient;
@@ -39,7 +39,7 @@ pub(crate) async fn approve_flow(
     button: bool,
 ) {
     if !cfg.is_authorized(user_id) {
-        reply_ephemeral(cfg, client, response_url, &not_authorized_blocks()).await;
+        reply_ephemeral(cfg, client, response_url, &not_authorized_blocks_for(cfg)).await;
         return;
     }
 

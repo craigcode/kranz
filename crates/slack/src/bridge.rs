@@ -931,8 +931,45 @@ pub fn not_authorized_blocks() -> Vec<Value> {
         "type": "section",
         "text": {
             "type": "mrkdwn",
-            "text": ":no_entry: You're not authorized to spend on missions here. \
-                     Ask an admin to add you to `slack.allowUsers` in `~/.kranz/config.json`."
+            "text": NOT_AUTHORIZED_ALLOWLIST_TEXT,
+        }
+    })]
+}
+
+/// The standard refusal text for a spend-gated action denied by a CONFIGURED
+/// `slack.allowUsers` allowlist — the remedy is "add me to the list".
+const NOT_AUTHORIZED_ALLOWLIST_TEXT: &str =
+    ":no_entry: You're not authorized to spend on missions here. \
+     Ask an admin to add you to `slack.allowUsers` in `~/.kranz/config.json`.";
+
+/// The fail-closed refusal text for a spend-gated action denied because
+/// `slack.allowUsers` is EMPTY and the operator never acknowledged the open
+/// posture — the remedy names both deliberate ways to open it.
+const SPEND_LOCKED_TEXT: &str =
+    ":no_entry: Spend actions are locked here: `slack.allowUsers` in `~/.kranz/config.json` \
+     is empty, so the bridge fails closed. An admin can list operator user ids there, or set \
+     `slack.allowAllUsers: true` to deliberately open spend to everyone.";
+
+/// The refusal text matching WHY the spend gate denied: fail-closed-empty
+/// tells the denied user how an admin opens it deliberately (list operators
+/// or `allowAllUsers: true`); a configured list keeps the standard
+/// "ask an admin to add you" refusal.
+pub(crate) fn not_authorized_text_for(cfg: &SlackConfig) -> &'static str {
+    if cfg.allow_users.is_empty() && !cfg.allow_all_users {
+        SPEND_LOCKED_TEXT
+    } else {
+        NOT_AUTHORIZED_ALLOWLIST_TEXT
+    }
+}
+
+/// The block form of [`not_authorized_text_for`] — byte-for-byte
+/// [`not_authorized_blocks`] when a configured allowlist did the denying.
+pub(crate) fn not_authorized_blocks_for(cfg: &SlackConfig) -> Vec<Value> {
+    vec![json!({
+        "type": "section",
+        "text": {
+            "type": "mrkdwn",
+            "text": not_authorized_text_for(cfg),
         }
     })]
 }
@@ -2058,7 +2095,7 @@ pub(crate) async fn change_config(
             response_url,
             channel,
             user_id,
-            &not_authorized_blocks(),
+            &not_authorized_blocks_for(cfg),
         )
         .await;
         return;
@@ -2115,7 +2152,7 @@ pub(crate) async fn steer(
     verb: &str,
 ) {
     if !cfg.is_authorized(user_id) {
-        reply_ephemeral(cfg, client, response_url, &not_authorized_blocks()).await;
+        reply_ephemeral(cfg, client, response_url, &not_authorized_blocks_for(cfg)).await;
         return;
     }
     match enqueue_steer(repo_root, mission_id, cmd) {
@@ -2175,7 +2212,7 @@ pub(crate) async fn revision_control(
     queued: &str,
 ) {
     if !cfg.is_authorized(user_id) {
-        reply_ephemeral(cfg, client, response_url, &not_authorized_blocks()).await;
+        reply_ephemeral(cfg, client, response_url, &not_authorized_blocks_for(cfg)).await;
         return;
     }
     match enqueue_revision_control(repo_root, mission_id, cmd) {
@@ -2244,7 +2281,7 @@ pub(crate) async fn grant_control(
     queued: &str,
 ) {
     if !cfg.is_authorized(user_id) {
-        reply_ephemeral(cfg, client, response_url, &not_authorized_blocks()).await;
+        reply_ephemeral(cfg, client, response_url, &not_authorized_blocks_for(cfg)).await;
         return;
     }
     match enqueue_grant_control(repo_root, mission_id, cmd) {
@@ -2710,6 +2747,10 @@ mod tests {
             channel: "C1".into(),
             notify: NotifyFlags::default(),
             allow_users: vec![],
+            // The tests using this cfg exercise ungated behavior (guidance
+            // pump, reconnects), so they deliberately acknowledge the open
+            // posture.
+            allow_all_users: true,
             dashboard_url: None,
             instance_name: None,
         }
@@ -3509,6 +3550,7 @@ mod tests {
             channel: "C1".into(),
             notify: NotifyFlags::default(),
             allow_users: vec!["U-allowed".into()],
+            allow_all_users: false,
             dashboard_url: None,
             instance_name: None,
         };
@@ -3719,6 +3761,7 @@ mod tests {
             channel: "C1".into(),
             notify: NotifyFlags::default(),
             allow_users: vec!["U-allowed".into()],
+            allow_all_users: false,
             dashboard_url: None,
             instance_name: None,
         };
@@ -3753,6 +3796,7 @@ mod tests {
             channel: "C1".into(),
             notify: NotifyFlags::default(),
             allow_users: vec!["U-allowed".into()],
+            allow_all_users: false,
             dashboard_url: None,
             instance_name: None,
         };
@@ -3778,6 +3822,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn steer_fails_closed_on_empty_allowlist_without_allow_all_users() {
+        // P2 (slack-allowusers-fail-closed): an EMPTY allowUsers list no
+        // longer authorizes everyone — a privileged action is denied and
+        // enqueues NOTHING unless the operator set `allowAllUsers: true`.
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-locked", "goal");
+        let mut cfg = test_cfg();
+        cfg.allow_all_users = false;
+        let client = SlackClient::new(&cfg).unwrap();
+        steer(
+            &cfg,
+            &client,
+            tmp.path(),
+            Some("m-locked"),
+            Some("U-anyone"),
+            None,
+            ControlCommand::Pause,
+            "paused",
+        )
+        .await;
+        assert!(
+            kranz_engine::control::drain(&MissionPaths::new(tmp.path(), "m-locked"))
+                .unwrap()
+                .is_empty(),
+            "empty allowlist without allowAllUsers must fail closed"
+        );
+
+        // The deliberate acknowledgement reopens the same action.
+        cfg.allow_all_users = true;
+        steer(
+            &cfg,
+            &client,
+            tmp.path(),
+            Some("m-locked"),
+            Some("U-anyone"),
+            None,
+            ControlCommand::Pause,
+            "paused",
+        )
+        .await;
+        assert_eq!(
+            kranz_engine::control::drain(&MissionPaths::new(tmp.path(), "m-locked"))
+                .unwrap()
+                .len(),
+            1,
+            "allowAllUsers: true deliberately opens spend"
+        );
+    }
+
+    #[test]
+    fn fail_closed_refusal_says_how_to_open_deliberately() {
+        // The fail-closed denial message must name both deliberate remedies;
+        // a configured-list denial keeps the standard "ask an admin" refusal.
+        let mut cfg = test_cfg();
+        cfg.allow_all_users = false;
+        let locked = serde_json::to_string(&not_authorized_blocks_for(&cfg)).unwrap();
+        assert!(locked.contains("fails closed"), "{locked}");
+        assert!(locked.contains("slack.allowUsers"), "{locked}");
+        assert!(locked.contains("slack.allowAllUsers: true"), "{locked}");
+
+        cfg.allow_users = vec!["U-allowed".into()];
+        let listed = serde_json::to_string(&not_authorized_blocks_for(&cfg)).unwrap();
+        let standard = serde_json::to_string(&not_authorized_blocks()).unwrap();
+        assert_eq!(
+            listed, standard,
+            "a configured allowlist keeps the standard refusal"
+        );
+        assert!(listed.contains("not authorized to spend"), "{listed}");
+    }
+
+    #[tokio::test]
     async fn revision_denies_an_unlisted_user_and_enqueues_nothing() {
         // The M2 revision arms are gated exactly like steer: a non-empty
         // allowlist refuses an unlisted user on all three revision commands and
@@ -3792,6 +3907,7 @@ mod tests {
             channel: "C1".into(),
             notify: NotifyFlags::default(),
             allow_users: vec!["U-allowed".into()],
+            allow_all_users: false,
             dashboard_url: None,
             instance_name: None,
         };
@@ -3854,6 +3970,7 @@ mod tests {
             channel: "C1".into(),
             notify: NotifyFlags::default(),
             allow_users: vec!["U-allowed".into()],
+            allow_all_users: false,
             dashboard_url: None,
             instance_name: None,
         };
@@ -4090,6 +4207,10 @@ mod tests {
             channel: "C1".into(),
             notify: NotifyFlags::default(),
             allow_users: vec![],
+            // The dispatched `ticket` action is spend-gated with no user id in
+            // the envelope, so this test deliberately acknowledges the open
+            // posture.
+            allow_all_users: true,
             dashboard_url: None,
             instance_name: None,
         };
@@ -4121,6 +4242,7 @@ mod tests {
             channel: "C1".into(),
             notify: NotifyFlags::default(),
             allow_users: vec![],
+            allow_all_users: false,
             dashboard_url: None,
             instance_name: None,
         };

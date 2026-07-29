@@ -624,6 +624,37 @@ pub enum SandboxProvider {
     Container,
 }
 
+impl SandboxProvider {
+    /// The config-file spelling of this provider (`"process"` / `"container"`),
+    /// for errors and reports that name it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SandboxProvider::Process => "process",
+            SandboxProvider::Container => "container",
+        }
+    }
+
+    /// Whether `enforce = "fs+net"` under this provider is backed by a HARD
+    /// network boundary for the given egress list — a session that ignores the
+    /// run's egress-proxy env vars still cannot open a direct socket. The
+    /// process provider qualifies on both supported platforms (macOS Seatbelt
+    /// cuts outbound TCP to loopback; Linux bwrap `--unshare-net` removes the
+    /// network entirely), so its proxy hop is the only reachable way out. The
+    /// container provider qualifies only with an EMPTY egress list
+    /// (`--network none`); a non-empty list keeps the runtime's default
+    /// bridge, where the proxy env vars are advisory and a direct socket
+    /// bypasses the filter — `config::validate` rejects that pair (fail
+    /// closed) until the internal-network/sidecar boundary exists
+    /// (docs/scoping/worker-sandboxing.md tier 3). The match is deliberately
+    /// exhaustive: a future provider must declare itself here.
+    pub fn enforces_hard_net_boundary(self, egress: &[String]) -> bool {
+        match self {
+            SandboxProvider::Process => true,
+            SandboxProvider::Container => egress.is_empty(),
+        }
+    }
+}
+
 /// Per-role OS sandbox config.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
@@ -641,7 +672,11 @@ pub struct SandboxConfig {
     /// Stored as raw strings; not expanded or canonicalized here.
     pub extra_write: Vec<String>,
     /// Extra network destinations allowed under `enforce = "fs+net"` (for
-    /// example package registries). Stored as `host:port` strings.
+    /// example package registries). Stored as `host:port` strings. With
+    /// `provider = "container"` a non-empty list is refused by
+    /// `config::validate` (proxy-env advisory only — see
+    /// [`SandboxProvider::enforces_hard_net_boundary`]); an empty list keeps
+    /// the hard `--network none` boundary.
     pub egress: Vec<String>,
 }
 

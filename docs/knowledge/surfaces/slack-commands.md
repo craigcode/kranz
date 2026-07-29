@@ -47,7 +47,9 @@ cleaned).
 The gate is `SlackConfig::is_authorized(user_id)` in
 [config.rs](../../../crates/slack/src/config.rs) — deliberately kept out of the
 router so routing stays pure and config-free. Policy: an **empty** `allowUsers`
-list is the solo default (anyone authorized); a **non-empty** list authorizes
+list FAILS CLOSED for privileged actions (nobody authorized, including an
+absent `user_id`) unless the operator deliberately opens spend with
+`slack.allowAllUsers: true`; a **non-empty** list authorizes
 only its members, and a blank/absent `user_id` is denied whenever a list is set
 (a spoofed-empty user can't slip past). Config key is `slack.allowUsers` in
 `~/.kranz/config.json` (camelCase in the file; `allow_users` in Rust).
@@ -59,17 +61,19 @@ publish — it is still ungated (its dispatch arm makes no `is_authorized` check
 Spend/mutation actions carry the invoking `user_id`, and their dispatch path —
 the `dispatch_action` arm itself or a gate helper it calls (`approve_flow`,
 `steer`, `revision_control`, `gate_draft_command`, `run_approve_ticket_command`,
-…) — checks `is_authorized` first, replying `not_authorized_blocks()` (a fixed
-`:no_entry:` ephemeral) on refusal before touching the host.
+…) — checks `is_authorized` first, replying `not_authorized_blocks_for(cfg)` (a
+fixed `:no_entry:` ephemeral; the fail-closed-empty variant says how an admin
+opens spend deliberately) on refusal before touching the host.
 
 **Ungated (read-only):** `status [<id>]`, `todo`, `roadmap`, `ticket list`,
-`ticket show <slug>`, `ticket <title>` (scaffold, a local write), `work`
+`ticket show <slug>`, `work`
 (report-only — never drains on the socket loop), `help`, and `app_home_opened`.
 
 **Gated:** `new <goal>` / bare `new` modal, `plan <id>`, `approve <id>`,
 `queue <slug>`, `draft <slug>`, `ask <question>` (spends tokens), `merge
 <slug|id>`, `work run`, `config …` / bare `config` modal, `pause`/`resume
-[<id>]`, `revise <id> <instr>`, `revision approve|reject <id> <rev>`, and
+[<id>]`, `revise <id> <instr>`, `revision approve|reject <id> <rev>`,
+`ticket <title>` (scaffold writes backlog state), and
 `ticket new <slug> <title…>` (the modal-open is gated). Buttons carry the same
 gate: **Approve & queue** (`kranz_approve`), **Approve & start** (`kranz_start`),
 **Merge** (`kranz_merge`), the todo **Queue** button (`kranz_queue_ticket`),

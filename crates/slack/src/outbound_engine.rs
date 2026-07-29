@@ -476,6 +476,7 @@ mod tests {
             channel: "C1".into(),
             notify: NotifyFlags::default(),
             allow_users: vec![],
+            allow_all_users: false,
             dashboard_url: None,
             instance_name: None,
         }

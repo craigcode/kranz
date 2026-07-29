@@ -456,12 +456,23 @@ impl PlanningHost for FakeHost {
 }
 
 fn gated_cfg(allow_users: Vec<String>) -> SlackConfig {
+    gated_cfg_with(allow_users, false)
+}
+
+/// A gated config whose empty allowlist keeps the open posture via the
+/// explicit `allowAllUsers: true` acknowledgement.
+fn gated_cfg_open(allow_users: Vec<String>) -> SlackConfig {
+    gated_cfg_with(allow_users, true)
+}
+
+fn gated_cfg_with(allow_users: Vec<String>, allow_all_users: bool) -> SlackConfig {
     SlackConfig {
         bot_token: "xoxb".into(),
         app_token: "xapp".into(),
         channel: "C1".into(),
         notify: NotifyFlags::default(),
         allow_users,
+        allow_all_users,
         dashboard_url: None,
         instance_name: None,
     }
@@ -531,10 +542,28 @@ async fn draft_gate_acks_before_any_draft_call_then_run_draft_spawns_exactly_onc
 }
 
 #[tokio::test]
-async fn draft_allowlist_empty_authorizes_everyone_same_as_new() {
-    // Empty allow_users = no gate at all (mirrors `/kranz new`'s degrade when
-    // unconfigured).
+async fn draft_allowlist_empty_fails_closed_without_allow_all_users() {
+    // Empty allow_users without the `allowAllUsers: true` acknowledgement =
+    // fail closed for spend actions (P2 slack-allowusers-fail-closed): the
+    // gate refuses and the fake host's draft counter never moves.
     let cfg = gated_cfg(vec![]);
+    let fake = Arc::new(FakeHost::new(DraftOutcomeKind::ParkedForReview));
+    let host: SharedHost = fake.clone();
+
+    let gate = gate_draft_command(&cfg, Some(&host), "rate-limit-notes", None);
+
+    assert!(
+        matches!(gate, DraftGate::Unauthorized),
+        "empty allowlist without allowAllUsers must fail closed"
+    );
+    assert_eq!(fake.draft_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn draft_allowlist_empty_with_allow_all_users_authorizes_same_as_new() {
+    // The deliberate open posture: `allowAllUsers: true` keeps an empty
+    // allowlist authorizing everyone (the old solo default).
+    let cfg = gated_cfg_open(vec![]);
     let fake = Arc::new(FakeHost::new(DraftOutcomeKind::ParkedForReview));
     let host: SharedHost = fake.clone();
 
@@ -665,7 +694,7 @@ async fn approve_slug_for_review_ticket_queues_the_drafted_mission_end_to_end() 
     Ticket::record_mission(tmp.path(), "rate-limit-notes", "m-rl").unwrap();
     Ticket::write_state(tmp.path(), "rate-limit-notes", TicketState::Review, None).unwrap();
 
-    let cfg = gated_cfg(vec![]);
+    let cfg = gated_cfg_open(vec![]);
     let fake = Arc::new(FakeHost::with_repo_root(tmp.path().to_path_buf()));
     let host: SharedHost = fake.clone();
 
@@ -713,7 +742,7 @@ async fn approve_slug_blocked_by_unsatisfied_dependency_refuses_verbatim_and_que
     Ticket::record_mission(tmp.path(), "downstream", "m-down").unwrap();
     Ticket::write_state(tmp.path(), "downstream", TicketState::Review, None).unwrap();
 
-    let cfg = gated_cfg(vec![]);
+    let cfg = gated_cfg_open(vec![]);
     let fake = Arc::new(FakeHost::with_repo_root(tmp.path().to_path_buf()));
     let host: SharedHost = fake.clone();
 

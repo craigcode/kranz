@@ -11,8 +11,12 @@
 //! (`crate::egress_proxy`) via `host.docker.internal` — the proxy enforces
 //! the per-host allowlist at CONNECT time and records structured denials.
 //! The proxy hop is env-based (advisory on the bridge: a process that ignores
-//! the proxy vars bypasses the filter); a hard per-host container boundary
-//! (internal-network sidecar) is follow-up work. API-driven workers that need
+//! the proxy vars bypasses the filter), so `config::validate` REFUSES
+//! `provider = "container"` with `enforce = "fs+net"` and a non-empty egress
+//! list (fail closed — [`crate::types::SandboxProvider::enforces_hard_net_boundary`])
+//! until a hard per-host container boundary (internal-network sidecar)
+//! lands; the builder below keeps the proxy-routed argv for that follow-up.
+//! API-driven workers that need
 //! no egress list use `fs` (runtime default bridge/NAT, the same
 //! permissiveness as the tier-2 fs tier).
 //!
@@ -99,7 +103,10 @@ pub struct ContainerSpec {
 /// default bridge and forwards the run's egress-proxy endpoint into the
 /// container env (`proxy_url`, reaching the host-side proxy via
 /// `host.docker.internal`; Linux docker additionally gets the `host-gateway`
-/// hosts entry). The runner guarantees `proxy_url` is `Some` whenever a
+/// hosts entry). That proxy-routed posture is advisory-only, so
+/// `config::validate` refuses it (fail closed) until the internal-network
+/// sidecar boundary lands — this branch remains for that follow-up. The
+/// runner guarantees `proxy_url` is `Some` whenever a
 /// proxy-routed container session spawns — a proxy start failure fails the
 /// run closed before this point. `fs` passes no network flag, keeping the
 /// runtime's default bridge/NAT — the same permissiveness as the tier-2 fs

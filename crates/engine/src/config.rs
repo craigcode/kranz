@@ -406,6 +406,30 @@ pub fn validate(cfg: &MissionConfig) -> Result<()> {
                 role_cfg.sandbox.enforce.as_str()
             )));
         }
+        // Fail closed on an advisory-only network boundary, the same posture
+        // as the backend check above: container `fs+net` with a non-empty
+        // egress list keeps the runtime's default bridge and routes egress by
+        // proxy env vars only, so a process that ignores them opens a direct
+        // socket past the "enforced" allowlist. Reject the pair until the
+        // internal-network/sidecar boundary exists; an empty egress list
+        // (`--network none`) stays accepted because that boundary is hard.
+        if role_cfg.sandbox.enforce == SandboxEnforce::FsNet
+            && !role_cfg
+                .sandbox
+                .provider
+                .enforces_hard_net_boundary(&role_cfg.sandbox.egress)
+        {
+            return Err(EngineError::Config(format!(
+                "{name}.sandbox provider {:?} with sandbox.enforce={:?} and a non-empty egress \
+                 list is advisory-only: the runtime's default bridge lets a process that ignores \
+                 the proxy env vars open a direct socket past the egress filter; use an empty \
+                 egress list (the hard `--network none` boundary), sandbox.provider \"process\", \
+                 or sandbox.enforce=off until the internal-network/sidecar boundary lands \
+                 (docs/scoping/worker-sandboxing.md tier 3)",
+                role_cfg.sandbox.provider.as_str(),
+                role_cfg.sandbox.enforce.as_str()
+            )));
+        }
         let effective = effective_model(role, kind, &role_cfg.model);
         let tier = model_tier(kind, &effective).ok_or_else(|| {
             EngineError::Config(format!(
@@ -1004,6 +1028,74 @@ mod tests {
         cfg.validator_scrutiny.sandbox.enforce = crate::types::SandboxEnforce::Fs;
         cfg.validator_scrutiny.sandbox.provider = crate::types::SandboxProvider::Container;
         assert!(validate(&cfg).is_err());
+    }
+
+    #[test]
+    fn container_net_boundary_is_hard_only_for_process_or_empty_egress() {
+        // The process provider's fs+net boundary is the OS profile itself
+        // (Seatbelt loopback-only on macOS, bwrap --unshare-net on Linux), so
+        // the proxy hop is the only reachable way out regardless of the list.
+        assert!(crate::types::SandboxProvider::Process
+            .enforces_hard_net_boundary(&["crates.io:443".to_string()]));
+        // The container provider's only hard net boundary today is
+        // `--network none` (empty egress); a non-empty list is proxy-env
+        // advisory on the runtime bridge.
+        assert!(crate::types::SandboxProvider::Container.enforces_hard_net_boundary(&[]));
+        assert!(!crate::types::SandboxProvider::Container
+            .enforces_hard_net_boundary(&["crates.io:443".to_string()]));
+    }
+
+    #[test]
+    fn validate_rejects_container_fs_net_with_egress_list() {
+        // Container fs+net with a non-empty egress list is proxy-env advisory
+        // on the default bridge — fail closed until the sidecar boundary.
+        let mut cfg = MissionConfig::default();
+        cfg.worker.sandbox.enforce = crate::types::SandboxEnforce::FsNet;
+        cfg.worker.sandbox.provider = crate::types::SandboxProvider::Container;
+        cfg.worker.sandbox.egress = vec!["crates.io:443".into()];
+        let err = validate(&cfg).unwrap_err().to_string();
+        // The error must name the role, the provider, the enforce mode, the
+        // remedies, and point at the boundary work.
+        assert!(err.contains("worker"), "{err}");
+        assert!(err.contains("container"), "{err}");
+        assert!(err.contains("fs+net"), "{err}");
+        assert!(err.contains("--network none"), "{err}");
+        assert!(err.contains("\"process\""), "{err}");
+        assert!(err.contains("sandbox.enforce=off"), "{err}");
+        assert!(err.contains("sidecar"), "{err}");
+    }
+
+    #[test]
+    fn validate_accepts_container_fs_and_container_fs_net_with_empty_egress() {
+        // `fs` claims no network enforcement at all, and fs+net with an empty
+        // egress list maps to the hard `--network none` boundary — both
+        // honest postures for the container provider.
+        for enforce in [
+            crate::types::SandboxEnforce::Fs,
+            crate::types::SandboxEnforce::FsNet,
+        ] {
+            let mut cfg = MissionConfig::default();
+            cfg.worker.sandbox.enforce = enforce;
+            cfg.worker.sandbox.provider = crate::types::SandboxProvider::Container;
+            assert!(
+                validate(&cfg).is_ok(),
+                "container provider with sandbox.enforce={} and an empty egress list must validate",
+                enforce.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_process_fs_net_with_egress_list() {
+        // The process provider keeps its kernel boundary (Seatbelt loopback /
+        // bwrap --unshare-net) regardless of the egress list — unchanged.
+        let mut cfg = MissionConfig::default();
+        cfg.worker.sandbox.enforce = crate::types::SandboxEnforce::FsNet;
+        cfg.worker.sandbox.egress = vec!["crates.io:443".into()];
+        assert!(
+            validate(&cfg).is_ok(),
+            "process provider fs+net with an egress list must still validate"
+        );
     }
 
     #[test]
