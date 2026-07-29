@@ -556,23 +556,28 @@ mod tests {
         let snap_path = root.parent().unwrap().join("snap-shot-under-test");
         let snapshot = ValidatorSnapshot::create(&repo, &snap_path).unwrap();
 
+        // Content comparisons normalize EOL: windows-latest runs with
+        // core.autocrlf=true, so the worktree checkout + git apply write
+        // CRLF — the replay is about content identity, not EOL convention.
+        let read_normalized =
+            |path: &Path| std::fs::read_to_string(path).unwrap().replace("\r\n", "\n");
         assert_eq!(
             GitRepo::open(&snap_path).unwrap().head_sha().unwrap(),
             head,
             "snapshot is detached at the real checkout's HEAD"
         );
         assert_eq!(
-            std::fs::read_to_string(snap_path.join("README.md")).unwrap(),
+            read_normalized(&snap_path.join("README.md")),
             "hello\nworker edit\n",
             "unstaged tracked edit must be visible in the snapshot"
         );
         assert_eq!(
-            std::fs::read_to_string(snap_path.join("staged.rs")).unwrap(),
+            read_normalized(&snap_path.join("staged.rs")),
             "fn staged() {}\n",
             "staged new file must be visible in the snapshot"
         );
         assert_eq!(
-            std::fs::read_to_string(snap_path.join("notes/todo.txt")).unwrap(),
+            read_normalized(&snap_path.join("notes/todo.txt")),
             "uncommitted\n",
             "untracked files must be visible in the snapshot"
         );
