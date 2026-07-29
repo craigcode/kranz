@@ -316,7 +316,8 @@ fn config_for_ticket(
     cfg
 }
 
-/// `kranz draft <slug> [--yes]`: non-interactive plan drafting.
+/// `kranz draft <slug> [--yes] [--from-mission m-xxxx]`: non-interactive plan
+/// drafting.
 ///
 /// Sets the ticket Drafting, creates a mission seeded with the whole ticket,
 /// requests the plan, and resolves via [`draft_decision`]:
@@ -327,14 +328,24 @@ fn config_for_ticket(
 /// - WrongPlan → append the planner's escalation reason to the ticket and set
 ///   WrongPlan (parked for the operator; never queued).
 ///
+/// `--from-mission` first seeds the ticket's `traced-from-mission`
+/// frontmatter (drafting a defect ticket traced back to the mission that
+/// shipped it — the flight-surgeon false-green join).
+///
 /// Only the orchestrator runs (no workers); spend is bounded by the
 /// orchestrator budget cap (per-ticket override applied).
 pub async fn cmd_draft(
     repo: PathBuf,
     slug: &str,
     yes: bool,
+    from_mission: Option<&str>,
     dangerously_allow_all: bool,
 ) -> Result<i32> {
+    if let Some(mission_id) = from_mission {
+        Ticket::seed_traced_from_mission(&repo, slug, mission_id)
+            .with_context(|| format!("seeding traced-from-mission on ticket '{slug}'"))?;
+        println!("ticket '{slug}' traced from mission {mission_id}");
+    }
     let ticket = load_ticket(&repo, slug)?;
     let cfg = config_for_ticket(load_config(&repo, dangerously_allow_all)?, &ticket);
     let backend = build_backend(&cfg)?;

@@ -566,6 +566,78 @@ export interface Outcomes {
   cycleTime: CycleTime;
 }
 
+// ---------------------------------------------------------------------------
+// Escalation metrics (crates/engine/src/escalation_metrics.rs) — the
+// flight-surgeon console: autonomy split by outcome, rubber-stamp signal,
+// false greens joined from traced-from-mission tickets, and the ledger.
+// ---------------------------------------------------------------------------
+
+export interface AutonomyOutcomeSplit {
+  missions: number;
+  zeroIntervention: number;
+  /** null when the arm has no missions. */
+  zeroInterventionShare: number | null;
+}
+
+export interface AutonomyMetric {
+  closedMissions: number;
+  zeroInterventionMissions: number;
+  /** null when nothing closed. */
+  zeroInterventionShare: number | null;
+  completed: AutonomyOutcomeSplit;
+  failed: AutonomyOutcomeSplit;
+}
+
+export interface RubberStamp {
+  decidedGrants: number;
+  /** Nearest-rank percentiles (ms); null when nothing was decided. */
+  p50Ms: number | null;
+  p90Ms: number | null;
+  underTenSeconds: number;
+}
+
+export interface FalseGreenSplit {
+  completedMissions: number;
+  falseGreens: number;
+  /** null when the arm has no completed missions. */
+  rate: number | null;
+}
+
+export interface TracedDefect {
+  ticket: string;
+  missionId: string;
+}
+
+export interface FalseGreens {
+  completedMissions: number;
+  falseGreens: number;
+  /** null when nothing completed. */
+  falseGreenRate: number | null;
+  withInterventions: FalseGreenSplit;
+  zeroIntervention: FalseGreenSplit;
+  tracedDefects: TracedDefect[];
+}
+
+export type LedgerKind = 'grant' | 'steer';
+
+export interface LedgerRow {
+  ts: string;
+  missionId: string;
+  kind: LedgerKind;
+  milestoneId: string | null;
+  ask: string;
+  decision: string;
+  latencyMs: number | null;
+}
+
+/** `GET /api/escalation-metrics` — the flight-surgeon console fold. */
+export interface EscalationMetrics {
+  autonomy: AutonomyMetric;
+  rubberStamp: RubberStamp;
+  falseGreens: FalseGreens;
+  ledger: LedgerRow[];
+}
+
 /** costUsd per merged non-meta commit (outcomes-view lagging metric). */
 export interface CostPerChange {
   totalCostUsd: number;

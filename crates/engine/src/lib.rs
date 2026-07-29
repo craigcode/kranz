@@ -31,6 +31,7 @@ pub mod cost;
 pub mod decompose;
 pub mod deps;
 pub mod egress_proxy;
+pub mod escalation_metrics;
 pub mod event_log;
 pub mod findings;
 pub mod git_ops;

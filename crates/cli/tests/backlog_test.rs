@@ -248,14 +248,43 @@ fn ticket_queue_alias_approve_still_parses() {
 fn parses_draft_and_draft_yes() {
     let plain = Cli::try_parse_from(["kranz", "draft", "slug"]).unwrap();
     match plain.command {
-        Command::Draft { slug, yes } => {
+        Command::Draft {
+            slug,
+            yes,
+            from_mission,
+        } => {
             assert_eq!(slug, "slug");
             assert!(!yes);
+            assert_eq!(from_mission, None);
         }
         other => panic!("unexpected: {other:?}"),
     }
     let yes = Cli::try_parse_from(["kranz", "draft", "slug", "--yes"]).unwrap();
     assert!(matches!(yes.command, Command::Draft { yes: true, .. }));
+}
+
+#[test]
+fn parses_draft_from_mission() {
+    let cli = Cli::try_parse_from([
+        "kranz",
+        "draft",
+        "defect-slug",
+        "--from-mission",
+        "m-abc123",
+    ])
+    .unwrap();
+    match cli.command {
+        Command::Draft {
+            slug,
+            yes,
+            from_mission,
+        } => {
+            assert_eq!(slug, "defect-slug");
+            assert!(!yes);
+            assert_eq!(from_mission.as_deref(), Some("m-abc123"));
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
 }
 
 #[test]

@@ -12,6 +12,7 @@ import { repoIdFromHash } from './routes';
 import type {
   ControlCommand,
   DrainState,
+  EscalationMetrics,
   MissionEvent,
   MissionState,
   MissionSummary,
@@ -176,6 +177,12 @@ export async function postJson<T>(path: string, body: unknown): Promise<T> {
  *  ratio, grant-latency distribution, escalation ledger). */
 export function getOutcomes(): Promise<Outcomes> {
   return getJson('/api/missions/outcomes');
+}
+
+/** `GET /api/escalation-metrics` — the flight-surgeon console (autonomy split
+ *  by outcome, rubber-stamp signal, false greens, escalation ledger). */
+export function getEscalationMetrics(): Promise<EscalationMetrics> {
+  return getJson('/api/escalation-metrics');
 }
 
 export const api = {

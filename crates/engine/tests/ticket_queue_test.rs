@@ -95,6 +95,111 @@ fn task_class_routing_absent_key_yields_none() {
 }
 
 // ---------------------------------------------------------------------------
+// traced-from-mission (flight-surgeon console defect→mission link)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn traced_from_mission_parses_both_spellings_and_absent_is_none() {
+    let md = "\
+---
+title: Login regression
+traced-from-mission: m-abc123
+---
+
+## Goal
+Fix the login regression.
+";
+    let t = Ticket::parse("defect-login", md).unwrap();
+    assert_eq!(t.traced_from_mission, Some("m-abc123".to_string()));
+
+    // The camelCase a hand-editor might type is tolerated (same rule as the
+    // other keys); an empty value reads as absent.
+    let camel = md.replace("traced-from-mission", "tracedFromMission");
+    let t = Ticket::parse("defect-login", &camel).unwrap();
+    assert_eq!(t.traced_from_mission, Some("m-abc123".to_string()));
+
+    let t = Ticket::parse("rate-limit", FULL).unwrap();
+    assert_eq!(t.traced_from_mission, None);
+
+    let empty = "\
+---
+title: x
+traced-from-mission:
+---
+
+## Goal
+g
+";
+    let t = Ticket::parse("defect-empty", empty).unwrap();
+    assert_eq!(t.traced_from_mission, None);
+}
+
+#[test]
+fn seed_traced_from_mission_inserts_into_existing_frontmatter() {
+    let repo = tempfile::tempdir().unwrap();
+    Ticket::scaffold(repo.path(), "defect-login", "Login regression", None, None).unwrap();
+    assert!(
+        Ticket::seed_traced_from_mission(repo.path(), "defect-login", "m-abc123").unwrap(),
+        "first seed changes the file"
+    );
+    let t = Ticket::load(&Ticket::tickets_dir(repo.path()).join("defect-login.md")).unwrap();
+    assert_eq!(t.traced_from_mission, Some("m-abc123".to_string()));
+    // The rest of the ticket survives untouched.
+    assert_eq!(t.title, "Login regression");
+    assert_eq!(t.priority, 2);
+
+    // Same value again: no-op, reported as unchanged.
+    assert!(
+        !Ticket::seed_traced_from_mission(repo.path(), "defect-login", "m-abc123").unwrap(),
+        "re-seeding the same mission is a no-op"
+    );
+    // A different mission replaces the link line in place.
+    assert!(Ticket::seed_traced_from_mission(repo.path(), "defect-login", "m-def456").unwrap());
+    let text =
+        fs::read_to_string(Ticket::tickets_dir(repo.path()).join("defect-login.md")).unwrap();
+    assert!(text.contains("traced-from-mission: m-def456"));
+    assert!(!text.contains("m-abc123"), "old link replaced: {text}");
+}
+
+#[test]
+fn seed_traced_from_mission_prepends_a_block_when_frontmatter_absent() {
+    let repo = tempfile::tempdir().unwrap();
+    let dir = Ticket::tickets_dir(repo.path());
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("defect-plain.md"),
+        "# Plain defect\n\nBody text stays.\n",
+    )
+    .unwrap();
+    Ticket::seed_traced_from_mission(repo.path(), "defect-plain", "m-1").unwrap();
+    let text = fs::read_to_string(dir.join("defect-plain.md")).unwrap();
+    assert!(
+        text.starts_with(
+            "---\ntraced-from-mission: m-1\n---\n\n# Plain defect\n\nBody text stays.\n"
+        ),
+        "body bytes preserved under the new block: {text}"
+    );
+    let t = Ticket::load(&dir.join("defect-plain.md")).unwrap();
+    assert_eq!(t.traced_from_mission, Some("m-1".to_string()));
+    assert_eq!(t.goal, "Body text stays.");
+}
+
+#[test]
+fn seed_traced_from_mission_rejects_an_unsafe_mission_id() {
+    let repo = tempfile::tempdir().unwrap();
+    Ticket::scaffold(repo.path(), "defect-login", "Login regression", None, None).unwrap();
+    for bad in ["", "../escape", "a/b", "a\\b", "host:port"] {
+        assert!(
+            Ticket::seed_traced_from_mission(repo.path(), "defect-login", bad).is_err(),
+            "{bad:?} must be refused"
+        );
+    }
+    // Nothing was written on the refused attempts.
+    let t = Ticket::load(&Ticket::tickets_dir(repo.path()).join("defect-login.md")).unwrap();
+    assert_eq!(t.traced_from_mission, None);
+}
+
+// ---------------------------------------------------------------------------
 // task-class travels through the folded mission_goal (f-1-2 integration seam:
 // `kranz exec` only ever sees the folded goal string, not the `Ticket`, so
 // this round-trip is what lets `MissionEngine::create` recover the class).

@@ -414,6 +414,7 @@ fn repo_api_routes() -> Router<Arc<ServerState>> {
             get(rest::list_missions).post(host::create_mission),
         )
         .route("/missions/outcomes", get(rest::mission_outcomes))
+        .route("/escalation-metrics", get(rest::escalation_metrics))
         .route("/missions/{id}/state", get(rest::mission_state))
         .route("/missions/{id}/workspace", get(rest::mission_workspace))
         .route("/missions/{id}/events", get(rest::mission_events))

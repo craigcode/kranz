@@ -120,6 +120,17 @@ pub enum Command {
         json: bool,
     },
 
+    /// Show the flight-surgeon console: autonomy ratio split by outcome,
+    /// the rubber-stamp signal (park→grant p50/p90 + sub-10s count), false
+    /// greens (completed missions with traced defect tickets), and the
+    /// escalation ledger (read-only, no lock)
+    EscalationMetrics {
+        /// Dump the full EscalationMetrics struct as JSON instead of the text
+        /// report
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Pause the mission (takes effect between worker runs)
     Pause,
 
@@ -218,6 +229,12 @@ pub enum Command {
         /// review
         #[arg(long)]
         yes: bool,
+
+        /// Seed the ticket's `traced-from-mission` frontmatter with this
+        /// mission id (drafting a defect ticket traced back to the mission
+        /// that shipped the defect — the flight-surgeon false-green join)
+        #[arg(long = "from-mission", value_name = "MISSION_ID")]
+        from_mission: Option<String>,
     },
 
     /// Decompose a complex goal into a ticket DAG (blocked-by edges).

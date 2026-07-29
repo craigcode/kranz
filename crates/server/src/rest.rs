@@ -100,6 +100,22 @@ pub(crate) async fn mission_outcomes(
     Ok(Json(outcomes))
 }
 
+/// `GET /api/escalation-metrics` — the flight-surgeon console (ticket
+/// `flight-surgeon-dashboard`): autonomy ratio split by outcome, the
+/// rubber-stamp signal (park→grant p50/p90 + sub-10s count), false greens
+/// (completed missions joined against `traced-from-mission` defect tickets),
+/// and the escalation ledger. Computed per-request from the event logs and
+/// ticket frontmatter by
+/// [`kranz_engine::escalation_metrics::compute_escalation_metrics`]. Read-gated
+/// like every other GET; no caching, no second source of truth.
+pub(crate) async fn escalation_metrics(
+    State(server): State<Arc<ServerState>>,
+) -> Result<Json<kranz_engine::escalation_metrics::EscalationMetrics>, ApiError> {
+    let metrics = kranz_engine::escalation_metrics::compute_escalation_metrics(&server.repo_root)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(metrics))
+}
+
 /// `<repo>/.kranz/missions/index.md` contents, or `""` if the file is absent
 /// (never created here — callers only read the catalog).
 fn read_missions_index(repo_root: &Path) -> String {
@@ -1037,6 +1053,95 @@ mod tests {
         assert_eq!(revision_row["missionId"], "m-1");
         assert_eq!(revision_row["summary"], "add tests");
         assert_eq!(revision_row["decision"], "accepted (rev 1)");
+    }
+
+    #[tokio::test]
+    async fn escalation_metrics_endpoint_empty_repo_returns_none_rates() {
+        let tmp = TempDir::new().unwrap();
+        let app = crate::router(tmp.path().to_path_buf(), None);
+
+        let response = app.oneshot(get("/api/escalation-metrics")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+
+        assert_eq!(body["autonomy"]["closedMissions"], 0);
+        assert!(body["autonomy"]["zeroInterventionShare"].is_null());
+        assert_eq!(body["rubberStamp"]["decidedGrants"], 0);
+        assert!(body["rubberStamp"]["p50Ms"].is_null());
+        assert_eq!(body["falseGreens"]["completedMissions"], 0);
+        assert!(body["falseGreens"]["falseGreenRate"].is_null());
+        assert_eq!(body["ledger"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn escalation_metrics_endpoint_seeded_repo_joins_traced_defects() {
+        let tmp = TempDir::new().unwrap();
+        seed_mission(
+            tmp.path(),
+            "m-1",
+            vec![
+                created("seeded"),
+                EventKind::GrantRequested {
+                    milestone_id: "ms-1".into(),
+                    kind: GrantKind::Command,
+                    command: "cargo test".into(),
+                },
+                EventKind::GrantApproved {
+                    kind: GrantKind::Command,
+                    command: "cargo test".into(),
+                },
+                EventKind::MissionCompleted {},
+            ],
+        );
+        seed_mission(
+            tmp.path(),
+            "m-2",
+            vec![created("clean"), EventKind::MissionCompleted {}],
+        );
+        // A hand-edited defect ticket traces back to m-1 (the grant-steered
+        // completion); the clean m-2 stays out of the false-green count.
+        let tickets = kranz_engine::ticket::Ticket::tickets_dir(tmp.path());
+        std::fs::create_dir_all(&tickets).unwrap();
+        std::fs::write(
+            tickets.join("defect-regression.md"),
+            "---\ntitle: Regression\ntraced-from-mission: m-1\n---\n\n## Goal\nfix\n",
+        )
+        .unwrap();
+
+        let app = crate::router(tmp.path().to_path_buf(), None);
+        let response = app.oneshot(get("/api/escalation-metrics")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+
+        assert_eq!(body["autonomy"]["closedMissions"], 2);
+        assert_eq!(body["autonomy"]["zeroInterventionMissions"], 1);
+        assert_eq!(body["autonomy"]["zeroInterventionShare"], 0.5);
+        assert_eq!(body["autonomy"]["completed"]["missions"], 2);
+        assert_eq!(body["autonomy"]["completed"]["zeroIntervention"], 1);
+
+        assert_eq!(body["rubberStamp"]["decidedGrants"], 1);
+        assert_eq!(body["rubberStamp"]["underTenSeconds"], 1);
+        assert!(body["rubberStamp"]["p50Ms"].is_number());
+
+        assert_eq!(body["falseGreens"]["completedMissions"], 2);
+        assert_eq!(body["falseGreens"]["falseGreens"], 1);
+        assert_eq!(body["falseGreens"]["falseGreenRate"], 0.5);
+        assert_eq!(body["falseGreens"]["withInterventions"]["falseGreens"], 1);
+        assert_eq!(body["falseGreens"]["zeroIntervention"]["falseGreens"], 0);
+        assert_eq!(
+            body["falseGreens"]["tracedDefects"][0]["ticket"],
+            "defect-regression"
+        );
+        assert_eq!(body["falseGreens"]["tracedDefects"][0]["missionId"], "m-1");
+
+        let ledger = body["ledger"].as_array().unwrap();
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger[0]["kind"], "grant");
+        assert_eq!(ledger[0]["missionId"], "m-1");
+        assert_eq!(ledger[0]["milestoneId"], "ms-1");
+        assert_eq!(ledger[0]["ask"], "command: cargo test");
+        assert_eq!(ledger[0]["decision"], "approved");
+        assert!(ledger[0]["latencyMs"].is_number());
     }
 
     /// `workspaceLifecycle` (ticket workspace-idle-hibernate): present with

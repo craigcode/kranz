@@ -58,6 +58,13 @@ pub const READINESS_SUMMARY_PREFIX: &str = "workspace readiness:";
 /// reasons (workspace_data.rs) provably share the prefix the lift matches.
 pub(crate) const GATE_REASON_PREFIX: &str = "workspace gate:";
 
+/// The `milestone.unblocked` reason [`WorkspaceGate::lift_gate_block`] emits
+/// when a previously failed gate passes — an ENGINE-owned unblock, not an
+/// operator decision. `pub(crate)` so the flight-surgeon fold
+/// (escalation_metrics.rs) excludes exactly this unblock from the operator
+/// intervention count by matching the same constant the lift emits.
+pub(crate) const GATE_LIFT_REASON: &str = "workspace gate now passing: bootstrap and readiness ok";
+
 /// Outcome of one bootstrap command / readiness check.
 #[derive(Debug, Clone)]
 pub struct CommandOutcome {
@@ -175,7 +182,7 @@ impl MissionEngine {
         if latest_block_is_gate_owned(&events, &milestone_id) {
             self.emit(EventKind::MilestoneUnblocked {
                 milestone_id,
-                reason: "workspace gate now passing: bootstrap and readiness ok".to_string(),
+                reason: GATE_LIFT_REASON.to_string(),
                 validator_guidance: None,
             })?;
         }

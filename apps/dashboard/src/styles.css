@@ -2233,6 +2233,41 @@ button {
   border-color: var(--accent);
 }
 
+/* -------------------------------------------------------- flight surgeon */
+
+.flight-surgeon-cards {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  padding: 4px 10px 8px;
+}
+
+.flight-surgeon-card {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px 8px;
+  min-width: 0;
+}
+
+.flight-surgeon-card-value {
+  font-size: 16px;
+  line-height: 1.2;
+}
+
+.flight-surgeon-card-label {
+  font-size: 11px;
+  font-variant-caps: all-small-caps;
+  letter-spacing: 0.08em;
+  color: var(--dim);
+  margin-top: 2px;
+}
+
+.flight-surgeon-card-detail {
+  font-size: 10px;
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+}
+
 /* --------------------------------------------------------------- narrow */
 
 @media (max-width: 900px) {

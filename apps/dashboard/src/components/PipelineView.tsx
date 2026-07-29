@@ -15,6 +15,7 @@ import type { MissionSummary, TicketSummary } from '../lib/types';
 import { LENSES, filterLensRows, landedCount, type Lens } from '../lib/lensFilter';
 import { missionHash, repoHash, ticketHash } from '../lib/routes';
 import { OutcomesPanel } from './OutcomesPanel';
+import { FlightSurgeonPanel } from './FlightSurgeonPanel';
 
 interface Row {
   key: string;
@@ -549,6 +550,7 @@ export function PipelineView({ initialLens = 'actionable' }: { initialLens?: Len
           </div>
         )}
         <ul className="picker-list">{visibleRows.map(row)}</ul>
+        <FlightSurgeonPanel />
         <OutcomesPanel />
       </div>
     </div>

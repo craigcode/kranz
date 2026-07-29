@@ -88,6 +88,15 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             }
             Ok(0)
         }
+        Command::EscalationMetrics { json } => {
+            let metrics = kranz_engine::escalation_metrics::compute_escalation_metrics(&repo)?;
+            if json {
+                println!("{}", output::render_escalation_metrics_json(&metrics)?);
+            } else {
+                print!("{}", output::render_escalation_metrics(&metrics));
+            }
+            Ok(0)
+        }
         Command::ExportTraces {
             mission_id,
             all,
@@ -210,11 +219,19 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
         }
         Command::Clean { yes, all } => cmd_clean(&repo, yes, all),
         Command::Ticket { command } => dispatch_ticket(&repo, command, cli.mission.as_deref()),
-        Command::Draft { slug, yes } => {
-            backlog::cmd_draft(repo, &slug, yes, cli.dangerously_allow_all)
-                .await
-                .map_err(augment_limit_hint)
-        }
+        Command::Draft {
+            slug,
+            yes,
+            from_mission,
+        } => backlog::cmd_draft(
+            repo,
+            &slug,
+            yes,
+            from_mission.as_deref(),
+            cli.dangerously_allow_all,
+        )
+        .await
+        .map_err(augment_limit_hint),
         Command::Decompose { goal, yes } => {
             backlog::cmd_decompose(repo, &goal, yes, cli.dangerously_allow_all)
                 .await

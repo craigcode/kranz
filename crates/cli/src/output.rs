@@ -3,6 +3,7 @@
 //! so tests can assert on the exact output.
 
 use kranz_engine::cost::{Confidence, CostEstimate, MIN_CALIBRATION_MISSIONS};
+use kranz_engine::escalation_metrics::EscalationMetrics;
 use kranz_engine::outcomes::Outcomes;
 use kranz_engine::types::{
     AssertionCheck, FeatureStatus, MilestoneStatus, MissionState, MissionStatus, Plan,
@@ -320,6 +321,118 @@ pub fn render_outcomes_json(outcomes: &Outcomes) -> anyhow::Result<String> {
     Ok(serde_json::to_string_pretty(outcomes)?)
 }
 
+/// Optional share as a percentage ("33%", or "—" when the denominator was 0).
+fn fmt_share_pct(share: Option<f64>) -> String {
+    share
+        .map(|s| format!("{:.0}%", s * 100.0))
+        .unwrap_or_else(|| "—".to_string())
+}
+
+/// Render `kranz escalation-metrics`'s default text view: Autonomy (split by
+/// outcome), Rubber-stamp signal, False greens, and the Escalation ledger —
+/// unless there is no history at all, in which case only the Autonomy section
+/// plus a short note is printed (the outcomes empty-history rule).
+pub fn render_escalation_metrics(metrics: &EscalationMetrics) -> String {
+    let autonomy = &metrics.autonomy;
+    let mut out = String::new();
+
+    out.push_str("Autonomy\n");
+    out.push_str(&format!(
+        "  zero-intervention share: {} ({} of {} closed missions)\n",
+        fmt_share_pct(autonomy.zero_intervention_share),
+        autonomy.zero_intervention_missions,
+        autonomy.closed_missions
+    ));
+    out.push_str(&format!(
+        "  completed: {} ({} of {})   failed: {} ({} of {})\n",
+        fmt_share_pct(autonomy.completed.zero_intervention_share),
+        autonomy.completed.zero_intervention,
+        autonomy.completed.missions,
+        fmt_share_pct(autonomy.failed.zero_intervention_share),
+        autonomy.failed.zero_intervention,
+        autonomy.failed.missions
+    ));
+
+    let has_history = autonomy.closed_missions > 0
+        || !metrics.ledger.is_empty()
+        || metrics.rubber_stamp.decided_grants > 0
+        || !metrics.false_greens.traced_defects.is_empty();
+    if !has_history {
+        out.push('\n');
+        out.push_str("no escalations recorded yet\n");
+        return out;
+    }
+
+    let stamp = &metrics.rubber_stamp;
+    out.push('\n');
+    out.push_str("Rubber-stamp signal\n");
+    out.push_str(&format!(
+        "  decided grants: {}   under 10s: {}\n",
+        stamp.decided_grants, stamp.under_ten_seconds
+    ));
+    let fmt_ms = |ms: Option<u64>| {
+        ms.map(format_duration_ms)
+            .unwrap_or_else(|| "—".to_string())
+    };
+    out.push_str(&format!(
+        "  p50: {}   p90: {}\n",
+        fmt_ms(stamp.p50_ms),
+        fmt_ms(stamp.p90_ms)
+    ));
+
+    let greens = &metrics.false_greens;
+    out.push('\n');
+    out.push_str("False greens\n");
+    out.push_str(&format!(
+        "  {} of {} completed missions ({}) produced a traced defect\n",
+        greens.false_greens,
+        greens.completed_missions,
+        fmt_share_pct(greens.false_green_rate)
+    ));
+    out.push_str(&format!(
+        "  with interventions: {} of {} ({})   zero-intervention: {} of {} ({})\n",
+        greens.with_interventions.false_greens,
+        greens.with_interventions.completed_missions,
+        fmt_share_pct(greens.with_interventions.rate),
+        greens.zero_intervention.false_greens,
+        greens.zero_intervention.completed_missions,
+        fmt_share_pct(greens.zero_intervention.rate)
+    ));
+    for defect in &greens.traced_defects {
+        out.push_str(&format!(
+            "  traced: {} → {}\n",
+            defect.ticket, defect.mission_id
+        ));
+    }
+
+    out.push('\n');
+    out.push_str("Escalation ledger\n");
+    for row in &metrics.ledger {
+        let milestone = row.milestone_id.as_deref().unwrap_or("-");
+        let latency = row
+            .latency_ms
+            .map(|ms| format!("{ms}ms"))
+            .unwrap_or_else(|| "-".to_string());
+        out.push_str(&format!(
+            "  {}  {}  {}  {}  {}  {}  {}\n",
+            row.ts.to_rfc3339(),
+            row.mission_id,
+            row.kind.as_str(),
+            milestone,
+            row.ask,
+            row.decision,
+            latency
+        ));
+    }
+
+    out
+}
+
+/// Serialize `kranz escalation-metrics --json`'s output.
+pub fn render_escalation_metrics_json(metrics: &EscalationMetrics) -> anyhow::Result<String> {
+    Ok(serde_json::to_string_pretty(metrics)?)
+}
+
 /// Milliseconds as a compact duration ("12s", "47m", "2.3h", "3.1d") for
 /// the cycle-time readout.
 fn format_duration_ms(ms: u64) -> String {
@@ -456,6 +569,100 @@ mod tests {
             assert!(text.contains("Cost per change"));
             assert!(text.contains("Cycle time"));
             assert!(text.contains("Escalation ledger"));
+        }
+    }
+
+    mod escalation_metrics_cli {
+        use super::*;
+        use kranz_engine::escalation_metrics::{compute_escalation_metrics, EscalationMetrics};
+        use kranz_engine::event_log::{EventLog, LockForce};
+        use kranz_engine::events::EventKind;
+        use kranz_engine::paths::MissionPaths;
+        use kranz_engine::types::{GrantKind, MissionConfig};
+        use std::time::Duration;
+        use tempfile::TempDir;
+
+        fn seed_mission(repo_root: &std::path::Path, id: &str, kinds: Vec<EventKind>) {
+            let paths = MissionPaths::new(repo_root, id);
+            let mut log = EventLog::acquire(&paths, id, Duration::ZERO, LockForce::No).unwrap();
+            for kind in kinds {
+                log.append(kind).unwrap();
+            }
+        }
+
+        fn created() -> EventKind {
+            EventKind::MissionCreated {
+                goal: "g".into(),
+                base_branch: "main".into(),
+                mission_branch: "kranz/mission-x".into(),
+                config: MissionConfig::default(),
+            }
+        }
+
+        fn seed_repo(root: &std::path::Path) {
+            seed_mission(
+                root,
+                "m-1",
+                vec![
+                    created(),
+                    EventKind::GrantRequested {
+                        milestone_id: "ms-1".into(),
+                        kind: GrantKind::Command,
+                        command: "cargo test".into(),
+                    },
+                    EventKind::GrantApproved {
+                        kind: GrantKind::Command,
+                        command: "cargo test".into(),
+                    },
+                    EventKind::MissionCompleted {},
+                ],
+            );
+            seed_mission(root, "m-2", vec![created(), EventKind::MissionCompleted {}]);
+            let tickets = kranz_engine::ticket::Ticket::tickets_dir(root);
+            std::fs::create_dir_all(&tickets).unwrap();
+            std::fs::write(
+                tickets.join("defect-regression.md"),
+                "---\ntitle: Regression\ntraced-from-mission: m-1\n---\n\n## Goal\nfix\n",
+            )
+            .unwrap();
+        }
+
+        #[test]
+        fn escalation_metrics_cli_json_round_trips_to_compute_value() {
+            let tmp = TempDir::new().unwrap();
+            seed_repo(tmp.path());
+            let expected = compute_escalation_metrics(tmp.path()).unwrap();
+            let json = render_escalation_metrics_json(&expected).unwrap();
+            let round_tripped: EscalationMetrics = serde_json::from_str(&json).unwrap();
+            assert_eq!(round_tripped, expected);
+        }
+
+        #[test]
+        fn escalation_metrics_cli_empty_history_text_shows_autonomy_alone() {
+            let tmp = TempDir::new().unwrap();
+            let metrics = compute_escalation_metrics(tmp.path()).unwrap();
+            let text = render_escalation_metrics(&metrics);
+            assert!(text.contains("Autonomy"));
+            assert!(text.contains("no escalations recorded yet"));
+            assert!(!text.contains("Rubber-stamp signal"));
+            assert!(!text.contains("Escalation ledger"));
+        }
+
+        #[test]
+        fn escalation_metrics_cli_populated_text_includes_all_sections() {
+            let tmp = TempDir::new().unwrap();
+            seed_repo(tmp.path());
+            let metrics = compute_escalation_metrics(tmp.path()).unwrap();
+            let text = render_escalation_metrics(&metrics);
+            assert!(text.contains("Autonomy"));
+            assert!(text.contains("Rubber-stamp signal"));
+            assert!(text.contains("False greens"));
+            assert!(text.contains("Escalation ledger"));
+            // m-2 completed clean, m-1 did not; the defect traces to m-1.
+            assert!(text.contains("zero-intervention share: 50% (1 of 2 closed missions)"));
+            assert!(text.contains("1 of 2 completed missions (50%) produced a traced defect"));
+            assert!(text.contains("traced: defect-regression → m-1"));
+            assert!(text.contains("command: cargo test"));
         }
     }
 

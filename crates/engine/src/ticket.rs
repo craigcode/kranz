@@ -84,6 +84,12 @@ pub struct Ticket {
     /// frontmatter) — set on webhook-drafted tickets (design D-F,
     /// [`crate::hooks`]); `None` on human-authored tickets.
     pub trigger: Option<String>,
+    /// Defect→mission link (`traced-from-mission: m-xxxx` frontmatter) — the
+    /// ONE data addition of the flight-surgeon console (ticket
+    /// `flight-surgeon-dashboard`): a defect ticket traces back to the mission
+    /// that shipped it. Seeded by `kranz draft --from-mission` or added by
+    /// hand; absent means "not a traced defect" (no false positives).
+    pub traced_from_mission: Option<String>,
     /// The full markdown body (everything after the frontmatter block).
     pub raw_body: String,
 }
@@ -238,6 +244,7 @@ impl Ticket {
         let mut blocked_by: Vec<String> = Vec::new();
         let mut task_class: Option<String> = None;
         let mut trigger: Option<String> = None;
+        let mut traced_from_mission: Option<String> = None;
 
         for (key, value) in front {
             match key.as_str() {
@@ -262,6 +269,12 @@ impl Ticket {
                 "trigger" => {
                     let v = value.scalar().trim().to_string();
                     trigger = if v.is_empty() { None } else { Some(v) };
+                }
+                // Defect→mission link (flight-surgeon console); additive —
+                // older readers ignore it via the unknown-key arm below.
+                "traced-from-mission" | "tracedfrommission" => {
+                    let v = value.scalar().trim().to_string();
+                    traced_from_mission = if v.is_empty() { None } else { Some(v) };
                 }
                 "schedule" => schedule = Schedule::parse(&value.scalar()),
                 "maxbudgetusd" | "max-budget-usd" => {
@@ -301,6 +314,7 @@ impl Ticket {
             blocked_by,
             task_class,
             trigger,
+            traced_from_mission,
             raw_body: body,
         })
     }
@@ -590,6 +604,99 @@ impl Ticket {
             Some(format!("WRONG-PLAN: {reason}")),
         )?;
         Ok(())
+    }
+
+    /// Seed or update the ticket's `traced-from-mission` frontmatter link
+    /// (the flight-surgeon console's defect→mission join). `kranz draft
+    /// --from-mission` calls this; hand-edited tickets need nothing here —
+    /// their field parses through [`Ticket::parse`] like any other. Only the
+    /// frontmatter block is rewritten (an existing link line in place, or a
+    /// new line right after the opening fence; a frontmatter-less ticket
+    /// gains a two-line block above its body) — body bytes are preserved.
+    /// Returns `Ok(true)` when the file changed, `Ok(false)` when the link
+    /// already named this mission.
+    pub fn seed_traced_from_mission(
+        repo_root: &Path,
+        slug: &str,
+        mission_id: &str,
+    ) -> Result<bool> {
+        Self::ensure_valid_slug(slug)?;
+        if !crate::paths::MissionPaths::is_safe_id(mission_id) {
+            return Err(EngineError::Config(format!(
+                "invalid mission id '{mission_id}' for traced-from-mission"
+            )));
+        }
+        let md = Self::md_path(repo_root, slug);
+        let text = std::fs::read_to_string(&md)?;
+        let new_line = format!("traced-from-mission: {mission_id}");
+
+        let (bom, source) = match text.strip_prefix('\u{feff}') {
+            Some(rest) => ("\u{feff}", rest),
+            None => ("", text.as_str()),
+        };
+        let lines: Vec<&str> = source.split_inclusive('\n').collect();
+        let has_frontmatter = lines
+            .first()
+            .map(|line| line.trim_end() == "---")
+            .unwrap_or(false);
+
+        let mut out = String::with_capacity(text.len() + new_line.len() + 8);
+        out.push_str(bom);
+
+        if !has_frontmatter {
+            out.push_str("---\n");
+            out.push_str(&new_line);
+            out.push('\n');
+            out.push_str("---\n\n");
+            out.push_str(source);
+            atomic_write(&md, out.as_bytes())?;
+            return Ok(true);
+        }
+
+        // Scan the frontmatter block for its closing fence and an existing
+        // link line (key spelling-tolerant, like the parser).
+        let mut closing: Option<usize> = None;
+        let mut existing: Option<(usize, String)> = None;
+        for (i, line) in lines.iter().enumerate().skip(1) {
+            if line.trim_end() == "---" {
+                closing = Some(i);
+                break;
+            }
+            if existing.is_none() && !line.trim_start().starts_with('#') {
+                if let Some((key, value)) = line.split_once(':') {
+                    let key = normalize_key(key);
+                    if key == "traced-from-mission" || key == "tracedfrommission" {
+                        existing = Some((i, unquote(value.trim())));
+                    }
+                }
+            }
+        }
+        if closing.is_none() {
+            return Err(EngineError::Config(format!(
+                "ticket {slug}: frontmatter opened with `---` but was never closed"
+            )));
+        }
+        if let Some((_, value)) = &existing {
+            if value == mission_id {
+                return Ok(false);
+            }
+        }
+        let replace_idx = existing.as_ref().map(|(i, _)| *i);
+        for (i, line) in lines.iter().enumerate() {
+            // No existing link: insert one right after the opening fence.
+            if i == 1 && replace_idx.is_none() {
+                out.push_str(&new_line);
+                out.push('\n');
+            }
+            if replace_idx == Some(i) {
+                out.push_str(&new_line);
+                out.push('\n');
+            } else {
+                out.push_str(line);
+            }
+        }
+        atomic_write(&md, out.as_bytes())?;
+        Ok(true)
     }
 }
 
