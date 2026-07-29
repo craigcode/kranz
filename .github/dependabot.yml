@@ -33,9 +33,21 @@ updates:
           - minor
           - patch
 
+  # Tauri standalone workspace (apps/dashboard/src-tauri): its own committed
+  # Cargo.lock, and the macOS `tauri` CI job compiles it, so bot bumps can't
+  # merge blind. Separate entry because dependabot scopes cargo per-directory.
+  - package-ecosystem: cargo
+    directory: /apps/dashboard/src-tauri
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - minor
+          - patch
+
   # Dashboard deps are few; group them so the trickle stays one PR.
-  # (The Tauri standalone workspace is intentionally uncovered: it has no
-  # committed lockfile and no CI job compiles it — bot bumps would merge blind.)
   - package-ecosystem: npm
     directory: /apps/dashboard
     schedule:

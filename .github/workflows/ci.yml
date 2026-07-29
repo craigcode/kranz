@@ -59,6 +59,31 @@ jobs:
         run: bash scripts/check-macos-ci.sh
       - run: cargo check --workspace --locked
 
+  # The Tauri desktop shell (apps/dashboard/src-tauri) is a STANDALONE cargo
+  # workspace with its own committed Cargo.lock, deliberately outside the
+  # root workspace gates above, so it gets its own compile gate here. macOS:
+  # Tauri's webview stack builds there with no extra system packages (Linux
+  # would need webkit2gtk). `cargo check --locked` only — no app bundle.
+  tauri:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/dashboard/package-lock.json
+      # `tauri::generate_context!` resolves `frontendDist: ../dist` at
+      # compile time, so the dashboard bundle must exist before cargo runs.
+      - run: npm ci
+        working-directory: apps/dashboard
+      - run: npm run build
+        working-directory: apps/dashboard
+      - run: cargo check --locked
+        working-directory: apps/dashboard/src-tauri
+
   dashboard:
     runs-on: ubuntu-latest
     steps:

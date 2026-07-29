@@ -505,9 +505,61 @@ impl Drop for Claim {
     }
 }
 
-/// Recover claims left by dead dispatchers: `*.claimed.<pid>` whose pid is
-/// provably dead (unix) — or, where liveness can't be probed, whose file is
-/// over an hour old — is renamed back to its entry name.
+/// Liveness verdict for the pid recorded in a claim filename.
+///
+/// Same INVARIANT as the event-log lock probe: anything uncertain must never
+/// report [`ClaimPidLiveness::Dead`] — a false "dead" requeues a mission a
+/// live dispatcher is still running, executing it twice (review P2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimPidLiveness {
+    /// `kill(pid, 0)` succeeded: the claiming process exists.
+    Alive,
+    /// `kill(pid, 0)` failed with ESRCH: no such process — positive proof.
+    Dead,
+    /// The probe cannot settle it on this platform/errno: the caller's age
+    /// backstop breaks the tie.
+    Unknown,
+}
+
+/// Probe the pid from a claim filename. unix: `kill(pid, 0)` == 0 → Alive;
+/// ESRCH → Dead; EPERM → Unknown (a process exists but is owned by another
+/// user — it cannot be our same-user dispatcher, yet its presence also means
+/// the pid was recycled, so let the age backstop decide); any other errno →
+/// Unknown. Non-positive pids → Unknown (never probe a process GROUP, and
+/// `kill(0, 0)` would match our own). Non-unix: no probe is wired up — the
+/// same posture as [`crate::event_log::lock_holder_is_alive`] — so every pid
+/// is Unknown and recovery keeps the conservative age-only rule there.
+fn probe_claim_pid(pid: i32) -> ClaimPidLiveness {
+    if pid <= 0 {
+        return ClaimPidLiveness::Unknown;
+    }
+    #[cfg(unix)]
+    {
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return ClaimPidLiveness::Alive;
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => ClaimPidLiveness::Dead,
+            _ => ClaimPidLiveness::Unknown,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        ClaimPidLiveness::Unknown
+    }
+}
+
+/// Recover claims left by dead dispatchers. A `*.claimed.<pid>` file is
+/// renamed back to its entry name when its pid is provably DEAD, whatever its
+/// age — or, when liveness cannot be determined, when the file is over an
+/// hour old (the pid-REUSE backstop: a recycled pid reads alive forever,
+/// which would strand the claim).
+///
+/// A pid probed ALIVE keeps its claim no matter how old the file is: age
+/// resolves ONLY the ambiguous cases (unprobeable platform, inconclusive
+/// errno), never confirmed liveness — otherwise a second dispatcher would
+/// requeue a genuinely long-running mission and run it twice (review P2).
 pub fn recover_dead_claims(repo_root: &Path) -> usize {
     let dir = queue_dir(repo_root);
     let Ok(rd) = std::fs::read_dir(&dir) else {
@@ -528,13 +580,19 @@ pub fn recover_dead_claims(repo_root: &Path) -> usize {
             .and_then(|t| t.elapsed().ok())
             .is_some_and(|age| age > Duration::from_secs(3600));
         let dead = match pid_str.parse::<i32>() {
-            // Pid liveness where we can probe it — with the age fallback as a
-            // pid-REUSE backstop (a recycled pid reads alive forever, which
-            // would strand the claim).
-            #[cfg(unix)]
-            Ok(pid) => (unsafe { libc::kill(pid, 0) != 0 }) || aged_out,
-            #[cfg(not(unix))]
-            Ok(_) => aged_out,
+            Ok(pid) => match probe_claim_pid(pid) {
+                // Confirmed liveness STANDS the claim regardless of age —
+                // this is the reorder: age must never requeue a mission a
+                // live dispatcher is still running.
+                ClaimPidLiveness::Alive => false,
+                ClaimPidLiveness::Dead => true,
+                // Ambiguous (unprobeable platform, EPERM, bad errno): age
+                // breaks the tie, as the pid-reuse backstop.
+                ClaimPidLiveness::Unknown => aged_out,
+            },
+            // A pid suffix that can't be parsed belongs to no probe-able
+            // dispatcher: recover immediately rather than strand the entry
+            // behind an unanswerable probe (existing rule, unchanged).
             Err(_) => true,
         };
         if dead && std::fs::rename(&path, dir.join(entry_name)).is_ok() {

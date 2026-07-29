@@ -28,9 +28,10 @@ CORS headers, so the dev page can call the API directly.
 
 ## Desktop mode (Tauri)
 
-The Tauri shell (`src-tauri/`) picks a free localhost port at startup, runs
-`kranz_server::serve` on it inside the app process, and opens a 1280x800
-"Kranz Mission Control" window pointed at the frontend.
+The Tauri shell (`src-tauri/`) binds a free localhost port at startup, runs
+the embedded kranz server on that very listener inside the app process (the
+port is never released for rebind — no pick-then-release race), and opens a
+1280x800 "Kranz Mission Control" window pointed at the frontend.
 
 Repo root resolution order: `KRANZ_REPO` env var, then the first CLI argument,
 then the current working directory.
@@ -52,6 +53,9 @@ Notes:
 - `src-tauri/` is a standalone cargo workspace (empty `[workspace]` table in
   its `Cargo.toml`) so the heavy Tauri dependency tree stays out of root
   workspace builds. It depends on `kranz-server` / `kranz-engine` by path.
+  Its `Cargo.lock` is committed and compiled by a dedicated macOS CI job
+  (`cargo check --locked`), and Dependabot covers it as a separate cargo
+  directory.
 - The desktop app exposes two IPC commands as a fallback to the injected
   global: `get_server_url()` and `get_repo_root()`.
 - The CSP in `src-tauri/tauri.conf.json` allows `connect-src` to

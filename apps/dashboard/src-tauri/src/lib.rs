@@ -1,10 +1,12 @@
 //! Kranz Mission Control desktop shell.
 //!
-//! On startup the app embeds `kranz_server::serve` on a runtime-chosen free
-//! localhost port, then builds the main window programmatically so it can
-//! carry an initialization script announcing that port to the frontend
-//! (`window.__KRANZ_SERVER__` — the UI reads only that global; the
-//! `get_server_url` / `get_repo_root` commands exist as an IPC fallback).
+//! On startup the app binds a free localhost port and embeds the kranz
+//! server on that very listener — the port is never released back to the
+//! OS for someone else to snipe — then builds the main window
+//! programmatically so it can carry an initialization script announcing
+//! that port to the frontend (`window.__KRANZ_SERVER__` — the UI reads
+//! only that global; the `get_server_url` / `get_repo_root` commands exist
+//! as an IPC fallback).
 
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -49,16 +51,36 @@ fn resolve_repo_root() -> PathBuf {
     std::fs::canonicalize(&raw).unwrap_or(raw)
 }
 
-/// Bind 127.0.0.1:0 to let the OS pick a free port, then release it so the
-/// embedded server can bind it a moment later.
-fn pick_free_port() -> u16 {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("failed to bind 127.0.0.1:0");
-    let port = listener
-        .local_addr()
-        .expect("listener has no local addr")
-        .port();
-    drop(listener);
-    port
+/// Bind 127.0.0.1:0 so the OS picks a free port, and KEEP the listener: the
+/// embedded server serves on this exact socket, so the port can never be
+/// re-taken between selection and bind — the old pick-then-release dance had
+/// precisely that TOCTOU window.
+fn bind_free_port() -> TcpListener {
+    TcpListener::bind(("127.0.0.1", 0)).expect("failed to bind 127.0.0.1:0")
+}
+
+/// Serve the kranz REST/WS API (docs/protocol.md) on an already-bound
+/// listener until the process exits. `static_dir: None`: the webview loads
+/// the bundled frontend itself and talks to the server for /api only. The
+/// shutdown future never fires: a desktop shell has no ctrl-c lifetime to
+/// honor — the app exiting IS the shutdown.
+async fn embedded_serve(
+    repo_root: PathBuf,
+    listener: TcpListener,
+    token: String,
+) -> anyhow::Result<()> {
+    // tokio's `from_std` requires the std listener to be nonblocking first.
+    listener.set_nonblocking(true)?;
+    let listener = tokio::net::TcpListener::from_std(listener)?;
+    let host = std::sync::Arc::new(kranz_server::MissionHost::new(repo_root));
+    kranz_server::serve_on_listener(
+        host,
+        listener,
+        None,
+        Some(token),
+        std::future::pending::<()>(),
+    )
+    .await
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -75,7 +97,11 @@ pub fn run() {
             }
 
             let repo_root = resolve_repo_root();
-            let port = pick_free_port();
+            let listener = bind_free_port();
+            let port = listener
+                .local_addr()
+                .expect("listener has no local addr")
+                .port();
             let url = format!("http://127.0.0.1:{port}");
             // Per-launch mutation token (protocol "Authority: mutation
             // token"): every POST /api/... must carry it, so other local
@@ -86,15 +112,12 @@ pub fn run() {
                 repo_root.display()
             );
 
-            // Embedded REST/WS server (docs/protocol.md). `static_dir: None`:
-            // the webview loads the bundled frontend itself and talks to the
-            // server for /api only.
+            // Embedded REST/WS server on the listener we already hold.
             {
                 let repo_root = repo_root.clone();
                 let token = token.clone();
                 tauri::async_runtime::spawn(async move {
-                    if let Err(err) = kranz_server::serve(repo_root, port, None, Some(token)).await
-                    {
+                    if let Err(err) = embedded_serve(repo_root, listener, token).await {
                         log::error!("embedded kranz server exited: {err:#}");
                     }
                 });

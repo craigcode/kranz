@@ -999,6 +999,149 @@ fn claim_lifecycle_finish_release_and_dead_recovery() {
 }
 
 // ---------------------------------------------------------------------------
+// Dead-claim recovery: liveness beats age (queue-liveness-over-age, review P2)
+// ---------------------------------------------------------------------------
+
+/// Back-date a file's mtime by `secs` (claim-recovery age tests).
+fn age_file(path: &Path, secs: u64) {
+    let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+    file.set_modified(past).unwrap();
+}
+
+fn queued(root: &Path, mission_id: &str) {
+    queue::enqueue(
+        root,
+        QueueEntry {
+            mission_id: mission_id.into(),
+            ticket_slug: None,
+            priority: 2,
+            seq: 0,
+        },
+    )
+    .unwrap();
+}
+
+/// Path of the single `.claimed.*` file currently in the queue dir.
+fn claimed_path(root: &Path) -> std::path::PathBuf {
+    fs::read_dir(queue::queue_dir(root))
+        .unwrap()
+        .flatten()
+        .map(|f| f.path())
+        .find(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().contains(".claimed."))
+        })
+        .expect("a claimed file exists")
+}
+
+/// Rename `mission_id`'s entry file into a claim held by `pid`, returning
+/// the claimed path.
+fn forge_claim(root: &Path, mission_id: &str, pid: &str) -> std::path::PathBuf {
+    let dir = queue::queue_dir(root);
+    let name = fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|f| f.file_name().to_string_lossy().into_owned())
+        .find(|n| n.ends_with(&format!("-{mission_id}.json")))
+        .expect("entry file exists");
+    let claimed = dir.join(format!("{name}.claimed.{pid}"));
+    fs::rename(dir.join(&name), &claimed).unwrap();
+    claimed
+}
+
+/// An OLD claim whose pid is ALIVE must NOT be requeued: age only breaks a
+/// tie the liveness probe cannot settle — it never overrides a live
+/// dispatcher, or a second dispatcher would requeue (and duplicate) a
+/// genuinely long-running mission. unix-only: the probe is `kill(pid, 0)`;
+/// on non-unix an aged claim is conservatively recovered by age alone (see
+/// the cfg(not(unix)) test below).
+#[cfg(unix)]
+#[test]
+fn old_claim_with_live_pid_is_not_recovered() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    queued(root, "m-long");
+    let claim = queue::claim_front(root).expect("front claimable");
+    age_file(&claimed_path(root), 2 * 3600);
+
+    assert_eq!(
+        queue::recover_dead_claims(root),
+        0,
+        "live pid: age must not override confirmed liveness"
+    );
+    assert!(
+        queue::peek(root).is_none(),
+        "entry stays claimed instead of being requeued"
+    );
+    queue::finish_claim(claim);
+}
+
+/// The dead-pid rule is unchanged by the reorder: a provably dead pid is
+/// recovered whatever the claim's age — here >1h.
+#[cfg(unix)]
+#[test]
+fn old_claim_with_dead_pid_is_recovered() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    queued(root, "m-dead-old");
+    age_file(&forge_claim(root, "m-dead-old", "999999999"), 2 * 3600);
+
+    assert_eq!(queue::recover_dead_claims(root), 1);
+    assert_eq!(
+        queue::peek(root).unwrap().mission_id,
+        "m-dead-old",
+        "requeued entry is claimable again"
+    );
+}
+
+/// Preserved pre-existing behavior: a dead pid is recovered even when the
+/// claim is younger than the one-hour backstop.
+#[cfg(unix)]
+#[test]
+fn young_claim_with_dead_pid_is_recovered() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    queued(root, "m-dead-young");
+    forge_claim(root, "m-dead-young", "999999999");
+
+    assert_eq!(queue::recover_dead_claims(root), 1);
+    assert_eq!(queue::peek(root).unwrap().mission_id, "m-dead-young");
+}
+
+/// Ambiguous-probe path: a claim whose pid suffix can't be parsed belongs
+/// to no dispatcher the probe could confirm — it is recovered immediately
+/// (existing rule, platform-independent).
+#[test]
+fn claim_with_unparseable_pid_is_recovered() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    queued(root, "m-garbled");
+    forge_claim(root, "m-garbled", "not-a-pid");
+
+    assert_eq!(queue::recover_dead_claims(root), 1);
+    assert_eq!(queue::peek(root).unwrap().mission_id, "m-garbled");
+}
+
+/// The non-unix posture: no liveness probe exists, so an aged claim is
+/// recovered by age ALONE even though the recorded pid (ours) is alive —
+/// the conservative choice, since a recycled pid reads alive and nothing
+/// can disprove it. Windows CI is the oracle for this path.
+#[cfg(not(unix))]
+#[test]
+fn old_claim_is_recovered_by_age_when_pid_liveness_is_unprobeable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    queued(root, "m-win");
+    let claim = queue::claim_front(root).expect("front claimable");
+    age_file(&claimed_path(root), 2 * 3600);
+
+    assert_eq!(queue::recover_dead_claims(root), 1);
+    assert_eq!(queue::peek(root).unwrap().mission_id, "m-win");
+    queue::finish_claim(claim);
+}
+
+// ---------------------------------------------------------------------------
 // Ticket→mission link (fix-ticket-mission-linkage)
 // ---------------------------------------------------------------------------
 
