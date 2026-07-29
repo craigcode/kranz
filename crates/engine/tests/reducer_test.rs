@@ -2560,7 +2560,13 @@ fn weight_hash_round_trips_through_serde_and_reducer_fold() {
 fn local_worker_spawned_from_stubbed_gguf(run_id: &str, gguf_bytes: &[u8]) -> (String, EventKind) {
     let mut hasher = Sha256::new();
     hasher.update(gguf_bytes);
-    let weight_hash = format!("{:x}", hasher.finalize());
+    // hybrid_array (sha2 0.11) has no LowerHex impl — hex by hand, matching
+    // the scrub.rs/orchestrator.rs idiom.
+    let weight_hash: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     assert_eq!(weight_hash.len(), 64, "sha256 hex digest is 64 chars");
 
     let kind = EventKind::WorkerSpawned {
