@@ -120,10 +120,11 @@ pub(crate) mod win_job {
             // SAFETY: CreateJobObjectW with a null SECURITY_ATTRIBUTES pointer
             // and a null name creates an unnamed, default-security job. It
             // returns a null handle on failure (GetLastError set), which we map
-            // to a windows Error via `from_win32`.
+            // to a windows Error via `from_thread` (the last-OS-error
+            // constructor; `from_win32` was removed in windows 0.62).
             let raw_job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
             if raw_job.is_null() {
-                return Err(windows::core::Error::from_win32());
+                return Err(windows::core::Error::from_thread());
             }
             let job = HANDLE(raw_job);
             // Wrap immediately so any early return below still closes the job.
