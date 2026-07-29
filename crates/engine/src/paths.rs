@@ -305,31 +305,54 @@ pub(crate) fn create_real_subdir(dir: &Dir, name: &str, full_path: &Path) -> Res
     }
 }
 
-/// Open `path` for reading WITHOUT following a final-component symlink: one
-/// syscall on unix (`O_NOFOLLOW` — `ELOOP` maps to the same refusal
-/// [`ensure_absent_or_regular_file`] produces), so there is no
-/// check-then-open window a concurrent writer could swap a symlink into.
-/// Off-unix there is no `O_NOFOLLOW`; fall back to check-then-open (Windows
-/// symlink creation needs privileges, so the residual race there is narrow,
-/// and documented here rather than hidden).
+/// Open `path` for reading WITHOUT following a symlink at ANY component:
+/// the parent is canonicalized (collapsing legitimate SYSTEM symlinks like
+/// macOS `/var` → `/private/var`), then every ancestor dir is opened
+/// relative to the already-pinned parent capability (`open_dir_nofollow`
+/// per component — a swap after canonicalization is refused), and the
+/// final component with `FollowSymlinks::No` (a symlinked FILE is refused,
+/// never read through). There is no check-then-open window at any level
+/// (3rd-pass review). Off-unix there is no `O_NOFOLLOW`; fall back to
+/// check-then-open (Windows symlink creation needs privileges, so the
+/// residual race there is narrow, and documented here rather than hidden).
 pub(crate) fn open_read_nofollow(path: &Path) -> Result<std::fs::File> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        match std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)
-        {
-            Ok(file) => Ok(file),
-            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
-                Err(EngineError::InvalidState(format!(
-                    "refusing mission runtime file that is not a regular file: {}",
-                    path.display()
-                )))
-            }
-            Err(e) => Err(e.into()),
+        use cap_fs_ext::{DirExt as _, OpenOptionsFollowExt as _};
+        use cap_primitives::fs::FollowSymlinks;
+
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| unsafe_mission_dir_path(path))?;
+        // NotFound here keeps callers' usual missing-file handling.
+        let canonical_parent = std::fs::canonicalize(parent)?;
+        let relative = canonical_parent
+            .strip_prefix("/")
+            .map_err(|_| unsafe_mission_dir_path(path))?;
+        let mut dir = Dir::open_ambient_dir("/", ambient_authority())?;
+        for component in relative.components() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(unsafe_mission_dir_path(path));
+            };
+            dir = dir
+                .open_dir_nofollow(name)
+                .map_err(|_| unsafe_mission_dir_path(path))?;
         }
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        dir.open_with(file_name, &options)
+            .map(|file| file.into_std())
+            .map_err(|e| {
+                if e.kind() == ErrorKind::NotFound {
+                    e.into()
+                } else {
+                    unsafe_mission_dir_path(path)
+                }
+            })
     }
     #[cfg(not(unix))]
     {

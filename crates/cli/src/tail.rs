@@ -264,11 +264,15 @@ impl EventRenderer {
                 head_after,
                 appeared,
                 resolved,
+                git_metadata_changed,
                 ..
             } => {
                 let mut what: Vec<String> = appeared.iter().take(3).cloned().collect();
                 if head_before != head_after {
                     what.push("HEAD moved".to_string());
+                }
+                if *git_metadata_changed {
+                    what.push(".git metadata".to_string());
                 }
                 if !resolved.is_empty() {
                     what.push(format!("{} entr(ies) hidden", resolved.len()));

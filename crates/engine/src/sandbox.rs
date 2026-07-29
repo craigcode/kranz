@@ -376,6 +376,11 @@ pub(crate) fn mission_write_denies(inputs: &SandboxInputs) -> MissionWriteDenies
 /// mission-dir forms are expanded (the dir exists at spawn time even when the
 /// token files do not yet), because Seatbelt matches against canonical paths
 /// — the same `/var` ↔ `/private/var` split the write allowlist handles.
+///
+/// Also denied: `$CARGO_HOME/credentials.toml` (or `~/.cargo/credentials.toml`
+/// when CARGO_HOME is unset) — CARGO_HOME crosses into child envs for
+/// registry-cache locality ([`crate::agent_env`]), but its registry auth
+/// tokens are the same credential class as the serve token.
 pub(crate) fn authority_read_deny_paths(inputs: &SandboxInputs) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     for mission_dir in [inputs.mission_dir.clone(), absolutize(&inputs.mission_dir)] {
@@ -383,6 +388,14 @@ pub(crate) fn authority_read_deny_paths(inputs: &SandboxInputs) -> Vec<PathBuf> 
             for name in ["serve.token", "serve.read.token", "config.json"] {
                 paths.push(kranz_dir.join(name));
             }
+        }
+    }
+    let cargo_home = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo")));
+    if let Some(cargo_home) = cargo_home {
+        for base in [cargo_home.clone(), absolutize(&cargo_home)] {
+            paths.push(base.join("credentials.toml"));
         }
     }
     paths
@@ -533,7 +546,11 @@ pub fn generate_profile(inputs: &SandboxInputs) -> String {
 /// shared system temp root are NOT writable (ticket sandbox-writable-scope).
 /// Mission metadata that an rw ancestor bind would otherwise cover (checkout
 /// mode) is masked back out, the bwrap analogue of the profile's write deny.
-pub fn bubblewrap_args(inputs: &SandboxInputs, binary: &Path, args: &[String]) -> Vec<String> {
+pub fn bubblewrap_args(
+    inputs: &SandboxInputs,
+    binary: &Path,
+    args: &[String],
+) -> crate::error::Result<Vec<String>> {
     let mut out = vec![
         "--die-with-parent".to_string(),
         "--ro-bind".to_string(),
@@ -582,21 +599,37 @@ pub fn bubblewrap_args(inputs: &SandboxInputs, binary: &Path, args: &[String]) -
     // the mask binds — an empty placeholder is inert: the engine truncates
     // it on use and nothing ever reads it. (The other metadata files are NOT
     // pre-created here: an empty `state.json` would turn a clean NotFound
-    // into a parse error for first-run flows.)
+    // into a parse error for first-run flows.) A creation failure is NOT
+    // best-effort: proceeding would silently leave the metadata writable —
+    // fail the spawn instead (3rd-pass review).
     let write_denies = mission_write_denies(inputs);
     for path in write_denies
         .files
         .iter()
         .filter(|p| p.ends_with("state.json.tmp"))
     {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        if path.exists() {
+            continue;
         }
-        let _ = std::fs::OpenOptions::new()
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                crate::error::EngineError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("bwrap mask prep: create {}: {e}", parent.display()),
+                ))
+            })?;
+        }
+        std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(false)
-            .open(path);
+            .open(path)
+            .map_err(|e| {
+                crate::error::EngineError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("bwrap mask prep: create {}: {e}", path.display()),
+                ))
+            })?;
     }
     let mut write_masks: std::collections::BTreeSet<String> = write_denies
         .files
@@ -638,7 +671,7 @@ pub fn bubblewrap_args(inputs: &SandboxInputs, binary: &Path, args: &[String]) -
     out.push("--".to_string());
     out.push(binary.display().to_string());
     out.extend(args.iter().cloned());
-    out
+    Ok(out)
 }
 
 /// Write the profile to a uniquely-named file under `dir`, returning its path.
@@ -817,6 +850,13 @@ mod tests {
                 );
             }
         }
+        // The cargo registry token file is denied too (CARGO_HOME crosses
+        // into child envs for cache locality; its credentials must not
+        // ride along).
+        assert!(
+            profile.contains("credentials.toml"),
+            "profile missing read deny for cargo credentials:\n{profile}"
+        );
     }
 
     #[test]
@@ -832,7 +872,8 @@ mod tests {
             &inputs(repo.path(), &mission, tmp.path(), vec![]),
             Path::new("/usr/bin/claude"),
             &[],
-        );
+        )
+        .unwrap();
         let joined = args.join(" ");
 
         let expected = format!("--ro-bind /dev/null {}", absolutize(&serve_token).display());
@@ -971,7 +1012,8 @@ mod tests {
             &inputs(repo.path(), &mission, scratch.path(), vec![]),
             Path::new("/usr/bin/claude"),
             &[],
-        );
+        )
+        .unwrap();
         let joined = args.join(" ");
 
         for f in [&events, &state, &transcript, &denials] {
@@ -1060,7 +1102,8 @@ mod tests {
         );
         inputs.enforce = crate::types::SandboxEnforce::FsNet;
 
-        let args = bubblewrap_args(&inputs, Path::new("/usr/bin/claude"), &["--print".into()]);
+        let args =
+            bubblewrap_args(&inputs, Path::new("/usr/bin/claude"), &["--print".into()]).unwrap();
         let joined = args.join(" ");
 
         assert!(args.contains(&"--unshare-net".to_string()));
@@ -1682,7 +1725,8 @@ mod tests {
             &inputs,
             Path::new("/bin/sh"),
             &["-c".into(), format!("echo hi > {}", inside_file.display())],
-        );
+        )
+        .unwrap();
         let inside_status = Command::new("bwrap")
             .args(inside_args)
             .status()
@@ -1700,7 +1744,8 @@ mod tests {
             &inputs,
             Path::new("/bin/sh"),
             &["-c".into(), format!("echo hi > {}", outside_file.display())],
-        );
+        )
+        .unwrap();
         let outside_status = Command::new("bwrap")
             .args(outside_args)
             .status()
@@ -1737,11 +1782,14 @@ mod tests {
         // The /dev/null mask hides the content rather than failing the open:
         // cat "succeeds" with empty output.
         let masked = Command::new("bwrap")
-            .args(bubblewrap_args(
-                &inputs,
-                Path::new("/bin/cat"),
-                &[serve_token.display().to_string()],
-            ))
+            .args(
+                bubblewrap_args(
+                    &inputs,
+                    Path::new("/bin/cat"),
+                    &[serve_token.display().to_string()],
+                )
+                .unwrap(),
+            )
             .output()
             .expect("failed to run bwrap");
         assert!(
@@ -1755,11 +1803,14 @@ mod tests {
         );
 
         let control = Command::new("bwrap")
-            .args(bubblewrap_args(
-                &inputs,
-                Path::new("/bin/cat"),
-                &[public.display().to_string()],
-            ))
+            .args(
+                bubblewrap_args(
+                    &inputs,
+                    Path::new("/bin/cat"),
+                    &[public.display().to_string()],
+                )
+                .unwrap(),
+            )
             .output()
             .expect("failed to run bwrap");
         assert_eq!(String::from_utf8_lossy(&control.stdout), "public");

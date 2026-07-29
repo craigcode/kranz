@@ -796,7 +796,7 @@ impl AgentBackend for ClaudeBackend {
                     &resolved.inputs,
                     &self.binary,
                     &args,
-                ));
+                )?);
                 command
             }
             Some(resolved) if resolved.backend == crate::sandbox::SandboxBackend::Container => {

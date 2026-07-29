@@ -162,6 +162,26 @@ impl GitRepo {
         Ok(self.run(&["rev-parse", "HEAD"])?.trim().to_string())
     }
 
+    /// The shared git directory (`.git` in a plain checkout, the MAIN repo's
+    /// git dir for a linked worktree) — where config, hooks, and refs live.
+    /// Relative `--git-common-dir` output resolves against the repo root.
+    pub fn git_common_dir(&self) -> Result<std::path::PathBuf> {
+        let out = self.run(&["rev-parse", "--git-common-dir"])?;
+        let path = std::path::PathBuf::from(out.trim());
+        Ok(if path.is_absolute() {
+            path
+        } else {
+            self.root.join(path)
+        })
+    }
+
+    /// All refs and their object ids, one per line — a validator moving a
+    /// ref retargets later merges without ever touching HEAD or the
+    /// worktree, so the immutability fingerprint covers it.
+    pub fn for_each_ref(&self) -> Result<String> {
+        self.run(&["for-each-ref", "--format=%(refname) %(objectname)"])
+    }
+
     /// Name of the currently checked-out branch (`"HEAD"` when detached).
     pub fn current_branch(&self) -> Result<String> {
         Ok(self

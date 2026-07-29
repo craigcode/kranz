@@ -3868,6 +3868,7 @@ impl MissionEngine {
             head_after: drift.head_after.clone(),
             appeared: drift.appeared.clone(),
             resolved: drift.resolved.clone(),
+            git_metadata_changed: drift.git_metadata_changed,
         })?;
         let reason = format!(
             "{} session altered the checkout ({}); validators are \

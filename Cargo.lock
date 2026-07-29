@@ -1406,6 +1406,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "cap-fs-ext",
+ "cap-primitives",
  "cap-std",
  "chrono",
  "globset",

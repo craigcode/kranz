@@ -242,6 +242,12 @@ pub enum EventKind {
         /// Porcelain entries present before but not after (the session
         /// reverted or hid a pre-existing dirty state — equally a mutation).
         resolved: Vec<String>,
+        /// Whether `.git` metadata (config/hooks/refs) changed across the
+        /// session — the checkout can look identical while the plumbing was
+        /// weaponized (`core.fsmonitor`/`core.hooksPath` execute on the
+        /// ENGINE's own git invocations; a moved ref retargets later merges).
+        #[serde(default, rename = "gitMetadataChanged")]
+        git_metadata_changed: bool,
     },
 
     /// Orchestrator converted findings into a fix-feature (origin: fix).
@@ -914,12 +920,29 @@ mod tests {
             head_after: "def5678".to_string(),
             appeared: vec![" M README.md".to_string(), "?? sneaky.rs".to_string()],
             resolved: vec![],
+            git_metadata_changed: false,
         };
         let json = serde_json::to_value(&tamper).unwrap();
         assert_eq!(json["type"], "validator.tamper");
         assert_eq!(json["payload"]["milestoneId"], "ms-1");
         assert_eq!(json["payload"]["headBefore"], "abc1234");
         assert_eq!(json["payload"]["headAfter"], "def5678");
+        assert_eq!(json["payload"]["gitMetadataChanged"], false);
+        // Back-compat: a pre-field log line (no gitMetadataChanged) still
+        // parses, defaulting to false.
+        let mut legacy = json.clone();
+        legacy["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("gitMetadataChanged");
+        let legacy_back: EventKind = serde_json::from_value(legacy).unwrap();
+        match legacy_back {
+            EventKind::ValidatorTamper {
+                git_metadata_changed,
+                ..
+            } => assert!(!git_metadata_changed),
+            _ => panic!("wrong variant"),
+        }
         assert_eq!(
             json["payload"]["appeared"],
             serde_json::json!([" M README.md", "?? sneaky.rs"])

@@ -25,6 +25,7 @@ uuid.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
 cap-std.workspace = true
+cap-primitives.workspace = true
 cap-fs-ext.workspace = true
 reqwest.workspace = true
 

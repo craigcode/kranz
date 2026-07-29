@@ -59,23 +59,21 @@ const AMBIENT_WINDOWS_VARS: &[&str] = &[
 ];
 
 /// Toolchain cache locations contract commands may inherit from ambient
-/// (design decision 3 of the ticket): they speed up `rustup`/`npm` contract
-/// gates and hold no user credentials. `CARGO_HOME` is DELIBERATELY absent:
-/// it carries `credentials.toml` (registry auth tokens) alongside the cache,
-/// and contract command text is agent-influenced — a credential is not a
-/// cache. A contract that talks to a PRIVATE registry gets that token via
-/// the mission config's `contractEnvPassthrough` (CARGO_HOME is not a
-/// managed key, so the passthrough can grant it deliberately), not ambient
-/// inheritance.
-const CONTRACT_TOOLCHAIN_VARS: &[&str] = &["RUSTUP_HOME", "NPM_CONFIG_CACHE"];
+/// (design decision 3 of the ticket): they speed up `cargo`/`npm` contract
+/// gates — dropping CARGO_HOME (3rd-pass review) forces a cold registry
+/// cache per mission, which fails outright under an egress-restricted
+/// sandbox. CARGO_HOME also carries `credentials.toml` (registry auth
+/// tokens); that is handled where the boundary actually is: the sandbox
+/// profiles READ-DENY it ([`crate::sandbox::authority_read_deny_paths`]),
+/// and contract command text is operator-approved at draft time. An
+/// UNSANDBOXED contract command can still read it — the documented residual
+/// for running with `sandbox.enforce=off`.
+const CONTRACT_TOOLCHAIN_VARS: &[&str] = &["CARGO_HOME", "RUSTUP_HOME", "NPM_CONFIG_CACHE"];
 
 /// Env names [`contract_command_env`] manages itself; a `contractEnvPassthrough`
 /// entry naming one of these is refused (loudly, name only) so the escape
 /// hatch cannot silently saw off the isolation it sits on — e.g. passing
 /// `HOME` through would hand the operator's real home to the contract.
-/// `CARGO_HOME` is deliberately NOT managed: it is the one toolchain dir
-/// carrying credentials (`credentials.toml`), so the passthrough is the
-/// sanctioned way to grant it deliberately.
 fn managed_contract_keys() -> &'static [&'static str] {
     &[
         "PATH",
@@ -96,6 +94,7 @@ fn managed_contract_keys() -> &'static [&'static str] {
         "LC_ALL",
         "TZ",
         "KRANZ_BASE_SHA",
+        "CARGO_HOME",
         "RUSTUP_HOME",
         "NPM_CONFIG_CACHE",
     ]
@@ -565,10 +564,10 @@ mod tests {
     }
 
     /// Contract env (design decision 3): base-sha + toolchain caches +
-    /// passthrough names cross; ambient secrets do not; CARGO_HOME (a
-    /// credential directory) crosses ONLY via an explicit passthrough grant;
-    /// a passthrough entry naming a managed key — in ANY letter casing — is
-    /// refused.
+    /// passthrough names cross; ambient secrets do not; a passthrough entry
+    /// naming a managed key — in ANY letter casing — is refused. CARGO_HOME
+    /// crosses (the registry cache makes contract gates viable); its
+    /// credentials.toml is denied at the sandbox layer instead.
     #[test]
     fn contract_command_env_shapes_the_gate_boundary() {
         let _guard = EnvTestGuard::engage(&[
@@ -579,7 +578,7 @@ mod tests {
         ]);
         let scratch = tempfile::tempdir().unwrap();
 
-        // No passthrough configured: exactly base + credential-free caches.
+        // No passthrough configured: exactly base + toolchain caches.
         let env = contract_command_env(scratch.path(), Some("deadbeef"), &[]);
         assert_eq!(
             env.get("KRANZ_BASE_SHA").map(String::as_str),
@@ -588,11 +587,12 @@ mod tests {
         assert_eq!(
             env.get("RUSTUP_HOME").map(String::as_str),
             Some("/poisoned/rustup-home"),
-            "credential-free toolchain caches cross from ambient"
+            "toolchain caches cross from ambient"
         );
-        assert!(
-            !env.contains_key("CARGO_HOME"),
-            "CARGO_HOME carries credentials.toml and must NOT cross by default"
+        assert_eq!(
+            env.get("CARGO_HOME").map(String::as_str),
+            Some("/poisoned/cargo-home"),
+            "CARGO_HOME crosses (cache locality); credentials.toml is denied at the sandbox"
         );
         assert!(!env.contains_key("GH_TOKEN"));
         assert!(
@@ -604,15 +604,13 @@ mod tests {
             Some(scratch.path().to_string_lossy().as_ref())
         );
 
-        // Passthrough configured: the named var crosses (including a
-        // deliberate CARGO_HOME grant); a managed name is refused in any
-        // letter casing (HOME stays the scratch).
+        // Passthrough configured: the named var crosses; a managed name is
+        // refused in any letter casing (HOME stays the scratch).
         let env = contract_command_env(
             scratch.path(),
             None,
             &[
                 "KRANZ_AGENT_ENV_TEST_CRED".to_string(),
-                "CARGO_HOME".to_string(),
                 "home".to_string(),
                 "KRANZ_AGENT_ENV_TEST_UNSET".to_string(),
             ],
@@ -621,11 +619,6 @@ mod tests {
             env.get("KRANZ_AGENT_ENV_TEST_CRED").map(String::as_str),
             Some("cred-value"),
             "the passthrough-named var crosses"
-        );
-        assert_eq!(
-            env.get("CARGO_HOME").map(String::as_str),
-            Some("/poisoned/cargo-home"),
-            "CARGO_HOME crosses via an explicit passthrough grant"
         );
         assert_eq!(
             env.get("HOME").map(String::as_str),
