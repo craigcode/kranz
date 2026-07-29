@@ -84,13 +84,14 @@ jobs:
       - run: cargo check --locked
         working-directory: apps/dashboard/src-tauri
       # Advisory gate on the committed lockfiles (3rd-pass review): Dependabot
-      # alerts surface advisories after the fact; `cargo audit --locked`
-      # blocks the merge. Covers the desktop tree AND the root workspace —
-      # no audit job exists anywhere else in this workflow.
+      # alerts surface advisories after the fact; `cargo audit` blocks the
+      # merge. Covers the desktop tree AND the root workspace — no audit job
+      # exists anywhere else in this workflow. (cargo-audit reads the
+      # committed Cargo.lock directly; there is no --locked flag.)
       - run: cargo install cargo-audit --locked
-      - run: cargo audit --locked
+      - run: cargo audit
         working-directory: apps/dashboard/src-tauri
-      - run: cargo audit --locked
+      - run: cargo audit
 
   dashboard:
     runs-on: ubuntu-latest
