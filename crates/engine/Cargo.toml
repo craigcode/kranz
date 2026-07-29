@@ -35,7 +35,7 @@ libc = "0.2"
 # Windows process-tree kill via Job Objects (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE).
 # Unverified on this repo's dev host (macOS); validated only by windows-latest CI.
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", features = [
+windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_JobObjects",
     "Win32_System_Threading",
