@@ -1,16 +1,25 @@
-//! Validator immutability proof (ticket `validator-immutability-proof`,
-//! security review P1 #5).
+//! Validator immutability: the TRIPWIRE half (ticket
+//! `validator-immutability-proof`, security review P1 #5; snapshot
+//! follow-up in [`crate::validator_snapshot`]).
 //!
-//! "Read-only" validators are nominal: backends do not enforce
+//! "Read-only" validators were nominal: backends do not enforce
 //! `writable: false`, and the process sandbox allows writes to the session
 //! checkout — a prompt-injected or misbehaving validator can edit tests to
 //! manufacture a pass, `git add && git commit` its own changes, or leave
-//! unreviewed files in the deliverable. Until a true immutable snapshot
-//! lands (a copy-on-write worktree discarded after the round), the honest
-//! interim is an IDENTITY ASSERTION around every validator session: capture
-//! HEAD + porcelain status before the spawn, re-capture after, and any drift
-//! fails the round honestly — the orchestrator emits `validator.tamper` and
-//! blocks the milestone, with no retry and no waivable finding.
+//! unreviewed files in the deliverable. The definitive fix is the
+//! copy-on-write immutable snapshot ([`crate::validator_snapshot`]): each
+//! validator session runs in a THROWAWAY worktree copy of the checkout and
+//! only its verdict crosses back, so writes are structurally discarded
+//! rather than caught.
+//!
+//! What remains here is the tripwire: an IDENTITY ASSERTION around every
+//! validator session, still taken on the REAL checkout. Capture HEAD +
+//! porcelain status before the spawn, re-capture after — with snapshot
+//! isolation in place the real checkout should be byte-identical, so any
+//! drift means the isolation itself failed (a validator escaped its
+//! snapshot, or moved shared git refs the snapshot cannot isolate). The
+//! orchestrator then emits `validator.tamper` and blocks the milestone,
+//! with no retry and no waivable finding.
 //!
 //! The assertion is precise: **no tracked file changed, HEAD unchanged,
 //! index unchanged** — plus no new non-ignored file (a dropped test file
@@ -20,8 +29,9 @@
 //! ENGINE's own git invocations), `hooks/`, or refs were weaponized, so the
 //! fingerprint covers them too (3rd-pass review). `git status --porcelain`
 //! respects .gitignore, so legitimate gate artifact churn (`target/`, the
-//! gitignored `.kranz` engine runtime) never trips it. Validators CAN still
-//! write; the guarantee is that any write is caught and fails the round.
+//! gitignored `.kranz` engine runtime) never trips it. The refs half is the
+//! one mutation class the snapshot does NOT contain (worktrees share the
+//! common `.git`), which is exactly why the tripwire must stay.
 
 use crate::error::Result;
 use crate::git_ops::GitRepo;

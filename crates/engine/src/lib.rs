@@ -56,6 +56,7 @@ mod stream_bounds;
 pub mod ticket;
 pub mod trace_export;
 pub mod validator_integrity;
+pub mod validator_snapshot;
 pub mod work;
 pub mod workspace_container;
 pub mod workspace_contract;

@@ -319,6 +319,14 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             }
         }
 
+        EventKind::ValidationSnapshot { milestone_id, .. } => {
+            // Audit record of the throwaway checkout a validator session
+            // ran in; no structural state change, and no run id exists at
+            // emit time (the session starts after the snapshot). Validate
+            // the milestone reference as a corruption guard only.
+            milestone_mut(state, milestone_id)?;
+        }
+
         EventKind::FixFeatureCreated {
             milestone_id,
             feature,

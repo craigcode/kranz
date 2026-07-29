@@ -91,8 +91,11 @@ kranz work                      # drain the queue (run missions)
     the claude backend (validation rejects other pairs — don't widen without
     a real spawn wrapper). `serve.token` is mutation authority, `serve.read.token`
     reads only; both must stay unreadable inside sandboxes
-    (`authority_read_deny_paths`). Validators may not mutate the checkout —
-    the `validator.tamper` fingerprint gate is what makes "read-only" real.
+    (`authority_read_deny_paths`). Validators never see the real checkout:
+    each session runs in a throwaway snapshot (`validator_snapshot.rs`,
+    warmed `target/` copy included) and only its verdict crosses back; the
+    `validator.tamper` fingerprint on the real checkout is now a tripwire
+    whose drift means the isolation itself failed.
 
 ## Tracked vs runtime
 

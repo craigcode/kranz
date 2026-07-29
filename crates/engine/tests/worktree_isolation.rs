@@ -997,8 +997,13 @@ fn validator_findings_empty() -> MockScript {
     }))
 }
 
-/// In worktree mode, a spawned validator's `SessionSpec.cwd` is the mission
-/// integration worktree (not `paths.repo_root`) — mirrors
+/// In worktree mode, a spawned validator's `SessionSpec.cwd` is the
+/// throwaway per-session snapshot of the mission integration worktree
+/// (under the mission's gitignored `runs/` scratch) — never the primary
+/// `paths.repo_root`, and never the integration worktree itself: the
+/// validator judges an immutable copy while gates and merges keep running
+/// against the real tree (copy-on-write validator snapshot, the follow-up
+/// to ticket validator-immutability-proof). Mirrors
 /// `worker_session_cwd_is_worktree` but for `run_validator_in`.
 #[tokio::test(flavor = "multi_thread")]
 async fn validator_session_cwd_is_worktree() {
@@ -1037,11 +1042,24 @@ async fn validator_session_cwd_is_worktree() {
         "worktree mode must not spawn the validator in the primary repo root"
     );
     assert!(
-        validator_spec
+        !validator_spec
             .cwd
             .to_string_lossy()
             .contains("_integration"),
-        "validator cwd should be the mission integration worktree path: {:?}",
+        "validator cwd must not be the real integration worktree: {:?}",
+        validator_spec.cwd
+    );
+    assert!(
+        validator_spec
+            .cwd
+            .to_string_lossy()
+            .contains("validator-snapshot"),
+        "validator cwd should be the per-session snapshot under runs/: {:?}",
+        validator_spec.cwd
+    );
+    assert!(
+        !validator_spec.cwd.exists(),
+        "the snapshot is discarded once its round is done: {:?}",
         validator_spec.cwd
     );
 

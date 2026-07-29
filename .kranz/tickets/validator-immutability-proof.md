@@ -58,3 +58,33 @@ copy-on-write worktree (or read-only mount of the checkout) that is
 discarded after the round, so writes are structurally impossible rather
 than caught. The `writable: false` spec field is separately being made
 fail-closed by the parallel backend-sandbox work.
+
+## Follow-up shipped: copy-on-write immutable validator snapshot
+
+The gap above is closed (`crates/engine/src/validator_snapshot.rs`, wired
+into `orchestrator.rs::validation_round` around BOTH the primary validator
+session and its single retry — the same sites the fingerprint wraps):
+
+- **Snapshot**: before each validator session the engine builds a
+  THROWAWAY detached worktree of the session checkout under the mission's
+  gitignored `runs/` scratch (`validator-snapshot-<kind>`): HEAD plus the
+  worker's uncommitted state (`git diff --binary HEAD` → `git apply`, and
+  a byte copy of every untracked non-ignored file), plus a COPY of the
+  real `target/` — APFS clonefile (`cp -c`) → Linux reflink
+  (`cp --reflink=always`) → size-capped plain copy → fresh empty target
+  (the cost is named in the log/event). The real `target/` is never
+  shared or symlinked. Session cwd, the validator's contract-command cwd,
+  and the sandbox profile's `session_cwd` all point at the snapshot, so
+  where the sandbox can express it the real checkout is not writable at
+  all. Only the verdict crosses back; the snapshot is discarded after the
+  round regardless of outcome (RAII). Deliverable gates and the
+  out-of-contract sweep keep running against the REAL checkout. Snapshot
+  creation failure blocks the round honestly (fail-closed).
+- **Fingerprint → tripwire** (`validator_integrity.rs`): the
+  before/after identity assertion stays on the REAL checkout. With
+  isolation in place it should never drift — a `validator.tamper` event
+  now means the isolation itself failed (the one mutation class the
+  snapshot cannot contain is shared git refs; worktrees share the common
+  `.git`, and the tripwire's `for-each-ref` half covers it).
+- **Event**: additive `validation.snapshot` (milestoneId, role, path,
+  targetTier, creationMs, detail).

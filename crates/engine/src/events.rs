@@ -250,6 +250,37 @@ pub enum EventKind {
         git_metadata_changed: bool,
     },
 
+    /// A validator session ran in a throwaway snapshot of the session
+    /// checkout (copy-on-write immutable validator snapshot, the follow-up
+    /// to ticket `validator-immutability-proof`; module
+    /// [`crate::validator_snapshot`]): HEAD plus the worker's uncommitted
+    /// diff and untracked files, a warmed `target/` copy, discarded after
+    /// the session regardless of outcome. The payload records the snapshot
+    /// path, which target-copy tier warmed it, and the creation cost.
+    /// Additive event; absent in pre-field logs.
+    #[serde(rename = "validation.snapshot")]
+    ValidationSnapshot {
+        #[serde(rename = "milestoneId")]
+        milestone_id: String,
+        role: Role,
+        /// Absolute path of the (already discarded) snapshot worktree,
+        /// under the mission's gitignored `runs/` scratch.
+        path: String,
+        /// How the snapshot's `target/` was warmed: "clonefile", "reflink",
+        /// "copy", "fresh" (empty target — the cost is named in `detail`),
+        /// or "absent" (no target/ in the session checkout).
+        #[serde(rename = "targetTier")]
+        target_tier: String,
+        /// Wall-clock cost of building the snapshot (worktree add + diff
+        /// apply + untracked copy + target warm), in milliseconds.
+        #[serde(rename = "creationMs")]
+        creation_ms: u64,
+        /// Extra context — notably the named cost when `targetTier` is
+        /// "fresh".
+        #[serde(default)]
+        detail: Option<String>,
+    },
+
     /// Orchestrator converted findings into a fix-feature (origin: fix).
     #[serde(rename = "fixfeature.created")]
     FixFeatureCreated {
@@ -257,7 +288,6 @@ pub enum EventKind {
         milestone_id: String,
         feature: Feature,
     },
-
     /// Orchestrator escalated the executor tier after repeated failed local
     /// validations, rather than blocking the milestone.
     #[serde(rename = "tier.escalated")]
@@ -452,6 +482,7 @@ impl EventKind {
             EventKind::MilestoneValidating { .. } => "milestone.validating",
             EventKind::ValidationFinding { .. } => "validation.finding",
             EventKind::ValidatorTamper { .. } => "validator.tamper",
+            EventKind::ValidationSnapshot { .. } => "validation.snapshot",
             EventKind::FixFeatureCreated { .. } => "fixfeature.created",
             EventKind::TierEscalated { .. } => "tier.escalated",
             EventKind::MilestoneBlocked { .. } => "milestone.blocked",
@@ -962,6 +993,64 @@ mod tests {
                 assert_eq!(appeared.len(), 2);
                 assert!(resolved.is_empty());
             }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// The additive `validation.snapshot` event (copy-on-write immutable
+    /// validator snapshot, the follow-up to ticket
+    /// `validator-immutability-proof`): wire name, payload shape, and
+    /// round-trip — the audit record of which throwaway checkout a
+    /// validator ran in and what warming it cost.
+    #[test]
+    fn validation_snapshot_round_trips() {
+        let snap = EventKind::ValidationSnapshot {
+            milestone_id: "ms-1".to_string(),
+            role: Role::ValidatorFunctional,
+            path: "/repo/.kranz/missions/m-1/runs/validator-snapshot-functional".to_string(),
+            target_tier: "clonefile".to_string(),
+            creation_ms: 42,
+            detail: None,
+        };
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["type"], "validation.snapshot");
+        assert_eq!(json["payload"]["milestoneId"], "ms-1");
+        assert_eq!(json["payload"]["targetTier"], "clonefile");
+        assert_eq!(json["payload"]["creationMs"], 42);
+        assert_eq!(snap.type_name(), "validation.snapshot");
+        let back: EventKind = serde_json::from_value(json).unwrap();
+        match back {
+            EventKind::ValidationSnapshot {
+                milestone_id,
+                role,
+                target_tier,
+                detail,
+                ..
+            } => {
+                assert_eq!(milestone_id, "ms-1");
+                assert_eq!(role, Role::ValidatorFunctional);
+                assert_eq!(target_tier, "clonefile");
+                assert_eq!(detail, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // The `fresh` tier's named cost rides `detail`, and a legacy line
+        // without the field still decodes (serde default).
+        let with_cost = EventKind::ValidationSnapshot {
+            milestone_id: "ms-1".to_string(),
+            role: Role::ValidatorScrutiny,
+            path: "/snap".to_string(),
+            target_tier: "fresh".to_string(),
+            creation_ms: 7,
+            detail: Some("target/ is 31 GiB; snapshot pays a cold rebuild".to_string()),
+        };
+        let mut json = serde_json::to_value(&with_cost).unwrap();
+        assert!(json["payload"]["detail"].as_str().unwrap().contains("GiB"));
+        json["payload"].as_object_mut().unwrap().remove("detail");
+        let legacy_back: EventKind = serde_json::from_value(json).unwrap();
+        match legacy_back {
+            EventKind::ValidationSnapshot { detail, .. } => assert_eq!(detail, None),
             _ => panic!("wrong variant"),
         }
     }

@@ -283,6 +283,21 @@ impl EventRenderer {
                     format!("validator TAMPER: {}", what.join("; ")),
                 )
             }
+            EventKind::ValidationSnapshot {
+                milestone_id,
+                target_tier,
+                detail,
+                ..
+            } => (
+                format!("milestone {milestone_id}"),
+                ansi::DIM,
+                match detail {
+                    Some(detail) => {
+                        format!("validator snapshot (target: {target_tier}) — {detail}")
+                    }
+                    None => format!("validator snapshot (target: {target_tier})"),
+                },
+            ),
             EventKind::FixFeatureCreated {
                 milestone_id,
                 feature,

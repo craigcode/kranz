@@ -632,6 +632,42 @@ impl GitRepo {
         self.run(&["diff", "--cached"])
     }
 
+    /// Full `git diff --binary HEAD` output (index + working tree vs HEAD),
+    /// verbatim — everything a worker left uncommitted on TRACKED files,
+    /// binary-safe so it replays byte-for-byte through `git apply`
+    /// ([`GitRepo::apply_patch`]). The validator snapshot
+    /// ([`crate::validator_snapshot`]) captures this in the real checkout and
+    /// applies it in the throwaway copy so validators judge exactly the tree
+    /// the worker left.
+    pub fn diff_head(&self) -> Result<String> {
+        self.run(&["diff", "--binary", "HEAD"])
+    }
+
+    /// `git apply <patch_file>` against the worktree (index untouched). The
+    /// validator snapshot replays the real checkout's [`GitRepo::diff_head`]
+    /// this way; the patch comes from a file path so no stdin plumbing is
+    /// needed.
+    pub fn apply_patch(&self, patch_file: &Path) -> Result<()> {
+        let args: Vec<OsString> = vec!["apply".into(), patch_file.as_os_str().to_os_string()];
+        self.run_os(&args)?;
+        Ok(())
+    }
+
+    /// Untracked, non-ignored files (`git ls-files --others
+    /// --exclude-standard -z`), repo-relative. `-z` gives unquoted raw paths
+    /// (NUL is the only byte git never allows in one), so even
+    /// newline-bearing names survive the split. Ignored paths (`target/`,
+    /// the `.kranz` runtime) never appear — mirroring
+    /// [`GitRepo::porcelain_status`].
+    pub fn untracked_files(&self) -> Result<Vec<String>> {
+        let out = self.run(&["ls-files", "--others", "--exclude-standard", "-z"])?;
+        Ok(out
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
     /// Full `git diff HEAD -- <paths>` output (index + working tree vs HEAD),
     /// verbatim — the checkpoint scan's "what this mission actually changed",
     /// never the pre-existing base content of files it merely touches.

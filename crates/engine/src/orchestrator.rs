@@ -74,6 +74,7 @@ use crate::scrub;
 use crate::ticket::Ticket;
 use crate::types::*;
 use crate::validator_integrity;
+use crate::validator_snapshot;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -3593,12 +3594,18 @@ impl MissionEngine {
             let backend = Arc::clone(&selected.backend);
             let cfg = selected.cfg;
 
-            let session_cwd = self.active_root().to_path_buf();
-            // Validator immutability proof (ticket validator-immutability-proof):
-            // fingerprint HEAD + index + worktree BEFORE the spawn; compared
-            // against a fresh capture right after the session ends.
+            // Validator snapshot (the follow-up to ticket
+            // validator-immutability-proof): the validator never sees the
+            // real checkout — it runs in a throwaway copy (HEAD + the
+            // worker's uncommitted diff, warmed target/) that is discarded
+            // with the session. The fingerprint on the REAL checkout stays
+            // as a tripwire: with isolation in place it should never drift.
             let fingerprint =
                 validator_integrity::CheckoutFingerprint::capture(self.active_repo())?;
+            let Some(snapshot) = self.validator_snapshot(&milestone_id, role)? else {
+                return Ok(());
+            };
+            let session_cwd = snapshot.path().to_path_buf();
             let outcome = runner::run_validator_in(
                 backend.as_ref(),
                 &mut self.log,
@@ -3622,12 +3629,15 @@ impl MissionEngine {
             let mut outcome = outcome?;
             caught?;
 
-            // Any checkout drift across the session fails the round honestly —
-            // before the grant-park/retry machinery, which must never launder
-            // a write into a second chance.
+            // Tripwire on the REAL checkout: any drift across the session
+            // means the isolation itself failed — fail the round honestly,
+            // before the grant-park/retry machinery.
             if self.fail_on_validator_tamper(&milestone_id, role, &outcome.run_id, &fingerprint)? {
                 return Ok(());
             }
+            // Discard the primary snapshot before any retry builds its own:
+            // one warm target/ copy at a time.
+            drop(snapshot);
 
             // Bounded (exactly one retry) runtime fallback: a validator run
             // that did not produce a trusted pass is retried once with the
@@ -3671,12 +3681,16 @@ impl MissionEngine {
                 )?;
                 let retry_cfg = self.claude_fallback_cfg_for_role(role);
                 let retry_backend = Arc::clone(&self.backend);
-                let retry_session_cwd = self.active_root().to_path_buf();
-                // The retry is a fresh validator session: its own before/after
-                // identity assertion (the baseline is the tree the first
-                // session provably left untouched).
+                // The retry is a fresh validator session: its own throwaway
+                // snapshot (the real checkout provably untouched by the
+                // primary — the isolation guarantees it, the tripwire
+                // verifies it) and its own before/after tripwire pair.
                 let retry_fingerprint =
                     validator_integrity::CheckoutFingerprint::capture(self.active_repo())?;
+                let Some(retry_snapshot) = self.validator_snapshot(&milestone_id, role)? else {
+                    return Ok(());
+                };
+                let retry_session_cwd = retry_snapshot.path().to_path_buf();
                 let retry_outcome = runner::run_validator_in(
                     retry_backend.as_ref(),
                     &mut self.log,
@@ -3708,6 +3722,7 @@ impl MissionEngine {
                 )? {
                     return Ok(());
                 }
+                drop(retry_snapshot);
 
                 // A denial the runner could only read on the Claude retry (a
                 // Codex/Droid primary whose events don't map to a command, or a
@@ -3841,14 +3856,71 @@ impl MissionEngine {
         Ok(())
     }
 
-    /// The after-side of the validator immutability proof (module
-    /// [`validator_integrity`]): re-fingerprint the session checkout and, on
-    /// any drift since `before`, fail the round honestly — emit
-    /// `validator.tamper` (recording WHAT changed) and block the milestone.
-    /// Never a retry, never a finding the orchestrator's conversion turn could
-    /// waive: a validator that wrote to its "read-only" checkout has
-    /// invalidated every judgement it made. Returns `true` when the round
-    /// failed (caller returns immediately).
+    /// Build the per-session validator snapshot (module
+    /// [`crate::validator_snapshot`]) under the mission's gitignored `runs/`
+    /// scratch and emit the `validation.snapshot` audit event (path,
+    /// target-copy tier, creation cost). A creation failure BLOCKS the round
+    /// honestly — decision + `milestone.blocked` naming the error — rather
+    /// than falling back to the real checkout: this hardening exists
+    /// precisely to keep validators out of it (fail-closed, mirroring
+    /// `resolve_sandbox_or_refuse`). Returns `None` when the round blocked.
+    fn validator_snapshot(
+        &mut self,
+        milestone_id: &str,
+        role: Role,
+    ) -> Result<Option<validator_snapshot::ValidatorSnapshot>> {
+        let kind = match role {
+            Role::ValidatorScrutiny => "scrutiny",
+            Role::ValidatorFunctional => "functional",
+            other => {
+                return Err(EngineError::InvalidState(format!(
+                    "validator snapshot requested for non-validator role {other:?}"
+                )))
+            }
+        };
+        let path = self
+            .paths
+            .runs_dir()
+            .join(format!("validator-snapshot-{kind}"));
+        match validator_snapshot::ValidatorSnapshot::create(self.active_repo(), &path) {
+            Ok(snapshot) => {
+                self.emit(EventKind::ValidationSnapshot {
+                    milestone_id: milestone_id.to_string(),
+                    role,
+                    path: snapshot.path().display().to_string(),
+                    target_tier: snapshot.target_tier().as_str().to_string(),
+                    creation_ms: snapshot.creation().as_millis() as u64,
+                    detail: snapshot.detail().map(str::to_string),
+                })?;
+                Ok(Some(snapshot))
+            }
+            Err(err) => {
+                let reason = format!(
+                    "could not create the {} snapshot ({err}); validators never run \
+                     against the real checkout, so the round blocks honestly",
+                    role_label(role)
+                );
+                self.emit_decision(&reason, None)?;
+                self.emit(EventKind::MilestoneBlocked {
+                    milestone_id: milestone_id.to_string(),
+                    reason,
+                })?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// The after-side of the validator tripwire (module
+    /// [`validator_integrity`]): re-fingerprint the REAL session checkout
+    /// after a validator session that ran in a throwaway snapshot
+    /// ([`crate::validator_snapshot`]). With isolation in place the real
+    /// checkout should be byte-identical across the session, so any drift
+    /// now means the ISOLATION itself failed (a validator escaped its
+    /// snapshot, or shared git refs were moved) — fail the round honestly:
+    /// emit `validator.tamper` (recording WHAT changed) and block the
+    /// milestone. Never a retry, never a finding the orchestrator's
+    /// conversion turn could waive. Returns `true` when the round failed
+    /// (caller returns immediately).
     fn fail_on_validator_tamper(
         &mut self,
         milestone_id: &str,
@@ -3871,8 +3943,9 @@ impl MissionEngine {
             git_metadata_changed: drift.git_metadata_changed,
         })?;
         let reason = format!(
-            "{} session altered the checkout ({}); validators are \
-             read-only, so the round fails honestly",
+            "{} session escaped its snapshot: the REAL checkout drifted ({}); \
+             the tripwire firing means the validator isolation itself failed, \
+             so the round fails honestly",
             role_label(role),
             drift.summary()
         );
@@ -6408,7 +6481,8 @@ pub(crate) mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // validator immutability proof (ticket validator-immutability-proof)
+    // validator immutability: snapshot isolation + tripwire
+    // (ticket validator-immutability-proof and its snapshot follow-up)
     // ---------------------------------------------------------------------------
 
     /// A validator report claiming a clean pass.
@@ -6442,7 +6516,9 @@ pub(crate) mod tests {
     }
 
     /// A clean validator round passes the identity assertion: no
-    /// `validator.tamper` event, the milestone completes.
+    /// `validator.tamper` event, the milestone completes — and the session
+    /// ran in the throwaway snapshot, audited by a `validation.snapshot`
+    /// event (removed once the round is done).
     #[tokio::test]
     async fn clean_validator_round_passes_immutability_assertion() {
         let Some((_dir, root)) = lessons_test_repo() else {
@@ -6451,7 +6527,7 @@ pub(crate) mod tests {
         let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
             clean_validator_script(),
         ]));
-        let backend: Arc<dyn AgentBackend> = mock;
+        let backend: Arc<dyn AgentBackend> = mock.clone();
         let mut engine = single_milestone_engine(backend, &root);
 
         engine.validation_round(0).await.unwrap();
@@ -6471,17 +6547,71 @@ pub(crate) mod tests {
             "clean round completes the milestone: {:?}",
             events.iter().map(|e| &e.kind).collect::<Vec<_>>()
         );
+
+        // The session ran in the snapshot, never the real checkout…
+        let expected = engine.paths.runs_dir().join("validator-snapshot-scrutiny");
+        let specs = mock.started_specs();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(
+            specs[0].cwd, expected,
+            "the validator session cwd IS the snapshot"
+        );
+        // …the event audits path/tier (no target/ in this repo → absent)…
+        let snapshot_event = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::ValidationSnapshot {
+                    milestone_id,
+                    role,
+                    path,
+                    target_tier,
+                    ..
+                } if milestone_id == "ms-1" => Some((*role, path.clone(), target_tier.clone())),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected validation.snapshot on the log: {:?}",
+                    events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(snapshot_event.0, Role::ValidatorScrutiny);
+        assert_eq!(snapshot_event.1, expected.display().to_string());
+        assert_eq!(snapshot_event.2, "absent");
+        // …and the snapshot is gone once the round is done.
+        assert!(
+            !expected.exists(),
+            "the snapshot is discarded after the round"
+        );
+        assert!(validator_snapshot_leftovers(&engine).is_empty());
     }
 
-    /// A validator that touches a TRACKED file fails the round with a
-    /// `validator.tamper` event naming the path — no retry, no completion.
+    /// `validator-snapshot*` dirs left under runs/ — the leak the RAII
+    /// guard must prevent, asserted empty after every kind of round.
+    fn validator_snapshot_leftovers(engine: &MissionEngine) -> Vec<String> {
+        std::fs::read_dir(engine.paths.runs_dir())
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.starts_with("validator-snapshot"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The whole point of the snapshot: a validator that edits a TRACKED
+    /// file writes into the THROWAWAY copy — the real checkout is
+    /// byte-untouched, the tripwire stays silent, and the round's outcome is
+    /// decided by the snapshot session's verdict (a clean pass completes).
     #[tokio::test]
-    async fn validator_touching_tracked_file_fails_round_with_tamper() {
+    async fn validator_writes_land_in_snapshot_not_the_real_checkout() {
         let Some((_dir, root)) = lessons_test_repo() else {
             return;
         };
         // The script claims a clean pass WHILE editing the tracked README —
-        // exactly the "alter tests to manufacture a pass" shape.
+        // the "alter tests to manufacture a pass" shape. With isolation the
+        // edit is discarded with the snapshot; only the verdict crosses back.
         let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
             clean_validator_script().writes_file("README.md", "tampered\n"),
         ]));
@@ -6490,64 +6620,36 @@ pub(crate) mod tests {
 
         engine.validation_round(0).await.unwrap();
 
+        assert_eq!(
+            std::fs::read_to_string(root.join("README.md")).unwrap(),
+            "seed\n",
+            "the validator's edit never reached the real checkout"
+        );
         let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
-        let tamper = events
-            .iter()
-            .find_map(|e| match &e.kind {
-                EventKind::ValidatorTamper {
-                    milestone_id,
-                    appeared,
-                    head_before,
-                    head_after,
-                    ..
-                } if milestone_id == "ms-1" => {
-                    Some((appeared.clone(), head_before.clone(), head_after.clone()))
-                }
-                _ => None,
-            })
-            .unwrap_or_else(|| {
-                panic!(
-                    "expected validator.tamper on the log: {:?}",
-                    events.iter().map(|e| &e.kind).collect::<Vec<_>>()
-                )
-            });
-        assert!(
-            tamper.0.iter().any(|entry| entry.contains("README.md")),
-            "tamper event names the touched file: {:?}",
-            tamper.0
-        );
-        assert_eq!(tamper.1, tamper.2, "a bare edit must not move HEAD");
-        assert!(
-            events.iter().any(|e| matches!(&e.kind, EventKind::MilestoneBlocked { milestone_id, reason } if milestone_id == "ms-1" && reason.contains("altered the checkout"))),
-            "tamper blocks the milestone honestly: {:?}",
-            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
-        );
         assert!(
             !events
                 .iter()
+                .any(|e| matches!(&e.kind, EventKind::ValidatorTamper { .. })),
+            "an isolated write is not drift — the tripwire must stay silent: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            events
+                .iter()
                 .any(|e| matches!(&e.kind, EventKind::MilestoneCompleted { milestone_id, .. } if milestone_id == "ms-1")),
-            "a tampering validator must not complete the milestone"
+            "the round is decided by the snapshot session's verdict: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
         );
-        let validator_spawns = events
-            .iter()
-            .filter(|e| {
-                matches!(
-                    &e.kind,
-                    EventKind::WorkerSpawned { role, .. } if *role == Role::ValidatorScrutiny
-                )
-            })
-            .count();
-        assert_eq!(
-            validator_spawns, 1,
-            "tamper is not retried — the round fails on the first session"
-        );
+        assert!(validator_snapshot_leftovers(&engine).is_empty());
         assert_eq!(mock.started_specs().len(), 1);
     }
 
-    /// A validator that commits inside its session moves HEAD: the round
-    /// fails with `validator.tamper` recording the before/after SHAs.
+    /// A validator that commits inside its session moves only the
+    /// SNAPSHOT's detached HEAD: the real checkout's HEAD is unchanged, the
+    /// commit is discarded with the snapshot, and the round completes on
+    /// the verdict.
     #[tokio::test]
-    async fn validator_moving_head_fails_round_with_tamper() {
+    async fn validator_commit_moves_only_the_snapshot_head() {
         let Some((_dir, root)) = lessons_test_repo() else {
             return;
         };
@@ -6562,16 +6664,64 @@ pub(crate) mod tests {
 
         engine.validation_round(0).await.unwrap();
 
+        assert_eq!(
+            engine.repo.head_sha().unwrap(),
+            head_before,
+            "the validator's commit moved only the snapshot HEAD"
+        );
+        assert!(
+            !root.join("sneaky.rs").exists(),
+            "the committed file never landed in the real checkout"
+        );
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::ValidatorTamper { .. })),
+            "a snapshot-local commit is not drift: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::MilestoneCompleted { milestone_id, .. } if milestone_id == "ms-1")),
+            "the round completes on the verdict: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(validator_snapshot_leftovers(&engine).is_empty());
+    }
+
+    /// The tripwire: if the REAL checkout drifts across a validator session
+    /// anyway (here: the mock seam writes through an absolute path, out of
+    /// its snapshot), the isolation itself has failed — `validator.tamper`
+    /// fires, the milestone blocks, no retry, no completion.
+    #[tokio::test]
+    async fn real_checkout_drift_trips_the_tripwire() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        // writes_file joins the path to the session cwd; an ABSOLUTE path
+        // replaces it (std::path::Path::join), so this write escapes the
+        // snapshot and lands in the real checkout — the isolation-failure
+        // shape the tripwire exists to catch.
+        let escape = root.join("README.md").to_string_lossy().into_owned();
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            clean_validator_script().writes_file(escape, "tampered\n"),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock;
+        let mut engine = single_milestone_engine(backend, &root);
+
+        engine.validation_round(0).await.unwrap();
+
         let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
         let tamper = events
             .iter()
             .find_map(|e| match &e.kind {
                 EventKind::ValidatorTamper {
                     milestone_id,
-                    head_before,
-                    head_after,
+                    appeared,
                     ..
-                } if milestone_id == "ms-1" => Some((head_before.clone(), head_after.clone())),
+                } if milestone_id == "ms-1" => Some(appeared.clone()),
                 _ => None,
             })
             .unwrap_or_else(|| {
@@ -6580,23 +6730,87 @@ pub(crate) mod tests {
                     events.iter().map(|e| &e.kind).collect::<Vec<_>>()
                 )
             });
-        assert_eq!(tamper.0, head_before, "tamper records the pre-session HEAD");
-        assert_ne!(tamper.0, tamper.1, "the validator's commit moved HEAD");
         assert!(
-            events.iter().any(|e| matches!(&e.kind, EventKind::MilestoneBlocked { milestone_id, reason } if milestone_id == "ms-1" && reason.contains("HEAD moved"))),
-            "head-move block reason names the drift: {:?}",
+            tamper.iter().any(|entry| entry.contains("README.md")),
+            "tamper event names the drifted file: {tamper:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(&e.kind, EventKind::MilestoneBlocked { milestone_id, reason } if milestone_id == "ms-1" && reason.contains("escaped its snapshot"))),
+            "the block reason names the isolation failure: {:?}",
             events.iter().map(|e| &e.kind).collect::<Vec<_>>()
         );
         assert!(
             !events
                 .iter()
                 .any(|e| matches!(&e.kind, EventKind::MilestoneCompleted { milestone_id, .. } if milestone_id == "ms-1")),
-            "a committing validator must not complete the milestone"
+            "a round whose isolation failed must not complete the milestone"
+        );
+        let validator_spawns = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.kind,
+                    EventKind::WorkerSpawned { role, .. } if *role == Role::ValidatorScrutiny
+                )
+            })
+            .count();
+        assert_eq!(
+            validator_spawns, 1,
+            "tripwire drift is not retried — the round fails on the spot"
+        );
+        assert!(
+            validator_snapshot_leftovers(&engine).is_empty(),
+            "the snapshot is discarded even on the tamper early-return"
         );
     }
 
-    /// Gate artifact churn is not tampering: writes under a gitignored path
-    /// (target/) never reach the porcelain fingerprint, so the round passes.
+    /// Teardown on a FAILED round: an untrusted primary and retry each get
+    /// their own snapshot, the milestone blocks honestly, and no snapshot
+    /// dir survives either session.
+    #[tokio::test]
+    async fn snapshot_removed_after_untrusted_round() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            crate::backend_mock::MockScript::single_shot("not json")
+                .with_exit(SessionExit::Failed("validator crashed".to_string())),
+            crate::backend_mock::MockScript::single_shot("still not json")
+                .with_exit(SessionExit::Failed("validator crashed again".to_string())),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock.clone();
+        let mut engine = single_milestone_engine(backend, &root);
+
+        engine.validation_round(0).await.unwrap();
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        assert!(
+            events.iter().any(|e| matches!(&e.kind, EventKind::MilestoneBlocked { milestone_id, reason } if milestone_id == "ms-1" && reason.contains("trusted report"))),
+            "the untrusted round blocks: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        let specs = mock.started_specs();
+        assert_eq!(specs.len(), 2, "primary + one retry");
+        let expected = engine.paths.runs_dir().join("validator-snapshot-scrutiny");
+        assert!(
+            specs.iter().all(|s| s.cwd == expected),
+            "both the primary and the retry ran in snapshots: {:?}",
+            specs.iter().map(|s| s.cwd.clone()).collect::<Vec<_>>()
+        );
+        let snapshot_events = events
+            .iter()
+            .filter(|e| matches!(&e.kind, EventKind::ValidationSnapshot { .. }))
+            .count();
+        assert_eq!(snapshot_events, 2, "one snapshot event per session");
+        assert!(
+            validator_snapshot_leftovers(&engine).is_empty(),
+            "no snapshot survives the failed round"
+        );
+    }
+
+    /// Gate artifact churn is not drift: writes under a gitignored path
+    /// (target/) never reach the porcelain tripwire — and with the snapshot
+    /// they land in the throwaway copy anyway — so the round passes.
     #[tokio::test]
     async fn validator_ignored_artifact_churn_passes_round() {
         let Some((_dir, root)) = lessons_test_repo() else {
