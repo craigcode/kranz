@@ -21,13 +21,13 @@ use crate::backend_claude::kill_group;
 use crate::backend_claude::win_job;
 use crate::cost;
 use crate::error::{EngineError, Result};
+use crate::stream_bounds::{drain_to_tail, BoundedLines, STDERR_TAIL_CAP};
 use crate::types::TokenUsage;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncBufReadExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdout};
 use tokio::task::JoinHandle;
 
@@ -524,16 +524,16 @@ impl AgentBackend for CodexBackend {
             .take()
             .ok_or_else(|| EngineError::Backend("codex child has no stderr pipe".to_string()))?;
 
+        // Capture stderr concurrently so a chatty child never blocks on a
+        // full pipe and failure messages can include the tail. The stream is
+        // drained to EOF but only a bounded tail is retained — a noisy or
+        // malicious CLI must not exhaust host memory (stream_bounds).
         let stderr_buf = Arc::new(Mutex::new(String::new()));
         let stderr_task = {
             let buf = Arc::clone(&stderr_buf);
             tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let mut guard = buf.lock().expect("stderr buffer lock");
-                    guard.push_str(&line);
-                    guard.push('\n');
-                }
+                let tail = drain_to_tail(stderr, STDERR_TAIL_CAP).await;
+                *buf.lock().expect("stderr buffer lock") = tail;
             })
         };
 
@@ -543,7 +543,7 @@ impl AgentBackend for CodexBackend {
             child,
             #[cfg(windows)]
             job,
-            lines: BufReader::new(stdout).lines(),
+            lines: BoundedLines::new(stdout),
             stderr_buf,
             stderr_task: Some(stderr_task),
             queue: VecDeque::new(),
@@ -569,7 +569,7 @@ pub struct CodexSession {
     child: Child,
     #[cfg(windows)]
     job: Option<win_job::JobHandle>,
-    lines: Lines<BufReader<ChildStdout>>,
+    lines: BoundedLines<ChildStdout>,
     stderr_buf: Arc<Mutex<String>>,
     stderr_task: Option<JoinHandle<()>>,
     /// Multi-block lines queue several events; popped one per `next_event`.

@@ -18,12 +18,27 @@ use crate::backend::{
     AgentBackend, AgentEvent, AgentSession, PromptMode, SessionExit, SessionSpec,
 };
 use crate::error::{EngineError, Result};
+use crate::stream_bounds::TailWindow;
 use crate::types::TokenUsage;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
+use std::time::Duration;
 
 /// Max characters of a response/error body included in failure messages.
 const BODY_TAIL_CHARS: usize = 500;
+
+/// One chat-completions round trip never blocks a mission longer than this.
+/// Ten minutes mirrors the contract-command cap
+/// (`command_exec::COMMAND_TIMEOUT`): local inference of a large prompt
+/// legitimately takes minutes, but a hung or malicious endpoint must fail
+/// the session, never stall the mission forever.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Max bytes retained from a response body. Real chat completions are
+/// KiB-scale; past this cap the body is tailed with a truncation marker (a
+/// success body that large then fails JSON parsing honestly) instead of
+/// exhausting host memory on an unbounded response.
+const RESPONSE_BODY_CAP: usize = 8 * 1024 * 1024;
 
 /// Deliberately crude token estimate (docs/scoping don't yet have a
 /// tokenizer dependency for arbitrary local models): 4 chars/token over the
@@ -106,6 +121,21 @@ fn extract_completion(body: &Value) -> std::result::Result<(String, TokenUsage),
     ))
 }
 
+/// Read a response body retaining only the bounded tail (chunked via
+/// `Response::chunk` — the core reqwest API, no `stream` feature needed): a
+/// malicious endpoint streaming an unbounded body cannot exhaust host
+/// memory. Like the old `.text().await.unwrap_or_default()`, a read error
+/// keeps whatever was already received rather than failing the session.
+async fn read_body_tail(mut response: reqwest::Response, cap: usize) -> String {
+    let mut window = TailWindow::new(cap);
+    // A read error ends the body exactly like the old
+    // `.text().await.unwrap_or_default()`: keep whatever was received.
+    while let Ok(Some(chunk)) = response.chunk().await {
+        window.push(&chunk);
+    }
+    window.render()
+}
+
 // ---------------------------------------------------------------------------
 // Backend
 // ---------------------------------------------------------------------------
@@ -118,6 +148,8 @@ pub struct LocalBackend {
     base_url: String,
     temperature: Option<f64>,
     context_budget: u32,
+    request_timeout: Duration,
+    body_cap: usize,
     client: reqwest::Client,
 }
 
@@ -127,6 +159,8 @@ impl LocalBackend {
             base_url,
             temperature,
             context_budget,
+            request_timeout: REQUEST_TIMEOUT,
+            body_cap: RESPONSE_BODY_CAP,
             client: reqwest::Client::new(),
         }
     }
@@ -167,10 +201,17 @@ impl AgentBackend for LocalBackend {
             "{}/v1/chat/completions",
             self.base_url.trim_end_matches('/')
         );
-        let outcome = match self.client.post(&url).json(&request_body).send().await {
+        let outcome = match self
+            .client
+            .post(&url)
+            .json(&request_body)
+            .timeout(self.request_timeout)
+            .send()
+            .await
+        {
             Ok(response) => {
                 let status = response.status();
-                let body_text = response.text().await.unwrap_or_default();
+                let body_text = read_body_tail(response, self.body_cap).await;
                 if status.is_success() {
                     match serde_json::from_str::<Value>(&body_text) {
                         Ok(parsed) => Ok(parsed),
@@ -186,6 +227,10 @@ impl AgentBackend for LocalBackend {
                     ))
                 }
             }
+            Err(e) if e.is_timeout() => Err(format!(
+                "local backend request timed out after {:?}",
+                self.request_timeout
+            )),
             Err(e) => Err(format!("local backend request failed: {e}")),
         };
 
@@ -604,6 +649,127 @@ mod tests {
                 assert!(
                     message.contains("context budget"),
                     "expected the failure message to name the context budget, got: {message}"
+                );
+            }
+            other => panic!("expected SessionExit::Failed, got {other:?}"),
+        }
+    }
+
+    /// Spawn an in-process stub that accepts connections and then holds them
+    /// open WITHOUT ever responding (a hung endpoint). The held sockets keep
+    /// the connections alive; the accept loop is dropped with the test
+    /// runtime.
+    async fn spawn_hung_stub() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind hung stub");
+        let addr: SocketAddr = listener.local_addr().expect("hung stub addr");
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// A hung endpoint must fail the session at the request timeout, not
+    /// stall the mission forever (hostile-workload finding: the local
+    /// backend previously had no timeout at all).
+    #[tokio::test]
+    async fn local_http_hung_endpoint_times_out_instead_of_stalling() {
+        let base_url = spawn_hung_stub().await;
+        let mut backend = LocalBackend::new(base_url, None, 100_000);
+        backend.request_timeout = Duration::from_millis(200);
+
+        let start = std::time::Instant::now();
+        let spec = base_spec("sess-hung", "do the thing", false);
+        let mut session = backend.start(spec).await.expect("start");
+        let events = drain(session.as_mut()).await;
+
+        assert!(events.is_empty(), "a timed-out request yields no events");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the request returned near the 200ms timeout, not after a stall"
+        );
+        match session.exit_status() {
+            Some(SessionExit::Failed(message)) => {
+                assert!(
+                    message.contains("timed out"),
+                    "expected the failure to name the timeout, got: {message}"
+                );
+            }
+            other => panic!("expected SessionExit::Failed, got {other:?}"),
+        }
+    }
+
+    /// A response body over the cap is tailed with a marker: the failure
+    /// message shows the END of the body and the marker, and stays bounded.
+    #[tokio::test]
+    async fn local_http_error_body_over_the_cap_is_tailed_with_a_marker() {
+        let body = format!("{}{}", "x".repeat(4096), "BODY-END");
+        let (base_url, _requests, _received) =
+            spawn_stub("HTTP/1.1 500 Internal Server Error", body).await;
+        let mut backend = LocalBackend::new(base_url, None, 100_000);
+        backend.body_cap = 128;
+
+        let spec = base_spec("sess-cap", "do the thing", false);
+        let mut session = backend.start(spec).await.expect("start");
+        let events = drain(session.as_mut()).await;
+        assert!(events.is_empty(), "expected no events on a failed response");
+
+        match session.exit_status() {
+            Some(SessionExit::Failed(message)) => {
+                assert!(
+                    message.contains(crate::stream_bounds::TRUNCATION_MARKER),
+                    "expected the truncation marker, got: {message}"
+                );
+                assert!(
+                    message.contains("BODY-END"),
+                    "expected the END of the body to be kept, got: {message}"
+                );
+                assert!(
+                    message.len() < 1024,
+                    "the surfaced body stayed bounded, got {} bytes",
+                    message.len()
+                );
+            }
+            other => panic!("expected SessionExit::Failed, got {other:?}"),
+        }
+    }
+
+    /// A syntactically valid completion padded past the cap: the retained
+    /// tail can no longer parse, so the session fails HONESTLY (with the
+    /// marker) instead of retaining the whole body in memory.
+    #[tokio::test]
+    async fn local_http_success_body_over_the_cap_fails_honestly_with_a_marker() {
+        let body = format!(
+            "{}{}",
+            json!({"choices": [{"message": {"role": "assistant", "content": "hi"}}],
+                   "usage": {"prompt_tokens": 1, "completion_tokens": 1}}),
+            " ".repeat(4096)
+        );
+        let (base_url, _requests, _received) = spawn_stub("HTTP/1.1 200 OK", body).await;
+        let mut backend = LocalBackend::new(base_url, None, 100_000);
+        backend.body_cap = 128;
+
+        let spec = base_spec("sess-cap200", "do the thing", false);
+        let mut session = backend.start(spec).await.expect("start");
+        let events = drain(session.as_mut()).await;
+        assert!(
+            events.is_empty(),
+            "an unparseable over-cap body yields no events"
+        );
+
+        match session.exit_status() {
+            Some(SessionExit::Failed(message)) => {
+                assert!(
+                    message.contains("failed to parse"),
+                    "expected an honest parse failure, got: {message}"
+                );
+                assert!(
+                    message.contains(crate::stream_bounds::TRUNCATION_MARKER),
+                    "expected the truncation marker, got: {message}"
                 );
             }
             other => panic!("expected SessionExit::Failed, got {other:?}"),

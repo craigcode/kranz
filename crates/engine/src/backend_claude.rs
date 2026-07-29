@@ -15,13 +15,14 @@ use crate::backend::{
     AgentBackend, AgentEvent, AgentSession, PromptMode, SessionExit, SessionSpec,
 };
 use crate::error::{EngineError, Result};
+use crate::stream_bounds::{drain_to_tail, BoundedLines, STDERR_TAIL_CAP};
 use crate::types::TokenUsage;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::task::JoinHandle;
 
@@ -894,17 +895,15 @@ impl AgentBackend for ClaudeBackend {
         let mut stdin = if streaming { child.stdin.take() } else { None };
 
         // Capture stderr concurrently so a chatty child never blocks on a
-        // full pipe and failure messages can include the tail.
+        // full pipe and failure messages can include the tail. The stream is
+        // drained to EOF but only a bounded tail is retained — a noisy or
+        // malicious CLI must not exhaust host memory (stream_bounds).
         let stderr_buf = Arc::new(Mutex::new(String::new()));
         let stderr_task = {
             let buf = Arc::clone(&stderr_buf);
             tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let mut guard = buf.lock().expect("stderr buffer lock");
-                    guard.push_str(&line);
-                    guard.push('\n');
-                }
+                let tail = drain_to_tail(stderr, STDERR_TAIL_CAP).await;
+                *buf.lock().expect("stderr buffer lock") = tail;
             })
         };
 
@@ -928,7 +927,7 @@ impl AgentBackend for ClaudeBackend {
             #[cfg(windows)]
             job,
             stdin,
-            lines: BufReader::new(stdout).lines(),
+            lines: BoundedLines::new(stdout),
             stderr_buf,
             stderr_task: Some(stderr_task),
             queue: VecDeque::new(),
@@ -972,7 +971,7 @@ pub struct ClaudeSession {
     job: Option<win_job::JobHandle>,
     /// Held open for streaming-input sessions; dropped to close stdin.
     stdin: Option<ChildStdin>,
-    lines: Lines<BufReader<ChildStdout>>,
+    lines: BoundedLines<ChildStdout>,
     stderr_buf: Arc<Mutex<String>>,
     stderr_task: Option<JoinHandle<()>>,
     /// Multi-block lines queue several events; popped one per `next_event`.
@@ -1421,5 +1420,95 @@ mod tests {
             "{\"token\":\"oauth\"}",
             "the OAuth credential copy must land in the seeded scratch config dir"
         );
+    }
+
+    /// Hostile-workload bound: a stub emitting one over-long line (9 MB,
+    /// past the 8 MiB per-line cap) is drained without unbounded memory; the
+    /// truncated line surfaces as an unparsed `Other` carrying the marker,
+    /// and the session still completes on the result line that follows.
+    #[tokio::test]
+    async fn over_long_stdout_line_is_truncated_and_the_session_completes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("claude-long-line-stub.sh");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\n\
+             printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"stub\",\"model\":\"stub\"}'\n\
+             head -c 9000000 /dev/zero | tr '\\0' 'x'\n\
+             printf '\\n'\n\
+             printf '%s\\n' '{\"type\":\"result\",\"is_error\":false,\"result\":\"done\",\"total_cost_usd\":0.0,\"usage\":{\"input_tokens\":1,\"output_tokens\":1},\"num_turns\":1}'\n\
+             exit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let backend = ClaudeBackend::new(&stub);
+        let spec = env_dump_spec(dir.path(), "long-line", HashMap::new());
+        let mut session = backend.start(spec).await.expect("stub session spawns");
+        let mut saw_truncated_other = false;
+        while let Some(event) = session.next_event().await.expect("stream reads") {
+            if let AgentEvent::Other { raw } = &event {
+                if raw
+                    .to_string()
+                    .contains(crate::stream_bounds::TRUNCATION_MARKER)
+                {
+                    saw_truncated_other = true;
+                }
+            }
+        }
+
+        assert!(
+            saw_truncated_other,
+            "the over-long line surfaced as a truncated unparsed Other"
+        );
+        assert_eq!(
+            session.exit_status(),
+            Some(SessionExit::Completed),
+            "the session completes on the result line after the truncated one"
+        );
+    }
+
+    /// Hostile-workload bound: a stub streaming more stderr than the 64 KiB
+    /// retention cap still has its whole pipe drained (no deadlock), and the
+    /// failure message carries only the bounded tail plus the marker.
+    #[tokio::test]
+    async fn endless_stderr_is_drained_and_only_the_tail_is_surfaced() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("claude-noisy-stderr-stub.sh");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\n\
+             head -c 200000 /dev/zero | tr '\\0' 'y' >&2\n\
+             echo 'STDERR-END' >&2\n\
+             exit 3\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let backend = ClaudeBackend::new(&stub);
+        let spec = env_dump_spec(dir.path(), "noisy-stderr", HashMap::new());
+        let mut session = backend.start(spec).await.expect("stub session spawns");
+        while session.next_event().await.expect("stream reads").is_some() {}
+
+        match session.exit_status() {
+            Some(SessionExit::Failed(message)) => {
+                assert!(
+                    message.contains(crate::stream_bounds::TRUNCATION_MARKER),
+                    "expected the truncation marker, got: {message}"
+                );
+                assert!(
+                    message.contains("STDERR-END"),
+                    "expected the END of stderr to be kept, got: {message}"
+                );
+                assert!(
+                    message.len() < 1024,
+                    "the surfaced stderr tail stayed bounded, got {} bytes",
+                    message.len()
+                );
+            }
+            other => panic!("expected SessionExit::Failed, got {other:?}"),
+        }
     }
 }

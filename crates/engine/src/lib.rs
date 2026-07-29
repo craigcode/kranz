@@ -52,6 +52,7 @@ pub mod report_render;
 pub mod sandbox;
 pub mod sandbox_container;
 pub mod scrub;
+mod stream_bounds;
 pub mod ticket;
 pub mod trace_export;
 pub mod validator_integrity;
