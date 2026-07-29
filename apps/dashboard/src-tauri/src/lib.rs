@@ -64,6 +64,12 @@ fn bind_free_port() -> TcpListener {
 /// the bundled frontend itself and talks to the server for /api only. The
 /// shutdown future never fires: a desktop shell has no ctrl-c lifetime to
 /// honor — the app exiting IS the shutdown.
+///
+/// `read_auth: true` arms the read gate even on the loopback bind: the
+/// desktop port is a long-lived local server and mission reads
+/// (state/transcripts) should not be open to every local process. The
+/// webview authenticates with the per-launch mutation token it already
+/// holds (accepted on gated reads), so no frontend change is needed.
 async fn embedded_serve(
     repo_root: PathBuf,
     listener: TcpListener,
@@ -73,11 +79,13 @@ async fn embedded_serve(
     listener.set_nonblocking(true)?;
     let listener = tokio::net::TcpListener::from_std(listener)?;
     let host = std::sync::Arc::new(kranz_server::MissionHost::new(repo_root));
-    kranz_server::serve_on_listener(
-        host,
+    kranz_server::serve_multi_on_listener(
+        std::sync::Arc::new(kranz_server::MultiRepoHost::with_host(host)),
         listener,
         None,
         Some(token),
+        None,
+        true,
         std::future::pending::<()>(),
     )
     .await

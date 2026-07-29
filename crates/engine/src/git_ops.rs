@@ -249,7 +249,10 @@ impl GitRepo {
     /// ([`crate::validator_integrity`]) compares this verbatim across a
     /// session; v1's C-quoting keeps even exotic paths to one line per entry.
     pub fn porcelain_status(&self) -> Result<String> {
-        self.run(&["status", "--porcelain"])
+        // --untracked-files=all: the default collapses untracked DIRECTORIES
+        // (`?? dir/`), so files added inside an already-untracked dir would
+        // be invisible to the validator-integrity fingerprint (review 2 pass).
+        self.run(&["status", "--porcelain", "--untracked-files=all"])
     }
 
     /// Like [`Self::is_clean`] but ignoring untracked files: `true` when no

@@ -305,12 +305,50 @@ pub(crate) fn create_real_subdir(dir: &Dir, name: &str, full_path: &Path) -> Res
     }
 }
 
+/// Open `path` for reading WITHOUT following a final-component symlink: one
+/// syscall on unix (`O_NOFOLLOW` — `ELOOP` maps to the same refusal
+/// [`ensure_absent_or_regular_file`] produces), so there is no
+/// check-then-open window a concurrent writer could swap a symlink into.
+/// Off-unix there is no `O_NOFOLLOW`; fall back to check-then-open (Windows
+/// symlink creation needs privileges, so the residual race there is narrow,
+/// and documented here rather than hidden).
+pub(crate) fn open_read_nofollow(path: &Path) -> Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+        {
+            Ok(file) => Ok(file),
+            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+                Err(EngineError::InvalidState(format!(
+                    "refusing mission runtime file that is not a regular file: {}",
+                    path.display()
+                )))
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        ensure_absent_or_regular_file(path)?;
+        Ok(std::fs::File::open(path)?)
+    }
+}
+
 /// Refuse `path` when it exists and is anything but a regular file — a
 /// symlink most of all. `symlink_metadata` (never `metadata`) inspects the
 /// link itself, so a symlinked runtime file (events.jsonl, state.json, the
 /// lock file) is rejected at open time instead of being read or written
 /// through into another tree. An absent path is `Ok`: the caller's own
 /// open/read produces its usual `NotFound`.
+///
+/// This is a CHECK ONLY: a caller that opens the file afterwards has a
+/// check-then-open window a concurrent writer could swap a symlink into.
+/// Readers should use [`open_read_nofollow`] instead, which closes that
+/// window on unix.
 pub(crate) fn ensure_absent_or_regular_file(path: &Path) -> Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() => Ok(()),

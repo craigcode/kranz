@@ -5,7 +5,10 @@ description = "Kranz Mission Control — Tauri desktop shell embedding the kranz
 authors = ["Kranz"]
 license = "MIT"
 edition = "2021"
-rust-version = "1.77.2"
+# Matches the root workspace (../Cargo.toml): the path dependencies on
+# kranz-server/kranz-engine require it, so a lower declared MSRV would be
+# false advertising (this standalone workspace cannot inherit the value).
+rust-version = "1.88"
 
 # Standalone workspace: keeps the heavy Tauri dependency tree out of the root
 # cargo workspace's builds (the root workspace does not list this package as a

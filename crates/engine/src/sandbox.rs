@@ -576,8 +576,28 @@ pub fn bubblewrap_args(inputs: &SandboxInputs, binary: &Path, args: &[String]) -
     // binds; the control dir gets an empty tmpfs shadow (writes evaporate,
     // the host dir is untouched). Same residual gap as the authority masks:
     // a metadata file created AFTER spawn is unmasked until the next
-    // session — the engine creates all of these before the first session.
+    // session — the engine creates all of these before the first session,
+    // EXCEPT `state.json.tmp`, which is transient (recreated on every atomic
+    // state write and routinely absent at spawn). Create just that one so
+    // the mask binds — an empty placeholder is inert: the engine truncates
+    // it on use and nothing ever reads it. (The other metadata files are NOT
+    // pre-created here: an empty `state.json` would turn a clean NotFound
+    // into a parse error for first-run flows.)
     let write_denies = mission_write_denies(inputs);
+    for path in write_denies
+        .files
+        .iter()
+        .filter(|p| p.ends_with("state.json.tmp"))
+    {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(path);
+    }
     let mut write_masks: std::collections::BTreeSet<String> = write_denies
         .files
         .iter()

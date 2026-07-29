@@ -559,10 +559,17 @@ mod tests {
             dump.contains("KRANZ_BASE_SHA=deadbeef"),
             "base sha must reach the contract env:\n{dump}"
         );
-        if let Some(cargo_home) = std::env::var_os("CARGO_HOME") {
+        // Credential-free toolchain caches cross; CARGO_HOME deliberately
+        // does NOT (it carries credentials.toml — grant it via
+        // contractEnvPassthrough when a private registry needs it).
+        assert!(
+            !dump.contains("CARGO_HOME="),
+            "CARGO_HOME must not cross by default:\n{dump}"
+        );
+        if let Some(rustup_home) = std::env::var_os("RUSTUP_HOME") {
             assert!(
-                dump.contains(&format!("CARGO_HOME={}", cargo_home.to_string_lossy())),
-                "toolchain caches cross from ambient when set:\n{dump}"
+                dump.contains(&format!("RUSTUP_HOME={}", rustup_home.to_string_lossy())),
+                "credential-free toolchain caches cross from ambient when set:\n{dump}"
             );
         }
     }

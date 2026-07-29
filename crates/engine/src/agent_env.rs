@@ -59,17 +59,23 @@ const AMBIENT_WINDOWS_VARS: &[&str] = &[
 ];
 
 /// Toolchain cache locations contract commands may inherit from ambient
-/// (design decision 3 of the ticket): they speed up `cargo`/`npm` contract
-/// gates and hold no user credentials beyond registry auth tokens. The
-/// trade is explicit — a contract that talks to a PRIVATE registry needs
-/// that token, and the sanctioned way to grant it is the mission config's
-/// `contractEnvPassthrough`, not ambient inheritance.
-const CONTRACT_TOOLCHAIN_VARS: &[&str] = &["CARGO_HOME", "RUSTUP_HOME", "NPM_CONFIG_CACHE"];
+/// (design decision 3 of the ticket): they speed up `rustup`/`npm` contract
+/// gates and hold no user credentials. `CARGO_HOME` is DELIBERATELY absent:
+/// it carries `credentials.toml` (registry auth tokens) alongside the cache,
+/// and contract command text is agent-influenced — a credential is not a
+/// cache. A contract that talks to a PRIVATE registry gets that token via
+/// the mission config's `contractEnvPassthrough` (CARGO_HOME is not a
+/// managed key, so the passthrough can grant it deliberately), not ambient
+/// inheritance.
+const CONTRACT_TOOLCHAIN_VARS: &[&str] = &["RUSTUP_HOME", "NPM_CONFIG_CACHE"];
 
 /// Env names [`contract_command_env`] manages itself; a `contractEnvPassthrough`
 /// entry naming one of these is refused (loudly, name only) so the escape
 /// hatch cannot silently saw off the isolation it sits on — e.g. passing
 /// `HOME` through would hand the operator's real home to the contract.
+/// `CARGO_HOME` is deliberately NOT managed: it is the one toolchain dir
+/// carrying credentials (`credentials.toml`), so the passthrough is the
+/// sanctioned way to grant it deliberately.
 fn managed_contract_keys() -> &'static [&'static str] {
     &[
         "PATH",
@@ -90,7 +96,6 @@ fn managed_contract_keys() -> &'static [&'static str] {
         "LC_ALL",
         "TZ",
         "KRANZ_BASE_SHA",
-        "CARGO_HOME",
         "RUSTUP_HOME",
         "NPM_CONFIG_CACHE",
     ]
@@ -261,7 +266,12 @@ pub fn contract_command_env(
         if name.is_empty() {
             continue;
         }
-        if managed.contains(&name) {
+        // Case-INSENSITIVE refusal: Windows env names are case-insensitive,
+        // so a `path`/`Temp` passthrough would otherwise slip the check and
+        // emit a duplicate-case entry — undefined which value the child
+        // sees, silently overriding a scratch redirect. Refusing every
+        // casing everywhere keeps one rule for all platforms.
+        if managed.iter().any(|m| m.eq_ignore_ascii_case(name)) {
             tracing::warn!(
                 key = name,
                 "contractEnvPassthrough entry refused: name is managed by the contract env itself"
@@ -555,27 +565,34 @@ mod tests {
     }
 
     /// Contract env (design decision 3): base-sha + toolchain caches +
-    /// passthrough names cross; ambient secrets do not; a passthrough entry
-    /// naming a managed key is refused.
+    /// passthrough names cross; ambient secrets do not; CARGO_HOME (a
+    /// credential directory) crosses ONLY via an explicit passthrough grant;
+    /// a passthrough entry naming a managed key — in ANY letter casing — is
+    /// refused.
     #[test]
     fn contract_command_env_shapes_the_gate_boundary() {
         let _guard = EnvTestGuard::engage(&[
+            ("RUSTUP_HOME", "/poisoned/rustup-home"),
             ("CARGO_HOME", "/poisoned/cargo-home"),
             ("KRANZ_AGENT_ENV_TEST_CRED", "cred-value"),
             ("GH_TOKEN", "hunter2"),
         ]);
         let scratch = tempfile::tempdir().unwrap();
 
-        // No passthrough configured: exactly base + toolchain.
+        // No passthrough configured: exactly base + credential-free caches.
         let env = contract_command_env(scratch.path(), Some("deadbeef"), &[]);
         assert_eq!(
             env.get("KRANZ_BASE_SHA").map(String::as_str),
             Some("deadbeef")
         );
         assert_eq!(
-            env.get("CARGO_HOME").map(String::as_str),
-            Some("/poisoned/cargo-home"),
-            "toolchain caches cross from ambient"
+            env.get("RUSTUP_HOME").map(String::as_str),
+            Some("/poisoned/rustup-home"),
+            "credential-free toolchain caches cross from ambient"
+        );
+        assert!(
+            !env.contains_key("CARGO_HOME"),
+            "CARGO_HOME carries credentials.toml and must NOT cross by default"
         );
         assert!(!env.contains_key("GH_TOKEN"));
         assert!(
@@ -587,14 +604,16 @@ mod tests {
             Some(scratch.path().to_string_lossy().as_ref())
         );
 
-        // Passthrough configured: the named var crosses; a managed name is
-        // refused (HOME stays the scratch).
+        // Passthrough configured: the named var crosses (including a
+        // deliberate CARGO_HOME grant); a managed name is refused in any
+        // letter casing (HOME stays the scratch).
         let env = contract_command_env(
             scratch.path(),
             None,
             &[
                 "KRANZ_AGENT_ENV_TEST_CRED".to_string(),
-                "HOME".to_string(),
+                "CARGO_HOME".to_string(),
+                "home".to_string(),
                 "KRANZ_AGENT_ENV_TEST_UNSET".to_string(),
             ],
         );
@@ -604,9 +623,14 @@ mod tests {
             "the passthrough-named var crosses"
         );
         assert_eq!(
+            env.get("CARGO_HOME").map(String::as_str),
+            Some("/poisoned/cargo-home"),
+            "CARGO_HOME crosses via an explicit passthrough grant"
+        );
+        assert_eq!(
             env.get("HOME").map(String::as_str),
             Some(scratch.path().to_string_lossy().as_ref()),
-            "a passthrough entry naming HOME must be refused"
+            "a passthrough entry naming `home` (any casing) must be refused"
         );
         assert!(
             !env.contains_key("KRANZ_BASE_SHA"),

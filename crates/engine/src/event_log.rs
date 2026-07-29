@@ -389,9 +389,11 @@ impl EventLog {
     /// whole log unreadable.
     fn parse_log(path: &Path) -> Result<ParsedLog> {
         // A symlinked log file is refused (never read through into another
-        // tree); an absent one errors NotFound from the read below, as before.
-        crate::paths::ensure_absent_or_regular_file(path)?;
-        let bytes = std::fs::read(path)?;
+        // tree); an absent one errors NotFound from the read below, as
+        // before. `O_NOFOLLOW` on unix — no check-then-open window.
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        crate::paths::open_read_nofollow(path)?.read_to_end(&mut bytes)?;
 
         let mut events = Vec::new();
         let mut valid_len: usize = 0;
@@ -477,9 +479,9 @@ impl EventLog {
     /// inside the window.
     pub fn read_tail_events(path: &Path, max_bytes: u64) -> Result<Vec<Event>> {
         use std::io::{Read, Seek, SeekFrom};
-        // Same no-follow refusal as `parse_log`: never tail through a symlink.
-        crate::paths::ensure_absent_or_regular_file(path)?;
-        let mut file = std::fs::File::open(path)?;
+        // Same no-follow refusal as `parse_log`: never tail through a
+        // symlink, `O_NOFOLLOW` on unix so there is no check-then-open window.
+        let mut file = crate::paths::open_read_nofollow(path)?;
         let len = file.metadata()?.len();
         let window_start = len.saturating_sub(max_bytes);
         // Read from one byte BEFORE the window: when the window happens to

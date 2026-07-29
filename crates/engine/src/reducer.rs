@@ -845,10 +845,12 @@ pub fn write_snapshot(state: &MissionState, path: &Path) -> Result<()> {
 }
 
 /// Read a snapshot previously written by [`write_snapshot`]. A symlinked
-/// `state.json` is refused (P1 mission-path-no-follow), never read through.
+/// `state.json` is refused (P1 mission-path-no-follow), never read through —
+/// opened with `O_NOFOLLOW` on unix so there is no check-then-open window.
 pub fn read_snapshot(path: &Path) -> Result<MissionState> {
-    crate::paths::ensure_absent_or_regular_file(path)?;
-    let content = std::fs::read_to_string(path)?;
+    use std::io::Read;
+    let mut content = String::new();
+    crate::paths::open_read_nofollow(path)?.read_to_string(&mut content)?;
     Ok(serde_json::from_str(&content)?)
 }
 
