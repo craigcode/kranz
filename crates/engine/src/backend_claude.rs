@@ -320,6 +320,15 @@ pub fn scratch_home_root(session_id: &str) -> std::path::PathBuf {
 /// `.claude` dir — mirroring how the `claude` CLI itself resolves its config
 /// location. Passing neither yields an empty (but present) scratch config.
 ///
+/// macOS Keychain auth additionally needs `$HOME/Library/Keychains`: the CLI
+/// resolves the login keychain by HOME-relative path, so a relocated HOME
+/// without it fails "Not logged in" even though the keychain item exists
+/// (observed 2026-07-29 after the CLI migrated token storage from
+/// `.credentials.json` to the keychain). Seed a SYMLINK to the real one —
+/// the OAuth credential the session legitimately needs, same trust class as
+/// the file-based credentials copy. macOS-only; other platforms store auth
+/// file-side.
+///
 /// Returns `(home_dir, config_dir)`: `home_dir` is what the caller should set
 /// `HOME` to (so `$HOME/.claude.json` resolves inside the sandbox), and
 /// `config_dir` — `home_dir/.claude` — is what the caller should set
@@ -343,6 +352,19 @@ pub fn seed_worker_scratch_home(
             let src = source_config_dir.join(entry);
             if src.is_file() {
                 std::fs::copy(&src, config_dir.join(entry))?;
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    if let Some(real_home) = real_home {
+        let real_keychains = real_home.join("Library").join("Keychains");
+        if real_keychains.is_dir() {
+            let scratch_library = home_dir.join("Library");
+            std::fs::create_dir_all(&scratch_library)?;
+            let link = scratch_library.join("Keychains");
+            if !link.exists() {
+                std::os::unix::fs::symlink(&real_keychains, &link)?;
             }
         }
     }
@@ -1421,6 +1443,39 @@ mod tests {
             "{\"token\":\"oauth\"}",
             "the OAuth credential copy must land in the seeded scratch config dir"
         );
+    }
+
+    /// macOS Keychain auth (the CLI's current token storage): the seeded
+    /// scratch HOME must carry `Library/Keychains` as a symlink to the real
+    /// one — the CLI resolves the login keychain by HOME-relative path, so
+    /// without it a relocated HOME fails "Not logged in" (2026-07-29).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seed_worker_scratch_home_links_the_real_keychain_dir() {
+        let real_home = tempfile::tempdir().unwrap();
+        let real_keychains = real_home.path().join("Library").join("Keychains");
+        std::fs::create_dir_all(&real_keychains).unwrap();
+        std::fs::write(real_keychains.join("login.keychain-db"), "db").unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+
+        let (home, _config) =
+            seed_worker_scratch_home(scratch.path(), Some(real_home.path()), None).unwrap();
+
+        let link = home.join("Library").join("Keychains");
+        let target = std::fs::read_link(&link).expect("Keychains must be a symlink");
+        assert_eq!(target, real_keychains);
+        // And reads through it work (the CLI's keychain-file lookup shape).
+        assert_eq!(
+            std::fs::read_to_string(link.join("login.keychain-db")).unwrap(),
+            "db"
+        );
+
+        // No real keychain dir: no link, no error (file-based auth hosts).
+        let bare_home = tempfile::tempdir().unwrap();
+        let scratch2 = tempfile::tempdir().unwrap();
+        let (home2, _) =
+            seed_worker_scratch_home(scratch2.path(), Some(bare_home.path()), None).unwrap();
+        assert!(!home2.join("Library").join("Keychains").exists());
     }
 
     /// Hostile-workload bound: a stub emitting one over-long line (9 MB,

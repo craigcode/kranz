@@ -54,20 +54,23 @@ that state lives.
 On macOS, the interactive CLI can store the OAuth token in the **Keychain**
 instead of `.credentials.json`. This matters for scratch-HOME isolation:
 
-- **Keychain-stored auth is HOME-independent.** It is looked up by service
-  name via the macOS Keychain API, not by reading a path under
-  `CLAUDE_CONFIG_DIR`/`HOME`. A worker given a scratch HOME/config dir will
-  **still authenticate successfully** via Keychain even though no
-  credentials file was seeded — because the lookup never touches the
-  filesystem path at all. This is easy to mistake for "the scratch env
-  carried the right files" when actually it carried nothing and Keychain
-  filled the gap.
+- **Keychain-stored auth is HOME-DEPENDENT after all (corrected
+  2026-07-29, live probe).** The earlier belief — that the lookup goes
+  through the macOS Keychain API and never touches a HOME-relative path —
+  is wrong for the current CLI: it resolves the login keychain at
+  `$HOME/Library/Keychains`, so a scratch HOME without that path fails
+  "Not logged in · Please run /login" even though
+  `security find-generic-password -s "Claude Code-credentials"` succeeds
+  in the same environment (the keychain ITEM is fine; the CLI's path to it
+  is not). Observed when the CLI migrated this host's token storage from
+  `.credentials.json` to the keychain: the file disappeared and every
+  seeded scratch spawn began failing. The fix: `seed_worker_scratch_home`
+  symlinks the real `~/Library/Keychains` into the scratch HOME (verified:
+  the same probe then authenticates headless).
 - **File-based auth (`.credentials.json`) follows `CLAUDE_CONFIG_DIR`/HOME.**
-  When the token lives in `.credentials.json` (as it does on this host —
-  confirmed present, JSON, containing only the `claudeAiOauth` key with no
-  Keychain entry checked here), a scratch config dir *must* carry a copy of
-  this file (or a variant with fresh/valid tokens) or the headless session
-  will fail to authenticate.
+  When the token lives in `.credentials.json`, a scratch config dir *must*
+  carry a copy of this file (or a variant with fresh/valid tokens) or the
+  headless session will fail to authenticate.
 - `--bare` mode explicitly documents this split: bare mode restricts auth to
   `ANTHROPIC_API_KEY` or `apiKeyHelper` only and states plainly that "OAuth
   and keychain are never read" in that mode — confirming Keychain and the
