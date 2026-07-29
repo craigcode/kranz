@@ -112,6 +112,25 @@ pub struct GitRepo {
     hooks_disabled: bool,
 }
 
+/// git on Windows cannot parse VERBATIM paths (`\\?\C:\...`, which
+/// `std::fs::canonicalize` returns there — and the engine canonicalizes
+/// repo roots for the no-follow guards): `git worktree add //?/C:/...`
+/// fails with "Invalid argument". Strip the prefix when handing a path to
+/// git; a no-op off Windows and on non-verbatim paths. (`\\?\UNC\` shares
+/// are not collapsed — no mission root legitimately lives on one.)
+fn git_path_arg(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let rendered = path.as_os_str().to_string_lossy();
+        if let Some(rest) = rendered.strip_prefix(r"\\?\") {
+            if !rest.starts_with("UNC") {
+                return PathBuf::from(rest);
+            }
+        }
+    }
+    path.to_path_buf()
+}
+
 impl GitRepo {
     /// Open `root` as a git repository.
     ///
@@ -801,7 +820,7 @@ impl GitRepo {
             "add".into(),
             "-b".into(),
             branch.into(),
-            path.as_os_str().to_os_string(),
+            git_path_arg(path).into_os_string(),
             from_sha.into(),
         ];
         self.run_os(&args)?;
@@ -825,7 +844,7 @@ impl GitRepo {
         let args: Vec<OsString> = vec![
             "worktree".into(),
             "add".into(),
-            path.as_os_str().to_os_string(),
+            git_path_arg(path).into_os_string(),
             branch.into(),
         ];
         self.run_os(&args)?;
@@ -846,7 +865,7 @@ impl GitRepo {
             "worktree".into(),
             "add".into(),
             "--detach".into(),
-            path.as_os_str().to_os_string(),
+            git_path_arg(path).into_os_string(),
             commit.into(),
         ];
         self.run_os(&args)?;
@@ -867,7 +886,7 @@ impl GitRepo {
             "worktree".into(),
             "remove".into(),
             "--force".into(),
-            path.as_os_str().to_os_string(),
+            git_path_arg(path).into_os_string(),
         ];
         let out = self.probe_os(&args)?;
         if out.status.success() {
@@ -1292,5 +1311,34 @@ fn failure_detail(out: &Output) -> String {
         (true, false) => stdout,
         (false, false) => format!("{stderr} | {stdout}"),
         (true, true) => "no output".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// git on Windows cannot parse verbatim (`\\?\C:\...`) paths — the
+    /// prefix is stripped for git arguments (worktree add/remove). On all
+    /// platforms a plain path passes through untouched; the verbatim strip
+    /// itself is cfg(windows) and oracled by the windows-latest CI leg.
+    #[test]
+    fn git_path_arg_passes_plain_paths_through() {
+        let plain = Path::new(if cfg!(windows) {
+            r"C:\repo\wt"
+        } else {
+            "/repo/wt"
+        });
+        assert_eq!(git_path_arg(plain), plain);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn git_path_arg_strips_the_verbatim_prefix() {
+        let verbatim = Path::new(r"\\?\C:\repo\wt");
+        assert_eq!(git_path_arg(verbatim), Path::new(r"C:\repo\wt"));
+        // UNC shares are NOT collapsed.
+        let unc = Path::new(r"\\?\UNC\share\repo");
+        assert_eq!(git_path_arg(unc), unc);
     }
 }
