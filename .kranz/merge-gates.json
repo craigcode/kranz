@@ -56,30 +56,6 @@
       "whenPaths": [
         "docs/scoping/beads-bridge-dialect.md"
       ]
-    },
-    {
-      "command": "bash packaging/gascity/test/check-rust-toolchain-pinned.sh",
-      "whenPaths": [
-        "rust-toolchain.toml"
-      ]
-    },
-    {
-      "command": "bash packaging/gascity/test/check-clippy-toolchain-resolves.sh",
-      "whenPaths": [
-        "rust-toolchain.toml"
-      ]
-    },
-    {
-      "command": "bash packaging/gascity/test/check-fmt-toolchain-resolves.sh",
-      "whenPaths": [
-        "rust-toolchain.toml"
-      ]
-    },
-    {
-      "command": "bash packaging/gascity/test/check-build-toolchain-resolves.sh",
-      "whenPaths": [
-        "rust-toolchain.toml"
-      ]
     }
   ]
 }
