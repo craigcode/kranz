@@ -32,8 +32,12 @@ use std::path::{Path, PathBuf};
 
 /// Locale/terminal variables passed through from ambient when present. None
 /// of them carry credentials; a missing one is simply omitted (CI runners
-/// routinely have no `TERM`).
-const AMBIENT_LOCALE_VARS: &[&str] = &["TERM", "LANG", "LC_ALL", "TZ"];
+/// routinely have no `TERM`). `USER` rides along as account identity, not a
+/// credential: the `claude` CLI's keychain-backed OAuth resolution FAILS
+/// without it ("Not logged in", probed 2026-07-29 — `USER` alone is
+/// sufficient, `LOGNAME` is not consulted), and a username is already
+/// visible in every absolute path the child sees.
+const AMBIENT_LOCALE_VARS: &[&str] = &["TERM", "LANG", "LC_ALL", "TZ", "USER"];
 
 /// Windows process requirements passed through from ambient: without
 /// `SystemRoot`/`ComSpec`/`PATHEXT` `cmd` and process creation break; the
@@ -93,6 +97,7 @@ fn managed_contract_keys() -> &'static [&'static str] {
         "LANG",
         "LC_ALL",
         "TZ",
+        "USER",
         "KRANZ_BASE_SHA",
         "CARGO_HOME",
         "RUSTUP_HOME",
@@ -430,6 +435,7 @@ mod tests {
             "LANG",
             "LC_ALL",
             "TZ",
+            "USER",
             "KRANZ_BASE_SHA",
         ];
         for key in env.keys() {
