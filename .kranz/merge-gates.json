@@ -74,6 +74,12 @@
       "whenPaths": [
         "packaging/gascity"
       ]
+    },
+    {
+      "command": "bash packaging/gascity/test/check-bridge-hygiene-selftest.sh",
+      "whenPaths": [
+        "packaging/gascity"
+      ]
     }
   ]
 }
