@@ -82,6 +82,24 @@ else
     echo "CREATE: PASS (fixture id $FIXTURE_ID)"
 fi
 
+# --- Case: atomic claim (bd update --claim, dialect doc §2 VERIFIED on the
+# installed 1.0.5 binary) — proves the bridge's CLAIM step, not just its
+# status/close verbs. No lease/TTL/heartbeat/liveness logic here; that is
+# milestone 3's problem (see the LEASE stub below).
+
+if [ -n "$FIXTURE_ID" ]; then
+    CLAIM_OUT=$(BD update "$FIXTURE_ID" --claim --json 2>&1)
+    CLAIM_STATUS=$(printf '%s' "$CLAIM_OUT" | unwrap | jq -r '.status // empty')
+    CLAIM_ASSIGNEE=$(printf '%s' "$CLAIM_OUT" | unwrap | jq -r '.assignee // empty')
+    if [ "$CLAIM_STATUS" != "in_progress" ]; then
+        fail_case "claim-status" "in_progress" "$CLAIM_STATUS"
+    elif [ -z "$CLAIM_ASSIGNEE" ]; then
+        fail_case "claim-assignee" "a non-empty assignee" "'$CLAIM_ASSIGNEE'"
+    else
+        echo "CLAIM: PASS (atomic claim, assignee set)"
+    fi
+fi
+
 # --- Case: status transitions, both directions, verified `bd update
 # --status` shape; bd set-state must never be invoked by the bridge -----
 
@@ -105,7 +123,7 @@ if [ -n "$FIXTURE_ID" ]; then
     assert_status "open"        "in_progress->open"
     assert_status "blocked"     "open->blocked"
     assert_status "open"        "blocked->open"
-    echo "STATUS: PASS (open/in_progress/blocked round-tripped both directions via bd update --status)"
+    echo "STATUS: PASS (open/in_progress/blocked/closed round-tripped via bd update --status, closed->open covered by the REOPEN case below)"
 fi
 
 # The bridge must only ever use `bd update --status`, never `bd set-state`.
@@ -129,6 +147,28 @@ if [ -n "$FIXTURE_ID" ]; then
         fail_case "close-reason" "close reason '$CLOSE_REASON' present on the issue" "not found in bd show --json output"
     else
         echo "CLOSE: PASS (status closed, reason carried)"
+    fi
+fi
+
+# --- Case: closed -> open, the fourth (reverse) status direction ------
+# `bd update --status open` is tried first (live-probed 2026-07-30 against
+# bd 1.0.5: it succeeds directly on a closed issue in this install); `bd
+# reopen` (dialect doc Appendix) is the fallback if the live binary ever
+# rejects the direct update on a closed issue.
+
+if [ -n "$FIXTURE_ID" ]; then
+    REOPEN_VERB="bd update --status open"
+    BD update "$FIXTURE_ID" --status open >/dev/null 2>&1
+    REOPEN_OBSERVED=$(status_of "$FIXTURE_ID")
+    if [ "$REOPEN_OBSERVED" != "open" ]; then
+        REOPEN_VERB="bd reopen"
+        BD reopen "$FIXTURE_ID" --reason "roundtrip fixture reopen" >/dev/null 2>&1
+        REOPEN_OBSERVED=$(status_of "$FIXTURE_ID")
+    fi
+    if [ "$REOPEN_OBSERVED" != "open" ]; then
+        fail_case "reopen-closed" "open" "$REOPEN_OBSERVED"
+    else
+        echo "REOPEN: PASS (closed->open via $REOPEN_VERB)"
     fi
 fi
 
@@ -162,40 +202,84 @@ STRING_CREATE_OUT=$(BD create "FIELDS string fixture" --type task --acceptance "
 }
 STRING_ID=$(printf '%s' "$STRING_CREATE_OUT" | unwrap | jq -r '.id // empty')
 ARRAY_ID="rt-array-1"
+NOACCEPT_ID="rt-noaccept-1"
+EMPTYARR_ID="rt-emptyarr-1"
+GC_CALLS_LOG="$SANDBOX/gc-calls.log"
+: > "$GC_CALLS_LOG"
 
+# The gc stub logs every invocation verbatim, and forwards update/comment
+# (and, for the RUNBEAD cases below, close) to the real bd binary in
+# $STORE_DIR whenever the target id really exists there — the synthetic
+# ARRAY_ID/NOACCEPT_ID/EMPTYARR_ID ids have no real bead behind them, so
+# they stay a no-op. It also accepts the `gc --city <dir> bd ...` and
+# `gc --city <dir> mail send human ...` shapes kranz-run-bead's bd()
+# wrapper uses.
 cat > "$STUB_BIN/gc" <<STUBEOF
 #!/bin/sh
 set -u
-if [ "\${1:-}" != "bd" ]; then
-    echo "gc-stub: unsupported invocation: gc \$*" >&2
-    exit 1
+echo "gc \$*" >> "$GC_CALLS_LOG"
+if [ "\${1:-}" = "--city" ]; then
+    shift 2
 fi
-shift
 case "\${1:-}" in
-    ready)
-        echo '[{"id":"$STRING_ID"},{"id":"$ARRAY_ID"}]'
+    bd)
+        shift
+        case "\${1:-}" in
+            ready)
+                echo '[{"id":"$STRING_ID"},{"id":"$ARRAY_ID"},{"id":"$NOACCEPT_ID"},{"id":"$EMPTYARR_ID"}]'
+                ;;
+            show)
+                ID=\$2
+                if [ "\$ID" = "$STRING_ID" ]; then
+                    ( cd "$STORE_DIR" && bd show "\$ID" --json )
+                elif [ "\$ID" = "$ARRAY_ID" ]; then
+                    printf '[{"id":"%s","title":"Array case","description":"desc","acceptance_criteria":["First hint","Second hint"]}]' "\$ID"
+                elif [ "\$ID" = "$NOACCEPT_ID" ]; then
+                    printf '[{"id":"%s","title":"No-acceptance case","description":"desc"}]' "\$ID"
+                elif [ "\$ID" = "$EMPTYARR_ID" ]; then
+                    printf '[{"id":"%s","title":"Empty-array case","description":"desc","acceptance_criteria":[]}]' "\$ID"
+                elif ( cd "$STORE_DIR" && bd show "\$ID" --json >/dev/null 2>&1 ); then
+                    ( cd "$STORE_DIR" && bd show "\$ID" --json )
+                else
+                    echo "gc-stub: unknown id \$ID" >&2
+                    exit 1
+                fi
+                ;;
+            update|comment|close)
+                ID=\$2
+                if ( cd "$STORE_DIR" && bd show "\$ID" --json >/dev/null 2>&1 ); then
+                    ( cd "$STORE_DIR" && bd "\$@" )
+                else
+                    exit 0
+                fi
+                ;;
+            *)
+                echo "gc-stub: unsupported bd subcommand: \$1" >&2
+                exit 1
+                ;;
+        esac
         ;;
-    show)
-        ID=\$2
-        if [ "\$ID" = "$STRING_ID" ]; then
-            ( cd "$STORE_DIR" && bd show "\$ID" --json )
-        elif [ "\$ID" = "$ARRAY_ID" ]; then
-            printf '[{"id":"%s","title":"Array case","description":"desc","acceptance_criteria":["First hint","Second hint"]}]' "\$ID"
-        else
-            echo "gc-stub: unknown id \$ID" >&2
-            exit 1
-        fi
-        ;;
-    update|comment)
+    mail)
         exit 0
         ;;
     *)
-        echo "gc-stub: unsupported bd subcommand: \$1" >&2
+        echo "gc-stub: unsupported invocation: gc \$*" >&2
         exit 1
         ;;
 esac
 STUBEOF
 chmod +x "$STUB_BIN/gc"
+
+# Stub `kranz` for the RUNBEAD cases below: echoes one summary line and
+# exits with whatever code KRANZ_STUB_EXIT names, simulating a mission run
+# without ever executing a real kranz/Claude session.
+cat > "$STUB_BIN/kranz" <<'STUBEOF'
+#!/bin/sh
+set -u
+echo "kranz-stub: simulated mission run (exit ${KRANZ_STUB_EXIT:-0})"
+exit "${KRANZ_STUB_EXIT:-0}"
+STUBEOF
+chmod +x "$STUB_BIN/kranz"
 
 DISPATCH_LOG=$(GC_CITY="$CITY_DIR" KRANZ_RIG_DIR="$RIG_DIR" KRANZ_LABEL="kranz" \
     KRANZ_SPOOL="$SPOOL_DIR" KRANZ_ALLOW_UNVALIDATED=1 \
@@ -204,12 +288,18 @@ DISPATCH_STATUS=$?
 
 STRING_BRIEF=$(ls "$SPOOL_DIR"/*-"$STRING_ID".md 2>/dev/null | head -1)
 ARRAY_BRIEF=$(ls "$SPOOL_DIR"/*-"$ARRAY_ID".md 2>/dev/null | head -1)
+NOACCEPT_BRIEF=$(ls "$SPOOL_DIR"/*-"$NOACCEPT_ID".md 2>/dev/null | head -1)
+EMPTYARR_BRIEF=$(ls "$SPOOL_DIR"/*-"$EMPTYARR_ID".md 2>/dev/null | head -1)
 
-if [ $DISPATCH_STATUS -ne 0 ] || [ -z "$STRING_BRIEF" ] || [ -z "$ARRAY_BRIEF" ]; then
-    fail_case "fields-dispatch-ran" "kranz-dispatch to spool a brief for both fixture ids" "exit=$DISPATCH_STATUS log: $DISPATCH_LOG"
+if [ $DISPATCH_STATUS -ne 0 ] || [ -z "$STRING_BRIEF" ] || [ -z "$ARRAY_BRIEF" ] ||
+    [ -z "$NOACCEPT_BRIEF" ] || [ -z "$EMPTYARR_BRIEF" ]; then
+    fail_case "fields-dispatch-ran" "kranz-dispatch to spool a brief for all four fixture ids" "exit=$DISPATCH_STATUS log: $DISPATCH_LOG"
 else
     STRING_HINTS=$(awk '/^## Acceptance hints$/{f=1;next}/^## /{f=0}f' "$STRING_BRIEF")
     ARRAY_HINTS=$(awk '/^## Acceptance hints$/{f=1;next}/^## /{f=0}f' "$ARRAY_BRIEF")
+    NOACCEPT_HINTS=$(awk '/^## Acceptance hints$/{f=1;next}/^## /{f=0}f' "$NOACCEPT_BRIEF")
+    EMPTYARR_HINTS=$(awk '/^## Acceptance hints$/{f=1;next}/^## /{f=0}f' "$EMPTYARR_BRIEF")
+    FALLBACK_TEXT="The goal above is demonstrably met."
 
     if ! printf '%s' "$STRING_HINTS" | grep -qF "$STRING_HINT_TEXT"; then
         fail_case "fields-string-verbatim" "string acceptance_criteria carried verbatim" "$STRING_HINTS"
@@ -219,19 +309,94 @@ else
         echo "FIELDS-STRING: PASS"
     fi
 
-    if ! printf '%s' "$ARRAY_HINTS" | grep -qF "First hint"; then
-        fail_case "fields-array-first" "'First hint' present" "$ARRAY_HINTS"
-    elif ! printf '%s' "$ARRAY_HINTS" | grep -qF "Second hint"; then
-        fail_case "fields-array-second" "'Second hint' present" "$ARRAY_HINTS"
+    ARRAY_HINT_LINES=$(printf '%s\n' "$ARRAY_HINTS" | grep -c '.')
+    if [ "$ARRAY_HINT_LINES" -ne 2 ]; then
+        fail_case "fields-array-line-count" "exactly two non-empty hint lines" "$ARRAY_HINT_LINES lines: $ARRAY_HINTS"
+    elif ! printf '%s\n' "$ARRAY_HINTS" | grep -qx "First hint"; then
+        fail_case "fields-array-first-wholeline" "'First hint' as a whole line" "$ARRAY_HINTS"
+    elif ! printf '%s\n' "$ARRAY_HINTS" | grep -qx "Second hint"; then
+        fail_case "fields-array-second-wholeline" "'Second hint' as a whole line" "$ARRAY_HINTS"
     elif printf '%s' "$ARRAY_HINTS" | grep -qE '[][]|"'; then
         fail_case "fields-array-no-raw-json" "no raw JSON bracket/quote text in the array case (newline-joined entries expected)" "$ARRAY_HINTS"
     else
         echo "FIELDS-ARRAY: PASS"
     fi
 
+    if [ "$NOACCEPT_HINTS" != "$FALLBACK_TEXT" ]; then
+        fail_case "fields-noaccept-fallback" "'$FALLBACK_TEXT'" "'$NOACCEPT_HINTS'"
+    else
+        echo "FIELDS-NOACCEPT: PASS (missing acceptance_criteria falls back)"
+    fi
+
+    if [ "$EMPTYARR_HINTS" != "$FALLBACK_TEXT" ]; then
+        fail_case "fields-emptyarr-fallback" "'$FALLBACK_TEXT'" "'$EMPTYARR_HINTS'"
+    else
+        echo "FIELDS-EMPTYARR: PASS (empty array acceptance_criteria falls back)"
+    fi
+
+    STRING_LIVE_STATUS=$(status_of "$STRING_ID")
+    if [ "$STRING_LIVE_STATUS" != "in_progress" ]; then
+        fail_case "gc-stub-forward-update" "live status in_progress for real fixture $STRING_ID after dispatch" "$STRING_LIVE_STATUS"
+    elif ! grep -qE "update ${ARRAY_ID} --status in_progress\$" "$GC_CALLS_LOG" 2>/dev/null; then
+        fail_case "gc-stub-log-array-update" "gc-calls.log to log an update for synthetic id $ARRAY_ID carrying exactly --status in_progress" "$(cat "$GC_CALLS_LOG" 2>/dev/null)"
+    else
+        echo "GC-STUB: PASS (forwards update/comment to real bd for a live id, logs every invocation, no-ops the synthetic id)"
+    fi
+
     if [ "$FAILED" -eq 0 ]; then
         echo "FIELDS: PASS (acceptance_criteria string+array)"
     fi
+fi
+
+# --- Case: kranz-run-bead exit-code -> live bead status translation ----
+# Exercises the real packaging/gascity/bin/kranz-run-bead against a fresh
+# fixture bead per case (closed is terminal, so each case needs its own
+# bead). Each fixture is claimed to in_progress first, mirroring what
+# kranz-dispatch does before spooling, so the assertion actually proves a
+# transition rather than an already-true tautology.
+
+run_runbead_case() {
+    # $1 = exit code for the kranz stub to simulate
+    # $2 = expected resulting live bead status
+    # $3 = case label
+    CASE_CREATE_OUT=$(BD create "RUNBEAD fixture ($3)" --type task --json 2>&1)
+    CASE_ID=$(printf '%s' "$CASE_CREATE_OUT" | unwrap | jq -r '.id // empty')
+    if [ -z "$CASE_ID" ]; then
+        fail_case "runbead-$3-create" "a non-empty issue id" "'$CASE_CREATE_OUT'"
+        return 1
+    fi
+    BD update "$CASE_ID" --status in_progress >/dev/null 2>&1
+
+    MFILE="$SANDBOX/runbead-$3-mission.md"
+    printf '## Goal\nRUNBEAD fixture (%s)\n' "$3" > "$MFILE"
+
+    KRANZ_STUB_EXIT="$1" PATH="$STUB_BIN:$PATH" \
+        "$BIN_DIR/kranz-run-bead" "$CITY_DIR" "$CASE_ID" "$MFILE" "$RIG_DIR" 1 >/dev/null 2>&1
+
+    OBSERVED=$(status_of "$CASE_ID")
+    if [ "$OBSERVED" != "$2" ]; then
+        fail_case "runbead-$3" "$2" "$OBSERVED"
+        return 1
+    fi
+
+    if [ "$3" = "exit2" ]; then
+        COMMENT_CHECK=$(BD show "$CASE_ID" --json --include-comments 2>/dev/null)
+        if ! printf '%s' "$COMMENT_CHECK" | grep -qF "kranz mission BLOCKED"; then
+            fail_case "runbead-exit2-comment" "a BLOCKED comment recorded on $CASE_ID" "not found in: $COMMENT_CHECK"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+RUNBEAD_OK=1
+run_runbead_case 0 "closed"   "exit0" || RUNBEAD_OK=0
+run_runbead_case 2 "blocked"  "exit2" || RUNBEAD_OK=0
+run_runbead_case 3 "open"     "exit3" || RUNBEAD_OK=0
+run_runbead_case 1 "open"     "exit1" || RUNBEAD_OK=0
+
+if [ "$RUNBEAD_OK" -eq 1 ]; then
+    echo "RUNBEAD: PASS (exit 0/2/3/1 map to live bead states)"
 fi
 
 # --- Verdict --------------------------------------------------------------
