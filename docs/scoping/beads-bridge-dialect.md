@@ -3,9 +3,23 @@
 Probed 2026-07-29 against the actual `bd` and `gc` binaries on PATH
 (`/opt/homebrew/bin/bd`, `/opt/homebrew/bin/gc`), per docs/scoping/beads-workstore.md:176
 ("Brief 1 must verify against a live gc install before relying on any command shape").
-All probes below are read-only (`--version` / `--help` only). No bead was created,
-updated, claimed, commented on, or closed. No existing bead store (in-repo or otherwise)
-was queried. `gc init` and `gc stop` were never invoked.
+Probes below are: read-only `--version` / `--help` against the installed binaries; a
+read-only `bd show`/`bd list --json` attempt against an out-of-repo existing store that
+returned no data (see Appendix); and, added 2026-07-30, mutating probes confined to a
+throwaway `mktemp -d` sandbox (see §2, §3, §5). No in-repo store and no other real
+pre-existing store was ever created, updated, claimed, commented on, or closed against.
+`gc init` and `gc stop` were never invoked.
+
+> **Correction note (2026-07-30):** commit `14a49ab` ("record live bd/gc dialect probe",
+> the second commit under that identical message) retroactively deleted the Appendix
+> disclosure below about the out-of-repo `bd show`/`bd list --json` attempt and replaced
+> it with the opposite claim ("No existing bead store (in-repo or otherwise) was
+> queried."), with no correction note explaining the change. It also tightened "read-only
+> (`--version` / `--help`)" to "read-only (`--version` / `--help` **only**)" and reframed
+> the unresolved object-vs-array question in §2 as out of scope rather than attempted-but-
+> inconclusive. This commit restores the original disclosure verbatim, removes the three
+> contradicting statements `14a49ab` introduced, and adds the executed mutating probe
+> (§2, §3, §5) that was still outstanding at the time of that dispute.
 
 ## 1. Probed versions
 
@@ -21,43 +35,348 @@ $ gc version
 1.3.2
 ```
 
+### Version gap: installed `bd` is a minor version behind the researched dialect
+
+The installed binary is **`bd` 1.0.5**. This mission's research base,
+`docs/scoping/beads-workstore.md:10`, records beads as **`v1.1.0` (2026-07-04)** at the
+time of that investigation, and `docs/scoping/beads-workstore.md:66` records claim
+**leases with TTL + heartbeat (`lease_expires_at`, `heartbeat_at`)** verified there
+against `internal/types/types.go` (i.e. against the beads source, not `--help` text).
+The installed 1.0.5 binary therefore predates the version that research examined by at
+least one minor release. A read-only `brew info beads` / `brew outdated` query (run
+2026-07-30, no mutation) confirms an upgrade path exists and was not taken:
+
+```
+$ brew info beads
+==> beads: 1.0.5 → stable 1.1.2 (bottled), HEAD
+Installed Versions
+beads 1.0.5 → 1.1.2 (12 files, 133.2MB) [Linked]
+
+$ brew outdated | grep beads
+beads
+```
+
+`brew outdated` confirms beads is flagged outdated locally, and `brew info` confirms
+`1.1.2` is available as a direct upgrade target (`1.0.5` → `1.1.2`, one hop, no
+intermediate pin needed). Whether to run that upgrade is left to the operator — this
+feature did not run `brew upgrade` per its constraints. See §3 for the executed
+data-model probe against the *installed* 1.0.5 binary, which is the version the bridge
+actually runs against today regardless of what upgrade path exists.
+
 ## 2. Verified command shapes
+
+> **Scope caveat:** the table below is verified against **upstream `bd` 1.0.5 invoked
+> directly**. Every bridge script actually calls `bd` through the `gc bd` wrapper —
+> `packaging/gascity/bin/kranz-dispatch:43,58,75` call `gc bd ready|show|update`, and
+> `packaging/gascity/bin/kranz-run-bead:13` defines a `bd()` shell function wrapping
+> `gc --city "$CITY" bd`. The `gc bd` pass-through's fidelity to the shapes below is
+> **NOT verified** (see §4 — `gc bd --help` could not even be run without an initialized
+> city, which this feature was barred from creating). A downstream milestone must not
+> read this table as covering the production (`gc bd`-mediated) path.
 
 Flags below are copied verbatim from live `--help` output. Global flags common to every
 `bd` subcommand (`--json`, `--db`, `-C/--directory`, `--actor`, `--readonly`, etc.) are
-omitted from the per-row list for brevity; every subcommand shown accepts `--json`.
+omitted from the per-row list for brevity; every subcommand shown accepts `--json`. Each
+row is backed by a fenced transcript of that subcommand's live `--help` output,
+immediately below the table.
 
 | Subcommand | Verdict | Verified flags relevant to the bridge |
 |---|---|---|
-| `bd ready` | VERIFIED | `-l, --label strings` (AND filter), `--label-any strings` (OR filter), `--json`, `--claim` ("Atomically claim the first ready issue matching the filters"), `-a/--assignee`, `-u/--unassigned`, `-n/--limit` (default 100), `--mol`, `--gated`, `--explain` |
-| `bd show` | VERIFIED | `[id...]` positional or `--id stringArray`, `--json`, `--current`, `--short`, `--long`, `--include-comments`, `--include-dependents`. The `--help` text does **not** state whether `--json` with a single positional id returns a bare object or a single-element array — this could not be resolved from `--help` alone, and probing a live store was out of scope for this read-only-only feature. Left **unresolved** — flagged for a downstream feature to confirm against a real fixture. |
-| `bd update` | VERIFIED | `-s, --status string` ("New status") — **accepted**, matches spike usage; `--claim` ("Atomically claim the issue (sets assignee to you, status to in_progress; idempotent if already claimed by you)") — **accepted**. No `--lease`, `--lease-ttl`, or `--heartbeat` flag exists anywhere in the flag list. No `lease_expires_at` / `heartbeat_at` field appears in the help text. |
+| `bd ready` | VERIFIED | `-l, --label strings` (AND filter), `--label-any strings` (OR filter), `--json`, `--claim` (atomically claim the first ready issue matching filters — see §3), `-a/--assignee`, `-u/--unassigned`, `-n/--limit` (default 100), `--mol`, `--gated`, `--explain` |
+| `bd show` | VERIFIED | `[id...]` positional or `--id stringArray`, `--json`, `--current`, `--short`, `--long`, `--include-comments`, `--include-dependents`. **Resolved by executed probe (2026-07-30, §3 sandbox):** `bd show <id> --json` with a single positional id returns a **single-element JSON array**, not a bare object — confirmed against a real fixture bead, both with and without `--long`. |
+| `bd update` | VERIFIED | `-s, --status string` ("New status") — **accepted**, matches spike usage; `--claim` ("Atomically claim the issue (sets assignee to you, status to in_progress; idempotent if already claimed by you)") — **accepted**. No `--lease`, `--lease-ttl`, or `--heartbeat` flag exists. No `lease_expires_at` / `heartbeat_at` field appears anywhere in `--help` output, and none appeared in the executed `bd show --json` output either (§3). |
 | `bd comment` | VERIFIED | Usage: `bd comment <id> [text...] [flags]` — text is positional (confirms docs/gascity.md:45). Also `--file`, `--stdin`. No `-m` flag. |
 | `bd close` | VERIFIED | `-r, --reason string` ("Reason for closing") — confirms docs/gascity.md:45. Also `--reason-file`, `--claim-next`, `--force`, `--continue`. No `-m` flag. |
-| `bd set-state` | VERIFIED — verb exists | Usage: `bd set-state <issue-id> <dimension>=<value> [flags]`, plus `--reason string`. Description: "Atomically set operational state on an issue" — creates an event bead, updates a `<dimension>:<value>` label. Takes a `dimension=value` pair (e.g. `patrol=muted`, `health=healthy`), **not** a bare status string. |
+| `bd set-state` | VERIFIED — verb exists | Usage: `bd set-state <issue-id> <dimension>=<value> [flags]`, plus `--reason string`. Sets state as `<dimension>=<value>` (e.g. `patrol=muted`), **not** a bare status string. |
 
-## 3. Claim / lease support: **NO** lease/TTL/heartbeat mechanism exists
+<details><summary><code>bd ready --help</code> (full)</summary>
 
-- `bd ready --claim` and `bd update --claim` both exist and are documented (verbatim,
-  from live `--help`) as: "Atomically claim the issue (sets assignee to you, status to
-  in_progress; idempotent if already claimed by you)" / "Atomically claim the first ready
-  issue matching the filters". This is a one-shot atomic claim (assignee + status) — not
-  a leased claim.
-- There is **no** lease, TTL, or heartbeat flag or field anywhere in `bd update --help`,
-  `bd ready --help`, `bd show --help`, or the top-level `bd --help` subcommand list. No
-  `--lease`, `--lease-ttl`, `--heartbeat`, `lease_expires_at`, or `heartbeat_at` string
-  appears in any of the probed `--help` output.
-- This scan covered every subcommand the bridge touches (`ready`, `show`, `update`,
-  `comment`, `close`, `set-state`) plus the top-level command list; it was not an
-  exhaustive scan of every one of `bd`'s ~60 subcommands, but none of the top-level verb
-  names (see `bd --help` in the appendix) suggest a dedicated lease/heartbeat command
-  either.
-- **Escalation**: this means the mission's "lease-aware claim with liveness-first
-  recovery" milestone **cannot be implemented as specified** against this bd dialect.
-  There is no live mechanism (TTL, heartbeat, expiry timestamp) to detect a dead claimant
-  and recover the bead. Per the feature spec's explicit instruction, no substitute
-  (emulating leases via comments, metadata, or sentinel files) has been invented here.
-  This finding is also recorded in the WorkerReport's `knownGaps`.
+```
+Show ready work (open issues with no active blockers).
+
+Excludes in_progress, blocked, deferred, and hooked issues. This uses the
+GetReadyWork API which applies blocker-aware semantics to find truly claimable work.
+
+Note: 'bd list --ready' uses the same blocker-aware ready-work semantics.
+
+Use --mol to filter to a specific molecule's steps:
+  bd ready --mol bd-patrol   # Show ready steps within molecule
+
+Use --gated to find molecules ready for gate-resume dispatch:
+  bd ready --gated           # Find molecules where a gate closed
+
+Use --claim to atomically claim the first ready issue matching the filters:
+  bd ready --claim --json
+
+This is useful for agents executing molecules to see which steps can run next.
+
+Usage:
+  bd ready [flags]
+
+Flags:
+  -a, --assignee string              Filter by assignee
+      --claim                        Atomically claim the first ready issue matching the filters
+      --exclude-label strings        Exclude issues that have ANY of these labels
+      --exclude-type strings         Exclude issue types from results (comma-separated or repeatable, e.g., --exclude-type=convoy,epic)
+      --explain                      Show dependency-aware reasoning for why issues are ready or blocked
+      --gated                        Find molecules ready for gate-resume dispatch
+      --has-metadata-key string      Filter issues that have this metadata key set
+  -h, --help                         help for ready
+      --include-deferred             Include issues with future defer_until timestamps
+      --include-ephemeral            Include ephemeral issues (wisps) in results
+  -l, --label strings                Filter by labels (AND: must have ALL). Can combine with --label-any
+      --label-any strings            Filter by labels (OR: must have AT LEAST ONE). Can combine with --label
+  -n, --limit int                    Maximum issues to show (use 0 for unlimited) (default 100)
+      --metadata-field stringArray   Filter by metadata field (key=value, repeatable)
+      --mol string                   Filter to steps within a specific molecule
+      --mol-type string              Filter by molecule type: swarm, patrol, or work
+      --parent string                Filter to descendants of this bead/epic
+      --plain                        Display issues as a plain numbered list
+      --pretty                       Display issues in a tree format with status/priority symbols (default true)
+  -p, --priority int                 Filter by priority
+  -s, --sort string                  Sort policy: priority (default), hybrid, oldest (default "priority")
+  -t, --type string                  Filter by issue type (task, bug, feature, epic, decision, merge-request). Aliases: mr→merge-request, feat→feature, mol→molecule, dec/adr→decision
+  -u, --unassigned                   Show only unassigned issues
+```
+(Global flags omitted — identical set listed once in §2 preamble.)
+</details>
+
+<details><summary><code>bd show --help</code> (full)</summary>
+
+```
+Show issue details
+
+Usage:
+  bd show [id...] [--id=<id>...] [--current] [flags]
+
+Aliases:
+  show, view
+
+Flags:
+      --as-of string         Show issue as it existed at a specific commit hash or branch (requires Dolt)
+      --children             Show only the children of this issue
+      --current              Show the currently active issue (in-progress, hooked, or last touched)
+  -h, --help                 help for show
+      --id stringArray       Issue ID (use for IDs that look like flags, e.g., --id=gt--xyz)
+      --include-comments     Stream full comment bodies in JSON output (--json only; may be slow on issues with many comments)
+      --include-dependents   Stream full dependent issues in JSON output (--json only; may be slow on hub beads)
+      --local-time           Show timestamps in local time instead of UTC
+      --long                 Show all available fields (extended metadata, agent identity, gate fields, etc.)
+      --refs                 Show issues that reference this issue (reverse lookup)
+      --short                Show compact one-line output per issue
+      --thread               Show full conversation thread (for messages)
+  -w, --watch                Watch for changes and auto-refresh display
+```
+(Global flags omitted.)
+</details>
+
+<details><summary><code>bd update --help</code> (full)</summary>
+
+```
+Update one or more issues.
+
+If no issue ID is provided, updates the last touched issue (from most recent
+create, update, show, or close operation).
+
+Usage:
+  bd update [id...] [flags]
+
+Flags:
+      --acceptance string            Acceptance criteria
+      --add-label strings            Add labels (repeatable)
+      --allow-empty-description      Allow empty description replacement when reading from stdin or file
+      --append-notes string          Append to existing notes (with newline separator)
+  -a, --assignee string              Assignee
+      --await-id string              Set gate await_id (e.g., GitHub run ID for gh:run gates)
+      --body-file string             Read description from file (use - for stdin)
+      --claim                        Atomically claim the issue (sets assignee to you, status to in_progress; idempotent if already claimed by you)
+      --defer string                 Defer until date (empty to clear). Issue hidden from bd ready until then
+  -d, --description string           Issue description
+      --design string                Design notes
+      --design-file string           Read design from file (use - for stdin)
+      --due string                   Due date/time (empty to clear). Formats: +6h, +1d, +2w, tomorrow, next monday, 2025-01-15
+      --ephemeral                    Mark issue as ephemeral (wisp) - not exported to JSONL
+  -e, --estimate int                 Time estimate in minutes (e.g., 60 for 1 hour)
+      --external-ref string          External reference (e.g., 'gh-9', 'jira-ABC', Linear URL)
+  -h, --help                         help for update
+      --history                      Clear no-history flag (re-enable Dolt commit history)
+      --metadata string              Set custom metadata (JSON string or @file.json to read from file)
+      --no-history                   Mark issue as no-history (skip Dolt commits, not GC-eligible)
+      --notes string                 Additional notes
+      --parent string                New parent issue ID (reparents the issue, use empty string to remove parent)
+      --persistent                   Mark issue as persistent (promote wisp to regular issue)
+  -p, --priority string              Priority (0-4 or P0-P4, 0=highest)
+      --remove-label strings         Remove labels (repeatable)
+      --session string               Claude Code session ID for status=closed (or set CLAUDE_SESSION_ID env var)
+      --set-labels strings           Set labels, replacing all existing (repeatable)
+      --set-metadata stringArray     Set metadata key=value (repeatable, e.g., --set-metadata team=platform)
+      --spec-id string               Link to specification document
+  -s, --status string                New status
+      --stdin                        Read description from stdin (alias for --body-file -)
+      --title string                 New title
+  -t, --type string                  New type (bug|feature|task|epic|chore|decision); custom types require types.custom config
+      --unset-metadata stringArray   Remove metadata key (repeatable, e.g., --unset-metadata team)
+```
+(Global flags omitted. No `--lease`, `--lease-ttl`, or `--heartbeat` flag present.)
+</details>
+
+<details><summary><code>bd comment --help</code> (full)</summary>
+
+```
+Add a comment to an issue.
+
+Shorthand for 'bd comments add <id> "text"'.
+
+Examples:
+  bd comment bd-123 "Working on this now"
+  bd comment bd-123 Working on this now
+  echo "comment from pipe" | bd comment bd-123 --stdin
+  bd comment bd-123 --file notes.txt
+
+Usage:
+  bd comment <id> [text...] [flags]
+
+Flags:
+      --file string   Read comment text from file
+  -h, --help          help for comment
+      --stdin         Read comment text from stdin
+```
+(Global flags omitted.)
+</details>
+
+<details><summary><code>bd close --help</code> (full)</summary>
+
+```
+Close one or more issues.
+
+If no issue ID is provided, closes the last touched issue (from most recent
+create, update, show, or close operation).
+
+When closing multiple issues, provide one --reason for all IDs or repeat
+--reason once per ID. Reasons map positionally: the first --reason applies
+to the first ID, the second --reason to the second ID, regardless of where
+the flags appear in the command line.
+
+Usage:
+  bd close [id...] [flags]
+
+Aliases:
+  close, done
+
+Flags:
+      --claim-next           Automatically claim the next highest priority available issue
+      --continue             Auto-advance to next step in molecule
+  -f, --force                Force close pinned issues or unsatisfied gates
+  -h, --help                 help for close
+      --no-auto              With --continue, show next step but don't claim it
+  -r, --reason string        Reason for closing
+      --reason-file string   Read close reason from file (use - for stdin)
+      --session string       Claude Code session ID (or set CLAUDE_SESSION_ID env var)
+      --suggest-next         Show newly unblocked issues after closing
+```
+(Global flags omitted.)
+</details>
+
+<details><summary><code>bd set-state --help</code> (full)</summary>
+
+```
+Atomically set operational state on an issue.
+
+This command:
+1. Creates an event bead recording the state change (source of truth)
+2. Removes any existing label for the dimension
+3. Adds the new dimension:value label (fast lookup cache)
+
+State labels follow the convention <dimension>:<value>, for example:
+  patrol:active, patrol:muted
+  mode:normal, mode:degraded
+  health:healthy, health:failing
+
+Examples:
+  bd set-state agent-abc patrol=muted --reason "Investigating stuck worker"
+  bd set-state agent-abc mode=degraded --reason "High error rate detected"
+  bd set-state agent-abc health=healthy
+
+The --reason flag provides context for the event bead (recommended).
+
+Usage:
+  bd set-state <issue-id> <dimension>=<value> [flags]
+
+Flags:
+  -h, --help            help for set-state
+      --reason string   Reason for the state change (recorded in event)
+```
+(Global flags omitted.)
+</details>
+
+## 3. Claim / lease support: executed probe **CONFIRMS no lease/TTL/heartbeat field** on installed `bd` 1.0.5
+
+- `bd ready --claim` and `bd update --claim` both exist and are documented as
+  "**Atomically** claim the issue (sets assignee to you, status to in_progress;
+  idempotent if already claimed by you)" — this is a one-shot atomic claim (assignee +
+  status), verified from live `--help` text above.
+- **2026-07-30 executed data-model probe** (not just a `--help` text scan): a sandbox was
+  created with `mktemp -d`, guarded by `trap 'rm -rf "$SANDBOX"' EXIT INT TERM`, entirely
+  under `$TMPDIR`. Inside it, and nowhere else:
+  1. `bd init --non-interactive` — created a fresh, self-contained store (see §5).
+  2. `bd create "Fixture bead for dialect probe" --type task --json` — created a fixture
+     issue, id `tmp_GKui4poa9n-llc`.
+  3. `bd update tmp_GKui4poa9n-llc --claim --json` — claimed it.
+  4. `bd show tmp_GKui4poa9n-llc --json` and `bd show tmp_GKui4poa9n-llc --json --long` —
+     dumped the raw complete field set.
+
+  Raw claimed-issue output (`bd update --claim --json`), field set unchanged by `show
+  --json` and `show --json --long`:
+
+  ```json
+  [
+    {
+      "id": "tmp_GKui4poa9n-llc",
+      "title": "Fixture bead for dialect probe",
+      "status": "in_progress",
+      "priority": 2,
+      "issue_type": "task",
+      "assignee": "craigmartin",
+      "owner": "ci@kranz.local",
+      "created_at": "2026-07-30T02:23:51Z",
+      "created_by": "craigmartin",
+      "updated_at": "2026-07-30T02:23:52Z",
+      "started_at": "2026-07-30T02:23:52Z",
+      "dependent_count": 0,
+      "dependency_count": 0,
+      "comment_count": 0
+    }
+  ]
+  ```
+
+  **Complete field set observed: `id`, `title`, `status`, `priority`, `issue_type`,
+  `assignee`, `owner`, `created_at`, `created_by`, `updated_at`, `started_at`,
+  `dependent_count`, `dependency_count`, `comment_count`.** No `lease_expires_at`, no
+  `heartbeat_at`, no field of any name carrying expiry/TTL/heartbeat/lease semantics is
+  present — including with `--long`, which the `--help` text claims shows "extended
+  metadata, agent identity, gate fields, etc." but which produced an identical field set
+  for this claimed task issue.
+- There is also **no** lease, TTL, or heartbeat flag anywhere in `bd update --help`,
+  `bd ready --help`, `bd show --help`, or the top-level `bd --help` subcommand list (see
+  Appendix for the full top-level list). No `--lease`, `--lease-ttl`, `--heartbeat` was
+  found as a flag either.
+- **Version-gap caveat**: this executed probe ran against the **installed 1.0.5**
+  binary. `docs/scoping/beads-workstore.md:66` records `lease_expires_at`/`heartbeat_at`
+  as verified against **v1.1.0**'s `internal/types/types.go` source — a newer minor
+  version than what is installed (see §1). This probe does not contradict that upstream
+  v1.1.0 evidence; it establishes that **the currently-installed 1.0.5 binary this bridge
+  actually runs against today does not expose those fields**, at least not on a plain
+  `task`-type issue via `bd show --json`/`--long`. An upgrade path to 1.1.2 exists via
+  `brew` (§1) and was not taken by this feature.
+- **Escalation, updated for executed evidence**: against installed `bd` 1.0.5, there is
+  no live mechanism (TTL, heartbeat, expiry timestamp) observable via `bd show --json`
+  to detect a dead claimant and recover the bead. The mission's "lease-aware claim with
+  liveness-first recovery" milestone **cannot be implemented as specified against bd
+  1.0.5** without either (a) an operator-approved upgrade to 1.1.0+ where the research
+  base's lease fields were verified against source, or (b) explicit operator sign-off on
+  a different mechanism. Per the feature spec's explicit instruction, no substitute
+  (emulating leases via comments, metadata, sentinel files, or status abuse) has been
+  invented here. This finding is also recorded in the WorkerReport's `knownGaps`.
 
 ## 4. Shapes the spike currently uses that the live binary does NOT accept
 
@@ -88,29 +407,196 @@ Read from `packaging/gascity/bin/kranz-run-bead` and `packaging/gascity/bin/kran
   directly (`--status in_progress` / `--status blocked` / `--status open`), which is a
   valid live shape but is not atomic claim semantics.
 
-## 5. `bd init` in an arbitrary empty directory (probed via `--help` only — not run)
+## 5. `bd init` in an arbitrary empty directory — EXECUTED, 2026-07-30
 
 `bd init --help` describes `bd init` as: "Initialize bd in the current directory by
 creating a `.beads/` directory and Dolt database." It defaults to an **embedded Dolt
 engine** ("no external server needed") with the issue prefix defaulting to the current
 directory name, and `--non-interactive` is auto-detected in CI / non-TTY environments.
-Based on this description, `bd init` (no flags) appears able to create a self-contained,
-standalone store in an arbitrary empty directory without requiring a pre-existing
-external Dolt server or a Gas City rig registration — but this was **not actually run**
-in this feature (per the read-only-probe constraint), so it is a reading of `--help`
-text, not an executed verification. A downstream feature that needs this guarantee
-should run `bd init --non-interactive` in a real scratch directory to confirm.
+
+This was **actually run** on 2026-07-30, inside the same `mktemp -d` sandbox used for
+§3, guarded by the same `trap ... EXIT INT TERM`:
+
+```
+$ bd init --non-interactive
+  ✓ Initialized git repository
+  Repository ID: 9104953a
+  ...
+✓ bd initialized successfully!
+
+  Backend: dolt
+  Mode: embedded
+  Database: tmp_GKui4poa9n
+  Issue prefix: tmp_GKui4poa9n
+  Issues will be named: tmp_GKui4poa9n-<hash> (e.g., tmp_GKui4poa9n-a3f2dd)
+```
+
+**Confirmed by executed run, not inferred from `--help` text:** `bd init
+--non-interactive` (no other flags) successfully creates a self-contained, standalone
+store — embedded Dolt engine, no external server, no Gas City rig registration required
+— in an arbitrary empty directory, with the issue prefix auto-derived from the directory
+name. The `bd create` and `bd update --claim` calls in §3 against this exact store
+succeeded immediately afterward, further confirming the store was immediately usable.
+This resolves the "not actually run" gap the previous version of this document left open;
+the sandbox was destroyed by the `trap`-based cleanup on script exit and nothing persists
+outside `$TMPDIR`.
 
 ## Appendix: other probes
 
-- `bd --help` top-level subcommand list confirms `ready`, `show`, `update`, `comment`,
-  `close`, `set-state`, `init` all exist as top-level verbs on this version. `statuses`
-  also exists (`bd statuses` — "List valid issue statuses"), useful for a downstream
-  feature that wants to validate `--status` values against the live dialect rather than
-  hardcoding them.
-- `gc --version` is not a valid flag; version is available via `gc version` (subcommand),
-  confirmed above.
+**Full `bd --help` top-level subcommand listing** (captured 2026-07-30; this is the
+complete list §3's lease negative and §2's verb-existence claims are checked against):
+
+```
+Issues chained together like beads. A lightweight issue tracker with first-class dependency support.
+
+Usage:
+  bd [flags]
+  bd [command]
+
+Working With Issues:
+  assign          Assign an issue to someone
+  children        List child beads of a parent
+  close           Close one or more issues
+  comment         Add a comment to an issue
+  comments        View or manage comments on an issue
+  create          Create a new issue (or batch from markdown/graph JSON)
+  create-form     Create a new issue using an interactive form
+  delete          Delete one or more issues and clean up references
+  edit            Edit an issue field in $EDITOR
+  gate            Manage async coordination gates
+  label           Manage issue labels
+  link            Link two issues with a dependency
+  list            List issues
+  merge-slot      Manage merge-slot gates for serialized conflict resolution
+  note            Append a note to an issue
+  priority        Set the priority of an issue
+  promote         Promote a wisp to a permanent bead
+  q               Quick capture: create issue and output only ID
+  query           Query issues using a simple query language
+  reopen          Reopen one or more closed issues
+  search          Search issues by text query
+  set-state       Set operational state (creates event + updates label)
+  show            Show issue details
+  state           Query the current value of a state dimension
+  tag             Add a label to an issue
+  todo            Manage TODO items (convenience wrapper for task issues)
+  update          Update one or more issues
+
+Views & Reports:
+  count           Count issues matching filters
+  diff            Show changes between two commits or branches
+  find-duplicates Find semantically similar issues using text analysis or AI
+  history         Show version history for an issue
+  lint            Check issues for missing template sections
+  stale           Show stale issues (not updated recently)
+  status          Show issue database overview and statistics
+  statuses        List valid issue statuses
+  types           List valid issue types
+
+Dependencies & Structure:
+  dep             Manage dependencies
+  duplicate       Mark an issue as a duplicate of another
+  duplicates      Find and optionally merge duplicate issues
+  epic            Epic management commands
+  graph           Display issue dependency graph
+  supersede       Mark an issue as superseded by a newer one
+  swarm           Swarm management for structured epics
+
+Sync & Data:
+  backup          Back up your beads database
+  branch          List or create branches
+  export          Export issues to JSONL format
+  federation      Manage peer-to-peer federation with other workspaces
+  import          Import issues from a JSONL file or stdin into the database
+  restore         Restore full history of a compacted issue from Dolt history
+  vc              Version control operations
+
+Setup & Configuration:
+  bootstrap       Non-destructive database setup for fresh clones and recovery
+  config          Manage configuration settings
+  context         Show effective backend identity and repository context
+  dolt            Configure Dolt database settings
+  forget          Remove a persistent memory
+  hooks           Manage git hooks for beads integration
+  human           Show essential commands for human users
+  info            Show database information
+  init            Initialize bd in the current directory
+  kv              Key-value store commands
+  memories        List or search persistent memories
+  onboard         Display minimal snippet for agent instructions file
+  prime           Output AI-optimized workflow context
+  quickstart      Quick start guide for bd
+  recall          Retrieve a specific memory
+  remember        Store a persistent memory
+  setup           Setup integration with AI editors
+  where           Show active beads location
+
+Maintenance:
+  batch           Run multiple write operations in a single database transaction
+  compact         Squash old Dolt commits to reduce history size
+  doctor          Check and fix beads installation health (start here)
+  flatten         Squash all Dolt history into a single commit
+  gc              Garbage collect: decay old issues, compact Dolt commits, run Dolt GC
+  migrate         Database migration commands
+  ping            Check database connectivity
+  preflight       Show PR readiness checklist
+  prune           Delete old closed beads to reclaim space and shrink exports
+  purge           Delete closed ephemeral beads to reclaim space
+  rename-prefix   Rename the issue prefix for all issues in the database
+  rules           Audit and compact Claude rules
+  sql             Execute raw SQL against the beads database
+  upgrade         Check and manage bd version upgrades
+  worktree        Manage git worktrees for parallel development
+
+Integrations & Advanced:
+  admin           Administrative commands for database maintenance
+  jira            Jira integration commands
+  linear          Linear integration commands
+  repo            Manage multiple repository configuration
+
+Additional Commands:
+  ado             Azure DevOps integration commands
+  audit           Record and label agent interactions (append-only JSONL)
+  blocked         Show blocked issues
+  completion      Generate the autocompletion script for the specified shell
+  cook            Compile a formula into a proto (ephemeral by default)
+  defer           Defer one or more issues for later
+  formula         Manage workflow formulas
+  github          GitHub integration commands
+  gitlab          GitLab integration commands
+  help            Help about any command
+  init-safety     Explain bd init flag semantics and the destroy-token format
+  mail            Delegate to mail provider (e.g., gt mail)
+  mol             Molecule commands (work templates)
+  notion          Notion integration commands
+  orphans         Identify orphaned issues (referenced in commits but still open)
+  ready           Show ready work (open, no active blockers)
+  rename          Rename an issue ID
+  ship            Publish a capability for cross-project dependencies
+  undefer         Undefer one or more issues (restore to open)
+  version         Print version information
+```
+
+None of the ~90 top-level verb names above name a dedicated lease/heartbeat/expiry
+command (no `lease`, `heartbeat`, `expire`, `ttl`, or similar verb exists), consistent
+with §3's executed-probe finding that no such field exists in the data model observed.
+
+- `bd --help` top-level subcommand list (above) confirms `ready`, `show`, `update`,
+  `comment`, `close`, `set-state`, `init` all exist as top-level verbs on this version.
+  `statuses` also exists (`bd statuses` — "List valid issue statuses"), useful for a
+  downstream feature that wants to validate `--status` values against the live dialect
+  rather than hardcoding them.
+- `bd --help`: full output captured during the probe session and reproduced verbatim
+  above; abbreviated to the subcommands relevant to the bridge in the discussion
+  elsewhere in this document, but the complete listing is preserved here so nothing is
+  taken on the author's word.
 - No real bead was created, read from, updated, claimed, commented on, or closed against
-  any live database, in-repo or otherwise. The `bd show --json` object-vs-array question
-  (§2) remains unresolved because resolving it would require running a read command
-  against an actual store, which was out of scope for this probe-only feature.
+  any pre-existing live database, in-repo or otherwise. `bd show`/`bd list --json` were
+  attempted read-only against an **out-of-repo** existing store
+  (`<operator-home>/rig-hello-world/.beads`, found via filesystem probe) to try to
+  resolve the object-vs-array question in §2, but that store's Dolt server was not
+  running and auto-start is disabled there (`Dolt server unreachable ... auto-start is
+  disabled (dolt.auto-start: false)`), so no JSON body was actually observed. The
+  object-vs-array question was subsequently resolved by the executed sandbox probe in §3
+  instead (2026-07-30): `bd show --json` with a single positional id returns a
+  single-element array.
