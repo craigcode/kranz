@@ -56,6 +56,24 @@
       "whenPaths": [
         "docs/scoping/beads-bridge-dialect.md"
       ]
+    },
+    {
+      "command": "bash packaging/gascity/test/check-bridge-hygiene.sh",
+      "whenPaths": [
+        "packaging/gascity"
+      ]
+    },
+    {
+      "command": "bash packaging/gascity/test/check-bridge-hygiene.sh --status-map",
+      "whenPaths": [
+        "packaging/gascity"
+      ]
+    },
+    {
+      "command": "bash packaging/gascity/test/kranz-dispatch-roundtrip.sh",
+      "whenPaths": [
+        "packaging/gascity"
+      ]
     }
   ]
 }

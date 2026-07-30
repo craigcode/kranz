@@ -54,3 +54,27 @@ refinement. Put constraints in `--context` and testable outcomes in
 Known spike-era deviations and the production path (event triggers, sling
 targets via agent-script, multi-rig routing): see `docs/gascity.md` in the
 kranz repo.
+
+## Testing the bridge
+
+`packaging/gascity/test/kranz-dispatch-roundtrip.sh` is a live-`bd` round-trip
+fixture test: it stands up a throwaway `bd` store and fixture git rig under
+`mktemp -d`, drives a fixture bead through status transitions and a close,
+and exercises `kranz-dispatch`'s brief-field translation. It is registered
+as a gate in `.kranz/merge-gates.json`.
+
+**A merge-gate skip is silent; the mission contract is not.** When `bd` is
+absent from a host's `PATH`, the round-trip script prints `ROUNDTRIP: SKIP
+(bd not on PATH)` and exits 0 — a merge on that host proceeds without ever
+having actually round-tripped against a live `bd`. The mission validation
+contract greps for the `ROUNDTRIP: PASS` marker specifically, so the same
+skip that lets a `bd`-less host merge quietly will fail the mission
+contract outright. Install `bd` before relying on a green merge gate here as
+evidence the bridge was proven against a live install.
+
+`packaging/gascity/test/check-bridge-hygiene.sh` is a static check (no `bd`
+required): default mode fails if any bridge script under `bin/` still calls
+`bd set-state`, or if anything under `packaging/gascity/` invokes `gc init`
+or `gc stop`; `--status-map` mode fails until the translator scripts'
+headers document the full bidirectional open/in_progress/blocked/closed
+status mapping.
