@@ -39,6 +39,22 @@ quota* and *the flywheel*, not by replacing Opus where Opus is free at the
 margin. Do not route interactive/ambiguous work locally to save money; route
 batch, bounded, well-specified work locally to scale past the quota ceiling.
 
+### Cost-reduction taxonomy: removal / shrink / discount (2026-07-29)
+
+Decision language adapted from an external token-burn analysis (Nate Jones,
+Jul 2026), kept because it sharpens the routing rationale: "save tokens"
+hides three different jobs. **Removal** — material never enters the request
+(kranz's fresh-context-per-feature sessions, selecting passages before a
+model reads a source, settled procedures as deterministic gates/code).
+**Shrinking** — necessary state gets smaller (briefs and accepted results
+instead of transcript history). **Discounting** — the material stays and
+only the economics change (prompt caching, cheaper models, this local
+tier). Only the first two make a request smaller. Routing to this tier is
+*discounting*: moving an oversized request to a cheaper model "changes its
+price, not its size." It is therefore never a substitute for plan-time
+sizing (`plan-feature-context-fit-check`) or brief discipline — size first,
+then route what still needs a model.
+
 ---
 
 ## 2. Architecture principles

@@ -320,12 +320,26 @@ fallback attempt's session id is never persisted over the primary's
 resume token (session-orphaning rule, §8 of the review). Reroute policy
 is config, not hardcoded; pools declared per role.
 
+Second invariant (added 2026-07-29, from an external token-burn analysis —
+Nate Jones, Jul 2026 — whose gateway retried a token-limit failure
+verbatim on a second provider): context-overflow/token-limit failures are
+their OWN failure class, distinct from quota and generic. An oversized
+request is never blind-retried and never rerouted unchanged — the target
+backend cannot repair the source request's size. The class resolves by
+shrinking or by escalating to re-planning, does not trip the quota
+breaker, and is never charged against the worker's retry budget as a
+worker error (same spirit as triumvirate's environment class, §10).
+
 ## Acceptance hints
 - Tests: quota-class trips at lower threshold than generic; cooldown caps
   at configured window; half-open allows exactly one probe; reroute
   target excludes same-pool backends; fallback session id not written
   back (assert primary resume token unchanged after a failed-over
   attempt); breaker events appear in the event log.
+- Oversized-class tests: a token-limit failure classifies as
+  context-overflow, is not forwarded to any reroute target, does not trip
+  the quota breaker, does not decrement worker retries, and surfaces a
+  shrink/re-plan signal in the event log.
 - Passed-count guard on the named filter.
 ```
 
