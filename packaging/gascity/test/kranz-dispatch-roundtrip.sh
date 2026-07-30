@@ -140,17 +140,27 @@ fi
 echo "LEASE: SKIP (not yet implemented)"
 
 # --- Case: field translation is type-correct (acceptance_criteria) -----
-# Exercises the real kranz-dispatch script's brief-generation logic against
-# a controlled `bd show --json` payload: bd 1.0.5's CLI cannot itself store
-# an array-valued acceptance_criteria (bd update --acceptance takes a
-# string), so a thin `gc` stub intercepts `gc bd show` and substitutes a
-# fixture payload with acceptance_criteria as a string in one case and a
-# JSON array in the other, exactly the two shapes kranz-dispatch must
-# translate. Every other bridge call (`gc bd ready`, `gc bd update`, `gc bd
-# comment`) still resolves to a synthetic no-op below; no real bd store is
-# touched by this case.
+# Exercises the real kranz-dispatch script's brief-generation logic. The
+# STRING case is real end-to-end: a fixture bead with a string-valued
+# acceptance_criteria is created in the sandbox store via the live `bd`
+# binary (`bd create --acceptance "..."`, confirmed 2026-07-30 to produce
+# an `acceptance_criteria` string field in `bd show --json`), and the `gc`
+# stub's `show` branch for that id execs real `bd show <id> --json` against
+# $STORE_DIR and passes its output through unmodified — so this case
+# exercises the true `bd show --json` outer-envelope shape, not a
+# stub-authored one. The ARRAY case stays synthetic: bd 1.0.5's CLI has no
+# way to store an array-valued acceptance_criteria (`bd create --help` /
+# `bd update --help` only expose `--acceptance string`), so a JSON-array
+# payload can only be produced by fabricating the `bd show --json` response.
+# Every other bridge call (`gc bd ready`, `gc bd update`, `gc bd comment`)
+# still resolves to a synthetic no-op below; no real bd store is mutated by
+# the ARRAY case.
 
-STRING_ID="rt-string-1"
+STRING_HINT_TEXT="Do the thing and verify it works."
+STRING_CREATE_OUT=$(BD create "FIELDS string fixture" --type task --acceptance "$STRING_HINT_TEXT" --json 2>&1) || {
+    fail_case "fields-string-create" "bd create --acceptance to succeed" "$STRING_CREATE_OUT"
+}
+STRING_ID=$(printf '%s' "$STRING_CREATE_OUT" | unwrap | jq -r '.id // empty')
 ARRAY_ID="rt-array-1"
 
 cat > "$STUB_BIN/gc" <<STUBEOF
@@ -168,7 +178,7 @@ case "\${1:-}" in
     show)
         ID=\$2
         if [ "\$ID" = "$STRING_ID" ]; then
-            printf '[{"id":"%s","title":"String case","description":"desc","acceptance_criteria":"Do the thing and verify it works."}]' "\$ID"
+            ( cd "$STORE_DIR" && bd show "\$ID" --json )
         elif [ "\$ID" = "$ARRAY_ID" ]; then
             printf '[{"id":"%s","title":"Array case","description":"desc","acceptance_criteria":["First hint","Second hint"]}]' "\$ID"
         else
@@ -201,7 +211,7 @@ else
     STRING_HINTS=$(awk '/^## Acceptance hints$/{f=1;next}/^## /{f=0}f' "$STRING_BRIEF")
     ARRAY_HINTS=$(awk '/^## Acceptance hints$/{f=1;next}/^## /{f=0}f' "$ARRAY_BRIEF")
 
-    if ! printf '%s' "$STRING_HINTS" | grep -qF "Do the thing and verify it works."; then
+    if ! printf '%s' "$STRING_HINTS" | grep -qF "$STRING_HINT_TEXT"; then
         fail_case "fields-string-verbatim" "string acceptance_criteria carried verbatim" "$STRING_HINTS"
     elif printf '%s' "$STRING_HINTS" | grep -qE '[][]|"'; then
         fail_case "fields-string-no-raw-json" "no raw JSON bracket/quote text in the string case" "$STRING_HINTS"
