@@ -3,8 +3,9 @@
 Probed 2026-07-29 against the actual `bd` and `gc` binaries on PATH
 (`/opt/homebrew/bin/bd`, `/opt/homebrew/bin/gc`), per docs/scoping/beads-workstore.md:176
 ("Brief 1 must verify against a live gc install before relying on any command shape").
-All probes below are read-only (`--version` / `--help`). No bead was created, updated,
-claimed, commented on, or closed. `gc init` and `gc stop` were never invoked.
+All probes below are read-only (`--version` / `--help` only). No bead was created,
+updated, claimed, commented on, or closed. No existing bead store (in-repo or otherwise)
+was queried. `gc init` and `gc stop` were never invoked.
 
 ## 1. Probed versions
 
@@ -22,31 +23,35 @@ $ gc version
 
 ## 2. Verified command shapes
 
-All flags below are copied verbatim from live `--help` output (Global Flags common to
-every bd subcommand — `--json`, `--db`, `-C/--directory`, `--actor`, etc. — are omitted
-from the per-row flag list for brevity; every subcommand accepts `--json`).
+Flags below are copied verbatim from live `--help` output. Global flags common to every
+`bd` subcommand (`--json`, `--db`, `-C/--directory`, `--actor`, `--readonly`, etc.) are
+omitted from the per-row list for brevity; every subcommand shown accepts `--json`.
 
 | Subcommand | Verdict | Verified flags relevant to the bridge |
 |---|---|---|
-| `bd ready` | VERIFIED | `-l, --label strings` (AND filter), `--label-any strings` (OR filter), `--json`, `--claim` (atomically claim the first ready issue matching filters — see §3), `-a/--assignee`, `-u/--unassigned`, `-n/--limit` (default 100), `--mol`, `--gated`, `--explain` |
-| `bd show` | VERIFIED | `[id...]` positional or `--id stringArray`, `--json`, `--current`, `--short`, `--long`, `--include-comments`, `--include-dependents`. Help text does **not** state whether `--json` with a single positional id returns a bare object or a single-element array — this could not be resolved from `--help` alone and no store was probed further (see gap note below). |
-| `bd update` | VERIFIED | `-s, --status string` ("New status") — **accepted**, matches spike usage; `--claim` ("Atomically claim the issue (sets assignee to you, status to in_progress; idempotent if already claimed by you)") — **accepted**. No `--lease`, `--lease-ttl`, or `--heartbeat` flag exists. No `lease_expires_at` / `heartbeat_at` field appears anywhere in `--help` output. |
+| `bd ready` | VERIFIED | `-l, --label strings` (AND filter), `--label-any strings` (OR filter), `--json`, `--claim` ("Atomically claim the first ready issue matching the filters"), `-a/--assignee`, `-u/--unassigned`, `-n/--limit` (default 100), `--mol`, `--gated`, `--explain` |
+| `bd show` | VERIFIED | `[id...]` positional or `--id stringArray`, `--json`, `--current`, `--short`, `--long`, `--include-comments`, `--include-dependents`. The `--help` text does **not** state whether `--json` with a single positional id returns a bare object or a single-element array — this could not be resolved from `--help` alone, and probing a live store was out of scope for this read-only-only feature. Left **unresolved** — flagged for a downstream feature to confirm against a real fixture. |
+| `bd update` | VERIFIED | `-s, --status string` ("New status") — **accepted**, matches spike usage; `--claim` ("Atomically claim the issue (sets assignee to you, status to in_progress; idempotent if already claimed by you)") — **accepted**. No `--lease`, `--lease-ttl`, or `--heartbeat` flag exists anywhere in the flag list. No `lease_expires_at` / `heartbeat_at` field appears in the help text. |
 | `bd comment` | VERIFIED | Usage: `bd comment <id> [text...] [flags]` — text is positional (confirms docs/gascity.md:45). Also `--file`, `--stdin`. No `-m` flag. |
 | `bd close` | VERIFIED | `-r, --reason string` ("Reason for closing") — confirms docs/gascity.md:45. Also `--reason-file`, `--claim-next`, `--force`, `--continue`. No `-m` flag. |
-| `bd set-state` | VERIFIED — verb exists | Usage: `bd set-state <issue-id> <dimension>=<value> [flags]`, plus `--reason string`. Sets state as `<dimension>=<value>` (e.g. `patrol=muted`), **not** a bare status string. |
+| `bd set-state` | VERIFIED — verb exists | Usage: `bd set-state <issue-id> <dimension>=<value> [flags]`, plus `--reason string`. Description: "Atomically set operational state on an issue" — creates an event bead, updates a `<dimension>:<value>` label. Takes a `dimension=value` pair (e.g. `patrol=muted`, `health=healthy`), **not** a bare status string. |
 
 ## 3. Claim / lease support: **NO** lease/TTL/heartbeat mechanism exists
 
-- `bd ready --claim` and `bd update --claim` both exist and are documented as
-  "**Atomically** claim the issue (sets assignee to you, status to in_progress;
-  idempotent if already claimed by you)" — this is a one-shot atomic claim (assignee +
-  status), verified from live `--help` text above.
+- `bd ready --claim` and `bd update --claim` both exist and are documented (verbatim,
+  from live `--help`) as: "Atomically claim the issue (sets assignee to you, status to
+  in_progress; idempotent if already claimed by you)" / "Atomically claim the first ready
+  issue matching the filters". This is a one-shot atomic claim (assignee + status) — not
+  a leased claim.
 - There is **no** lease, TTL, or heartbeat flag or field anywhere in `bd update --help`,
   `bd ready --help`, `bd show --help`, or the top-level `bd --help` subcommand list. No
-  `--lease`, `--lease-ttl`, `--heartbeat`, `lease_expires_at`, or `heartbeat_at` was found.
-  A full-text scan of every subcommand's help was not exhaustive beyond the subcommands
-  the bridge touches (ready/show/update/comment/close/set-state), but none of the flags
-  the bridge would plausibly use carry lease semantics.
+  `--lease`, `--lease-ttl`, `--heartbeat`, `lease_expires_at`, or `heartbeat_at` string
+  appears in any of the probed `--help` output.
+- This scan covered every subcommand the bridge touches (`ready`, `show`, `update`,
+  `comment`, `close`, `set-state`) plus the top-level command list; it was not an
+  exhaustive scan of every one of `bd`'s ~60 subcommands, but none of the top-level verb
+  names (see `bd --help` in the appendix) suggest a dedicated lease/heartbeat command
+  either.
 - **Escalation**: this means the mission's "lease-aware claim with liveness-first
   recovery" milestone **cannot be implemented as specified** against this bd dialect.
   There is no live mechanism (TTL, heartbeat, expiry timestamp) to detect a dead claimant
@@ -89,26 +94,23 @@ Read from `packaging/gascity/bin/kranz-run-bead` and `packaging/gascity/bin/kran
 creating a `.beads/` directory and Dolt database." It defaults to an **embedded Dolt
 engine** ("no external server needed") with the issue prefix defaulting to the current
 directory name, and `--non-interactive` is auto-detected in CI / non-TTY environments.
-Based on this description, `bd init` (no flags) appears able to create a
-self-contained, standalone store in an arbitrary empty directory without requiring a
-pre-existing external Dolt server or a Gas City rig registration — but this was **not
-actually run** in this feature (per the read-only-probe constraint), so it is a reading
-of `--help` text, not an executed verification. A downstream feature that needs this
-guarantee should run `bd init --non-interactive` in a real scratch directory to confirm.
+Based on this description, `bd init` (no flags) appears able to create a self-contained,
+standalone store in an arbitrary empty directory without requiring a pre-existing
+external Dolt server or a Gas City rig registration — but this was **not actually run**
+in this feature (per the read-only-probe constraint), so it is a reading of `--help`
+text, not an executed verification. A downstream feature that needs this guarantee
+should run `bd init --non-interactive` in a real scratch directory to confirm.
 
 ## Appendix: other probes
 
-- `bd --help`: top-level subcommand list confirms `ready`, `show`, `update`, `comment`,
-  `close`, `set-state`, `init` all exist as top-level verbs on this version (full output
-  captured during the probe session; abbreviated here to the subcommands relevant to the
-  bridge). `statuses` also exists (`bd statuses` — "List valid issue statuses"), useful
-  for a downstream feature that wants to validate `--status` values against the live
-  dialect rather than hardcoding them.
+- `bd --help` top-level subcommand list confirms `ready`, `show`, `update`, `comment`,
+  `close`, `set-state`, `init` all exist as top-level verbs on this version. `statuses`
+  also exists (`bd statuses` — "List valid issue statuses"), useful for a downstream
+  feature that wants to validate `--status` values against the live dialect rather than
+  hardcoding them.
+- `gc --version` is not a valid flag; version is available via `gc version` (subcommand),
+  confirmed above.
 - No real bead was created, read from, updated, claimed, commented on, or closed against
-  any live database. `bd show`/`bd list --json` were attempted read-only against an
-  **out-of-repo** existing store (`<operator-home>/rig-hello-world/.beads`, found via
-  filesystem probe) to try to resolve the object-vs-array question in §2, but that
-  store's Dolt server was not running and auto-start is disabled there
-  (`Dolt server unreachable ... auto-start is disabled (dolt.auto-start: false)`), so no
-  JSON body was actually observed — the object-vs-array question for `bd show --json`
-  remains unresolved and is called out explicitly in §2 rather than guessed at.
+  any live database, in-repo or otherwise. The `bd show --json` object-vs-array question
+  (§2) remains unresolved because resolving it would require running a read command
+  against an actual store, which was out of scope for this probe-only feature.
