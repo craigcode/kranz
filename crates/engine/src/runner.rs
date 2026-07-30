@@ -775,17 +775,15 @@ fn seed_worker_env(
     let mut relocated = false;
     if auth_verdict == AuthVerdict::Authenticated {
         let scratch_root = crate::backend_claude::scratch_home_root(&spec.session_id);
-        if let Ok((home, config_dir)) = crate::backend_claude::seed_worker_scratch_home(
+        if let Ok((home, _config_dir)) = crate::backend_claude::seed_worker_scratch_home(
             &scratch_root,
             real_home,
             real_config_dir,
         ) {
             spec.env
                 .insert("HOME".to_string(), home.display().to_string());
-            spec.env.insert(
-                "CLAUDE_CONFIG_DIR".to_string(),
-                config_dir.display().to_string(),
-            );
+            // CLAUDE_CONFIG_DIR deliberately NOT set (it poisons keychain
+            // OAuth resolution; redundant with a relocated HOME).
             relocated = true;
         }
     }
@@ -1484,18 +1482,17 @@ mod tests {
         );
 
         let home = spec.env.get("HOME").expect("HOME must be relocated");
-        let config_dir = spec
-            .env
-            .get("CLAUDE_CONFIG_DIR")
-            .expect("CLAUDE_CONFIG_DIR must be relocated");
+        // CLAUDE_CONFIG_DIR is deliberately NOT set (it poisons keychain
+        // OAuth); the config dir is HOME/.claude implicitly.
+        assert!(
+            !spec.env.contains_key("CLAUDE_CONFIG_DIR"),
+            "CLAUDE_CONFIG_DIR must NOT be relocated (keychain OAuth poison)"
+        );
         let scratch_root = crate::backend_claude::scratch_home_root(&spec.session_id);
         assert!(std::path::Path::new(home).starts_with(&scratch_root));
-        assert_eq!(
-            std::path::Path::new(config_dir),
-            std::path::Path::new(home).join(".claude")
-        );
+        let config_dir = std::path::Path::new(home).join(".claude");
 
-        let entries: Vec<_> = std::fs::read_dir(config_dir)
+        let entries: Vec<_> = std::fs::read_dir(&config_dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();

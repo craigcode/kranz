@@ -754,12 +754,14 @@ fn claude_child_env(spec: &SessionSpec) -> HashMap<String, String> {
         real_home.as_deref(),
         real_config_dir.as_deref(),
     ) {
-        Ok((home, config_dir)) => {
-            let mut spec_env = spec.env.clone();
-            spec_env.insert(
-                "CLAUDE_CONFIG_DIR".to_string(),
-                config_dir.display().to_string(),
-            );
+        Ok((home, _config_dir)) => {
+            // CLAUDE_CONFIG_DIR is deliberately NOT set: when present it
+            // poisons the CLI's keychain-backed OAuth resolution entirely
+            // ("Not logged in", probed 2026-07-29 — even with the real
+            // config contents copied in), and it is redundant for a
+            // relocated HOME, where `$HOME/.claude` resolves implicitly.
+            // The seeded scratch home (config entries + Library/Keychains
+            // symlink + USER passthrough) is the whole recipe.
             tracing::info!(
                 session_id = %spec.session_id,
                 decision = "scratch-seeded",
@@ -767,7 +769,7 @@ fn claude_child_env(spec: &SessionSpec) -> HashMap<String, String> {
                  scratch HOME (agent-env-clear)"
             );
             crate::agent_env::session_env_with_home(
-                &spec_env,
+                &spec.env,
                 &spec.session_id,
                 Some(CLAUDE_AUTH_ENV),
                 &home,
@@ -1427,11 +1429,9 @@ mod tests {
             "a HOME-less spec must spawn into the per-session scratch HOME:\n{child_env}"
         );
         assert!(
-            child_env.contains(&format!(
-                "CLAUDE_CONFIG_DIR={}",
-                expected_home.join(".claude").display()
-            )),
-            "the scratch config dir must be wired:\n{child_env}"
+            !child_env.contains("CLAUDE_CONFIG_DIR"),
+            "CLAUDE_CONFIG_DIR must NOT be set (it poisons keychain OAuth; \
+             HOME/.claude resolves implicitly):\n{child_env}"
         );
         assert!(
             !child_env.contains("GH_TOKEN") && !child_env.contains("hunter2"),
