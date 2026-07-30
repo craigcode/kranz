@@ -74,6 +74,12 @@
       "whenPaths": [
         "rust-toolchain.toml"
       ]
+    },
+    {
+      "command": "bash packaging/gascity/test/check-build-toolchain-resolves.sh",
+      "whenPaths": [
+        "rust-toolchain.toml"
+      ]
     }
   ]
 }
