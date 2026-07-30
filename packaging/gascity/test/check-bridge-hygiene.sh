@@ -28,7 +28,7 @@ status_map_file_missing() {
     MISSING=""
 
     check_pair() {
-        # $2 = bead status, $3 = kranz-side word (regex, case-insensitive)
+        # $1 = bead status, $2 = kranz-side word (regex, case-insensitive)
         bead_status="$1"
         kranz_word="$2"
         # A bidirectional comment line naming both, in either order, joined
@@ -123,8 +123,9 @@ default_mode() {
             "$SCRIPT_DIR/check-bridge-hygiene.sh":*) return 0 ;;
         esac
         CONTENT=$(printf '%s\n' "$line" | sed -e 's/^[^:]*:[0-9][0-9]*://')
-        case "$CONTENT" in
-            [[:space:]]*#*|'#'*) return 0 ;;
+        STRIPPED=$(printf '%s\n' "$CONTENT" | sed -e 's/^[[:space:]]*//')
+        case "$STRIPPED" in
+            '#'*) return 0 ;;
         esac
         return 1
     }
