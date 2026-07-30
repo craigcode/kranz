@@ -18,7 +18,8 @@ brief and mapping the exit code back into City state. Dispatch flow:
 1. Bead fields → ticket-shaped `mission.md`
    (`title → ## Goal`, `description → ## Context`,
    `acceptance_criteria → ## Acceptance hints`).
-2. Bead claimed (`in_progress`) and spooled; the worker runs
+2. Bead marked `in_progress` by a direct status write (not an atomic claim)
+   and spooled; the worker runs
    `kranz exec -f mission.md` in the rig checkout — fully autonomous,
    auto-approved plan, bounded fix cycles (`KRANZ_MAX_CYCLES`, default 1).
    Rigs that disable the scrutiny validator are REFUSED (letter-over-spirit
