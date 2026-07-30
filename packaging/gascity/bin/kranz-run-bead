@@ -11,7 +11,7 @@
 # Bidirectional bead status <-> kranz-side state map (all four bead
 # statuses, both directions):
 #   open         <-> Queued           (ready for dispatch / re-readied)
-#   in_progress  <-> Running          (kranz-dispatch claims it before spooling)
+#   in_progress  <-> Running          (set by kranz-dispatch after the brief is spooled)
 #   blocked      <-> Blocked-report   (exit 2 below; escalated to a human)
 #   closed       <-> Done             (exit 0 below; mission complete)
 #
