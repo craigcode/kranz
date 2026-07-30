@@ -325,8 +325,7 @@ Flags:
   4. `bd show tmp_GKui4poa9n-llc --json` and `bd show tmp_GKui4poa9n-llc --json --long` —
      dumped the raw complete field set.
 
-  Raw claimed-issue output (`bd update --claim --json`), field set unchanged by `show
-  --json` and `show --json --long`:
+  Raw claimed-issue output (`bd update --claim --json`):
 
   ```json
   [
@@ -356,6 +355,65 @@ Flags:
   present — including with `--long`, which the `--help` text claims shows "extended
   metadata, agent identity, gate fields, etc." but which produced an identical field set
   for this claimed task issue.
+
+  **2026-07-30, second executed probe — `bd show --json` itself actually run.** A
+  fresh, independent `mktemp -d` sandbox was created (store name `bd_probe_aWzwPk`,
+  issue prefix `bd-probe-aWzwPk`), guarded by `trap 'rm -rf "$SANDBOX"' EXIT INT TERM`,
+  entirely under `$TMPDIR`, with its own `bd init --non-interactive` store. Neither
+  `gc init` nor `gc stop` was run, and no real bead store was touched. A fixture issue
+  `bd-probe-aWzwPk-1li` was created and claimed exactly as in steps 1–3 above, then the
+  two `bd show` commands were run directly, back to back, and their raw stdout is
+  pasted verbatim below (whitespace, key order, and values unmodified):
+
+  ```
+  $ bd show bd-probe-aWzwPk-1li --json
+  [
+    {
+      "id": "bd-probe-aWzwPk-1li",
+      "title": "Fixture bead for dialect probe",
+      "status": "in_progress",
+      "priority": 2,
+      "issue_type": "task",
+      "assignee": "craigmartin",
+      "owner": "ci@kranz.local",
+      "created_at": "2026-07-30T17:49:57Z",
+      "created_by": "craigmartin",
+      "updated_at": "2026-07-30T17:49:58Z",
+      "started_at": "2026-07-30T17:49:58Z",
+      "dependent_count": 0,
+      "dependency_count": 0,
+      "comment_count": 0
+    }
+  ]
+  ```
+
+  ```
+  $ bd show bd-probe-aWzwPk-1li --json --long
+  [
+    {
+      "id": "bd-probe-aWzwPk-1li",
+      "title": "Fixture bead for dialect probe",
+      "status": "in_progress",
+      "priority": 2,
+      "issue_type": "task",
+      "assignee": "craigmartin",
+      "owner": "ci@kranz.local",
+      "created_at": "2026-07-30T17:49:57Z",
+      "created_by": "craigmartin",
+      "updated_at": "2026-07-30T17:49:58Z",
+      "started_at": "2026-07-30T17:49:58Z",
+      "dependent_count": 0,
+      "dependency_count": 0,
+      "comment_count": 0
+    }
+  ]
+  ```
+
+  These two transcripts independently confirm, from `bd show --json` itself rather
+  than inference from `update --claim --json`: (1) `bd show <id> --json` with a single
+  positional id returns a **single-element JSON array**, not a bare object; and (2) the
+  field set carries no `lease_expires_at`, `heartbeat_at`, or any other expiry/TTL/
+  heartbeat/lease-named field, identically with and without `--long`.
 - There is also **no** lease, TTL, or heartbeat flag anywhere in `bd update --help`,
   `bd ready --help`, `bd show --help`, or the top-level `bd --help` subcommand list (see
   Appendix for the full top-level list). No `--lease`, `--lease-ttl`, `--heartbeat` was
