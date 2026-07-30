@@ -248,6 +248,11 @@ pub enum EventKind {
         /// ENGINE's own git invocations; a moved ref retargets later merges).
         #[serde(default, rename = "gitMetadataChanged")]
         git_metadata_changed: bool,
+        /// WHICH metadata surfaces changed (additive): `config` / `hooks` /
+        /// `refs` / `index-flags` / `info-exclude` — a tripwire fire is
+        /// diagnosable from the event alone.
+        #[serde(default, rename = "gitMetadataFields")]
+        git_metadata_fields: Vec<String>,
     },
 
     /// A validator session ran in a throwaway snapshot of the session
@@ -952,6 +957,7 @@ mod tests {
             appeared: vec![" M README.md".to_string(), "?? sneaky.rs".to_string()],
             resolved: vec![],
             git_metadata_changed: false,
+            git_metadata_fields: Vec::new(),
         };
         let json = serde_json::to_value(&tamper).unwrap();
         assert_eq!(json["type"], "validator.tamper");

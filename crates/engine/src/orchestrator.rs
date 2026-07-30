@@ -3961,6 +3961,7 @@ impl MissionEngine {
             appeared: drift.appeared.clone(),
             resolved: drift.resolved.clone(),
             git_metadata_changed: drift.git_metadata_changed,
+            git_metadata_fields: drift.git_metadata_fields.clone(),
         })?;
         let reason = format!(
             "{} session escaped its snapshot: the REAL checkout drifted ({}); \
@@ -4005,6 +4006,7 @@ impl MissionEngine {
             appeared: validator_flags.clone(),
             resolved: Vec::new(),
             git_metadata_changed: false,
+            git_metadata_fields: Vec::new(),
         })?;
         let reason = format!(
             "{} session set skip-worktree/assume-unchanged flags in its \

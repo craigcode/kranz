@@ -99,16 +99,30 @@ impl CheckoutFingerprint {
         }
         let before: std::collections::BTreeSet<&str> = self.status.lines().collect();
         let later: std::collections::BTreeSet<&str> = after.status.lines().collect();
+        let mut metadata_fields: Vec<String> = Vec::new();
+        if self.git_config != after.git_config {
+            metadata_fields.push("config".to_string());
+        }
+        if self.git_hooks != after.git_hooks {
+            metadata_fields.push("hooks".to_string());
+        }
+        if self.git_refs != after.git_refs {
+            metadata_fields.push("refs".to_string());
+        }
+        if self.index_flags != after.index_flags {
+            metadata_fields.push("index-flags".to_string());
+        }
+        if self.info_exclude != after.info_exclude {
+            metadata_fields.push("info-exclude".to_string());
+        }
+        let git_metadata_changed = !metadata_fields.is_empty();
         Some(CheckoutDrift {
             head_before: self.head.clone(),
             head_after: after.head.clone(),
             appeared: later.difference(&before).map(|s| s.to_string()).collect(),
             resolved: before.difference(&later).map(|s| s.to_string()).collect(),
-            git_metadata_changed: self.git_config != after.git_config
-                || self.git_hooks != after.git_hooks
-                || self.git_refs != after.git_refs
-                || self.index_flags != after.index_flags
-                || self.info_exclude != after.info_exclude,
+            git_metadata_changed,
+            git_metadata_fields: metadata_fields,
         })
     }
 }
@@ -191,6 +205,11 @@ pub struct CheckoutDrift {
     /// `.git` config/hooks/refs changed — the checkout can look identical
     /// while the plumbing was weaponized.
     pub git_metadata_changed: bool,
+    /// WHICH metadata surfaces changed (`config`/`hooks`/`refs`/
+    /// `index-flags`/`info-exclude`) — recorded so a tripwire fire is
+    /// diagnosable without reconstructing the window (mission m-83d1ed
+    /// fired on metadata alone with no field named).
+    pub git_metadata_fields: Vec<String>,
 }
 
 impl CheckoutDrift {
@@ -225,7 +244,10 @@ impl CheckoutDrift {
             ));
         }
         if self.git_metadata_changed {
-            parts.push(".git metadata changed (config/hooks/refs)".to_string());
+            parts.push(format!(
+                ".git metadata changed ({})",
+                self.git_metadata_fields.join("/")
+            ));
         }
         parts.join("; ")
     }
