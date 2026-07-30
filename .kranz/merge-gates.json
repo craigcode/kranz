@@ -68,6 +68,12 @@
       "whenPaths": [
         "rust-toolchain.toml"
       ]
+    },
+    {
+      "command": "bash packaging/gascity/test/check-fmt-toolchain-resolves.sh",
+      "whenPaths": [
+        "rust-toolchain.toml"
+      ]
     }
   ]
 }
