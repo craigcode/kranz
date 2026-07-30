@@ -62,6 +62,12 @@
       "whenPaths": [
         "rust-toolchain.toml"
       ]
+    },
+    {
+      "command": "bash packaging/gascity/test/check-clippy-toolchain-resolves.sh",
+      "whenPaths": [
+        "rust-toolchain.toml"
+      ]
     }
   ]
 }
