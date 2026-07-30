@@ -56,6 +56,12 @@
       "whenPaths": [
         "docs/scoping/beads-bridge-dialect.md"
       ]
+    },
+    {
+      "command": "bash packaging/gascity/test/check-rust-toolchain-pinned.sh",
+      "whenPaths": [
+        "rust-toolchain.toml"
+      ]
     }
   ]
 }
