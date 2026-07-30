@@ -50,6 +50,12 @@
       "whenPaths": [
         "apps/dashboard"
       ]
+    },
+    {
+      "command": "bash packaging/gascity/test/check-dialect-doc-scope.sh",
+      "whenPaths": [
+        "docs/scoping/beads-bridge-dialect.md"
+      ]
     }
   ]
 }
