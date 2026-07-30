@@ -116,14 +116,22 @@ default_mode() {
         line="$1"
         case "$line" in
             "$GASCITY_DIR/README.md":*) return 0 ;;
-            # This script's own detection code necessarily embeds the
-            # literal search strings as grep patterns/messages — that is
-            # data, not an invocation of either command. Every OTHER file
-            # under packaging/gascity/, including test/, is still checked.
-            "$SCRIPT_DIR/check-bridge-hygiene.sh":*) return 0 ;;
         esac
         CONTENT=$(printf '%s\n' "$line" | sed -e 's/^[^:]*:[0-9][0-9]*://')
         STRIPPED=$(printf '%s\n' "$CONTENT" | sed -e 's/^[[:space:]]*//')
+        case "$line" in
+            # This script's own detection code necessarily embeds the
+            # literal search patterns/messages as grep invocations and echo
+            # diagnostics — that is data, not an invocation of either
+            # command. Only THOSE specific lines are exempt; any other line
+            # in this file (e.g. a bare `gc init`/`gc stop` slipped in
+            # elsewhere) is still caught below like any other file.
+            "$SCRIPT_DIR/check-bridge-hygiene.sh":*)
+                case "$STRIPPED" in
+                    *grep*|echo\ *) return 0 ;;
+                esac
+                ;;
+        esac
         case "$STRIPPED" in
             '#'*) return 0 ;;
         esac
@@ -147,7 +155,16 @@ $line"
         printf '%s' "$FILTERED" | sed -e '/^$/d'
     }
 
-    RAW=$(grep -rn "gc init" "$GASCITY_DIR" 2>/dev/null || true)
+    # Match the VERB (init/stop) as a whole word following a "gc" invocation,
+    # with any run of whitespace and any number of intervening flag/value
+    # tokens allowed (e.g. `gc init`, `gc  init`, `gc --city "$CITY" init`,
+    # `gc -C dir stop`) — not just the adjacent literal "gc init"/"gc stop".
+    # Word-boundary anchors on both "gc" and the verb keep this from firing
+    # on substrings like "mygc init", "gc reinit", or "gc stopwatch".
+    GC_TOKEN='(-[A-Za-z0-9_-]*|"[^"]*"|[A-Za-z0-9_./$${}"-]+)'
+    GC_VERB_RE="(^|[^A-Za-z0-9_.-])gc([[:space:]]+${GC_TOKEN})*[[:space:]]+VERB([^A-Za-z0-9_-]|\$)"
+
+    RAW=$(grep -rnE "$(printf '%s' "$GC_VERB_RE" | sed -e 's/VERB/init/')" "$GASCITY_DIR" 2>/dev/null || true)
     HITS=$(filter_code_hits "$RAW")
     if [ -n "$HITS" ]; then
         echo "check-bridge-hygiene: 'gc init' invocation found under packaging/gascity/ (forbidden - see docs/gascity.md:48):" >&2
@@ -155,7 +172,7 @@ $line"
         VIOLATIONS=1
     fi
 
-    RAW=$(grep -rn "gc stop" "$GASCITY_DIR" 2>/dev/null || true)
+    RAW=$(grep -rnE "$(printf '%s' "$GC_VERB_RE" | sed -e 's/VERB/stop/')" "$GASCITY_DIR" 2>/dev/null || true)
     HITS=$(filter_code_hits "$RAW")
     if [ -n "$HITS" ]; then
         echo "check-bridge-hygiene: 'gc stop' invocation found under packaging/gascity/ (forbidden - see docs/gascity.md:48):" >&2
