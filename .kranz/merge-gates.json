@@ -56,6 +56,12 @@
       "whenPaths": [
         "docs/scoping/beads-bridge-dialect.md"
       ]
+    },
+    {
+      "command": "bash packaging/gascity/test/check-dialect-doc-bd-init-executed.sh",
+      "whenPaths": [
+        "docs/scoping/beads-bridge-dialect.md"
+      ]
     }
   ]
 }
