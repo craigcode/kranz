@@ -9,10 +9,10 @@
 # Claude session; those two calls are off-limits to any script in this repo).
 #
 # This test is written against the TARGET bridge behaviour (verified in
-# docs/scoping/beads-bridge-dialect.md), which the sibling feature in this
-# milestone has not landed yet at the time this script is committed — the
-# FIELDS case is expected to fail until packaging/gascity/bin/kranz-dispatch
-# is fixed to translate acceptance_criteria type-correctly.
+# docs/scoping/beads-bridge-dialect.md). The FIELDS case asserts behaviour
+# packaging/gascity/bin/kranz-dispatch already implements (the jq type-switch
+# at bin/kranz-dispatch:82, landed in commit d3f48c3) — a FIELDS failure is a
+# real regression of contract assertion [a6], not an expected condition.
 #
 # Marker discipline: the mission's validation contract greps stdout for the
 # literal "ROUNDTRIP: PASS" marker, so it must appear if and only if every
@@ -117,17 +117,22 @@ assert_status() {
     OBSERVED=$(status_of "$FIXTURE_ID")
     if [ "$OBSERVED" != "$1" ]; then
         fail_case "status-transition:$2" "$1" "$OBSERVED"
+        STATUS_OK=0
     fi
 }
 
+STATUS_OK=1
 if [ -n "$FIXTURE_ID" ]; then
+    assert_status "open"        "claim->open"
     assert_status "in_progress" "open->in_progress"
     assert_status "blocked"     "in_progress->blocked"
     assert_status "in_progress" "blocked->in_progress"
     assert_status "open"        "in_progress->open"
     assert_status "blocked"     "open->blocked"
     assert_status "open"        "blocked->open"
-    echo "STATUS: PASS (open/in_progress/blocked round-tripped via bd update --status; closed and closed->open covered by the CLOSE and REOPEN cases below)"
+    if [ "$STATUS_OK" -eq 1 ]; then
+        echo "STATUS: PASS (open/in_progress/blocked round-tripped via bd update --status; closed and closed->open covered by the CLOSE and REOPEN cases below)"
+    fi
 fi
 
 # The bridge must only ever use `bd update --status`, never `bd set-state`.
