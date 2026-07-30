@@ -83,9 +83,13 @@ else
 fi
 
 # --- Case: atomic claim (bd update --claim, dialect doc §2 VERIFIED on the
-# installed 1.0.5 binary) — proves the bridge's CLAIM step, not just its
-# status/close verbs. No lease/TTL/heartbeat/liveness logic here; that is
-# milestone 3's problem (see the LEASE stub below).
+# installed 1.0.5 binary) — verifies the live binary's atomic claim shape
+# (status plus assignee) on the fixture bead, which contract assertion a2's
+# "claimed" clause requires. Neither bridge script calls --claim today (the
+# dialect doc records both as mutating status directly instead); milestone 3
+# would build atomic claim into the bridge if an operator authorises it. No
+# lease/TTL/heartbeat/liveness logic here; that is milestone 3's problem (see
+# the LEASE stub below).
 
 if [ -n "$FIXTURE_ID" ]; then
     CLAIM_OUT=$(BD update "$FIXTURE_ID" --claim --json 2>&1)
@@ -123,7 +127,7 @@ if [ -n "$FIXTURE_ID" ]; then
     assert_status "open"        "in_progress->open"
     assert_status "blocked"     "open->blocked"
     assert_status "open"        "blocked->open"
-    echo "STATUS: PASS (open/in_progress/blocked/closed round-tripped via bd update --status, closed->open covered by the REOPEN case below)"
+    echo "STATUS: PASS (open/in_progress/blocked round-tripped via bd update --status; closed and closed->open covered by the CLOSE and REOPEN cases below)"
 fi
 
 # The bridge must only ever use `bd update --status`, never `bd set-state`.
