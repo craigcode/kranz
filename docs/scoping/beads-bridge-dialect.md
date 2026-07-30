@@ -83,7 +83,7 @@ immediately below the table.
 | Subcommand | Verdict | Verified flags relevant to the bridge |
 |---|---|---|
 | `bd ready` | VERIFIED | `-l, --label strings` (AND filter), `--label-any strings` (OR filter), `--json`, `--claim` (atomically claim the first ready issue matching filters — see §3), `-a/--assignee`, `-u/--unassigned`, `-n/--limit` (default 100), `--mol`, `--gated`, `--explain` |
-| `bd show` | VERIFIED | `[id...]` positional or `--id stringArray`, `--json`, `--current`, `--short`, `--long`, `--include-comments`, `--include-dependents`. **Resolved by executed probe (2026-07-30, §3 sandbox):** `bd show <id> --json` with a single positional id returns a **single-element JSON array**, not a bare object — confirmed against a real fixture bead, both with and without `--long`. Verbatim `bd show --json`/`bd show --json --long` transcripts (a second, independent probe run, distinct from the `bd update --claim --json` capture) are pasted in §3. |
+| `bd show` | VERIFIED | `[id...]` positional or `--id stringArray`, `--json`, `--current`, `--short`, `--long`, `--include-comments`, `--include-dependents`. **Resolved by executed probe (2026-07-30, §3 sandbox):** `bd show <id> --json` with a single positional id returns a **single-element JSON array**, not a bare object — confirmed against a real fixture bead, both with and without `--long`. |
 | `bd update` | VERIFIED | `-s, --status string` ("New status") — **accepted**, matches spike usage; `--claim` ("Atomically claim the issue (sets assignee to you, status to in_progress; idempotent if already claimed by you)") — **accepted**. No `--lease`, `--lease-ttl`, or `--heartbeat` flag exists. No `lease_expires_at` / `heartbeat_at` field appears anywhere in `--help` output, and none appeared in the executed `bd show --json` output either (§3). |
 | `bd comment` | VERIFIED | Usage: `bd comment <id> [text...] [flags]` — text is positional (confirms docs/gascity.md:45). Also `--file`, `--stdin`. No `-m` flag. |
 | `bd close` | VERIFIED | `-r, --reason string` ("Reason for closing") — confirms docs/gascity.md:45. Also `--reason-file`, `--claim-next`, `--force`, `--continue`. No `-m` flag. |
@@ -356,70 +356,6 @@ Flags:
   present — including with `--long`, which the `--help` text claims shows "extended
   metadata, agent identity, gate fields, etc." but which produced an identical field set
   for this claimed task issue.
-
-  **2026-07-30, second independent sandbox run — verbatim `bd show --json` /
-  `bd show --json --long` transcripts.** The block above captures `bd update --claim
-  --json` output and asserts (in prose) that `show --json`/`show --json --long` are
-  unchanged. To back that assertion with an actual transcript rather than the author's
-  word, a second, separate `mktemp -d` sandbox was created (same isolation: its own
-  `bd init --non-interactive` store, `trap 'rm -rf "$SANDBOX"' EXIT INT TERM`, destroyed
-  on exit, no `gc init`/`gc stop`, no real bead store touched) with a second fixture bead,
-  `bd-probe-s5GMmI-b3k`, created/claimed the same way as steps 1-3 above. The two commands
-  below were then run directly, back to back, and their raw stdout is pasted verbatim:
-
-  ```
-  $ bd show bd-probe-s5GMmI-b3k --json
-  ```
-  ```json
-  [
-    {
-      "id": "bd-probe-s5GMmI-b3k",
-      "title": "Fixture bead for dialect probe 2",
-      "status": "in_progress",
-      "priority": 2,
-      "issue_type": "task",
-      "assignee": "craigmartin",
-      "owner": "ci@kranz.local",
-      "created_at": "2026-07-30T17:45:40Z",
-      "created_by": "craigmartin",
-      "updated_at": "2026-07-30T17:45:41Z",
-      "started_at": "2026-07-30T17:45:41Z",
-      "dependent_count": 0,
-      "dependency_count": 0,
-      "comment_count": 0
-    }
-  ]
-  ```
-
-  ```
-  $ bd show bd-probe-s5GMmI-b3k --json --long
-  ```
-  ```json
-  [
-    {
-      "id": "bd-probe-s5GMmI-b3k",
-      "title": "Fixture bead for dialect probe 2",
-      "status": "in_progress",
-      "priority": 2,
-      "issue_type": "task",
-      "assignee": "craigmartin",
-      "owner": "ci@kranz.local",
-      "created_at": "2026-07-30T17:45:40Z",
-      "created_by": "craigmartin",
-      "updated_at": "2026-07-30T17:45:41Z",
-      "started_at": "2026-07-30T17:45:41Z",
-      "dependent_count": 0,
-      "dependency_count": 0,
-      "comment_count": 0
-    }
-  ]
-  ```
-
-  These two transcripts independently confirm both claims: (1) `bd show <id> --json`
-  returns a top-level JSON **array** with a single element, not a bare object — for
-  either `--json` alone or `--json --long`; and (2) the field set contains no
-  `lease_expires_at`, `heartbeat_at`, or any other expiry/TTL/heartbeat/lease-named field,
-  and `--long` adds no additional fields for this issue type.
 - There is also **no** lease, TTL, or heartbeat flag anywhere in `bd update --help`,
   `bd ready --help`, `bd show --help`, or the top-level `bd --help` subcommand list (see
   Appendix for the full top-level list). No `--lease`, `--lease-ttl`, `--heartbeat` was
