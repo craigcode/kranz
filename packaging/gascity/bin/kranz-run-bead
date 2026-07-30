@@ -7,6 +7,27 @@
 # host multi-minute missions (learned live; see docs/gascity.md).
 #
 # Usage: kranz-run-bead <city-dir> <bead-id> <mission.md> <rig-dir> <max-cycles>
+#
+# Bidirectional bead status <-> kranz-side state map (all four bead
+# statuses, both directions):
+#   open         <-> Queued           (ready for dispatch / re-readied)
+#   in_progress  <-> Running          (kranz-dispatch claims it before spooling)
+#   blocked      <-> Blocked-report   (exit 2 below; escalated to a human)
+#   closed       <-> Done             (exit 0 below; mission complete)
+#
+# Exit-code contract (kranz-run-bead owns this translation):
+#   0            -> closed  (mission COMPLETE)
+#   2            -> blocked (mission BLOCKED, escalate to a human)
+#   exit 3       -> open    (refused as UNDERSPECIFIED; refine and re-ready)
+#   exit 1/other -> open    (mission FAILED; reopen for re-readying)
+#
+# open is many-to-one on the kranz side: both exit 3 (refused,
+# underspecified brief) and exit 1/other (mission failed outright) return
+# the bead to open, because in both cases there is no partial progress
+# worth preserving as "blocked" — the bead just needs to be re-readied,
+# either after a human refines it (exit 3) or as-is for a retry (exit
+# 1/other). Only exit 2 (blocked) preserves an in-flight state for
+# escalation; every other non-success outcome collapses to open.
 set -u
 CITY=$1; ID=$2; MFILE=$3; RIG_DIR=$4; MAX_CYCLES=$5
 
@@ -22,7 +43,7 @@ case $CODE in
         bd close "$ID" --reason "kranz mission COMPLETE — $LINE" >/dev/null
         ;;
     2)
-        bd set-state "$ID" blocked >/dev/null 2>&1 || bd update "$ID" --status blocked >/dev/null 2>&1
+        bd update "$ID" --status blocked >/dev/null 2>&1
         bd comment "$ID" "kranz mission BLOCKED — $LINE (event log in the rig's .kranz/missions dir)" >/dev/null
         gc --city "$CITY" mail send human -s "ESCALATION: bead $ID blocked in kranz" \
             -m "kranz mission for bead $ID blocked awaiting guidance. $LINE. Steer via kranz (web/Slack/CLI) or refine the bead and re-ready it." \

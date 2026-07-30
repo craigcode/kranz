@@ -21,6 +21,27 @@
 #   KRANZ_MAX_CYCLES         fix-cycle bound per mission (default 1)
 #   KRANZ_SPOOL              spool dir (default $GC_CITY/.gc/kranz-spool)
 #   KRANZ_ALLOW_UNVALIDATED  =1 permits validators-off rigs (NOT recommended)
+#
+# Bidirectional bead status <-> kranz-side state map (all four bead
+# statuses, both directions):
+#   open         <-> Queued           (ready for dispatch / re-readied)
+#   in_progress  <-> Running          (set below once a bead is spooled)
+#   blocked      <-> Blocked-report   (set by kranz-run-bead, exit 2)
+#   closed       <-> Done             (set by kranz-run-bead, exit 0)
+#
+# Exit-code contract (kranz-run-bead owns the exit-code translation; this
+# script only ever moves a bead from open to in_progress on spool):
+#   0            -> closed  (mission COMPLETE)
+#   2            -> blocked (mission BLOCKED, escalate to a human)
+#   exit 3       -> open    (refused as UNDERSPECIFIED; refine and re-ready)
+#   exit 1/other -> open    (mission FAILED; reopen for re-readying)
+#
+# open is many-to-one on the kranz side: both exit 3 (refused,
+# underspecified brief) and exit 1/other (mission failed outright) return
+# the bead to open, because neither outcome leaves partial progress worth
+# preserving as "blocked" — the bead just needs to be re-readied, either
+# after a human refines it (exit 3) or as-is for a retry (exit 1/other).
+# Only exit 2 (blocked) preserves an in-flight state for escalation.
 set -u
 
 LABEL=${KRANZ_LABEL:-kranz}
@@ -58,7 +79,7 @@ for ID in $READY; do
     BEAD=$(gc bd show "$ID" --json) || continue
     TITLE=$(printf '%s' "$BEAD" | jq -r '(if type == "array" then .[0] else . end) | .title // empty')
     DESC=$(printf '%s' "$BEAD" | jq -r '(if type == "array" then .[0] else . end) | .description // ""')
-    ACCEPT=$(printf '%s' "$BEAD" | jq -r '(if type == "array" then .[0] else . end) | .acceptance_criteria // ""')
+    ACCEPT=$(printf '%s' "$BEAD" | jq -r '(if type == "array" then .[0] else . end) | (.acceptance_criteria // "") | if type == "array" then map(if type == "string" then . else tostring end) | join("\n") else . end')
 
     STAMP=$(date +%s)
     MFILE="$SPOOL/$STAMP-$ID.md"
