@@ -52,13 +52,7 @@
       ]
     },
     {
-      "command": "bash packaging/gascity/test/check-dialect-doc-scope.sh",
-      "whenPaths": [
-        "docs/scoping/beads-bridge-dialect.md"
-      ]
-    },
-    {
-      "command": "bash packaging/gascity/test/check-dialect-doc-bd-init-executed.sh",
+      "command": "bash packaging/gascity/test/check-dialect-doc.sh",
       "whenPaths": [
         "docs/scoping/beads-bridge-dialect.md"
       ]
