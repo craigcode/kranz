@@ -108,7 +108,11 @@ fn managed_contract_keys() -> &'static [&'static str] {
 /// Build a cleared child environment from scratch: EXACTLY `PATH` (from
 /// ambient — binaries must resolve), `HOME = base_home` (the scratch dir the
 /// session/command already gets, never the operator's real home),
-/// `TMPDIR = base_home/tmp`, the ambient locale vars when present, and on
+/// `TMPDIR = base_home/tmp`, the ambient locale vars when present, the
+/// toolchain cache vars ([`CONTRACT_TOOLCHAIN_VARS`] — see its doc for the
+/// credentials.toml handling; without them every agent session re-downloads
+/// a whole rustup toolchain and crates registry into scratch, which filled
+/// the disk and killed mission m-533143), and on
 /// Windows the process-required passthroughs ([`AMBIENT_WINDOWS_VARS`])
 /// plus `USERPROFILE = base_home`, `TEMP`/`TMP = base_home/tmp`, and
 /// `APPDATA`/`LOCALAPPDATA = base_home/AppData/{Roaming,Local}`. Then
@@ -136,6 +140,15 @@ pub fn sanitized_child_env(
         base_home.join("tmp").display().to_string(),
     );
     for key in AMBIENT_LOCALE_VARS {
+        if let Some(value) = std::env::var_os(key) {
+            env.insert((*key).to_string(), value.to_string_lossy().into_owned());
+        }
+    }
+    // Toolchain caches ride for BOTH sessions and contract commands: a
+    // session without RUSTUP_HOME bootstraps a whole toolchain download
+    // into scratch (ENOSPC, m-533143). contract_command_env adds the same
+    // vars again as extras — identical values, so the overlap is a no-op.
+    for key in CONTRACT_TOOLCHAIN_VARS {
         if let Some(value) = std::env::var_os(key) {
             env.insert((*key).to_string(), value.to_string_lossy().into_owned());
         }
@@ -436,6 +449,9 @@ mod tests {
             "LC_ALL",
             "TZ",
             "USER",
+            "CARGO_HOME",
+            "RUSTUP_HOME",
+            "NPM_CONFIG_CACHE",
             "KRANZ_BASE_SHA",
         ];
         for key in env.keys() {
