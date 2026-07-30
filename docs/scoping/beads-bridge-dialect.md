@@ -10,6 +10,13 @@ throwaway `mktemp -d` sandbox (see §2, §3, §5). No in-repo store and no other
 pre-existing store was ever created, updated, claimed, commented on, or closed against.
 `gc init` and `gc stop` were never invoked.
 
+**Line-number note:** `path:line` citations into `packaging/gascity/bin/` or
+`packaging/gascity/test/` below were verified against commit `329010f` (the tip this
+feature branched from). Line numbers drift as unrelated header/comment growth lands in
+those scripts, so each citation below also names the actual code construct it points at
+(a flag, a function signature, a literal command) so it stays findable by search even
+after the number moves.
+
 > **Correction note (2026-07-30):** commit `14a49ab` ("record live bd/gc dialect probe",
 > the second commit under that identical message) retroactively deleted the Appendix
 > disclosure below about the out-of-repo `bd show`/`bd list --json` attempt and replaced
@@ -67,8 +74,10 @@ actually runs against today regardless of what upgrade path exists.
 
 > **Scope caveat:** the table below is verified against **upstream `bd` 1.0.5 invoked
 > directly**. Every bridge script actually calls `bd` through the `gc bd` wrapper —
-> `packaging/gascity/bin/kranz-dispatch:43,58,75` call `gc bd ready|show|update`, and
-> `packaging/gascity/bin/kranz-run-bead:13` defines a `bd()` shell function wrapping
+> `packaging/gascity/bin/kranz-dispatch` calls `gc bd ready --label "$LABEL" --json`
+> (line 64), `gc bd show "$ID" --json` (line 79), and `gc bd update "$ID" --status
+> in_progress` (line 96), and `packaging/gascity/bin/kranz-run-bead:34` defines a `bd()`
+> shell function — `bd() { gc --city "$CITY" bd "$@"; }` — wrapping
 > `gc --city "$CITY" bd`. The `gc bd` pass-through's fidelity to the shapes below is
 > **NOT verified** (see §4 — `gc bd --help` could not even be run without an initialized
 > city, which this feature was barred from creating). A downstream milestone must not
@@ -459,8 +468,9 @@ still current.
   > regression is guarded going forward. The probe finding above is preserved verbatim as
   > historical evidence of what the live binary accepts; it no longer describes the
   > current tree.
-- `packaging/gascity/bin/kranz-dispatch:43,58,75` calls `gc bd ready --label ... --json`,
-  `gc bd show "$ID" --json`, `gc bd update "$ID" --status in_progress` — these could
+- `packaging/gascity/bin/kranz-dispatch` calls `gc bd ready --label "$LABEL" --json`
+  (line 64), `gc bd show "$ID" --json` (line 79), and `gc bd update "$ID" --status
+  in_progress` (line 96) — these could
   **not be verified as a faithful pass-through** in this probe. `gc bd --help` was run
   from outside a Gas City rig (no `city.toml`/`.gc/` in this checkout) and failed with:
 
