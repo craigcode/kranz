@@ -436,16 +436,29 @@ Flags:
   (emulating leases via comments, metadata, sentinel files, or status abuse) has been
   invented here. This finding is also recorded in the WorkerReport's `knownGaps`.
 
-## 4. Shapes the spike currently uses that the live binary does NOT accept
+## 4. Shapes the spike used, at probe time, that the live binary did NOT accept
 
 Read from `packaging/gascity/bin/kranz-run-bead` and `packaging/gascity/bin/kranz-dispatch`
-(not modified in this feature — read-only comparison only):
+at the time each bullet below was probed (read-only comparison only). Bullets below are
+findings as of their stated date; where a later milestone has since changed the code, a
+dated resolution note says so explicitly — absence of such a note means the finding is
+still current.
 
-- `packaging/gascity/bin/kranz-run-bead:25`: `bd set-state "$ID" blocked` — **wrong
-  shape**. Live `bd set-state` requires `<issue-id> <dimension>=<value>` (e.g.
-  `bd set-state "$ID" mode=blocked`), not a bare status word. As written this call would
-  fail against the live binary (it falls through to `bd update "$ID" --status blocked`
-  via `||`, which is the shape that actually works).
+- **[PROBE FINDING, 2026-07-29 — HISTORICAL]** `packaging/gascity/bin/kranz-run-bead:25`:
+  `bd set-state "$ID" blocked` — **wrong shape**. Live `bd set-state` requires
+  `<issue-id> <dimension>=<value>` (e.g. `bd set-state "$ID" mode=blocked`), not a bare
+  status word. As written this call would fail against the live binary (it falls through
+  to `bd update "$ID" --status blocked` via `||`, which is the shape that actually works).
+
+  > **Resolution note (2026-07-30, ms-2-fix-2-3):** this defect no longer exists in the
+  > shipped script. `packaging/gascity/bin/kranz-run-bead:46` now reads a bare `bd update
+  > "$ID" --status blocked >/dev/null 2>&1` (verified by reading the current file) — the
+  > `set-state` call and its `||` fallback chain were removed entirely, not merely
+  > reordered. `packaging/gascity/test/check-bridge-hygiene.sh` (default mode) now greps
+  > `packaging/gascity/bin/` for `set-state` and fails the build if it reappears, so this
+  > regression is guarded going forward. The probe finding above is preserved verbatim as
+  > historical evidence of what the live binary accepts; it no longer describes the
+  > current tree.
 - `packaging/gascity/bin/kranz-dispatch:43,58,75` calls `gc bd ready --label ... --json`,
   `gc bd show "$ID" --json`, `gc bd update "$ID" --status in_progress` — these could
   **not be verified as a faithful pass-through** in this probe. `gc bd --help` was run
