@@ -123,12 +123,18 @@ default_mode() {
             # This script's own detection code necessarily embeds the
             # literal search patterns/messages as grep invocations and echo
             # diagnostics — that is data, not an invocation of either
-            # command. Only THOSE specific lines are exempt; any other line
-            # in this file (e.g. a bare `gc init`/`gc stop` slipped in
-            # elsewhere) is still caught below like any other file.
+            # command. Only THOSE specific lines are exempt, matched by their
+            # actual anchored shape rather than a "contains grep anywhere" or
+            # "starts with echo" substring test (a substring test would also
+            # exempt an unrelated line that merely carries a trailing
+            # `# grep`-mentioning comment, or a helper function whose NAME
+            # happens to contain "grep", even though its body invokes a `gc`
+            # verb). Any other line in this file (e.g. a bare `gc init`/
+            # `gc stop` slipped in elsewhere, however disguised) is still
+            # caught below like any other file.
             "$SCRIPT_DIR/check-bridge-hygiene.sh":*)
                 case "$STRIPPED" in
-                    *grep*|echo\ *) return 0 ;;
+                    *'=$(grep '*|'echo "check-bridge-hygiene:'*) return 0 ;;
                 esac
                 ;;
         esac

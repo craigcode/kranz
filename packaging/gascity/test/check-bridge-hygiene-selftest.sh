@@ -118,6 +118,149 @@ run_self_exemption_case() {
 run_self_exemption_case "self-exempt-init" "$VERB_A"
 run_self_exemption_case "self-exempt-stop" "$VERB_B"
 
+# Self-exemption anchoring (ms-2-fix-2-2): the exemption used to be a bare
+# substring test (`*grep*` / `echo `-prefix), which is broader than the
+# actual pattern-bearing lines it needs to cover. Prove the two idioms named
+# in the finding still get caught now that the match is anchored to the
+# real grep-assignment / echo-diagnostic shapes:
+#   1. a bare invocation whose line carries a trailing comment mentioning
+#      the word "grep" (the old `*grep*` test matched this anywhere on the
+#      line, so a trailing `# grep ...` comment used to swallow the hit).
+#   2. a helper function whose NAME contains "grep" but whose body invokes
+#      the bare verb (the old `*grep*` test matched the function name too).
+run_self_exemption_trailing_comment_case() {
+    # $1 = case name, $2 = verb token to append as a bare invocation with a
+    # trailing comment mentioning "grep"
+    name="$1"
+    verb="$2"
+
+    cp "$HYGIENE" "$SANDBOX/test/check-bridge-hygiene.sh"
+    chmod +x "$SANDBOX/test/check-bridge-hygiene.sh"
+    printf '\nfoo() { %s %s; } # grep note\n' "$GC_CMD" "$verb" >>"$SANDBOX/test/check-bridge-hygiene.sh"
+
+    rm -f "$SANDBOX/bin/probe.sh"
+
+    OUT=$("$SANDBOX/test/check-bridge-hygiene.sh" 2>&1)
+    STATUS=$?
+
+    if [ "$STATUS" -eq 0 ]; then
+        fail "$name" "check-bridge-hygiene to reject a bare invocation with a trailing 'grep'-mentioning comment" \
+            "exit 0 (OK) — swallowed by the self-exemption: $OUT"
+    fi
+    case "$OUT" in
+        *"forbidden - see docs/gascity.md:48"*) : ;;
+        *) fail "$name" "violation message naming the forbidden verb" "$OUT" ;;
+    esac
+    echo "SELFTEST [$name]: PASS (trailing-comment evasion idiom still caught)"
+}
+
+run_self_exemption_helper_name_case() {
+    # $1 = case name, $2 = verb token to append inside a helper function
+    # whose name contains "grep"
+    name="$1"
+    verb="$2"
+
+    cp "$HYGIENE" "$SANDBOX/test/check-bridge-hygiene.sh"
+    chmod +x "$SANDBOX/test/check-bridge-hygiene.sh"
+    printf '\nmy_grep_helper() { %s %s; }\n' "$GC_CMD" "$verb" >>"$SANDBOX/test/check-bridge-hygiene.sh"
+
+    rm -f "$SANDBOX/bin/probe.sh"
+
+    OUT=$("$SANDBOX/test/check-bridge-hygiene.sh" 2>&1)
+    STATUS=$?
+
+    if [ "$STATUS" -eq 0 ]; then
+        fail "$name" "check-bridge-hygiene to reject a bare invocation inside a grep-named helper function" \
+            "exit 0 (OK) — swallowed by the self-exemption: $OUT"
+    fi
+    case "$OUT" in
+        *"forbidden - see docs/gascity.md:48"*) : ;;
+        *) fail "$name" "violation message naming the forbidden verb" "$OUT" ;;
+    esac
+    echo "SELFTEST [$name]: PASS (grep-named-helper evasion idiom still caught)"
+}
+
+run_self_exemption_trailing_comment_case "self-exempt-trailing-comment-init" "$VERB_A"
+run_self_exemption_trailing_comment_case "self-exempt-trailing-comment-stop" "$VERB_B"
+run_self_exemption_helper_name_case "self-exempt-grep-named-helper-init" "$VERB_A"
+run_self_exemption_helper_name_case "self-exempt-grep-named-helper-stop" "$VERB_B"
+
+# Non-vacuity: restore the OLD broad substring exemption (`*grep*` /
+# `echo `-prefix) on a temp copy and confirm these two new cases FAIL with
+# the swallowed-by-self-exemption diagnostic — proving the new cases would
+# have caught the regression the old exemption was vulnerable to. The old
+# and new exemption lines are passed to perl via the environment (not
+# interpolated into the perl source) so none of their shell/regex
+# metacharacters need hand-escaping; \Q...\E makes the search literal.
+export OLD_EXEMPTION_LINE='                    *grep*|echo\ *) return 0 ;;'
+export NEW_EXEMPTION_LINE='                    *'"'"'=$(grep '"'"'*|'"'"'echo "check-bridge-hygiene:'"'"'*) return 0 ;;'
+
+if ! grep -qF "$NEW_EXEMPTION_LINE" "$HYGIENE"; then
+    fail "non-vacuity-setup" "the new anchored exemption line to be present in $HYGIENE" \
+        "marker not found — cannot construct the broad-exemption regression copy"
+fi
+
+# Remove the $SANDBOX/test/check-bridge-hygiene.sh copy used by the cases
+# above (it was left holding an injected probe line from the last case, and
+# even an unmodified copy would confuse the scan below: BROAD's own
+# self-exemption only applies to ITS OWN path, so a second, unrelated copy
+# of check-bridge-hygiene.sh elsewhere under the same GASCITY_DIR would get
+# its legitimate echo diagnostics flagged as if they were a real violation).
+rm -f "$SANDBOX/test/check-bridge-hygiene.sh"
+
+# The regression copy keeps the SAME basename (check-bridge-hygiene.sh) as
+# the real checker, in a sibling directory — the self-exemption case in
+# is_comment_or_readme_hit matches on "$SCRIPT_DIR/check-bridge-hygiene.sh",
+# i.e. by basename relative to wherever the running script lives, so a
+# renamed copy would never hit that case at all and the test would prove
+# nothing about the exemption logic itself.
+mkdir -p "$SANDBOX/broad"
+BROAD="$SANDBOX/broad/check-bridge-hygiene.sh"
+perl -pe 's/\Q$ENV{NEW_EXEMPTION_LINE}\E/$ENV{OLD_EXEMPTION_LINE}/' "$HYGIENE" >"$BROAD"
+chmod +x "$BROAD"
+
+if ! grep -qF "$OLD_EXEMPTION_LINE" "$BROAD"; then
+    fail "non-vacuity-setup" "the broad-exemption regression copy to contain the old substring exemption" \
+        "substitution did not take effect"
+fi
+if grep -qF "$NEW_EXEMPTION_LINE" "$BROAD"; then
+    fail "non-vacuity-setup" "the broad-exemption regression copy to no longer contain the new anchored exemption" \
+        "substitution left the new line in place"
+fi
+
+printf '\nfoo() { %s %s; } # grep note\n' "$GC_CMD" "$VERB_A" >>"$BROAD"
+rm -f "$SANDBOX/bin/probe.sh"
+OUT=$("$BROAD" 2>&1)
+STATUS=$?
+if [ "$STATUS" -eq 0 ]; then
+    :
+else
+    fail "non-vacuity-trailing-comment" \
+        "the OLD broad exemption to swallow the trailing-comment evasion (exit 0)" \
+        "exit $STATUS: $OUT"
+fi
+echo "SELFTEST [non-vacuity-trailing-comment]: PASS (old broad exemption is indeed swallowed by it, confirming the new test is non-vacuous)"
+
+perl -pe 's/\Q$ENV{NEW_EXEMPTION_LINE}\E/$ENV{OLD_EXEMPTION_LINE}/' "$HYGIENE" >"$BROAD"
+chmod +x "$BROAD"
+printf '\nmy_grep_helper() { %s %s; }\n' "$GC_CMD" "$VERB_B" >>"$BROAD"
+rm -f "$SANDBOX/bin/probe.sh"
+OUT=$("$BROAD" 2>&1)
+STATUS=$?
+if [ "$STATUS" -eq 0 ]; then
+    :
+else
+    fail "non-vacuity-grep-named-helper" \
+        "the OLD broad exemption to swallow the grep-named-helper evasion (exit 0)" \
+        "exit $STATUS: $OUT"
+fi
+echo "SELFTEST [non-vacuity-grep-named-helper]: PASS (old broad exemption is indeed swallowed by it, confirming the new test is non-vacuous)"
+
+# Discard the broad-exemption regression copy entirely — it must not linger
+# under $SANDBOX and be picked up by the final unmodified-checker sanity
+# scan below (that scan walks the whole GASCITY_DIR, i.e. all of $SANDBOX).
+rm -rf "$SANDBOX/broad"
+
 # Sanity: the unmodified checker (whose only "gc ... init/stop"-shaped text
 # lives in its own grep patterns and echo diagnostics) must still pass
 # against itself — proves the narrowed exemption doesn't over-exempt back
