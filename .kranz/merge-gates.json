@@ -80,6 +80,12 @@
       "whenPaths": [
         "packaging/gascity"
       ]
+    },
+    {
+      "command": "bash packaging/gascity/test/check-a4-claim-wording.sh",
+      "whenPaths": [
+        "packaging/gascity"
+      ]
     }
   ]
 }

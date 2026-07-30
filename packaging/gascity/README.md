@@ -10,7 +10,8 @@ side.
 ## How it works
 
 Two halves, split by Gas City's order-exec deadline: `bin/kranz-dispatch`
-(the order, on a cooldown) CLAIMS ready `kranz`-labeled beads and spools
+(the order, on a cooldown) marks ready `kranz`-labeled beads `in_progress`
+(direct status write, not an atomic claim) and spools
 mission briefs; `bin/kranz-city-worker` (a supervised long-running session —
 see `agents/kranz-worker/`) drains the spool strictly serially, running each
 brief and mapping the exit code back into City state. Dispatch flow:
