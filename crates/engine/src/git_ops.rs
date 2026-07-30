@@ -201,11 +201,21 @@ impl GitRepo {
         })
     }
 
-    /// All refs and their object ids, one per line — a validator moving a
-    /// ref retargets later merges without ever touching HEAD or the
-    /// worktree, so the immutability fingerprint covers it.
+    /// All LOCAL refs (heads + tags) and their object ids, one per line — a
+    /// validator moving a ref retargets later merges without ever touching
+    /// HEAD or the worktree, so the immutability fingerprint covers it.
+    /// `refs/remotes/*` is deliberately EXCLUDED: remote-tracking refs move
+    /// on any ambient `git fetch`/`push` by the operator or CI (mission
+    /// m-83d1ed's tripwire fired on exactly that — an operator fetch
+    /// mid-window, not a validator), and they are mirror state, not
+    /// checkout identity.
     pub fn for_each_ref(&self) -> Result<String> {
-        self.run(&["for-each-ref", "--format=%(refname) %(objectname)"])
+        self.run(&[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/heads",
+            "refs/tags",
+        ])
     }
 
     /// Name of the currently checked-out branch (`"HEAD"` when detached).
