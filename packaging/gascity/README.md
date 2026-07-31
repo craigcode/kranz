@@ -80,3 +80,42 @@ required): default mode fails if any bridge script under `bin/` still calls
 or `gc stop`; `--status-map` mode fails until the translator scripts'
 headers document the full bidirectional open/in_progress/blocked/closed
 status mapping.
+
+## Lease-aware claiming: blocked pending operator sign-off (finding [f-3-1])
+
+Atomic, first-wins claiming at dispatch time (`bd update --claim`, before any
+spool write) IS shipped — see `bin/kranz-dispatch`'s header. What is NOT
+shipped is the heartbeat/TTL layer that would let a dead claim's holder be
+distinguished from a live one and recovered automatically.
+
+`docs/scoping/beads-bridge-dialect.md` §3 records an executed, live probe
+(not a `--help` scan) against the installed `bd` 1.0.5 that confirms no
+`lease_expires_at`, `heartbeat_at`, or any other lease/TTL/heartbeat field or
+flag exists anywhere in its data model. This milestone's own feature spec
+carries a HARD PRECONDITION for exactly that finding: STOP, do not invent a
+substitute (no emulating a lease via comments, metadata, sentinel files, or
+status abuse), and report the block rather than fabricate a mechanism.
+
+An earlier attempt (`dbe5cf8`) built a heartbeat + `updated_at`-staleness
+backstop anyway, reasoning that the same feature spec's numbered steps
+describe building exactly that kind of mechanism. It was reverted in full
+(`5a7585c`) because (a) it could reap a bead that is claimed and spooled but
+not yet picked up by `kranz-city-worker` — verifiably alive in the sense
+that a mission is still queued for it, but indistinguishable from dead by
+any signal `bd` 1.0.5 exposes — and (b) no operator has signed off on that
+staleness heuristic as the alternate mechanism the dialect doc's escalation
+section calls for.
+
+That tension — a HARD PRECONDITION to stop, inside a feature spec whose own
+numbered steps assume the mechanism gets built — has now been hit twice in
+independent fix cycles with the same resolution (stay honest, don't ship the
+heuristic). Resolving it for real needs one of: an operator-approved upgrade
+to `bd` 1.1.0+ (where `docs/scoping/beads-workstore.md:66` records
+`lease_expires_at`/`heartbeat_at` as verified against source), or explicit
+operator sign-off on the `updated_at`-staleness mechanism and its documented
+residual exposure window. Until either happens, `bin/kranz-dispatch` and
+`bin/kranz-run-bead` stay in the honest NOT-YET-IMPLEMENTED state their
+headers already document, and
+`test/kranz-dispatch-roundtrip.sh` keeps printing `LEASE: SKIP (not yet
+implemented — awaiting operator decision on bd's TTL/heartbeat capability
+gap)` rather than a fabricated `LEASE: PASS`.
