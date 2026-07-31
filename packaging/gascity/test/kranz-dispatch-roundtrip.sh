@@ -111,6 +111,18 @@ fi
 # signs off on the staleness heuristic and its residual exposure window.
 
 if [ -n "$FIXTURE_ID" ]; then
+    # Positive control: before any claim, the fixture must actually be
+    # listed by `bd ready` — otherwise the later "absent from ready"
+    # assertion would pass vacuously (e.g. if the label/filter were wrong).
+    PRECLAIM_READY_IDS=$(BD ready --json 2>/dev/null | jq -r '.[].id')
+    PRECLAIM_LISTED=0
+    for RID in $PRECLAIM_READY_IDS; do
+        [ "$RID" = "$FIXTURE_ID" ] && PRECLAIM_LISTED=1
+    done
+    if [ "$PRECLAIM_LISTED" -ne 1 ]; then
+        fail_case "claim-in-ready-before-claim" "unclaimed fixture $FIXTURE_ID listed by bd ready --json" "not listed: $PRECLAIM_READY_IDS"
+    fi
+
     CLAIM_OUT=$(BD update "$FIXTURE_ID" --claim --json 2>&1)
     CLAIM_STATUS=$(printf '%s' "$CLAIM_OUT" | unwrap | jq -r '.status // empty')
     CLAIM_ASSIGNEE=$(printf '%s' "$CLAIM_OUT" | unwrap | jq -r '.assignee // empty')
@@ -135,6 +147,10 @@ if [ -n "$FIXTURE_ID" ]; then
         # A different actor's claim attempt on the same, already-claimed
         # bead must fail outright (native bd 1.0.5 semantics: "issue already
         # claimed by <assignee>"), leaving status and assignee untouched.
+        # Assert the error TEXT, not merely a non-zero exit — a bare exit
+        # code would also pass on an unrelated failure (a moved --actor
+        # flag, a cd failure, a store-permission error) while proving
+        # nothing about competing-claim semantics.
         COMPETE_OUT=$( (cd "$STORE_DIR" && bd --actor "kranz-roundtrip-competitor" update "$FIXTURE_ID" --claim --json) 2>&1)
         COMPETE_EXIT=$?
         POST_COMPETE_SHOW=$(BD show "$FIXTURE_ID" --json 2>/dev/null | unwrap)
@@ -151,12 +167,14 @@ if [ -n "$FIXTURE_ID" ]; then
             fail_case "claim-not-in-ready" "claimed bead $FIXTURE_ID absent from bd ready --json" "still listed as ready"
         elif [ "$COMPETE_EXIT" -eq 0 ]; then
             fail_case "claim-competing-fails" "a different actor's claim to fail (non-zero exit)" "exit 0: $COMPETE_OUT"
+        elif ! printf '%s' "$COMPETE_OUT" | grep -qiE 'already claimed'; then
+            fail_case "claim-competing-error-text" "error text matching 'already claimed'" "$COMPETE_OUT"
         elif [ "$POST_COMPETE_STATUS" != "in_progress" ]; then
             fail_case "claim-competing-status-preserved" "in_progress" "$POST_COMPETE_STATUS"
         elif [ "$POST_COMPETE_ASSIGNEE" != "$CLAIM_ASSIGNEE" ]; then
             fail_case "claim-competing-assignee-preserved" "original assignee '$CLAIM_ASSIGNEE' untouched" "'$POST_COMPETE_ASSIGNEE'"
         else
-            echo "CLAIM: PASS (atomic claim, idempotent re-claim, competing claim by a different actor fails)"
+            echo "CLAIM: PASS (atomic claim, idempotent re-claim, competing claim by a different actor fails with 'already claimed')"
         fi
     fi
 fi
@@ -425,9 +443,11 @@ fi
 # --- Case: kranz-run-bead exit-code -> live bead status translation ----
 # Exercises the real packaging/gascity/bin/kranz-run-bead against a fresh
 # fixture bead per case (closed is terminal, so each case needs its own
-# bead). Each fixture is claimed to in_progress first, mirroring what
-# kranz-dispatch does before spooling, so the assertion actually proves a
-# transition rather than an already-true tautology.
+# bead). Each fixture is claimed via `--claim` first, mirroring exactly what
+# kranz-dispatch does before spooling (dispatch uses `--claim`, which also
+# sets an assignee — a bare `--status in_progress` seed would not exercise
+# the assignee-release regression this fix covers), so the assertion
+# actually proves a transition rather than an already-true tautology.
 
 run_runbead_case() {
     # $1 = exit code for the kranz stub to simulate
@@ -439,7 +459,7 @@ run_runbead_case() {
         fail_case "runbead-$3-create" "a non-empty issue id" "'$CASE_CREATE_OUT'"
         return 1
     fi
-    BD update "$CASE_ID" --status in_progress >/dev/null 2>&1
+    BD update "$CASE_ID" --claim >/dev/null 2>&1
 
     MFILE="$SANDBOX/runbead-$3-mission.md"
     printf '## Goal\nRUNBEAD fixture (%s)\n' "$3" > "$MFILE"
@@ -471,6 +491,42 @@ run_runbead_case 1 "open"     "exit1" || RUNBEAD_OK=0
 
 if [ "$RUNBEAD_OK" -eq 1 ]; then
     echo "RUNBEAD: PASS (exit 0/2/3/1 map to live bead states)"
+fi
+
+# --- Case: claim released on reopen — a DIFFERENT actor can claim the bead
+# after kranz-run-bead reopens it (direct regression test for this fix: a
+# bead driven through exit 3 used to stay assigned to the original actor,
+# silently starving any dispatcher running as a different actor) -----------
+
+RELEASE_CREATE_OUT=$(BD create "RUNBEAD fixture (release-on-reopen)" --type task --json 2>&1)
+RELEASE_ID=$(printf '%s' "$RELEASE_CREATE_OUT" | unwrap | jq -r '.id // empty')
+if [ -z "$RELEASE_ID" ]; then
+    fail_case "runbead-release-create" "a non-empty issue id" "'$RELEASE_CREATE_OUT'"
+else
+    BD update "$RELEASE_ID" --claim >/dev/null 2>&1
+    RELEASE_MFILE="$SANDBOX/runbead-release-mission.md"
+    printf '## Goal\nRUNBEAD fixture (release-on-reopen)\n' > "$RELEASE_MFILE"
+
+    KRANZ_STUB_EXIT=3 PATH="$STUB_BIN:$PATH" \
+        "$BIN_DIR/kranz-run-bead" "$CITY_DIR" "$RELEASE_ID" "$RELEASE_MFILE" "$RIG_DIR" 1 >/dev/null 2>&1
+
+    RELEASE_STATUS=$(status_of "$RELEASE_ID")
+    RELEASE_ASSIGNEE=$(BD show "$RELEASE_ID" --json 2>/dev/null | unwrap | jq -r '.assignee // empty')
+    OTHER_CLAIM_OUT=$( (cd "$STORE_DIR" && bd --actor "kranz-roundtrip-different-actor" update "$RELEASE_ID" --claim --json) 2>&1)
+    OTHER_CLAIM_EXIT=$?
+    OTHER_CLAIM_ASSIGNEE=$(printf '%s' "$OTHER_CLAIM_OUT" | unwrap | jq -r '.assignee // empty')
+
+    if [ "$RELEASE_STATUS" != "open" ]; then
+        fail_case "runbead-release-status" "open" "$RELEASE_STATUS"
+    elif [ -n "$RELEASE_ASSIGNEE" ]; then
+        fail_case "runbead-release-assignee-cleared" "assignee cleared (empty) after exit 3" "'$RELEASE_ASSIGNEE'"
+    elif [ "$OTHER_CLAIM_EXIT" -ne 0 ]; then
+        fail_case "runbead-release-different-actor-claims" "a different actor's claim to succeed after release" "exit $OTHER_CLAIM_EXIT: $OTHER_CLAIM_OUT"
+    elif [ "$OTHER_CLAIM_ASSIGNEE" != "kranz-roundtrip-different-actor" ]; then
+        fail_case "runbead-release-different-actor-assignee" "assignee 'kranz-roundtrip-different-actor'" "'$OTHER_CLAIM_ASSIGNEE'"
+    else
+        echo "RUNBEAD-REOPEN-RECLAIM: PASS (exit 3 clears the assignee; a different actor can then claim the bead)"
+    fi
 fi
 
 # --- Verdict --------------------------------------------------------------

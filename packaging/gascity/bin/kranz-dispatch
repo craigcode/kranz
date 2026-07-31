@@ -26,6 +26,17 @@
 # any other bd error — the bead is skipped SILENTLY: no comment, no spool
 # files, no orphan .md/.env pair.
 #
+# Claim rollback on abandonment (shipped): once the claim above succeeds,
+# every path in the loop body that gives up on the bead BEFORE both spool
+# files are written releases that claim first — `gc bd update "$ID" --status
+# open --assignee ""` (dialect doc §2's verified `-a/--assignee`; an empty
+# string clears it, confirmed by an executed probe) — then continues, so the
+# bead is returned to open and unassigned rather than left claimed with no
+# spool entry. This covers a `gc bd show` failure and a failure writing
+# either the .md or .env spool file. The lost-race path (the `--claim`
+# call itself failing) is unaffected and stays silent: no comment, no spool
+# files, no rollback needed because no claim was ever taken.
+#
 # NOT lease-aware (as shipped): bd 1.0.5 exposes no TTL, heartbeat, or
 # expiry mechanism — no --lease/--lease-ttl/--heartbeat flag, and no
 # lease_expires_at/heartbeat_at field in `bd show --json`, confirmed by an
@@ -38,10 +49,16 @@
 # holder is never stolen, and expiry is only a backstop for an ambiguous or
 # dead holder.
 #
-# Residual exposure (as shipped): a bead that is claimed and spooled but not
-# yet drained by kranz-city-worker is covered by nothing today — no
-# heartbeat runs between dispatch exit and drain start, and there is no TTL
-# backstop either.
+# Residual exposure (as shipped): the rollback above only covers failures
+# THIS process can detect and act on. If this dispatch process itself dies
+# (killed, crashes) after the claim succeeds but before it reaches one of
+# the rollback points or the final spool write, the bead is left claimed
+# and unspooled with nothing to release it — that claim-succeeded-then-
+# abandoned window has no heartbeat and no TTL backstop, same as any other
+# dead-claim case today. Likewise, a bead that is claimed and BOTH spool
+# files are written successfully, but not yet drained by kranz-city-worker,
+# is covered by nothing today — no heartbeat runs between dispatch exit and
+# drain start, and there is no TTL backstop either.
 #
 # Env:
 #   KRANZ_RIG_DIR            explicit rig checkout (optional)
@@ -110,22 +127,35 @@ for ID in $READY; do
     # silently, no comment, no spool files.
     gc bd update "$ID" --claim >/dev/null 2>&1 || continue
 
-    BEAD=$(gc bd show "$ID" --json) || continue
+    # Release the claim on any abandonment from here on, so the bead is
+    # returned to open/unassigned rather than left claimed with no spool
+    # entry (see the "Claim rollback on abandonment" header note above).
+    release_claim() {
+        gc bd update "$ID" --status open --assignee "" >/dev/null 2>&1
+    }
+
+    BEAD=$(gc bd show "$ID" --json) || { release_claim; continue; }
     TITLE=$(printf '%s' "$BEAD" | jq -r '(if type == "array" then .[0] else . end) | .title // empty')
     DESC=$(printf '%s' "$BEAD" | jq -r '(if type == "array" then .[0] else . end) | .description // ""')
     ACCEPT=$(printf '%s' "$BEAD" | jq -r '(if type == "array" then .[0] else . end) | (.acceptance_criteria // "") | if type == "array" then map(if type == "string" then . else tostring end) | join("\n") else . end')
 
     STAMP=$(date +%s)
     MFILE="$SPOOL/$STAMP-$ID.md"
-    {
+    if ! {
         printf '## Goal\n%s\n\n' "$TITLE"
         printf '## Context\nDispatched from Gas City bead %s (label %s). Work fully autonomously.\n\n%s\n\n' "$ID" "$LABEL" "$DESC"
         printf '## Scoping answers\nNo human is available during this run. Prefer the smallest faithful interpretation; if materially ambiguous, block rather than guess. Validators stay enabled.\n\n'
         printf '## Acceptance hints\n%s\n' "${ACCEPT:-The goal above is demonstrably met.}"
-    } > "$MFILE"
-    {
+    } > "$MFILE"; then
+        release_claim
+        continue
+    fi
+    if ! {
         printf 'ID=%s\nCITY=%s\nRIG_DIR=%s\nMAX_CYCLES=%s\n' "$ID" "$CITY" "$RIG_DIR" "$MAX_CYCLES"
-    } > "$SPOOL/$STAMP-$ID.env"
+    } > "$SPOOL/$STAMP-$ID.env"; then
+        release_claim
+        continue
+    fi
 
     echo "kranz-dispatch: bead $ID spooled for $RIG_DIR"
 done
