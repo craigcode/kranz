@@ -94,6 +94,12 @@
         "packaging/gascity/bin/kranz-dispatch",
         "packaging/gascity/bin/kranz-run-bead"
       ]
+    },
+    {
+      "command": "bash packaging/gascity/test/kranz-dispatch-roundtrip-claim-selftest.sh",
+      "whenPaths": [
+        "packaging/gascity/test/kranz-dispatch-roundtrip.sh"
+      ]
     }
   ]
 }
