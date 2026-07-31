@@ -2,9 +2,10 @@
 # kranz-dispatch v2 — Gas City → kranz bridge, dispatch side.
 #
 # FAST PATH ONLY (gc order exec enforces a context deadline): drains READY
-# beads carrying the kranz label by marking each in_progress and SPOOLING a
-# ticket-shaped mission brief for the long-lived kranz-city-worker to run.
-# No mission executes here — dispatch and get out of the way.
+# beads carrying the kranz label by atomically CLAIMING each (first-wins)
+# and SPOOLING a ticket-shaped mission brief for the long-lived
+# kranz-city-worker to run. No mission executes here — dispatch and get out
+# of the way.
 #
 # Scrutiny floor (docs/gascity.md lesson 3): a rig whose .kranz/config.json
 # disables the scrutiny validator is REFUSED for autonomous dispatch — the
@@ -14,6 +15,33 @@
 # Rig routing: KRANZ_RIG_DIR wins when set (single-rig city); otherwise the
 # bead id's prefix is resolved via `gc rig list --json`. A resolved rig must
 # be a git checkout.
+#
+# Atomic claim (shipped): after the rig-routing and scrutiny-floor refusals
+# below — so a refused bead is never claimed — dispatch issues
+# `gc bd update "$ID" --claim` BEFORE either spool file is written. Per
+# docs/scoping/beads-bridge-dialect.md §3 (verified against installed bd
+# 1.0.5), `--claim` atomically sets assignee and status to in_progress in
+# one call, first-wins, and is idempotent if this dispatcher already holds
+# the claim. If the claim fails — lost the race to another dispatcher, or
+# any other bd error — the bead is skipped SILENTLY: no comment, no spool
+# files, no orphan .md/.env pair.
+#
+# NOT lease-aware (as shipped): bd 1.0.5 exposes no TTL, heartbeat, or
+# expiry mechanism — no --lease/--lease-ttl/--heartbeat flag, and no
+# lease_expires_at/heartbeat_at field in `bd show --json`, confirmed by an
+# executed sandbox probe (docs/scoping/beads-bridge-dialect.md §3). A claim
+# held by a dispatcher or worker process that dies is therefore NOT
+# automatically recoverable today; it must be cleared manually (e.g. `bd
+# update <id> --status open`). The INTENDED future posture — NOT YET
+# IMPLEMENTED, pending an operator decision once bd exposes a lease
+# mechanism (1.1.0+) — is liveness first: a claim held by a verifiably live
+# holder is never stolen, and expiry is only a backstop for an ambiguous or
+# dead holder.
+#
+# Residual exposure (as shipped): a bead that is claimed and spooled but not
+# yet drained by kranz-city-worker is covered by nothing today — no
+# heartbeat runs between dispatch exit and drain start, and there is no TTL
+# backstop either.
 #
 # Env:
 #   KRANZ_RIG_DIR            explicit rig checkout (optional)
@@ -25,12 +53,13 @@
 # Bidirectional bead status <-> kranz-side state map (all four bead
 # statuses, both directions):
 #   open         <-> Queued           (ready for dispatch / re-readied)
-#   in_progress  <-> Running          (set below once a bead is spooled)
+#   in_progress  <-> Running          (set below by the atomic claim, before spooling)
 #   blocked      <-> Blocked-report   (set by kranz-run-bead, exit 2)
 #   closed       <-> Done             (set by kranz-run-bead, exit 0)
 #
 # Exit-code contract (kranz-run-bead owns the exit-code translation; this
-# script only ever moves a bead from open to in_progress on spool):
+# script only ever moves a bead from open to in_progress, via the atomic
+# claim, before spooling):
 #   0            -> closed  (mission COMPLETE)
 #   2            -> blocked (mission BLOCKED, escalate to a human)
 #   exit 3       -> open    (refused as UNDERSPECIFIED; refine and re-ready)
@@ -76,6 +105,11 @@ for ID in $READY; do
         continue
     fi
 
+    # Atomic, first-wins claim BEFORE any spool write. A failed claim means
+    # another dispatcher won the race (or some other bd error): skip
+    # silently, no comment, no spool files.
+    gc bd update "$ID" --claim >/dev/null 2>&1 || continue
+
     BEAD=$(gc bd show "$ID" --json) || continue
     TITLE=$(printf '%s' "$BEAD" | jq -r '(if type == "array" then .[0] else . end) | .title // empty')
     DESC=$(printf '%s' "$BEAD" | jq -r '(if type == "array" then .[0] else . end) | .description // ""')
@@ -93,6 +127,5 @@ for ID in $READY; do
         printf 'ID=%s\nCITY=%s\nRIG_DIR=%s\nMAX_CYCLES=%s\n' "$ID" "$CITY" "$RIG_DIR" "$MAX_CYCLES"
     } > "$SPOOL/$STAMP-$ID.env"
 
-    gc bd update "$ID" --status in_progress >/dev/null 2>&1
     echo "kranz-dispatch: bead $ID spooled for $RIG_DIR"
 done

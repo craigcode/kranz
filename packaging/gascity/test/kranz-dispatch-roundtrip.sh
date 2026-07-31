@@ -82,14 +82,16 @@ else
     echo "CREATE: PASS (fixture id $FIXTURE_ID)"
 fi
 
-# --- Case: atomic claim (bd update --claim, dialect doc §2 VERIFIED on the
-# installed 1.0.5 binary) — verifies the live binary's atomic claim shape
-# (status plus assignee) on the fixture bead, which contract assertion a2's
-# "claimed" clause requires. Neither bridge script calls --claim today (the
-# dialect doc records both as mutating status directly instead); milestone 3
-# would build atomic claim into the bridge if an operator authorises it. No
-# lease/TTL/heartbeat/liveness logic here; that is milestone 3's problem (see
-# the LEASE stub below).
+# --- Case: atomic claim + idempotent re-claim + ready-drain coverage (bd
+# update --claim, dialect doc §3 VERIFIED on the installed 1.0.5 binary) —
+# verifies the live binary's atomic claim shape (status plus assignee) on
+# the fixture bead, which contract assertion a2's "claimed" clause requires,
+# PLUS the behaviour this milestone actually ships in kranz-dispatch: a
+# fresh claim, re-claiming a bead already held by the same actor being a
+# no-op success, and a claimed bead being reflected as claimed/in_progress
+# by `bd ready` rather than still offered to a second dispatcher's drain.
+# No lease/TTL/heartbeat/liveness logic here — that stays out of scope and
+# is covered by the LEASE stub below instead.
 
 if [ -n "$FIXTURE_ID" ]; then
     CLAIM_OUT=$(BD update "$FIXTURE_ID" --claim --json 2>&1)
@@ -100,7 +102,30 @@ if [ -n "$FIXTURE_ID" ]; then
     elif [ -z "$CLAIM_ASSIGNEE" ]; then
         fail_case "claim-assignee" "a non-empty assignee" "'$CLAIM_ASSIGNEE'"
     else
-        echo "CLAIM: PASS (atomic claim, assignee set)"
+        # Re-claim the same bead (still held by the same actor): must
+        # succeed (idempotent), stay in_progress, keep the same assignee.
+        RECLAIM_OUT=$(BD update "$FIXTURE_ID" --claim --json 2>&1)
+        RECLAIM_EXIT=$?
+        RECLAIM_STATUS=$(printf '%s' "$RECLAIM_OUT" | unwrap | jq -r '.status // empty')
+        RECLAIM_ASSIGNEE=$(printf '%s' "$RECLAIM_OUT" | unwrap | jq -r '.assignee // empty')
+        # A claimed bead must no longer be offered by `bd ready`, so a
+        # second dispatcher's drain does not re-serve it.
+        READY_IDS=$(BD ready --json 2>/dev/null | jq -r '.[].id')
+        STILL_READY=0
+        for RID in $READY_IDS; do
+            [ "$RID" = "$FIXTURE_ID" ] && STILL_READY=1
+        done
+        if [ "$RECLAIM_EXIT" -ne 0 ]; then
+            fail_case "claim-reclaim-exit" "re-claim to succeed (exit 0)" "exit $RECLAIM_EXIT: $RECLAIM_OUT"
+        elif [ "$RECLAIM_STATUS" != "in_progress" ]; then
+            fail_case "claim-reclaim-status" "in_progress" "$RECLAIM_STATUS"
+        elif [ "$RECLAIM_ASSIGNEE" != "$CLAIM_ASSIGNEE" ]; then
+            fail_case "claim-reclaim-assignee" "same assignee '$CLAIM_ASSIGNEE'" "'$RECLAIM_ASSIGNEE'"
+        elif [ "$STILL_READY" -ne 0 ]; then
+            fail_case "claim-not-in-ready" "claimed bead $FIXTURE_ID absent from bd ready --json" "still listed as ready"
+        else
+            echo "CLAIM: PASS (atomic claim, idempotent re-claim)"
+        fi
     fi
 fi
 
@@ -183,10 +208,14 @@ fi
 
 # --- Case: lease-aware claim / liveness-first recovery ------------------
 # Stubbed per this feature's spec: bd 1.0.5 exposes no lease/TTL/heartbeat
-# field (docs/scoping/beads-bridge-dialect.md §3, executed probe). The next
-# milestone fills this in once an operator-approved mechanism exists.
+# field (docs/scoping/beads-bridge-dialect.md §3, executed probe), so there
+# is no way to distinguish a dead claim holder from a live one. This stays
+# stubbed until either bd exposes a TTL/heartbeat mechanism (an upgrade path
+# to 1.1.2 exists via brew, docs/scoping/beads-bridge-dialect.md §1/§3) or
+# an operator signs off on an alternate mechanism — this is an operator
+# decision, not an ordinal-milestone one.
 
-echo "LEASE: SKIP (not yet implemented)"
+echo "LEASE: SKIP (not yet implemented — awaiting operator decision on bd's TTL/heartbeat capability gap)"
 
 # --- Case: field translation is type-correct (acceptance_criteria) -----
 # Exercises the real kranz-dispatch script's brief-generation logic. The
@@ -346,8 +375,8 @@ else
     STRING_LIVE_STATUS=$(status_of "$STRING_ID")
     if [ "$STRING_LIVE_STATUS" != "in_progress" ]; then
         fail_case "gc-stub-forward-update" "live status in_progress for real fixture $STRING_ID after dispatch" "$STRING_LIVE_STATUS"
-    elif ! grep -qE "update ${ARRAY_ID} --status in_progress\$" "$GC_CALLS_LOG" 2>/dev/null; then
-        fail_case "gc-stub-log-array-update" "gc-calls.log to log an update for synthetic id $ARRAY_ID carrying exactly --status in_progress" "$(cat "$GC_CALLS_LOG" 2>/dev/null)"
+    elif ! grep -qE "update ${ARRAY_ID} --claim\$" "$GC_CALLS_LOG" 2>/dev/null; then
+        fail_case "gc-stub-log-array-update" "gc-calls.log to log an atomic claim for synthetic id $ARRAY_ID carrying exactly --claim" "$(cat "$GC_CALLS_LOG" 2>/dev/null)"
     else
         echo "GC-STUB: PASS (forwards update/comment to real bd for a live id, logs every invocation, no-ops the synthetic id)"
     fi
