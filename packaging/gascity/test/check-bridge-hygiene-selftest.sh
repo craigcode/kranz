@@ -9,17 +9,28 @@
 # each evasion idiom is still caught (and that a genuinely unrelated line is
 # still left alone), independent of the current state of packaging/gascity/.
 #
-# It also regression-tests a second sub-finding of [a1] (ms-2-fix-1-11):
-# check-bridge-hygiene.sh used to exempt its OWN file wholesale, by path,
-# from the gc init/stop scan — so a bare `gc init`/`gc stop` slipped into
-# the checker itself, anywhere, would never be reported. The exemption is
-# now narrowed to only the lines that embed the literal grep patterns/echo
-# diagnostics (see is_comment_or_readme_hit in check-bridge-hygiene.sh); a
-# bare invocation elsewhere in the checker must still be caught.
+# It also regression-tests a second sub-finding of [a1]: check-bridge-
+# hygiene.sh used to carry a self-exemption in is_comment_or_readme_hit for
+# its own file path, because its detection code spelled out the literal
+# search patterns/messages it was scanning for. That exemption was narrowed
+# three times (ms-2-fix-1-2, ms-2-fix-2-2, ms-2-fix-2-7) and a validator
+# found a residual evasion hole every time. ms-2-fix-3-1 removed the root
+# cause instead of narrowing further: the checker now assembles the command
+# name and verbs from split tokens at runtime (same idiom this selftest
+# uses below), so its own source never carries the literals, and the
+# self-exemption was deleted outright — there is no special case left to
+# evade. This file proves that behaviourally, by injecting a runtime-
+# assembled `gc init`/`gc stop` onto the exact line shapes the old
+# exemption used to swallow (a grep-assignment line, a diagnostic echo
+# line, and a bare statement elsewhere in the body), rather than pinning
+# any literal copy of the checker's implementation text — a frozen source
+# literal inside a merge gate is the defect this milestone is removing.
 set -u
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 HYGIENE="$SCRIPT_DIR/check-bridge-hygiene.sh"
+REAL_GASCITY_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+REAL_BIN_DIR="$REAL_GASCITY_DIR/bin"
 
 fail() {
     echo "FAIL [$1]: expected $2, observed $3" >&2
@@ -38,8 +49,8 @@ chmod +x "$SANDBOX/test/check-bridge-hygiene.sh"
 # Probe text is assembled from separate tokens at runtime, never written
 # adjacently as "gc ... init"/"gc ... stop" literals in this file's own
 # source — otherwise this selftest would itself trip the very guard it
-# tests (this file is under packaging/gascity/ and, unlike
-# check-bridge-hygiene.sh, carries no self-exemption).
+# tests (this file is under packaging/gascity/ and, like the checker
+# itself now, carries no self-exemption).
 GC_CMD=g
 GC_CMD="${GC_CMD}c"
 VERB_A=in
@@ -83,189 +94,74 @@ STATUS=$?
     "check-bridge-hygiene to pass on an ordinary 'gc ... bd' invocation" \
     "exit $STATUS: $OUT"
 echo "SELFTEST [no-false-positive]: PASS"
-
-# Self-exemption narrowing (ms-2-fix-1-11): a bare gc init/stop invocation
-# added directly to check-bridge-hygiene.sh's own body — not one of its
-# pattern-bearing grep/echo lines — must still be caught, not swallowed by
-# the file's self-exemption.
-run_self_exemption_case() {
-    # $1 = case name, $2 = verb token to append as a bare invocation
-    name="$1"
-    verb="$2"
-
-    cp "$HYGIENE" "$SANDBOX/test/check-bridge-hygiene.sh"
-    chmod +x "$SANDBOX/test/check-bridge-hygiene.sh"
-    printf '\nfoo() { %s %s; }\n' "$GC_CMD" "$verb" >>"$SANDBOX/test/check-bridge-hygiene.sh"
-
-    # Clear out any leftover bin/ probe from earlier cases so this case's
-    # result is attributable only to the self-injected line.
-    rm -f "$SANDBOX/bin/probe.sh"
-
-    OUT=$("$SANDBOX/test/check-bridge-hygiene.sh" 2>&1)
-    STATUS=$?
-
-    if [ "$STATUS" -eq 0 ]; then
-        fail "$name" "check-bridge-hygiene to reject a bare invocation in its own body" \
-            "exit 0 (OK) — swallowed by the self-exemption: $OUT"
-    fi
-    case "$OUT" in
-        *"forbidden - see docs/gascity.md:48"*) : ;;
-        *) fail "$name" "violation message naming the forbidden verb" "$OUT" ;;
-    esac
-    echo "SELFTEST [$name]: PASS (bare invocation in checker's own body still caught)"
-}
-
-run_self_exemption_case "self-exempt-init" "$VERB_A"
-run_self_exemption_case "self-exempt-stop" "$VERB_B"
-
-# Self-exemption anchoring (ms-2-fix-2-2): the exemption used to be a bare
-# substring test (`*grep*` / `echo `-prefix), which is broader than the
-# actual pattern-bearing lines it needs to cover. Prove the two idioms named
-# in the finding still get caught now that the match is anchored to the
-# real grep-assignment / echo-diagnostic shapes:
-#   1. a bare invocation whose line carries a trailing comment mentioning
-#      the word "grep" (the old `*grep*` test matched this anywhere on the
-#      line, so a trailing `# grep ...` comment used to swallow the hit).
-#   2. a helper function whose NAME contains "grep" but whose body invokes
-#      the bare verb (the old `*grep*` test matched the function name too).
-run_self_exemption_trailing_comment_case() {
-    # $1 = case name, $2 = verb token to append as a bare invocation with a
-    # trailing comment mentioning "grep"
-    name="$1"
-    verb="$2"
-
-    cp "$HYGIENE" "$SANDBOX/test/check-bridge-hygiene.sh"
-    chmod +x "$SANDBOX/test/check-bridge-hygiene.sh"
-    printf '\nfoo() { %s %s; } # grep note\n' "$GC_CMD" "$verb" >>"$SANDBOX/test/check-bridge-hygiene.sh"
-
-    rm -f "$SANDBOX/bin/probe.sh"
-
-    OUT=$("$SANDBOX/test/check-bridge-hygiene.sh" 2>&1)
-    STATUS=$?
-
-    if [ "$STATUS" -eq 0 ]; then
-        fail "$name" "check-bridge-hygiene to reject a bare invocation with a trailing 'grep'-mentioning comment" \
-            "exit 0 (OK) — swallowed by the self-exemption: $OUT"
-    fi
-    case "$OUT" in
-        *"forbidden - see docs/gascity.md:48"*) : ;;
-        *) fail "$name" "violation message naming the forbidden verb" "$OUT" ;;
-    esac
-    echo "SELFTEST [$name]: PASS (trailing-comment evasion idiom still caught)"
-}
-
-run_self_exemption_helper_name_case() {
-    # $1 = case name, $2 = verb token to append inside a helper function
-    # whose name contains "grep"
-    name="$1"
-    verb="$2"
-
-    cp "$HYGIENE" "$SANDBOX/test/check-bridge-hygiene.sh"
-    chmod +x "$SANDBOX/test/check-bridge-hygiene.sh"
-    printf '\nmy_grep_helper() { %s %s; }\n' "$GC_CMD" "$verb" >>"$SANDBOX/test/check-bridge-hygiene.sh"
-
-    rm -f "$SANDBOX/bin/probe.sh"
-
-    OUT=$("$SANDBOX/test/check-bridge-hygiene.sh" 2>&1)
-    STATUS=$?
-
-    if [ "$STATUS" -eq 0 ]; then
-        fail "$name" "check-bridge-hygiene to reject a bare invocation inside a grep-named helper function" \
-            "exit 0 (OK) — swallowed by the self-exemption: $OUT"
-    fi
-    case "$OUT" in
-        *"forbidden - see docs/gascity.md:48"*) : ;;
-        *) fail "$name" "violation message naming the forbidden verb" "$OUT" ;;
-    esac
-    echo "SELFTEST [$name]: PASS (grep-named-helper evasion idiom still caught)"
-}
-
-run_self_exemption_trailing_comment_case "self-exempt-trailing-comment-init" "$VERB_A"
-run_self_exemption_trailing_comment_case "self-exempt-trailing-comment-stop" "$VERB_B"
-run_self_exemption_helper_name_case "self-exempt-grep-named-helper-init" "$VERB_A"
-run_self_exemption_helper_name_case "self-exempt-grep-named-helper-stop" "$VERB_B"
-
-# Non-vacuity: restore the OLD broad substring exemption (`*grep*` /
-# `echo `-prefix) on a temp copy and confirm these two new cases FAIL with
-# the swallowed-by-self-exemption diagnostic — proving the new cases would
-# have caught the regression the old exemption was vulnerable to. The old
-# and new exemption lines are passed to perl via the environment (not
-# interpolated into the perl source) so none of their shell/regex
-# metacharacters need hand-escaping; \Q...\E makes the search literal.
-export OLD_EXEMPTION_LINE='                    *grep*|echo\ *) return 0 ;;'
-export NEW_EXEMPTION_LINE='                    *'"'"'=$(grep '"'"'*|'"'"'echo "check-bridge-hygiene:'"'"'*) return 0 ;;'
-
-if ! grep -qF "$NEW_EXEMPTION_LINE" "$HYGIENE"; then
-    fail "non-vacuity-setup" "the new anchored exemption line to be present in $HYGIENE" \
-        "marker not found — cannot construct the broad-exemption regression copy"
-fi
-
-# Remove the $SANDBOX/test/check-bridge-hygiene.sh copy used by the cases
-# above (it was left holding an injected probe line from the last case, and
-# even an unmodified copy would confuse the scan below: BROAD's own
-# self-exemption only applies to ITS OWN path, so a second, unrelated copy
-# of check-bridge-hygiene.sh elsewhere under the same GASCITY_DIR would get
-# its legitimate echo diagnostics flagged as if they were a real violation).
-rm -f "$SANDBOX/test/check-bridge-hygiene.sh"
-
-# The regression copy keeps the SAME basename (check-bridge-hygiene.sh) as
-# the real checker, in a sibling directory — the self-exemption case in
-# is_comment_or_readme_hit matches on "$SCRIPT_DIR/check-bridge-hygiene.sh",
-# i.e. by basename relative to wherever the running script lives, so a
-# renamed copy would never hit that case at all and the test would prove
-# nothing about the exemption logic itself.
-mkdir -p "$SANDBOX/broad"
-BROAD="$SANDBOX/broad/check-bridge-hygiene.sh"
-perl -pe 's/\Q$ENV{NEW_EXEMPTION_LINE}\E/$ENV{OLD_EXEMPTION_LINE}/' "$HYGIENE" >"$BROAD"
-chmod +x "$BROAD"
-
-if ! grep -qF "$OLD_EXEMPTION_LINE" "$BROAD"; then
-    fail "non-vacuity-setup" "the broad-exemption regression copy to contain the old substring exemption" \
-        "substitution did not take effect"
-fi
-if grep -qF "$NEW_EXEMPTION_LINE" "$BROAD"; then
-    fail "non-vacuity-setup" "the broad-exemption regression copy to no longer contain the new anchored exemption" \
-        "substitution left the new line in place"
-fi
-
-printf '\nfoo() { %s %s; } # grep note\n' "$GC_CMD" "$VERB_A" >>"$BROAD"
 rm -f "$SANDBOX/bin/probe.sh"
-OUT=$("$BROAD" 2>&1)
-STATUS=$?
-if [ "$STATUS" -eq 0 ]; then
-    :
-else
-    fail "non-vacuity-trailing-comment" \
-        "the OLD broad exemption to swallow the trailing-comment evasion (exit 0)" \
-        "exit $STATUS: $OUT"
-fi
-echo "SELFTEST [non-vacuity-trailing-comment]: PASS (old broad exemption is indeed swallowed by it, confirming the new test is non-vacuous)"
 
-perl -pe 's/\Q$ENV{NEW_EXEMPTION_LINE}\E/$ENV{OLD_EXEMPTION_LINE}/' "$HYGIENE" >"$BROAD"
-chmod +x "$BROAD"
-printf '\nmy_grep_helper() { %s %s; }\n' "$GC_CMD" "$VERB_B" >>"$BROAD"
-rm -f "$SANDBOX/bin/probe.sh"
-OUT=$("$BROAD" 2>&1)
-STATUS=$?
-if [ "$STATUS" -eq 0 ]; then
-    :
-else
-    fail "non-vacuity-grep-named-helper" \
-        "the OLD broad exemption to swallow the grep-named-helper evasion (exit 0)" \
-        "exit $STATUS: $OUT"
-fi
-echo "SELFTEST [non-vacuity-grep-named-helper]: PASS (old broad exemption is indeed swallowed by it, confirming the new test is non-vacuous)"
+# No-self-exemption (ms-2-fix-3-1): with the self-exemption deleted, a
+# runtime-assembled `gc init`/`gc stop` injected directly into the
+# checker's own body must still be caught on every line shape the old
+# exemption used to swallow — including the two shapes the old exemption
+# matched BY DESIGN (a grep-assignment line, a diagnostic echo line), not
+# just the shapes prior narrowings happened to miss. Injected as a trailing
+# shell comment on an existing line (so the sandbox copy stays syntactically
+# valid and the probe is never actually executed as a real `gc` invocation),
+# or as a new, never-called function body for the "elsewhere" case.
+run_injected_line_case() {
+    # $1 = case name, $2 = mode ("grep-line" | "diag-line" | "bare"),
+    # $3 = verb token
+    name="$1"
+    mode="$2"
+    verb="$3"
+    TARGET="$SANDBOX/test/check-bridge-hygiene.sh"
 
-# Discard the broad-exemption regression copy entirely — it must not linger
-# under $SANDBOX and be picked up by the final unmodified-checker sanity
-# scan below (that scan walks the whole GASCITY_DIR, i.e. all of $SANDBOX).
-rm -rf "$SANDBOX/broad"
+    cp "$HYGIENE" "$TARGET"
+    chmod +x "$TARGET"
+
+    case "$mode" in
+        grep-line)
+            N=$(grep -Fn '=$(grep ' "$TARGET" | head -n1 | cut -d: -f1)
+            [ -n "$N" ] || fail "$name" "a grep-assignment line to exist in $TARGET" "none found"
+            sed "${N}s|\$| # ${GC_CMD} ${verb}|" "$TARGET" >"$TARGET.tmp" && mv "$TARGET.tmp" "$TARGET" && chmod +x "$TARGET"
+            ;;
+        diag-line)
+            N=$(grep -Fn 'echo "check-bridge-hygiene:' "$TARGET" | head -n1 | cut -d: -f1)
+            [ -n "$N" ] || fail "$name" "a check-bridge-hygiene: diagnostic echo line to exist in $TARGET" "none found"
+            sed "${N}s|\$| # ${GC_CMD} ${verb}|" "$TARGET" >"$TARGET.tmp" && mv "$TARGET.tmp" "$TARGET" && chmod +x "$TARGET"
+            ;;
+        bare)
+            printf '\nfoo() { %s %s; }\n' "$GC_CMD" "$verb" >>"$TARGET"
+            ;;
+        *)
+            fail "$name" "a known injection mode" "$mode"
+            ;;
+    esac
+
+    rm -f "$SANDBOX/bin/probe.sh"
+
+    OUT=$("$TARGET" 2>&1)
+    STATUS=$?
+
+    if [ "$STATUS" -eq 0 ]; then
+        fail "$name" "check-bridge-hygiene to reject a $mode invocation in its own body" \
+            "exit 0 (OK) — invocation was not caught: $OUT"
+    fi
+    case "$OUT" in
+        *"forbidden - see docs/gascity.md:48"*) : ;;
+        *) fail "$name" "violation message naming the forbidden verb" "$OUT" ;;
+    esac
+    echo "SELFTEST [$name]: PASS ($mode invocation in checker's own body still caught)"
+}
+
+run_injected_line_case "no-self-exempt-grep-line-init" "grep-line" "$VERB_A"
+run_injected_line_case "no-self-exempt-grep-line-stop" "grep-line" "$VERB_B"
+run_injected_line_case "no-self-exempt-diag-line-init" "diag-line" "$VERB_A"
+run_injected_line_case "no-self-exempt-diag-line-stop" "diag-line" "$VERB_B"
+run_injected_line_case "no-self-exempt-bare-init" "bare" "$VERB_A"
+run_injected_line_case "no-self-exempt-bare-stop" "bare" "$VERB_B"
 
 # Sanity: the unmodified checker (whose only "gc ... init/stop"-shaped text
-# lives in its own grep patterns and echo diagnostics) must still pass
-# against itself — proves the narrowed exemption doesn't over-exempt back
-# to whole-file, but also doesn't under-exempt and start flagging its own
-# detection code.
+# lives in its own runtime-assembled grep patterns and echo diagnostics —
+# never spelled out literally, so no exemption is needed) must still pass
+# against itself.
 cp "$HYGIENE" "$SANDBOX/test/check-bridge-hygiene.sh"
 chmod +x "$SANDBOX/test/check-bridge-hygiene.sh"
 rm -f "$SANDBOX/bin/probe.sh"
@@ -275,5 +171,60 @@ STATUS=$?
     "check-bridge-hygiene to pass when run unmodified against a copy of itself" \
     "exit $STATUS: $OUT"
 echo "SELFTEST [self-unmodified-clean]: PASS"
+
+# set-state positive-direction case: the FIRST half of [a1] (the set-state
+# guard in default_mode) previously had no test proving it actually fires
+# — only a clean tree was ever scanned, so the guard passed vacuously.
+# Assemble the token from split parts at runtime, exactly like gc/init/stop
+# above, so this file's own source never carries it adjacently either.
+SET_STATE_A=set
+SET_STATE_B=state
+SET_STATE_TOKEN="${SET_STATE_A}-${SET_STATE_B}"
+
+cp "$HYGIENE" "$SANDBOX/test/check-bridge-hygiene.sh"
+chmod +x "$SANDBOX/test/check-bridge-hygiene.sh"
+printf '#!/bin/sh\n%s foo bar\n' "$SET_STATE_TOKEN" >"$SANDBOX/bin/probe.sh"
+
+OUT=$("$SANDBOX/test/check-bridge-hygiene.sh" 2>&1)
+STATUS=$?
+if [ "$STATUS" -eq 0 ]; then
+    fail "set-state-guard" "check-bridge-hygiene to reject a '${SET_STATE_TOKEN}' probe under bin/ with nonzero exit" \
+        "exit 0 (OK) — evaded the guard: $OUT"
+fi
+case "$OUT" in
+    *"'${SET_STATE_TOKEN}' found under packaging/gascity/bin/"*) : ;;
+    *) fail "set-state-guard" "violation message naming the forbidden '${SET_STATE_TOKEN}' token" "$OUT" ;;
+esac
+echo "SELFTEST [set-state-guard]: PASS (set-state token under bin/ still caught)"
+rm -f "$SANDBOX/bin/probe.sh"
+
+# --status-map negative case: contract assertion [a4] previously had no test
+# proving the check actually fires — only trees that already satisfy it
+# were ever scanned. Copy the real translator scripts into the sandbox
+# bin/, strip their bidirectional (<-> / <-->) mapping comment lines, and
+# confirm --status-map rejects the result and names what's missing.
+for NAME in kranz-dispatch kranz-run-bead; do
+    SRC="$REAL_BIN_DIR/$NAME"
+    [ -f "$SRC" ] || fail "status-map-missing-mapping" "$SRC to exist" "not found"
+    grep -vE '<-{1,2}>' "$SRC" >"$SANDBOX/bin/$NAME"
+    chmod +x "$SANDBOX/bin/$NAME"
+done
+
+OUT=$("$SANDBOX/test/check-bridge-hygiene.sh" --status-map 2>&1)
+STATUS=$?
+if [ "$STATUS" -eq 0 ]; then
+    fail "status-map-missing-mapping" \
+        "check-bridge-hygiene --status-map to reject scripts stripped of their mapping lines" \
+        "exit 0 (OK) — evaded the check: $OUT"
+fi
+case "$OUT" in
+    *"is missing:"*) : ;;
+    *) fail "status-map-missing-mapping" "a message naming what's missing" "$OUT" ;;
+esac
+echo "SELFTEST [status-map-missing-mapping]: PASS (--status-map rejects scripts stripped of mapping lines)"
+
+# Restore the sandbox bin/ to a clean state so it doesn't leak into any
+# case that might be added after this point.
+rm -f "$SANDBOX/bin/kranz-dispatch" "$SANDBOX/bin/kranz-run-bead" "$SANDBOX/bin/probe.sh"
 
 echo "CHECK-BRIDGE-HYGIENE-SELFTEST: PASS (all [a1] evasion idioms caught, no false positive)"

@@ -119,25 +119,12 @@ default_mode() {
         esac
         CONTENT=$(printf '%s\n' "$line" | sed -e 's/^[^:]*:[0-9][0-9]*://')
         STRIPPED=$(printf '%s\n' "$CONTENT" | sed -e 's/^[[:space:]]*//')
-        case "$line" in
-            # This script's own detection code necessarily embeds the
-            # literal search patterns/messages as grep invocations and echo
-            # diagnostics — that is data, not an invocation of either
-            # command. Only THOSE specific lines are exempt, matched by their
-            # actual anchored shape rather than a "contains grep anywhere" or
-            # "starts with echo" substring test (a substring test would also
-            # exempt an unrelated line that merely carries a trailing
-            # `# grep`-mentioning comment, or a helper function whose NAME
-            # happens to contain "grep", even though its body invokes a `gc`
-            # verb). Any other line in this file (e.g. a bare `gc init`/
-            # `gc stop` slipped in elsewhere, however disguised) is still
-            # caught below like any other file.
-            "$SCRIPT_DIR/check-bridge-hygiene.sh":*)
-                case "$STRIPPED" in
-                    *'=$(grep '*|'echo "check-bridge-hygiene:'*) return 0 ;;
-                esac
-                ;;
-        esac
+        # No self-exemption for this file: its detection code assembles the
+        # forbidden command name and verbs from split tokens (see GC_NAME,
+        # VERB_INIT, VERB_STOP below) instead of spelling them out, so its
+        # own grep patterns and echo diagnostics never match themselves.
+        # Reintroducing a path-specific exemption here would reopen exactly
+        # the evasion class the prior narrowings kept failing to close.
         case "$STRIPPED" in
             '#'*) return 0 ;;
         esac
@@ -161,27 +148,39 @@ $line"
         printf '%s' "$FILTERED" | sed -e '/^$/d'
     }
 
+    # Command name and verbs, assembled from split tokens at runtime so no
+    # line of this file spells out the forbidden invocations adjacently
+    # (see the sibling selftest's identical technique). Used below for BOTH
+    # the grep -rnE pattern construction and the echo diagnostics.
+    GC_NAME=g
+    GC_NAME="${GC_NAME}c"
+    VERB_INIT=in
+    VERB_INIT="${VERB_INIT}it"
+    VERB_STOP=st
+    VERB_STOP="${VERB_STOP}op"
+
     # Match the VERB (init/stop) as a whole word following a "gc" invocation,
     # with any run of whitespace and any number of intervening flag/value
-    # tokens allowed (e.g. `gc init`, `gc  init`, `gc --city "$CITY" init`,
-    # `gc -C dir stop`) — not just the adjacent literal "gc init"/"gc stop".
+    # tokens allowed — e.g. "gc" immediately before the verb, "gc" with two
+    # spaces before the verb, or "gc --city "$CITY"" before the verb — not
+    # just the two tokens written directly adjacent to each other.
     # Word-boundary anchors on both "gc" and the verb keep this from firing
-    # on substrings like "mygc init", "gc reinit", or "gc stopwatch".
+    # on a "gc"-prefixed identifier, or a verb embedded in a longer word.
     GC_TOKEN='(-[A-Za-z0-9_-]*|"[^"]*"|[A-Za-z0-9_./$${}"-]+)'
-    GC_VERB_RE="(^|[^A-Za-z0-9_.-])gc([[:space:]]+${GC_TOKEN})*[[:space:]]+VERB([^A-Za-z0-9_-]|\$)"
+    GC_VERB_RE="(^|[^A-Za-z0-9_.-])${GC_NAME}([[:space:]]+${GC_TOKEN})*[[:space:]]+VERB([^A-Za-z0-9_-]|\$)"
 
-    RAW=$(grep -rnE "$(printf '%s' "$GC_VERB_RE" | sed -e 's/VERB/init/')" "$GASCITY_DIR" 2>/dev/null || true)
+    RAW=$(grep -rnE "$(printf '%s' "$GC_VERB_RE" | sed -e "s/VERB/${VERB_INIT}/")" "$GASCITY_DIR" 2>/dev/null || true)
     HITS=$(filter_code_hits "$RAW")
     if [ -n "$HITS" ]; then
-        echo "check-bridge-hygiene: 'gc init' invocation found under packaging/gascity/ (forbidden - see docs/gascity.md:48):" >&2
+        echo "check-bridge-hygiene: '${GC_NAME} ${VERB_INIT}' invocation found under packaging/gascity/ (forbidden - see docs/gascity.md:48):" >&2
         echo "$HITS" >&2
         VIOLATIONS=1
     fi
 
-    RAW=$(grep -rnE "$(printf '%s' "$GC_VERB_RE" | sed -e 's/VERB/stop/')" "$GASCITY_DIR" 2>/dev/null || true)
+    RAW=$(grep -rnE "$(printf '%s' "$GC_VERB_RE" | sed -e "s/VERB/${VERB_STOP}/")" "$GASCITY_DIR" 2>/dev/null || true)
     HITS=$(filter_code_hits "$RAW")
     if [ -n "$HITS" ]; then
-        echo "check-bridge-hygiene: 'gc stop' invocation found under packaging/gascity/ (forbidden - see docs/gascity.md:48):" >&2
+        echo "check-bridge-hygiene: '${GC_NAME} ${VERB_STOP}' invocation found under packaging/gascity/ (forbidden - see docs/gascity.md:48):" >&2
         echo "$HITS" >&2
         VIOLATIONS=1
     fi
@@ -190,7 +189,7 @@ $line"
         return 1
     fi
 
-    echo "check-bridge-hygiene: OK (no set-state under bin/, no gc init/gc stop under gascity/)"
+    echo "check-bridge-hygiene: OK (no set-state under bin/, no ${GC_NAME} ${VERB_INIT}/${GC_NAME} ${VERB_STOP} under gascity/)"
     return 0
 }
 
