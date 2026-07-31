@@ -271,6 +271,86 @@ fi
 
 echo "LEASE: SKIP (dead-claim recovery not implemented — no lease/TTL/heartbeat signal in bd 1.0.5; awaiting operator decision. Idempotent re-claim and competing-claim-fails are proven by the CLAIM case above.)"
 
+# --- Case: claim-succeeded-then-spool-failed window (finding f-3-1: "skips
+# silently on a lost race leaving no orphan spool entry" / the header's
+# residual-exposure paragraph) — a real bead is claimed via the atomic
+# `--claim` call inside kranz-dispatch, then `gc bd show "$ID" --json` fails.
+# Per the rollback shipped at bin/kranz-dispatch:137 (`release_claim`), the
+# bead must be returned to open/unassigned rather than left claimed with no
+# spool entry, and no .md/.env pair must exist for it. -----------------------
+
+SHOWFAIL_CREATE_OUT=$(BD create "SHOWFAIL fixture" --type task --json 2>&1)
+SHOWFAIL_ID=$(printf '%s' "$SHOWFAIL_CREATE_OUT" | unwrap | jq -r '.id // empty')
+if [ -z "$SHOWFAIL_ID" ]; then
+    fail_case "showfail-create" "a non-empty issue id" "'$SHOWFAIL_CREATE_OUT'"
+else
+    SHOWFAIL_CITY_DIR="$SANDBOX/showfail-city"
+    SHOWFAIL_SPOOL_DIR="$SHOWFAIL_CITY_DIR/.gc/kranz-spool"
+    SHOWFAIL_STUB_BIN="$SANDBOX/showfail-stubbin"
+    mkdir -p "$SHOWFAIL_SPOOL_DIR" "$SHOWFAIL_STUB_BIN"
+
+    # `gc` stub: `ready` offers only the fixture; `update --claim` and the
+    # rollback's `update --status open --assignee ""` both forward to the
+    # real bd store (so the claim and any rollback are real, live-bd
+    # mutations); `show` unconditionally fails, simulating the window this
+    # case targets.
+    cat > "$SHOWFAIL_STUB_BIN/gc" <<STUBEOF
+#!/bin/sh
+set -u
+if [ "\${1:-}" = "--city" ]; then
+    shift 2
+fi
+case "\${1:-}" in
+    bd)
+        shift
+        case "\${1:-}" in
+            ready)
+                echo '[{"id":"$SHOWFAIL_ID"}]'
+                ;;
+            show)
+                echo "gc-stub: simulated bd show failure" >&2
+                exit 1
+                ;;
+            update|comment)
+                ID=\$2
+                ( cd "$STORE_DIR" && bd "\$@" )
+                ;;
+            *)
+                echo "gc-stub: unsupported bd subcommand: \$1" >&2
+                exit 1
+                ;;
+        esac
+        ;;
+    *)
+        echo "gc-stub: unsupported invocation: gc \$*" >&2
+        exit 1
+        ;;
+esac
+STUBEOF
+    chmod +x "$SHOWFAIL_STUB_BIN/gc"
+
+    GC_CITY="$SHOWFAIL_CITY_DIR" KRANZ_RIG_DIR="$RIG_DIR" KRANZ_LABEL="kranz" \
+        KRANZ_SPOOL="$SHOWFAIL_SPOOL_DIR" KRANZ_ALLOW_UNVALIDATED=1 \
+        PATH="$SHOWFAIL_STUB_BIN:$PATH" "$BIN_DIR/kranz-dispatch" >/dev/null 2>&1
+
+    SHOWFAIL_STATUS=$(status_of "$SHOWFAIL_ID")
+    SHOWFAIL_ASSIGNEE=$(BD show "$SHOWFAIL_ID" --json 2>/dev/null | unwrap | jq -r '.assignee // empty')
+    SHOWFAIL_MFILE=$(ls "$SHOWFAIL_SPOOL_DIR"/*-"$SHOWFAIL_ID".md 2>/dev/null | head -1)
+    SHOWFAIL_EFILE=$(ls "$SHOWFAIL_SPOOL_DIR"/*-"$SHOWFAIL_ID".env 2>/dev/null | head -1)
+
+    if [ "$SHOWFAIL_STATUS" != "open" ]; then
+        fail_case "showfail-status-rolled-back" "open" "$SHOWFAIL_STATUS"
+    elif [ -n "$SHOWFAIL_ASSIGNEE" ]; then
+        fail_case "showfail-assignee-cleared" "assignee cleared (empty) after a gc bd show failure post-claim" "'$SHOWFAIL_ASSIGNEE'"
+    elif [ -n "$SHOWFAIL_MFILE" ]; then
+        fail_case "showfail-no-orphan-md" "no .md spool file for $SHOWFAIL_ID" "found: $SHOWFAIL_MFILE"
+    elif [ -n "$SHOWFAIL_EFILE" ]; then
+        fail_case "showfail-no-orphan-env" "no .env spool file for $SHOWFAIL_ID" "found: $SHOWFAIL_EFILE"
+    else
+        echo "SHOWFAIL: PASS (claim rolled back to open/unassigned and no orphan spool pair when gc bd show fails after a successful claim)"
+    fi
+fi
+
 # --- Case: field translation is type-correct (acceptance_criteria) -----
 # Exercises the real kranz-dispatch script's brief-generation logic. The
 # STRING case is real end-to-end: a fixture bead with a string-valued
