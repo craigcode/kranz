@@ -377,10 +377,12 @@ pub(crate) fn mission_write_denies(inputs: &SandboxInputs) -> MissionWriteDenies
 /// token files do not yet), because Seatbelt matches against canonical paths
 /// — the same `/var` ↔ `/private/var` split the write allowlist handles.
 ///
-/// Also denied: `$CARGO_HOME/credentials.toml` (or `~/.cargo/credentials.toml`
-/// when CARGO_HOME is unset) — CARGO_HOME crosses into child envs for
-/// registry-cache locality ([`crate::agent_env`]), but its registry auth
-/// tokens are the same credential class as the serve token.
+/// Also denied: `$CARGO_HOME/credentials.toml` AND the legacy extensionless
+/// `$CARGO_HOME/credentials` (or `~/.cargo/...` when CARGO_HOME is unset) —
+/// CARGO_HOME crosses into child envs for registry-cache locality
+/// ([`crate::agent_env`]), but cargo reads BOTH filenames for registry auth
+/// tokens (the legacy one is still supported and takes precedence where
+/// present), so both are the same credential class as the serve token.
 pub(crate) fn authority_read_deny_paths(inputs: &SandboxInputs) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     for mission_dir in [inputs.mission_dir.clone(), absolutize(&inputs.mission_dir)] {
@@ -396,6 +398,7 @@ pub(crate) fn authority_read_deny_paths(inputs: &SandboxInputs) -> Vec<PathBuf> 
     if let Some(cargo_home) = cargo_home {
         for base in [cargo_home.clone(), absolutize(&cargo_home)] {
             paths.push(base.join("credentials.toml"));
+            paths.push(base.join("credentials"));
         }
     }
     paths

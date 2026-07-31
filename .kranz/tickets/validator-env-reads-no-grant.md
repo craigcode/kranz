@@ -29,29 +29,33 @@ the checkout or the world.
 
 ## Design (locked)
 
-1. **Allow a fixed set of read-only env introspection forms** for
-   validators, alongside the contract commands: `printenv`, `printenv
-   <NAME>`, `env`, and `echo`-of-env forms — expressed as exact prefix
-   rules (`Bash(printenv*)` style matching the existing pattern idiom),
-   NOT a wildcarded shell. The narrowest form that covers the incident is
-   `printenv` (bare and with names); `env` is included for parity (same
-   read-only class).
-2. **No variable-name filtering**: the session env is already the
-   sanitized set (agent_env.rs) — anything readable there is already
-   deliberate. No secrets ride the validator env by construction, so
-   allowing env reads adds no disclosure surface (unlike allowing
-   arbitrary file reads).
-3. **Document in the validator prompts** (prompts/validator-*.md) that
-   env introspection is allowed and grant requests are for actual
-   capability boundaries, so models stop parking on trivia.
-4. **Explicitly out of scope**: widening any other command class. The
+1. **Allow exactly one introspection form**: `printenv <KRANZ_…>` — the
+   variable NAME must start with `KRANZ_` (exact-prefix rules matching the
+   existing pattern idiom, e.g. `Bash(printenv KRANZ_BASE_SHA*)` plus the
+   literal-prefix `Bash(printenv KRANZ_*)` for engine vars added later).
+   Nothing wider:
+   - **No bare `printenv`** and **no `env`**: a full env dump writes the
+     backend's injected auth key (ANTHROPIC_API_KEY et al. — injected into
+     the session env post-sanitization by design) into the transcript,
+     which is otherwise sanitized. `env <cmd>` is also a command RUNNER
+     (`env ls` executes `ls`), so `env*` is arbitrary shell with extra
+     steps.
+   - **No `echo`**: `echo $(…)` is command substitution — an allow rule
+     for echo is an allow rule for the substituted command.
+   The KRANZ_-prefixed vars are engine-injected by construction
+   (KRANZ_BASE_SHA and friends), so name-prefixing is what makes the
+   disclosure set exactly the deliberate set.
+2. **Document in the validator prompts** (prompts/validator-*.md) that
+   `printenv KRANZ_*` is the sanctioned way to inspect the session env,
+   and that grant requests are for actual capability boundaries, so models
+   stop parking on trivia.
+3. **Explicitly out of scope**: widening any other command class. The
    4th-pass narrowing stands everywhere else.
 
 ## Test gate
 
 - `cargo test --workspace validator_env_reads 2>&1 | grep -qE 'test result: ok. [1-9]'`
-  — a validator allow-set contains `printenv` forms and NOT arbitrary
-  shell (e.g. no `Bash(curl*)`); the incident command `printenv
-  KRANZ_BASE_SHA` matches an allowed rule and never produces a grant
-  park.
+  — `printenv KRANZ_BASE_SHA` matches an allowed rule; bare `printenv`,
+  `env`, `env <anything>`, and `echo $KRANZ_BASE_SHA` all stay DENIED
+  (the auth-key-dump and command-runner/substitution shapes).
 - Workspace gates green, bare exit codes, never piped.

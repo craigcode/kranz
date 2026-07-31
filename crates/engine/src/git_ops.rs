@@ -203,8 +203,11 @@ impl GitRepo {
 
     /// Mission-significant refs for the tamper fingerprint: the CONTENT of
     /// `refs/heads/kranz/*` (mission branches — a validator force-moving one
-    /// retargets the deliverable) and `refs/tags/*`, plus the COUNT of all
-    /// `refs/heads/*` (a validator-created sneaky branch shows as count+1).
+    /// retargets the deliverable), `refs/tags/*`, AND `refs/replace/*` (a
+    /// replace ref changes how EVERY later git command resolves an object —
+    /// `git show <base>` renders a fake without HEAD, status, heads, or tags
+    /// moving), plus the COUNT of all `refs/heads/*` (a validator-created
+    /// sneaky branch shows as count+1).
     ///
     /// `refs/remotes/*` is excluded (ambient mirror state: any operator/CI
     /// fetch), and other local heads' CONTENT is excluded too — the operator
@@ -217,6 +220,7 @@ impl GitRepo {
             "--format=%(refname) %(objectname)",
             "refs/heads/kranz",
             "refs/tags",
+            "refs/replace",
         ])?;
         let all_heads = self.run(&["for-each-ref", "--format=%(refname)", "refs/heads"])?;
         let count = all_heads.lines().filter(|l| !l.trim().is_empty()).count();

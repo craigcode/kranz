@@ -190,6 +190,33 @@ pub fn container_run_args(
     out.push(format!("HOME={scratch}"));
     out.push("-e".to_string());
     out.push(format!("TMPDIR={scratch}"));
+    // Toolchain caches cross as READ-ONLY mounts + matching env (6th-pass
+    // review: without them a container session cold-bootstraps a whole
+    // rustup toolchain + registry into scratch, the container twin of the
+    // m-533143 ENOSPC regression). rw would let a poisoned cache ride into
+    // the operator's later builds — the same class as a shared target/, so
+    // ro it is: a cache MISS (uncached crate) fails visibly inside the
+    // container rather than writing through to the operator's cache.
+    for (var, default_subdir) in [
+        ("RUSTUP_HOME", ".rustup"),
+        ("CARGO_HOME", ".cargo"),
+        ("NPM_CONFIG_CACHE", ".npm"),
+    ] {
+        let host = std::env::var_os(var)
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(default_subdir))
+            });
+        if let Some(host) = host {
+            if host.is_dir() {
+                let mounted = crate::sandbox::absolutize(&host).display().to_string();
+                out.push("-v".to_string());
+                out.push(mount_arg(&mounted, true));
+                out.push("-e".to_string());
+                out.push(format!("{var}={mounted}"));
+            }
+        }
+    }
     if inputs.enforce == crate::types::SandboxEnforce::FsNet {
         if inputs.egress.is_empty() {
             out.push("--network".to_string());
