@@ -201,21 +201,26 @@ impl GitRepo {
         })
     }
 
-    /// All LOCAL refs (heads + tags) and their object ids, one per line — a
-    /// validator moving a ref retargets later merges without ever touching
-    /// HEAD or the worktree, so the immutability fingerprint covers it.
-    /// `refs/remotes/*` is deliberately EXCLUDED: remote-tracking refs move
-    /// on any ambient `git fetch`/`push` by the operator or CI (mission
-    /// m-83d1ed's tripwire fired on exactly that — an operator fetch
-    /// mid-window, not a validator), and they are mirror state, not
-    /// checkout identity.
+    /// Mission-significant refs for the tamper fingerprint: the CONTENT of
+    /// `refs/heads/kranz/*` (mission branches — a validator force-moving one
+    /// retargets the deliverable) and `refs/tags/*`, plus the COUNT of all
+    /// `refs/heads/*` (a validator-created sneaky branch shows as count+1).
+    ///
+    /// `refs/remotes/*` is excluded (ambient mirror state: any operator/CI
+    /// fetch), and other local heads' CONTENT is excluded too — the operator
+    /// committing to `main` mid-round is ambient work, not tamper (mission
+    /// m-83d1ed's second tripwire fire was exactly that: the instrumented
+    /// `refs` field catching the operator's own push to main).
     pub fn for_each_ref(&self) -> Result<String> {
-        self.run(&[
+        let scoped = self.run(&[
             "for-each-ref",
             "--format=%(refname) %(objectname)",
-            "refs/heads",
+            "refs/heads/kranz",
             "refs/tags",
-        ])
+        ])?;
+        let all_heads = self.run(&["for-each-ref", "--format=%(refname)", "refs/heads"])?;
+        let count = all_heads.lines().filter(|l| !l.trim().is_empty()).count();
+        Ok(format!("{scoped}heads-count: {count}\n"))
     }
 
     /// Name of the currently checked-out branch (`"HEAD"` when detached).
