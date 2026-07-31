@@ -88,10 +88,14 @@ jobs:
       # merge. Covers the desktop tree AND the root workspace — no audit job
       # exists anywhere else in this workflow. (cargo-audit reads the
       # committed Cargo.lock directly; there is no --locked flag.)
-      - run: cargo install cargo-audit --locked
-      - run: cargo audit
+      # 7th-pass review: plain `cargo audit` lets "unsound" advisories through
+      # as allowed warnings (RUSTSEC-2024-0429/glib stayed green while its
+      # Dependabot alert was open) — gate them with --deny unsound, and pin
+      # the installer version instead of floating on latest.
+      - run: cargo install cargo-audit --locked --version 0.22.1
+      - run: cargo audit --deny unsound
         working-directory: apps/dashboard/src-tauri
-      - run: cargo audit
+      - run: cargo audit --deny unsound
 
   dashboard:
     runs-on: ubuntu-latest

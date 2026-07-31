@@ -611,8 +611,27 @@ pub fn bubblewrap_args(
         .iter()
         .filter(|p| p.ends_with("state.json.tmp"))
     {
-        if path.exists() {
-            continue;
+        let metadata = std::fs::symlink_metadata(path);
+        match metadata {
+            // A regular file already there: mask binds over it as-is.
+            Ok(m) if m.file_type().is_file() => continue,
+            // A SYMLINKED leaf (7th-pass review): `exists()` follows links,
+            // so a pre-existing state.json.tmp symlink previously took the
+            // early return and the mask bound over the TARGET — leaving the
+            // symlink leaf itself writable, free to be swapped to anything.
+            // Masking the leaf path covers whatever it points at, so just
+            // skip creation; the mask loop below handles the leaf as a path.
+            Ok(m) if m.file_type().is_symlink() => continue,
+            // Anything else present (dir, fifo, device): refuse — never mask
+            // over an entry we cannot reason about.
+            Ok(_) => {
+                return Err(crate::error::EngineError::InvalidState(format!(
+                    "bwrap mask prep: {} exists and is not a regular file or symlink",
+                    path.display()
+                )));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
         }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
@@ -622,17 +641,30 @@ pub fn bubblewrap_args(
                 ))
             })?;
         }
-        std::fs::OpenOptions::new()
+        // O_NOFOLLOW (unix): a symlink planted between the stat above and
+        // this open is refused (ELOOP) rather than written through.
+        #[cfg(unix)]
+        let open_result = {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(path)
+        };
+        #[cfg(not(unix))]
+        let open_result = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(false)
-            .open(path)
-            .map_err(|e| {
-                crate::error::EngineError::Io(std::io::Error::new(
-                    e.kind(),
-                    format!("bwrap mask prep: create {}: {e}", path.display()),
-                ))
-            })?;
+            .open(path);
+        open_result.map_err(|e| {
+            crate::error::EngineError::Io(std::io::Error::new(
+                e.kind(),
+                format!("bwrap mask prep: create {}: {e}", path.display()),
+            ))
+        })?;
     }
     let mut write_masks: std::collections::BTreeSet<String> = write_denies
         .files

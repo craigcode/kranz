@@ -853,8 +853,11 @@ pub fn write_snapshot(state: &MissionState, path: &Path) -> Result<()> {
 }
 
 /// Read a snapshot previously written by [`write_snapshot`]. A symlinked
-/// `state.json` is refused (P1 mission-path-no-follow), never read through —
-/// opened with `O_NOFOLLOW` on unix so there is no check-then-open window.
+/// `state.json` — or any symlinked component above it — is refused (P1
+/// mission-path-no-follow), never read through: mission-layout paths are
+/// pinned capability-relative from the trusted repo-root anchor (7th-pass
+/// review); out-of-layout paths (test scratch) use the weaker
+/// canonicalize tier — see [`crate::paths::open_read_nofollow`].
 pub fn read_snapshot(path: &Path) -> Result<MissionState> {
     use std::io::Read;
     let mut content = String::new();

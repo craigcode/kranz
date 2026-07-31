@@ -62,8 +62,8 @@ const AMBIENT_WINDOWS_VARS: &[&str] = &[
     "PSModulePath",
 ];
 
-/// Toolchain cache locations contract commands may inherit from ambient
-/// (design decision 3 of the ticket): they speed up `cargo`/`npm` contract
+/// Toolchain cache locations contract commands and agent sessions may
+/// inherit (design decision 3 of the ticket): they speed up `cargo`/`npm`
 /// gates — dropping CARGO_HOME (3rd-pass review) forces a cold registry
 /// cache per mission, which fails outright under an egress-restricted
 /// sandbox. CARGO_HOME also carries `credentials.toml` (registry auth
@@ -72,7 +72,30 @@ const AMBIENT_WINDOWS_VARS: &[&str] = &[
 /// and contract command text is operator-approved at draft time. An
 /// UNSANDBOXED contract command can still read it — the documented residual
 /// for running with `sandbox.enforce=off`.
-const CONTRACT_TOOLCHAIN_VARS: &[&str] = &["CARGO_HOME", "RUSTUP_HOME", "NPM_CONFIG_CACHE"];
+///
+/// Resolution rule for each var: the ambient value when set, ELSE the
+/// default under the OPERATOR's real home (`<real home>/.rustup` etc.) when
+/// that dir exists. The fallback matters: standard rustup/cargo installs
+/// export NEITHER var and derive both from HOME — and the child's HOME is
+/// mission scratch, so without the explicit derivation `cargo --version`
+/// fails "no default is configured" (7th-pass review, reproduced on the
+/// review host and this one).
+const CONTRACT_TOOLCHAIN_VARS: &[(&str, &str)] = &[
+    ("CARGO_HOME", ".cargo"),
+    ("RUSTUP_HOME", ".rustup"),
+    ("NPM_CONFIG_CACHE", ".npm"),
+];
+
+/// The value a toolchain var resolves to for a child env: ambient when set,
+/// else `<real home>/<default_subdir>` when that directory exists.
+fn toolchain_var_value(var: &str, default_subdir: &str) -> Option<String> {
+    if let Some(value) = std::env::var_os(var) {
+        return Some(value.to_string_lossy().into_owned());
+    }
+    let real_home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let candidate = real_home.join(default_subdir);
+    candidate.is_dir().then(|| candidate.display().to_string())
+}
 
 /// Env names [`contract_command_env`] manages itself; a `contractEnvPassthrough`
 /// entry naming one of these is refused (loudly, name only) so the escape
@@ -148,9 +171,9 @@ pub fn sanitized_child_env(
     // session without RUSTUP_HOME bootstraps a whole toolchain download
     // into scratch (ENOSPC, m-533143). contract_command_env adds the same
     // vars again as extras — identical values, so the overlap is a no-op.
-    for key in CONTRACT_TOOLCHAIN_VARS {
-        if let Some(value) = std::env::var_os(key) {
-            env.insert((*key).to_string(), value.to_string_lossy().into_owned());
+    for (var, default_subdir) in CONTRACT_TOOLCHAIN_VARS {
+        if let Some(value) = toolchain_var_value(var, default_subdir) {
+            env.insert((*var).to_string(), value);
         }
     }
     #[cfg(windows)]
@@ -272,9 +295,9 @@ pub fn contract_command_env(
 ) -> HashMap<String, String> {
     let mut extra: Vec<(String, String)> =
         crate::runner::contract_env(base_sha).into_iter().collect();
-    for key in CONTRACT_TOOLCHAIN_VARS {
-        if let Some(value) = std::env::var_os(key) {
-            extra.push(((*key).to_string(), value.to_string_lossy().into_owned()));
+    for (var, default_subdir) in CONTRACT_TOOLCHAIN_VARS {
+        if let Some(value) = toolchain_var_value(var, default_subdir) {
+            extra.push(((*var).to_string(), value));
         }
     }
     let managed = managed_contract_keys();
@@ -582,6 +605,54 @@ mod tests {
             env.get("CLAUDE_CONFIG_DIR").map(String::as_str),
             Some(home.path().join(".claude").to_string_lossy().as_ref()),
             "the seeded config dir must survive env clearing (auth probe shape)"
+        );
+    }
+
+    /// 7th-pass review: a standard rustup install exports NEITHER
+    /// RUSTUP_HOME nor CARGO_HOME — the child env must derive both from
+    /// the OPERATOR's real home, not the scratch home, or `cargo --version`
+    /// fails "no default is configured". Proven by actually executing
+    /// cargo under the generated env.
+    #[cfg(unix)]
+    #[test]
+    fn contract_env_derives_toolchain_homes_from_the_real_home_and_cargo_runs() {
+        let _guard = EnvTestGuard::engage_unsetting(&[], &["RUSTUP_HOME", "CARGO_HOME"]);
+        let scratch = tempfile::tempdir().unwrap();
+        let real_home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
+
+        let env = contract_command_env(scratch.path(), None, &[]);
+
+        // The derivation (not the scratch) supplies both homes.
+        assert_eq!(
+            env.get("RUSTUP_HOME").map(String::as_str),
+            Some(real_home.join(".rustup").display().to_string().as_str()),
+            "RUSTUP_HOME derives from the operator's real home"
+        );
+        assert_eq!(
+            env.get("CARGO_HOME").map(String::as_str),
+            Some(real_home.join(".cargo").display().to_string().as_str()),
+            "CARGO_HOME derives from the operator's real home"
+        );
+
+        // And cargo actually executes under the generated env: not a PATH
+        // probe, a real run with HOME=scratch and the derived homes.
+        let mut cmd = std::process::Command::new("cargo");
+        cmd.arg("--version")
+            .env_clear()
+            .envs(&env)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let out = cmd.output().expect("spawn cargo --version");
+        assert!(
+            out.status.success(),
+            "cargo --version must succeed under the generated env: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let version = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            version.starts_with("cargo "),
+            "expected a cargo version string: {version}"
         );
     }
 

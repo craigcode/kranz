@@ -255,6 +255,32 @@ impl MissionPaths {
     }
 }
 
+/// Open `name` for reading RELATIVE to an already-pinned capability dir
+/// with `FollowSymlinks::No` — the final step of the pinned-chain reads
+/// ([`MissionPaths::open_mission_file_read_nofollow`] /
+/// [`MissionPaths::open_ticket_file_read_nofollow`]). `NotFound` passes
+/// through as `io` (callers keep missing-file handling); every other
+/// failure maps to the mission-refusal error.
+fn open_file_nofollow_under<P: AsRef<Path>>(
+    dir: &Dir,
+    name: P,
+    display_path: &Path,
+) -> Result<std::fs::File> {
+    use cap_fs_ext::OpenOptionsFollowExt as _;
+    use cap_primitives::fs::FollowSymlinks;
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    dir.open_with(name, &options)
+        .map(|file| file.into_std())
+        .map_err(|e| {
+            if e.kind() == ErrorKind::NotFound {
+                e.into()
+            } else {
+                unsafe_mission_dir_path(display_path)
+            }
+        })
+}
+
 /// One [`MissionPaths::open_mission_dir_nofollow`] step: refuse a `name` that
 /// exists but is not a real directory (a symlink most of all), create it when
 /// permitted and missing, then open it with `open_dir_nofollow` — the open is
@@ -305,60 +331,115 @@ pub(crate) fn create_real_subdir(dir: &Dir, name: &str, full_path: &Path) -> Res
     }
 }
 
-/// Open `path` for reading WITHOUT following a symlink at ANY component:
-/// the parent is canonicalized (collapsing legitimate SYSTEM symlinks like
-/// macOS `/var` → `/private/var`), then every ancestor dir is opened
-/// relative to the already-pinned parent capability (`open_dir_nofollow`
-/// per component — a swap after canonicalization is refused), and the
-/// final component with `FollowSymlinks::No` (a symlinked FILE is refused,
-/// never read through). There is no check-then-open window at any level
-/// (3rd-pass review). Off-unix there is no `O_NOFOLLOW`; fall back to
-/// check-then-open (Windows symlink creation needs privileges, so the
-/// residual race there is narrow, and documented here rather than hidden).
+/// Open `path` for reading with the mission-tree chain pinned
+/// (7th-pass review): when the path carries the mission layout
+/// (`<root>/.kranz/missions/<id>/...` or `<root>/.kranz/tickets/...`), the
+/// prefix BEFORE `.kranz` is taken as the trusted anchor (ambient
+/// authority — the same trust basis [`MissionPaths`] uses for its repo
+/// root), and every component from `.kranz` down is opened per-component
+/// no-follow, the final file with `FollowSymlinks::No`. No
+/// canonicalization of the untrusted region anywhere: the earlier
+/// canonicalize-then-walk shape resolved a hostile parent symlink BEFORE
+/// the no-follow discipline began.
+///
+/// Paths OUTSIDE the mission layout (test scratch dirs under macOS
+/// `/var`, which is itself a system symlink) keep the weaker
+/// canonicalize-then-walk tier: those regions are outside the mission
+/// threat model, and canonicalizing them is the only way macOS tempdirs
+/// resolve at all. Off-unix there is no `O_NOFOLLOW`; fall back to
+/// check-then-open (Windows symlink creation needs privileges).
 pub(crate) fn open_read_nofollow(path: &Path) -> Result<std::fs::File> {
     #[cfg(unix)]
     {
-        use cap_fs_ext::{DirExt as _, OpenOptionsFollowExt as _};
-        use cap_primitives::fs::FollowSymlinks;
+        use cap_fs_ext::DirExt as _;
 
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        let file_name = path
-            .file_name()
-            .ok_or_else(|| unsafe_mission_dir_path(path))?;
-        // NotFound here keeps callers' usual missing-file handling.
-        let canonical_parent = std::fs::canonicalize(parent)?;
-        let relative = canonical_parent
-            .strip_prefix("/")
-            .map_err(|_| unsafe_mission_dir_path(path))?;
-        let mut dir = Dir::open_ambient_dir("/", ambient_authority())?;
-        for component in relative.components() {
-            let std::path::Component::Normal(name) = component else {
-                return Err(unsafe_mission_dir_path(path));
-            };
-            dir = dir
-                .open_dir_nofollow(name)
-                .map_err(|_| unsafe_mission_dir_path(path))?;
-        }
-        let mut options = cap_std::fs::OpenOptions::new();
-        options.read(true).follow(FollowSymlinks::No);
-        dir.open_with(file_name, &options)
-            .map(|file| file.into_std())
-            .map_err(|e| {
-                if e.kind() == ErrorKind::NotFound {
-                    e.into()
-                } else {
-                    unsafe_mission_dir_path(path)
+        let components: Vec<_> = path.components().collect();
+        let kranz_at = components
+            .iter()
+            .position(|c| matches!(c, std::path::Component::Normal(os) if *os == ".kranz"));
+        // The mission layout yields a trusted prefix + an untrusted suffix
+        // to pin; anything else takes the weaker tier.
+        let anchor_info = kranz_at.and_then(|idx| {
+            let after: Vec<_> = components[idx + 1..].iter().collect();
+            match after.first() {
+                Some(std::path::Component::Normal(os)) if *os == "missions" => {
+                    if let Some(std::path::Component::Normal(id)) = after.get(1) {
+                        MissionPaths::is_safe_id(&id.to_string_lossy()).then_some(idx)
+                    } else {
+                        None
+                    }
                 }
-            })
+                Some(std::path::Component::Normal(os)) if *os == "tickets" => Some(idx),
+                _ => None,
+            }
+        });
+
+        if let Some(idx) = anchor_info {
+            // Trusted anchor: everything before `.kranz` ("/" when relative).
+            let anchor: PathBuf = components[..idx].iter().collect();
+            let anchor = if anchor.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                anchor
+            };
+            let mut dir = Dir::open_ambient_dir(&anchor, ambient_authority())?;
+            let mut components_iter = components[idx..].iter().peekable();
+            while let Some(component) = components_iter.next() {
+                let std::path::Component::Normal(name) = component else {
+                    return Err(unsafe_mission_dir_path(path));
+                };
+                if components_iter.peek().is_some() {
+                    dir = dir
+                        .open_dir_nofollow(name)
+                        .map_err(|_| unsafe_mission_dir_path(path))?;
+                } else {
+                    return open_file_nofollow_under(&dir, name, path);
+                }
+            }
+            return Err(unsafe_mission_dir_path(path));
+        }
+
+        // Weaker tier (out-of-model paths): canonicalize the parent, pin
+        // the canonical ancestors, open the final no-follow.
+        open_read_nofollow_weaker_tier(path)
     }
     #[cfg(not(unix))]
     {
         ensure_absent_or_regular_file(path)?;
         Ok(std::fs::File::open(path)?)
     }
+}
+
+/// The pre-7th-pass behavior for paths outside the mission layout:
+/// canonicalize the parent (resolves macOS `/var`-style system symlinks),
+/// pin the canonical ancestors per-component no-follow, open the final
+/// file with `FollowSymlinks::No`. Used only for out-of-model paths (test
+/// scratch), where canonicalization is required for tempdirs to resolve at
+/// all; the mission-tree paths never reach here.
+#[cfg(unix)]
+fn open_read_nofollow_weaker_tier(path: &Path) -> Result<std::fs::File> {
+    use cap_fs_ext::DirExt as _;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| unsafe_mission_dir_path(path))?;
+    let canonical_parent = std::fs::canonicalize(parent)?;
+    let relative = canonical_parent
+        .strip_prefix("/")
+        .map_err(|_| unsafe_mission_dir_path(path))?;
+    let mut dir = Dir::open_ambient_dir("/", ambient_authority())?;
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(unsafe_mission_dir_path(path));
+        };
+        dir = dir
+            .open_dir_nofollow(name)
+            .map_err(|_| unsafe_mission_dir_path(path))?;
+    }
+    open_file_nofollow_under(&dir, file_name, path)
 }
 
 /// Refuse `path` when it exists and is anything but a regular file — a

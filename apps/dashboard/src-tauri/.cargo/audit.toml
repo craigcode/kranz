@@ -1,0 +1,9 @@
+[advisories]
+# RUSTSEC-2024-0429 (unsound Iterator impls on glib::VariantStrIter):
+# reaches us only transitively — webkit2gtk → wry → tauri. kranz code
+# never calls the unsound API, and no patched release exists in the
+# gtk 0.18 series (clearing it requires a Tauri-major dependency chain
+# upgrade). Accepted deliberately so `cargo audit --deny unsound` can
+# gate everything else honestly; remove this entry when tauri moves to a
+# glib series carrying the fix.
+ignore = ["RUSTSEC-2024-0429"]
