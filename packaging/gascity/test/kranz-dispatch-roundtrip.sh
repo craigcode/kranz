@@ -11,8 +11,9 @@
 # This test is written against the TARGET bridge behaviour (verified in
 # docs/scoping/beads-bridge-dialect.md). The FIELDS case asserts behaviour
 # packaging/gascity/bin/kranz-dispatch already implements (the jq type-switch
-# at bin/kranz-dispatch:82, landed in commit d3f48c3) — a FIELDS failure is a
-# real regression of contract assertion [a6], not an expected condition.
+# over acceptance_criteria that builds ACCEPT in the dispatch loop, landed in
+# commit d3f48c3) — a FIELDS failure is a real regression of contract
+# assertion [a6], not an expected condition.
 #
 # Marker discipline: the mission's validation contract greps stdout for the
 # literal "ROUNDTRIP: PASS" marker, so it must appear if and only if every
@@ -310,20 +311,76 @@ if [ -n "$FIXTURE_ID" ]; then
     fi
 fi
 
-# --- Case: lease-aware dead-claim recovery (heartbeat/TTL) --------------
-# Blocked per this feature's HARD PRECONDITION, not merely stubbed: bd 1.0.5
-# exposes no lease/TTL/heartbeat field or flag (docs/scoping/beads-bridge-
-# dialect.md §3, executed probe), so there is no signal that distinguishes a
-# dead claim holder from a live one. Idempotent re-claim and competing-claim
-# rejection ARE proven above (the CLAIM case) using bd's native --claim
-# semantics — no invented mechanism required for those. Recovering a claim
-# left behind by a dead holder stays blocked until either bd exposes a
-# TTL/heartbeat mechanism (an upgrade path to 1.1.2 exists via brew,
-# docs/scoping/beads-bridge-dialect.md §1/§3) or an operator signs off on an
-# alternate staleness heuristic and its documented residual exposure window
-# — this is an operator decision, not an ordinal-milestone one.
+# --- Case: lease-aware dead-claim recovery (client-side, f-3-1) ---------
+# bd 1.0.5 exposes no lease/TTL/heartbeat field (docs/scoping/beads-bridge-
+# dialect.md §3, executed probe), so the bridge keeps its own lease files
+# (.gc/kranz-leases/<id>.lease: <pid> <unix-ts>), renewed by kranz-run-bead
+# and swept by `kranz-dispatch --reclaim`. Liveness-first, mirroring the
+# kranz queue's posture: a claim whose recorded pid is ALIVE is never
+# stolen, whatever its age; a dead pid releases the claim. The operator
+# decision for the client-side design is D-BW-2 (accepted 2026-07-29).
 
-echo "LEASE: SKIP (dead-claim recovery not implemented — no lease/TTL/heartbeat signal in bd 1.0.5; awaiting operator decision. Idempotent re-claim and competing-claim-fails are proven by the CLAIM case above.)"
+LEASE_CREATE_OUT=$(BD create "LEASE fixture (dead holder)" --type task --json 2>&1)
+LEASE_DEAD_ID=$(printf '%s' "$LEASE_CREATE_OUT" | unwrap | jq -r '.id // empty')
+LIVE_CREATE_OUT=$(BD create "LEASE fixture (live holder)" --type task --json 2>&1)
+LEASE_LIVE_ID=$(printf '%s' "$LIVE_CREATE_OUT" | unwrap | jq -r '.id // empty')
+if [ -z "$LEASE_DEAD_ID" ] || [ -z "$LEASE_LIVE_ID" ]; then
+    fail_case "lease-create" "two non-empty fixture ids" "'$LEASE_DEAD_ID' / '$LEASE_LIVE_ID'"
+else
+    LEASE_DIR="$CITY_DIR/.gc/kranz-leases"
+    mkdir -p "$LEASE_DIR"
+    BD update "$LEASE_DEAD_ID" --claim >/dev/null 2>&1
+    BD update "$LEASE_LIVE_ID" --claim >/dev/null 2>&1
+    # Dead holder: a pid that cannot exist, recorded now.
+    printf '999999999 %s\n' "$(date +%s)" > "$LEASE_DIR/$LEASE_DEAD_ID.lease"
+    # Live holder: this test process itself, freshly renewed.
+    printf '%s %s\n' "$$" "$(date +%s)" > "$LEASE_DIR/$LEASE_LIVE_ID.lease"
+
+    # The reclaim runs through the bridge's ambient `gc bd` convention
+    # (never `gc --city` — the harness is city-less by design), so give it
+    # the established pass-through stub: every bd subcommand forwards to the
+    # real store, every invocation is logged.
+    LEASE_STUB_BIN="$SANDBOX/lease-stubbin"
+    mkdir -p "$LEASE_STUB_BIN"
+    cat > "$LEASE_STUB_BIN/gc" <<STUBEOF
+#!/bin/sh
+set -u
+if [ "\${1:-}" = "--city" ]; then
+    shift 2
+fi
+if [ "\${1:-}" = "bd" ]; then
+    shift
+    ( cd "$STORE_DIR" && bd "\$@" )
+    exit \$?
+fi
+echo "lease-stub-gc: unsupported invocation: gc \$*" >&2
+exit 1
+STUBEOF
+    chmod +x "$LEASE_STUB_BIN/gc"
+
+    PATH="$LEASE_STUB_BIN:$PATH" GC_CITY="$CITY_DIR" KRANZ_LABEL="kranz" \
+        KRANZ_LEASE_DIR="$LEASE_DIR" "$BIN_DIR/kranz-dispatch" --reclaim >/dev/null 2>&1
+
+    DEAD_STATUS=$(status_of "$LEASE_DEAD_ID")
+    DEAD_ASSIGNEE=$(BD show "$LEASE_DEAD_ID" --json 2>/dev/null | unwrap | jq -r '.assignee // empty')
+    LIVE_STATUS=$(status_of "$LEASE_LIVE_ID")
+    LIVE_ASSIGNEE=$(BD show "$LEASE_LIVE_ID" --json 2>/dev/null | unwrap | jq -r '.assignee // empty')
+
+    if [ "$DEAD_STATUS" != "open" ] || [ -n "$DEAD_ASSIGNEE" ]; then
+        fail_case "lease-dead-recovered" "dead claim released to open/unassigned" "status=$DEAD_STATUS assignee='$DEAD_ASSIGNEE'"
+    elif [ "$LIVE_STATUS" != "in_progress" ] || [ -z "$LIVE_ASSIGNEE" ]; then
+        fail_case "lease-live-preserved" "live claim preserved at in_progress/assigned" "status=$LIVE_STATUS assignee='$LIVE_ASSIGNEE'"
+    else
+        # The released bead is immediately claimable again (idempotent re-claim).
+        BD update "$LEASE_DEAD_ID" --claim >/dev/null 2>&1
+        RECLAIMED=$(status_of "$LEASE_DEAD_ID")
+        if [ "$RECLAIMED" != "in_progress" ]; then
+            fail_case "lease-reclaimable-after-recovery" "in_progress after re-claim" "$RECLAIMED"
+        else
+            echo "LEASE: PASS (dead-claim recovered, live-claim preserved)"
+        fi
+    fi
+fi
 
 # --- Case: claim-succeeded-then-show-failed window — a real bead is claimed
 # via the atomic `--claim` call inside kranz-dispatch, then `gc bd show
@@ -413,6 +470,220 @@ STUBEOF
         fail_case "showfail-no-orphan-env" "no .env spool file for $SHOWFAIL_ID" "found: $SHOWFAIL_EFILE"
     else
         echo "SHOWFAIL: PASS (claim rolled back to open/unassigned and no orphan spool pair when gc bd show fails after a successful claim)"
+    fi
+fi
+
+# --- Case: the .env-write failure — the ONLY path on which an orphan .md
+# can ever exist. SHOWFAIL above forces `gc bd show` to fail BEFORE either
+# spool file is opened, so its no-orphan-md/no-orphan-env assertions hold
+# vacuously with respect to the `rm -f` rollback (bin/kranz-dispatch's
+# second `rm -f "$SPOOL/$STAMP-$ID.md" "$SPOOL/$STAMP-$ID.env"`, in the
+# branch where the .md write already succeeded and the .env write then
+# fails) — they would still pass with both `rm -f` lines deleted. This case
+# drives that branch for real: `date` is stubbed on PATH so the dispatch
+# subshell's `STAMP=$(date +%s)` is pinned to a known value (`+%s` returns a
+# fixed constant; every other invocation execs the real /bin/date), which
+# lets this case pre-create the exact `$SPOOL/<stamp>-<id>.env` path as a
+# read-only (chmod 444) placeholder file before dispatch ever runs. Opening
+# that path for truncating write then fails with EACCES (verified below:
+# the negative-control run shows the placeholder's content is untouched),
+# while the .md file at the same stamp is a distinct path the placeholder
+# never touches, so the .md write goes through normally. This is a real
+# permission failure on this platform (confirmed non-root via `id -u`
+# below), not a stand-in for one.
+
+ENVFAIL_UID=$(id -u 2>/dev/null || echo "")
+if [ "$ENVFAIL_UID" = "0" ]; then
+    echo "ENVFAIL: SKIP (running as root — chmod 444 does not block root's own writes, so the .env-write failure cannot be constructed reliably)"
+else
+    ENVFAIL_STAMP="1700000000"
+
+    ENVFAIL_CREATE_OUT=$(BD create "ENVFAIL fixture" --type task --json 2>&1)
+    ENVFAIL_ID=$(printf '%s' "$ENVFAIL_CREATE_OUT" | unwrap | jq -r '.id // empty')
+    if [ -z "$ENVFAIL_ID" ]; then
+        fail_case "envfail-create" "a non-empty issue id" "'$ENVFAIL_CREATE_OUT'"
+    else
+        ENVFAIL_CITY_DIR="$SANDBOX/envfail-city"
+        ENVFAIL_SPOOL_DIR="$ENVFAIL_CITY_DIR/.gc/kranz-spool"
+        ENVFAIL_STUB_BIN="$SANDBOX/envfail-stubbin"
+        ENVFAIL_CALLS_LOG="$SANDBOX/envfail-gc-calls.log"
+        mkdir -p "$ENVFAIL_SPOOL_DIR" "$ENVFAIL_STUB_BIN"
+        : > "$ENVFAIL_CALLS_LOG"
+
+        # Pre-create the exact .env path dispatch will compute (fixed stamp,
+        # known id) as a read-only placeholder, so the redirect inside
+        # dispatch cannot open it for writing.
+        ENVFAIL_ENV_PATH="$ENVFAIL_SPOOL_DIR/$ENVFAIL_STAMP-$ENVFAIL_ID.env"
+        : > "$ENVFAIL_ENV_PATH"
+        chmod 444 "$ENVFAIL_ENV_PATH"
+
+        # `date` stub: pins `date +%s` to $ENVFAIL_STAMP; every other
+        # invocation (there are none on this path, but stay general) execs
+        # the real binary so nothing else on the platform is disturbed.
+        cat > "$ENVFAIL_STUB_BIN/date" <<STUBEOF
+#!/bin/sh
+set -u
+if [ "\$#" -eq 1 ] && [ "\$1" = "+%s" ]; then
+    echo "$ENVFAIL_STAMP"
+else
+    exec /bin/date "\$@"
+fi
+STUBEOF
+        chmod +x "$ENVFAIL_STUB_BIN/date"
+
+        # `gc` stub: logs every invocation; `ready` offers only the fixture;
+        # `show`/`update`/`comment` all forward to the real bd store, so the
+        # claim and the rollback release are real, live-bd mutations.
+        cat > "$ENVFAIL_STUB_BIN/gc" <<STUBEOF
+#!/bin/sh
+set -u
+echo "gc \$*" >> "$ENVFAIL_CALLS_LOG"
+if [ "\${1:-}" = "--city" ]; then
+    shift 2
+fi
+case "\${1:-}" in
+    bd)
+        shift
+        case "\${1:-}" in
+            ready)
+                echo '[{"id":"$ENVFAIL_ID"}]'
+                ;;
+            show|update|comment)
+                ( cd "$STORE_DIR" && bd "\$@" )
+                ;;
+            *)
+                echo "gc-stub: unsupported bd subcommand: \$1" >&2
+                exit 1
+                ;;
+        esac
+        ;;
+    *)
+        echo "gc-stub: unsupported invocation: gc \$*" >&2
+        exit 1
+        ;;
+esac
+STUBEOF
+        chmod +x "$ENVFAIL_STUB_BIN/gc"
+
+        GC_CITY="$ENVFAIL_CITY_DIR" KRANZ_RIG_DIR="$RIG_DIR" KRANZ_LABEL="kranz" \
+            KRANZ_SPOOL="$ENVFAIL_SPOOL_DIR" KRANZ_ALLOW_UNVALIDATED=1 \
+            PATH="$ENVFAIL_STUB_BIN:$PATH" "$BIN_DIR/kranz-dispatch" >/dev/null 2>&1
+
+        ENVFAIL_STATUS=$(status_of "$ENVFAIL_ID")
+        ENVFAIL_ASSIGNEE=$(BD show "$ENVFAIL_ID" --json 2>/dev/null | unwrap | jq -r '.assignee // empty')
+        ENVFAIL_MFILE=$(ls "$ENVFAIL_SPOOL_DIR"/*-"$ENVFAIL_ID".md 2>/dev/null | head -1)
+        ENVFAIL_EFILE=$(ls "$ENVFAIL_SPOOL_DIR"/*-"$ENVFAIL_ID".env 2>/dev/null | head -1)
+        ENVFAIL_CLAIM_LINE=$(grep -nE "update ${ENVFAIL_ID} --claim\$" "$ENVFAIL_CALLS_LOG" 2>/dev/null | head -1 | cut -d: -f1)
+        ENVFAIL_RELEASE_LINE=$(grep -nE "update ${ENVFAIL_ID} --status open --assignee" "$ENVFAIL_CALLS_LOG" 2>/dev/null | head -1 | cut -d: -f1)
+
+        if [ -z "$ENVFAIL_CLAIM_LINE" ]; then
+            fail_case "envfail-claim-taken" "gc-calls log to record an atomic claim (update $ENVFAIL_ID --claim) before the rollback" "$(cat "$ENVFAIL_CALLS_LOG" 2>/dev/null)"
+        elif [ -z "$ENVFAIL_RELEASE_LINE" ]; then
+            fail_case "envfail-claim-released" "gc-calls log to record the rollback release (update $ENVFAIL_ID --status open --assignee) after the .env write failure" "$(cat "$ENVFAIL_CALLS_LOG" 2>/dev/null)"
+        elif [ "$ENVFAIL_CLAIM_LINE" -ge "$ENVFAIL_RELEASE_LINE" ]; then
+            fail_case "envfail-claim-then-release-order" "the claim (line $ENVFAIL_CLAIM_LINE) to precede the release (line $ENVFAIL_RELEASE_LINE) in the call log" "$(cat "$ENVFAIL_CALLS_LOG" 2>/dev/null)"
+        elif [ "$ENVFAIL_STATUS" != "open" ]; then
+            fail_case "envfail-status-rolled-back" "open" "$ENVFAIL_STATUS"
+        elif [ -n "$ENVFAIL_ASSIGNEE" ]; then
+            fail_case "envfail-assignee-cleared" "assignee cleared (empty) after a .env spool-write failure post-claim" "'$ENVFAIL_ASSIGNEE'"
+        elif [ -n "$ENVFAIL_MFILE" ]; then
+            fail_case "envfail-no-orphan-md" "no .md spool file for $ENVFAIL_ID (the .md write succeeded but must be rolled back with the .env)" "found: $ENVFAIL_MFILE"
+        elif [ -n "$ENVFAIL_EFILE" ]; then
+            fail_case "envfail-no-orphan-env" "no .env spool file for $ENVFAIL_ID" "found: $ENVFAIL_EFILE"
+        else
+            echo "ENVFAIL: PASS (claim rolled back to open/unassigned and no orphan spool pair when the .env write fails after a successful .md write)"
+
+            # --- Negative control: same scenario, but against a SANDBOX
+            # COPY of kranz-dispatch with both `rm -f` rollback lines
+            # deleted (never the real bin/kranz-dispatch). If the ENVFAIL
+            # case above is a real test of the rollback rather than a
+            # vacuous one, removing the rollback must make the orphan .md
+            # survive.
+            ENVFAIL_NOROLLBACK="$SANDBOX/kranz-dispatch-no-rm-f"
+            grep -vF '        rm -f "$SPOOL/$STAMP-$ID.md" "$SPOOL/$STAMP-$ID.env"' \
+                "$BIN_DIR/kranz-dispatch" > "$ENVFAIL_NOROLLBACK"
+            chmod +x "$ENVFAIL_NOROLLBACK"
+
+            ENVFAIL_NOROLLBACK_RMF_COUNT=$(grep -c 'rm -f' "$ENVFAIL_NOROLLBACK" 2>/dev/null || echo 0)
+            ENVFAIL_ORIG_RMF_COUNT=$(grep -c 'rm -f' "$BIN_DIR/kranz-dispatch" 2>/dev/null || echo 0)
+            if [ "$ENVFAIL_NOROLLBACK_RMF_COUNT" -ge "$ENVFAIL_ORIG_RMF_COUNT" ]; then
+                fail_case "envfail-negctl-setup" "the sandbox copy to carry fewer 'rm -f' lines than the original ($ENVFAIL_ORIG_RMF_COUNT)" "$ENVFAIL_NOROLLBACK_RMF_COUNT still present"
+            else
+                NEGCTL_CREATE_OUT=$(BD create "ENVFAIL negative-control fixture" --type task --json 2>&1)
+                NEGCTL_ID=$(printf '%s' "$NEGCTL_CREATE_OUT" | unwrap | jq -r '.id // empty')
+                if [ -z "$NEGCTL_ID" ]; then
+                    fail_case "envfail-negctl-create" "a non-empty issue id" "'$NEGCTL_CREATE_OUT'"
+                else
+                    NEGCTL_CITY_DIR="$SANDBOX/envfail-negctl-city"
+                    NEGCTL_SPOOL_DIR="$NEGCTL_CITY_DIR/.gc/kranz-spool"
+                    NEGCTL_STUB_BIN="$SANDBOX/envfail-negctl-stubbin"
+                    NEGCTL_CALLS_LOG="$SANDBOX/envfail-negctl-gc-calls.log"
+                    mkdir -p "$NEGCTL_SPOOL_DIR" "$NEGCTL_STUB_BIN"
+                    : > "$NEGCTL_CALLS_LOG"
+
+                    NEGCTL_ENV_PATH="$NEGCTL_SPOOL_DIR/$ENVFAIL_STAMP-$NEGCTL_ID.env"
+                    : > "$NEGCTL_ENV_PATH"
+                    chmod 444 "$NEGCTL_ENV_PATH"
+
+                    cat > "$NEGCTL_STUB_BIN/date" <<STUBEOF
+#!/bin/sh
+set -u
+if [ "\$#" -eq 1 ] && [ "\$1" = "+%s" ]; then
+    echo "$ENVFAIL_STAMP"
+else
+    exec /bin/date "\$@"
+fi
+STUBEOF
+                    chmod +x "$NEGCTL_STUB_BIN/date"
+
+                    cat > "$NEGCTL_STUB_BIN/gc" <<STUBEOF
+#!/bin/sh
+set -u
+echo "gc \$*" >> "$NEGCTL_CALLS_LOG"
+if [ "\${1:-}" = "--city" ]; then
+    shift 2
+fi
+case "\${1:-}" in
+    bd)
+        shift
+        case "\${1:-}" in
+            ready)
+                echo '[{"id":"$NEGCTL_ID"}]'
+                ;;
+            show|update|comment)
+                ( cd "$STORE_DIR" && bd "\$@" )
+                ;;
+            *)
+                echo "gc-stub: unsupported bd subcommand: \$1" >&2
+                exit 1
+                ;;
+        esac
+        ;;
+    *)
+        echo "gc-stub: unsupported invocation: gc \$*" >&2
+        exit 1
+        ;;
+esac
+STUBEOF
+                    chmod +x "$NEGCTL_STUB_BIN/gc"
+
+                    GC_CITY="$NEGCTL_CITY_DIR" KRANZ_RIG_DIR="$RIG_DIR" KRANZ_LABEL="kranz" \
+                        KRANZ_SPOOL="$NEGCTL_SPOOL_DIR" KRANZ_ALLOW_UNVALIDATED=1 \
+                        PATH="$NEGCTL_STUB_BIN:$PATH" "$ENVFAIL_NOROLLBACK" >/dev/null 2>&1
+
+                    NEGCTL_MFILE=$(ls "$NEGCTL_SPOOL_DIR"/*-"$NEGCTL_ID".md 2>/dev/null | head -1)
+                    NEGCTL_ENV_CONTENT=$(cat "$NEGCTL_ENV_PATH" 2>/dev/null)
+
+                    if [ -z "$NEGCTL_MFILE" ]; then
+                        fail_case "envfail-negative-control" "the orphan .md for $NEGCTL_ID to SURVIVE against the sandbox copy with rm -f removed (proves the ENVFAIL case above actually depends on the rollback, not a vacuous pass)" "no .md found — the case cannot fail even with the rollback deleted"
+                    elif [ -n "$NEGCTL_ENV_CONTENT" ]; then
+                        fail_case "envfail-negctl-env-write-truly-failed" "the read-only .env placeholder to remain empty (proving the .env write attempt itself failed with EACCES, not merely that content differs)" "'$NEGCTL_ENV_CONTENT'"
+                    else
+                        echo "ENVFAIL-NEGATIVE-CONTROL: PASS (against a sandbox copy of kranz-dispatch with both rm -f rollback lines removed, the orphan .md for $NEGCTL_ID survives and the read-only .env placeholder stays untouched — confirms ENVFAIL is a real, non-vacuous test of the rollback, and that the .env write genuinely fails rather than silently succeeding)"
+                    fi
+                fi
+            fi
+        fi
     fi
 fi
 

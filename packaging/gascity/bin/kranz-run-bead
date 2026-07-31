@@ -19,24 +19,23 @@
 # atomic, first-wins claim (`bd update --claim`, docs/scoping/beads-bridge-
 # dialect.md §3) before spooling the brief this script runs. That claim is
 # NOT lease-aware on the installed bd 1.0.5 — no TTL, heartbeat, or expiry
-# field exists (same §3), so if the process running this script dies before
-# reaching a terminal exit code below, the claim is stuck in_progress and is
-# NOT automatically recoverable; it must be cleared manually. The intended
-# future posture — NOT YET IMPLEMENTED, pending an operator decision once bd
-# exposes a lease mechanism (1.1.0+) — is liveness first: a claim held by a
-# verifiably live holder is never stolen, expiry only backstops an ambiguous
-# or dead holder. Residual exposure today: a bead claimed and spooled but
-# not yet drained by kranz-city-worker (i.e. before this script even starts,
-# or if this process itself dies mid-mission before reaching a case below)
-# has no heartbeat and no TTL backstop covering it either — that window is
-# not addressed by the release logic below, only the terminal-exit paths are.
+# field exists (same §3) — so the bridge keeps its own client-side lease
+# (f-3-1, implemented here): a heartbeat file under .gc/kranz-leases/
+# renewed while this mission runs and removed on any terminal exit.
+# Recovery (kranz-dispatch --reclaim) is liveness-first: a claim held by a
+# verifiably live pid is never stolen; a dead pid (or a missing lease past
+# the TTL) is released. The residual window: a bead claimed and spooled
+# but not yet drained by kranz-city-worker (before this script starts) has
+# no heartbeat — the TTL backstop covers it.
 #
 # Claim release on reopen (shipped here): exit 3 and exit 1/other both clear
 # the assignee (`bd update --assignee ""`) alongside the status reset to
 # open, per docs/scoping/beads-bridge-dialect.md §2 (`bd update`'s verified
 # `-a/--assignee` flag; an empty string clears it, confirmed by an executed
-# probe: claim, clear via the combined `--status open --assignee ""` call
-# this script issues, then a different actor claims the same bead
+# probe against upstream `bd` directly — the `gc bd` pass-through used here
+# (via this script's own `bd()` wrapper) is unverified, per dialect doc §2):
+# claim, clear via the combined `--status open --assignee ""` call this
+# script issues, then a different actor claims the same bead
 # successfully — a bare `--assignee ""` without `--status open` was also
 # probed and leaves the issue in_progress, still blocking reclaim). A bead
 # reopened this way is therefore claimable
@@ -65,6 +64,34 @@ set -u
 CITY=$1; ID=$2; MFILE=$3; RIG_DIR=$4; MAX_CYCLES=$5
 
 bd() { gc --city "$CITY" bd "$@"; }
+
+# Client-side lease heartbeat (f-3-1): bd 1.0.5 has no lease/TTL/heartbeat
+# field, so the bridge keeps its own. While the mission runs, a background
+# loop renews $LEASE_FILE with <pid> <unix-ts>; on ANY terminal exit
+# (success, failure, INT, TERM) the loop is killed and the file removed —
+# a completed mission never leaves a dangling lease. Recovery is
+# liveness-first (kranz-dispatch --reclaim): a claim whose recorded pid is
+# ALIVE is never stolen, however old; a dead pid (or a missing lease past
+# the TTL) releases the claim so a dead dispatcher's work is reclaimable.
+LEASE_DIR="$CITY/.gc/kranz-leases"
+mkdir -p "$LEASE_DIR"
+LEASE_FILE="$LEASE_DIR/$ID.lease"
+heartbeat() {
+    while :; do
+        printf '%s %s\n' "$$" "$(date +%s)" > "$LEASE_FILE" 2>/dev/null || exit 0
+        sleep 15
+    done
+}
+heartbeat &
+HEARTBEAT_PID=$!
+cleanup_lease() {
+    kill "$HEARTBEAT_PID" 2>/dev/null || true
+    rm -f "$LEASE_FILE"
+}
+trap 'cleanup_lease' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+printf '%s %s\n' "$$" "$(date +%s)" > "$LEASE_FILE" 2>/dev/null || true
 
 LINE=$( cd "$RIG_DIR" && kranz exec -f "$MFILE" --max-cycles "$MAX_CYCLES" 2>>"${MFILE%.md}.events.log" )
 CODE=$?

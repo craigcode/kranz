@@ -32,12 +32,13 @@
 # stamp/id (`rm -f` on both the .md and .env, whichever exist) and releases
 # that claim — `gc bd update "$ID" --status open --assignee ""` (dialect doc
 # §2's verified `-a/--assignee`; an empty string clears it, confirmed by an
-# executed probe) — then continues, so the bead is returned to open and
-# unassigned with no partial spool pair left behind. This covers a `gc bd
-# show` failure and a failure writing either the .md or .env spool file. The
-# lost-race path (the `--claim` call itself failing) is unaffected and stays
-# silent: no comment, no spool files, no rollback needed because no claim
-# was ever taken.
+# executed probe against upstream `bd` directly — the `gc bd` pass-through
+# used here is unverified, per dialect doc §2) — then continues, so the bead
+# is returned to open and unassigned with no partial spool pair left behind.
+# This covers a `gc bd show` failure and a failure writing either the .md or
+# .env spool file. The lost-race path (the `--claim` call itself failing) is
+# unaffected and stays silent: no comment, no spool files, no rollback needed
+# because no claim was ever taken.
 #
 # NOT lease-aware (as shipped): bd 1.0.5 exposes no TTL, heartbeat, or
 # expiry mechanism — no --lease/--lease-ttl/--heartbeat flag, and no
@@ -110,6 +111,48 @@ resolve_rig() {
 }
 
 READY=$(gc bd ready --label "$LABEL" --json 2>/dev/null | jq -r '.[].id') || READY=""
+
+# --- Reclaim mode (f-3-1): sweep claimed beads, release dead claims ------
+# `kranz-dispatch --reclaim` runs ONLY the sweep (no dispatch). bd 1.0.5 has
+# no lease field, so the bridge keeps client-side leases under
+# $LEASE_DIR/<id>.lease (<pid> <unix-ts>, renewed by kranz-run-bead).
+# Liveness-first, mirroring the kranz queue: a claim whose recorded pid is
+# ALIVE is never stolen, whatever its age; a DEAD pid releases the claim;
+# a MISSING lease is the ambiguous case the TTL backstop covers (the bead's
+# updated_at older than KRANZ_CLAIM_TTL, default 120s).
+if [ "${1:-}" = "--reclaim" ]; then
+    LEASE_DIR=${KRANZ_LEASE_DIR:-$CITY/.gc/kranz-leases}
+    TTL=${KRANZ_CLAIM_TTL:-120}
+    NOW=$(date +%s)
+    CLAIMED=$(gc bd list --json 2>/dev/null | jq -r '.[] | select(.status == "in_progress") | .id') || CLAIMED=""
+    for CID in $CLAIMED; do
+        LEASE_FILE="$LEASE_DIR/$CID.lease"
+        PID=""
+        TS=""
+        if [ -f "$LEASE_FILE" ]; then
+            read -r PID TS < "$LEASE_FILE" || true
+        fi
+        if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+            continue # live holder: stands at any age
+        fi
+        if [ -n "$PID" ]; then
+            # Dead recorded pid: the claimant is gone — release.
+            gc bd update "$CID" --status open --assignee "" >/dev/null 2>&1
+            rm -f "$LEASE_FILE"
+            echo "kranz-dispatch --reclaim: released dead claim $CID (pid $PID gone)"
+            continue
+        fi
+        # No lease file: TTL backstop on the bead's updated timestamp.
+        UPDATED=$(gc bd show "$CID" --json 2>/dev/null | jq -r '(if type == "array" then .[0] else . end) | .updated_at // .updatedAt // 0' | head -1)
+        UPDATED=$(date -j -f '%Y-%m-%dT%H:%M:%S' "${UPDATED%%.*}" +%s 2>/dev/null || echo 0)
+        if [ "$UPDATED" -gt 0 ] && [ $((NOW - UPDATED)) -gt "$TTL" ]; then
+            gc bd update "$CID" --status open --assignee "" >/dev/null 2>&1
+            echo "kranz-dispatch --reclaim: released lease-less stale claim $CID (idle $((NOW - UPDATED))s > ${TTL}s)"
+        fi
+    done
+    exit 0
+fi
+
 [ -n "$READY" ] || { echo "kranz-dispatch: no ready beads labeled '$LABEL'"; exit 0; }
 
 for ID in $READY; do
@@ -143,23 +186,28 @@ for ID in $READY; do
 
     STAMP=$(date +%s)
     MFILE="$SPOOL/$STAMP-$ID.md"
-    if ! {
+    # Rollback form matters: `cmd >file || rollback` — dash/macOS /bin/sh
+    # evaluates `if ! { compound; } >file` such that a REDIRECT failure
+    # (read-only target, full disk) never runs the then-branch, leaving the
+    # rollback as dead code exactly when it is needed (round-trip case
+    # envfail-claim-released).
+    {
         printf '## Goal\n%s\n\n' "$TITLE"
         printf '## Context\nDispatched from Gas City bead %s (label %s). Work fully autonomously.\n\n%s\n\n' "$ID" "$LABEL" "$DESC"
         printf '## Scoping answers\nNo human is available during this run. Prefer the smallest faithful interpretation; if materially ambiguous, block rather than guess. Validators stay enabled.\n\n'
         printf '## Acceptance hints\n%s\n' "${ACCEPT:-The goal above is demonstrably met.}"
-    } > "$MFILE"; then
+    } > "$MFILE" || {
         rm -f "$SPOOL/$STAMP-$ID.md" "$SPOOL/$STAMP-$ID.env"
         release_claim
         continue
-    fi
-    if ! {
+    }
+    {
         printf 'ID=%s\nCITY=%s\nRIG_DIR=%s\nMAX_CYCLES=%s\n' "$ID" "$CITY" "$RIG_DIR" "$MAX_CYCLES"
-    } > "$SPOOL/$STAMP-$ID.env"; then
+    } > "$SPOOL/$STAMP-$ID.env" || {
         rm -f "$SPOOL/$STAMP-$ID.md" "$SPOOL/$STAMP-$ID.env"
         release_claim
         continue
-    fi
+    }
 
     echo "kranz-dispatch: bead $ID spooled for $RIG_DIR"
 done
