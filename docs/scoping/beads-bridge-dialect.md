@@ -77,11 +77,12 @@ actually runs against today regardless of what upgrade path exists.
 > `packaging/gascity/bin/kranz-dispatch` calls `gc bd ready`, `gc bd show`, `gc bd
 > update` (claim, status transitions, and the `--reclaim` sweep's release calls), and
 > `gc bd list`; `packaging/gascity/bin/kranz-run-bead` defines a `bd()` shell function
-> wrapping `gc --city "$CITY" bd`. The `gc bd` pass-through's fidelity to the shapes
-> below is **NOT verified** (see §4 — `gc bd --help` could not even be run without an
-> initialized city, which this feature was barred from creating). A downstream milestone
-> must not read this table as covering the production (`gc bd`-mediated) path. (Line
-> references deliberately omitted: they pin to line numbers that move with every edit.)
+> wrapping `gc --city "$CITY" bd`.
+> The `gc bd` pass-through's fidelity to the shapes below is unverified (see §4 —
+> `gc bd --help` could not even be run without an initialized city, which this feature
+> was barred from creating). A downstream milestone must not read this table as
+> covering the production (`gc bd`-mediated) path. (Line references deliberately
+> omitted: they pin to line numbers that move with every edit.)
 
 Flags below are copied verbatim from live `--help` output. Global flags common to every
 `bd` subcommand (`--json`, `--db`, `-C/--directory`, `--actor`, `--readonly`, etc.) are
@@ -92,6 +93,7 @@ immediately below the table.
 | Subcommand | Verdict | Verified flags relevant to the bridge |
 |---|---|---|
 | `bd ready` | VERIFIED | `-l, --label strings` (AND filter), `--label-any strings` (OR filter), `--json`, `--claim` (atomically claim the first ready issue matching filters — see §3), `-a/--assignee`, `-u/--unassigned`, `-n/--limit` (default 100), `--mol`, `--gated`, `--explain` |
+| `bd list` | VERIFIED (added 2026-07-31 for the `--reclaim` sweep) | `-s, --status string` — comma-separated for multiple (`--status open,in_progress`) — the sweep's candidate-claim filter; `--json` (returns a JSON array of issue objects, each carrying `id`, `status`, `assignee`, `updated_at` — `updated_at` is UTC ISO-8601 with a trailing `Z`, confirmed by executed probe below); `-a, --assignee string`, `--no-assignee`, `-l, --label strings`, `--label-any strings`, `-n, --limit int` (default 50, `0` = unlimited), `--ready`. |
 | `bd show` | VERIFIED | `[id...]` positional or `--id stringArray`, `--json`, `--current`, `--short`, `--long`, `--include-comments`, `--include-dependents`. **Resolved by executed probe (2026-07-30, §3 sandbox):** `bd show <id> --json` with a single positional id returns a **single-element JSON array**, not a bare object — confirmed against a real fixture bead, both with and without `--long`. |
 | `bd update` | VERIFIED | `-s, --status string` ("New status") — **accepted**, matches spike usage; `--claim` ("Atomically claim the issue (sets assignee to you, status to in_progress; idempotent if already claimed by you)") — **accepted**. `-a, --assignee string` — **accepted**; empty string clears it, confirmed by an executed probe below. No `--lease`, `--lease-ttl`, or `--heartbeat` flag exists. No `lease_expires_at` / `heartbeat_at` field appears anywhere in `--help` output, and none appeared in the executed `bd show --json` output either (§3). |
 | `bd comment` | VERIFIED | Usage: `bd comment <id> [text...] [flags]` — text is positional (confirms docs/gascity.md:45). Also `--file`, `--stdin`. No `-m` flag. |
@@ -146,6 +148,91 @@ Flags:
   -s, --sort string                  Sort policy: priority (default), hybrid, oldest (default "priority")
   -t, --type string                  Filter by issue type (task, bug, feature, epic, decision, merge-request). Aliases: mr→merge-request, feat→feature, mol→molecule, dec/adr→decision
   -u, --unassigned                   Show only unassigned issues
+```
+(Global flags omitted — identical set listed once in §2 preamble.)
+</details>
+
+<details><summary><code>bd list --help</code> (full)</summary>
+
+```
+List issues
+
+Usage:
+  bd list [flags]
+
+Flags:
+      --all                          Show all issues including closed (overrides default filter)
+  -a, --assignee string              Filter by assignee
+      --closed-after string          Filter issues closed after date (YYYY-MM-DD or RFC3339)
+      --closed-before string         Filter issues closed before date (YYYY-MM-DD or RFC3339)
+      --created-after string         Filter issues created after date (YYYY-MM-DD or RFC3339)
+      --created-before string        Filter issues created before date (YYYY-MM-DD or RFC3339)
+      --defer-after string           Filter issues deferred after date (supports relative: +6h, tomorrow)
+      --defer-before string          Filter issues deferred before date (supports relative: +6h, tomorrow)
+      --deferred                     Show only issues with defer_until set
+      --desc-contains string         Filter by description substring (case-insensitive)
+      --due-after string             Filter issues due after date (supports relative: +6h, tomorrow)
+      --due-before string            Filter issues due before date (supports relative: +6h, tomorrow)
+      --empty-description            Filter issues with empty or missing description
+      --exclude-label strings        Exclude issues that have ANY of these labels
+      --exclude-type strings         Exclude issue types from results (comma-separated or repeatable, e.g., --exclude-type=convoy,epic)
+      --flat                         Disable tree format and use legacy flat list output
+      --format string                Output format: 'digraph' (for golang.org/x/tools/cmd/digraph), 'dot' (Graphviz), or Go template
+      --has-metadata-key string      Filter issues that have this metadata key set
+  -h, --help                         help for list
+      --id string                    Filter by specific issue IDs (comma-separated, e.g., bd-1,bd-5,bd-10)
+      --include-gates                Include gate issues in output (normally hidden)
+      --include-infra                Include infrastructure beads (agent/rig/role/message) in output
+      --include-templates            Include template molecules in output
+  -l, --label strings                Filter by labels (AND: must have ALL). Can combine with --label-any
+      --label-any strings            Filter by labels (OR: must have AT LEAST ONE). Can combine with --label
+      --label-pattern string         Filter by label glob pattern (e.g., 'tech-*' matches tech-debt, tech-legacy)
+      --label-regex string           Filter by label regex pattern (e.g., 'tech-(debt|legacy)')
+  -n, --limit int                    Limit results (default 50, use 0 for unlimited) (default 50)
+      --long                         Show detailed multi-line output for each issue
+      --metadata-field stringArray   Filter by metadata field (key=value, repeatable)
+      --mol-type string              Filter by molecule type: swarm, patrol, or work
+      --no-assignee                  Filter issues with no assignee
+      --no-labels                    Filter issues with no labels
+      --no-pager                     Disable pager output
+      --no-parent                    Exclude child issues (show only top-level issues)
+      --no-pinned                    Exclude pinned issues
+      --notes-contains string        Filter by notes substring (case-insensitive)
+      --overdue                      Show only issues with due_at in the past (not closed)
+      --parent string                Filter by parent issue ID (shows children of specified issue)
+      --pinned                       Show only pinned issues
+      --pretty                       Display issues in a tree format with status/priority symbols
+  -p, --priority string              Priority (0-4 or P0-P4, 0=highest)
+      --priority-max string          Filter by maximum priority (inclusive, 0-4 or P0-P4)
+      --priority-min string          Filter by minimum priority (inclusive, 0-4 or P0-P4)
+      --ready                        Show only ready issues (no active blockers, same semantics as bd ready)
+  -r, --reverse                      Reverse sort order
+      --skip-labels                  Skip label hydration. The labels field in output will be empty regardless of actual labels. Use only when the caller does not depend on label data. Cannot combine with --label, --label-any, --label-pattern, --label-regex, --exclude-label, or --no-labels.
+      --sort string                  Sort by field: priority, created, updated, closed, status, id, title, type, assignee
+      --spec string                  Filter by spec_id prefix
+  -s, --status string                Filter by stored status (open, in_progress, blocked, deferred, closed). Comma-separated for multiple: --status open,in_progress
+      --title string                 Filter by title text (case-insensitive substring match)
+      --title-contains string        Filter by title substring (case-insensitive)
+      --tree                         Hierarchical tree format (default: true; use --flat to disable) (default true)
+  -t, --type string                  Filter by type (bug, feature, task, epic, chore, decision, merge-request, molecule, gate, convoy). Aliases: mr→merge-request, feat→feature, mol→molecule, dec/adr→decision
+      --updated-after string         Filter issues updated after date (YYYY-MM-DD or RFC3339)
+      --updated-before string        Filter issues updated before date (YYYY-MM-DD or RFC3339)
+  -w, --watch                        Watch for changes and auto-update display (implies --pretty)
+      --wisp-type string             Filter by wisp type: heartbeat, ping, patrol, gc_report, recovery, error, escalation
+
+Global Flags:
+      --actor string              Actor name for audit trail (default: $BEADS_ACTOR, git user.name, $USER)
+      --db string                 Database path (default: auto-discover .beads/*.db)
+  -C, --directory string          Change to this directory before running the command (like git -C)
+      --dolt-auto-commit string   Dolt auto-commit policy (off|on|batch). 'on': commit after each write. 'batch': defer commits to bd dolt commit; uncommitted changes persist in the working set until then. SIGTERM/SIGHUP flush pending batch commits. Default: off. Override via config key dolt.auto-commit
+      --global                    Use the global shared-server database (beads_global)
+      --ignore-schema-skew        Proceed despite forward schema drift (some queries may fail)
+      --json                      Output in JSON format
+      --profile                   Generate CPU profile for performance analysis
+  -q, --quiet                     Suppress non-essential output (errors only)
+      --readonly                  Read-only mode: block write operations (for worker sandboxes)
+      --sandbox                   Sandbox mode: disables Dolt auto-push
+  -v, --verbose                   Enable verbose/debug output
 ```
 (Global flags omitted — identical set listed once in §2 preamble.)
 </details>
@@ -509,6 +596,19 @@ destroyed by the `trap`-based cleanup on script exit; nothing persists outside `
   a different mechanism. Per the feature spec's explicit instruction, no substitute
   (emulating leases via comments, metadata, sentinel files, or status abuse) has been
   invented here. This finding is also recorded in the WorkerReport's `knownGaps`.
+
+- **RESOLUTION NOTE, 2026-07-31:** resolved client-side per operator decision D-BW-2
+  (accepted 2026-07-29) — NOT the rejected `updated_at`-staleness heuristic
+  (`dbe5cf8`, reverted in `5a7585c`). The bridge now ships its own lease:
+  `kranz-run-bead` renews `${KRANZ_LEASE_DIR:-.gc/kranz-leases}/<id>.lease`
+  (`<pid> <unix-ts>`) while a mission runs (trap-cleaned on terminal exit), and
+  `kranz-dispatch --reclaim` sweeps liveness-first — a live pid's claim is never
+  reaped; a dead pid's claim is released; a lease-less claim is released only past
+  `KRANZ_CLAIM_TTL` (default 120s, expiry strictly as backstop). Proven live by the
+  `LEASE: PASS`, `LEASE-TTL: PASS`, and `LEASE-PRODUCER: PASS` cases in
+  `packaging/gascity/test/kranz-dispatch-roundtrip.sh`. bd 1.0.5 still has no
+  server-side lease field; an upstream mechanism (1.1.0+) remains the tracked path
+  and this note should be revisited when it ships.
 
 ## 4. Shapes the spike used, at probe time, that the live binary did NOT accept
 

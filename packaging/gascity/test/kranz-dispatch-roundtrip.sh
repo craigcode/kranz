@@ -411,6 +411,53 @@ STUBEOF
     fi
 fi
 
+# --- Case: lease PRODUCER end-to-end (f-3-1) --------------------------------
+# The heartbeat producer itself, not only the consumer: a kranz-run-bead
+# running a simulated mission must create the lease with its live pid
+# (visible mid-run), honor the KRANZ_LEASE_DIR override, and remove the
+# file on terminal exit — the complement of the consumer's --reclaim sweep.
+PROD_CREATE_OUT=$(BD create "LEASE-PRODUCER fixture" --type task --json 2>&1)
+PROD_ID=$(printf '%s' "$PROD_CREATE_OUT" | unwrap | jq -r '.id // empty')
+if [ -z "$PROD_ID" ]; then
+    fail_case "lease-producer-create" "a non-empty fixture id" "'$PROD_CREATE_OUT'"
+else
+    PROD_LEASE_DIR="$SANDBOX/prod-leases"
+    PROD_BIN="$SANDBOX/prod-bin"
+    mkdir -p "$PROD_LEASE_DIR" "$PROD_BIN"
+    # A slow kranz stub: a visible mid-run window to observe the live lease.
+    cat > "$PROD_BIN/kranz" <<'STUBEOF'
+#!/bin/sh
+sleep 2
+echo "kranz-stub: simulated slow mission run"
+exit 0
+STUBEOF
+    chmod +x "$PROD_BIN/kranz"
+    MFILE="$SANDBOX/prod-mission.md"
+    printf '## Goal\nproducer fixture\n' > "$MFILE"
+
+    PATH="$PROD_BIN:$LEASE_STUB_BIN:$PATH" KRANZ_LEASE_DIR="$PROD_LEASE_DIR" \
+        "$BIN_DIR/kranz-run-bead" "$CITY_DIR" "$PROD_ID" "$MFILE" "$RIG_DIR" 1 >/dev/null 2>&1 &
+    PROD_PID=$!
+    sleep 1
+
+    LEASE_LIVE_PID=""
+    if [ -f "$PROD_LEASE_DIR/$PROD_ID.lease" ]; then
+        read -r LPID LTS < "$PROD_LEASE_DIR/$PROD_ID.lease"
+        if kill -0 "$LPID" 2>/dev/null; then
+            LEASE_LIVE_PID="$LPID"
+        fi
+    fi
+    wait "$PROD_PID" || true
+
+    if [ -z "$LEASE_LIVE_PID" ]; then
+        fail_case "lease-producer-live-heartbeat" "lease file with a live pid visible mid-run (KRANZ_LEASE_DIR honored)" "$(ls -la "$PROD_LEASE_DIR" 2>/dev/null)"
+    elif [ -e "$PROD_LEASE_DIR/$PROD_ID.lease" ]; then
+        fail_case "lease-producer-cleanup-on-exit" "lease file removed on terminal exit" "lease still present: $(cat "$PROD_LEASE_DIR/$PROD_ID.lease" 2>/dev/null)"
+    else
+        echo "LEASE-PRODUCER: PASS (heartbeat created with live pid mid-run, removed on terminal exit)"
+    fi
+fi
+
 # --- Case: claim-succeeded-then-show-failed window — a real bead is claimed
 # via the atomic `--claim` call inside kranz-dispatch, then `gc bd show
 # "$ID" --json` fails. Per the rollback shipped in kranz-dispatch's spool-write failure handling
