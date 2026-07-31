@@ -15,19 +15,21 @@
 #   blocked      <-> Blocked-report   (exit 2 below; escalated to a human)
 #   closed       <-> Done             (exit 0 below; mission complete)
 #
-# Claim posture (shipped in kranz-dispatch, not here): dispatch takes an
+# Claim posture / liveness-first heartbeat (ms-3-fix-1-6): dispatch takes an
 # atomic, first-wins claim (`bd update --claim`, docs/scoping/beads-bridge-
-# dialect.md §3) before spooling the brief this script runs. That claim is
-# NOT lease-aware on the installed bd 1.0.5 — no TTL, heartbeat, or expiry
-# field exists (same §3), so if the process running this script dies before
-# reaching a terminal exit code below, the claim is stuck in_progress and is
-# NOT automatically recoverable; it must be cleared manually. The intended
-# future posture — NOT YET IMPLEMENTED, pending an operator decision once bd
-# exposes a lease mechanism (1.1.0+) — is liveness first: a claim held by a
-# verifiably live holder is never stolen, expiry only backstops an ambiguous
-# or dead holder. Residual exposure today: a bead claimed and spooled but
-# not yet drained by kranz-city-worker (i.e. before this script even starts)
-# has no heartbeat and no TTL backstop covering it either.
+# dialect.md §3) before spooling the brief this script runs. bd 1.0.5 has no
+# TTL/heartbeat field, so this script proves liveness the same way
+# kranz-dispatch's dead-claim recovery checks for it: by keeping the claim's
+# `updated_at` fresh. While `kranz exec` runs, a background loop re-issues
+# the (idempotent, same-actor) `bd update --claim` every
+# KRANZ_HEARTBEAT_SECONDS, well inside kranz-dispatch's
+# KRANZ_CLAIM_STALE_SECONDS threshold, so a liveness-first dispatcher never
+# mistakes a live run for a dead one and never steals it. If this process
+# dies, the heartbeat stops, updated_at goes stale, and kranz-dispatch's
+# recovery pass reaps the claim on a later cycle.
+# Residual exposure: a bead claimed and spooled but not yet picked up by this
+# script (i.e. before the heartbeat loop starts) has no heartbeat yet; only
+# kranz-dispatch's staleness backstop covers that window.
 #
 # Exit-code contract (kranz-run-bead owns this translation):
 #   0            -> closed  (mission COMPLETE)
@@ -47,8 +49,21 @@ CITY=$1; ID=$2; MFILE=$3; RIG_DIR=$4; MAX_CYCLES=$5
 
 bd() { gc --city "$CITY" bd "$@"; }
 
+HEARTBEAT_SECONDS=${KRANZ_HEARTBEAT_SECONDS:-300}
+heartbeat_loop() {
+    while :; do
+        sleep "$HEARTBEAT_SECONDS"
+        bd update "$ID" --claim >/dev/null 2>&1
+    done
+}
+heartbeat_loop &
+HEARTBEAT_PID=$!
+
 LINE=$( cd "$RIG_DIR" && kranz exec -f "$MFILE" --max-cycles "$MAX_CYCLES" 2>>"${MFILE%.md}.events.log" )
 CODE=$?
+
+kill "$HEARTBEAT_PID" >/dev/null 2>&1
+wait "$HEARTBEAT_PID" 2>/dev/null
 
 # bd flag shapes (learned live): close takes --reason, comment takes the
 # text positionally; -m belongs to neither.

@@ -206,16 +206,101 @@ if [ -n "$FIXTURE_ID" ]; then
     fi
 fi
 
-# --- Case: lease-aware claim / liveness-first recovery ------------------
-# Stubbed per this feature's spec: bd 1.0.5 exposes no lease/TTL/heartbeat
-# field (docs/scoping/beads-bridge-dialect.md §3, executed probe), so there
-# is no way to distinguish a dead claim holder from a live one. This stays
-# stubbed until either bd exposes a TTL/heartbeat mechanism (an upgrade path
-# to 1.1.2 exists via brew, docs/scoping/beads-bridge-dialect.md §1/§3) or
-# an operator signs off on an alternate mechanism — this is an operator
-# decision, not an ordinal-milestone one.
+# --- Case: lease-aware claim / liveness-first dead-claim recovery ------
+# bd 1.0.5 exposes no lease/TTL/heartbeat field (docs/scoping/beads-bridge-
+# dialect.md §3), so kranz-dispatch's recovery pass (bin/kranz-dispatch,
+# ms-3-fix-1-6) builds liveness on the one timestamp bd does expose on every
+# issue: `updated_at`. This case exercises the real kranz-dispatch binary
+# against two real fixture beads in the sandbox store, both carrying the
+# drained label: a DEAD claim (claimed once, then left untouched past
+# KRANZ_CLAIM_STALE_SECONDS) and a LIVE claim (claimed immediately before
+# dispatch runs, so its updated_at is fresh). The gc stub here forwards every
+# bd invocation straight to the real bd binary in $STORE_DIR — no synthetic
+# ids, no fabricated JSON.
 
-echo "LEASE: SKIP (not yet implemented — awaiting operator decision on bd's TTL/heartbeat capability gap)"
+LEASE_LABEL="kranz-lease-rt"
+LEASE_SPOOL="$SANDBOX/lease-spool"
+mkdir -p "$LEASE_SPOOL"
+
+DEAD_CREATE_OUT=$(BD create "LEASE dead-claim fixture" --type task --labels "$LEASE_LABEL" --json 2>&1) || {
+    fail_case "lease-dead-create" "bd create to succeed" "$DEAD_CREATE_OUT"
+}
+DEAD_ID=$(printf '%s' "$DEAD_CREATE_OUT" | unwrap | jq -r '.id // empty')
+
+LIVE_CREATE_OUT=$(BD create "LEASE live-claim fixture" --type task --labels "$LEASE_LABEL" --json 2>&1) || {
+    fail_case "lease-live-create" "bd create to succeed" "$LIVE_CREATE_OUT"
+}
+LIVE_ID=$(printf '%s' "$LIVE_CREATE_OUT" | unwrap | jq -r '.id // empty')
+
+if [ -z "$DEAD_ID" ] || [ -z "$LIVE_ID" ]; then
+    fail_case "lease-fixture-ids" "non-empty DEAD_ID and LIVE_ID" "DEAD_ID='$DEAD_ID' LIVE_ID='$LIVE_ID'"
+else
+    ( cd "$STORE_DIR" && BEADS_ACTOR=lease-dead-actor bd update "$DEAD_ID" --claim --json >/dev/null 2>&1 )
+
+    STALE_SECONDS=2
+    # Let the dead claim's updated_at age past the threshold before dispatch
+    # runs its recovery pass.
+    sleep $((STALE_SECONDS + 3))
+
+    ( cd "$STORE_DIR" && BEADS_ACTOR=lease-live-actor bd update "$LIVE_ID" --claim --json >/dev/null 2>&1 )
+
+    STUB_BIN_LEASE="$SANDBOX/stubbin-lease"
+    mkdir -p "$STUB_BIN_LEASE"
+    cat > "$STUB_BIN_LEASE/gc" <<STUBEOF
+#!/bin/sh
+set -u
+if [ "\${1:-}" = "--city" ]; then
+    shift 2
+fi
+case "\${1:-}" in
+    bd)
+        shift
+        ( cd "$STORE_DIR" && bd "\$@" )
+        ;;
+    mail)
+        exit 0
+        ;;
+    *)
+        echo "gc-stub(lease): unsupported invocation: gc \$*" >&2
+        exit 1
+        ;;
+esac
+STUBEOF
+    chmod +x "$STUB_BIN_LEASE/gc"
+
+    LEASE_DISPATCH_OUT=$(GC_CITY="$CITY_DIR" KRANZ_RIG_DIR="$RIG_DIR" KRANZ_LABEL="$LEASE_LABEL" \
+        KRANZ_SPOOL="$LEASE_SPOOL" KRANZ_ALLOW_UNVALIDATED=1 \
+        KRANZ_CLAIM_STALE_SECONDS="$STALE_SECONDS" \
+        PATH="$STUB_BIN_LEASE:$PATH" "$BIN_DIR/kranz-dispatch" 2>&1)
+    LEASE_DISPATCH_STATUS=$?
+
+    DEAD_AFTER=$(BD show "$DEAD_ID" --json 2>/dev/null | unwrap)
+    DEAD_STATUS_AFTER=$(printf '%s' "$DEAD_AFTER" | jq -r '.status // empty')
+    DEAD_ASSIGNEE_AFTER=$(printf '%s' "$DEAD_AFTER" | jq -r '.assignee // empty')
+    LIVE_AFTER=$(BD show "$LIVE_ID" --json 2>/dev/null | unwrap)
+    LIVE_STATUS_AFTER=$(printf '%s' "$LIVE_AFTER" | jq -r '.status // empty')
+    LIVE_ASSIGNEE_AFTER=$(printf '%s' "$LIVE_AFTER" | jq -r '.assignee // empty')
+    DEAD_BRIEF=$(ls "$LEASE_SPOOL"/*-"$DEAD_ID".md 2>/dev/null | head -1)
+    LIVE_BRIEF=$(ls "$LEASE_SPOOL"/*-"$LIVE_ID".md 2>/dev/null | head -1)
+
+    if [ "$LEASE_DISPATCH_STATUS" -ne 0 ]; then
+        fail_case "lease-dispatch-ran" "kranz-dispatch to exit 0" "exit=$LEASE_DISPATCH_STATUS log: $LEASE_DISPATCH_OUT"
+    elif [ "$DEAD_STATUS_AFTER" != "in_progress" ]; then
+        fail_case "lease-dead-recovered-status" "in_progress (reaped, then re-claimed by dispatch)" "$DEAD_STATUS_AFTER"
+    elif [ "$DEAD_ASSIGNEE_AFTER" = "lease-dead-actor" ]; then
+        fail_case "lease-dead-recovered-assignee" "assignee other than the dead actor" "$DEAD_ASSIGNEE_AFTER"
+    elif [ -z "$DEAD_BRIEF" ]; then
+        fail_case "lease-dead-spooled" "a spooled brief for recovered dead-claim bead $DEAD_ID" "none found in $LEASE_SPOOL"
+    elif [ "$LIVE_STATUS_AFTER" != "in_progress" ]; then
+        fail_case "lease-live-preserved-status" "in_progress (untouched)" "$LIVE_STATUS_AFTER"
+    elif [ "$LIVE_ASSIGNEE_AFTER" != "lease-live-actor" ]; then
+        fail_case "lease-live-preserved-assignee" "lease-live-actor (never stolen)" "$LIVE_ASSIGNEE_AFTER"
+    elif [ -n "$LIVE_BRIEF" ]; then
+        fail_case "lease-live-not-spooled" "no spooled brief for the still-live claim $LIVE_ID" "found: $LIVE_BRIEF"
+    else
+        echo "LEASE: PASS (dead claim recovered and re-claimed, live claim preserved)"
+    fi
+fi
 
 # --- Case: field translation is type-correct (acceptance_criteria) -----
 # Exercises the real kranz-dispatch script's brief-generation logic. The
@@ -265,6 +350,9 @@ case "\${1:-}" in
         case "\${1:-}" in
             ready)
                 echo '[{"id":"$STRING_ID"},{"id":"$ARRAY_ID"},{"id":"$NOACCEPT_ID"},{"id":"$EMPTYARR_ID"}]'
+                ;;
+            list)
+                ( cd "$STORE_DIR" && bd "\$@" )
                 ;;
             show)
                 ID=\$2

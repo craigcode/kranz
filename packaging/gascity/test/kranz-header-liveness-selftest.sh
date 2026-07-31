@@ -1,14 +1,24 @@
 #!/bin/sh
 # kranz-header-liveness-selftest.sh — regression test for finding [f-3-1]:
 # both bridge translator headers (kranz-dispatch and kranz-run-bead) must
-# document the liveness-first posture for future lease-aware claim recovery
-# and the residual spooled-but-not-drained TTL-only exposure window, in
-# addition to their existing status-map and exit-code-contract blocks. This
-# is pure documentation content — it does not depend on bd exposing a lease
-# capability — so this test greps the shipped header comments for the
-# required content. It is registered in .kranz/merge-gates.json (scoped to
-# packaging/gascity/bin/kranz-dispatch and packaging/gascity/bin/kranz-run-bead),
-# so a regression here is caught by the merge gate, not just by manual re-run.
+# document the liveness-first posture for lease-aware claim recovery and the
+# residual spooled-but-not-drained exposure window, in addition to their
+# existing status-map and exit-code-contract blocks. This is pure
+# documentation content — this test greps the shipped header comments for
+# the required content. It is registered in .kranz/merge-gates.json (scoped
+# to packaging/gascity/bin/kranz-dispatch and
+# packaging/gascity/bin/kranz-run-bead), so a regression here is caught by
+# the merge gate, not just by manual re-run.
+#
+# Updated for ms-3-fix-1-6 (finding [a3]): liveness-first dead-claim
+# recovery is now actually implemented (staleness-based, built on bd's
+# `updated_at` field plus a heartbeat loop in kranz-run-bead — bd 1.0.5 has
+# no dedicated lease/TTL/heartbeat field, docs/scoping/beads-bridge-
+# dialect.md §3). The checks below were updated in lockstep: they now assert
+# the mechanism is documented as implemented (staleness threshold + recovery
+# language), not that it is flagged "not yet implemented" — and that the
+# residual pre-heartbeat window is documented as heartbeat-less but still
+# covered by the staleness backstop, not as covered by nothing.
 #
 # Matching is deliberately tolerant of prose rewording (case-insensitive,
 # space-or-hyphen between words, substance checks instead of frozen
@@ -41,8 +51,11 @@ check_liveness_first() {
     printf '%s' "$1" | grep -qiE 'liveness[ -]first'
 }
 
-check_not_yet_implemented() {
-    printf '%s' "$1" | grep -qiE 'not yet implemented'
+check_liveness_implemented() {
+    # The mechanism must be documented as shipped (a staleness/threshold
+    # based recovery), not merely aspirational.
+    HDR=$1
+    printf '%s' "$HDR" | grep -qiE 'stale' && printf '%s' "$HDR" | grep -qiE 'recover'
 }
 
 check_residual_named() {
@@ -50,12 +63,13 @@ check_residual_named() {
 }
 
 check_ttl_heartbeat_substance() {
-    # The spooled-but-not-drained window must be documented as covered by
-    # neither a heartbeat nor a TTL backstop. Accept either clause order
-    # and reworded negations (no/not/without/lacks/covered by nothing).
+    # The spooled-but-not-drained (pre-heartbeat) window must be documented
+    # as lacking a heartbeat, while still being covered by the
+    # staleness/threshold backstop (not "covered by nothing"). Accept either
+    # clause order and reworded negations (no/not/without/lacks).
     HDR=$1
-    printf '%s' "$HDR" | grep -qiE '(no|not|without|lacks?|nothing)[^.]*heartbeat|heartbeat[^.]*(no|not|without|lacks?|nothing)' \
-        && printf '%s' "$HDR" | grep -qiE '(no|not|without|lacks?|nothing)[^.]*ttl|ttl[^.]*(no|not|without|lacks?|nothing)'
+    printf '%s' "$HDR" | grep -qiE '(no|not|without|lacks?)[^.]*heartbeat|heartbeat[^.]*(no|not|without|lacks?)' \
+        && printf '%s' "$HDR" | grep -qiE 'stale'
 }
 
 # Remove all case-insensitive occurrences of a word from a header string,
@@ -78,9 +92,9 @@ for NAME in kranz-dispatch kranz-run-bead; do
         "header to document a liveness-first posture (a live claim holder is never stolen)" \
         "no liveness-first phrase in header"
 
-    check_not_yet_implemented "$HEADER" || fail "$NAME-liveness-not-yet-implemented" \
-        "header to flag the liveness-first posture as not yet implemented (pending a bd lease mechanism)" \
-        "no 'not yet implemented' phrase in header"
+    check_liveness_implemented "$HEADER" || fail "$NAME-liveness-implemented" \
+        "header to document the liveness-first mechanism as implemented (a staleness-threshold based dead-claim recovery)" \
+        "no stale+recover wording in header"
 
     check_residual_named "$HEADER" || fail "$NAME-residual-exposure" \
         "header to name the residual spooled-but-not-drained exposure explicitly" \
@@ -102,10 +116,11 @@ for NAME in kranz-dispatch kranz-run-bead; do
             "check still passed"
     fi
 
-    STRIPPED_HEADER=$(strip_word "$HEADER" 'not yet implemented')
-    if check_not_yet_implemented "$STRIPPED_HEADER"; then
-        fail "$NAME-negctrl-not-yet-implemented" \
-            "not-yet-implemented check to fail once that wording is stripped" \
+    STRIPPED_HEADER=$(strip_word "$HEADER" 'stale')
+    STRIPPED_HEADER=$(strip_word "$STRIPPED_HEADER" 'staleness')
+    if check_liveness_implemented "$STRIPPED_HEADER"; then
+        fail "$NAME-negctrl-liveness-implemented" \
+            "liveness-implemented check to fail once staleness wording is stripped" \
             "check still passed"
     fi
 
@@ -117,10 +132,11 @@ for NAME in kranz-dispatch kranz-run-bead; do
     fi
 
     STRIPPED_HEADER=$(strip_word "$HEADER" 'heartbeat')
-    STRIPPED_HEADER=$(strip_word "$STRIPPED_HEADER" 'ttl')
+    STRIPPED_HEADER=$(strip_word "$STRIPPED_HEADER" 'stale')
+    STRIPPED_HEADER=$(strip_word "$STRIPPED_HEADER" 'staleness')
     if check_ttl_heartbeat_substance "$STRIPPED_HEADER"; then
         fail "$NAME-negctrl-residual-ttl-only" \
-            "heartbeat/TTL substance check to fail once that wording is stripped" \
+            "heartbeat/staleness substance check to fail once that wording is stripped" \
             "check still passed"
     fi
 
