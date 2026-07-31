@@ -212,10 +212,10 @@ pub fn mission_escalation(mission_id: &str, events: &[Event]) -> MissionEscalati
         _ => None,
     });
 
-    let plan_approved_ts = mission_events
+    let plan_approved_seq = mission_events
         .iter()
         .find(|e| matches!(e.kind, EventKind::PlanApproved { .. }))
-        .map(|e| e.ts);
+        .map(|e| e.seq);
 
     let mut interventions: u64 = 0;
     let mut ledger = Vec::new();
@@ -224,8 +224,12 @@ pub fn mission_escalation(mission_id: &str, events: &[Event]) -> MissionEscalati
     for e in &mission_events {
         match &e.kind {
             EventKind::UserMessage { text, .. } => {
-                if let Some(approved_ts) = plan_approved_ts {
-                    if e.ts >= approved_ts {
+                // Classify by SEQUENCE, not wall clock (5th-pass review):
+                // the event log's seq is the order of truth — timestamps
+                // can tie or move backward across a clock step, and either
+                // would silently misclassify a steer as drafting.
+                if let Some(approved_seq) = plan_approved_seq {
+                    if e.seq >= approved_seq {
                         interventions += 1;
                         ledger.push(LedgerRow {
                             ts: e.ts,

@@ -713,12 +713,36 @@ impl GitRepo {
     /// newline-bearing names survive the split. Ignored paths (`target/`,
     /// the `.kranz` runtime) never appear — mirroring
     /// [`GitRepo::porcelain_status`].
-    pub fn untracked_files(&self) -> Result<Vec<String>> {
-        let out = self.run(&["ls-files", "--others", "--exclude-standard", "-z"])?;
+    /// Untracked non-ignored files, NUL-separated raw bytes preserved:
+    /// `ls-files -z` output is byte-oriented, and a name that is not valid
+    /// UTF-8 must NOT be lossy-mangled — the replacement character turns
+    /// into a path that then fails to copy and (pre-fix) was silently
+    /// swallowed as NotFound (5th-pass review). On unix the raw bytes are
+    /// used verbatim; on Windows (where git emits WTF-8) the lossy form is
+    /// the pragmatic fallback, documented.
+    pub fn untracked_files(&self) -> Result<Vec<std::ffi::OsString>> {
+        let out = self.probe(&["ls-files", "--others", "--exclude-standard", "-z"])?;
+        if !out.status.success() {
+            return Err(EngineError::Git(format!(
+                "git ls-files --others failed ({})",
+                failure_detail(&out)
+            )));
+        }
         Ok(out
-            .split('\0')
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
+            .stdout
+            .split(|b| *b == 0)
+            .filter(|seg| !seg.is_empty())
+            .map(|seg| {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::ffi::OsStrExt as _;
+                    std::ffi::OsString::from(std::ffi::OsStr::from_bytes(seg))
+                }
+                #[cfg(not(unix))]
+                {
+                    std::ffi::OsString::from(String::from_utf8_lossy(seg).into_owned())
+                }
+            })
             .collect())
     }
 

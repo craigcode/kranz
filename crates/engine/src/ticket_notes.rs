@@ -70,13 +70,42 @@ pub fn append_note(repo_root: &Path, slug: &str, author: &str, text: &str) -> Re
 
     let dir = Ticket::tickets_dir(repo_root);
     std::fs::create_dir_all(&dir)?;
+    let path = notes_path(repo_root, slug);
+    // Never append through a planted symlink (5th-pass review): a committed
+    // `<slug>.notes.jsonl` symlink would redirect the append into any
+    // same-user writable file. O_NOFOLLOW on unix makes the open itself
+    // refuse (ELOOP); off-unix the check-then-open window is documented
+    // (Windows symlink creation needs privileges).
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(|e| {
+                if e.raw_os_error() == Some(libc::ELOOP) {
+                    EngineError::InvalidState(format!(
+                        "refusing ticket notes sidecar that is a symlink: {}",
+                        path.display()
+                    ))
+                } else {
+                    EngineError::Io(e)
+                }
+            })?
+    };
+    #[cfg(not(unix))]
+    let mut file = {
+        crate::paths::ensure_absent_or_regular_file(&path)?;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&path)?
+    };
     // The event-log idiom: O_APPEND + create, a single write of the whole
     // line, then fsync — a concurrent appender can interleave between notes
     // but never within one.
-    let mut file = std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(notes_path(repo_root, slug))?;
     file.write_all(line.as_bytes())?;
     file.flush()?;
     file.sync_data()?;
@@ -91,10 +120,17 @@ pub fn append_note(repo_root: &Path, slug: &str, author: &str, text: &str) -> Re
 pub fn read_notes(repo_root: &Path, slug: &str) -> Result<Vec<TicketNote>> {
     Ticket::ensure_valid_slug(slug)?;
     let path = notes_path(repo_root, slug);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e.into()),
+    let text = match crate::paths::open_read_nofollow(&path) {
+        Ok(mut file) => {
+            use std::io::Read as _;
+            let mut text = String::new();
+            file.read_to_string(&mut text)?;
+            text
+        }
+        Err(e) if matches!(&e, EngineError::Io(io) if io.kind() == std::io::ErrorKind::NotFound) => {
+            return Ok(Vec::new())
+        }
+        Err(e) => return Err(e),
     };
     let mut notes = Vec::new();
     for (i, line) in text.lines().enumerate() {

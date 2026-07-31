@@ -155,6 +155,7 @@ impl ValidatorSnapshot {
 
         // Capture the real checkout's state BEFORE the add, so the snapshot
         // replays exactly what the worker left.
+        let repo = &repo.with_hooks_disabled();
         let head = repo.head_sha()?;
         let diff = repo.diff_head()?;
         let untracked = repo.untracked_files()?;
@@ -213,7 +214,7 @@ impl ValidatorSnapshot {
         &self,
         session_root: &Path,
         diff: &str,
-        untracked: &[String],
+        untracked: &[std::ffi::OsString],
     ) -> Result<(TargetCopyTier, Option<String>)> {
         let snap_repo = GitRepo::open(&self.path)?;
         if !diff.trim().is_empty() {
@@ -228,8 +229,15 @@ impl ValidatorSnapshot {
             let _ = std::fs::remove_file(&patch);
             applied?;
         }
-        copy_untracked(session_root, &self.path, untracked)?;
-        Ok(warm_target(session_root, &self.path))
+        let skip_note = copy_untracked(session_root, &self.path, untracked)?;
+        let (tier, mut detail) = warm_target(session_root, &self.path);
+        if let (Some(note), Some(existing)) = (&skip_note, &mut detail) {
+            existing.push_str("; ");
+            existing.push_str(note);
+        } else if let Some(note) = skip_note {
+            detail = Some(note);
+        }
+        Ok((tier, detail))
     }
 
     /// Root of the throwaway checkout — the validator session's cwd.
@@ -266,10 +274,44 @@ impl Drop for ValidatorSnapshot {
 /// preserving repo-relative paths. A file that vanishes between the
 /// `ls-files` listing and the copy is skipped (a racing external process
 /// must not fail the round); real I/O errors propagate.
-fn copy_untracked(session_root: &Path, snapshot_root: &Path, untracked: &[String]) -> Result<()> {
+/// Copy the untracked files into the snapshot WITHOUT following any
+/// link: only regular files cross (5th-pass review — an untracked
+/// symlink could point a denied authority file, e.g. `.kranz/serve.token`,
+/// into the snapshot where the validator reads it freely, and a FIFO or
+/// device link would block the build forever). Non-regular entries are
+/// skipped and recorded in the returned note (never opened), so the build
+/// neither follows nor hangs; the CoW design means the real checkout is
+/// untouched regardless.
+fn copy_untracked(
+    session_root: &Path,
+    snapshot_root: &Path,
+    untracked: &[std::ffi::OsString],
+) -> Result<Option<String>> {
+    let mut skipped: Vec<String> = Vec::new();
     for rel in untracked {
         let src = session_root.join(rel);
         let dst = snapshot_root.join(rel);
+        let metadata = match std::fs::symlink_metadata(&src) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(EngineError::Git(format!(
+                    "snapshot untracked stat {}: {e}",
+                    src.display()
+                )))
+            }
+        };
+        if !metadata.file_type().is_file() {
+            let kind = if metadata.file_type().is_symlink() {
+                "symlink"
+            } else if metadata.file_type().is_dir() {
+                "dir"
+            } else {
+                "special"
+            };
+            skipped.push(format!("{} ({kind})", rel.to_string_lossy()));
+            continue;
+        }
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
                 EngineError::Git(format!("snapshot untracked {}: {e}", parent.display()))
@@ -287,7 +329,19 @@ fn copy_untracked(session_root: &Path, snapshot_root: &Path, untracked: &[String
             }
         }
     }
-    Ok(())
+    Ok((!skipped.is_empty()).then(|| {
+        format!(
+            "skipped {} non-regular untracked entr{}: {}",
+            skipped.len(),
+            if skipped.len() == 1 { "y" } else { "ies" },
+            skipped
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }))
 }
 
 /// Warm the snapshot's `target/` from the session checkout's, trying each

@@ -567,18 +567,20 @@ fn probe_claim_pid(pid: i32) -> ClaimPidLiveness {
 /// claim name, which forgoes reuse detection like the legacy lock formats).
 fn claim_identity_suffix() -> String {
     crate::event_log::process_identity_token(std::process::id() as i32)
-        .map(|token| format!(".{:016x}", identity_token_hash(&token)))
+        .map(|token| format!(".{}", identity_token_hash(&token)))
         .unwrap_or_default()
 }
 
-/// DefaultHasher over the identity token: equality is all that matters
-/// (matching the lock idiom's raw-equality compare), and the hex hash keeps
-/// spaces and punctuation out of the claim filename.
-fn identity_token_hash(token: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    token.hash(&mut hasher);
-    hasher.finish()
+/// A STABLE digest of the identity token (5th-pass review): the claim name
+/// is persisted on disk and compared by a later — possibly upgraded —
+/// binary, so the hash must be a stable format across rustc versions.
+/// DefaultHasher's algorithm is explicitly not one. SHA-256 truncated to
+/// 16 hex chars is (sha2 is already a dependency), and equality is all
+/// that matters, matching the lock idiom's raw-equality compare.
+fn identity_token_hash(token: &str) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(token.as_bytes());
+    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Recover claims left by dead dispatchers. A `*.claimed.<pid>[.<token>]`
@@ -630,11 +632,7 @@ pub fn recover_dead_claims(repo_root: &Path) -> usize {
                         // the pid was recycled after a crash — the age
                         // backstop decides, or the claim strands forever
                         // behind an unrelated long-lived process.
-                        Some(current)
-                            if format!("{:016x}", identity_token_hash(&current)) != recorded =>
-                        {
-                            aged_out
-                        }
+                        Some(current) if identity_token_hash(&current) != recorded => aged_out,
                         // Token matches (provably the claimant), or the
                         // token is unprobeable right now: alive stands.
                         _ => false,

@@ -75,19 +75,21 @@ impl CheckoutFingerprint {
     /// never get its payload executed by the detection itself (4th-pass
     /// review — detection previously ran `git status` before comparing
     /// config, so the payload ran first). The `.git` metadata itself is
-    /// read via the filesystem, never through git.
+    /// read via the filesystem with BOUNDED, no-follow reads (5th-pass: a
+    /// replaced config or info/exclude that is a FIFO or an unbounded
+    /// source must not hang or exhaust the engine mid-detection — anything
+    /// unusual reads as a stable refusal marker, which is itself drift).
     pub fn capture(repo: &GitRepo) -> Result<Self> {
         let verification = repo.with_hooks_disabled();
         let common = verification.git_common_dir()?;
         Ok(CheckoutFingerprint {
             head: verification.head_sha()?,
             status: verification.porcelain_status()?,
-            git_config: std::fs::read_to_string(common.join("config")).unwrap_or_default(),
+            git_config: bounded_metadata_read(&common.join("config")),
             git_hooks: hook_listing(&common.join("hooks")),
             git_refs: verification.for_each_ref()?,
             index_flags: verification.ls_files_v()?,
-            info_exclude: std::fs::read_to_string(common.join("info").join("exclude"))
-                .unwrap_or_default(),
+            info_exclude: bounded_metadata_read(&common.join("info").join("exclude")),
         })
     }
 
@@ -127,18 +129,61 @@ impl CheckoutFingerprint {
     }
 }
 
+/// Bounded, no-follow read of a `.git` metadata file (config,
+/// info/exclude): regular files only, first 64 KiB (`.git` config files
+/// are kilobyte-scale; anything larger is itself suspicious). A symlink,
+/// FIFO, oversized, or unreadable path returns a STABLE refusal marker
+/// instead of being opened (5th-pass review: a validator that can replace
+/// the shared config with a FIFO or an unbounded source must not hang or
+/// exhaust the engine mid-capture — the marker is constant per shape, so
+/// it only registers as drift when it changes).
+fn bounded_metadata_read(path: &std::path::Path) -> String {
+    use std::io::Read as _;
+    const CAP: u64 = 64 * 1024;
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return String::new(); // absent — same as before (empty)
+    };
+    let file_type = metadata.file_type();
+    if !file_type.is_file() {
+        let kind = if file_type.is_symlink() {
+            "symlink"
+        } else if file_type.is_dir() {
+            "dir"
+        } else {
+            "special"
+        };
+        return format!("SUSPECT:{kind}");
+    }
+    if metadata.len() > CAP {
+        return format!("SUSPECT:oversized:{}", metadata.len());
+    }
+    match std::fs::File::open(path) {
+        Ok(file) => {
+            let mut buf = Vec::new();
+            match file.take(CAP).read_to_end(&mut buf) {
+                Ok(_) => String::from_utf8_lossy(&buf).into_owned(),
+                Err(_) => "SUSPECT:unreadable".to_string(),
+            }
+        }
+        Err(_) => "SUSPECT:unreadable".to_string(),
+    }
+}
+
 /// Sorted `name HASH` lines for the non-`.sample` hooks in `hooks_dir`
 /// (content-hashed: a same-length rewrite must not slip past). Reads are
-/// BOUNDED and never followed (4th-pass review): only regular files, hashed
-/// as first-32 KiB + last-32 KiB + length (a same-length edit anywhere in
-/// the file still changes the line; reads never exceed 64 KiB). A symlink,
-/// FIFO, device, or other special entry is NEVER opened — a FIFO would
-/// block forever, a `/dev/zero` symlink would allocate without bound — and
-/// records a stable `name SUSPECT:<kind>` marker instead: the same marker
-/// on the next capture, so an unchanged oddity is not itself drift, but any
-/// change to it is. Absent or unreadable dirs list as empty.
+/// BOUNDED and never followed (4th-pass review): only regular files —
+/// hashed whole when ≤ 1 MiB (hooks are kilobyte-scale; the whole file
+/// closes the middle blind spot), and as first-32 KiB + last-32 KiB +
+/// length above 1 MiB (pathological size; the residual middle gap there is
+/// documented, not hidden). A symlink, FIFO, device, or other special
+/// entry is NEVER opened — a FIFO would block forever, a `/dev/zero`
+/// symlink would allocate without bound — and records a stable
+/// `name SUSPECT:<kind>` marker instead: the same marker on the next
+/// capture, so an unchanged oddity is not itself drift, but any change to
+/// it is. Absent or unreadable dirs list as empty.
 fn hook_listing(hooks_dir: &std::path::Path) -> String {
     use std::hash::{Hash, Hasher};
+    const HOOK_FULL_READ_MAX: u64 = 1024 * 1024;
     const HOOK_WINDOW: u64 = 32 * 1024;
     let mut lines: Vec<String> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(hooks_dir) {
@@ -168,18 +213,26 @@ fn hook_listing(hooks_dir: &std::path::Path) -> String {
                     use std::io::{Read as _, Seek as _, SeekFrom};
                     let len = metadata.len();
                     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                    let mut head = vec![0u8; HOOK_WINDOW as usize];
-                    let head_read = file.read(&mut head).unwrap_or(0);
-                    head[..head_read].hash(&mut hasher);
-                    if len > HOOK_WINDOW {
+                    if len <= HOOK_FULL_READ_MAX {
+                        let mut contents = Vec::new();
+                        if file.read_to_end(&mut contents).is_ok() {
+                            contents.hash(&mut hasher);
+                        } else {
+                            lines.push(format!("{name} SUSPECT:unreadable"));
+                            continue;
+                        }
+                    } else {
+                        let mut head = vec![0u8; HOOK_WINDOW as usize];
+                        let head_read = file.read(&mut head).unwrap_or(0);
+                        head[..head_read].hash(&mut hasher);
                         let tail_start = len.saturating_sub(HOOK_WINDOW);
                         if file.seek(SeekFrom::Start(tail_start)).is_ok() {
                             let mut tail = vec![0u8; HOOK_WINDOW as usize];
                             let tail_read = file.read(&mut tail).unwrap_or(0);
                             tail[..tail_read].hash(&mut hasher);
                         }
+                        len.hash(&mut hasher);
                     }
-                    len.hash(&mut hasher);
                     lines.push(format!("{name} {:016x}", hasher.finish()));
                 }
                 Err(_) => lines.push(format!("{name} SUSPECT:unreadable")),
