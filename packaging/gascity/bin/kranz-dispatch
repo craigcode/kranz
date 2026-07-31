@@ -28,14 +28,16 @@
 #
 # Claim rollback on abandonment (shipped): once the claim above succeeds,
 # every path in the loop body that gives up on the bead BEFORE both spool
-# files are written releases that claim first — `gc bd update "$ID" --status
-# open --assignee ""` (dialect doc §2's verified `-a/--assignee`; an empty
-# string clears it, confirmed by an executed probe) — then continues, so the
-# bead is returned to open and unassigned rather than left claimed with no
-# spool entry. This covers a `gc bd show` failure and a failure writing
-# either the .md or .env spool file. The lost-race path (the `--claim`
-# call itself failing) is unaffected and stays silent: no comment, no spool
-# files, no rollback needed because no claim was ever taken.
+# files are written removes any spool file already written for that
+# stamp/id (`rm -f` on both the .md and .env, whichever exist) and releases
+# that claim — `gc bd update "$ID" --status open --assignee ""` (dialect doc
+# §2's verified `-a/--assignee`; an empty string clears it, confirmed by an
+# executed probe) — then continues, so the bead is returned to open and
+# unassigned with no partial spool pair left behind. This covers a `gc bd
+# show` failure and a failure writing either the .md or .env spool file. The
+# lost-race path (the `--claim` call itself failing) is unaffected and stays
+# silent: no comment, no spool files, no rollback needed because no claim
+# was ever taken.
 #
 # NOT lease-aware (as shipped): bd 1.0.5 exposes no TTL, heartbeat, or
 # expiry mechanism — no --lease/--lease-ttl/--heartbeat flag, and no
@@ -147,12 +149,14 @@ for ID in $READY; do
         printf '## Scoping answers\nNo human is available during this run. Prefer the smallest faithful interpretation; if materially ambiguous, block rather than guess. Validators stay enabled.\n\n'
         printf '## Acceptance hints\n%s\n' "${ACCEPT:-The goal above is demonstrably met.}"
     } > "$MFILE"; then
+        rm -f "$SPOOL/$STAMP-$ID.md" "$SPOOL/$STAMP-$ID.env"
         release_claim
         continue
     fi
     if ! {
         printf 'ID=%s\nCITY=%s\nRIG_DIR=%s\nMAX_CYCLES=%s\n' "$ID" "$CITY" "$RIG_DIR" "$MAX_CYCLES"
     } > "$SPOOL/$STAMP-$ID.env"; then
+        rm -f "$SPOOL/$STAMP-$ID.md" "$SPOOL/$STAMP-$ID.env"
         release_claim
         continue
     fi

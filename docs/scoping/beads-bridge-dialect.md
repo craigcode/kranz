@@ -93,7 +93,7 @@ immediately below the table.
 |---|---|---|
 | `bd ready` | VERIFIED | `-l, --label strings` (AND filter), `--label-any strings` (OR filter), `--json`, `--claim` (atomically claim the first ready issue matching filters — see §3), `-a/--assignee`, `-u/--unassigned`, `-n/--limit` (default 100), `--mol`, `--gated`, `--explain` |
 | `bd show` | VERIFIED | `[id...]` positional or `--id stringArray`, `--json`, `--current`, `--short`, `--long`, `--include-comments`, `--include-dependents`. **Resolved by executed probe (2026-07-30, §3 sandbox):** `bd show <id> --json` with a single positional id returns a **single-element JSON array**, not a bare object — confirmed against a real fixture bead, both with and without `--long`. |
-| `bd update` | VERIFIED | `-s, --status string` ("New status") — **accepted**, matches spike usage; `--claim` ("Atomically claim the issue (sets assignee to you, status to in_progress; idempotent if already claimed by you)") — **accepted**. No `--lease`, `--lease-ttl`, or `--heartbeat` flag exists. No `lease_expires_at` / `heartbeat_at` field appears anywhere in `--help` output, and none appeared in the executed `bd show --json` output either (§3). |
+| `bd update` | VERIFIED | `-s, --status string` ("New status") — **accepted**, matches spike usage; `--claim` ("Atomically claim the issue (sets assignee to you, status to in_progress; idempotent if already claimed by you)") — **accepted**. `-a, --assignee string` — **accepted**; empty string clears it, confirmed by an executed probe below. No `--lease`, `--lease-ttl`, or `--heartbeat` flag exists. No `lease_expires_at` / `heartbeat_at` field appears anywhere in `--help` output, and none appeared in the executed `bd show --json` output either (§3). |
 | `bd comment` | VERIFIED | Usage: `bd comment <id> [text...] [flags]` — text is positional (confirms docs/gascity.md:45). Also `--file`, `--stdin`. No `-m` flag. |
 | `bd close` | VERIFIED | `-r, --reason string` ("Reason for closing") — confirms docs/gascity.md:45. Also `--reason-file`, `--claim-next`, `--force`, `--continue`. No `-m` flag. |
 | `bd set-state` | VERIFIED — verb exists | Usage: `bd set-state <issue-id> <dimension>=<value> [flags]`, plus `--reason string`. Sets state as `<dimension>=<value>` (e.g. `patrol=muted`), **not** a bare status string. |
@@ -317,6 +317,71 @@ Flags:
 ```
 (Global flags omitted.)
 </details>
+
+**`-a/--assignee` empty-string clear — EXECUTED PROBE, 2026-07-31.** A fresh,
+independent `mktemp -d` sandbox was created, guarded by `trap 'rm -rf "$SANDBOX"' EXIT
+INT TERM`, entirely under `$TMPDIR`, with its own `bd init --non-interactive` store.
+Neither `gc init` nor `gc stop` was run, and no real bead store was touched. This probe
+directly confirms the claim-clear-reclaim cycle `bin/kranz-dispatch` and
+`bin/kranz-run-bead` rely on for releasing an abandoned claim:
+
+```
+$ bd create "Fixture bead for assignee-clear probe" --type task --json
+{
+  "id": "tmp_MzT4KEnbla-0if",
+  ...
+  "status": "open",
+  ...
+}
+
+$ whoami
+craigmartin
+
+$ bd update tmp_MzT4KEnbla-0if --claim --json
+[
+  {
+    "id": "tmp_MzT4KEnbla-0if",
+    "status": "in_progress",
+    "assignee": "craigmartin",
+    ...
+  }
+]
+
+$ bd update tmp_MzT4KEnbla-0if --status open --assignee "" --json
+[
+  {
+    "id": "tmp_MzT4KEnbla-0if",
+    "status": "open",
+    ...
+  }
+]
+```
+
+(No `assignee` key appears in the row above — clearing it removes the field from the
+JSON output entirely rather than emitting `"assignee": ""`.)
+
+```
+$ bd update tmp_MzT4KEnbla-0if --claim --actor other-actor --json
+[
+  {
+    "id": "tmp_MzT4KEnbla-0if",
+    "status": "in_progress",
+    "assignee": "other-actor",
+    ...
+  }
+]
+```
+
+**Confirmed by executed run:** `bd update <id> --status open --assignee ""` — the exact
+shape both `bin/kranz-dispatch`'s `release_claim` and `bin/kranz-run-bead`'s exit-3/
+exit-other cases issue — clears the assignee and reopens the issue in one call, and a
+different actor's subsequent `--claim` then succeeds against that now-open,
+now-unassigned issue. A bare `--assignee ""` with no accompanying `--status open` clears
+the assignee field but leaves `status: in_progress`, which still blocks `--claim` for
+another actor (`Error claiming ...: issue not claimable: status in_progress`, observed in
+an earlier run of this probe) — confirming the bridge's combined `--status open
+--assignee ""` call is the correct shape, not `--assignee ""` alone. The sandbox was
+destroyed by the `trap`-based cleanup on script exit; nothing persists outside `$TMPDIR`.
 
 ## 3. Claim / lease support: executed probe **CONFIRMS no lease/TTL/heartbeat field** on installed `bd` 1.0.5
 

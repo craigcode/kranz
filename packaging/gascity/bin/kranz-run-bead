@@ -35,8 +35,11 @@
 # the assignee (`bd update --assignee ""`) alongside the status reset to
 # open, per docs/scoping/beads-bridge-dialect.md §2 (`bd update`'s verified
 # `-a/--assignee` flag; an empty string clears it, confirmed by an executed
-# probe: claim, clear via `--assignee ""`, then a different actor claims the
-# same bead successfully). A bead reopened this way is therefore claimable
+# probe: claim, clear via the combined `--status open --assignee ""` call
+# this script issues, then a different actor claims the same bead
+# successfully — a bare `--assignee ""` without `--status open` was also
+# probed and leaves the issue in_progress, still blocking reclaim). A bead
+# reopened this way is therefore claimable
 # by ANY actor afterward, not stuck assigned to whichever actor ran this
 # mission. Exit 2 (blocked) deliberately does NOT clear the assignee: a
 # blocked bead is escalated to a human via mail and is never re-offered by
