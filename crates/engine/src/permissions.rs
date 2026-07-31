@@ -469,7 +469,12 @@ mod tests {
                     .contains(&"Bash(printenv KRANZ_*)".to_string()),
                 "{role:?} must allow printenv of KRANZ_ vars"
             );
-            for poisoned in ["Bash(printenv*)", "Bash(env*)", "Bash(echo*)", "Bash(echo *)"] {
+            for poisoned in [
+                "Bash(printenv*)",
+                "Bash(env*)",
+                "Bash(echo*)",
+                "Bash(echo *)",
+            ] {
                 assert!(
                     !profile.allowed_tools.iter().any(|p| p == poisoned),
                     "{role:?} must NOT allow {poisoned} (auth-key dump / command runner / substitution)"
