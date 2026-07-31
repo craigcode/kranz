@@ -30,29 +30,48 @@ if ! command -v bd >/dev/null 2>&1; then
 fi
 
 SANDBOX=$(mktemp -d)
-trap 'rm -rf "$SANDBOX"' EXIT
+trap 'rm -rf "$SANDBOX"' EXIT INT TERM
 
 # --- Case: a broken status transition must never print STATUS: PASS -------
 #
 # Patch a copy of the script so one status-transition case is guaranteed to
-# fail: replace the "open->in_progress" assertion's target status with a
-# value bd will never actually report back (bd rejects/ignores unknown
-# status values), forcing assert_status's mismatch branch and STATUS_OK=0.
+# fail: locate the assert_status call whose second argument is the
+# open->in_progress transition label — by construct, not by pinning the
+# label text, so a relabel of that assertion doesn't break this test — and
+# replace ONLY that line's first argument with a value bd will never
+# actually report back (bd rejects/ignores unknown status values), forcing
+# assert_status's mismatch branch and STATUS_OK=0.
 BROKEN="$SANDBOX/kranz-dispatch-roundtrip-broken.sh"
-sed 's/assert_status "in_progress" "open->in_progress"/assert_status "not_a_real_status" "open->in_progress"/' \
+
+TARGET_LINE_NO=$(grep -nE 'assert_status[[:space:]]+"[a-z_]+"[[:space:]]+"open->in_progress' "$ROUNDTRIP" \
+    | head -n1 | cut -d: -f1)
+[ -n "$TARGET_LINE_NO" ] || fail "broken-setup" \
+    "an assert_status call with label \"open->in_progress\" to exist in $ROUNDTRIP" \
+    "no matching line found"
+
+sed "${TARGET_LINE_NO}s/assert_status[[:space:]]*\"[a-z_]*\"/assert_status \"not_a_real_status\"/" \
     "$ROUNDTRIP" >"$BROKEN"
 chmod +x "$BROKEN"
 
-if ! grep -qF 'assert_status "not_a_real_status" "open->in_progress"' "$BROKEN"; then
-    fail "broken-setup" "the patched copy to contain the forced-mismatch assertion" \
-        "sed substitution did not take effect — check the target line text still matches"
+ORIG_LINE=$(sed -n "${TARGET_LINE_NO}p" "$ROUNDTRIP")
+PATCHED_LINE=$(sed -n "${TARGET_LINE_NO}p" "$BROKEN")
+if [ "$PATCHED_LINE" = "$ORIG_LINE" ]; then
+    fail "broken-setup" "the patched copy's target line to differ from the original" \
+        "line $TARGET_LINE_NO unchanged: $PATCHED_LINE"
 fi
+case "$PATCHED_LINE" in
+    *'assert_status'*'"not_a_real_status"'*'"open->in_progress'*) : ;;
+    *)
+        fail "broken-setup" "the patched line to carry the forced-mismatch status and original label" \
+            "$PATCHED_LINE"
+        ;;
+esac
 
 OUT=$("$BROKEN" 2>&1)
 STATUS=$?
 
 case "$OUT" in
-    *"FAIL [status-transition:open->in_progress]"*) : ;;
+    *"FAIL [status-transition:open->in_progress"*) : ;;
     *) fail "broken-fails" "a FAIL line for status-transition:open->in_progress" "$OUT" ;;
 esac
 

@@ -40,7 +40,7 @@ fail() {
 [ -f "$HYGIENE" ] || fail "hygiene-script-exists" "$HYGIENE to exist" "not found"
 
 SANDBOX=$(mktemp -d)
-trap 'rm -rf "$SANDBOX"' EXIT
+trap 'rm -rf "$SANDBOX"' EXIT INT TERM
 
 mkdir -p "$SANDBOX/test" "$SANDBOX/bin"
 cp "$HYGIENE" "$SANDBOX/test/check-bridge-hygiene.sh"
