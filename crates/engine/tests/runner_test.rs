@@ -1097,10 +1097,13 @@ async fn run_worker_seeds_scratch_home_and_config_dir_worker_env_hygiene() {
         Some(base_sha)
     );
 
-    // seed_worker_env relocates HOME / CLAUDE_CONFIG_DIR only once the
-    // preflight has proven the scratch env authenticates (mission m-165b6f,
-    // f-1-2). With an Authenticated verdict, the worker spec is relocated to
-    // the scratch home under `scratch_home_root(session_id)`.
+    // seed_worker_env relocates HOME only once the preflight has proven the
+    // scratch env authenticates (mission m-165b6f, f-1-2). With an
+    // Authenticated verdict, the worker spec is relocated to the scratch
+    // home under `scratch_home_root(session_id)`. CLAUDE_CONFIG_DIR is
+    // deliberately NOT set: it poisons keychain-backed OAuth resolution
+    // (probed 2026-07-29), and a relocated HOME resolves HOME/.claude
+    // implicitly.
     let scratch_root = kranz_engine::backend_claude::scratch_home_root(&spec.session_id);
     let home = spec.env.get("HOME").expect("HOME relocated to scratch dir");
     assert!(
@@ -1108,14 +1111,13 @@ async fn run_worker_seeds_scratch_home_and_config_dir_worker_env_hygiene() {
         "HOME {home} must be under scratch root {}",
         scratch_root.display()
     );
-    let config_dir = spec
-        .env
-        .get("CLAUDE_CONFIG_DIR")
-        .expect("CLAUDE_CONFIG_DIR relocated to scratch dir");
     assert!(
-        std::path::Path::new(config_dir).starts_with(&scratch_root),
-        "CLAUDE_CONFIG_DIR {config_dir} must be under scratch root {}",
-        scratch_root.display()
+        !spec.env.contains_key("CLAUDE_CONFIG_DIR"),
+        "CLAUDE_CONFIG_DIR must NOT be relocated (keychain OAuth poison)"
+    );
+    assert!(
+        std::path::Path::new(home).join(".claude").is_dir(),
+        "the seeded scratch config dir is HOME/.claude"
     );
 }
 

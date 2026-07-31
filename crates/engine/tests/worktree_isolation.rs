@@ -1972,7 +1972,7 @@ fn worker_specs(
 /// one worker — three workers total, exercising both spawn paths) drives the
 /// auth preflight exactly once, and every worker shares that one decision.
 /// An `Authenticated` preflight verdict means every one of the three worker
-/// specs relocates `HOME`/`CLAUDE_CONFIG_DIR` — proving the decision was
+/// specs relocates `HOME` (never `CLAUDE_CONFIG_DIR`, which poisons keychain OAuth) — proving the decision was
 /// reused, not recomputed (and silently flipping) per worker.
 #[tokio::test(flavor = "multi_thread")]
 async fn worker_auth_preflight_cached_once_per_mission() {
@@ -2029,8 +2029,9 @@ async fn worker_auth_preflight_cached_once_per_mission() {
     );
     for spec in &workers {
         assert!(
-            spec.env.contains_key("HOME") && spec.env.contains_key("CLAUDE_CONFIG_DIR"),
-            "every worker must share the single Authenticated decision and relocate HOME: {:?}",
+            spec.env.contains_key("HOME") && !spec.env.contains_key("CLAUDE_CONFIG_DIR"),
+            "every worker must share the single Authenticated decision and relocate HOME \
+             (CLAUDE_CONFIG_DIR deliberately unset — keychain OAuth poison): {:?}",
             spec.env
         );
     }
@@ -2122,13 +2123,15 @@ async fn worker_auth_both_spawn_paths_gated() {
     }
 
     // Success: an Authenticated preflight means every worker on both spawn
-    // paths relocates.
+    // paths relocates HOME (CLAUDE_CONFIG_DIR deliberately unset on all of
+    // them — it poisons keychain-backed OAuth resolution, probed 2026-07-29).
     let authenticated_flags =
         run_mission_and_collect_worker_env_flags(preflight_authenticated_script()).await;
     for (has_home, has_config_dir) in &authenticated_flags {
         assert!(
-            *has_home && *has_config_dir,
-            "an Authenticated cached verdict must gate ON relocation on every spawn path: \
+            *has_home && !*has_config_dir,
+            "an Authenticated cached verdict must gate ON HOME relocation on every spawn path \
+             (and never set CLAUDE_CONFIG_DIR): \
              HOME present={has_home}, CLAUDE_CONFIG_DIR present={has_config_dir}"
         );
     }
