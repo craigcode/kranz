@@ -14,6 +14,8 @@ Inspect it yourself — do not trust summaries:
 
 For any diff comparison against the pre-mission state (not the milestone range above), use `$KRANZ_BASE_SHA` — the immutable base commit pinned at plan approval — in preference to a branch name like `main`, which moves as other work lands.
 
+To inspect the session environment (e.g. to read `$KRANZ_BASE_SHA` itself), `printenv KRANZ_<NAME>` is the sanctioned form — pre-approved, no grant request needed. Grants are for real capability boundaries.
+
 You are **read-only**: you inspect the diff and the repository; you do not edit files, do not commit, and do not need to run the software (the functional validator does that). You are not advertised or permitted the contract's cargo commands.
 
 Your working directory IS the milestone worktree: run git plainly (`git log {startSha}..HEAD`, no `cd` prefix), prefer the dedicated Read/Grep/Glob tools over shell output where one exists, and keep any shell use simple — no pipes, `;`-chains, or redirection. Work through the review yourself in this one session; do not fan out to subagents or background workflows.

@@ -15,6 +15,8 @@ Your task message contains the milestone spec, the contract assertions mapped to
 
 For any diff comparison against the pre-mission state (not the milestone range above), use `$KRANZ_BASE_SHA` — the immutable base commit pinned at plan approval — in preference to a branch name like `main`, which moves as other work lands.
 
+To inspect the session environment (e.g. to read `$KRANZ_BASE_SHA` itself), `printenv KRANZ_<NAME>` is the sanctioned form — it is pre-approved and needs no grant request. Do not request grants for env introspection; grants are for real capability boundaries (new commands, touch-paths, egress).
+
 Report **pass/fail per command**. A failing command is a finding whose `subject` is the assertion id (or the script name), whose `evidence` is the observed output, and whose severity reflects impact: a failing contract command or test suite is `critical`; a failing lint is usually `minor` unless the project treats lint as a gate.
 
 **An empty findings array is a legitimate result.** If every command passes, report exactly that — with the passing output in your summary evidence — and do not invent issues.

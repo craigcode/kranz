@@ -187,6 +187,14 @@ pub fn for_role(
         Role::ValidatorScrutiny | Role::ValidatorFunctional => {
             let mut allowed = to_strings(&["Read", "Glob", "Grep"]);
             allowed.extend(to_strings(GIT_INSPECT));
+            // Read-only env introspection (ticket validator-env-reads-no-grant;
+            // m-83d1ed's ms-2 blocked on a printenv park): exactly
+            // `printenv <KRANZ_*>` — never bare `printenv` or `env` (a full
+            // dump writes the injected backend auth key into the otherwise
+            // sanitized transcript, and `env <cmd>` is a command runner),
+            // never `echo` (command substitution). The KRANZ_ prefix IS the
+            // disclosure boundary: those vars are engine-injected.
+            allowed.push("Bash(printenv KRANZ_*)".to_string());
             // Scrutiny/mechanical split: only the functional validator runs
             // the contract/validator commands. Scrutiny inspects the range
             // read-only (Read/Grep/Glob + plain git) and is neither
@@ -446,6 +454,28 @@ mod tests {
             .iter()
             .any(|p| p == "Bash(cargo test*)"));
         assert!(!profile.allowed_tools.iter().any(|p| p == "Bash(cargo*)"));
+    }
+
+    /// Ticket validator-env-reads-no-grant (m-83d1ed): validators get
+    /// exactly `printenv KRANZ_*` — never bare printenv/env/echo forms.
+    #[test]
+    fn validator_env_reads_allow_kranz_printenv_only() {
+        let cfg = MissionConfig::default();
+        for role in [Role::ValidatorFunctional, Role::ValidatorScrutiny] {
+            let profile = for_role(role, &cfg, &[], &[], &[]);
+            assert!(
+                profile
+                    .allowed_tools
+                    .contains(&"Bash(printenv KRANZ_*)".to_string()),
+                "{role:?} must allow printenv of KRANZ_ vars"
+            );
+            for poisoned in ["Bash(printenv*)", "Bash(env*)", "Bash(echo*)", "Bash(echo *)"] {
+                assert!(
+                    !profile.allowed_tools.iter().any(|p| p == poisoned),
+                    "{role:?} must NOT allow {poisoned} (auth-key dump / command runner / substitution)"
+                );
+            }
+        }
     }
 
     #[test]
