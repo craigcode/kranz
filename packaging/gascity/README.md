@@ -81,12 +81,18 @@ or `gc stop`; `--status-map` mode fails until the translator scripts'
 headers document the full bidirectional open/in_progress/blocked/closed
 status mapping.
 
-## Lease-aware claiming: blocked pending operator sign-off (finding [f-3-1])
+## Lease-aware claiming: dead-claim recovery blocked pending operator sign-off (finding [f-3-1])
 
 Atomic, first-wins claiming at dispatch time (`bd update --claim`, before any
-spool write) IS shipped — see `bin/kranz-dispatch`'s header. What is NOT
-shipped is the heartbeat/TTL layer that would let a dead claim's holder be
-distinguished from a live one and recovered automatically.
+spool write) IS shipped — see `bin/kranz-dispatch`'s header. So is the
+behaviour bd 1.0.5 actually supports around a claim: idempotent re-claim by
+the same actor, and a competing claim by a DIFFERENT actor failing outright
+(`bd`'s own "issue already claimed by <assignee>" error, not anything the
+bridge builds). Both are proven against a live `bd` by the `CLAIM: PASS`
+case in `test/kranz-dispatch-roundtrip.sh`.
+
+What is NOT shipped is the heartbeat/TTL layer that would let a dead claim's
+holder be distinguished from a live one and recovered automatically.
 
 `docs/scoping/beads-bridge-dialect.md` §3 records an executed, live probe
 (not a `--help` scan) against the installed `bd` 1.0.5 that confirms no
@@ -115,7 +121,9 @@ to `bd` 1.1.0+ (where `docs/scoping/beads-workstore.md:66` records
 operator sign-off on the `updated_at`-staleness mechanism and its documented
 residual exposure window. Until either happens, `bin/kranz-dispatch` and
 `bin/kranz-run-bead` stay in the honest NOT-YET-IMPLEMENTED state their
-headers already document, and
-`test/kranz-dispatch-roundtrip.sh` keeps printing `LEASE: SKIP (not yet
-implemented — awaiting operator decision on bd's TTL/heartbeat capability
-gap)` rather than a fabricated `LEASE: PASS`.
+headers already document for dead-claim recovery specifically, and
+`test/kranz-dispatch-roundtrip.sh` keeps printing `LEASE: SKIP (dead-claim
+recovery not implemented — no lease/TTL/heartbeat signal in bd 1.0.5;
+awaiting operator decision. Idempotent re-claim and competing-claim-fails
+are proven by the CLAIM case above.)` rather than a fabricated `LEASE:
+PASS`.

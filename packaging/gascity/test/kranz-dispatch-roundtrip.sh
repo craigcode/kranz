@@ -82,16 +82,33 @@ else
     echo "CREATE: PASS (fixture id $FIXTURE_ID)"
 fi
 
-# --- Case: atomic claim + idempotent re-claim + ready-drain coverage (bd
-# update --claim, dialect doc §3 VERIFIED on the installed 1.0.5 binary) —
-# verifies the live binary's atomic claim shape (status plus assignee) on
-# the fixture bead, which contract assertion a2's "claimed" clause requires,
-# PLUS the behaviour this milestone actually ships in kranz-dispatch: a
-# fresh claim, re-claiming a bead already held by the same actor being a
-# no-op success, and a claimed bead being reflected as claimed/in_progress
-# by `bd ready` rather than still offered to a second dispatcher's drain.
-# No lease/TTL/heartbeat/liveness logic here — that stays out of scope and
-# is covered by the LEASE stub below instead.
+# --- Case: atomic claim + idempotent re-claim + competing-claim-fails +
+# ready-drain coverage (bd update --claim, dialect doc §3 VERIFIED on the
+# installed 1.0.5 binary) — verifies the live binary's atomic claim shape
+# (status plus assignee) on the fixture bead, which contract assertion a2's
+# "claimed" clause requires, PLUS the behaviour this milestone actually
+# ships in kranz-dispatch: a fresh claim, re-claiming a bead already held by
+# the same actor being a no-op success, a DIFFERENT actor's claim attempt on
+# an already-claimed bead FAILING outright (native bd 1.0.5 semantics, not
+# anything the bridge builds), and a claimed bead being reflected as
+# claimed/in_progress by `bd ready` rather than still offered to a second
+# dispatcher's drain.
+#
+# No lease/TTL/heartbeat/liveness-recovery logic here. That mechanism is
+# blocked, not stubbed: docs/scoping/beads-bridge-dialect.md §3 is an
+# executed, live probe against installed bd 1.0.5 confirming no
+# lease_expires_at/heartbeat_at field or --lease/--lease-ttl/--heartbeat
+# flag exists anywhere in its data model, and this milestone's feature spec
+# carries a HARD PRECONDITION for exactly that finding: stop, do not invent
+# a substitute (no emulating a lease via comments, metadata, sentinel
+# files, or status abuse), and report the block. An earlier cycle
+# (dbe5cf8) built an updated_at-staleness heuristic anyway and it was
+# reverted (5a7585c): it could reap a bead that is claimed and spooled but
+# not yet picked up by kranz-city-worker — verifiably still queued, but
+# indistinguishable from dead by any signal bd 1.0.5 exposes. Recovering a
+# dead claim stays a manual operator action (`bd update <id> --status
+# open`) until bd exposes a real lease mechanism (1.1.0+) or an operator
+# signs off on the staleness heuristic and its residual exposure window.
 
 if [ -n "$FIXTURE_ID" ]; then
     CLAIM_OUT=$(BD update "$FIXTURE_ID" --claim --json 2>&1)
@@ -115,6 +132,15 @@ if [ -n "$FIXTURE_ID" ]; then
         for RID in $READY_IDS; do
             [ "$RID" = "$FIXTURE_ID" ] && STILL_READY=1
         done
+        # A different actor's claim attempt on the same, already-claimed
+        # bead must fail outright (native bd 1.0.5 semantics: "issue already
+        # claimed by <assignee>"), leaving status and assignee untouched.
+        COMPETE_OUT=$( (cd "$STORE_DIR" && bd --actor "kranz-roundtrip-competitor" update "$FIXTURE_ID" --claim --json) 2>&1)
+        COMPETE_EXIT=$?
+        POST_COMPETE_SHOW=$(BD show "$FIXTURE_ID" --json 2>/dev/null | unwrap)
+        POST_COMPETE_STATUS=$(printf '%s' "$POST_COMPETE_SHOW" | jq -r '.status // empty')
+        POST_COMPETE_ASSIGNEE=$(printf '%s' "$POST_COMPETE_SHOW" | jq -r '.assignee // empty')
+
         if [ "$RECLAIM_EXIT" -ne 0 ]; then
             fail_case "claim-reclaim-exit" "re-claim to succeed (exit 0)" "exit $RECLAIM_EXIT: $RECLAIM_OUT"
         elif [ "$RECLAIM_STATUS" != "in_progress" ]; then
@@ -123,8 +149,14 @@ if [ -n "$FIXTURE_ID" ]; then
             fail_case "claim-reclaim-assignee" "same assignee '$CLAIM_ASSIGNEE'" "'$RECLAIM_ASSIGNEE'"
         elif [ "$STILL_READY" -ne 0 ]; then
             fail_case "claim-not-in-ready" "claimed bead $FIXTURE_ID absent from bd ready --json" "still listed as ready"
+        elif [ "$COMPETE_EXIT" -eq 0 ]; then
+            fail_case "claim-competing-fails" "a different actor's claim to fail (non-zero exit)" "exit 0: $COMPETE_OUT"
+        elif [ "$POST_COMPETE_STATUS" != "in_progress" ]; then
+            fail_case "claim-competing-status-preserved" "in_progress" "$POST_COMPETE_STATUS"
+        elif [ "$POST_COMPETE_ASSIGNEE" != "$CLAIM_ASSIGNEE" ]; then
+            fail_case "claim-competing-assignee-preserved" "original assignee '$CLAIM_ASSIGNEE' untouched" "'$POST_COMPETE_ASSIGNEE'"
         else
-            echo "CLAIM: PASS (atomic claim, idempotent re-claim)"
+            echo "CLAIM: PASS (atomic claim, idempotent re-claim, competing claim by a different actor fails)"
         fi
     fi
 fi
@@ -206,16 +238,20 @@ if [ -n "$FIXTURE_ID" ]; then
     fi
 fi
 
-# --- Case: lease-aware claim / liveness-first recovery ------------------
-# Stubbed per this feature's spec: bd 1.0.5 exposes no lease/TTL/heartbeat
-# field (docs/scoping/beads-bridge-dialect.md §3, executed probe), so there
-# is no way to distinguish a dead claim holder from a live one. This stays
-# stubbed until either bd exposes a TTL/heartbeat mechanism (an upgrade path
-# to 1.1.2 exists via brew, docs/scoping/beads-bridge-dialect.md §1/§3) or
-# an operator signs off on an alternate mechanism — this is an operator
-# decision, not an ordinal-milestone one.
+# --- Case: lease-aware dead-claim recovery (heartbeat/TTL) --------------
+# Blocked per this feature's HARD PRECONDITION, not merely stubbed: bd 1.0.5
+# exposes no lease/TTL/heartbeat field or flag (docs/scoping/beads-bridge-
+# dialect.md §3, executed probe), so there is no signal that distinguishes a
+# dead claim holder from a live one. Idempotent re-claim and competing-claim
+# rejection ARE proven above (the CLAIM case) using bd's native --claim
+# semantics — no invented mechanism required for those. Recovering a claim
+# left behind by a dead holder stays blocked until either bd exposes a
+# TTL/heartbeat mechanism (an upgrade path to 1.1.2 exists via brew,
+# docs/scoping/beads-bridge-dialect.md §1/§3) or an operator signs off on an
+# alternate staleness heuristic and its documented residual exposure window
+# — this is an operator decision, not an ordinal-milestone one.
 
-echo "LEASE: SKIP (not yet implemented — awaiting operator decision on bd's TTL/heartbeat capability gap)"
+echo "LEASE: SKIP (dead-claim recovery not implemented — no lease/TTL/heartbeat signal in bd 1.0.5; awaiting operator decision. Idempotent re-claim and competing-claim-fails are proven by the CLAIM case above.)"
 
 # --- Case: field translation is type-correct (acceptance_criteria) -----
 # Exercises the real kranz-dispatch script's brief-generation logic. The
