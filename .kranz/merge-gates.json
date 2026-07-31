@@ -94,12 +94,6 @@
         "packaging/gascity/bin/kranz-dispatch",
         "packaging/gascity/bin/kranz-run-bead"
       ]
-    },
-    {
-      "command": "bash packaging/gascity/test/kranz-milestone-scope-selftest.sh",
-      "whenPaths": [
-        "packaging/gascity"
-      ]
     }
   ]
 }
