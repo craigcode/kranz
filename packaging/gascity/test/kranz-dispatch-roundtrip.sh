@@ -179,6 +179,60 @@ if [ -n "$FIXTURE_ID" ]; then
     fi
 fi
 
+# --- Case: the assignee seam — does bd 1.0.5 gate `--claim` on the
+# assignee, or merely on status=in_progress? The CLAIM case above only
+# proves a competing claim fails while the bead is in_progress; it never
+# isolates status from assignee, so it cannot tell which one is doing the
+# gating. This case seeds a bead into open-but-still-assigned state (claim
+# it, then `bd update --status open` WITHOUT clearing the assignee) and
+# attempts a competing claim as a different actor, asserting the ACTUALLY
+# OBSERVED result rather than an assumed one.
+#
+# RESULT (executed against the installed bd 1.0.5 both in an ad hoc probe
+# and reproduced by this case, 2026-07-30): the competing claim FAILS with
+# "already claimed by <assignee>" even though status is open — bd gates
+# `--claim` on the assignee, not on status. This confirms the
+# assignee-clearing in bin/kranz-run-bead (see RUNBEAD-REOPEN-RECLAIM below)
+# is a real regression fix, not mere hygiene: without it, a bead returned to
+# open by kranz-run-bead would still refuse every other actor's claim.
+
+SEAM_CREATE_OUT=$(BD create "SEAM fixture (open-but-assigned)" --type task --json 2>&1)
+SEAM_ID=$(printf '%s' "$SEAM_CREATE_OUT" | unwrap | jq -r '.id // empty')
+if [ -z "$SEAM_ID" ]; then
+    fail_case "seam-create" "a non-empty issue id" "'$SEAM_CREATE_OUT'"
+else
+    BD update "$SEAM_ID" --claim >/dev/null 2>&1
+    SEAM_ORIG_ASSIGNEE=$(BD show "$SEAM_ID" --json 2>/dev/null | unwrap | jq -r '.assignee // empty')
+    # Reset status only — deliberately does NOT clear the assignee, so the
+    # bead is open but still assigned to the original actor.
+    BD update "$SEAM_ID" --status open >/dev/null 2>&1
+    SEAM_PRECOMPETE_SHOW=$(BD show "$SEAM_ID" --json 2>/dev/null | unwrap)
+    SEAM_PRECOMPETE_STATUS=$(printf '%s' "$SEAM_PRECOMPETE_SHOW" | jq -r '.status // empty')
+    SEAM_PRECOMPETE_ASSIGNEE=$(printf '%s' "$SEAM_PRECOMPETE_SHOW" | jq -r '.assignee // empty')
+
+    SEAM_COMPETE_OUT=$( (cd "$STORE_DIR" && bd --actor "kranz-roundtrip-seam-competitor" update "$SEAM_ID" --claim --json) 2>&1)
+    SEAM_COMPETE_EXIT=$?
+    SEAM_POST_SHOW=$(BD show "$SEAM_ID" --json 2>/dev/null | unwrap)
+    SEAM_POST_STATUS=$(printf '%s' "$SEAM_POST_SHOW" | jq -r '.status // empty')
+    SEAM_POST_ASSIGNEE=$(printf '%s' "$SEAM_POST_SHOW" | jq -r '.assignee // empty')
+
+    if [ "$SEAM_PRECOMPETE_STATUS" != "open" ]; then
+        fail_case "seam-precondition-open" "open (bead reset without clearing assignee)" "$SEAM_PRECOMPETE_STATUS"
+    elif [ -z "$SEAM_PRECOMPETE_ASSIGNEE" ] || [ "$SEAM_PRECOMPETE_ASSIGNEE" != "$SEAM_ORIG_ASSIGNEE" ]; then
+        fail_case "seam-precondition-assigned" "assignee still '$SEAM_ORIG_ASSIGNEE' (status-only reset, assignee untouched)" "'$SEAM_PRECOMPETE_ASSIGNEE'"
+    elif [ "$SEAM_COMPETE_EXIT" -eq 0 ]; then
+        fail_case "seam-competing-claim-gated-by-assignee" "a different actor's claim on an open-but-assigned bead to FAIL (assignee gates claiming, not status)" "exit 0: $SEAM_COMPETE_OUT"
+    elif ! printf '%s' "$SEAM_COMPETE_OUT" | grep -qiE 'already claimed'; then
+        fail_case "seam-competing-error-text" "error text matching 'already claimed'" "$SEAM_COMPETE_OUT"
+    elif [ "$SEAM_POST_STATUS" != "open" ]; then
+        fail_case "seam-post-status-preserved" "open" "$SEAM_POST_STATUS"
+    elif [ "$SEAM_POST_ASSIGNEE" != "$SEAM_ORIG_ASSIGNEE" ]; then
+        fail_case "seam-post-assignee-preserved" "original assignee '$SEAM_ORIG_ASSIGNEE' untouched" "'$SEAM_POST_ASSIGNEE'"
+    else
+        echo "SEAM: PASS (bd 1.0.5 gates --claim on the assignee, not status: an open-but-still-assigned bead still refuses a competing claim with 'already claimed')"
+    fi
+fi
+
 # --- Case: status transitions, both directions, verified `bd update
 # --status` shape; bd set-state must never be invoked by the bridge -----
 
@@ -271,13 +325,15 @@ fi
 
 echo "LEASE: SKIP (dead-claim recovery not implemented — no lease/TTL/heartbeat signal in bd 1.0.5; awaiting operator decision. Idempotent re-claim and competing-claim-fails are proven by the CLAIM case above.)"
 
-# --- Case: claim-succeeded-then-spool-failed window (finding f-3-1: "skips
-# silently on a lost race leaving no orphan spool entry" / the header's
-# residual-exposure paragraph) — a real bead is claimed via the atomic
-# `--claim` call inside kranz-dispatch, then `gc bd show "$ID" --json` fails.
-# Per the rollback shipped at bin/kranz-dispatch:137 (`release_claim`), the
-# bead must be returned to open/unassigned rather than left claimed with no
-# spool entry, and no .md/.env pair must exist for it. -----------------------
+# --- Case: claim-succeeded-then-show-failed window — a real bead is claimed
+# via the atomic `--claim` call inside kranz-dispatch, then `gc bd show
+# "$ID" --json` fails. Per the rollback shipped at bin/kranz-dispatch:137
+# (`release_claim`), the bead must be returned to open/unassigned rather
+# than left claimed with no spool entry, and no .md/.env pair must exist for
+# it. The stub keeps its own call log (same style as the FIELDS stub below)
+# so this case can assert POSITIVELY that a claim was actually taken and
+# then released, rather than only asserting a final state that a no-op
+# claim would also produce. -----------------------------------------------
 
 SHOWFAIL_CREATE_OUT=$(BD create "SHOWFAIL fixture" --type task --json 2>&1)
 SHOWFAIL_ID=$(printf '%s' "$SHOWFAIL_CREATE_OUT" | unwrap | jq -r '.id // empty')
@@ -287,16 +343,21 @@ else
     SHOWFAIL_CITY_DIR="$SANDBOX/showfail-city"
     SHOWFAIL_SPOOL_DIR="$SHOWFAIL_CITY_DIR/.gc/kranz-spool"
     SHOWFAIL_STUB_BIN="$SANDBOX/showfail-stubbin"
+    SHOWFAIL_CALLS_LOG="$SANDBOX/showfail-gc-calls.log"
     mkdir -p "$SHOWFAIL_SPOOL_DIR" "$SHOWFAIL_STUB_BIN"
+    : > "$SHOWFAIL_CALLS_LOG"
 
-    # `gc` stub: `ready` offers only the fixture; `update --claim` and the
-    # rollback's `update --status open --assignee ""` both forward to the
-    # real bd store (so the claim and any rollback are real, live-bd
+    # `gc` stub: logs every invocation verbatim (same style as the FIELDS
+    # stub below), so the case can assert positively that a claim was
+    # actually taken; `ready` offers only the fixture; `update --claim` and
+    # the rollback's `update --status open --assignee ""` both forward to
+    # the real bd store (so the claim and any rollback are real, live-bd
     # mutations); `show` unconditionally fails, simulating the window this
     # case targets.
     cat > "$SHOWFAIL_STUB_BIN/gc" <<STUBEOF
 #!/bin/sh
 set -u
+echo "gc \$*" >> "$SHOWFAIL_CALLS_LOG"
 if [ "\${1:-}" = "--city" ]; then
     shift 2
 fi
@@ -338,7 +399,11 @@ STUBEOF
     SHOWFAIL_MFILE=$(ls "$SHOWFAIL_SPOOL_DIR"/*-"$SHOWFAIL_ID".md 2>/dev/null | head -1)
     SHOWFAIL_EFILE=$(ls "$SHOWFAIL_SPOOL_DIR"/*-"$SHOWFAIL_ID".env 2>/dev/null | head -1)
 
-    if [ "$SHOWFAIL_STATUS" != "open" ]; then
+    if ! grep -qE "update ${SHOWFAIL_ID} --claim\$" "$SHOWFAIL_CALLS_LOG" 2>/dev/null; then
+        fail_case "showfail-claim-taken" "gc-calls log to record an atomic claim (update $SHOWFAIL_ID --claim) before the rollback" "$(cat "$SHOWFAIL_CALLS_LOG" 2>/dev/null)"
+    elif ! grep -qE "update ${SHOWFAIL_ID} --status open --assignee" "$SHOWFAIL_CALLS_LOG" 2>/dev/null; then
+        fail_case "showfail-claim-released" "gc-calls log to record the rollback release (update $SHOWFAIL_ID --status open --assignee) after the show failure" "$(cat "$SHOWFAIL_CALLS_LOG" 2>/dev/null)"
+    elif [ "$SHOWFAIL_STATUS" != "open" ]; then
         fail_case "showfail-status-rolled-back" "open" "$SHOWFAIL_STATUS"
     elif [ -n "$SHOWFAIL_ASSIGNEE" ]; then
         fail_case "showfail-assignee-cleared" "assignee cleared (empty) after a gc bd show failure post-claim" "'$SHOWFAIL_ASSIGNEE'"
@@ -348,6 +413,168 @@ STUBEOF
         fail_case "showfail-no-orphan-env" "no .env spool file for $SHOWFAIL_ID" "found: $SHOWFAIL_EFILE"
     else
         echo "SHOWFAIL: PASS (claim rolled back to open/unassigned and no orphan spool pair when gc bd show fails after a successful claim)"
+    fi
+fi
+
+# --- Case: the lost race — `gc bd update --claim` itself returns non-zero
+# (another dispatcher won the race). Per bin/kranz-dispatch:130 (`gc bd
+# update "$ID" --claim >/dev/null 2>&1 || continue`), this must be a SILENT
+# skip: no comment, no spool files, no rollback call (none is needed — no
+# claim was ever taken), and the bead untouched at open with an empty
+# assignee. Until this case, that behaviour rested entirely on reading the
+# `|| continue` in the source. -----------------------------------------------
+
+LOSTRACE_CREATE_OUT=$(BD create "LOSTRACE fixture" --type task --json 2>&1)
+LOSTRACE_ID=$(printf '%s' "$LOSTRACE_CREATE_OUT" | unwrap | jq -r '.id // empty')
+if [ -z "$LOSTRACE_ID" ]; then
+    fail_case "lostrace-create" "a non-empty issue id" "'$LOSTRACE_CREATE_OUT'"
+else
+    LOSTRACE_CITY_DIR="$SANDBOX/lostrace-city"
+    LOSTRACE_SPOOL_DIR="$LOSTRACE_CITY_DIR/.gc/kranz-spool"
+    LOSTRACE_STUB_BIN="$SANDBOX/lostrace-stubbin"
+    LOSTRACE_CALLS_LOG="$SANDBOX/lostrace-gc-calls.log"
+    mkdir -p "$LOSTRACE_SPOOL_DIR" "$LOSTRACE_STUB_BIN"
+    : > "$LOSTRACE_CALLS_LOG"
+
+    # `gc` stub: logs every invocation; `ready` offers only the fixture;
+    # `update` (the atomic claim) always fails, simulating a lost race. No
+    # other bd subcommand should ever be reached from this path.
+    cat > "$LOSTRACE_STUB_BIN/gc" <<STUBEOF
+#!/bin/sh
+set -u
+echo "gc \$*" >> "$LOSTRACE_CALLS_LOG"
+if [ "\${1:-}" = "--city" ]; then
+    shift 2
+fi
+case "\${1:-}" in
+    bd)
+        shift
+        case "\${1:-}" in
+            ready)
+                echo '[{"id":"$LOSTRACE_ID"}]'
+                ;;
+            update)
+                echo "gc-stub: simulated lost race (claim fails)" >&2
+                exit 1
+                ;;
+            *)
+                echo "gc-stub: unsupported bd subcommand: \$1" >&2
+                exit 1
+                ;;
+        esac
+        ;;
+    *)
+        echo "gc-stub: unsupported invocation: gc \$*" >&2
+        exit 1
+        ;;
+esac
+STUBEOF
+    chmod +x "$LOSTRACE_STUB_BIN/gc"
+
+    GC_CITY="$LOSTRACE_CITY_DIR" KRANZ_RIG_DIR="$RIG_DIR" KRANZ_LABEL="kranz" \
+        KRANZ_SPOOL="$LOSTRACE_SPOOL_DIR" KRANZ_ALLOW_UNVALIDATED=1 \
+        PATH="$LOSTRACE_STUB_BIN:$PATH" "$BIN_DIR/kranz-dispatch" >/dev/null 2>&1
+
+    LOSTRACE_STATUS=$(status_of "$LOSTRACE_ID")
+    LOSTRACE_ASSIGNEE=$(BD show "$LOSTRACE_ID" --json 2>/dev/null | unwrap | jq -r '.assignee // empty')
+    LOSTRACE_MFILE=$(ls "$LOSTRACE_SPOOL_DIR"/*-"$LOSTRACE_ID".md 2>/dev/null | head -1)
+    LOSTRACE_EFILE=$(ls "$LOSTRACE_SPOOL_DIR"/*-"$LOSTRACE_ID".env 2>/dev/null | head -1)
+
+    if [ "$LOSTRACE_STATUS" != "open" ]; then
+        fail_case "lostrace-status-untouched" "open" "$LOSTRACE_STATUS"
+    elif [ -n "$LOSTRACE_ASSIGNEE" ]; then
+        fail_case "lostrace-assignee-untouched" "empty assignee (bead never claimed)" "'$LOSTRACE_ASSIGNEE'"
+    elif [ -n "$LOSTRACE_MFILE" ]; then
+        fail_case "lostrace-no-md" "no .md spool file for $LOSTRACE_ID" "found: $LOSTRACE_MFILE"
+    elif [ -n "$LOSTRACE_EFILE" ]; then
+        fail_case "lostrace-no-env" "no .env spool file for $LOSTRACE_ID" "found: $LOSTRACE_EFILE"
+    elif grep -qE "bd comment ${LOSTRACE_ID}" "$LOSTRACE_CALLS_LOG" 2>/dev/null; then
+        fail_case "lostrace-no-comment" "no gc bd comment call for $LOSTRACE_ID (silent skip)" "$(cat "$LOSTRACE_CALLS_LOG")"
+    else
+        echo "LOSTRACE: PASS (a failing claim itself skips silently: no .md/.env, no comment, bead untouched at open/unassigned)"
+    fi
+fi
+
+# --- Case: the scrutiny floor — refusal checks run BEFORE any claim, so a
+# refused bead is never claimed. Every other dispatch invocation in this
+# script sets KRANZ_ALLOW_UNVALIDATED=1, which short-circuits the branch at
+# bin/kranz-dispatch:121-125 entirely; this case is the only one that
+# leaves it unset against a rig whose .kranz/config.json disables scrutiny,
+# so it is the only one that can prove the branch actually refuses. --------
+
+SCRUTINY_RIG_DIR="$SANDBOX/scrutiny-rig"
+mkdir -p "$SCRUTINY_RIG_DIR/.kranz"
+( cd "$SCRUTINY_RIG_DIR" && git init -q && git config user.email "roundtrip@kranz.local" && git config user.name "roundtrip" )
+printf '{"skipScrutiny": true}\n' > "$SCRUTINY_RIG_DIR/.kranz/config.json"
+
+SCRUTINY_CREATE_OUT=$(BD create "SCRUTINY fixture" --type task --json 2>&1)
+SCRUTINY_ID=$(printf '%s' "$SCRUTINY_CREATE_OUT" | unwrap | jq -r '.id // empty')
+if [ -z "$SCRUTINY_ID" ]; then
+    fail_case "scrutiny-create" "a non-empty issue id" "'$SCRUTINY_CREATE_OUT'"
+else
+    SCRUTINY_CITY_DIR="$SANDBOX/scrutiny-city"
+    SCRUTINY_SPOOL_DIR="$SCRUTINY_CITY_DIR/.gc/kranz-spool"
+    SCRUTINY_STUB_BIN="$SANDBOX/scrutiny-stubbin"
+    SCRUTINY_CALLS_LOG="$SANDBOX/scrutiny-gc-calls.log"
+    mkdir -p "$SCRUTINY_SPOOL_DIR" "$SCRUTINY_STUB_BIN"
+    : > "$SCRUTINY_CALLS_LOG"
+
+    # `gc` stub: logs every invocation; `ready` offers only the fixture;
+    # `comment` forwards to the real bd store (so the REFUSED comment is a
+    # real, live-bd mutation); `update` (a claim) must never be reached from
+    # this path, so it fails loudly if it ever is.
+    cat > "$SCRUTINY_STUB_BIN/gc" <<STUBEOF
+#!/bin/sh
+set -u
+echo "gc \$*" >> "$SCRUTINY_CALLS_LOG"
+if [ "\${1:-}" = "--city" ]; then
+    shift 2
+fi
+case "\${1:-}" in
+    bd)
+        shift
+        case "\${1:-}" in
+            ready)
+                echo '[{"id":"$SCRUTINY_ID"}]'
+                ;;
+            comment)
+                ( cd "$STORE_DIR" && bd "\$@" )
+                ;;
+            update)
+                echo "gc-stub: unexpected claim attempt in scrutiny-floor case" >&2
+                exit 1
+                ;;
+            *)
+                echo "gc-stub: unsupported bd subcommand: \$1" >&2
+                exit 1
+                ;;
+        esac
+        ;;
+    *)
+        echo "gc-stub: unsupported invocation: gc \$*" >&2
+        exit 1
+        ;;
+esac
+STUBEOF
+    chmod +x "$SCRUTINY_STUB_BIN/gc"
+
+    GC_CITY="$SCRUTINY_CITY_DIR" KRANZ_RIG_DIR="$SCRUTINY_RIG_DIR" KRANZ_LABEL="kranz" \
+        KRANZ_SPOOL="$SCRUTINY_SPOOL_DIR" \
+        PATH="$SCRUTINY_STUB_BIN:$PATH" "$BIN_DIR/kranz-dispatch" >/dev/null 2>&1
+
+    SCRUTINY_STATUS=$(status_of "$SCRUTINY_ID")
+    SCRUTINY_ASSIGNEE=$(BD show "$SCRUTINY_ID" --json 2>/dev/null | unwrap | jq -r '.assignee // empty')
+
+    if ! grep -qF "REFUSED" "$SCRUTINY_CALLS_LOG" 2>/dev/null; then
+        fail_case "scrutiny-refused-comment" "a REFUSED comment logged for $SCRUTINY_ID" "$(cat "$SCRUTINY_CALLS_LOG" 2>/dev/null)"
+    elif [ "$SCRUTINY_STATUS" != "open" ]; then
+        fail_case "scrutiny-status-untouched" "open" "$SCRUTINY_STATUS"
+    elif [ -n "$SCRUTINY_ASSIGNEE" ]; then
+        fail_case "scrutiny-assignee-untouched" "empty assignee (bead never claimed)" "'$SCRUTINY_ASSIGNEE'"
+    elif grep -qE "update ${SCRUTINY_ID} --claim" "$SCRUTINY_CALLS_LOG" 2>/dev/null; then
+        fail_case "scrutiny-no-claim-call" "no gc bd update --claim call for $SCRUTINY_ID in the call log" "$(cat "$SCRUTINY_CALLS_LOG")"
+    else
+        echo "SCRUTINY: PASS (skipScrutiny rig refused before any claim: REFUSED comment logged, bead untouched at open/unassigned, no --claim call)"
     fi
 fi
 
