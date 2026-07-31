@@ -60,6 +60,15 @@ anything else whose purpose is to make an agent write better code. Also
 frozen (standing non-goals, restated): terminal replacement, editor/LSP
 shells, a general agentic IDE.
 
+**Boundary gloss (2026-07-31):** the freeze covers pools whose claimed
+value is code velocity or quality. Heterogeneous dispatch
+(`heterogeneous-dispatch-pool.md`, KRZ-303) is NOT such a pool — it is a
+retained evidence primitive, provided it keeps three properties: outputs
+are candidates for judgement (never auto-merged into a winner), the
+claimed value is divergence for scrutiny (never throughput), and the
+cost multiplier is explicit in the consent surface. Any future use of an
+N-backend fan-out for codegen velocity falls under the freeze.
+
 ## What is retained, and why it is not "execution"
 
 - **Worktree isolation and the gated merge** (M3/M7): this is how kranz

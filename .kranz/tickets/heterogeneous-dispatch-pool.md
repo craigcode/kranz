@@ -27,4 +27,7 @@ consent, and the per-mission budget applies to the sum.
   config degrades to today's behavior (regression).
 - One stream failing does not abort its sibling; both terminal states are
   recorded.
+- No silent-winner or throughput path exists; any use of the fan-out for
+  codegen velocity is out of scope per the positioning ADR's freeze (see
+  its 2026-07-31 boundary gloss).
 - Anti-vacuity grep on a named filter unique to this work.
