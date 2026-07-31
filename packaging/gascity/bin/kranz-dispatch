@@ -26,27 +26,22 @@
 # any other bd error — the bead is skipped SILENTLY: no comment, no spool
 # files, no orphan .md/.env pair.
 #
-# Lease-aware claim / liveness-first dead-claim recovery (ms-3-fix-1-6): bd
-# 1.0.5 exposes no --lease/--lease-ttl/--heartbeat flag and no
-# lease_expires_at/heartbeat_at field (docs/scoping/beads-bridge-dialect.md
-# §3), so this bridge builds liveness on the one timestamp bd *does* expose
-# on every issue: `updated_at` (`bd show --json`). Before computing the READY
-# set, dispatch lists every in_progress bead carrying $LABEL (`gc bd list
-# --label "$LABEL" --status in_progress --json`) and reaps any whose
-# `updated_at` is at least $KRANZ_CLAIM_STALE_SECONDS old: `bd update <id>
-# --status open --assignee ""` reopens it (assignee must be cleared too —
-# `--claim` refuses a bead with any assignee set, live-probed 2026-07-31,
-# regardless of status) so the normal READY/claim path below can re-drain it
-# this same cycle. A holder that is still alive keeps its claim's
-# `updated_at` fresh — see kranz-run-bead's heartbeat loop — so a live claim
-# is never reaped; only a claim that has gone silent past the threshold is.
-# KRANZ_CLAIM_STALE_SECONDS defaults to 1800s (30m).
+# NOT lease-aware (as shipped): bd 1.0.5 exposes no TTL, heartbeat, or
+# expiry mechanism — no --lease/--lease-ttl/--heartbeat flag, and no
+# lease_expires_at/heartbeat_at field in `bd show --json`, confirmed by an
+# executed sandbox probe (docs/scoping/beads-bridge-dialect.md §3). A claim
+# held by a dispatcher or worker process that dies is therefore NOT
+# automatically recoverable today; it must be cleared manually (e.g. `bd
+# update <id> --status open`). The INTENDED future posture — NOT YET
+# IMPLEMENTED, pending an operator decision once bd exposes a lease
+# mechanism (1.1.0+) — is liveness first: a claim held by a verifiably live
+# holder is never stolen, and expiry is only a backstop for an ambiguous or
+# dead holder.
 #
-# Residual exposure: a bead that is claimed and spooled but not yet picked up
-# by kranz-city-worker (i.e. before kranz-run-bead's heartbeat loop starts)
-# is covered only by the same staleness backstop above, not a live heartbeat
-# — if kranz-city-worker never starts it, recovery still reaps it once
-# KRANZ_CLAIM_STALE_SECONDS elapses.
+# Residual exposure (as shipped): a bead that is claimed and spooled but not
+# yet drained by kranz-city-worker is covered by nothing today — no
+# heartbeat runs between dispatch exit and drain start, and there is no TTL
+# backstop either.
 #
 # Env:
 #   KRANZ_RIG_DIR            explicit rig checkout (optional)
@@ -54,7 +49,6 @@
 #   KRANZ_MAX_CYCLES         fix-cycle bound per mission (default 1)
 #   KRANZ_SPOOL              spool dir (default $GC_CITY/.gc/kranz-spool)
 #   KRANZ_ALLOW_UNVALIDATED  =1 permits validators-off rigs (NOT recommended)
-#   KRANZ_CLAIM_STALE_SECONDS  dead-claim recovery threshold (default 1800)
 #
 # Bidirectional bead status <-> kranz-side state map (all four bead
 # statuses, both directions):
@@ -95,36 +89,6 @@ resolve_rig() {
     gc rig list --json 2>/dev/null |
         jq -r --arg p "$PREFIX" '.rigs[] | select(.prefix == $p) | .path' | head -1
 }
-
-STALE_SECONDS=${KRANZ_CLAIM_STALE_SECONDS:-1800}
-
-to_epoch() {
-    # $1 = bd's UTC timestamp (RFC3339, optionally with fractional seconds).
-    # Echoes the epoch seconds, or nothing if it cannot be parsed.
-    TS=$(printf '%s' "$1" | sed 's/\.[0-9]*Z$/Z/')
-    date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$TS" +%s 2>/dev/null ||
-        date -u -d "$TS" +%s 2>/dev/null
-}
-
-# Dead-claim recovery: reap any in_progress, $LABEL-carrying bead whose
-# updated_at is stale, BEFORE computing this cycle's READY set, so a
-# recovered bead is eligible for re-claim below in the same pass. A claim
-# still being heartbeated (kranz-run-bead) has a fresh updated_at and is
-# left alone.
-NOW_EPOCH=$(date -u +%s)
-STUCK=$(gc bd list --label "$LABEL" --status in_progress --json 2>/dev/null) || STUCK="[]"
-printf '%s' "$STUCK" | jq -r '(if type == "array" then . else [] end)[] | [.id, .updated_at] | @tsv' 2>/dev/null |
-    while IFS="$(printf '\t')" read -r SID SUPDATED; do
-        [ -n "$SID" ] || continue
-        SEPOCH=$(to_epoch "$SUPDATED")
-        [ -n "$SEPOCH" ] || continue
-        AGE=$((NOW_EPOCH - SEPOCH))
-        if [ "$AGE" -ge "$STALE_SECONDS" ]; then
-            if gc bd update "$SID" --status open --assignee "" >/dev/null 2>&1; then
-                gc bd comment "$SID" "kranz-dispatch: dead-claim recovery — claim stale for ${AGE}s (>= ${STALE_SECONDS}s threshold), reopened for re-claim" >/dev/null 2>&1
-            fi
-        fi
-    done
 
 READY=$(gc bd ready --label "$LABEL" --json 2>/dev/null | jq -r '.[].id') || READY=""
 [ -n "$READY" ] || { echo "kranz-dispatch: no ready beads labeled '$LABEL'"; exit 0; }
