@@ -17,16 +17,17 @@
 #
 # Claim posture (shipped in kranz-dispatch, not here): dispatch takes an
 # atomic, first-wins claim (`bd update --claim`, docs/scoping/beads-bridge-
-# dialect.md §3) before spooling the brief this script runs. That claim is
-# NOT lease-aware on the installed bd 1.0.5 — no TTL, heartbeat, or expiry
-# field exists (same §3) — so the bridge keeps its own client-side lease
-# (f-3-1, implemented here): a heartbeat file under .gc/kranz-leases/
-# renewed while this mission runs and removed on any terminal exit.
-# Recovery (kranz-dispatch --reclaim) is liveness-first: a claim held by a
-# verifiably live pid is never stolen; a dead pid (or a missing lease past
-# the TTL) is released. The residual window: a bead claimed and spooled
-# but not yet drained by kranz-city-worker (before this script starts) has
-# no heartbeat — the TTL backstop covers it.
+# dialect.md §3) before spooling the brief this script runs. bd 1.0.5
+# itself has NO lease/TTL/heartbeat field — a server-side lease mechanism
+# is NOT YET IMPLEMENTED upstream (§3; 1.1.0+ is the tracked path) — so
+# the bridge ships its own client-side lease (f-3-1): a heartbeat file
+# under ${KRANZ_LEASE_DIR:-.gc/kranz-leases}/ renewed while this mission
+# runs and removed on any terminal exit. Recovery (kranz-dispatch
+# --reclaim) is liveness-first: a claim held by a verifiably live pid is
+# never stolen; a dead pid (or a missing lease past KRANZ_CLAIM_TTL) is
+# released. Residual exposure window: a bead claimed and spooled but not
+# yet drained by kranz-city-worker (before this script starts) has no
+# heartbeat yet — only the TTL backstop covers it.
 #
 # Claim release on reopen (shipped here): exit 3 and exit 1/other both clear
 # the assignee (`bd update --assignee ""`) alongside the status reset to
@@ -73,7 +74,7 @@ bd() { gc --city "$CITY" bd "$@"; }
 # liveness-first (kranz-dispatch --reclaim): a claim whose recorded pid is
 # ALIVE is never stolen, however old; a dead pid (or a missing lease past
 # the TTL) releases the claim so a dead dispatcher's work is reclaimable.
-LEASE_DIR="$CITY/.gc/kranz-leases"
+LEASE_DIR=${KRANZ_LEASE_DIR:-$CITY/.gc/kranz-leases}
 mkdir -p "$LEASE_DIR"
 LEASE_FILE="$LEASE_DIR/$ID.lease"
 heartbeat() {

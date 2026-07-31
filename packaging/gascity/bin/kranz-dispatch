@@ -40,34 +40,33 @@
 # unaffected and stays silent: no comment, no spool files, no rollback needed
 # because no claim was ever taken.
 #
-# NOT lease-aware (as shipped): bd 1.0.5 exposes no TTL, heartbeat, or
-# expiry mechanism — no --lease/--lease-ttl/--heartbeat flag, and no
-# lease_expires_at/heartbeat_at field in `bd show --json`, confirmed by an
-# executed sandbox probe (docs/scoping/beads-bridge-dialect.md §3). A claim
-# held by a dispatcher or worker process that dies is therefore NOT
-# automatically recoverable today; it must be cleared manually (e.g. `bd
-# update <id> --status open`). The INTENDED future posture — NOT YET
-# IMPLEMENTED, pending an operator decision once bd exposes a lease
-# mechanism (1.1.0+) — is liveness first: a claim held by a verifiably live
-# holder is never stolen, and expiry is only a backstop for an ambiguous or
-# dead holder.
+# Lease (shipped client-side, f-3-1): bd 1.0.5 itself exposes no TTL,
+# heartbeat, or expiry mechanism — no --lease/--lease-ttl/--heartbeat flag,
+# and no lease_expires_at/heartbeat_at field in `bd show --json`, confirmed
+# by an executed sandbox probe (docs/scoping/beads-bridge-dialect.md §3) —
+# an upstream lease mechanism (1.1.0+) is NOT YET IMPLEMENTED there. The
+# bridge therefore keeps its own lease: kranz-run-bead renews
+# ${KRANZ_LEASE_DIR:-.gc/kranz-leases}/<id>.lease (<pid> <unix-ts>) while a
+# mission runs, removed on terminal exit, and `kranz-dispatch --reclaim`
+# sweeps claimed beads liveness-first: a claim held by a verifiably live
+# pid is never stolen at any age; a dead pid's claim is released; a
+# lease-less claim is released only past KRANZ_CLAIM_TTL (default 120s —
+# expiry strictly as backstop, the operator's accepted design D-BW-2).
 #
 # Residual exposure (as shipped): the rollback above only covers failures
-# THIS process can detect and act on. If this dispatch process itself dies
-# (killed, crashes) after the claim succeeds but before it reaches one of
-# the rollback points or the final spool write, the bead is left claimed
-# and unspooled with nothing to release it — that claim-succeeded-then-
-# abandoned window has no heartbeat and no TTL backstop, same as any other
-# dead-claim case today. Likewise, a bead that is claimed and BOTH spool
-# files are written successfully, but not yet drained by kranz-city-worker,
-# is covered by nothing today — no heartbeat runs between dispatch exit and
-# drain start, and there is no TTL backstop either.
+# THIS process can detect and act on, and the reclaim sweep only runs when
+# invoked — a dispatch process that dies after claiming but before spooling
+# leaves a lease-less claim the TTL backstop (not any heartbeat) must age
+# out. The window between spool write and kranz-run-bead's first heartbeat
+# is TTL-only the same way.
 #
 # Env:
 #   KRANZ_RIG_DIR            explicit rig checkout (optional)
 #   KRANZ_LABEL              bead label to drain (default "kranz")
 #   KRANZ_MAX_CYCLES         fix-cycle bound per mission (default 1)
 #   KRANZ_SPOOL              spool dir (default $GC_CITY/.gc/kranz-spool)
+#   KRANZ_LEASE_DIR          lease dir (default $GC_CITY/.gc/kranz-leases)
+#   KRANZ_CLAIM_TTL          lease-less claim TTL in seconds (default 120)
 #   KRANZ_ALLOW_UNVALIDATED  =1 permits validators-off rigs (NOT recommended)
 #
 # Bidirectional bead status <-> kranz-side state map (all four bead
@@ -143,9 +142,16 @@ if [ "${1:-}" = "--reclaim" ]; then
             continue
         fi
         # No lease file: TTL backstop on the bead's updated timestamp.
+        # bd renders updated_at UTC ISO-8601 with a trailing Z — strip the
+        # Z, then the fractional seconds (SHORTEST suffix match: %% would
+        # eat everything from the FIRST dot onward).
         UPDATED=$(gc bd show "$CID" --json 2>/dev/null | jq -r '(if type == "array" then .[0] else . end) | .updated_at // .updatedAt // 0' | head -1)
-        UPDATED=$(date -j -f '%Y-%m-%dT%H:%M:%S' "${UPDATED%%.*}" +%s 2>/dev/null || echo 0)
-        if [ "$UPDATED" -gt 0 ] && [ $((NOW - UPDATED)) -gt "$TTL" ]; then
+        UPDATED=${UPDATED%Z}
+        UPDATED=${UPDATED%.*}
+        # bd's updated_at is UTC; parse it AS UTC (date -j reads local time
+        # otherwise and skews the comparison by the host offset).
+        UPDATED=$(TZ=UTC0 date -j -f '%Y-%m-%dT%H:%M:%S' "$UPDATED" +%s 2>/dev/null || date -d "$UPDATED" +%s 2>/dev/null || echo 0)
+        if [ "$UPDATED" -gt 0 ] && [ $((NOW - UPDATED)) -ge "$TTL" ]; then
             gc bd update "$CID" --status open --assignee "" >/dev/null 2>&1
             echo "kranz-dispatch --reclaim: released lease-less stale claim $CID (idle $((NOW - UPDATED))s > ${TTL}s)"
         fi

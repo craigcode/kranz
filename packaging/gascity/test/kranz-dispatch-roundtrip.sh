@@ -95,21 +95,16 @@ fi
 # claimed/in_progress by `bd ready` rather than still offered to a second
 # dispatcher's drain.
 #
-# No lease/TTL/heartbeat/liveness-recovery logic here. That mechanism is
-# blocked, not stubbed: docs/scoping/beads-bridge-dialect.md §3 is an
-# executed, live probe against installed bd 1.0.5 confirming no
-# lease_expires_at/heartbeat_at field or --lease/--lease-ttl/--heartbeat
-# flag exists anywhere in its data model, and this milestone's feature spec
-# carries a HARD PRECONDITION for exactly that finding: stop, do not invent
-# a substitute (no emulating a lease via comments, metadata, sentinel
-# files, or status abuse), and report the block. An earlier cycle
-# (dbe5cf8) built an updated_at-staleness heuristic anyway and it was
-# reverted (5a7585c): it could reap a bead that is claimed and spooled but
-# not yet picked up by kranz-city-worker — verifiably still queued, but
-# indistinguishable from dead by any signal bd 1.0.5 exposes. Recovering a
-# dead claim stays a manual operator action (`bd update <id> --status
-# open`) until bd exposes a real lease mechanism (1.1.0+) or an operator
-# signs off on the staleness heuristic and its residual exposure window.
+# No bd-native lease/TTL/heartbeat field is used here: bd 1.0.5 has none
+# (docs/scoping/beads-bridge-dialect.md §3, executed probe), so the bridge
+# ships its own client-side lease instead (f-3-1; see the LEASE and
+# LEASE-TTL cases below — kranz-run-bead renews a heartbeat file during a
+# mission, kranz-dispatch --reclaim sweeps liveness-first). The history:
+# an updated_at-staleness heuristic (dbe5cf8) was reverted (5a7585c)
+# because it could reap a verifiably-alive queued bead; the shipped design
+# answers that failure mode by making liveness authoritative — a live
+# pid's claim is never reaped — with TTL strictly as the backstop for
+# lease-less claims (operator sign-off D-BW-2, 2026-07-29).
 
 if [ -n "$FIXTURE_ID" ]; then
     # Positive control: before any claim, the fixture must actually be
@@ -380,11 +375,45 @@ STUBEOF
             echo "LEASE: PASS (dead-claim recovered, live-claim preserved)"
         fi
     fi
+
+    # TTL backstop branch (f-3-1): a claim with NO lease file is recovered
+    # only when idle past KRANZ_CLAIM_TTL. bd's embedded store can't be
+    # backdated, so the branch is driven through the TTL knob itself:
+    # huge TTL keeps a lease-less claim; TTL=0 recovers it (idle > 0).
+    TTL_CREATE_OUT=$(BD create "LEASE-TTL fixture" --type task --json 2>&1)
+    TTL_ID=$(printf '%s' "$TTL_CREATE_OUT" | unwrap | jq -r '.id // empty')
+    if [ -z "$TTL_ID" ]; then
+        fail_case "lease-ttl-create" "a non-empty fixture id" "'$TTL_CREATE_OUT'"
+    else
+        BD update "$TTL_ID" --claim >/dev/null 2>&1
+        rm -f "$LEASE_DIR/$TTL_ID.lease"
+
+        # Huge TTL: the lease-less claim stands (expiry only as backstop).
+        PATH="$LEASE_STUB_BIN:$PATH" GC_CITY="$CITY_DIR" KRANZ_LABEL="kranz" \
+            KRANZ_LEASE_DIR="$LEASE_DIR" KRANZ_CLAIM_TTL=999999 \
+            "$BIN_DIR/kranz-dispatch" --reclaim >/dev/null 2>&1
+        TTL_FRESH=$(status_of "$TTL_ID")
+
+        # TTL=0: any lease-less claim is stale — recovered, with the
+        # bd-updated_at (Z-suffixed ISO) parse path exercised for real.
+        PATH="$LEASE_STUB_BIN:$PATH" GC_CITY="$CITY_DIR" KRANZ_LABEL="kranz" \
+            KRANZ_LEASE_DIR="$LEASE_DIR" KRANZ_CLAIM_TTL=0 \
+            "$BIN_DIR/kranz-dispatch" --reclaim >/dev/null 2>&1
+        TTL_STALE=$(status_of "$TTL_ID")
+
+        if [ "$TTL_FRESH" != "in_progress" ]; then
+            fail_case "lease-ttl-fresh-kept" "lease-less claim kept under a huge TTL" "$TTL_FRESH"
+        elif [ "$TTL_STALE" != "open" ]; then
+            fail_case "lease-ttl-stale-recovered" "lease-less claim recovered at TTL=0" "$TTL_STALE"
+        else
+            echo "LEASE-TTL: PASS (expiry only as backstop: fresh kept, stale recovered)"
+        fi
+    fi
 fi
 
 # --- Case: claim-succeeded-then-show-failed window — a real bead is claimed
 # via the atomic `--claim` call inside kranz-dispatch, then `gc bd show
-# "$ID" --json` fails. Per the rollback shipped at bin/kranz-dispatch:137
+# "$ID" --json` fails. Per the rollback shipped in kranz-dispatch's spool-write failure handling
 # (`release_claim`), the bead must be returned to open/unassigned rather
 # than left claimed with no spool entry, and no .md/.env pair must exist for
 # it. The stub keeps its own call log (same style as the FIELDS stub below)
@@ -688,7 +717,7 @@ STUBEOF
 fi
 
 # --- Case: the lost race — `gc bd update --claim` itself returns non-zero
-# (another dispatcher won the race). Per bin/kranz-dispatch:130 (`gc bd
+# (another dispatcher won the race). Per kranz-dispatch's atomic claim step (`gc bd
 # update "$ID" --claim >/dev/null 2>&1 || continue`), this must be a SILENT
 # skip: no comment, no spool files, no rollback call (none is needed — no
 # claim was ever taken), and the bead untouched at open with an empty
@@ -769,7 +798,7 @@ fi
 # --- Case: the scrutiny floor — refusal checks run BEFORE any claim, so a
 # refused bead is never claimed. Every other dispatch invocation in this
 # script sets KRANZ_ALLOW_UNVALIDATED=1, which short-circuits the branch at
-# bin/kranz-dispatch:121-125 entirely; this case is the only one that
+# kranz-dispatch's rollback blocks entirely; this case is the only one that
 # leaves it unset against a rig whose .kranz/config.json disables scrutiny,
 # so it is the only one that can prove the branch actually refuses. --------
 

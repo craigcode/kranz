@@ -81,7 +81,7 @@ or `gc stop`; `--status-map` mode fails until the translator scripts'
 headers document the full bidirectional open/in_progress/blocked/closed
 status mapping.
 
-## Lease-aware claiming: dead-claim recovery blocked pending operator sign-off (finding [f-3-1])
+## Lease-aware claiming: shipped client-side (f-3-1, operator sign-off D-BW-2)
 
 Atomic, first-wins claiming at dispatch time (`bd update --claim`, before any
 spool write) IS shipped — see `bin/kranz-dispatch`'s header. So is the
@@ -91,39 +91,44 @@ the same actor, and a competing claim by a DIFFERENT actor failing outright
 bridge builds). Both are proven against a live `bd` by the `CLAIM: PASS`
 case in `test/kranz-dispatch-roundtrip.sh`.
 
-What is NOT shipped is the heartbeat/TTL layer that would let a dead claim's
-holder be distinguished from a live one and recovered automatically.
+Also now shipped: the **client-side lease** for dead-claim recovery. `bd`
+1.0.5 itself exposes no lease/TTL/heartbeat field (the executed live probe
+in `docs/scoping/beads-bridge-dialect.md` §3, and an upstream mechanism is
+only tracked for 1.1.0+), so the bridge keeps its own:
 
-`docs/scoping/beads-bridge-dialect.md` §3 records an executed, live probe
-(not a `--help` scan) against the installed `bd` 1.0.5 that confirms no
-`lease_expires_at`, `heartbeat_at`, or any other lease/TTL/heartbeat field or
-flag exists anywhere in its data model. This milestone's own feature spec
-carries a HARD PRECONDITION for exactly that finding: STOP, do not invent a
-substitute (no emulating a lease via comments, metadata, sentinel files, or
-status abuse), and report the block rather than fabricate a mechanism.
+- **Heartbeat**: `kranz-run-bead` renews
+  `${KRANZ_LEASE_DIR:-$GC_CITY/.gc/kranz-leases}/<id>.lease`
+  (`<pid> <unix-ts>`) every 15s while the mission runs; a trap on EXIT /
+  INT / TERM kills the renewal loop and removes the file, so a completed
+  mission never leaves a dangling lease.
+- **Reclaim sweep**: `kranz-dispatch --reclaim` walks claimed beads
+  liveness-first — a claim whose recorded pid is ALIVE is never stolen,
+  whatever its age (this is what the reverted `dbe5cf8` attempt got wrong:
+  it could reap a verifiably-alive queued bead); a DEAD pid's claim is
+  released (`bd update --status open --assignee ""`) and immediately
+  re-claimable; a claim with NO lease file is released only when the
+  bead's `updated_at` is older than `KRANZ_CLAIM_TTL` (default 120s) —
+  expiry strictly as backstop.
 
-An earlier attempt (`dbe5cf8`) built a heartbeat + `updated_at`-staleness
-backstop anyway, reasoning that the same feature spec's numbered steps
-describe building exactly that kind of mechanism. It was reverted in full
-(`5a7585c`) because (a) it could reap a bead that is claimed and spooled but
-not yet picked up by `kranz-city-worker` — verifiably alive in the sense
-that a mission is still queued for it, but indistinguishable from dead by
-any signal `bd` 1.0.5 exposes — and (b) no operator has signed off on that
-staleness heuristic as the alternate mechanism the dialect doc's escalation
-section calls for.
+Proven against a live `bd` by the `LEASE: PASS (dead-claim recovered,
+live-claim preserved)` and `LEASE-TTL: PASS (expiry only as backstop:
+fresh kept, stale recovered)` cases in `test/kranz-dispatch-roundtrip.sh`.
 
-That tension — a HARD PRECONDITION to stop, inside a feature spec whose own
-numbered steps assume the mechanism gets built — has now been hit twice in
-independent fix cycles with the same resolution (stay honest, don't ship the
-heuristic). Resolving it for real needs one of: an operator-approved upgrade
-to `bd` 1.1.0+ (where `docs/scoping/beads-workstore.md:66` records
-`lease_expires_at`/`heartbeat_at` as verified against source), or explicit
-operator sign-off on the `updated_at`-staleness mechanism and its documented
-residual exposure window. Until either happens, `bin/kranz-dispatch` and
-`bin/kranz-run-bead` stay in the honest NOT-YET-IMPLEMENTED state their
-headers already document for dead-claim recovery specifically, and
-`test/kranz-dispatch-roundtrip.sh` keeps printing `LEASE: SKIP (dead-claim
-recovery not implemented — no lease/TTL/heartbeat signal in bd 1.0.5;
-awaiting operator decision. Idempotent re-claim and competing-claim-fails
-are proven by the CLAIM case above.)` rather than a fabricated `LEASE:
-PASS`.
+### The history that required sign-off first
+
+This mechanism was blocked twice on a HARD PRECONDITION in the feature
+spec: an executed probe confirming bd 1.0.5 has no lease field, and an
+explicit instruction not to invent a substitute. An earlier attempt
+(`dbe5cf8`) shipped an `updated_at`-staleness heuristic anyway and was
+reverted in full (`5a7585c`) because it could reap a bead that was
+claimed-and-spooled-but-alive (queued for a worker, indistinguishable
+from dead by any signal bd exposes), and no operator had accepted that
+heuristic. The resolution that unblocked it is exactly the operator
+sign-off the dialect doc's escalation section calls for: **D-BW-2
+(accepted 2026-07-29)** approving the client-side design with the
+liveness-first posture — a live pid's claim is never reaped — and TTL
+only as the backstop for lease-less (ambiguous) claims, which closes the
+failure mode that got the heuristic reverted. Residual window, documented
+rather than hidden: a claim between spool-write and a worker's first
+heartbeat is TTL-only.
+

@@ -73,15 +73,15 @@ actually runs against today regardless of what upgrade path exists.
 ## 2. Verified command shapes
 
 > **Scope caveat:** the table below is verified against **upstream `bd` 1.0.5 invoked
-> directly**. Every bridge script actually calls `bd` through the `gc bd` wrapper —
-> `packaging/gascity/bin/kranz-dispatch` calls `gc bd ready --label "$LABEL" --json`
-> (line 64), `gc bd show "$ID" --json` (line 79), and `gc bd update "$ID" --status
-> in_progress` (line 96), and `packaging/gascity/bin/kranz-run-bead:34` defines a `bd()`
-> shell function — `bd() { gc --city "$CITY" bd "$@"; }` — wrapping
-> `gc --city "$CITY" bd`. The `gc bd` pass-through's fidelity to the shapes below is
-> **NOT verified** (see §4 — `gc bd --help` could not even be run without an initialized
-> city, which this feature was barred from creating). A downstream milestone must not
-> read this table as covering the production (`gc bd`-mediated) path.
+> directly**. Every bridge script actually calls `bd` through the `gc bd` wrapper:
+> `packaging/gascity/bin/kranz-dispatch` calls `gc bd ready`, `gc bd show`, `gc bd
+> update` (claim, status transitions, and the `--reclaim` sweep's release calls), and
+> `gc bd list`; `packaging/gascity/bin/kranz-run-bead` defines a `bd()` shell function
+> wrapping `gc --city "$CITY" bd`. The `gc bd` pass-through's fidelity to the shapes
+> below is **NOT verified** (see §4 — `gc bd --help` could not even be run without an
+> initialized city, which this feature was barred from creating). A downstream milestone
+> must not read this table as covering the production (`gc bd`-mediated) path. (Line
+> references deliberately omitted: they pin to line numbers that move with every edit.)
 
 Flags below are copied verbatim from live `--help` output. Global flags common to every
 `bd` subcommand (`--json`, `--db`, `-C/--directory`, `--actor`, `--readonly`, etc.) are
