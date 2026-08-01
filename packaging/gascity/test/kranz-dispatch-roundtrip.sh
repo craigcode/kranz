@@ -437,6 +437,48 @@ fi
 # A dedicated, unique label keeps this section's candidate query isolated
 # from every other fixture created earlier in this script (many of which
 # carry no label, and a few of which carry "kranz").
+#
+# Setup-race note (respawn stabilisation): a naive claim-then-immediately-
+# sweep sequence here was flaky. Diagnosed, not guessed — see wait_in_progress
+# below: the candidate query (`bd list --status in_progress --limit 0
+# ...--json`) is visible immediately after `bd update --claim` returns (40
+# rapid create+claim+query round trips in an instrumented sandbox, 0
+# misses), so store-side list-visibility is NOT the cause. The real cause is
+# sub-second clock skew in the idle-age comparison: comparing a freshly
+# captured `date +%s` (NOW, floor-truncated) against the claim's `updated_at`
+# (also floor-truncated) can read UPDATED one second AHEAD of NOW purely from
+# where each timestamp's fractional second falls relative to the whole-second
+# boundary (measured directly: 16/40 rapid claim-then-compare round trips in
+# an instrumented sandbox landed NOW - UPDATED == -1, never less). With
+# KRANZ_CLAIM_TTL=0 that negative diff fails `-ge 0` and the bead is skipped
+# — a flake, not a genuine defect. Fixed below two ways: (a) poll the
+# candidate query itself before sweeping, so a real visibility gap would
+# still surface as a deterministic, explanatory failure rather than a race;
+# (b) let one full second of wall clock elapse between claim and sweep,
+# which is more than the measured skew, so truncation cannot manufacture a
+# negative idle age.
+wait_in_progress() {
+    # $1 = case name for fail_case on timeout, $2 = extra bd-list args (may
+    # be empty), remaining args = ids that must all appear in the query's
+    # in_progress result before returning. Bounded ~20 tries @ 0.25s (~5s).
+    WIP_CASE=$1
+    WIP_EXTRA=$2
+    shift 2
+    WIP_TRIES=0
+    while [ "$WIP_TRIES" -lt 20 ]; do
+        WIP_RAW=$(BD list --status in_progress --limit 0 $WIP_EXTRA --json 2>&1)
+        WIP_ALL=1
+        for WIP_ID in "$@"; do
+            WIP_FOUND=$(printf '%s' "$WIP_RAW" | jq -r --arg id "$WIP_ID" '[.[]? | select(.id == $id)] | length' 2>/dev/null)
+            [ "$WIP_FOUND" = "1" ] || WIP_ALL=0
+        done
+        [ "$WIP_ALL" -eq 1 ] && return 0
+        WIP_TRIES=$((WIP_TRIES + 1))
+        sleep 0.25
+    done
+    fail_case "$WIP_CASE" "ids ($*) visible via bd list --status in_progress --limit 0 $WIP_EXTRA --json within ~5s" "$WIP_RAW"
+    return 1
+}
 RECLAIM_TEST_LABEL="kranz-reclaim-scope-test"
 RECLAIM_LEASE_DIR="$SANDBOX/reclaim-scope-leases"
 mkdir -p "$RECLAIM_LEASE_DIR"
@@ -479,9 +521,20 @@ else
 
     FOREIGN_ORIG_ASSIGNEE=$(BD show "$FOREIGN_ID" --json 2>/dev/null | unwrap | jq -r '.assignee // empty')
 
+    # Store-catchup gate: unfiltered (no --label) so FOREIGN_ID — which the
+    # sweep's own label-filtered query must NOT return — is provably visible
+    # to the store too. Only once both ids are confirmed in_progress can
+    # FOREIGN-BEAD's survival below be attributed to the label filter rather
+    # than the sweep simply not having seen it yet.
+    wait_in_progress "reclaim-scope-store-catchup" "" "$FOREIGN_ID" "$POSCTRL_ID"
+    sleep 1
+
     # TTL=0 so "past TTL" is trivially true for a lease-less claim (bd's
     # embedded store can't be backdated — same technique as the LEASE-TTL
-    # case above).
+    # case above). The sleep above (not a retry, not a softened assertion)
+    # guarantees a full second of real elapsed time between the claim and
+    # this single invocation, so sub-second truncation skew (see the
+    # setup-race note above) cannot manufacture a negative idle age.
     GC_CITY="$CITY_DIR" KRANZ_LABEL="$RECLAIM_TEST_LABEL" KRANZ_LEASE_DIR="$RECLAIM_LEASE_DIR" \
         KRANZ_CLAIM_TTL=0 PATH="$RECLAIM_STUB_BIN:$PATH" \
         "$BIN_DIR/kranz-dispatch" --reclaim >/dev/null 2>&1
@@ -515,6 +568,13 @@ else
     REACH_CITY_DIR="$SANDBOX/reachability-city"
     REACH_SPOOL_DIR="$REACH_CITY_DIR/.gc/kranz-spool"
     mkdir -p "$REACH_SPOOL_DIR"
+
+    # Store-catchup gate using the SAME query shape the sweep issues
+    # (label-filtered), then the same one-second wait as above so the idle-
+    # age comparison inside the sweep cannot read negative from sub-second
+    # truncation skew.
+    wait_in_progress "reachability-store-catchup" "--label $RECLAIM_TEST_LABEL" "$REACH_ID"
+    sleep 1
 
     # No --reclaim argument: this is the exact invocation
     # packaging/gascity/orders/kranz-dispatch.toml runs (`exec =
