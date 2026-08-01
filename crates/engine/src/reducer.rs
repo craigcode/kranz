@@ -335,20 +335,53 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             if let Some(existing) = ms.features.iter().find(|f| f.id == feature.id) {
                 // A duplicate with an IDENTICAL proposal is an idempotent
                 // replay — a retried emission after a crash between emit
-                // and fold (mission m-83d1ed: a duplicate emit wedged every
-                // subsequent run with "invalid state"). Event-sourced
-                // recovery must no-op it, not brick. A duplicate with a
-                // DIFFERENT payload is still the loud shadowing the guard
-                // exists for.
-                if existing.title != feature.title
-                    || existing.spec != feature.spec
-                    || existing.validation_criteria != feature.validation_criteria
+                // and fold (mission m-83d1ed). Event-sourced recovery must
+                // no-op it, not brick.
+                if existing.title == feature.title
+                    && existing.spec == feature.spec
+                    && existing.validation_criteria == feature.validation_criteria
                 {
+                    return Ok(());
+                }
+                // A duplicate with a DIFFERENT payload is an implicit
+                // SUPERSESSION when the prior feature never produced work:
+                // an unstarted (Pending) or failed-and-commitless feature
+                // can be re-proposed by a re-plan — this is the normal
+                // shape after new findings (m-83d1ed re-proposed the same
+                // id twice). The successor REPLACES the prior payload in
+                // place and restarts as Pending; the original payload is
+                // not lost — it lives in this same event log (the first
+                // fixfeature.created). Once a feature has started,
+                // committed, or completed, a revision is genuinely
+                // shadowing and stays loudly invalid.
+                let idx = ms
+                    .features
+                    .iter()
+                    .position(|f| f.id == feature.id)
+                    .expect("found above");
+                let existing = &ms.features[idx];
+                let prior_started = matches!(
+                    existing.status,
+                    FeatureStatus::Active | FeatureStatus::Complete | FeatureStatus::Skipped
+                ) || !existing.commits.is_empty()
+                    || !existing.worker_runs.is_empty();
+                if prior_started {
                     return Err(EngineError::InvalidState(format!(
                         "duplicate fixfeature.created for feature '{}' with a different payload",
                         feature.id
                     )));
                 }
+                tracing::info!(
+                    feature_id = %feature.id,
+                    "fixfeature re-proposed before any work: folding as implicit supersession"
+                );
+                if ms.status == MilestoneStatus::Validating {
+                    ms.fix_cycles += 1;
+                    ms.status = MilestoneStatus::Active;
+                }
+                let mut successor = feature.clone();
+                successor.status = FeatureStatus::Pending;
+                ms.features[idx] = successor;
             } else {
                 // One fix-cycle increment per validation round: the first
                 // fixfeature after milestone.validating flips the milestone back

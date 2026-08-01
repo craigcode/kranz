@@ -198,6 +198,12 @@ fn duplicate_fixfeature_with_identical_payload_is_idempotent() {
 
 #[test]
 fn duplicate_fixfeature_with_different_payload_is_invalid() {
+    // Supersession is rejected once the prior feature has WORK attached:
+    // a started feature (Active) with a commit cannot be shadowed by a
+    // re-proposal — the audit trail of work done must not be rewritten.
+    let mut started = fix_feature("ms-1-fix-1-1");
+    started.status = FeatureStatus::Active;
+    started.commits = vec!["deadbeef".to_string()];
     let mut changed = fix_feature("ms-1-fix-1-1");
     changed.title = "a different proposal".to_string();
     let mut state = fold_kinds(vec![
@@ -212,7 +218,7 @@ fn duplicate_fixfeature_with_different_payload_is_invalid() {
         },
         EventKind::FixFeatureCreated {
             milestone_id: "ms-1".into(),
-            feature: fix_feature("ms-1-fix-1-1"),
+            feature: started,
         },
     ]);
     let err = apply(
@@ -227,6 +233,50 @@ fn duplicate_fixfeature_with_different_payload_is_invalid() {
     )
     .unwrap_err();
     assert!(matches!(err, EngineError::InvalidState(_)), "{err}");
+}
+
+/// Implicit supersession (m-83d1ed): re-proposing an UNSTARTED fixfeature
+/// with a revised payload replaces it in place (status back to Pending,
+/// original payload preserved in the event log) rather than erroring.
+#[test]
+fn duplicate_fixfeature_with_different_payload_supersedes_an_unstarted_feature() {
+    let mut changed = fix_feature("ms-1-fix-1-1");
+    changed.title = "the revised proposal".to_string();
+    changed.spec = "tighter spec after findings".to_string();
+    let kinds = vec![
+        created(),
+        EventKind::PlanApproved {
+            plan: plan(),
+            base_sha: None,
+        },
+        EventKind::MilestoneStarted {
+            milestone_id: "ms-1".into(),
+            start_sha: "a".into(),
+        },
+        EventKind::FixFeatureCreated {
+            milestone_id: "ms-1".into(),
+            feature: fix_feature("ms-1-fix-1-1"),
+        },
+        EventKind::FixFeatureCreated {
+            milestone_id: "ms-1".into(),
+            feature: changed,
+        },
+    ];
+    let state = fold_kinds(kinds);
+    let ms = state
+        .mission
+        .milestones
+        .iter()
+        .find(|m| m.id == "ms-1")
+        .unwrap();
+    let matches: Vec<_> = ms
+        .features
+        .iter()
+        .filter(|f| f.id == "ms-1-fix-1-1")
+        .collect();
+    assert_eq!(matches.len(), 1, "one registration for the id");
+    assert_eq!(matches[0].title, "the revised proposal");
+    assert_eq!(matches[0].status, FeatureStatus::Pending);
 }
 
 // ---------------------------------------------------------------------------
@@ -2023,22 +2073,30 @@ fn fixfeature_created_rejects_a_duplicate_feature_id() {
     .expect("fold base");
     let ms = state.mission.milestones[0].id.clone();
 
-    // First fixfeature with id "dup" — accepted.
+    // First fixfeature with id "dup" — accepted (and given WORK attached:
+    // a run + a commit, so a later re-proposal is shadowing, not
+    // supersession).
+    let mut prior = fix_feature("dup");
+    prior.status = FeatureStatus::Active;
+    prior.worker_runs = vec!["r-1".to_string()];
+    prior.commits = vec!["deadbeef".to_string()];
     apply(
         &mut state,
         &ev(
             3,
             EventKind::FixFeatureCreated {
                 milestone_id: ms.clone(),
-                feature: fix_feature("dup"),
+                feature: prior,
             },
         ),
     )
     .expect("first fixfeature accepted");
 
-    // Second fixfeature reusing the same id with a DIFFERENT payload — must
-    // error, not shadow. (An identical re-emission is an idempotent no-op
-    // since m-83d1ed; shadowing stays invalid.)
+    // Second fixfeature reusing the same id with a DIFFERENT payload —
+    // rejected because the prior has work attached (an identical
+    // re-emission is an idempotent no-op, and a revision of an UNSTARTED
+    // feature is an implicit supersession; only shadowing real work stays
+    // invalid).
     let mut shadowed = fix_feature("dup");
     shadowed.spec = "a different proposal under the same id".to_string();
     let err = apply(
@@ -2051,7 +2109,7 @@ fn fixfeature_created_rejects_a_duplicate_feature_id() {
             },
         ),
     )
-    .expect_err("duplicate feature id with a different payload must be rejected");
+    .expect_err("shadowing a started feature must be rejected");
     assert!(
         matches!(err, EngineError::InvalidState(_)),
         "expected InvalidState, got {err:?}"
