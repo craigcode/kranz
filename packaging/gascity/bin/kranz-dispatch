@@ -163,7 +163,7 @@ reclaim_sweep() {
             # Dead recorded pid: the claimant is gone — release.
             gc bd update "$CID" --status open --assignee "" >/dev/null 2>&1
             rm -f "$LEASE_FILE"
-            echo "kranz-dispatch --reclaim: released dead claim $CID (pid $PID gone)"
+            echo "kranz-dispatch: reclaim sweep released dead claim $CID (pid $PID gone)"
             continue
         fi
         # No lease file: TTL backstop on the bead's updated timestamp.
@@ -179,7 +179,7 @@ reclaim_sweep() {
         UPDATED=$(TZ=UTC0 date -j -f '%Y-%m-%dT%H:%M:%S' "$UPDATED" +%s 2>/dev/null || TZ=UTC0 date -d "$UPDATED" +%s 2>/dev/null || echo 0)
         if [ "$UPDATED" -gt 0 ] && [ $((NOW - UPDATED)) -ge "$TTL" ]; then
             gc bd update "$CID" --status open --assignee "" >/dev/null 2>&1
-            echo "kranz-dispatch --reclaim: released lease-less stale claim $CID (idle $((NOW - UPDATED))s > ${TTL}s)"
+            echo "kranz-dispatch: reclaim sweep released lease-less stale claim $CID (idle $((NOW - UPDATED))s > ${TTL}s)"
         fi
     done
 }

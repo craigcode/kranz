@@ -536,6 +536,110 @@ else
     fi
 fi
 
+# --- Case: sweep non-fatality + --reclaim's sweep-only mode (ms-3-fix-5-1,
+# validation criterion 7). Both properties previously rested only on reading
+# the source (no `set -e`, `--reclaim` exits right after reclaim_sweep); the
+# two cases below make them into live-bd assertions.
+#
+#   SWEEP-NONFATAL: `gc bd list` (the sweep's candidate query) fails outright.
+#     A bare kranz-dispatch must still drain a ready bead afterward. What
+#     would break this: if the sweep's failure propagated (e.g. a stray
+#     `set -e` interaction, or `reclaim_sweep`'s exit status somehow aborting
+#     the calling shell), no spool pair would ever be written and the bead
+#     would stay open/unclaimed.
+#   RECLAIM-NO-DRAIN: a routable, $LABEL-carrying READY bead is present, but
+#     `kranz-dispatch --reclaim` must not touch it — the spool dir stays
+#     empty and the bead stays open/unassigned. This is what makes
+#     "--reclaim is sweep-only" a tested claim: a --reclaim that fell through
+#     to the drain would spool and claim the bead.
+
+NONFATAL_TEST_LABEL="kranz-nonfatal-test"
+NONFATAL_CITY_DIR="$SANDBOX/nonfatal-city"
+NONFATAL_SPOOL_DIR="$NONFATAL_CITY_DIR/.gc/kranz-spool"
+NONFATAL_STUB_BIN="$SANDBOX/nonfatal-stubbin"
+mkdir -p "$NONFATAL_SPOOL_DIR" "$NONFATAL_STUB_BIN"
+
+# `gc` stub: `bd list` (the sweep's candidate query) always fails; every
+# other bd subcommand forwards to the real store, same pass-through
+# convention as the other stubs in this script.
+cat > "$NONFATAL_STUB_BIN/gc" <<STUBEOF
+#!/bin/sh
+set -u
+if [ "\${1:-}" = "--city" ]; then
+    shift 2
+fi
+if [ "\${1:-}" = "bd" ]; then
+    shift
+    if [ "\${1:-}" = "list" ]; then
+        echo "nonfatal-stub-gc: simulated bd list failure" >&2
+        exit 1
+    fi
+    ( cd "$STORE_DIR" && bd "\$@" )
+    exit \$?
+fi
+echo "nonfatal-stub-gc: unsupported invocation: gc \$*" >&2
+exit 1
+STUBEOF
+chmod +x "$NONFATAL_STUB_BIN/gc"
+
+NONFATAL_CREATE_OUT=$(BD create "SWEEP-NONFATAL fixture ($NONFATAL_TEST_LABEL-labeled)" --type task --json 2>&1)
+NONFATAL_ID=$(printf '%s' "$NONFATAL_CREATE_OUT" | unwrap | jq -r '.id // empty')
+if [ -z "$NONFATAL_ID" ]; then
+    fail_case "sweep-nonfatal-create" "a non-empty issue id" "'$NONFATAL_CREATE_OUT'"
+else
+    BD update "$NONFATAL_ID" --add-label "$NONFATAL_TEST_LABEL" >/dev/null 2>&1
+
+    # Bare invocation (no --reclaim): the sweep runs first, `gc bd list`
+    # fails inside it, then the ready-drain must still proceed.
+    GC_CITY="$NONFATAL_CITY_DIR" KRANZ_RIG_DIR="$RIG_DIR" KRANZ_LABEL="$NONFATAL_TEST_LABEL" \
+        KRANZ_SPOOL="$NONFATAL_SPOOL_DIR" KRANZ_ALLOW_UNVALIDATED=1 \
+        PATH="$NONFATAL_STUB_BIN:$PATH" "$BIN_DIR/kranz-dispatch" >/dev/null 2>&1
+
+    NONFATAL_STATUS=$(status_of "$NONFATAL_ID")
+    NONFATAL_MFILE=$(ls "$NONFATAL_SPOOL_DIR"/*-"$NONFATAL_ID".md 2>/dev/null | head -1)
+    NONFATAL_EFILE=$(ls "$NONFATAL_SPOOL_DIR"/*-"$NONFATAL_ID".env 2>/dev/null | head -1)
+
+    if [ "$NONFATAL_STATUS" != "in_progress" ]; then
+        fail_case "sweep-nonfatal-drain-status" "in_progress (drain proceeded despite the sweep's bd list failure)" "$NONFATAL_STATUS"
+    elif [ -z "$NONFATAL_MFILE" ] || [ -z "$NONFATAL_EFILE" ]; then
+        fail_case "sweep-nonfatal-spool-pair" "both .md and .env spool files for $NONFATAL_ID" "md='$NONFATAL_MFILE' env='$NONFATAL_EFILE'"
+    else
+        echo "SWEEP-NONFATAL: PASS (a failing bd list inside the sweep does not abort the dispatch drain that follows)"
+    fi
+fi
+
+NODRAIN_TEST_LABEL="kranz-nodrain-test"
+NODRAIN_CITY_DIR="$SANDBOX/nodrain-city"
+NODRAIN_SPOOL_DIR="$NODRAIN_CITY_DIR/.gc/kranz-spool"
+mkdir -p "$NODRAIN_SPOOL_DIR"
+
+NODRAIN_CREATE_OUT=$(BD create "RECLAIM-NO-DRAIN fixture ($NODRAIN_TEST_LABEL-labeled)" --type task --json 2>&1)
+NODRAIN_ID=$(printf '%s' "$NODRAIN_CREATE_OUT" | unwrap | jq -r '.id // empty')
+if [ -z "$NODRAIN_ID" ]; then
+    fail_case "reclaim-no-drain-create" "a non-empty issue id" "'$NODRAIN_CREATE_OUT'"
+else
+    BD update "$NODRAIN_ID" --add-label "$NODRAIN_TEST_LABEL" >/dev/null 2>&1
+
+    # KRANZ_RIG_DIR points at a real git checkout, so a drain WOULD spool
+    # this bead if --reclaim fell through to it. $RECLAIM_STUB_BIN (defined
+    # above) forwards every bd subcommand to the real store.
+    GC_CITY="$NODRAIN_CITY_DIR" KRANZ_RIG_DIR="$RIG_DIR" KRANZ_LABEL="$NODRAIN_TEST_LABEL" \
+        KRANZ_SPOOL="$NODRAIN_SPOOL_DIR" KRANZ_ALLOW_UNVALIDATED=1 \
+        PATH="$RECLAIM_STUB_BIN:$PATH" "$BIN_DIR/kranz-dispatch" --reclaim >/dev/null 2>&1
+
+    NODRAIN_STATUS=$(status_of "$NODRAIN_ID")
+    NODRAIN_ASSIGNEE=$(BD show "$NODRAIN_ID" --json 2>/dev/null | unwrap | jq -r '.assignee // empty')
+    NODRAIN_SPOOLED=$(ls "$NODRAIN_SPOOL_DIR" 2>/dev/null)
+
+    if [ -n "$NODRAIN_SPOOLED" ]; then
+        fail_case "reclaim-no-drain-spool-empty" "spool dir to stay empty" "found: $NODRAIN_SPOOLED"
+    elif [ "$NODRAIN_STATUS" != "open" ] || [ -n "$NODRAIN_ASSIGNEE" ]; then
+        fail_case "reclaim-no-drain-bead-untouched" "open with no assignee (never drained)" "status=$NODRAIN_STATUS assignee='$NODRAIN_ASSIGNEE'"
+    else
+        echo "RECLAIM-NO-DRAIN: PASS (--reclaim runs the sweep only, never drains a routable ready bead)"
+    fi
+fi
+
 # --- Case: lease PRODUCER end-to-end (f-3-1) --------------------------------
 # The heartbeat producer itself, not only the consumer: a kranz-run-bead
 # running a simulated mission must create the lease with its live pid
