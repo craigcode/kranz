@@ -149,6 +149,86 @@ fn fold_kinds(kinds: Vec<EventKind>) -> MissionState {
     fold(&events).unwrap()
 }
 
+/// Idempotent-event recovery (mission m-83d1ed): a fixfeature.created
+/// re-emitted with an IDENTICAL payload is a no-op (crash between emit and
+/// fold), not an invalid state; a duplicate with a DIFFERENT payload stays
+/// the loud corruption the guard exists for.
+#[test]
+fn duplicate_fixfeature_with_identical_payload_is_idempotent() {
+    let kinds = vec![
+        created(),
+        EventKind::PlanApproved {
+            plan: plan(),
+            base_sha: None,
+        },
+        EventKind::MilestoneStarted {
+            milestone_id: "ms-1".into(),
+            start_sha: "a".into(),
+        },
+        EventKind::MilestoneValidating {
+            milestone_id: "ms-1".into(),
+        },
+        EventKind::FixFeatureCreated {
+            milestone_id: "ms-1".into(),
+            feature: fix_feature("ms-1-fix-1-1"),
+        },
+        // The exact duplicate: same id, same proposal content.
+        EventKind::FixFeatureCreated {
+            milestone_id: "ms-1".into(),
+            feature: fix_feature("ms-1-fix-1-1"),
+        },
+    ];
+    let state = fold_kinds(kinds);
+    let ms = state
+        .mission
+        .milestones
+        .iter()
+        .find(|m| m.id == "ms-1")
+        .unwrap();
+    assert_eq!(
+        ms.features
+            .iter()
+            .filter(|f| f.id == "ms-1-fix-1-1")
+            .count(),
+        1,
+        "an identical duplicate is folded once"
+    );
+    assert_eq!(ms.fix_cycles, 1, "one fix-cycle increment, not two");
+}
+
+#[test]
+fn duplicate_fixfeature_with_different_payload_is_invalid() {
+    let mut changed = fix_feature("ms-1-fix-1-1");
+    changed.title = "a different proposal".to_string();
+    let mut state = fold_kinds(vec![
+        created(),
+        EventKind::PlanApproved {
+            plan: plan(),
+            base_sha: None,
+        },
+        EventKind::MilestoneStarted {
+            milestone_id: "ms-1".into(),
+            start_sha: "a".into(),
+        },
+        EventKind::FixFeatureCreated {
+            milestone_id: "ms-1".into(),
+            feature: fix_feature("ms-1-fix-1-1"),
+        },
+    ]);
+    let err = apply(
+        &mut state,
+        &ev(
+            99,
+            EventKind::FixFeatureCreated {
+                milestone_id: "ms-1".into(),
+                feature: changed,
+            },
+        ),
+    )
+    .unwrap_err();
+    assert!(matches!(err, EngineError::InvalidState(_)), "{err}");
+}
+
 // ---------------------------------------------------------------------------
 // Golden happy path
 // ---------------------------------------------------------------------------
@@ -1956,18 +2036,22 @@ fn fixfeature_created_rejects_a_duplicate_feature_id() {
     )
     .expect("first fixfeature accepted");
 
-    // Second fixfeature reusing the same id — must error, not shadow.
+    // Second fixfeature reusing the same id with a DIFFERENT payload — must
+    // error, not shadow. (An identical re-emission is an idempotent no-op
+    // since m-83d1ed; shadowing stays invalid.)
+    let mut shadowed = fix_feature("dup");
+    shadowed.spec = "a different proposal under the same id".to_string();
     let err = apply(
         &mut state,
         &ev(
             4,
             EventKind::FixFeatureCreated {
                 milestone_id: ms.clone(),
-                feature: fix_feature("dup"),
+                feature: shadowed,
             },
         ),
     )
-    .expect_err("duplicate feature id must be rejected");
+    .expect_err("duplicate feature id with a different payload must be rejected");
     assert!(
         matches!(err, EngineError::InvalidState(_)),
         "expected InvalidState, got {err:?}"

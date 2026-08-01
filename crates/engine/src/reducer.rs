@@ -332,25 +332,34 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             feature,
         } => {
             let ms = milestone_mut(state, milestone_id)?;
-            // Reject a colliding feature id loudly rather than silently
-            // shadowing (mirrors the worker.spawned duplicate guard). A second
-            // re-plan of the same milestone could otherwise mint a duplicate
-            // `<ms>-replan-N` id.
-            if ms.features.iter().any(|f| f.id == feature.id) {
-                return Err(EngineError::InvalidState(format!(
-                    "duplicate fixfeature.created for feature '{}'",
-                    feature.id
-                )));
+            if let Some(existing) = ms.features.iter().find(|f| f.id == feature.id) {
+                // A duplicate with an IDENTICAL proposal is an idempotent
+                // replay — a retried emission after a crash between emit
+                // and fold (mission m-83d1ed: a duplicate emit wedged every
+                // subsequent run with "invalid state"). Event-sourced
+                // recovery must no-op it, not brick. A duplicate with a
+                // DIFFERENT payload is still the loud shadowing the guard
+                // exists for.
+                if existing.title != feature.title
+                    || existing.spec != feature.spec
+                    || existing.validation_criteria != feature.validation_criteria
+                {
+                    return Err(EngineError::InvalidState(format!(
+                        "duplicate fixfeature.created for feature '{}' with a different payload",
+                        feature.id
+                    )));
+                }
+            } else {
+                // One fix-cycle increment per validation round: the first
+                // fixfeature after milestone.validating flips the milestone back
+                // to Active; later fixfeatures in the same round arrive while
+                // Active and do not increment.
+                if ms.status == MilestoneStatus::Validating {
+                    ms.fix_cycles += 1;
+                    ms.status = MilestoneStatus::Active;
+                }
+                ms.features.push(feature.clone());
             }
-            // One fix-cycle increment per validation round: the first
-            // fixfeature after milestone.validating flips the milestone back
-            // to Active; later fixfeatures in the same round arrive while
-            // Active and do not increment.
-            if ms.status == MilestoneStatus::Validating {
-                ms.fix_cycles += 1;
-                ms.status = MilestoneStatus::Active;
-            }
-            ms.features.push(feature.clone());
         }
 
         EventKind::TierEscalated { milestone_id, .. } => {
