@@ -177,6 +177,12 @@ fn duplicate_fixfeature_with_identical_payload_is_idempotent() {
             milestone_id: "ms-1".into(),
             feature: fix_feature("ms-1-fix-1-1"),
         },
+        // One event AFTER the duplicate: proves the no-op still advanced
+        // last_seq (the m-83d1ed wedge form — without the advance, this
+        // event fails contiguity).
+        EventKind::MilestoneValidating {
+            milestone_id: "ms-1".into(),
+        },
     ];
     let state = fold_kinds(kinds);
     let ms = state

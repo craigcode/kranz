@@ -336,52 +336,55 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
                 // A duplicate with an IDENTICAL proposal is an idempotent
                 // replay — a retried emission after a crash between emit
                 // and fold (mission m-83d1ed). Event-sourced recovery must
-                // no-op it, not brick.
+                // no-op it, not brick — and it must NOT skip the last_seq
+                // advance at the tail, or the next event fails contiguity
+                // (the m-83d1ed wedge's second form).
                 if existing.title == feature.title
                     && existing.spec == feature.spec
                     && existing.validation_criteria == feature.validation_criteria
                 {
-                    return Ok(());
-                }
-                // A duplicate with a DIFFERENT payload is an implicit
-                // SUPERSESSION when the prior feature never produced work:
-                // an unstarted (Pending) or failed-and-commitless feature
-                // can be re-proposed by a re-plan — this is the normal
-                // shape after new findings (m-83d1ed re-proposed the same
-                // id twice). The successor REPLACES the prior payload in
-                // place and restarts as Pending; the original payload is
-                // not lost — it lives in this same event log (the first
-                // fixfeature.created). Once a feature has started,
-                // committed, or completed, a revision is genuinely
-                // shadowing and stays loudly invalid.
-                let idx = ms
-                    .features
-                    .iter()
-                    .position(|f| f.id == feature.id)
-                    .expect("found above");
-                let existing = &ms.features[idx];
-                let prior_started = matches!(
-                    existing.status,
-                    FeatureStatus::Active | FeatureStatus::Complete | FeatureStatus::Skipped
-                ) || !existing.commits.is_empty()
-                    || !existing.worker_runs.is_empty();
-                if prior_started {
-                    return Err(EngineError::InvalidState(format!(
+                    // fall through to the tail: seq advances, state unchanged
+                } else {
+                    // A duplicate with a DIFFERENT payload is an implicit
+                    // SUPERSESSION when the prior feature never produced work:
+                    // an unstarted (Pending) or failed-and-commitless feature
+                    // can be re-proposed by a re-plan — this is the normal
+                    // shape after new findings (m-83d1ed re-proposed the same
+                    // id twice). The successor REPLACES the prior payload in
+                    // place and restarts as Pending; the original payload is
+                    // not lost — it lives in this same event log (the first
+                    // fixfeature.created). Once a feature has started,
+                    // committed, or completed, a revision is genuinely
+                    // shadowing and stays loudly invalid.
+                    let idx = ms
+                        .features
+                        .iter()
+                        .position(|f| f.id == feature.id)
+                        .expect("found above");
+                    let existing = &ms.features[idx];
+                    let prior_started = matches!(
+                        existing.status,
+                        FeatureStatus::Active | FeatureStatus::Complete | FeatureStatus::Skipped
+                    ) || !existing.commits.is_empty()
+                        || !existing.worker_runs.is_empty();
+                    if prior_started {
+                        return Err(EngineError::InvalidState(format!(
                         "duplicate fixfeature.created for feature '{}' with a different payload",
                         feature.id
                     )));
+                    }
+                    tracing::info!(
+                        feature_id = %feature.id,
+                        "fixfeature re-proposed before any work: folding as implicit supersession"
+                    );
+                    if ms.status == MilestoneStatus::Validating {
+                        ms.fix_cycles += 1;
+                        ms.status = MilestoneStatus::Active;
+                    }
+                    let mut successor = feature.clone();
+                    successor.status = FeatureStatus::Pending;
+                    ms.features[idx] = successor;
                 }
-                tracing::info!(
-                    feature_id = %feature.id,
-                    "fixfeature re-proposed before any work: folding as implicit supersession"
-                );
-                if ms.status == MilestoneStatus::Validating {
-                    ms.fix_cycles += 1;
-                    ms.status = MilestoneStatus::Active;
-                }
-                let mut successor = feature.clone();
-                successor.status = FeatureStatus::Pending;
-                ms.features[idx] = successor;
             } else {
                 // One fix-cycle increment per validation round: the first
                 // fixfeature after milestone.validating flips the milestone back
@@ -882,15 +885,47 @@ pub fn write_snapshot(state: &MissionState, path: &Path) -> Result<()> {
     let file_name = path.file_name().ok_or_else(|| {
         EngineError::InvalidState(format!("snapshot path {} has no file name", path.display()))
     })?;
-    let tmp = path.with_file_name(format!("{}.tmp", file_name.to_string_lossy()));
+    let tmp_name = format!("{}.tmp", file_name.to_string_lossy());
+    let (parent, pinned_name) = crate::paths::open_parent_nofollow(path)?;
+
+    // Refuse hostile leaves before opening. The no-follow open below is the
+    // authoritative race-safe check; this metadata pass gives a useful error
+    // for directories, fifos, devices, and pre-existing symlinks.
+    for (name, display) in [
+        (pinned_name.as_os_str(), path.to_path_buf()),
+        (
+            std::ffi::OsStr::new(&tmp_name),
+            path.with_file_name(&tmp_name),
+        ),
+    ] {
+        match parent.symlink_metadata(name) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => {
+                return Err(EngineError::InvalidState(format!(
+                    "refusing snapshot write through non-regular path {}",
+                    display.display()
+                )))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
 
     let json = serde_json::to_string_pretty(state)?;
     {
-        let mut file = std::fs::File::create(&tmp)?;
+        use cap_fs_ext::OpenOptionsFollowExt as _;
+        use cap_primitives::fs::FollowSymlinks;
+        let mut options = cap_std::fs::OpenOptions::new();
+        options
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .follow(FollowSymlinks::No);
+        let mut file = parent.open_with(&tmp_name, &options)?.into_std();
         std::io::Write::write_all(&mut file, json.as_bytes())?;
         file.sync_data()?;
     }
-    std::fs::rename(&tmp, path)?;
+    parent.rename(&tmp_name, &parent, &pinned_name)?;
     Ok(())
 }
 
