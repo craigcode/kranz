@@ -400,6 +400,15 @@ STUBEOF
             "$BIN_DIR/kranz-dispatch" --reclaim >/dev/null 2>&1
         TTL_FRESH=$(status_of "$TTL_ID")
 
+        # One full second of wall clock between the claim above and the
+        # TTL=0 sweep below: the same sub-second clock-truncation skew fixed
+        # for FOREIGN-BEAD/POSITIVE-CONTROL/REACHABILITY in fa35941 (NOW=
+        # $(date +%s) vs a floor-truncated updated_at can read NOW - UPDATED
+        # == -1, failing `-ge 0` under KRANZ_CLAIM_TTL=0) applies here too —
+        # this case drives the identical --claim-then-TTL=0-sweep sequence
+        # and had no such guard.
+        sleep 1
+
         # TTL=0: any lease-less claim is stale — recovered, with the
         # bd-updated_at (Z-suffixed ISO) parse path exercised for real.
         PATH="$LEASE_STUB_BIN:$PATH" GC_CITY="$CITY_DIR" KRANZ_LABEL="kranz" \
@@ -554,6 +563,89 @@ else
         fail_case "reclaim-positive-control-released" "open with assignee cleared" "status=$POSCTRL_STATUS assignee='$POSCTRL_ASSIGNEE'"
     else
         echo "POSITIVE-CONTROL: PASS ($RECLAIM_TEST_LABEL-carrying lease-less past-TTL claim still released)"
+    fi
+fi
+
+# --- Case: the client-side label guard, genuinely exercised (ms-3-fix-5-2)
+# FOREIGN-BEAD above creates its foreign bead with no labels at all, so `gc
+# bd list --label ...` excludes it SERVER-SIDE before the sweep's jq
+# `.labels` select() ever sees it — that case would pass identically with
+# the select() deleted from kranz-dispatch, proving nothing about the
+# client-side guard the kranz-dispatch header documents ("...even if the
+# server-side filter is dropped by the `gc bd` pass-through"). This case
+# defeats the server-side filter for real via a `gc` stub whose `bd list`
+# branch strips --label/--status before forwarding to the real store (same
+# pass-through convention as every other stub above), so an unlabelled,
+# lease-less, past-TTL in_progress bead genuinely reaches the sweep and only
+# the client-side jq guard can save it.
+GUARDBYPASS_LEASE_DIR="$SANDBOX/guard-bypass-leases"
+mkdir -p "$GUARDBYPASS_LEASE_DIR"
+
+GUARDBYPASS_STUB_BIN="$SANDBOX/guard-bypass-stubbin"
+mkdir -p "$GUARDBYPASS_STUB_BIN"
+cat > "$GUARDBYPASS_STUB_BIN/gc" <<STUBEOF
+#!/bin/sh
+set -u
+if [ "\${1:-}" = "--city" ]; then
+    shift 2
+fi
+if [ "\${1:-}" = "bd" ]; then
+    shift
+    if [ "\${1:-}" = "list" ]; then
+        shift
+        STRIPPED=""
+        while [ "\$#" -gt 0 ]; do
+            case "\$1" in
+                --label|--status)
+                    shift 2
+                    ;;
+                *)
+                    STRIPPED="\$STRIPPED \$1"
+                    shift
+                    ;;
+            esac
+        done
+        ( cd "$STORE_DIR" && bd list \$STRIPPED )
+        exit \$?
+    fi
+    ( cd "$STORE_DIR" && bd "\$@" )
+    exit \$?
+fi
+echo "guard-bypass-stub-gc: unsupported invocation: gc \$*" >&2
+exit 1
+STUBEOF
+chmod +x "$GUARDBYPASS_STUB_BIN/gc"
+
+GUARDBYPASS_CREATE_OUT=$(BD create "GUARD-BYPASS fixture (no label at all)" --type task --json 2>&1)
+GUARDBYPASS_ID=$(printf '%s' "$GUARDBYPASS_CREATE_OUT" | unwrap | jq -r '.id // empty')
+if [ -z "$GUARDBYPASS_ID" ]; then
+    fail_case "guard-bypass-create" "a non-empty issue id" "'$GUARDBYPASS_CREATE_OUT'"
+else
+    BD update "$GUARDBYPASS_ID" --claim >/dev/null 2>&1
+    GUARDBYPASS_ORIG_ASSIGNEE=$(BD show "$GUARDBYPASS_ID" --json 2>/dev/null | unwrap | jq -r '.assignee // empty')
+
+    # Store-catchup gate (unfiltered, same convention as FOREIGN-BEAD above),
+    # then the same one-second wall-clock wait so the sweep's idle-age
+    # comparison cannot read negative from sub-second truncation skew.
+    wait_in_progress "guard-bypass-store-catchup" "" "$GUARDBYPASS_ID"
+    sleep 1
+
+    # TTL=0 so "past TTL" is trivially true for the lease-less claim. The
+    # label the sweep is asked to drain is one this bead never carries, and
+    # the stub strips --label from the forwarded query, so only the
+    # client-side jq `.labels` select() stands between this bead and being
+    # released.
+    GC_CITY="$CITY_DIR" KRANZ_LABEL="$RECLAIM_TEST_LABEL" KRANZ_LEASE_DIR="$GUARDBYPASS_LEASE_DIR" \
+        KRANZ_CLAIM_TTL=0 PATH="$GUARDBYPASS_STUB_BIN:$PATH" \
+        "$BIN_DIR/kranz-dispatch" --reclaim >/dev/null 2>&1
+
+    GUARDBYPASS_STATUS=$(status_of "$GUARDBYPASS_ID")
+    GUARDBYPASS_ASSIGNEE=$(BD show "$GUARDBYPASS_ID" --json 2>/dev/null | unwrap | jq -r '.assignee // empty')
+
+    if [ "$GUARDBYPASS_STATUS" != "in_progress" ] || [ "$GUARDBYPASS_ASSIGNEE" != "$GUARDBYPASS_ORIG_ASSIGNEE" ]; then
+        fail_case "guard-bypass-clientside-guard-holds" "in_progress, assignee unchanged ('$GUARDBYPASS_ORIG_ASSIGNEE') even with the server-side --label filter stripped" "status=$GUARDBYPASS_STATUS assignee='$GUARDBYPASS_ASSIGNEE'"
+    else
+        echo "LABEL-GUARD-BYPASS: PASS (client-side .labels guard holds even when gc bd list drops --label/--status server-side)"
     fi
 fi
 
