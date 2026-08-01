@@ -324,6 +324,11 @@ if [ -z "$LEASE_DEAD_ID" ] || [ -z "$LEASE_LIVE_ID" ]; then
 else
     LEASE_DIR="$CITY_DIR/.gc/kranz-leases"
     mkdir -p "$LEASE_DIR"
+    # ms-3-fix-5-1: the sweep's candidate query is now scoped HARD to
+    # $LABEL-carrying beads (defect 1), so these fixtures must actually
+    # carry the "kranz" label to be swept at all.
+    BD update "$LEASE_DEAD_ID" --add-label kranz >/dev/null 2>&1
+    BD update "$LEASE_LIVE_ID" --add-label kranz >/dev/null 2>&1
     BD update "$LEASE_DEAD_ID" --claim >/dev/null 2>&1
     BD update "$LEASE_LIVE_ID" --claim >/dev/null 2>&1
     # Dead holder: a pid that cannot exist, recorded now.
@@ -385,6 +390,7 @@ STUBEOF
     if [ -z "$TTL_ID" ]; then
         fail_case "lease-ttl-create" "a non-empty fixture id" "'$TTL_CREATE_OUT'"
     else
+        BD update "$TTL_ID" --add-label kranz >/dev/null 2>&1
         BD update "$TTL_ID" --claim >/dev/null 2>&1
         rm -f "$LEASE_DIR/$TTL_ID.lease"
 
@@ -408,6 +414,125 @@ STUBEOF
         else
             echo "LEASE-TTL: PASS (expiry only as backstop: fresh kept, stale recovered)"
         fi
+    fi
+fi
+
+# --- Case: reclaim sweep scope + reachability (ms-3-fix-5-1) --------------
+# Three defects fixed together, proven here:
+#   FOREIGN-BEAD  (defect 1, CRITICAL): the sweep must never release or
+#     un-assign an in_progress bead that does not carry $LABEL, however
+#     stale. This case MUST fail against the pre-fix kranz-dispatch (which
+#     swept every in_progress bead in the store with no label filter at
+#     all) — see the stash/verify note in the WorkerReport.
+#   POSITIVE-CONTROL: a $LABEL-carrying, lease-less, past-TTL in_progress
+#     bead run through the SAME sweep invocation IS still released, so
+#     FOREIGN-BEAD is not passing merely because the sweep did nothing.
+#   REACHABILITY (defect 4, CRITICAL): a bare `kranz-dispatch` — no
+#     `--reclaim` argument, the exact shape
+#     packaging/gascity/orders/kranz-dispatch.toml runs — performs the
+#     sweep before draining, with no rig-routing stub in play so the
+#     freshly-released bead is left open by the "no routable rig" comment
+#     path rather than being re-claimed in the same run.
+#
+# A dedicated, unique label keeps this section's candidate query isolated
+# from every other fixture created earlier in this script (many of which
+# carry no label, and a few of which carry "kranz").
+RECLAIM_TEST_LABEL="kranz-reclaim-scope-test"
+RECLAIM_LEASE_DIR="$SANDBOX/reclaim-scope-leases"
+mkdir -p "$RECLAIM_LEASE_DIR"
+
+# `gc` stub: forwards every `bd` subcommand (including `list`, which no
+# other stub in this script needs to support) straight to the real store,
+# same pass-through convention as LEASE_STUB_BIN above. `gc rig list` and
+# anything else deliberately fails, so REACHABILITY's ready-drain cannot
+# route a rig and therefore cannot re-claim the bead the sweep just
+# released.
+RECLAIM_STUB_BIN="$SANDBOX/reclaim-scope-stubbin"
+mkdir -p "$RECLAIM_STUB_BIN"
+cat > "$RECLAIM_STUB_BIN/gc" <<STUBEOF
+#!/bin/sh
+set -u
+if [ "\${1:-}" = "--city" ]; then
+    shift 2
+fi
+if [ "\${1:-}" = "bd" ]; then
+    shift
+    ( cd "$STORE_DIR" && bd "\$@" )
+    exit \$?
+fi
+echo "reclaim-scope-stub-gc: unsupported invocation: gc \$*" >&2
+exit 1
+STUBEOF
+chmod +x "$RECLAIM_STUB_BIN/gc"
+
+FOREIGN_CREATE_OUT=$(BD create "FOREIGN fixture (no $RECLAIM_TEST_LABEL label)" --type task --json 2>&1)
+FOREIGN_ID=$(printf '%s' "$FOREIGN_CREATE_OUT" | unwrap | jq -r '.id // empty')
+POSCTRL_CREATE_OUT=$(BD create "POSCTRL fixture ($RECLAIM_TEST_LABEL-labeled)" --type task --json 2>&1)
+POSCTRL_ID=$(printf '%s' "$POSCTRL_CREATE_OUT" | unwrap | jq -r '.id // empty')
+
+if [ -z "$FOREIGN_ID" ] || [ -z "$POSCTRL_ID" ]; then
+    fail_case "reclaim-scope-create" "two non-empty fixture ids" "'$FOREIGN_ID' / '$POSCTRL_ID'"
+else
+    BD update "$POSCTRL_ID" --add-label "$RECLAIM_TEST_LABEL" >/dev/null 2>&1
+    BD update "$FOREIGN_ID" --claim >/dev/null 2>&1
+    BD update "$POSCTRL_ID" --claim >/dev/null 2>&1
+
+    FOREIGN_ORIG_ASSIGNEE=$(BD show "$FOREIGN_ID" --json 2>/dev/null | unwrap | jq -r '.assignee // empty')
+
+    # TTL=0 so "past TTL" is trivially true for a lease-less claim (bd's
+    # embedded store can't be backdated — same technique as the LEASE-TTL
+    # case above).
+    GC_CITY="$CITY_DIR" KRANZ_LABEL="$RECLAIM_TEST_LABEL" KRANZ_LEASE_DIR="$RECLAIM_LEASE_DIR" \
+        KRANZ_CLAIM_TTL=0 PATH="$RECLAIM_STUB_BIN:$PATH" \
+        "$BIN_DIR/kranz-dispatch" --reclaim >/dev/null 2>&1
+
+    FOREIGN_STATUS=$(status_of "$FOREIGN_ID")
+    FOREIGN_ASSIGNEE=$(BD show "$FOREIGN_ID" --json 2>/dev/null | unwrap | jq -r '.assignee // empty')
+    POSCTRL_STATUS=$(status_of "$POSCTRL_ID")
+    POSCTRL_ASSIGNEE=$(BD show "$POSCTRL_ID" --json 2>/dev/null | unwrap | jq -r '.assignee // empty')
+
+    if [ "$FOREIGN_STATUS" != "in_progress" ] || [ "$FOREIGN_ASSIGNEE" != "$FOREIGN_ORIG_ASSIGNEE" ]; then
+        fail_case "reclaim-foreign-bead-untouched" "in_progress, assignee unchanged ('$FOREIGN_ORIG_ASSIGNEE')" "status=$FOREIGN_STATUS assignee='$FOREIGN_ASSIGNEE'"
+    else
+        echo "FOREIGN-BEAD: PASS (sweep never releases an in_progress bead lacking $RECLAIM_TEST_LABEL)"
+    fi
+
+    if [ "$POSCTRL_STATUS" != "open" ] || [ -n "$POSCTRL_ASSIGNEE" ]; then
+        fail_case "reclaim-positive-control-released" "open with assignee cleared" "status=$POSCTRL_STATUS assignee='$POSCTRL_ASSIGNEE'"
+    else
+        echo "POSITIVE-CONTROL: PASS ($RECLAIM_TEST_LABEL-carrying lease-less past-TTL claim still released)"
+    fi
+fi
+
+REACH_CREATE_OUT=$(BD create "REACHABILITY fixture ($RECLAIM_TEST_LABEL-labeled)" --type task --json 2>&1)
+REACH_ID=$(printf '%s' "$REACH_CREATE_OUT" | unwrap | jq -r '.id // empty')
+if [ -z "$REACH_ID" ]; then
+    fail_case "reachability-create" "a non-empty issue id" "'$REACH_CREATE_OUT'"
+else
+    BD update "$REACH_ID" --add-label "$RECLAIM_TEST_LABEL" >/dev/null 2>&1
+    BD update "$REACH_ID" --claim >/dev/null 2>&1
+
+    REACH_CITY_DIR="$SANDBOX/reachability-city"
+    REACH_SPOOL_DIR="$REACH_CITY_DIR/.gc/kranz-spool"
+    mkdir -p "$REACH_SPOOL_DIR"
+
+    # No --reclaim argument: this is the exact invocation
+    # packaging/gascity/orders/kranz-dispatch.toml runs (`exec =
+    # "kranz-dispatch"`, bare, on its 5m cooldown). KRANZ_RIG_DIR is
+    # deliberately unset and the stub's `gc rig list` unsupported, so IF the
+    # sweep failed to release $REACH_ID here, the only other way it could
+    # end up open is via the "no routable rig" comment path leaving it
+    # untouched at in_progress — which is not what we assert below.
+    GC_CITY="$REACH_CITY_DIR" KRANZ_LABEL="$RECLAIM_TEST_LABEL" \
+        KRANZ_SPOOL="$REACH_SPOOL_DIR" KRANZ_LEASE_DIR="$RECLAIM_LEASE_DIR" \
+        KRANZ_CLAIM_TTL=0 PATH="$RECLAIM_STUB_BIN:$PATH" "$BIN_DIR/kranz-dispatch" >/dev/null 2>&1
+
+    REACH_STATUS=$(status_of "$REACH_ID")
+    REACH_ASSIGNEE=$(BD show "$REACH_ID" --json 2>/dev/null | unwrap | jq -r '.assignee // empty')
+    if [ "$REACH_STATUS" != "open" ] || [ -n "$REACH_ASSIGNEE" ]; then
+        fail_case "reachability-bare-invocation-sweeps" "open with assignee cleared (bare kranz-dispatch performs the sweep before draining)" "status=$REACH_STATUS assignee='$REACH_ASSIGNEE'"
+    else
+        echo "REACHABILITY: PASS (bare kranz-dispatch with no --reclaim performs the sweep before draining)"
     fi
 fi
 
