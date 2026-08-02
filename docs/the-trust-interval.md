@@ -102,6 +102,9 @@ from the same event logs that drive everything else:
   proposed and what was decided. It doubles as the consent corpus for
   fine-tuning work: labeled human judgment, not just execution traces.
 
+The four metrics are now a published vocabulary with definitions,
+denominators, and reproduce-commands: **`docs/metrics.md`**.
+
 (Status note, 2026-07-23: the console SHIPPED as mission m-d1e3c3 —
 `kranz outcomes`, the dashboard panel, and the `/kranz outcomes` Slack
 card all fold the same engine module. Live numbers on this repo: 0.60
