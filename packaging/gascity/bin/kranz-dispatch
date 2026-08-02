@@ -46,7 +46,7 @@
 # by an executed sandbox probe (docs/scoping/beads-bridge-dialect.md §3) —
 # an upstream lease mechanism (1.1.0+) is NOT YET IMPLEMENTED there. The
 # bridge therefore keeps its own lease: kranz-run-bead renews
-# ${KRANZ_LEASE_DIR:-.gc/kranz-leases}/<id>.lease (<pid> <unix-ts>) while a
+# ${KRANZ_LEASE_DIR:-$GC_CITY/.gc/kranz-leases}/<id>.lease (<pid> <unix-ts>) while a
 # mission runs, removed on terminal exit, and the reclaim sweep (see
 # reclaim_sweep() below) releases claimed beads liveness-first: a claim
 # held by a verifiably live pid is never stolen at any age; a dead pid's
@@ -155,6 +155,13 @@ reclaim_sweep() {
         TS=""
         if [ -f "$LEASE_FILE" ]; then
             read -r PID TS < "$LEASE_FILE" || true
+            if [ -z "$PID" ]; then
+                # Lease file present but empty/unparseable: a holder was
+                # here very recently (the write landed mid-rename window)
+                # — skip this bead this sweep rather than falling through
+                # to the lease-less TTL backstop below.
+                continue
+            fi
         fi
         if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
             continue # live holder: stands at any age

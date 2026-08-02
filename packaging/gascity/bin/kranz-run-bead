@@ -21,7 +21,7 @@
 # itself has NO lease/TTL/heartbeat field — a server-side lease mechanism
 # is NOT YET IMPLEMENTED upstream (§3; 1.1.0+ is the tracked path) — so
 # the bridge ships its own client-side lease (f-3-1): a heartbeat file
-# under ${KRANZ_LEASE_DIR:-.gc/kranz-leases}/ renewed while this mission
+# under ${KRANZ_LEASE_DIR:-$CITY/.gc/kranz-leases}/ renewed while this mission
 # runs and removed on any terminal exit. Recovery (kranz-dispatch
 # --reclaim) is liveness-first: a claim held by a verifiably live pid is
 # never stolen; a dead pid (or a missing lease past KRANZ_CLAIM_TTL) is
@@ -79,7 +79,8 @@ mkdir -p "$LEASE_DIR"
 LEASE_FILE="$LEASE_DIR/$ID.lease"
 heartbeat() {
     while :; do
-        printf '%s %s\n' "$$" "$(date +%s)" > "$LEASE_FILE" 2>/dev/null || exit 0
+        printf '%s %s\n' "$$" "$(date +%s)" > "$LEASE_FILE.$$.tmp" 2>/dev/null &&
+            mv -f "$LEASE_FILE.$$.tmp" "$LEASE_FILE" 2>/dev/null || exit 0
         sleep 15
     done
 }
@@ -87,12 +88,13 @@ heartbeat &
 HEARTBEAT_PID=$!
 cleanup_lease() {
     kill "$HEARTBEAT_PID" 2>/dev/null || true
-    rm -f "$LEASE_FILE"
+    rm -f "$LEASE_FILE" "$LEASE_FILE.$$.tmp"
 }
 trap 'cleanup_lease' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-printf '%s %s\n' "$$" "$(date +%s)" > "$LEASE_FILE" 2>/dev/null || true
+printf '%s %s\n' "$$" "$(date +%s)" > "$LEASE_FILE.$$.tmp" 2>/dev/null &&
+    mv -f "$LEASE_FILE.$$.tmp" "$LEASE_FILE" 2>/dev/null || true
 
 LINE=$( cd "$RIG_DIR" && kranz exec -f "$MFILE" --max-cycles "$MAX_CYCLES" 2>>"${MFILE%.md}.events.log" )
 CODE=$?
