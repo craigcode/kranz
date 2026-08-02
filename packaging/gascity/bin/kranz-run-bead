@@ -21,8 +21,10 @@
 # itself has NO lease/TTL/heartbeat field — a server-side lease mechanism
 # is NOT YET IMPLEMENTED upstream (§3; 1.1.0+ is the tracked path) — so
 # the bridge ships its own client-side lease (f-3-1): a heartbeat file
-# under ${KRANZ_LEASE_DIR:-$GC_CITY/.gc/kranz-leases}/ renewed while this mission
-# runs and removed on any terminal exit. Recovery (kranz-dispatch
+# under ${KRANZ_LEASE_DIR:-$CITY/.gc/kranz-leases}/ renewed while this mission
+# runs and removed on any terminal exit ($CITY here is the city directory
+# passed as $1 by kranz-city-worker, which kranz-dispatch resolved from
+# $GC_CITY and wrote into the spool .env). Recovery (kranz-dispatch
 # --reclaim) is liveness-first: a claim held by a verifiably live pid is
 # never stolen; a dead pid (or a missing lease past KRANZ_CLAIM_TTL) is
 # released. Residual exposure window: a bead claimed and spooled but not
