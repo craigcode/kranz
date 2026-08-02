@@ -50,6 +50,63 @@
       "whenPaths": [
         "apps/dashboard"
       ]
+    },
+    {
+      "command": "bash packaging/gascity/test/check-dialect-doc.sh",
+      "whenPaths": [
+        "docs/scoping/beads-bridge-dialect.md",
+        "packaging/gascity/bin/kranz-run-bead"
+      ]
+    },
+    {
+      "command": "bash packaging/gascity/test/check-bridge-hygiene.sh",
+      "whenPaths": [
+        "packaging/gascity"
+      ]
+    },
+    {
+      "command": "bash packaging/gascity/test/check-bridge-hygiene.sh --status-map",
+      "whenPaths": [
+        "packaging/gascity"
+      ]
+    },
+    {
+      "command": "bash packaging/gascity/test/kranz-dispatch-roundtrip.sh",
+      "whenPaths": [
+        "packaging/gascity"
+      ]
+    },
+    {
+      "command": "bash packaging/gascity/test/check-bridge-hygiene-selftest.sh",
+      "whenPaths": [
+        "packaging/gascity"
+      ]
+    },
+    {
+      "command": "bash packaging/gascity/test/kranz-dispatch-roundtrip-selftest.sh",
+      "whenPaths": [
+        "packaging/gascity"
+      ]
+    },
+    {
+      "command": "bash packaging/gascity/test/kranz-header-liveness-selftest.sh",
+      "whenPaths": [
+        "packaging/gascity/bin/kranz-dispatch",
+        "packaging/gascity/bin/kranz-run-bead"
+      ]
+    },
+    {
+      "command": "bash packaging/gascity/test/kranz-header-lease-dir-selftest.sh",
+      "whenPaths": [
+        "packaging/gascity/bin/kranz-dispatch",
+        "packaging/gascity/bin/kranz-run-bead"
+      ]
+    },
+    {
+      "command": "bash packaging/gascity/test/kranz-dispatch-roundtrip-claim-selftest.sh",
+      "whenPaths": [
+        "packaging/gascity/test/kranz-dispatch-roundtrip.sh"
+      ]
     }
   ]
 }

@@ -55,3 +55,4 @@ Approved plans, newest last.
 - 2026-07-21 · [m-781413](m-781413/plan.md) — At the final gate, route a failing contract command assertion the orchestrator judges to be author-broken (a false negat… [truncated] · [report](m-781413/report.md)
 - 2026-07-21 · [m-d1e3c3](m-d1e3c3/plan.md) — Add a flight-surgeon outcomes fold (autonomy ratio, grant-latency distribution, escalation ledger) computed per-request … [truncated] · [report](m-d1e3c3/report.md)
 - 2026-07-07 · [m-66aff8](m-66aff8/plan.md) — Fix worktree-mode gated merges: relocate the untracked operator preview copies so they no longer collide with the canoni… [truncated] · [report](m-66aff8/report.md)
+- 2026-07-30 · [m-83d1ed](m-83d1ed/plan.md) — Harden the Gas City beads bridge translator (packaging/gascity/bin/) so its status verbs match the live bd dialect, clai… [truncated]

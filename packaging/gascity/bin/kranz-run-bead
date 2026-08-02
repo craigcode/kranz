@@ -7,10 +7,96 @@
 # host multi-minute missions (learned live; see docs/gascity.md).
 #
 # Usage: kranz-run-bead <city-dir> <bead-id> <mission.md> <rig-dir> <max-cycles>
+#
+# Bidirectional bead status <-> kranz-side state map (all four bead
+# statuses, both directions):
+#   open         <-> Queued           (ready for dispatch / re-readied)
+#   in_progress  <-> Running          (set by kranz-dispatch's atomic claim, before the brief is spooled)
+#   blocked      <-> Blocked-report   (exit 2 below; escalated to a human)
+#   closed       <-> Done             (exit 0 below; mission complete)
+#
+# Claim posture (shipped in kranz-dispatch, not here): dispatch takes an
+# atomic, first-wins claim (`bd update --claim`, docs/scoping/beads-bridge-
+# dialect.md §3) before spooling the brief this script runs. bd 1.0.5
+# itself has NO lease/TTL/heartbeat field — a server-side lease mechanism
+# is NOT YET IMPLEMENTED upstream (§3; 1.1.0+ is the tracked path) — so
+# the bridge ships its own client-side lease (f-3-1): a heartbeat file
+# under ${KRANZ_LEASE_DIR:-$CITY/.gc/kranz-leases}/ renewed while this mission
+# runs and removed on any terminal exit ($CITY here is the city directory
+# passed as $1 by kranz-city-worker, which kranz-dispatch resolved from
+# $GC_CITY and wrote into the spool .env). Recovery (kranz-dispatch
+# --reclaim) is liveness-first: a claim held by a verifiably live pid is
+# never stolen; a dead pid (or a missing lease past KRANZ_CLAIM_TTL) is
+# released. Residual exposure window: a bead claimed and spooled but not
+# yet drained by kranz-city-worker (before this script starts) has no
+# heartbeat yet — only the TTL backstop covers it.
+#
+# Claim release on reopen (shipped here): exit 3 and exit 1/other both clear
+# the assignee (`bd update --assignee ""`) alongside the status reset to
+# open, per docs/scoping/beads-bridge-dialect.md §2 (`bd update`'s verified
+# `-a/--assignee` flag; an empty string clears it, confirmed by an executed
+# probe against upstream `bd` directly — the `gc bd` pass-through used here
+# (via this script's own `bd()` wrapper) is unverified, per dialect doc §2):
+# claim, clear via the combined `--status open --assignee ""` call this
+# script issues, then a different actor claims the same bead
+# successfully — a bare `--assignee ""` without `--status open` was also
+# probed and leaves the issue in_progress, still blocking reclaim). A bead
+# reopened this way is therefore claimable
+# by ANY actor afterward, not stuck assigned to whichever actor ran this
+# mission. Exit 2 (blocked) deliberately does NOT clear the assignee: a
+# blocked bead is escalated to a human via mail and is never re-offered by
+# `bd ready` regardless of assignee (blocked is excluded from ready work), so
+# releasing the claim there would not change dispatch behaviour but would
+# discard the record of who last worked the bead before a human intervenes.
+#
+# Exit-code contract (kranz-run-bead owns this translation):
+#   0            -> closed  (mission COMPLETE)
+#   2            -> blocked (mission BLOCKED, escalate to a human)
+#   exit 3       -> open    (refused as UNDERSPECIFIED; refine and re-ready)
+#   exit 1/other -> open    (mission FAILED; reopen for re-readying)
+#
+# open is many-to-one on the kranz side: both exit 3 (refused,
+# underspecified brief) and exit 1/other (mission failed outright) return
+# the bead to open, because in both cases there is no partial progress
+# worth preserving as "blocked" — the bead just needs to be re-readied,
+# either after a human refines it (exit 3) or as-is for a retry (exit
+# 1/other). Only exit 2 (blocked) preserves an in-flight state for
+# escalation; every other non-success outcome collapses to open and releases
+# the assignee so a different actor may re-claim it.
 set -u
 CITY=$1; ID=$2; MFILE=$3; RIG_DIR=$4; MAX_CYCLES=$5
 
 bd() { gc --city "$CITY" bd "$@"; }
+
+# Client-side lease heartbeat (f-3-1): bd 1.0.5 has no lease/TTL/heartbeat
+# field, so the bridge keeps its own. While the mission runs, a background
+# loop renews $LEASE_FILE with <pid> <unix-ts>; on ANY terminal exit
+# (success, failure, INT, TERM) the loop is killed and the file removed —
+# a completed mission never leaves a dangling lease. Recovery is
+# liveness-first (kranz-dispatch --reclaim): a claim whose recorded pid is
+# ALIVE is never stolen, however old; a dead pid (or a missing lease past
+# the TTL) releases the claim so a dead dispatcher's work is reclaimable.
+LEASE_DIR=${KRANZ_LEASE_DIR:-$CITY/.gc/kranz-leases}
+mkdir -p "$LEASE_DIR"
+LEASE_FILE="$LEASE_DIR/$ID.lease"
+heartbeat() {
+    while :; do
+        printf '%s %s\n' "$$" "$(date +%s)" > "$LEASE_FILE.hb.$$.tmp" 2>/dev/null &&
+            mv -f "$LEASE_FILE.hb.$$.tmp" "$LEASE_FILE" 2>/dev/null || exit 0
+        sleep 15
+    done
+}
+heartbeat &
+HEARTBEAT_PID=$!
+cleanup_lease() {
+    kill "$HEARTBEAT_PID" 2>/dev/null || true
+    rm -f "$LEASE_FILE" "$LEASE_FILE.hb.$$.tmp" "$LEASE_FILE.init.$$.tmp"
+}
+trap 'cleanup_lease' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+printf '%s %s\n' "$$" "$(date +%s)" > "$LEASE_FILE.init.$$.tmp" 2>/dev/null &&
+    mv -f "$LEASE_FILE.init.$$.tmp" "$LEASE_FILE" 2>/dev/null || true
 
 LINE=$( cd "$RIG_DIR" && kranz exec -f "$MFILE" --max-cycles "$MAX_CYCLES" 2>>"${MFILE%.md}.events.log" )
 CODE=$?
@@ -22,18 +108,18 @@ case $CODE in
         bd close "$ID" --reason "kranz mission COMPLETE — $LINE" >/dev/null
         ;;
     2)
-        bd set-state "$ID" blocked >/dev/null 2>&1 || bd update "$ID" --status blocked >/dev/null 2>&1
+        bd update "$ID" --status blocked >/dev/null 2>&1
         bd comment "$ID" "kranz mission BLOCKED — $LINE (event log in the rig's .kranz/missions dir)" >/dev/null
         gc --city "$CITY" mail send human -s "ESCALATION: bead $ID blocked in kranz" \
             -m "kranz mission for bead $ID blocked awaiting guidance. $LINE. Steer via kranz (web/Slack/CLI) or refine the bead and re-ready it." \
             --notify >/dev/null 2>&1 || true
         ;;
     3)
-        bd update "$ID" --status open >/dev/null 2>&1
+        bd update "$ID" --status open --assignee "" >/dev/null 2>&1
         bd comment "$ID" "kranz refused headless run: UNDERSPECIFIED — refine title/description/acceptance so the brief is self-sufficient, then re-ready. $LINE" >/dev/null
         ;;
     *)
-        bd update "$ID" --status open >/dev/null 2>&1
+        bd update "$ID" --status open --assignee "" >/dev/null 2>&1
         bd comment "$ID" "kranz mission FAILED (exit $CODE) — $LINE (inspect the rig's .kranz/missions dir)" >/dev/null
         ;;
 esac
