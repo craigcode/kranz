@@ -24,6 +24,7 @@ pub mod auth_verify;
 pub mod backend_readiness;
 pub mod command_exec;
 pub mod config;
+pub mod contract_gates;
 pub mod contract_health;
 pub mod contract_lint;
 pub mod contract_sweep;

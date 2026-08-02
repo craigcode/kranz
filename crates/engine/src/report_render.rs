@@ -17,6 +17,12 @@ use std::path::Path;
 /// mission branch beside plan.json for later review and reference. Pure and
 /// deterministic given its inputs (no wall-clock reads; the estimate is
 /// computed by the caller and passed in).
+///
+/// `gate_reports` carries the named contract-validation gate verdicts
+/// ([`crate::contract_gates`], ticket contract-validation-gates.md) rendered
+/// into the Contract lint section; callers that do not run the gates
+/// (re-plan previews — see the orchestrator's no-lint note) pass `&[]`.
+#[allow(clippy::too_many_arguments)]
 pub fn render_plan_markdown(
     plan: &Plan,
     mission: &Mission,
@@ -25,6 +31,7 @@ pub fn render_plan_markdown(
     fit_note: Option<&str>,
     missions_used: usize,
     contract_lint: &contract_lint::ContractLintReport,
+    gate_reports: &[crate::gate::GateReport],
 ) -> String {
     use std::fmt::Write as _;
     let mut md = String::new();
@@ -139,6 +146,16 @@ pub fn render_plan_markdown(
              in the assertion itself. This never blocks approval.\n"
         );
         let _ = writeln!(md, "{}\n", contract_lint.summary());
+        // Named contract-validation gates (contract-validation-gates): the
+        // defect classes behind the lint, each verdict carrying its class
+        // name. Same advisory posture as the lint.
+        if !gate_reports.is_empty() {
+            let _ = writeln!(
+                md,
+                "{}\n",
+                crate::contract_gates::render_gate_verdicts(gate_reports)
+            );
+        }
     }
 
     for (mi, m) in plan.milestones.iter().enumerate() {

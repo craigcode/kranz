@@ -6453,6 +6453,126 @@ async fn approval_lint_no_nested_runtime_panic() {
     assert_eq!(engine.state().mission.status, MissionStatus::Approved);
 }
 
+/// ticket contract-validation-gates: the named, deterministic contract gates
+/// run at approval through the gate plugin interface. A negated grep whose
+/// target is absent from the pristine base trips BOTH wrong-polarity
+/// (static: passes because the target is absent) and passes-on-base
+/// (graduated lint: exits zero on the untouched base), and the defect-class
+/// names reach plan.md and the approval orchestrator.decision — while
+/// approval itself still succeeds (advisory posture unchanged).
+#[tokio::test(flavor = "multi_thread")]
+async fn contract_gate_named_verdicts_reach_plan_md_and_decision() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let backend = Arc::new(MockBackend::new());
+    let mut engine = make_engine(&backend, &root, test_cfg());
+
+    // `! grep -q marker <missing>`: grep errors on the absent path and the
+    // negation turns that into success — the assertion passes BECAUSE the
+    // target is absent, and it already exits zero on the untouched base.
+    let plan = simple_plan(
+        1,
+        vec![
+            assertion(
+                "",
+                "marker absent",
+                Some("! grep -q landed-marker kranz-no-such-file.txt"),
+            ),
+            assertion("", "not-yet-landed assertion", Some("false")),
+        ],
+    );
+    engine.approve_plan(plan).unwrap();
+
+    let paths = engine.paths().clone();
+    let md = std::fs::read_to_string(paths.plan_md_file()).expect("plan.md written");
+    assert!(md.contains("named contract gates"), "{md}");
+    assert!(md.contains("wrong-polarity: FAIL"), "{md}");
+    assert!(md.contains("passes-on-base: FAIL"), "{md}");
+    assert!(md.contains("vacuous-filter: PASS"), "{md}");
+    assert!(md.contains("env-sensitive: PASS"), "{md}");
+
+    drop(engine);
+    let events = read_log(&paths);
+    let decision = events.iter().find_map(|e| match &e.kind {
+        EventKind::OrchestratorDecision { summary, detail }
+            if summary.contains("contract lint") =>
+        {
+            Some((summary.clone(), detail.clone()))
+        }
+        _ => None,
+    });
+    let (summary, detail) = decision.expect("contract lint orchestrator.decision emitted");
+    // The pre-existing suspect headline is preserved; the failed classes
+    // are appended by name (contract_health still parses the prefix).
+    assert!(summary.contains("1 author-bug suspect"), "{summary}");
+    assert!(
+        summary.contains("named contract gate(s) failed: wrong-polarity, passes-on-base"),
+        "{summary}"
+    );
+    let detail = detail.expect("decision carries the lint summary and gate verdicts");
+    assert!(detail.contains("wrong-polarity: FAIL"), "{detail}");
+    assert!(detail.contains("passes-on-base: FAIL"), "{detail}");
+    assert!(detail.contains("[a-1]"), "{detail}");
+}
+
+/// ticket contract-validation-gates: at the final gate the static named
+/// gates re-check the contract against the ACTIVE tree — a negated grep
+/// whose target is STILL absent there passed vacuously, so an advisory
+/// decision names the class. The mission still completes: the gate records
+/// the named verdict, it does not change what passes (posture unchanged).
+#[tokio::test(flavor = "multi_thread")]
+async fn contract_gate_final_gate_decision_names_vacuous_green() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let contract = vec![assertion(
+        "",
+        "marker absent",
+        Some("! grep -q landed-marker kranz-no-such-file.txt"),
+    )];
+    // One worker (passing report), one orchestrator turn (checkpoint +
+    // feature-completion judgement + lesson extraction); both validators
+    // are off in test_cfg, so the milestone tags clean and the final gate
+    // runs the contract.
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+    ]));
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(simple_plan(1, contract)).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+    let decision = events.iter().find_map(|e| match &e.kind {
+        EventKind::OrchestratorDecision { summary, detail }
+            if summary.contains("contract gates (final gate)") =>
+        {
+            Some((summary.clone(), detail.clone()))
+        }
+        _ => None,
+    });
+    let (summary, detail) = decision.expect("final-gate contract-gate decision emitted");
+    assert!(summary.contains("wrong-polarity"), "{summary}");
+    let detail = detail.expect("decision carries the gate verdicts");
+    assert!(detail.contains("wrong-polarity: FAIL"), "{detail}");
+    assert!(detail.contains("[a-1]"), "{detail}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn approve_plan_requires_considered_alternatives_for_large_scope() {
     let (_dir, root) = init_repo();

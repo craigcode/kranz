@@ -42,6 +42,7 @@ use crate::backend::{
 };
 use crate::command_exec::{run_shell_command, tail_chars};
 use crate::config;
+use crate::contract_gates;
 use crate::contract_lint;
 use crate::contract_sweep;
 use crate::control;
@@ -1082,6 +1083,21 @@ impl MissionEngine {
             &self.state.config.contract_env_passthrough,
         );
 
+        // Named, deterministic contract-validation gates (ticket
+        // contract-validation-gates.md): the defect classes behind the lint —
+        // vacuous-filter, wrong-polarity, passes-on-base, env-sensitive —
+        // evaluated through the gate plugin interface (gate.rs) so each
+        // verdict carries its class name into the approval decision and
+        // plan.md below. Static gates inspect the command text against the
+        // (still pristine) repo root; passes-on-base graduates the lint
+        // report. Advisory only, exactly like the lint: approval never
+        // blocks on these.
+        let gate_reports = contract_gates::contract_gate_reports(
+            &plan.validation_contract,
+            Some(&contract_lint_report),
+            &self.paths.repo_root,
+        );
+
         // Human-readable twin, committed alongside: reviewable in any git UI
         // and diffable across re-plans (plan.json stays the durable source).
         // The calibrated cost estimate is baked in here so the Reviewable
@@ -1096,6 +1112,7 @@ impl MissionEngine {
             fit_note.as_deref(),
             calibration.missions_used,
             &contract_lint_report,
+            &gate_reports,
         );
         // research.md (repo-knowledge-store slice 1): the evidence the
         // orchestrator emitted with the plan, committed beside plan.md.
@@ -1214,9 +1231,14 @@ impl MissionEngine {
         // feature f-1-2): suspects (already pass on the untouched base) get a
         // headline distinct from the benign base-expected-to-fail case, but
         // either way this only informs — approval above already succeeded.
+        // The named gate verdicts (contract-validation-gates) ride the same
+        // decision: failed defect classes are named in the headline, and the
+        // full per-gate verdict block appends to the lint summary in the
+        // detail. The existing headline text is preserved verbatim so
+        // contract_health's lint counters keep classifying it.
         if !contract_lint_report.is_empty() {
             let suspect_count = contract_lint_report.suspects().len();
-            let headline = if suspect_count > 0 {
+            let mut headline = if suspect_count > 0 {
                 format!(
                     "contract lint: {suspect_count} author-bug suspect assertion(s) already \
                      pass on the untouched base — see plan.md"
@@ -1225,7 +1247,19 @@ impl MissionEngine {
                 "contract lint: all command assertions correctly fail on the untouched base"
                     .to_string()
             };
-            self.emit_decision(&headline, Some(contract_lint_report.summary()))?;
+            let failed_gates = contract_gates::failed_gate_names(&gate_reports);
+            if !failed_gates.is_empty() {
+                headline.push_str(&format!(
+                    "; named contract gate(s) failed: {}",
+                    failed_gates.join(", ")
+                ));
+            }
+            let detail = format!(
+                "{}\n\n{}",
+                contract_lint_report.summary(),
+                contract_gates::render_gate_verdicts(&gate_reports)
+            );
+            self.emit_decision(&headline, Some(detail))?;
         }
 
         Ok(())
@@ -1725,6 +1759,7 @@ impl MissionEngine {
             fit_note.as_deref(),
             calibration.missions_used,
             &no_lint,
+            &[],
         );
         let revised_md_body = render_revised_plan_markdown(plan, &self.state.mission, &[], &[]);
         let research_md = self
@@ -4244,6 +4279,30 @@ impl MissionEngine {
                     class: "command-assertion".to_string(),
                 });
             }
+        }
+
+        // Named contract gates at the final-gate surface (ticket
+        // contract-validation-gates.md): the static, deterministic classes
+        // (vacuous-filter, wrong-polarity, env-sensitive) re-checked against
+        // the ACTIVE tree — e.g. a negated grep whose target is still absent
+        // here passed vacuously, and its green contributes nothing. The
+        // passes-on-base gate is absent: the work has landed, so passing on
+        // base is now expected. Advisory only, same posture as at approval:
+        // the command outcomes and findings above are unchanged — this
+        // records the named verdicts so a vacuously-green contract is
+        // visible in the event log instead of silently trusted.
+        let final_gate_reports =
+            contract_gates::contract_gate_reports(&contract, None, self.active_root());
+        let failed_gates = contract_gates::failed_gate_names(&final_gate_reports);
+        if !failed_gates.is_empty() {
+            self.emit_decision(
+                &format!(
+                    "contract gates (final gate): named gate(s) failed: {} — advisory only; \
+                     command outcomes and findings above are unchanged",
+                    failed_gates.join(", ")
+                ),
+                Some(contract_gates::render_gate_verdicts(&final_gate_reports)),
+            )?;
         }
 
         // agent-judgement assertions — one orchestrator verdicts turn.
