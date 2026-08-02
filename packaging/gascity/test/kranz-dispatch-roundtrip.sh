@@ -474,6 +474,58 @@ STUBEOF
             echo "LEASE-TTL: PASS (expiry only as backstop: fresh kept, stale recovered)"
         fi
     fi
+
+    # Lease observed mid-rewrite (f-3-1): the producer's write is atomic
+    # (tmp+mv, packaging/gascity/bin/kranz-run-bead:82/96) but the sweep can
+    # still catch the file in the brief window between the producer's
+    # truncate-on-create of a NEW lease and its first rename into place —
+    # or, as simulated here, any transient empty/unparseable read. The
+    # sweep's bounded retry (packaging/gascity/bin/kranz-dispatch:158-175)
+    # must not treat that as lease-less: a live pid recorded moments later
+    # (within the retry window) must still preserve the claim. KRANZ_CLAIM_
+    # TTL=0 makes any wrongful fall-through to the TTL backstop release the
+    # claim immediately, so this distinguishes "retried and found live"
+    # from a pass that only got lucky.
+    MIDWRITE_CREATE_OUT=$(BD create "LEASE-MIDWRITE fixture" --type task --json 2>&1)
+    MIDWRITE_ID=$(printf '%s' "$MIDWRITE_CREATE_OUT" | unwrap | jq -r '.id // empty')
+    if [ -z "$MIDWRITE_ID" ]; then
+        fail_case "lease-midwrite-create" "a non-empty fixture id" "'$MIDWRITE_CREATE_OUT'"
+    else
+        BD update "$MIDWRITE_ID" --add-label kranz >/dev/null 2>&1
+        BD update "$MIDWRITE_ID" --claim >/dev/null 2>&1
+        MIDWRITE_ORIG_ASSIGNEE=$(BD show "$MIDWRITE_ID" --json 2>/dev/null | unwrap | jq -r '.assignee // empty')
+
+        # Simulate the producer caught mid-truncate: an empty lease file in
+        # place when the sweep's first read happens.
+        : > "$LEASE_DIR/$MIDWRITE_ID.lease"
+
+        # Race the producer's real atomic write (tmp+mv, matching kranz-run-
+        # bead's own producer code) against the sweep's bounded retry window
+        # (up to two 1s-spaced re-reads, so ~2s of margin). A 1s delay lands
+        # the real write comfortably inside that window without depending
+        # on sub-second sleep support.
+        (
+            sleep 1
+            printf '%s %s\n' "$$" "$(date +%s)" > "$LEASE_DIR/$MIDWRITE_ID.lease.tmp.$$" 2>/dev/null &&
+                mv -f "$LEASE_DIR/$MIDWRITE_ID.lease.tmp.$$" "$LEASE_DIR/$MIDWRITE_ID.lease" 2>/dev/null
+        ) &
+        MIDWRITE_WRITER_PID=$!
+
+        PATH="$LEASE_STUB_BIN:$PATH" GC_CITY="$CITY_DIR" KRANZ_LABEL="kranz" \
+            KRANZ_LEASE_DIR="$LEASE_DIR" KRANZ_CLAIM_TTL=0 \
+            "$BIN_DIR/kranz-dispatch" --reclaim >/dev/null 2>&1
+
+        wait "$MIDWRITE_WRITER_PID" 2>/dev/null || true
+
+        MIDWRITE_STATUS=$(status_of "$MIDWRITE_ID")
+        MIDWRITE_ASSIGNEE=$(BD show "$MIDWRITE_ID" --json 2>/dev/null | unwrap | jq -r '.assignee // empty')
+
+        if [ "$MIDWRITE_STATUS" != "in_progress" ] || [ "$MIDWRITE_ASSIGNEE" != "$MIDWRITE_ORIG_ASSIGNEE" ]; then
+            fail_case "lease-midwrite-preserved" "claim preserved at in_progress/assignee '$MIDWRITE_ORIG_ASSIGNEE' despite the sweep's first read landing on an empty lease file (mid-rewrite)" "status=$MIDWRITE_STATUS assignee='$MIDWRITE_ASSIGNEE'"
+        else
+            echo "LEASE-MIDWRITE: PASS (empty mid-rewrite read retried and resolved to the live pid, claim preserved)"
+        fi
+    fi
 fi
 
 # --- Case: reclaim sweep scope + reachability (ms-3-fix-5-1) --------------
