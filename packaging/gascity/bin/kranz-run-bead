@@ -24,12 +24,22 @@
 # under ${KRANZ_LEASE_DIR:-$CITY/.gc/kranz-leases}/ renewed while this mission
 # runs and removed on any terminal exit ($CITY here is the city directory
 # passed as $1 by kranz-city-worker, which kranz-dispatch resolved from
-# $GC_CITY and wrote into the spool .env). Recovery (kranz-dispatch
-# --reclaim) is liveness-first: a claim held by a verifiably live pid is
-# never stolen; a dead pid (or a missing lease past KRANZ_CLAIM_TTL) is
-# released. Residual exposure window: a bead claimed and spooled but not
-# yet drained by kranz-city-worker (before this script starts) has no
-# heartbeat yet — only the TTL backstop covers it.
+# $GC_CITY and wrote into the spool .env). The lease line is
+# `<pid> <unix-ts> <start-token>`, the token being this process's start
+# time (`ps -o lstart=`, normalized for plain string equality) — the
+# sweep's way to tell "pid alive and provably this claimant" from a
+# recycled pid wearing the same number (the kranz queue's identity-token
+# idiom). Recovery (kranz-dispatch --reclaim) is liveness-first: a claim
+# held by a verifiably live pid is never stolen; a provably dead pid
+# releases claim, lease, and stale spool pair together; a probe that
+# cannot settle it (another uid's process, a recycled token) and a
+# missing lease fall to the KRANZ_CLAIM_TTL backstop, which also removes
+# the spool pair when it releases so a re-dispatch spools exactly once.
+# Residual exposure window: a bead claimed and spooled but not yet drained
+# by kranz-city-worker (before this script starts) has no heartbeat yet
+# and without the TTL backstop would never be recovered — with the
+# spool-atomic release the window costs one reclaim cycle's delay, not a
+# duplicate mission.
 #
 # Claim release on reopen (shipped here): exit 3 and exit 1/other both clear
 # the assignee (`bd update --assignee ""`) alongside the status reset to
@@ -70,18 +80,26 @@ bd() { gc --city "$CITY" bd "$@"; }
 
 # Client-side lease heartbeat (f-3-1): bd 1.0.5 has no lease/TTL/heartbeat
 # field, so the bridge keeps its own. While the mission runs, a background
-# loop renews $LEASE_FILE with <pid> <unix-ts>; on ANY terminal exit
-# (success, failure, INT, TERM) the loop is killed and the file removed —
-# a completed mission never leaves a dangling lease. Recovery is
-# liveness-first (kranz-dispatch --reclaim): a claim whose recorded pid is
-# ALIVE is never stolen, however old; a dead pid (or a missing lease past
-# the TTL) releases the claim so a dead dispatcher's work is reclaimable.
+# loop renews $LEASE_FILE with `<pid> <unix-ts> <start-token>`; on ANY
+# terminal exit (success, failure, INT, TERM) the loop is killed and the
+# file removed — a completed mission never leaves a dangling lease. The
+# start-token is this process's `ps -o lstart=` (normalized), so the sweep
+# can prove the recorded pid is still THIS claimant rather than a recycled
+# pid. Recovery is liveness-first (kranz-dispatch --reclaim): a claim
+# whose recorded pid is ALIVE (and token-verified) is never stolen,
+# however old; a provably dead pid releases the claim, and anything the
+# probe cannot settle (or a missing lease) falls to the TTL backstop —
+# every release drops the stale spool pair with it.
 LEASE_DIR=${KRANZ_LEASE_DIR:-$CITY/.gc/kranz-leases}
 mkdir -p "$LEASE_DIR"
 LEASE_FILE="$LEASE_DIR/$ID.lease"
+# Normalized for plain string equality with the sweep's own probe of the
+# same pid (tr collapses ps's field padding, the seds drop leading and
+# trailing whitespace — `read` trims both when the sweep parses the lease).
+START_TOKEN=$(ps -o lstart= -p $$ 2>/dev/null | tr -s ' ' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
 heartbeat() {
     while :; do
-        printf '%s %s\n' "$$" "$(date +%s)" > "$LEASE_FILE.hb.$$.tmp" 2>/dev/null &&
+        printf '%s %s %s\n' "$$" "$(date +%s)" "$START_TOKEN" > "$LEASE_FILE.hb.$$.tmp" 2>/dev/null &&
             mv -f "$LEASE_FILE.hb.$$.tmp" "$LEASE_FILE" 2>/dev/null || exit 0
         sleep 15
     done
@@ -95,7 +113,7 @@ cleanup_lease() {
 trap 'cleanup_lease' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-printf '%s %s\n' "$$" "$(date +%s)" > "$LEASE_FILE.init.$$.tmp" 2>/dev/null &&
+printf '%s %s %s\n' "$$" "$(date +%s)" "$START_TOKEN" > "$LEASE_FILE.init.$$.tmp" 2>/dev/null &&
     mv -f "$LEASE_FILE.init.$$.tmp" "$LEASE_FILE" 2>/dev/null || true
 
 LINE=$( cd "$RIG_DIR" && kranz exec -f "$MFILE" --max-cycles "$MAX_CYCLES" 2>>"${MFILE%.md}.events.log" )

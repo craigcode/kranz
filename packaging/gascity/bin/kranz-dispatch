@@ -46,13 +46,24 @@
 # by an executed sandbox probe (docs/scoping/beads-bridge-dialect.md §3) —
 # an upstream lease mechanism (1.1.0+) is NOT YET IMPLEMENTED there. The
 # bridge therefore keeps its own lease: kranz-run-bead renews
-# ${KRANZ_LEASE_DIR:-$GC_CITY/.gc/kranz-leases}/<id>.lease (<pid> <unix-ts>) while a
-# mission runs, removed on terminal exit, and the reclaim sweep (see
-# reclaim_sweep() below) releases claimed beads liveness-first: a claim
-# held by a verifiably live pid is never stolen at any age; a dead pid's
-# claim is released; a lease-less claim is released only past
-# KRANZ_CLAIM_TTL (default 120s — expiry strictly as backstop, the
-# operator's accepted design D-BW-2).
+# ${KRANZ_LEASE_DIR:-$GC_CITY/.gc/kranz-leases}/<id>.lease — `<pid> <unix-ts>
+# <start-token>`, the token being the claimant's process start time
+# (`ps -o lstart=`, equality-compared) — while a mission runs, removed on
+# terminal exit. The reclaim sweep (see reclaim_sweep() below) releases
+# claimed beads liveness-first with the kranz queue's three-way verdict:
+# a claim whose pid is ALIVE and — when the lease carries a token —
+# provably the claimant's (a recycled pid fails the start-time compare; an
+# unverifiable one stands conservatively; a tokenless legacy lease's live
+# pid stands at any age) is never stolen. A pid proven DEAD (the signal
+# probe failed AND ps shows no such process — never EPERM, which is the
+# Unknown class) releases claim, lease, and any stale spool pair together.
+# Everything the probe cannot settle — another uid's process, a recycled
+# or unverifiable token, a missing lease — falls to the KRANZ_CLAIM_TTL
+# backstop (default 120s — expiry strictly as backstop, the operator's
+# accepted design D-BW-2). Every release removes the bead's spool pair
+# with the claim, so a released bead's re-dispatch spools exactly once —
+# never duplicating in-flight work for one bead
+# (bridge-reclaim-sweep-defects).
 #
 # Reclaim sweep placement (ms-3-fix-5-1): reclaim_sweep runs at the START
 # of every invocation, before the ready-bead drain, so a bare
@@ -74,7 +85,9 @@
 # invoked — a dispatch process that dies after claiming but before spooling
 # leaves a lease-less claim the TTL backstop (not any heartbeat) must age
 # out. The window between spool write and kranz-run-bead's first heartbeat
-# is TTL-only the same way.
+# is TTL-only the same way — but the release now removes the stale spool
+# pair with the claim, so the worst case is one reclaim cycle's delay,
+# never a duplicate mission.
 #
 # Env:
 #   KRANZ_RIG_DIR            explicit rig checkout (optional)
@@ -126,13 +139,36 @@ resolve_rig() {
 }
 
 # --- Reclaim sweep (f-3-1, wired into the fast path by ms-3-fix-5-1): -----
-# sweep beads carrying $LABEL, release dead claims. Liveness-first,
-# mirroring the kranz queue: a claim whose recorded pid is ALIVE is never
-# stolen, whatever its age; a DEAD pid releases the claim; a MISSING lease
-# is the ambiguous case the TTL backstop covers (the bead's updated_at
-# older than KRANZ_CLAIM_TTL, default 120s). Non-fatal throughout: every
-# bd/jq call is guarded with `|| ...` so a failure here never aborts the
-# dispatch drain that runs after it.
+# sweep beads carrying $LABEL, release dead claims. Liveness-first with the
+# kranz queue's three-way verdict (Alive/Dead/Unknown — anything uncertain
+# is never read as Dead): Alive-by-token stands at any age; Dead releases
+# claim, lease, and stale spool pair together; Unknown (EPERM, recycled or
+# unverifiable token, missing lease) hits only the TTL backstop on the
+# bead's updated_at (KRANZ_CLAIM_TTL, default 120s). Non-fatal throughout:
+# every bd/jq call is guarded with `|| ...` so a failure here never aborts
+# the dispatch drain that runs after it.
+
+# The claimant-identity token for a live pid: its process start time,
+# normalized for plain string equality (tr collapses ps's field padding,
+# the seds drop ps's leading/trailing whitespace — `read` trims both from
+# the recorded field, so the probe must match). Mirrors the kranz queue's
+# process_identity_token compare: same pid + same start time is the same
+# process; same pid + a different start time is a recycled pid wearing the
+# claimant's number.
+lease_pid_token() {
+    ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+# Drop a bead's spool pair (.md/.env, any stamp) alongside a claim release.
+# A released bead returns to open and WILL be re-dispatched by a later
+# drain; with the stale pair still present that re-dispatch spools a SECOND
+# brief for one bead and the city-worker runs two missions (the verified
+# claimed-and-spooled defect). rm -f on a non-matching glob's literal is a
+# no-op, so an absent pair costs nothing.
+remove_spool_pair() {
+    rm -f "$SPOOL"/*-"$1".md "$SPOOL"/*-"$1".env
+}
+
 reclaim_sweep() {
     LEASE_DIR=${KRANZ_LEASE_DIR:-$CITY/.gc/kranz-leases}
     TTL=${KRANZ_CLAIM_TTL:-120}
@@ -153,8 +189,9 @@ reclaim_sweep() {
         LEASE_FILE="$LEASE_DIR/$CID.lease"
         PID=""
         TS=""
+        TOKEN=""
         if [ -f "$LEASE_FILE" ]; then
-            read -r PID TS < "$LEASE_FILE" || true
+            read -r PID TS TOKEN < "$LEASE_FILE" || true
             if [ -z "$PID" ]; then
                 # Lease file present but empty/unparseable: retry a small
                 # bounded number of times with a short pause. A genuine
@@ -169,22 +206,51 @@ reclaim_sweep() {
                 ATTEMPT=0
                 while [ -z "$PID" ] && [ "$ATTEMPT" -lt 2 ]; do
                     sleep 1
-                    read -r PID TS < "$LEASE_FILE" || true
+                    read -r PID TS TOKEN < "$LEASE_FILE" || true
                     ATTEMPT=$((ATTEMPT + 1))
                 done
             fi
         fi
-        if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
-            continue # live holder: stands at any age
-        fi
         if [ -n "$PID" ]; then
-            # Dead recorded pid: the claimant is gone — release.
-            gc bd update "$CID" --status open --assignee "" >/dev/null 2>&1
-            rm -f "$LEASE_FILE"
-            echo "kranz-dispatch: reclaim sweep released dead claim $CID (pid $PID gone)"
-            continue
+            if kill -0 "$PID" 2>/dev/null; then
+                if [ -z "$TOKEN" ]; then
+                    continue # legacy tokenless lease: a live pid stands at any age
+                fi
+                CURRENT_TOKEN=$(lease_pid_token "$PID")
+                if [ -z "$CURRENT_TOKEN" ]; then
+                    # Alive but identity unverifiable right now: stand
+                    # conservatively — a false stand delays recovery, a
+                    # false release runs a mission twice (the queue's rule).
+                    continue
+                fi
+                if [ "$CURRENT_TOKEN" = "$TOKEN" ]; then
+                    continue # alive and provably the claimant: stands at any age
+                fi
+                # Token mismatch: the pid was RECYCLED after the claimant
+                # died — alive, but not ours. Not proof the claim is
+                # abandonware on its own (a wrong-pid heartbeat reads the
+                # same), so the TTL backstop below decides, as the queue's
+                # pid-reuse rule does.
+            else
+                # kill -0 failed: distinguish ESRCH (truly gone) from EPERM
+                # (a process exists under another uid — never OUR same-user
+                # claimant, but not proof of death either). `ps -o pid=`
+                # prints a row iff the process EXISTS, across owners.
+                if [ -z "$(ps -o pid= -p "$PID" 2>/dev/null)" ]; then
+                    # DEAD with positive proof: release claim, lease, and
+                    # stale spool pair together (see remove_spool_pair).
+                    gc bd update "$CID" --status open --assignee "" >/dev/null 2>&1
+                    rm -f "$LEASE_FILE"
+                    remove_spool_pair "$CID"
+                    echo "kranz-dispatch: reclaim sweep released dead claim $CID (pid $PID gone)"
+                    continue
+                fi
+                # EPERM-class Unknown: a process exists but is not ours to
+                # signal. Never read as dead — the TTL backstop decides.
+            fi
         fi
-        # No lease file: TTL backstop on the bead's updated timestamp.
+        # TTL backstop — the lease-less claim, the wedged/unparseable lease,
+        # the EPERM-unknown, and the recycled-token claim all land here.
         # bd renders updated_at UTC ISO-8601 with a trailing Z — strip the
         # Z, then the fractional seconds (SHORTEST suffix match: %% would
         # eat everything from the FIRST dot onward).
@@ -196,8 +262,13 @@ reclaim_sweep() {
         # skews the comparison by the host's UTC offset if left unwrapped).
         UPDATED=$(TZ=UTC0 date -j -f '%Y-%m-%dT%H:%M:%S' "$UPDATED" +%s 2>/dev/null || TZ=UTC0 date -d "$UPDATED" +%s 2>/dev/null || echo 0)
         if [ "$UPDATED" -gt 0 ] && [ $((NOW - UPDATED)) -ge "$TTL" ]; then
+            # Release the claim AND the stale spool pair (and any wedged
+            # lease file) as one unit: the bead re-enters open exactly once
+            # reclaimable, never double-spooled.
             gc bd update "$CID" --status open --assignee "" >/dev/null 2>&1
-            echo "kranz-dispatch: reclaim sweep released lease-less stale claim $CID (idle $((NOW - UPDATED))s > ${TTL}s)"
+            rm -f "$LEASE_FILE"
+            remove_spool_pair "$CID"
+            echo "kranz-dispatch: reclaim sweep released stale claim $CID (idle $((NOW - UPDATED))s > ${TTL}s)"
         fi
     done
 }

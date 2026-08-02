@@ -309,11 +309,15 @@ fi
 # --- Case: lease-aware dead-claim recovery (client-side, f-3-1) ---------
 # bd 1.0.5 exposes no lease/TTL/heartbeat field (docs/scoping/beads-bridge-
 # dialect.md §3, executed probe), so the bridge keeps its own lease files
-# (.gc/kranz-leases/<id>.lease: <pid> <unix-ts>), renewed by kranz-run-bead
-# and swept by `kranz-dispatch --reclaim`. Liveness-first, mirroring the
-# kranz queue's posture: a claim whose recorded pid is ALIVE is never
-# stolen, whatever its age; a dead pid releases the claim. The operator
-# decision for the client-side design is D-BW-2 (accepted 2026-07-29).
+# (.gc/kranz-leases/<id>.lease: `<pid> <unix-ts> [<start-token>]`), renewed
+# by kranz-run-bead and swept by `kranz-dispatch --reclaim`. Liveness-first,
+# mirroring the kranz queue's posture: a claim whose recorded pid is ALIVE
+# (and, for token-carrying leases, provably the claimant's) is never
+# stolen, whatever its age; a proven-dead pid releases the claim. The
+# fixtures below write the LEGACY tokenless two-field form, which remains
+# valid and exercises the legacy "alive stands at any age" rule. The
+# operator decision for the client-side design is D-BW-2 (accepted
+# 2026-07-29).
 
 LEASE_CREATE_OUT=$(BD create "LEASE fixture (dead holder)" --type task --json 2>&1)
 LEASE_DEAD_ID=$(printf '%s' "$LEASE_CREATE_OUT" | unwrap | jq -r '.id // empty')
@@ -400,9 +404,10 @@ STUBEOF
         BD update "$LEASE_LIVE_PASTTTL_ID" --add-label kranz >/dev/null 2>&1
         BD update "$LEASE_LIVE_PASTTTL_ID" --claim >/dev/null 2>&1
         LIVE_PASTTTL_ORIG_ASSIGNEE=$(BD show "$LEASE_LIVE_PASTTTL_ID" --json 2>/dev/null | unwrap | jq -r '.assignee // empty')
-        # Live holder: this test process itself, in the EXACT format the
-        # producer (packaging/gascity/bin/kranz-run-bead's heartbeat/init
-        # writers) emits: `printf '%s %s\n' "$$" "$(date +%s)"`.
+        # Live holder: this test process itself, in the LEGACY tokenless
+        # two-field lease form — the producer now appends a start-token
+        # third field, and this fixture deliberately exercises the pre-
+        # token shape the sweep must still honor (alive stands at any age).
         printf '%s %s\n' "$$" "$(date +%s)" > "$LEASE_DIR/$LEASE_LIVE_PASTTTL_ID.lease"
 
         # Same one-second wall-clock guard the other TTL=0 cases carry
@@ -590,6 +595,134 @@ STUBEOF
             echo "LEASE-MIDWRITE: PASS (lease observed live pid $MIDWRITE_LEASE_PID after the mid-rewrite read, claim preserved at in_progress/assignee '$MIDWRITE_ORIG_ASSIGNEE')"
         else
             fail_case "lease-midwrite-preserved" "claim preserved at in_progress/assignee '$MIDWRITE_ORIG_ASSIGNEE' once the lease showed live pid $MIDWRITE_LEASE_PID" "status=$MIDWRITE_STATUS assignee='$MIDWRITE_ASSIGNEE'"
+        fi
+    fi
+
+    # --- Case: spool-atomic release (bridge-reclaim-sweep-defects, defect 1)
+    # A claimed bead with a spool pair present must never be DOUBLE-
+    # dispatched. Lease-less + inside TTL: claim and pair stand. Lease-less
+    # + past TTL, or a proven-dead lease at any TTL: the claim IS released
+    # (that is the sweep's job) but the stale spool pair goes with it, so
+    # the next drain re-spools exactly once — the pre-fix code released the
+    # claim and left the pair, so the re-dispatch spooled a SECOND brief
+    # and the city-worker ran two missions for one bead. Claimed + live
+    # lease + spool present: untouched, pair intact.
+    SPOOLGUARD_CREATE_OUT=$(BD create "RECLAIM-SPOOL fixture (stale claim with spool pair)" --type task --json 2>&1)
+    SPOOLGUARD_ID=$(printf '%s' "$SPOOLGUARD_CREATE_OUT" | unwrap | jq -r '.id // empty')
+    SPOOLDEAD_CREATE_OUT=$(BD create "RECLAIM-SPOOL fixture (dead lease with spool pair)" --type task --json 2>&1)
+    SPOOLDEAD_ID=$(printf '%s' "$SPOOLDEAD_CREATE_OUT" | unwrap | jq -r '.id // empty')
+    SPOOLKEEP_CREATE_OUT=$(BD create "RECLAIM-SPOOL fixture (live lease with spool pair)" --type task --json 2>&1)
+    SPOOLKEEP_ID=$(printf '%s' "$SPOOLKEEP_CREATE_OUT" | unwrap | jq -r '.id // empty')
+    if [ -z "$SPOOLGUARD_ID" ] || [ -z "$SPOOLDEAD_ID" ] || [ -z "$SPOOLKEEP_ID" ]; then
+        fail_case "reclaim-spool-create" "three non-empty fixture ids" "'$SPOOLGUARD_ID' / '$SPOOLDEAD_ID' / '$SPOOLKEEP_ID'"
+    else
+        for SID in "$SPOOLGUARD_ID" "$SPOOLDEAD_ID" "$SPOOLKEEP_ID"; do
+            BD update "$SID" --add-label kranz >/dev/null 2>&1
+            BD update "$SID" --claim >/dev/null 2>&1
+            # Spool pairs exactly as the dispatch loop writes them.
+            printf 'brief\n' > "$SPOOL_DIR/1690000000-$SID.md"
+            printf 'ID=%s\n' "$SID" > "$SPOOL_DIR/1690000000-$SID.env"
+        done
+        # Lease-less stale claim (TTL backstop cell).
+        rm -f "$LEASE_DIR/$SPOOLGUARD_ID.lease"
+        # Proven-dead lease (a pid that cannot exist).
+        printf '999999999 %s\n' "$(date +%s)" > "$LEASE_DIR/$SPOOLDEAD_ID.lease"
+        # Live holder: this test process, in the legacy tokenless form —
+        # which doubles as coverage that pre-token leases still stand.
+        printf '%s %s\n' "$$" "$(date +%s)" > "$LEASE_DIR/$SPOOLKEEP_ID.lease"
+
+        # Control: inside a huge TTL, the lease-less spooled claim stands —
+        # and so does its spool pair.
+        PATH="$LEASE_STUB_BIN:$PATH" GC_CITY="$CITY_DIR" KRANZ_LABEL="kranz" \
+            KRANZ_LEASE_DIR="$LEASE_DIR" KRANZ_CLAIM_TTL=999999 \
+            "$BIN_DIR/kranz-dispatch" --reclaim >/dev/null 2>&1
+        SPOOL_FRESH_STATUS=$(status_of "$SPOOLGUARD_ID")
+        SPOOL_FRESH_PAIR=missing
+        [ -f "$SPOOL_DIR/1690000000-$SPOOLGUARD_ID.md" ] && [ -f "$SPOOL_DIR/1690000000-$SPOOLGUARD_ID.env" ] && SPOOL_FRESH_PAIR=present
+
+        # Same one-second wall-clock guard the other TTL=0 cases carry.
+        sleep 1
+
+        # TTL=0: the stale and dead claims ARE recovered — and each stale
+        # spool pair goes with its claim.
+        PATH="$LEASE_STUB_BIN:$PATH" GC_CITY="$CITY_DIR" KRANZ_LABEL="kranz" \
+            KRANZ_LEASE_DIR="$LEASE_DIR" KRANZ_CLAIM_TTL=0 \
+            "$BIN_DIR/kranz-dispatch" --reclaim >/dev/null 2>&1
+        SPOOL_STALE_STATUS=$(status_of "$SPOOLGUARD_ID")
+        SPOOL_STALE_MD=gone
+        [ -e "$SPOOL_DIR/1690000000-$SPOOLGUARD_ID.md" ] && SPOOL_STALE_MD=present
+        SPOOL_STALE_ENV=gone
+        [ -e "$SPOOL_DIR/1690000000-$SPOOLGUARD_ID.env" ] && SPOOL_STALE_ENV=present
+        SPOOL_DEAD_STATUS=$(status_of "$SPOOLDEAD_ID")
+        SPOOL_DEAD_PAIR=missing
+        [ -f "$SPOOL_DIR/1690000000-$SPOOLDEAD_ID.md" ] && [ -f "$SPOOL_DIR/1690000000-$SPOOLDEAD_ID.env" ] && SPOOL_DEAD_PAIR=present
+        SPOOL_KEEP_STATUS=$(status_of "$SPOOLKEEP_ID")
+        SPOOL_KEEP_PAIR=missing
+        [ -f "$SPOOL_DIR/1690000000-$SPOOLKEEP_ID.md" ] && [ -f "$SPOOL_DIR/1690000000-$SPOOLKEEP_ID.env" ] && SPOOL_KEEP_PAIR=present
+
+        if [ "$SPOOL_FRESH_STATUS" != "in_progress" ] || [ "$SPOOL_FRESH_PAIR" != "present" ]; then
+            fail_case "reclaim-spool-fresh-kept" "lease-less spooled claim+pair kept inside a huge TTL" "status=$SPOOL_FRESH_STATUS pair=$SPOOL_FRESH_PAIR"
+        elif [ "$SPOOL_STALE_STATUS" != "open" ]; then
+            fail_case "reclaim-spool-stale-released" "stale spooled claim released at TTL=0" "$SPOOL_STALE_STATUS"
+        elif [ "$SPOOL_STALE_MD" != "gone" ] || [ "$SPOOL_STALE_ENV" != "gone" ]; then
+            fail_case "reclaim-spool-pair-removed" "stale spool pair removed with the claim release" "md=$SPOOL_STALE_MD env=$SPOOL_STALE_ENV"
+        elif [ "$SPOOL_DEAD_STATUS" != "open" ] || [ "$SPOOL_DEAD_PAIR" != "missing" ]; then
+            fail_case "reclaim-spool-dead-released-once" "dead-lease claim released with its spool pair" "status=$SPOOL_DEAD_STATUS pair=$SPOOL_DEAD_PAIR"
+        elif [ "$SPOOL_KEEP_STATUS" != "in_progress" ] || [ "$SPOOL_KEEP_PAIR" != "present" ]; then
+            fail_case "reclaim-spool-live-untouched" "claimed + live lease + spool present left untouched at TTL=0" "status=$SPOOL_KEEP_STATUS pair=$SPOOL_KEEP_PAIR"
+        else
+            echo "RECLAIM-SPOOL: PASS (stale/dead claims released with their spool pairs; live claim + pair untouched)"
+        fi
+    fi
+
+    # --- Case: identity-token liveness (bridge-reclaim-sweep-defects, defect 2)
+    # The sweep's liveness verdict mirrors the kranz queue's three-way shape.
+    # A live pid whose recorded start-time token MATCHES stands even at
+    # TTL=0 (Alive-by-token). The same live pid wearing a MISMATCHED token
+    # is a recycled-pid reading: kill -0 succeeds, so the pre-fix code
+    # stood on it ("live and ours"); the mirrored verdict sends it to the
+    # TTL backstop instead — not proof of death, but not a stand either.
+    # EPERM proper (a live process under another uid) can't be fixtured
+    # without root; it takes the same Unknown->TTL fall-through the
+    # mismatched-token cell exercises here.
+    TOKENMATCH_CREATE_OUT=$(BD create "RECLAIM-TOKEN fixture (matching token)" --type task --json 2>&1)
+    TOKENMATCH_ID=$(printf '%s' "$TOKENMATCH_CREATE_OUT" | unwrap | jq -r '.id // empty')
+    TOKENCYCLE_CREATE_OUT=$(BD create "RECLAIM-TOKEN fixture (recycled-pid reading)" --type task --json 2>&1)
+    TOKENCYCLE_ID=$(printf '%s' "$TOKENCYCLE_CREATE_OUT" | unwrap | jq -r '.id // empty')
+    if [ -z "$TOKENMATCH_ID" ] || [ -z "$TOKENCYCLE_ID" ]; then
+        fail_case "reclaim-token-create" "two non-empty fixture ids" "'$TOKENMATCH_ID' / '$TOKENCYCLE_ID'"
+    else
+        BD update "$TOKENMATCH_ID" --add-label kranz >/dev/null 2>&1
+        BD update "$TOKENMATCH_ID" --claim >/dev/null 2>&1
+        BD update "$TOKENCYCLE_ID" --add-label kranz >/dev/null 2>&1
+        BD update "$TOKENCYCLE_ID" --claim >/dev/null 2>&1
+        # The same normalization the sweep's lease_pid_token applies (tr
+        # collapses padding; both edge whitespaces stripped — ps emits a
+        # trailing space, which cost this fixture one red round).
+        SELF_TOKEN=$(ps -o lstart= -p $$ 2>/dev/null | tr -s ' ' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        if [ -z "$SELF_TOKEN" ]; then
+            echo "RECLAIM-TOKEN: SKIP (ps -o lstart= unavailable on this host)"
+        else
+            # Alive-by-token: this process's pid with its true start token.
+            printf '%s %s %s\n' "$$" "$(date +%s)" "$SELF_TOKEN" > "$LEASE_DIR/$TOKENMATCH_ID.lease"
+            # Recycled-pid reading: the same live pid, wrong token.
+            printf '%s %s %s\n' "$$" "$(date +%s)" "bogus-not-the-real-start-time" > "$LEASE_DIR/$TOKENCYCLE_ID.lease"
+
+            sleep 1 # standard TTL=0 sub-second skew guard
+
+            PATH="$LEASE_STUB_BIN:$PATH" GC_CITY="$CITY_DIR" KRANZ_LABEL="kranz" \
+                KRANZ_LEASE_DIR="$LEASE_DIR" KRANZ_CLAIM_TTL=0 \
+                "$BIN_DIR/kranz-dispatch" --reclaim >/dev/null 2>&1
+            TOKEN_MATCH_STATUS=$(status_of "$TOKENMATCH_ID")
+            TOKEN_CYCLE_STATUS=$(status_of "$TOKENCYCLE_ID")
+
+            if [ "$TOKEN_MATCH_STATUS" != "in_progress" ]; then
+                fail_case "reclaim-token-match-stands" "alive-by-token claim preserved at TTL=0" "$TOKEN_MATCH_STATUS"
+            elif [ "$TOKEN_CYCLE_STATUS" != "open" ]; then
+                fail_case "reclaim-token-mismatch-falls-to-ttl" "recycled-pid reading falls to the TTL backstop (released at TTL=0)" "$TOKEN_CYCLE_STATUS"
+            else
+                echo "RECLAIM-TOKEN: PASS (alive-by-token stands; recycled-pid reading falls to the TTL backstop)"
+            fi
         fi
     fi
 fi
