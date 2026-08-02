@@ -106,11 +106,33 @@ pub fn contract_gate_reports(
     lint: Option<&ContractLintReport>,
     tree_root: &Path,
 ) -> Vec<GateReport> {
+    let mut pipeline = GatePipeline::new();
+    register_contract_gates(&mut pipeline, contract, lint, tree_root);
+    pipeline.evaluate()
+}
+
+/// Register the engine floor gates into `pipeline` WITHOUT evaluating —
+/// the composition seam for surfaces that evaluate the floor together with
+/// MORE gates (the pack contract's final-gate surface, ticket
+/// `.kranz/tickets/pack-contract-gates-prompts.md`). Registration order IS
+/// the evaluation order within the pipeline's deterministic section
+/// (gate.rs), so a caller building a shared pipeline must call this FIRST:
+/// the floor then precedes anything registered later by construction, and a
+/// pack can add to the floor but never precede or displace it.
+///
+/// Registers nothing when the contract has no command assertions (the same
+/// emptiness rule as [`contract_gate_reports`]). `lint` and `tree_root`
+/// carry the same meaning as there.
+pub fn register_contract_gates(
+    pipeline: &mut GatePipeline,
+    contract: &[Assertion],
+    lint: Option<&ContractLintReport>,
+    tree_root: &Path,
+) {
     let checks = command_checks(contract);
     if checks.is_empty() {
-        return Vec::new();
+        return;
     }
-    let mut pipeline = GatePipeline::new();
     pipeline
         .register(Box::new(VacuousFilterGate {
             checks: checks.clone(),
@@ -132,7 +154,6 @@ pub fn contract_gate_reports(
         }));
     }
     pipeline.register(Box::new(EnvSensitiveGate { checks }));
-    pipeline.evaluate()
 }
 
 /// Names of the gates that failed, in pipeline order — the defect-class
@@ -149,7 +170,14 @@ pub fn failed_gate_names(reports: &[GateReport]) -> Vec<&str> {
 /// and the plan.md lint section: one `- <class>: PASS|FAIL` line per gate,
 /// with the failing gate's per-assertion findings indented beneath it.
 pub fn render_gate_verdicts(reports: &[GateReport]) -> String {
-    let mut out = String::from("named contract gates (defect classes):");
+    render_verdict_block("named contract gates (defect classes):", reports)
+}
+
+/// [`render_gate_verdicts`] with a caller-chosen header line — the pack
+/// contract's final-gate surface renders the same per-gate block under its
+/// own header rather than the contract-defect one.
+pub fn render_verdict_block(header: &str, reports: &[GateReport]) -> String {
+    let mut out = String::from(header);
     for report in reports {
         let verdict = match report.outcome.verdict {
             GateVerdict::Pass => "PASS",

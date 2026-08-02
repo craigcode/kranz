@@ -660,6 +660,7 @@ pub async fn run_worker_in(
 ) -> Result<RunOutcome> {
     let (spec, run_meta) = build_worker_spec(
         cfg,
+        &paths.repo_root,
         feature,
         plan_goal,
         milestone_title,
@@ -711,6 +712,7 @@ pub async fn run_worker_in_buffered(
 ) -> Result<(Vec<EventKind>, RunOutcome)> {
     let (spec, run_meta) = build_worker_spec(
         cfg,
+        &paths.repo_root,
         feature,
         plan_goal,
         milestone_title,
@@ -837,6 +839,7 @@ fn seed_worker_env(
 #[allow(clippy::too_many_arguments)]
 fn build_worker_spec(
     cfg: &MissionConfig,
+    repo_root: &std::path::Path,
     feature: &Feature,
     plan_goal: &str,
     milestone_title: &str,
@@ -868,7 +871,26 @@ fn build_worker_spec(
     vars.insert("milestoneTitle", milestone_title.to_string());
     vars.insert("turnBudget", turn_budget);
     vars.insert("guidance", guidance.clone());
-    let role_prompt = prompts::render(prompts::text(role), &vars);
+    let mut role_prompt = prompts::render(prompts::text(role), &vars);
+
+    // Pack contract (ticket pack-contract-gates-prompts): a configured pack's
+    // prompts targeting this role append to the rendered role prompt — the
+    // append_system_prompt channel is the same plumbing the embedded
+    // template flows through, so no new prompt path is invented. The load
+    // validates and fails closed (an invalid pack errors the spawn rather
+    // than silently dropping the pack the operator configured). No packDir
+    // ⇒ None ⇒ the prompt and its recorded hash are byte-identical.
+    let pack = crate::pack::load_for_config(cfg, repo_root).map_err(EngineError::Config)?;
+    let mut pack_prompt_hash = None;
+    if let Some(pack) = &pack {
+        let section = pack.prompt_section(role);
+        if !section.is_empty() {
+            role_prompt.push_str(&section);
+            // The recorded hash must name the exact text the session ran
+            // with — the template hash would no longer be true.
+            pack_prompt_hash = Some(prompts::hash_text(&role_prompt));
+        }
+    }
 
     let mut task = format!(
         "Implement feature `{id}`: {title}\n\n\
@@ -930,7 +952,7 @@ fn build_worker_spec(
         feature_id: Some(feature.id.clone()),
         milestone_id: None,
         model: role_cfg.model.clone(),
-        prompt_hash: prompts::hash(role),
+        prompt_hash: pack_prompt_hash.unwrap_or_else(|| prompts::hash(role)),
     };
     Ok((spec, run_meta))
 }
@@ -1072,7 +1094,21 @@ pub async fn run_validator_in(
     vars.insert("contract", contract_rendered.clone());
     vars.insert("criteria", criteria.clone());
     vars.insert("commands", commands.clone());
-    let role_prompt = prompts::render(prompts::text(kind), &vars);
+    let mut role_prompt = prompts::render(prompts::text(kind), &vars);
+
+    // Pack contract (ticket pack-contract-gates-prompts): same injection as
+    // the worker path — a configured pack's prompts for this validator role
+    // append to the rendered role prompt through the same channel; the load
+    // fails closed and no packDir leaves prompt and hash byte-identical.
+    let pack = crate::pack::load_for_config(cfg, &paths.repo_root).map_err(EngineError::Config)?;
+    let mut pack_prompt_hash = None;
+    if let Some(pack) = &pack {
+        let section = pack.prompt_section(kind);
+        if !section.is_empty() {
+            role_prompt.push_str(&section);
+            pack_prompt_hash = Some(prompts::hash_text(&role_prompt));
+        }
+    }
 
     let mut task = if kind == Role::ValidatorScrutiny {
         // Scrutiny/mechanical split: scrutiny reviews the range read-only
@@ -1162,7 +1198,7 @@ pub async fn run_validator_in(
         feature_id: None,
         milestone_id: Some(milestone.id.clone()),
         model: role_cfg.model.clone(),
-        prompt_hash: prompts::hash(kind),
+        prompt_hash: pack_prompt_hash.unwrap_or_else(|| prompts::hash(kind)),
     };
     run_session(backend, spec, log, paths, run_meta, cancel).await
 }

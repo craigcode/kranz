@@ -6522,6 +6522,15 @@ async fn contract_gate_named_verdicts_reach_plan_md_and_decision() {
 /// whose target is STILL absent there passed vacuously, so an advisory
 /// decision names the class. The mission still completes: the gate records
 /// the named verdict, it does not change what passes (posture unchanged).
+///
+/// unix-only fixture: the vacuous-green shape needs shell negation
+/// (`! grep -q …`), which the final gate's `cmd /C` on Windows cannot
+/// parse (the approve-time lint always runs `sh`, the final gate runs the
+/// platform shell — a pre-existing divergence this fixture would trip,
+/// not a behavior of the gates under test). The static gate logic itself
+/// is platform-neutral and covered by the contract_gates unit tests on
+/// every platform; this test only proves the decision-event plumbing.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn contract_gate_final_gate_decision_names_vacuous_green() {
     if !setup() {
@@ -8957,5 +8966,301 @@ async fn parallel_secret_scan_refusal_is_recorded_not_swallowed() {
         worktrees.len(),
         1,
         "only the primary worktree remains: {worktrees:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Pack contract (ticket pack-contract-gates-prompts): a configured pack's
+// deterministic gate runs at the final gate and its prompt reaches the
+// target role; invalid packs fail closed; no pack ⇒ byte-identical.
+// ---------------------------------------------------------------------------
+
+/// The committed synthetic example pack — ALL vocabulary synthetic (`zz-`).
+fn pack_contract_fixture_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pack-contract-synthetic")
+}
+
+/// Minimal script set for a one-feature, validators-off mission that reaches
+/// the final gate and completes (the same shape as the other single-feature
+/// completions in this file).
+fn pack_contract_scripts() -> Vec<MockScript> {
+    vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+    ]
+}
+
+/// The worker session's rendered system prompt among the started sessions
+/// (the worker's SingleShot task is the only one naming its feature id).
+fn worker_system_prompt(backend: &MockBackend) -> String {
+    let specs: Vec<_> = backend
+        .started_specs()
+        .into_iter()
+        .filter(|s| {
+            matches!(&s.prompt, PromptMode::SingleShot(task) if task.contains("Implement feature `f-1-1`"))
+        })
+        .collect();
+    assert_eq!(specs.len(), 1, "exactly one worker session for f-1-1");
+    specs[0]
+        .append_system_prompt
+        .clone()
+        .expect("worker sessions carry an append_system_prompt")
+}
+
+/// The prompt hash recorded on the worker role's worker.spawned event.
+fn worker_prompt_hash(events: &[Event]) -> String {
+    events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::WorkerSpawned {
+                role: Role::Worker,
+                prompt_hash,
+                ..
+            } => Some(prompt_hash.clone()),
+            _ => None,
+        })
+        .expect("worker.spawned for the worker role")
+}
+
+/// (summary, detail) of every orchestrator.decision on the log.
+fn pack_contract_decisions(events: &[Event]) -> Vec<(String, Option<String>)> {
+    events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::OrchestratorDecision { summary, detail } => {
+                Some((summary.clone(), detail.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// THE acceptance fixture: the synthetic example pack loads, its gate RUNS
+/// (its verdict is evaluated at the final-gate surface), and its prompt
+/// reaches the targeted role's prompt — and only that role's.
+#[tokio::test(flavor = "multi_thread")]
+async fn pack_contract_gate_runs_and_prompt_reaches_worker() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let backend = Arc::new(MockBackend::with_scripts(pack_contract_scripts()));
+    let cfg = MissionConfig {
+        pack_dir: Some(pack_contract_fixture_dir().display().to_string()),
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    let decisions = pack_contract_decisions(&events);
+
+    // Run-start audit: the pack and everything it registered is on the log
+    // (short summary; the full registration list rides in the detail).
+    assert!(
+        decisions.iter().any(|(summary, detail)| summary
+            .starts_with("pack contract: pack `zz-synthetic-fixture-pack` (schema 3) registered:")
+            && detail
+                .as_deref()
+                .is_some_and(|d| d.contains("zz-pack-gate-synthetic")
+                    && d.contains("zz-pack-prompt-synthetic"))),
+        "run-start pack decision missing: {decisions:?}"
+    );
+
+    // The gate RAN and its verdict was evaluated at the final-gate surface.
+    let (summary, detail) = decisions
+        .iter()
+        .find(|(summary, _)| {
+            summary.starts_with("pack `zz-synthetic-fixture-pack` gates (final gate):")
+        })
+        .expect("final-gate pack decision missing");
+    assert!(
+        summary.contains("1 deterministic gate(s) passed"),
+        "{summary}"
+    );
+    let detail = detail.as_deref().expect("verdict detail");
+    assert!(detail.contains("zz-pack-gate-synthetic: PASS"), "{detail}");
+
+    // The pack prompt reached the worker's rendered prompt — marked as pack
+    // guidance, text sourced from the pack's textFile.
+    let worker_prompt = worker_system_prompt(&backend);
+    assert!(
+        worker_prompt.contains("ZZ-SYNTHETIC-PACK-MARKER"),
+        "pack guidance missing from the worker prompt"
+    );
+    assert!(
+        worker_prompt
+            .contains("pack `zz-synthetic-fixture-pack`, prompt `zz-pack-prompt-synthetic`"),
+        "the injection is marked with its pack/prompt provenance"
+    );
+    // …and ONLY the worker's: no other session's system prompt carries it.
+    for spec in backend.started_specs() {
+        let is_worker = matches!(&spec.prompt, PromptMode::SingleShot(task) if task.contains("Implement feature `f-1-1`"));
+        if !is_worker {
+            let prompt = spec.append_system_prompt.as_deref().unwrap_or("");
+            assert!(
+                !prompt.contains("ZZ-SYNTHETIC-PACK-MARKER"),
+                "pack guidance leaked into a non-target role's prompt"
+            );
+        }
+    }
+
+    // The recorded prompt hash names the extended text, not the bare
+    // template — traceability to the exact prompt that ran.
+    assert_ne!(
+        worker_prompt_hash(&events),
+        kranz_engine::prompts::hash(Role::Worker),
+        "a pack-extended prompt must not record the bare template hash"
+    );
+}
+
+/// A failing pack gate is advisory, exactly like the engine floor gates:
+/// its verdict is named and recorded, and the mission still completes.
+/// (Also exercises repo-relative packDir resolution.)
+#[tokio::test(flavor = "multi_thread")]
+async fn pack_contract_failing_gate_is_advisory_named_and_never_blocks() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    // `exit 1` fails under both `sh -c` and `cmd /C`.
+    let pack_dir = root.join("zz-failing-pack");
+    std::fs::create_dir_all(&pack_dir).unwrap();
+    std::fs::write(
+        pack_dir.join("pack.toml"),
+        "[pack]\nname = \"zz-failing-pack\"\nschema = 3\n\n\
+         [[gate]]\nname = \"zz-pack-gate-failing\"\ncommand = \"exit 1\"\n",
+    )
+    .unwrap();
+
+    let backend = Arc::new(MockBackend::with_scripts(pack_contract_scripts()));
+    let cfg = MissionConfig {
+        pack_dir: Some("zz-failing-pack".to_string()),
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(
+        status,
+        MissionStatus::Complete,
+        "advisory: a failing pack gate never blocks completion"
+    );
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    let (summary, detail) = pack_contract_decisions(&events)
+        .into_iter()
+        .find(|(summary, _)| summary.starts_with("pack `zz-failing-pack` gates (final gate):"))
+        .expect("final-gate pack decision missing");
+    assert!(
+        summary.contains("named gate(s) failed: zz-pack-gate-failing"),
+        "{summary}"
+    );
+    let detail = detail.expect("verdict detail");
+    assert!(detail.contains("zz-pack-gate-failing: FAIL"), "{detail}");
+}
+
+/// Regression: with no packDir configured the mission is byte-identical to
+/// a pack-less engine — no pack decisions, the worker prompt is the bare
+/// rendered template, and the recorded hash is the template hash.
+#[tokio::test(flavor = "multi_thread")]
+async fn pack_contract_no_pack_behavior_is_byte_identical() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let backend = Arc::new(MockBackend::with_scripts(pack_contract_scripts()));
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    let decisions = pack_contract_decisions(&events);
+    assert!(
+        !decisions
+            .iter()
+            .any(|(summary, _)| summary.starts_with("pack contract:") || summary.contains("pack `")),
+        "no pack decisions without a pack: {decisions:?}"
+    );
+    let worker_prompt = worker_system_prompt(&backend);
+    assert!(
+        !worker_prompt.contains("Pack guidance"),
+        "no pack section without a pack"
+    );
+    assert_eq!(
+        worker_prompt_hash(&events),
+        kranz_engine::prompts::hash(Role::Worker),
+        "the bare template hash is recorded without a pack"
+    );
+}
+
+/// An invalid pack fails CLOSED at run start — the error names the
+/// offending field and no worker ever spawns.
+#[tokio::test(flavor = "multi_thread")]
+async fn pack_contract_invalid_pack_fails_closed_at_run_start() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let pack_dir = root.join("zz-broken-pack");
+    std::fs::create_dir_all(&pack_dir).unwrap();
+    std::fs::write(
+        pack_dir.join("pack.toml"),
+        "[pack]\nname = \"zz-broken-pack\"\nschema = 3\n\n\
+         [[gate]]\nname = \"zz-dup\"\ncommand = \"cd .\"\n\n\
+         [[gate]]\nname = \"zz-dup\"\ncommand = \"cd .\"\n",
+    )
+    .unwrap();
+
+    let backend = Arc::new(MockBackend::with_scripts(pack_contract_scripts()));
+    let cfg = MissionConfig {
+        pack_dir: Some("zz-broken-pack".to_string()),
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let err = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .expect_err("an invalid pack must fail the run closed");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("duplicate [[gate]] name `zz-dup`"),
+        "the error names the offending field: {msg}"
+    );
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::WorkerSpawned { .. })),
+        "nothing spends when the pack cannot load"
     );
 }

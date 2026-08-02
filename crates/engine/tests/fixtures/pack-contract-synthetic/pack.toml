@@ -1,0 +1,17 @@
+# Synthetic example pack for the pack-contract mission fixtures (ticket
+# pack-contract-gates-prompts). ALL vocabulary is synthetic — the `zz-`
+# prefix marks every identifier as belonging to no real domain, team, or
+# system. Registers one deterministic gate (`cd .`, which succeeds under
+# both `sh -c` and `cmd /C`) and one worker prompt sourced from a file.
+[pack]
+name = "zz-synthetic-fixture-pack"
+schema = 3
+
+[[gate]]
+name = "zz-pack-gate-synthetic"
+command = "cd ."
+
+[[prompt]]
+name = "zz-pack-prompt-synthetic"
+role = "worker"
+textFile = "prompts/worker.md"

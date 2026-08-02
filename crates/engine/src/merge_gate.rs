@@ -69,7 +69,10 @@ pub fn parse_gate_suite(bytes: &[u8]) -> Result<GateSuite, String> {
     Ok(suite)
 }
 
-fn normalize_relative_path(raw: &str, dot_for_empty: bool) -> String {
+/// Message-free `.`-component normalization, shared with the pack contract
+/// ([`crate::pack`]) — same normalization, pack-worded errors live with the
+/// caller.
+pub(crate) fn normalize_relative_path(raw: &str, dot_for_empty: bool) -> String {
     let normalized = Path::new(raw)
         .components()
         .filter_map(|component| match component {
@@ -177,8 +180,16 @@ where
 }
 
 fn gate_applies(gate: &Gate, changed_paths: &[String]) -> bool {
-    gate.when_paths.is_empty()
-        || gate.when_paths.iter().any(|prefix| {
+    when_paths_match(&gate.when_paths, changed_paths)
+}
+
+/// The `whenPaths` applicability rule, shared with the pack contract
+/// ([`crate::pack`]): empty prefixes match everything (the gate runs
+/// unconditionally); otherwise at least one changed path must equal a prefix
+/// or sit below it. Trailing slashes on a prefix are insignificant.
+pub(crate) fn when_paths_match(when_paths: &[String], changed_paths: &[String]) -> bool {
+    when_paths.is_empty()
+        || when_paths.iter().any(|prefix| {
             let prefix = prefix.trim_end_matches('/');
             changed_paths.iter().any(|path| {
                 path == prefix

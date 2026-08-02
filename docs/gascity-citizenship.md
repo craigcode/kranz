@@ -35,7 +35,9 @@ not register a city.
 
 - **`packaging/gascity/pack.toml`** — the pack manifest (name "kranz", schema
   2); the file `gc lint` validates and the unit a future `gc pack` remote
-  source would fetch.
+  source would fetch. (Schema 3 — packs declaring gates, prompts, checklists,
+  and artefact stores that kranz itself validates and runs, fully locally —
+  is the pack contract in [pack-contract.md](pack-contract.md).)
 
 - **`packaging/gascity/orders/kranz-dispatch.toml`** — the order config that
   wires `bin/kranz-dispatch` into the city (see below). `trigger =

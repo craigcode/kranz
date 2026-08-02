@@ -875,6 +875,15 @@ pub struct MissionConfig {
     /// local-worktree; unknown names fail closed at run start.
     #[serde(default)]
     pub workspace: WorkspaceConfig,
+    /// Pack contract (ticket `pack-contract-gates-prompts`): directory of the
+    /// pack this mission runs with — a `pack.toml` declaring deterministic
+    /// gates, role prompts, checklists, and artefact stores
+    /// (docs/pack-contract.md). Relative paths resolve against the repo
+    /// root. Loaded and validated (fail-closed, naming the offending field)
+    /// at run start and at each consuming surface; absent ⇒ byte-identical
+    /// pack-less behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pack_dir: Option<String>,
 }
 
 impl Default for MissionConfig {
@@ -947,6 +956,7 @@ impl Default for MissionConfig {
             worker_isolation: WorkerIsolation::Worktree,
             contract_env_passthrough: vec![],
             workspace: WorkspaceConfig::default(),
+            pack_dir: None,
         }
     }
 }

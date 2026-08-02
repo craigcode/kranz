@@ -2110,6 +2110,32 @@ impl MissionEngine {
         let teardown_mode = crate::workspace_provider::teardown_mode(&self.state.config.workspace)?;
         self.workspace_provider = Some(Arc::clone(&provider));
 
+        // Pack contract (ticket pack-contract-gates-prompts): validate the
+        // configured pack BEFORE any side effects — an invalid pack fails
+        // closed here, at run start, the same backstop as provider
+        // resolution above, rather than silently degrading to pack-less
+        // behavior at the surfaces that consume it (the final gate, the
+        // role-prompt builders). No packDir ⇒ None ⇒ byte-identical run.
+        // The summary stays short (decision summaries are length-capped);
+        // the full registration list rides in the detail.
+        if let Some(pack) = crate::pack::load_for_config(&self.state.config, &self.paths.repo_root)
+            .map_err(EngineError::Config)?
+        {
+            self.emit_decision(
+                &format!(
+                    "pack contract: pack `{}` (schema {}) registered: {} gate(s), \
+                     {} prompt(s), {} checklist(s), {} artefact store(s)",
+                    pack.name,
+                    pack.schema,
+                    pack.gates.len(),
+                    pack.prompts.len(),
+                    pack.checklists.len(),
+                    pack.artefact_stores.len(),
+                ),
+                Some(pack.describe()),
+            )?;
+        }
+
         // Branch isolation: workers commit on the mission branch, never on
         // whatever branch the operator (or a previous mission/draft) left
         // checked out. Approval created and checked out the branch, but
@@ -4228,12 +4254,17 @@ impl MissionEngine {
         let commits = self.active_repo().commits_between(&base, "HEAD")?;
         let gate_mission_id = self.state.mission.id.clone();
         let mut non_meta_commit_count = 0usize;
+        // The union of paths the mission diff touches — the `whenPaths`
+        // scoping input for pack gates below (merge-gate idiom: a scoped
+        // gate runs when at least one changed path sits under a prefix).
+        let mut changed_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
         for commit in &commits {
             let paths = commit_changed_paths(self.active_repo(), &commit.sha)?;
             if !contract_sweep::is_meta_commit_with_paths(&commit.subject, &gate_mission_id, &paths)
             {
                 non_meta_commit_count += 1;
             }
+            changed_paths.extend(paths);
         }
         if non_meta_commit_count == 0 {
             self.emit(EventKind::MissionFailed {
@@ -4291,9 +4322,55 @@ impl MissionEngine {
         // the command outcomes and findings above are unchanged — this
         // records the named verdicts so a vacuously-green contract is
         // visible in the event log instead of silently trusted.
-        let final_gate_reports =
-            contract_gates::contract_gate_reports(&contract, None, self.active_root());
-        let failed_gates = contract_gates::failed_gate_names(&final_gate_reports);
+        //
+        // ONE shared pipeline (ticket pack-contract-gates-prompts): the
+        // engine floor gates register FIRST and the configured pack's
+        // deterministic gates register AFTER — registration order is the
+        // evaluation order within the deterministic section (gate.rs), so a
+        // pack can add to the floor but never precede, displace, or replace
+        // it (a pack gate named like a floor gate was already refused at
+        // load). Pack gate commands run FIRST, before the pipeline exists:
+        // Gate::evaluate is synchronous (and the pipeline is not Send, so it
+        // must never be held across an await) while the engine's bounded
+        // shell runner is async — each gate captures its command's outcome
+        // (same cleared contract env and active root as the contract
+        // assertions above) and the pipeline still owns ordering and
+        // reporting — see pack.rs's module docs. Same advisory posture as
+        // the floor: a failing pack gate is recorded, never blocking.
+        let pack = crate::pack::load_for_config(&self.state.config, &self.paths.repo_root)
+            .map_err(EngineError::Config)?;
+        let mut pack_gates: Vec<crate::pack::PackGate> = Vec::new();
+        if let Some(pack) = &pack {
+            let changed_paths: Vec<String> = changed_paths.into_iter().collect();
+            for decl in pack.gates_for_paths(&changed_paths) {
+                let (ok, output) = run_shell_command(self.active_root(), &decl.command, &env).await;
+                pack_gates.push(crate::pack::PackGate::from_run(
+                    &decl.name,
+                    &decl.command,
+                    ok,
+                    output,
+                ));
+            }
+        }
+        // The pipeline is scoped to this block: it is not Send (Box<dyn
+        // Gate>), so it must be fully dropped before the next await below.
+        let (floor_reports, pack_reports) = {
+            let mut pipeline = crate::gate::GatePipeline::new();
+            contract_gates::register_contract_gates(
+                &mut pipeline,
+                &contract,
+                None,
+                self.active_root(),
+            );
+            let floor_gate_count = pipeline.len();
+            for gate in pack_gates {
+                pipeline.register(Box::new(gate));
+            }
+            let final_gate_reports = pipeline.evaluate();
+            let (floor, pack) = final_gate_reports.split_at(floor_gate_count);
+            (floor.to_vec(), pack.to_vec())
+        };
+        let failed_gates = contract_gates::failed_gate_names(&floor_reports);
         if !failed_gates.is_empty() {
             self.emit_decision(
                 &format!(
@@ -4301,8 +4378,38 @@ impl MissionEngine {
                      command outcomes and findings above are unchanged",
                     failed_gates.join(", ")
                 ),
-                Some(contract_gates::render_gate_verdicts(&final_gate_reports)),
+                Some(contract_gates::render_gate_verdicts(&floor_reports)),
             )?;
+        }
+        // The pack's verdicts are recorded whenever a configured pack had
+        // applicable gates — pass or fail, since a pack's silent green is
+        // exactly as invisible as its failure would be. No pack ⇒ no
+        // decision ⇒ byte-identical behavior.
+        if let Some(pack) = &pack {
+            if !pack_reports.is_empty() {
+                let failed_pack = contract_gates::failed_gate_names(&pack_reports);
+                let summary = if failed_pack.is_empty() {
+                    format!(
+                        "pack `{}` gates (final gate): {} deterministic gate(s) passed — advisory only",
+                        pack.name,
+                        pack_reports.len()
+                    )
+                } else {
+                    format!(
+                        "pack `{}` gates (final gate): named gate(s) failed: {} — advisory only; \
+                         command outcomes and findings above are unchanged",
+                        pack.name,
+                        failed_pack.join(", ")
+                    )
+                };
+                self.emit_decision(
+                    &summary,
+                    Some(contract_gates::render_verdict_block(
+                        &format!("pack `{}` gates:", pack.name),
+                        &pack_reports,
+                    )),
+                )?;
+            }
         }
 
         // agent-judgement assertions — one orchestrator verdicts turn.

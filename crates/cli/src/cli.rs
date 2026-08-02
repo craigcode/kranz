@@ -464,6 +464,31 @@ pub enum Command {
         #[command(subcommand)]
         command: crate::config_cmd::ConfigCommand,
     },
+
+    /// Work with kranz packs (the pack contract: deterministic gates, role
+    /// prompts, checklists, artefact stores — docs/pack-contract.md)
+    Pack {
+        #[command(subcommand)]
+        command: PackCommand,
+    },
+}
+
+/// Subcommands under `kranz pack` — the pack contract surface (ticket
+/// `.kranz/tickets/pack-contract-gates-prompts.md`).
+#[derive(Subcommand, Debug)]
+pub enum PackCommand {
+    /// Load and validate a pack directory fully locally, printing what it
+    /// registers (gates, prompts, checklists, artefact stores).
+    ///
+    /// A directory without a pack.toml is not a pack — the command says so
+    /// plainly and exits 0. An invalid pack fails closed: nonzero exit
+    /// naming the offending field (unknown field, wrong type, missing
+    /// required key, empty gate command, duplicate name, model-judged gate
+    /// kind, engine-reserved gate name).
+    Lint {
+        /// The pack directory containing pack.toml
+        dir: PathBuf,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -621,6 +646,17 @@ mod tests {
                 assert_eq!(read_token.as_deref(), Some("ro-123"))
             }
             other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pack_contract_pack_lint_parses_dir() {
+        let cli = Cli::try_parse_from(["kranz", "pack", "lint", "some/dir"]).unwrap();
+        match cli.command {
+            Command::Pack { command } => match command {
+                PackCommand::Lint { dir } => assert_eq!(dir, PathBuf::from("some/dir")),
+            },
+            other => panic!("expected Pack, got {other:?}"),
         }
     }
 

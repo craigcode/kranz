@@ -314,6 +314,9 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
         Command::Config { command } => {
             crate::config_cmd::cmd_config(&repo, command, cli.mission.as_deref())
         }
+        Command::Pack { command } => match command {
+            crate::cli::PackCommand::Lint { dir } => cmd_pack_lint(&dir),
+        },
         Command::Otel {
             endpoint,
             from_start,
@@ -1242,6 +1245,32 @@ pub fn cmd_scan(repo: &Path, staged: bool, range: Option<&str>) -> Result<i32> {
             kranz_engine::scrub::format_findings(&findings)
         );
         Ok(2)
+    }
+}
+
+/// `kranz pack lint <dir>` (ticket pack-contract-gates-prompts): fully-local
+/// pack contract validation — no City infrastructure, no repo needed. A
+/// valid pack prints what it registered; a directory without a pack.toml is
+/// not a pack and says so plainly (exit 0); an invalid pack fails closed
+/// with exit 1 naming the offending field.
+fn cmd_pack_lint(dir: &Path) -> Result<i32> {
+    match kranz_engine::pack::Pack::load(dir) {
+        Ok(Some(pack)) => {
+            print!("{}", kranz_engine::pack::render_lint(&pack));
+            Ok(0)
+        }
+        Ok(None) => {
+            println!(
+                "no pack at {} (no {}) — nothing to lint",
+                dir.display(),
+                kranz_engine::pack::PACK_MANIFEST
+            );
+            Ok(0)
+        }
+        Err(err) => {
+            eprintln!("invalid pack at {}: {err}", dir.display());
+            Ok(1)
+        }
     }
 }
 
