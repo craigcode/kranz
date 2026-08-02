@@ -2359,7 +2359,7 @@ impl MissionEngine {
                     }
                 }
             }
-            std::fs::remove_file(&path)?;
+            control::acknowledge(&self.paths, &path)?;
         }
         Ok(())
     }

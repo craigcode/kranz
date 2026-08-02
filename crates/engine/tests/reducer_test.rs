@@ -1686,6 +1686,35 @@ fn snapshot_round_trips_atomically() {
     assert_eq!(read_snapshot(&path).unwrap().last_seq, state.last_seq);
 }
 
+#[cfg(unix)]
+#[test]
+fn snapshot_write_refuses_symlinked_mission_parent_without_touching_target() {
+    use kranz_engine::paths::MissionPaths;
+    use std::os::unix::fs::symlink;
+
+    let repo = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let missions = repo.path().join(".kranz").join("missions");
+    std::fs::create_dir_all(&missions).unwrap();
+    std::fs::write(outside.path().join("state.json"), "outside").unwrap();
+    symlink(outside.path(), missions.join("m-hostile")).unwrap();
+    let paths = MissionPaths::new(repo.path(), "m-hostile");
+    let state = fold_kinds(vec![created()]);
+
+    let error = write_snapshot(&state, &paths.state_file())
+        .expect_err("snapshot writes must not follow a symlinked mission directory");
+
+    assert!(error.to_string().contains("refusing"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(outside.path().join("state.json")).unwrap(),
+        "outside"
+    );
+    assert!(
+        !outside.path().join("state.json.tmp").exists(),
+        "capability-relative temp creation must not reach the symlink target"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Wire format (§4.3 envelope): exact JSON shape, including key order
 // ---------------------------------------------------------------------------

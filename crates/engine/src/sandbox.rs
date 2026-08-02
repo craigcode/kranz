@@ -272,6 +272,19 @@ pub(crate) fn absolutize(path: &Path) -> PathBuf {
     }
 }
 
+/// Make a path absolute without resolving any component. Mount destinations
+/// must name the inspected leaf itself; canonicalizing a hostile symlink
+/// would instead mask its target and leave the leaf replaceable.
+fn lexical_absolute(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
+}
+
 /// Escape a path for embedding in an SBPL string literal.
 fn escape_sbpl_literal(path: &Path) -> String {
     escape_sbpl_string(&path.to_string_lossy())
@@ -606,6 +619,19 @@ pub fn bubblewrap_args(
     // best-effort: proceeding would silently leave the metadata writable —
     // fail the spawn instead (3rd-pass review).
     let write_denies = mission_write_denies(inputs);
+    for path in &write_denies.files {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => {
+                return Err(crate::error::EngineError::InvalidState(format!(
+                    "bwrap mask prep: {} exists and is not a regular file",
+                    path.display()
+                )))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
     for path in write_denies
         .files
         .iter()
@@ -615,50 +641,32 @@ pub fn bubblewrap_args(
         match metadata {
             // A regular file already there: mask binds over it as-is.
             Ok(m) if m.file_type().is_file() => continue,
-            // A SYMLINKED leaf (7th-pass review): `exists()` follows links,
-            // so a pre-existing state.json.tmp symlink previously took the
-            // early return and the mask bound over the TARGET — leaving the
-            // symlink leaf itself writable, free to be swapped to anything.
-            // Masking the leaf path covers whatever it points at, so just
-            // skip creation; the mask loop below handles the leaf as a path.
-            Ok(m) if m.file_type().is_symlink() => continue,
-            // Anything else present (dir, fifo, device): refuse — never mask
-            // over an entry we cannot reason about.
+            // Anything else present (symlink, dir, fifo, device): refuse.
+            // In particular, accepting a symlink and later canonicalizing it
+            // masks the target rather than the state.json.tmp mount point.
             Ok(_) => {
                 return Err(crate::error::EngineError::InvalidState(format!(
-                    "bwrap mask prep: {} exists and is not a regular file or symlink",
+                    "bwrap mask prep: {} exists and is not a regular file",
                     path.display()
                 )));
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                crate::error::EngineError::Io(std::io::Error::new(
-                    e.kind(),
-                    format!("bwrap mask prep: create {}: {e}", parent.display()),
-                ))
-            })?;
-        }
-        // O_NOFOLLOW (unix): a symlink planted between the stat above and
-        // this open is refused (ELOOP) rather than written through.
-        #[cfg(unix)]
-        let open_result = {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(false)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(path)
-        };
-        #[cfg(not(unix))]
-        let open_result = std::fs::OpenOptions::new()
+        // Pin the mission parent from the trusted repository anchor, then
+        // create the leaf relative to that capability with no-follow. This
+        // closes both the hostile-parent canonicalization gap and the leaf
+        // swap between metadata and open.
+        let (parent, name) = crate::paths::open_parent_nofollow(path)?;
+        use cap_fs_ext::OpenOptionsFollowExt as _;
+        use cap_primitives::fs::FollowSymlinks;
+        let mut options = cap_std::fs::OpenOptions::new();
+        options
             .create(true)
             .write(true)
             .truncate(false)
-            .open(path);
+            .follow(FollowSymlinks::No);
+        let open_result = parent.open_with(name, &options);
         open_result.map_err(|e| {
             crate::error::EngineError::Io(std::io::Error::new(
                 e.kind(),
@@ -669,8 +677,10 @@ pub fn bubblewrap_args(
     let mut write_masks: std::collections::BTreeSet<String> = write_denies
         .files
         .iter()
-        .filter(|path| path.exists())
-        .map(|path| absolutize(path).display().to_string())
+        .filter(|path| {
+            std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
+        })
+        .map(|path| lexical_absolute(path).display().to_string())
         .collect();
     // Transcripts: bwrap cannot express the Seatbelt `runs/*.jsonl` regex,
     // so mask each transcript file present at spawn individually. The sweep
@@ -680,8 +690,10 @@ pub fn bubblewrap_args(
         if let Ok(entries) = std::fs::read_dir(runs_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.is_file() && path.extension().is_some_and(|ext| ext == "jsonl") {
-                    write_masks.insert(absolutize(&path).display().to_string());
+                if entry.file_type().is_ok_and(|kind| kind.is_file())
+                    && path.extension().is_some_and(|ext| ext == "jsonl")
+                {
+                    write_masks.insert(lexical_absolute(&path).display().to_string());
                 }
             }
         }
@@ -1081,6 +1093,37 @@ mod tests {
         assert!(
             !joined.contains(&scratch_jsonl.display().to_string()),
             "runs/ subdir scratch files must not be masked: {args:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bubblewrap_mask_prep_rejects_preexisting_state_tmp_symlink() {
+        use std::os::unix::fs::symlink;
+        let repo = tempfile::tempdir().unwrap();
+        let mission = repo.path().join(".kranz").join("missions").join("m-x");
+        std::fs::create_dir_all(mission.join("runs")).unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        let target = target_dir.path().join("outside");
+        std::fs::write(&target, "unchanged").unwrap();
+        symlink(&target, mission.join("state.json.tmp")).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+
+        let error = bubblewrap_args(
+            &inputs(repo.path(), &mission, scratch.path(), vec![]),
+            Path::new("/usr/bin/claude"),
+            &[],
+        )
+        .expect_err("a symlink cannot become a bwrap mask mount point");
+
+        assert!(error.to_string().contains("not a regular file"), "{error}");
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "unchanged");
+        assert!(
+            std::fs::symlink_metadata(mission.join("state.json.tmp"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "mask preparation must not replace or follow the hostile leaf"
         );
     }
 

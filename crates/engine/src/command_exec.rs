@@ -511,7 +511,8 @@ mod tests {
     /// agent-env-clear: a contract command run through the final-gate path
     /// (`run_shell_command`, env built by `contract_command_env`) cannot see
     /// poisoned ambient secrets — but does see PATH, the per-mission scratch
-    /// HOME, KRANZ_BASE_SHA, and ambient toolchain caches.
+    /// HOME, KRANZ_BASE_SHA, the real rustup toolchain, and an isolated
+    /// cache-only Cargo home.
     #[cfg(unix)]
     #[tokio::test]
     async fn contract_command_cannot_see_ambient_secrets() {
@@ -559,14 +560,15 @@ mod tests {
             dump.contains("KRANZ_BASE_SHA=deadbeef"),
             "base sha must reach the contract env:\n{dump}"
         );
-        // Toolchain caches cross for cache locality; the registry tokens
-        // inside CARGO_HOME are denied at the sandbox layer instead.
-        if let Some(cargo_home) = std::env::var_os("CARGO_HOME") {
-            assert!(
-                dump.contains(&format!("CARGO_HOME={}", cargo_home.to_string_lossy())),
-                "toolchain caches cross from ambient when set:\n{dump}"
-            );
-        }
+        let cargo_home = env.get("CARGO_HOME").expect("CARGO_HOME");
+        assert!(
+            std::path::Path::new(cargo_home).starts_with(scratch.path()),
+            "contract CARGO_HOME must live under mission scratch: {cargo_home}"
+        );
+        assert!(
+            dump.contains(&format!("CARGO_HOME={cargo_home}")),
+            "cache-only Cargo home must reach the child:\n{dump}"
+        );
     }
 
     /// agent-env-clear design 4: `contractEnvPassthrough` admits EXACTLY the

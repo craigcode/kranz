@@ -140,33 +140,53 @@ impl CheckoutFingerprint {
 fn bounded_metadata_read(path: &std::path::Path) -> String {
     use std::io::Read as _;
     const CAP: u64 = 64 * 1024;
-    let Ok(metadata) = std::fs::symlink_metadata(path) else {
-        return String::new(); // absent — same as before (empty)
+    let mut file = match open_regular_nofollow_nonblocking(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return String::new(),
+        Err(_) => return suspect_marker(path),
+    };
+    let Ok(metadata) = file.metadata() else {
+        return "SUSPECT:unreadable".to_string();
     };
     let file_type = metadata.file_type();
     if !file_type.is_file() {
-        let kind = if file_type.is_symlink() {
-            "symlink"
-        } else if file_type.is_dir() {
-            "dir"
-        } else {
-            "special"
-        };
+        let kind = if file_type.is_dir() { "dir" } else { "special" };
         return format!("SUSPECT:{kind}");
     }
     if metadata.len() > CAP {
         return format!("SUSPECT:oversized:{}", metadata.len());
     }
-    match std::fs::File::open(path) {
-        Ok(file) => {
-            let mut buf = Vec::new();
-            match file.take(CAP).read_to_end(&mut buf) {
-                Ok(_) => String::from_utf8_lossy(&buf).into_owned(),
-                Err(_) => "SUSPECT:unreadable".to_string(),
-            }
-        }
+    let mut buf = Vec::new();
+    match (&mut file).take(CAP + 1).read_to_end(&mut buf) {
+        Ok(_) if buf.len() as u64 <= CAP => String::from_utf8_lossy(&buf).into_owned(),
+        Ok(_) => format!("SUSPECT:oversized:{}+", CAP),
         Err(_) => "SUSPECT:unreadable".to_string(),
     }
+}
+
+/// Open a validator-controlled metadata entry without following its leaf and
+/// without blocking on a FIFO. The fd is verified after open, so swapping a
+/// regular entry for a symlink/device between `readdir` and `open` cannot
+/// escape the checks.
+fn open_regular_nofollow_nonblocking(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    options.open(path)
+}
+
+fn suspect_marker(path: &std::path::Path) -> String {
+    let kind = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => "symlink",
+        Ok(metadata) if metadata.file_type().is_dir() => "dir",
+        Ok(metadata) if !metadata.file_type().is_file() => "special",
+        _ => "unreadable",
+    };
+    format!("SUSPECT:{kind}")
 }
 
 /// Sorted `name HASH` lines for the non-`.sample` hooks in `hooks_dir`
@@ -192,51 +212,51 @@ fn hook_listing(hooks_dir: &std::path::Path) -> String {
             if name.ends_with(".sample") {
                 continue;
             }
-            let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
+            let mut file = match open_regular_nofollow_nonblocking(&entry.path()) {
+                Ok(file) => file,
+                Err(_) => {
+                    lines.push(format!("{name} {}", suspect_marker(&entry.path())));
+                    continue;
+                }
+            };
+            let Ok(metadata) = file.metadata() else {
                 lines.push(format!("{name} SUSPECT:unreadable"));
                 continue;
             };
             let file_type = metadata.file_type();
             if !file_type.is_file() {
-                let kind = if file_type.is_symlink() {
-                    "symlink"
-                } else if file_type.is_dir() {
-                    "dir"
-                } else {
-                    "special"
-                };
+                let kind = if file_type.is_dir() { "dir" } else { "special" };
                 lines.push(format!("{name} SUSPECT:{kind}"));
                 continue;
             }
-            match std::fs::File::open(entry.path()) {
-                Ok(mut file) => {
-                    use std::io::{Read as _, Seek as _, SeekFrom};
-                    let len = metadata.len();
-                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                    if len <= HOOK_FULL_READ_MAX {
-                        let mut contents = Vec::new();
-                        if file.read_to_end(&mut contents).is_ok() {
-                            contents.hash(&mut hasher);
-                        } else {
-                            lines.push(format!("{name} SUSPECT:unreadable"));
-                            continue;
-                        }
-                    } else {
-                        let mut head = vec![0u8; HOOK_WINDOW as usize];
-                        let head_read = file.read(&mut head).unwrap_or(0);
-                        head[..head_read].hash(&mut hasher);
-                        let tail_start = len.saturating_sub(HOOK_WINDOW);
-                        if file.seek(SeekFrom::Start(tail_start)).is_ok() {
-                            let mut tail = vec![0u8; HOOK_WINDOW as usize];
-                            let tail_read = file.read(&mut tail).unwrap_or(0);
-                            tail[..tail_read].hash(&mut hasher);
-                        }
-                        len.hash(&mut hasher);
-                    }
-                    lines.push(format!("{name} {:016x}", hasher.finish()));
+            use std::io::{Read as _, Seek as _, SeekFrom};
+            let len = metadata.len();
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            if len <= HOOK_FULL_READ_MAX {
+                let mut contents = Vec::new();
+                if (&mut file)
+                    .take(HOOK_FULL_READ_MAX + 1)
+                    .read_to_end(&mut contents)
+                    .is_err()
+                    || contents.len() as u64 > HOOK_FULL_READ_MAX
+                {
+                    lines.push(format!("{name} SUSPECT:oversized"));
+                    continue;
                 }
-                Err(_) => lines.push(format!("{name} SUSPECT:unreadable")),
+                contents.hash(&mut hasher);
+            } else {
+                let mut head = vec![0u8; HOOK_WINDOW as usize];
+                let head_read = file.read(&mut head).unwrap_or(0);
+                head[..head_read].hash(&mut hasher);
+                let tail_start = len.saturating_sub(HOOK_WINDOW);
+                if file.seek(SeekFrom::Start(tail_start)).is_ok() {
+                    let mut tail = vec![0u8; HOOK_WINDOW as usize];
+                    let tail_read = file.read(&mut tail).unwrap_or(0);
+                    tail[..tail_read].hash(&mut hasher);
+                }
+                len.hash(&mut hasher);
             }
+            lines.push(format!("{name} {:016x}", hasher.finish()));
         }
     }
     lines.sort();
@@ -413,6 +433,81 @@ mod tests {
         assert!(listing.contains("good-hook "), "{listing}");
         // Stable: the same oddities list identically (no false drift).
         assert_eq!(listing, hook_listing(&hooks));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_reader_refuses_fifo_and_unbounded_symlink_without_opening_them() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("config-fifo");
+        let fifo_c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        let link = dir.path().join("config-link");
+        symlink("/dev/zero", &link).unwrap();
+
+        assert_eq!(bounded_metadata_read(&fifo), "SUSPECT:special");
+        assert_eq!(bounded_metadata_read(&link), "SUSPECT:symlink");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_disables_validator_controlled_fsmonitor_before_running_git() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .expect("run git")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        std::fs::write(dir.path().join("tracked"), "one").unwrap();
+        assert!(git(&["add", "tracked"]).status.success());
+        assert!(git(&[
+            "-c",
+            "user.name=kranz-test",
+            "-c",
+            "user.email=kranz@test.invalid",
+            "commit",
+            "-qm",
+            "initial",
+        ])
+        .status
+        .success());
+
+        let marker = dir.path().join("fsmonitor-ran");
+        let monitor = dir.path().join("evil-fsmonitor");
+        std::fs::write(
+            &monitor,
+            format!(
+                "#!/bin/sh\nprintf invoked > '{}'\nexit 1\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&monitor, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            git(&["config", "core.fsmonitor", monitor.to_str().unwrap()])
+                .status
+                .success()
+        );
+
+        let _ = git(&["status", "--porcelain"]);
+        assert!(
+            marker.exists(),
+            "fixture: ordinary git status runs fsmonitor"
+        );
+        std::fs::remove_file(&marker).unwrap();
+
+        let repo = GitRepo::open(dir.path()).unwrap();
+        CheckoutFingerprint::capture(&repo).unwrap();
+        assert!(
+            !marker.exists(),
+            "fingerprint capture must disable fsmonitor before its first git invocation"
+        );
     }
 
     /// An over-cap hook still hashes deterministically, and a tail change

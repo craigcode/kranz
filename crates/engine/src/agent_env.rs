@@ -14,8 +14,9 @@
 //!   ([`agent_session_env`]), never the ambient set.
 //! - **Contract/gate commands** (validation round, final gate, approval-time
 //!   contract lint) run with `env_clear` + [`contract_command_env`]: the
-//!   sanitized base plus `KRANZ_BASE_SHA`, toolchain caches, and at most the
-//!   operator's `contractEnvPassthrough` names.
+//!   sanitized base plus `KRANZ_BASE_SHA`, a cache-only Cargo home, the
+//!   non-credential toolchain locations, and at most the operator's
+//!   `contractEnvPassthrough` names.
 //!
 //! The ENGINE process itself keeps its ambient environment — the clearing
 //! applies to child processes only. Merge gates keep their own pre-existing
@@ -62,16 +63,12 @@ const AMBIENT_WINDOWS_VARS: &[&str] = &[
     "PSModulePath",
 ];
 
-/// Toolchain cache locations contract commands and agent sessions may
-/// inherit (design decision 3 of the ticket): they speed up `cargo`/`npm`
-/// gates — dropping CARGO_HOME (3rd-pass review) forces a cold registry
-/// cache per mission, which fails outright under an egress-restricted
-/// sandbox. CARGO_HOME also carries `credentials.toml` (registry auth
-/// tokens); that is handled where the boundary actually is: the sandbox
-/// profiles READ-DENY it ([`crate::sandbox::authority_read_deny_paths`]),
-/// and contract command text is operator-approved at draft time. An
-/// UNSANDBOXED contract command can still read it — the documented residual
-/// for running with `sandbox.enforce=off`.
+/// Toolchain locations children may inherit. `CARGO_HOME` is the exception:
+/// [`sanitized_child_env`] always replaces it with a per-invocation
+/// cache-only home (see [`cache_only_cargo_home`]), so neither agent sessions
+/// nor engine-run contract code receives the ambient credential/config root.
+/// `RUSTUP_HOME` must remain visible so a standard rustup shim can locate the
+/// installed toolchain.
 ///
 /// Resolution rule for each var: the ambient value when set, ELSE the
 /// default under the OPERATOR's real home (`<real home>/.rustup` etc.) when
@@ -85,6 +82,66 @@ const CONTRACT_TOOLCHAIN_VARS: &[(&str, &str)] = &[
     ("RUSTUP_HOME", ".rustup"),
     ("NPM_CONFIG_CACHE", ".npm"),
 ];
+
+/// Build a fresh Cargo home containing only the two cache directories Cargo
+/// uses for registry and git dependencies. Root-level Cargo configuration,
+/// `credentials.toml`, and the legacy `credentials` file are deliberately
+/// never copied or linked. This matters even though contract command text is
+/// operator-approved: `cargo test` executes worker-authored build scripts and
+/// test binaries outside the agent sandbox.
+///
+/// A fresh, unpredictable directory is used for every generated child env so
+/// worker code cannot pre-plant `config.toml` or a credential-provider in a
+/// stable scratch location. Only `registry/` and `git/` are linked into it;
+/// this preserves cache locality without making the operator's Cargo root
+/// reachable. Cache writes can reach those shared cache directories (the
+/// remaining trade until engine-run gates are sandbox-wrapped), but Cargo
+/// credentials and credential-provider configuration cannot. A failed link
+/// simply leaves that cache absent and lets Cargo populate the isolated home.
+fn cache_only_cargo_home(base_home: &Path) -> PathBuf {
+    let destination = base_home.join(format!(
+        ".cargo-cache-only-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    if let Err(error) = std::fs::create_dir_all(&destination) {
+        tracing::warn!(
+            path = %destination.display(),
+            error = %error,
+            "could not create cache-only Cargo home; Cargo will surface the failure"
+        );
+        return destination;
+    }
+
+    let Some(source) = toolchain_var_value("CARGO_HOME", ".cargo").map(PathBuf::from) else {
+        return destination;
+    };
+    for name in ["registry", "git"] {
+        let from = source.join(name);
+        let to = destination.join(name);
+        if !from.is_dir() {
+            continue;
+        }
+        #[cfg(unix)]
+        if let Err(error) = std::os::unix::fs::symlink(&from, &to) {
+            tracing::warn!(
+                cache = name,
+                source = %from.display(),
+                error = %error,
+                "could not seed contract Cargo cache; using an empty isolated cache"
+            );
+        }
+        #[cfg(windows)]
+        if let Err(error) = std::os::windows::fs::symlink_dir(&from, &to) {
+            tracing::warn!(
+                cache = name,
+                source = %from.display(),
+                error = %error,
+                "could not seed contract Cargo cache; using an empty isolated cache"
+            );
+        }
+    }
+    destination
+}
 
 /// The value a toolchain var resolves to for a child env: ambient when set,
 /// else `<real home>/<default_subdir>` when that directory exists.
@@ -132,10 +189,10 @@ fn managed_contract_keys() -> &'static [&'static str] {
 /// ambient — binaries must resolve), `HOME = base_home` (the scratch dir the
 /// session/command already gets, never the operator's real home),
 /// `TMPDIR = base_home/tmp`, the ambient locale vars when present, the
-/// toolchain cache vars ([`CONTRACT_TOOLCHAIN_VARS`] — see its doc for the
-/// credentials.toml handling; without them every agent session re-downloads
-/// a whole rustup toolchain and crates registry into scratch, which filled
-/// the disk and killed mission m-533143), and on
+/// non-credential toolchain locations plus the cache-only Cargo home
+/// ([`CONTRACT_TOOLCHAIN_VARS`] / [`cache_only_cargo_home`]; without cache
+/// seeding every agent session re-downloads the registry into scratch, which
+/// filled the disk and killed mission m-533143), and on
 /// Windows the process-required passthroughs ([`AMBIENT_WINDOWS_VARS`])
 /// plus `USERPROFILE = base_home`, `TEMP`/`TMP = base_home/tmp`, and
 /// `APPDATA`/`LOCALAPPDATA = base_home/AppData/{Roaming,Local}`. Then
@@ -167,15 +224,21 @@ pub fn sanitized_child_env(
             env.insert((*key).to_string(), value.to_string_lossy().into_owned());
         }
     }
-    // Toolchain caches ride for BOTH sessions and contract commands: a
-    // session without RUSTUP_HOME bootstraps a whole toolchain download
-    // into scratch (ENOSPC, m-533143). contract_command_env adds the same
-    // vars again as extras — identical values, so the overlap is a no-op.
+    // Non-credential toolchain locations ride for BOTH sessions and contract
+    // commands. CARGO_HOME is always replaced with an isolated cache-only
+    // root; no prompt-injectable child receives operator Cargo config/tokens.
     for (var, default_subdir) in CONTRACT_TOOLCHAIN_VARS {
+        if *var == "CARGO_HOME" {
+            continue;
+        }
         if let Some(value) = toolchain_var_value(var, default_subdir) {
             env.insert((*var).to_string(), value);
         }
     }
+    env.insert(
+        "CARGO_HOME".to_string(),
+        cache_only_cargo_home(base_home).display().to_string(),
+    );
     #[cfg(windows)]
     {
         for key in AMBIENT_WINDOWS_VARS {
@@ -282,7 +345,7 @@ pub fn session_env_with_home(
 /// `mission_scratch` home, plus
 ///
 /// - `KRANZ_BASE_SHA` via the shared [`crate::runner::contract_env`] idiom,
-/// - the [`CONTRACT_TOOLCHAIN_VARS`] caches from ambient when present,
+/// - a cache-only `CARGO_HOME` plus the non-credential toolchain locations,
 /// - exactly the ambient vars NAMED in `passthrough` (the mission config's
 ///   `contractEnvPassthrough` escape hatch — the sanctioned way to give a
 ///   contract one credential). Names only are logged, never values; a
@@ -296,6 +359,9 @@ pub fn contract_command_env(
     let mut extra: Vec<(String, String)> =
         crate::runner::contract_env(base_sha).into_iter().collect();
     for (var, default_subdir) in CONTRACT_TOOLCHAIN_VARS {
+        if *var == "CARGO_HOME" {
+            continue;
+        }
         if let Some(value) = toolchain_var_value(var, default_subdir) {
             extra.push(((*var).to_string(), value));
         }
@@ -609,10 +675,10 @@ mod tests {
     }
 
     /// 7th-pass review: a standard rustup install exports NEITHER
-    /// RUSTUP_HOME nor CARGO_HOME — the child env must derive both from
-    /// the OPERATOR's real home, not the scratch home, or `cargo --version`
-    /// fails "no default is configured". Proven by actually executing
-    /// cargo under the generated env.
+    /// RUSTUP_HOME nor CARGO_HOME. RUSTUP_HOME must derive from the
+    /// OPERATOR's real home or the shim fails "no default is configured";
+    /// CARGO_HOME must instead be isolated under scratch. Proven by actually
+    /// executing Cargo under the generated env.
     #[cfg(unix)]
     #[test]
     fn contract_env_derives_toolchain_homes_from_the_real_home_and_cargo_runs() {
@@ -622,16 +688,23 @@ mod tests {
 
         let env = contract_command_env(scratch.path(), None, &[]);
 
-        // The derivation (not the scratch) supplies both homes.
+        // The operator's rustup toolchain remains discoverable, while Cargo's
+        // config/credential home is a fresh cache-only directory.
         assert_eq!(
             env.get("RUSTUP_HOME").map(String::as_str),
             Some(real_home.join(".rustup").display().to_string().as_str()),
             "RUSTUP_HOME derives from the operator's real home"
         );
-        assert_eq!(
-            env.get("CARGO_HOME").map(String::as_str),
-            Some(real_home.join(".cargo").display().to_string().as_str()),
-            "CARGO_HOME derives from the operator's real home"
+        let cargo_home = PathBuf::from(env.get("CARGO_HOME").expect("CARGO_HOME"));
+        assert!(
+            cargo_home.starts_with(scratch.path()),
+            "CARGO_HOME must be isolated under mission scratch: {}",
+            cargo_home.display()
+        );
+        assert_ne!(
+            cargo_home,
+            real_home.join(".cargo"),
+            "the operator's real Cargo home must never reach contract code"
         );
 
         // And cargo actually executes under the generated env: not a PATH
@@ -656,11 +729,10 @@ mod tests {
         );
     }
 
-    /// Contract env (design decision 3): base-sha + toolchain caches +
-    /// passthrough names cross; ambient secrets do not; a passthrough entry
-    /// naming a managed key — in ANY letter casing — is refused. CARGO_HOME
-    /// crosses (the registry cache makes contract gates viable); its
-    /// credentials.toml is denied at the sandbox layer instead.
+    /// Contract env: base-sha + non-credential toolchain caches + passthrough
+    /// names cross; ambient secrets do not; a passthrough entry naming a
+    /// managed key — in ANY letter casing — is refused. CARGO_HOME always
+    /// points at a fresh cache-only directory under mission scratch.
     #[test]
     fn contract_command_env_shapes_the_gate_boundary() {
         let _guard = EnvTestGuard::engage(&[
@@ -682,11 +754,19 @@ mod tests {
             Some("/poisoned/rustup-home"),
             "toolchain caches cross from ambient"
         );
-        assert_eq!(
-            env.get("CARGO_HOME").map(String::as_str),
-            Some("/poisoned/cargo-home"),
-            "CARGO_HOME crosses (cache locality); credentials.toml is denied at the sandbox"
+        let cargo_home = PathBuf::from(env.get("CARGO_HOME").expect("CARGO_HOME"));
+        assert!(
+            cargo_home.starts_with(scratch.path()),
+            "CARGO_HOME must be cache-only mission scratch: {}",
+            cargo_home.display()
         );
+        assert_ne!(cargo_home, PathBuf::from("/poisoned/cargo-home"));
+        for forbidden in ["credentials.toml", "credentials", "config.toml", "config"] {
+            assert!(
+                !cargo_home.join(forbidden).exists(),
+                "cache-only Cargo home copied forbidden root file {forbidden}"
+            );
+        }
         assert!(!env.contains_key("GH_TOKEN"));
         assert!(
             !env.contains_key("KRANZ_AGENT_ENV_TEST_CRED"),
@@ -722,5 +802,43 @@ mod tests {
             !env.contains_key("KRANZ_BASE_SHA"),
             "no base sha pinned => no KRANZ_BASE_SHA key"
         );
+    }
+
+    /// The cache seed admits only registry/git. Root Cargo credentials and
+    /// credential-provider configuration stay outside the child namespace,
+    /// while cache contents remain available for offline/egress-restricted
+    /// contract gates.
+    #[cfg(unix)]
+    #[test]
+    fn contract_cargo_home_contains_caches_but_no_credentials_or_config() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(source.path().join("registry")).unwrap();
+        std::fs::create_dir_all(source.path().join("git")).unwrap();
+        std::fs::write(source.path().join("registry/cache-marker"), "registry").unwrap();
+        std::fs::write(source.path().join("git/cache-marker"), "git").unwrap();
+        for name in ["credentials.toml", "credentials", "config.toml", "config"] {
+            std::fs::write(source.path().join(name), "operator-secret").unwrap();
+        }
+        let _guard = EnvTestGuard::engage(&[(
+            "CARGO_HOME",
+            source.path().to_str().expect("utf-8 temp path"),
+        )]);
+        let scratch = tempfile::tempdir().unwrap();
+
+        let env = contract_command_env(scratch.path(), None, &[]);
+        let cargo_home = PathBuf::from(env.get("CARGO_HOME").expect("CARGO_HOME"));
+
+        for cache in ["registry", "git"] {
+            assert_eq!(
+                std::fs::read_to_string(cargo_home.join(cache).join("cache-marker")).unwrap(),
+                cache
+            );
+        }
+        for forbidden in ["credentials.toml", "credentials", "config.toml", "config"] {
+            assert!(
+                std::fs::symlink_metadata(cargo_home.join(forbidden)).is_err(),
+                "cache-only Cargo home exposed {forbidden}"
+            );
+        }
     }
 }

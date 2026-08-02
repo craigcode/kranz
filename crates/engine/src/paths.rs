@@ -20,6 +20,7 @@ use crate::error::{EngineError, Result};
 use cap_fs_ext::DirExt as _;
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
+use std::ffi::OsString;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
@@ -331,6 +332,93 @@ pub(crate) fn create_real_subdir(dir: &Dir, name: &str, full_path: &Path) -> Res
     }
 }
 
+/// Open a real child directory beneath an already-pinned capability,
+/// optionally creating it. The returned capability is the one callers must
+/// retain for subsequent reads, writes, removals, and renames; going back to
+/// the absolute display path would reintroduce a parent-swap window.
+pub(crate) fn open_real_subdir(
+    dir: &Dir,
+    name: &str,
+    full_path: &Path,
+    create: bool,
+) -> Result<Dir> {
+    open_child_dir_nofollow(dir, name, full_path, create)
+}
+
+/// Locate the LAST `.kranz` component whose suffix has a recognized runtime
+/// layout. Using the last matching component matters when a perfectly valid
+/// repository itself lives below an unrelated ancestor named `.kranz`.
+fn mission_layout_anchor(components: &[std::path::Component<'_>]) -> Option<usize> {
+    components
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(idx, component)| {
+            if !matches!(component, std::path::Component::Normal(os) if *os == ".kranz") {
+                return None;
+            }
+            let after = &components[idx + 1..];
+            match after.first() {
+                Some(std::path::Component::Normal(os)) if *os == "missions" => {
+                    if let Some(std::path::Component::Normal(id)) = after.get(1) {
+                        MissionPaths::is_safe_id(&id.to_string_lossy()).then_some(idx)
+                    } else {
+                        None
+                    }
+                }
+                Some(std::path::Component::Normal(os)) if *os == "tickets" => Some(idx),
+                _ => None,
+            }
+        })
+}
+
+/// Pin the parent of `path` and return its leaf name. Mission-layout paths
+/// are resolved from the trusted repository prefix and every component from
+/// `.kranz` downward is opened no-follow. This is the write-side counterpart
+/// of [`open_read_nofollow`]: callers perform the eventual open/rename/remove
+/// relative to the returned capability, never through the absolute path that
+/// was checked.
+///
+/// Paths outside the mission/ticket layout are used by unit-test scratch
+/// fixtures and retain the weaker canonical-parent tier described by
+/// [`open_read_nofollow`].
+pub(crate) fn open_parent_nofollow(path: &Path) -> Result<(Dir, OsString)> {
+    let name = path.file_name().map(OsString::from).ok_or_else(|| {
+        EngineError::InvalidState(format!("path {} has no file name", path.display()))
+    })?;
+    let components: Vec<_> = path.components().collect();
+    let anchor_info = mission_layout_anchor(&components);
+
+    if let Some(idx) = anchor_info {
+        let anchor: PathBuf = components[..idx].iter().collect();
+        let anchor = if anchor.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            anchor
+        };
+        let mut dir = Dir::open_ambient_dir(&anchor, ambient_authority())?;
+        let parent_end = components.len().saturating_sub(1);
+        let mut walked = anchor;
+        for component in &components[idx..parent_end] {
+            let std::path::Component::Normal(component) = component else {
+                return Err(unsafe_mission_dir_path(path));
+            };
+            let Some(component) = component.to_str() else {
+                return Err(unsafe_mission_dir_path(path));
+            };
+            walked.push(component);
+            dir = open_child_dir_nofollow(&dir, component, &walked, false)?;
+        }
+        return Ok((dir, name));
+    }
+
+    let parent = path.parent().ok_or_else(|| {
+        EngineError::InvalidState(format!("path {} has no parent", path.display()))
+    })?;
+    let parent = parent.canonicalize()?;
+    Ok((Dir::open_ambient_dir(parent, ambient_authority())?, name))
+}
+
 /// Open `path` for reading with the mission-tree chain pinned
 /// (7th-pass review): when the path carries the mission layout
 /// (`<root>/.kranz/missions/<id>/...` or `<root>/.kranz/tickets/...`), the
@@ -354,25 +442,9 @@ pub(crate) fn open_read_nofollow(path: &Path) -> Result<std::fs::File> {
         use cap_fs_ext::DirExt as _;
 
         let components: Vec<_> = path.components().collect();
-        let kranz_at = components
-            .iter()
-            .position(|c| matches!(c, std::path::Component::Normal(os) if *os == ".kranz"));
         // The mission layout yields a trusted prefix + an untrusted suffix
         // to pin; anything else takes the weaker tier.
-        let anchor_info = kranz_at.and_then(|idx| {
-            let after: Vec<_> = components[idx + 1..].iter().collect();
-            match after.first() {
-                Some(std::path::Component::Normal(os)) if *os == "missions" => {
-                    if let Some(std::path::Component::Normal(id)) = after.get(1) {
-                        MissionPaths::is_safe_id(&id.to_string_lossy()).then_some(idx)
-                    } else {
-                        None
-                    }
-                }
-                Some(std::path::Component::Normal(os)) if *os == "tickets" => Some(idx),
-                _ => None,
-            }
-        });
+        let anchor_info = mission_layout_anchor(&components);
 
         if let Some(idx) = anchor_info {
             // Trusted anchor: everything before `.kranz` ("/" when relative).
@@ -389,9 +461,13 @@ pub(crate) fn open_read_nofollow(path: &Path) -> Result<std::fs::File> {
                     return Err(unsafe_mission_dir_path(path));
                 };
                 if components_iter.peek().is_some() {
-                    dir = dir
-                        .open_dir_nofollow(name)
-                        .map_err(|_| unsafe_mission_dir_path(path))?;
+                    dir = dir.open_dir_nofollow(name).map_err(|error| {
+                        if error.kind() == ErrorKind::NotFound {
+                            EngineError::Io(error)
+                        } else {
+                            unsafe_mission_dir_path(path)
+                        }
+                    })?;
                 } else {
                     return open_file_nofollow_under(&dir, name, path);
                 }
@@ -453,6 +529,7 @@ fn open_read_nofollow_weaker_tier(path: &Path) -> Result<std::fs::File> {
 /// check-then-open window a concurrent writer could swap a symlink into.
 /// Readers should use [`open_read_nofollow`] instead, which closes that
 /// window on unix.
+#[cfg(any(not(unix), test))]
 pub(crate) fn ensure_absent_or_regular_file(path: &Path) -> Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() => Ok(()),
