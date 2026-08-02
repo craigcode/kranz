@@ -466,8 +466,8 @@ fn parse_array(text: &str, line_no: usize) -> Result<Value, String> {
             let end = rest
                 .find([',', ']'])
                 .ok_or_else(|| format!("line {line_no}: unterminated `[` in array value"))?;
-            let token = rest[..end].trim();
-            let value = parse_value(token, line_no)?;
+            let raw = rest[..end].trim();
+            let value = parse_value(raw, line_no)?;
             (value, &rest[end..])
         };
         items.push(element);
