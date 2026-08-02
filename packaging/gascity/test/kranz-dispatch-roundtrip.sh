@@ -1632,6 +1632,22 @@ STRING_ID=$(printf '%s' "$STRING_CREATE_OUT" | unwrap | jq -r '.id // empty')
 ARRAY_ID="rt-array-1"
 NOACCEPT_ID="rt-noaccept-1"
 EMPTYARR_ID="rt-emptyarr-1"
+
+# EXTERNAL-REF fixtures (D-BW-2 brief 2, outbound leg): two more real
+# beads joining the same drain — one with no external_ref (dispatch must
+# stamp kranz-<slug-of-title>), one with a pre-existing ref (dispatch must
+# NOT clobber it). Created here so the gc stub's ready list can name them.
+EXTREF_NEW_TITLE="EXTERNAL-REF fixture (fresh provenance)"
+EXTREF_NEW_CREATE_OUT=$(BD create "$EXTREF_NEW_TITLE" --type task --json 2>&1)
+EXTREF_NEW_ID=$(printf '%s' "$EXTREF_NEW_CREATE_OUT" | unwrap | jq -r '.id // empty')
+EXTREF_PRE_CREATE_OUT=$(BD create "EXTERNAL-REF fixture (pre-existing ref)" --type task --json 2>&1)
+EXTREF_PRE_ID=$(printf '%s' "$EXTREF_PRE_CREATE_OUT" | unwrap | jq -r '.id // empty')
+if [ -z "$EXTREF_NEW_ID" ] || [ -z "$EXTREF_PRE_ID" ]; then
+    fail_case "extref-create" "two non-empty fixture ids" "'$EXTREF_NEW_ID' / '$EXTREF_PRE_ID'"
+else
+    BD update "$EXTREF_PRE_ID" --external-ref "kranz-already-there" >/dev/null 2>&1
+fi
+
 GC_CALLS_LOG="$SANDBOX/gc-calls.log"
 : > "$GC_CALLS_LOG"
 
@@ -1654,7 +1670,7 @@ case "\${1:-}" in
         shift
         case "\${1:-}" in
             ready)
-                echo '[{"id":"$STRING_ID"},{"id":"$ARRAY_ID"},{"id":"$NOACCEPT_ID"},{"id":"$EMPTYARR_ID"}]'
+                echo '[{"id":"$STRING_ID"},{"id":"$ARRAY_ID"},{"id":"$NOACCEPT_ID"},{"id":"$EMPTYARR_ID"},{"id":"$EXTREF_NEW_ID"},{"id":"$EXTREF_PRE_ID"}]'
                 ;;
             show)
                 ID=\$2
@@ -1667,7 +1683,10 @@ case "\${1:-}" in
                 elif [ "\$ID" = "$EMPTYARR_ID" ]; then
                     printf '[{"id":"%s","title":"Empty-array case","description":"desc","acceptance_criteria":[]}]' "\$ID"
                 elif ( cd "$STORE_DIR" && bd show "\$ID" --json >/dev/null 2>&1 ); then
-                    ( cd "$STORE_DIR" && bd show "\$ID" --json )
+                    # Forward ALL args verbatim (kranz-run-bead's return-path
+                    # dedup passes --include-comments; dropping it here made
+                    # the dedup blind and double-posted).
+                    ( cd "$STORE_DIR" && bd show "\$@" )
                 else
                     echo "gc-stub: unknown id \$ID" >&2
                     exit 1
@@ -1700,11 +1719,13 @@ chmod +x "$STUB_BIN/gc"
 
 # Stub `kranz` for the RUNBEAD cases below: echoes one summary line and
 # exits with whatever code KRANZ_STUB_EXIT names, simulating a mission run
-# without ever executing a real kranz/Claude session.
+# without ever executing a real kranz/Claude session. The line carries a
+# mission-id-shaped token (m-bea5ed) so the return-path comment write has
+# the same input the real `kranz exec` output provides.
 cat > "$STUB_BIN/kranz" <<'STUBEOF'
 #!/bin/sh
 set -u
-echo "kranz-stub: simulated mission run (exit ${KRANZ_STUB_EXIT:-0})"
+echo "kranz-stub: simulated mission run m-bea5ed (exit ${KRANZ_STUB_EXIT:-0})"
 exit "${KRANZ_STUB_EXIT:-0}"
 STUBEOF
 chmod +x "$STUB_BIN/kranz"
@@ -1771,6 +1792,21 @@ else
         echo "GC-STUB: PASS (forwards update/comment to real bd for a live id, logs every invocation, no-ops the synthetic id)"
     fi
 
+    # EXTERNAL-REF (D-BW-2 brief 2, outbound leg): the same drain above
+    # stamped kranz-<slug-of-title> on the ref-less fixture and left the
+    # pre-existing ref untouched. The expected slug is computed with the
+    # same pipeline the dispatch loop documents.
+    EXPECTED_REF="kranz-$(printf '%s' "$EXTREF_NEW_TITLE" | tr 'A-Z' 'a-z' | sed -e 's/[^a-z0-9][^a-z0-9]*/-/g' -e 's/^-//' -e 's/-$//' | cut -c1-60 | sed -e 's/-$//')"
+    NEW_REF=$(BD show "$EXTREF_NEW_ID" --json 2>/dev/null | unwrap | jq -r '.external_ref // empty')
+    PRE_REF=$(BD show "$EXTREF_PRE_ID" --json 2>/dev/null | unwrap | jq -r '.external_ref // empty')
+    if [ "$NEW_REF" != "$EXPECTED_REF" ]; then
+        fail_case "extref-stamped" "external_ref '$EXPECTED_REF' on the ref-less bead" "'$NEW_REF'"
+    elif [ "$PRE_REF" != "kranz-already-there" ]; then
+        fail_case "extref-not-clobbered" "pre-existing external_ref 'kranz-already-there' preserved" "'$PRE_REF'"
+    else
+        echo "EXTERNAL-REF: PASS (ref-less bead stamped kranz-<slug>; pre-existing ref not clobbered)"
+    fi
+
     if [ "$FAILED" -eq 0 ]; then
         echo "FIELDS: PASS (acceptance_criteria string+array)"
     fi
@@ -1827,6 +1863,44 @@ run_runbead_case 1 "open"     "exit1" || RUNBEAD_OK=0
 
 if [ "$RUNBEAD_OK" -eq 1 ]; then
     echo "RUNBEAD: PASS (exit 0/2/3/1 map to live bead states)"
+fi
+
+# --- Case: return path — mission-id comment, written once (D-BW-2 brief 2)
+# Closing the fixture mission (the kranz stub prints m-bea5ed) must write
+# exactly ONE bd comment containing the mission id; running kranz-run-bead
+# a second time for the same mission must write nothing (comment-dedup on
+# the mission-id string). Counts are taken over comment TEXTS only — the
+# close --reason also embeds the mission id but is not a comment.
+comment_count_for() {
+    # $1 = bead id, $2 = needle
+    BD show "$1" --json --include-comments 2>/dev/null | unwrap |
+        jq -r --arg needle "$2" '[.comments // [] | .[] | .text | select(contains($needle))] | length'
+}
+
+RETPATH_CREATE_OUT=$(BD create "RETURN-PATH fixture" --type task --json 2>&1)
+RETPATH_ID=$(printf '%s' "$RETPATH_CREATE_OUT" | unwrap | jq -r '.id // empty')
+if [ -z "$RETPATH_ID" ]; then
+    fail_case "retpath-create" "a non-empty fixture id" "'$RETPATH_CREATE_OUT'"
+else
+    BD update "$RETPATH_ID" --claim >/dev/null 2>&1
+    RETPATH_MFILE="$SANDBOX/retpath-mission.md"
+    printf '## Goal\nRETURN-PATH fixture\n' > "$RETPATH_MFILE"
+
+    KRANZ_STUB_EXIT=0 PATH="$STUB_BIN:$PATH" \
+        "$BIN_DIR/kranz-run-bead" "$CITY_DIR" "$RETPATH_ID" "$RETPATH_MFILE" "$RIG_DIR" 1 >/dev/null 2>&1
+    RETPATH_COUNT1=$(comment_count_for "$RETPATH_ID" "m-bea5ed")
+
+    KRANZ_STUB_EXIT=0 PATH="$STUB_BIN:$PATH" \
+        "$BIN_DIR/kranz-run-bead" "$CITY_DIR" "$RETPATH_ID" "$RETPATH_MFILE" "$RIG_DIR" 1 >/dev/null 2>&1
+    RETPATH_COUNT2=$(comment_count_for "$RETPATH_ID" "m-bea5ed")
+
+    if [ "$RETPATH_COUNT1" != "1" ]; then
+        fail_case "retpath-comment-written" "exactly one comment containing m-bea5ed after close" "$RETPATH_COUNT1"
+    elif [ "$RETPATH_COUNT2" != "1" ]; then
+        fail_case "retpath-comment-deduped" "still exactly one comment containing m-bea5ed after a second close" "$RETPATH_COUNT2"
+    else
+        echo "RETURN-PATH: PASS (exactly one mission-id comment; a second close writes nothing)"
+    fi
 fi
 
 # --- Case: claim released on reopen — a DIFFERENT actor can claim the bead

@@ -89,6 +89,17 @@
 # pair with the claim, so the worst case is one reclaim cycle's delay,
 # never a duplicate mission.
 #
+# Outbound provenance (shipped, D-BW-2 brief 2): after a successful claim
+# the dispatch records `external_ref = kranz-<slug>` on the bead — the
+# slug derived from the bead TITLE (lowercase, non-alnum runs collapsed to
+# dashes, 60-char cap; a title with no alnum falls back to the bead id),
+# which for a bead created from a kranz ticket recovers the ticket's own
+# slug. A bead already carrying an external_ref (an imported ticket's slug
+# or a foreign system's ref) is NEVER clobbered, and a failed write is
+# logged but never fails the dispatch — provenance is a map, not a gate.
+# The return path (kranz-run-bead comments the mission id and terminal
+# outcome back, deduped) completes the two-way navigation.
+#
 # Env:
 #   KRANZ_RIG_DIR            explicit rig checkout (optional)
 #   KRANZ_LABEL              bead label to drain (default "kranz")
@@ -311,6 +322,18 @@ for ID in $READY; do
     TITLE=$(printf '%s' "$BEAD" | jq -r '(if type == "array" then .[0] else . end) | .title // empty')
     DESC=$(printf '%s' "$BEAD" | jq -r '(if type == "array" then .[0] else . end) | .description // ""')
     ACCEPT=$(printf '%s' "$BEAD" | jq -r '(if type == "array" then .[0] else . end) | (.acceptance_criteria // "") | if type == "array" then map(if type == "string" then . else tostring end) | join("\n") else . end')
+
+    # Outbound provenance (D-BW-2 brief 2): name the kranz-side work item
+    # on the bead, once. Never clobbers an existing external_ref — an
+    # imported ticket's own slug or a foreign system's ref wins — and a
+    # failed write never fails the dispatch (a map, not a gate).
+    EXISTING_REF=$(printf '%s' "$BEAD" | jq -r '(if type == "array" then .[0] else . end) | .external_ref // empty')
+    if [ -z "$EXISTING_REF" ]; then
+        SLUG=$(printf '%s' "$TITLE" | tr 'A-Z' 'a-z' | sed -e 's/[^a-z0-9][^a-z0-9]*/-/g' -e 's/^-//' -e 's/-$//' | cut -c1-60 | sed -e 's/-$//')
+        [ -n "$SLUG" ] || SLUG="bead-$ID"
+        gc bd update "$ID" --external-ref "kranz-$SLUG" >/dev/null 2>&1 ||
+            echo "kranz-dispatch: external_ref write failed for $ID (provenance only; dispatch continues)" >&2
+    fi
 
     STAMP=$(date +%s)
     MFILE="$SPOOL/$STAMP-$ID.md"
