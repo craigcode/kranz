@@ -604,7 +604,35 @@ impl MissionEngine {
     ///
     /// The snapshot write is mandatory for lifecycle events and best-effort
     /// for `worker.message` stream deltas (recoverable by refolding the log).
+    ///
+    /// Fold-validate BEFORE append (ticket `emit-never-poisons-log`; source
+    /// m-83d1ed, where a re-proposed fixfeature payload appended fine and then
+    /// failed the fold — the append-only log was left holding an event no
+    /// replay can ever fold, and recovery meant surgery on the audit log).
+    /// The fold is computed against a CLONE of the current state; on failure
+    /// nothing is appended, the error surfaces to the caller, and log and
+    /// state stay exactly as they were. On success the real path below folds
+    /// the same event a second time — the honest price of the invariant,
+    /// trivial next to an agent turn. Stream deltas are exempt: their apply
+    /// arm is infallible by construction and they are the hot path, so
+    /// cloning state per delta would tax the one caller that emits thousands.
+    ///
+    /// One named gap: the probe validates the UNscrubbed kind while the real
+    /// fold applies the redaction-scrubbed event. Scrubbing only rewrites
+    /// secret-shaped substrings inside string payloads, which no
+    /// fold-validity rule keys on — a payload id literally shaped like an API
+    /// key is the pathological exception, accepted and documented.
     pub(crate) fn emit(&mut self, kind: EventKind) -> Result<Event> {
+        if !kind.is_stream_delta() {
+            let mut probe = self.state.clone();
+            let probe_event = Event {
+                seq: self.state.last_seq + 1,
+                ts: chrono::Utc::now(),
+                mission_id: self.paths.mission_id.clone(),
+                kind: kind.clone(),
+            };
+            reducer::apply(&mut probe, &probe_event)?;
+        }
         let (event, audits) = self.log.append_with_redaction_audits(kind)?;
         let stream_delta = event.kind.is_stream_delta();
         reducer::apply(&mut self.state, &event)?;
@@ -5533,6 +5561,103 @@ pub(crate) mod tests {
             "integration worktree still listed after teardown: {after:?}"
         );
         assert!(!path.exists(), "integration worktree dir must be gone");
+    }
+
+    // -----------------------------------------------------------------------
+    // emit-never-poisons-log: fold-validate before append
+    // -----------------------------------------------------------------------
+
+    /// Build an engine on a throwaway repo and return it with its events path.
+    fn emit_test_engine(root: &std::path::Path) -> (MissionEngine, std::path::PathBuf) {
+        let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
+        let engine =
+            MissionEngine::create(backend, root, "goal", MissionConfig::default()).unwrap();
+        let events_path = engine.paths.events_file();
+        (engine, events_path)
+    }
+
+    /// An emit whose fold would fail must append NOTHING: the log stays
+    /// byte-identical, the state is untouched, and the error surfaces to the
+    /// caller. This is the m-83d1ed wedge class — appended-then-unfoldable —
+    /// closed at emit time.
+    #[test]
+    fn emit_never_appends_an_unfoldable_event() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let (mut engine, events_path) = emit_test_engine(&root);
+        let log_before = std::fs::read(&events_path).unwrap();
+        let state_before = serde_json::to_string(&engine.state).unwrap();
+
+        // mission.created is fold-valid ONLY as the log's first event — and
+        // this log already has one (create() wrote it). Re-emitting the REAL
+        // first event's own kind is the simplest guaranteed unfoldable emit.
+        let first_line = std::fs::read_to_string(&events_path)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
+        let first_event: Event = serde_json::from_str(&first_line).unwrap();
+        let result = engine.emit(first_event.kind);
+
+        let err = result.expect_err("a fold-invalid emit must be rejected");
+        assert!(
+            err.to_string().contains("only valid as the first event"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&events_path).unwrap(),
+            log_before,
+            "a rejected emit must leave the log byte-identical"
+        );
+        assert_eq!(
+            serde_json::to_string(&engine.state).unwrap(),
+            state_before,
+            "a rejected emit must leave the state untouched"
+        );
+    }
+
+    /// The happy path keeps its exact-once shape under the new pre-fold: one
+    /// valid emit appends exactly one event, folds it (last_seq +1), and
+    /// refreshes the snapshot to match.
+    #[test]
+    fn emit_never_appends_valid_emit_lands_exactly_once() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let (mut engine, events_path) = emit_test_engine(&root);
+        let lines_before = std::fs::read_to_string(&events_path)
+            .unwrap()
+            .lines()
+            .count();
+        let seq_before = engine.state.last_seq;
+
+        engine
+            .emit(EventKind::OrchestratorDecision {
+                summary: "a fold-valid decision".to_string(),
+                detail: None,
+            })
+            .expect("a fold-valid emit must land");
+
+        let lines_after = std::fs::read_to_string(&events_path)
+            .unwrap()
+            .lines()
+            .count();
+        assert_eq!(lines_after, lines_before + 1, "exactly one event appended");
+        assert_eq!(
+            engine.state.last_seq,
+            seq_before + 1,
+            "the event folded exactly once"
+        );
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(engine.paths.state_file()).unwrap())
+                .unwrap();
+        assert_eq!(
+            snapshot["lastSeq"].as_u64().unwrap(),
+            seq_before + 1,
+            "the snapshot reflects the fold"
+        );
     }
 
     // -----------------------------------------------------------------------
