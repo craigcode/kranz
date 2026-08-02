@@ -51,6 +51,7 @@ pub mod planning;
 pub mod pr_handoff;
 pub mod preflight;
 pub mod prompts;
+pub mod provenance;
 pub mod queue;
 pub mod reducer;
 pub mod report_render;

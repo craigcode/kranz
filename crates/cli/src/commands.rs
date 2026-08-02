@@ -97,6 +97,16 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             }
             Ok(0)
         }
+        Command::Provenance { mission_id, json } => {
+            let mission = select_mission(&repo, mission_id.as_deref().or(cli.mission.as_deref()))?;
+            let chain = kranz_engine::provenance::compute_provenance(&repo, &mission)?;
+            if json {
+                println!("{}", output::render_provenance_json(&chain)?);
+            } else {
+                print!("{}", output::render_provenance(&chain));
+            }
+            Ok(0)
+        }
         Command::ExportTraces {
             mission_id,
             all,

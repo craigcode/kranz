@@ -179,8 +179,9 @@ pub struct MissionEscalation {
 }
 
 /// Kebab-case wire name of a [`crate::types::GrantKind`] (mirrors its serde
-/// rename) for the ledger's `ask` text.
-fn grant_kind_str(kind: &crate::types::GrantKind) -> &'static str {
+/// rename) for the ledger's `ask` text. `pub(crate)` so the provenance
+/// replay's grant-decision summaries spell the kind identically.
+pub(crate) fn grant_kind_str(kind: &crate::types::GrantKind) -> &'static str {
     match kind {
         crate::types::GrantKind::Command => "command",
         crate::types::GrantKind::TouchPath => "touch-path",
@@ -190,8 +191,10 @@ fn grant_kind_str(kind: &crate::types::GrantKind) -> &'static str {
 }
 
 /// True when a `milestone.unblocked` reason is the engine-owned workspace-gate
-/// lift rather than an operator decision.
-fn is_engine_lift(reason: &str) -> bool {
+/// lift rather than an operator decision. `pub(crate)` so the provenance
+/// replay excludes the same lift from its human-decision chain — one
+/// classification rule, no drift between the two folds.
+pub(crate) fn is_engine_lift(reason: &str) -> bool {
     reason == crate::workspace_gate::GATE_LIFT_REASON
 }
 

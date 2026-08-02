@@ -4,9 +4,11 @@
 
 use kranz_engine::cost::{Confidence, CostEstimate, MIN_CALIBRATION_MISSIONS};
 use kranz_engine::escalation_metrics::EscalationMetrics;
+use kranz_engine::gate::{GateKind, GateSurface, GateVerdict};
 use kranz_engine::outcomes::Outcomes;
+use kranz_engine::provenance::{ArtefactStatus, ProvenanceChain};
 use kranz_engine::types::{
-    AssertionCheck, FeatureStatus, MilestoneStatus, MissionState, MissionStatus, Plan,
+    AssertionCheck, FeatureStatus, MilestoneStatus, MissionState, MissionStatus, Plan, Role,
 };
 
 /// Raw ANSI escape codes (no color crates; callers gate on a tty check).
@@ -433,6 +435,165 @@ pub fn render_escalation_metrics_json(metrics: &EscalationMetrics) -> anyhow::Re
     Ok(serde_json::to_string_pretty(metrics)?)
 }
 
+/// Kebab-case ladder surface for the provenance text view (mirrors the
+/// event's serde rename).
+fn gate_surface_str(surface: GateSurface) -> &'static str {
+    match surface {
+        GateSurface::Approval => "approval",
+        GateSurface::FinalGate => "final-gate",
+    }
+}
+
+/// Kebab-case ladder section for the provenance text view.
+fn gate_kind_str(kind: GateKind) -> &'static str {
+    match kind {
+        GateKind::Deterministic => "deterministic",
+        GateKind::ModelJudged => "model-judged",
+    }
+}
+
+/// UPPERCASE verdict for the provenance ladder lines.
+fn gate_verdict_str(verdict: GateVerdict) -> &'static str {
+    match verdict {
+        GateVerdict::Pass => "PASS",
+        GateVerdict::Fail => "FAIL",
+    }
+}
+
+/// Kebab-case role for the provenance session lines (the serde wire name).
+fn role_str(role: Role) -> &'static str {
+    match role {
+        Role::Orchestrator => "orchestrator",
+        Role::Worker => "worker",
+        Role::ValidatorScrutiny => "validator-scrutiny",
+        Role::ValidatorFunctional => "validator-functional",
+    }
+}
+
+/// Artefact-resolution annotation for the text view — "unresolved" spells
+/// out WHY (evidence bytes gone) so a pruned mission reads as degraded, not
+/// broken.
+fn artefact_annotation(status: ArtefactStatus) -> &'static str {
+    match status {
+        ArtefactStatus::Resolved => "resolved",
+        ArtefactStatus::Unresolved => "unresolved — evidence bytes gone",
+        ArtefactStatus::Inline => "inline",
+    }
+}
+
+/// Render `kranz provenance`'s default text view: the mission identity, the
+/// gate ladder in log order, the sessions, the human decisions, and the
+/// terminal outcome. Empty sections say so plainly — a pre-gate.result log
+/// or an in-flight mission must read as "nothing recorded", never as an
+/// error.
+pub fn render_provenance(chain: &ProvenanceChain) -> String {
+    let mut out = String::new();
+
+    out.push_str(&format!("Provenance — mission {}\n", chain.mission_id));
+    if let Some(goal) = &chain.goal {
+        out.push_str(&format!("  goal: {}\n", one_line(goal, 120)));
+    }
+    if let (Some(branch), Some(base)) = (&chain.mission_branch, &chain.base_branch) {
+        let pinned = chain
+            .base_sha
+            .as_deref()
+            .map(|sha| format!(" @ {sha}"))
+            .unwrap_or_default();
+        out.push_str(&format!("  branch: {branch} (base {base}{pinned})\n"));
+    }
+
+    out.push('\n');
+    out.push_str("Gate ladder (log order)\n");
+    if chain.gates.is_empty() {
+        out.push_str("  (no gate.result events recorded)\n");
+    }
+    for gate in &chain.gates {
+        let score = match (gate.score, gate.threshold) {
+            (Some(score), Some(threshold)) => format!("  score {score}/{threshold}"),
+            _ => String::new(),
+        };
+        out.push_str(&format!(
+            "  [seq {}] {} {} #{}  {}  {}{}  — {} ({})\n",
+            gate.seq,
+            gate_surface_str(gate.surface),
+            gate_kind_str(gate.kind),
+            gate.index,
+            gate.gate,
+            gate_verdict_str(gate.verdict),
+            score,
+            gate.artefact_ref,
+            artefact_annotation(gate.artefact),
+        ));
+    }
+
+    out.push('\n');
+    out.push_str("Sessions\n");
+    if chain.sessions.is_empty() {
+        out.push_str("  (no sessions recorded)\n");
+    }
+    for session in &chain.sessions {
+        let backend = session.backend.as_deref().unwrap_or("?");
+        let scope = match (&session.feature_id, &session.milestone_id) {
+            (Some(feature), _) => format!("  feature {feature}"),
+            (None, Some(milestone)) => format!("  milestone {milestone}"),
+            (None, None) => String::new(),
+        };
+        out.push_str(&format!(
+            "  [seq {}] {} {}  {}/{}  prompt {}{}  transcript {} ({})\n",
+            session.seq,
+            role_str(session.role),
+            session.run_id,
+            backend,
+            session.model,
+            session.prompt_hash,
+            scope,
+            session.transcript_ref,
+            artefact_annotation(session.transcript),
+        ));
+    }
+
+    out.push('\n');
+    out.push_str("Human decisions\n");
+    if chain.decisions.is_empty() {
+        out.push_str("  (no human decisions recorded)\n");
+    }
+    for decision in &chain.decisions {
+        out.push_str(&format!(
+            "  [seq {}] {}  {}\n",
+            decision.seq,
+            decision.kind.as_str(),
+            one_line(&decision.summary, 120),
+        ));
+    }
+
+    out.push('\n');
+    out.push_str("Outcome\n");
+    match &chain.outcome {
+        Some(terminal) => {
+            let reason = terminal
+                .reason
+                .as_deref()
+                .map(|reason| format!(" — {}", one_line(reason, 120)))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "  {} at seq {}{}\n",
+                terminal.status.as_str().to_uppercase(),
+                terminal.seq,
+                reason,
+            ));
+        }
+        None => out.push_str("  in flight — no terminal event recorded\n"),
+    }
+
+    out
+}
+
+/// Serialize `kranz provenance --json`'s output — byte-identical across runs
+/// over an unchanged log (the chain carries no clock, no host paths).
+pub fn render_provenance_json(chain: &ProvenanceChain) -> anyhow::Result<String> {
+    Ok(serde_json::to_string_pretty(chain)?)
+}
+
 /// Milliseconds as a compact duration ("12s", "47m", "2.3h", "3.1d") for
 /// the cycle-time readout.
 fn format_duration_ms(ms: u64) -> String {
@@ -663,6 +824,245 @@ mod tests {
             assert!(text.contains("1 of 2 completed missions (50%) produced a traced defect"));
             assert!(text.contains("traced: defect-regression → m-1"));
             assert!(text.contains("command: cargo test"));
+        }
+    }
+
+    mod provenance_cli {
+        use super::*;
+        use kranz_engine::event_log::{EventLog, LockForce};
+        use kranz_engine::events::EventKind;
+        use kranz_engine::gate::{GateKind, GateSurface, GateVerdict};
+        use kranz_engine::paths::MissionPaths;
+        use kranz_engine::provenance::{compute_provenance, ProvenanceChain};
+        use kranz_engine::types::{GrantKind, MissionConfig, Plan, Role};
+        use std::time::Duration;
+        use tempfile::TempDir;
+
+        fn sample_plan() -> Plan {
+            Plan {
+                goal: "ship the thing".into(),
+                validation_contract: vec![],
+                milestones: vec![],
+                considered_alternatives: None,
+                command_grants: vec![],
+                touch_set: vec![],
+            }
+        }
+
+        fn gate_result(
+            gate: &str,
+            surface: GateSurface,
+            kind: GateKind,
+            index: u32,
+            artefact_ref: &str,
+        ) -> EventKind {
+            EventKind::GateResult {
+                gate: gate.to_string(),
+                surface,
+                kind,
+                index,
+                verdict: GateVerdict::Pass,
+                artefact_ref: artefact_ref.to_string(),
+                artefact_detail: None,
+                score: None,
+                threshold: None,
+            }
+        }
+
+        fn worker_spawned(run_id: &str, role: Role, model: &str, prompt_hash: &str) -> EventKind {
+            EventKind::WorkerSpawned {
+                run_id: run_id.to_string(),
+                role,
+                feature_id: None,
+                milestone_id: None,
+                sdk_session_id: format!("sess-{run_id}"),
+                model: model.to_string(),
+                quant: "n/a".to_string(),
+                weight_hash: None,
+                prompt_hash: prompt_hash.to_string(),
+                transcript_path: MissionPaths::transcript_rel(run_id),
+            }
+        }
+
+        /// The full replay shape in one mission: both gate surfaces (an
+        /// inline ref, a resolved file ref, a file ref whose bytes were never
+        /// written, a scored model-judged gate), three sessions straddling a
+        /// mid-mission backend flip, the decision set (grant request + park
+        /// approval, operator unblock, engine lift, steer), COMPLETED.
+        fn seed_repo(root: &std::path::Path) {
+            let mut config = MissionConfig::default();
+            config.worker.backend = Some("codex".to_string());
+            let mut judged = gate_result(
+                "plan-review",
+                GateSurface::Approval,
+                GateKind::ModelJudged,
+                0,
+                "file:runs/gone.jsonl",
+            );
+            if let EventKind::GateResult {
+                score, threshold, ..
+            } = &mut judged
+            {
+                *score = Some(0.9);
+                *threshold = Some(0.5);
+            }
+            let paths = MissionPaths::new(root, "m-1");
+            let mut log = EventLog::acquire(&paths, "m-1", Duration::ZERO, LockForce::No).unwrap();
+            for kind in [
+                EventKind::MissionCreated {
+                    goal: "ship the thing".into(),
+                    base_branch: "main".into(),
+                    mission_branch: "kranz/mission-x".into(),
+                    config,
+                },
+                EventKind::PlanApproved {
+                    plan: sample_plan(),
+                    base_sha: Some("deadbeef".to_string()),
+                },
+                gate_result(
+                    "vacuous-filter",
+                    GateSurface::Approval,
+                    GateKind::Deterministic,
+                    0,
+                    "contract gate vacuous-filter",
+                ),
+                gate_result(
+                    "merge-gate-suite",
+                    GateSurface::Approval,
+                    GateKind::Deterministic,
+                    1,
+                    "file:runs/gate-base.jsonl",
+                ),
+                judged,
+                {
+                    let mut spawn = worker_spawned("r-1", Role::Worker, "gpt-5", "aaaabbbbcccc");
+                    if let EventKind::WorkerSpawned { feature_id, .. } = &mut spawn {
+                        *feature_id = Some("f-1-1".to_string());
+                    }
+                    spawn
+                },
+                EventKind::GrantRequested {
+                    milestone_id: "ms-1".into(),
+                    kind: GrantKind::Command,
+                    command: "cargo test".into(),
+                },
+                EventKind::GrantApproved {
+                    kind: GrantKind::Command,
+                    command: "cargo test".into(),
+                },
+                EventKind::ConfigChanged {
+                    patch: serde_json::json!({"worker": {"backend": "local"}}),
+                },
+                worker_spawned("r-2", Role::Worker, "my-local-model", "dddd11112222"),
+                worker_spawned("r-3", Role::ValidatorScrutiny, "sonnet", "ffff33334444"),
+                EventKind::MilestoneBlocked {
+                    milestone_id: "ms-1".into(),
+                    reason: "fix-cycle cap".into(),
+                },
+                EventKind::MilestoneUnblocked {
+                    milestone_id: "ms-1".into(),
+                    reason: "user skipped findings".into(),
+                    validator_guidance: None,
+                },
+                EventKind::MilestoneUnblocked {
+                    milestone_id: "ms-1".into(),
+                    reason: "workspace gate now passing: bootstrap and readiness ok".into(),
+                    validator_guidance: None,
+                },
+                EventKind::UserMessage {
+                    text: "skip the flaky test".into(),
+                    interrupt: false,
+                },
+                gate_result(
+                    "merge-gate-suite",
+                    GateSurface::FinalGate,
+                    GateKind::Deterministic,
+                    0,
+                    ".kranz/merge-gates.json",
+                ),
+                EventKind::MissionCompleted {},
+            ] {
+                log.append(kind).unwrap();
+            }
+            drop(log);
+            std::fs::write(paths.runs_dir().join("gate-base.jsonl"), b"{}").unwrap();
+            std::fs::write(paths.runs_dir().join("r-1.jsonl"), b"{}").unwrap();
+        }
+
+        #[test]
+        fn provenance_replay_cli_json_round_trips_to_compute_value() {
+            let tmp = TempDir::new().unwrap();
+            seed_repo(tmp.path());
+            let expected = compute_provenance(tmp.path(), "m-1").unwrap();
+            let json = render_provenance_json(&expected).unwrap();
+            let round_tripped: ProvenanceChain = serde_json::from_str(&json).unwrap();
+            assert_eq!(round_tripped, expected);
+        }
+
+        /// The text view names the ladder in log order with verdicts and
+        /// artefact resolutions, each session's backend/model + prompt
+        /// identity, every human decision with its seq, and the outcome —
+        /// while the grant REQUEST (seq 7) and the engine-owned lift
+        /// (seq 14) stay out of the decision list.
+        #[test]
+        fn provenance_replay_cli_text_names_ladder_sessions_decisions_and_outcome() {
+            let tmp = TempDir::new().unwrap();
+            seed_repo(tmp.path());
+            let chain = compute_provenance(tmp.path(), "m-1").unwrap();
+            let text = render_provenance(&chain);
+
+            assert!(text.contains("Provenance — mission m-1"));
+            assert!(text.contains("goal: ship the thing"));
+            assert!(text.contains("branch: kranz/mission-x (base main @ deadbeef)"));
+            for line in [
+                "[seq 3] approval deterministic #0  vacuous-filter  PASS  — contract gate vacuous-filter (inline)",
+                "[seq 4] approval deterministic #1  merge-gate-suite  PASS  — file:runs/gate-base.jsonl (resolved)",
+                "[seq 5] approval model-judged #0  plan-review  PASS  score 0.9/0.5  — file:runs/gone.jsonl (unresolved — evidence bytes gone)",
+                "[seq 16] final-gate deterministic #0  merge-gate-suite  PASS  — .kranz/merge-gates.json (inline)",
+                "[seq 6] worker r-1  codex/gpt-5  prompt aaaabbbbcccc  feature f-1-1  transcript runs/r-1.jsonl (resolved)",
+                "[seq 10] worker r-2  local/my-local-model  prompt dddd11112222  transcript runs/r-2.jsonl (unresolved — evidence bytes gone)",
+                "[seq 11] validator-scrutiny r-3  claude/sonnet  prompt ffff33334444",
+                "[seq 2] plan-approval  plan approved",
+                "[seq 8] grant-approval  approved command: cargo test",
+                "[seq 13] milestone-unblock  unblocked ms-1: user skipped findings",
+                "[seq 15] steer  skip the flaky test",
+                "COMPLETED at seq 17",
+            ] {
+                assert!(text.contains(line), "missing line: {line}\n{text}");
+            }
+            // The ladder renders in LOG order: each gate's first mention in
+            // that order.
+            let positions: Vec<usize> = [
+                "vacuous-filter",
+                "file:runs/gate-base.jsonl",
+                "plan-review",
+                "final-gate",
+            ]
+            .iter()
+            .map(|needle| text.find(needle).expect(needle))
+            .collect();
+            assert!(
+                positions.windows(2).all(|pair| pair[0] < pair[1]),
+                "ladder out of log order: {positions:?}\n{text}"
+            );
+            // Neither the grant request nor the engine lift is a decision.
+            assert!(!text.contains("[seq 7]"), "grant request leaked: {text}");
+            assert!(!text.contains("[seq 14]"), "engine lift leaked: {text}");
+        }
+
+        /// Same log → byte-identical output, in both forms, across two
+        /// independent compute passes.
+        #[test]
+        fn provenance_replay_cli_render_is_byte_identical_across_replays() {
+            let tmp = TempDir::new().unwrap();
+            seed_repo(tmp.path());
+            let first = compute_provenance(tmp.path(), "m-1").unwrap();
+            let second = compute_provenance(tmp.path(), "m-1").unwrap();
+            assert_eq!(
+                render_provenance_json(&first).unwrap(),
+                render_provenance_json(&second).unwrap()
+            );
+            assert_eq!(render_provenance(&first), render_provenance(&second));
         }
     }
 

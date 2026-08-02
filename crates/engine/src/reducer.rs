@@ -871,8 +871,10 @@ fn run_mut<'a>(state: &'a mut MissionState, id: &str) -> Result<&'a mut WorkerRu
 }
 
 /// Recursive JSON merge: objects merge key-by-key, anything else in the patch
-/// replaces the base value wholesale.
-fn deep_merge(base: &mut serde_json::Value, patch: &serde_json::Value) {
+/// replaces the base value wholesale. `pub(crate)` so the provenance replay
+/// (provenance.rs) evolves its tracked config by the SAME merge — a second
+/// spelling of "how a config.changed patch applies" could drift from this one.
+pub(crate) fn deep_merge(base: &mut serde_json::Value, patch: &serde_json::Value) {
     use serde_json::Value;
     match (base, patch) {
         (Value::Object(base_map), Value::Object(patch_map)) => {

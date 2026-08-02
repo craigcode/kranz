@@ -131,6 +131,22 @@ pub enum Command {
         json: bool,
     },
 
+    /// Replay why a mission's unit passed from its event log alone: the gate
+    /// ladder in order (verdicts + artefact resolution against the mission
+    /// dir), each session's backend/model and prompt identity, every human
+    /// decision with its event seq, and the terminal outcome (read-only, no
+    /// lock). A cleaned runs/ degrades artefact refs to "unresolved", never
+    /// to an error.
+    Provenance {
+        /// The mission id (defaults to the global --mission / auto-selection)
+        mission_id: Option<String>,
+
+        /// Dump the full ProvenanceChain struct as JSON instead of the text
+        /// report
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Pause the mission (takes effect between worker runs)
     Pause,
 
