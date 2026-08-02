@@ -227,14 +227,14 @@ reclaim_sweep() {
                 if [ -z "$TOKEN" ]; then
                     continue # legacy tokenless lease: a live pid stands at any age
                 fi
-                CURRENT_TOKEN=$(lease_pid_token "$PID")
-                if [ -z "$CURRENT_TOKEN" ]; then
+                CURRENT_START=$(lease_pid_token "$PID")
+                if [ -z "$CURRENT_START" ]; then
                     # Alive but identity unverifiable right now: stand
                     # conservatively — a false stand delays recovery, a
                     # false release runs a mission twice (the queue's rule).
                     continue
                 fi
-                if [ "$CURRENT_TOKEN" = "$TOKEN" ]; then
+                if [ "$CURRENT_START" = "$TOKEN" ]; then
                     continue # alive and provably the claimant: stands at any age
                 fi
                 # Token mismatch: the pid was RECYCLED after the claimant
