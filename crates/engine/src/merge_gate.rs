@@ -6,6 +6,13 @@
 //! diff, and lets non-Rust repositories define gates in their own language.
 //! The runner itself is pure and injectable: production wraps the existing
 //! bounded shell runner while tests inject deterministic outcomes.
+//!
+//! The suite also runs through the first-class gate interface
+//! ([`crate::gate`], ticket `.kranz/tickets/gate-plugin-interface.md`) via
+//! [`MergeSuiteGate`]; [`crate::merge`] drives it that way. The adaptation
+//! changes nothing about ownership or behavior: the suite bytes are still
+//! read from the live base branch, gates still run in declared order, and
+//! the suite still stops at the first failure.
 
 use serde::Deserialize;
 use std::path::{Component, Path, PathBuf};
@@ -182,6 +189,66 @@ fn gate_applies(gate: &Gate, changed_paths: &[String]) -> bool {
         })
 }
 
+/// The merge-gate suite adapted to the first-class [`crate::gate::Gate`]
+/// interface (ticket `.kranz/tickets/gate-plugin-interface.md`).
+///
+/// The adapter is a thin, behavior-preserving wrapper: `evaluate` delegates
+/// to [`run_gate_suite`], so the suite runs the same commands in the same
+/// declared order and still stops at the first failure. The suite is a
+/// deterministic, boolean-only gate — it reports no confidence score — and
+/// its artefact is the failing gate's command plus captured output, or the
+/// tracked suite path when every gate passed. Ownership is unchanged: the
+/// suite bytes are read from the live base branch by [`crate::merge`], so a
+/// mission cannot weaken or reorder the gates that judge its own diff.
+pub struct MergeSuiteGate<F> {
+    repo_root: PathBuf,
+    changed_paths: Vec<String>,
+    suite: GateSuite,
+    executor: F,
+}
+
+impl<F> MergeSuiteGate<F>
+where
+    F: Fn(&str, &Path) -> (bool, String),
+{
+    pub fn new(repo_root: &Path, changed_paths: &[String], suite: GateSuite, executor: F) -> Self {
+        Self {
+            repo_root: repo_root.to_path_buf(),
+            changed_paths: changed_paths.to_vec(),
+            suite,
+            executor,
+        }
+    }
+}
+
+impl<F> crate::gate::Gate for MergeSuiteGate<F>
+where
+    F: Fn(&str, &Path) -> (bool, String),
+{
+    fn name(&self) -> &str {
+        "merge-gate-suite"
+    }
+
+    fn kind(&self) -> crate::gate::GateKind {
+        crate::gate::GateKind::Deterministic
+    }
+
+    fn evaluate(&self) -> crate::gate::GateOutcome {
+        use crate::gate::{ArtefactRef, GateOutcome};
+        match run_gate_suite(
+            &self.repo_root,
+            &self.changed_paths,
+            &self.suite,
+            &self.executor,
+        ) {
+            GateSuiteResult::Passed => GateOutcome::pass(ArtefactRef::new(MERGE_GATES_PATH)),
+            GateSuiteResult::Failed { gate, output } => {
+                GateOutcome::fail(ArtefactRef::new(gate).with_detail(output))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,5 +394,70 @@ mod tests {
             }
         );
         assert_eq!(exec.calls.borrow().len(), 1);
+    }
+
+    #[test]
+    fn gate_plugin_merge_suite_runs_through_the_interface_unchanged() {
+        use crate::gate::Gate;
+        let root = PathBuf::from("/repo");
+        let exec = FakeExecutor::all_pass();
+        let gate = MergeSuiteGate::new(
+            &root,
+            &["apps/dashboard/src/App.tsx".to_string()],
+            suite(),
+            |cmd, cwd| exec.run(cmd, cwd),
+        );
+        assert_eq!(gate.name(), "merge-gate-suite");
+        assert_eq!(gate.kind(), crate::gate::GateKind::Deterministic);
+
+        let outcome = gate.evaluate();
+        assert!(outcome.passed());
+        assert_eq!(outcome.score, None, "the suite is a boolean-only gate");
+        assert_eq!(outcome.artefact.reference, MERGE_GATES_PATH);
+        assert_eq!(outcome.artefact.detail, None);
+        assert_eq!(
+            *exec.calls.borrow(),
+            vec![
+                ("cargo test --workspace".to_string(), root.clone()),
+                ("npm test".to_string(), root.join("apps/dashboard")),
+            ],
+            "same commands, same order as run_gate_suite"
+        );
+    }
+
+    #[test]
+    fn gate_plugin_merge_suite_stops_at_first_failure_through_the_interface() {
+        use crate::gate::Gate;
+        let root = PathBuf::from("/repo");
+        let exec = FakeExecutor::failing("cargo test --workspace");
+        let gate = MergeSuiteGate::new(
+            &root,
+            &["apps/dashboard/src/App.tsx".to_string()],
+            suite(),
+            |cmd, cwd| exec.run(cmd, cwd),
+        );
+
+        let outcome = gate.evaluate();
+        assert!(!outcome.passed());
+        assert_eq!(outcome.artefact.reference, "cargo test --workspace");
+        assert_eq!(outcome.artefact.detail.as_deref(), Some("gate failed"));
+        assert_eq!(exec.calls.borrow().len(), 1, "later gates never ran");
+    }
+
+    #[test]
+    fn gate_plugin_merge_suite_skips_unrelated_conditional_gates() {
+        use crate::gate::Gate;
+        let root = PathBuf::from("/repo");
+        let exec = FakeExecutor::all_pass();
+        let gate = MergeSuiteGate::new(
+            &root,
+            &["crates/engine/src/lib.rs".to_string()],
+            suite(),
+            |cmd, cwd| exec.run(cmd, cwd),
+        );
+
+        assert!(gate.evaluate().passed());
+        assert_eq!(exec.calls.borrow().len(), 1);
+        assert_eq!(exec.calls.borrow()[0].0, "cargo test --workspace");
     }
 }

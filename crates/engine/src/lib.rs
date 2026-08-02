@@ -34,6 +34,7 @@ pub mod egress_proxy;
 pub mod escalation_metrics;
 pub mod event_log;
 pub mod findings;
+pub mod gate;
 pub mod git_ops;
 pub mod hooks;
 pub mod judgement;

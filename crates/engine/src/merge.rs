@@ -5,8 +5,9 @@
 //!
 //! `merge_mission` ties together three primitives that each already carry
 //! their own safety contract: [`GitRepo::is_clean_tracked`] (refuse dirty),
-//! [`crate::merge_gate::run_gate_suite`] (refuse on a failing gate, base
-//! untouched), and [`GitRepo::merge_no_ff`] (clean-abort on conflict). The
+//! [`crate::merge_gate::MergeSuiteGate`] (refuse on a failing gate, base
+//! untouched — the suite runs through the [`crate::gate`] interface), and
+//! [`GitRepo::merge_no_ff`] (clean-abort on conflict). The
 //! merge and gates run in a detached scratch worktree; the primary base only
 //! fast-forwards to that exact tested commit. Every git command on this path
 //! runs via [`GitRepo::with_hooks_disabled`], so mission-planted
@@ -14,8 +15,9 @@
 //! never calls [`GitRepo::push_mission_branch`] or any other push.
 
 use crate::error::Result;
+use crate::gate::{Gate, GateVerdict};
 use crate::git_ops::{with_kranz_trailers, GitRepo, KranzCommitMetadata, MergeOutcome};
-use crate::merge_gate::{parse_gate_suite, run_gate_suite, GateSuiteResult, MERGE_GATES_PATH};
+use crate::merge_gate::{parse_gate_suite, MergeSuiteGate, MERGE_GATES_PATH};
 use crate::scrub::{self, SecretFinding};
 use std::path::Path;
 
@@ -75,9 +77,9 @@ pub struct StaleBaseWarning {
 
 /// Runs the gated merge: refuse-if-dirty, then gates, then `--no-ff` merge.
 ///
-/// `executor` is forwarded to [`crate::merge_gate::run_gate_suite`] as-is
-/// (production callers wrap the orchestrator's shell runner, tests inject a
-/// scripted fake). This function never calls
+/// `executor` is forwarded to the [`crate::merge_gate::MergeSuiteGate`]
+/// adapter as-is (production callers wrap the orchestrator's shell runner,
+/// tests inject a scripted fake). This function never calls
 /// [`GitRepo::push_mission_branch`] or any push — the base branch is only
 /// ever advanced locally.
 pub fn merge_mission<F>(
@@ -170,11 +172,16 @@ where
     }
     let tested_commit = scratch.head_sha()?;
 
-    match run_gate_suite(scratch.root(), &changed_paths, &gate_suite, executor) {
-        GateSuiteResult::Failed { gate, output } => {
-            return Ok(MergeReport::GateFailed { gate, output });
-        }
-        GateSuiteResult::Passed => {}
+    // The suite runs through the first-class gate interface (gate.rs) —
+    // behavior is unchanged: same commands, same declared order, stop at
+    // first failure, suite bytes read from the live base branch above.
+    let outcome =
+        MergeSuiteGate::new(scratch.root(), &changed_paths, gate_suite, executor).evaluate();
+    if outcome.verdict == GateVerdict::Fail {
+        return Ok(MergeReport::GateFailed {
+            gate: outcome.artefact.reference,
+            output: outcome.artefact.detail.unwrap_or_default(),
+        });
     }
 
     let post_gate_head = scratch.head_sha()?;
