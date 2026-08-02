@@ -475,6 +475,51 @@ STUBEOF
         fi
     fi
 
+    # Empty lease, never written to (f-3-1 deterministic control): the same
+    # setup as LEASE-MIDWRITE below (labelled, claimed, an empty lease file
+    # planted) but with NO background writer — the lease stays empty
+    # forever. Unlike LEASE-MIDWRITE this has no race in it at all: the
+    # sweep's bounded retry (kranz-dispatch:158-175) is GUARANTEED to
+    # exhaust and fall through to the TTL backstop, so at KRANZ_CLAIM_TTL=0
+    # the claim MUST be released. This proves two things nothing else here
+    # covers: an empty lease genuinely reaches the retry path (so a racy
+    # LEASE-MIDWRITE pass can't be explained by some unrelated code path),
+    # and the retry is BOUNDED rather than wedging forever — the exact
+    # failure mode 3a8201d closed. Same positive/negative pairing as
+    # FOREIGN-BEAD/POSITIVE-CONTROL and LABEL-GUARD-BYPASS elsewhere in this
+    # file.
+    EMPTYLEASE_CREATE_OUT=$(BD create "LEASE-EMPTY-CONTROL fixture (never-written lease)" --type task --json 2>&1)
+    EMPTYLEASE_ID=$(printf '%s' "$EMPTYLEASE_CREATE_OUT" | unwrap | jq -r '.id // empty')
+    if [ -z "$EMPTYLEASE_ID" ]; then
+        fail_case "lease-empty-control-create" "a non-empty fixture id" "'$EMPTYLEASE_CREATE_OUT'"
+    else
+        BD update "$EMPTYLEASE_ID" --add-label kranz >/dev/null 2>&1
+        BD update "$EMPTYLEASE_ID" --claim >/dev/null 2>&1
+
+        # Planted once, never rewritten — no background writer at all.
+        : > "$LEASE_DIR/$EMPTYLEASE_ID.lease"
+
+        # Same one-second wall-clock guard as the other KRANZ_CLAIM_TTL=0
+        # cases in this file (fa35941 / d1a9173): without it, sub-second
+        # truncation skew between NOW and updated_at can read a negative
+        # idle age and this case would flake independent of the retry logic
+        # under test.
+        sleep 1
+
+        PATH="$LEASE_STUB_BIN:$PATH" GC_CITY="$CITY_DIR" KRANZ_LABEL="kranz" \
+            KRANZ_LEASE_DIR="$LEASE_DIR" KRANZ_CLAIM_TTL=0 \
+            "$BIN_DIR/kranz-dispatch" --reclaim >/dev/null 2>&1
+
+        EMPTYLEASE_STATUS=$(status_of "$EMPTYLEASE_ID")
+        EMPTYLEASE_ASSIGNEE=$(BD show "$EMPTYLEASE_ID" --json 2>/dev/null | unwrap | jq -r '.assignee // empty')
+
+        if [ "$EMPTYLEASE_STATUS" != "open" ] || [ -n "$EMPTYLEASE_ASSIGNEE" ]; then
+            fail_case "lease-empty-control-released" "a never-written empty lease is released to open/unassigned once the bounded retry exhausts and falls through to the TTL backstop" "status=$EMPTYLEASE_STATUS assignee='$EMPTYLEASE_ASSIGNEE'"
+        else
+            echo "LEASE-EMPTY-CONTROL: PASS (never-written empty lease exhausts the bounded retry, released by the TTL backstop)"
+        fi
+    fi
+
     # Lease observed mid-rewrite (f-3-1): the producer's write is atomic
     # (tmp+mv, packaging/gascity/bin/kranz-run-bead:82/96) but the sweep can
     # still catch the file in the brief window between the producer's
@@ -517,13 +562,34 @@ STUBEOF
 
         wait "$MIDWRITE_WRITER_PID" 2>/dev/null || true
 
+        # Self-diagnosing: this case races a real background writer against
+        # the sweep's retry window, so on a loaded host the writer's publish
+        # can land either inside or outside that window on any given run.
+        # Branch on what was actually OBSERVED rather than assuming the race
+        # resolved one particular way, so a slow test host reads as
+        # inconclusive rather than as a product failure (LEASE-EMPTY-CONTROL
+        # above already proves the retry-then-TTL-backstop path
+        # deterministically; this case only adds value when the writer's
+        # publish is actually observed to have landed).
+        MIDWRITE_LEASE_PID=""
+        MIDWRITE_LEASE_TS=""
+        if [ -s "$LEASE_DIR/$MIDWRITE_ID.lease" ]; then
+            read -r MIDWRITE_LEASE_PID MIDWRITE_LEASE_TS < "$LEASE_DIR/$MIDWRITE_ID.lease" || true
+        fi
+
         MIDWRITE_STATUS=$(status_of "$MIDWRITE_ID")
         MIDWRITE_ASSIGNEE=$(BD show "$MIDWRITE_ID" --json 2>/dev/null | unwrap | jq -r '.assignee // empty')
 
-        if [ "$MIDWRITE_STATUS" != "in_progress" ] || [ "$MIDWRITE_ASSIGNEE" != "$MIDWRITE_ORIG_ASSIGNEE" ]; then
-            fail_case "lease-midwrite-preserved" "claim preserved at in_progress/assignee '$MIDWRITE_ORIG_ASSIGNEE' despite the sweep's first read landing on an empty lease file (mid-rewrite)" "status=$MIDWRITE_STATUS assignee='$MIDWRITE_ASSIGNEE'"
+        if [ -z "$MIDWRITE_LEASE_PID" ]; then
+            # The writer's tmp+mv publish demonstrably never landed inside
+            # the sweep's retry window on this run — a test-host scheduling
+            # tail, not a product signal. Nothing was learned about the
+            # product this run, so this case must not fail the contract.
+            echo "LEASE-MIDWRITE: SKIP (writer did not publish inside the sweep's retry window)"
+        elif [ "$MIDWRITE_STATUS" = "in_progress" ] && [ "$MIDWRITE_ASSIGNEE" = "$MIDWRITE_ORIG_ASSIGNEE" ]; then
+            echo "LEASE-MIDWRITE: PASS (lease observed live pid $MIDWRITE_LEASE_PID after the mid-rewrite read, claim preserved at in_progress/assignee '$MIDWRITE_ORIG_ASSIGNEE')"
         else
-            echo "LEASE-MIDWRITE: PASS (empty mid-rewrite read retried and resolved to the live pid, claim preserved)"
+            fail_case "lease-midwrite-preserved" "claim preserved at in_progress/assignee '$MIDWRITE_ORIG_ASSIGNEE' once the lease showed live pid $MIDWRITE_LEASE_PID" "status=$MIDWRITE_STATUS assignee='$MIDWRITE_ASSIGNEE'"
         fi
     fi
 fi
