@@ -6582,6 +6582,222 @@ async fn contract_gate_final_gate_decision_names_vacuous_green() {
     assert!(detail.contains("[a-1]"), "{detail}");
 }
 
+/// ticket gate-results-first-class-events (KRZ-312): approving a plan
+/// records every approval-gate evaluation as a first-class gate.result
+/// event — one per gate, in pipeline order (the four-gate floor in ticket
+/// order), each carrying its ladder position (surface + section index), the
+/// stated verdict, and the gate-local artefact handle. The events land
+/// AFTER plan.approved (the "Git first" invariant: no event until approval
+/// cannot fail) and before the advisory lint decision.
+#[tokio::test(flavor = "multi_thread")]
+async fn gate_result_events_record_the_approval_ladder() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let backend = Arc::new(MockBackend::new());
+    let mut engine = make_engine(&backend, &root, test_cfg());
+
+    // Same contract shape as contract_gate_named_verdicts_…: a vacuous-green
+    // negated grep (trips wrong-polarity + passes-on-base) plus a benign
+    // not-yet-landed assertion.
+    let plan = simple_plan(
+        1,
+        vec![
+            assertion(
+                "",
+                "marker absent",
+                Some("! grep -q landed-marker kranz-no-such-file.txt"),
+            ),
+            assertion("", "not-yet-landed assertion", Some("false")),
+        ],
+    );
+    engine.approve_plan(plan).unwrap();
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+
+    let ladder: Vec<(String, u32, String, String)> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::GateResult {
+                gate,
+                surface,
+                kind,
+                index,
+                verdict,
+                artefact_ref,
+                ..
+            } => {
+                assert_eq!(
+                    *surface,
+                    kranz_engine::gate::GateSurface::Approval,
+                    "approval gates carry the approval surface"
+                );
+                assert_eq!(*kind, kranz_engine::gate::GateKind::Deterministic);
+                Some((
+                    gate.clone(),
+                    *index,
+                    serde_json::to_value(verdict)
+                        .unwrap()
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                    artefact_ref.clone(),
+                ))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ladder,
+        vec![
+            (
+                "vacuous-filter".to_string(),
+                0,
+                "pass".to_string(),
+                "contract gate vacuous-filter".to_string()
+            ),
+            (
+                "wrong-polarity".to_string(),
+                1,
+                "fail".to_string(),
+                "contract gate wrong-polarity".to_string()
+            ),
+            (
+                "passes-on-base".to_string(),
+                2,
+                "fail".to_string(),
+                "contract gate passes-on-base".to_string()
+            ),
+            (
+                "env-sensitive".to_string(),
+                3,
+                "pass".to_string(),
+                "contract gate env-sensitive".to_string()
+            ),
+        ],
+        "one gate.result per approval gate, in pipeline order"
+    );
+
+    // The failing gates' findings travel in the event payload (verbatim
+    // gate-local detail), so the log alone carries the evidence.
+    let wrong_polarity = events.iter().find_map(|e| match &e.kind {
+        EventKind::GateResult {
+            gate,
+            artefact_detail,
+            ..
+        } if gate == "wrong-polarity" => artefact_detail.clone(),
+        _ => None,
+    });
+    assert!(
+        wrong_polarity
+            .as_deref()
+            .unwrap_or_default()
+            .contains("negated grep targets missing path"),
+        "{wrong_polarity:?}"
+    );
+
+    // Ordering: plan.approved < gate.result ladder < the advisory lint
+    // decision (a retried approval can never double-record a ladder).
+    let seq_of = |pred: &dyn Fn(&Event) -> bool| {
+        events
+            .iter()
+            .find(|e| pred(e))
+            .map(|e| e.seq)
+            .expect("event present")
+    };
+    let approved_seq = seq_of(&|e| matches!(e.kind, EventKind::PlanApproved { .. }));
+    let first_gate_seq = seq_of(&|e| matches!(e.kind, EventKind::GateResult { .. }));
+    let decision_seq = seq_of(
+        &|e| matches!(&e.kind, EventKind::OrchestratorDecision { summary, .. } if summary.contains("contract lint")),
+    );
+    assert!(
+        approved_seq < first_gate_seq,
+        "{approved_seq} < {first_gate_seq}"
+    );
+    assert!(
+        first_gate_seq < decision_seq,
+        "{first_gate_seq} < {decision_seq}"
+    );
+}
+
+/// ticket gate-results-first-class-events (KRZ-312): the final gate records
+/// its whole ladder as gate.result events too — the static floor re-checked
+/// against the active tree (passes-on-base absent by design), one event per
+/// gate, pass AND fail, with the final-gate surface. The mission still
+/// completes: the events are records, not gates.
+///
+/// unix-only for the same reason as
+/// contract_gate_final_gate_decision_names_vacuous_green (the
+/// vacuous-green shape needs shell negation).
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn gate_result_events_record_the_final_gate_ladder() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let contract = vec![assertion(
+        "",
+        "marker absent",
+        Some("! grep -q landed-marker kranz-no-such-file.txt"),
+    )];
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+    ]));
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(simple_plan(1, contract)).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+
+    let ladder: Vec<(String, u32, String)> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::GateResult {
+                gate,
+                surface,
+                index,
+                verdict,
+                ..
+            } if *surface == kranz_engine::gate::GateSurface::FinalGate => Some((
+                gate.clone(),
+                *index,
+                serde_json::to_value(verdict)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ladder,
+        vec![
+            ("vacuous-filter".to_string(), 0, "pass".to_string()),
+            ("wrong-polarity".to_string(), 1, "fail".to_string()),
+            ("env-sensitive".to_string(), 2, "pass".to_string()),
+        ],
+        "the final-gate floor, in pipeline order, passes and failures alike"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn approve_plan_requires_considered_alternatives_for_large_scope() {
     let (_dir, root) = init_repo();

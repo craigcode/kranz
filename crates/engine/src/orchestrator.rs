@@ -52,6 +52,7 @@ use crate::error::{EngineError, Result};
 use crate::event_log::{EventLog, LockForce};
 use crate::events::{Event, EventKind};
 use crate::findings::{synthesize_fix_specs, FindingsConversion, FixFeatureSpec};
+use crate::gate_results;
 use crate::git_ops::{with_kranz_trailers, CommitInfo, GitRepo, KranzCommitMetadata};
 use crate::judgement::{lesson_provenance_clean, JudgementOutcome};
 use crate::knowledge::{self, KnowledgeQuery};
@@ -1226,6 +1227,19 @@ impl MissionEngine {
             plan,
             base_sha: Some(base_sha),
         })?;
+
+        // First-class gate results (ticket gate-results-first-class-events,
+        // KRZ-312): one gate.result event per evaluated approval gate, in
+        // pipeline order. Emitted AFTER plan.approved, preserving the "Git
+        // first" invariant above (no event lands until approval can no
+        // longer fail) — a retried approve_plan therefore never double-
+        // records a ladder. Record-only: the advisory posture is unchanged,
+        // these events gate nothing.
+        for kind in
+            gate_results::gate_result_events(crate::gate::GateSurface::Approval, &gate_reports)
+        {
+            self.emit(kind)?;
+        }
 
         // Fold the contract lint into an operator-facing decision (M8 tier 1,
         // feature f-1-2): suspects (already pass on the untouched base) get a
@@ -4370,6 +4384,22 @@ impl MissionEngine {
             let (floor, pack) = final_gate_reports.split_at(floor_gate_count);
             (floor.to_vec(), pack.to_vec())
         };
+        // First-class gate results (ticket gate-results-first-class-events,
+        // KRZ-312): one gate.result event per evaluation, recorded for the
+        // WHOLE ladder — floor then pack, concatenated back into pipeline
+        // (registration) order so the per-section indices the helper assigns
+        // run continuously across both. Unconditional, pass or fail: a
+        // gate's silent green is exactly as invisible as its failure, and
+        // replay reconstructs the ladder from these events alone. Record-
+        // only; the advisory posture of both floors is unchanged.
+        let ladder: Vec<crate::gate::GateReport> = floor_reports
+            .iter()
+            .chain(pack_reports.iter())
+            .cloned()
+            .collect();
+        for kind in gate_results::gate_result_events(crate::gate::GateSurface::FinalGate, &ladder) {
+            self.emit(kind)?;
+        }
         let failed_gates = contract_gates::failed_gate_names(&floor_reports);
         if !failed_gates.is_empty() {
             self.emit_decision(

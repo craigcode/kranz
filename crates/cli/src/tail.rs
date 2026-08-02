@@ -298,6 +298,35 @@ impl EventRenderer {
                     None => format!("validator snapshot (target: {target_tier})"),
                 },
             ),
+            EventKind::GateResult {
+                gate,
+                surface,
+                kind,
+                index,
+                verdict,
+                ..
+            } => (
+                "gate".to_string(),
+                match verdict {
+                    kranz_engine::gate::GateVerdict::Pass => ansi::GREEN,
+                    kranz_engine::gate::GateVerdict::Fail => ansi::YELLOW,
+                },
+                format!(
+                    "{gate} ({}, {} #{index}) {}",
+                    match surface {
+                        kranz_engine::gate::GateSurface::Approval => "approval",
+                        kranz_engine::gate::GateSurface::FinalGate => "final gate",
+                    },
+                    match kind {
+                        kranz_engine::gate::GateKind::Deterministic => "det",
+                        kranz_engine::gate::GateKind::ModelJudged => "model",
+                    },
+                    match verdict {
+                        kranz_engine::gate::GateVerdict::Pass => "pass",
+                        kranz_engine::gate::GateVerdict::Fail => "FAIL",
+                    }
+                ),
+            ),
             EventKind::FixFeatureCreated {
                 milestone_id,
                 feature,

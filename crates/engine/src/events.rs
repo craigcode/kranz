@@ -286,6 +286,79 @@ pub enum EventKind {
         detail: Option<String>,
     },
 
+    /// One gate evaluation, recorded as a first-class event (ticket
+    /// `.kranz/tickets/gate-results-first-class-events`, KRZ-312 — the
+    /// governance evidence layer's last substrate gap before
+    /// provenance-replay). Every [`crate::gate::GatePipeline`] evaluation
+    /// emits one of these per gate, in pipeline order, carrying the gate id,
+    /// its ladder position, the stated verdict, and the artefact handle —
+    /// so the mission's full gate ladder replays from the log alone, with no
+    /// dependency on external state that may have moved. Record-only: the
+    /// reducer treats it as an audit record (like `secret.redacted`), never
+    /// a state transition, so old logs without any gate.result fold
+    /// unchanged.
+    ///
+    /// WHY `surface` is a first-class field: the same gate id is evaluated
+    /// more than once per mission (approval and final gate), so gate id +
+    /// ladder position cannot name ONE evaluation — and reconstructing the
+    /// surface from neighbouring events would couple replay to emission
+    /// order, exactly the external-state fragility this event abolishes.
+    ///
+    /// WHY there is no separate `section` field: [`crate::gate::GateKind`]
+    /// selects the pipeline section one-to-one (gate.rs), so `kind` doubles
+    /// as the section discriminator; `index` is the zero-based evaluation
+    /// position WITHIN that section.
+    ///
+    /// Artefact discipline (ticket text): `artefactRef` is mission-relative
+    /// or content-addressed, NEVER an absolute host path — a `file:`-schemed
+    /// mission-relative path when the evidence is a file
+    /// ([`crate::gate_results`]), or the gate-local handle verbatim (a
+    /// command line, a description) when the evidence is inherently textual.
+    /// A reference whose bytes are gone resolves to "unresolved", never to
+    /// an error that blocks replay.
+    #[serde(rename = "gate.result")]
+    GateResult {
+        /// Gate identity: the registered `Gate::name()` — e.g. a defect-class
+        /// name (`vacuous-filter`), a pack gate name, `merge-gate-suite`.
+        gate: String,
+        /// Which evaluation surface ran the pipeline (see
+        /// [`crate::gate::GateSurface`]).
+        surface: crate::gate::GateSurface,
+        /// The gate's kind — doubling as the ladder section (see the variant
+        /// docs).
+        kind: crate::gate::GateKind,
+        /// Zero-based evaluation position within the section: registration
+        /// order is evaluation order (gate.rs), so index order within
+        /// (surface, kind) IS the pipeline order.
+        index: u32,
+        /// The verdict the gate stated — never derived from `score`.
+        verdict: crate::gate::GateVerdict,
+        /// The artefact handle, verbatim from the outcome's
+        /// [`crate::gate::ArtefactRef::reference`].
+        #[serde(rename = "artefactRef")]
+        artefact_ref: String,
+        /// Evidence captured verbatim by the gate (a failing command's
+        /// output tail, per-assertion findings), from
+        /// [`crate::gate::ArtefactRef::detail`]. Absent when the reference
+        /// alone is the evidence; `None` never hits the wire.
+        #[serde(
+            rename = "artefactDetail",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        artefact_detail: Option<String>,
+        /// Gate-supplied confidence score (KRZ-315), purely evidentiary —
+        /// absent for boolean-only gates, never consulted to compute
+        /// `verdict`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        score: Option<f64>,
+        /// The threshold the gate judged `score` against; present exactly
+        /// when `score` is (the two travel as a pair from
+        /// [`crate::gate::GateScore`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        threshold: Option<f64>,
+    },
+
     /// Orchestrator converted findings into a fix-feature (origin: fix).
     #[serde(rename = "fixfeature.created")]
     FixFeatureCreated {
@@ -488,6 +561,7 @@ impl EventKind {
             EventKind::ValidationFinding { .. } => "validation.finding",
             EventKind::ValidatorTamper { .. } => "validator.tamper",
             EventKind::ValidationSnapshot { .. } => "validation.snapshot",
+            EventKind::GateResult { .. } => "gate.result",
             EventKind::FixFeatureCreated { .. } => "fixfeature.created",
             EventKind::TierEscalated { .. } => "tier.escalated",
             EventKind::MilestoneBlocked { .. } => "milestone.blocked",
@@ -1057,6 +1131,130 @@ mod tests {
         let legacy_back: EventKind = serde_json::from_value(json).unwrap();
         match legacy_back {
             EventKind::ValidationSnapshot { detail, .. } => assert_eq!(detail, None),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// The additive `gate.result` event (ticket
+    /// `gate-results-first-class-events`, KRZ-312): wire name, exact payload
+    /// shape, and round-trip. A full record — surface, ladder section +
+    /// index, stated verdict, artefact handle with captured detail, and the
+    /// optional score pair — survives serde verbatim, because replay
+    /// reconstructs the ladder from these bytes alone.
+    #[test]
+    fn gate_result_event_wire_shape_and_round_trip() {
+        let result = EventKind::GateResult {
+            gate: "vacuous-filter".to_string(),
+            surface: crate::gate::GateSurface::Approval,
+            kind: crate::gate::GateKind::Deterministic,
+            index: 0,
+            verdict: crate::gate::GateVerdict::Fail,
+            artefact_ref: "contract gate vacuous-filter".to_string(),
+            artefact_detail: Some("[a-1] test-runner pipeline's grep anchors no nonzero count: `cargo test | grep ok`".to_string()),
+            score: Some(0.42),
+            threshold: Some(0.75),
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["type"], "gate.result");
+        assert_eq!(json["payload"]["gate"], "vacuous-filter");
+        assert_eq!(json["payload"]["surface"], "approval");
+        assert_eq!(json["payload"]["kind"], "deterministic");
+        assert_eq!(json["payload"]["index"], 0);
+        assert_eq!(json["payload"]["verdict"], "fail");
+        assert_eq!(
+            json["payload"]["artefactRef"],
+            "contract gate vacuous-filter"
+        );
+        assert_eq!(json["payload"]["score"], 0.42);
+        assert_eq!(json["payload"]["threshold"], 0.75);
+        assert_eq!(result.type_name(), "gate.result");
+        let back: EventKind = serde_json::from_value(json).unwrap();
+        match back {
+            EventKind::GateResult {
+                gate,
+                surface,
+                kind,
+                index,
+                verdict,
+                artefact_ref,
+                artefact_detail,
+                score,
+                threshold,
+            } => {
+                assert_eq!(gate, "vacuous-filter");
+                assert_eq!(surface, crate::gate::GateSurface::Approval);
+                assert_eq!(kind, crate::gate::GateKind::Deterministic);
+                assert_eq!(index, 0);
+                assert_eq!(verdict, crate::gate::GateVerdict::Fail);
+                assert_eq!(artefact_ref, "contract gate vacuous-filter");
+                assert!(artefact_detail.as_deref().unwrap().contains("[a-1]"));
+                assert_eq!(score, Some(0.42));
+                assert_eq!(threshold, Some(0.75));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// Boolean-only gates carry no score, and a reference without captured
+    /// content carries no detail: all three are additive-optional — `None`
+    /// stays OFF the wire (byte-identical to a payload that never had them)
+    /// and a line without them parses back to `None` (serde default), so
+    /// hand-written or future-trimmed logs fold like engine-written ones.
+    #[test]
+    fn gate_result_event_optional_fields_are_additive() {
+        let sparse = EventKind::GateResult {
+            gate: "env-sensitive".to_string(),
+            surface: crate::gate::GateSurface::FinalGate,
+            kind: crate::gate::GateKind::ModelJudged,
+            index: 2,
+            verdict: crate::gate::GateVerdict::Pass,
+            artefact_ref: "contract gate env-sensitive".to_string(),
+            artefact_detail: None,
+            score: None,
+            threshold: None,
+        };
+        let json = serde_json::to_value(&sparse).unwrap();
+        assert_eq!(json["payload"]["surface"], "final-gate");
+        assert_eq!(json["payload"]["kind"], "model-judged");
+        assert_eq!(json["payload"]["verdict"], "pass");
+        let payload = json["payload"].as_object().unwrap();
+        for absent in ["artefactDetail", "score", "threshold"] {
+            assert!(
+                !payload.contains_key(absent),
+                "payload must not contain {absent} when None: {json}"
+            );
+        }
+
+        // A wire line naming only the required fields folds with the
+        // optional ones defaulted to None.
+        let line = r#"{
+            "seq": 7,
+            "ts": "2026-01-02T03:04:05Z",
+            "missionId": "m-1",
+            "type": "gate.result",
+            "payload": {
+                "gate": "merge-gate-suite",
+                "surface": "final-gate",
+                "kind": "deterministic",
+                "index": 1,
+                "verdict": "pass",
+                "artefactRef": ".kranz/merge-gates.json"
+            }
+        }"#;
+        let event: Event = serde_json::from_str(line).unwrap();
+        match event.kind {
+            EventKind::GateResult {
+                gate,
+                artefact_detail,
+                score,
+                threshold,
+                ..
+            } => {
+                assert_eq!(gate, "merge-gate-suite");
+                assert_eq!(artefact_detail, None);
+                assert_eq!(score, None);
+                assert_eq!(threshold, None);
+            }
             _ => panic!("wrong variant"),
         }
     }

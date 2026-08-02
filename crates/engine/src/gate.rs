@@ -40,7 +40,13 @@
 /// Whether a gate's verdict comes from a reproducible check or from model
 /// judgement. The kind selects the gate's pipeline section — deterministic
 /// gates always evaluate first (see the module docs).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serde kebab-case (the Role/GrantKind idiom): the persisted `gate.result`
+/// event (KRZ-312) carries the kind as its ladder-SECTION discriminator —
+/// kind and section are one-to-one by pipeline construction, so the event
+/// needs no separate section field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum GateKind {
     /// Exit codes, lints, scans: cheap, reproducible, no model spend.
     Deterministic,
@@ -51,10 +57,33 @@ pub enum GateKind {
 
 /// The authoritative outcome of one gate evaluation: pass or fail, as
 /// stated by the gate — never derived from [`GateOutcome::score`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serde kebab-case for the persisted `gate.result` event (KRZ-312).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum GateVerdict {
     Pass,
     Fail,
+}
+
+/// Which evaluation surface ran the pipeline a `gate.result` event came from
+/// (KRZ-312). The same gate id is evaluated more than once per mission —
+/// once at plan approval and once at the final gate — so a gate id plus
+/// ladder position alone cannot name ONE evaluation; the surface does. It is
+/// recorded on the event itself rather than inferred from neighbouring
+/// events: a replay that reconstructs the ladder from the log alone must not
+/// depend on emission-order conventions that a later refactor could move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GateSurface {
+    /// Plan-approval contract gates (`orchestrator::approve_plan`): the
+    /// defect-class floor including `passes-on-base`, evaluated against the
+    /// pristine base tree.
+    Approval,
+    /// Final-gate contract gates (`orchestrator::final_gate`): the static
+    /// floor re-checked against the active tree, plus any configured pack's
+    /// deterministic gates registered after it.
+    FinalGate,
 }
 
 /// A gate-supplied confidence score and the threshold the gate judged it

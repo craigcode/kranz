@@ -3303,3 +3303,228 @@ fn workspace_provider_pin_backcompat_with_pre_pin_logs_and_snapshots() {
         "{value}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// gate.result events (ticket gate-results-first-class-events, KRZ-312)
+// ---------------------------------------------------------------------------
+
+/// The ladder a replay reconstructs from gate.result events alone:
+/// (surface, section index, gate id, verdict, artefact ref) per evaluation.
+type ReplayedLadder = Vec<(String, u32, String, String, String)>;
+
+/// Reconstruct the full gate ladder from events — the provenance-replay
+/// consumer shape: nothing read but the log. Sorted by (surface, kind,
+/// index) the events reproduce pipeline order exactly (registration order
+/// is evaluation order within a section, gate.rs).
+fn replay_gate_ladder(events: &[Event]) -> ReplayedLadder {
+    let mut ladder: ReplayedLadder = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::GateResult {
+                gate,
+                surface,
+                index,
+                verdict,
+                artefact_ref,
+                ..
+            } => Some((
+                serde_json::to_value(surface)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                *index,
+                gate.clone(),
+                serde_json::to_value(verdict)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                artefact_ref.clone(),
+            )),
+            _ => None,
+        })
+        .collect();
+    ladder.sort();
+    ladder
+}
+
+/// Acceptance: replaying the committed fixture log (a mission whose
+/// approval ran the four-gate floor and whose final gate re-ran the static
+/// three) reconstructs the full gate ladder — ids, order, verdicts,
+/// artefact refs — with no reads outside the log. The fold itself runs the
+/// distance to mission.completed, proving the record-only apply arm.
+#[test]
+fn gate_result_event_fixture_log_replays_the_full_ladder() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/gate-results-ladder.events.jsonl");
+    let events = kranz_engine::event_log::EventLog::read_events(&fixture).unwrap();
+    assert_eq!(events.len(), 16, "fixture log changed; update the ladder");
+
+    let state = fold(&events).unwrap();
+    assert_eq!(state.mission.status, MissionStatus::Complete);
+
+    let ladder = replay_gate_ladder(&events);
+    let expected: ReplayedLadder = vec![
+        // The approval ladder: the full four-gate floor in ticket order.
+        (
+            "approval".to_string(),
+            0,
+            "vacuous-filter".to_string(),
+            "pass".to_string(),
+            "contract gate vacuous-filter".to_string(),
+        ),
+        (
+            "approval".to_string(),
+            1,
+            "wrong-polarity".to_string(),
+            "fail".to_string(),
+            "contract gate wrong-polarity".to_string(),
+        ),
+        (
+            "approval".to_string(),
+            2,
+            "passes-on-base".to_string(),
+            "fail".to_string(),
+            "contract gate passes-on-base".to_string(),
+        ),
+        (
+            "approval".to_string(),
+            3,
+            "env-sensitive".to_string(),
+            "pass".to_string(),
+            "contract gate env-sensitive".to_string(),
+        ),
+        // The final-gate ladder: the static floor (passes-on-base is absent
+        // by design — the work has landed).
+        (
+            "final-gate".to_string(),
+            0,
+            "vacuous-filter".to_string(),
+            "pass".to_string(),
+            "contract gate vacuous-filter".to_string(),
+        ),
+        (
+            "final-gate".to_string(),
+            1,
+            "wrong-polarity".to_string(),
+            "fail".to_string(),
+            "contract gate wrong-polarity".to_string(),
+        ),
+        (
+            "final-gate".to_string(),
+            2,
+            "env-sensitive".to_string(),
+            "pass".to_string(),
+            "contract gate env-sensitive".to_string(),
+        ),
+    ];
+    assert_eq!(ladder, expected);
+
+    // The failing gates' captured evidence replays verbatim from the log.
+    let wrong_polarity = events
+        .iter()
+        .find_map(|event| match &event.kind {
+            EventKind::GateResult {
+                gate,
+                artefact_detail,
+                ..
+            } if gate == "wrong-polarity" => artefact_detail.clone(),
+            _ => None,
+        })
+        .expect("wrong-polarity gate.result present");
+    assert!(
+        wrong_polarity.contains("negated grep targets missing path"),
+        "{wrong_polarity}"
+    );
+
+    // Determinism: the same log folds to byte-identical machine output
+    // across two replays (state JSON and the reconstructed ladder alike).
+    let first = serde_json::to_string(&fold(&events).unwrap()).unwrap();
+    let second = serde_json::to_string(&fold(&events).unwrap()).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(replay_gate_ladder(&events), ladder);
+}
+
+/// Backcompat: a log written by an engine predating gate.result — same
+/// mission, not one gate event — still folds cleanly to the same terminal
+/// state. Old logs are the rule, not the exception: the variant is purely
+/// additive, and its absence changes nothing.
+#[test]
+fn gate_result_event_absent_from_pre_gate_logs_folds_clean() {
+    let old_log = r#"{"seq":1,"ts":"2026-01-02T03:04:05Z","missionId":"m-gateladder","type":"mission.created","payload":{"goal":"prove gate ladder replay","baseBranch":"main","missionBranch":"kranz/mission-m-gateladder","config":{}}}
+{"seq":2,"ts":"2026-01-02T03:04:06Z","missionId":"m-gateladder","type":"workspace.provider.pinned","payload":{"provider":"local-worktree","template":"worktree","version":"1"}}
+{"seq":3,"ts":"2026-01-02T03:04:07Z","missionId":"m-gateladder","type":"plan.approved","payload":{"plan":{"goal":"prove gate ladder replay","validationContract":[{"id":"a-1","statement":"tests gate on the landed marker","check":"command","command":"grep -q landed-marker marker.txt"}],"milestones":[{"title":"the work","features":[{"title":"add marker","spec":"write marker.txt","validationCriteria":["marker present"]}]}]},"baseSha":"0123456789abcdef0123456789abcdef01234567"}}
+{"seq":4,"ts":"2026-01-02T03:04:08Z","missionId":"m-gateladder","type":"milestone.started","payload":{"milestoneId":"ms-1","startSha":"0123456789abcdef0123456789abcdef01234567"}}
+{"seq":5,"ts":"2026-01-02T03:04:09Z","missionId":"m-gateladder","type":"feature.started","payload":{"featureId":"f-1-1"}}
+{"seq":6,"ts":"2026-01-02T03:04:10Z","missionId":"m-gateladder","type":"feature.completed","payload":{"featureId":"f-1-1","commits":["fedcba9876543210fedcba9876543210fedcba98"]}}
+{"seq":7,"ts":"2026-01-02T03:04:11Z","missionId":"m-gateladder","type":"milestone.completed","payload":{"milestoneId":"ms-1","tag":"ms-1"}}
+{"seq":8,"ts":"2026-01-02T03:04:12Z","missionId":"m-gateladder","type":"mission.validating","payload":{}}
+{"seq":9,"ts":"2026-01-02T03:04:13Z","missionId":"m-gateladder","type":"mission.completed","payload":{}}
+"#;
+    let events: Vec<Event> = old_log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let state = fold(&events).unwrap();
+    assert_eq!(state.mission.status, MissionStatus::Complete);
+    assert_eq!(state.mission.milestones.len(), 1);
+    assert!(
+        replay_gate_ladder(&events).is_empty(),
+        "a pre-gate log reconstructs an empty ladder, never an error"
+    );
+}
+
+/// Record-only means record-only: folding a gate.result changes no state —
+/// the fold with the event interleaved is byte-identical to the fold
+/// without it (modulo last_seq), so verdicts can never masquerade as gates
+/// on state transitions.
+#[test]
+fn gate_result_event_is_record_only_in_the_fold() {
+    let gate_event = |seq: u64| Event {
+        seq,
+        ts: base_ts() + chrono::Duration::seconds(seq as i64),
+        mission_id: MISSION.to_string(),
+        kind: EventKind::GateResult {
+            gate: "vacuous-filter".to_string(),
+            surface: kranz_engine::gate::GateSurface::Approval,
+            kind: kranz_engine::gate::GateKind::Deterministic,
+            index: 0,
+            verdict: kranz_engine::gate::GateVerdict::Pass,
+            artefact_ref: "contract gate vacuous-filter".to_string(),
+            artefact_detail: None,
+            score: None,
+            threshold: None,
+        },
+    };
+    let without = fold(&[
+        ev(1, created()),
+        ev(
+            2,
+            EventKind::PlanApproved {
+                plan: plan(),
+                base_sha: None,
+            },
+        ),
+    ])
+    .unwrap();
+    let with = fold(&[
+        ev(1, created()),
+        ev(
+            2,
+            EventKind::PlanApproved {
+                plan: plan(),
+                base_sha: None,
+            },
+        ),
+        gate_event(3),
+    ])
+    .unwrap();
+    let mut without_shifted = without;
+    without_shifted.last_seq = with.last_seq;
+    assert_eq!(
+        serde_json::to_string(&with).unwrap(),
+        serde_json::to_string(&without_shifted).unwrap(),
+        "a gate.result must not perturb state beyond last_seq"
+    );
+}

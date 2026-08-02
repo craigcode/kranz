@@ -327,6 +327,18 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             milestone_mut(state, milestone_id)?;
         }
 
+        EventKind::GateResult { .. } => {
+            // Audit-only record (KRZ-312): one gate evaluation — id, ladder
+            // position, verdict, artefact handle. Gate results drive no
+            // state transition (the advisory posture of contract gates is
+            // unchanged: verdicts inform, they never block), and the ladder
+            // a replay reconstructs is read from the events themselves, so
+            // state shape intentionally does not grow. And unlike
+            // validation.finding there is no milestone/run reference on the
+            // payload to validate as a corruption guard — the arm is a pure
+            // no-op, exactly like secret.redacted below.
+        }
+
         EventKind::FixFeatureCreated {
             milestone_id,
             feature,
