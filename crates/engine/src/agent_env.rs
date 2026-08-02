@@ -23,7 +23,9 @@
 //! `command_exec::sanitized_gate_env` allowlist (it intentionally retains
 //! ambient `HOME`/`CI`/temp dirs for the operator's toolchain; not a clean
 //! swap for this module's scratch-HOME shape, so both lists stay, each
-//! documented at its site).
+//! documented at its site) — with ONE exception: the gate env never carries
+//! the ambient `CARGO_HOME`, which `run_bounded_gate_command` replaces with
+//! a fresh [`cache_only_cargo_home`] exactly like the contract env.
 //!
 //! Secret hygiene: only variable NAMES are ever logged here (the injected
 //! auth key's name, the passthrough names applied/skipped) — never values.
@@ -98,7 +100,12 @@ const CONTRACT_TOOLCHAIN_VARS: &[(&str, &str)] = &[
 /// remaining trade until engine-run gates are sandbox-wrapped), but Cargo
 /// credentials and credential-provider configuration cannot. A failed link
 /// simply leaves that cache absent and lets Cargo populate the isolated home.
-fn cache_only_cargo_home(base_home: &Path) -> PathBuf {
+///
+/// Used by BOTH child-env builders here and by
+/// [`crate::command_exec::run_bounded_gate_command`], whose merge-gate env
+/// substitutes this for the ambient `CARGO_HOME` over a self-cleaning temp
+/// scratch.
+pub(crate) fn cache_only_cargo_home(base_home: &Path) -> PathBuf {
     let destination = base_home.join(format!(
         ".cargo-cache-only-{}",
         uuid::Uuid::new_v4().simple()

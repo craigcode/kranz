@@ -325,8 +325,35 @@ where
 /// inherited environment. This synchronous wrapper is intended for a
 /// `spawn_blocking` thread; it owns a current-thread runtime so the robust
 /// async timeout/kill implementation remains the single source of truth.
+///
+/// The gate env intentionally retains ambient `HOME`/`CI`/temp dirs (the
+/// operator's toolchain shape — see `agent_env`'s module doc), but NOT the
+/// ambient `CARGO_HOME`: gate commands execute worker-authored build scripts
+/// and test binaries engine-side, outside any sandbox profile, and the real
+/// Cargo root carries registry credentials and credential-provider config.
+/// It is replaced with a fresh cache-only home (registry/git seeded by
+/// symlink, no credentials — [`crate::agent_env::cache_only_cargo_home`])
+/// over a temp scratch that self-cleans when the gate returns. The
+/// substitution FAILS CLOSED: no scratch, no gate run — running with the
+/// ambient Cargo root is the hole this exists to close.
 pub fn run_bounded_gate_command(cwd: &std::path::Path, command: &str) -> (bool, String) {
-    let env = sanitized_gate_env();
+    // cache_only_cargo_home creates a fresh unpredictable dir under the
+    // given base; the system temp dir keeps it out of the gated worktree
+    // (an untracked `.cargo-cache-only-*` at the root would dirty every
+    // gate's `git status`). The dir holds two symlinks plus whatever Cargo
+    // drops at its root; it is removed after the run.
+    let cargo_home = crate::agent_env::cache_only_cargo_home(std::env::temp_dir().as_path());
+    if !cargo_home.is_dir() {
+        return (
+            false,
+            format!(
+                "could not create the gate's cache-only Cargo home at {}",
+                cargo_home.display()
+            ),
+        );
+    }
+    let mut env = sanitized_gate_env();
+    env.insert("CARGO_HOME".to_string(), cargo_home.display().to_string());
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -341,6 +368,7 @@ pub fn run_bounded_gate_command(cwd: &std::path::Path, command: &str) -> (bool, 
         &env,
         true,
     ));
+    let _ = std::fs::remove_dir_all(&cargo_home);
     (code == Some(0), output)
 }
 
@@ -348,6 +376,9 @@ fn sanitized_gate_env() -> HashMap<String, String> {
     // Keep only process/toolchain location and locale values. In particular,
     // API keys, GitHub/Slack tokens, cloud credentials, SSH agent sockets and
     // arbitrary server configuration never cross into mission-authored tests.
+    // `CARGO_HOME` is deliberately ABSENT from this list — the caller
+    // substitutes a cache-only home (see `run_bounded_gate_command`); the
+    // ambient Cargo root is a credential directory.
     const SAFE: &[&str] = &[
         "PATH",
         "HOME",
@@ -360,7 +391,6 @@ fn sanitized_gate_env() -> HashMap<String, String> {
         "COMSPEC",
         "ComSpec",
         "PATHEXT",
-        "CARGO_HOME",
         "RUSTUP_HOME",
         "NPM_CONFIG_CACHE",
         "CI",
@@ -485,6 +515,11 @@ mod tests {
         ] {
             assert!(!env.contains_key(secret), "gate env leaked {secret}");
         }
+        assert!(
+            !env.contains_key("CARGO_HOME"),
+            "the ambient Cargo root is a credential directory; \
+             run_bounded_gate_command substitutes a cache-only home"
+        );
         assert!(env.keys().all(|key| matches!(
             key.as_str(),
             "PATH"
@@ -498,7 +533,6 @@ mod tests {
                 | "COMSPEC"
                 | "ComSpec"
                 | "PATHEXT"
-                | "CARGO_HOME"
                 | "RUSTUP_HOME"
                 | "NPM_CONFIG_CACHE"
                 | "CI"
@@ -507,6 +541,40 @@ mod tests {
                 | "LC_ALL"
                 | "TZ"
         )));
+    }
+
+    /// contract-cargo-home-cache-only: the merge gate's `CARGO_HOME` is a
+    /// fresh cache-only home — registry/git caches seeded, NO credentials —
+    /// never the ambient Cargo root. Gate commands run worker-authored test
+    /// code engine-side and unsandboxed, so this is the link that keeps
+    /// registry tokens out of mission-authored code.
+    #[cfg(unix)]
+    #[test]
+    fn contract_cargo_home_replaces_ambient_root_in_merge_gates() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(source.path().join("registry")).unwrap();
+        std::fs::write(source.path().join("registry/cache-marker"), "registry").unwrap();
+        std::fs::write(source.path().join("credentials.toml"), "operator-secret").unwrap();
+        let _guard = crate::agent_env::EnvTestGuard::engage(&[(
+            "CARGO_HOME",
+            source.path().to_str().expect("utf-8 temp path"),
+        )]);
+        let dir = tempfile::tempdir().unwrap();
+
+        let (ok, output) = run_bounded_gate_command(
+            dir.path(),
+            "printf '%s' \"$CARGO_HOME\" \
+             && test -f \"$CARGO_HOME/registry/cache-marker\" \
+             && test ! -e \"$CARGO_HOME/credentials.toml\"",
+        );
+        assert!(
+            ok,
+            "gate command must see a seeded, credential-free Cargo home: {output}"
+        );
+        assert!(
+            !output.is_empty() && output != source.path().to_string_lossy().as_ref(),
+            "the gate must NOT receive the ambient Cargo root: {output}"
+        );
     }
     /// agent-env-clear: a contract command run through the final-gate path
     /// (`run_shell_command`, env built by `contract_command_env`) cannot see
