@@ -366,19 +366,69 @@ STUBEOF
     LIVE_STATUS=$(status_of "$LEASE_LIVE_ID")
     LIVE_ASSIGNEE=$(BD show "$LEASE_LIVE_ID" --json 2>/dev/null | unwrap | jq -r '.assignee // empty')
 
+    LEASE_OK=1
     if [ "$DEAD_STATUS" != "open" ] || [ -n "$DEAD_ASSIGNEE" ]; then
         fail_case "lease-dead-recovered" "dead claim released to open/unassigned" "status=$DEAD_STATUS assignee='$DEAD_ASSIGNEE'"
+        LEASE_OK=0
     elif [ "$LIVE_STATUS" != "in_progress" ] || [ -z "$LIVE_ASSIGNEE" ]; then
         fail_case "lease-live-preserved" "live claim preserved at in_progress/assigned" "status=$LIVE_STATUS assignee='$LIVE_ASSIGNEE'"
+        LEASE_OK=0
     else
         # The released bead is immediately claimable again (idempotent re-claim).
         BD update "$LEASE_DEAD_ID" --claim >/dev/null 2>&1
         RECLAIMED=$(status_of "$LEASE_DEAD_ID")
         if [ "$RECLAIMED" != "in_progress" ]; then
             fail_case "lease-reclaimable-after-recovery" "in_progress after re-claim" "$RECLAIMED"
-        else
-            echo "LEASE: PASS (dead-claim recovered, live-claim preserved)"
+            LEASE_OK=0
         fi
+    fi
+
+    # Live-pid-holds-past-expired-TTL (ms-3-fix-6-2): the cell where
+    # "liveness first" actually differs from "TTL first". Every case above
+    # either exercises a fresh (well-inside-TTL) live claim or a lease-less
+    # past-TTL claim; none pairs a LIVE pid lease with an EXPIRED TTL. A
+    # hypothetical TTL-first implementation that only preserved claims
+    # inside the TTL window would release this one — kranz-dispatch must
+    # not, per its "a claim held by a verifiably live pid is never stolen
+    # at any age" contract.
+    LIVE_PASTTTL_CREATE_OUT=$(BD create "LEASE fixture (live holder, past TTL)" --type task --json 2>&1)
+    LEASE_LIVE_PASTTTL_ID=$(printf '%s' "$LIVE_PASTTTL_CREATE_OUT" | unwrap | jq -r '.id // empty')
+    if [ -z "$LEASE_LIVE_PASTTTL_ID" ]; then
+        fail_case "lease-live-pastttl-create" "a non-empty fixture id" "'$LIVE_PASTTTL_CREATE_OUT'"
+        LEASE_OK=0
+    else
+        BD update "$LEASE_LIVE_PASTTTL_ID" --add-label kranz >/dev/null 2>&1
+        BD update "$LEASE_LIVE_PASTTTL_ID" --claim >/dev/null 2>&1
+        LIVE_PASTTTL_ORIG_ASSIGNEE=$(BD show "$LEASE_LIVE_PASTTTL_ID" --json 2>/dev/null | unwrap | jq -r '.assignee // empty')
+        # Live holder: this test process itself, in the EXACT format the
+        # producer (packaging/gascity/bin/kranz-run-bead's heartbeat/init
+        # writers) emits: `printf '%s %s\n' "$$" "$(date +%s)"`.
+        printf '%s %s\n' "$$" "$(date +%s)" > "$LEASE_DIR/$LEASE_LIVE_PASTTTL_ID.lease"
+
+        # Same one-second wall-clock guard the other TTL=0 cases carry
+        # (fa35941 / d1a9173): without it, sub-second truncation skew
+        # between NOW and updated_at can read a negative idle age and this
+        # case would flake independent of the liveness-first logic under
+        # test.
+        sleep 1
+
+        # KRANZ_CLAIM_TTL=0: the TTL is expired the instant the sweep runs.
+        # Liveness-first means this must NOT matter for a live-pid holder.
+        PATH="$LEASE_STUB_BIN:$PATH" GC_CITY="$CITY_DIR" KRANZ_LABEL="kranz" \
+            KRANZ_LEASE_DIR="$LEASE_DIR" KRANZ_CLAIM_TTL=0 \
+            "$BIN_DIR/kranz-dispatch" --reclaim >/dev/null 2>&1
+
+        LIVE_PASTTTL_STATUS=$(status_of "$LEASE_LIVE_PASTTTL_ID")
+        LIVE_PASTTTL_ASSIGNEE=$(BD show "$LEASE_LIVE_PASTTTL_ID" --json 2>/dev/null | unwrap | jq -r '.assignee // empty')
+
+        if [ "$LIVE_PASTTTL_STATUS" != "in_progress" ] || [ "$LIVE_PASTTTL_ASSIGNEE" != "$LIVE_PASTTTL_ORIG_ASSIGNEE" ]; then
+            fail_case "lease-live-pid-preserved-past-ttl" "live-pid claim preserved at in_progress with assignee unchanged ('$LIVE_PASTTTL_ORIG_ASSIGNEE') even at KRANZ_CLAIM_TTL=0" "status=$LIVE_PASTTTL_STATUS assignee='$LIVE_PASTTTL_ASSIGNEE'"
+            LEASE_OK=0
+        fi
+    fi
+
+    if [ "$LEASE_OK" -eq 1 ]; then
+        echo "LEASE: PASS (dead-claim recovered, live-claim preserved)"
     fi
 
     # TTL backstop branch (f-3-1): a claim with NO lease file is recovered
