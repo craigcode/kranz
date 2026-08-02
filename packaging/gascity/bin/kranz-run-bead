@@ -79,8 +79,8 @@ mkdir -p "$LEASE_DIR"
 LEASE_FILE="$LEASE_DIR/$ID.lease"
 heartbeat() {
     while :; do
-        printf '%s %s\n' "$$" "$(date +%s)" > "$LEASE_FILE.$$.tmp" 2>/dev/null &&
-            mv -f "$LEASE_FILE.$$.tmp" "$LEASE_FILE" 2>/dev/null || exit 0
+        printf '%s %s\n' "$$" "$(date +%s)" > "$LEASE_FILE.hb.$$.tmp" 2>/dev/null &&
+            mv -f "$LEASE_FILE.hb.$$.tmp" "$LEASE_FILE" 2>/dev/null || exit 0
         sleep 15
     done
 }
@@ -88,13 +88,13 @@ heartbeat &
 HEARTBEAT_PID=$!
 cleanup_lease() {
     kill "$HEARTBEAT_PID" 2>/dev/null || true
-    rm -f "$LEASE_FILE" "$LEASE_FILE.$$.tmp"
+    rm -f "$LEASE_FILE" "$LEASE_FILE.hb.$$.tmp" "$LEASE_FILE.init.$$.tmp"
 }
 trap 'cleanup_lease' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-printf '%s %s\n' "$$" "$(date +%s)" > "$LEASE_FILE.$$.tmp" 2>/dev/null &&
-    mv -f "$LEASE_FILE.$$.tmp" "$LEASE_FILE" 2>/dev/null || true
+printf '%s %s\n' "$$" "$(date +%s)" > "$LEASE_FILE.init.$$.tmp" 2>/dev/null &&
+    mv -f "$LEASE_FILE.init.$$.tmp" "$LEASE_FILE" 2>/dev/null || true
 
 LINE=$( cd "$RIG_DIR" && kranz exec -f "$MFILE" --max-cycles "$MAX_CYCLES" 2>>"${MFILE%.md}.events.log" )
 CODE=$?

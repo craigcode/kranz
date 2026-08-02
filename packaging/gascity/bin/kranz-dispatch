@@ -156,11 +156,22 @@ reclaim_sweep() {
         if [ -f "$LEASE_FILE" ]; then
             read -r PID TS < "$LEASE_FILE" || true
             if [ -z "$PID" ]; then
-                # Lease file present but empty/unparseable: a holder was
-                # here very recently (the write landed mid-rename window)
-                # — skip this bead this sweep rather than falling through
-                # to the lease-less TTL backstop below.
-                continue
+                # Lease file present but empty/unparseable: retry a small
+                # bounded number of times with a short pause. A genuine
+                # mid-rename window is sub-millisecond, so a real live
+                # holder's lease parses on retry and takes the live-pid
+                # branch below. If it still doesn't parse, this is a wedged
+                # empty file (not a live holder) — fall through to the
+                # lease-less TTL backstop rather than skipping forever, so
+                # a genuinely dead/stuck claim can still be recovered; a
+                # truly live holder stays safe because its bd updated_at
+                # keeps getting refreshed.
+                ATTEMPT=0
+                while [ -z "$PID" ] && [ "$ATTEMPT" -lt 2 ]; do
+                    sleep 1
+                    read -r PID TS < "$LEASE_FILE" || true
+                    ATTEMPT=$((ATTEMPT + 1))
+                done
             fi
         fi
         if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
