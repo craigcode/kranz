@@ -79,12 +79,30 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             }
             Ok(0)
         }
-        Command::Outcomes { json } => {
-            let outcomes = kranz_engine::outcomes::compute_outcomes(&repo)?;
-            if json {
-                println!("{}", output::render_outcomes_json(&outcomes)?);
+        Command::Outcomes {
+            json,
+            all,
+            window_days,
+        } => {
+            if all {
+                // KRZ-329: the same fold, grouped by repo across the M8 host
+                // catalog (mirrors `kranz ready --all`).
+                let config = kranz_engine::paths::global_config()
+                    .ok_or_else(|| anyhow::anyhow!("cannot locate the home directory"))?;
+                let report =
+                    crate::merged_costs::assess_all(&config, window_days, chrono::Utc::now());
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print!("{}", crate::merged_costs::render_org(&report));
+                }
             } else {
-                print!("{}", output::render_outcomes(&outcomes));
+                let outcomes = kranz_engine::outcomes::compute_outcomes(&repo)?;
+                if json {
+                    println!("{}", output::render_outcomes_json(&outcomes)?);
+                } else {
+                    print!("{}", output::render_outcomes(&outcomes));
+                }
             }
             Ok(0)
         }

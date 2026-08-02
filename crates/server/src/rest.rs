@@ -116,6 +116,32 @@ pub(crate) async fn escalation_metrics(
     Ok(Json(metrics))
 }
 
+/// `GET /api/cost-per-merged-change?windowDays=30` — cost per merged change
+/// for the served repo (ticket `cost-per-merged-change`, KRZ-329): the cost
+/// fold over missions closed in the window beside the merged-change count
+/// derived at fold time (merged.rs's landed/ancestry probe — never stored)
+/// and the window's autonomy ratio. `windowDays` defaults to
+/// [`kranz_engine::outcomes::DEFAULT_MERGED_CHANGE_WINDOW_DAYS`]; the same
+/// folded JSON the CLI's `kranz outcomes --all` aggregates per catalog repo.
+pub(crate) async fn cost_per_merged_change(
+    State(server): State<Arc<ServerState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<kranz_engine::outcomes::CostPerMergedChange>, ApiError> {
+    let window_days = match params.get("windowDays") {
+        Some(raw) => raw
+            .parse::<u64>()
+            .map_err(|_| ApiError::bad_request("windowDays must be a non-negative integer"))?,
+        None => kranz_engine::outcomes::DEFAULT_MERGED_CHANGE_WINDOW_DAYS,
+    };
+    let report = kranz_engine::outcomes::compute_cost_per_merged_change(
+        &server.repo_root,
+        window_days,
+        chrono::Utc::now(),
+    )
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(report))
+}
+
 /// `<repo>/.kranz/missions/index.md` contents, or `""` if the file is absent
 /// (never created here — callers only read the catalog).
 fn read_missions_index(repo_root: &Path) -> String {
@@ -1143,6 +1169,96 @@ mod tests {
         assert_eq!(ledger[0]["ask"], "command: cargo test");
         assert_eq!(ledger[0]["decision"], "approved");
         assert!(ledger[0]["latencyMs"].is_number());
+    }
+
+    #[tokio::test]
+    async fn outcomes_report_cost_per_merged_endpoint_defaults_and_validates_window() {
+        let tmp = TempDir::new().unwrap();
+        seed_mission(
+            tmp.path(),
+            "m-1",
+            vec![created("seeded"), EventKind::MissionCompleted {}],
+        );
+        let app = crate::router(tmp.path().to_path_buf(), None);
+
+        // Default window: 30 days; a repo that merged nothing reads absent,
+        // never zero.
+        let response = app
+            .clone()
+            .oneshot(get("/api/cost-per-merged-change"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["windowDays"], 30);
+        assert_eq!(body["closedInWindow"], 1);
+        assert_eq!(body["mergedChanges"], 0);
+        assert!(body["usdPerMergedChange"].is_null());
+        assert_eq!(body["zeroInterventionShare"], 1.0);
+
+        // The window is a parameter.
+        let response = app
+            .clone()
+            .oneshot(get("/api/cost-per-merged-change?windowDays=7"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["windowDays"], 7);
+
+        // A malformed window is a 400, never a silent default.
+        let response = app
+            .oneshot(get("/api/cost-per-merged-change?windowDays=abc"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn outcomes_report_outcomes_endpoint_carries_the_new_fold_sections() {
+        let tmp = TempDir::new().unwrap();
+        seed_mission(
+            tmp.path(),
+            "m-1",
+            vec![
+                created("do the thing\n\n## Task class\nexecution-class\n"),
+                EventKind::GrantRequested {
+                    milestone_id: "ms-1".into(),
+                    kind: GrantKind::Command,
+                    command: "cargo test".into(),
+                },
+                EventKind::GrantApproved {
+                    kind: GrantKind::Command,
+                    command: "cargo test".into(),
+                },
+                EventKind::MissionCompleted {},
+            ],
+        );
+        let app = crate::router(tmp.path().to_path_buf(), None);
+
+        let response = app.oneshot(get("/api/missions/outcomes")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+
+        // KRZ-321: the per-task-class row (same fold, class grouping).
+        let classes = body["taskClasses"].as_array().unwrap();
+        assert_eq!(classes.len(), 1);
+        assert_eq!(classes[0]["taskClass"], "execution-class");
+        assert_eq!(classes[0]["missions"], 1);
+        assert_eq!(classes[0]["advisorInvocations"], 1);
+        // KRZ-323: the flag row plus the per-grant marker (seed_mission's
+        // request→approval gap lands far under the 10s default threshold).
+        assert_eq!(body["rubberStamp"]["thresholdMs"], 10_000);
+        assert_eq!(body["rubberStamp"]["flagged"], 1);
+        assert_eq!(body["rubberStamp"]["approvedDecisions"], 1);
+        let grant = body["escalations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["kind"] == "grant")
+            .unwrap()
+            .clone();
+        assert_eq!(grant["rubberStamp"], true);
     }
 
     /// `workspaceLifecycle` (ticket workspace-idle-hibernate): present with

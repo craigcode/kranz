@@ -1,7 +1,11 @@
 //! Flight-surgeon outcomes fold: autonomy ratio, grant-latency distribution,
-//! and an escalation ledger — all computed per-request from the existing
-//! event log. Pure-fold style, mirroring [`crate::trace_export`]: there is no
-//! second persisted source of truth, only a function over `&[Event]`.
+//! an escalation ledger, cost and cycle time — plus the KRZ-321/323/329
+//! extensions (per-task-class rows, the context-reuse split, the rubber-stamp
+//! flag, and cost per merged change) — all computed per-request from the
+//! existing event log. Pure-fold style, mirroring [`crate::trace_export`]:
+//! there is no second persisted source of truth, only a function over
+//! `&[Event]` (the merged-change denominator adds the live ancestry probe at
+//! fold time — derived, never stored).
 
 use crate::events::{Event, EventKind};
 use chrono::{DateTime, Utc};
@@ -59,6 +63,14 @@ pub struct EscalationRow {
     pub summary: String,
     pub decision: String,
     pub latency_ms: Option<u64>,
+    /// Rubber-stamp marker (ticket `rubber-stamp-grant-flag`), stamped at
+    /// aggregate time against the configured threshold: `Some(true)` when
+    /// this is a grant APPROVED in under the threshold, `Some(false)` for an
+    /// approved grant at/over it, `None` when the marker does not apply
+    /// (denied or pending grants — a fast DENY is not a rubber stamp — and
+    /// non-grant rows). A flag, never an enforcement.
+    #[serde(default)]
+    pub rubber_stamp: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -71,6 +83,112 @@ pub struct Outcomes {
     pub cost_per_change: CostPerChange,
     /// mission.created → terminal, minus paused spans (dashboard rule).
     pub cycle_time: CycleTime,
+    /// The same fold grouped by task class (ticket
+    /// `outcomes-report-task-class`): one row per class recovered from
+    /// `mission.created` goals, plus an explicit "unclassified" row for
+    /// missions whose goal carries none. Sorted by class name with
+    /// "unclassified" last.
+    #[serde(default)]
+    pub task_classes: Vec<TaskClassRow>,
+    /// Context-reuse split per backend (fresh vs cache-read vs cache-write
+    /// input tokens) — only for backends whose wire reports cache fields at
+    /// all; a backend that reports none yields NO row (absent, never a
+    /// fabricated 0%).
+    #[serde(default)]
+    pub context_reuse: Vec<ContextReuseRow>,
+    /// Rubber-stamp flag summary (ticket `rubber-stamp-grant-flag`), shown
+    /// alongside the latency distribution.
+    #[serde(default)]
+    pub rubber_stamp: RubberStampReport,
+}
+
+/// One task class's row in the outcomes report (KRZ-321).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskClassRow {
+    /// The class as written in ticket frontmatter / the mission goal, or
+    /// [`UNCLASSIFIED_TASK_CLASS`] when the mission carried none.
+    pub task_class: String,
+    pub missions: u64,
+    pub closed_missions: u64,
+    /// Σ worker cost across the class's missions (same rule as
+    /// [`CostPerChange::total_cost_usd`]).
+    pub total_cost_usd: f64,
+    pub non_meta_commits: u64,
+    /// total_cost_usd / non_meta_commits — None when the class has no
+    /// non-meta commits (the ratio is meaningless, not zero).
+    pub usd_per_commit: Option<f64>,
+    /// Grant + block + revision rows raised by the class's missions.
+    pub escalations: u64,
+    /// Of those, the grant parks — the advisor invocations.
+    pub advisor_invocations: u64,
+    /// escalations / missions (every row has at least one mission).
+    pub escalations_per_mission: f64,
+    /// Mean created→terminal (paused spans excluded) over the class's
+    /// missions with a computable cycle — None when none closed.
+    pub cycle_mean_ms: Option<f64>,
+}
+
+/// The task-class label missions without a `task-class` group under
+/// (KRZ-321: an explicit row, never silently dropped).
+pub const UNCLASSIFIED_TASK_CLASS: &str = "unclassified";
+
+/// One backend's context-reuse split (KRZ-321). Emitted ONLY for backends
+/// whose wire reports cache token fields
+/// ([`crate::types::BackendKind::reports_cache_read_tokens`]); reuse shares
+/// above ~95% are the cost pattern per-mission totals hide — a signal to
+/// investigate carried context, not a target to optimize.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextReuseRow {
+    /// [`crate::types::BackendKind::as_str`] of the backend the mission's
+    /// config routed these runs to.
+    pub backend: String,
+    /// Missions contributing at least one completed run on this backend.
+    pub missions: u64,
+    /// Completed runs folded.
+    pub runs: u64,
+    /// Σ non-cache input tokens.
+    pub fresh_input: u64,
+    /// Σ cache-read input tokens.
+    pub cache_read: u64,
+    /// Σ cache-write (creation) input tokens — None for backends whose wire
+    /// has no such field (codex), never zero-filled.
+    pub cache_write: Option<u64>,
+    /// (cache_read + cache_write) / (fresh + cache_read + cache_write) over
+    /// reported fields — None when no input tokens were recorded at all.
+    pub reuse_share: Option<f64>,
+}
+
+/// The rubber-stamp flag summary (KRZ-323): approved grants decided under
+/// the configured threshold, counted against all approved decisions with a
+/// computable latency.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RubberStampReport {
+    /// The threshold in effect (config `rubberStampThresholdMs`; default
+    /// [`crate::types::DEFAULT_RUBBER_STAMP_THRESHOLD_MS`]).
+    pub threshold_ms: u64,
+    /// Approved grant decisions with a computable latency (the population).
+    pub approved_decisions: u64,
+    /// Approved decisions under `threshold_ms` (strictly under; at/over is
+    /// not flagged).
+    pub flagged: u64,
+    /// flagged / approved_decisions — None when nothing was approved.
+    pub share: Option<f64>,
+}
+
+impl Default for RubberStampReport {
+    /// The serde-backfill / empty-history default carries the DOCUMENTED
+    /// threshold, never a zero that would flag everything.
+    fn default() -> Self {
+        Self {
+            threshold_ms: crate::types::DEFAULT_RUBBER_STAMP_THRESHOLD_MS,
+            approved_decisions: 0,
+            flagged: 0,
+            share: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -96,8 +214,9 @@ pub struct CycleTime {
     pub mean_ms: Option<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// Per-mission fold intermediate (never serialized — the report structs are
+/// the wire surface; this lives in the memo cache and the aggregator).
+#[derive(Debug, Clone, PartialEq)]
 pub struct MissionOutcomes {
     pub interventions: u64,
     pub is_closed: bool,
@@ -109,6 +228,25 @@ pub struct MissionOutcomes {
     pub non_meta_commits: u64,
     /// created → terminal minus paused spans; None while no terminal event.
     pub cycle_time_ms: Option<u64>,
+    /// The `task-class` recovered from the mission.created goal via
+    /// [`crate::ticket::parse_task_class_from_goal`]; None when the goal
+    /// carries no class heading (the "unclassified" row).
+    pub task_class: Option<String>,
+    /// Token usage summed per backend (as routed by the mission.created
+    /// config for each run's role) — the context-reuse split's input.
+    pub token_sums: Vec<BackendTokenSum>,
+}
+
+/// One mission's token usage on one backend, summed over its completed runs
+/// (KRZ-321 context-reuse split).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BackendTokenSum {
+    pub backend: crate::types::BackendKind,
+    pub runs: u64,
+    /// Non-cache input tokens.
+    pub fresh_input: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
 }
 
 /// The four fixed grant-latency bucket labels, in display order.
@@ -311,6 +449,8 @@ pub fn mission_outcomes(mission_id: &str, events: &[Event]) -> MissionOutcomes {
             summary: command.clone(),
             decision,
             latency_ms,
+            // Stamped at aggregate time against the configured threshold.
+            rubber_stamp: None,
         });
     }
 
@@ -361,6 +501,7 @@ pub fn mission_outcomes(mission_id: &str, events: &[Event]) -> MissionOutcomes {
             summary: reason.clone(),
             decision,
             latency_ms: None,
+            rubber_stamp: None,
         });
     }
 
@@ -399,6 +540,7 @@ pub fn mission_outcomes(mission_id: &str, events: &[Event]) -> MissionOutcomes {
             summary: instructions.clone(),
             decision,
             latency_ms: None,
+            rubber_stamp: None,
         });
     }
 
@@ -424,6 +566,12 @@ pub fn mission_outcomes(mission_id: &str, events: &[Event]) -> MissionOutcomes {
         EventKind::MissionCreated { config, .. } => Some(config),
         _ => None,
     });
+    // The task class travels in the goal (ticket.rs folds it in under a
+    // fixed heading; create() only ever sees the folded goal).
+    let task_class = mission_events.iter().find_map(|e| match &e.kind {
+        EventKind::MissionCreated { goal, .. } => crate::ticket::parse_task_class_from_goal(goal),
+        _ => None,
+    });
     let mut run_models: std::collections::HashMap<&str, (&str, crate::types::Role)> =
         std::collections::HashMap::new();
     for e in &mission_events {
@@ -438,6 +586,12 @@ pub fn mission_outcomes(mission_id: &str, events: &[Event]) -> MissionOutcomes {
         }
     }
     let mut cost_usd = 0.0;
+    // Token usage summed per backend (keyed by its as_str for deterministic
+    // output) — the context-reuse split's per-mission input. The backend is
+    // the one the mission.created config routes the run's role to, the same
+    // rule the cost fallback prices with.
+    let mut token_sums: std::collections::BTreeMap<&'static str, BackendTokenSum> =
+        std::collections::BTreeMap::new();
     for e in &mission_events {
         if let EventKind::WorkerCompleted {
             run_id,
@@ -446,16 +600,28 @@ pub fn mission_outcomes(mission_id: &str, events: &[Event]) -> MissionOutcomes {
             ..
         } = &e.kind
         {
-            cost_usd += recorded.unwrap_or_else(|| {
-                let (model, role) = run_models
-                    .get(run_id.as_str())
-                    .copied()
-                    .unwrap_or(("", crate::types::Role::Worker));
-                let backend = config
-                    .map(|c| c.backend_kind(role))
-                    .unwrap_or(crate::types::BackendKind::Claude);
-                crate::cost::usage_cost_usd_for_backend(tokens, model, backend)
-            });
+            let (model, role) = run_models
+                .get(run_id.as_str())
+                .copied()
+                .unwrap_or(("", crate::types::Role::Worker));
+            let backend = config
+                .map(|c| c.backend_kind(role))
+                .unwrap_or(crate::types::BackendKind::Claude);
+            cost_usd += recorded
+                .unwrap_or_else(|| crate::cost::usage_cost_usd_for_backend(tokens, model, backend));
+            let sum = token_sums
+                .entry(backend.as_str())
+                .or_insert(BackendTokenSum {
+                    backend,
+                    runs: 0,
+                    fresh_input: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                });
+            sum.runs += 1;
+            sum.fresh_input += tokens.input;
+            sum.cache_read += tokens.cache_read;
+            sum.cache_write += tokens.cache_write;
         }
     }
 
@@ -505,6 +671,64 @@ pub fn mission_outcomes(mission_id: &str, events: &[Event]) -> MissionOutcomes {
         cost_usd,
         non_meta_commits,
         cycle_time_ms,
+        task_class,
+        token_sums: token_sums.into_values().collect(),
+    }
+}
+
+/// Per-task-class accumulator for the KRZ-321 grouping (fold-internal).
+#[derive(Default)]
+struct TaskClassAcc {
+    missions: u64,
+    closed_missions: u64,
+    total_cost_usd: f64,
+    non_meta_commits: u64,
+    escalations: u64,
+    advisor_invocations: u64,
+    cycle_count: u64,
+    cycle_total_ms: u64,
+}
+
+/// Per-backend context-reuse accumulator (fold-internal).
+struct ReuseAcc {
+    backend: crate::types::BackendKind,
+    missions: u64,
+    runs: u64,
+    fresh_input: u64,
+    cache_read: u64,
+    cache_write: u64,
+}
+
+/// Fold-time options for the outcomes report (ticket
+/// `rubber-stamp-grant-flag`). Pure-fold idiom preserved: the same log plus
+/// the same options always yields byte-identical report data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutcomesOptions {
+    /// Grants APPROVED in under this many ms are flagged as rubber-stamp
+    /// signals (strictly under; at/over is not flagged).
+    pub rubber_stamp_threshold_ms: u64,
+}
+
+impl Default for OutcomesOptions {
+    fn default() -> Self {
+        Self {
+            rubber_stamp_threshold_ms: crate::types::DEFAULT_RUBBER_STAMP_THRESHOLD_MS,
+        }
+    }
+}
+
+impl OutcomesOptions {
+    /// Resolve from the repo's layered config (`rubberStampThresholdMs`).
+    /// A missing key falls back to the documented default; a broken config
+    /// degrades to the default too — the report fold never fails on config
+    /// (the engine proper rejects bad config at run start).
+    pub fn resolve(repo_root: &std::path::Path) -> Self {
+        match crate::config::load(repo_root) {
+            Ok(cfg) => Self {
+                rubber_stamp_threshold_ms: cfg.rubber_stamp_threshold_ms,
+            },
+            Err(_) => Self::default(),
+        }
     }
 }
 
@@ -515,6 +739,15 @@ pub fn mission_outcomes(mission_id: &str, events: &[Event]) -> MissionOutcomes {
 /// A mission with no `events.jsonl` or an unreadable/corrupt log is skipped
 /// (degrade per-row); this never panics or fails the whole aggregate.
 pub fn compute_outcomes(repo_root: &std::path::Path) -> anyhow::Result<Outcomes> {
+    compute_outcomes_with_options(repo_root, &OutcomesOptions::resolve(repo_root))
+}
+
+/// [`compute_outcomes`] with explicit fold options (the hermetic test seam:
+/// no config file is consulted).
+pub fn compute_outcomes_with_options(
+    repo_root: &std::path::Path,
+    options: &OutcomesOptions,
+) -> anyhow::Result<Outcomes> {
     let index_contents = std::fs::read_to_string(
         crate::paths::MissionPaths::new(repo_root, "_")
             .missions_dir()
@@ -539,6 +772,13 @@ pub fn compute_outcomes(repo_root: &std::path::Path) -> anyhow::Result<Outcomes>
     let mut total_non_meta_commits: u64 = 0;
     let mut cycle_closed: u64 = 0;
     let mut cycle_total_ms: u64 = 0;
+    // Per-task-class accumulators, keyed by class name (BTreeMap: the fold's
+    // output order must be a function of the log, never of hash iteration).
+    let mut class_accs: std::collections::BTreeMap<String, TaskClassAcc> =
+        std::collections::BTreeMap::new();
+    // Per-backend context-reuse accumulators, keyed by the backend's as_str.
+    let mut reuse_accs: std::collections::BTreeMap<&'static str, ReuseAcc> =
+        std::collections::BTreeMap::new();
 
     for id in ids {
         let paths = crate::paths::MissionPaths::new(repo_root, &id);
@@ -565,13 +805,56 @@ pub fn compute_outcomes(repo_root: &std::path::Path) -> anyhow::Result<Outcomes>
             }
         }
         all_latencies_ms.extend(out.latencies_ms);
-        escalations.extend(out.escalations);
         total_cost_usd += out.cost_usd;
         total_non_meta_commits += out.non_meta_commits;
         if let Some(ms) = out.cycle_time_ms {
             cycle_closed += 1;
             cycle_total_ms += ms;
         }
+
+        // Same fold, grouped by task class (KRZ-321).
+        let class_key = out
+            .task_class
+            .clone()
+            .unwrap_or_else(|| UNCLASSIFIED_TASK_CLASS.to_string());
+        let acc = class_accs.entry(class_key).or_default();
+        acc.missions += 1;
+        if out.is_closed {
+            acc.closed_missions += 1;
+        }
+        acc.total_cost_usd += out.cost_usd;
+        acc.non_meta_commits += out.non_meta_commits;
+        if let Some(ms) = out.cycle_time_ms {
+            acc.cycle_count += 1;
+            acc.cycle_total_ms += ms;
+        }
+        acc.escalations += out.escalations.len() as u64;
+        acc.advisor_invocations += out
+            .escalations
+            .iter()
+            .filter(|r| r.kind == EscalationKind::Grant)
+            .count() as u64;
+
+        // Same fold, grouped by backend (KRZ-321 context-reuse split).
+        for sum in &out.token_sums {
+            let acc = reuse_accs
+                .entry(sum.backend.as_str())
+                .or_insert_with(|| ReuseAcc {
+                    backend: sum.backend,
+                    missions: 0,
+                    runs: 0,
+                    fresh_input: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                });
+            acc.missions += 1;
+            acc.runs += sum.runs;
+            acc.fresh_input += sum.fresh_input;
+            acc.cache_read += sum.cache_read;
+            acc.cache_write += sum.cache_write;
+        }
+
+        escalations.extend(out.escalations);
     }
 
     let interventions_per_closed_mission = if closed_missions > 0 {
@@ -586,6 +869,78 @@ pub fn compute_outcomes(repo_root: &std::path::Path) -> anyhow::Result<Outcomes>
     };
 
     escalations.sort_by_key(|e| std::cmp::Reverse(e.ts));
+
+    // Rubber-stamp flag (KRZ-323): stamp each approved grant row against the
+    // configured threshold and count the share. Strictly under flags; at or
+    // over does not. Denied/pending grants and non-grant rows keep `None` —
+    // a fast deny is not a rubber stamp.
+    let mut approved_decisions: u64 = 0;
+    let mut flagged: u64 = 0;
+    for row in &mut escalations {
+        if row.kind != EscalationKind::Grant || row.decision != "approved" {
+            continue;
+        }
+        let Some(latency) = row.latency_ms else {
+            continue;
+        };
+        approved_decisions += 1;
+        let is_flagged = latency < options.rubber_stamp_threshold_ms;
+        if is_flagged {
+            flagged += 1;
+        }
+        row.rubber_stamp = Some(is_flagged);
+    }
+
+    // Rows sorted by class name (BTreeMap order) with "unclassified" moved
+    // last — documented and deterministic.
+    let mut task_classes: Vec<TaskClassRow> = class_accs
+        .into_iter()
+        .map(|(task_class, acc)| TaskClassRow {
+            escalations_per_mission: acc.escalations as f64 / acc.missions as f64,
+            usd_per_commit: (acc.non_meta_commits > 0)
+                .then(|| acc.total_cost_usd / acc.non_meta_commits as f64),
+            cycle_mean_ms: (acc.cycle_count > 0)
+                .then(|| acc.cycle_total_ms as f64 / acc.cycle_count as f64),
+            task_class,
+            missions: acc.missions,
+            closed_missions: acc.closed_missions,
+            total_cost_usd: acc.total_cost_usd,
+            non_meta_commits: acc.non_meta_commits,
+            escalations: acc.escalations,
+            advisor_invocations: acc.advisor_invocations,
+        })
+        .collect();
+    task_classes.sort_by_key(|row| {
+        (
+            row.task_class == UNCLASSIFIED_TASK_CLASS,
+            row.task_class.clone(),
+        )
+    });
+
+    // Context-reuse rows: ONLY backends whose wire reports cache fields —
+    // a backend reporting none yields no row (absent, never a fabricated
+    // 0% split).
+    let context_reuse: Vec<ContextReuseRow> = reuse_accs
+        .into_values()
+        .filter(|acc| acc.backend.reports_cache_read_tokens())
+        .map(|acc| {
+            let cache_write = acc
+                .backend
+                .reports_cache_write_tokens()
+                .then_some(acc.cache_write);
+            let cached = acc.cache_read + cache_write.unwrap_or(0);
+            let total = acc.fresh_input + cached;
+            ContextReuseRow {
+                backend: acc.backend.as_str().to_string(),
+                missions: acc.missions,
+                runs: acc.runs,
+                fresh_input: acc.fresh_input,
+                cache_read: acc.cache_read,
+                cache_write,
+                reuse_share: (total > 0).then(|| cached as f64 / total as f64),
+            }
+        })
+        .collect();
 
     Ok(Outcomes {
         autonomy_ratio: AutonomyRatio {
@@ -608,6 +963,141 @@ pub fn compute_outcomes(repo_root: &std::path::Path) -> anyhow::Result<Outcomes>
             total_ms: cycle_total_ms,
             mean_ms: (cycle_closed > 0).then(|| cycle_total_ms as f64 / cycle_closed as f64),
         },
+        task_classes,
+        context_reuse,
+        rubber_stamp: RubberStampReport {
+            threshold_ms: options.rubber_stamp_threshold_ms,
+            approved_decisions,
+            flagged,
+            share: (approved_decisions > 0).then(|| flagged as f64 / approved_decisions as f64),
+        },
+    })
+}
+
+/// Default time window for [`compute_cost_per_merged_change`] (KRZ-329):
+/// 30 days. The window selects missions by their terminal-event timestamp
+/// and is inclusive at both ends (`cutoff <= terminal_ts <= now`).
+pub const DEFAULT_MERGED_CHANGE_WINDOW_DAYS: u64 = 30;
+
+/// Cost per merged change for one repo (KRZ-329), beside the autonomy
+/// ratio. The numerator is the existing cost fold over missions closed in
+/// the window; the denominator is merged changes — missions that COMPLETED
+/// in the window AND whose branch tip is an ancestor of the live base tip
+/// ([`crate::merged::merged_bit`]), derived at fold time, never stored.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CostPerMergedChange {
+    /// The window in effect (days).
+    pub window_days: u64,
+    /// Missions with a terminal event inside the window (any terminal kind —
+    /// the same closed set as [`AutonomyRatio`]).
+    pub closed_in_window: u64,
+    /// Σ worker cost over the windowed missions (same rule as
+    /// [`CostPerChange::total_cost_usd`]).
+    pub total_cost_usd: f64,
+    /// Windowed missions that closed COMPLETE with their branch landed.
+    pub merged_changes: u64,
+    /// total_cost_usd / merged_changes — None when nothing merged in the
+    /// window (absent, never zero: no fabricated numbers).
+    pub usd_per_merged_change: Option<f64>,
+    /// zero-intervention closed / closed over the same window — None when
+    /// nothing closed in it.
+    pub zero_intervention_share: Option<f64>,
+}
+
+/// Fold one repo's cost per merged change. Pure over (event logs, live git
+/// refs, `now`): the same inputs always yield byte-identical data, and no
+/// merge state is ever persisted — the ancestry probe runs at fold time.
+/// A mission with an unreadable/corrupt log is skipped (degrade per-row);
+/// a repo git fails to open simply yields no merged changes (the ratio
+/// reads absent, never zero).
+pub fn compute_cost_per_merged_change(
+    repo_root: &std::path::Path,
+    window_days: u64,
+    now: DateTime<Utc>,
+) -> anyhow::Result<CostPerMergedChange> {
+    let index_contents = std::fs::read_to_string(
+        crate::paths::MissionPaths::new(repo_root, "_")
+            .missions_dir()
+            .join("index.md"),
+    )
+    .unwrap_or_default();
+
+    let mut ids = crate::paths::MissionPaths::list_missions(repo_root);
+    for id in crate::mission_catalog::mission_index_ids(&index_contents) {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids.sort();
+
+    let cutoff = now - chrono::Duration::days(window_days as i64);
+    let repo = crate::git_ops::GitRepo::open(repo_root).ok();
+
+    let mut closed_in_window: u64 = 0;
+    let mut zero_intervention: u64 = 0;
+    let mut total_cost_usd = 0.0;
+    let mut merged_changes: u64 = 0;
+
+    for id in ids {
+        let paths = crate::paths::MissionPaths::new(repo_root, &id);
+        let events_path = paths.events_file();
+        if !events_path.is_file() {
+            continue;
+        }
+        if paths.require_no_follow().is_err() {
+            continue;
+        }
+        let events = match crate::event_log::EventLog::read_events(&events_path) {
+            Ok(events) => events,
+            Err(_) => continue, // corrupt log degrades per-mission, never fails
+        };
+        // The window keys on the terminal event's own timestamp (the same
+        // "first terminal in seq order" the cycle-time fold uses).
+        let Some(terminal_ts) = events.iter().find_map(|e| {
+            matches!(
+                e.kind,
+                EventKind::MissionCompleted {}
+                    | EventKind::MissionFailed { .. }
+                    | EventKind::MissionAbandoned { .. }
+            )
+            .then_some(e.ts)
+        }) else {
+            continue; // still open — not in any closed window
+        };
+        if terminal_ts < cutoff || terminal_ts > now {
+            continue;
+        }
+        let out = mission_outcomes(&id, &events);
+        closed_in_window += 1;
+        if out.interventions == 0 {
+            zero_intervention += 1;
+        }
+        total_cost_usd += out.cost_usd;
+
+        // Merged change: closed COMPLETE and the mission branch landed on the
+        // live base (merged.rs's probe — the same derivation the mission rows
+        // and ticket projection use, run at fold time).
+        if let (Some(repo), Ok(state)) = (
+            repo.as_ref(),
+            crate::reducer::fold(&events).map(|s| s.mission),
+        ) {
+            if state.status == crate::types::MissionStatus::Complete
+                && crate::merged::merged_bit(repo, &state) == Some(true)
+            {
+                merged_changes += 1;
+            }
+        }
+    }
+
+    Ok(CostPerMergedChange {
+        window_days,
+        closed_in_window,
+        total_cost_usd,
+        merged_changes,
+        usd_per_merged_change: (merged_changes > 0).then(|| total_cost_usd / merged_changes as f64),
+        zero_intervention_share: (closed_in_window > 0)
+            .then(|| zero_intervention as f64 / closed_in_window as f64),
     })
 }
 
@@ -1463,6 +1953,579 @@ mod tests {
 
             let outcomes = compute_outcomes(root).unwrap();
             assert_eq!(outcomes.autonomy_ratio.closed_missions, 1);
+        }
+    }
+
+    /// KRZ-321/323 fold extensions: per-task-class rows, the context-reuse
+    /// split, and the rubber-stamp flag — all derived from the same event
+    /// log at fold time.
+    mod outcomes_report_tests {
+        use super::*;
+        use crate::paths::MissionPaths;
+        use crate::types::{GrantKind, MissionConfig, Role, RunResult, TokenUsage};
+        use tempfile::TempDir;
+
+        fn ev_ms(seq: u64, mission_id: &str, ts_ms: i64, kind: EventKind) -> Event {
+            Event {
+                seq,
+                ts: DateTime::from_timestamp_millis(ts_ms).unwrap(),
+                mission_id: mission_id.to_string(),
+                kind,
+            }
+        }
+
+        fn write_log(repo_root: &std::path::Path, id: &str, events: Vec<Event>) {
+            let paths = MissionPaths::new(repo_root, id);
+            std::fs::create_dir_all(paths.mission_dir()).unwrap();
+            let lines: Vec<String> = events
+                .iter()
+                .map(|e| serde_json::to_string(e).unwrap())
+                .collect();
+            std::fs::write(paths.events_file(), lines.join("\n") + "\n").unwrap();
+        }
+
+        fn sample_plan() -> crate::types::Plan {
+            crate::types::Plan {
+                goal: "g".into(),
+                validation_contract: vec![],
+                milestones: vec![],
+                considered_alternatives: None,
+                command_grants: vec![],
+                touch_set: vec![],
+            }
+        }
+
+        /// A mission.created whose goal carries a `task-class` heading in the
+        /// exact layout [`crate::ticket::Ticket::mission_goal`] folds it in.
+        fn created_with_class(mission_branch: &str, task_class: Option<&str>) -> EventKind {
+            let goal = match task_class {
+                Some(class) => format!("do the thing\n\n## Task class\n{class}\n"),
+                None => "do the thing".to_string(),
+            };
+            created_with_config(mission_branch, goal, MissionConfig::default())
+        }
+
+        fn created_with_config(
+            mission_branch: &str,
+            goal: String,
+            config: MissionConfig,
+        ) -> EventKind {
+            EventKind::MissionCreated {
+                goal,
+                base_branch: "main".into(),
+                mission_branch: mission_branch.into(),
+                config,
+            }
+        }
+
+        fn worker_spawned(run_id: &str) -> EventKind {
+            EventKind::WorkerSpawned {
+                run_id: run_id.into(),
+                role: Role::Worker,
+                feature_id: Some("f-1-1".into()),
+                milestone_id: Some("ms-1".into()),
+                sdk_session_id: "s".into(),
+                model: "sonnet".into(),
+                quant: "n/a".into(),
+                weight_hash: None,
+                prompt_hash: "h".into(),
+                transcript_path: "t".into(),
+            }
+        }
+
+        fn worker_completed(run_id: &str, tokens: TokenUsage, cost_usd: f64) -> EventKind {
+            EventKind::WorkerCompleted {
+                run_id: run_id.into(),
+                result: RunResult::Pass,
+                tokens,
+                cost_usd: Some(cost_usd),
+                report: None,
+            }
+        }
+
+        fn grant_req(seq: u64, mission_id: &str, ts_ms: i64, command: &str) -> Event {
+            ev_ms(
+                seq,
+                mission_id,
+                ts_ms,
+                EventKind::GrantRequested {
+                    milestone_id: "ms-1".into(),
+                    kind: GrantKind::Command,
+                    command: command.into(),
+                },
+            )
+        }
+
+        fn grant_yes(seq: u64, mission_id: &str, ts_ms: i64, command: &str) -> Event {
+            ev_ms(
+                seq,
+                mission_id,
+                ts_ms,
+                EventKind::GrantApproved {
+                    kind: GrantKind::Command,
+                    command: command.into(),
+                },
+            )
+        }
+
+        #[test]
+        fn outcomes_report_task_class_rows_group_and_unclassified_last() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+
+            // m-a: execution-class, closed, $10 spend, one non-meta commit,
+            // one approved grant park, a 100s cycle.
+            write_log(
+                root,
+                "m-a",
+                vec![
+                    ev_ms(
+                        1,
+                        "m-a",
+                        0,
+                        created_with_class("kranz/m-a", Some("execution-class")),
+                    ),
+                    ev_ms(2, "m-a", 1_000, worker_spawned("r-a")),
+                    ev_ms(
+                        3,
+                        "m-a",
+                        2_000,
+                        worker_completed(
+                            "r-a",
+                            TokenUsage {
+                                input: 1,
+                                output: 1,
+                                cache_read: 0,
+                                cache_write: 0,
+                            },
+                            10.0,
+                        ),
+                    ),
+                    ev_ms(
+                        4,
+                        "m-a",
+                        3_000,
+                        EventKind::FeatureCompleted {
+                            feature_id: "f-1-1".into(),
+                            commits: vec!["aaa [f-1-1] add the thing".to_string()],
+                        },
+                    ),
+                    grant_req(5, "m-a", 4_000, "cargo test"),
+                    grant_yes(6, "m-a", 64_000, "cargo test"),
+                    ev_ms(7, "m-a", 100_000, EventKind::MissionCompleted {}),
+                ],
+            );
+            // m-b: same class, still open (no terminal), $5 spend, one
+            // pending grant park.
+            write_log(
+                root,
+                "m-b",
+                vec![
+                    ev_ms(
+                        1,
+                        "m-b",
+                        0,
+                        created_with_class("kranz/m-b", Some("execution-class")),
+                    ),
+                    ev_ms(2, "m-b", 1_000, worker_spawned("r-b")),
+                    ev_ms(
+                        3,
+                        "m-b",
+                        2_000,
+                        worker_completed(
+                            "r-b",
+                            TokenUsage {
+                                input: 1,
+                                output: 1,
+                                cache_read: 0,
+                                cache_write: 0,
+                            },
+                            5.0,
+                        ),
+                    ),
+                    grant_req(4, "m-b", 3_000, "cargo clippy"),
+                ],
+            );
+            // m-c: no task class in its goal, closed with a 50s cycle, no
+            // escalations and no spend.
+            write_log(
+                root,
+                "m-c",
+                vec![
+                    ev_ms(1, "m-c", 0, created_with_class("kranz/m-c", None)),
+                    ev_ms(2, "m-c", 50_000, EventKind::MissionCompleted {}),
+                ],
+            );
+
+            let outcomes =
+                compute_outcomes_with_options(root, &OutcomesOptions::default()).unwrap();
+            assert_eq!(outcomes.task_classes.len(), 2);
+            let exec = &outcomes.task_classes[0];
+            assert_eq!(exec.task_class, "execution-class");
+            assert_eq!(exec.missions, 2);
+            assert_eq!(exec.closed_missions, 1);
+            assert_eq!(exec.total_cost_usd, 15.0);
+            assert_eq!(exec.non_meta_commits, 1);
+            assert_eq!(exec.usd_per_commit, Some(15.0));
+            assert_eq!(exec.escalations, 2);
+            assert_eq!(exec.advisor_invocations, 2);
+            assert_eq!(exec.escalations_per_mission, 1.0);
+            assert_eq!(exec.cycle_mean_ms, Some(100_000.0));
+
+            let unclassified = &outcomes.task_classes[1];
+            assert_eq!(unclassified.task_class, UNCLASSIFIED_TASK_CLASS);
+            assert_eq!(unclassified.missions, 1);
+            assert_eq!(unclassified.closed_missions, 1);
+            assert_eq!(unclassified.non_meta_commits, 0);
+            // Missing data is absent, never zero-filled.
+            assert_eq!(unclassified.usd_per_commit, None);
+            assert_eq!(unclassified.escalations, 0);
+            assert_eq!(unclassified.advisor_invocations, 0);
+            assert_eq!(unclassified.escalations_per_mission, 0.0);
+            assert_eq!(unclassified.cycle_mean_ms, Some(50_000.0));
+        }
+
+        #[test]
+        fn outcomes_report_context_reuse_split_absent_for_unreporting_backends() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+
+            // Claude run with cache fields reported.
+            write_log(
+                root,
+                "m-claude",
+                vec![
+                    ev_ms(1, "m-claude", 0, created_with_class("kranz/m-c", None)),
+                    ev_ms(2, "m-claude", 1_000, worker_spawned("r-1")),
+                    ev_ms(
+                        3,
+                        "m-claude",
+                        2_000,
+                        worker_completed(
+                            "r-1",
+                            TokenUsage {
+                                input: 500,
+                                output: 10,
+                                cache_read: 800,
+                                cache_write: 200,
+                            },
+                            1.0,
+                        ),
+                    ),
+                    ev_ms(4, "m-claude", 3_000, EventKind::MissionCompleted {}),
+                ],
+            );
+            // Local-tier mission: the local backend's wire carries no cache
+            // fields at all, so it must yield NO reuse row (absent — never a
+            // fabricated 0% split).
+            let mut local_cfg = MissionConfig::default();
+            local_cfg.worker.backend = Some("local".into());
+            write_log(
+                root,
+                "m-local",
+                vec![
+                    ev_ms(
+                        1,
+                        "m-local",
+                        0,
+                        created_with_config("kranz/m-l", "g".into(), local_cfg),
+                    ),
+                    ev_ms(2, "m-local", 1_000, worker_spawned("r-2")),
+                    ev_ms(
+                        3,
+                        "m-local",
+                        2_000,
+                        worker_completed(
+                            "r-2",
+                            TokenUsage {
+                                input: 100,
+                                output: 10,
+                                cache_read: 0,
+                                cache_write: 0,
+                            },
+                            0.0,
+                        ),
+                    ),
+                    ev_ms(4, "m-local", 3_000, EventKind::MissionCompleted {}),
+                ],
+            );
+
+            let outcomes =
+                compute_outcomes_with_options(root, &OutcomesOptions::default()).unwrap();
+            assert_eq!(outcomes.context_reuse.len(), 1);
+            let row = &outcomes.context_reuse[0];
+            assert_eq!(row.backend, "claude");
+            assert_eq!(row.missions, 1);
+            assert_eq!(row.runs, 1);
+            assert_eq!(row.fresh_input, 500);
+            assert_eq!(row.cache_read, 800);
+            assert_eq!(row.cache_write, Some(200));
+            assert_eq!(row.reuse_share, Some(1_000.0 / 1_500.0));
+        }
+
+        #[test]
+        fn outcomes_report_context_reuse_codex_cache_write_is_absent() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+
+            // Codex reports cached input tokens but has no cache-write field
+            // on its wire: cache_read is real, cache_write must be absent
+            // (None), never zero-filled.
+            let mut codex_cfg = MissionConfig::default();
+            codex_cfg.worker.backend = Some("codex".into());
+            write_log(
+                root,
+                "m-codex",
+                vec![
+                    ev_ms(
+                        1,
+                        "m-codex",
+                        0,
+                        created_with_config("kranz/m-x", "g".into(), codex_cfg),
+                    ),
+                    ev_ms(2, "m-codex", 1_000, worker_spawned("r-1")),
+                    ev_ms(
+                        3,
+                        "m-codex",
+                        2_000,
+                        worker_completed(
+                            "r-1",
+                            TokenUsage {
+                                input: 900,
+                                output: 10,
+                                cache_read: 100,
+                                cache_write: 0,
+                            },
+                            1.0,
+                        ),
+                    ),
+                    ev_ms(4, "m-codex", 3_000, EventKind::MissionCompleted {}),
+                ],
+            );
+
+            let outcomes =
+                compute_outcomes_with_options(root, &OutcomesOptions::default()).unwrap();
+            assert_eq!(outcomes.context_reuse.len(), 1);
+            let row = &outcomes.context_reuse[0];
+            assert_eq!(row.backend, "codex");
+            assert_eq!(row.cache_read, 100);
+            assert_eq!(row.cache_write, None);
+            assert_eq!(row.reuse_share, Some(100.0 / 1_000.0));
+        }
+
+        #[test]
+        fn outcomes_report_rubber_stamp_boundary_at_threshold() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+
+            // Five parks against the default 10s threshold:
+            // - 9_999ms approval → flagged (strictly under);
+            // - 10_000ms approval → NOT flagged (at the threshold);
+            // - 15_000ms approval → NOT flagged (over);
+            // - 5_000ms DENIAL → marker does not apply (a fast deny is not a
+            //   rubber stamp) and is not in the population;
+            // - pending → no marker, not in the population.
+            write_log(
+                root,
+                "m-1",
+                vec![
+                    ev_ms(1, "m-1", 0, created_with_class("kranz/m-1", None)),
+                    ev_ms(
+                        2,
+                        "m-1",
+                        1_000,
+                        EventKind::PlanApproved {
+                            plan: sample_plan(),
+                            base_sha: None,
+                        },
+                    ),
+                    grant_req(3, "m-1", 2_000, "under"),
+                    grant_yes(4, "m-1", 11_999, "under"),
+                    grant_req(5, "m-1", 20_000, "at"),
+                    grant_yes(6, "m-1", 30_000, "at"),
+                    grant_req(7, "m-1", 40_000, "over"),
+                    grant_yes(8, "m-1", 55_000, "over"),
+                    grant_req(9, "m-1", 60_000, "denied-fast"),
+                    ev_ms(
+                        10,
+                        "m-1",
+                        65_000,
+                        EventKind::GrantDenied {
+                            kind: GrantKind::Command,
+                            command: "denied-fast".into(),
+                            reason: "no".into(),
+                        },
+                    ),
+                    grant_req(11, "m-1", 70_000, "pending"),
+                    ev_ms(12, "m-1", 80_000, EventKind::MissionCompleted {}),
+                ],
+            );
+
+            let outcomes =
+                compute_outcomes_with_options(root, &OutcomesOptions::default()).unwrap();
+            let stamp = &outcomes.rubber_stamp;
+            assert_eq!(
+                stamp.threshold_ms,
+                crate::types::DEFAULT_RUBBER_STAMP_THRESHOLD_MS
+            );
+            assert_eq!(stamp.approved_decisions, 3);
+            assert_eq!(stamp.flagged, 1);
+            assert_eq!(stamp.share, Some(1.0 / 3.0));
+
+            let marker = |summary: &str| {
+                outcomes
+                    .escalations
+                    .iter()
+                    .find(|r| r.summary == summary)
+                    .unwrap()
+                    .rubber_stamp
+            };
+            assert_eq!(marker("under"), Some(true));
+            assert_eq!(
+                marker("at"),
+                Some(false),
+                "at the threshold is not under it"
+            );
+            assert_eq!(marker("over"), Some(false));
+            assert_eq!(marker("denied-fast"), None);
+            assert_eq!(marker("pending"), None);
+        }
+
+        #[test]
+        fn outcomes_report_rubber_stamp_threshold_resolves_from_config() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+
+            // The threshold is a config key (rubberStampThresholdMs); the
+            // project layer sets 60s here, so a 15s approval flags.
+            std::fs::create_dir_all(root.join(".kranz")).unwrap();
+            std::fs::write(
+                root.join(".kranz").join("config.json"),
+                "{\"rubberStampThresholdMs\": 60000}",
+            )
+            .unwrap();
+            assert_eq!(
+                OutcomesOptions::resolve(root).rubber_stamp_threshold_ms,
+                60_000
+            );
+
+            write_log(
+                root,
+                "m-1",
+                vec![
+                    ev_ms(1, "m-1", 0, created_with_class("kranz/m-1", None)),
+                    ev_ms(
+                        2,
+                        "m-1",
+                        1_000,
+                        EventKind::PlanApproved {
+                            plan: sample_plan(),
+                            base_sha: None,
+                        },
+                    ),
+                    grant_req(3, "m-1", 2_000, "fifteen seconds"),
+                    grant_yes(4, "m-1", 17_000, "fifteen seconds"),
+                    ev_ms(5, "m-1", 20_000, EventKind::MissionCompleted {}),
+                ],
+            );
+
+            // compute_outcomes is the config-reading entry point the CLI and
+            // REST surfaces call.
+            let outcomes = compute_outcomes(root).unwrap();
+            assert_eq!(outcomes.rubber_stamp.threshold_ms, 60_000);
+            assert_eq!(outcomes.rubber_stamp.flagged, 1);
+            assert_eq!(outcomes.rubber_stamp.share, Some(1.0));
+            assert_eq!(outcomes.escalations[0].rubber_stamp, Some(true));
+        }
+
+        #[test]
+        fn outcomes_report_rubber_stamp_absent_without_approvals() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+
+            write_log(
+                root,
+                "m-1",
+                vec![
+                    ev_ms(1, "m-1", 0, created_with_class("kranz/m-1", None)),
+                    ev_ms(
+                        2,
+                        "m-1",
+                        1_000,
+                        EventKind::PlanApproved {
+                            plan: sample_plan(),
+                            base_sha: None,
+                        },
+                    ),
+                    grant_req(3, "m-1", 2_000, "only-denied"),
+                    ev_ms(
+                        4,
+                        "m-1",
+                        3_000,
+                        EventKind::GrantDenied {
+                            kind: GrantKind::Command,
+                            command: "only-denied".into(),
+                            reason: "no".into(),
+                        },
+                    ),
+                    ev_ms(5, "m-1", 4_000, EventKind::MissionCompleted {}),
+                ],
+            );
+
+            let outcomes =
+                compute_outcomes_with_options(root, &OutcomesOptions::default()).unwrap();
+            assert_eq!(outcomes.rubber_stamp.approved_decisions, 0);
+            assert_eq!(outcomes.rubber_stamp.flagged, 0);
+            assert_eq!(outcomes.rubber_stamp.share, None);
+            assert_eq!(outcomes.escalations[0].rubber_stamp, None);
+        }
+
+        #[test]
+        fn outcomes_report_fold_is_byte_identical_across_repeated_computes() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+
+            write_log(
+                root,
+                "m-1",
+                vec![
+                    ev_ms(
+                        1,
+                        "m-1",
+                        0,
+                        created_with_class("kranz/m-1", Some("execution-class")),
+                    ),
+                    ev_ms(2, "m-1", 1_000, worker_spawned("r-1")),
+                    ev_ms(
+                        3,
+                        "m-1",
+                        2_000,
+                        worker_completed(
+                            "r-1",
+                            TokenUsage {
+                                input: 500,
+                                output: 10,
+                                cache_read: 800,
+                                cache_write: 200,
+                            },
+                            3.0,
+                        ),
+                    ),
+                    grant_req(4, "m-1", 3_000, "cargo test"),
+                    grant_yes(5, "m-1", 6_000, "cargo test"),
+                    ev_ms(6, "m-1", 10_000, EventKind::MissionCompleted {}),
+                ],
+            );
+
+            let options = OutcomesOptions::default();
+            let first = compute_outcomes_with_options(root, &options).unwrap();
+            let second = compute_outcomes_with_options(root, &options).unwrap();
+            assert_eq!(first, second);
+            assert_eq!(
+                serde_json::to_string(&first).unwrap(),
+                serde_json::to_string(&second).unwrap(),
+                "the same log plus the same options yields byte-identical data"
+            );
         }
     }
 }

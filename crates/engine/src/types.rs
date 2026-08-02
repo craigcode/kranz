@@ -719,6 +719,32 @@ impl BackendKind {
             }
         }
     }
+
+    /// Whether this backend's wire reports cache-READ input tokens the
+    /// parser records (outcomes-report context-reuse split, ticket
+    /// `outcomes-report-task-class`). Claude/droid read
+    /// `cache_read_input_tokens`; codex reads `cached_input_tokens`. Kimi's
+    /// wire carries no usage at all and local hardcodes zeros — for both, a
+    /// zero would be fabricated, so they report nothing (absent, never 0%).
+    /// The match is deliberately exhaustive: a future backend must declare
+    /// itself here.
+    pub fn reports_cache_read_tokens(self) -> bool {
+        match self {
+            BackendKind::Claude | BackendKind::Codex | BackendKind::Droid => true,
+            BackendKind::Kimi | BackendKind::Local => false,
+        }
+    }
+
+    /// Whether this backend's wire reports cache-WRITE (creation) input
+    /// tokens. Only claude/droid carry `cache_creation_input_tokens`; codex
+    /// has no such field (its cache write side is never recorded, so the
+    /// split's cache-write column is absent for codex, never zero-filled).
+    pub fn reports_cache_write_tokens(self) -> bool {
+        match self {
+            BackendKind::Claude | BackendKind::Droid => true,
+            BackendKind::Codex | BackendKind::Kimi | BackendKind::Local => false,
+        }
+    }
 }
 
 /// Which inference tier executes a ticket, derived deterministically from its
@@ -815,6 +841,12 @@ pub struct RemoteWorkspaceConfig {
     pub idle_after_hours: Option<f64>,
 }
 
+/// Default for [`MissionConfig::rubber_stamp_threshold_ms`] (ticket
+/// `rubber-stamp-grant-flag`): the docs/metrics.md §2 sub-ten-second bucket,
+/// made configurable. A grant APPROVED in under this latency is flagged as a
+/// rubber-stamp signal in the outcomes report — a flag, never an enforcement.
+pub const DEFAULT_RUBBER_STAMP_THRESHOLD_MS: u64 = 10_000;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct MissionConfig {
@@ -884,6 +916,11 @@ pub struct MissionConfig {
     /// pack-less behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pack_dir: Option<String>,
+    /// Outcomes-report flag threshold (ticket `rubber-stamp-grant-flag`):
+    /// grants APPROVED in under this many milliseconds are flagged as
+    /// rubber-stamp signals — a flag on a report row, never an enforcement.
+    /// The default (10s) is the docs/metrics.md §2 bucket made configurable.
+    pub rubber_stamp_threshold_ms: u64,
 }
 
 impl Default for MissionConfig {
@@ -957,6 +994,7 @@ impl Default for MissionConfig {
             contract_env_passthrough: vec![],
             workspace: WorkspaceConfig::default(),
             pack_dir: None,
+            rubber_stamp_threshold_ms: DEFAULT_RUBBER_STAMP_THRESHOLD_MS,
         }
     }
 }

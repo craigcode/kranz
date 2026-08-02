@@ -460,6 +460,7 @@ fn outcomes_slack_card_shows_ratio_buckets_and_escalation_count() {
             summary: "cargo test".into(),
             decision: "approved".into(),
             latency_ms: Some(5_000),
+            rubber_stamp: Some(true),
         }],
         cost_per_change: kranz_engine::outcomes::CostPerChange {
             total_cost_usd: 42.50,
@@ -470,6 +471,14 @@ fn outcomes_slack_card_shows_ratio_buckets_and_escalation_count() {
             closed_missions: 4,
             total_ms: 14_400_000,
             mean_ms: Some(3_600_000.0),
+        },
+        task_classes: vec![],
+        context_reuse: vec![],
+        rubber_stamp: kranz_engine::outcomes::RubberStampReport {
+            threshold_ms: 10_000,
+            approved_decisions: 1,
+            flagged: 1,
+            share: Some(1.0),
         },
     };
 
@@ -555,6 +564,9 @@ fn outcomes_slack_card_empty_history_renders_gracefully() {
             total_ms: 0,
             mean_ms: None,
         },
+        task_classes: vec![],
+        context_reuse: vec![],
+        rubber_stamp: kranz_engine::outcomes::RubberStampReport::default(),
     };
 
     let blocks = build_outcomes_summary(&outcomes);

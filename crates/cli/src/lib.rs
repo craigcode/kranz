@@ -29,6 +29,7 @@ pub mod config_cmd;
 pub mod exec;
 pub mod host_bridge;
 pub mod init;
+pub mod merged_costs;
 pub mod otel;
 pub mod output;
 pub mod planning_tui;

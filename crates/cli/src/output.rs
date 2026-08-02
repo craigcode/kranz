@@ -233,9 +233,9 @@ pub fn render_cost_estimate(estimate: &CostEstimate, missions_used: usize) -> St
 
 /// Render `kranz outcomes`'s default text view: an Autonomy section always,
 /// then Grant latency and Escalation ledger sections — unless there is no
-/// history at all (no closed missions, no escalations, no decided grants),
-/// in which case only the Autonomy section (zeros) plus a short note is
-/// printed, per the spec's empty-history rule.
+/// history at all (no closed missions, no escalations, no decided grants,
+/// no task-class rows), in which case only the Autonomy section (zeros) plus
+/// a short note is printed, per the spec's empty-history rule.
 pub fn render_outcomes(outcomes: &Outcomes) -> String {
     let ratio = &outcomes.autonomy_ratio;
     let mut out = String::new();
@@ -253,7 +253,8 @@ pub fn render_outcomes(outcomes: &Outcomes) -> String {
 
     let has_history = ratio.closed_missions > 0
         || !outcomes.escalations.is_empty()
-        || outcomes.grant_latency.total_decided > 0;
+        || outcomes.grant_latency.total_decided > 0
+        || !outcomes.task_classes.is_empty();
 
     if !has_history {
         out.push('\n');
@@ -270,6 +271,25 @@ pub fn render_outcomes(outcomes: &Outcomes) -> String {
         "  total decided: {}\n",
         outcomes.grant_latency.total_decided
     ));
+
+    // Rubber-stamp flag (KRZ-323) beside the latency distribution — a flag,
+    // never an enforcement.
+    let stamp = &outcomes.rubber_stamp;
+    out.push('\n');
+    out.push_str("Rubber-stamp signal\n");
+    match stamp.share {
+        Some(share) => out.push_str(&format!(
+            "  {} of {} approved grants under {} ({:.0}%)\n",
+            stamp.flagged,
+            stamp.approved_decisions,
+            format_duration_ms(stamp.threshold_ms),
+            share * 100.0
+        )),
+        None => out.push_str(&format!(
+            "  no approved grants yet (flag threshold {})\n",
+            format_duration_ms(stamp.threshold_ms)
+        )),
+    }
 
     let cost = &outcomes.cost_per_change;
     out.push('\n');
@@ -295,6 +315,63 @@ pub fn render_outcomes(outcomes: &Outcomes) -> String {
         None => out.push_str("  no closed missions yet\n"),
     }
 
+    // The same fold grouped by task class (KRZ-321).
+    if !outcomes.task_classes.is_empty() {
+        out.push('\n');
+        out.push_str("Per task class\n");
+        for row in &outcomes.task_classes {
+            let per_commit = row
+                .usd_per_commit
+                .map(|usd| format!("${usd:.2}/commit"))
+                .unwrap_or_else(|| "—/commit".to_string());
+            let mean_cycle = row
+                .cycle_mean_ms
+                .map(|ms| format_duration_ms(ms as u64))
+                .unwrap_or_else(|| "—".to_string());
+            out.push_str(&format!(
+                "  {}: {} mission{} ({} closed), ${:.2} total, {} ({} commits), {:.2} escalations/mission ({} advisor), mean cycle {}\n",
+                row.task_class,
+                row.missions,
+                if row.missions == 1 { "" } else { "s" },
+                row.closed_missions,
+                row.total_cost_usd,
+                per_commit,
+                row.non_meta_commits,
+                row.escalations_per_mission,
+                row.advisor_invocations,
+                mean_cycle
+            ));
+        }
+    }
+
+    // Context-reuse split per backend (KRZ-321) — only backends whose wire
+    // reports cache fields get a row at all.
+    if !outcomes.context_reuse.is_empty() {
+        out.push('\n');
+        out.push_str("Context reuse (input tokens)\n");
+        for row in &outcomes.context_reuse {
+            let share = row
+                .reuse_share
+                .map(|s| format!("{:.0}%", s * 100.0))
+                .unwrap_or_else(|| "—".to_string());
+            let cache_write = row
+                .cache_write
+                .map(|w| format!(", {} cache-write", fmt_tokens(w)))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "  {}: {} reused — {} cache-read{}, {} fresh ({} mission{}, {} runs)\n",
+                row.backend,
+                share,
+                fmt_tokens(row.cache_read),
+                cache_write,
+                fmt_tokens(row.fresh_input),
+                row.missions,
+                if row.missions == 1 { "" } else { "s" },
+                row.runs
+            ));
+        }
+    }
+
     out.push('\n');
     out.push_str("Escalation ledger\n");
     for row in &outcomes.escalations {
@@ -302,18 +379,36 @@ pub fn render_outcomes(outcomes: &Outcomes) -> String {
             .latency_ms
             .map(|ms| format!("{ms}ms"))
             .unwrap_or_else(|| "-".to_string());
+        // The per-grant rubber-stamp marker (KRZ-323).
+        let flag = if row.rubber_stamp == Some(true) {
+            "  rubber-stamp"
+        } else {
+            ""
+        };
         out.push_str(&format!(
-            "  {}  {}  {}  {}  {}  {}\n",
+            "  {}  {}  {}  {}  {}  {}{}\n",
             row.ts.to_rfc3339(),
             row.mission_id,
             row.kind.as_str(),
             row.summary,
             row.decision,
-            latency
+            latency,
+            flag
         ));
     }
 
     out
+}
+
+/// Token counts in the report's compact form ("1.5M", "800.0k", "42").
+fn fmt_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
 }
 
 /// Serialize `kranz outcomes --json`'s output — the source of truth for the
@@ -730,6 +825,71 @@ mod tests {
             assert!(text.contains("Cost per change"));
             assert!(text.contains("Cycle time"));
             assert!(text.contains("Escalation ledger"));
+        }
+
+        #[test]
+        fn outcomes_report_cli_text_renders_class_reuse_and_stamp_sections() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            // seed_mission stamps Utc::now() per append, so the park→decision
+            // gap lands far under the 10s default threshold: this grant is a
+            // rubber-stamp flag in the text.
+            seed_mission(
+                root,
+                "m-1",
+                vec![
+                    created("do the thing\n\n## Task class\nexecution-class\n"),
+                    EventKind::WorkerSpawned {
+                        run_id: "r-1".into(),
+                        role: kranz_engine::types::Role::Worker,
+                        feature_id: None,
+                        milestone_id: None,
+                        sdk_session_id: "s".into(),
+                        model: "sonnet".into(),
+                        quant: "n/a".into(),
+                        weight_hash: None,
+                        prompt_hash: "h".into(),
+                        transcript_path: "t".into(),
+                    },
+                    EventKind::WorkerCompleted {
+                        run_id: "r-1".into(),
+                        result: kranz_engine::types::RunResult::Pass,
+                        tokens: kranz_engine::types::TokenUsage {
+                            input: 500,
+                            output: 10,
+                            cache_read: 800,
+                            cache_write: 200,
+                        },
+                        cost_usd: Some(1.0),
+                        report: None,
+                    },
+                    EventKind::GrantRequested {
+                        milestone_id: "ms-1".into(),
+                        kind: GrantKind::Command,
+                        command: "cargo test".into(),
+                    },
+                    EventKind::GrantApproved {
+                        kind: GrantKind::Command,
+                        command: "cargo test".into(),
+                    },
+                    EventKind::MissionCompleted {},
+                ],
+            );
+
+            let outcomes = compute_outcomes(root).unwrap();
+            let text = render_outcomes(&outcomes);
+            assert!(text.contains("Rubber-stamp signal"), "{text}");
+            assert!(text.contains("1 of 1 approved grants under"), "{text}");
+            assert!(text.contains("Per task class"), "{text}");
+            assert!(text.contains("execution-class"), "{text}");
+            assert!(text.contains("Context reuse (input tokens)"), "{text}");
+            assert!(text.contains("claude: 67% reused"), "{text}");
+            // The per-grant marker rides the ledger row.
+            let grant_line = text
+                .lines()
+                .find(|l| l.contains("cargo test") && l.contains("approved"))
+                .expect("grant ledger row present");
+            assert!(grant_line.contains("rubber-stamp"), "{grant_line}");
         }
     }
 

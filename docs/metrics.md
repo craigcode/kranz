@@ -59,6 +59,16 @@ the pathological mode is the fast one.
 **Reproduce:** `kranz escalation-metrics --json` → `.rubberStamp` (and the
 per-grant rows in `.ledger`).
 
+**The threshold is config.** The ten-second bucket above is the documented
+default, not a constant: `rubberStampThresholdMs` (layered config, default
+`10000`) sets the latency under which an APPROVED grant is flagged as a
+rubber-stamp signal in the outcomes report — `kranz outcomes --json` →
+`.rubberStamp` (the flag row: flagged/approved counts and share) and
+`.escalations[].rubberStamp` (the per-grant marker; `null` on denied and
+pending grants — a fast deny is not a rubber stamp). Strictly under flags;
+at or over the threshold does not. It is a flag, never an enforcement: the
+operator judges what to do with the signal.
+
 **This repo, 2026-08-02:** 32 decided grants, **0 under ten seconds**.
 Approved-grant latencies run 10 minutes to 13 hours (a human read them);
 the rest are one-hour deny-default timeouts (a human was away, and the
@@ -108,3 +118,28 @@ by default and the ones that told it to stop and rework.
 Everyone in the field is building the viewing gallery — dashboards for
 watching agents work. Nobody else audits the go/no-go calls. These four
 numbers are the audit.
+
+## Addendum: the consumption numbers (KRZ-321/329)
+
+Same fold, different groupings — everything above stays event-log-derived,
+and so do these:
+
+- **Per task class.** `kranz outcomes --json` → `.taskClasses`: cost,
+  cost per non-meta commit, mean cycle time, and escalation/advisor
+  invocation rates broken down per `task-class` (missions without one group
+  under an explicit `unclassified` row).
+- **Context reuse.** `.contextReuse`: fresh vs cache-read vs cache-write
+  input tokens per backend, but only for backends whose wire reports cache
+  fields — a backend that reports none yields no row (absent, never a
+  fabricated 0% split). Reuse shares above ~95% are a cost pattern
+  per-mission totals hide: a signal to investigate carried context, not a
+  target to optimize.
+- **Cost per merged change.** `GET /api/cost-per-merged-change` for the
+  served repo, `kranz outcomes --all` for the host-catalog grouping beside
+  the autonomy ratio. The numerator is the cost fold over missions closed in
+  the window; the denominator is merged changes — missions that COMPLETED in
+  the window whose branch tip is an ancestor of the live base tip
+  (merged.rs's probe, derived at fold time, never stored). The window is a
+  parameter (`windowDays` / `--window-days`, default **30 days**, inclusive
+  at both ends). A repo that merged nothing in the window reads absent
+  (`null` / `—`), never zero.

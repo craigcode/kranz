@@ -113,11 +113,22 @@ pub enum Command {
     },
 
     /// Show the flight-surgeon outcomes fold: autonomy ratio, grant-latency
-    /// distribution, and escalation ledger (read-only, no lock)
+    /// distribution, per-task-class rows, context reuse, the rubber-stamp
+    /// flag, and the escalation ledger (read-only, no lock)
     Outcomes {
         /// Dump the full Outcomes struct as JSON instead of the text report
         #[arg(long)]
         json: bool,
+
+        /// Cost per merged change grouped by repo across the host catalog
+        /// (~/.kranz/config.json), beside the autonomy ratio (KRZ-329)
+        #[arg(long)]
+        all: bool,
+
+        /// Window in days for the merged-change denominator (only with
+        /// --all; default 30, inclusive at both ends)
+        #[arg(long, default_value_t = kranz_engine::outcomes::DEFAULT_MERGED_CHANGE_WINDOW_DAYS)]
+        window_days: u64,
     },
 
     /// Show the flight-surgeon console: autonomy ratio split by outcome,
