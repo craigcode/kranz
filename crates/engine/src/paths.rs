@@ -262,6 +262,7 @@ impl MissionPaths {
 /// [`MissionPaths::open_ticket_file_read_nofollow`]). `NotFound` passes
 /// through as `io` (callers keep missing-file handling); every other
 /// failure maps to the mission-refusal error.
+#[cfg(unix)]
 fn open_file_nofollow_under<P: AsRef<Path>>(
     dir: &Dir,
     name: P,
