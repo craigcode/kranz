@@ -121,16 +121,28 @@ pub(crate) async fn escalation_metrics(
 /// fold over missions closed in the window beside the merged-change count
 /// derived at fold time (merged.rs's landed/ancestry probe — never stored)
 /// and the window's autonomy ratio. `windowDays` defaults to
-/// [`kranz_engine::outcomes::DEFAULT_MERGED_CHANGE_WINDOW_DAYS`]; the same
-/// folded JSON the CLI's `kranz outcomes --all` aggregates per catalog repo.
+/// [`kranz_engine::outcomes::DEFAULT_MERGED_CHANGE_WINDOW_DAYS`] and is
+/// capped at [`kranz_engine::outcomes::MAX_MERGED_CHANGE_WINDOW_DAYS`] —
+/// over the cap is a 400, never a wrapped/panicked handler (12th-pass
+/// review); the same folded JSON the CLI's `kranz outcomes --all`
+/// aggregates per catalog repo.
 pub(crate) async fn cost_per_merged_change(
     State(server): State<Arc<ServerState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<kranz_engine::outcomes::CostPerMergedChange>, ApiError> {
     let window_days = match params.get("windowDays") {
-        Some(raw) => raw
-            .parse::<u64>()
-            .map_err(|_| ApiError::bad_request("windowDays must be a non-negative integer"))?,
+        Some(raw) => {
+            let parsed = raw
+                .parse::<u64>()
+                .map_err(|_| ApiError::bad_request("windowDays must be a non-negative integer"))?;
+            if parsed > kranz_engine::outcomes::MAX_MERGED_CHANGE_WINDOW_DAYS {
+                return Err(ApiError::bad_request(format!(
+                    "windowDays must be at most {} days",
+                    kranz_engine::outcomes::MAX_MERGED_CHANGE_WINDOW_DAYS
+                )));
+            }
+            parsed
+        }
         None => kranz_engine::outcomes::DEFAULT_MERGED_CHANGE_WINDOW_DAYS,
     };
     let report = kranz_engine::outcomes::compute_cost_per_merged_change(
@@ -1440,5 +1452,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// 12th-pass review: an unbounded `windowDays` once reached the engine's
+    /// `as i64` cast / chrono arithmetic and could wrap or panic the handler
+    /// — a read-authorized request crashing its own endpoint. Over the
+    /// documented maximum is a 400 now; the bound itself still computes.
+    #[tokio::test]
+    async fn cost_per_merged_change_window_days_bound_over_max_gets_400() {
+        let tmp = TempDir::new().unwrap();
+        let app = crate::router(tmp.path().to_path_buf(), None);
+
+        for raw in [
+            format!(
+                "{}",
+                kranz_engine::outcomes::MAX_MERGED_CHANGE_WINDOW_DAYS + 1
+            ),
+            u64::MAX.to_string(),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(get(&format!(
+                    "/api/cost-per-merged-change?windowDays={raw}"
+                )))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "windowDays={raw} must be a 400, never a crash"
+            );
+        }
+        // At the bound the endpoint computes normally (empty repo zeroes).
+        let response = app
+            .oneshot(get(&format!(
+                "/api/cost-per-merged-change?windowDays={}",
+                kranz_engine::outcomes::MAX_MERGED_CHANGE_WINDOW_DAYS
+            )))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(
+            body["windowDays"],
+            kranz_engine::outcomes::MAX_MERGED_CHANGE_WINDOW_DAYS
+        );
     }
 }

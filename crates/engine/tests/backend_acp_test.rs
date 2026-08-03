@@ -17,7 +17,10 @@ use kranz_engine::backend::{
 use kranz_engine::backend_acp::AcpBackend;
 use kranz_engine::event_log::{EventLog, LockForce};
 use kranz_engine::paths::MissionPaths;
-use kranz_engine::types::{Feature, FeatureOrigin, FeatureStatus, MissionConfig, TokenUsage};
+use kranz_engine::types::{
+    Feature, FeatureOrigin, FeatureStatus, Milestone, MilestoneStatus, MissionConfig, Role,
+    RunResult, TokenUsage,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -527,4 +530,192 @@ async fn backend_acp_peer_death_mid_run_leaves_a_resumable_event_log() {
             "seqs must be contiguous after re-acquire"
         );
     }
+}
+
+/// Streams one chunk, then answers `session/prompt` with the given
+/// `stopReason` (`None` = the field is omitted entirely) and exits 0: the
+/// non-completing-turn scenarios (12th-pass review).
+fn stop_reason_peer(reason: Option<&str>) -> String {
+    let mut body = String::from(PEER_PREAMBLE);
+    body.push_str("    *'\"method\":\"session/prompt\"'*)\n");
+    body.push_str(&notification("{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"partial answer\"},\"messageId\":\"m1\"}"));
+    let result = match reason {
+        Some(reason) => format!("{{\"stopReason\":\"{reason}\"}}"),
+        None => "{}".to_string(),
+    };
+    body.push_str(&format!(
+        "      printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":'\"$id\"',\"result\":{result}}}'\n      exit 0\n      ;;\n"
+    ));
+    body.push_str(PEER_SUFFIX);
+    body
+}
+
+/// Streams a COMPLETE validator report as one chunk, then ends the turn at
+/// `max_tokens`: the truncated-turn validator scenario (12th-pass review).
+fn truncated_validator_peer() -> String {
+    let mut body = String::from(PEER_PREAMBLE);
+    body.push_str("    *'\"method\":\"session/prompt\"'*)\n");
+    body.push_str(&notification("{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"{\\\"findings\\\": [], \\\"summary\\\": \\\"everything holds\\\"}\"},\"messageId\":\"m1\"}"));
+    body.push_str(
+        "      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":'\"$id\"',\"result\":{\"stopReason\":\"max_tokens\"}}'\n      exit 0\n      ;;\n",
+    );
+    body.push_str(PEER_SUFFIX);
+    body
+}
+
+/// 12th-pass review: ACP v1 names `end_turn` as the only natural completion.
+/// `refusal`, the truncation reasons, `cancelled`, and any UNKNOWN reason
+/// must all synthesize an error result — never a success — with the reason
+/// carried in the raw payload so the failure is diagnosable.
+#[tokio::test]
+async fn backend_acp_acp_stop_reason_non_end_turn_reasons_fail_honestly() {
+    for reason in [
+        "refusal",
+        "max_tokens",
+        "max_turn_requests",
+        "cancelled",
+        "mystery-reason",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let peer = write_peer(
+            dir.path(),
+            "mock-acp-stop.sh",
+            &stop_reason_peer(Some(reason)),
+        );
+        let backend = AcpBackend::new(peer, vec![]);
+
+        let mut session = backend
+            .start(spec(dir.path(), "kranz-sess-stop", true, &[]))
+            .await
+            .unwrap();
+        let mut result = None;
+        while let Some(event) = next(&mut session).await {
+            if matches!(event, AgentEvent::Result { .. }) {
+                result = Some(event);
+            }
+        }
+        match result.expect("terminal result") {
+            AgentEvent::Result {
+                text,
+                is_error,
+                cost_usd,
+                raw,
+                ..
+            } => {
+                assert!(is_error, "stopReason {reason:?} must fail honestly");
+                assert_eq!(text, "partial answer", "streamed text is still captured");
+                assert_eq!(
+                    raw["stopReason"], reason,
+                    "the raw payload names the reason: {raw}"
+                );
+                assert_eq!(cost_usd, None, "cost capture is unchanged");
+            }
+            other => panic!("expected Result, got {other:?}"),
+        }
+        // The peer exited 0 after answering: a clean PROCESS exit whose
+        // error RESULT the runner maps to an honest Fail.
+        assert_eq!(session.exit_status(), Some(SessionExit::Completed));
+    }
+}
+
+/// A missing `stopReason` is not a completion either: the result fails and
+/// the raw payload shows the field was absent (`null`), not silently
+/// treated as natural completion.
+#[tokio::test]
+async fn backend_acp_acp_stop_reason_absent_fails_honestly() {
+    let dir = tempfile::tempdir().unwrap();
+    let peer = write_peer(dir.path(), "mock-acp-no-reason.sh", &stop_reason_peer(None));
+    let backend = AcpBackend::new(peer, vec![]);
+
+    let mut session = backend
+        .start(spec(dir.path(), "kranz-sess-noreason", true, &[]))
+        .await
+        .unwrap();
+    let mut result = None;
+    while let Some(event) = next(&mut session).await {
+        if matches!(event, AgentEvent::Result { .. }) {
+            result = Some(event);
+        }
+    }
+    match result.expect("terminal result") {
+        AgentEvent::Result { is_error, raw, .. } => {
+            assert!(is_error, "a missing stopReason must fail honestly");
+            assert!(
+                raw["stopReason"].is_null(),
+                "absent stays visibly absent in the raw payload: {raw}"
+            );
+        }
+        other => panic!("expected Result, got {other:?}"),
+    }
+}
+
+/// The regression the mapping fixes: a validator turn cut at `max_tokens`
+/// AFTER streaming a parseable report must NOT pass validation — the report
+/// parses, yet the run records an honest failure because the turn did not
+/// complete naturally.
+#[tokio::test]
+async fn backend_acp_acp_stop_reason_truncated_turn_validator_cannot_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = MissionPaths::new(dir.path(), "m-acp-stop");
+    let mut log = EventLog::acquire(
+        &paths,
+        "m-acp-stop",
+        Duration::from_millis(0),
+        LockForce::No,
+    )
+    .unwrap();
+    let cfg = MissionConfig::default();
+    let milestone = Milestone {
+        id: "ms-1".to_string(),
+        title: "Auth".to_string(),
+        features: vec![Feature {
+            id: "f-1".to_string(),
+            title: "Add login".to_string(),
+            spec: "Build the login endpoint".to_string(),
+            validation_criteria: vec!["users can log in".to_string()],
+            origin: FeatureOrigin::Plan,
+            status: FeatureStatus::Pending,
+            worker_runs: vec![],
+            commits: vec![],
+            respawns: 0,
+        }],
+        status: MilestoneStatus::Validating,
+        fix_cycles: 0,
+        start_sha: Some("abc123".to_string()),
+        validator_guidance: None,
+    };
+
+    let peer = write_peer(
+        dir.path(),
+        "mock-acp-truncated-validator.sh",
+        &truncated_validator_peer(),
+    );
+    let backend = AcpBackend::new(peer, vec![]);
+    let outcome = kranz_engine::runner::run_validator(
+        &backend,
+        &mut log,
+        &paths,
+        &cfg,
+        Role::ValidatorScrutiny,
+        &milestone,
+        &[],
+        "abc123",
+        None,
+        None,
+        &[],
+        &[],
+        &[],
+        None,
+    )
+    .await
+    .expect("run_validator returns the recorded outcome even for a failed run");
+    assert!(
+        outcome.validator_report.is_some(),
+        "the streamed report parses — the failure must come from the stop reason"
+    );
+    assert!(
+        matches!(outcome.result, RunResult::Fail),
+        "a max_tokens validator turn must fail honestly, got {:?}",
+        outcome.result
+    );
 }

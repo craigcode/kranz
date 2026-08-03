@@ -1071,6 +1071,14 @@ pub fn compute_outcomes_with_options(
 /// and is inclusive at both ends (`cutoff <= terminal_ts <= now`).
 pub const DEFAULT_MERGED_CHANGE_WINDOW_DAYS: u64 = 30;
 
+/// Largest window [`compute_cost_per_merged_change`] accepts: 36,525 days
+/// (100 years) — far past any real audit window. The bound exists so the
+/// `u64 → i64` conversion and the chrono subtraction can never wrap, panic,
+/// or push the cutoff out of representable range (12th-pass review): the
+/// REST layer rejects over-bound values with 400, and the engine errors
+/// here so ANY caller is safe.
+pub const MAX_MERGED_CHANGE_WINDOW_DAYS: u64 = 36_525;
+
 /// Cost per merged change for one repo (KRZ-329), beside the autonomy
 /// ratio. The numerator is the existing cost fold over missions closed in
 /// the window; the denominator is merged changes — missions that COMPLETED
@@ -1102,7 +1110,9 @@ pub struct CostPerMergedChange {
 /// merge state is ever persisted — the ancestry probe runs at fold time.
 /// A mission with an unreadable/corrupt log is skipped (degrade per-row);
 /// a repo git fails to open simply yields no merged changes (the ratio
-/// reads absent, never zero).
+/// reads absent, never zero). A `window_days` over
+/// [`MAX_MERGED_CHANGE_WINDOW_DAYS`] is an honest error — never a wrapped
+/// or panicked computation.
 pub fn compute_cost_per_merged_change(
     repo_root: &std::path::Path,
     window_days: u64,
@@ -1123,7 +1133,29 @@ pub fn compute_cost_per_merged_change(
     }
     ids.sort();
 
-    let cutoff = now - chrono::Duration::days(window_days as i64);
+    // Bound the window BEFORE any arithmetic (12th-pass review): an
+    // unbounded `window_days` wraps the `as i64` cast negative (a cutoff in
+    // the future, silently windowing the wrong missions) or panics the
+    // chrono arithmetic — a read-authorized request could crash its own
+    // handler. The conversions stay checked so the failure mode is always
+    // an honest error, for this and every other caller.
+    if window_days > MAX_MERGED_CHANGE_WINDOW_DAYS {
+        return Err(crate::error::EngineError::InvalidState(format!(
+            "window_days {window_days} exceeds the maximum {MAX_MERGED_CHANGE_WINDOW_DAYS} days"
+        ))
+        .into());
+    }
+    let days = i64::try_from(window_days).map_err(|_| {
+        crate::error::EngineError::InvalidState(format!(
+            "window_days {window_days} is out of range"
+        ))
+    })?;
+    let window = chrono::Duration::try_days(days).ok_or_else(|| {
+        crate::error::EngineError::InvalidState(format!(
+            "window_days {window_days} is out of range"
+        ))
+    })?;
+    let cutoff = now - window;
     let repo = crate::git_ops::GitRepo::open(repo_root).ok();
 
     let mut closed_in_window: u64 = 0;
@@ -2094,6 +2126,29 @@ mod tests {
             assert_eq!(outcomes.grant_latency.total_decided, 0);
 
             assert!(outcomes.escalations.is_empty());
+        }
+
+        /// 12th-pass review: an unbounded `window_days` once wrapped the
+        /// `as i64` cast negative or panicked the chrono arithmetic — a
+        /// read-authorized request could crash its handler. Over the
+        /// documented maximum is now an honest error for ANY caller;
+        /// the maximum itself still computes.
+        #[test]
+        fn window_days_bound_over_max_errors_instead_of_panicking() {
+            let tmp = TempDir::new().unwrap();
+            let now = Utc::now();
+            let err = compute_cost_per_merged_change(tmp.path(), u64::MAX, now)
+                .expect_err("u64::MAX must error, never wrap or panic");
+            assert!(err.to_string().contains("exceeds the maximum"), "{err}");
+            let err =
+                compute_cost_per_merged_change(tmp.path(), MAX_MERGED_CHANGE_WINDOW_DAYS + 1, now)
+                    .expect_err("just over the bound errors");
+            assert!(err.to_string().contains("exceeds the maximum"), "{err}");
+            let report =
+                compute_cost_per_merged_change(tmp.path(), MAX_MERGED_CHANGE_WINDOW_DAYS, now)
+                    .expect("the documented maximum computes");
+            assert_eq!(report.window_days, MAX_MERGED_CHANGE_WINDOW_DAYS);
+            assert_eq!(report.closed_in_window, 0);
         }
 
         #[test]

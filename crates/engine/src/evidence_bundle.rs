@@ -58,14 +58,16 @@
 //! log fails the export outright.
 
 use crate::error::EngineError;
-use crate::events::Event;
 use crate::gate_results::{file_artefact_ref, resolve_artefact, ArtefactResolution};
 use crate::outcomes::MissionOutcomes;
 use crate::paths::MissionPaths;
 use crate::provenance::{ArtefactStatus, ProvenanceChain};
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, OpenOptions};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::io::Read as _;
+use std::io::{ErrorKind, Read as _, Write as _};
 use std::path::{Component, Path, PathBuf};
 
 /// `manifest.json`'s `version` field: the bundle format version. Bump on any
@@ -514,14 +516,17 @@ pub fn assemble_evidence_bundle(
     paths.require_no_follow()?;
     let mission_dir = paths.mission_dir();
 
-    // The primary record, twice: parsed+validated for the folds, raw for the
-    // bundle's verbatim copy. A concurrent append between the two reads would
-    // make the copy a strict prefix of what was folded (or vice versa) —
-    // acceptable for a read-only observer of a live mission; a closed
-    // mission's log never moves.
-    let events: Vec<Event> = crate::event_log::EventLog::read_events(&paths.events_file())?;
-    let mut log_bytes = Vec::new();
-    crate::paths::open_read_nofollow(&paths.events_file())?.read_to_end(&mut log_bytes)?;
+    // The primary record, read ONCE: the same buffer is parsed+validated
+    // for the folds AND shipped verbatim as the bundle's log copy
+    // (12th-pass review). Two separate opens — parse here, reread raw bytes
+    // there — would let a concurrent append (or a torn final line the
+    // parser dropped) desync the shipped `events.jsonl` from the
+    // chain/cost/escalations folded from it; the auditor's re-fold of the
+    // shipped bytes must reproduce the bundle exactly. The torn-tail rule
+    // (`read_events_and_log_bytes`): a torn final line is excluded from
+    // BOTH the events and the shipped bytes — bytes-shipped == bytes-parsed.
+    let (events, log_bytes) =
+        crate::event_log::EventLog::read_events_and_log_bytes(&paths.events_file())?;
 
     let chain = crate::provenance::provenance_chain(&mission_dir, mission_id, &events)?;
     let outcomes: MissionOutcomes = crate::outcomes::mission_outcomes(mission_id, &events);
@@ -641,30 +646,167 @@ pub fn assemble_evidence_bundle(
     })
 }
 
-/// Write an assembled bundle to `out_dir`, returning the number of files
-/// written (including `manifest.json`). The directory must not already hold
-/// anything: silently mixing two exports would leave stale artefacts no
-/// manifest entry names — the same honesty discipline as unresolved entries.
-/// Bundle paths are re-validated on the way out (relative, `Normal`
-/// components only) so a hostile or buggy assembly cannot write outside
-/// `out_dir`.
-pub fn write_evidence_bundle(bundle: &EvidenceBundle, out_dir: &Path) -> anyhow::Result<usize> {
-    if out_dir.exists() {
-        let mut read_dir = std::fs::read_dir(out_dir).map_err(|error| {
+/// Absolutize `path` and fold `.`/`..` LEXICALLY, without touching the
+/// filesystem: `std::path::absolute` PRESERVES `..` on this host, so the
+/// fold is what makes an `outside/../.kranz/...` shape comparable with
+/// `starts_with`. A `..` above the root is inert (`/..` == `/`). Lexical
+/// folding is sound for the containment check only because the write path
+/// below verifies no component it traverses is a symlink — a folded `a/..`
+/// equals `a` only when `a` cannot redirect.
+fn absolute_lexical(path: &Path) -> anyhow::Result<PathBuf> {
+    let absolute = std::path::absolute(path)?;
+    let mut out = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if out.file_name().is_some() {
+                    out.pop();
+                } else if !out.has_root() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    Ok(out)
+}
+
+/// The planned bundle output directory: the canonical anchor to open and
+/// the missing components to create beneath it.
+struct OutDirPlan {
+    /// Canonical path of the deepest EXISTING ancestor (the trusted anchor —
+    /// canonicalization resolves system symlinks such as macOS `/var`, the
+    /// same trust basis [`crate::paths::open_parent_nofollow`]'s weaker tier
+    /// uses for out-of-model paths).
+    anchor: PathBuf,
+    /// Missing components below the anchor, created no-follow at pin time.
+    tail: Vec<String>,
+    /// The canonical path the pinned out dir will have (`anchor` + `tail` —
+    /// canonical by construction: the anchor is canonical and the tail is
+    /// created as real directories under it).
+    canonical_out: PathBuf,
+}
+
+/// Plan the out dir WITHOUT creating anything: absolutize + lexically fold,
+/// walk up to the deepest existing ancestor (a SYMLINKED or non-directory
+/// ancestor is a refusal — `symlink_metadata` inspects the component
+/// itself, never its target), canonicalize the anchor, and compute the
+/// canonical out path. The containment check runs on this plan before any
+/// directory is created, so a refusal writes nothing (12th-pass review).
+fn plan_out_dir(out_dir: &Path) -> anyhow::Result<OutDirPlan> {
+    let normalized = absolute_lexical(out_dir)?;
+    let mut anchor = normalized.as_path();
+    loop {
+        match std::fs::symlink_metadata(anchor) {
+            Ok(metadata) => {
+                let file_type = metadata.file_type();
+                if file_type.is_symlink() {
+                    return Err(EngineError::InvalidState(format!(
+                        "bundle output {} resolves through a symlinked component: {}",
+                        out_dir.display(),
+                        anchor.display()
+                    ))
+                    .into());
+                }
+                if !file_type.is_dir() {
+                    return Err(EngineError::InvalidState(format!(
+                        "bundle output {} is blocked by a non-directory component: {}",
+                        out_dir.display(),
+                        anchor.display()
+                    ))
+                    .into());
+                }
+                break;
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                anchor = anchor.parent().ok_or_else(|| {
+                    EngineError::InvalidState(format!(
+                        "bundle output {} has no existing ancestor",
+                        out_dir.display()
+                    ))
+                })?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let canonical_anchor = anchor.canonicalize()?;
+    let mut tail = Vec::new();
+    let mut canonical_out = canonical_anchor.clone();
+    // The anchor is a lexical prefix of `normalized` by construction; every
+    // component below it is `Normal` (the fold left nothing else).
+    for component in normalized
+        .strip_prefix(anchor)
+        .map_err(|_| {
             EngineError::InvalidState(format!(
-                "bundle output {} is not an empty directory: {error}",
+                "bundle output {} escaped its anchor",
                 out_dir.display()
             ))
-        })?;
-        if read_dir.next().is_some() {
+        })?
+        .components()
+    {
+        let Component::Normal(name) = component else {
             return Err(EngineError::InvalidState(format!(
-                "bundle output {} is not empty; choose a fresh --out or remove it",
+                "bundle output {} has a non-normal component below its anchor",
                 out_dir.display()
             ))
             .into());
-        }
+        };
+        let name = name.to_str().ok_or_else(|| {
+            EngineError::InvalidState(format!(
+                "bundle output {} has a non-UTF-8 component",
+                out_dir.display()
+            ))
+        })?;
+        tail.push(name.to_string());
+        canonical_out.push(name);
     }
-    std::fs::create_dir_all(out_dir)?;
+    Ok(OutDirPlan {
+        anchor: canonical_anchor,
+        tail,
+        canonical_out,
+    })
+}
+
+/// Pin the planned out dir as a RETAINED capability: open the canonical
+/// anchor ambient, then create and open every missing tail component
+/// per-component no-follow ([`crate::paths::open_real_subdir`] — a component
+/// planted as a symlink mid-walk is refused, never followed). Every later
+/// write goes through the returned capability, never back through the
+/// display path that was checked — closing the check-then-write window.
+fn pin_out_dir(plan: &OutDirPlan) -> anyhow::Result<Dir> {
+    let mut dir = Dir::open_ambient_dir(&plan.anchor, ambient_authority())?;
+    let mut walked = plan.anchor.clone();
+    for component in &plan.tail {
+        walked.push(component);
+        dir = crate::paths::open_real_subdir(&dir, component, &walked, true)?;
+    }
+    Ok(dir)
+}
+
+/// Write the bundle through the pinned no-follow capability: the emptiness
+/// check, per-entry parent creation, and every file write go through `out`
+/// (never back through the display path), so nothing crosses a symlink
+/// between check and write. Bundle paths are re-validated on the way out
+/// (relative, non-empty `Normal` components only) so a hostile or buggy
+/// assembly cannot write outside the out dir, and each file is
+/// `create_new` + `FollowSymlinks::No` — the out dir was empty, so a
+/// pre-existing name (a planted symlink most of all) fails instead of
+/// being written through.
+fn write_bundle_files(bundle: &EvidenceBundle, out_dir: &Path, out: &Dir) -> anyhow::Result<usize> {
+    let mut entries = out.entries().map_err(|error| {
+        EngineError::InvalidState(format!(
+            "bundle output {} is not an empty directory: {error}",
+            out_dir.display()
+        ))
+    })?;
+    if entries.next().is_some() {
+        return Err(EngineError::InvalidState(format!(
+            "bundle output {} is not empty; choose a fresh --out or remove it",
+            out_dir.display()
+        ))
+        .into());
+    }
 
     let manifest_bytes = to_json_bytes(&bundle.manifest)?;
     let mut written = 0usize;
@@ -676,49 +818,110 @@ pub fn write_evidence_bundle(bundle: &EvidenceBundle, out_dir: &Path) -> anyhow:
         .map(|file| (file.path.as_str(), file.bytes.as_slice()))
         .chain([(MANIFEST_FILE, manifest_bytes.as_slice())])
     {
-        let mut target = out_dir.to_path_buf();
+        let mut names = Vec::new();
         for component in relative.split('/') {
             if component.is_empty() || component == "." || component == ".." {
                 return Err(
                     EngineError::InvalidState(format!("unsafe bundle path {relative:?}")).into(),
                 );
             }
-            target.push(component);
+            names.push(component);
         }
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
+        let (leaf, parents) = names.split_last().expect("validated non-empty");
+        let mut dir = None;
+        let mut display = out_dir.to_path_buf();
+        for parent in parents {
+            display.push(parent);
+            dir = Some(crate::paths::open_real_subdir(
+                dir.as_ref().unwrap_or(out),
+                parent,
+                &display,
+                true,
+            )?);
         }
-        std::fs::write(&target, bytes)?;
+        let mut options = OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No);
+        let mut file = dir.as_ref().unwrap_or(out).open_with(leaf, &options)?;
+        file.write_all(bytes)?;
         written += 1;
     }
     Ok(written)
+}
+
+/// Write an assembled bundle to `out_dir`, returning the number of files
+/// written (including `manifest.json`). The directory must not already hold
+/// anything: silently mixing two exports would leave stale artefacts no
+/// manifest entry names — the same honesty discipline as unresolved entries.
+/// The out dir is created and written through a pinned no-follow capability
+/// ([`plan_out_dir`] / [`pin_out_dir`]): a symlinked existing component is
+/// refused, and nothing written ever crosses a symlink.
+pub fn write_evidence_bundle(bundle: &EvidenceBundle, out_dir: &Path) -> anyhow::Result<usize> {
+    let plan = plan_out_dir(out_dir)?;
+    let out = pin_out_dir(&plan)?;
+    write_bundle_files(bundle, out_dir, &out)
 }
 
 /// Assemble + write the bundle, with the one placement rule enforced: the
 /// write target must be OUTSIDE the mission dir (a bundle written into the
 /// tree it audits would both mutate the read-only surface and risk shipping
 /// itself as evidence).
+///
+/// The rule is enforced in two tiers, both BEFORE anything is written
+/// (12th-pass review): a lexical tier (absolutize + fold `..`, then
+/// `starts_with`) that catches the direct and `..`-shaped in-mission paths
+/// without touching the filesystem, and a canonical tier — `absolute`
+/// preserves `..` on this host and a symlinked component makes a lexical
+/// `starts_with` lie — that canonicalizes the out dir's deepest existing
+/// ancestor and compares the canonical out path against the canonical
+/// mission dir. The write itself then goes through the pinned no-follow
+/// capability from [`plan_out_dir`] / [`pin_out_dir`].
 pub fn export_evidence_bundle(
     repo_root: &Path,
     mission_id: &str,
     out_dir: &Path,
 ) -> anyhow::Result<ExportOutcome> {
     let paths = MissionPaths::new(repo_root, mission_id);
-    // Lexical containment is sufficient — the mission dir layout is fixed
-    // and `absolute` normalizes `.`/`..` without touching the filesystem.
-    let out_abs = std::path::absolute(out_dir)?;
-    let mission_abs = std::path::absolute(paths.mission_dir())?;
-    if out_abs.starts_with(&mission_abs) {
-        return Err(EngineError::InvalidState(format!(
+    paths.require_no_follow()?;
+    let refusal = || {
+        EngineError::InvalidState(format!(
             "bundle output {} must be outside the mission dir {}",
             out_dir.display(),
             paths.mission_dir().display()
         ))
-        .into());
+    };
+    // Lexical tier: refuses the direct and `..`-shaped placements before
+    // any filesystem write (a refusal leaves nothing behind).
+    let out_lexical = absolute_lexical(out_dir)?;
+    let mission_lexical = absolute_lexical(&paths.mission_dir())?;
+    if out_lexical.starts_with(&mission_lexical) {
+        return Err(refusal().into());
+    }
+    // Canonical tier: the lexical fold cannot see symlinks, so compare the
+    // canonical out path against the canonical mission dir. A symlinked
+    // existing component of the out path is refused by the plan itself.
+    // (A not-yet-existing mission dir skips this tier — there is no audited
+    // tree to contaminate, and the assembly below fails the unknown mission
+    // honestly.)
+    let plan = plan_out_dir(out_dir)?;
+    match std::fs::symlink_metadata(paths.mission_dir()) {
+        Ok(_) => {
+            if plan
+                .canonical_out
+                .starts_with(paths.mission_dir().canonicalize()?)
+            {
+                return Err(refusal().into());
+            }
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
 
     let bundle = assemble_evidence_bundle(repo_root, mission_id)?;
-    let files_written = write_evidence_bundle(&bundle, out_dir)?;
+    let out = pin_out_dir(&plan)?;
+    let files_written = write_bundle_files(&bundle, out_dir, &out)?;
     let resolved_artefacts = bundle
         .manifest
         .entries
@@ -1195,5 +1398,112 @@ mod tests {
             std::fs::read_to_string(out.join("stale.txt")).unwrap(),
             "stale"
         );
+    }
+
+    /// 12th-pass review: the bundle's log copy is the SAME buffer the folds
+    /// were derived from — the log is read once, never re-opened for the raw
+    /// bytes. A torn final line (a crash write the parser drops) is excluded
+    /// from BOTH the parsed events and the shipped bytes, so the shipped log
+    /// always re-folds to the shipped chain/cost/escalations.
+    /// bytes-shipped == bytes-parsed.
+    #[test]
+    fn evidence_single_snapshot_torn_tail_is_excluded_from_parse_and_bytes() {
+        use std::io::Write as _;
+        let tmp = TempDir::new().unwrap();
+        let paths = seed_full_mission(tmp.path());
+        let pristine = std::fs::read(paths.events_file()).unwrap();
+        // A crash-torn append the writer never finished: partial JSON, no
+        // newline — the parser drops it (with a warning).
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(paths.events_file())
+            .unwrap();
+        file.write_all(b"{\"seq\":999,\"ts\":\"torn").unwrap();
+        drop(file);
+
+        let bundle = assemble_evidence_bundle(tmp.path(), "m-1").unwrap();
+        let shipped = bundle
+            .files
+            .iter()
+            .find(|file| file.path == LOG_FILE)
+            .expect("the raw log ships");
+        assert_eq!(
+            shipped.bytes, pristine,
+            "the torn tail is in NEITHER the events nor the shipped bytes"
+        );
+        // The folds are unaffected (the same gate ladder as the clean log).
+        assert_eq!(bundle.manifest.mission_id, "m-1");
+        // And the shipped bytes alone reproduce the fold: a re-parse of the
+        // bundle's log copy yields exactly the events the mission log's
+        // valid prefix yields.
+        let replay = paths.runs_dir().join("replay.jsonl");
+        std::fs::write(&replay, &shipped.bytes).unwrap();
+        let folded = crate::event_log::EventLog::read_events(&paths.events_file()).unwrap();
+        let refolded = crate::event_log::EventLog::read_events(&replay).unwrap();
+        assert_eq!(refolded.len(), folded.len());
+        assert_eq!(
+            refolded.last().map(|event| event.seq),
+            folded.last().map(|event| event.seq)
+        );
+    }
+
+    // ---- out-dir containment (12th-pass review) --------------------------
+
+    /// `std::path::absolute` preserves `..` on this host, so containment
+    /// must fold `..` lexically AND compare canonical paths: the
+    /// `outside/../.kranz/missions/<id>/bundle` shape must be refused
+    /// exactly like the direct in-mission path — before anything is written.
+    #[test]
+    fn evidence_outdir_containment_refuses_dotdot_escape_into_the_mission() {
+        let tmp = TempDir::new().unwrap();
+        let paths = seed_full_mission(tmp.path());
+        let escape = tmp
+            .path()
+            .join("outside")
+            .join("..")
+            .join(".kranz")
+            .join("missions")
+            .join("m-1")
+            .join("bundle");
+        let result = export_evidence_bundle(tmp.path(), "m-1", &escape);
+        assert!(result.is_err(), "the `..` shape must be refused");
+        assert!(
+            !paths.mission_dir().join("bundle").exists(),
+            "nothing must be written on refusal"
+        );
+    }
+
+    /// A symlinked out-dir component pointing into the audited mission:
+    /// refused (the plan's symlink screen, with canonical containment behind
+    /// it) — the bundle must never write through a link into the tree it
+    /// audits. Unix-only, like every symlink-creating test in the repo.
+    #[cfg(unix)]
+    #[test]
+    fn evidence_outdir_containment_refuses_a_symlinked_component() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let paths = seed_full_mission(tmp.path());
+        let link = tmp.path().join("linked-out");
+        symlink(paths.mission_dir(), &link).unwrap();
+        let result = export_evidence_bundle(tmp.path(), "m-1", &link.join("bundle"));
+        let err = result.expect_err("a symlinked out-dir component must be refused");
+        assert!(err.to_string().contains("symlinked"), "{err}");
+        assert!(
+            !paths.mission_dir().join("bundle").exists(),
+            "nothing must be written through the link"
+        );
+    }
+
+    /// The honest path: a normal external out dir still exports, with
+    /// multi-level missing components created through the no-follow pin.
+    #[test]
+    fn evidence_outdir_containment_normal_external_dir_works() {
+        let tmp = TempDir::new().unwrap();
+        seed_full_mission(tmp.path());
+        let out = tmp.path().join("fresh").join("bundle-out");
+        let outcome = export_evidence_bundle(tmp.path(), "m-1", &out).unwrap();
+        assert!(outcome.files_written > 0);
+        assert!(out.join(MANIFEST_FILE).is_file());
+        assert!(out.join(LOG_FILE).is_file());
     }
 }

@@ -20,7 +20,7 @@
 //! | `session/update` `tool_call_update` with terminal status (`completed`/`failed`) | [`AgentEvent::ToolResult`] (`denied: false` — a failed tool is a normal failure, not a denial, mirroring `backend_codex`) |
 //! | `session/request_permission` refused at the seam | synthesized [`AgentEvent::ToolResult`] with `denied: true` (the refusal IS the event — the peer may report nothing itself) |
 //! | `session/update` `usage_update` | remembered; its `cost` (USD only) lands on the terminal `Result.cost_usd` |
-//! | `session/prompt` response (`stopReason`) | synthesized terminal [`AgentEvent::Result`]: text stitched from the LAST assistant message's chunks (mirrors `backend_codex` "last agent_message wins"; `messageId` changes delimit messages), `is_error` ⇔ `stopReason == "refusal"` |
+//! | `session/prompt` response (`stopReason`) | synthesized terminal [`AgentEvent::Result`]: text stitched from the LAST assistant message's chunks (mirrors `backend_codex` "last agent_message wins"; `messageId` changes delimit messages), `is_error` ⇔ `stopReason != "end_turn"` — ACP v1 names `end_turn` as the ONLY natural completion, so `refusal`, `max_tokens`, `max_turn_requests`, `cancelled`, and any missing/unknown reason all fail honestly (12th-pass review: a truncated or cancelled validator report must never read as a pass) |
 //! | everything else (`plan`, `agent_thought_chunk`, `available_commands_update`, unknown kinds, unparseable lines) | [`AgentEvent::Other`] — kept for transcripts, never dropped |
 //!
 //! ## What is NOT on this wire (absent, never fabricated)
@@ -1099,8 +1099,19 @@ impl AcpSession {
 
     /// Synthesize the terminal `Result` from a `session/prompt` response
     /// (see module docs): text stitched from the turn's last assistant
-    /// message, `is_error` ⇔ `stopReason == "refusal"`, cost only when the
+    /// message, `is_error` ⇔ `stopReason != "end_turn"`, cost only when the
     /// peer reported a USD amount — absent data stays absent.
+    ///
+    /// WHY non-`end_turn` is an error, not just `refusal` (12th-pass review):
+    /// ACP v1's stop reasons are `end_turn` (natural completion), `refusal`,
+    /// `max_tokens`, `max_turn_requests`, and `cancelled`. Mapping only
+    /// `refusal` to `is_error` let a turn cut short by `max_tokens`/
+    /// `max_turn_requests` — or answered `cancelled`, or carrying a missing
+    /// or unrecognized reason — surface as a SUCCESSFUL result, so a
+    /// truncated validator report could pass validation. Fail-closed is the
+    /// only honest mapping: anything but a natural completion is an error,
+    /// and the reason string rides the raw payload so the failure is
+    /// diagnosable (`null` when the peer omitted the field entirely).
     fn synthesize_result(&mut self, outcome: RpcOutcome, request_id: u64) {
         let last_cost_usd = self
             .last_usage
@@ -1113,18 +1124,18 @@ impl AcpSession {
             .and_then(|cost| cost.get("amount").and_then(Value::as_f64));
         let (text, is_error, raw) = match outcome {
             RpcOutcome::Result(result) => {
-                let stop_reason = result
-                    .get("stopReason")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
+                let stop_reason = result.get("stopReason").and_then(Value::as_str);
                 (
                     std::mem::take(&mut self.message_text),
-                    stop_reason == "refusal",
+                    stop_reason != Some("end_turn"),
                     json!({
                         "promptResponse": result,
                         "usageUpdate": self.last_usage,
                         "synthesizedBy": "backend_acp",
+                        // The classification input, verbatim: exactly what the
+                        // peer sent, `null` when it sent nothing — the raw
+                        // payload always explains WHY a non-end_turn failed.
+                        "stopReason": stop_reason,
                     }),
                 )
             }

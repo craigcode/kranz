@@ -631,13 +631,7 @@ fn load_prompt(table: &toml::Table, index: usize, pack_dir: &Path) -> Result<Pac
         (None, Some(rel)) => {
             validate_pack_relative_path(&rel, &section, "textFile")?;
             let normalized = crate::merge_gate::normalize_relative_path(&rel, false);
-            let path = pack_dir.join(&normalized);
-            let text = std::fs::read_to_string(&path).map_err(|e| {
-                format!(
-                    "{section} field `textFile` = {rel:?} cannot be read at {}: {e}",
-                    path.display()
-                )
-            })?;
+            let text = read_pack_text_file_nofollow(pack_dir, &normalized, &section)?;
             (text, PromptSource::File(normalized))
         }
     };
@@ -713,6 +707,67 @@ fn validate_pack_relative_path(raw: &str, section: &str, field: &str) -> Result<
         ));
     }
     Ok(())
+}
+
+/// Read a `[[prompt]]` `textFile` NO-FOLLOW from a pinned pack-directory
+/// capability (12th-pass review): lexical validation
+/// ([`validate_pack_relative_path`]) only sees path COMPONENTS, so a
+/// textFile that is a symlink — or that resolves through a symlinked
+/// parent directory — could load an engine-readable secret from outside
+/// the pack and ship it to a remote model as prompt text. The pack dir is
+/// the operator-chosen anchor (opened ambient — the same trust basis the
+/// engine uses for the repo root in [`crate::paths`]); every parent
+/// component is opened `open_dir_nofollow` and the leaf with
+/// `FollowSymlinks::No`, so a symlink anywhere below the anchor is REFUSED
+/// with an error naming the field, never followed. `rel` reaches here
+/// already normalized ([`crate::merge_gate::normalize_relative_path`]
+/// keeps only `Normal` components), so splitting on '/' yields plain
+/// names.
+fn read_pack_text_file_nofollow(
+    pack_dir: &Path,
+    rel: &str,
+    section: &str,
+) -> Result<String, String> {
+    use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
+    use std::io::Read as _;
+
+    let display = pack_dir.join(rel);
+    let field_error = |message: String| format!("{section} field `textFile` = {rel:?} {message}");
+    let no_follow_refusal = |what: &str| {
+        field_error(format!(
+            "resolves through {what} ({}) — pack prompt files load no-follow so a pack \
+             cannot read outside its own directory",
+            display.display()
+        ))
+    };
+    let mut dir = cap_std::fs::Dir::open_ambient_dir(pack_dir, cap_std::ambient_authority())
+        .map_err(|e| field_error(format!("cannot open pack dir {}: {e}", pack_dir.display())))?;
+    let mut names = rel.split('/').peekable();
+    while let Some(name) = names.next() {
+        if names.peek().is_some() {
+            dir = dir
+                .open_dir_nofollow(name)
+                .map_err(|_| no_follow_refusal("a symlinked or non-directory component"))?;
+        } else {
+            let mut options = cap_std::fs::OpenOptions::new();
+            options.read(true).follow(FollowSymlinks::No);
+            let mut file = dir.open_with(name, &options).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    field_error(format!("cannot be read at {}: {e}", display.display()))
+                } else {
+                    no_follow_refusal("a symlink or other non-regular file")
+                }
+            })?;
+            let mut text = String::new();
+            file.read_to_string(&mut text).map_err(|e| {
+                field_error(format!("cannot be read at {}: {e}", display.display()))
+            })?;
+            return Ok(text);
+        }
+    }
+    // Unreachable: validation guarantees a non-empty path of Normal
+    // components — but fail closed rather than panic if that ever changes.
+    Err(field_error("resolves to no file".to_string()))
 }
 
 #[cfg(test)]
@@ -1105,5 +1160,76 @@ kind = "local-dir"
         };
         let err = load_for_config(&cfg, repo.path()).expect_err("must fail");
         assert!(err.contains("is not a directory"), "{err}");
+    }
+
+    // ---- textFile no-follow containment (12th-pass review) --------------
+    //
+    // Symlink-creating tests are unix-only, exactly like the paths.rs guard
+    // tests (`std::os::unix::fs::symlink`); Windows needs privileges to
+    // create symlinks, so CI coverage there comes from the no-symlink case.
+
+    /// A textFile that is a SYMLINK to a file outside the pack would load an
+    /// engine-readable secret as prompt text and ship it to a remote model —
+    /// refused at load, naming the field.
+    #[cfg(unix)]
+    #[test]
+    fn pack_textfile_nofollow_refuses_a_symlinked_leaf() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let secret = tmp.path().join("engine-readable-secret.md");
+        std::fs::write(&secret, "sk-live-secret-value").unwrap();
+        let pack = tmp.path().join("pack");
+        std::fs::create_dir_all(pack.join("prompts")).unwrap();
+        std::fs::write(
+            pack.join(PACK_MANIFEST),
+            "[pack]\nname = \"x\"\nschema = 3\n\n[[prompt]]\nname = \"p\"\nrole = \"worker\"\ntextFile = \"prompts/scrutiny.md\"\n",
+        )
+        .unwrap();
+        symlink(&secret, pack.join("prompts").join("scrutiny.md")).unwrap();
+
+        let err = Pack::load(&pack).expect_err("a symlinked textFile must be refused");
+        assert!(err.contains("field `textFile`"), "names the field: {err}");
+        assert!(err.contains("no-follow"), "says why: {err}");
+    }
+
+    /// A symlinked PARENT directory escapes the pack just as surely as a
+    /// symlinked leaf — same refusal, same named field.
+    #[cfg(unix)]
+    #[test]
+    fn pack_textfile_nofollow_refuses_a_symlinked_parent_dir() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("scrutiny.md"), "exfiltrated prompt text").unwrap();
+        let pack = tmp.path().join("pack");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(
+            pack.join(PACK_MANIFEST),
+            "[pack]\nname = \"x\"\nschema = 3\n\n[[prompt]]\nname = \"p\"\nrole = \"worker\"\ntextFile = \"prompts/scrutiny.md\"\n",
+        )
+        .unwrap();
+        symlink(&outside, pack.join("prompts")).unwrap();
+
+        let err = Pack::load(&pack).expect_err("a symlinked parent dir must be refused");
+        assert!(err.contains("field `textFile`"), "names the field: {err}");
+        assert!(err.contains("no-follow"), "says why: {err}");
+    }
+
+    /// The honest path: a plain in-pack textFile still loads (the existing
+    /// `pack_contract_full_pack_loads_all_sections` pins the same behavior
+    /// through the full manifest).
+    #[test]
+    fn pack_textfile_nofollow_plain_in_pack_file_loads() {
+        let (_tmp, dir) = pack_dir_with(
+            "[pack]\nname = \"x\"\nschema = 3\n\n[[prompt]]\nname = \"p\"\nrole = \"worker\"\ntextFile = \"prompts/scrutiny.md\"\n",
+            &[("prompts/scrutiny.md", "zz plain in-pack text\n")],
+        );
+        let pack = Pack::load(&dir).expect("load").expect("a pack");
+        assert_eq!(pack.prompts[0].text, "zz plain in-pack text\n");
+        assert_eq!(
+            pack.prompts[0].source,
+            PromptSource::File("prompts/scrutiny.md".to_string())
+        );
     }
 }

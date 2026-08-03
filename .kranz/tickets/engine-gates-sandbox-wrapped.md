@@ -1,6 +1,6 @@
 ---
 title: "Sandbox-wrap engine-run gate commands when enforcement is on"
-priority: 2
+priority: 1
 schedule: once
 ---
 
@@ -13,6 +13,14 @@ final-gate, and merge-gate commands (`command_exec::run_shell_command` /
 scripts and test binaries OUTSIDE any sandbox profile, with full network and
 — for merge gates — ambient `HOME`. Stage 1 closed the Cargo credential link;
 this closes the rest of the filesystem/egress surface.
+
+**12th-pass review re-flag (2026-08-02, P1):** env-clearing alone is not
+isolation — those processes retain the engine's filesystem and network
+authority, and code can discover the operator home without `HOME` (pwent,
+`/Users/*` enumeration), read credentials, modify host state, and exfiltrate
+over unrestricted egress. The review's verdict: every engine-side execution
+of mission-authored code needs the enforced sandbox, not environment-only
+isolation. Raised to pri 1 on that evidence.
 
 ## Problem
 

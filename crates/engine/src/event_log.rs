@@ -449,6 +449,28 @@ impl EventLog {
         Ok(Self::parse_log(path)?.events)
     }
 
+    /// Read the log at `path` ONCE and return the validated events together
+    /// with the exact byte prefix they were parsed from (12th-pass review):
+    /// the evidence bundle must ship `events.jsonl` bytes that reproduce the
+    /// chain/cost/escalations it derived, so parsing one snapshot and then
+    /// rereading the file for the raw copy is not allowed — a concurrent
+    /// append between the two opens would ship bytes the folds never saw.
+    ///
+    /// Torn-tail rule (the honest one): an unparseable FINAL line is
+    /// dropped from the events AND excluded from the returned bytes — the
+    /// shipped prefix is exactly what parsed, so the bundle's log always
+    /// re-folds to the bundle's derived files. bytes-shipped == bytes-parsed.
+    pub fn read_events_and_log_bytes(path: &Path) -> Result<(Vec<Event>, Vec<u8>)> {
+        use std::io::Read;
+        // Same no-follow refusal as `parse_log`: never read through a
+        // symlink, `O_NOFOLLOW` on unix so there is no check-then-open window.
+        let mut bytes = Vec::new();
+        crate::paths::open_read_nofollow(path)?.read_to_end(&mut bytes)?;
+        let parsed = Self::parse_log_bytes(&bytes, path)?;
+        bytes.truncate(parsed.valid_len as usize);
+        Ok((parsed.events, bytes))
+    }
+
     /// Parse and validate the log at `path`, tracking how many leading bytes
     /// form the valid prefix so [`EventLog::acquire`] can truncate torn tails.
     ///
@@ -469,7 +491,14 @@ impl EventLog {
         use std::io::Read;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
+        Self::parse_log_bytes(&bytes, path)
+    }
 
+    /// Parse one in-memory buffer — the single entry point every reader
+    /// funnels into, so the validation rules (seq contiguity, one mission
+    /// id, torn-final-line drop) can never drift between the file-reading
+    /// forms and the single-snapshot form.
+    fn parse_log_bytes(bytes: &[u8], path: &Path) -> Result<ParsedLog> {
         let mut events = Vec::new();
         let mut valid_len: usize = 0;
         let mut terminated = true;
