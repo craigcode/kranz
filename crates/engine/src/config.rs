@@ -36,6 +36,7 @@ pub fn parse_backend(raw: Option<&str>) -> std::result::Result<BackendKind, Stri
         Some("droid") => Ok(BackendKind::Droid),
         Some("kimi") => Ok(BackendKind::Kimi),
         Some("local") => Ok(BackendKind::Local),
+        Some("acp") => Ok(BackendKind::Acp),
         Some(other) => Err(other.to_string()),
     }
 }
@@ -142,6 +143,10 @@ fn backend_default_model(kind: BackendKind) -> Option<&'static str> {
         BackendKind::Droid => Some(DEFAULT_DROID_MODEL),
         BackendKind::Kimi => Some(DEFAULT_KIMI_MODEL),
         BackendKind::Local => None,
+        // ACP has no standard model-selection parameter in v1: the peer's
+        // model is its own concern (encoded in acpCommand/acpArgs), so there
+        // is no backend default to rewrite to.
+        BackendKind::Acp => None,
     }
 }
 
@@ -217,6 +222,10 @@ pub fn model_tier(kind: BackendKind, model: &str) -> Option<ModelTier> {
         // the allowBelowDefaultWorkerModel opt-in, and a local orchestrator
         // always fails the frontier floor.
         BackendKind::Local => Some(ModelTier::BelowDefault),
+        // ACP model ids are equally free-form (the string is recorded for
+        // attribution only; ACP v1 has no model-selection parameter), so the
+        // same uniform below-default classification applies.
+        BackendKind::Acp => Some(ModelTier::BelowDefault),
     }
 }
 
@@ -485,6 +494,29 @@ pub fn validate(cfg: &MissionConfig) -> Result<()> {
                 if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
                     return Err(EngineError::Config(format!(
                         "{name}.temperature must be finite and in 0.0..=2.0, got {temperature}"
+                    )));
+                }
+            }
+        }
+
+        if kind == BackendKind::Acp {
+            // KRZ-301 lands worker-first: the orchestrator needs
+            // streaming-input + resume semantics this backend deliberately
+            // rejects at the seam, and the validator roles wait for live
+            // soak — refuse those pairings here rather than degrading
+            // mid-mission.
+            if role != Role::Worker {
+                return Err(EngineError::Config(format!(
+                    "{name}.backend \"acp\" is supported for the worker role only in this pass \
+                     (KRZ-301); validators and the orchestrator stay on their existing backends"
+                )));
+            }
+            match role_cfg.acp_command.as_deref() {
+                Some(command) if !command.trim().is_empty() => {}
+                _ => {
+                    return Err(EngineError::Config(format!(
+                        "{name}.acpCommand is required when {name}.backend is \"acp\" \
+                         (the ACP agent executable; extra argv goes in {name}.acpArgs)"
                     )));
                 }
             }
@@ -1153,6 +1185,78 @@ mod tests {
             allow_below_default_worker_model: true,
             ..MissionConfig::default()
         }
+    }
+
+    /// ACP (KRZ-301): the worker-role-only backend wiring — parse, role
+    /// restriction, required command, model-tier opt-in.
+    fn acp_worker_cfg() -> MissionConfig {
+        let mut cfg = MissionConfig {
+            allow_below_default_worker_model: true,
+            ..MissionConfig::default()
+        };
+        cfg.worker.backend = Some("acp".into());
+        cfg.worker.acp_command = Some("/opt/bin/my-acp-agent".into());
+        cfg.worker.acp_args = vec!["--serve".into()];
+        cfg
+    }
+
+    #[test]
+    fn backend_acp_config_round_trips_and_parses() {
+        assert_eq!(parse_backend(Some("acp")), Ok(BackendKind::Acp));
+        let cfg = acp_worker_cfg();
+        assert_eq!(cfg.backend_kind(Role::Worker), BackendKind::Acp);
+        assert_eq!(BackendKind::Acp.as_str(), "acp");
+        assert!(!BackendKind::Acp.supports_sandbox_enforcement());
+        assert!(!BackendKind::Acp.reports_cache_read_tokens());
+        assert!(!BackendKind::Acp.reports_cache_write_tokens());
+        assert!(
+            validate(&cfg).is_ok(),
+            "worker + acpCommand + the below-default opt-in must validate"
+        );
+    }
+
+    #[test]
+    fn backend_acp_config_requires_worker_role_and_command() {
+        // Validators and the orchestrator are refused (KRZ-301 lands
+        // worker-first).
+        for role in [
+            Role::Orchestrator,
+            Role::ValidatorScrutiny,
+            Role::ValidatorFunctional,
+        ] {
+            let mut cfg = acp_worker_cfg();
+            let role_cfg = match role {
+                Role::Orchestrator => &mut cfg.orchestrator,
+                Role::ValidatorScrutiny => &mut cfg.validator_scrutiny,
+                Role::ValidatorFunctional => &mut cfg.validator_functional,
+                Role::Worker => unreachable!("loop excludes the worker"),
+            };
+            role_cfg.backend = Some("acp".into());
+            role_cfg.acp_command = Some("/opt/bin/my-acp-agent".into());
+            let err = validate(&cfg).expect_err("non-worker acp must be refused");
+            assert!(
+                err.to_string().contains("worker role only"),
+                "refusal must name the role restriction: {err}"
+            );
+        }
+
+        // The command is required (and a blank one is as good as absent).
+        let mut cfg = acp_worker_cfg();
+        cfg.worker.acp_command = None;
+        let err = validate(&cfg).expect_err("missing acpCommand must be refused");
+        assert!(err.to_string().contains("acpCommand"), "{err}");
+        cfg.worker.acp_command = Some("   ".into());
+        assert!(validate(&cfg).is_err(), "blank acpCommand must be refused");
+
+        // ACP model ids are free-form → uniformly below-default → the
+        // worker needs the explicit opt-in, same as local.
+        let mut cfg = acp_worker_cfg();
+        cfg.allow_below_default_worker_model = false;
+        let err = validate(&cfg).expect_err("below-default acp worker needs the opt-in");
+        assert!(
+            err.to_string().contains("allowBelowDefaultWorkerModel"),
+            "{err}"
+        );
     }
 
     #[test]

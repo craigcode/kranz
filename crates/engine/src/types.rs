@@ -567,8 +567,10 @@ pub struct RoleConfig {
     /// Claude Code backend, `"codex"` selects
     /// [`crate::backend_codex::CodexBackend`], `"droid"` selects
     /// [`crate::backend_droid::DroidBackend`], `"kimi"` selects
-    /// [`crate::backend_kimi::KimiBackend`], and `"local"` selects an
-    /// OpenAI-compatible HTTP endpoint. `config::validate` checks that
+    /// [`crate::backend_kimi::KimiBackend`], `"local"` selects an
+    /// OpenAI-compatible HTTP endpoint, and `"acp"` selects
+    /// [`crate::backend_acp::AcpBackend`] (worker role only).
+    /// `config::validate` checks that
     /// the selected backend/model pair is supported for the role.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
@@ -576,6 +578,15 @@ pub struct RoleConfig {
     /// Required and validated when a role selects the local backend.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// Executable of the ACP (Agent Client Protocol) agent for
+    /// `backend = "acp"`. Required and validated when a role selects the acp
+    /// backend (KRZ-301; worker role only for now).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_command: Option<String>,
+    /// Extra argv for `acpCommand` (model flags, agent-specific options —
+    /// ACP itself has no standard model-selection parameter in v1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acp_args: Vec<String>,
     /// Context window budget (tokens) for `backend = "local"`, used to guard
     /// against KV-cache blowout. Required and validated when a role selects
     /// the local backend.
@@ -690,6 +701,9 @@ pub enum BackendKind {
     /// OpenAI-compatible HTTP endpoint, configured via the role's `baseUrl`,
     /// `contextBudget`, and optional `temperature`.
     Local,
+    /// ACP (Agent Client Protocol) agent executable, configured via the
+    /// role's `acpCommand`/`acpArgs` (KRZ-301; worker role only).
+    Acp,
 }
 
 impl BackendKind {
@@ -700,6 +714,7 @@ impl BackendKind {
             BackendKind::Droid => "droid",
             BackendKind::Kimi => "kimi",
             BackendKind::Local => "local",
+            BackendKind::Acp => "acp",
         }
     }
 
@@ -714,9 +729,11 @@ impl BackendKind {
     pub fn supports_sandbox_enforcement(self) -> bool {
         match self {
             BackendKind::Claude => true,
-            BackendKind::Codex | BackendKind::Droid | BackendKind::Kimi | BackendKind::Local => {
-                false
-            }
+            BackendKind::Codex
+            | BackendKind::Droid
+            | BackendKind::Kimi
+            | BackendKind::Local
+            | BackendKind::Acp => false,
         }
     }
 
@@ -724,14 +741,16 @@ impl BackendKind {
     /// parser records (outcomes-report context-reuse split, ticket
     /// `outcomes-report-task-class`). Claude/droid read
     /// `cache_read_input_tokens`; codex reads `cached_input_tokens`. Kimi's
-    /// wire carries no usage at all and local hardcodes zeros — for both, a
-    /// zero would be fabricated, so they report nothing (absent, never 0%).
+    /// wire carries no usage at all, local hardcodes zeros, and ACP v1's
+    /// `usage_update` reports context-window state rather than a token
+    /// split — for all three, a zero would be fabricated, so they report
+    /// nothing (absent, never 0%).
     /// The match is deliberately exhaustive: a future backend must declare
     /// itself here.
     pub fn reports_cache_read_tokens(self) -> bool {
         match self {
             BackendKind::Claude | BackendKind::Codex | BackendKind::Droid => true,
-            BackendKind::Kimi | BackendKind::Local => false,
+            BackendKind::Kimi | BackendKind::Local | BackendKind::Acp => false,
         }
     }
 
@@ -742,7 +761,7 @@ impl BackendKind {
     pub fn reports_cache_write_tokens(self) -> bool {
         match self {
             BackendKind::Claude | BackendKind::Droid => true,
-            BackendKind::Codex | BackendKind::Kimi | BackendKind::Local => false,
+            BackendKind::Codex | BackendKind::Kimi | BackendKind::Local | BackendKind::Acp => false,
         }
     }
 }
@@ -936,6 +955,8 @@ impl Default for MissionConfig {
                 base_url: None,
                 context_budget: None,
                 temperature: None,
+                acp_command: None,
+                acp_args: vec![],
                 sandbox: SandboxConfig::default(),
             },
             worker: RoleConfig {
@@ -948,6 +969,8 @@ impl Default for MissionConfig {
                 base_url: None,
                 context_budget: None,
                 temperature: None,
+                acp_command: None,
+                acp_args: vec![],
                 sandbox: SandboxConfig::default(),
             },
             validator_scrutiny: RoleConfig {
@@ -960,6 +983,8 @@ impl Default for MissionConfig {
                 base_url: None,
                 context_budget: None,
                 temperature: None,
+                acp_command: None,
+                acp_args: vec![],
                 sandbox: SandboxConfig::default(),
             },
             validator_functional: RoleConfig {
@@ -972,6 +997,8 @@ impl Default for MissionConfig {
                 base_url: None,
                 context_budget: None,
                 temperature: None,
+                acp_command: None,
+                acp_args: vec![],
                 sandbox: SandboxConfig::default(),
             },
             skip_scrutiny: false,
@@ -1023,6 +1050,7 @@ impl MissionConfig {
             Some("droid") => BackendKind::Droid,
             Some("kimi") => BackendKind::Kimi,
             Some("local") => BackendKind::Local,
+            Some("acp") => BackendKind::Acp,
             _ => BackendKind::Claude,
         }
     }

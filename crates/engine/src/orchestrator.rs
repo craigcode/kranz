@@ -835,6 +835,35 @@ impl MissionEngine {
                     fallback_reason: None,
                 }
             }
+            BackendKind::Acp => {
+                let role_cfg = match role {
+                    Role::Orchestrator => &cfg.orchestrator,
+                    Role::Worker => &cfg.worker,
+                    Role::ValidatorScrutiny => &cfg.validator_scrutiny,
+                    Role::ValidatorFunctional => &cfg.validator_functional,
+                };
+                // `config::validate` has already guaranteed acp_command is
+                // present for an acp-backed role (worker only). Like local,
+                // there is no binary discovery: ACP defines no `--version`
+                // convention, so the initialize handshake at session start
+                // IS the probe — a non-ACP executable fails there, loudly,
+                // and there is no claude fallback to hide that behind.
+                let acp_command = role_cfg
+                    .acp_command
+                    .clone()
+                    .expect("validate guarantees acp_command for backend = acp");
+                let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_acp::AcpBackend::new(
+                    acp_command,
+                    role_cfg.acp_args.clone(),
+                ));
+                set_effective_model(&mut cfg, BackendKind::Acp);
+                SelectedBackend {
+                    backend,
+                    kind: BackendKind::Acp,
+                    cfg,
+                    fallback_reason: None,
+                }
+            }
             BackendKind::Claude => {
                 set_effective_model(&mut cfg, BackendKind::Claude);
                 SelectedBackend {

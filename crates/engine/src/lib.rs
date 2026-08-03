@@ -73,6 +73,7 @@ pub mod workspace_gate;
 pub mod workspace_provider;
 pub mod workspace_remote;
 
+pub mod backend_acp;
 pub mod backend_claude;
 pub mod backend_codex;
 pub mod backend_droid;

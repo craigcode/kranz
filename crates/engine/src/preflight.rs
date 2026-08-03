@@ -118,6 +118,12 @@ impl MissionEngine {
                     }
                 }
                 BackendKind::Claude => {}
+                BackendKind::Acp => {
+                    // No cheap probe exists for an ACP executable (there is
+                    // no `--version` convention); the initialize handshake
+                    // at session start is the real probe, and a spawn
+                    // failure surfaces there as an honest backend error.
+                }
                 BackendKind::Local => {
                     if let Some(base_url) = self.state.config.role(role).base_url.as_deref() {
                         if !probe_local_endpoint_reachable(base_url) {
