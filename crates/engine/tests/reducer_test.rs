@@ -3621,3 +3621,251 @@ fn dispatch_pool_candidate_links_fold_without_respawn_charge() {
         .candidate
         .is_none());
 }
+
+// ---------------------------------------------------------------------------
+// divergence.noted / divergence.resolved (ticket divergence-first-class-event,
+// KRZ-304)
+// ---------------------------------------------------------------------------
+
+/// A pool-shaped log written BEFORE the divergence events existed — the
+/// KRZ-303 record: candidate-linked spawns/completions, then the
+/// judgement-pending milestone.blocked — folds unchanged: no resolution set
+/// (and it stays off the state wire), the block still drives the park.
+/// Old logs are the rule, not the exception: the two kinds are additive.
+#[test]
+fn divergence_event_old_logs_fold_cleanly() {
+    let candidate_spawn = |run_id: &str, index: u32, backend: &str| EventKind::WorkerSpawned {
+        run_id: run_id.to_string(),
+        role: Role::Worker,
+        feature_id: Some("f-1-1".to_string()),
+        milestone_id: None,
+        candidate: Some(CandidateLink {
+            unit: "f-1-1".to_string(),
+            index,
+            count: 2,
+            backend: backend.to_string(),
+        }),
+        sdk_session_id: format!("sess-{run_id}"),
+        model: "sonnet".to_string(),
+        quant: "n/a".to_string(),
+        weight_hash: None,
+        prompt_hash: "deadbeef".to_string(),
+        transcript_path: format!("runs/{run_id}.jsonl"),
+    };
+    let events = vec![
+        ev(1, created()),
+        ev(
+            2,
+            EventKind::PlanApproved {
+                plan: plan(),
+                base_sha: None,
+            },
+        ),
+        ev(
+            3,
+            EventKind::FeatureStarted {
+                feature_id: "f-1-1".to_string(),
+            },
+        ),
+        ev(4, candidate_spawn("r-c0", 0, "claude")),
+        ev(5, candidate_spawn("r-c1", 1, "codex")),
+        ev(6, completed("r-c0", tokens(10, 1), None)),
+        ev(7, completed("r-c1", tokens(10, 1), None)),
+        ev(
+            8,
+            EventKind::MilestoneBlocked {
+                milestone_id: "ms-1".to_string(),
+                reason: "dispatch pool: 2/2 candidate stream(s) recorded for unit f-1-1; …"
+                    .to_string(),
+            },
+        ),
+    ];
+
+    let state = fold(&events).unwrap();
+    assert_eq!(state.mission.status, MissionStatus::Blocked);
+    assert!(
+        state.resolved_divergence_units.is_empty(),
+        "a pre-divergence log folds with no resolutions"
+    );
+    // The empty set is omitted from the state wire (additive: a reader
+    // comparing against a pre-field state.json sees no new key).
+    let value = serde_json::to_value(&state).unwrap();
+    assert!(
+        !value
+            .as_object()
+            .unwrap()
+            .contains_key("resolvedDivergenceUnits"),
+        "an empty resolution set must not hit the wire: {value}"
+    );
+}
+
+/// The new events fold in: `divergence.noted` is record-only (state
+/// unchanged modulo last_seq — the agreement-not-trust rule made
+/// mechanical), `divergence.resolved` lands the unit in the folded
+/// resolution set exactly once even when a hand-written log repeats it.
+#[test]
+fn divergence_event_records_fold_and_resolution_is_idempotent() {
+    let spawn = |run_id: &str, index: u32| EventKind::WorkerSpawned {
+        run_id: run_id.to_string(),
+        role: Role::Worker,
+        feature_id: Some("f-1-1".to_string()),
+        milestone_id: None,
+        candidate: Some(CandidateLink {
+            unit: "f-1-1".to_string(),
+            index,
+            count: 2,
+            backend: "claude".to_string(),
+        }),
+        sdk_session_id: format!("sess-{run_id}"),
+        model: "sonnet".to_string(),
+        quant: "n/a".to_string(),
+        weight_hash: None,
+        prompt_hash: "deadbeef".to_string(),
+        transcript_path: format!("runs/{run_id}.jsonl"),
+    };
+    let noted = |seq: u64, diverged: bool| Event {
+        seq,
+        ts: base_ts() + chrono::Duration::seconds(seq as i64),
+        mission_id: MISSION.to_string(),
+        kind: EventKind::DivergenceNoted {
+            unit: "f-1-1".to_string(),
+            candidates: vec![
+                DivergenceCandidate {
+                    run_id: "r-c0".to_string(),
+                    branch: "kranz/pool/m-1/f-1-1-c0".to_string(),
+                    backend: "claude".to_string(),
+                    tree: "aaa".to_string(),
+                },
+                DivergenceCandidate {
+                    run_id: "r-c1".to_string(),
+                    branch: "kranz/pool/m-1/f-1-1-c1".to_string(),
+                    backend: "codex".to_string(),
+                    tree: "bbb".to_string(),
+                },
+            ],
+            diverged,
+        },
+    };
+    let resolved = |seq: u64| Event {
+        seq,
+        ts: base_ts() + chrono::Duration::seconds(seq as i64),
+        mission_id: MISSION.to_string(),
+        kind: EventKind::DivergenceResolved {
+            unit: "f-1-1".to_string(),
+            selected: Some(1),
+            reason: "codex kept it total".to_string(),
+            decided_by: "operator".to_string(),
+        },
+    };
+
+    let without_noted = fold(&[
+        ev(1, created()),
+        ev(
+            2,
+            EventKind::PlanApproved {
+                plan: plan(),
+                base_sha: None,
+            },
+        ),
+        ev(
+            3,
+            EventKind::FeatureStarted {
+                feature_id: "f-1-1".to_string(),
+            },
+        ),
+        ev(4, spawn("r-c0", 0)),
+        ev(5, spawn("r-c1", 1)),
+    ])
+    .unwrap();
+    let with_noted = fold(&[
+        ev(1, created()),
+        ev(
+            2,
+            EventKind::PlanApproved {
+                plan: plan(),
+                base_sha: None,
+            },
+        ),
+        ev(
+            3,
+            EventKind::FeatureStarted {
+                feature_id: "f-1-1".to_string(),
+            },
+        ),
+        ev(4, spawn("r-c0", 0)),
+        ev(5, spawn("r-c1", 1)),
+        noted(6, true),
+    ])
+    .unwrap();
+    // Record-only: the noted event perturbs NOTHING but last_seq — the
+    // diverged verdict folds into no state a decision could key on.
+    let mut shifted = without_noted;
+    shifted.last_seq = with_noted.last_seq;
+    assert_eq!(
+        serde_json::to_string(&with_noted).unwrap(),
+        serde_json::to_string(&shifted).unwrap(),
+        "divergence.noted must be record-only in the fold"
+    );
+
+    // The resolution lands the unit once; a duplicated hand-written
+    // resolution folds benignly (set insert is idempotent).
+    let mut events = vec![
+        ev(1, created()),
+        ev(
+            2,
+            EventKind::PlanApproved {
+                plan: plan(),
+                base_sha: None,
+            },
+        ),
+        ev(
+            3,
+            EventKind::FeatureStarted {
+                feature_id: "f-1-1".to_string(),
+            },
+        ),
+        ev(4, spawn("r-c0", 0)),
+        ev(5, spawn("r-c1", 1)),
+        noted(6, true),
+        resolved(7),
+        resolved(8),
+    ];
+    let state = fold(&events).unwrap();
+    assert_eq!(
+        state.resolved_divergence_units.len(),
+        1,
+        "one unit resolved, duplicated event folded once"
+    );
+    assert!(state.resolved_divergence_units.contains("f-1-1"));
+    let value = serde_json::to_value(&state).unwrap();
+    assert_eq!(value["resolvedDivergenceUnits"], json!(["f-1-1"]));
+
+    // Corruption guards: a noted naming an unknown run, or a resolution
+    // naming an unknown unit, fails the fold instead of folding a dangling
+    // reference.
+    events.push(noted(9, true));
+    let mut bad = events.clone();
+    if let EventKind::DivergenceNoted { candidates, .. } = &mut bad[8].kind {
+        candidates[0].run_id = "r-ghost".to_string();
+    }
+    assert!(
+        fold(&bad).is_err(),
+        "a noted referencing an unknown run must fail the fold"
+    );
+    let mut bad_unit = events;
+    bad_unit.push(Event {
+        seq: 10,
+        ts: base_ts() + chrono::Duration::seconds(10),
+        mission_id: MISSION.to_string(),
+        kind: EventKind::DivergenceResolved {
+            unit: "f-9-9".to_string(),
+            selected: None,
+            reason: "phantom".to_string(),
+            decided_by: "operator".to_string(),
+        },
+    });
+    assert!(
+        fold(&bad_unit).is_err(),
+        "a resolution naming an unknown unit must fail the fold"
+    );
+}

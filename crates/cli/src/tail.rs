@@ -327,6 +327,37 @@ impl EventRenderer {
                     }
                 ),
             ),
+            EventKind::DivergenceNoted {
+                unit,
+                candidates,
+                diverged,
+            } => (
+                format!("feature {unit}"),
+                ansi::BLUE,
+                // The agreement wording carries the rule: logged, never
+                // trusted — the tail must not read as a green light.
+                if *diverged {
+                    format!("pool streams DIVERGED ({} candidates)", candidates.len())
+                } else {
+                    format!(
+                        "pool streams agreed ({} candidates) — logged, never trusted",
+                        candidates.len()
+                    )
+                },
+            ),
+            EventKind::DivergenceResolved {
+                unit,
+                selected,
+                decided_by,
+                ..
+            } => (
+                format!("feature {unit}"),
+                ansi::BLUE,
+                match selected {
+                    Some(index) => format!("pool resolved → candidate c{index} (by {decided_by})"),
+                    None => format!("pool resolved → no candidate (by {decided_by})"),
+                },
+            ),
             EventKind::FixFeatureCreated {
                 milestone_id,
                 feature,

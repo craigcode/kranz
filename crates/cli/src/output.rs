@@ -662,6 +662,55 @@ pub fn render_provenance(chain: &ProvenanceChain) -> String {
     }
 
     out.push('\n');
+    out.push_str("Divergences\n");
+    if chain.divergences.is_empty() {
+        out.push_str("  (no divergence records — no dispatch pools ran)\n");
+    }
+    for link in &chain.divergences {
+        match link {
+            kranz_engine::provenance::DivergenceLink::Noted {
+                seq,
+                unit,
+                candidates,
+                diverged,
+            } => {
+                // The verdict wording carries the rule with it: agreement is
+                // a logged signal, never a trusted one.
+                let verdict = if *diverged {
+                    "DIVERGED".to_string()
+                } else {
+                    "AGREED (logged, never trusted)".to_string()
+                };
+                let refs = candidates
+                    .iter()
+                    .map(|c| format!("{}@{}", c.run_id, c.branch))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.push_str(&format!(
+                    "  [seq {seq}] {unit}  {verdict}  {} candidate(s): {refs}\n",
+                    candidates.len(),
+                ));
+            }
+            kranz_engine::provenance::DivergenceLink::Resolved {
+                seq,
+                unit,
+                selected,
+                reason,
+                decided_by,
+            } => {
+                let choice = match selected {
+                    Some(index) => format!("candidate c{index}"),
+                    None => "no candidate".to_string(),
+                };
+                out.push_str(&format!(
+                    "  [seq {seq}] {unit}  resolved → {choice}  by {decided_by} — {}\n",
+                    one_line(reason, 120),
+                ));
+            }
+        }
+    }
+
+    out.push('\n');
     out.push_str("Outcome\n");
     match &chain.outcome {
         Some(terminal) => {
@@ -1225,6 +1274,67 @@ mod tests {
                 render_provenance_json(&second).unwrap()
             );
             assert_eq!(render_provenance(&first), render_provenance(&second));
+        }
+
+        /// The text view lists the divergence record and its resolution
+        /// (KRZ-304): the noted line names the verdict (with the agreement
+        /// rule spelled out) and every candidate ref; the resolution line
+        /// names the choice and the decider. A pool-less mission says so
+        /// plainly instead of erroring.
+        #[test]
+        fn divergence_event_provenance_text_lists_record_and_resolution() {
+            let tmp = TempDir::new().unwrap();
+            let paths = MissionPaths::new(tmp.path(), "m-1");
+            let mut log = EventLog::acquire(&paths, "m-1", Duration::ZERO, LockForce::No).unwrap();
+            let candidate = |run_id: &str, tree: &str| kranz_engine::types::DivergenceCandidate {
+                run_id: run_id.into(),
+                branch: format!("kranz/pool/m-1/f-1-1-{run_id}"),
+                backend: "claude".into(),
+                tree: tree.into(),
+            };
+            for kind in [
+                EventKind::MissionCreated {
+                    goal: "ship the thing".into(),
+                    base_branch: "main".into(),
+                    mission_branch: "kranz/mission-x".into(),
+                    config: MissionConfig::default(),
+                },
+                EventKind::DivergenceNoted {
+                    unit: "f-1-1".into(),
+                    candidates: vec![candidate("r-c0", "aaa"), candidate("r-c1", "aaa")],
+                    diverged: false,
+                },
+                EventKind::DivergenceResolved {
+                    unit: "f-1-1".into(),
+                    selected: Some(1),
+                    reason: "codex kept it total".into(),
+                    decided_by: "operator".into(),
+                },
+            ] {
+                log.append(kind).unwrap();
+            }
+            drop(log);
+
+            let chain = compute_provenance(tmp.path(), "m-1").unwrap();
+            let text = render_provenance(&chain);
+            for line in [
+                "Divergences",
+                "[seq 2] f-1-1  AGREED (logged, never trusted)  2 candidate(s): r-c0@kranz/pool/m-1/f-1-1-r-c0, r-c1@kranz/pool/m-1/f-1-1-r-c1",
+                "[seq 3] f-1-1  resolved → candidate c1  by operator — codex kept it total",
+            ] {
+                assert!(text.contains(line), "missing line: {line}\n{text}");
+            }
+
+            // Pool-less: the section says so plainly (seed_repo's mission
+            // has no pool events).
+            let tmp2 = TempDir::new().unwrap();
+            seed_repo(tmp2.path());
+            let chain = compute_provenance(tmp2.path(), "m-1").unwrap();
+            let text = render_provenance(&chain);
+            assert!(
+                text.contains("(no divergence records — no dispatch pools ran)"),
+                "the empty ledger reads plainly:\n{text}"
+            );
         }
     }
 

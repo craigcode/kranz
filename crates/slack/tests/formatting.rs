@@ -480,6 +480,7 @@ fn outcomes_slack_card_shows_ratio_buckets_and_escalation_count() {
             flagged: 1,
             share: Some(1.0),
         },
+        divergences: None,
     };
 
     let blocks = build_outcomes_summary(&outcomes);
@@ -567,6 +568,7 @@ fn outcomes_slack_card_empty_history_renders_gracefully() {
         task_classes: vec![],
         context_reuse: vec![],
         rubber_stamp: kranz_engine::outcomes::RubberStampReport::default(),
+        divergences: None,
     };
 
     let blocks = build_outcomes_summary(&outcomes);

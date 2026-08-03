@@ -367,6 +367,83 @@ pub enum EventKind {
         threshold: Option<f64>,
     },
 
+    /// The candidate-comparison record of a heterogeneous dispatch pool
+    /// (ticket `divergence-first-class-event`, KRZ-304; the follow-up the
+    /// KRZ-303 pool parks for): when a unit's sibling streams have all
+    /// recorded and the engine parks the milestone for judgement, the
+    /// candidate branch TREES are compared and exactly one of these is
+    /// appended, naming the unit, every compared candidate (run id, branch,
+    /// backend, tree hash — see [`crate::types::DivergenceCandidate`]), and
+    /// the verdict.
+    ///
+    /// **Agreement between models is a signal to log, never a criterion to
+    /// trust.** Identical candidate trees produce THE SAME record kind with
+    /// `diverged: false` — the agreement record: logged, never trusted. A
+    /// unit is done when gates are green and no escalation is open, not
+    /// when streams stop disagreeing; no gate, judgement, or park posture
+    /// anywhere in the engine is keyed on this verdict (the
+    /// agreement-record test pins that).
+    ///
+    /// TWO kinds, not one with a resolution field: the log is append-only,
+    /// so a resolution that arrives later (or never) could only ever be a
+    /// second event — mirroring `grant.requested` → `grant.approved` /
+    /// `grant.denied`. Record-only in the reducer (the `gate.result`
+    /// additive template, with reference validation as a corruption guard):
+    /// the accompanying `milestone.blocked` drives the park, so old logs
+    /// without any divergence.noted fold unchanged.
+    ///
+    /// WHY the tree hash travels on the event: it pins the exact bytes the
+    /// verdict was computed from, so replay (provenance, the training
+    /// corpus) never needs git — the branches stay for the judging human,
+    /// the hash is the audit anchor. Only streams that produced a run
+    /// record are compared (a stream that never started has no candidate
+    /// diff; counting its untouched branch would fabricate agreement out of
+    /// a failure), and with fewer than two recorded candidates NO event is
+    /// appended at all — a one-stream "agreement" would be vacuous.
+    #[serde(rename = "divergence.noted")]
+    DivergenceNoted {
+        /// The dispatch unit — the feature id fanned out to the pool
+        /// ([`crate::types::CandidateLink::unit`] of every compared run).
+        unit: String,
+        /// Every compared candidate stream, in candidate-index order.
+        candidates: Vec<DivergenceCandidate>,
+        /// TRUE when at least two candidate branch trees differ (the
+        /// streams diverged); FALSE = the agreement record (identical
+        /// trees) — logged, never trusted (see the variant docs).
+        diverged: bool,
+    },
+
+    /// The resolution of a unit's divergence record (ticket
+    /// `divergence-first-class-event`, KRZ-304): WHICH candidate was chosen
+    /// (or that none was), WHY, and decided by WHOM — today always the
+    /// operator through the milestone unblock path the pool parks on; the
+    /// string leaves room for a gate decider without a schema change.
+    /// RECORD ONLY: the engine never merges a candidate (the KRZ-303
+    /// freeze), so this changes nothing about the mission's course — it is
+    /// the judgement landing in the log, feeding the escalation ledger and
+    /// the provenance chain. At most one per unit: the first operator
+    /// judgement stands (the reducer folds the unit set the engine dedupes
+    /// against across restarts).
+    #[serde(rename = "divergence.resolved")]
+    DivergenceResolved {
+        /// The dispatch unit whose divergence is resolved (the feature id).
+        unit: String,
+        /// The chosen candidate's zero-based stream index (the `-c<i>`
+        /// branch suffix / [`crate::types::CandidateLink::index`]); `None`
+        /// when no candidate was selected — a judged-and-abandoned unit is
+        /// itself a recorded resolution, distinct from "not yet judged".
+        /// `None` never hits the wire.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selected: Option<u32>,
+        /// WHY, verbatim from the decider (the operator's note, or the
+        /// unblock action when no note was given).
+        reason: String,
+        /// WHO or WHAT decided: `"operator"` for the unblock path; a gate
+        /// identity when a gate ever resolves (none does today).
+        #[serde(rename = "decidedBy")]
+        decided_by: String,
+    },
+
     /// Orchestrator converted findings into a fix-feature (origin: fix).
     #[serde(rename = "fixfeature.created")]
     FixFeatureCreated {
@@ -570,6 +647,8 @@ impl EventKind {
             EventKind::ValidatorTamper { .. } => "validator.tamper",
             EventKind::ValidationSnapshot { .. } => "validation.snapshot",
             EventKind::GateResult { .. } => "gate.result",
+            EventKind::DivergenceNoted { .. } => "divergence.noted",
+            EventKind::DivergenceResolved { .. } => "divergence.resolved",
             EventKind::FixFeatureCreated { .. } => "fixfeature.created",
             EventKind::TierEscalated { .. } => "tier.escalated",
             EventKind::MilestoneBlocked { .. } => "milestone.blocked",
@@ -1326,6 +1405,166 @@ mod tests {
         .unwrap();
         match old {
             EventKind::WorkerSpawned { candidate, .. } => assert_eq!(candidate, None),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// The additive `divergence.noted` event (ticket
+    /// `divergence-first-class-event`, KRZ-304): wire name, payload shape,
+    /// and round-trip — the comparison record naming every candidate ref
+    /// (run id + branch + backend + tree hash) and the verdict. The
+    /// `diverged: false` form IS the agreement record: logged, never
+    /// trusted.
+    #[test]
+    fn divergence_event_noted_wire_shape_and_round_trip() {
+        let noted = EventKind::DivergenceNoted {
+            unit: "f-1-1".into(),
+            candidates: vec![
+                DivergenceCandidate {
+                    run_id: "r-1".into(),
+                    branch: "kranz/pool/m-1/f-1-1-c0".into(),
+                    backend: "claude".into(),
+                    tree: "aaa".into(),
+                },
+                DivergenceCandidate {
+                    run_id: "r-2".into(),
+                    branch: "kranz/pool/m-1/f-1-1-c1".into(),
+                    backend: "codex".into(),
+                    tree: "bbb".into(),
+                },
+            ],
+            diverged: true,
+        };
+        let json = serde_json::to_value(&noted).unwrap();
+        assert_eq!(json["type"], "divergence.noted");
+        assert_eq!(json["payload"]["unit"], "f-1-1");
+        assert_eq!(json["payload"]["diverged"], true);
+        assert_eq!(json["payload"]["candidates"][0]["runId"], "r-1");
+        assert_eq!(
+            json["payload"]["candidates"][1]["branch"],
+            "kranz/pool/m-1/f-1-1-c1"
+        );
+        assert_eq!(json["payload"]["candidates"][1]["backend"], "codex");
+        assert_eq!(json["payload"]["candidates"][1]["tree"], "bbb");
+        assert_eq!(noted.type_name(), "divergence.noted");
+        let back: EventKind = serde_json::from_value(json).unwrap();
+        match back {
+            EventKind::DivergenceNoted {
+                unit,
+                candidates,
+                diverged,
+            } => {
+                assert_eq!(unit, "f-1-1");
+                assert!(diverged);
+                assert_eq!(candidates.len(), 2);
+                assert_eq!(candidates[0].run_id, "r-1");
+                assert_eq!(candidates[1].tree, "bbb");
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // The agreement record is the SAME kind with diverged = false —
+        // there is no separate, trustable "agreement" event shape.
+        let agreed = EventKind::DivergenceNoted {
+            unit: "f-1-1".into(),
+            candidates: vec![
+                DivergenceCandidate {
+                    run_id: "r-1".into(),
+                    branch: "kranz/pool/m-1/f-1-1-c0".into(),
+                    backend: "claude".into(),
+                    tree: "aaa".into(),
+                },
+                DivergenceCandidate {
+                    run_id: "r-2".into(),
+                    branch: "kranz/pool/m-1/f-1-1-c1".into(),
+                    backend: "codex".into(),
+                    tree: "aaa".into(),
+                },
+            ],
+            diverged: false,
+        };
+        let json = serde_json::to_value(&agreed).unwrap();
+        assert_eq!(json["type"], "divergence.noted");
+        assert_eq!(json["payload"]["diverged"], false);
+    }
+
+    /// The additive `divergence.resolved` event (KRZ-304): the resolution
+    /// naming WHICH candidate (or none), WHY, and decided by WHOM.
+    /// `selected: None` means judged-and-abandoned, is omitted from the
+    /// wire, and a wire line without it parses back to None (serde default)
+    /// — so hand-written or future-trimmed logs fold like engine-written
+    /// ones.
+    #[test]
+    fn divergence_event_resolved_wire_shape_and_round_trip() {
+        let resolved = EventKind::DivergenceResolved {
+            unit: "f-1-1".into(),
+            selected: Some(1),
+            reason: "the codex candidate keeps the parser total".into(),
+            decided_by: "operator".into(),
+        };
+        let json = serde_json::to_value(&resolved).unwrap();
+        assert_eq!(json["type"], "divergence.resolved");
+        assert_eq!(json["payload"]["unit"], "f-1-1");
+        assert_eq!(json["payload"]["selected"], 1);
+        assert_eq!(
+            json["payload"]["reason"],
+            "the codex candidate keeps the parser total"
+        );
+        assert_eq!(json["payload"]["decidedBy"], "operator");
+        assert_eq!(resolved.type_name(), "divergence.resolved");
+        let back: EventKind = serde_json::from_value(json).unwrap();
+        match back {
+            EventKind::DivergenceResolved {
+                unit,
+                selected,
+                reason,
+                decided_by,
+            } => {
+                assert_eq!(unit, "f-1-1");
+                assert_eq!(selected, Some(1));
+                assert!(reason.contains("codex"));
+                assert_eq!(decided_by, "operator");
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // None = judged-and-abandoned: off the wire, and a wire line
+        // without the key parses back to None.
+        let none = EventKind::DivergenceResolved {
+            unit: "f-1-1".into(),
+            selected: None,
+            reason: "neither candidate survives review".into(),
+            decided_by: "operator".into(),
+        };
+        let json = serde_json::to_value(&none).unwrap();
+        assert!(
+            !json["payload"]
+                .as_object()
+                .unwrap()
+                .contains_key("selected"),
+            "selected must not serialize when None: {json}"
+        );
+        let line = r#"{
+            "seq": 9,
+            "ts": "2026-01-02T03:04:05Z",
+            "missionId": "m-1",
+            "type": "divergence.resolved",
+            "payload": {
+                "unit": "f-1-1",
+                "reason": "milestone skipped by operator",
+                "decidedBy": "operator"
+            }
+        }"#;
+        let event: Event = serde_json::from_str(line).unwrap();
+        match event.kind {
+            EventKind::DivergenceResolved {
+                selected,
+                decided_by,
+                ..
+            } => {
+                assert_eq!(selected, None);
+                assert_eq!(decided_by, "operator");
+            }
             _ => panic!("wrong variant"),
         }
     }

@@ -8,7 +8,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 // ---------------------------------------------------------------------------
 // Mission
@@ -231,6 +231,29 @@ pub struct CandidateLink {
     /// the harness — e.g. a claude-routed and a codex-routed stream may both
     /// record a gpt-family model name after alias normalization).
     pub backend: String,
+}
+
+/// One compared candidate stream on a `divergence.noted` event (ticket
+/// `divergence-first-class-event`, KRZ-304): the reference to the candidate
+/// DIFF the judgement act inspects — the run that produced it, the branch
+/// that carries it (KEPT: `kranz/pool/<mission>/<unit>-c<index>` is the
+/// deliverable), the backend that ran it, and the tree hash of the branch
+/// HEAD at record time. The hash pins the exact bytes the `diverged`
+/// verdict was computed from, so replay (provenance, the training corpus)
+/// re-reads the record without git; only streams that produced a run
+/// record appear (a stream that never started has no diff to compare).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DivergenceCandidate {
+    /// The candidate stream's run id — its `worker.spawned` carries the
+    /// [`CandidateLink`] for the same unit and index.
+    pub run_id: String,
+    /// The candidate branch — the deliverable the judging human inspects.
+    pub branch: String,
+    /// Backend the stream ran ([`CandidateLink::backend`] verbatim).
+    pub backend: String,
+    /// Tree hash of the branch HEAD at record time.
+    pub tree: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -502,6 +525,15 @@ pub struct MissionState {
     /// field — v1 keep-only teardowns carried no outcome.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_lifecycle: Option<WorkspaceLifecycle>,
+    /// Dispatch-pool units with a recorded resolution, folded from
+    /// `divergence.resolved` (ticket `divergence-first-class-event`,
+    /// KRZ-304). The engine emits at most one resolution per unit — the
+    /// FIRST operator judgement stands — and this set is how the unblock
+    /// path knows, across a process restart, that a unit's judgement
+    /// already landed. Derived at fold time (state.json is only a cache of
+    /// the fold); empty on pre-pool logs and omitted from the wire then.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub resolved_divergence_units: BTreeSet<String>,
 }
 
 impl MissionState {

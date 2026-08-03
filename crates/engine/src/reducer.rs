@@ -8,7 +8,7 @@
 use crate::error::{EngineError, Result};
 use crate::events::{Event, EventKind};
 use crate::types::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// Reserved `run_id` for `validation.finding` events produced by the engine
@@ -345,6 +345,32 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             // no-op, exactly like secret.redacted below.
         }
 
+        EventKind::DivergenceNoted {
+            unit, candidates, ..
+        } => {
+            // Audit record of the candidate comparison (KRZ-304); the
+            // accompanying milestone.blocked drives the park, and the
+            // `diverged` verdict is deliberately NEVER folded into any
+            // state a decision could key on — agreement between models is a
+            // signal to log, never a criterion to trust. Validate
+            // references as a corruption guard (mirrors validation.finding):
+            // the unit names a feature, every candidate a recorded run.
+            feature_mut(state, unit)?;
+            for candidate in candidates {
+                run_mut(state, &candidate.run_id)?;
+            }
+        }
+
+        EventKind::DivergenceResolved { unit, .. } => {
+            // The judgement record (KRZ-304). The unit joins the folded
+            // resolution set — the engine's restart-safe memory for "this
+            // unit was already judged" (at most one resolution per unit;
+            // the set insert keeps a duplicated hand-written event benign).
+            // Reference validation as a corruption guard, as above.
+            feature_mut(state, unit)?;
+            state.resolved_divergence_units.insert(unit.clone());
+        }
+
         EventKind::FixFeatureCreated {
             milestone_id,
             feature,
@@ -595,6 +621,7 @@ fn initial_state(event: &Event) -> Result<MissionState> {
         workspace_provider: None,
         workspace_pin: None,
         workspace_lifecycle: None,
+        resolved_divergence_units: BTreeSet::new(),
     })
 }
 

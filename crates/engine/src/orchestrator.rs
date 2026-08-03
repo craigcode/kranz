@@ -138,6 +138,13 @@ struct UnblockDecision {
     action: String,
     #[serde(default)]
     note: String,
+    /// For a milestone parked on a dispatch-pool judgement (KRZ-303/304):
+    /// the zero-based index of the candidate the operator chose (the
+    /// `-c<i>` suffix of the `kranz/pool/*` branches), or null when no
+    /// candidate was selected. Purely the resolution RECORD's payload —
+    /// the engine never merges a candidate.
+    #[serde(default)]
+    candidate: Option<u32>,
     /// Optional operator guidance injected verbatim into the next validator
     /// task (and its retry) — the only channel by which unblock text can
     /// reach a fresh validator session.
@@ -2558,7 +2565,7 @@ impl MissionEngine {
         let message = format!(
             "Milestone {milestone_id} is BLOCKED. The user sent:\n- {messages}\n\n\
              Decide how to proceed. Respond with ONLY this JSON:\n\
-             {{\"action\":\"unblock-raise-cap\"|\"unblock-skip-findings\"|\"unblock-add-fix\"|\"skip-milestone\"|\"stay-blocked\",\"note\":\"string\",\"validatorGuidance\":\"string (optional)\",\"fix\":{{\"title\":\"string\",\"spec\":\"string\",\"validationCriteria\":[\"string\"]}} (optional)}}\n\
+             {{\"action\":\"unblock-raise-cap\"|\"unblock-skip-findings\"|\"unblock-add-fix\"|\"skip-milestone\"|\"stay-blocked\",\"note\":\"string\",\"candidate\":null,\"validatorGuidance\":\"string (optional)\",\"fix\":{{\"title\":\"string\",\"spec\":\"string\",\"validationCriteria\":[\"string\"]}} (optional)}}\n\
              Use \"unblock-add-fix\" when validation fails for a mechanical reason a repair \
              worker should fix BEFORE re-validating (run cargo fmt, fix a doc/test lint) — \
              resuming validation unchanged would just fail again; include the fix object \
@@ -2566,14 +2573,19 @@ impl MissionEngine {
              verbatim instructions for the next validator session (e.g. \"run cargo fmt \
              before the gate\", \"the a3 grep pattern is the problem\") — it is folded into \
              mission state and injected into the next validator task and its retry, even \
-             across a process restart."
+             across a process restart. When the milestone is parked on a dispatch-pool \
+             judgement (the block reason names kranz/pool/* candidate branches) and the \
+             user names a winning candidate, set \"candidate\" to its zero-based stream \
+             index (the -c<i> branch suffix); leave it null when no candidate was chosen. \
+             This only RECORDS the judgement — the engine never merges a candidate."
         );
         let (decision, text) = self.json_decision::<UnblockDecision>(&message).await?;
         // Conservative default (documented): stay blocked.
-        let (action, note, validator_guidance, fix) = match decision {
+        let (action, note, candidate, validator_guidance, fix) = match decision {
             Some(d) => (
                 d.action.trim().to_ascii_lowercase(),
                 d.note,
+                d.candidate,
                 d.validator_guidance,
                 d.fix,
             ),
@@ -2582,12 +2594,18 @@ impl MissionEngine {
                 "unparseable unblock decision".to_string(),
                 None,
                 None,
+                None,
             ),
         };
         self.emit_decision(
             &format!("unblock decision for {milestone_id}: {action}"),
             Some(text.clone()),
         )?;
+
+        // Dispatch-pool resolution RECORD (KRZ-304): the judgement the pool
+        // parked for lands here, BEFORE the unblock it rides on, so the log
+        // reads record-then-move. Record-only — the match below is untouched.
+        self.record_pool_resolutions(mi, &action, &note, candidate)?;
 
         match action.as_str() {
             "unblock-raise-cap" | "unblock-skip-findings" => {
@@ -2655,6 +2673,86 @@ impl MissionEngine {
             }
             _ => Ok(Some(MissionStatus::Blocked)),
         }
+    }
+
+    /// Dispatch-pool resolution RECORD (ticket `divergence-first-class-event`,
+    /// KRZ-304): the pool parks its unit's milestone for a human judgement
+    /// act (KRZ-303); this is where that judgement lands in the log. An
+    /// operator steer that NAMES a candidate (`candidate` on the unblock
+    /// decision) or that DISPOSES of the unit (skip-milestone) resolves it:
+    /// append one `divergence.resolved` per unresolved pool unit of this
+    /// milestone — which candidate (or none), why, decided by whom.
+    ///
+    /// RECORD ONLY: the resolution changes nothing about the mission's
+    /// course. The engine never merges a candidate (the KRZ-303 freeze),
+    /// an unblock-* action on a pool park simply re-parks via the
+    /// re-dispatch guard, and agreement between models is a signal to log,
+    /// never a criterion to trust — a unit is done when gates are green and
+    /// no escalation is open, not when its streams stopped disagreeing.
+    ///
+    /// FIRST JUDGEMENT WINS: at most one resolution per unit — the
+    /// reducer-folded `resolved_divergence_units` set is the durable memory
+    /// (restart-safe), so a re-blocked-then-re-steered unit never accrues a
+    /// second record; a changed mind after the record is a conversation
+    /// (user.message), not a resolution amendment. A bare unblock that
+    /// names no candidate and does not dispose of the unit records NOTHING
+    /// — the judgement has not arrived, and the park continues honestly.
+    fn record_pool_resolutions(
+        &mut self,
+        mi: usize,
+        action: &str,
+        note: &str,
+        candidate: Option<u32>,
+    ) -> Result<()> {
+        let disposes = action == "skip-milestone";
+        if candidate.is_none() && !disposes {
+            return Ok(());
+        }
+        let units: Vec<String> = self.state.mission.milestones[mi]
+            .features
+            .iter()
+            .map(|f| f.id.clone())
+            .filter(|id| !self.state.resolved_divergence_units.contains(id))
+            .filter(|id| {
+                self.state
+                    .runs
+                    .values()
+                    .any(|r| r.candidate.as_ref().is_some_and(|c| &c.unit == id))
+            })
+            .collect();
+        for unit in units {
+            let recorded: Vec<u32> = self
+                .state
+                .runs
+                .values()
+                .filter_map(|r| {
+                    r.candidate
+                        .as_ref()
+                        .filter(|c| c.unit == unit)
+                        .map(|c| c.index)
+                })
+                .collect();
+            let base_reason = if note.is_empty() { action } else { note };
+            // `selected` must name a stream that was actually recorded: an
+            // out-of-range index folds to None with the discrepancy named in
+            // the reason — the record never points at a candidate that does
+            // not exist (a resolution of "none" is honest; a phantom is not).
+            let (selected, reason) = match candidate {
+                Some(i) if recorded.contains(&i) => (Some(i), base_reason.to_string()),
+                Some(i) => (
+                    None,
+                    format!("{base_reason} (named candidate c{i} has no recorded stream)"),
+                ),
+                None => (None, base_reason.to_string()),
+            };
+            self.emit(EventKind::DivergenceResolved {
+                unit,
+                selected,
+                reason,
+                decided_by: "operator".to_string(),
+            })?;
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -3012,6 +3110,65 @@ impl MissionEngine {
         )
     }
 
+    /// Append the unit's divergence/agreement record (ticket
+    /// `divergence-first-class-event`, KRZ-304): compare every RECORDED
+    /// candidate stream's branch tree and emit one `divergence.noted`
+    /// naming the unit and the candidates (run id + branch + backend +
+    /// tree hash) with the verdict. Called from the pool dispatch after
+    /// every stream's checkpoint commit, so each branch HEAD IS the
+    /// candidate deliverable the hash pins.
+    ///
+    /// **Agreement between models is a signal to log, never a criterion to
+    /// trust.** Identical trees emit the same kind with `diverged: false`
+    /// and change NOTHING about the mission's course — the milestone parks
+    /// for judgement either way, no gate is consulted or skipped on the
+    /// verdict, and a unit is done when gates are green and no escalation
+    /// is open, not when streams stop disagreeing.
+    ///
+    /// Only streams with a run record are compared: a stream that never
+    /// started has no candidate diff, and counting its untouched branch
+    /// would fabricate agreement (or divergence) out of a failure — the
+    /// pool decision's detail names failed streams verbatim instead. With
+    /// fewer than two recorded candidates there is nothing to compare and
+    /// NO event is appended (a one-stream "agreement" would be vacuous).
+    /// The crash-resume re-dispatch guard never calls here: a half-recorded
+    /// candidate set parks without a comparison rather than fabricating one
+    /// from incomplete streams.
+    fn emit_pool_divergence_record(
+        &mut self,
+        feature: &Feature,
+        workspaces: &[PoolWorkspace],
+    ) -> Result<()> {
+        let mut candidates: Vec<DivergenceCandidate> = Vec::new();
+        for (index, ws) in workspaces.iter().enumerate() {
+            let run = self.state.runs.values().find(|r| {
+                r.candidate
+                    .as_ref()
+                    .is_some_and(|c| c.unit == feature.id && c.index == index as u32)
+            });
+            let Some(run) = run else { continue };
+            // Read-only probe on the shared refs (worktree isolation
+            // untouched): the tree hash anchors the verdict to exact bytes.
+            let tree = self.repo.rev_parse(&format!("{}^{{tree}}", ws.branch))?;
+            candidates.push(DivergenceCandidate {
+                run_id: run.id.clone(),
+                branch: ws.branch.clone(),
+                backend: ws.spec.backend.clone(),
+                tree,
+            });
+        }
+        if candidates.len() < 2 {
+            return Ok(());
+        }
+        let diverged = candidates.iter().any(|c| c.tree != candidates[0].tree);
+        self.emit(EventKind::DivergenceNoted {
+            unit: feature.id.clone(),
+            candidates,
+            diverged,
+        })?;
+        Ok(())
+    }
+
     /// Fallible body of [`Self::run_feature_dispatch_pool`] (the caller's
     /// worktree-dir cleanup guard runs regardless of how this returns).
     async fn run_dispatch_pool_inner(
@@ -3220,6 +3377,13 @@ impl MissionEngine {
                 }
             }
         }
+
+        // The divergence/agreement record (KRZ-304): emitted while every
+        // candidate branch HEAD is final (checkpoints committed above) and
+        // BEFORE the park, so the judgement the milestone waits on has a
+        // first-class handle. Record-only — the park below is unchanged
+        // whether the streams diverged or agreed.
+        self.emit_pool_divergence_record(feature, workspaces)?;
 
         // One first-class decision record for the dispatch: the candidate
         // table AND the freeze statements, so the replayed history shows what
@@ -7020,6 +7184,7 @@ pub(crate) mod tests {
             workspace_provider: None,
             workspace_pin: None,
             workspace_lifecycle: None,
+            resolved_divergence_units: std::collections::BTreeSet::new(),
         };
 
         assert_eq!(
@@ -10000,6 +10165,329 @@ pub(crate) mod tests {
                 EventKind::OrchestratorDecision { summary, .. } if summary.starts_with("dispatch pool:")
             )),
             "no pool decision on the single-backend path"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Divergence as a first-class event (ticket divergence-first-class-event,
+    // KRZ-304)
+    // -----------------------------------------------------------------------
+
+    /// The streaming orchestrator session for the resolution tests: one
+    /// init/ready pair, then one scripted reply per unblock decision turn.
+    fn divergence_orch_script(replies: Vec<String>) -> crate::backend_mock::MockScript {
+        use crate::backend_mock::{mock_init, mock_result_text, mock_text};
+        crate::backend_mock::MockScript::streaming(vec![
+            mock_init("orch-session"),
+            mock_result_text("ready"),
+        ])
+        .responding(
+            replies
+                .iter()
+                .map(|reply| vec![mock_text(reply), mock_result_text(reply)])
+                .collect(),
+        )
+    }
+
+    /// Acceptance hint 1 (noted): two divergent candidate diffs produce ONE
+    /// divergence record referencing BOTH candidates — run ids, branch refs,
+    /// backends, and the exact tree hashes the verdict was computed from —
+    /// emitted before the milestone parks for judgement.
+    #[tokio::test]
+    async fn divergence_event_divergent_candidates_record_references_both_streams() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let claude_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("claude candidate", "claude.txt", "claude was here"),
+        ]));
+        let codex_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("codex candidate", "codex.txt", "codex was here"),
+        ]));
+        let backend: Arc<dyn AgentBackend> = claude_mock.clone();
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", dispatch_pool_cfg()).unwrap();
+        engine.seed_worker_auth_verdict_for_test(AuthVerdict::Authenticated);
+        engine.seed_kind_backend_for_test(BackendKind::Codex, codex_mock.clone());
+        engine
+            .state
+            .mission
+            .milestones
+            .push(dispatch_pool_milestone(&engine));
+
+        engine.run_feature(0, 0).await.unwrap();
+
+        let mission_id = engine.mission_id().to_string();
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        let noted: Vec<&Event> = events
+            .iter()
+            .filter(|e| matches!(&e.kind, EventKind::DivergenceNoted { .. }))
+            .collect();
+        assert_eq!(noted.len(), 1, "exactly one comparison record per unit");
+        let EventKind::DivergenceNoted {
+            unit,
+            candidates,
+            diverged,
+        } = &noted[0].kind
+        else {
+            unreachable!()
+        };
+        assert_eq!(unit, "f-1-1");
+        assert!(diverged, "different contents must record a divergence");
+        assert_eq!(candidates.len(), 2, "the record references BOTH streams");
+        // Candidate order is stream order; every ref (run id, branch,
+        // backend, tree) names the candidate diff it was computed from.
+        let expected_runs: Vec<String> = {
+            let mut linked: Vec<&WorkerRun> = engine
+                .state()
+                .runs
+                .values()
+                .filter(|r| r.candidate.is_some())
+                .collect();
+            linked.sort_by_key(|r| r.candidate.as_ref().unwrap().index);
+            linked.iter().map(|r| r.id.clone()).collect()
+        };
+        for (index, candidate) in candidates.iter().enumerate() {
+            let branch = format!("kranz/pool/{mission_id}/f-1-1-c{index}");
+            assert_eq!(candidate.run_id, expected_runs[index]);
+            assert_eq!(candidate.branch, branch);
+            assert_eq!(
+                candidate.tree,
+                engine
+                    .repo
+                    .rev_parse(&format!("{branch}^{{tree}}"))
+                    .unwrap(),
+                "the tree hash pins the exact candidate bytes"
+            );
+        }
+        assert_eq!(candidates[0].backend, "claude");
+        assert_eq!(candidates[1].backend, "codex");
+        assert_ne!(
+            candidates[0].tree, candidates[1].tree,
+            "divergent streams carry distinct tree hashes"
+        );
+        // The record lands BEFORE the park it explains.
+        let noted_seq = noted[0].seq;
+        let blocked_seq = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::MilestoneBlocked { milestone_id, .. } if milestone_id == "ms-1" => {
+                    Some(e.seq)
+                }
+                _ => None,
+            })
+            .expect("the milestone parks for judgement");
+        assert!(
+            noted_seq < blocked_seq,
+            "the record precedes the park: noted seq {noted_seq}, blocked seq {blocked_seq}"
+        );
+    }
+
+    /// Acceptance hint 3 (agreement, the load-bearing rule): identical
+    /// candidate trees produce the agreement record (`diverged: false`) —
+    /// **logged, never trusted**: the park posture is byte-identical to the
+    /// divergent case, no gate is consulted or skipped because the streams
+    /// agreed, and no code path completes the unit.
+    #[tokio::test]
+    async fn divergence_event_identical_candidates_log_agreement_and_no_gate_is_skipped() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        // Both streams write the SAME path with the SAME bytes: the two
+        // checkpoint commits differ (per-index messages) but the branch
+        // TREES are identical — agreement is a tree comparison, never a
+        // commit-message one.
+        let claude_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("claude candidate", "same.txt", "identical bytes"),
+        ]));
+        let codex_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("codex candidate", "same.txt", "identical bytes"),
+        ]));
+        let backend: Arc<dyn AgentBackend> = claude_mock.clone();
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", dispatch_pool_cfg()).unwrap();
+        engine.seed_worker_auth_verdict_for_test(AuthVerdict::Authenticated);
+        engine.seed_kind_backend_for_test(BackendKind::Codex, codex_mock.clone());
+        engine
+            .state
+            .mission
+            .milestones
+            .push(dispatch_pool_milestone(&engine));
+
+        engine.run_feature(0, 0).await.unwrap();
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        let noted = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::DivergenceNoted {
+                    unit,
+                    candidates,
+                    diverged,
+                } => Some((unit, candidates, diverged)),
+                _ => None,
+            })
+            .expect("identical streams still produce the record");
+        assert_eq!(noted.0, "f-1-1");
+        assert!(!noted.2, "identical trees record agreement, not divergence");
+        assert_eq!(noted.1.len(), 2);
+        assert_eq!(
+            noted.1[0].tree, noted.1[1].tree,
+            "same bytes on both branches → one tree hash"
+        );
+
+        // Agreement changes NOTHING about the mission's course:
+        // - the milestone parks with the SAME judgement-pending reason as
+        //   the divergent case (no "streams agreed" shortcut);
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.kind,
+                EventKind::MilestoneBlocked { milestone_id, reason }
+                if milestone_id == "ms-1" && reason.contains("candidate for judgement")
+            )),
+            "agreement never un-parks the judgement: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        // - no gate was consulted, so none could have been skipped on the
+        //   agreement (the ladder runs only in the normal validation flow,
+        //   after judgement — never on the stream verdict);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::GateResult { .. })),
+            "no gate.result anywhere: agreement skips no gate"
+        );
+        // - the unit is neither completed nor failed from the agreement;
+        // - and no validation round ran (a unit is done when gates are
+        //   green and no escalation is open — not when streams agree).
+        assert!(
+            !events.iter().any(|e| matches!(
+                &e.kind,
+                EventKind::FeatureCompleted { feature_id, .. } | EventKind::FeatureFailed { feature_id, .. }
+                if feature_id == "f-1-1"
+            )),
+            "agreement never completes or fails the unit"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::MilestoneValidating { .. })),
+            "agreement never starts a validation round"
+        );
+    }
+
+    /// Acceptance hint 1 (resolution): the operator's steer on the parked
+    /// milestone appends ONE resolution naming the chosen candidate, the
+    /// why, and the decider — before the unblock it rides on. First
+    /// judgement wins: a later steer re-acting on the same unit records no
+    /// second resolution (the folded set is the durable memory).
+    #[tokio::test]
+    async fn divergence_event_resolution_records_the_decider_once() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let first = serde_json::json!({
+            "action": "unblock-skip-findings",
+            "note": "candidate 1 kept the parser total",
+            "candidate": 1,
+        })
+        .to_string();
+        let second = serde_json::json!({
+            "action": "skip-milestone",
+            "note": "skip it now",
+            "candidate": 0,
+        })
+        .to_string();
+        let claude_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("claude candidate", "claude.txt", "claude was here"),
+            divergence_orch_script(vec![first, second]),
+        ]));
+        let codex_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("codex candidate", "codex.txt", "codex was here"),
+        ]));
+        let backend: Arc<dyn AgentBackend> = claude_mock.clone();
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", dispatch_pool_cfg()).unwrap();
+        engine.seed_worker_auth_verdict_for_test(AuthVerdict::Authenticated);
+        engine.seed_kind_backend_for_test(BackendKind::Codex, codex_mock.clone());
+        engine
+            .state
+            .mission
+            .milestones
+            .push(dispatch_pool_milestone(&engine));
+        engine.run_feature(0, 0).await.unwrap();
+
+        // The operator judges: "candidate 1, and carry on".
+        engine
+            .emit(EventKind::UserMessage {
+                text: "take candidate 1".into(),
+                interrupt: false,
+            })
+            .unwrap();
+        let status = engine.handle_blocked(0).await.unwrap();
+        assert_eq!(status, None, "an unblock action moves the milestone");
+
+        // A second steer re-acts on the same unit (here: dispose of it) —
+        // the FIRST resolution already stands, so nothing new is recorded.
+        engine
+            .emit(EventKind::UserMessage {
+                text: "actually, just skip the milestone".into(),
+                interrupt: false,
+            })
+            .unwrap();
+        engine.handle_blocked(0).await.unwrap();
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        let resolutions: Vec<&Event> = events
+            .iter()
+            .filter(|e| matches!(&e.kind, EventKind::DivergenceResolved { .. }))
+            .collect();
+        assert_eq!(
+            resolutions.len(),
+            1,
+            "first judgement wins — no second resolution for the unit"
+        );
+        let EventKind::DivergenceResolved {
+            unit,
+            selected,
+            reason,
+            decided_by,
+        } = &resolutions[0].kind
+        else {
+            unreachable!()
+        };
+        assert_eq!(unit, "f-1-1");
+        assert_eq!(*selected, Some(1), "the operator's candidate, verbatim");
+        assert_eq!(reason, "candidate 1 kept the parser total");
+        assert_eq!(decided_by, "operator", "the unblock path names the decider");
+        // The resolution precedes the unblock it rode in on.
+        let unblock_seq = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::MilestoneUnblocked { milestone_id, .. } if milestone_id == "ms-1" => {
+                    Some(e.seq)
+                }
+                _ => None,
+            })
+            .expect("the unblock landed");
+        assert!(
+            resolutions[0].seq < unblock_seq,
+            "record-then-move: resolution seq {} < unblock seq {unblock_seq}",
+            resolutions[0].seq
+        );
+        // The folded set is the restart-safe memory of "already judged".
+        assert!(
+            engine.state().resolved_divergence_units.contains("f-1-1"),
+            "the unit joins the folded resolution set"
+        );
+        // The second steer still disposed of the milestone — the dedupe
+        // suppresses only the duplicate RECORD, never the operator's act.
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.kind,
+                EventKind::MilestoneCompleted { milestone_id, .. } if milestone_id == "ms-1"
+            )),
+            "the skip still completes the milestone"
         );
     }
 }

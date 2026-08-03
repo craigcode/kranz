@@ -244,6 +244,7 @@ mod tests {
             workspace_provider: None,
             workspace_pin: None,
             workspace_lifecycle: None,
+            resolved_divergence_units: Default::default(),
         }
     }
 

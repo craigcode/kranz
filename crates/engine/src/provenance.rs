@@ -207,6 +207,35 @@ pub struct DecisionLink {
     pub summary: String,
 }
 
+/// One divergence-ledger entry, replayed (ticket
+/// `divergence-first-class-event`, KRZ-304): the comparison the pool
+/// parked on, or the resolution that later landed — pinned to its `seq`
+/// so the record and its resolution interleave with the rest of the chain
+/// in log order. The candidate refs (run id, branch, backend, tree hash)
+/// ride verbatim, so the resolution's `selected` index resolves against
+/// the SAME replayed record without git.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum DivergenceLink {
+    /// A `divergence.noted` — the comparison record. `diverged: false` is
+    /// the agreement record: logged, never trusted.
+    Noted {
+        seq: u64,
+        unit: String,
+        candidates: Vec<crate::types::DivergenceCandidate>,
+        diverged: bool,
+    },
+    /// A `divergence.resolved` — which candidate (or none), why, decided
+    /// by whom.
+    Resolved {
+        seq: u64,
+        unit: String,
+        selected: Option<u32>,
+        reason: String,
+        decided_by: String,
+    },
+}
+
 /// How the mission ended, when it did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -254,6 +283,11 @@ pub struct ProvenanceChain {
     pub gates: Vec<GateLink>,
     pub sessions: Vec<SessionLink>,
     pub decisions: Vec<DecisionLink>,
+    /// The divergence ledger (KRZ-304): comparison records and their
+    /// resolutions, each pinned to its seq. Empty on pre-pool logs
+    /// (`#[serde(default)]` keeps a pre-field chain.json readable).
+    #[serde(default)]
+    pub divergences: Vec<DivergenceLink>,
     /// The FIRST terminal event (a well-formed log has exactly one); `None`
     /// while the mission is still in flight.
     pub outcome: Option<TerminalLink>,
@@ -284,6 +318,7 @@ pub fn provenance_chain(
         gates: Vec::new(),
         sessions: Vec::new(),
         decisions: Vec::new(),
+        divergences: Vec::new(),
         outcome: None,
     };
     // The config in force at the current seq (backend derivation); set by
@@ -423,6 +458,28 @@ pub fn provenance_chain(
                 score: *score,
                 threshold: *threshold,
                 artefact: ArtefactStatus::classify(&resolve_artefact(mission_dir, artefact_ref)),
+            }),
+            EventKind::DivergenceNoted {
+                unit,
+                candidates,
+                diverged,
+            } => chain.divergences.push(DivergenceLink::Noted {
+                seq: event.seq,
+                unit: unit.clone(),
+                candidates: candidates.clone(),
+                diverged: *diverged,
+            }),
+            EventKind::DivergenceResolved {
+                unit,
+                selected,
+                reason,
+                decided_by,
+            } => chain.divergences.push(DivergenceLink::Resolved {
+                seq: event.seq,
+                unit: unit.clone(),
+                selected: *selected,
+                reason: reason.clone(),
+                decided_by: decided_by.clone(),
             }),
             EventKind::WorkerSpawned {
                 run_id,
@@ -990,5 +1047,83 @@ mod tests {
             matches!(result, Err(EngineError::Config(_))),
             "expected the reducer's Config error, got {result:?}"
         );
+    }
+
+    /// The divergence record and its resolution survive provenance replay
+    /// (ticket divergence-first-class-event, KRZ-304): both appear in the
+    /// chain pinned to their seqs, the candidate refs verbatim, and a
+    /// pre-pool log folds with an empty ledger (`#[serde(default)]` keeps a
+    /// pre-field chain.json readable too).
+    #[test]
+    fn divergence_event_provenance_chain_carries_record_and_resolution() {
+        let tmp = TempDir::new().unwrap();
+        let candidate = |run_id: &str, tree: &str| crate::types::DivergenceCandidate {
+            run_id: run_id.into(),
+            branch: format!("kranz/pool/m-1/f-1-1-{run_id}"),
+            backend: "claude".into(),
+            tree: tree.into(),
+        };
+        let paths = seed_mission(
+            tmp.path(),
+            "m-1",
+            vec![
+                created(),
+                EventKind::DivergenceNoted {
+                    unit: "f-1-1".into(),
+                    candidates: vec![candidate("r-c0", "aaa"), candidate("r-c1", "bbb")],
+                    diverged: true,
+                },
+                EventKind::DivergenceResolved {
+                    unit: "f-1-1".into(),
+                    selected: Some(1),
+                    reason: "codex kept it total".into(),
+                    decided_by: "operator".into(),
+                },
+            ],
+        );
+        let events = EventLog::read_events(&paths.events_file()).unwrap();
+        let chain = provenance_chain(&paths.mission_dir(), "m-1", &events).unwrap();
+        assert_eq!(chain.divergences.len(), 2);
+        match &chain.divergences[0] {
+            DivergenceLink::Noted {
+                seq,
+                unit,
+                candidates,
+                diverged,
+            } => {
+                assert_eq!(*seq, 2);
+                assert_eq!(unit, "f-1-1");
+                assert!(diverged);
+                assert_eq!(candidates.len(), 2);
+                assert_eq!(candidates[1].tree, "bbb");
+            }
+            other => panic!("expected the noted link first: {other:?}"),
+        }
+        match &chain.divergences[1] {
+            DivergenceLink::Resolved {
+                seq,
+                unit,
+                selected,
+                reason,
+                decided_by,
+            } => {
+                assert_eq!(*seq, 3);
+                assert_eq!(unit, "f-1-1");
+                assert_eq!(*selected, Some(1));
+                assert_eq!(reason, "codex kept it total");
+                assert_eq!(decided_by, "operator");
+            }
+            other => panic!("expected the resolution link: {other:?}"),
+        }
+
+        // A pre-pool log folds with an empty ledger, and a chain.json
+        // predating the field still deserializes (serde default).
+        let quiet = provenance_chain(&paths.mission_dir(), "m-1", &[]).unwrap();
+        assert!(quiet.divergences.is_empty());
+        let json = serde_json::to_value(&chain).unwrap();
+        let mut stripped = json.clone();
+        stripped.as_object_mut().unwrap().remove("divergences");
+        let back: ProvenanceChain = serde_json::from_value(stripped).unwrap();
+        assert!(back.divergences.is_empty());
     }
 }

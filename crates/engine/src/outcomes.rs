@@ -73,6 +73,35 @@ pub struct EscalationRow {
     pub rubber_stamp: Option<bool>,
 }
 
+/// The divergence ledger of one mission (ticket
+/// `divergence-first-class-event`, KRZ-304), folded from its
+/// `divergence.noted` / `divergence.resolved` events. A ledger exists only
+/// for missions that recorded pool activity — a mission without pools has
+/// NO row (absent, never zeroed).
+///
+/// The counts are records, not verdicts: agreement between models is a
+/// signal to log, never a criterion to trust, so `agreed` feeds the
+/// escalation ledger and the training corpus but gates nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DivergenceOutcomes {
+    /// Units whose sibling candidate streams were compared
+    /// (`divergence.noted` events).
+    pub noted: u64,
+    /// Of those, units whose candidate branch trees differed.
+    pub diverged: u64,
+    /// Of those, units with identical candidate trees — the agreement
+    /// records (logged, never trusted).
+    pub agreed: u64,
+    /// Resolutions that chose a candidate (first-wins per unit, the
+    /// engine's own emission posture — a duplicated hand-written resolution
+    /// counts once).
+    pub resolved_selected: u64,
+    /// Resolutions that chose NONE — the unit was judged and abandoned;
+    /// itself a recorded judgement, distinct from "not yet judged".
+    pub resolved_none: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Outcomes {
@@ -100,6 +129,12 @@ pub struct Outcomes {
     /// alongside the latency distribution.
     #[serde(default)]
     pub rubber_stamp: RubberStampReport,
+    /// Fleet divergence ledger (KRZ-304), summed over the missions that
+    /// have one — `None` when NO mission recorded a divergence event
+    /// (absent means "no pools", never a fabricated zero report), and
+    /// omitted from the wire then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub divergences: Option<DivergenceOutcomes>,
 }
 
 /// One task class's row in the outcomes report (KRZ-321).
@@ -235,6 +270,10 @@ pub struct MissionOutcomes {
     /// Token usage summed per backend (as routed by the mission.created
     /// config for each run's role) — the context-reuse split's input.
     pub token_sums: Vec<BackendTokenSum>,
+    /// The mission's divergence ledger (KRZ-304) — `None` when the mission
+    /// recorded no divergence events at all (missions without pools:
+    /// absent, never a zeroed ledger).
+    pub divergences: Option<DivergenceOutcomes>,
 }
 
 /// One mission's token usage on one backend, summed over its completed runs
@@ -663,6 +702,44 @@ pub fn mission_outcomes(mission_id: &str, events: &[Event]) -> MissionOutcomes {
         _ => None,
     };
 
+    // --- divergence ledger (KRZ-304) --------------------------------------
+    // The pool's judgement trail per mission: units compared, the diverged/
+    // agreed split, and the resolution KINDS (a candidate chosen vs judged-
+    // and-abandoned). Resolutions count first-wins per unit — the engine
+    // emits at most one, and the fold dedupes a hand-written duplicate the
+    // same way so a crafted log cannot inflate the ledger.
+    let mut noted: u64 = 0;
+    let mut diverged: u64 = 0;
+    let mut resolved_units: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut resolved_selected: u64 = 0;
+    let mut resolved_none: u64 = 0;
+    for e in &mission_events {
+        match &e.kind {
+            EventKind::DivergenceNoted { diverged: d, .. } => {
+                noted += 1;
+                if *d {
+                    diverged += 1;
+                }
+            }
+            EventKind::DivergenceResolved { unit, selected, .. } => {
+                let first_for_unit = resolved_units.insert(unit.as_str());
+                match (first_for_unit, selected) {
+                    (true, Some(_)) => resolved_selected += 1,
+                    (true, None) => resolved_none += 1,
+                    (false, _) => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    let divergences = (noted > 0 || !resolved_units.is_empty()).then(|| DivergenceOutcomes {
+        noted,
+        diverged,
+        agreed: noted - diverged,
+        resolved_selected,
+        resolved_none,
+    });
+
     MissionOutcomes {
         interventions,
         is_closed,
@@ -673,6 +750,7 @@ pub fn mission_outcomes(mission_id: &str, events: &[Event]) -> MissionOutcomes {
         cycle_time_ms,
         task_class,
         token_sums: token_sums.into_values().collect(),
+        divergences,
     }
 }
 
@@ -779,6 +857,9 @@ pub fn compute_outcomes_with_options(
     // Per-backend context-reuse accumulators, keyed by the backend's as_str.
     let mut reuse_accs: std::collections::BTreeMap<&'static str, ReuseAcc> =
         std::collections::BTreeMap::new();
+    // Fleet divergence ledger (KRZ-304): summed over missions that have one;
+    // stays None when no mission recorded a divergence event.
+    let mut divergence_acc: Option<DivergenceOutcomes> = None;
 
     for id in ids {
         let paths = crate::paths::MissionPaths::new(repo_root, &id);
@@ -852,6 +933,16 @@ pub fn compute_outcomes_with_options(
             acc.fresh_input += sum.fresh_input;
             acc.cache_read += sum.cache_read;
             acc.cache_write += sum.cache_write;
+        }
+
+        // The fleet divergence ledger sums only missions that HAVE one.
+        if let Some(d) = &out.divergences {
+            let acc = divergence_acc.get_or_insert_with(DivergenceOutcomes::default);
+            acc.noted += d.noted;
+            acc.diverged += d.diverged;
+            acc.agreed += d.agreed;
+            acc.resolved_selected += d.resolved_selected;
+            acc.resolved_none += d.resolved_none;
         }
 
         escalations.extend(out.escalations);
@@ -971,6 +1062,7 @@ pub fn compute_outcomes_with_options(
             flagged,
             share: (approved_decisions > 0).then(|| flagged as f64 / approved_decisions as f64),
         },
+        divergences: divergence_acc,
     })
 }
 
@@ -1504,6 +1596,80 @@ mod tests {
         }
     }
 
+    /// Acceptance hint 2: the per-mission fold surfaces the divergence count
+    /// and the resolution KINDS (a candidate chosen vs judged-and-abandoned),
+    /// first-wins per unit — and a mission without pool activity has NO
+    /// ledger at all (absent, never a zeroed row).
+    #[test]
+    fn divergence_event_outcomes_fold_surfaces_count_and_resolution_kind() {
+        let candidate = |run_id: &str, tree: &str| crate::types::DivergenceCandidate {
+            run_id: run_id.into(),
+            branch: format!("kranz/pool/m-1/f-1-1-{run_id}"),
+            backend: "claude".into(),
+            tree: tree.into(),
+        };
+        let noted = |seq: u64, unit: &str, diverged: bool| {
+            ev(
+                seq,
+                "m-1",
+                seq as i64,
+                EventKind::DivergenceNoted {
+                    unit: unit.into(),
+                    candidates: vec![candidate("r-c0", "aaa"), candidate("r-c1", "bbb")],
+                    diverged,
+                },
+            )
+        };
+        let resolved = |seq: u64, unit: &str, selected: Option<u32>| {
+            ev(
+                seq,
+                "m-1",
+                seq as i64,
+                EventKind::DivergenceResolved {
+                    unit: unit.into(),
+                    selected,
+                    reason: "r".into(),
+                    decided_by: "operator".into(),
+                },
+            )
+        };
+        let events = vec![
+            noted(1, "f-1-1", true),       // diverged
+            noted(2, "f-1-2", false),      // agreement record
+            resolved(3, "f-1-1", Some(1)), // chose a candidate
+            resolved(4, "f-1-2", None),    // judged, none chosen
+            resolved(5, "f-1-1", Some(0)), // duplicate: first-wins
+        ];
+        let out = mission_outcomes("m-1", &events);
+        let ledger = out.divergences.expect("a pool mission has a ledger");
+        assert_eq!(ledger.noted, 2, "two units compared");
+        assert_eq!(ledger.diverged, 1);
+        assert_eq!(
+            ledger.agreed, 1,
+            "the agreement record counts — logged, never trusted"
+        );
+        assert_eq!(ledger.resolved_selected, 1, "first-wins dedupes the repeat");
+        assert_eq!(ledger.resolved_none, 1);
+
+        // A mission with NO divergence events has no ledger at all.
+        let quiet = mission_outcomes(
+            "m-1",
+            &[ev(
+                1,
+                "m-1",
+                1,
+                EventKind::UserMessage {
+                    text: "hi".into(),
+                    interrupt: false,
+                },
+            )],
+        );
+        assert_eq!(
+            quiet.divergences, None,
+            "absent for missions without pools — never a zeroed row"
+        );
+    }
+
     mod compute_outcomes_tests {
         use super::*;
         use crate::event_log::{EventLog, LockForce};
@@ -1955,6 +2121,61 @@ mod tests {
 
             let outcomes = compute_outcomes(root).unwrap();
             assert_eq!(outcomes.autonomy_ratio.closed_missions, 1);
+        }
+
+        /// The fleet ledger sums only missions that HAVE one; a repo with no
+        /// pool activity reports None (absent — never a fabricated zero).
+        #[test]
+        fn divergence_event_fleet_ledger_sums_only_pool_missions() {
+            let candidate = |run_id: &str| crate::types::DivergenceCandidate {
+                run_id: run_id.into(),
+                branch: format!("kranz/pool/m-pool/f-1-1-{run_id}"),
+                backend: "claude".into(),
+                tree: "aaa".into(),
+            };
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            seed_mission(
+                root,
+                "m-pool",
+                vec![
+                    created("pool"),
+                    EventKind::DivergenceNoted {
+                        unit: "f-1-1".into(),
+                        candidates: vec![candidate("r-c0"), candidate("r-c1")],
+                        diverged: true,
+                    },
+                    EventKind::DivergenceResolved {
+                        unit: "f-1-1".into(),
+                        selected: Some(0),
+                        reason: "kept".into(),
+                        decided_by: "operator".into(),
+                    },
+                ],
+            );
+            seed_mission(root, "m-quiet", vec![created("quiet")]);
+
+            let outcomes = compute_outcomes(root).unwrap();
+            let ledger = outcomes
+                .divergences
+                .expect("a repo with a pool mission reports a fleet ledger");
+            assert_eq!(ledger.noted, 1);
+            assert_eq!(ledger.diverged, 1);
+            assert_eq!(ledger.agreed, 0);
+            assert_eq!(ledger.resolved_selected, 1);
+            assert_eq!(ledger.resolved_none, 0);
+
+            // No pool activity anywhere → the fleet ledger is absent, and
+            // stays off the wire (additive: pool-less reports are unchanged).
+            let tmp2 = TempDir::new().unwrap();
+            seed_mission(tmp2.path(), "m-quiet", vec![created("quiet")]);
+            let outcomes = compute_outcomes(tmp2.path()).unwrap();
+            assert_eq!(outcomes.divergences, None);
+            let value = serde_json::to_value(&outcomes).unwrap();
+            assert!(
+                !value.as_object().unwrap().contains_key("divergences"),
+                "no divergences key on the wire without pools: {value}"
+            );
         }
     }
 
