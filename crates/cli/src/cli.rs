@@ -455,6 +455,23 @@ pub enum Command {
         from_start: bool,
     },
 
+    /// Export a mission's portable audit bundle (KRZ-326): a self-contained
+    /// directory an auditor can open without repo access — manifest.json
+    /// (every entry with its sha256 + source ref), a human summary.md, the
+    /// provenance chain.json, the escalation ledger and cost fold, the raw
+    /// scrubbed event log, and every resolvable artefact's bytes under
+    /// artefacts/. Missing artefact bytes are listed as unresolved manifest
+    /// entries, never omitted. The same log always yields the same bundle.
+    EvidenceBundle {
+        /// The mission id (defaults to the global --mission / auto-selection)
+        mission_id: Option<String>,
+
+        /// Directory to write the bundle into (created; must be empty).
+        /// Defaults to ./evidence-bundle-<mission-id>
+        #[arg(long, value_name = "DIR")]
+        out: Option<PathBuf>,
+    },
+
     /// Export validation-PASSED worker traces as fine-tuning-ready JSONL.
     ///
     /// Derived and regenerable: loads and folds the target mission's event
@@ -684,6 +701,30 @@ mod tests {
                 PackCommand::Lint { dir } => assert_eq!(dir, PathBuf::from("some/dir")),
             },
             other => panic!("expected Pack, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evidence_bundle_parses_mission_and_out() {
+        let cli =
+            Cli::try_parse_from(["kranz", "evidence-bundle", "m-1", "--out", "some/dir"]).unwrap();
+        match cli.command {
+            Command::EvidenceBundle { mission_id, out } => {
+                assert_eq!(mission_id.as_deref(), Some("m-1"));
+                assert_eq!(out.as_deref(), Some(PathBuf::from("some/dir").as_path()));
+            }
+            other => panic!("expected EvidenceBundle, got {other:?}"),
+        }
+
+        // Both optional: the mission falls back to auto-selection, the output
+        // dir to ./evidence-bundle-<mission-id>.
+        let cli = Cli::try_parse_from(["kranz", "evidence-bundle"]).unwrap();
+        match cli.command {
+            Command::EvidenceBundle { mission_id, out } => {
+                assert_eq!(mission_id, None);
+                assert_eq!(out, None);
+            }
+            other => panic!("expected EvidenceBundle, got {other:?}"),
         }
     }
 

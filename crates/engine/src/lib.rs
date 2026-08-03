@@ -34,6 +34,7 @@ pub mod deps;
 pub mod egress_proxy;
 pub mod escalation_metrics;
 pub mod event_log;
+pub mod evidence_bundle;
 pub mod findings;
 pub mod gate;
 pub mod gate_results;

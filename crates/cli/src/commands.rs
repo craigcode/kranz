@@ -125,6 +125,20 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             }
             Ok(0)
         }
+        Command::EvidenceBundle { mission_id, out } => {
+            let mission = select_mission(&repo, mission_id.as_deref().or(cli.mission.as_deref()))?;
+            let out = out.unwrap_or_else(|| PathBuf::from(format!("evidence-bundle-{mission}")));
+            let outcome =
+                kranz_engine::evidence_bundle::export_evidence_bundle(&repo, &mission, &out)?;
+            println!(
+                "evidence bundle for mission {mission} written to {} ({} files; {} resolved artefacts, {} unresolved)",
+                outcome.out_dir.display(),
+                outcome.files_written,
+                outcome.resolved_artefacts,
+                outcome.unresolved_artefacts,
+            );
+            Ok(0)
+        }
         Command::ExportTraces {
             mission_id,
             all,
