@@ -86,20 +86,26 @@ const CONTRACT_TOOLCHAIN_VARS: &[(&str, &str)] = &[
 ];
 
 /// Above this size seeding one shared cache directory as a per-env COPY —
-/// even an accelerated clonefile/reflink one — costs more wall clock per
-/// generated child env than the cache reuse saves: this builder runs for
-/// EVERY agent session and EVERY contract command, and the copy cost scales
-/// with the cache's entry count even when its bytes would clone instantly
-/// (measured 2026-08-03: a 1.34 GiB / ~55k-entry APFS registry takes ~7s to
-/// clonefile — all syscall time — and a mission builds dozens of these
-/// envs). Above the ceiling the cache is therefore LINKED instead — the
-/// residual trade documented at [`cache_only_cargo_home`]: a poisoned write
-/// can then still reach the operator's shared cache, but only one the
-/// operator let grow past half a GiB (the 12th-pass finding's "multi-GB
-/// cache the operator explicitly accepted", the number adjusted to the
-/// per-env cadence — the validator snapshot can afford a 2 GiB cap because
-/// it warms once per validator session).
-const CACHE_COPY_MAX_BYTES: u64 = 512 * 1024 * 1024;
+/// even an accelerated clonefile/reflink one — costs more wall clock and
+/// disk per generated child env than the cache reuse saves: this builder
+/// runs for EVERY agent session and EVERY contract command, and the copy
+/// cost scales with the cache's entry count even when its bytes would
+/// clone instantly. Two measurements set the ceiling. Local (2026-08-03):
+/// a 1.34 GiB / ~55k-entry APFS registry takes ~7s to clonefile per env —
+/// all syscall time — and a mission builds dozens of these envs. CI
+/// (same day, run 30842947196): a 512 MiB ceiling put every runner's
+/// registry UNDER the copy threshold, so the workspace suite copied
+/// hundreds of MB per env-build until all three OS legs filled their
+/// disks (windows-latest died "No space left"). Above the ceiling the
+/// cache is therefore LINKED instead — the residual trade documented at
+/// [`cache_only_cargo_home`]: a poisoned write can then still reach the
+/// operator's shared cache. That trade stands for real-world registries
+/// (which are never this small) until `engine-gates-sandbox-wrapped`
+/// (pri 1) lands: under the enforced sandbox the link target is outside
+/// the writable roots and read-only in practice, which is the finding's
+/// true fix. The ceiling still protects the small-cache rigs where the
+/// copy is genuinely cheap.
+const CACHE_COPY_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// File names that must NEVER reach a contract Cargo home: credentials and
 /// credential-provider configuration. Only `registry/` and `git/` are ever
@@ -1076,7 +1082,8 @@ mod tests {
             !probe(dir.path(), CACHE_COPY_MAX_BYTES),
             "a small cache is always copied"
         );
-        // The configured ceiling is the documented per-env-cadence one.
-        assert_eq!(CACHE_COPY_MAX_BYTES, 512 * 1024 * 1024);
+        // The configured ceiling is the documented per-env-cadence one
+        // (64 MiB — see the constant's CI/local measurement notes).
+        assert_eq!(CACHE_COPY_MAX_BYTES, 64 * 1024 * 1024);
     }
 }

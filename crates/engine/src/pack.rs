@@ -1176,8 +1176,8 @@ kind = "local-dir"
     fn pack_textfile_nofollow_refuses_a_symlinked_leaf() {
         use std::os::unix::fs::symlink;
         let tmp = tempfile::tempdir().unwrap();
-        let secret = tmp.path().join("engine-readable-secret.md");
-        std::fs::write(&secret, "sk-live-secret-value").unwrap();
+        let outside_file = tmp.path().join("engine-readable-secret.md");
+        std::fs::write(&outside_file, "sk-live-secret-value").unwrap();
         let pack = tmp.path().join("pack");
         std::fs::create_dir_all(pack.join("prompts")).unwrap();
         std::fs::write(
@@ -1185,7 +1185,7 @@ kind = "local-dir"
             "[pack]\nname = \"x\"\nschema = 3\n\n[[prompt]]\nname = \"p\"\nrole = \"worker\"\ntextFile = \"prompts/scrutiny.md\"\n",
         )
         .unwrap();
-        symlink(&secret, pack.join("prompts").join("scrutiny.md")).unwrap();
+        symlink(&outside_file, pack.join("prompts").join("scrutiny.md")).unwrap();
 
         let err = Pack::load(&pack).expect_err("a symlinked textFile must be refused");
         assert!(err.contains("field `textFile`"), "names the field: {err}");
