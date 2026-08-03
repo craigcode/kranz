@@ -3073,11 +3073,23 @@ impl MissionEngine {
         // engine. They ARE the recorded deliverables a judging human inspects
         // (and a future judgement act consumes); resume()'s leak sweep
         // deletes only the dirs for the same reason.
+        //
+        // `preserve` comes back from the inner body with the indices of
+        // candidates whose worktree could not even be INSPECTED (12th-pass
+        // review, P2): an inspection error must never be read as a clean
+        // tree and reaped with a possibly dirty deliverable inside, so the
+        // guard skips those dirs. (Their branches were never deletable
+        // anyway; resume()'s operator-initiated leak sweep still reaps by
+        // path shape — the failure record names the path while it survives.)
+        let mut preserve: Vec<usize> = Vec::new();
         let pool_result = self
-            .run_dispatch_pool_inner(mi, &feature, &pre_run_sha, &workspaces)
+            .run_dispatch_pool_inner(mi, &feature, &pre_run_sha, &workspaces, &mut preserve)
             .await;
 
-        for ws in &workspaces {
+        for (idx, ws) in workspaces.iter().enumerate() {
+            if preserve.contains(&idx) {
+                continue;
+            }
             if let Err(e) = self.repo.remove_worktree(&ws.path) {
                 tracing::warn!(path = %ws.path.display(), error = %e, "pool worktree cleanup failed");
             }
@@ -3171,12 +3183,19 @@ impl MissionEngine {
 
     /// Fallible body of [`Self::run_feature_dispatch_pool`] (the caller's
     /// worktree-dir cleanup guard runs regardless of how this returns).
+    ///
+    /// `preserve` collects the indices of candidates whose worktree inspection
+    /// failed at the Phase C checkpoint (12th-pass review, P2): the caller's
+    /// cleanup guard skips reaping those dirs so the unverified bytes survive
+    /// for human inspection. Populated as the failures happen, so even a
+    /// later `?` return cannot lose a preservation decision already made.
     async fn run_dispatch_pool_inner(
         &mut self,
         mi: usize,
         feature: &Feature,
         pre_run_sha: &str,
         workspaces: &[PoolWorkspace],
+        preserve: &mut Vec<usize>,
     ) -> Result<()> {
         let milestone_id = self.state.mission.milestones[mi].id.clone();
         let n = workspaces.len();
@@ -3334,10 +3353,43 @@ impl MissionEngine {
                     // the sequential dirty-tree turn; a secret-scan refusal is
                     // recorded (never silently dropped) and the leftovers go
                     // away with the worktree dir.
-                    let wt_repo = GitRepo::open(&ws.path)?;
-                    wt_repo.ensure_identity()?;
+                    //
+                    // The worktree is HOSTILE (12th-pass review, P1): the
+                    // stream that just ran in it could plant `core.fsmonitor`,
+                    // `core.hooksPath`, or a hook in its git metadata, which
+                    // the checkpoint's own status/commit would then EXECUTE
+                    // with the engine's ambient privileges. The handle runs
+                    // hooks/fsmonitor-disabled — the same countermeasure the
+                    // validator-fingerprint and gated-merge paths use
+                    // (`GitRepo::with_hooks_disabled`).
+                    //
+                    // And inspection is LOAD-BEARING (12th-pass, P2): an
+                    // inspection ERROR must never be read as "clean" or "0
+                    // commits" — that reaped the worktree with a possibly
+                    // dirty deliverable inside. Any failure to open, inspect,
+                    // or query the worktree fails the candidate honestly —
+                    // recorded exactly where stream failures are recorded —
+                    // and PRESERVES its worktree dir + branch (the cleanup
+                    // guard skips the index), so the bytes survive for a
+                    // human. Only a COMMIT-time failure stays a dispatch
+                    // error (`?`): the tree was inspectable by then, so that
+                    // is a real git failure, not hostile metadata.
+                    let inspection: Result<(GitRepo, bool)> = (|| {
+                        let wt_repo = GitRepo::open(&ws.path)?.with_hooks_disabled();
+                        wt_repo.ensure_identity()?;
+                        let clean = wt_repo.is_clean()?;
+                        Ok((wt_repo, clean))
+                    })();
+                    let (wt_repo, clean) = match inspection {
+                        Ok(pair) => pair,
+                        Err(error) => {
+                            preserve.push(idx);
+                            lines.push(pool_inspection_failure_line(idx, n, ws, &error));
+                            continue;
+                        }
+                    };
                     let mut note = String::new();
-                    if !wt_repo.is_clean().unwrap_or(true) {
+                    if !clean {
                         match wt_repo.commit_dirty_paths(
                             &contract_sweep::pool_checkpoint_commit_message(&feature.id, idx),
                         )? {
@@ -3349,10 +3401,14 @@ impl MissionEngine {
                             }
                         }
                     }
-                    let commits = wt_repo
-                        .commits_between(pre_run_sha, "HEAD")
-                        .unwrap_or_default()
-                        .len();
+                    let commits = match wt_repo.commits_between(pre_run_sha, "HEAD") {
+                        Ok(commits) => commits.len(),
+                        Err(error) => {
+                            preserve.push(idx);
+                            lines.push(pool_inspection_failure_line(idx, n, ws, &error));
+                            continue;
+                        }
+                    };
                     lines.push(format!(
                         "- candidate {idx}/{}: `{}` / `{}` → branch `{}` — run {:?}, {} commit(s){}",
                         n - 1,
@@ -3705,14 +3761,28 @@ impl MissionEngine {
         // The whole batch is wrapped so we can ALWAYS clean up worktrees, even
         // on an error return. `batch_result` carries the fallible body's error
         // to re-raise after cleanup.
+        //
+        // `preserve` comes back from the inner body with the indices of
+        // features whose worktree could not even be INSPECTED at the Phase C
+        // checkpoint (12th-pass review, P2): an inspection error must never
+        // be read as a clean tree and reaped with a possibly dirty
+        // deliverable inside, so the guard skips BOTH the worktree dir and
+        // its branch for those. (resume()'s operator-initiated crash sweep
+        // still reaps by path shape — the failure record names the path
+        // while it survives.)
+        let mut preserve: Vec<usize> = Vec::new();
         let batch_result = self
-            .run_parallel_batch_inner(mi, &start_sha, &mission_branch, &workspaces)
+            .run_parallel_batch_inner(mi, &start_sha, &mission_branch, &workspaces, &mut preserve)
             .await;
 
-        // Cleanup guard: remove every worktree + branch we created. Best-effort
+        // Cleanup guard: remove every worktree + branch we created, except
+        // the preserved inspection failures. Best-effort
         // and idempotent (remove_worktree/delete_branch_force tolerate absence);
         // a cleanup failure is logged, never allowed to mask the batch outcome.
-        for ws in &workspaces {
+        for (idx, ws) in workspaces.iter().enumerate() {
+            if preserve.contains(&idx) {
+                continue;
+            }
             if let Err(e) = self.repo.remove_worktree(&ws.path) {
                 tracing::warn!(path = %ws.path.display(), error = %e, "worktree cleanup failed");
             }
@@ -3802,12 +3872,18 @@ impl MissionEngine {
     /// path recovers from (any half-emitted feature is re-forked, its stale
     /// worktree/branch swept). This is gated behind `max_parallel_workers > 1`;
     /// the sequential path never reaches here.
+    ///
+    /// `preserve` collects the indices of workspaces whose Phase C checkpoint
+    /// found the worktree UNINSPECTABLE (12th-pass review, P2): the caller's
+    /// cleanup guard skips reaping those worktree dirs and branches so the
+    /// unverified bytes survive for human inspection.
     async fn run_parallel_batch_inner(
         &mut self,
         mi: usize,
         start_sha: &str,
         mission_branch: &str,
         workspaces: &[ParallelWorkspace],
+        preserve: &mut Vec<usize>,
     ) -> Result<()> {
         let milestone_id = self.state.mission.milestones[mi].id.clone();
         let mut merged_ok: usize = 0;
@@ -3925,15 +4001,20 @@ impl MissionEngine {
         // --- Phase C (serial, single-writer, DECLARED merge order) -----------
         // Replay each worker's buffered kinds through the engine's own writer,
         // then judge + commit + merge exactly as the sequential-merge code did.
-        let mut worker_ok: Vec<bool> = Vec::with_capacity(workspaces.len());
+        let mut worker_ok: Vec<WorktreeDisposition> = Vec::with_capacity(workspaces.len());
         for (idx, ws) in workspaces.iter().enumerate() {
             let (events, outcome) = buffered[idx]
                 .take()
                 .expect("every non-errored workspace has a buffered result");
-            let ok = self
+            let disposition = self
                 .append_and_judge_worktree(ws, start_sha, events, &outcome)
                 .await?;
-            worker_ok.push(ok);
+            // An uninspectable worktree keeps its bytes (12th-pass review,
+            // P2): the caller's cleanup guard skips its dir AND branch.
+            if matches!(disposition, WorktreeDisposition::InspectionFailed) {
+                preserve.push(idx);
+            }
+            worker_ok.push(disposition);
         }
 
         // (2) Merge the per-feature branches into the mission branch in the
@@ -3941,14 +4022,32 @@ impl MissionEngine {
         // conflict (aborted, clean tree) → feature.failed PLUS a resolution
         // fix-feature (below); a worker that failed in its worktree →
         // feature.failed without attempting a merge.
-        for (ws, ok) in workspaces.iter().zip(&worker_ok) {
+        for (ws, disposition) in workspaces.iter().zip(&worker_ok) {
             let feature_id = ws.feature_id.clone();
-            if !ok {
-                self.emit(EventKind::FeatureFailed {
-                    feature_id,
-                    reason: "worker run did not complete in its parallel worktree".to_string(),
-                })?;
-                continue;
+            match disposition {
+                WorktreeDisposition::Ready => {}
+                WorktreeDisposition::NotReady => {
+                    self.emit(EventKind::FeatureFailed {
+                        feature_id,
+                        reason: "worker run did not complete in its parallel worktree".to_string(),
+                    })?;
+                    continue;
+                }
+                WorktreeDisposition::InspectionFailed => {
+                    // Named separately from a plain worker failure: the bytes
+                    // were never verified, and they SURVIVE (the cleanup
+                    // guard skips this worktree + branch) so a human can
+                    // inspect what the engine could not (12th-pass review).
+                    self.emit(EventKind::FeatureFailed {
+                        feature_id,
+                        reason: format!(
+                            "worktree inspection failed after the run; worktree and branch {} \
+                             are preserved for inspection (see the checkpoint decision record)",
+                            ws.branch
+                        ),
+                    })?;
+                    continue;
+                }
             }
             let pre_merge_sha = self.active_repo().head_sha()?;
             match self.active_repo().merge_no_ff(&ws.branch)? {
@@ -4074,8 +4173,9 @@ impl MissionEngine {
 
     /// Phase C for one feature (roadmap M3): append the worker's BUFFERED event
     /// kinds through the engine's single-writer `emit`, checkpoint-commit its
-    /// worktree, and judge the run. Returns `true` when the work is ready to
-    /// merge, `false` when it should be failed.
+    /// worktree, and judge the run. Returns [`WorktreeDisposition::Ready`] when
+    /// the work is ready to merge; any other variant fails the feature (and
+    /// `InspectionFailed` additionally preserves the worktree + branch).
     ///
     /// `buffered` is exactly the `worker.spawned` / `worker.message` /
     /// `worker.completed` kinds `run_worker_in_buffered` collected while the
@@ -4094,7 +4194,7 @@ impl MissionEngine {
         start_sha: &str,
         buffered: Vec<EventKind>,
         outcome: &runner::RunOutcome,
-    ) -> Result<bool> {
+    ) -> Result<WorktreeDisposition> {
         // Replay the buffered run kinds through the engine's own single writer,
         // in the order the session produced them. `emit` folds each into state
         // (worker.spawned → the run is registered on the feature, etc.), so no
@@ -4106,8 +4206,29 @@ impl MissionEngine {
         self.log.flush()?;
 
         // A GitRepo rooted at the worktree, for its own dirty-tree/commit ops.
-        let wt_repo = GitRepo::open(&ws.path)?;
-        wt_repo.ensure_identity()?;
+        // The worktree is HOSTILE (12th-pass review, P1): the worker that ran
+        // in it could plant `core.fsmonitor`, `core.hooksPath`, or a hook in
+        // its git metadata, which the checkpoint's own status/commit would
+        // then EXECUTE with the engine's ambient privileges. The handle runs
+        // hooks/fsmonitor-disabled — the same countermeasure the
+        // validator-fingerprint and gated-merge paths use
+        // (`GitRepo::with_hooks_disabled`).
+        //
+        // Inspection is LOAD-BEARING (12th-pass, P2): an inspection ERROR
+        // must never be read as "clean" (the old `unwrap_or(true)`) or "0
+        // commits" (`unwrap_or_default()`) — the cleanup guard would then
+        // reap the worktree with a possibly dirty deliverable inside. Any
+        // failure to open, identify, inspect, or query the worktree fails the
+        // feature honestly and PRESERVES its bytes. Only a COMMIT-time
+        // failure stays a batch error (`?`): the tree was inspectable by
+        // then, so that is a real git failure, not hostile metadata.
+        let wt_repo = match GitRepo::open(&ws.path) {
+            Ok(repo) => repo.with_hooks_disabled(),
+            Err(error) => return self.record_uninspectable_worktree(ws, &error),
+        };
+        if let Err(error) = wt_repo.ensure_identity() {
+            return self.record_uninspectable_worktree(ws, &error);
+        }
 
         // Commit any worker output on the per-feature branch (in the worktree)
         // so the merge carries it. The worker session's own commits (if any)
@@ -4115,9 +4236,14 @@ impl MissionEngine {
         // here rather than run through the sequential dirty-tree turn — the
         // parallel subset keeps its worktree self-contained. A real git
         // failure `?`-aborts the batch (the caller's cleanup guard still
-        // reaps every worktree); a secret-scan refusal is recorded below, so
-        // dirty deliverables are never silently dropped before judgement.
-        if !wt_repo.is_clean().unwrap_or(true) {
+        // reaps every non-preserved worktree); a secret-scan refusal is
+        // recorded below, so dirty deliverables are never silently dropped
+        // before judgement.
+        let clean = match wt_repo.is_clean() {
+            Ok(clean) => clean,
+            Err(error) => return self.record_uninspectable_worktree(ws, &error),
+        };
+        if !clean {
             match wt_repo.commit_dirty_paths(
                 &contract_sweep::parallel_checkpoint_commit_message(&ws.feature_id),
             )? {
@@ -4135,29 +4261,56 @@ impl MissionEngine {
                         ),
                         Some(detail),
                     )?;
-                    return Ok(false);
+                    return Ok(WorktreeDisposition::NotReady);
                 }
             }
         }
 
         // Judge the run against the worktree's own commit range (start_sha..HEAD
         // in the worktree — the branch was forked at start_sha).
-        let commits: Vec<String> = wt_repo
-            .commits_between(start_sha, "HEAD")
-            .unwrap_or_default()
-            .iter()
-            .map(|c| format!("{} {}", c.sha, c.subject))
-            .collect();
+        let commits: Vec<String> = match wt_repo.commits_between(start_sha, "HEAD") {
+            Ok(commits) => commits
+                .iter()
+                .map(|c| format!("{} {}", c.sha, c.subject))
+                .collect(),
+            Err(error) => return self.record_uninspectable_worktree(ws, &error),
+        };
         let diff_stat = wt_repo.diff_stat(start_sha, "HEAD").unwrap_or_default();
         match self
             .judge_worker_run(&ws.feature_id, outcome, &commits, &diff_stat)
             .await?
         {
-            JudgementOutcome::Complete => Ok(true),
+            JudgementOutcome::Complete => Ok(WorktreeDisposition::Ready),
             // Respawn/Failed both mean "not ready to merge" in the parallel
             // subset (no respawn here); the feature is failed by the caller.
-            JudgementOutcome::Failed(_) | JudgementOutcome::Respawn(_) => Ok(false),
+            JudgementOutcome::Failed(_) | JudgementOutcome::Respawn(_) => {
+                Ok(WorktreeDisposition::NotReady)
+            }
         }
+    }
+
+    /// Record an uninspectable parallel worktree (12th-pass review, P2): the
+    /// failure lands in a decision record — where the batch's other
+    /// checkpoint failures (e.g. a secret-scan refusal) are recorded — and
+    /// the caller marks the feature failed AND preserves the worktree dir +
+    /// branch. An inspection error must never be read as a clean tree whose
+    /// bytes the cleanup guard may reap.
+    fn record_uninspectable_worktree(
+        &mut self,
+        ws: &ParallelWorkspace,
+        error: &EngineError,
+    ) -> Result<WorktreeDisposition> {
+        self.emit_decision(
+            &format!(
+                "parallel checkpoint for {}: worktree inspection failed",
+                ws.feature_id
+            ),
+            Some(format!(
+                "{error} — the feature is failed honestly and its worktree dir + branch are \
+                 PRESERVED for inspection (an inspection error is never a clean, reapable tree)"
+            )),
+        )?;
+        Ok(WorktreeDisposition::InspectionFailed)
     }
 
     /// Locate a feature by id, returning `(milestone_index, feature_index)`.
@@ -5984,6 +6137,22 @@ struct ParallelWorkspace {
     path: PathBuf,
 }
 
+/// How one parallel worktree's Phase C ended (12th-pass review). The merge
+/// loop treats every non-`Ready` variant as "fail the feature", but an
+/// inspection failure additionally PRESERVES the worktree + branch — the
+/// cleanup guard must not reap bytes the checkpoint never verified.
+enum WorktreeDisposition {
+    /// Judged complete: merge the branch.
+    Ready,
+    /// Not ready to merge (a secret-scan policy refusal or a non-complete
+    /// judgement): the feature fails and the cleanup guard reaps as before.
+    NotReady,
+    /// The worktree could not be opened, inspected, or queried: the feature
+    /// fails AND its index lands in the batch's `preserve` set, so the
+    /// cleanup guard keeps the worktree dir and branch for human inspection.
+    InspectionFailed,
+}
+
 /// Result of one buffered parallel worker session (roadmap M3): the event
 /// kinds it collected (to be replayed by the engine's single writer) plus its
 /// [`runner::RunOutcome`], or the error that aborted the session.
@@ -6191,6 +6360,29 @@ fn pool_worktree_path(
         "kranz-pool-{}-{mission_id}-{safe}-c{index}",
         repo_worktree_namespace(repo_root)
     ))
+}
+
+/// The dispatch-pool decision line for a candidate whose worktree could not
+/// even be INSPECTED at the checkpoint (12th-pass review, P2). Recorded
+/// exactly where stream failures are recorded in the pool decision detail,
+/// and the caller additionally pushes the candidate's index into `preserve`
+/// so the cleanup guard skips reaping its worktree dir (its branch is never
+/// deleted regardless) — an inspection error must never destroy deliverable
+/// bytes the engine never got to verify.
+fn pool_inspection_failure_line(
+    idx: usize,
+    n: usize,
+    ws: &PoolWorkspace,
+    error: &EngineError,
+) -> String {
+    format!(
+        "- candidate {idx}/{}: `{}` / `{}` → branch `{}` — worktree inspection failed: {error} \
+         (candidate FAILED; worktree dir and branch preserved for inspection)",
+        n - 1,
+        ws.spec.backend,
+        ws.spec.model,
+        ws.branch
+    )
 }
 
 /// Stable, non-secret repository namespace for process-global temporary
@@ -9897,6 +10089,372 @@ pub(crate) mod tests {
             &e.kind,
             EventKind::FeatureCompleted { feature_id, .. } if feature_id == "f-1-1"
         )));
+    }
+
+    /// 12th-pass review (P1): the pool checkpoint reopens each candidate's
+    /// HOSTILE worktree and runs status/commit there with the engine's
+    /// ambient privileges. A worker that planted `core.fsmonitor` in the
+    /// (shared) git config or a hook in the (shared) hooks dir must never
+    /// get its payload EXECUTED by those engine git invocations — and the
+    /// checkpoint must still commit the deliverable. Fixture idiom mirrors
+    /// validator_integrity's planted-fsmonitor test.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pool_checkpoint_hooks_disabled_against_planted_fsmonitor_and_hook() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let Some((dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let claude_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("claude candidate", "claude.txt", "claude was here"),
+        ]));
+        let codex_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("codex candidate", "codex.txt", "codex was here"),
+        ]));
+        let backend: Arc<dyn AgentBackend> = claude_mock.clone();
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", dispatch_pool_cfg()).unwrap();
+        engine.seed_worker_auth_verdict_for_test(AuthVerdict::Authenticated);
+        engine.seed_kind_backend_for_test(BackendKind::Codex, codex_mock.clone());
+        engine
+            .state
+            .mission
+            .milestones
+            .push(dispatch_pool_milestone(&engine));
+
+        // Arm the hostile metadata the way a worker would from inside its
+        // session (a linked worktree shares the main repo's git dir): a
+        // `core.fsmonitor` command (fired by `git status`) and a pre-commit
+        // hook (fired by `git commit`). The fsmonitor payload logs its PARENT
+        // command line so the assertion below can tell the checkpoint's own
+        // status/commit apart from Phase A machinery; both payloads log
+        // OUTSIDE the repo so they can never become deliverable content.
+        let fsmonitor_log = dir.path().join("fsmonitor-invocations");
+        let hook_log = dir.path().join("hook-invocations");
+        let fsmonitor = dir.path().join("evil-fsmonitor");
+        std::fs::write(
+            &fsmonitor,
+            format!(
+                "#!/bin/sh\nps -p $PPID -o command= >> '{}'\nexit 1\n",
+                fsmonitor_log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fsmonitor, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let hook = root.join(".git/hooks/pre-commit");
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\necho \"pre-commit:$PWD\" >> '{}'\n",
+                hook_log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .expect("spawn git");
+            assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        };
+        git(&["config", "core.fsmonitor", fsmonitor.to_str().unwrap()]);
+
+        // Fixture proof (validator-integrity idiom): ORDINARY git invocations
+        // execute both payloads — then reset the logs so any later invocation
+        // can only have come from the engine's dispatch.
+        git(&["status", "--porcelain"]);
+        git(&["commit", "--allow-empty", "-m", "fixture probe"]);
+        assert!(
+            std::fs::read_to_string(&fsmonitor_log)
+                .map(|hits| !hits.is_empty())
+                .unwrap_or(false),
+            "fixture: ordinary git status runs the planted fsmonitor"
+        );
+        assert!(
+            std::fs::read_to_string(&hook_log)
+                .map(|hits| !hits.is_empty())
+                .unwrap_or(false),
+            "fixture: ordinary git commit runs the planted pre-commit hook"
+        );
+        std::fs::remove_file(&fsmonitor_log).unwrap();
+        std::fs::remove_file(&hook_log).unwrap();
+
+        let pre_run_sha = engine.repo.head_sha().unwrap();
+        engine.run_feature(0, 0).await.unwrap();
+
+        // The checkpoint's own git never executed either payload. The
+        // fsmonitor log may hold `git worktree add`'s INTERNAL `reset --hard`
+        // (Phase A fork, which populates each new worktree via a child reset
+        // that refreshes its index) — that runs BEFORE the worker session
+        // could have planted anything, so it is not the checkpoint surface
+        // this finding covers; what must never appear is a checkpoint-shaped
+        // invocation (status/add/commit) executing the planted payload. The
+        // pre-commit hook has no such pre-worker noise: it must not fire at
+        // all.
+        let fsmonitor_hits = std::fs::read_to_string(&fsmonitor_log).unwrap_or_default();
+        for line in fsmonitor_hits.lines() {
+            assert!(
+                line.contains("reset --hard"),
+                "only worktree-add's internal reset may consult the planted fsmonitor — \
+                 the checkpoint's own status/add/commit must never execute it: {fsmonitor_hits}"
+            );
+        }
+        assert!(
+            !hook_log.exists(),
+            "the checkpoint must never execute the planted hook: {}",
+            std::fs::read_to_string(&hook_log).unwrap_or_default()
+        );
+
+        // And the happy path still commits both deliverables — the checkpoint
+        // commit lands with hooks disabled.
+        let mission_id = engine.mission_id().to_string();
+        for (index, file) in [(0usize, "claude.txt"), (1usize, "codex.txt")] {
+            let branch = format!("kranz/pool/{mission_id}/f-1-1-c{index}");
+            let commits = engine.repo.commits_between(&pre_run_sha, &branch).unwrap();
+            assert_eq!(
+                commits.len(),
+                1,
+                "candidate {index} carries exactly its checkpoint commit"
+            );
+            let shown = engine
+                .repo
+                .show_file(&branch, file)
+                .expect("git show works")
+                .expect("candidate branch carries the deliverable");
+            assert!(String::from_utf8(shown).unwrap().contains("was here"));
+        }
+    }
+
+    /// 12th-pass review (P2): a candidate whose worktree cannot be INSPECTED
+    /// at the checkpoint (here: the worker removed its `.git`) was once read
+    /// as "clean, 0 commits" and REAPED with its deliverable inside. Now the
+    /// candidate is recorded FAILED exactly where stream failures are
+    /// recorded, its worktree dir + branch survive — and the sibling's happy
+    /// path is byte-identical.
+    #[tokio::test]
+    async fn candidate_inspection_failure_fails_pool_candidate_and_preserves_bytes() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let claude_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("claude candidate", "claude.txt", "claude was here")
+                .removes_path(".git"),
+        ]));
+        let codex_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("codex candidate", "codex.txt", "codex was here"),
+        ]));
+        let backend: Arc<dyn AgentBackend> = claude_mock.clone();
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", dispatch_pool_cfg()).unwrap();
+        engine.seed_worker_auth_verdict_for_test(AuthVerdict::Authenticated);
+        engine.seed_kind_backend_for_test(BackendKind::Codex, codex_mock.clone());
+        let pre_run_sha = engine.repo.head_sha().unwrap();
+        engine
+            .state
+            .mission
+            .milestones
+            .push(dispatch_pool_milestone(&engine));
+
+        // The inspection failure must not error the dispatch itself.
+        engine.run_feature(0, 0).await.unwrap();
+
+        let mission_id = engine.mission_id().to_string();
+        // Candidate 0's worktree dir SURVIVES with the deliverable bytes
+        // inside (nothing was verified, so nothing is destroyed)…
+        let c0_path = pool_worktree_path(&root, &mission_id, "f-1-1", 0);
+        assert!(
+            c0_path.exists(),
+            "an uninspectable candidate's worktree dir must be preserved, not reaped"
+        );
+        assert_eq!(
+            std::fs::read_to_string(c0_path.join("claude.txt")).unwrap(),
+            "claude was here",
+            "the unverified deliverable bytes survive for human inspection"
+        );
+        // … and so does its branch.
+        let c0_branch = format!("kranz/pool/{mission_id}/f-1-1-c0");
+        assert!(
+            engine.repo.branch_exists(&c0_branch).unwrap(),
+            "an uninspectable candidate's branch must be preserved"
+        );
+        // The healthy sibling is reaped exactly as before — only the failed
+        // candidate is preserved.
+        let c1_path = pool_worktree_path(&root, &mission_id, "f-1-1", 1);
+        assert!(
+            !c1_path.exists(),
+            "the healthy sibling's worktree dir is reaped as before"
+        );
+        let c1_branch = format!("kranz/pool/{mission_id}/f-1-1-c1");
+        let sibling_commits = engine
+            .repo
+            .commits_between(&pre_run_sha, &c1_branch)
+            .unwrap();
+        assert_eq!(
+            sibling_commits.len(),
+            1,
+            "the sibling's checkpoint commit still lands"
+        );
+
+        // The failure is recorded where stream failures are recorded: the
+        // dispatch decision detail. The sibling's line keeps its exact
+        // happy-path shape.
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        let detail = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::OrchestratorDecision { summary, detail }
+                    if summary.starts_with("dispatch pool:") =>
+                {
+                    detail.clone()
+                }
+                _ => None,
+            })
+            .expect("dispatch decision recorded");
+        assert!(
+            detail.contains("- candidate 0/1: `claude` / `sonnet` → branch `kranz/pool/")
+                && detail.contains("worktree inspection failed")
+                && detail.contains("preserved for inspection"),
+            "the inspection failure is the candidate's recorded terminal state: {detail}"
+        );
+        assert!(
+            detail.contains("- candidate 1/1: `codex` / `gpt-5-codex` → branch `kranz/pool/")
+                && detail.contains("— run Pass, 1 commit(s)"),
+            "the sibling's decision line keeps its byte-identical happy-path shape: {detail}"
+        );
+        // Both streams still completed Pass (the failure is at the
+        // checkpoint, after the runs), and the freeze holds: the unit is
+        // neither completed nor failed from a candidate.
+        let completed: Vec<RunResult> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::WorkerCompleted { result, .. } => Some(*result),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(completed, vec![RunResult::Pass, RunResult::Pass]);
+        assert!(events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::MilestoneBlocked { milestone_id, .. } if milestone_id == "ms-1"
+        )));
+        assert!(!events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::FeatureCompleted { feature_id, .. } | EventKind::FeatureFailed { feature_id, .. }
+            if feature_id == "f-1-1"
+        )));
+
+        // The preserved dir lives in the shared temp dir (outside the
+        // repo tempdir) — sweep it so the test leaves nothing behind.
+        let _ = std::fs::remove_dir_all(&c0_path);
+    }
+
+    /// 12th-pass review (P2, parallel-batch half): the M3 checkpoint treats
+    /// an uninspectable worktree the same way — the feature is failed via
+    /// the checkpoint decision record, and the cleanup guard spares BOTH its
+    /// worktree dir and its branch. Both workers sabotage their own `.git`
+    /// so the (racy) script→feature assignment cannot make the outcome
+    /// nondeterministic; the happy-path half of the guard is covered by the
+    /// existing parallel integration tests and the pool sibling above.
+    #[tokio::test]
+    async fn candidate_inspection_failure_fails_parallel_feature_and_preserves_bytes() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("one", "deliverable.txt", "worker output")
+                .removes_path(".git"),
+            dispatch_pool_pass_script("two", "deliverable.txt", "worker output")
+                .removes_path(".git"),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock.clone();
+        let mut engine = MissionEngine::create(
+            backend,
+            &root,
+            "goal",
+            MissionConfig {
+                worker_isolation: WorkerIsolation::Checkout,
+                ..MissionConfig::default()
+            },
+        )
+        .unwrap();
+        engine.seed_worker_auth_verdict_for_test(AuthVerdict::Authenticated);
+        // Two Pending plan features on one Active milestone.
+        let mut milestone = dispatch_pool_milestone(&engine);
+        milestone.features.push(Feature {
+            id: "f-1-2".to_string(),
+            title: "f".to_string(),
+            spec: "s".to_string(),
+            validation_criteria: vec![],
+            origin: FeatureOrigin::Plan,
+            status: FeatureStatus::Pending,
+            worker_runs: vec![],
+            commits: vec![],
+            respawns: 0,
+        });
+        engine.state.mission.milestones.push(milestone);
+
+        engine
+            .run_parallel_batch(0, &[("f-1-1".to_string(), 0), ("f-1-2".to_string(), 1)])
+            .await
+            .unwrap();
+
+        let mission_id = engine.mission_id().to_string();
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        for feature_id in ["f-1-1", "f-1-2"] {
+            // The checkpoint decision records the inspection failure…
+            assert!(
+                events.iter().any(|e| matches!(
+                    &e.kind,
+                    EventKind::OrchestratorDecision { summary, .. }
+                        if summary == &format!(
+                            "parallel checkpoint for {feature_id}: worktree inspection failed"
+                        )
+                )),
+                "inspection failure decision recorded for {feature_id}"
+            );
+            // … the feature is failed with the preservation named…
+            assert!(
+                events.iter().any(|e| matches!(
+                    &e.kind,
+                    EventKind::FeatureFailed { feature_id: fid, reason }
+                        if fid == feature_id
+                            && reason.contains("worktree inspection failed")
+                            && reason.contains("preserved")
+                )),
+                "feature.failed names the preservation for {feature_id}"
+            );
+            // … and BOTH the worktree dir (deliverable bytes inside) and its
+            // branch survive the cleanup guard.
+            let wt = parallel_worktree_path(&root, &mission_id, feature_id);
+            assert!(
+                wt.exists(),
+                "{feature_id}'s uninspectable worktree dir must be preserved"
+            );
+            assert_eq!(
+                std::fs::read_to_string(wt.join("deliverable.txt")).unwrap(),
+                "worker output",
+                "{feature_id}'s unverified deliverable bytes survive"
+            );
+            assert!(
+                engine
+                    .repo
+                    .branch_exists(&format!("kranz/wt/{mission_id}/{feature_id}"))
+                    .unwrap(),
+                "{feature_id}'s branch must be preserved"
+            );
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::FeatureCompleted { .. })),
+            "nothing merges from an unverified worktree"
+        );
+
+        // The preserved dirs live in the shared temp dir — sweep them.
+        for feature_id in ["f-1-1", "f-1-2"] {
+            let _ = std::fs::remove_dir_all(parallel_worktree_path(&root, &mission_id, feature_id));
+        }
     }
 
     /// Failure isolation at the spawn boundary: a candidate whose backend

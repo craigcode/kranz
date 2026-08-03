@@ -331,17 +331,19 @@ where
 /// ambient `CARGO_HOME`: gate commands execute worker-authored build scripts
 /// and test binaries engine-side, outside any sandbox profile, and the real
 /// Cargo root carries registry credentials and credential-provider config.
-/// It is replaced with a fresh cache-only home (registry/git seeded by
-/// symlink, no credentials — [`crate::agent_env::cache_only_cargo_home`])
-/// over a temp scratch that self-cleans when the gate returns. The
+/// It is replaced with a fresh cache-only home (registry/git seeded as
+/// per-env copies — clonefile/reflink/plain — never credentials;
+/// [`crate::agent_env::cache_only_cargo_home`]) over a temp scratch that
+/// self-cleans when the gate returns. The
 /// substitution FAILS CLOSED: no scratch, no gate run — running with the
 /// ambient Cargo root is the hole this exists to close.
 pub fn run_bounded_gate_command(cwd: &std::path::Path, command: &str) -> (bool, String) {
     // cache_only_cargo_home creates a fresh unpredictable dir under the
     // given base; the system temp dir keeps it out of the gated worktree
     // (an untracked `.cargo-cache-only-*` at the root would dirty every
-    // gate's `git status`). The dir holds two symlinks plus whatever Cargo
-    // drops at its root; it is removed after the run.
+    // gate's `git status`). The dir holds the seeded registry/git cache
+    // copies plus whatever Cargo drops at its root; it is removed after the
+    // run.
     let cargo_home = crate::agent_env::cache_only_cargo_home(std::env::temp_dir().as_path());
     if !cargo_home.is_dir() {
         return (

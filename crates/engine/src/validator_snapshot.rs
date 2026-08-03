@@ -390,16 +390,18 @@ fn warm_target(session_root: &Path, snapshot_root: &Path) -> (TargetCopyTier, Op
 /// `cp -c -R src dst` (APFS clonefile). `false` on any failure — non-macOS
 /// `cp` has no `-c`, and a non-APFS volume makes clonefile itself fail — so
 /// the caller falls through to the next tier. A partial copy is swept
-/// before returning `false`. Never shares or links the real target: the
-/// clone is copy-on-write, owned by the snapshot.
-fn copy_dir_clonefile(src: &Path, dst: &Path) -> bool {
+/// before returning `false`. Never shares or links the source: the clone is
+/// copy-on-write, owned by the destination. Shared with the contract Cargo
+/// cache seeding ([`crate::agent_env`]), which seeds per-env copies of the
+/// operator's registry/git caches through the same tier order.
+pub(crate) fn copy_dir_clonefile(src: &Path, dst: &Path) -> bool {
     run_cp(&["-c", "-R"], src, dst)
 }
 
 /// `cp --reflink=always -R src dst` (GNU coreutils). `always` (not `auto`)
 /// so a non-reflink filesystem FAILS LOUDLY here and the caller falls
 /// through to the size-capped plain copy instead of silently paying one.
-fn copy_dir_reflink(src: &Path, dst: &Path) -> bool {
+pub(crate) fn copy_dir_reflink(src: &Path, dst: &Path) -> bool {
     run_cp(&["--reflink=always", "-R"], src, dst)
 }
 
@@ -419,9 +421,9 @@ fn run_cp(extra_flags: &[&str], src: &Path, dst: &Path) -> bool {
 }
 
 /// Total byte size of `dir` (metadata walk, best-effort: unreadable entries
-/// count as zero). Cheap even on a large `target/` — it reads no file
-/// contents.
-fn dir_size_bytes(dir: &Path) -> u64 {
+/// count as zero). Cheap even on a large `target/` or Cargo cache — it reads
+/// no file contents.
+pub(crate) fn dir_size_bytes(dir: &Path) -> u64 {
     let mut total = 0u64;
     let mut stack = vec![dir.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -440,10 +442,37 @@ fn dir_size_bytes(dir: &Path) -> u64 {
     total
 }
 
+/// Whether `dir`'s total byte size exceeds `limit`, stopping the metadata
+/// walk the moment the answer is known. The cheap pre-check the contract
+/// Cargo cache seeding ([`crate::agent_env`]) runs on EVERY generated child
+/// env, where a full walk of a multi-GiB cache would itself be the cost the
+/// copy ceiling exists to avoid.
+pub(crate) fn dir_size_exceeds(dir: &Path, limit: u64) -> bool {
+    let mut total = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                if let Ok(meta) = entry.metadata() {
+                    if meta.is_dir() {
+                        stack.push(entry.path());
+                    } else {
+                        total += meta.len();
+                        if total > limit {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Recursive plain byte copy of `src` to `dst` (created). Symlinks are
-/// followed (the copy owns real bytes; the snapshot must never share state
-/// with the real checkout through a link).
-fn copy_dir_plain(src: &Path, dst: &Path) -> std::io::Result<()> {
+/// followed (the copy owns real bytes; the destination must never share
+/// state with the source through a link).
+pub(crate) fn copy_dir_plain(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
