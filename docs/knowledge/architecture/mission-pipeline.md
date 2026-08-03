@@ -113,6 +113,36 @@ assertions itself and sends `agent-judgement` assertions to the orchestrator
 against the `base_sha..HEAD` diff. Roles: `Orchestrator`, `Worker`,
 `ValidatorScrutiny`, `ValidatorFunctional`.
 
+## The dispatch pool (`workerCandidates`, KRZ-303)
+
+With ≥2 entries in `workerCandidates` (`[{backend, model}, …]`, validated like
+role selections; mutually exclusive with `maxParallelWorkers > 1`),
+`run_feature` instead forks to `run_feature_dispatch_pool`: ONE unit of work
+(the feature) runs on ALL N configured backends concurrently — one git
+worktree per stream (`kranz-pool-*` dirs, `kranz/pool/<mission>/<feature>-c<i>`
+branches, kept as the deliverables), the M3 buffered/replay single-writer
+idiom. Each stream's `worker.spawned` carries an additive `candidate` link
+(`{unit, index, count, backend}`) tying the sibling set to the unit; one
+stream's failure never aborts its siblings — every terminal state is recorded.
+
+Three freeze properties (the positioning ADR's 2026-07-31 boundary gloss),
+enforced in code, not just docs:
+
+1. **Outputs are candidates for judgement — never a winner.** The pool path
+   calls no judgement turn, emits no `feature.completed`, selects/ranks/merges
+   nothing; the milestone blocks for the human judgement act (surfaced by the
+   `divergence-first-class-event` follow-up). A re-dispatch guard never
+   silently re-fans a recorded unit.
+2. **The claimed value is divergence for scrutiny — never throughput.** All N
+   streams run the SAME unit; there is no "run N to go faster" path, and a
+   candidate whose backend is unavailable fails its own stream loudly (no
+   claude fallback) rather than silently duplicating a sibling's backend.
+3. **The cost multiplier is explicit in consent.** `cost::estimate` multiplies
+   worker runs by N; plan.md's "Dispatch pool" section names N and the
+   candidates and states that the per-mission budget applies to the SUM.
+
+Empty pool ⇒ the sequential path is byte-identical (regression-tested).
+
 ## Resumability
 
 `MissionEngine::resume` reads the log, `fold`s it back to `MissionState`,

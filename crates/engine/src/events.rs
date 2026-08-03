@@ -137,6 +137,14 @@ pub enum EventKind {
         feature_id: Option<String>,
         #[serde(rename = "milestoneId", skip_serializing_if = "Option::is_none")]
         milestone_id: Option<String>,
+        /// Sibling-candidate linkage when this run is one stream of a
+        /// heterogeneous dispatch pool (KRZ-303): which unit it belongs to,
+        /// the stream's index, N, and the backend it ran. Additive; absent on
+        /// ordinary runs and in every pre-pool log — `None` never hits the
+        /// wire. Carried on `worker.spawned` (not `worker.completed`) so the
+        /// run is a labelled candidate from the moment it exists.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        candidate: Option<CandidateLink>,
         #[serde(rename = "sdkSessionId")]
         sdk_session_id: String,
         model: String,
@@ -1255,6 +1263,69 @@ mod tests {
                 assert_eq!(score, None);
                 assert_eq!(threshold, None);
             }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// The additive `candidate` on `worker.spawned` (ticket
+    /// heterogeneous-dispatch-pool, KRZ-303): the sibling linkage round-trips
+    /// when present, old log lines without it fold to None, and None never
+    /// hits the wire.
+    #[test]
+    fn dispatch_pool_worker_spawned_candidate_is_additive() {
+        fn spawned(candidate: Option<CandidateLink>) -> EventKind {
+            EventKind::WorkerSpawned {
+                run_id: "r-1".into(),
+                role: Role::Worker,
+                feature_id: Some("f-1-1".into()),
+                milestone_id: None,
+                candidate,
+                sdk_session_id: "s".into(),
+                model: "sonnet".into(),
+                quant: "n/a".into(),
+                weight_hash: None,
+                prompt_hash: "h".into(),
+                transcript_path: "t".into(),
+            }
+        }
+        let link = CandidateLink {
+            unit: "f-1-1".into(),
+            index: 1,
+            count: 2,
+            backend: "codex".into(),
+        };
+
+        // Some: camelCase wire shape, full round-trip.
+        let json = serde_json::to_value(spawned(Some(link.clone()))).unwrap();
+        assert_eq!(json["payload"]["candidate"]["unit"], "f-1-1");
+        assert_eq!(json["payload"]["candidate"]["index"], 1);
+        assert_eq!(json["payload"]["candidate"]["count"], 2);
+        assert_eq!(json["payload"]["candidate"]["backend"], "codex");
+        let back: EventKind = serde_json::from_value(json).unwrap();
+        match back {
+            EventKind::WorkerSpawned { candidate, .. } => {
+                assert_eq!(candidate, Some(link))
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // None: omitted from the wire (byte-identical to pre-pool logs).
+        let json = serde_json::to_value(spawned(None)).unwrap();
+        assert!(
+            !json["payload"]
+                .as_object()
+                .unwrap()
+                .contains_key("candidate"),
+            "candidate must not serialize when None: {json}"
+        );
+
+        // Old log line (pre-candidate): folds with candidate = None.
+        let old: EventKind = serde_json::from_str(
+            r#"{"type":"worker.spawned","payload":{"runId":"r-1","role":"worker","featureId":"f-1-1","sdkSessionId":"s","model":"sonnet","promptHash":"h","transcriptPath":"t"}}"#,
+        )
+        .unwrap();
+        match old {
+            EventKind::WorkerSpawned { candidate, .. } => assert_eq!(candidate, None),
             _ => panic!("wrong variant"),
         }
     }

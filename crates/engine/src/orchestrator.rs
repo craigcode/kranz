@@ -467,6 +467,18 @@ impl MissionEngine {
                         let _ = repo.remove_worktree(&path);
                     }
                 }
+                // Dispatch-pool candidate worktree DIRS (KRZ-303) are crash
+                // leaks under the same lifetime rule (they exist only while a
+                // lock-holding engine is mid-dispatch). Pool BRANCHES are
+                // deliberately NOT deleted here: they are the recorded
+                // candidate deliverables — deleting them would destroy the
+                // evidence the mission parked to preserve.
+                for index in 0..crate::config::MAX_WORKER_CANDIDATES {
+                    let path = pool_worktree_path(&repo_root, mission_id, &feature.id, index);
+                    if path.exists() {
+                        let _ = repo.remove_worktree(&path);
+                    }
+                }
             }
         }
         // A leaked mission integration worktree (M7 tier 1) is the same story:
@@ -695,25 +707,37 @@ impl MissionEngine {
         };
 
         match requested {
-            BackendKind::Codex => {
-                if let Some(cached) = &self.codex_backend {
-                    set_effective_model(&mut cfg, BackendKind::Codex);
-                    return SelectedBackend {
-                        backend: Arc::clone(cached),
-                        kind: BackendKind::Codex,
-                        cfg,
-                        fallback_reason: None,
-                    };
+            BackendKind::Claude => {
+                set_effective_model(&mut cfg, BackendKind::Claude);
+                SelectedBackend {
+                    backend: Arc::clone(&self.backend),
+                    kind: BackendKind::Claude,
+                    cfg,
+                    fallback_reason: None,
                 }
-                match crate::backend_codex::discover_codex_binary(None) {
-                    Ok(binary) => {
-                        let backend: Arc<dyn AgentBackend> =
-                            Arc::new(crate::backend_codex::CodexBackend::new(binary));
-                        self.codex_backend = Some(Arc::clone(&backend));
-                        set_effective_model(&mut cfg, BackendKind::Codex);
+            }
+            BackendKind::Local | BackendKind::Acp => {
+                // No-fallback kinds: `config::validate` has already guaranteed
+                // the role's endpoint/command config, and there is no binary
+                // to probe — construction cannot fail.
+                set_effective_model(&mut cfg, requested);
+                let backend = self
+                    .resolve_kind_backend(requested, role)
+                    .expect("validate guarantees local/acp role config");
+                SelectedBackend {
+                    backend,
+                    kind: requested,
+                    cfg,
+                    fallback_reason: None,
+                }
+            }
+            BackendKind::Codex | BackendKind::Droid | BackendKind::Kimi => {
+                match self.resolve_kind_backend(requested, role) {
+                    Ok(backend) => {
+                        set_effective_model(&mut cfg, requested);
                         SelectedBackend {
                             backend,
-                            kind: BackendKind::Codex,
+                            kind: requested,
                             cfg,
                             fallback_reason: None,
                         }
@@ -725,94 +749,60 @@ impl MissionEngine {
                             kind: BackendKind::Claude,
                             cfg,
                             fallback_reason: Some(format!(
-                                "codex backend requested for the {role_name} but not available \
-                                 ({err}); falling back to the claude {role_name}"
+                                "{} backend requested for the {role_name} but not available \
+                                 ({err}); falling back to the claude {role_name}",
+                                requested.as_str()
                             )),
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Construct (or reuse the cached) backend for `kind`, WITHOUT any claude
+    /// fallback. Shared by [`Self::select_backend`] — which layers the
+    /// per-kind fallback policy on top — and [`Self::select_pool_candidate`],
+    /// which must never fall back (see there).
+    fn resolve_kind_backend(
+        &mut self,
+        kind: BackendKind,
+        role: Role,
+    ) -> Result<Arc<dyn AgentBackend>> {
+        match kind {
+            BackendKind::Claude => Ok(Arc::clone(&self.backend)),
+            BackendKind::Codex => {
+                if let Some(cached) = &self.codex_backend {
+                    return Ok(Arc::clone(cached));
+                }
+                let binary = crate::backend_codex::discover_codex_binary(None)?;
+                let backend: Arc<dyn AgentBackend> =
+                    Arc::new(crate::backend_codex::CodexBackend::new(binary));
+                self.codex_backend = Some(Arc::clone(&backend));
+                Ok(backend)
             }
             BackendKind::Droid => {
                 if let Some(cached) = &self.droid_backend {
-                    set_effective_model(&mut cfg, BackendKind::Droid);
-                    return SelectedBackend {
-                        backend: Arc::clone(cached),
-                        kind: BackendKind::Droid,
-                        cfg,
-                        fallback_reason: None,
-                    };
+                    return Ok(Arc::clone(cached));
                 }
-                match crate::backend_droid::discover_droid_binary(None) {
-                    Ok(binary) => {
-                        let backend: Arc<dyn AgentBackend> =
-                            Arc::new(crate::backend_droid::DroidBackend::new(binary));
-                        self.droid_backend = Some(Arc::clone(&backend));
-                        set_effective_model(&mut cfg, BackendKind::Droid);
-                        SelectedBackend {
-                            backend,
-                            kind: BackendKind::Droid,
-                            cfg,
-                            fallback_reason: None,
-                        }
-                    }
-                    Err(err) => {
-                        set_effective_model(&mut cfg, BackendKind::Claude);
-                        SelectedBackend {
-                            backend: Arc::clone(&self.backend),
-                            kind: BackendKind::Claude,
-                            cfg,
-                            fallback_reason: Some(format!(
-                                "droid backend requested for the {role_name} but not available \
-                                 ({err}); falling back to the claude {role_name}"
-                            )),
-                        }
-                    }
-                }
+                let binary = crate::backend_droid::discover_droid_binary(None)?;
+                let backend: Arc<dyn AgentBackend> =
+                    Arc::new(crate::backend_droid::DroidBackend::new(binary));
+                self.droid_backend = Some(Arc::clone(&backend));
+                Ok(backend)
             }
             BackendKind::Kimi => {
                 if let Some(cached) = &self.kimi_backend {
-                    set_effective_model(&mut cfg, BackendKind::Kimi);
-                    return SelectedBackend {
-                        backend: Arc::clone(cached),
-                        kind: BackendKind::Kimi,
-                        cfg,
-                        fallback_reason: None,
-                    };
+                    return Ok(Arc::clone(cached));
                 }
-                match crate::backend_kimi::discover_kimi_binary(None) {
-                    Ok(binary) => {
-                        let backend: Arc<dyn AgentBackend> =
-                            Arc::new(crate::backend_kimi::KimiBackend::new(binary));
-                        self.kimi_backend = Some(Arc::clone(&backend));
-                        set_effective_model(&mut cfg, BackendKind::Kimi);
-                        SelectedBackend {
-                            backend,
-                            kind: BackendKind::Kimi,
-                            cfg,
-                            fallback_reason: None,
-                        }
-                    }
-                    Err(err) => {
-                        set_effective_model(&mut cfg, BackendKind::Claude);
-                        SelectedBackend {
-                            backend: Arc::clone(&self.backend),
-                            kind: BackendKind::Claude,
-                            cfg,
-                            fallback_reason: Some(format!(
-                                "kimi backend requested for the {role_name} but not available \
-                                 ({err}); falling back to the claude {role_name}"
-                            )),
-                        }
-                    }
-                }
+                let binary = crate::backend_kimi::discover_kimi_binary(None)?;
+                let backend: Arc<dyn AgentBackend> =
+                    Arc::new(crate::backend_kimi::KimiBackend::new(binary));
+                self.kimi_backend = Some(Arc::clone(&backend));
+                Ok(backend)
             }
             BackendKind::Local => {
-                let role_cfg = match role {
-                    Role::Orchestrator => &cfg.orchestrator,
-                    Role::Worker => &cfg.worker,
-                    Role::ValidatorScrutiny => &cfg.validator_scrutiny,
-                    Role::ValidatorFunctional => &cfg.validator_functional,
-                };
+                let role_cfg = self.state.config.role(role);
                 // `config::validate` has already guaranteed base_url and
                 // context_budget are present for a local-backed role; there
                 // is no binary to probe and therefore no claude fallback.
@@ -827,21 +817,10 @@ impl MissionEngine {
                 let backend: Arc<dyn AgentBackend> = Arc::new(
                     crate::backend_local::LocalBackend::new(base_url, temperature, context_budget),
                 );
-                set_effective_model(&mut cfg, BackendKind::Local);
-                SelectedBackend {
-                    backend,
-                    kind: BackendKind::Local,
-                    cfg,
-                    fallback_reason: None,
-                }
+                Ok(backend)
             }
             BackendKind::Acp => {
-                let role_cfg = match role {
-                    Role::Orchestrator => &cfg.orchestrator,
-                    Role::Worker => &cfg.worker,
-                    Role::ValidatorScrutiny => &cfg.validator_scrutiny,
-                    Role::ValidatorFunctional => &cfg.validator_functional,
-                };
+                let role_cfg = self.state.config.role(role);
                 // `config::validate` has already guaranteed acp_command is
                 // present for an acp-backed role (worker only). Like local,
                 // there is no binary discovery: ACP defines no `--version`
@@ -856,24 +835,45 @@ impl MissionEngine {
                     acp_command,
                     role_cfg.acp_args.clone(),
                 ));
-                set_effective_model(&mut cfg, BackendKind::Acp);
-                SelectedBackend {
-                    backend,
-                    kind: BackendKind::Acp,
-                    cfg,
-                    fallback_reason: None,
-                }
-            }
-            BackendKind::Claude => {
-                set_effective_model(&mut cfg, BackendKind::Claude);
-                SelectedBackend {
-                    backend: Arc::clone(&self.backend),
-                    kind: BackendKind::Claude,
-                    cfg,
-                    fallback_reason: None,
-                }
+                Ok(backend)
             }
         }
+    }
+
+    /// Select the backend for ONE dispatch-pool candidate (KRZ-303). Unlike
+    /// [`Self::select_backend`] there is deliberately NO claude fallback: a
+    /// pool whose unavailable candidate silently reran on claude would record
+    /// two same-backend "candidates" — fake diversity, the exact opposite of
+    /// the ticket's point (cross-harness divergence for scrutiny). An
+    /// unavailable candidate backend errors here; the caller records that
+    /// stream's terminal state and its siblings run unaffected.
+    ///
+    /// The returned cfg pins the WORKER role to the candidate's backend and
+    /// (backend-normalized) model; everything else is the mission config.
+    fn select_pool_candidate(&mut self, spec: &CandidateSpec) -> Result<SelectedBackend> {
+        let kind = config::parse_backend(Some(&spec.backend)).map_err(|other| {
+            EngineError::Config(format!(
+                "workerCandidates entry names unknown backend {other:?} (config::validate \
+                 should have rejected it at mission boundaries)"
+            ))
+        })?;
+        if matches!(kind, BackendKind::Local | BackendKind::Acp) {
+            return Err(EngineError::Config(format!(
+                "workerCandidates entry backend {:?} is not supported in this pass \
+                 (config::validate should have rejected it at mission boundaries)",
+                spec.backend
+            )));
+        }
+        let mut cfg = self.state.config.clone();
+        cfg.worker.backend = Some(spec.backend.clone());
+        cfg.worker.model = config::effective_model(Role::Worker, kind, &spec.model);
+        let backend = self.resolve_kind_backend(kind, Role::Worker)?;
+        Ok(SelectedBackend {
+            backend,
+            kind,
+            cfg,
+            fallback_reason: None,
+        })
     }
 
     fn claude_fallback_cfg_for_role(&self, role: Role) -> MissionConfig {
@@ -946,6 +946,28 @@ impl MissionEngine {
     #[doc(hidden)]
     pub fn seed_worker_auth_verdict_for_test(&mut self, verdict: AuthVerdict) {
         self.worker_auth_verdict = Some(verdict);
+    }
+
+    /// Test hook: pre-seed a lazily-constructed per-kind backend cache so
+    /// dispatch-pool tests can drive non-claude candidates with scripted
+    /// [`crate::backend_mock::MockBackend`]s instead of real agent CLIs (the
+    /// discovery probes read the host, which has no codex/droid/kimi binary
+    /// under test). Never call this outside tests: it bypasses the real
+    /// backend discovery the probe exists to perform.
+    #[doc(hidden)]
+    pub fn seed_kind_backend_for_test(
+        &mut self,
+        kind: BackendKind,
+        backend: Arc<dyn AgentBackend>,
+    ) {
+        match kind {
+            BackendKind::Codex => self.codex_backend = Some(backend),
+            BackendKind::Droid => self.droid_backend = Some(backend),
+            BackendKind::Kimi => self.kimi_backend = Some(backend),
+            // claude is the engine's primary backend (injected at create);
+            // local/acp have no probe cache to seed.
+            BackendKind::Claude | BackendKind::Local | BackendKind::Acp => {}
+        }
     }
 
     /// Fold events appended by `runner::run_*` (which writes to the log
@@ -1143,6 +1165,7 @@ impl MissionEngine {
             calibration.missions_used,
             &contract_lint_report,
             &gate_reports,
+            &self.state.config.worker_candidates,
         );
         // research.md (repo-knowledge-store slice 1): the evidence the
         // orchestrator emitted with the plan, committed beside plan.md.
@@ -1803,6 +1826,7 @@ impl MissionEngine {
             calibration.missions_used,
             &no_lint,
             &[],
+            &self.state.config.worker_candidates,
         );
         let revised_md_body = render_revised_plan_markdown(plan, &self.state.mission, &[], &[]);
         let research_md = self
@@ -2641,6 +2665,15 @@ impl MissionEngine {
     /// wiring, the §4.4 dirty-tree discipline, an orchestrator judgement turn,
     /// and the bounded respawn loop.
     async fn run_feature(&mut self, mi: usize, fi: usize) -> Result<()> {
+        // Heterogeneous dispatch pool (ticket heterogeneous-dispatch-pool,
+        // KRZ-303): with >= 2 configured `workerCandidates` the unit fans out
+        // to ALL of them concurrently and the mission parks for the human
+        // judgement act — a strictly opt-in fork of this method. An empty
+        // pool (or the validated-away 1-entry list) keeps the byte-for-byte
+        // sequential path below.
+        if self.state.config.worker_candidates.len() >= 2 {
+            return self.run_feature_dispatch_pool(mi, fi).await;
+        }
         if self.state.mission.milestones[mi].features[fi].status == FeatureStatus::Pending {
             let feature_id = self.state.mission.milestones[mi].features[fi].id.clone();
             self.emit(EventKind::FeatureStarted { feature_id })?;
@@ -2826,6 +2859,398 @@ impl MissionEngine {
                 }
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Heterogeneous dispatch pool (KRZ-303)
+    // -----------------------------------------------------------------------
+
+    /// Heterogeneous dispatch pool (ticket `heterogeneous-dispatch-pool`,
+    /// KRZ-303; the positioning ADR's 2026-07-31 boundary gloss): run ONE
+    /// unit of work (this feature) on all N configured `workerCandidates`
+    /// backends concurrently — one git worktree per stream, reusing the M3
+    /// wall-clock idiom — record every output as a SIBLING CANDIDATE tied to
+    /// the unit, then park the milestone for the human judgement act.
+    ///
+    /// The ticket's three freeze properties, enforced HERE (not just
+    /// documented):
+    ///
+    /// 1. CANDIDATES FOR JUDGEMENT, NEVER A WINNER. This path calls
+    ///    `judge_worker_run` NOWHERE and emits no `feature.completed`: there
+    ///    is no code path that selects, ranks, or merges a candidate. Every
+    ///    stream gets its own run record ([`CandidateLink`]ed to the unit and
+    ///    its sibling set) and its own branch
+    ///    (`kranz/pool/<mission>/<feature>-c<i>`, KEPT — the branches ARE the
+    ///    candidate deliverables the later judgement act inspects). The
+    ///    unit's milestone is then BLOCKED: without a judgement surface (the
+    ///    divergence follow-up ticket) the only honest terminal posture is to
+    ///    park for a human.
+    /// 2. DIVERGENCE FOR SCRUTINY, NEVER THROUGHPUT. The N streams all run
+    ///    the SAME unit; nothing here fans out distinct work to go faster,
+    ///    and a candidate whose backend is unavailable fails its own stream
+    ///    loudly ([`Self::select_pool_candidate`] has no claude fallback)
+    ///    rather than silently duplicating a sibling's backend.
+    /// 3. COST MULTIPLIER IN CONSENT. `cost::estimate` multiplies worker runs
+    ///    by N and plan.md's dispatch-pool section names N; each stream keeps
+    ///    the per-run `maxBudgetUsd` cap, so worst-case spend is N × cap and
+    ///    the approved estimate prices exactly that sum.
+    ///
+    /// Single-writer discipline mirrors the M3 batch: Phase A (serial,
+    /// engine-owned writer) emits `feature.started` and forks the worktrees;
+    /// Phase B (concurrent, no log access) runs the N sessions via a JoinSet,
+    /// each BUFFERING its event kinds; Phase C (serial, candidate order)
+    /// replays each stream's kinds through `emit`, stamping the
+    /// [`CandidateLink`] onto its `worker.spawned`.
+    ///
+    /// FAILURE ISOLATION: one stream failing (backend-unavailable selection
+    /// error, session spawn/run error, task panic) does NOT abort its
+    /// siblings — every stream's terminal state is recorded in the pool
+    /// decision's detail, and a run record exists for every stream that
+    /// started. A stream that never started gets NO synthetic run record
+    /// (fabricating one would be dishonest — no session, no transcript); its
+    /// terminal state lives in the decision detail.
+    ///
+    /// NO respawn loop and no dirty-tree orchestrator turn: the sequential
+    /// path's judgement-driven machinery is exactly the winner-selection the
+    /// freeze forbids here. Per-worktree dirty trees are checkpoint-committed
+    /// onto the candidate branch (M3 idiom) so every candidate's deliverable
+    /// is its branch HEAD; a secret-scan refusal is recorded in the decision
+    /// detail and that candidate's leftovers are discarded with its worktree.
+    ///
+    /// RE-DISPATCH GUARD: a feature that already has candidate-linked runs is
+    /// NEVER fanned out again silently (each dispatch is N paid sessions) —
+    /// the guard re-blocks the milestone with the same judgement-pending
+    /// reason, which is also the crash-resume posture (a half-recorded
+    /// candidate set parks instead of silently completing or re-running).
+    async fn run_feature_dispatch_pool(&mut self, mi: usize, fi: usize) -> Result<()> {
+        let feature = self.state.mission.milestones[mi].features[fi].clone();
+        let milestone_id = self.state.mission.milestones[mi].id.clone();
+
+        if feature.status == FeatureStatus::Pending {
+            self.emit(EventKind::FeatureStarted {
+                feature_id: feature.id.clone(),
+            })?;
+        }
+
+        // The re-dispatch guard. Checked against the DURABLE record (any run
+        // candidate-linked to this unit), so it holds across restarts.
+        let already_dispatched = self
+            .state
+            .runs
+            .values()
+            .any(|r| r.candidate.as_ref().is_some_and(|c| c.unit == feature.id));
+        if already_dispatched {
+            // Re-block only when the milestone is not already parked —
+            // re-emitting an identical milestone.blocked would just spam the
+            // log on every resume poll.
+            if self.state.mission.milestones[mi].status != MilestoneStatus::Blocked {
+                let reason = self.pool_judgement_block_reason(&feature.id);
+                self.emit(EventKind::MilestoneBlocked {
+                    milestone_id,
+                    reason,
+                })?;
+            }
+            return Ok(());
+        }
+
+        let specs = self.state.config.worker_candidates.clone();
+        let mission_id = self.state.mission.id.clone();
+        let pre_run_sha = self.active_repo().head_sha()?;
+
+        // Per-candidate worktree layout, built up front so the cleanup guard
+        // sees every path even if a fork fails midway (M3 idiom).
+        let workspaces: Vec<PoolWorkspace> = specs
+            .into_iter()
+            .enumerate()
+            .map(|(index, spec)| PoolWorkspace {
+                branch: format!("kranz/pool/{mission_id}/{}-c{index}", feature.id),
+                path: pool_worktree_path(&self.paths.repo_root, &mission_id, &feature.id, index),
+                spec,
+            })
+            .collect();
+
+        // The fallible body is wrapped so the worktree-DIR cleanup runs on
+        // every exit — mirroring run_parallel_batch's cleanup guard, with one
+        // deliberate difference: candidate BRANCHES are never deleted by the
+        // engine. They ARE the recorded deliverables a judging human inspects
+        // (and a future judgement act consumes); resume()'s leak sweep
+        // deletes only the dirs for the same reason.
+        let pool_result = self
+            .run_dispatch_pool_inner(mi, &feature, &pre_run_sha, &workspaces)
+            .await;
+
+        for ws in &workspaces {
+            if let Err(e) = self.repo.remove_worktree(&ws.path) {
+                tracing::warn!(path = %ws.path.display(), error = %e, "pool worktree cleanup failed");
+            }
+        }
+        if let Err(e) = self.repo.prune_worktrees() {
+            tracing::warn!(error = %e, "pool worktree prune failed");
+        }
+
+        pool_result
+    }
+
+    /// The `milestone.blocked` reason a dispatch-pool unit parks with
+    /// (KRZ-303): names the unit, the recorded candidate count against N, and
+    /// WHY the mission stops here — selection is a human judgement act (the
+    /// divergence follow-up surfaces it); the engine never picks a winner.
+    fn pool_judgement_block_reason(&self, feature_id: &str) -> String {
+        let recorded = self
+            .state
+            .runs
+            .values()
+            .filter(|r| r.candidate.as_ref().is_some_and(|c| c.unit == feature_id))
+            .count();
+        let n = self.state.config.worker_candidates.len();
+        format!(
+            "dispatch pool: {recorded}/{n} candidate stream(s) recorded for unit {feature_id}; \
+             every output is a candidate for judgement — the engine never selects or merges a \
+             winner (KRZ-303), and the judgement surface lands with the divergence follow-up \
+             ticket. Inspect the candidate branches (kranz/pool/*); to proceed without \
+             judging, skip the milestone."
+        )
+    }
+
+    /// Fallible body of [`Self::run_feature_dispatch_pool`] (the caller's
+    /// worktree-dir cleanup guard runs regardless of how this returns).
+    async fn run_dispatch_pool_inner(
+        &mut self,
+        mi: usize,
+        feature: &Feature,
+        pre_run_sha: &str,
+        workspaces: &[PoolWorkspace],
+    ) -> Result<()> {
+        let milestone_id = self.state.mission.milestones[mi].id.clone();
+        let n = workspaces.len();
+
+        // --- Phase A (serial, single-writer): fork every candidate worktree
+        // off the mission branch tip. `feature.started` was already emitted by
+        // the caller before the re-dispatch guard.
+        for ws in workspaces {
+            self.repo.add_worktree(&ws.path, &ws.branch, pre_run_sha)?;
+        }
+
+        // Resolve every candidate's backend BEFORE spawning: a candidate
+        // whose backend cannot be constructed becomes a recorded stream
+        // failure — never a batch abort, and NEVER a silent claude fallback
+        // (a same-backend duplicate would fake the diversity that is the
+        // pool's entire point).
+        let mut selected: Vec<Option<SelectedBackend>> = Vec::with_capacity(n);
+        let mut stream_errors: Vec<Option<String>> = (0..n).map(|_| None).collect();
+        for (idx, ws) in workspaces.iter().enumerate() {
+            match self.select_pool_candidate(&ws.spec) {
+                Ok(selection) => selected.push(Some(selection)),
+                Err(e) => {
+                    stream_errors[idx] = Some(e.to_string());
+                    selected.push(None);
+                }
+            }
+        }
+
+        // The claude auth probe is once-per-mission and meaningful only for
+        // the claude backend; compute it BEFORE any concurrent task spawns
+        // when ANY selected candidate is claude-backed (mirrors the M3
+        // batch's pre-spawn probe), then hand it to claude streams only.
+        let any_claude = selected
+            .iter()
+            .flatten()
+            .any(|s| s.kind == BackendKind::Claude);
+        let auth_verdict = if any_claude {
+            self.worker_auth_verdict().await
+        } else {
+            AuthVerdict::Inconclusive
+        };
+
+        // --- Phase B (CONCURRENT, no log access): run every stream at once.
+        // Mirrors the M3 batch: each task buffers its kinds and returns them
+        // with its RunOutcome; nothing touches the shared log. The tracker
+        // records the wall-clock overlap for the pool decision (and tests).
+        let goal = self.state.mission.goal.clone();
+        let milestone_title = self.state.mission.milestones[mi].title.clone();
+        let base_sha = self.state.mission.base_sha.clone();
+        let grants = self.state.mission.command_grants.clone();
+        let egress_grants = self.state.mission.egress_grants.clone();
+        let deny_exceptions = self.state.mission.deny_exceptions.clone();
+        let tracker = ConcurrencyTracker::new();
+
+        let mut set: tokio::task::JoinSet<(usize, BufferedRunResult)> = tokio::task::JoinSet::new();
+        for (idx, ws) in workspaces.iter().enumerate() {
+            let Some(selection) = selected[idx].take() else {
+                continue; // selection error already recorded for this stream
+            };
+            let verdict = if selection.kind == BackendKind::Claude {
+                auth_verdict
+            } else {
+                AuthVerdict::Inconclusive
+            };
+            let backend = selection.backend;
+            let cfg = selection.cfg;
+            let paths = self.paths.clone();
+            let feature = feature.clone();
+            let goal = goal.clone();
+            let milestone_title = milestone_title.clone();
+            let ws_path = ws.path.clone();
+            let guard = tracker.clone();
+            let base_sha = base_sha.clone();
+            let grants = grants.clone();
+            let egress_grants = egress_grants.clone();
+            let deny_exceptions = deny_exceptions.clone();
+            set.spawn(async move {
+                let _live = guard.enter(); // count this session as live
+                let result = runner::run_worker_in_buffered(
+                    backend.as_ref(),
+                    &paths,
+                    &cfg,
+                    &feature,
+                    &goal,
+                    &milestone_title,
+                    None,
+                    &ws_path,
+                    base_sha.as_deref(),
+                    &grants,
+                    &egress_grants,
+                    &deny_exceptions,
+                    verdict,
+                )
+                .await;
+                (idx, result)
+            });
+        }
+
+        // Collect per-stream results keyed by candidate index. UNLIKE the M3
+        // batch there is no batch-level error: one stream's failure is
+        // recorded against that stream and the survivors still replay — a
+        // failed candidate must never abort its siblings (KRZ-303).
+        let mut buffered: Vec<Option<(Vec<EventKind>, runner::RunOutcome)>> =
+            (0..n).map(|_| None).collect();
+        let mut panic_note: Option<String> = None;
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok((idx, Ok(result))) => buffered[idx] = Some(result),
+                Ok((idx, Err(e))) => stream_errors[idx] = Some(e.to_string()),
+                Err(e) => {
+                    panic_note = panic_note.or(Some(format!("pool worker task panicked: {e}")));
+                }
+            }
+        }
+        // A panicked task carries no index; any stream that produced neither
+        // a result nor an error was spawned but never returned (selection
+        // errors already populated `stream_errors`), so the panic becomes
+        // its recorded terminal state.
+        for (idx, slot) in stream_errors.iter_mut().enumerate() {
+            if buffered[idx].is_none() && slot.is_none() {
+                *slot = Some(
+                    panic_note
+                        .clone()
+                        .unwrap_or_else(|| "stream ended without a result".to_string()),
+                );
+            }
+        }
+        let peak = tracker.peak();
+
+        // --- Phase C (serial, single-writer, candidate order): replay each
+        // stream's buffered kinds — stamping the sibling linkage onto its
+        // worker.spawned — then checkpoint-commit its worktree so the
+        // candidate branch HEAD is the deliverable.
+        let mut lines: Vec<String> = Vec::with_capacity(n);
+        for (idx, ws) in workspaces.iter().enumerate() {
+            match buffered[idx].take() {
+                Some((events, outcome)) => {
+                    let link = CandidateLink {
+                        unit: feature.id.clone(),
+                        index: idx as u32,
+                        count: n as u32,
+                        backend: ws.spec.backend.clone(),
+                    };
+                    for mut kind in events {
+                        if let EventKind::WorkerSpawned { candidate, .. } = &mut kind {
+                            *candidate = Some(link.clone());
+                        }
+                        self.emit(kind)?;
+                    }
+                    self.log.flush()?;
+
+                    // Checkpoint any stream output on the candidate branch (in
+                    // its worktree), exactly the M3 worktree idiom: a dirty
+                    // deliverable is committed here rather than run through
+                    // the sequential dirty-tree turn; a secret-scan refusal is
+                    // recorded (never silently dropped) and the leftovers go
+                    // away with the worktree dir.
+                    let wt_repo = GitRepo::open(&ws.path)?;
+                    wt_repo.ensure_identity()?;
+                    let mut note = String::new();
+                    if !wt_repo.is_clean().unwrap_or(true) {
+                        match wt_repo.commit_dirty_paths(
+                            &contract_sweep::pool_checkpoint_commit_message(&feature.id, idx),
+                        )? {
+                            crate::git_ops::CheckpointOutcome::Committed(_) => {}
+                            crate::git_ops::CheckpointOutcome::RefusedBySecretScan { detail } => {
+                                note = format!(
+                                    "; dirty-tree checkpoint refused by secret scan ({detail})"
+                                );
+                            }
+                        }
+                    }
+                    let commits = wt_repo
+                        .commits_between(pre_run_sha, "HEAD")
+                        .unwrap_or_default()
+                        .len();
+                    lines.push(format!(
+                        "- candidate {idx}/{}: `{}` / `{}` → branch `{}` — run {:?}, {} commit(s){}",
+                        n - 1,
+                        ws.spec.backend,
+                        ws.spec.model,
+                        ws.branch,
+                        outcome.result,
+                        commits,
+                        note
+                    ));
+                }
+                None => {
+                    let err = stream_errors[idx]
+                        .clone()
+                        .unwrap_or_else(|| "stream produced no run record".to_string());
+                    lines.push(format!(
+                        "- candidate {idx}/{}: `{}` / `{}` — stream failed, no run record: {err}",
+                        n - 1,
+                        ws.spec.backend,
+                        ws.spec.model
+                    ));
+                }
+            }
+        }
+
+        // One first-class decision record for the dispatch: the candidate
+        // table AND the freeze statements, so the replayed history shows what
+        // was produced and why nothing was picked. The N and peak numbers in
+        // the summary let tests assert the fan-out and the overlap.
+        self.emit_decision(
+            &format!(
+                "dispatch pool: unit {} fanned out to {n} candidates (peak {peak} concurrent) \
+                 — candidates for judgement, no winner selected",
+                feature.id
+            ),
+            Some(format!(
+                "Heterogeneous dispatch (KRZ-303): unit `{}` ran on {n} backends concurrently, \
+                 one worktree per stream. Every output below is a CANDIDATE FOR JUDGEMENT tied \
+                 to the unit — the engine never selects, ranks, or merges a winner; selection \
+                 is the human judgement act the divergence follow-up surfaces. The claimed \
+                 value is divergence for scrutiny, not throughput. Cost: the approved estimate \
+                 priced all {n} streams (the per-mission budget applies to the sum).\n\n{}",
+                feature.id,
+                lines.join("\n")
+            )),
+        )?;
+
+        // Park the milestone for the human judgement act (freeze property 1:
+        // no code path completes the unit from a candidate).
+        let reason = self.pool_judgement_block_reason(&feature.id);
+        self.emit(EventKind::MilestoneBlocked {
+            milestone_id,
+            reason,
+        })?;
+        Ok(())
     }
 
     /// Dirty tree after a worker run: ask the orchestrator (JSON), defaulting
@@ -5146,6 +5571,7 @@ impl MissionEngine {
             role: Role::Orchestrator,
             feature_id: None,
             milestone_id: None,
+            candidate: None,
             sdk_session_id: sdk_session_id.clone(),
             model: role_cfg.model,
             quant: "n/a".to_string(),
@@ -5399,6 +5825,23 @@ struct ParallelWorkspace {
 /// [`runner::RunOutcome`], or the error that aborted the session.
 type BufferedRunResult = Result<(Vec<EventKind>, runner::RunOutcome)>;
 
+/// One candidate stream's slot in a dispatch pool (KRZ-303): the configured
+/// backend/model pairing, its branch, and the worktree directory that branch
+/// is checked out in. Mirrors [`ParallelWorkspace`] with one deliberate
+/// difference: pool branches (`kranz/pool/<mission>/<feature>-c<index>`) are
+/// NEVER deleted by the engine — they are the candidate deliverables a
+/// judging human inspects; only the worktree dirs are reaped. The candidate
+/// index is the slot's position in the `workspaces` vec itself (built in
+/// `workerCandidates` order), so it is not duplicated here.
+struct PoolWorkspace {
+    /// Per-candidate branch, off the mission branch tip at dispatch.
+    branch: String,
+    /// Absolute worktree directory the branch is checked out in.
+    path: PathBuf,
+    /// The configured candidate this stream runs.
+    spec: CandidateSpec,
+}
+
 /// Tracks how many parallel worker sessions were live at once (roadmap M3),
 /// so the batch can prove real wall-clock overlap. Cheap and lock-free: each
 /// session bumps the live count on entry and records the running peak, then
@@ -5552,6 +5995,36 @@ fn parallel_worktree_path(
 pub fn mission_worktree_path(repo_root: &std::path::Path, mission_id: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         "kranz-wt-{}-{mission_id}-_integration",
+        repo_worktree_namespace(repo_root)
+    ))
+}
+
+/// Absolute worktree directory for one dispatch-pool candidate stream
+/// (KRZ-303). Same temp-dir base and repo namespacing as
+/// [`parallel_worktree_path`], with a distinct `kranz-pool-` prefix so
+/// candidate worktrees are mechanically and visually distinct from M3
+/// per-feature worktrees (resume()'s sweeps key off each path shape: M3
+/// branches die with their worktrees; pool BRANCHES are kept — only pool
+/// dirs are reaped).
+fn pool_worktree_path(
+    repo_root: &std::path::Path,
+    mission_id: &str,
+    feature_id: &str,
+    index: usize,
+) -> PathBuf {
+    // Same defensive sanitization as parallel_worktree_path.
+    let safe: String = feature_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    std::env::temp_dir().join(format!(
+        "kranz-pool-{}-{mission_id}-{safe}-c{index}",
         repo_worktree_namespace(repo_root)
     ))
 }
@@ -6480,6 +6953,7 @@ pub(crate) mod tests {
             role: Role::Worker,
             feature_id: Some("f1".to_string()),
             milestone_id: None,
+            candidate: None,
             sdk_session_id: "sdk-1".to_string(),
             model: "m".to_string(),
             quant: "n/a".to_string(),
@@ -8947,6 +9421,585 @@ pub(crate) mod tests {
                 .iter()
                 .any(|f| f.origin == FeatureOrigin::Fix),
             "fix feature from the retry's findings must be folded into mission state"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Heterogeneous dispatch pool (ticket heterogeneous-dispatch-pool,
+    // KRZ-303; the positioning ADR's 2026-07-31 boundary gloss)
+    // -----------------------------------------------------------------------
+
+    fn dispatch_pool_report(summary: &str) -> serde_json::Value {
+        serde_json::json!({
+            "result": "pass",
+            "summary": summary,
+            "filesTouched": [],
+            "testsAdded": [],
+            "testEvidence": "",
+            "dependenciesAdded": [],
+            "knownGaps": [],
+            "commits": [],
+            "commandsRun": []
+        })
+    }
+
+    fn dispatch_pool_cfg() -> MissionConfig {
+        MissionConfig {
+            worker_isolation: WorkerIsolation::Checkout,
+            worker_candidates: vec![
+                CandidateSpec {
+                    backend: "claude".into(),
+                    model: "sonnet".into(),
+                },
+                CandidateSpec {
+                    backend: "codex".into(),
+                    model: "gpt-5-codex".into(),
+                },
+            ],
+            ..MissionConfig::default()
+        }
+    }
+
+    fn dispatch_pool_milestone(engine: &MissionEngine) -> Milestone {
+        Milestone {
+            id: "ms-1".to_string(),
+            title: "m".to_string(),
+            features: vec![Feature {
+                id: "f-1-1".to_string(),
+                title: "f".to_string(),
+                spec: "s".to_string(),
+                validation_criteria: vec![],
+                origin: FeatureOrigin::Plan,
+                status: FeatureStatus::Pending,
+                worker_runs: vec![],
+                commits: vec![],
+                respawns: 0,
+            }],
+            status: MilestoneStatus::Active,
+            fix_cycles: 0,
+            start_sha: Some(engine.repo.head_sha().unwrap()),
+            validator_guidance: None,
+        }
+    }
+
+    /// A passing single-shot worker script that leaves `path` dirty in its
+    /// session worktree (so the pool checkpoint has a deliverable to commit).
+    fn dispatch_pool_pass_script(
+        summary: &str,
+        path: &str,
+        contents: &str,
+    ) -> crate::backend_mock::MockScript {
+        crate::backend_mock::MockScript::single_shot_json(&dispatch_pool_report(summary))
+            .writes_file(path, contents)
+    }
+
+    /// Acceptance hint 1: one brief to two mock backends yields two sibling
+    /// run records linked to one unit id, each in its own worktree — and the
+    /// freeze holds: no winner, no completion, the mission parks for the
+    /// human judgement act.
+    #[tokio::test]
+    async fn dispatch_pool_two_backends_yield_sibling_candidates() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let claude_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("claude candidate", "claude.txt", "claude was here"),
+        ]));
+        let codex_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("codex candidate", "codex.txt", "codex was here"),
+        ]));
+        let backend: Arc<dyn AgentBackend> = claude_mock.clone();
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", dispatch_pool_cfg()).unwrap();
+        engine.seed_worker_auth_verdict_for_test(AuthVerdict::Authenticated);
+        engine.seed_kind_backend_for_test(BackendKind::Codex, codex_mock.clone());
+        let pre_run_sha = engine.repo.head_sha().unwrap();
+        engine
+            .state
+            .mission
+            .milestones
+            .push(dispatch_pool_milestone(&engine));
+
+        engine.run_feature(0, 0).await.unwrap();
+
+        let mission_id = engine.mission_id().to_string();
+        let state = engine.state();
+        // Two sibling run records, each candidate-linked to the one unit id.
+        let mut linked: Vec<&WorkerRun> = state
+            .runs
+            .values()
+            .filter(|r| r.role == Role::Worker && r.candidate.is_some())
+            .collect();
+        linked.sort_by_key(|r| r.candidate.as_ref().unwrap().index);
+        assert_eq!(linked.len(), 2, "expected two candidate-linked run records");
+        assert_eq!(
+            linked[0].candidate,
+            Some(CandidateLink {
+                unit: "f-1-1".to_string(),
+                index: 0,
+                count: 2,
+                backend: "claude".to_string(),
+            })
+        );
+        assert_eq!(
+            linked[1].candidate,
+            Some(CandidateLink {
+                unit: "f-1-1".to_string(),
+                index: 1,
+                count: 2,
+                backend: "codex".to_string(),
+            })
+        );
+        // Each stream ran in its OWN worktree (the M3 isolation idiom), and
+        // the worktree dirs are reaped afterwards while the branches persist.
+        let claude_specs = claude_mock.started_specs();
+        let codex_specs = codex_mock.started_specs();
+        assert_eq!(claude_specs.len(), 1, "claude stream ran exactly once");
+        assert_eq!(codex_specs.len(), 1, "codex stream ran exactly once");
+        let c0_path = pool_worktree_path(&root, &mission_id, "f-1-1", 0);
+        let c1_path = pool_worktree_path(&root, &mission_id, "f-1-1", 1);
+        assert_eq!(claude_specs[0].cwd, c0_path);
+        assert_eq!(codex_specs[0].cwd, c1_path);
+        assert_ne!(c0_path, c1_path, "streams must not share a worktree");
+        assert!(
+            !c0_path.exists() && !c1_path.exists(),
+            "worktree dirs are reaped after the dispatch; branches carry the deliverables"
+        );
+        // The candidate branches are kept, each carrying its stream's
+        // checkpointed deliverable (the mock's dirty write).
+        for (index, file) in [(0usize, "claude.txt"), (1usize, "codex.txt")] {
+            let branch = format!("kranz/pool/{mission_id}/f-1-1-c{index}");
+            assert!(
+                engine.repo.branch_exists(&branch).unwrap(),
+                "candidate branch {branch} must be kept for judgement"
+            );
+            let commits = engine.repo.commits_between(&pre_run_sha, &branch).unwrap();
+            assert_eq!(
+                commits.len(),
+                1,
+                "candidate {index} branch carries exactly its checkpoint commit"
+            );
+            let shown = engine
+                .repo
+                .show_file(&branch, file)
+                .expect("git show works")
+                .expect("candidate branch carries the stream's file");
+            let shown = String::from_utf8(shown).unwrap();
+            assert!(shown.contains("was here"), "{file} on {branch}: {shown}");
+        }
+        // Siblings are one logical dispatch: no respawn budget charged.
+        let feature = &state.mission.milestones[0].features[0];
+        assert_eq!(feature.worker_runs.len(), 2);
+        assert_eq!(feature.respawns, 0);
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        // The dispatch decision names N and proves the wall-clock overlap.
+        let decision = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::OrchestratorDecision { summary, detail }
+                    if summary.starts_with("dispatch pool:") =>
+                {
+                    Some((summary.clone(), detail.clone().unwrap_or_default()))
+                }
+                _ => None,
+            })
+            .expect("a dispatch pool decision must be recorded");
+        assert!(
+            decision
+                .0
+                .contains("unit f-1-1 fanned out to 2 candidates (peak 2 concurrent)"),
+            "decision names N and the overlap: {}",
+            decision.0
+        );
+        assert!(
+            decision.1.contains("CANDIDATE FOR JUDGEMENT")
+                && decision
+                    .1
+                    .contains("divergence for scrutiny, not throughput"),
+            "the decision detail states the freeze properties: {}",
+            decision.1
+        );
+        // Both terminal states recorded (both passed here).
+        let completed: Vec<RunResult> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::WorkerCompleted { result, .. } => Some(*result),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(completed, vec![RunResult::Pass, RunResult::Pass]);
+        // The freeze: no winner — the unit is neither completed nor failed,
+        // and the milestone parks for the human judgement act.
+        assert!(
+            !events.iter().any(|e| matches!(
+                &e.kind,
+                EventKind::FeatureCompleted { feature_id, .. } | EventKind::FeatureFailed { feature_id, .. }
+                if feature_id == "f-1-1"
+            )),
+            "no code path completes or fails the unit from a candidate"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.kind,
+                EventKind::MilestoneBlocked { milestone_id, reason }
+                if milestone_id == "ms-1" && reason.contains("candidate for judgement")
+            )),
+            "the milestone must park for judgement: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+    }
+
+    /// Acceptance hint 3: one stream failing (a crashed backend session) does
+    /// not abort its sibling — both terminal states are recorded.
+    #[tokio::test]
+    async fn dispatch_pool_one_stream_failure_keeps_sibling_terminal_state() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let claude_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("claude candidate", "claude.txt", "claude was here"),
+        ]));
+        let codex_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            crate::backend_mock::MockScript::single_shot_json(&dispatch_pool_report(
+                "codex claimed pass before dying",
+            ))
+            .with_exit(SessionExit::Failed("codex exploded".to_string())),
+        ]));
+        let backend: Arc<dyn AgentBackend> = claude_mock.clone();
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", dispatch_pool_cfg()).unwrap();
+        engine.seed_worker_auth_verdict_for_test(AuthVerdict::Authenticated);
+        engine.seed_kind_backend_for_test(BackendKind::Codex, codex_mock.clone());
+        engine
+            .state
+            .mission
+            .milestones
+            .push(dispatch_pool_milestone(&engine));
+
+        // The sibling's failure must not error the dispatch itself.
+        engine.run_feature(0, 0).await.unwrap();
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        // Both streams got run records (replayed in candidate order) with
+        // their own terminal states: pass for the survivor, fail for the
+        // crashed sibling.
+        let spawns: Vec<Option<CandidateLink>> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::WorkerSpawned { candidate, .. } => Some(candidate.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(spawns.len(), 2, "both streams spawned: {spawns:?}");
+        assert_eq!(spawns[0].as_ref().map(|c| c.index), Some(0));
+        assert_eq!(spawns[1].as_ref().map(|c| c.index), Some(1));
+        let completed: Vec<RunResult> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::WorkerCompleted { result, .. } => Some(*result),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            completed,
+            vec![RunResult::Pass, RunResult::Fail],
+            "both terminal states recorded, in candidate order"
+        );
+        // The failure is named in the dispatch record, and the mission still
+        // parks for judgement (never auto-completes from the survivor).
+        let detail = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::OrchestratorDecision { summary, detail }
+                    if summary.starts_with("dispatch pool:") =>
+                {
+                    detail.clone()
+                }
+                _ => None,
+            })
+            .expect("dispatch decision recorded");
+        assert!(detail.contains("run Fail"), "failed stream named: {detail}");
+        assert!(
+            detail.contains("run Pass"),
+            "surviving stream named: {detail}"
+        );
+        assert!(events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::MilestoneBlocked { milestone_id, .. } if milestone_id == "ms-1"
+        )));
+        assert!(!events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::FeatureCompleted { feature_id, .. } if feature_id == "f-1-1"
+        )));
+    }
+
+    /// Failure isolation at the spawn boundary: a candidate whose backend
+    /// cannot start gets NO fabricated run record — its terminal state is
+    /// recorded in the dispatch decision, and its sibling runs unaffected.
+    #[tokio::test]
+    async fn dispatch_pool_spawn_failure_records_stream_terminal_state() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let claude_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("claude candidate", "claude.txt", "claude was here"),
+        ]));
+        // No scripts queued: start() errors, exactly a backend-unavailable
+        // spawn failure.
+        let codex_mock = Arc::new(crate::backend_mock::MockBackend::new());
+        let backend: Arc<dyn AgentBackend> = claude_mock.clone();
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", dispatch_pool_cfg()).unwrap();
+        engine.seed_worker_auth_verdict_for_test(AuthVerdict::Authenticated);
+        engine.seed_kind_backend_for_test(BackendKind::Codex, codex_mock.clone());
+        engine
+            .state
+            .mission
+            .milestones
+            .push(dispatch_pool_milestone(&engine));
+
+        engine.run_feature(0, 0).await.unwrap();
+
+        assert_eq!(claude_mock.started_specs().len(), 1);
+        assert_eq!(
+            codex_mock.started_specs().len(),
+            0,
+            "the failed stream never started a session"
+        );
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        let spawns: Vec<&EventKind> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                kind @ EventKind::WorkerSpawned { .. } => Some(kind),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            spawns.len(),
+            1,
+            "only the surviving stream has a run record — never a fabricated one: {spawns:?}"
+        );
+        let detail = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::OrchestratorDecision { summary, detail }
+                    if summary.starts_with("dispatch pool:") =>
+                {
+                    detail.clone()
+                }
+                _ => None,
+            })
+            .expect("dispatch decision recorded");
+        assert!(
+            detail.contains("stream failed, no run record") && detail.contains("no script queued"),
+            "the spawn failure is the stream's recorded terminal state: {detail}"
+        );
+        // The survivor's sibling linkage still names the full sibling set.
+        match spawns[0] {
+            EventKind::WorkerSpawned { candidate, .. } => {
+                let link = candidate.as_ref().expect("survivor is candidate-linked");
+                assert_eq!(link.count, 2);
+                assert_eq!(link.unit, "f-1-1");
+            }
+            _ => unreachable!("filtered to spawned"),
+        }
+        assert!(events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::MilestoneBlocked { milestone_id, reason }
+            if milestone_id == "ms-1" && reason.contains("1/2 candidate stream(s)")
+        )));
+    }
+
+    /// The re-dispatch guard: a unit with a recorded candidate set is never
+    /// fanned out again silently (each dispatch is N paid sessions) — it
+    /// re-parks with the same judgement-pending reason.
+    #[tokio::test]
+    async fn dispatch_pool_redispatch_guard_never_refans_silently() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let claude_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("claude candidate", "claude.txt", "claude was here"),
+        ]));
+        let codex_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("codex candidate", "codex.txt", "codex was here"),
+        ]));
+        let backend: Arc<dyn AgentBackend> = claude_mock.clone();
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", dispatch_pool_cfg()).unwrap();
+        engine.seed_worker_auth_verdict_for_test(AuthVerdict::Authenticated);
+        engine.seed_kind_backend_for_test(BackendKind::Codex, codex_mock.clone());
+        engine
+            .state
+            .mission
+            .milestones
+            .push(dispatch_pool_milestone(&engine));
+
+        engine.run_feature(0, 0).await.unwrap();
+        engine.run_feature(0, 0).await.unwrap();
+
+        assert_eq!(claude_mock.started_specs().len(), 1, "no silent re-fan-out");
+        assert_eq!(codex_mock.started_specs().len(), 1, "no silent re-fan-out");
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        let blocked = events
+            .iter()
+            .filter(|e| matches!(&e.kind, EventKind::MilestoneBlocked { .. }))
+            .count();
+        assert_eq!(
+            blocked, 1,
+            "the milestone is already parked; the guard must not spam duplicate blocks"
+        );
+        let spawns = events
+            .iter()
+            .filter(|e| matches!(&e.kind, EventKind::WorkerSpawned { .. }))
+            .count();
+        assert_eq!(spawns, 2, "exactly the first dispatch's two streams ran");
+    }
+
+    /// Acceptance hint 2 (consent): plan approval names N and the multiplied
+    /// estimate — the pool's cost multiplier is explicit in the surface the
+    /// operator approves, and the persisted estimate prices the SUM.
+    #[tokio::test]
+    async fn dispatch_pool_plan_approval_consent_names_n_and_multiplied_estimate() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
+        let cfg = dispatch_pool_cfg();
+        let mut engine = MissionEngine::create(backend, &root, "goal", cfg.clone()).unwrap();
+        let plan = Plan {
+            goal: "g".into(),
+            validation_contract: vec![],
+            milestones: vec![PlanMilestone {
+                title: "m".into(),
+                features: vec![PlanFeature {
+                    title: "f".into(),
+                    spec: "s".into(),
+                    validation_criteria: vec![],
+                }],
+            }],
+            considered_alternatives: None,
+            command_grants: vec![],
+            touch_set: vec![],
+        };
+
+        engine.approve_plan(plan.clone()).unwrap();
+
+        // What the operator consents to: the fresh-repo calibration is the
+        // built-in default band, so the approval estimate is the raw
+        // pool-multiplied estimate.
+        let expected = cost::estimate(&plan, &cfg, &cost::EstimateParams::default());
+        let single = cost::estimate(
+            &plan,
+            &MissionConfig {
+                worker_candidates: vec![],
+                ..cfg.clone()
+            },
+            &cost::EstimateParams::default(),
+        );
+        assert_eq!(expected.worker_runs, single.worker_runs * 2.0);
+
+        let plan_md = std::fs::read_to_string(engine.paths().plan_md_file()).unwrap();
+        assert!(
+            plan_md.contains("## Dispatch pool — 2 candidates per unit of work"),
+            "plan.md names N:\n{plan_md}"
+        );
+        assert!(
+            plan_md.contains("`claude` / `sonnet`") && plan_md.contains("`codex` / `gpt-5-codex`"),
+            "plan.md names the candidates:\n{plan_md}"
+        );
+        assert!(
+            plan_md.contains("Cost multiplies by 2")
+                && plan_md.contains("budget applies to that SUM"),
+            "plan.md states the multiplier and the sum-budget:\n{plan_md}"
+        );
+        assert!(
+            plan_md.contains("candidate for judgement") && plan_md.contains("not throughput"),
+            "plan.md states the freeze properties:\n{plan_md}"
+        );
+        assert!(
+            plan_md.contains(&format!("expected ~${:.2}", expected.expected_usd)),
+            "plan.md renders the MULTIPLIED estimate (${:.2}), not the single-backend one (${:.2}):\n{plan_md}",
+            expected.expected_usd,
+            single.expected_usd
+        );
+        // The persisted approval estimate (what the completion report will
+        // compare actuals against) is the multiplied one.
+        let persisted: cost::CostEstimate =
+            serde_json::from_str(&std::fs::read_to_string(engine.paths().estimate_file()).unwrap())
+                .unwrap();
+        assert_eq!(persisted.expected_usd, expected.expected_usd);
+        assert_eq!(persisted.worker_runs, expected.worker_runs);
+    }
+
+    /// Acceptance hint 2 (regression): an empty pool is today's exact
+    /// single-backend behavior — the sequential run/judge path, no candidate
+    /// linkage anywhere.
+    #[tokio::test]
+    async fn dispatch_pool_absent_pool_is_single_backend_regression() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let report = dispatch_pool_report("did the thing");
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            crate::backend_mock::MockScript::single_shot("auth ok"),
+            crate::backend_mock::MockScript::single_shot_json(&report)
+                .with_exit(SessionExit::Aborted),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock.clone();
+        let cfg = MissionConfig {
+            max_respawns: 0,
+            worker_isolation: WorkerIsolation::Checkout,
+            ..MissionConfig::default()
+        };
+        assert!(
+            cfg.worker_candidates.is_empty(),
+            "default config has no pool"
+        );
+        let mut engine = MissionEngine::create(backend, &root, "goal", cfg).unwrap();
+        engine
+            .state
+            .mission
+            .milestones
+            .push(dispatch_pool_milestone(&engine));
+
+        engine.run_feature(0, 0).await.unwrap();
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        // The sequential path: one run, no candidate linkage, the existing
+        // fail/respawn judgement — no pool parking.
+        let spawns: Vec<&EventKind> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                kind @ EventKind::WorkerSpawned { .. } => Some(kind),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(spawns.len(), 1);
+        match spawns[0] {
+            EventKind::WorkerSpawned { candidate, .. } => assert_eq!(*candidate, None),
+            _ => unreachable!(),
+        }
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.kind,
+                EventKind::FeatureFailed { feature_id, .. } if feature_id == "f-1-1"
+            )),
+            "the sequential judgement still fails the feature"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::MilestoneBlocked { .. })),
+            "no pool parking on the single-backend path"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(
+                &e.kind,
+                EventKind::OrchestratorDecision { summary, .. } if summary.starts_with("dispatch pool:")
+            )),
+            "no pool decision on the single-backend path"
         );
     }
 }

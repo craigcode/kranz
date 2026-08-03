@@ -562,6 +562,7 @@ mod tests {
             role,
             feature_id: None,
             milestone_id: None,
+            candidate: None,
             sdk_session_id: format!("sess-{run_id}"),
             model: model.to_string(),
             quant: "n/a".to_string(),

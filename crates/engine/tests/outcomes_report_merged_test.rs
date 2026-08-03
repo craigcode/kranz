@@ -164,6 +164,7 @@ fn completed_mission_events(
                 role: Role::Worker,
                 feature_id: None,
                 milestone_id: None,
+                candidate: None,
                 sdk_session_id: "s".into(),
                 model: "sonnet".into(),
                 quant: "n/a".into(),

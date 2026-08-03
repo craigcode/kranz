@@ -214,6 +214,14 @@ pub enum Confidence {
 /// where `r` is the respawn allowance, `x` fix cycles per milestone, and `f`
 /// fix features per cycle. `skip_scrutiny` / `skip_functional` each remove
 /// half of the validator pairs.
+///
+/// Dispatch-pool multiplier (KRZ-303, the positioning ADR's 2026-07-31
+/// boundary gloss — "the cost multiplier is explicit in the consent
+/// surface"): a configured `workerCandidates` pool dispatches EVERY worker
+/// unit to all N candidates, so the worker-run count multiplies by N and the
+/// estimate the operator approves prices the SUM of all streams. Only the
+/// worker term multiplies — validators and orchestrator overhead are not
+/// fanned out.
 pub fn estimate(plan: &Plan, cfg: &MissionConfig, p: &EstimateParams) -> CostEstimate {
     let milestones = plan.milestones.len() as f64;
     let features = plan
@@ -226,7 +234,9 @@ pub fn estimate(plan: &Plan, cfg: &MissionConfig, p: &EstimateParams) -> CostEst
     let x = p.fix_cycles_per_milestone;
     let f = p.fix_features_per_cycle;
 
-    let worker_runs = features * (1.0 + r) + milestones * x * f * (1.0 + r);
+    // Empty pool → multiplier 1 → byte-identical to the pre-pool formula.
+    let pool_n = cfg.worker_candidates.len().max(1) as f64;
+    let worker_runs = (features * (1.0 + r) + milestones * x * f * (1.0 + r)) * pool_n;
 
     let validators_per_milestone =
         2.0 - (cfg.skip_scrutiny as u8 as f64) - (cfg.skip_functional as u8 as f64);
@@ -273,12 +283,18 @@ pub struct TwoPathEstimate {
 
 /// Two-path estimate from the (shape-adjusted) frontier estimate when `cfg`
 /// routes the executor to the local tier; None for frontier-routed plans
-/// (their single frontier estimate is honest).
+/// (their single frontier estimate is honest). Always None with a configured
+/// dispatch pool: pool candidates are never local-backed (validation rejects
+/// `local` entries), so a stray local `worker.backend` next to a pool must
+/// not paint a $0-marginal path over N paid streams.
 pub fn estimate_two_path(
     frontier: CostEstimate,
     cfg: &MissionConfig,
     p: &EstimateParams,
 ) -> Option<TwoPathEstimate> {
+    if !cfg.worker_candidates.is_empty() {
+        return None;
+    }
     if cfg.worker.backend.as_deref() != Some("local") {
         return None;
     }
@@ -438,9 +454,12 @@ pub enum MissionCostClass {
 /// Classify a folded mission. After a `tier.escalated` fold the reducer
 /// resets `config.worker.backend` to None, so `still_local` reads true only
 /// for never-escalated local missions; the (still_local, escalated) cell is
-/// unreachable today and classified Mixed defensively.
+/// unreachable today and classified Mixed defensively. A configured dispatch
+/// pool forces Frontier: pool candidates are never local-backed, so every
+/// pool stream is per-token frontier spend.
 pub fn mission_cost_class(state: &MissionState) -> MissionCostClass {
-    let still_local = state.config.worker.backend.as_deref() == Some("local");
+    let still_local = state.config.worker.backend.as_deref() == Some("local")
+        && state.config.worker_candidates.is_empty();
     let escalated = state.escalated_milestones > 0;
     match (still_local, escalated) {
         (true, false) => MissionCostClass::Local,
@@ -1247,5 +1266,84 @@ mod tests {
         );
         assert_eq!(two.escalated.low_usd, 5.0 + miss);
         assert_eq!(two.escalated.high_usd, 25.0 + miss);
+    }
+
+    // -----------------------------------------------------------------------
+    // Heterogeneous dispatch pool (KRZ-303): the consent multiplier
+    // -----------------------------------------------------------------------
+
+    fn dispatch_pool_config() -> MissionConfig {
+        MissionConfig {
+            worker_candidates: vec![
+                crate::types::CandidateSpec {
+                    backend: "claude".into(),
+                    model: "sonnet".into(),
+                },
+                crate::types::CandidateSpec {
+                    backend: "codex".into(),
+                    model: DEFAULT_CODEX_MODEL.into(),
+                },
+            ],
+            ..MissionConfig::default()
+        }
+    }
+
+    #[test]
+    fn dispatch_pool_estimate_multiplies_worker_runs_only() {
+        // The consent multiplier: N=2 candidates double every worker session
+        // count; validators and orchestrator overhead are not fanned out.
+        let plan = counts_plan(1, 2);
+        let p = EstimateParams::default();
+        let single = estimate(&plan, &MissionConfig::default(), &p);
+        let pooled = estimate(&plan, &dispatch_pool_config(), &p);
+
+        assert_eq!(pooled.worker_runs, single.worker_runs * 2.0);
+        assert_eq!(pooled.validator_runs, single.validator_runs);
+        let expected = single.worker_runs * 2.0 * p.avg_worker_run_usd
+            + single.validator_runs * p.avg_validator_run_usd
+            + 2.0 * p.orchestrator_overhead_usd_per_feature;
+        assert!(
+            (pooled.expected_usd - expected).abs() < 1e-9,
+            "pooled {} vs hand-computed {expected}",
+            pooled.expected_usd
+        );
+        assert!(pooled.expected_usd > single.expected_usd);
+        assert!(pooled.high_usd > single.high_usd);
+        // The multiplier is exactly N (not more): the estimate must not
+        // double-count the fan-out.
+        let delta = pooled.expected_usd - single.expected_usd;
+        assert!(
+            (delta - single.worker_runs * p.avg_worker_run_usd).abs() < 1e-9,
+            "delta {delta} should be exactly one more worker-share ({})",
+            single.worker_runs * p.avg_worker_run_usd
+        );
+    }
+
+    #[test]
+    fn dispatch_pool_two_path_suppressed_and_cost_class_frontier() {
+        // A stray local worker.backend next to a pool must not paint a
+        // $0-marginal path over N paid streams, nor classify the mission's
+        // actuals as local-tier for calibration.
+        let p = EstimateParams::default();
+        let mut cfg = dispatch_pool_config();
+        cfg.worker.backend = Some("local".to_string());
+        let base = estimate(&counts_plan(1, 1), &cfg, &p);
+        assert!(estimate_two_path(base, &cfg, &p).is_none());
+
+        let mut kinds = vec![created_with(cfg)];
+        kinds.extend(approved_and_completed());
+        let events: Vec<Event> = kinds
+            .into_iter()
+            .enumerate()
+            .map(|(i, kind)| Event {
+                seq: (i + 1) as u64,
+                ts: chrono::Utc::now(),
+                mission_id: "m-1".into(),
+                kind,
+            })
+            .collect();
+        let state = crate::reducer::fold(&events).unwrap();
+        assert_eq!(mission_cost_class(&state), MissionCostClass::Frontier);
+        assert_eq!(state.executor_tier(), crate::types::ExecutorTier::Frontier);
     }
 }

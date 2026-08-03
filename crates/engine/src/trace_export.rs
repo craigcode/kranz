@@ -183,6 +183,7 @@ mod tests {
             role: Role::Worker,
             feature_id: Some(feature_id.to_string()),
             milestone_id: None,
+            candidate: None,
             sdk_session_id: format!("sess-{run_id}"),
             model: "sonnet".to_string(),
             quant: "n/a".to_string(),

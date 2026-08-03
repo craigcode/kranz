@@ -285,6 +285,9 @@ pub async fn run_session_to(
         role: run_meta.role,
         feature_id: run_meta.feature_id.clone(),
         milestone_id: run_meta.milestone_id.clone(),
+        // The runner is pool-agnostic: a dispatch-pool replay stamps the
+        // sibling linkage onto the buffered kind at emit time (KRZ-303).
+        candidate: None,
         sdk_session_id,
         model: run_meta.model.clone(),
         quant: "n/a".to_string(),

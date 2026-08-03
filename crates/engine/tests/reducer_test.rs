@@ -78,6 +78,7 @@ fn spawn(run_id: &str, feature_id: Option<&str>, milestone_id: Option<&str>) -> 
         },
         feature_id: feature_id.map(str::to_string),
         milestone_id: milestone_id.map(str::to_string),
+        candidate: None,
         sdk_session_id: format!("sess-{run_id}"),
         model: "sonnet".to_string(),
         quant: "n/a".to_string(),
@@ -1508,6 +1509,7 @@ fn approved_status_guard_never_overwrites_terminal_status() {
                 role: Role::ValidatorScrutiny,
                 feature_id: None,
                 milestone_id: None,
+                candidate: None,
                 sdk_session_id: "sess-r-after-failure".to_string(),
                 model: "sonnet".to_string(),
                 quant: "n/a".to_string(),
@@ -2685,6 +2687,7 @@ fn weight_hash_round_trips_through_serde_and_reducer_fold() {
         role: Role::Worker,
         feature_id: Some("f-1-1".to_string()),
         milestone_id: None,
+        candidate: None,
         sdk_session_id: "sess-r-1".to_string(),
         model: "sonnet".to_string(),
         quant: "q4_k_m".to_string(),
@@ -2751,6 +2754,7 @@ fn local_worker_spawned_from_stubbed_gguf(run_id: &str, gguf_bytes: &[u8]) -> (S
         role: Role::Worker,
         feature_id: Some("f-1-1".to_string()),
         milestone_id: None,
+        candidate: None,
         sdk_session_id: format!("sess-{run_id}"),
         model: "local-llama-3-8b".to_string(),
         quant: "q4_k_m".to_string(),
@@ -3527,4 +3531,93 @@ fn gate_result_event_is_record_only_in_the_fold() {
         serde_json::to_string(&without_shifted).unwrap(),
         "a gate.result must not perturb state beyond last_seq"
     );
+}
+
+/// Dispatch-pool sibling linkage (ticket heterogeneous-dispatch-pool,
+/// KRZ-303): candidate-linked spawns fold into run records carrying the link,
+/// and the N siblings of ONE unit are one logical dispatch — they must not
+/// deplete the feature's respawn budget; a later ordinary re-run still
+/// counts.
+#[test]
+fn dispatch_pool_candidate_links_fold_without_respawn_charge() {
+    let candidate_spawn = |run_id: &str, index: u32, backend: &str| EventKind::WorkerSpawned {
+        run_id: run_id.to_string(),
+        role: Role::Worker,
+        feature_id: Some("f-1-1".to_string()),
+        milestone_id: None,
+        candidate: Some(CandidateLink {
+            unit: "f-1-1".to_string(),
+            index,
+            count: 2,
+            backend: backend.to_string(),
+        }),
+        sdk_session_id: format!("sess-{run_id}"),
+        model: "sonnet".to_string(),
+        quant: "n/a".to_string(),
+        weight_hash: None,
+        prompt_hash: "deadbeef".to_string(),
+        transcript_path: format!("runs/{run_id}.jsonl"),
+    };
+
+    let state = fold(&[
+        ev(1, created()),
+        ev(
+            2,
+            EventKind::PlanApproved {
+                plan: plan(),
+                base_sha: None,
+            },
+        ),
+        ev(
+            3,
+            EventKind::FeatureStarted {
+                feature_id: "f-1-1".to_string(),
+            },
+        ),
+        ev(4, candidate_spawn("r-c0", 0, "claude")),
+        ev(5, candidate_spawn("r-c1", 1, "codex")),
+        // An ordinary (non-pool) re-run of the same feature afterwards.
+        ev(6, spawn("r-plain", Some("f-1-1"), None)),
+    ])
+    .unwrap();
+
+    let c0 = state.runs.get("r-c0").expect("candidate 0 recorded");
+    let c1 = state.runs.get("r-c1").expect("candidate 1 recorded");
+    assert_eq!(
+        c0.candidate,
+        Some(CandidateLink {
+            unit: "f-1-1".to_string(),
+            index: 0,
+            count: 2,
+            backend: "claude".to_string(),
+        })
+    );
+    assert_eq!(
+        c1.candidate,
+        Some(CandidateLink {
+            unit: "f-1-1".to_string(),
+            index: 1,
+            count: 2,
+            backend: "codex".to_string(),
+        })
+    );
+    // The sibling set: both runs tied to the one unit id.
+    let feature = &state.mission.milestones[0].features[0];
+    assert_eq!(
+        feature.worker_runs,
+        vec![
+            "r-c0".to_string(),
+            "r-c1".to_string(),
+            "r-plain".to_string()
+        ]
+    );
+    // Siblings are one logical dispatch, not retries: only the ordinary
+    // third run charges the respawn budget.
+    assert_eq!(feature.respawns, 1);
+    assert!(state
+        .runs
+        .get("r-plain")
+        .expect("plain run recorded")
+        .candidate
+        .is_none());
 }

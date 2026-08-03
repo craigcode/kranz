@@ -20,6 +20,11 @@ use std::path::{Path, PathBuf};
 /// Reasoning-effort values accepted by `claude --effort`.
 const VALID_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
+/// Maximum dispatch-pool size (`workerCandidates`, KRZ-303). Each candidate
+/// is a full paid worker session per unit of work, so the same 8-wide bound
+/// as `maxParallelWorkers` applies — well past any useful fan-out.
+pub const MAX_WORKER_CANDIDATES: usize = 8;
+
 /// Coarse model capability tiers used by config safety floors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ModelTier {
@@ -69,12 +74,19 @@ pub struct LocalEndpoint {
 /// Returns the APPLIED tier, which may differ from the requested `tier`: a
 /// `Local` request with no configured endpoint fails safe to `Frontier`
 /// (leaving the Worker on its frontier default) rather than routing to an
-/// endpoint that doesn't exist.
+/// endpoint that doesn't exist. A configured dispatch pool
+/// (`worker_candidates`) also pins `Frontier`: the pool is an explicit
+/// per-candidate backend declaration, and local routing's rewrite of
+/// `worker.backend` would sit next to it as a dead, misleading key (pool
+/// candidates are never local-backed — validation rejects `local` entries).
 pub fn apply_executor_routing(
     config: &mut MissionConfig,
     tier: ExecutorTier,
     local_endpoint: Option<&LocalEndpoint>,
 ) -> ExecutorTier {
+    if !config.worker_candidates.is_empty() {
+        return ExecutorTier::Frontier;
+    }
     match (tier, local_endpoint) {
         (ExecutorTier::Frontier, _) => ExecutorTier::Frontier,
         (ExecutorTier::Local, None) => ExecutorTier::Frontier,
@@ -386,6 +398,88 @@ pub fn validate(cfg: &MissionConfig) -> Result<()> {
              parallel workers), got {}",
             cfg.max_parallel_workers
         )));
+    }
+
+    // Heterogeneous dispatch pool (ticket heterogeneous-dispatch-pool,
+    // KRZ-303): `workerCandidates` is the COMPLETE backend list the worker
+    // role fans out to (worker.backend applies only when the list is empty).
+    // Every entry is checked by the same rules as the worker role itself —
+    // known backend, supported backend/model pair, the worker model floor,
+    // and the sandbox fail-closed pairs — because each one WILL drive real
+    // worker sessions.
+    if cfg.worker_candidates.len() == 1 {
+        return Err(EngineError::Config(
+            "workerCandidates with exactly one entry is a roundabout worker.backend; \
+             use worker.backend (the pool exists for N >= 2 heterogeneous candidates)"
+                .into(),
+        ));
+    }
+    if cfg.worker_candidates.len() > MAX_WORKER_CANDIDATES {
+        return Err(EngineError::Config(format!(
+            "workerCandidates supports at most {MAX_WORKER_CANDIDATES} candidates, got {}",
+            cfg.worker_candidates.len()
+        )));
+    }
+    // The pool and M3 parallel features are two different fan-out models
+    // (same unit to N backends vs N units to one backend each). Combining
+    // them has no defined semantics in this pass — reject rather than pick
+    // one silently.
+    if !cfg.worker_candidates.is_empty() && cfg.max_parallel_workers > 1 {
+        return Err(EngineError::Config(
+            "workerCandidates (dispatch pool: one unit to N backends) and \
+             maxParallelWorkers > 1 (M3: N independent units concurrently) are mutually \
+             exclusive in this pass; configure one fan-out model"
+                .into(),
+        ));
+    }
+    for (i, candidate) in cfg.worker_candidates.iter().enumerate() {
+        let kind = parse_backend(Some(&candidate.backend)).map_err(|other| {
+            EngineError::Config(format!(
+                "workerCandidates[{i}].backend must be one of \"claude\", \"codex\", \"droid\", \"kimi\", got {other:?}"
+            ))
+        })?;
+        // local/acp need per-role endpoint/command config (baseUrl /
+        // contextBudget / acpCommand) that has no per-candidate home in this
+        // pass; refuse rather than silently share the worker role's.
+        if matches!(kind, BackendKind::Local | BackendKind::Acp) {
+            return Err(EngineError::Config(format!(
+                "workerCandidates[{i}].backend {:?} is not supported in this pass: local/acp \
+                 need per-candidate endpoint/command config (a deliberate widening); use \
+                 claude, codex, droid, or kimi candidates",
+                candidate.backend
+            )));
+        }
+        // Same fail-closed sandbox pair as the worker role: a candidate that
+        // cannot honor the requested enforcement must never run with the
+        // operator believing it contained.
+        if cfg.worker.sandbox.enforce != SandboxEnforce::Off && !kind.supports_sandbox_enforcement()
+        {
+            return Err(EngineError::Config(format!(
+                "workerCandidates[{i}].backend {:?} cannot honor sandbox.enforce={:?}: only the \
+                 claude backend applies the resolved OS sandbox; run with sandbox.enforce=off, \
+                 or drop the non-claude candidate",
+                candidate.backend,
+                cfg.worker.sandbox.enforce.as_str()
+            )));
+        }
+        let effective = effective_model(Role::Worker, kind, &candidate.model);
+        let tier = model_tier(kind, &effective).ok_or_else(|| {
+            EngineError::Config(format!(
+                "workerCandidates[{i}] effective model {effective:?} (configured as {:?}) is not supported by backend {:?}",
+                candidate.model,
+                candidate.backend
+            ))
+        })?;
+        // The worker model floor applies per candidate — a below-default
+        // stream is exactly as much a worker session as the role's own.
+        if tier < ModelTier::Default && !cfg.allow_below_default_worker_model {
+            return Err(EngineError::Config(format!(
+                "workerCandidates[{i}] effective model {effective:?} (configured as {:?}) on backend {:?} is below the default worker tier; set \
+                 allowBelowDefaultWorkerModel=true on this mission to opt in",
+                candidate.model,
+                candidate.backend
+            )));
+        }
     }
 
     for (role, name) in [
@@ -1530,6 +1624,197 @@ mod tests {
 
         assert_ne!(cfg.validator_scrutiny.backend.as_deref(), Some("local"));
         assert_ne!(cfg.validator_functional.backend.as_deref(), Some("local"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Heterogeneous dispatch pool (ticket heterogeneous-dispatch-pool, KRZ-303)
+    // -----------------------------------------------------------------------
+
+    use crate::types::CandidateSpec;
+
+    fn dispatch_pool_pair() -> Vec<CandidateSpec> {
+        vec![
+            CandidateSpec {
+                backend: "claude".into(),
+                model: "sonnet".into(),
+            },
+            CandidateSpec {
+                backend: "codex".into(),
+                model: DEFAULT_CODEX_MODEL.into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn dispatch_pool_defaults_empty_and_parses_camel_case() {
+        // Additive contract change: absent key (every pre-existing config and
+        // every old mission.created event payload) deserializes to empty —
+        // today's single-backend behavior exactly.
+        assert!(MissionConfig::default().worker_candidates.is_empty());
+        let value = serde_json::to_value(MissionConfig::default()).unwrap();
+        assert_eq!(value["workerCandidates"], serde_json::json!([]));
+
+        let dir = tempfile::tempdir().unwrap();
+        let layer_path = dir.path().join("config.json");
+        std::fs::write(
+            &layer_path,
+            r#"{"workerCandidates": [{"backend": "claude", "model": "sonnet"}, {"backend": "codex", "model": "gpt-5-codex"}]}"#,
+        )
+        .unwrap();
+        let cfg = load_layers(&[layer_path]).unwrap();
+        assert_eq!(cfg.worker_candidates, dispatch_pool_pair());
+
+        // A layer naming unrelated keys only (the old-config shape) leaves
+        // the pool empty.
+        let layer_path = dir.path().join("config-old.json");
+        std::fs::write(&layer_path, r#"{"maxRespawns": 3}"#).unwrap();
+        let cfg = load_layers(&[layer_path]).unwrap();
+        assert!(cfg.worker_candidates.is_empty());
+    }
+
+    #[test]
+    fn dispatch_pool_validate_accepts_heterogeneous_pair() {
+        let cfg = MissionConfig {
+            worker_candidates: dispatch_pool_pair(),
+            ..MissionConfig::default()
+        };
+        validate(&cfg).unwrap();
+    }
+
+    #[test]
+    fn dispatch_pool_validate_rejects_single_entry() {
+        let cfg = MissionConfig {
+            worker_candidates: vec![CandidateSpec {
+                backend: "claude".into(),
+                model: "sonnet".into(),
+            }],
+            ..MissionConfig::default()
+        };
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(
+            err.contains("workerCandidates with exactly one entry"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn dispatch_pool_validate_rejects_local_and_acp_candidates() {
+        for backend in ["local", "acp"] {
+            let cfg = MissionConfig {
+                worker_candidates: vec![
+                    CandidateSpec {
+                        backend: "claude".into(),
+                        model: "sonnet".into(),
+                    },
+                    CandidateSpec {
+                        backend: backend.into(),
+                        model: "anything".into(),
+                    },
+                ],
+                ..MissionConfig::default()
+            };
+            let err = validate(&cfg).unwrap_err().to_string();
+            assert!(
+                err.contains("not supported in this pass"),
+                "{backend}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_pool_validate_rejects_parallel_workers_combination() {
+        let cfg = MissionConfig {
+            worker_candidates: dispatch_pool_pair(),
+            max_parallel_workers: 2,
+            ..MissionConfig::default()
+        };
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn dispatch_pool_validate_rejects_unknown_backend_and_model() {
+        let cfg = MissionConfig {
+            worker_candidates: vec![
+                CandidateSpec {
+                    backend: "claude".into(),
+                    model: "sonnet".into(),
+                },
+                CandidateSpec {
+                    backend: "gemini".into(),
+                    model: "sonnet".into(),
+                },
+            ],
+            ..MissionConfig::default()
+        };
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("workerCandidates[1].backend"), "{err}");
+
+        let cfg = MissionConfig {
+            worker_candidates: vec![
+                CandidateSpec {
+                    backend: "claude".into(),
+                    model: "sonnet".into(),
+                },
+                CandidateSpec {
+                    backend: "codex".into(),
+                    model: "kranz-test-model".into(),
+                },
+            ],
+            ..MissionConfig::default()
+        };
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("not supported by backend"), "{err}");
+    }
+
+    #[test]
+    fn dispatch_pool_validate_enforces_worker_floor_per_candidate() {
+        // droid's default GLM is below the default worker tier — rejected
+        // without the opt-in, accepted with it, exactly like the role check.
+        let mut cfg = MissionConfig {
+            worker_candidates: vec![
+                CandidateSpec {
+                    backend: "claude".into(),
+                    model: "sonnet".into(),
+                },
+                CandidateSpec {
+                    backend: "droid".into(),
+                    model: DEFAULT_DROID_MODEL.into(),
+                },
+            ],
+            ..MissionConfig::default()
+        };
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("below the default worker tier"), "{err}");
+        cfg.allow_below_default_worker_model = true;
+        validate(&cfg).unwrap();
+    }
+
+    #[test]
+    fn dispatch_pool_validate_rejects_sandboxed_non_claude_candidate() {
+        let mut cfg = MissionConfig {
+            worker_candidates: dispatch_pool_pair(),
+            ..MissionConfig::default()
+        };
+        cfg.worker.sandbox.enforce = crate::types::SandboxEnforce::Fs;
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("cannot honor sandbox.enforce"), "{err}");
+    }
+
+    #[test]
+    fn dispatch_pool_executor_routing_never_goes_local() {
+        // An execution-class ticket with a configured pool must NOT get
+        // worker.backend rewritten to local: the pool is the explicit
+        // per-candidate backend declaration, and the local key would sit
+        // next to it dead and misleading.
+        let mut cfg = MissionConfig {
+            worker_candidates: dispatch_pool_pair(),
+            ..MissionConfig::default()
+        };
+        let endpoint = test_local_endpoint();
+        let applied = apply_executor_routing(&mut cfg, ExecutorTier::Local, Some(&endpoint));
+        assert_eq!(applied, ExecutorTier::Frontier);
+        assert!(cfg.worker.backend.is_none());
     }
 
     trait RoleConfigTestExt {

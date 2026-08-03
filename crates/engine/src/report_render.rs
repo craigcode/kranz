@@ -22,6 +22,12 @@ use std::path::Path;
 /// ([`crate::contract_gates`], ticket contract-validation-gates.md) rendered
 /// into the Contract lint section; callers that do not run the gates
 /// (re-plan previews — see the orchestrator's no-lint note) pass `&[]`.
+///
+/// `pool` is the mission's configured dispatch pool
+/// ([`crate::types::MissionConfig::worker_candidates`], KRZ-303): empty for
+/// the ordinary single-backend shape (no pool section rendered); the
+/// approval-time spend-consent surface otherwise — it must name N and say
+/// what the multiplied estimate pays for.
 #[allow(clippy::too_many_arguments)]
 pub fn render_plan_markdown(
     plan: &Plan,
@@ -32,6 +38,7 @@ pub fn render_plan_markdown(
     missions_used: usize,
     contract_lint: &contract_lint::ContractLintReport,
     gate_reports: &[crate::gate::GateReport],
+    pool: &[CandidateSpec],
 ) -> String {
     use std::fmt::Write as _;
     let mut md = String::new();
@@ -90,6 +97,46 @@ pub fn render_plan_markdown(
 
     if let Some(note) = fit_note {
         let _ = writeln!(md, "{note}\n");
+    }
+
+    // Dispatch-pool spend consent (KRZ-303; the positioning ADR's 2026-07-31
+    // boundary gloss). The approval surface must name N and say what the
+    // multiplied estimate pays for — the operator is consenting to N paid
+    // worker sessions per unit of work, and the per-mission budget applies
+    // to the SUM. The two negative claims are the ticket's other two freeze
+    // properties, stated where consent is given: outputs are candidates for
+    // judgement (never auto-merged into a winner), and the claimed value is
+    // divergence for scrutiny (never throughput).
+    if !pool.is_empty() {
+        let n = pool.len();
+        let _ = writeln!(md, "## Dispatch pool — {n} candidates per unit of work\n");
+        let _ = writeln!(
+            md,
+            "Every worker feature is dispatched to **{n} backends concurrently** \
+             (heterogeneous dispatch, KRZ-303), one git worktree per stream:"
+        );
+        for (i, candidate) in pool.iter().enumerate() {
+            let _ = writeln!(
+                md,
+                "{}. `{}` / `{}`",
+                i + 1,
+                candidate.backend,
+                candidate.model
+            );
+        }
+        let _ = writeln!(md);
+        let _ = writeln!(
+            md,
+            "Each stream's output is recorded as a sibling **candidate for judgement** tied to \
+             the same unit of work. The engine never selects, ranks, or merges a candidate into \
+             a winner — selection is a later human judgement act — and the pool's claimed value \
+             is **divergence for scrutiny, not throughput**.\n"
+        );
+        let _ = writeln!(
+            md,
+            "**Cost multiplies by {n}:** the estimate above already prices all {n} candidates \
+             for every worker unit, and the per-mission budget applies to that SUM.\n"
+        );
     }
 
     if let Some(alternatives) = &plan.considered_alternatives {
@@ -604,6 +651,55 @@ pub fn render_mission_report(
             }
             for commit in &f.commits {
                 let _ = writeln!(md, "  - {}", short_commit(commit));
+            }
+            // Dispatch-pool candidates (KRZ-303): the unit's sibling outputs,
+            // labelled candidates-for-judgement — the engine never selected,
+            // ranked, or merged a winner; selection is the pending human
+            // judgement act. Each candidate names its backend, its recorded
+            // terminal state, and its (kept) branch so a judge can diff it.
+            let mut candidates: Vec<&WorkerRun> = f
+                .worker_runs
+                .iter()
+                .filter_map(|id| state.runs.get(id))
+                .filter(|r| r.candidate.is_some())
+                .collect();
+            if !candidates.is_empty() {
+                candidates.sort_by_key(|r| r.candidate.as_ref().map(|c| c.index).unwrap_or(0));
+                let n = candidates
+                    .first()
+                    .and_then(|r| r.candidate.as_ref())
+                    .map(|c| c.count)
+                    .unwrap_or(candidates.len() as u32);
+                let _ = writeln!(
+                    md,
+                    "  **{} candidates for judgement** (no winner selected; selection is a \
+                     later human judgement act):",
+                    candidates.len()
+                );
+                for r in candidates {
+                    let c = r
+                        .candidate
+                        .as_ref()
+                        .expect("filtered to candidate-linked runs");
+                    let result = match r.result {
+                        Some(RunResult::Pass) => "pass",
+                        Some(RunResult::Fail) => "fail",
+                        Some(RunResult::Partial) => "partial",
+                        None => "no terminal state recorded",
+                    };
+                    let _ = writeln!(
+                        md,
+                        "  - candidate {}/{}: `{}` / `{}` — {} — branch `kranz/pool/{}/{}-c{}`",
+                        c.index,
+                        n.saturating_sub(1),
+                        c.backend,
+                        r.model,
+                        result,
+                        mission.id,
+                        f.id,
+                        c.index
+                    );
+                }
             }
             if f.status == FeatureStatus::Complete {
                 for criterion in &f.validation_criteria {

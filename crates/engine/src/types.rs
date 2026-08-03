@@ -205,6 +205,34 @@ pub struct Feature {
 // Worker runs
 // ---------------------------------------------------------------------------
 
+/// Sibling-candidate linkage for one stream of a heterogeneous dispatch pool
+/// (ticket `heterogeneous-dispatch-pool`, KRZ-303; the positioning ADR's
+/// 2026-07-31 boundary gloss): one unit of work (a feature) fanned out to N
+/// configured backends concurrently, every output recorded as a CANDIDATE FOR
+/// JUDGEMENT tied to the same unit — never auto-merged into a winner.
+///
+/// The sibling set is every run sharing `unit` (the feature id, duplicated
+/// here so the linkage is first-class on the record rather than implied by
+/// `feature_id`). `index` is the stream's zero-based position in the
+/// mission's `workerCandidates` config list; `count` is N. Purely
+/// evidentiary: no code path ranks, selects, or merges candidates — selection
+/// is a later human judgement act (the divergence follow-up ticket), and the
+/// claimed value is divergence for scrutiny, never throughput.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CandidateLink {
+    /// The dispatch unit — the feature id fanned out to the pool.
+    pub unit: String,
+    /// Zero-based position of this stream's backend in `workerCandidates`.
+    pub index: u32,
+    /// Total streams dispatched for the unit (N).
+    pub count: u32,
+    /// Backend this stream ran (the run's `model` field alone cannot name
+    /// the harness — e.g. a claude-routed and a codex-routed stream may both
+    /// record a gpt-family model name after alias normalization).
+    pub backend: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Role {
@@ -255,6 +283,11 @@ pub struct WorkerRun {
     pub feature_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub milestone_id: Option<String>,
+    /// Sibling-candidate linkage when this run is one stream of a
+    /// heterogeneous dispatch pool (KRZ-303). Absent on ordinary runs (and in
+    /// every pre-pool state snapshot); `None` never hits the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate: Option<CandidateLink>,
     /// Claude Code session id (UUID chosen by the engine, used for --resume).
     pub sdk_session_id: String,
     pub model: String,
@@ -488,9 +521,15 @@ impl MissionState {
     /// [`ExecutorTier::Local`] when the Worker backend is
     /// [`BackendKind::Local`] (applied at seed time by
     /// [`crate::config::apply_executor_routing`] or by any later
-    /// `config.changed`), else [`ExecutorTier::Frontier`].
+    /// `config.changed`), else [`ExecutorTier::Frontier`]. A configured
+    /// dispatch pool (`worker_candidates`) is always Frontier: pool
+    /// candidates are never local-backed (validation rejects `local`
+    /// entries), so a stray local `worker.backend` alongside a pool must not
+    /// classify the mission's spend as $0-marginal.
     pub fn executor_tier(&self) -> ExecutorTier {
-        if self.config.backend_kind(Role::Worker) == BackendKind::Local {
+        if self.config.worker_candidates.is_empty()
+            && self.config.backend_kind(Role::Worker) == BackendKind::Local
+        {
             ExecutorTier::Local
         } else {
             ExecutorTier::Frontier
@@ -689,6 +728,24 @@ pub struct SandboxConfig {
     /// [`SandboxProvider::enforces_hard_net_boundary`]); an empty list keeps
     /// the hard `--network none` boundary.
     pub egress: Vec<String>,
+}
+
+/// One backend+model pairing in the heterogeneous dispatch pool
+/// (`MissionConfig::worker_candidates`, ticket `heterogeneous-dispatch-pool`
+/// / KRZ-303). Structured rather than a `"backend/model"` string so
+/// `config::validate` can apply the exact same backend/model pair checks as a
+/// role selection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CandidateSpec {
+    /// Backend name, same vocabulary as [`RoleConfig::backend`]. `local` and
+    /// `acp` are rejected at validation in this pass: their per-role
+    /// endpoint/command config (`baseUrl`/`acpCommand`) has no per-candidate
+    /// home yet — a deliberate widening, never a silent share.
+    pub backend: String,
+    /// Model alias or id, interpreted against `backend`'s table by the same
+    /// `effective_model` / `model_tier` rules as a role selection.
+    pub model: String,
 }
 
 /// Which [`AgentBackend`](crate::backend::AgentBackend) drives a role's sessions.
@@ -940,6 +997,22 @@ pub struct MissionConfig {
     /// rubber-stamp signals — a flag on a report row, never an enforcement.
     /// The default (10s) is the docs/metrics.md §2 bucket made configurable.
     pub rubber_stamp_threshold_ms: u64,
+    /// Heterogeneous dispatch pool (ticket `heterogeneous-dispatch-pool`,
+    /// KRZ-303; the positioning ADR's 2026-07-31 boundary gloss). Empty (the
+    /// default) is today's single-backend worker behavior EXACTLY. With ≥2
+    /// candidates, every worker feature — the unit of work — is dispatched to
+    /// ALL of them concurrently, one git worktree per stream, and every
+    /// output is recorded as a sibling [`CandidateLink`]ed run: a candidate
+    /// for judgement, never auto-merged into a winner (no code path selects
+    /// or merges one), and the mission then parks for the human judgement act
+    /// the follow-up divergence ticket surfaces. The claimed value is
+    /// divergence for scrutiny, never throughput; cost multiplies by N and
+    /// the approval-time estimate prices the SUM. `config::validate` rejects
+    /// a 1-entry list (use `worker.backend`), `local`/`acp` entries (no
+    /// per-candidate endpoint config in this pass), and combining the pool
+    /// with `maxParallelWorkers > 1` (a different fan-out model).
+    #[serde(default)]
+    pub worker_candidates: Vec<CandidateSpec>,
 }
 
 impl Default for MissionConfig {
@@ -1022,6 +1095,7 @@ impl Default for MissionConfig {
             workspace: WorkspaceConfig::default(),
             pack_dir: None,
             rubber_stamp_threshold_ms: DEFAULT_RUBBER_STAMP_THRESHOLD_MS,
+            worker_candidates: vec![],
         }
     }
 }

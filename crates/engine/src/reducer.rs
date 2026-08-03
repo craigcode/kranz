@@ -199,6 +199,7 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             role,
             feature_id,
             milestone_id,
+            candidate,
             sdk_session_id,
             model,
             quant,
@@ -217,8 +218,12 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             if let Some(fid) = feature_id {
                 let feature = feature_mut(state, fid)?;
                 feature.worker_runs.push(run_id.clone());
-                // A 2nd+ run on the same feature is a respawn.
-                if feature.worker_runs.len() > 1 {
+                // A 2nd+ run on the same feature is a respawn — EXCEPT a
+                // dispatch-pool candidate (KRZ-303): the N sibling streams
+                // are ONE logical dispatch of the unit, not N-1 retries, and
+                // the pool path has no judgement-driven respawn loop at all,
+                // so counting them would silently deplete `max_respawns`.
+                if feature.worker_runs.len() > 1 && candidate.is_none() {
                     feature.respawns += 1;
                 }
             }
@@ -229,6 +234,7 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
                     role: *role,
                     feature_id: feature_id.clone(),
                     milestone_id: milestone_id.clone(),
+                    candidate: candidate.clone(),
                     sdk_session_id: sdk_session_id.clone(),
                     model: model.clone(),
                     quant: quant.clone(),

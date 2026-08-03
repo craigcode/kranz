@@ -504,6 +504,7 @@ pub(crate) async fn mission_revision_diff(
         calibration.missions_used,
         &no_lint,
         &[],
+        &state.config.worker_candidates,
     );
     Ok(Json(json!({
         "revision": pending.revision,
