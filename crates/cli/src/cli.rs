@@ -495,6 +495,31 @@ pub enum Command {
         out: Option<PathBuf>,
     },
 
+    /// Export the provenance-tagged training corpus as JSONL (KRZ-332).
+    ///
+    /// One tagged record per line (`source`: worker-trace / divergence /
+    /// escalation): validation-PASSED worker traces, divergence
+    /// comparison+resolution pairs, and escalation-ledger human judgments —
+    /// every record carrying the provenance refs (mission, backend/model,
+    /// run id, gate-chain seqs) that resolve it through `kranz provenance`.
+    /// Derived and regenerable like export-traces (which stays a
+    /// traces-only contract): same logs in, byte-identical JSONL out.
+    ExportCorpus {
+        /// The mission id (defaults to the global --mission / auto-selection;
+        /// ignored with --all)
+        mission_id: Option<String>,
+
+        /// Aggregate the corpus across every mission under .kranz/missions
+        /// (ids sorted). A mission whose event log is missing, unreadable,
+        /// or corrupt is skipped, not fatal.
+        #[arg(long)]
+        all: bool,
+
+        /// Write the JSONL output to this path instead of stdout.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+    },
+
     /// Inspect and edit kranz configuration (files + mid-mission changes).
     ///
     /// Config resolves from three layers, later winning: compiled-in defaults

@@ -231,6 +231,40 @@ fn parses_export_traces() {
 }
 
 #[test]
+fn corpus_export_cli_parses() {
+    let cli = Cli::try_parse_from(["kranz", "export-corpus"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Command::ExportCorpus {
+            mission_id: None,
+            all: false,
+            out: None,
+        }
+    ));
+
+    let cli = Cli::try_parse_from(["kranz", "export-corpus", "m-1"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Command::ExportCorpus {
+            mission_id: Some(ref id),
+            all: false,
+            out: None,
+        } if id == "m-1"
+    ));
+
+    let cli =
+        Cli::try_parse_from(["kranz", "export-corpus", "--all", "--out", "corpus.jsonl"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Command::ExportCorpus {
+            mission_id: None,
+            all: true,
+            out: Some(ref path),
+        } if path == std::path::Path::new("corpus.jsonl")
+    ));
+}
+
+#[test]
 fn parses_pause_and_resume() {
     assert!(matches!(
         Cli::try_parse_from(["kranz", "pause"]).unwrap().command,
@@ -789,6 +823,181 @@ fn export_traces_all_aggregates_and_skips_unreadable_missions() {
     let value: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
     assert_eq!(value["runId"], "w-a-pass");
     assert_eq!(value["missionId"], "m-a");
+}
+
+/// Seed a mission exercising all three corpus sources: a validation-PASSED
+/// worker run, a divergence noted+resolved (its second candidate stream
+/// spawned but never completed — an unvalidated session), and an approved
+/// grant park.
+fn write_corpus_mission(repo: &Path, mission_id: &str) {
+    write_events(
+        repo,
+        mission_id,
+        vec![
+            created_kind("ship it", mission_id),
+            EventKind::PlanApproved {
+                plan: sample_plan(),
+                base_sha: None,
+            },
+            EventKind::MilestoneStarted {
+                milestone_id: "ms-1".to_string(),
+                start_sha: "abc123".to_string(),
+            },
+            EventKind::FeatureStarted {
+                feature_id: "f-1-1".to_string(),
+            },
+            EventKind::WorkerSpawned {
+                run_id: "w-pass".to_string(),
+                role: Role::Worker,
+                feature_id: Some("f-1-1".to_string()),
+                milestone_id: None,
+                candidate: None,
+                sdk_session_id: "sess-pass".to_string(),
+                model: "sonnet".to_string(),
+                quant: "n/a".to_string(),
+                weight_hash: None,
+                prompt_hash: "hash".to_string(),
+                transcript_path: "runs/w-pass.jsonl".to_string(),
+            },
+            EventKind::WorkerCompleted {
+                run_id: "w-pass".to_string(),
+                result: RunResult::Pass,
+                tokens: TokenUsage::default(),
+                cost_usd: None,
+                report: Some(WorkerReport {
+                    result: RunResult::Pass,
+                    summary: "built feature one".to_string(),
+                    files_touched: vec![],
+                    tests_added: vec![],
+                    test_evidence: "cargo test: ok".to_string(),
+                    dependencies_added: vec![],
+                    known_gaps: vec![],
+                    commits: vec!["abc feature one".to_string()],
+                    commands_run: vec![],
+                }),
+            },
+            EventKind::FeatureCompleted {
+                feature_id: "f-1-1".to_string(),
+                commits: vec!["abc feature one".to_string()],
+            },
+            EventKind::WorkerSpawned {
+                run_id: "w-cand".to_string(),
+                role: Role::Worker,
+                feature_id: Some("f-1-1".to_string()),
+                milestone_id: None,
+                candidate: None,
+                sdk_session_id: "sess-cand".to_string(),
+                model: "gpt-5".to_string(),
+                quant: "n/a".to_string(),
+                weight_hash: None,
+                prompt_hash: "hash".to_string(),
+                transcript_path: "runs/w-cand.jsonl".to_string(),
+            },
+            EventKind::DivergenceNoted {
+                unit: "f-1-1".to_string(),
+                candidates: vec![
+                    DivergenceCandidate {
+                        run_id: "w-pass".to_string(),
+                        branch: format!("kranz/pool/{mission_id}/f-1-1-c0"),
+                        backend: "claude".to_string(),
+                        tree: "aaa".to_string(),
+                    },
+                    DivergenceCandidate {
+                        run_id: "w-cand".to_string(),
+                        branch: format!("kranz/pool/{mission_id}/f-1-1-c1"),
+                        backend: "codex".to_string(),
+                        tree: "bbb".to_string(),
+                    },
+                ],
+                diverged: true,
+            },
+            EventKind::DivergenceResolved {
+                unit: "f-1-1".to_string(),
+                selected: Some(0),
+                reason: "kept the first candidate".to_string(),
+                decided_by: "operator".to_string(),
+            },
+            EventKind::GrantRequested {
+                milestone_id: "ms-1".to_string(),
+                kind: GrantKind::Command,
+                command: "cargo test".to_string(),
+            },
+            EventKind::GrantApproved {
+                kind: GrantKind::Command,
+                command: "cargo test".to_string(),
+            },
+            EventKind::MilestoneCompleted {
+                milestone_id: "ms-1".to_string(),
+                tag: None,
+            },
+        ],
+    );
+}
+
+#[test]
+fn corpus_export_cli_is_regenerable_and_covers_all_sources() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+    write_corpus_mission(repo, "m-corpus");
+
+    let first = commands::cmd_export_corpus(repo, "m-corpus").unwrap();
+    let second = commands::cmd_export_corpus(repo, "m-corpus").unwrap();
+    assert_eq!(
+        first, second,
+        "export-corpus must be byte-identical across consecutive invocations"
+    );
+
+    let lines: Vec<&str> = first.lines().collect();
+    assert_eq!(lines.len(), 3, "one record per source: {first}");
+    let records: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+
+    // worker-trace: provenance-tagged (backend derived, gate chain present
+    // though empty on this gateless fixture); the unvalidated w-cand stream
+    // never enters the corpus as a trace.
+    assert_eq!(records[0]["source"], "worker-trace");
+    assert_eq!(records[0]["runId"], "w-pass");
+    assert_eq!(records[0]["missionId"], "m-corpus");
+    assert_eq!(records[0]["backend"], "claude");
+    assert!(records[0]["gateChain"].is_array());
+    // divergence: both candidates and the resolution.
+    assert_eq!(records[1]["source"], "divergence");
+    assert_eq!(records[1]["candidates"][0]["runId"], "w-pass");
+    assert_eq!(records[1]["candidates"][1]["runId"], "w-cand");
+    assert_eq!(records[1]["resolution"]["selected"], 0);
+    assert_eq!(records[1]["resolution"]["decidedBy"], "operator");
+    // escalation: the approved grant park as a labeled judgment.
+    assert_eq!(records[2]["source"], "escalation");
+    assert_eq!(records[2]["kind"], "grant");
+    assert_eq!(records[2]["ask"], "command: cargo test");
+    assert_eq!(records[2]["decision"], "approved");
+    assert!(records[2]["askSeq"].is_number());
+}
+
+#[test]
+fn corpus_export_all_aggregates_and_skips_unreadable_missions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+    write_corpus_mission(repo, "m-a");
+    // A second mission directory whose event log is missing entirely — must
+    // be skipped, not fatal, for --all.
+    fs::create_dir_all(repo.join(".kranz/missions/m-broken")).unwrap();
+
+    let jsonl = commands::cmd_export_corpus_all(repo);
+    let lines: Vec<&str> = jsonl.lines().collect();
+    assert_eq!(
+        lines.len(),
+        3,
+        "m-a's three records, m-broken skipped: {jsonl}"
+    );
+    for line in &lines {
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(value["missionId"], "m-a");
+    }
+    // Aggregation is deterministic too: same tree in, same bytes out.
+    assert_eq!(jsonl, commands::cmd_export_corpus_all(repo));
 }
 
 #[test]

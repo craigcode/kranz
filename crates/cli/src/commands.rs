@@ -15,6 +15,7 @@ use kranz_engine::backend::AgentBackend;
 use kranz_engine::backend_claude::ClaudeBackend;
 use kranz_engine::config;
 use kranz_engine::control;
+use kranz_engine::corpus_export;
 use kranz_engine::cost;
 use kranz_engine::event_log::{EventLog, LockForce};
 use kranz_engine::mission_catalog;
@@ -154,6 +155,26 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             match out {
                 Some(path) => std::fs::write(&path, &jsonl).with_context(|| {
                     format!("writing export-traces output to {}", path.display())
+                })?,
+                None => print!("{jsonl}"),
+            }
+            Ok(0)
+        }
+        Command::ExportCorpus {
+            mission_id,
+            all,
+            out,
+        } => {
+            let jsonl = if all {
+                cmd_export_corpus_all(&repo)
+            } else {
+                let mission =
+                    select_mission(&repo, mission_id.as_deref().or(cli.mission.as_deref()))?;
+                cmd_export_corpus(&repo, &mission)?
+            };
+            match out {
+                Some(path) => std::fs::write(&path, &jsonl).with_context(|| {
+                    format!("writing export-corpus output to {}", path.display())
                 })?,
                 None => print!("{jsonl}"),
             }
@@ -632,6 +653,47 @@ pub fn cmd_export_traces_all(repo: &Path) -> String {
         pairs.extend(trace_export::export_validated_traces(&state, &events));
     }
     trace_export::to_jsonl(&pairs)
+}
+
+/// Read a mission's event log, derive the provenance-tagged training corpus
+/// (validated worker traces + divergence pairs + escalation judgments), and
+/// render it as JSONL. Pure function of the on-disk event log (no persisted
+/// dataset file), so consecutive invocations over an unchanged log are
+/// byte-identical. No-follow like every read that probes the mission dir
+/// (the corpus anchors the provenance replay's artefact resolution there).
+pub fn cmd_export_corpus(repo: &Path, mission_id: &str) -> Result<String> {
+    let paths = require_mission(repo, mission_id)?;
+    paths.require_no_follow()?;
+    let events = EventLog::read_events(&paths.events_file())
+        .with_context(|| format!("reading the event log of mission '{mission_id}'"))?;
+    let records = corpus_export::export_corpus(&paths.mission_dir(), mission_id, &events)
+        .with_context(|| format!("deriving the training corpus of mission '{mission_id}'"))?;
+    Ok(corpus_export::to_jsonl(&records))
+}
+
+/// `--all`: aggregate the corpus across every mission under .kranz/missions
+/// (ids sorted, so the aggregate's mission order is deterministic). A
+/// mission whose event log is missing, unreadable, or corrupt — or whose
+/// path fails the no-follow guard — is skipped rather than failing the
+/// whole export, mirroring `cmd_export_traces_all`.
+pub fn cmd_export_corpus_all(repo: &Path) -> String {
+    let mut records = Vec::new();
+    for mission_id in MissionPaths::list_missions(repo) {
+        let paths = MissionPaths::new(repo, &mission_id);
+        if paths.require_no_follow().is_err() {
+            continue;
+        }
+        let Ok(events) = EventLog::read_events(&paths.events_file()) else {
+            continue;
+        };
+        let Ok(mission_records) =
+            corpus_export::export_corpus(&paths.mission_dir(), &mission_id, &events)
+        else {
+            continue;
+        };
+        records.extend(mission_records);
+    }
+    corpus_export::to_jsonl(&records)
 }
 
 /// Loud multi-line warning on stderr for `--dangerously-allow-all`.

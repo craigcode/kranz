@@ -28,6 +28,7 @@ pub mod contract_gates;
 pub mod contract_health;
 pub mod contract_lint;
 pub mod contract_sweep;
+pub mod corpus_export;
 pub mod cost;
 pub mod decompose;
 pub mod deps;
