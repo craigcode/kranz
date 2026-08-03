@@ -24,7 +24,7 @@
 # under ${KRANZ_LEASE_DIR:-$CITY/.gc/kranz-leases}/ renewed while this mission
 # runs and removed on any terminal exit ($CITY here is the city directory
 # passed as $1 by kranz-city-worker, which kranz-dispatch resolved from
-# $GC_CITY and wrote into the spool .env). The lease line is
+# $GC_CITY and wrote into the spool .json). The lease line is
 # `<pid> <unix-ts> <start-token>`, the token being this process's start
 # time (`ps -o lstart=`, normalized for plain string equality) — the
 # sweep's way to tell "pid alive and provably this claimant" from a

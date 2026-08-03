@@ -24,19 +24,19 @@
 # one call, first-wins, and is idempotent if this dispatcher already holds
 # the claim. If the claim fails — lost the race to another dispatcher, or
 # any other bd error — the bead is skipped SILENTLY: no comment, no spool
-# files, no orphan .md/.env pair.
+# files, no orphan .md/.json entry.
 #
 # Claim rollback on abandonment (shipped): once the claim above succeeds,
 # every path in the loop body that gives up on the bead BEFORE both spool
 # files are written removes any spool file already written for that
-# stamp/id (`rm -f` on both the .md and .env, whichever exist) and releases
+# stamp/id (`rm -f` on both the .md and .json, whichever exist) and releases
 # that claim — `gc bd update "$ID" --status open --assignee ""` (dialect doc
 # §2's verified `-a/--assignee`; an empty string clears it, confirmed by an
 # executed probe against upstream `bd` directly — the `gc bd` pass-through
 # used here is unverified, per dialect doc §2) — then continues, so the bead
-# is returned to open and unassigned with no partial spool pair left behind.
+# is returned to open and unassigned with no partial spool entry left behind.
 # This covers a `gc bd show` failure and a failure writing either the .md or
-# .env spool file. The lost-race path (the `--claim` call itself failing) is
+# .json spool file. The lost-race path (the `--claim` call itself failing) is
 # unaffected and stays silent: no comment, no spool files, no rollback needed
 # because no claim was ever taken.
 #
@@ -170,14 +170,14 @@ lease_pid_token() {
     ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
 }
 
-# Drop a bead's spool pair (.md/.env, any stamp) alongside a claim release.
-# A released bead returns to open and WILL be re-dispatched by a later
-# drain; with the stale pair still present that re-dispatch spools a SECOND
-# brief for one bead and the city-worker runs two missions (the verified
-# claimed-and-spooled defect). rm -f on a non-matching glob's literal is a
-# no-op, so an absent pair costs nothing.
+# Drop a bead's spool entry (.md/.json/.inflight, any stamp) alongside a
+# claim release. A released bead returns to open and WILL be re-dispatched
+# by a later drain; with the stale entry still present that re-dispatch
+# spools a SECOND brief for one bead and the city-worker runs two missions
+# (the verified claimed-and-spooled defect). rm -f on a non-matching
+# glob's literal is a no-op, so an absent file costs nothing.
 remove_spool_pair() {
-    rm -f "$SPOOL"/*-"$1".md "$SPOOL"/*-"$1".env
+    rm -f "$SPOOL"/*-"$1".md "$SPOOL"/*-"$1".json "$SPOOL"/*-"$1".inflight
 }
 
 reclaim_sweep() {
@@ -249,11 +249,17 @@ reclaim_sweep() {
                 # prints a row iff the process EXISTS, across owners.
                 if [ -z "$(ps -o pid= -p "$PID" 2>/dev/null)" ]; then
                     # DEAD with positive proof: release claim, lease, and
-                    # stale spool pair together (see remove_spool_pair).
-                    gc bd update "$CID" --status open --assignee "" >/dev/null 2>&1
-                    rm -f "$LEASE_FILE"
-                    remove_spool_pair "$CID"
-                    echo "kranz-dispatch: reclaim sweep released dead claim $CID (pid $PID gone)"
+                    # stale spool entry together (see remove_spool_pair) —
+                    # but ONLY on a confirmed release. A transient City
+                    # failure must not destroy the only copy of the queued
+                    # brief while the bead stays claimed (12th-pass review).
+                    if gc bd update "$CID" --status open --assignee "" >/dev/null 2>&1; then
+                        rm -f "$LEASE_FILE"
+                        remove_spool_pair "$CID"
+                        echo "kranz-dispatch: reclaim sweep released dead claim $CID (pid $PID gone)"
+                    else
+                        echo "kranz-dispatch: reclaim sweep could not release $CID (bd update failed); claim, lease, and spool entry LEFT INTACT" >&2
+                    fi
                     continue
                 fi
                 # EPERM-class Unknown: a process exists but is not ours to
@@ -273,13 +279,18 @@ reclaim_sweep() {
         # skews the comparison by the host's UTC offset if left unwrapped).
         UPDATED=$(TZ=UTC0 date -j -f '%Y-%m-%dT%H:%M:%S' "$UPDATED" +%s 2>/dev/null || TZ=UTC0 date -d "$UPDATED" +%s 2>/dev/null || echo 0)
         if [ "$UPDATED" -gt 0 ] && [ $((NOW - UPDATED)) -ge "$TTL" ]; then
-            # Release the claim AND the stale spool pair (and any wedged
-            # lease file) as one unit: the bead re-enters open exactly once
-            # reclaimable, never double-spooled.
-            gc bd update "$CID" --status open --assignee "" >/dev/null 2>&1
-            rm -f "$LEASE_FILE"
-            remove_spool_pair "$CID"
-            echo "kranz-dispatch: reclaim sweep released stale claim $CID (idle $((NOW - UPDATED))s > ${TTL}s)"
+            # Release the claim AND the stale spool entry (and any wedged
+            # lease file) as one unit — only when the release is CONFIRMED;
+            # a failed bd update leaves everything intact (the bead re-enters
+            # open exactly once reclaimable, never double-spooled, and never
+            # brief-less).
+            if gc bd update "$CID" --status open --assignee "" >/dev/null 2>&1; then
+                rm -f "$LEASE_FILE"
+                remove_spool_pair "$CID"
+                echo "kranz-dispatch: reclaim sweep released stale claim $CID (idle $((NOW - UPDATED))s > ${TTL}s)"
+            else
+                echo "kranz-dispatch: reclaim sweep could not release $CID (bd update failed); claim, lease, and spool entry LEFT INTACT" >&2
+            fi
         fi
     done
 }
@@ -348,14 +359,18 @@ for ID in $READY; do
         printf '## Scoping answers\nNo human is available during this run. Prefer the smallest faithful interpretation; if materially ambiguous, block rather than guess. Validators stay enabled.\n\n'
         printf '## Acceptance hints\n%s\n' "${ACCEPT:-The goal above is demonstrably met.}"
     } > "$MFILE" || {
-        rm -f "$SPOOL/$STAMP-$ID.md" "$SPOOL/$STAMP-$ID.env"
+        rm -f "$SPOOL/$STAMP-$ID.md" "$SPOOL/$STAMP-$ID.json"
         release_claim
         continue
     }
-    {
-        printf 'ID=%s\nCITY=%s\nRIG_DIR=%s\nMAX_CYCLES=%s\n' "$ID" "$CITY" "$RIG_DIR" "$MAX_CYCLES"
-    } > "$SPOOL/$STAMP-$ID.env" || {
-        rm -f "$SPOOL/$STAMP-$ID.md" "$SPOOL/$STAMP-$ID.env"
+    # The spool record is DATA, not shell: JSON written by jq (values are
+    # escaped by construction — a metacharacter-bearing rig path or bead id
+    # can never become code), parsed by the worker with jq, never sourced
+    # (12th-pass review: sourcing the spool was arbitrary code execution in
+    # the unsanitized city worker).
+    jq -n --arg id "$ID" --arg city "$CITY" --arg rig "$RIG_DIR" --arg cycles "$MAX_CYCLES" \
+        '{id:$id, city:$city, rigDir:$rig, maxCycles:$cycles}' > "$SPOOL/$STAMP-$ID.json" || {
+        rm -f "$SPOOL/$STAMP-$ID.md" "$SPOOL/$STAMP-$ID.json"
         release_claim
         continue
     }

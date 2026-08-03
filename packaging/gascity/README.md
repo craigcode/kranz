@@ -131,4 +131,3 @@ only as the backstop for lease-less (ambiguous) claims, which closes the
 failure mode that got the heuristic reverted. Residual window, documented
 rather than hidden: a claim between spool-write and a worker's first
 heartbeat is TTL-only.
-

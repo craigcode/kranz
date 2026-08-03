@@ -619,9 +619,11 @@ STUBEOF
         for SID in "$SPOOLGUARD_ID" "$SPOOLDEAD_ID" "$SPOOLKEEP_ID"; do
             BD update "$SID" --add-label kranz >/dev/null 2>&1
             BD update "$SID" --claim >/dev/null 2>&1
-            # Spool pairs exactly as the dispatch loop writes them.
+            # Spool entries exactly as the dispatch loop writes them: a
+            # markdown brief plus a jq-escaped JSON record (never shell).
             printf 'brief\n' > "$SPOOL_DIR/1690000000-$SID.md"
-            printf 'ID=%s\n' "$SID" > "$SPOOL_DIR/1690000000-$SID.env"
+            jq -n --arg id "$SID" --arg city "$CITY_DIR" --arg rig "$RIG_DIR" --arg cycles "1" \
+                '{id:$id, city:$city, rigDir:$rig, maxCycles:$cycles}' > "$SPOOL_DIR/1690000000-$SID.json"
         done
         # Lease-less stale claim (TTL backstop cell).
         rm -f "$LEASE_DIR/$SPOOLGUARD_ID.lease"
@@ -638,7 +640,7 @@ STUBEOF
             "$BIN_DIR/kranz-dispatch" --reclaim >/dev/null 2>&1
         SPOOL_FRESH_STATUS=$(status_of "$SPOOLGUARD_ID")
         SPOOL_FRESH_PAIR=missing
-        [ -f "$SPOOL_DIR/1690000000-$SPOOLGUARD_ID.md" ] && [ -f "$SPOOL_DIR/1690000000-$SPOOLGUARD_ID.env" ] && SPOOL_FRESH_PAIR=present
+        [ -f "$SPOOL_DIR/1690000000-$SPOOLGUARD_ID.md" ] && [ -f "$SPOOL_DIR/1690000000-$SPOOLGUARD_ID.json" ] && SPOOL_FRESH_PAIR=present
 
         # Same one-second wall-clock guard the other TTL=0 cases carry.
         sleep 1
@@ -652,13 +654,13 @@ STUBEOF
         SPOOL_STALE_MD=gone
         [ -e "$SPOOL_DIR/1690000000-$SPOOLGUARD_ID.md" ] && SPOOL_STALE_MD=present
         SPOOL_STALE_ENV=gone
-        [ -e "$SPOOL_DIR/1690000000-$SPOOLGUARD_ID.env" ] && SPOOL_STALE_ENV=present
+        [ -e "$SPOOL_DIR/1690000000-$SPOOLGUARD_ID.json" ] && SPOOL_STALE_ENV=present
         SPOOL_DEAD_STATUS=$(status_of "$SPOOLDEAD_ID")
         SPOOL_DEAD_PAIR=missing
-        [ -f "$SPOOL_DIR/1690000000-$SPOOLDEAD_ID.md" ] && [ -f "$SPOOL_DIR/1690000000-$SPOOLDEAD_ID.env" ] && SPOOL_DEAD_PAIR=present
+        [ -f "$SPOOL_DIR/1690000000-$SPOOLDEAD_ID.md" ] && [ -f "$SPOOL_DIR/1690000000-$SPOOLDEAD_ID.json" ] && SPOOL_DEAD_PAIR=present
         SPOOL_KEEP_STATUS=$(status_of "$SPOOLKEEP_ID")
         SPOOL_KEEP_PAIR=missing
-        [ -f "$SPOOL_DIR/1690000000-$SPOOLKEEP_ID.md" ] && [ -f "$SPOOL_DIR/1690000000-$SPOOLKEEP_ID.env" ] && SPOOL_KEEP_PAIR=present
+        [ -f "$SPOOL_DIR/1690000000-$SPOOLKEEP_ID.md" ] && [ -f "$SPOOL_DIR/1690000000-$SPOOLKEEP_ID.json" ] && SPOOL_KEEP_PAIR=present
 
         if [ "$SPOOL_FRESH_STATUS" != "in_progress" ] || [ "$SPOOL_FRESH_PAIR" != "present" ]; then
             fail_case "reclaim-spool-fresh-kept" "lease-less spooled claim+pair kept inside a huge TTL" "status=$SPOOL_FRESH_STATUS pair=$SPOOL_FRESH_PAIR"
@@ -1050,12 +1052,12 @@ else
 
     NONFATAL_STATUS=$(status_of "$NONFATAL_ID")
     NONFATAL_MFILE=$(ls "$NONFATAL_SPOOL_DIR"/*-"$NONFATAL_ID".md 2>/dev/null | head -1)
-    NONFATAL_EFILE=$(ls "$NONFATAL_SPOOL_DIR"/*-"$NONFATAL_ID".env 2>/dev/null | head -1)
+    NONFATAL_EFILE=$(ls "$NONFATAL_SPOOL_DIR"/*-"$NONFATAL_ID".json 2>/dev/null | head -1)
 
     if [ "$NONFATAL_STATUS" != "in_progress" ]; then
         fail_case "sweep-nonfatal-drain-status" "in_progress (drain proceeded despite the sweep's bd list failure)" "$NONFATAL_STATUS"
     elif [ -z "$NONFATAL_MFILE" ] || [ -z "$NONFATAL_EFILE" ]; then
-        fail_case "sweep-nonfatal-spool-pair" "both .md and .env spool files for $NONFATAL_ID" "md='$NONFATAL_MFILE' env='$NONFATAL_EFILE'"
+        fail_case "sweep-nonfatal-spool-pair" "both .md and .json spool files for $NONFATAL_ID" "md='$NONFATAL_MFILE' env='$NONFATAL_EFILE'"
     else
         echo "SWEEP-NONFATAL: PASS (a failing bd list inside the sweep does not abort the dispatch drain that follows)"
     fi
@@ -1144,7 +1146,7 @@ fi
 # via the atomic `--claim` call inside kranz-dispatch, then `gc bd show
 # "$ID" --json` fails. Per the rollback shipped in kranz-dispatch's spool-write failure handling
 # (`release_claim`), the bead must be returned to open/unassigned rather
-# than left claimed with no spool entry, and no .md/.env pair must exist for
+# than left claimed with no spool entry, and no .md/.json pair must exist for
 # it. The stub keeps its own call log (same style as the FIELDS stub below)
 # so this case can assert POSITIVELY that a claim was actually taken and
 # then released, rather than only asserting a final state that a no-op
@@ -1212,7 +1214,7 @@ STUBEOF
     SHOWFAIL_STATUS=$(status_of "$SHOWFAIL_ID")
     SHOWFAIL_ASSIGNEE=$(BD show "$SHOWFAIL_ID" --json 2>/dev/null | unwrap | jq -r '.assignee // empty')
     SHOWFAIL_MFILE=$(ls "$SHOWFAIL_SPOOL_DIR"/*-"$SHOWFAIL_ID".md 2>/dev/null | head -1)
-    SHOWFAIL_EFILE=$(ls "$SHOWFAIL_SPOOL_DIR"/*-"$SHOWFAIL_ID".env 2>/dev/null | head -1)
+    SHOWFAIL_EFILE=$(ls "$SHOWFAIL_SPOOL_DIR"/*-"$SHOWFAIL_ID".json 2>/dev/null | head -1)
 
     if ! grep -qE "update ${SHOWFAIL_ID} --claim\$" "$SHOWFAIL_CALLS_LOG" 2>/dev/null; then
         fail_case "showfail-claim-taken" "gc-calls log to record an atomic claim (update $SHOWFAIL_ID --claim) before the rollback" "$(cat "$SHOWFAIL_CALLS_LOG" 2>/dev/null)"
@@ -1225,23 +1227,23 @@ STUBEOF
     elif [ -n "$SHOWFAIL_MFILE" ]; then
         fail_case "showfail-no-orphan-md" "no .md spool file for $SHOWFAIL_ID" "found: $SHOWFAIL_MFILE"
     elif [ -n "$SHOWFAIL_EFILE" ]; then
-        fail_case "showfail-no-orphan-env" "no .env spool file for $SHOWFAIL_ID" "found: $SHOWFAIL_EFILE"
+        fail_case "showfail-no-orphan-env" "no .json spool file for $SHOWFAIL_ID" "found: $SHOWFAIL_EFILE"
     else
         echo "SHOWFAIL: PASS (claim rolled back to open/unassigned and no orphan spool pair when gc bd show fails after a successful claim)"
     fi
 fi
 
-# --- Case: the .env-write failure — the ONLY path on which an orphan .md
+# --- Case: the .json-write failure — the ONLY path on which an orphan .md
 # can ever exist. SHOWFAIL above forces `gc bd show` to fail BEFORE either
 # spool file is opened, so its no-orphan-md/no-orphan-env assertions hold
 # vacuously with respect to the `rm -f` rollback (bin/kranz-dispatch's
-# second `rm -f "$SPOOL/$STAMP-$ID.md" "$SPOOL/$STAMP-$ID.env"`, in the
-# branch where the .md write already succeeded and the .env write then
+# second `rm -f "$SPOOL/$STAMP-$ID.md" "$SPOOL/$STAMP-$ID.json"`, in the
+# branch where the .md write already succeeded and the .json write then
 # fails) — they would still pass with both `rm -f` lines deleted. This case
 # drives that branch for real: `date` is stubbed on PATH so the dispatch
 # subshell's `STAMP=$(date +%s)` is pinned to a known value (`+%s` returns a
 # fixed constant; every other invocation execs the real /bin/date), which
-# lets this case pre-create the exact `$SPOOL/<stamp>-<id>.env` path as a
+# lets this case pre-create the exact `$SPOOL/<stamp>-<id>.json` path as a
 # read-only (chmod 444) placeholder file before dispatch ever runs. Opening
 # that path for truncating write then fails with EACCES (verified below:
 # the negative-control run shows the placeholder's content is untouched),
@@ -1252,7 +1254,7 @@ fi
 
 ENVFAIL_UID=$(id -u 2>/dev/null || echo "")
 if [ "$ENVFAIL_UID" = "0" ]; then
-    echo "ENVFAIL: SKIP (running as root — chmod 444 does not block root's own writes, so the .env-write failure cannot be constructed reliably)"
+    echo "ENVFAIL: SKIP (running as root — chmod 444 does not block root's own writes, so the .json-write failure cannot be constructed reliably)"
 else
     ENVFAIL_STAMP="1700000000"
 
@@ -1268,10 +1270,10 @@ else
         mkdir -p "$ENVFAIL_SPOOL_DIR" "$ENVFAIL_STUB_BIN"
         : > "$ENVFAIL_CALLS_LOG"
 
-        # Pre-create the exact .env path dispatch will compute (fixed stamp,
+        # Pre-create the exact .json path dispatch will compute (fixed stamp,
         # known id) as a read-only placeholder, so the redirect inside
         # dispatch cannot open it for writing.
-        ENVFAIL_ENV_PATH="$ENVFAIL_SPOOL_DIR/$ENVFAIL_STAMP-$ENVFAIL_ID.env"
+        ENVFAIL_ENV_PATH="$ENVFAIL_SPOOL_DIR/$ENVFAIL_STAMP-$ENVFAIL_ID.json"
         : > "$ENVFAIL_ENV_PATH"
         chmod 444 "$ENVFAIL_ENV_PATH"
 
@@ -1330,26 +1332,26 @@ STUBEOF
         ENVFAIL_STATUS=$(status_of "$ENVFAIL_ID")
         ENVFAIL_ASSIGNEE=$(BD show "$ENVFAIL_ID" --json 2>/dev/null | unwrap | jq -r '.assignee // empty')
         ENVFAIL_MFILE=$(ls "$ENVFAIL_SPOOL_DIR"/*-"$ENVFAIL_ID".md 2>/dev/null | head -1)
-        ENVFAIL_EFILE=$(ls "$ENVFAIL_SPOOL_DIR"/*-"$ENVFAIL_ID".env 2>/dev/null | head -1)
+        ENVFAIL_EFILE=$(ls "$ENVFAIL_SPOOL_DIR"/*-"$ENVFAIL_ID".json 2>/dev/null | head -1)
         ENVFAIL_CLAIM_LINE=$(grep -nE "update ${ENVFAIL_ID} --claim\$" "$ENVFAIL_CALLS_LOG" 2>/dev/null | head -1 | cut -d: -f1)
         ENVFAIL_RELEASE_LINE=$(grep -nE "update ${ENVFAIL_ID} --status open --assignee" "$ENVFAIL_CALLS_LOG" 2>/dev/null | head -1 | cut -d: -f1)
 
         if [ -z "$ENVFAIL_CLAIM_LINE" ]; then
             fail_case "envfail-claim-taken" "gc-calls log to record an atomic claim (update $ENVFAIL_ID --claim) before the rollback" "$(cat "$ENVFAIL_CALLS_LOG" 2>/dev/null)"
         elif [ -z "$ENVFAIL_RELEASE_LINE" ]; then
-            fail_case "envfail-claim-released" "gc-calls log to record the rollback release (update $ENVFAIL_ID --status open --assignee) after the .env write failure" "$(cat "$ENVFAIL_CALLS_LOG" 2>/dev/null)"
+            fail_case "envfail-claim-released" "gc-calls log to record the rollback release (update $ENVFAIL_ID --status open --assignee) after the .json write failure" "$(cat "$ENVFAIL_CALLS_LOG" 2>/dev/null)"
         elif [ "$ENVFAIL_CLAIM_LINE" -ge "$ENVFAIL_RELEASE_LINE" ]; then
             fail_case "envfail-claim-then-release-order" "the claim (line $ENVFAIL_CLAIM_LINE) to precede the release (line $ENVFAIL_RELEASE_LINE) in the call log" "$(cat "$ENVFAIL_CALLS_LOG" 2>/dev/null)"
         elif [ "$ENVFAIL_STATUS" != "open" ]; then
             fail_case "envfail-status-rolled-back" "open" "$ENVFAIL_STATUS"
         elif [ -n "$ENVFAIL_ASSIGNEE" ]; then
-            fail_case "envfail-assignee-cleared" "assignee cleared (empty) after a .env spool-write failure post-claim" "'$ENVFAIL_ASSIGNEE'"
+            fail_case "envfail-assignee-cleared" "assignee cleared (empty) after a .json spool-write failure post-claim" "'$ENVFAIL_ASSIGNEE'"
         elif [ -n "$ENVFAIL_MFILE" ]; then
-            fail_case "envfail-no-orphan-md" "no .md spool file for $ENVFAIL_ID (the .md write succeeded but must be rolled back with the .env)" "found: $ENVFAIL_MFILE"
+            fail_case "envfail-no-orphan-md" "no .md spool file for $ENVFAIL_ID (the .md write succeeded but must be rolled back with the .json)" "found: $ENVFAIL_MFILE"
         elif [ -n "$ENVFAIL_EFILE" ]; then
-            fail_case "envfail-no-orphan-env" "no .env spool file for $ENVFAIL_ID" "found: $ENVFAIL_EFILE"
+            fail_case "envfail-no-orphan-env" "no .json spool file for $ENVFAIL_ID" "found: $ENVFAIL_EFILE"
         else
-            echo "ENVFAIL: PASS (claim rolled back to open/unassigned and no orphan spool pair when the .env write fails after a successful .md write)"
+            echo "ENVFAIL: PASS (claim rolled back to open/unassigned and no orphan spool pair when the .json write fails after a successful .md write)"
 
             # --- Negative control: same scenario, but against a SANDBOX
             # COPY of kranz-dispatch with both `rm -f` rollback lines
@@ -1358,7 +1360,7 @@ STUBEOF
             # vacuous one, removing the rollback must make the orphan .md
             # survive.
             ENVFAIL_NOROLLBACK="$SANDBOX/kranz-dispatch-no-rm-f"
-            grep -vF '        rm -f "$SPOOL/$STAMP-$ID.md" "$SPOOL/$STAMP-$ID.env"' \
+            grep -vF '        rm -f "$SPOOL/$STAMP-$ID.md" "$SPOOL/$STAMP-$ID.json"' \
                 "$BIN_DIR/kranz-dispatch" > "$ENVFAIL_NOROLLBACK"
             chmod +x "$ENVFAIL_NOROLLBACK"
 
@@ -1379,7 +1381,7 @@ STUBEOF
                     mkdir -p "$NEGCTL_SPOOL_DIR" "$NEGCTL_STUB_BIN"
                     : > "$NEGCTL_CALLS_LOG"
 
-                    NEGCTL_ENV_PATH="$NEGCTL_SPOOL_DIR/$ENVFAIL_STAMP-$NEGCTL_ID.env"
+                    NEGCTL_ENV_PATH="$NEGCTL_SPOOL_DIR/$ENVFAIL_STAMP-$NEGCTL_ID.json"
                     : > "$NEGCTL_ENV_PATH"
                     chmod 444 "$NEGCTL_ENV_PATH"
 
@@ -1435,9 +1437,9 @@ STUBEOF
                     if [ -z "$NEGCTL_MFILE" ]; then
                         fail_case "envfail-negative-control" "the orphan .md for $NEGCTL_ID to SURVIVE against the sandbox copy with rm -f removed (proves the ENVFAIL case above actually depends on the rollback, not a vacuous pass)" "no .md found — the case cannot fail even with the rollback deleted"
                     elif [ -n "$NEGCTL_ENV_CONTENT" ]; then
-                        fail_case "envfail-negctl-env-write-truly-failed" "the read-only .env placeholder to remain empty (proving the .env write attempt itself failed with EACCES, not merely that content differs)" "'$NEGCTL_ENV_CONTENT'"
+                        fail_case "envfail-negctl-env-write-truly-failed" "the read-only .json placeholder to remain empty (proving the .json write attempt itself failed with EACCES, not merely that content differs)" "'$NEGCTL_ENV_CONTENT'"
                     else
-                        echo "ENVFAIL-NEGATIVE-CONTROL: PASS (against a sandbox copy of kranz-dispatch with both rm -f rollback lines removed, the orphan .md for $NEGCTL_ID survives and the read-only .env placeholder stays untouched — confirms ENVFAIL is a real, non-vacuous test of the rollback, and that the .env write genuinely fails rather than silently succeeding)"
+                        echo "ENVFAIL-NEGATIVE-CONTROL: PASS (against a sandbox copy of kranz-dispatch with both rm -f rollback lines removed, the orphan .md for $NEGCTL_ID survives and the read-only .json placeholder stays untouched — confirms ENVFAIL is a real, non-vacuous test of the rollback, and that the .json write genuinely fails rather than silently succeeding)"
                     fi
                 fi
             fi
@@ -1507,7 +1509,7 @@ STUBEOF
     LOSTRACE_STATUS=$(status_of "$LOSTRACE_ID")
     LOSTRACE_ASSIGNEE=$(BD show "$LOSTRACE_ID" --json 2>/dev/null | unwrap | jq -r '.assignee // empty')
     LOSTRACE_MFILE=$(ls "$LOSTRACE_SPOOL_DIR"/*-"$LOSTRACE_ID".md 2>/dev/null | head -1)
-    LOSTRACE_EFILE=$(ls "$LOSTRACE_SPOOL_DIR"/*-"$LOSTRACE_ID".env 2>/dev/null | head -1)
+    LOSTRACE_EFILE=$(ls "$LOSTRACE_SPOOL_DIR"/*-"$LOSTRACE_ID".json 2>/dev/null | head -1)
 
     if [ "$LOSTRACE_STATUS" != "open" ]; then
         fail_case "lostrace-status-untouched" "open" "$LOSTRACE_STATUS"
@@ -1516,11 +1518,11 @@ STUBEOF
     elif [ -n "$LOSTRACE_MFILE" ]; then
         fail_case "lostrace-no-md" "no .md spool file for $LOSTRACE_ID" "found: $LOSTRACE_MFILE"
     elif [ -n "$LOSTRACE_EFILE" ]; then
-        fail_case "lostrace-no-env" "no .env spool file for $LOSTRACE_ID" "found: $LOSTRACE_EFILE"
+        fail_case "lostrace-no-env" "no .json spool file for $LOSTRACE_ID" "found: $LOSTRACE_EFILE"
     elif grep -qE "bd comment ${LOSTRACE_ID}" "$LOSTRACE_CALLS_LOG" 2>/dev/null; then
         fail_case "lostrace-no-comment" "no gc bd comment call for $LOSTRACE_ID (silent skip)" "$(cat "$LOSTRACE_CALLS_LOG")"
     else
-        echo "LOSTRACE: PASS (a failing claim itself skips silently: no .md/.env, no comment, bead untouched at open/unassigned)"
+        echo "LOSTRACE: PASS (a failing claim itself skips silently: no .md/.json, no comment, bead untouched at open/unassigned)"
     fi
 fi
 
@@ -1900,6 +1902,149 @@ else
         fail_case "retpath-comment-deduped" "still exactly one comment containing m-bea5ed after a second close" "$RETPATH_COUNT2"
     else
         echo "RETURN-PATH: PASS (exactly one mission-id comment; a second close writes nothing)"
+    fi
+fi
+
+# --- Case: release failure keeps claim, lease, and spool entry (12th-pass)
+# The sweep's release path must confirm the bd update BEFORE deleting
+# anything: a transient City failure that destroyed the only copy of the
+# queued brief while the bead stayed claimed was the reviewed defect. The
+# stub fails exactly the release call for the target id; everything else
+# forwards to the real store.
+RELEASEFAIL_CREATE_OUT=$(BD create "RECLAIM-RELEASE-FAIL fixture" --type task --json 2>&1)
+RELEASEFAIL_ID=$(printf '%s' "$RELEASEFAIL_CREATE_OUT" | unwrap | jq -r '.id // empty')
+if [ -z "$RELEASEFAIL_ID" ]; then
+    fail_case "releasefail-create" "a non-empty fixture id" "'$RELEASEFAIL_CREATE_OUT'"
+else
+    BD update "$RELEASEFAIL_ID" --add-label kranz >/dev/null 2>&1
+    BD update "$RELEASEFAIL_ID" --claim >/dev/null 2>&1
+    printf '999999999 %s\n' "$(date +%s)" > "$LEASE_DIR/$RELEASEFAIL_ID.lease"
+    printf 'brief\n' > "$SPOOL_DIR/1690000000-$RELEASEFAIL_ID.md"
+    jq -n --arg id "$RELEASEFAIL_ID" --arg city "$CITY_DIR" --arg rig "$RIG_DIR" --arg cycles "1" \
+        '{id:$id, city:$city, rigDir:$rig, maxCycles:$cycles}' > "$SPOOL_DIR/1690000000-$RELEASEFAIL_ID.json"
+
+    RELEASEFAIL_STUB_BIN="$SANDBOX/releasefail-stubbin"
+    mkdir -p "$RELEASEFAIL_STUB_BIN"
+    cat > "$RELEASEFAIL_STUB_BIN/gc" <<STUBEOF
+#!/bin/sh
+set -u
+if [ "\${1:-}" = "--city" ]; then
+    shift 2
+fi
+if [ "\${1:-}" = "bd" ]; then
+    shift
+    # Exactly the release call for the target id fails (simulated transient
+    # City failure); every other invocation forwards to the real store.
+    if [ "\${1:-}" = "update" ] && [ "\${2:-}" = "$RELEASEFAIL_ID" ]; then
+        case " \$* " in
+            *" --status open "*)
+                echo "releasefail-stub: simulated transient update failure" >&2
+                exit 1
+                ;;
+        esac
+    fi
+    ( cd "$STORE_DIR" && bd "\$@" )
+    exit \$?
+fi
+echo "releasefail-stub-gc: unsupported invocation: gc \$*" >&2
+exit 1
+STUBEOF
+    chmod +x "$RELEASEFAIL_STUB_BIN/gc"
+
+    PATH="$RELEASEFAIL_STUB_BIN:$PATH" GC_CITY="$CITY_DIR" KRANZ_LABEL="kranz" \
+        KRANZ_LEASE_DIR="$LEASE_DIR" KRANZ_CLAIM_TTL=0 \
+        "$BIN_DIR/kranz-dispatch" --reclaim >/dev/null 2>&1
+
+    RF_STATUS=$(status_of "$RELEASEFAIL_ID")
+    RF_LEASE=missing
+    [ -f "$LEASE_DIR/$RELEASEFAIL_ID.lease" ] && RF_LEASE=present
+    RF_PAIR=missing
+    [ -f "$SPOOL_DIR/1690000000-$RELEASEFAIL_ID.md" ] && [ -f "$SPOOL_DIR/1690000000-$RELEASEFAIL_ID.json" ] && RF_PAIR=present
+
+    if [ "$RF_STATUS" != "in_progress" ] || [ "$RF_LEASE" != "present" ] || [ "$RF_PAIR" != "present" ]; then
+        fail_case "reclaim-release-failure-keeps-everything" "failed release to leave claim, lease, and spool entry intact" "status=$RF_STATUS lease=$RF_LEASE pair=$RF_PAIR"
+    else
+        echo "RECLAIM-RELEASE-FAIL: PASS (a failed release leaves claim, lease, and spool entry intact)"
+    fi
+    # Fixture hygiene: the intact entry above is this case's whole point, but
+    # a leftover .json would be the OLDEST spool record for the city-worker
+    # cases below (they drain by sort order) — remove it now that the
+    # assertions are made. The claim stays for the sweep fixtures.
+    rm -f "$SPOOL_DIR"/*-"$RELEASEFAIL_ID".md "$SPOOL_DIR"/*-"$RELEASEFAIL_ID".json "$SPOOL_DIR"/*-"$RELEASEFAIL_ID".inflight
+fi
+
+# --- Case: city-worker crash idempotency + ownership guard (12th-pass) ----
+# A worker that dies after run-bead reached a terminal bead state but before
+# the entry sweep must not replay the mission on restart: the startup
+# recovery sweep reconciles the .inflight marker against the bead's live
+# status. Here the bead is already closed, so --once must sweep the entry
+# WITHOUT driving kranz (the gc stub logs every call; a run-bead execution
+# would show up as a close/comment for the bead).
+#
+# Spool hygiene: the city-worker drains the OLDEST .json by sort order, so
+# earlier sections' leftovers (kept live-claim entries, released-bead
+# remnants) would be drained FIRST and mask the fixture under test. Every
+# prior fixture's assertions are complete; clear the spool so each worker
+# case drains exactly its own entry.
+rm -f "$SPOOL_DIR"/*-*.md "$SPOOL_DIR"/*-*.json "$SPOOL_DIR"/*-*.inflight 2>/dev/null || true
+
+INFLIGHT_CREATE_OUT=$(BD create "WORKER-INFLIGHT fixture" --type task --json 2>&1)
+INFLIGHT_ID=$(printf '%s' "$INFLIGHT_CREATE_OUT" | unwrap | jq -r '.id // empty')
+if [ -z "$INFLIGHT_ID" ]; then
+    fail_case "inflight-create" "a non-empty fixture id" "'$INFLIGHT_CREATE_OUT'"
+else
+    BD update "$INFLIGHT_ID" --claim >/dev/null 2>&1
+    BD close "$INFLIGHT_ID" --reason "completed before the crash" >/dev/null 2>&1
+    printf 'brief\n' > "$SPOOL_DIR/1690000000-$INFLIGHT_ID.md"
+    jq -n --arg id "$INFLIGHT_ID" --arg city "$CITY_DIR" --arg rig "$RIG_DIR" --arg cycles "1" \
+        '{id:$id, city:$city, rigDir:$rig, maxCycles:$cycles}' > "$SPOOL_DIR/1690000000-$INFLIGHT_ID.json"
+    : > "$SPOOL_DIR/1690000000-$INFLIGHT_ID.inflight"
+
+    WORKER_OUT=$(GC_CITY="$CITY_DIR" KRANZ_SPOOL="$SPOOL_DIR" \
+        PATH="$STUB_BIN:$PATH" "$BIN_DIR/kranz-city-worker" --once 2>&1)
+
+    INFLIGHT_LEFT=$(ls "$SPOOL_DIR"/*-"$INFLIGHT_ID".* 2>/dev/null | head -1)
+    # grep -c prints 0 AND exits 1 on no match; `|| true` keeps exactly one
+    # "0" (a second one would break the numeric test below).
+    INFLIGHT_RAN=$(grep -c "close $INFLIGHT_ID\|comment $INFLIGHT_ID" "$GC_CALLS_LOG" 2>/dev/null || true)
+
+    if [ -n "$INFLIGHT_LEFT" ]; then
+        fail_case "worker-inflight-swept" "terminal-bead inflight entry swept" "left: $INFLIGHT_LEFT"
+    elif [ "$INFLIGHT_RAN" -ne 0 ]; then
+        fail_case "worker-inflight-no-replay" "no close/comment call for the already-terminal bead (no replay)" "$INFLIGHT_RAN calls"
+    else
+        echo "WORKER-INFLIGHT: PASS (terminal-bead entry swept with zero mission execution)"
+    fi
+fi
+
+# --- Case: spool record is data, not shell (12th-pass) ---------------------
+# A metacharacter-bearing rigDir must travel to the runner literally. The
+# guard is structural (jq parse, never sourced); this pins it: the hostile
+# value names a marker file that would be created ONLY by shell evaluation.
+INJ_CREATE_OUT=$(BD create "WORKER-JSON-INJECTION fixture" --type task --json 2>&1)
+INJ_ID=$(printf '%s' "$INJ_CREATE_OUT" | unwrap | jq -r '.id // empty')
+if [ -z "$INJ_ID" ]; then
+    fail_case "workerjson-create" "a non-empty fixture id" "'$INJ_CREATE_OUT'"
+else
+    BD update "$INJ_ID" --claim >/dev/null 2>&1
+    PWN="$SANDBOX/pwned-by-spool-source"
+    HOSTILE_RIG='$(touch '"$PWN"')'
+    printf 'brief\n' > "$SPOOL_DIR/1690000000-$INJ_ID.md"
+    jq -n --arg id "$INJ_ID" --arg city "$CITY_DIR" --arg rig "$HOSTILE_RIG" --arg cycles "1" \
+        '{id:$id, city:$city, rigDir:$rig, maxCycles:$cycles}' > "$SPOOL_DIR/1690000000-$INJ_ID.json"
+
+    GC_CITY="$CITY_DIR" KRANZ_SPOOL="$SPOOL_DIR" KRANZ_STUB_EXIT=1 \
+        PATH="$STUB_BIN:$PATH" "$BIN_DIR/kranz-city-worker" --once >/dev/null 2>&1
+
+    if [ -e "$PWN" ]; then
+        fail_case "worker-spool-never-sourced" "hostile rigDir to stay inert data" "$PWN was created — the spool was evaluated as shell"
+    else
+        INJ_STATUS=$(status_of "$INJ_ID")
+        if [ "$INJ_STATUS" != "open" ]; then
+            fail_case "worker-spool-literal-path" "hostile path to reach the runner literally (cd fails, bead reopens open)" "$INJ_STATUS"
+        else
+            echo "WORKER-JSON: PASS (hostile rigDir stayed inert data; literal path failed cd honestly, bead reopened)"
+        fi
     fi
 fi
 
