@@ -327,6 +327,21 @@ impl EventRenderer {
                     }
                 ),
             ),
+            EventKind::HookGateFired {
+                gate,
+                tool,
+                subject,
+                verdict,
+                ..
+            } => (
+                "hook gate".to_string(),
+                if verdict == "blocked" {
+                    ansi::YELLOW
+                } else {
+                    ansi::DIM
+                },
+                format!("{gate}: {tool} {subject} {verdict} (in-process)"),
+            ),
             EventKind::DivergenceNoted {
                 unit,
                 candidates,

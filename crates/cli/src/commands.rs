@@ -331,6 +331,10 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             Ok(0)
         }
         Command::Scan { staged, range } => cmd_scan(&repo, staged, range.as_deref()),
+        Command::HookGuard { config } => {
+            let mut stdin = std::io::stdin();
+            Ok(crate::hook_guard::run_hook_guard(&config, &mut stdin))
+        }
         Command::Ready { json, all } => {
             if all {
                 let config = kranz_engine::paths::global_config()

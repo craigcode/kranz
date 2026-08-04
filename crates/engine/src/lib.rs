@@ -41,6 +41,7 @@ pub mod gate;
 pub mod gate_results;
 pub mod gate_scores;
 pub mod git_ops;
+pub mod hook_gates;
 pub mod hooks;
 pub mod judgement;
 pub mod knowledge;

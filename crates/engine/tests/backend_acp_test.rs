@@ -497,6 +497,7 @@ async fn backend_acp_peer_death_mid_run_leaves_a_resumable_event_log() {
         &[],
         &[],
         AuthVerdict::Inconclusive,
+        &[],
     )
     .await
     .expect("run_worker returns the recorded outcome even for a failed run");

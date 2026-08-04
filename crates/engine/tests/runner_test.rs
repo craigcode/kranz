@@ -989,6 +989,7 @@ async fn run_worker_builds_spec_and_uses_report_result() {
         &[],
         &[],
         AuthVerdict::Inconclusive,
+        &[],
     )
     .await
     .unwrap();
@@ -1084,6 +1085,7 @@ async fn run_worker_seeds_scratch_home_and_config_dir_worker_env_hygiene() {
         &[],
         &[],
         AuthVerdict::Authenticated,
+        &[],
     )
     .await
     .unwrap();
@@ -1147,6 +1149,7 @@ async fn run_worker_routes_macos_fs_net_through_egress_proxy() {
         &[],
         &[],
         AuthVerdict::Inconclusive,
+        &[],
     )
     .await
     .unwrap();
@@ -1468,6 +1471,7 @@ async fn run_worker_in_buffered_collects_kinds_without_touching_the_log() {
         &[],
         &[],
         AuthVerdict::Inconclusive,
+        &[],
     )
     .await
     .unwrap();
@@ -1822,5 +1826,353 @@ async fn run_session_fs_net_proxy_start_failure_fails_closed_before_spawn() {
     assert!(
         backend.started_specs().is_empty(),
         "fail-closed means the session never spawns"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Hook gate projection (ticket claude-code-hook-gate-projection, KRZ-302)
+// ---------------------------------------------------------------------------
+
+/// A worker run with a declared touch set gets the out-of-contract write
+/// rule projected onto its per-session settings (the PreToolUse hook block),
+/// and the engine-written spec file lands under the session-private scratch
+/// root. The mock session never invokes the hook, so NO records exist and
+/// nothing folds — a silent hook is not a failure (the engine-side sweep is
+/// the authoritative layer).
+#[tokio::test]
+async fn hook_gate_projection_worker_run_projects_hook_settings_and_spec_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    let mut log = seeded_log(&p);
+    let cfg = MissionConfig::default();
+
+    let backend =
+        MockBackend::with_scripts(vec![MockScript::single_shot_json(&worker_report_json())]);
+    let touch_set = vec!["src/**".to_string(), "!src/generated/**".to_string()];
+    let outcome = run_worker(
+        &backend,
+        &mut log,
+        &p,
+        &cfg,
+        &feature(),
+        "ship the auth system",
+        "Auth",
+        None,
+        None,
+        None,
+        &[],
+        &[],
+        &[],
+        AuthVerdict::Inconclusive,
+        &touch_set,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.result, RunResult::Pass);
+
+    let specs = backend.started_specs();
+    assert_eq!(specs.len(), 1);
+    let spec = &specs[0];
+
+    // The per-session settings carry the hooks block in the documented
+    // schema shape (hook_gates module docs): PreToolUse, the write-tool
+    // matcher, one command handler naming `hook-guard --config <spec>`.
+    let settings = spec.settings_json.as_ref().expect("hook settings set");
+    let group = &settings["hooks"]["PreToolUse"][0];
+    assert_eq!(group["matcher"], json!("Write|Edit|MultiEdit|NotebookEdit"));
+    let command = group["hooks"][0]["command"].as_str().unwrap();
+    assert!(
+        command.contains("hook-guard") && command.contains("--config"),
+        "the hook command invokes the guard subcommand: {command}"
+    );
+    assert!(group["hooks"][0]["timeout"].is_number());
+
+    // The spec file it points at exists, under the session-private scratch
+    // root, carrying the touch set verbatim and the session cwd.
+    let spec_path = kranz_engine::hook_gates::spec_file(&spec.session_id);
+    assert!(
+        spec_path.starts_with(kranz_engine::backend_claude::scratch_home_root(
+            &spec.session_id
+        )),
+        "the spec file lives under the session-private scratch root"
+    );
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&spec_path).unwrap()).unwrap();
+    assert_eq!(written["touchSet"], json!(touch_set));
+    assert_eq!(
+        written["sessionCwd"],
+        json!(p.repo_root.display().to_string())
+    );
+    assert_eq!(
+        written["recordFile"],
+        json!(kranz_engine::hook_gates::record_file(&spec.session_id)
+            .display()
+            .to_string())
+    );
+    assert!(
+        command.contains(&spec_path.display().to_string()),
+        "the hook command names the written spec file: {command}"
+    );
+
+    // The hook never fired in the mock session: no records, so no
+    // hook.gate.fired events — and the run still completes normally.
+    drop(log);
+    let events = read_log(&p);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(&e.kind, EventKind::HookGateFired { .. })),
+        "no records means no hook.gate.fired events"
+    );
+    assert!(events
+        .iter()
+        .any(|e| matches!(&e.kind, EventKind::WorkerCompleted { .. })));
+
+    let _ = std::fs::remove_dir_all(kranz_engine::backend_claude::scratch_home_root(
+        &spec.session_id,
+    ));
+}
+
+/// Regression: an EMPTY touch set is advisory-off (the sweep's posture) —
+/// the worker spec is byte-for-byte the pre-projection shape (no
+/// settings_json, no spec file), which is also exactly how sessions on
+/// backends without hook support behave (they ignore settings_json).
+#[tokio::test]
+async fn hook_gate_projection_empty_touch_set_leaves_worker_spec_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    let mut log = seeded_log(&p);
+    let cfg = MissionConfig::default();
+
+    let backend =
+        MockBackend::with_scripts(vec![MockScript::single_shot_json(&worker_report_json())]);
+    run_worker(
+        &backend,
+        &mut log,
+        &p,
+        &cfg,
+        &feature(),
+        "ship the auth system",
+        "Auth",
+        None,
+        None,
+        None,
+        &[],
+        &[],
+        &[],
+        AuthVerdict::Inconclusive,
+        &[],
+    )
+    .await
+    .unwrap();
+
+    let specs = backend.started_specs();
+    assert_eq!(specs.len(), 1);
+    assert!(
+        specs[0].settings_json.is_none(),
+        "an empty touch set projects nothing"
+    );
+    assert!(!kranz_engine::hook_gates::spec_file(&specs[0].session_id).exists());
+}
+
+/// A gate-failing action inside the session surfaces as a structured
+/// `hook.gate.fired` event BEFORE `worker.completed` — the record file the
+/// guard wrote (here pre-seeded exactly as `kranz hook-guard` writes it)
+/// folds into the log at session end, with the run id stamped from the run.
+#[tokio::test]
+async fn hook_gate_projection_records_fold_into_the_log_before_worker_completed() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    let mut log = seeded_log(&p);
+
+    // A unique session id (never the shared fixture id) so the record file
+    // cannot collide with another parallel test's scratch state.
+    let mut spec = session_spec(PromptMode::SingleShot("task".to_string()));
+    spec.session_id = format!("hook-gate-projection-{}", uuid::Uuid::new_v4());
+    let session_id = spec.session_id.clone();
+
+    let gate_spec = kranz_engine::hook_gates::HookGateSpec {
+        version: kranz_engine::hook_gates::SPEC_VERSION,
+        gate: kranz_engine::hook_gates::HOOK_GATE_ID.to_string(),
+        session_cwd: p.repo_root.clone(),
+        touch_set: vec!["src/**".to_string()],
+        record_file: kranz_engine::hook_gates::record_file(&session_id),
+    };
+    kranz_engine::hook_gates::HookGateRecord::blocked(
+        &gate_spec,
+        "PreToolUse",
+        "Write",
+        "docs/oops.md",
+        "matches none of the declared touch-set globs",
+        Some("cli-session-1"),
+        Some("toolu_1"),
+    )
+    .append_to(&kranz_engine::hook_gates::record_file(&session_id))
+    .unwrap();
+
+    let backend =
+        MockBackend::with_scripts(vec![MockScript::single_shot_json(&worker_report_json())]);
+    let outcome = run_session(&backend, spec, &mut log, &p, worker_meta("run-hook"), None)
+        .await
+        .unwrap();
+    // The hook verdict never changes the run's own result mapping —
+    // record-only evidence, with the sweep authoritative.
+    assert_eq!(outcome.result, RunResult::Pass);
+
+    drop(log);
+    let events = read_log(&p);
+    let types = event_types(&events);
+    let fired_at = types
+        .iter()
+        .position(|t| *t == "hook.gate.fired")
+        .expect("the hook record folded into an event: {types:?}");
+    let completed_at = types
+        .iter()
+        .position(|t| *t == "worker.completed")
+        .expect("worker.completed: {types:?}");
+    assert!(
+        fired_at < completed_at,
+        "hook.gate.fired must land BEFORE worker.completed: {types:?}"
+    );
+    match &events[fired_at].kind {
+        EventKind::HookGateFired {
+            run_id,
+            gate,
+            hook_event,
+            tool,
+            subject,
+            verdict,
+            detail,
+        } => {
+            assert_eq!(run_id, "run-hook", "the run id is engine-stamped");
+            assert_eq!(gate, "out-of-contract-write");
+            assert_eq!(hook_event, "PreToolUse");
+            assert_eq!(tool, "Write");
+            assert_eq!(subject, "docs/oops.md");
+            assert_eq!(verdict, "blocked");
+            assert_eq!(
+                detail.as_deref(),
+                Some("matches none of the declared touch-set globs")
+            );
+        }
+        other => panic!("expected hook.gate.fired, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(kranz_engine::backend_claude::scratch_home_root(&session_id));
+}
+
+/// The authoritative layer is unchanged: a worker that bypasses the hook
+/// entirely (here: the write lands via a scripted commit — the Bash-write
+/// shape a PreToolUse Write hook never sees) produces NO hook.gate.fired
+/// events, and the engine-side out-of-contract sweep still flags the path
+/// afterwards. Mirrors the orchestrator's
+/// `out_of_contract_sweep_flags_path_outside_touch_set` fixture, which must
+/// also keep firing untouched.
+#[tokio::test]
+async fn hook_gate_projection_bypassed_failure_still_caught_by_the_sweep() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // A real repo so the scripted commit lands; `.kranz/` ignored so the
+    // mission's own bookkeeping never enters the sweep's candidate set.
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("git spawns");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    git(&["init", "-q"]);
+    std::fs::write(root.join(".gitignore"), ".kranz/\n").unwrap();
+    git(&["add", ".gitignore"]);
+    git(&[
+        "-c",
+        "user.name=test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-q",
+        "-m",
+        "init",
+    ]);
+    let base_sha = String::from_utf8_lossy(&git(&["rev-parse", "HEAD"]).stdout)
+        .trim()
+        .to_string();
+
+    let p = paths(root);
+    let mut log = seeded_log(&p);
+    let cfg = MissionConfig::default();
+    let touch_set = vec!["src/**".to_string()];
+
+    // The hook-bypass shape: the worker's out-of-contract write lands via a
+    // commit the Write hook never sees; NO record file ever exists.
+    let script = MockScript::single_shot_json(&worker_report_json())
+        .writes_file("docs/oops.md", "written past the hook\n")
+        .commits_all("[f-1] add login (and a sneaky note)");
+    let backend = MockBackend::with_scripts(vec![script]);
+    let outcome = run_worker(
+        &backend,
+        &mut log,
+        &p,
+        &cfg,
+        &feature(),
+        "ship the auth system",
+        "Auth",
+        None,
+        None,
+        None,
+        &[],
+        &[],
+        &[],
+        AuthVerdict::Inconclusive,
+        &touch_set,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.result, RunResult::Pass);
+
+    // Hook bypassed ⇒ no in-process evidence…
+    drop(log);
+    let events = read_log(&p);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(&e.kind, EventKind::HookGateFired { .. })),
+        "a bypassed hook leaves no hook.gate.fired events"
+    );
+
+    // …and the engine-side sweep still catches the out-of-contract write,
+    // via the same commit-range + path_findings composition the
+    // orchestrator's out_of_contract_sweep runs.
+    let diff = std::process::Command::new("git")
+        .args(["diff", "--name-only", &format!("{base_sha}..HEAD")])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(diff.status.success());
+    let commit = kranz_engine::git_ops::CommitInfo {
+        sha: "HEAD".to_string(),
+        subject: "[f-1] add login (and a sneaky note)".to_string(),
+    };
+    let diff_stdout = String::from_utf8_lossy(&diff.stdout);
+    let changes: Vec<kranz_engine::contract_sweep::AttributedChange> = diff_stdout
+        .lines()
+        .map(|path| kranz_engine::contract_sweep::AttributedChange {
+            path,
+            commit: &commit,
+        })
+        .collect();
+    assert_eq!(changes.len(), 1, "only the bypassed write was committed");
+    let findings = kranz_engine::contract_sweep::path_findings(&touch_set, &changes);
+    assert_eq!(findings.len(), 1, "the sweep still fires: {findings:?}");
+    assert_eq!(findings[0].subject, "docs/oops.md");
+    assert_eq!(
+        findings[0].class,
+        kranz_engine::contract_sweep::FINDING_CLASS
     );
 }

@@ -367,6 +367,49 @@ pub enum EventKind {
         threshold: Option<f64>,
     },
 
+    /// One deterministic gate projected onto a Claude Code lifecycle hook
+    /// fired IN-PROCESS inside a worker session (ticket
+    /// `.kranz/tickets/claude-code-hook-gate-projection.md`, KRZ-302; module
+    /// [`crate::hook_gates`]). The first projection is the out-of-contract
+    /// write rule: a `PreToolUse` hook on the file-writing tools judges the
+    /// target path against the mission's `touch_set` and blocks an
+    /// out-of-contract write before it happens. The payload carries the
+    /// gate identity, the hook event, the tool, the judged path, and the
+    /// guard's verdict (`blocked` — refused in-process; `error` — the guard
+    /// itself failed open, so only the engine-side sweep can judge it).
+    ///
+    /// Additive, RECORD-ONLY (the `gate.result` template): the engine-side
+    /// gate ladder remains authoritative — hooks are defense-in-depth, never
+    /// a replacement — so this event drives no state transition; it is the
+    /// in-process layer's evidence landing in the log (folded from the
+    /// per-session record file after the session stream closes, BEFORE
+    /// `worker.completed`). `runId` is stamped from the run's metadata at
+    /// fold time, never from the session-writable record file.
+    #[serde(rename = "hook.gate.fired")]
+    HookGateFired {
+        #[serde(rename = "runId")]
+        run_id: String,
+        /// Gate identity (e.g. `out-of-contract-write`) — the same
+        /// defect-class name the engine-side sweep reports, so one gate
+        /// reads at two layers.
+        gate: String,
+        /// The lifecycle event that fired (`PreToolUse`).
+        #[serde(rename = "hookEvent")]
+        hook_event: String,
+        /// The tool whose call was judged (`Write`, `Edit`, ...).
+        tool: String,
+        /// The judged target (repo-relative when it resolved inside the
+        /// checkout, else the raw path).
+        subject: String,
+        /// `blocked` | `error` (see the variant docs).
+        verdict: String,
+        /// The guard's reason / error note, scrubbed and truncated at fold
+        /// time. Absent when the record carried none; `None` never hits the
+        /// wire.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+
     /// The candidate-comparison record of a heterogeneous dispatch pool
     /// (ticket `divergence-first-class-event`, KRZ-304; the follow-up the
     /// KRZ-303 pool parks for): when a unit's sibling streams have all
@@ -647,6 +690,7 @@ impl EventKind {
             EventKind::ValidatorTamper { .. } => "validator.tamper",
             EventKind::ValidationSnapshot { .. } => "validation.snapshot",
             EventKind::GateResult { .. } => "gate.result",
+            EventKind::HookGateFired { .. } => "hook.gate.fired",
             EventKind::DivergenceNoted { .. } => "divergence.noted",
             EventKind::DivergenceResolved { .. } => "divergence.resolved",
             EventKind::FixFeatureCreated { .. } => "fixfeature.created",
@@ -1565,6 +1609,76 @@ mod tests {
                 assert_eq!(selected, None);
                 assert_eq!(decided_by, "operator");
             }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// The additive `hook.gate.fired` event (ticket
+    /// claude-code-hook-gate-projection, KRZ-302): wire name and payload
+    /// round-trip, `detail` is omitted when None, and a sparse wire line
+    /// folds with serde defaults — the gate.result additive template.
+    #[test]
+    fn hook_gate_projection_event_wire_shape_round_trips() {
+        let fired = EventKind::HookGateFired {
+            run_id: "r-1".into(),
+            gate: "out-of-contract-write".into(),
+            hook_event: "PreToolUse".into(),
+            tool: "Write".into(),
+            subject: "docs/oops.md".into(),
+            verdict: "blocked".into(),
+            detail: Some("matches none of the declared touch-set globs".into()),
+        };
+        let json = serde_json::to_value(&fired).unwrap();
+        assert_eq!(json["type"], "hook.gate.fired");
+        assert_eq!(json["payload"]["runId"], "r-1");
+        assert_eq!(json["payload"]["gate"], "out-of-contract-write");
+        assert_eq!(json["payload"]["hookEvent"], "PreToolUse");
+        assert_eq!(json["payload"]["tool"], "Write");
+        assert_eq!(json["payload"]["subject"], "docs/oops.md");
+        assert_eq!(json["payload"]["verdict"], "blocked");
+        assert_eq!(fired.type_name(), "hook.gate.fired");
+        let back: EventKind = serde_json::from_value(json).unwrap();
+        match back {
+            EventKind::HookGateFired {
+                run_id,
+                gate,
+                verdict,
+                detail,
+                ..
+            } => {
+                assert_eq!(run_id, "r-1");
+                assert_eq!(gate, "out-of-contract-write");
+                assert_eq!(verdict, "blocked");
+                assert_eq!(
+                    detail.as_deref(),
+                    Some("matches none of the declared touch-set globs")
+                );
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // detail = None stays off the wire (additive; old readers never see
+        // the key), and a wire line without it folds to None.
+        let no_detail = EventKind::HookGateFired {
+            run_id: "r-2".into(),
+            gate: "out-of-contract-write".into(),
+            hook_event: "PreToolUse".into(),
+            tool: "Edit".into(),
+            subject: "x".into(),
+            verdict: "error".into(),
+            detail: None,
+        };
+        let json = serde_json::to_value(&no_detail).unwrap();
+        assert!(
+            !json["payload"].as_object().unwrap().contains_key("detail"),
+            "detail must not serialize when None: {json}"
+        );
+        let sparse: EventKind = serde_json::from_str(
+            r#"{"type":"hook.gate.fired","payload":{"runId":"r-3","gate":"out-of-contract-write","hookEvent":"PreToolUse","tool":"Write","subject":"y","verdict":"blocked"}}"#,
+        )
+        .unwrap();
+        match sparse {
+            EventKind::HookGateFired { detail, .. } => assert_eq!(detail, None),
             _ => panic!("wrong variant"),
         }
     }

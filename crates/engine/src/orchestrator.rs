@@ -2788,6 +2788,7 @@ impl MissionEngine {
             let grants = self.state.mission.command_grants.clone();
             let egress_grants = self.state.mission.egress_grants.clone();
             let deny_exceptions = self.state.mission.deny_exceptions.clone();
+            let touch_set = self.state.mission.touch_set.clone();
             let pre_run_sha = self.active_repo().head_sha()?;
 
             // Interrupt wiring: a control watcher polls the inbox and fires
@@ -2836,6 +2837,7 @@ impl MissionEngine {
                     &egress_grants,
                     &deny_exceptions,
                     auth_verdict,
+                    &touch_set,
                 )
                 .await
             } else {
@@ -2854,6 +2856,7 @@ impl MissionEngine {
                     &egress_grants,
                     &deny_exceptions,
                     auth_verdict,
+                    &touch_set,
                 )
                 .await
             };
@@ -3256,6 +3259,7 @@ impl MissionEngine {
         let grants = self.state.mission.command_grants.clone();
         let egress_grants = self.state.mission.egress_grants.clone();
         let deny_exceptions = self.state.mission.deny_exceptions.clone();
+        let touch_set = self.state.mission.touch_set.clone();
         let tracker = ConcurrencyTracker::new();
 
         let mut set: tokio::task::JoinSet<(usize, BufferedRunResult)> = tokio::task::JoinSet::new();
@@ -3280,6 +3284,7 @@ impl MissionEngine {
             let grants = grants.clone();
             let egress_grants = egress_grants.clone();
             let deny_exceptions = deny_exceptions.clone();
+            let touch_set = touch_set.clone();
             set.spawn(async move {
                 let _live = guard.enter(); // count this session as live
                 let result = runner::run_worker_in_buffered(
@@ -3296,6 +3301,7 @@ impl MissionEngine {
                     &egress_grants,
                     &deny_exceptions,
                     verdict,
+                    &touch_set,
                 )
                 .await;
                 (idx, result)
@@ -3938,6 +3944,7 @@ impl MissionEngine {
         let grants = self.state.mission.command_grants.clone();
         let egress_grants = self.state.mission.egress_grants.clone();
         let deny_exceptions = self.state.mission.deny_exceptions.clone();
+        let touch_set = self.state.mission.touch_set.clone();
         let tracker = ConcurrencyTracker::new();
         let selected = self.select_backend(Role::Worker);
         if let Some(reason) = selected.fallback_reason.as_deref() {
@@ -3971,6 +3978,7 @@ impl MissionEngine {
             let grants = grants.clone();
             let egress_grants = egress_grants.clone();
             let deny_exceptions = deny_exceptions.clone();
+            let touch_set = touch_set.clone();
             set.spawn(async move {
                 let _live = guard.enter(); // count this session as live
                 let result = runner::run_worker_in_buffered(
@@ -3987,6 +3995,7 @@ impl MissionEngine {
                     &egress_grants,
                     &deny_exceptions,
                     auth_verdict,
+                    &touch_set,
                 )
                 .await;
                 (idx, result)
@@ -4199,10 +4208,11 @@ impl MissionEngine {
     ///
     /// `buffered` is exactly the `worker.spawned` / `worker.message` /
     /// `worker.completed` kinds `run_worker_in_buffered` collected while the
-    /// session ran concurrently in Phase B — replaying them here, serially,
-    /// through `emit` is what keeps events.jsonl single-writer with contiguous
-    /// seq even though the sessions overlapped. `feature.started` was already
-    /// emitted in Phase A.
+    /// session ran concurrently in Phase B (plus any `hook.gate.fired`
+    /// records folded at session end, KRZ-302) — replaying them here,
+    /// serially, through `emit` is what keeps events.jsonl single-writer
+    /// with contiguous seq even though the sessions overlapped.
+    /// `feature.started` was already emitted in Phase A.
     ///
     /// Deliberately does NOT respawn: the parallel batch is best-effort per the
     /// honest subset. A non-complete judgement fails the feature (its branch is

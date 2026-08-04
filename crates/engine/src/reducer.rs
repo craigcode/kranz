@@ -345,6 +345,18 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             // no-op, exactly like secret.redacted below.
         }
 
+        EventKind::HookGateFired { run_id, .. } => {
+            // Record-only (KRZ-302, the gate.result additive template): the
+            // in-process hook verdict already happened inside the session,
+            // and the engine-side sweep remains the authoritative layer —
+            // so this drives no state transition and state shape does not
+            // grow. Validate the run reference as a corruption guard
+            // (mirrors validation.finding); the run id is engine-stamped at
+            // fold time, so this cannot be aimed at a run the log never
+            // recorded.
+            run_mut(state, run_id)?;
+        }
+
         EventKind::DivergenceNoted {
             unit, candidates, ..
         } => {
@@ -1043,5 +1055,110 @@ mod executor_tier_tests {
             state.config.backend_kind(Role::ValidatorFunctional),
             BackendKind::Claude
         );
+    }
+}
+
+#[cfg(test)]
+mod hook_gate_projection_tests {
+    use super::*;
+    use crate::events::EventKind;
+
+    fn event(seq: u64, kind: EventKind) -> Event {
+        Event {
+            seq,
+            ts: chrono::Utc::now(),
+            mission_id: "m-test".to_string(),
+            kind,
+        }
+    }
+
+    fn spawned(seq: u64, run_id: &str) -> Event {
+        event(
+            seq,
+            EventKind::WorkerSpawned {
+                run_id: run_id.to_string(),
+                role: Role::Worker,
+                feature_id: None,
+                milestone_id: None,
+                candidate: None,
+                sdk_session_id: "s-1".to_string(),
+                model: "m".to_string(),
+                quant: "n/a".to_string(),
+                weight_hash: None,
+                prompt_hash: "h".to_string(),
+                transcript_path: "runs/r-1.jsonl".to_string(),
+            },
+        )
+    }
+
+    /// The hook.gate.fired fold arm is record-only (KRZ-302): the run
+    /// reference is validated as a corruption guard, and state shape does
+    /// not grow — the mission's course is unchanged by the in-process
+    /// verdict (the engine-side sweep remains the authoritative layer).
+    #[test]
+    fn hook_gate_projection_event_folds_record_only() {
+        let created = event(
+            1,
+            EventKind::MissionCreated {
+                goal: "g".to_string(),
+                base_branch: "main".to_string(),
+                mission_branch: "kranz/mission-m-test".to_string(),
+                config: MissionConfig::default(),
+            },
+        );
+        let fired = event(
+            3,
+            EventKind::HookGateFired {
+                run_id: "r-1".to_string(),
+                gate: "out-of-contract-write".to_string(),
+                hook_event: "PreToolUse".to_string(),
+                tool: "Write".to_string(),
+                subject: "docs/oops.md".to_string(),
+                verdict: "blocked".to_string(),
+                detail: Some("outside the touch set".to_string()),
+            },
+        );
+
+        let with_hook = fold(&[created.clone(), spawned(2, "r-1"), fired]).unwrap();
+        let without_hook = fold(&[created, spawned(2, "r-1")]).unwrap();
+
+        // No state transition: identical mission status, run set, and run
+        // outcome with and without the hook event.
+        assert_eq!(with_hook.mission.status, without_hook.mission.status);
+        assert_eq!(with_hook.runs.len(), 1);
+        assert!(with_hook.runs["r-1"].result.is_none());
+        assert_eq!(
+            with_hook.mission.milestones.len(),
+            without_hook.mission.milestones.len()
+        );
+    }
+
+    /// The run reference is a corruption guard: a hook.gate.fired naming a
+    /// run the log never recorded refuses the fold (the run id is
+    /// engine-stamped at fold time, so this can only be log corruption).
+    #[test]
+    fn hook_gate_projection_event_with_unknown_run_is_refused() {
+        let created = event(
+            1,
+            EventKind::MissionCreated {
+                goal: "g".to_string(),
+                base_branch: "main".to_string(),
+                mission_branch: "kranz/mission-m-test".to_string(),
+                config: MissionConfig::default(),
+            },
+        );
+        let bogus = event(
+            2,
+            EventKind::HookGateFired {
+                run_id: "no-such-run".to_string(),
+                gate: "out-of-contract-write".to_string(),
+                hook_event: "PreToolUse".to_string(),
+                tool: "Write".to_string(),
+                subject: "docs/oops.md".to_string(),
+                verdict: "blocked".to_string(),
+                detail: None,
+            },
+        );
+        assert!(fold(&[created, bogus]).is_err());
     }
 }

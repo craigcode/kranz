@@ -354,6 +354,18 @@ pub enum Command {
         range: Option<String>,
     },
 
+    /// INTERNAL: the Claude Code lifecycle-hook command the engine installs
+    /// into worker sessions (KRZ-302). Never invoked by operators — the
+    /// session's CLI pipes a PreToolUse hook payload to stdin; the guard
+    /// judges it against the engine-written spec file, records the outcome,
+    /// and exits 0 (allow) / 2 (block, stderr fed to the model) / 1 (guard
+    /// error, failing open — the engine-side sweep remains authoritative).
+    HookGuard {
+        /// The per-session hook-gate spec file the engine wrote
+        #[arg(long, value_name = "PATH")]
+        config: PathBuf,
+    },
+
     /// Score how ready this repo is for autonomous kranz missions.
     Ready {
         /// Print the serializable scorecard JSON.

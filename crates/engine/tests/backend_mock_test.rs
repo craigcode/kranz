@@ -446,6 +446,7 @@ async fn worker_session_carries_configured_tools_onto_the_spec() {
         &[],
         &[],
         AuthVerdict::Inconclusive,
+        &[],
     )
     .await
     .unwrap();

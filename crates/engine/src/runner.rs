@@ -20,7 +20,8 @@
 //! incompatible with running N worker sessions concurrently: two live sessions
 //! would race the one `&mut EventLog`. So a run may instead target an
 //! in-memory buffer ([`LogTarget::Buffer`]): every [`EventKind`] the run would
-//! have appended (`worker.spawned`, throttled `worker.message` deltas,
+//! have appended (`worker.spawned`, throttled `worker.message` deltas, any
+//! folded `hook.gate.fired` records — KRZ-302, [`crate::hook_gates`],
 //! `worker.completed`) is collected in order into a `Vec` and returned
 //! alongside the [`RunOutcome`], and NOTHING touches the EventLog. The engine
 //! then replays those buffered kinds through its own single-writer `emit`
@@ -257,11 +258,12 @@ pub async fn run_session(
 /// With [`LogTarget::Live`] this is byte-for-byte the sequential behaviour
 /// (every kind appended to the log immediately). With [`LogTarget::Buffer`]
 /// the exact same kinds — `worker.spawned`, throttled `worker.message` deltas,
-/// `worker.completed` — are collected in append order into the buffer instead,
-/// and NO log is touched, so the session can run concurrently with others; the
-/// engine replays the buffer through its own single-writer `emit` afterwards
-/// (preserving monotonic seq). The transcript file is written live in both
-/// modes (it is not the single-writer log).
+/// any folded `hook.gate.fired` records (KRZ-302), `worker.completed` — are
+/// collected in append order into the buffer instead, and NO log is touched,
+/// so the session can run concurrently with others; the engine replays the
+/// buffer through its own single-writer `emit` afterwards (preserving
+/// monotonic seq). The transcript file is written live in both modes (it is
+/// not the single-writer log).
 pub async fn run_session_to(
     backend: &dyn AgentBackend,
     mut spec: SessionSpec,
@@ -303,6 +305,12 @@ pub async fn run_session_to(
     // resolve_sandbox_or_refuse).
     let egress_proxy = crate::egress_proxy::maybe_start_for_session(&mut spec, paths).await?;
 
+    // KRZ-302 (hook gate projection): the session id keys this run's
+    // hook-gate record file (hook_gates::record_file), so it must be
+    // captured before the spec moves into the backend. The fold below is a
+    // no-op for sessions that never had hook config projected (validators,
+    // orchestrators, every non-claude backend).
+    let hook_gate_session_id = spec.session_id.clone();
     let mut session = backend.start(spec).await?;
     let session_id = session.session_id();
 
@@ -445,6 +453,16 @@ pub async fn run_session_to(
             Role::Orchestrator => RunResult::Pass,
         }
     };
+
+    // KRZ-302 (hook gate projection): fold the session's hook records into
+    // structured `hook.gate.fired` events BEFORE `worker.completed` — a
+    // gate-failing action inside the session is visible as an event before
+    // session-end processing completes. The events are record-only
+    // defense-in-depth evidence; the engine-side out-of-contract sweep
+    // remains the authoritative layer (hook_gates module docs).
+    for kind in crate::hook_gates::records_to_events(&hook_gate_session_id, &run_meta.run_id) {
+        log.record(kind)?;
+    }
 
     log.record(EventKind::WorkerCompleted {
         run_id: run_meta.run_id.clone(),
@@ -613,6 +631,7 @@ pub async fn run_worker(
     egress_grants: &[String],
     deny_exceptions: &[String],
     auth_verdict: AuthVerdict,
+    touch_set: &[String],
 ) -> Result<RunOutcome> {
     let cwd = paths.repo_root.clone();
     run_worker_in(
@@ -631,6 +650,7 @@ pub async fn run_worker(
         egress_grants,
         deny_exceptions,
         auth_verdict,
+        touch_set,
     )
     .await
 }
@@ -660,6 +680,7 @@ pub async fn run_worker_in(
     egress_grants: &[String],
     deny_exceptions: &[String],
     auth_verdict: AuthVerdict,
+    touch_set: &[String],
 ) -> Result<RunOutcome> {
     let (spec, run_meta) = build_worker_spec(
         cfg,
@@ -675,6 +696,7 @@ pub async fn run_worker_in(
         deny_exceptions,
         paths.mission_dir(),
         auth_verdict,
+        touch_set,
     )?;
     let mut target = LogTarget::Live(log);
     run_session_to(backend, spec, &mut target, paths, run_meta, cancel).await
@@ -684,7 +706,8 @@ pub async fn run_worker_in(
 /// the shared log (roadmap M3 wall-clock overlap).
 ///
 /// Returns the `worker.spawned` / `worker.message` / `worker.completed` kinds
-/// this run produced, in append order, alongside the [`RunOutcome`]. It takes
+/// this run produced (plus any `hook.gate.fired` records folded at session
+/// end, KRZ-302), in append order, alongside the [`RunOutcome`]. It takes
 /// NO `&mut EventLog`, so N of these can run concurrently (each in its own
 /// worktree) via `tokio::join!`/`JoinSet` without racing the single writer.
 /// The engine replays the returned kinds through its own single-writer `emit`
@@ -712,6 +735,7 @@ pub async fn run_worker_in_buffered(
     egress_grants: &[String],
     deny_exceptions: &[String],
     auth_verdict: AuthVerdict,
+    touch_set: &[String],
 ) -> Result<(Vec<EventKind>, RunOutcome)> {
     let (spec, run_meta) = build_worker_spec(
         cfg,
@@ -727,6 +751,7 @@ pub async fn run_worker_in_buffered(
         deny_exceptions,
         paths.mission_dir(),
         auth_verdict,
+        touch_set,
     )?;
     let mut target = LogTarget::Buffer(Vec::new());
     let outcome = run_session_to(backend, spec, &mut target, paths, run_meta, None).await?;
@@ -839,6 +864,14 @@ fn seed_worker_env(
 /// buffered worker paths. Identical spec construction guarantees a buffered
 /// run and a live run are byte-for-byte the same session, differing only in
 /// where their event kinds land.
+///
+/// `touch_set` is the mission's declared touch-set: a non-empty set is
+/// projected onto the session's Claude Code lifecycle hooks (KRZ-302,
+/// [`crate::hook_gates`]) so an out-of-contract write is blocked in-process
+/// — defense-in-depth under the authoritative engine-side sweep. Non-claude
+/// backends ignore `settings_json` by design, so their sessions behave
+/// exactly as before; an empty set projects nothing (the sweep's
+/// advisory-off posture).
 #[allow(clippy::too_many_arguments)]
 fn build_worker_spec(
     cfg: &MissionConfig,
@@ -854,6 +887,7 @@ fn build_worker_spec(
     deny_exceptions: &[String],
     mission_dir: std::path::PathBuf,
     auth_verdict: AuthVerdict,
+    touch_set: &[String],
 ) -> Result<(SessionSpec, RunMeta)> {
     let role = Role::Worker;
     let role_cfg = cfg.role(role);
@@ -948,6 +982,12 @@ fn build_worker_spec(
         permissions::for_role(role, cfg, &[], grants, deny_exceptions),
         &mut spec,
     );
+    // KRZ-302: project the out-of-contract write rule onto the session's
+    // Claude Code lifecycle hooks (settings_json) — a PreToolUse guard
+    // blocks an out-of-contract write IN-PROCESS. Defense-in-depth only:
+    // the engine-side contract_sweep stays authoritative, and non-claude
+    // backends ignore settings_json entirely.
+    crate::hook_gates::project_worker_hook_gates(&mut spec, touch_set);
 
     let run_meta = RunMeta {
         run_id: uuid::Uuid::new_v4().to_string(),
