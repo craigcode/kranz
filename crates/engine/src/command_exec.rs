@@ -350,9 +350,13 @@ pub(crate) struct GateSandboxResolution {
 ///   `std::env::temp_dir()` (a custom `TMPDIR` on the server) gets a loud
 ///   gate failure, not a silent hole — the documented edge.
 fn gate_profile_extras() -> String {
-    let mut extras = String::from("\n(allow file-write* (literal \"/dev/null\"))\n");
+    // The /dev/null literal is universal; the xcrun regex is macOS-only. The
+    // shadowed rebinding keeps the mutation inside the cfg so linux clippy
+    // sees no unused `mut` (windows-latest CI gates -D warnings).
+    let extras = String::from("\n(allow file-write* (literal \"/dev/null\"))\n");
     #[cfg(target_os = "macos")]
-    {
+    let extras = {
+        let mut extras = extras;
         let temp = std::env::temp_dir();
         let mut prefixes = std::collections::BTreeSet::new();
         prefixes.insert(crate::sandbox::escape_sbpl_regex(&temp));
@@ -364,7 +368,8 @@ fn gate_profile_extras() -> String {
             extras.push_str(&format!("  (regex #\"^{prefix}/xcrun_db[^/]*$\")\n"));
         }
         extras.push_str(")\n");
-    }
+        extras
+    };
     extras
 }
 
