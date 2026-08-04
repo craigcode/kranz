@@ -720,23 +720,26 @@ impl MissionHost {
         // inside the resolved sandbox profile. `enforce == off` falls
         // through to the injected `gate_executor` — byte-identical pre-wrap
         // behavior, and the test seam (`with_gate_executor`) stays
-        // authoritative there. The fail-closed postures (an unsupported
-        // platform, linux without `bwrap`) route INTO the sandboxed runner
-        // so they error loudly at resolve rather than running unsandboxed
+        // authoritative there. Every enforced posture routes INTO the
+        // sandboxed runner: the process provider wraps in the resolved
+        // profile; `provider: container` wraps the gates in the mission
+        // container when a runtime is detected (ticket
+        // container-gate-wrapper); and the fail-closed postures (an
+        // unsupported platform, linux without `bwrap`, container without a
+        // runtime) error loudly at resolve rather than running unsandboxed
         // (13th-pass review, P1).
         let gate_policy = kranz_engine::command_exec::MergeGatePolicy {
             sandbox: state.config.worker.sandbox.clone(),
             mission_dir: paths.mission_dir(),
         };
-        // 13th-pass review (P1): a container-provider mission's merge gates
-        // are not wrapped (tier-3 wraps agent sessions; wrapping engine-side
-        // gates is the follow-up — ticket tier3-container-sandbox). The
-        // engine's validation/final-gate paths record that degradation as a
-        // decision event; this merge path has no event log, so the SAME
-        // note goes to the operator-visible server log — never a silent
-        // unsandboxed gate under an enforced config.
+        // A container-provider mission whose host has NO container runtime
+        // cannot wrap its merge gates (ticket container-gate-wrapper): they
+        // fail closed at resolve instead of running unsandboxed. This merge
+        // path has no event log, so the SAME note the resolve error carries
+        // goes to the operator-visible server log first — the refusal then
+        // reads as the config problem it is, never a flaky gate.
         if let Some(note) = gate_policy.degradation_note() {
-            tracing::warn!(mission = %id, note = %note, "merge gate sandbox degraded to a no-op");
+            tracing::warn!(mission = %id, note = %note, "merge gate sandbox cannot wrap; gates fail closed");
         }
         let report = tokio::task::spawn_blocking(move || {
             let repo = GitRepo::open(&repo_root)?;

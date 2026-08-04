@@ -59,6 +59,32 @@
 //! clear cargo error instead of a kernel-denied socket. Toolchains without a
 //! warm seeded cache (a cold `npm ci`) need `enforce: fs`.
 //!
+//! ## Container arm (ticket container-gate-wrapper)
+//!
+//! With `provider = "container"` and `enforce != off`, the gate command runs
+//! INSIDE the mission container instead of on the host beside the
+//! container-wrapped sessions: [`GateSandbox::Container`] builds a
+//! `container_gate_run_args` argv (the same `run --rm -i --read-only` shape
+//! agent sessions get — gate cwd rw, mission metadata ro, scratch rw,
+//! authority files /dev/null-masked) and executes it through the same
+//! bounded core, so timeout/tree-kill/drain discipline is identical. The
+//! deltas from the session argv: the payload is `sh -c <command>`, the
+//! container is NAMED so the timeout path can force-remove it (the bounded
+//! core's group SIGKILL reaches the runtime client, not the in-container
+//! tree — the daemon owns those processes), the gate's sanitized env crosses
+//! via `-e` flags (a runtime client forwards no env), and the real Cargo
+//! root is NEVER mounted (a credential directory; the gate's cache-only
+//! `CARGO_HOME` under the rw scratch is forwarded instead — only the
+//! credential-free `<cargo>/bin` shim dir crosses, alongside the read-only
+//! rustup toolchain + npm cache the gate's toolchain resolution needs).
+//! `fs+net` mirrors the session container's handling: empty egress →
+//! `--network none` (the hard boundary); a non-empty list FAILS CLOSED at
+//! resolve (no egress proxy exists engine-side, and the bridge would be
+//! advisory-only — `config::validate` already refuses the pair up front).
+//! A requested container with no runtime on PATH FAILS CLOSED at resolve,
+//! mirroring session resolution (`runner::resolve_sandbox_or_refuse`) —
+//! never a silent host-side gate under an enforced container config.
+//!
 //! Measured spawn cost (2026-08-03, macOS 15, M-series, Seatbelt; harness:
 //! `gate_sandbox_wrap_measure`). Per-spawn micro (`true`, 50 reps): 23.5ms
 //! unwrapped vs 26.0ms wrapped — +2.5ms/spawn (+10.8%; across four runs the
@@ -269,17 +295,18 @@ pub(crate) async fn run_bounded_argv(
 ///
 /// [`GateSandbox::Disabled`] is the byte-identical pre-wrap behavior:
 /// `enforce == off` (the operator opted out; the cache-only `CARGO_HOME`
-/// still applies) or `provider = "container"` (tier-3 wraps agent sessions;
-/// container-wrapping engine-side gates is the follow-up — ticket
-/// tier3-container-sandbox — and the degradation is RECORDED: the engine
-/// paths emit a decision event, the server's merge path logs
-/// [`MergeGatePolicy::degradation_note`]). A platform
-/// [`crate::sandbox::platform_support`] cannot honor FAILS CLOSED at
-/// resolve time (13th-pass review, P1: agent sessions already refuse to
+/// still applies). Every enforced posture wraps: the process provider via
+/// [`GateSandbox::Seatbelt`] (`sandbox-exec -f`) on macOS /
+/// [`GateSandbox::Bubblewrap`] on Linux, reusing `crate::sandbox`'s
+/// writable-root computation, mission-metadata write denies, and authority
+/// read denies; the container provider via [`GateSandbox::Container`] (the
+/// mission container — ticket container-gate-wrapper). A platform
+/// [`crate::sandbox::platform_support`] cannot honor, tooling that is
+/// requested but missing (Linux without `bwrap`), and `provider: container`
+/// with no runtime on PATH all FAIL CLOSED at resolve time (13th-pass
+/// review, P1, and the container ticket: agent sessions already refuse to
 /// run there; a standalone merge gate must fail loudly too, never run
-/// unsandboxed under an enforced config). Tooling that is requested but
-/// missing (Linux without `bwrap`) FAILS CLOSED the same way, mirroring
-/// session resolution.
+/// unsandboxed under an enforced config).
 #[derive(Debug)]
 pub(crate) enum GateSandbox {
     /// Run the shell exactly as before the wrap — no wrapper process.
@@ -295,6 +322,32 @@ pub(crate) enum GateSandbox {
     Bubblewrap {
         inputs: Box<crate::sandbox::SandboxInputs>,
     },
+    /// Tier-3 container: `<runtime> run --rm -i --read-only --name <name> …
+    /// <image> sh -c <command>` (ticket container-gate-wrapper). Inputs and
+    /// spec ride along because the argv — the gate's sanitized env included
+    /// — is built per command.
+    Container {
+        inputs: Box<crate::sandbox::SandboxInputs>,
+        spec: crate::sandbox_container::ContainerSpec,
+    },
+}
+
+/// The `(program, args)` a resolved gate sandbox produces for one command,
+/// plus the best-effort teardown the runner issues when the command did not
+/// exit on its own.
+pub(crate) struct WrappedCommand {
+    pub program: std::path::PathBuf,
+    pub args: Vec<String>,
+    /// `<runtime> rm -f <name>` for the container arm: the bounded core's
+    /// timeout SIGKILL reaches the runtime CLIENT's process group, but the
+    /// in-container tree belongs to the daemon and can outlive the client
+    /// (a parked `sleep 300` gate would otherwise run on, holding the rw
+    /// mounts, until its command exits naturally). Force-removing the named
+    /// container kills that tree. `None` for the process-sandbox arms —
+    /// there the group SIGKILL IS the tree kill. Best-effort: a teardown
+    /// failure (the runtime already reaped the container, an unsupported
+    /// `rm -f`) is ignored, and `--rm` still reaps every normal exit.
+    pub timeout_teardown: Option<(std::path::PathBuf, Vec<String>)>,
 }
 
 impl GateSandbox {
@@ -305,23 +358,46 @@ impl GateSandbox {
             GateSandbox::Disabled => crate::types::SandboxEnforce::Off,
             GateSandbox::Seatbelt { enforce, .. } => *enforce,
             GateSandbox::Bubblewrap { inputs } => inputs.enforce,
+            GateSandbox::Container { inputs, .. } => inputs.enforce,
         }
     }
 
-    /// Build the `(program, args)` that runs `command` under this posture.
+    /// Build the [`WrappedCommand`] that runs `command` under this posture.
     /// `Disabled` reproduces [`shell_argv`] EXACTLY, so the off path is
     /// byte-identical to the pre-wrap behavior. A bubblewrap mask-prep
     /// failure FAILS CLOSED — a gate that cannot be wrapped must not run
     /// unsandboxed under enforcement.
-    fn wrap_shell(&self, command: &str) -> crate::error::Result<(std::path::PathBuf, Vec<String>)> {
+    ///
+    /// `env` is the gate's FINAL (already sanitized, offline-adjusted)
+    /// environment: the process-sandbox arms ignore it (their child inherits
+    /// it from the bounded runner), but the container arm must bake it into
+    /// the argv as `-e` flags — a runtime client forwards no env into the
+    /// container.
+    fn wrap_shell(
+        &self,
+        command: &str,
+        env: &HashMap<String, String>,
+    ) -> crate::error::Result<WrappedCommand> {
         match self {
-            GateSandbox::Disabled => Ok(shell_argv(command)),
+            GateSandbox::Disabled => {
+                let (program, args) = shell_argv(command);
+                Ok(WrappedCommand {
+                    program,
+                    args,
+                    timeout_teardown: None,
+                })
+            }
             GateSandbox::Seatbelt { profile_path, .. } => {
-                Ok(crate::backend_claude::sandbox_command(
+                let (program, args) = crate::backend_claude::sandbox_command(
                     profile_path,
                     std::path::Path::new("/bin/sh"),
                     &["-c".to_string(), command.to_string()],
-                ))
+                );
+                Ok(WrappedCommand {
+                    program,
+                    args,
+                    timeout_teardown: None,
+                })
             }
             GateSandbox::Bubblewrap { inputs } => {
                 let args = crate::sandbox::bubblewrap_args(
@@ -329,7 +405,28 @@ impl GateSandbox {
                     std::path::Path::new("/bin/sh"),
                     &["-c".to_string(), command.to_string()],
                 )?;
-                Ok((std::path::PathBuf::from("bwrap"), args))
+                Ok(WrappedCommand {
+                    program: std::path::PathBuf::from("bwrap"),
+                    args,
+                    timeout_teardown: None,
+                })
+            }
+            GateSandbox::Container { inputs, spec } => {
+                // Named per command (never per resolve): parallel gate
+                // commands from one resolution must not collide on the name,
+                // and the teardown below targets exactly this container.
+                let name = format!("kranz-gate-{}", uuid::Uuid::new_v4().simple());
+                let args = crate::sandbox_container::container_gate_run_args(
+                    inputs, spec, command, env, &name,
+                );
+                Ok(WrappedCommand {
+                    program: std::path::PathBuf::from(spec.runtime.binary()),
+                    args,
+                    timeout_teardown: Some((
+                        std::path::PathBuf::from(spec.runtime.binary()),
+                        vec!["rm".to_string(), "-f".to_string(), name],
+                    )),
+                })
             }
         }
     }
@@ -337,9 +434,12 @@ impl GateSandbox {
 
 /// The outcome of resolving a gate sandbox: the posture plus an optional
 /// operator-facing note (surfaced as an orchestrator decision / merge log
-/// line) when enforcement degraded to the one documented no-op posture
-/// (`provider:container` — see [`container_gate_note`]; every other
-/// requested-but-unavailable posture fails closed at resolve).
+/// line) should a future posture degrade to a no-op. Every CURRENT posture
+/// either wraps (`note: None`) or fails closed at resolve (an Err naming the
+/// missing support — an unsupported platform, linux without `bwrap`,
+/// `provider:container` without a runtime): the note seam is kept so a
+/// degraded no-op can never return SILENTLY — a posture that adds one must
+/// also teach the callers to surface it.
 #[derive(Debug)]
 pub(crate) struct GateSandboxResolution {
     pub sandbox: GateSandbox,
@@ -405,20 +505,24 @@ fn prewarm_xcrun_cache_outside_sandbox() {
 static GATE_XCRUN_PREWARM_SPAWNS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// The ONE degradation note for the container provider, shared by
-/// [`resolve_gate_sandbox_target`] (whose note the engine paths surface as a
-/// decision event) and [`MergeGatePolicy::degradation_note`] (which the
-/// server's merge path logs — it has no event log). The text must match on
-/// every path so an operator sees the SAME explanation wherever the gate
-/// ran, and it names the follow-up: wrapping engine-side gates is the
-/// container provider's remaining work (ticket tier3-container-sandbox —
-/// deliberately NOT built here, and the container provider itself is
-/// untouched).
+/// The ONE note for the container provider's runtime-unavailable posture,
+/// shared by [`resolve_gate_sandbox_target`] (whose Err the engine paths
+/// surface — the gate refuses to run) and
+/// [`MergeGatePolicy::degradation_note`] (which the server's merge path logs
+/// once — it has no event log, and the gate run itself then fails closed at
+/// resolve). The text must match on every path so an operator sees the SAME
+/// explanation wherever the gate ran. Ticket container-gate-wrapper wraps
+/// engine-run gates in the mission container whenever a runtime is detected;
+/// this note is the fail-closed remainder: with no runtime on PATH the gate
+/// must NOT degrade to a silent host-side run — container SESSIONS already
+/// refuse to run unsandboxed there (`runner::resolve_sandbox_or_refuse`),
+/// and engine-run gates mirror that posture.
 fn container_gate_note(enforce: crate::types::SandboxEnforce) -> String {
     format!(
-        "engine-run gates are not container-wrapped (provider:container wraps agent \
-         sessions only); gates run unsandboxed despite enforce:{} — wrapping \
-         engine-side gates is the container follow-up (ticket tier3-container-sandbox)",
+        "sandbox provider:container with enforce:{} wraps engine-run gates in the mission \
+         container, but no container runtime (docker/podman/nerdctl/container) was found on \
+         PATH; refusing to run engine-run gates unsandboxed (fail closed, mirroring container \
+         session resolution) — install a runtime or set worker.sandbox.provider to \"process\"",
         enforce.as_str()
     )
 }
@@ -452,12 +556,42 @@ pub(crate) fn resolve_gate_sandbox(
         profile_dir,
         std::env::consts::OS,
         crate::sandbox::command_available("bwrap"),
+        crate::sandbox_container::detect(),
     )
 }
 
-/// [`resolve_gate_sandbox`] parameterized on the target OS and bwrap
-/// availability so the decision matrix is testable cross-platform (mirrors
-/// `crate::sandbox::resolve_for_session_target`).
+/// The gate-shaped [`crate::sandbox::SandboxInputs`], shared by every
+/// enforced provider arm: the gate cwd fills the session profile's
+/// `session_cwd` slot so the writable-root computation is REUSED, never
+/// re-rolled; mission metadata write-denies and authority read-denies derive
+/// from `mission_dir` exactly as sessions derive them; the validator
+/// read-deny set is the validator-session wrap's, never a gate's (gates work
+/// IN the real tree).
+fn gate_sandbox_inputs(
+    sandbox_cfg: &crate::types::SandboxConfig,
+    gate_cwd: &std::path::Path,
+    mission_dir: &std::path::Path,
+    scratch_home: &std::path::Path,
+) -> crate::sandbox::SandboxInputs {
+    crate::sandbox::SandboxInputs {
+        enforce: sandbox_cfg.enforce,
+        session_cwd: gate_cwd.to_path_buf(),
+        mission_dir: mission_dir.to_path_buf(),
+        tmpdir: scratch_home.to_path_buf(),
+        extra_write: sandbox_cfg
+            .extra_write
+            .iter()
+            .map(|raw| crate::sandbox::expand_tilde(raw))
+            .collect(),
+        egress: sandbox_cfg.egress.clone(),
+        validator_read_deny_roots: Vec::new(),
+    }
+}
+
+/// [`resolve_gate_sandbox`] parameterized on the target OS, bwrap
+/// availability, and container runtime so the decision matrix is testable
+/// cross-platform (mirrors `crate::sandbox::resolve_for_session_target`).
+#[allow(clippy::too_many_arguments)]
 fn resolve_gate_sandbox_target(
     sandbox_cfg: &crate::types::SandboxConfig,
     gate_cwd: &std::path::Path,
@@ -466,6 +600,7 @@ fn resolve_gate_sandbox_target(
     profile_dir: &std::path::Path,
     target_os: &str,
     bwrap_available: bool,
+    container_runtime: Option<crate::sandbox_container::ContainerRuntime>,
 ) -> crate::error::Result<GateSandboxResolution> {
     use crate::types::{SandboxEnforce, SandboxProvider};
     let disabled = |note: Option<String>| {
@@ -478,7 +613,54 @@ fn resolve_gate_sandbox_target(
         return disabled(None);
     }
     if sandbox_cfg.provider == SandboxProvider::Container {
-        return disabled(Some(container_gate_note(sandbox_cfg.enforce)));
+        // Ticket container-gate-wrapper: engine-run gates join the agent
+        // sessions INSIDE the mission container. The fail postures mirror
+        // session resolution exactly (`sandbox::resolve_container_target` +
+        // `runner::resolve_sandbox_or_refuse`): a requested container with
+        // no runtime on PATH is refused — never a silent host-side gate.
+        let Some(runtime) = container_runtime else {
+            return Err(crate::error::EngineError::Config(container_gate_note(
+                sandbox_cfg.enforce,
+            )));
+        };
+        // `fs+net` with a non-empty egress list is proxy-env advisory on the
+        // runtime bridge (no hard boundary), and engine-run gates are never
+        // wired through the egress proxy (session infrastructure — see the
+        // module doc). `config::validate` refuses the pair up front
+        // (`SandboxProvider::enforces_hard_net_boundary`); this resolve
+        // refuses it again so a standalone merge gate can never silently
+        // bridge either.
+        if sandbox_cfg.enforce == SandboxEnforce::FsNet
+            && !sandbox_cfg
+                .provider
+                .enforces_hard_net_boundary(&sandbox_cfg.egress)
+        {
+            return Err(crate::error::EngineError::Config(
+                "sandbox provider:container with enforce:fs+net and a non-empty egress list is \
+                 advisory-only for engine-run gates (no egress proxy exists engine-side); use an \
+                 empty egress list (the hard `--network none` boundary) or sandbox.provider \
+                 \"process\" — refusing to run engine-run gates with an advisory boundary"
+                    .to_string(),
+            ));
+        }
+        return Ok(GateSandboxResolution {
+            sandbox: GateSandbox::Container {
+                inputs: Box::new(gate_sandbox_inputs(
+                    sandbox_cfg,
+                    gate_cwd,
+                    mission_dir,
+                    scratch_home,
+                )),
+                spec: crate::sandbox_container::ContainerSpec {
+                    runtime,
+                    image: sandbox_cfg
+                        .image
+                        .clone()
+                        .unwrap_or_else(|| crate::sandbox_container::DEFAULT_IMAGE.to_string()),
+                },
+            },
+            note: None,
+        });
     }
     match crate::sandbox::platform_support(sandbox_cfg.enforce, target_os) {
         // Unreachable (Off returns above) — platform_support is the shared
@@ -506,18 +688,7 @@ fn resolve_gate_sandbox_target(
             )))
         }
         crate::sandbox::SandboxDecision::Enforce(backend) => {
-            let inputs = crate::sandbox::SandboxInputs {
-                enforce: sandbox_cfg.enforce,
-                session_cwd: gate_cwd.to_path_buf(),
-                mission_dir: mission_dir.to_path_buf(),
-                tmpdir: scratch_home.to_path_buf(),
-                extra_write: sandbox_cfg
-                    .extra_write
-                    .iter()
-                    .map(|raw| crate::sandbox::expand_tilde(raw))
-                    .collect(),
-                egress: sandbox_cfg.egress.clone(),
-            };
+            let inputs = gate_sandbox_inputs(sandbox_cfg, gate_cwd, mission_dir, scratch_home);
             match backend {
                 crate::sandbox::SandboxBackend::Seatbelt => {
                     // 13th-pass (P1): the profile no longer permits xcrun_db
@@ -579,10 +750,15 @@ fn gate_env_for_sandbox(
 /// validation-round contract commands, the final gate, and pack gates run
 /// through here. [`GateSandbox::Disabled`] reproduces the pre-wrap `sh -c`
 /// behavior byte-for-byte;
-/// an enforced posture wraps the SAME `sh -c` in the resolved profile, and
-/// the wrapper still leads the SAME new process group
+/// an enforced posture wraps the SAME `sh -c` in the resolved profile (or the
+/// mission container — ticket container-gate-wrapper), and the wrapper still
+/// leads the SAME new process group
 /// ([`configure_bounded_child`]) — so the bounded core's timeout SIGKILL
-/// reaches the whole tree, sandbox-exec/bwrap and every descendant alike.
+/// reaches the whole tree, sandbox-exec/bwrap/the runtime client and every
+/// descendant alike. The container arm additionally force-removes its NAMED
+/// container when a run produced no exit code ([`WrappedCommand::timeout_teardown`]):
+/// the group SIGKILL stops the runtime client, but the in-container tree
+/// belongs to the daemon and would otherwise outlive the killed client.
 pub(crate) async fn run_shell_command_sandboxed(
     cwd: &std::path::Path,
     command: &str,
@@ -604,8 +780,12 @@ async fn run_shell_command_sandboxed_with_code(
     env: &HashMap<String, String>,
     sandbox: &GateSandbox,
 ) -> (Option<i32>, String) {
-    let (program, args) = match sandbox.wrap_shell(command) {
-        Ok(argv) => argv,
+    // The FINAL env first (the fs+net offline-by-cache adjustment included) —
+    // the container arm bakes it into the argv as `-e` flags, so wrap_shell
+    // must see the adjusted map, not the caller's original.
+    let env = gate_env_for_sandbox(env, sandbox);
+    let wrapped = match sandbox.wrap_shell(command, &env) {
+        Ok(wrapped) => wrapped,
         Err(error) => {
             return (
                 None,
@@ -613,8 +793,19 @@ async fn run_shell_command_sandboxed_with_code(
             )
         }
     };
-    let env = gate_env_for_sandbox(env, sandbox);
-    run_bounded_argv(cwd, &program, &args, timeout, &env).await
+    let (code, output) =
+        run_bounded_argv(cwd, &wrapped.program, &wrapped.args, timeout, &env).await;
+    if code.is_none() {
+        if let Some((program, args)) = wrapped.timeout_teardown {
+            // Best-effort, bounded, off the async executor: a teardown
+            // failure (the runtime already reaped the container) is ignored.
+            let _ = tokio::task::spawn_blocking(move || {
+                run_with_timeout(&program, &args, Duration::from_secs(30))
+            })
+            .await;
+        }
+    }
+    (code, output)
 }
 
 /// Child setup shared by every bounded run: piped stdout/stderr (drained
@@ -852,34 +1043,53 @@ impl MergeGatePolicy {
 
     /// Whether resolution on THIS host yields an enforced wrap — the cheap
     /// pre-check callers use to choose between the sandboxed runner and their
-    /// pre-existing executor seam. `false` for `enforce: off` (the
-    /// byte-identical pre-wrap path) and for `provider: container` (gates
-    /// are not container-wrapped; the degradation is RECORDED — see
-    /// [`MergeGatePolicy::degradation_note`]). Every OTHER requested
-    /// enforcement returns `true` — including platforms
-    /// [`crate::sandbox::platform_support`] cannot honor and linux WITHOUT
-    /// `bwrap`: those FAIL CLOSED at resolve time (13th-pass review, P1 —
-    /// never a silent unsandboxed gate under an enforced config).
+    /// pre-existing executor seam. `false` only for `enforce: off` (the
+    /// byte-identical pre-wrap path). Every requested enforcement returns
+    /// `true` — the process provider on any platform (`platform_support`
+    /// decides the wrap shape), the container provider with or without a
+    /// detected runtime (ticket container-gate-wrapper: a runtime wraps the
+    /// gate in the mission container; none FAILS CLOSED at resolve), and the
+    /// fail-closed postures (a platform
+    /// [`crate::sandbox::platform_support`] cannot honor, linux WITHOUT
+    /// `bwrap`) — those route INTO the sandboxed runner so they error loudly
+    /// at resolve rather than running unsandboxed (13th-pass review, P1).
     pub fn enforces_on_this_host(&self) -> bool {
-        self.sandbox.provider == crate::types::SandboxProvider::Process
-            && !matches!(
+        if self.sandbox.enforce == crate::types::SandboxEnforce::Off {
+            return false;
+        }
+        match self.sandbox.provider {
+            crate::types::SandboxProvider::Process => !matches!(
                 crate::sandbox::platform_support(self.sandbox.enforce, std::env::consts::OS),
                 crate::sandbox::SandboxDecision::Off
-            )
+            ),
+            crate::types::SandboxProvider::Container => true,
+        }
     }
 
-    /// The operator-visible note when this policy does NOT wrap gates
-    /// despite `enforce != off` — provider:container today (13th-pass
-    /// review, P1). The engine's validation/final-gate paths record the
-    /// same degradation as a decision event; the server's merge path has no
-    /// event log and MUST log this note instead, or a container-provider
-    /// mission's merge gates run unsandboxed SILENTLY. `None` for
-    /// `enforce: off` (nothing to degrade) and for the process provider
-    /// (which wraps, or fails closed loudly at resolve — an unsupported
-    /// platform or linux without `bwrap` needs no note because it errors).
+    /// The operator-visible note when this policy CANNOT wrap gates despite
+    /// `enforce != off`: `provider: container` with no container runtime on
+    /// PATH (ticket container-gate-wrapper). The merge gates themselves then
+    /// FAIL CLOSED at resolve — the server's merge path has no event log and
+    /// MUST log this note so the refusal reads as the operator's config
+    /// problem it is, not a flaky gate. `None` for `enforce: off` (nothing
+    /// to refuse), for the process provider (which wraps, or fails closed
+    /// loudly at resolve — an unsupported platform or linux without `bwrap`
+    /// needs no note because it errors), and for a container policy WITH a
+    /// runtime (the gates wrap in the mission container — nothing degraded).
     pub fn degradation_note(&self) -> Option<String> {
+        self.degradation_note_target(crate::sandbox_container::detect())
+    }
+
+    /// [`MergeGatePolicy::degradation_note`] parameterized on runtime
+    /// detection so the decision is testable without a container runtime
+    /// (mirrors [`resolve_gate_sandbox_target`]).
+    pub(crate) fn degradation_note_target(
+        &self,
+        container_runtime: Option<crate::sandbox_container::ContainerRuntime>,
+    ) -> Option<String> {
         if self.sandbox.provider == crate::types::SandboxProvider::Container
             && self.sandbox.enforce != crate::types::SandboxEnforce::Off
+            && container_runtime.is_none()
         {
             Some(container_gate_note(self.sandbox.enforce))
         } else {
@@ -1556,8 +1766,8 @@ mod tests {
     /// allow appended, NO xcrun write allow — 13th-pass prewarm + deny,
     /// denies + writable roots in shape), linux resolves Bubblewrap and
     /// fails CLOSED without bwrap, an unsupported platform fails CLOSED, and
-    /// the container provider degrades to the one documented no-op (with
-    /// the shared note).
+    /// the container provider wraps in the mission container with a runtime
+    /// and fails CLOSED without one (ticket container-gate-wrapper).
     #[test]
     fn gate_sandbox_wrap_resolve_matrix() {
         let repo = tempfile::tempdir().unwrap();
@@ -1576,6 +1786,7 @@ mod tests {
             scratch.path(),
             "macos",
             false,
+            None,
         )
         .unwrap();
         assert!(matches!(resolution.sandbox, GateSandbox::Disabled));
@@ -1591,6 +1802,7 @@ mod tests {
             scratch.path(),
             "macos",
             false,
+            None,
         )
         .unwrap();
         assert!(resolution.note.is_none());
@@ -1631,6 +1843,7 @@ mod tests {
             scratch.path(),
             "linux",
             true,
+            None,
         )
         .unwrap();
         let GateSandbox::Bubblewrap { inputs } = &resolution.sandbox else {
@@ -1650,6 +1863,7 @@ mod tests {
             scratch.path(),
             "linux",
             false,
+            None,
         )
         .expect_err("linux without bwrap must fail closed");
         assert!(error.to_string().contains("bwrap"), "{error}");
@@ -1666,6 +1880,7 @@ mod tests {
             scratch.path(),
             "windows",
             false,
+            None,
         )
         .expect_err("an unsupported platform must fail closed");
         assert!(error.to_string().contains("unsupported"), "{error}");
@@ -1675,32 +1890,157 @@ mod tests {
                 .contains("refusing to run engine-run gates unsandboxed"),
             "{error}"
         );
+    }
 
-        // provider:container → Disabled with the shared degradation note
-        // (tier-3 wraps sessions; container-wrapping engine-side gates is
-        // the follow-up — the note names the ticket so the merge path can
-        // surface the same explanation).
-        let container = crate::types::SandboxConfig {
-            enforce: crate::types::SandboxEnforce::Fs,
+    /// The container arm of the resolve matrix (ticket container-gate-wrapper):
+    /// provider:container + enforce != off + a detected runtime resolves to
+    /// [`GateSandbox::Container`] with gate-shaped inputs (the gate cwd as the
+    /// writable root, the scratch as tmpdir, the mission dir for the metadata
+    /// denies) and the configured/default image — on ANY target OS (the
+    /// container runtime, not the platform sandbox tier, is the mechanism).
+    /// No runtime FAILS CLOSED with the shared note (mirroring session
+    /// resolution — never a silent host-side gate); `fs+net` with a non-empty
+    /// egress list FAILS CLOSED (advisory-only on the bridge, and no egress
+    /// proxy exists engine-side); `enforce: off` stays Disabled.
+    #[test]
+    fn container_gate_wrap_resolve_matrix() {
+        let repo = tempfile::tempdir().unwrap();
+        let mission = repo.path().join(".kranz").join("missions").join("m-x");
+        std::fs::create_dir_all(&mission).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let container = |enforce| crate::types::SandboxConfig {
+            enforce,
             provider: crate::types::SandboxProvider::Container,
             image: None,
             extra_write: vec![],
             egress: vec![],
         };
+        let runtime = Some(crate::sandbox_container::ContainerRuntime::Docker);
+
+        // A detected runtime → the container wrap, target-OS-independent.
+        for target_os in ["macos", "linux", "windows"] {
+            let resolution = resolve_gate_sandbox_target(
+                &container(crate::types::SandboxEnforce::Fs),
+                repo.path(),
+                &mission,
+                scratch.path(),
+                scratch.path(),
+                target_os,
+                false,
+                runtime,
+            )
+            .unwrap();
+            assert!(resolution.note.is_none());
+            let GateSandbox::Container { inputs, spec } = &resolution.sandbox else {
+                panic!("container + runtime must resolve to GateSandbox::Container on {target_os}");
+            };
+            assert_eq!(inputs.session_cwd, repo.path());
+            assert_eq!(inputs.tmpdir, scratch.path());
+            assert_eq!(inputs.mission_dir, mission);
+            assert_eq!(inputs.enforce, crate::types::SandboxEnforce::Fs);
+            assert_eq!(
+                spec.runtime,
+                crate::sandbox_container::ContainerRuntime::Docker
+            );
+            assert_eq!(spec.image, crate::sandbox_container::DEFAULT_IMAGE);
+        }
+
+        // A configured image rides into the spec (the mission container
+        // image carries the gate's toolchain — the documented assumption).
+        let mut imaged = container(crate::types::SandboxEnforce::Fs);
+        imaged.image = Some("ghcr.io/example/kranz-worker:1".to_string());
         let resolution = resolve_gate_sandbox_target(
-            &container,
+            &imaged,
             repo.path(),
             &mission,
             scratch.path(),
             scratch.path(),
             "macos",
             false,
+            runtime,
+        )
+        .unwrap();
+        let GateSandbox::Container { spec, .. } = &resolution.sandbox else {
+            panic!("container + runtime must resolve to GateSandbox::Container");
+        };
+        assert_eq!(spec.image, "ghcr.io/example/kranz-worker:1");
+
+        // NO runtime → FAIL CLOSED with the shared note text (the same text
+        // MergeGatePolicy::degradation_note surfaces on the merge path).
+        let error = resolve_gate_sandbox_target(
+            &container(crate::types::SandboxEnforce::Fs),
+            repo.path(),
+            &mission,
+            scratch.path(),
+            scratch.path(),
+            "macos",
+            false,
+            None,
+        )
+        .expect_err("container without a runtime must fail closed");
+        assert!(
+            error.to_string().contains("no container runtime"),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to run engine-run gates unsandboxed"),
+            "{error}"
+        );
+
+        // fs+net with a NON-EMPTY egress list → FAIL CLOSED: advisory-only
+        // on the runtime bridge and no egress proxy exists engine-side, so
+        // the gate must never silently keep the bridge.
+        let mut egress = container(crate::types::SandboxEnforce::FsNet);
+        egress.egress = vec!["crates.io:443".to_string()];
+        let error = resolve_gate_sandbox_target(
+            &egress,
+            repo.path(),
+            &mission,
+            scratch.path(),
+            scratch.path(),
+            "linux",
+            false,
+            runtime,
+        )
+        .expect_err("container fs+net with an egress list must fail closed");
+        assert!(error.to_string().contains("advisory"), "{error}");
+
+        // fs+net with an EMPTY egress list wraps (`--network none` is the
+        // hard boundary) — and the wrap carries fs+net for the runner's
+        // offline-by-cache env adjustment.
+        let resolution = resolve_gate_sandbox_target(
+            &container(crate::types::SandboxEnforce::FsNet),
+            repo.path(),
+            &mission,
+            scratch.path(),
+            scratch.path(),
+            "linux",
+            false,
+            runtime,
+        )
+        .unwrap();
+        assert_eq!(
+            resolution.sandbox.enforce(),
+            crate::types::SandboxEnforce::FsNet
+        );
+
+        // enforce: off + container → Disabled, no note (the off check
+        // precedes the provider — no runtime is required either).
+        let resolution = resolve_gate_sandbox_target(
+            &container(crate::types::SandboxEnforce::Off),
+            repo.path(),
+            &mission,
+            scratch.path(),
+            scratch.path(),
+            "macos",
+            false,
+            None,
         )
         .unwrap();
         assert!(matches!(resolution.sandbox, GateSandbox::Disabled));
-        let note = resolution.note.expect("container provider must be noted");
-        assert!(note.contains("container"), "{note}");
-        assert!(note.contains("tier3-container-sandbox"), "{note}");
+        assert!(resolution.note.is_none());
     }
 
     /// 13th-pass review (P1), the prewarm half of the macOS xcrun posture:
@@ -1729,8 +2069,9 @@ mod tests {
 
         // Wrapping commands from this resolution prewarms NOTHING further —
         // the wrap is argv construction, the prewarm lives in resolve.
-        let _argv_one = resolution.sandbox.wrap_shell("true").unwrap();
-        let _argv_two = resolution.sandbox.wrap_shell("echo hi").unwrap();
+        let env = std::collections::HashMap::new();
+        let _argv_one = resolution.sandbox.wrap_shell("true", &env).unwrap();
+        let _argv_two = resolution.sandbox.wrap_shell("echo hi", &env).unwrap();
         let after_wraps = GATE_XCRUN_PREWARM_SPAWNS.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(after_wraps, after_one, "command wraps must not prewarm");
 
@@ -1744,14 +2085,15 @@ mod tests {
         );
     }
 
-    /// 13th-pass review (P1): provider:container merge gates are not
-    /// wrapped, and the merge path must RECORD the degradation — the engine
-    /// paths emit the resolution note as a decision event; the server logs
-    /// [`MergeGatePolicy::degradation_note`]. The two notes are the SAME
-    /// text (an operator sees one explanation on every path), and the note
-    /// names the container gate wrapper follow-up.
+    /// Ticket container-gate-wrapper, the merge-policy half: a
+    /// provider:container policy ENFORCES on every host (the pre-check
+    /// routes into the sandboxed runner, which wraps the gate in the mission
+    /// container when a runtime is detected), and the merge path's note
+    /// fires ONLY for the fail-closed remainder — no runtime on PATH. The
+    /// note text the policy logs and the resolve error the gate run fails
+    /// with are the SAME text (one explanation on every path).
     #[test]
-    fn gate_container_posture_merge_policy_notes_degradation() {
+    fn container_gate_wrap_merge_policy_enforces_or_notes_the_fail_closed() {
         let container = |enforce| crate::types::SandboxConfig {
             enforce,
             provider: crate::types::SandboxProvider::Container,
@@ -1763,25 +2105,31 @@ mod tests {
             sandbox: container(crate::types::SandboxEnforce::Fs),
             mission_dir: std::path::PathBuf::new(),
         };
-        // Not wrapped on ANY host (the pre-check routes to the pre-existing
-        // executor seam)…
-        assert!(!policy.enforces_on_this_host());
-        // …but never silently.
+        // Enforces on EVERY host (host-independent: the wrap needs a
+        // runtime, not a platform tier; runtime-absent fails closed inside
+        // the sandboxed runner rather than routing to the unsandboxed seam).
+        assert!(policy.enforces_on_this_host());
+        // With a runtime the gates wrap — nothing degraded, no note.
+        assert!(policy
+            .degradation_note_target(Some(crate::sandbox_container::ContainerRuntime::Docker))
+            .is_none());
+        // Without one the merge path MUST log the fail-closed note…
         let note = policy
-            .degradation_note()
-            .expect("the container posture must be noted");
-        assert!(note.contains("container"), "{note}");
+            .degradation_note_target(None)
+            .expect("the runtime-unavailable container posture must be noted");
+        assert!(note.contains("no container runtime"), "{note}");
         assert!(
-            note.contains("tier3-container-sandbox"),
-            "the note must name the container gate wrapper follow-up: {note}"
+            note.contains("refusing to run engine-run gates unsandboxed"),
+            "{note}"
         );
-        // The engine-path note (the resolution) matches the merge-path note
-        // verbatim.
+        // …and the resolve error the gate run then fails with carries the
+        // SAME text verbatim (the EngineError::Config display prefix is the
+        // error-variant decoration, not part of the note).
         let repo = tempfile::tempdir().unwrap();
         let mission = repo.path().join(".kranz").join("missions").join("m-x");
         std::fs::create_dir_all(&mission).unwrap();
         let scratch = tempfile::tempdir().unwrap();
-        let resolution = resolve_gate_sandbox_target(
+        let error = resolve_gate_sandbox_target(
             &policy.sandbox,
             repo.path(),
             &mission,
@@ -1789,27 +2137,29 @@ mod tests {
             scratch.path(),
             "macos",
             false,
+            None,
         )
-        .unwrap();
+        .expect_err("container without a runtime must fail closed");
         assert_eq!(
-            resolution.note.as_deref(),
-            Some(note.as_str()),
-            "the engine-path note and the merge-path note must match"
+            error.to_string(),
+            format!("configuration error: {note}"),
+            "the engine-path resolve error and the merge-path note must match"
         );
 
-        // enforce: off + container: nothing to degrade. A process-provider
-        // policy has no note either — it wraps, or fails closed loudly.
+        // enforce: off + container: nothing to enforce, nothing to note. A
+        // process-provider policy has no note either — it wraps, or fails
+        // closed loudly.
         let off = MergeGatePolicy {
             sandbox: container(crate::types::SandboxEnforce::Off),
             mission_dir: std::path::PathBuf::new(),
         };
-        assert!(off.degradation_note().is_none());
+        assert!(off.degradation_note_target(None).is_none());
         assert!(!off.enforces_on_this_host());
         let process = MergeGatePolicy {
             sandbox: fs_sandbox_config(crate::types::SandboxEnforce::Fs),
             mission_dir: std::path::PathBuf::new(),
         };
-        assert!(process.degradation_note().is_none());
+        assert!(process.degradation_note_target(None).is_none());
     }
 
     /// The off regression: `enforce == off` resolves to
@@ -2320,10 +2670,285 @@ mod tests {
             !gate_env_for_sandbox(&base, &GateSandbox::Disabled).contains_key("CARGO_NET_OFFLINE"),
             "the off path is byte-identical — no offline flag"
         );
+        // The container arm keys off the same `enforce()`: fs+net inside the
+        // mission container is `--network none`, so cargo must run
+        // offline-by-cache there too.
+        let container_fs_net = GateSandbox::Container {
+            inputs: Box::new(crate::sandbox::SandboxInputs {
+                enforce: crate::types::SandboxEnforce::FsNet,
+                session_cwd: std::path::PathBuf::from("/nonexistent"),
+                mission_dir: std::path::PathBuf::from("/nonexistent"),
+                tmpdir: std::path::PathBuf::from("/nonexistent"),
+                extra_write: Vec::new(),
+                egress: Vec::new(),
+                validator_read_deny_roots: Vec::new(),
+            }),
+            spec: crate::sandbox_container::ContainerSpec {
+                runtime: crate::sandbox_container::ContainerRuntime::Docker,
+                image: crate::sandbox_container::DEFAULT_IMAGE.to_string(),
+            },
+        };
+        assert_eq!(
+            gate_env_for_sandbox(&base, &container_fs_net)
+                .get("CARGO_NET_OFFLINE")
+                .map(String::as_str),
+            Some("true"),
+            "fs+net container gates run cargo offline-by-cache"
+        );
         assert!(
             !base.contains_key("CARGO_NET_OFFLINE"),
             "the caller's env map is never mutated"
         );
+    }
+
+    /// The container arm's per-command wrap shape (ticket
+    /// container-gate-wrapper): the runtime binary is the program, the argv
+    /// names a UNIQUE per-command container (`kranz-gate-*`) and carries the
+    /// command as the image's `sh -c` payload, and the timeout teardown is
+    /// `<runtime> rm -f <name>` targeting exactly that container (the
+    /// bounded core's group SIGKILL stops the runtime client; the teardown
+    /// stops the daemon-owned in-container tree). The process-sandbox arms
+    /// have NO teardown — the group kill IS the tree kill there.
+    #[test]
+    fn container_gate_wrap_shell_shape_names_the_container_and_teardown() {
+        let inputs = crate::sandbox::SandboxInputs {
+            enforce: crate::types::SandboxEnforce::Fs,
+            session_cwd: std::path::PathBuf::from("/nonexistent"),
+            mission_dir: std::path::PathBuf::from("/nonexistent-m"),
+            tmpdir: std::path::PathBuf::from("/nonexistent-s"),
+            extra_write: Vec::new(),
+            egress: Vec::new(),
+            validator_read_deny_roots: Vec::new(),
+        };
+        let container = GateSandbox::Container {
+            inputs: Box::new(inputs),
+            spec: crate::sandbox_container::ContainerSpec {
+                runtime: crate::sandbox_container::ContainerRuntime::Docker,
+                image: crate::sandbox_container::DEFAULT_IMAGE.to_string(),
+            },
+        };
+        let env: HashMap<String, String> = [("KRANZ_BASE_SHA".to_string(), "deadbeef".to_string())]
+            .into_iter()
+            .collect();
+
+        let one = container.wrap_shell("echo hi", &env).unwrap();
+        let two = container.wrap_shell("echo hi", &env).unwrap();
+        assert_eq!(one.program, std::path::PathBuf::from("docker"));
+        let name_of = |wrapped: &WrappedCommand| {
+            wrapped
+                .args
+                .windows(2)
+                .find(|w| w[0] == "--name")
+                .map(|w| w[1].clone())
+                .expect("the container argv must name its container")
+        };
+        let (name_one, name_two) = (name_of(&one), name_of(&two));
+        assert!(
+            name_one.starts_with("kranz-gate-"),
+            "gate containers carry the kranz-gate- prefix: {name_one}"
+        );
+        assert_ne!(
+            name_one, name_two,
+            "container names are per command, never per resolve — parallel \
+             gate commands from one resolution must not collide"
+        );
+        assert_eq!(
+            one.timeout_teardown,
+            Some((
+                std::path::PathBuf::from("docker"),
+                vec!["rm".to_string(), "-f".to_string(), name_one]
+            )),
+            "the teardown force-removes exactly this command's container"
+        );
+        assert!(
+            one.args.ends_with(&[
+                crate::sandbox_container::DEFAULT_IMAGE.to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo hi".to_string()
+            ]),
+            "image then sh -c payload: {:?}",
+            one.args
+        );
+
+        // The process-sandbox arms and Disabled carry no teardown.
+        let seatbelt = GateSandbox::Seatbelt {
+            enforce: crate::types::SandboxEnforce::Fs,
+            profile_path: std::path::PathBuf::from("/nonexistent"),
+        };
+        assert!(seatbelt
+            .wrap_shell("true", &env)
+            .unwrap()
+            .timeout_teardown
+            .is_none());
+        assert!(GateSandbox::Disabled
+            .wrap_shell("true", &env)
+            .unwrap()
+            .timeout_teardown
+            .is_none());
+    }
+
+    /// The ticket's core test gate: with provider:container + enforce != off
+    /// a contract command provably executes INSIDE the mission container —
+    /// reads/writes on the mount set work (the gate cwd write lands on the
+    /// host, the scratch is writable via $HOME, `KRANZ_BASE_SHA` crosses via
+    /// the forwarded `-e`), writes OUTSIDE the mount set fail (`/etc` on the
+    /// read-only rootfs, and a sibling host temp dir the container never
+    /// mounts), the mission metadata mount is read-only (the events.jsonl
+    /// append fails and the host bytes are untouched), and the host's
+    /// `.kranz/serve.token` is unreachable (its /dev/null mask reads back
+    /// empty, so `test -s` fails). The off arm (GateSandbox::Disabled on the
+    /// host) proves the probes are valid — the SAME probes succeed there, so
+    /// the container is what denies them.
+    ///
+    /// Skips cleanly on hosts with no container runtime (this macOS dev
+    /// host); CI ubuntu-latest has docker. Unix-only: the probes are POSIX
+    /// shell inside the container and POSIX tempfile paths on the host. No
+    /// GATE_SANDBOX_WRAP_LOCK: that lock serializes sandbox-exec/bwrap spawn
+    /// contention, and this test spawns only the container runtime.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn container_gate_wrap_runs_contract_command_inside_the_container() {
+        if crate::sandbox_container::detect().is_none() {
+            eprintln!(
+                "no container runtime (docker/podman/nerdctl/container) on PATH; skipping \
+                 container gate wrap fixture"
+            );
+            return;
+        }
+
+        let (repo, mission) = gate_wrap_layout();
+        let kranz_dir = repo.path().join(".kranz");
+        let scratch = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let container_cfg = crate::types::SandboxConfig {
+            enforce: crate::types::SandboxEnforce::Fs,
+            provider: crate::types::SandboxProvider::Container,
+            image: None,
+            extra_write: vec![],
+            egress: vec![],
+        };
+        let resolution = resolve_gate_sandbox(
+            &container_cfg,
+            repo.path(),
+            &mission,
+            scratch.path(),
+            scratch.path(),
+        )
+        .unwrap();
+        assert!(resolution.note.is_none());
+        let sandbox = resolution.sandbox;
+        assert!(
+            matches!(sandbox, GateSandbox::Container { .. }),
+            "provider:container with a runtime must resolve to the container wrap"
+        );
+        let env = crate::agent_env::contract_command_env(scratch.path(), Some("deadbeef"), &[]);
+
+        // Reads/writes on the mount set work: the gate cwd write lands on
+        // the host, the scratch (HOME) is writable, and the contract env
+        // crossed into the container.
+        let ok_file = repo.path().join("container_gate_wrap_ok.txt");
+        let (ok, output) = run_shell_command_sandboxed(
+            repo.path(),
+            &format!(
+                "echo ok > '{}' && echo scratch > \"$HOME/container_gate_wrap_scratch.txt\" \
+                 && test \"$KRANZ_BASE_SHA\" = deadbeef",
+                ok_file.display()
+            ),
+            &env,
+            &sandbox,
+        )
+        .await;
+        assert!(
+            ok && ok_file.exists()
+                && scratch
+                    .path()
+                    .join("container_gate_wrap_scratch.txt")
+                    .exists(),
+            "writes inside the mount set and the forwarded env must work: {output}"
+        );
+
+        // Writes OUTSIDE the mount set fail: /etc (read-only rootfs) and a
+        // sibling host temp dir the container never mounts.
+        let outside_file = outside.path().join("container_gate_wrap_marker");
+        for probe in [
+            "echo nope > /etc/container_gate_wrap_nope".to_string(),
+            format!("echo x > '{}'", outside_file.display()),
+        ] {
+            let (ok, output) =
+                run_shell_command_sandboxed(repo.path(), &probe, &env, &sandbox).await;
+            assert!(
+                !ok,
+                "write outside the mount set must fail inside the container: {probe}\n{output}"
+            );
+        }
+        assert!(
+            !outside_file.exists(),
+            "the denied write must not create the host file"
+        );
+
+        // Mission metadata is read-only: the append fails and the audit log
+        // keeps its host bytes.
+        let (ok, _) = run_shell_command_sandboxed(
+            repo.path(),
+            &format!(
+                "echo tampered >> '{}'",
+                mission.join("events.jsonl").display()
+            ),
+            &env,
+            &sandbox,
+        )
+        .await;
+        assert!(!ok, "the events.jsonl append must fail on the ro mount");
+        assert_eq!(
+            std::fs::read_to_string(mission.join("events.jsonl")).unwrap(),
+            "{\"seq\":1}\n",
+            "the audit log must be untouched by the container gate"
+        );
+
+        // The host's authority material is unreachable: the /dev/null mask
+        // reads back EMPTY (test -s fails) while an ordinary repo file still
+        // reads fine.
+        for name in ["serve.token", "serve.read.token", "config.json"] {
+            let (ok, output) = run_shell_command_sandboxed(
+                repo.path(),
+                &format!("test -s '{}'", kranz_dir.join(name).display()),
+                &env,
+                &sandbox,
+            )
+            .await;
+            assert!(
+                !ok,
+                ".kranz/{name} must be /dev/null-masked inside the container: {output}"
+            );
+        }
+        let (ok, output) = run_shell_command_sandboxed(
+            repo.path(),
+            &format!("test -s '{}'", repo.path().join("public.txt").display()),
+            &env,
+            &sandbox,
+        )
+        .await;
+        assert!(ok, "ordinary repo reads must keep working: {output}");
+
+        // Anti-vacuity: the SAME probes succeed with enforcement off (the
+        // probe commands are valid; only the container denies them).
+        let (ok, output) = run_shell_command_sandboxed(
+            repo.path(),
+            &format!(
+                "echo x > '{}' && test -s '{}'",
+                outside_file.display(),
+                kranz_dir.join("serve.token").display()
+            ),
+            &env,
+            &GateSandbox::Disabled,
+        )
+        .await;
+        assert!(
+            ok,
+            "with enforce == off the probes succeed (today's posture): {output}"
+        );
+        let _ = std::fs::remove_file(&outside_file);
     }
 
     /// MEASUREMENT HARNESS, not a CI gate (ticket
