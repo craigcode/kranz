@@ -126,6 +126,15 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             }
             Ok(0)
         }
+        Command::GateScores { gate, json } => {
+            let series = kranz_engine::gate_scores::compute_gate_score_series(&repo, &gate)?;
+            if json {
+                println!("{}", output::render_gate_score_series_json(&series)?);
+            } else {
+                print!("{}", output::render_gate_score_series(&series));
+            }
+            Ok(0)
+        }
         Command::EvidenceBundle { mission_id, out } => {
             let mission = select_mission(&repo, mission_id.as_deref().or(cli.mission.as_deref()))?;
             let out = out.unwrap_or_else(|| PathBuf::from(format!("evidence-bundle-{mission}")));

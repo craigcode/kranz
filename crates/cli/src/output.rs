@@ -5,6 +5,7 @@
 use kranz_engine::cost::{Confidence, CostEstimate, MIN_CALIBRATION_MISSIONS};
 use kranz_engine::escalation_metrics::EscalationMetrics;
 use kranz_engine::gate::{GateKind, GateSurface, GateVerdict};
+use kranz_engine::gate_scores::GateScoreSeries;
 use kranz_engine::outcomes::Outcomes;
 use kranz_engine::provenance::{ArtefactStatus, ProvenanceChain};
 use kranz_engine::types::{
@@ -738,6 +739,77 @@ pub fn render_provenance_json(chain: &ProvenanceChain) -> anyhow::Result<String>
     Ok(serde_json::to_string_pretty(chain)?)
 }
 
+/// Render `kranz gate-scores`'s default text view: the gate identity, the
+/// recorded-count line, and one row per evaluation in series order
+/// (timestamp, mission, seq, surface, verdict, score pair). The score
+/// column appears only when at least one evaluation was scored — a
+/// boolean-only gate's series shows verdicts with NO score column, never
+/// zeros (KRZ-315: absence is the normal case, and a `0.0` would invent a
+/// reading the gate never stated). An unknown gate says so plainly rather
+/// than erroring (the outcomes empty-history rule).
+pub fn render_gate_score_series(series: &GateScoreSeries) -> String {
+    let mut out = String::new();
+
+    out.push_str(&format!("Gate scores — {}\n", series.gate));
+    if series.evaluations.is_empty() {
+        out.push_str(&format!(
+            "  no gate.result events recorded for gate `{}`\n",
+            series.gate
+        ));
+        return out;
+    }
+
+    let scored = series
+        .evaluations
+        .iter()
+        .filter(|point| point.score.is_some())
+        .count();
+    if scored == 0 {
+        out.push_str(&format!(
+            "  {} evaluation(s) recorded, none scored (boolean-only gate — verdicts only)\n",
+            series.evaluations.len()
+        ));
+    } else {
+        out.push_str(&format!(
+            "  {} evaluation(s) recorded, {} scored\n",
+            series.evaluations.len(),
+            scored
+        ));
+    }
+
+    out.push('\n');
+    for point in &series.evaluations {
+        // The score pair rides verbatim (the provenance ladder's raw
+        // `score/threshold` idiom); an unscored row in a scored series gets
+        // an honest dash, and a fully unscored series gets no column at all.
+        let score = if scored == 0 {
+            String::new()
+        } else {
+            match (point.score, point.threshold) {
+                (Some(score), Some(threshold)) => format!("  score {score}/{threshold}"),
+                _ => "  score —".to_string(),
+            }
+        };
+        out.push_str(&format!(
+            "  {}  {}  seq {}  {}  {}{}\n",
+            point.ts.to_rfc3339(),
+            point.mission_id,
+            point.seq,
+            gate_surface_str(point.surface),
+            gate_verdict_str(point.verdict),
+            score
+        ));
+    }
+
+    out
+}
+
+/// Serialize `kranz gate-scores --json`'s output — byte-identical across
+/// runs over unchanged logs (the series carries no clock, no host paths).
+pub fn render_gate_score_series_json(series: &GateScoreSeries) -> anyhow::Result<String> {
+    Ok(serde_json::to_string_pretty(series)?)
+}
+
 /// Milliseconds as a compact duration ("12s", "47m", "2.3h", "3.1d") for
 /// the cycle-time readout.
 fn format_duration_ms(ms: u64) -> String {
@@ -1392,5 +1464,151 @@ mod tests {
         let label = mission_status_label(state.mission.status);
         assert_eq!(label, "APPROVED");
         assert_ne!(label, "RUNNING");
+    }
+
+    mod gate_scores_cli {
+        use super::*;
+        use kranz_engine::event_log::{EventLog, LockForce};
+        use kranz_engine::gate::{GateKind, GateSurface, GateVerdict};
+        use kranz_engine::gate_scores::{
+            compute_gate_score_series, GateScorePoint, GateScoreSeries,
+        };
+        use kranz_engine::paths::MissionPaths;
+        use std::time::Duration;
+        use tempfile::TempDir;
+
+        fn point(
+            mission: &str,
+            seq: u64,
+            surface: GateSurface,
+            verdict: GateVerdict,
+            score: Option<(f64, f64)>,
+        ) -> GateScorePoint {
+            GateScorePoint {
+                mission_id: mission.to_string(),
+                seq,
+                ts: Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap(),
+                surface,
+                verdict,
+                score: score.map(|(score, _)| score),
+                threshold: score.map(|(_, threshold)| threshold),
+            }
+        }
+
+        /// A scored gate's series renders the score pair verbatim beside the
+        /// stated verdict — including the FAIL-with-a-low-score row's mirror:
+        /// nothing "corrects" the verdict from the score in either direction.
+        #[test]
+        fn gate_score_series_cli_text_shows_score_column_when_scored() {
+            let series = GateScoreSeries {
+                gate: "vacuous-filter".to_string(),
+                evaluations: vec![
+                    point(
+                        "m-1",
+                        4,
+                        GateSurface::Approval,
+                        GateVerdict::Pass,
+                        Some((1.0, 1.0)),
+                    ),
+                    point(
+                        "m-2",
+                        9,
+                        GateSurface::FinalGate,
+                        GateVerdict::Fail,
+                        Some((0.5, 1.0)),
+                    ),
+                    point("m-2", 11, GateSurface::FinalGate, GateVerdict::Pass, None),
+                ],
+            };
+            let text = render_gate_score_series(&series);
+            assert!(text.contains("Gate scores — vacuous-filter"), "{text}");
+            assert!(
+                text.contains("3 evaluation(s) recorded, 2 scored"),
+                "{text}"
+            );
+            assert!(
+                text.contains("m-1  seq 4  approval  PASS  score 1/1"),
+                "{text}"
+            );
+            assert!(
+                text.contains("m-2  seq 9  final-gate  FAIL  score 0.5/1"),
+                "{text}"
+            );
+            // An unscored row in a scored series: an honest dash, not a zero.
+            assert!(
+                text.contains("m-2  seq 11  final-gate  PASS  score —"),
+                "{text}"
+            );
+        }
+
+        /// A boolean-only gate's series shows verdicts with NO score column
+        /// at all — never a column of zeros (KRZ-315: absence is the normal
+        /// case; a 0.0 would invent a reading the gate never stated).
+        #[test]
+        fn gate_score_series_cli_text_boolean_only_gate_has_no_score_column() {
+            let series = GateScoreSeries {
+                gate: "env-sensitive".to_string(),
+                evaluations: vec![
+                    point("m-1", 7, GateSurface::Approval, GateVerdict::Pass, None),
+                    point("m-2", 3, GateSurface::Approval, GateVerdict::Pass, None),
+                ],
+            };
+            let text = render_gate_score_series(&series);
+            assert!(
+                text.contains(
+                    "2 evaluation(s) recorded, none scored (boolean-only gate — verdicts only)"
+                ),
+                "{text}"
+            );
+            assert!(text.contains("m-1  seq 7  approval  PASS"), "{text}");
+            assert!(
+                !text.contains("score "),
+                "no score column, never zeros:\n{text}"
+            );
+        }
+
+        /// An unknown gate says so plainly instead of erroring (the outcomes
+        /// empty-history rule: a query over no history is not a failure).
+        #[test]
+        fn gate_score_series_cli_text_unknown_gate_says_no_events() {
+            let series = GateScoreSeries {
+                gate: "no-such-gate".to_string(),
+                evaluations: vec![],
+            };
+            let text = render_gate_score_series(&series);
+            assert!(
+                text.contains("no gate.result events recorded for gate `no-such-gate`"),
+                "{text}"
+            );
+        }
+
+        /// The --json form round-trips to the computed series value (the
+        /// escalation-metrics/provenance JSON idiom) over a real fixture log.
+        #[test]
+        fn gate_score_series_cli_json_round_trips_over_fixture_repo() {
+            let tmp = TempDir::new().unwrap();
+            let paths = MissionPaths::new(tmp.path(), "m-1");
+            let mut log = EventLog::acquire(&paths, "m-1", Duration::ZERO, LockForce::No).unwrap();
+            log.append(EventKind::GateResult {
+                gate: "vacuous-filter".to_string(),
+                surface: GateSurface::Approval,
+                kind: GateKind::Deterministic,
+                index: 0,
+                verdict: GateVerdict::Pass,
+                artefact_ref: "contract gate vacuous-filter".to_string(),
+                artefact_detail: None,
+                score: Some(1.0),
+                threshold: Some(1.0),
+            })
+            .unwrap();
+
+            let series = compute_gate_score_series(tmp.path(), "vacuous-filter").unwrap();
+            let json = render_gate_score_series_json(&series).unwrap();
+            let round_tripped: GateScoreSeries = serde_json::from_str(&json).unwrap();
+            assert_eq!(round_tripped, series);
+            assert_eq!(round_tripped.evaluations.len(), 1);
+            assert_eq!(round_tripped.evaluations[0].score, Some(1.0));
+            assert_eq!(round_tripped.evaluations[0].threshold, Some(1.0));
+        }
     }
 }

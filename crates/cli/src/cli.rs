@@ -158,6 +158,24 @@ pub enum Command {
         json: bool,
     },
 
+    /// Show the recorded evaluation series for one gate identity across all
+    /// missions: every gate.result with that gate name, in log order —
+    /// verdict, and the gate-supplied score + threshold where the gate
+    /// reported them (read-only, no lock). kranz records what gates report,
+    /// never normalizes it, and never derives the verdict from the score;
+    /// a boolean-only gate's series shows verdicts with no score column
+    /// (absence is the normal case, never a zero).
+    GateScores {
+        /// The gate identity (the `gate` field on gate.result events — a
+        /// defect-class name like `vacuous-filter`, a pack gate name,
+        /// `merge-gate-suite`)
+        gate: String,
+
+        /// Dump the GateScoreSeries struct as JSON instead of the text table
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Pause the mission (takes effect between worker runs)
     Pause,
 

@@ -18,7 +18,10 @@
 //!   implementation). Static and fast: it greps test files for the substring,
 //!   it never compiles anything. The collision signal runs only where the
 //!   work has NOT landed yet (approval) — at the final gate a well-formed
-//!   filter collides with its own just-landed tests by design.
+//!   filter collides with its own just-landed tests by design. This gate is
+//!   also the engine's one SCORED gate (KRZ-315): its confidence score is
+//!   the share of its applicable signal surface it could fully determine —
+//!   see [`VacuousFilterAnalysis`].
 //! - **`wrong-polarity`** — an assertion that passes BECAUSE its target is
 //!   absent rather than because the property holds: a negated grep
 //!   (`! grep -q pattern <path>`) or a neutralized one
@@ -41,7 +44,11 @@
 //! tilde), an unparseable grep, or an unfamiliar test runner is a PASS, never
 //! a guess. The regression bar is the repo's own well-formed contract
 //! commands (`.kranz/merge-gates.json`, the [`crate::contract_lint`] test
-//! fixtures): those must pass all gates unchanged.
+//! fixtures): those must pass all gates unchanged. The vacuous-filter
+//! confidence score (KRZ-315) exists to make that conservative pass VISIBLE:
+//! a verdict resting partly on undetermined surface scores below 1.0, so the
+//! recorded series can route it to a human instead of letting "passed
+//! because we could not tell" read as "verified".
 //!
 //! WHY the posture is advisory: approval blocking behavior is unchanged by
 //! this ticket. The gates SURFACE named verdicts — through the existing
@@ -230,15 +237,69 @@ impl Gate for VacuousFilterGate {
         GateKind::Deterministic
     }
     fn evaluate(&self) -> GateOutcome {
-        outcome_from_findings(
-            VACUOUS_FILTER,
-            vacuous_filter_findings(&self.checks, &self.repo_root, self.filter_collision),
-        )
+        let analysis =
+            vacuous_filter_analysis(&self.checks, &self.repo_root, self.filter_collision);
+        // The score ATTACHES to the stated verdict — `with_score` has no
+        // path back to the verdict (gate.rs), so a pass with a low score
+        // stays a pass and a fail with a high one stays a fail.
+        let score = analysis.score();
+        let mut outcome = outcome_from_findings(VACUOUS_FILTER, analysis.findings);
+        if let Some(score) = score {
+            outcome = outcome.with_score(score.score, score.threshold);
+        }
+        outcome
     }
 }
 
-/// Per-assertion findings for the vacuous-filter class. Two independent
-/// signals, both static:
+/// The threshold [`VacuousFilterGate`] judges its confidence score against
+/// (KRZ-315): 1.0, full determinability. The gate's posture is that every
+/// rule fires only on shapes it can fully account for (module docs), so any
+/// score below 1.0 means part of the verdict rests on the conservative pass
+/// rather than a verified shape — exactly the low-confidence evaluation a
+/// later slice routes back to a human.
+const VACUOUS_FILTER_SCORE_THRESHOLD: f64 = 1.0;
+
+/// The vacuous-filter analysis of one contract's command assertions: the
+/// per-assertion findings PLUS the analysis coverage behind the verdict
+/// (KRZ-315 — this gate's honest graded measure, and the reason it is the
+/// engine's scored demonstration gate). Coverage counts the signal surface
+/// the gate could fully DETERMINE against the surface it could only pass
+/// conservatively:
+///
+/// - **determined** — a test-runner pipeline's grep whose pattern parsed
+///   (the `[1-9]` anchor was actually checked), and each `cargo test`
+///   filter whose collision scan ran. The verdict on these surfaces rests
+///   on evidence.
+/// - **undetermined** — a test-runner pipeline whose grep pattern was
+///   undeterminable (e.g. a `-f` pattern file). Today such a pipeline
+///   PASSES without its anchor ever being checked (the conservative pass
+///   the module docs promise); the coverage count is what keeps that from
+///   reading as verification.
+struct VacuousFilterAnalysis {
+    findings: Vec<String>,
+    determined: u64,
+    undetermined: u64,
+}
+
+impl VacuousFilterAnalysis {
+    /// The gate's confidence in its verdict: the share of the applicable
+    /// signal surface it fully determined, judged against
+    /// [`VACUOUS_FILTER_SCORE_THRESHOLD`]. `None` when NOTHING applied — no
+    /// test-runner greps and no cargo filters: the gate examined no graded
+    /// surface at all, and inventing a confidence there would be the
+    /// vacuous shape this gate exists to catch (absence over invention,
+    /// KRZ-315). Never consulted to compute the verdict (gate.rs).
+    fn score(&self) -> Option<crate::gate::GateScore> {
+        let total = self.determined + self.undetermined;
+        (total > 0).then(|| crate::gate::GateScore {
+            score: self.determined as f64 / total as f64,
+            threshold: VACUOUS_FILTER_SCORE_THRESHOLD,
+        })
+    }
+}
+
+/// Analyze the contract's command assertions for the vacuous-filter class.
+/// Two independent signals, both static:
 ///
 /// 1. A test-runner invocation (`cargo test`, `cargo nextest run`,
 ///    `npm test`, `pytest`, `go test`) sharing a command with a grep whose
@@ -251,12 +312,19 @@ impl Gate for VacuousFilterGate {
 ///    pre-existing tests with zero implementation. Checked by grepping test
 ///    files' `fn` names, never by compiling. Runs only when
 ///    `filter_collision` is set (approval — see [`VacuousFilterGate`]).
-fn vacuous_filter_findings(
+///
+/// Each signal also records its coverage into the returned
+/// [`VacuousFilterAnalysis`] (the gate's confidence basis, KRZ-315); the
+/// findings and the coverage come from the SAME walk so they can never
+/// drift.
+fn vacuous_filter_analysis(
     checks: &[CommandCheck],
     repo_root: &Path,
     filter_collision: bool,
-) -> Vec<String> {
+) -> VacuousFilterAnalysis {
     let mut findings = Vec::new();
+    let mut determined = 0u64;
+    let mut undetermined = 0u64;
     for check in checks {
         let words = lex(&check.command);
         let segments = segments(&words);
@@ -267,8 +335,14 @@ fn vacuous_filter_findings(
                     continue;
                 };
                 let Some(patterns) = grep_patterns(args) else {
+                    // The anchor signal APPLIES (a test-runner pipeline
+                    // greps its output) but the pattern is undeterminable:
+                    // the pipeline passes without its anchor ever being
+                    // checked — counted, never guessed at.
+                    undetermined += 1;
                     continue;
                 };
+                determined += 1;
                 if !patterns.iter().any(|p| p.contains("[1-9]")) {
                     findings.push(format!(
                         "[{}] test-runner pipeline's grep anchors no nonzero count \
@@ -285,6 +359,10 @@ fn vacuous_filter_findings(
         }
         for segment in &segments {
             if let Some(filter) = cargo_test_filter(&segment.words) {
+                // The collision scan IS the full analysis of this surface —
+                // it ran, so the surface is determined whether or not it
+                // finds a collision.
+                determined += 1;
                 if let Some(site) = find_test_name_collision(repo_root, &filter) {
                     findings.push(format!(
                         "[{}] cargo test filter `{filter}` collides with an existing \
@@ -297,7 +375,11 @@ fn vacuous_filter_findings(
             }
         }
     }
-    findings
+    VacuousFilterAnalysis {
+        findings,
+        determined,
+        undetermined,
+    }
 }
 
 /// True when the segment invokes a recognized test runner. Conservative:
@@ -1012,7 +1094,7 @@ mod tests {
             "a3",
             "cargo test --workspace zz_contract_gate_no_such_filter 2>&1 | grep -qE 'test result: ok\\.'",
         )];
-        let findings = vacuous_filter_findings(&checks, &workspace_root(), true);
+        let findings = vacuous_filter_analysis(&checks, &workspace_root(), true).findings;
         assert_eq!(findings.len(), 1, "{findings:?}");
         assert!(findings[0].contains("[a3]"), "{findings:?}");
         assert!(findings[0].contains("[1-9]"), "{findings:?}");
@@ -1025,7 +1107,7 @@ mod tests {
             "a3",
             "cargo test --workspace zz_contract_gate_no_such_filter 2>&1 | grep -qE 'test result: ok\\. [1-9]'",
         )];
-        let findings = vacuous_filter_findings(&checks, &workspace_root(), true);
+        let findings = vacuous_filter_analysis(&checks, &workspace_root(), true).findings;
         assert!(findings.is_empty(), "{findings:?}");
     }
 
@@ -1038,7 +1120,7 @@ mod tests {
             "a3",
             "cargo test --workspace approval_lint_ 2>&1 | grep -qE 'test result: ok\\. [1-9]'",
         )];
-        let findings = vacuous_filter_findings(&checks, &workspace_root(), true);
+        let findings = vacuous_filter_analysis(&checks, &workspace_root(), true).findings;
         assert_eq!(findings.len(), 1, "{findings:?}");
         assert!(findings[0].contains("collides"), "{findings:?}");
         assert!(findings[0].contains("approval_lint_"), "{findings:?}");
@@ -1052,7 +1134,7 @@ mod tests {
             "a3",
             "cargo test --workspace zz_contract_gate_no_such_filter 2>&1 | grep -qE 'test result: ok\\. [1-9]'",
         )];
-        let findings = vacuous_filter_findings(&checks, &workspace_root(), true);
+        let findings = vacuous_filter_analysis(&checks, &workspace_root(), true).findings;
         assert!(findings.is_empty(), "{findings:?}");
     }
 
@@ -1084,7 +1166,7 @@ mod tests {
             "a3",
             "cargo test --workspace approval_lint_ 2>&1 | grep -qE 'test result: ok\\. [1-9]'",
         )];
-        let findings = vacuous_filter_findings(&colliding, &workspace_root(), false);
+        let findings = vacuous_filter_analysis(&colliding, &workspace_root(), false).findings;
         assert!(findings.is_empty(), "{findings:?}");
 
         // …but an unanchored grep is still caught in the final-gate phase.
@@ -1092,8 +1174,107 @@ mod tests {
             "a3",
             "cargo test --workspace zz_contract_gate_no_such_filter 2>&1 | grep -qE 'test result: ok\\.'",
         )];
-        let findings = vacuous_filter_findings(&unanchored, &workspace_root(), false);
+        let findings = vacuous_filter_analysis(&unanchored, &workspace_root(), false).findings;
         assert_eq!(findings.len(), 1, "{findings:?}");
+    }
+
+    /// KRZ-315: a fully determined verdict scores 1.0/1.0 — the anchored
+    /// grep was checked and the fresh filter's collision scan ran, so the
+    /// pass rests entirely on verified shapes.
+    #[test]
+    fn contract_gate_vacuous_filter_gate_score_series_scores_full_coverage() {
+        let gate = VacuousFilterGate {
+            checks: vec![check(
+                "a3",
+                "cargo test --workspace zz_contract_gate_no_such_filter 2>&1 | grep -qE 'test result: ok\\. [1-9]'",
+            )],
+            repo_root: workspace_root(),
+            filter_collision: true,
+        };
+        let outcome = gate.evaluate();
+        assert!(outcome.passed(), "{outcome:?}");
+        let score = outcome
+            .score
+            .expect("graded surface exists — score attached");
+        assert_eq!(score.score, 1.0);
+        assert_eq!(score.threshold, 1.0);
+    }
+
+    /// KRZ-315: a test-runner pipeline whose grep pattern is undeterminable
+    /// (`-f` pattern file) passes WITHOUT its anchor being checked — the
+    /// coverage score drops below the 1.0 threshold while the verdict stays
+    /// a stated PASS: the low score never flips the verdict (gate.rs), it
+    /// flags the unverified surface to a human.
+    #[test]
+    fn contract_gate_vacuous_filter_gate_score_series_undetermined_grep_lowers_coverage() {
+        let gate = VacuousFilterGate {
+            checks: vec![check(
+                "a3",
+                "cargo test --workspace zz_contract_gate_no_such_filter 2>&1 | grep -qf gate-score-patterns.txt",
+            )],
+            repo_root: workspace_root(),
+            filter_collision: true,
+        };
+        let outcome = gate.evaluate();
+        assert!(outcome.passed(), "{outcome:?}");
+        let score = outcome
+            .score
+            .expect("graded surface exists — score attached");
+        // determined: the fresh filter's collision scan (1); undetermined:
+        // the `-f` grep (1) → 1/2.
+        assert_eq!(score.score, 0.5);
+        assert_eq!(score.threshold, 1.0);
+    }
+
+    /// KRZ-315, absence over invention: a contract with no test-runner
+    /// greps and no cargo filters gives the gate NO graded surface — the
+    /// outcome carries no score at all (a fabricated 1.0 would be the
+    /// vacuous shape this gate exists to catch).
+    #[test]
+    fn contract_gate_vacuous_filter_gate_score_series_absent_without_graded_surface() {
+        let gate = VacuousFilterGate {
+            checks: vec![
+                check("a1", "true"),
+                check("a2", "grep -q marker src/lib.rs"),
+            ],
+            repo_root: workspace_root(),
+            filter_collision: true,
+        };
+        let outcome = gate.evaluate();
+        assert!(outcome.passed(), "{outcome:?}");
+        assert_eq!(outcome.score, None);
+    }
+
+    /// Regression: the other floor gates stay boolean-only — only
+    /// vacuous-filter reports a score (KRZ-315 makes ONE demonstration gate
+    /// scored; every other gate emits nothing, unchanged).
+    #[test]
+    fn contract_gate_vacuous_filter_gate_score_series_other_floor_gates_stay_boolean() {
+        let contract = vec![command_assertion(
+            "a1",
+            "cargo test --workspace zz_contract_gate_no_such_filter 2>&1 | grep -qE 'test result: ok\\. [1-9]'",
+        )];
+        let lint = ContractLintReport {
+            results: vec![lint_result(
+                "a1",
+                "cargo test …",
+                AssertionLintOutcome::FailedOnBase,
+            )],
+            tree_clean_at_base: true,
+        };
+        let reports = contract_gate_reports(&contract, Some(&lint), &workspace_root());
+        assert_eq!(reports.len(), 4, "{reports:?}");
+        for report in reports {
+            if report.name == VACUOUS_FILTER {
+                assert!(report.outcome.score.is_some(), "the scored gate scores");
+            } else {
+                assert_eq!(
+                    report.outcome.score, None,
+                    "{} stays boolean-only",
+                    report.name
+                );
+            }
+        }
     }
 
     // ---- wrong-polarity -------------------------------------------------

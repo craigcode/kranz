@@ -39,6 +39,7 @@ pub mod evidence_bundle;
 pub mod findings;
 pub mod gate;
 pub mod gate_results;
+pub mod gate_scores;
 pub mod git_ops;
 pub mod hooks;
 pub mod judgement;
