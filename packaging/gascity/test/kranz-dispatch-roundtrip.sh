@@ -2048,6 +2048,138 @@ else
     fi
 fi
 
+# --- Case: terminal-unconfirmed entries defer, never re-run (13th-pass) ---
+# run-bead's terminal bd writes are best-effort; a transient City failure
+# leaves the bead in_progress after a completed mission. The worker must
+# NOT sweep the entry (that destroys the recovery trail) and must NOT
+# re-run it — it defers it aside. The stub fails exactly the close/update
+# calls for the target bead; kranz exits 0 (mission "completed").
+DEFER_CREATE_OUT=$(BD create "WORKER-DEFER fixture" --type task --json 2>&1)
+DEFER_ID=$(printf '%s' "$DEFER_CREATE_OUT" | unwrap | jq -r '.id // empty')
+if [ -z "$DEFER_ID" ]; then
+    fail_case "workerdefer-create" "a non-empty fixture id" "'$DEFER_CREATE_OUT'"
+else
+    BD update "$DEFER_ID" --claim >/dev/null 2>&1
+    printf 'brief\n' > "$SPOOL_DIR/1690000000-$DEFER_ID.md"
+    jq -n --arg id "$DEFER_ID" --arg city "$CITY_DIR" --arg rig "$RIG_DIR" --arg cycles "1" \
+        '{id:$id, city:$city, rigDir:$rig, maxCycles:$cycles}' > "$SPOOL_DIR/1690000000-$DEFER_ID.json"
+
+    DEFER_STUB_BIN="$SANDBOX/defer-stubbin"
+    mkdir -p "$DEFER_STUB_BIN"
+    cat > "$DEFER_STUB_BIN/gc" <<STUBEOF
+#!/bin/sh
+set -u
+if [ "\${1:-}" = "--city" ]; then
+    shift 2
+fi
+if [ "\${1:-}" = "bd" ]; then
+    shift
+    # The terminal writes (close, and update --status for the target id)
+    # fail transiently; show and everything else forwards to the store.
+    if [ "\$2" = "$DEFER_ID" ]; then
+        case "\$1" in
+            close | update)
+                echo "defer-stub: simulated transient City failure" >&2
+                exit 1
+                ;;
+        esac
+    fi
+    ( cd "$STORE_DIR" && bd "\$@" )
+    exit \$?
+fi
+echo "defer-stub-gc: unsupported invocation: gc \$*" >&2
+exit 1
+STUBEOF
+    chmod +x "$DEFER_STUB_BIN/gc"
+    # The kranz stub reports a completed mission; the close write fails.
+    cat > "$DEFER_STUB_BIN/kranz" <<'STUBEOF'
+#!/bin/sh
+set -u
+echo "kranz-stub: simulated mission run m-bea5ed (exit 0)"
+exit 0
+STUBEOF
+    chmod +x "$DEFER_STUB_BIN/kranz"
+
+    GC_CITY="$CITY_DIR" KRANZ_SPOOL="$SPOOL_DIR" \
+        PATH="$DEFER_STUB_BIN:$PATH" "$BIN_DIR/kranz-city-worker" --once >/dev/null 2>&1
+
+    DEFER_MARKER=missing
+    [ -e "$SPOOL_DIR/1690000000-$DEFER_ID.deferred" ] && DEFER_MARKER=present
+    DEFER_JSON=missing
+    [ -e "$SPOOL_DIR/1690000000-$DEFER_ID.json.deferred" ] && DEFER_JSON=present
+    # The drain glob (*.json) must not match the deferred rename — this ls
+    # asserts BOTH properties (deferred exists, nothing drainable left).
+    DEFER_DRAINABLE=$(ls "$SPOOL_DIR"/*.json 2>/dev/null | head -1)
+    DEFER_STATUS=$(status_of "$DEFER_ID")
+
+    if [ "$DEFER_MARKER" != "present" ] || [ "$DEFER_JSON" != "present" ]; then
+        fail_case "worker-defer-entry-deferred" "terminal-unconfirmed entry deferred aside intact" "marker=$DEFER_MARKER json=$DEFER_JSON"
+    elif [ -n "$DEFER_DRAINABLE" ]; then
+        fail_case "worker-defer-out-of-drain" "no drainable .json left in the spool" "found: $DEFER_DRAINABLE"
+    elif [ "$DEFER_STATUS" != "in_progress" ]; then
+        fail_case "worker-defer-bead-untouched" "bead still in_progress (the failed write changed nothing)" "$DEFER_STATUS"
+    else
+        echo "WORKER-DEFER: PASS (terminal-unconfirmed entry deferred intact, out of the drain path, bead untouched)"
+    fi
+fi
+
+# --- Case: crash-safe worker lock (13th-pass) ------------------------------
+# A plain mkdir lock survives SIGKILL and disables dispatch forever. The
+# holder file (<pid> <start-token>) makes the lock reclaimable exactly when
+# the recorded process is provably gone — and never when it is alive.
+LOCK_CREATE_OUT=$(BD create "WORKER-LOCK fixture" --type task --json 2>&1)
+LOCK_ID=$(printf '%s' "$LOCK_CREATE_OUT" | unwrap | jq -r '.id // empty')
+if [ -z "$LOCK_ID" ]; then
+    fail_case "workerlock-create" "a non-empty fixture id" "'$LOCK_CREATE_OUT'"
+else
+    BD update "$LOCK_ID" --claim >/dev/null 2>&1
+    printf 'brief\n' > "$SPOOL_DIR/1690000000-$LOCK_ID.md"
+    jq -n --arg id "$LOCK_ID" --arg city "$CITY_DIR" --arg rig "$RIG_DIR" --arg cycles "1" \
+        '{id:$id, city:$city, rigDir:$rig, maxCycles:$cycles}' > "$SPOOL_DIR/1690000000-$LOCK_ID.json"
+
+    # (a) Stale lock: a pid that cannot exist. The worker must RECLAIM it
+    # and drain the entry normally (bead closes via the kranz stub).
+    LOCKDIR="$SPOOL_DIR/.worker-lock"
+    mkdir "$LOCKDIR"
+    printf '999999999 bogus-token\n' > "$LOCKDIR/holder"
+    GC_CITY="$CITY_DIR" KRANZ_SPOOL="$SPOOL_DIR" KRANZ_STUB_EXIT=0 \
+        PATH="$STUB_BIN:$PATH" "$BIN_DIR/kranz-city-worker" --once >/dev/null 2>&1
+    LOCK_STALE_STATUS=$(status_of "$LOCK_ID")
+    if [ "$LOCK_STALE_STATUS" != "closed" ]; then
+        fail_case "worker-lock-stale-reclaimed" "stale lock reclaimed and the entry drained to closed" "$LOCK_STALE_STATUS"
+    else
+        echo "WORKER-LOCK-STALE: PASS (dead-pid lock reclaimed, entry drained)"
+    fi
+
+    # (b) Live lock: THIS process with its real token. A second worker must
+    # exit quietly and drain NOTHING (a fresh entry stays in the spool).
+    LOCK2_CREATE_OUT=$(BD create "WORKER-LOCK fixture (live)" --type task --json 2>&1)
+    LOCK2_ID=$(printf '%s' "$LOCK2_CREATE_OUT" | unwrap | jq -r '.id // empty')
+    if [ -z "$LOCK2_ID" ]; then
+        fail_case "workerlock-live-create" "a non-empty fixture id" "'$LOCK2_CREATE_OUT'"
+    else
+    BD update "$LOCK2_ID" --claim >/dev/null 2>&1
+    printf 'brief\n' > "$SPOOL_DIR/1690000000-$LOCK2_ID.md"
+    jq -n --arg id "$LOCK2_ID" --arg city "$CITY_DIR" --arg rig "$RIG_DIR" --arg cycles "1" \
+        '{id:$id, city:$city, rigDir:$rig, maxCycles:$cycles}' > "$SPOOL_DIR/1690000000-$LOCK2_ID.json"
+    mkdir "$LOCKDIR" 2>/dev/null || true
+    SELF_TOKEN=$(ps -o lstart= -p $$ 2>/dev/null | tr -s ' ' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    printf '%s %s\n' "$$" "$SELF_TOKEN" > "$LOCKDIR/holder"
+    GC_CITY="$CITY_DIR" KRANZ_SPOOL="$SPOOL_DIR" KRANZ_STUB_EXIT=0 \
+        PATH="$STUB_BIN:$PATH" "$BIN_DIR/kranz-city-worker" --once >/dev/null 2>&1
+    LOCK_LIVE_STATUS=$(status_of "$LOCK2_ID")
+    LOCK_LIVE_JSON=missing
+    [ -f "$SPOOL_DIR/1690000000-$LOCK2_ID.json" ] && LOCK_LIVE_JSON=present
+    rm -f "$LOCKDIR/holder"
+    rmdir "$LOCKDIR" 2>/dev/null || true
+    if [ "$LOCK_LIVE_STATUS" != "in_progress" ] || [ "$LOCK_LIVE_JSON" != "present" ]; then
+        fail_case "worker-lock-live-stands" "live-by-token lock never stolen (entry untouched, bead claimed)" "status=$LOCK_LIVE_STATUS json=$LOCK_LIVE_JSON"
+    else
+        echo "WORKER-LOCK-LIVE: PASS (alive-by-token holder stands; second worker exits without draining)"
+    fi
+    fi
+fi
+
 # --- Case: claim released on reopen — a DIFFERENT actor can claim the bead
 # after kranz-run-bead reopens it (direct regression test for this fix: a
 # bead driven through exit 3 used to stay assigned to the original actor,
