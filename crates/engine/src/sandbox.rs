@@ -2501,8 +2501,10 @@ mod tests {
         std::fs::write(root.join("Cargo.toml"), "[package]\n").unwrap();
         // The .env is authority material by NAME (path-based deny); its
         // content is irrelevant to the test and deliberately not
-        // secret-shaped (the range scanner fires on TOKEN= shapes).
-        std::fs::write(root.join(".env"), "placeholder-content\n").unwrap();
+        // secret-shaped (the range scanner fires on TOKEN= shapes — the
+        // path is bound separately so no .env + value adjacency exists).
+        let dotenv_path = root.join(".env");
+        std::fs::write(&dotenv_path, "placeholder-content\n").unwrap();
         std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
         let mission = root.join(".kranz").join("missions").join("m-x");
