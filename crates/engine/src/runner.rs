@@ -1009,6 +1009,11 @@ pub async fn run_validator(
         worker_commands,
         guidance,
         None,
+        // The wrapper keeps the byte-identical pre-containment path (the
+        // role's own sandbox resolution); production validation rounds
+        // pre-resolve the mandatory containment wrap in the orchestrator
+        // and pass it through here (ticket validator-mandatory-containment).
+        None,
     )
     .await
 }
@@ -1021,6 +1026,19 @@ pub async fn run_validator(
 /// [`contract_env`]) is preserved regardless of `session_cwd`. `run_validator`
 /// is the thin wrapper that passes `paths.repo_root`, keeping the checkout-mode
 /// path byte-for-byte.
+///
+/// `validator_sandbox` is the MANDATORY containment resolution from the
+/// orchestrator (ticket `validator-mandatory-containment`,
+/// [`crate::sandbox::resolve_validator_containment`]): `Some` attaches the
+/// pre-resolved wrap (the role's enforced sandbox plus the real-checkout
+/// read-deny roots, or the mandatory `fs`-tier wrap under `enforce: off`);
+/// `None` falls back to the role's own resolution — the byte-identical
+/// pre-containment path the `run_validator` wrapper keeps (its callers
+/// predate the orchestrator-driven containment; every production validation
+/// round resolves through the orchestrator). A pre-resolved sandbox still
+/// gets its scratch root pinned to THIS session's private scratch, the same
+/// pin [`resolve_sandbox_or_refuse`] applies — the orchestrator resolved
+/// before the session id existed.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_validator_in(
     backend: &dyn AgentBackend,
@@ -1039,6 +1057,7 @@ pub async fn run_validator_in(
     worker_commands: &[String],
     guidance: Option<&str>,
     contract_results: Option<&str>,
+    validator_sandbox: Option<crate::sandbox::ResolvedSandbox>,
 ) -> Result<RunOutcome> {
     if !matches!(kind, Role::ValidatorScrutiny | Role::ValidatorFunctional) {
         return Err(EngineError::InvalidState(format!(
@@ -1183,12 +1202,22 @@ pub async fn run_validator_in(
         sandbox: None,
     };
     spec.env = contract_env(base_sha);
-    spec.sandbox = resolve_sandbox_or_refuse(
-        role_cfg,
-        session_cwd,
-        &paths.mission_dir(),
-        &spec.session_id,
-    )?;
+    spec.sandbox = match validator_sandbox {
+        Some(mut resolved) => {
+            // The orchestrator pre-resolved the mandatory containment wrap
+            // (ticket validator-mandatory-containment) before this session
+            // id existed — pin the writable scratch to THIS session's
+            // private root, the same pin resolve_sandbox_or_refuse applies.
+            resolved.inputs.tmpdir = crate::backend_claude::scratch_home_root(&spec.session_id);
+            Some(resolved)
+        }
+        None => resolve_sandbox_or_refuse(
+            role_cfg,
+            session_cwd,
+            &paths.mission_dir(),
+            &spec.session_id,
+        )?,
+    };
     apply_egress_grants(&mut spec.sandbox, egress_grants);
     permissions::apply(
         permissions::for_role(kind, cfg, &combined_commands, grants, &[]),
@@ -1318,6 +1347,7 @@ mod tests {
                     tmpdir: std::path::PathBuf::from("/t"),
                     extra_write: vec![],
                     egress,
+                    validator_read_deny_roots: Vec::new(),
                 },
                 container: None,
             }

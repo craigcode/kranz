@@ -98,9 +98,16 @@ kranz work                      # drain the queue (run missions)
     `run_bounded_gate_command_sandboxed`); `off` keeps the env-only posture
     byte-for-byte. Validators never see the real checkout:
     each session runs in a throwaway snapshot (`validator_snapshot.rs`,
-    warmed `target/` copy included) and only its verdict crosses back; the
-    `validator.tamper` fingerprint on the real checkout is now a tripwire
-    whose drift means the isolation itself failed.
+    warmed `target/` copy included) and only its verdict crosses back — and
+    the snapshot is separation, not containment, so validator sessions are
+    ADDITIONALLY wrapped regardless of `sandbox.enforce`
+    (`sandbox::resolve_validator_containment`): the snapshot is the sole
+    writable root, the real checkout's source tree is read-denied, and the
+    shared `.git` is readable but write-denied; uncontainable
+    platforms/backends degrade with a loud per-round decision, never
+    silently. The `validator.tamper` fingerprint on the real checkout is
+    the tripwire (defense-in-depth) whose drift means the isolation itself
+    failed.
 
 ## Tracked vs runtime
 

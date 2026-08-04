@@ -1112,6 +1112,7 @@ mod sandbox_wrap {
             tmpdir: tmp.path().to_path_buf(),
             extra_write: vec![],
             egress: vec![],
+            validator_read_deny_roots: vec![],
         };
         let resolved = ResolvedSandbox {
             backend: SandboxBackend::Seatbelt,
@@ -1207,6 +1208,7 @@ mod sandbox_wrap {
             tmpdir: tmp.path().to_path_buf(),
             extra_write: vec![],
             egress: vec![],
+            validator_read_deny_roots: vec![],
         };
         let resolved = ResolvedSandbox {
             backend: SandboxBackend::Seatbelt,

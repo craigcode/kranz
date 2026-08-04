@@ -36,13 +36,31 @@
 //! `preflight.rs`'s `DisposableWorktree` idiom). The deliverable gates and
 //! the out-of-contract sweep keep running against the REAL checkout.
 //!
+//! The snapshot is physical separation, NOT containment (13th-pass review,
+//! P1 — ticket `validator-mandatory-containment`): the worktree sits
+//! underneath the real repository hierarchy and references the shared git
+//! directory, so an UNWRAPPED validator (`enforce: off`, the old default)
+//! could still walk to the real checkout, modify tests, run them, and
+//! restore the bytes — modify → use → restore leaves no drift for the
+//! tripwire to catch. The mandatory validator wrap
+//! (`crate::sandbox::resolve_validator_containment`) closes that: every
+//! validator session runs under a Seatbelt/bwrap profile regardless of
+//! `sandbox.enforce`, with the snapshot as the sole writable root, the
+//! real checkout's source tree read-denied, and the shared `.git` readable
+//! but write-denied. Where the platform or backend cannot contain, the
+//! round records the loud degradation decision and the snapshot plus the
+//! tripwire are the remaining layers.
+//!
 //! Two honest limits, both covered by the fingerprint-turned-tripwire on
 //! the real checkout:
 //!
 //! - The file tree is isolated; git REFS are not. Worktrees share the
 //!   common `.git`, so a validator `git branch -f` in the snapshot still
-//!   moves shared refs — which the tripwire's `for-each-ref` half catches
-//!   at session end. A drift event now means the isolation itself failed.
+//!   moves shared refs where no containment applies — which the
+//!   tripwire's `for-each-ref` half catches at session end. (Under the
+//!   mandatory wrap the ref write is hard-denied by deny-default; the
+//!   tripwire is the defense-in-depth for the degraded platforms.) A
+//!   drift event now means the isolation itself failed.
 //! - Under an enforced sandbox the snapshot's gitdir (`.git/worktrees/<n>`)
 //!   lives outside the writable `session_cwd`, so validator git commands
 //!   that try to refresh the index degrade (read-only git still works;

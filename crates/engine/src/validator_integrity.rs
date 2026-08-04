@@ -1,25 +1,41 @@
 //! Validator immutability: the TRIPWIRE half (ticket
 //! `validator-immutability-proof`, security review P1 #5; snapshot
-//! follow-up in [`crate::validator_snapshot`]).
+//! follow-up in [`crate::validator_snapshot`]; mandatory containment in
+//! `crate::sandbox::resolve_validator_containment`, ticket
+//! `validator-mandatory-containment`).
 //!
 //! "Read-only" validators were nominal: backends do not enforce
 //! `writable: false`, and the process sandbox allows writes to the session
 //! checkout — a prompt-injected or misbehaving validator can edit tests to
 //! manufacture a pass, `git add && git commit` its own changes, or leave
-//! unreviewed files in the deliverable. The definitive fix is the
-//! copy-on-write immutable snapshot ([`crate::validator_snapshot`]): each
-//! validator session runs in a THROWAWAY worktree copy of the checkout and
-//! only its verdict crosses back, so writes are structurally discarded
-//! rather than caught.
+//! unreviewed files in the deliverable. The layered posture that replaced
+//! that, outermost net first:
 //!
-//! What remains here is the tripwire: an IDENTITY ASSERTION around every
-//! validator session, still taken on the REAL checkout. Capture HEAD +
-//! porcelain status before the spawn, re-capture after — with snapshot
-//! isolation in place the real checkout should be byte-identical, so any
-//! drift means the isolation itself failed (a validator escaped its
-//! snapshot, or moved shared git refs the snapshot cannot isolate). The
-//! orchestrator then emits `validator.tamper` and blocks the milestone,
-//! with no retry and no waivable finding.
+//! 1. MANDATORY OS CONTAINMENT (ticket `validator-mandatory-containment`):
+//!    every validator session runs under a Seatbelt/bwrap wrap regardless
+//!    of `sandbox.enforce`, exposing only the snapshot — the real
+//!    checkout's source tree is read-denied, writes land nowhere but the
+//!    snapshot and the session scratch, and the shared git plumbing
+//!    (index, refs) is write-denied by deny-default. The snapshot alone
+//!    was physical separation, not containment: a hostile validator could
+//!    walk to the real checkout, modify tests, run them, and restore the
+//!    bytes — modify → use → restore leaves no drift for this module to
+//!    catch. Where the platform or backend cannot contain, the round
+//!    carries the loud degradation decision and the layers below are what
+//!    remains.
+//! 2. The copy-on-write immutable snapshot ([`crate::validator_snapshot`]):
+//!    each validator session runs in a THROWAWAY worktree copy of the
+//!    checkout and only its verdict crosses back, so writes are
+//!    structurally discarded rather than caught.
+//! 3. THIS MODULE — the tripwire, now explicitly defense-in-depth rather
+//!    than the net: an IDENTITY ASSERTION around every validator session,
+//!    still taken on the REAL checkout. Capture HEAD + porcelain status
+//!    before the spawn, re-capture after — with containment and snapshot
+//!    isolation in place the real checkout should be byte-identical, so
+//!    any drift means BOTH outer layers failed (a validator escaped its
+//!    containment and its snapshot, or moved shared git refs the snapshot
+//!    cannot isolate). The orchestrator then emits `validator.tamper` and
+//!    blocks the milestone, with no retry and no waivable finding.
 //!
 //! The assertion is precise: **no tracked file changed, HEAD unchanged,
 //! index unchanged** — plus no new non-ignored file (a dropped test file
@@ -30,8 +46,9 @@
 //! fingerprint covers them too (3rd-pass review). `git status --porcelain`
 //! respects .gitignore, so legitimate gate artifact churn (`target/`, the
 //! gitignored `.kranz` engine runtime) never trips it. The refs half is the
-//! one mutation class the snapshot does NOT contain (worktrees share the
-//! common `.git`), which is exactly why the tripwire must stay.
+//! one mutation class neither outer layer fully contains (worktrees share
+//! the common `.git`, and an uncontained platform keeps no write deny),
+//! which is exactly why the tripwire must stay.
 
 use crate::error::Result;
 use crate::git_ops::GitRepo;

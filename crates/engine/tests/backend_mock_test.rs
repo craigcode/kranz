@@ -673,6 +673,7 @@ async fn engine_run_contract_results_reach_functional_task_only() {
             &[],
             None,
             Some(results),
+            None,
         )
         .await
         .unwrap();

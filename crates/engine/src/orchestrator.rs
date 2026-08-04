@@ -4377,16 +4377,18 @@ impl MissionEngine {
     }
 
     /// The sandbox posture engine-run gate commands execute under (ticket
-    /// engine-gates-sandbox-wrapped): the worker role's resolved profile,
-    /// with the gate's cwd (`root`, the active tree) as the writable root
-    /// and the mission's `runs/contract-home` as the private scratch — the
-    /// same shape the contract env already points HOME/TMPDIR/CARGO_HOME at,
-    /// so no env change is needed on this path. `enforce: off` resolves to
+    /// engine-gates-sandbox-wrapped): the worker role's resolved wrap —
+    /// process profile or, with `provider: container`, the mission container
+    /// (ticket container-gate-wrapper) — with the gate's cwd (`root`, the
+    /// active tree) as the writable root and the mission's
+    /// `runs/contract-home` as the private scratch — the same shape the
+    /// contract env already points HOME/TMPDIR/CARGO_HOME at, so no env
+    /// change is needed on this path. `enforce: off` resolves to
     /// [`crate::command_exec::GateSandbox::Disabled`], today's exact
-    /// behavior; an enforced posture or a degraded no-op is recorded as a
-    /// decision so the wrap (or its absence) is audible in the event log.
-    /// Resolution failures (linux without `bwrap`, an unsupported platform)
-    /// fail closed, mirroring session resolution.
+    /// behavior; an enforced posture is recorded as a decision so the wrap
+    /// is audible in the event log. Resolution failures (linux without
+    /// `bwrap`, an unsupported platform, `provider: container` with no
+    /// runtime on PATH) fail closed, mirroring session resolution.
     fn gate_sandbox(&mut self, root: &std::path::Path) -> Result<crate::command_exec::GateSandbox> {
         let resolution = crate::command_exec::resolve_gate_sandbox(
             &self.state.config.worker.sandbox,
@@ -4403,10 +4405,11 @@ impl MissionEngine {
                 .emit_decision(
                     "engine-run gates sandbox-wrapped",
                     Some(format!(
-                        "validation/final-gate commands execute under the resolved worker \
-                         sandbox profile (enforce:{}): writes limited to the gate tree plus \
-                         the contract scratch; mission metadata write-denies and authority \
-                         read-denies apply as they do to agent sessions",
+                        "validation/final-gate commands execute inside the resolved worker \
+                         sandbox wrap (provider:{}, enforce:{}): writes limited to the gate \
+                         tree plus the contract scratch; mission metadata write-denies and \
+                         authority read-denies apply as they do to agent sessions",
+                        self.state.config.worker.sandbox.provider.as_str(),
                         self.state.config.worker.sandbox.enforce.as_str()
                     )),
                 )?,
@@ -4545,6 +4548,12 @@ impl MissionEngine {
                 return Ok(());
             };
             let session_cwd = snapshot.path().to_path_buf();
+            // Mandatory containment (ticket validator-mandatory-containment):
+            // resolved per spawn so the posture decision lands next to the
+            // session it covers; `enforce: off` no longer runs the validator
+            // bare where the platform and backend can contain it.
+            let validator_sandbox =
+                self.validator_containment(role, selected_kind, &cfg, &session_cwd)?;
             let outcome = runner::run_validator_in(
                 backend.as_ref(),
                 &mut self.log,
@@ -4562,6 +4571,7 @@ impl MissionEngine {
                 &worker_commands,
                 milestone.validator_guidance.as_deref(),
                 contract_results.as_deref(),
+                validator_sandbox,
             )
             .await;
             let caught = self.catch_up();
@@ -4641,6 +4651,14 @@ impl MissionEngine {
                     return Ok(());
                 };
                 let retry_session_cwd = retry_snapshot.path().to_path_buf();
+                // The retry runs on the injected claude backend — the one
+                // backend that always honors the containment wrap.
+                let retry_validator_sandbox = self.validator_containment(
+                    role,
+                    BackendKind::Claude,
+                    &retry_cfg,
+                    &retry_session_cwd,
+                )?;
                 let retry_outcome = runner::run_validator_in(
                     retry_backend.as_ref(),
                     &mut self.log,
@@ -4658,6 +4676,7 @@ impl MissionEngine {
                     &worker_commands,
                     milestone.validator_guidance.as_deref(),
                     contract_results.as_deref(),
+                    retry_validator_sandbox,
                 )
                 .await;
                 let caught = self.catch_up();
@@ -4813,6 +4832,68 @@ impl MissionEngine {
             }
         }
         Ok(())
+    }
+
+    /// Mandatory validator containment resolution (ticket
+    /// `validator-mandatory-containment`): the wrap every validator session
+    /// gets regardless of the role's `sandbox.enforce` — the decision matrix
+    /// lives in [`crate::sandbox::resolve_validator_containment`]. Surfaces
+    /// the posture as an orchestrator decision per spawn: the LOUD
+    /// degradation note when the platform or the selected backend cannot
+    /// contain (deliberately NOT fail-closed — the ticket names that as a
+    /// later operator decision; snapshot isolation plus the after-fingerprint
+    /// tripwire still apply), and the positive note when the mandatory wrap
+    /// contains a session whose `enforce: off` would previously have run
+    /// bare. A resolution Err is the role's own fail-closed posture
+    /// (enforcement requested but unhonorable here) — unchanged.
+    fn validator_containment(
+        &mut self,
+        role: Role,
+        kind: BackendKind,
+        cfg: &MissionConfig,
+        session_cwd: &std::path::Path,
+    ) -> Result<Option<crate::sandbox::ResolvedSandbox>> {
+        // The real checkout roots the validator must not read: the tree the
+        // snapshot was taken from (the active tree — the integration
+        // worktree in worktree mode), plus the primary checkout when they
+        // differ (the snapshot lives under the primary's `.kranz`, so the
+        // read-deny carve-outs keep it — and the shared git dir —
+        // reachable).
+        let mut deny_roots = vec![self.active_root().to_path_buf()];
+        if !deny_roots.contains(&self.paths.repo_root) {
+            deny_roots.push(self.paths.repo_root.clone());
+        }
+        let containment = crate::sandbox::resolve_validator_containment(
+            &cfg.role(role).sandbox,
+            kind,
+            session_cwd,
+            &self.paths.mission_dir(),
+            &deny_roots,
+        )?;
+        match &containment.note {
+            Some(note) => self.emit_decision(
+                "validator session NOT sandbox-contained",
+                Some(note.clone()),
+            )?,
+            None if containment.sandbox.is_some()
+                && cfg.role(role).sandbox.enforce == crate::types::SandboxEnforce::Off =>
+            {
+                self.emit_decision(
+                    "validator session sandbox-contained (mandatory)",
+                    Some(format!(
+                        "enforce:off no longer leaves the {} unwrapped: writes are limited to \
+                         the throwaway snapshot plus the session-private scratch, the real \
+                         checkout's source tree is read-denied (the shared git objects/refs \
+                         the inspection needs stay readable), and mission metadata \
+                         write-denies plus authority read-denies apply as they do to any \
+                         session (ticket validator-mandatory-containment)",
+                        role_label(role)
+                    )),
+                )?
+            }
+            None => {}
+        }
+        Ok(containment.sandbox)
     }
 
     /// Build the per-session validator snapshot (module
@@ -7963,6 +8044,120 @@ pub(crate) mod tests {
         );
         assert!(validator_snapshot_leftovers(&engine).is_empty());
         assert_eq!(mock.started_specs().len(), 1);
+    }
+
+    /// Mandatory containment (ticket `validator-mandatory-containment`): with
+    /// the default `enforce: off` a validation round STILL wraps the
+    /// validator where the platform and backend can contain it — the
+    /// pre-resolved sandbox reaches the session spec with the snapshot as
+    /// the writable root, the real checkout as the read-deny root, and the
+    /// session-private scratch pinned — the posture is recorded as an
+    /// orchestrator decision, the round completes, and the after-fingerprint
+    /// tripwire stays armed as defense-in-depth (never the only net). Where
+    /// the platform cannot contain (no bwrap, no Seatbelt), the round still
+    /// completes and the LOUD degradation note is recorded instead — never
+    /// silently bare.
+    #[tokio::test]
+    async fn validator_containment_wraps_enforce_off_round_and_records_posture() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            clean_validator_script(),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock.clone();
+        let mut engine = single_milestone_engine(backend, &root);
+
+        engine.validation_round(0).await.unwrap();
+
+        // The round completes regardless of the containment posture…
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::MilestoneCompleted { milestone_id, .. } if milestone_id == "ms-1")),
+            "the contained (or loudly degraded) round still completes: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        // …and the after-fingerprint remains — defense-in-depth, not the
+        // only net: the tripwire ran and stayed silent on a clean round.
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::ValidatorTamper { .. })),
+            "the tripwire stays armed: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+
+        let specs = mock.started_specs();
+        assert_eq!(specs.len(), 1);
+        let decisions: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::OrchestratorDecision { summary, .. } => Some(summary.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        let containable = cfg!(target_os = "macos")
+            || (cfg!(target_os = "linux") && crate::sandbox::command_available("bwrap"));
+        if containable {
+            let sandbox = specs[0]
+                .sandbox
+                .as_ref()
+                .expect("enforce: off no longer leaves the validator unwrapped");
+            let expected_cwd = engine.paths.runs_dir().join("validator-snapshot-scrutiny");
+            assert_eq!(
+                sandbox.inputs.session_cwd, expected_cwd,
+                "the snapshot is the writable root"
+            );
+            assert_eq!(
+                sandbox.inputs.tmpdir,
+                crate::backend_claude::scratch_home_root(&specs[0].session_id),
+                "the writable scratch is pinned to THIS session's private root"
+            );
+            assert_eq!(
+                sandbox.inputs.validator_read_deny_roots,
+                vec![engine.paths.repo_root.clone()],
+                "checkout mode: the real checkout is the single read-deny root"
+            );
+            assert!(
+                sandbox.inputs.extra_write.is_empty(),
+                "no operator extraWrite widening under the mandatory wrap"
+            );
+            assert!(
+                decisions
+                    .iter()
+                    .any(|s| s.contains("sandbox-contained (mandatory)")),
+                "the contained posture is recorded per round: {decisions:?}"
+            );
+            // The generated profile read-denies the real tree's contents
+            // (string-level; the applied sandbox-exec/bwrap probes live in
+            // crate::sandbox's tests).
+            let profile = crate::sandbox::generate_profile(&sandbox.inputs);
+            let readme = format!("(literal \"{}\")", root.join("README.md").display());
+            assert!(
+                profile.contains(&readme),
+                "the real checkout's source files are read-denied:\n{profile}"
+            );
+            let git_dir = format!("\"{}\"", root.join(".git").display());
+            assert!(
+                !profile.contains(&git_dir),
+                "the shared git dir stays readable (the inspection surface):\n{profile}"
+            );
+        } else {
+            assert!(
+                specs[0].sandbox.is_none(),
+                "an uncontainable platform runs degraded — never silently wrapped"
+            );
+            assert!(
+                decisions
+                    .iter()
+                    .any(|s| s.contains("NOT sandbox-contained")),
+                "the LOUD degradation note is recorded per round: {decisions:?}"
+            );
+        }
+        assert!(validator_snapshot_leftovers(&engine).is_empty());
     }
 
     /// A validator that commits inside its session moves only the

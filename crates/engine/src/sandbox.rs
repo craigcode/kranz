@@ -19,6 +19,21 @@
 //! control inbox, transcripts) is additionally denied/masked so it stays
 //! read-only even in checkout mode, where the writable `session_cwd` is an
 //! ancestor of the mission dir.
+//!
+//! Mandatory validator containment (ticket `validator-mandatory-containment`):
+//! VALIDATOR sessions are the one class wrapped regardless of
+//! `sandbox.enforce` — the validator is the adversarial reader the whole
+//! gate rests on, so its isolation cannot be operator-opt-in.
+//! [`resolve_validator_containment`] resolves the posture: the role's own
+//! enforced sandbox plus the real-checkout read-deny set when enforcement
+//! is configured, the mandatory `fs`-tier wrap when it is not, and a loud
+//! per-round degradation note (never a silent bare run, never fail-closed
+//! validation) where the platform or the selected backend cannot contain.
+//! The read-deny set ([`validator_read_deny_entries`]) closes the broad
+//! read allow over the real checkout's source tree — the snapshot
+//! worktree is the sole writable root and the only tree the validator can
+//! read — keeping the narrow `.git`/`.kranz` carve-outs the inspection
+//! legitimately needs.
 
 use std::path::{Path, PathBuf};
 
@@ -42,6 +57,18 @@ pub struct SandboxInputs {
     pub tmpdir: PathBuf,
     pub extra_write: Vec<PathBuf>,
     pub egress: Vec<String>,
+    /// Mandatory validator containment (ticket
+    /// `validator-mandatory-containment`): the REAL checkout roots a
+    /// VALIDATOR session must not read — the checkout the snapshot was taken
+    /// from, plus the primary checkout when worktree mode separates them.
+    /// Empty for every non-validator session (workers, orchestrator turns)
+    /// and for engine-run gates: those legitimately work in the real tree,
+    /// and an empty set keeps the generated profile/argv byte-identical to
+    /// the pre-containment shape. The validator's own snapshot worktree is
+    /// never in this set — it lives under the mission dir, which the
+    /// read-deny carve-outs (`<root>/.git`, `<root>/.kranz`) deliberately
+    /// keep reachable; see [`validator_read_deny_entries`].
+    pub validator_read_deny_roots: Vec<PathBuf>,
 }
 
 /// Concrete OS sandbox backend selected for this session.
@@ -249,6 +276,208 @@ fn build_inputs(
         tmpdir: mission_dir.join("runs").join("contract-home"),
         extra_write,
         egress: role_sandbox.egress.clone(),
+        // Session sandboxes never read-deny the tree they work in — the
+        // validator containment resolution sets this explicitly.
+        validator_read_deny_roots: Vec::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mandatory validator containment (ticket validator-mandatory-containment)
+// ---------------------------------------------------------------------------
+
+/// The outcome of resolving one validator session's MANDATORY containment
+/// (ticket `validator-mandatory-containment`). The validator is the
+/// adversarial reader the whole gate rests on; its isolation must not depend
+/// on the operator opting into enforcement, so `sandbox.enforce: off` (the
+/// default) no longer means an unwrapped validator — where the platform has
+/// a process-sandbox tier and the selected backend can apply it, the session
+/// is wrapped regardless.
+#[derive(Debug)]
+pub struct ValidatorContainment {
+    /// The sandbox to attach to the validator's [`crate::backend::SessionSpec`]
+    /// — `Some` whenever a wrap applies (the role's own enforced sandbox
+    /// plus the read-deny roots, or the mandatory `fs`-tier wrap under
+    /// `enforce: off`), `None` only when containment degraded (see `note`).
+    pub sandbox: Option<ResolvedSandbox>,
+    /// The LOUD operator-facing posture note when containment could not be
+    /// applied — an unsupported platform, a linux without `bwrap`, or a
+    /// backend that does not honor the resolved sandbox. The orchestrator
+    /// surfaces it as a decision per validator spawn (so every validation
+    /// round carries it); `None` when the session is contained. Degradation
+    /// here is deliberately NOT fail-closed: the snapshot's physical
+    /// separation plus the after-fingerprint tripwire still apply, and
+    /// hard-refusing validation on uncontainable platforms is the operator
+    /// decision the ticket names for later.
+    pub note: Option<String>,
+}
+
+/// Resolve the containment posture for one validator session (both roles —
+/// scrutiny and functional run the same shape).
+///
+/// `session_cwd` is the throwaway snapshot worktree — the profile's sole
+/// writable root alongside the session-private scratch. `read_deny_roots`
+/// are the REAL checkout roots the snapshot was taken from (the active tree,
+/// plus the primary checkout when worktree mode separates them); their
+/// source trees become read-denied in the generated profile/argv
+/// ([`validator_read_deny_entries`]). `backend` decides whether the wrap can
+/// be honored at all: only the claude backend applies a resolved sandbox
+/// ([`crate::types::BackendKind::supports_sandbox_enforcement`]).
+///
+/// `enforce != off` keeps today's fail-closed posture byte-for-byte: the
+/// role's own resolution governs (an unsupported platform or missing `bwrap`
+/// is an Err, mirroring the runner's `resolve_sandbox_or_refuse`), with the
+/// read-deny roots ATTACHED on the process tier. The container provider
+/// resolves untouched — its read-only rootfs and named mounts are already
+/// the stronger containment, and the real tree is simply not mounted.
+///
+/// `enforce == off` is the case this ticket exists for: the mandatory
+/// `fs`-tier wrap (write containment with the validator's API egress intact;
+/// no operator `extraWrite` widening — the snapshot is the sole writable
+/// root) wherever the platform supports it and the backend can apply it, and
+/// the loud degradation note everywhere else.
+pub fn resolve_validator_containment(
+    role_sandbox: &crate::types::SandboxConfig,
+    backend: crate::types::BackendKind,
+    session_cwd: &Path,
+    mission_dir: &Path,
+    read_deny_roots: &[PathBuf],
+) -> crate::error::Result<ValidatorContainment> {
+    resolve_validator_containment_target(
+        role_sandbox,
+        backend,
+        session_cwd,
+        mission_dir,
+        read_deny_roots,
+        std::env::consts::OS,
+        command_available("bwrap"),
+        crate::sandbox_container::detect(),
+    )
+}
+
+/// [`resolve_validator_containment`] parameterized on the target OS, `bwrap`
+/// availability, and container runtime so the decision matrix is testable
+/// cross-platform (mirrors [`resolve_for_session_target`] /
+/// `crate::command_exec::resolve_gate_sandbox_target`).
+#[allow(clippy::too_many_arguments)]
+fn resolve_validator_containment_target(
+    role_sandbox: &crate::types::SandboxConfig,
+    backend: crate::types::BackendKind,
+    session_cwd: &Path,
+    mission_dir: &Path,
+    read_deny_roots: &[PathBuf],
+    target_os: &str,
+    bwrap_available: bool,
+    container_runtime: Option<crate::sandbox_container::ContainerRuntime>,
+) -> crate::error::Result<ValidatorContainment> {
+    if role_sandbox.enforce != crate::types::SandboxEnforce::Off {
+        // The role's own resolution governs; an enforced pair with a
+        // backend that cannot honor it is already refused by
+        // `config::validate` (fail closed) before a mission reaches here.
+        let (sandbox, warn) = resolve_for_session_target(
+            role_sandbox,
+            session_cwd,
+            mission_dir,
+            target_os,
+            bwrap_available,
+            container_runtime,
+        );
+        return match sandbox {
+            Some(mut resolved) => {
+                // Process-tier wraps (Seatbelt/bwrap) get the read-deny
+                // roots; the container tier's mounts are the containment
+                // and simply do not include the real tree.
+                if resolved.backend != SandboxBackend::Container {
+                    resolved.inputs.validator_read_deny_roots = read_deny_roots.to_vec();
+                }
+                Ok(ValidatorContainment {
+                    sandbox: Some(resolved),
+                    note: None,
+                })
+            }
+            // Fail closed, mirroring resolve_sandbox_or_refuse: enforcement
+            // was requested and cannot be honored on this platform.
+            None => Err(crate::error::EngineError::Backend(warn.unwrap_or_else(|| {
+                format!(
+                    "sandbox enforce:{} requested but no sandbox could be resolved; refusing to run unsandboxed",
+                    role_sandbox.enforce.as_str()
+                )
+            }))),
+        };
+    }
+
+    // enforce: off — MANDATORY containment. The provider is ignored here:
+    // `provider: container` with `enforce: off` documents "no sandboxing,
+    // same as today", and the mandatory wrap is the process tier.
+    if !backend.supports_sandbox_enforcement() {
+        return Ok(ValidatorContainment {
+            sandbox: None,
+            note: Some(format!(
+                "validator sessions on the {} backend cannot be OS-sandbox-contained (only the \
+                 claude backend applies the resolved sandbox profile); this validator runs with \
+                 snapshot isolation and the after-fingerprint tripwire only — the real checkout \
+                 is reachable from the session. Select a claude validator backend for mandatory \
+                 containment (ticket validator-mandatory-containment)",
+                backend.as_str()
+            )),
+        });
+    }
+    let degraded = |why: String| {
+        Ok(ValidatorContainment {
+            sandbox: None,
+            note: Some(format!(
+                "validator sessions are NOT OS-sandbox-contained ({why}); the validator still \
+                 runs in its throwaway snapshot with the after-fingerprint tripwire on the real \
+                 checkout, but hostile validator code could walk to the real checkout and \
+                 restore bytes before the fingerprint — containment here is the snapshot's \
+                 physical separation only. Fail-closed on uncontainable platforms is the \
+                 operator decision ticket validator-mandatory-containment names for later"
+            )),
+        })
+    };
+    match platform_support(crate::types::SandboxEnforce::Fs, target_os) {
+        // Unreachable (Fs is not Off) — platform_support is the shared
+        // vocabulary, so the match stays exhaustive anyway.
+        SandboxDecision::Off => unreachable!("fs never decides Off"),
+        SandboxDecision::UnsupportedWarn => {
+            degraded(format!("target_os={target_os} has no process-sandbox tier"))
+        }
+        SandboxDecision::Enforce(SandboxBackend::Bubblewrap) if !bwrap_available => {
+            degraded("linux without `bwrap` on PATH".to_string())
+        }
+        // platform_support never selects Container (that resolution is
+        // resolve_container_target's, and the enforce!=off arm above owns
+        // the provider) — the match stays exhaustive anyway.
+        SandboxDecision::Enforce(SandboxBackend::Container) => {
+            unreachable!("process tier only")
+        }
+        SandboxDecision::Enforce(backend_kind) => Ok(ValidatorContainment {
+            sandbox: Some(ResolvedSandbox {
+                backend: backend_kind,
+                inputs: SandboxInputs {
+                    // The fs tier: write containment with network intact
+                    // (denying egress would brick the validator's API
+                    // session — the same reason the session profile
+                    // allows network under fs).
+                    enforce: crate::types::SandboxEnforce::Fs,
+                    session_cwd: session_cwd.to_path_buf(),
+                    mission_dir: mission_dir.to_path_buf(),
+                    // Pinned per session by the runner to the session's
+                    // private scratch root (the same pin
+                    // resolve_sandbox_or_refuse applies); the default
+                    // here is the probe-shaped contract home.
+                    tmpdir: mission_dir.join("runs").join("contract-home"),
+                    // NO operator extraWrite widening under the mandatory
+                    // wrap: the snapshot worktree is the sole writable
+                    // root (plus the session-private scratch).
+                    extra_write: Vec::new(),
+                    egress: Vec::new(),
+                    validator_read_deny_roots: read_deny_roots.to_vec(),
+                },
+                container: None,
+            }),
+            note: None,
+        }),
     }
 }
 
@@ -455,6 +684,94 @@ pub(crate) fn authority_read_deny_paths(inputs: &SandboxInputs) -> Vec<PathBuf> 
     paths
 }
 
+/// One entry of the validator read-deny set: a top-level path of a real
+/// checkout root the validator must not read, classified so the Seatbelt
+/// profile can pick `subpath` vs `literal` and the bwrap argv can pick a
+/// tmpfs shadow vs a `/dev/null` mask.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ValidatorReadDenyEntry {
+    pub path: PathBuf,
+    pub is_dir: bool,
+}
+
+/// Top-level names a validator read-deny root ALWAYS keeps readable, because
+/// the validator's own machinery cannot work without them:
+///
+/// - `.git` — the shared git directory. The snapshot is a WORKTREE: its
+///   `.git` file points into `<root>/.git/worktrees/<n>`, and every
+///   `git log`/`diff`/`show` the scrutiny/inspection flow runs resolves
+///   objects and refs through the common dir. This is the narrow
+///   `.git` surface the ticket keeps: READABLE (the fold needs it), never
+///   writable (deny-default; a ref move is the tripwire's `for-each-ref`
+///   half). `.git/config` stays readable for the same reason git itself
+///   reads it — the same posture today's broad-read sandbox has.
+/// - `.kranz` — the mission dir lives here, and the validator's snapshot
+///   worktree sits under it (`<root>/.kranz/missions/<id>/runs/`). The
+///   engine-owned metadata inside stays write-denied
+///   ([`mission_write_denies`]) and the authority files read-denied
+///   ([`authority_read_deny_paths`]) exactly as for any session; the rest
+///   (tracked `workspace.json`, tickets) is content the snapshot already
+///   carries.
+const VALIDATOR_READ_DENY_CARVEOUTS: &[&str] = &[".git", ".kranz"];
+
+/// The validator read-deny set (ticket `validator-mandatory-containment`):
+/// every TOP-LEVEL entry of each [`SandboxInputs::validator_read_deny_roots`]
+/// root EXCEPT the [`VALIDATOR_READ_DENY_CARVEOUTS`]. Denying whole top-level
+/// entries covers the source tree without naming the root itself as a
+/// subpath (which would swallow the carved-out `.git`/`.kranz` beneath it —
+/// SBPL denies take precedence over every allow, so no allow could carve
+/// them back out).
+///
+/// Entries are classified by `std::fs::metadata` — which FOLLOWS symlinks —
+/// so a symlinked top-level dir is denied as a dir (and the canonical form
+/// emitted alongside covers the link TARGET, the same raw+canonical idiom
+/// [`authority_read_deny_paths`] uses; Seatbelt matches canonical paths).
+/// Entries whose metadata fails (a broken symlink, a racer's unlink) are
+/// skipped: a dangling link leaks nothing, and a vanished entry is gone.
+///
+/// The root ITSELF is not in this set: a literal deny on the root dir would
+/// block stat/readdir of it, and coreutils `mkdir -p` stats every ancestor
+/// of an absolute path — denying the root broke `mkdir -p` under the
+/// snapshot (probed 2026-08-04). The root's directory LISTING therefore
+/// stays readable on both tiers (names, never contents — the bwrap side
+/// cannot express a listing deny without masking the carve-outs anyway).
+///
+/// One documented residual gap, outside the threat model (validator code can
+/// create NOTHING at a deny root — writes there are deny-default): an entry
+/// created at a root AFTER profile generation is not in the set — the same
+/// spawn-time shape the bwrap authority masks already accept.
+pub(crate) fn validator_read_deny_entries(inputs: &SandboxInputs) -> Vec<ValidatorReadDenyEntry> {
+    let mut entries = std::collections::BTreeSet::new();
+    for root in &inputs.validator_read_deny_roots {
+        let Ok(read_dir) = std::fs::read_dir(root) else {
+            continue;
+        };
+        for entry in read_dir.flatten() {
+            let name = entry.file_name();
+            if VALIDATOR_READ_DENY_CARVEOUTS.contains(&name.to_string_lossy().as_ref()) {
+                continue;
+            }
+            let path = entry.path();
+            let Ok(metadata) = std::fs::metadata(&path) else {
+                continue;
+            };
+            let is_dir = metadata.is_dir();
+            entries.insert(ValidatorReadDenyEntry {
+                path: path.clone(),
+                is_dir,
+            });
+            let canonical = absolutize(&path);
+            if canonical != path {
+                entries.insert(ValidatorReadDenyEntry {
+                    path: canonical,
+                    is_dir,
+                });
+            }
+        }
+    }
+    entries.into_iter().collect()
+}
+
 /// Default Anthropic egress plus mission-configured additions, trimmed and
 /// de-duplicated in stable order.
 pub fn effective_egress(configured: &[String]) -> Vec<String> {
@@ -486,6 +803,21 @@ pub fn effective_egress(configured: &[String]) -> Vec<String> {
 /// of their own (13th-pass review, P1 — [`cargo_cache_write_deny_paths`]):
 /// the isolated contract home may LINK them in above the copy ceiling, and
 /// the linked target must stay read-only under every allow.
+///
+/// Mandatory validator containment (ticket `validator-mandatory-containment`):
+/// when [`SandboxInputs::validator_read_deny_roots`] is non-empty (validator
+/// sessions only), a second read-deny block closes the broad read allow over
+/// the REAL checkout's source tree — every top-level entry of each root
+/// except the `.git`/`.kranz` carve-outs ([`validator_read_deny_entries`]) —
+/// plus the `/dev/null` write allow every shell/git needs under deny-default
+/// (the gate wrap's documented finding). The root's own listing stays
+/// readable (names, never contents — a literal deny on the root breaks
+/// `mkdir -p` under the snapshot, which stats every ancestor; the bwrap
+/// side cannot express the listing deny at all). The snapshot worktree
+/// (under `<root>/.kranz/...`) and the shared git dir stay readable; the
+/// validator provably reads only its snapshot's contents. Denies take
+/// precedence over the broad allow regardless of clause order (the same
+/// guarantee the authority deny above relies on).
 pub fn generate_profile(inputs: &SandboxInputs) -> String {
     let write_paths = write_allowlist(inputs);
 
@@ -520,6 +852,43 @@ pub fn generate_profile(inputs: &SandboxInputs) -> String {
             profile.push_str(&format!("  (literal \"{lit}\")\n"));
         }
         profile.push_str(")\n");
+        profile.push('\n');
+    }
+    // Mandatory validator containment (see the fn doc): read-deny the real
+    // checkout's source tree. Directories deny as subpaths (the whole
+    // subtree), files as literals. Deny wins over the broad read allow
+    // regardless of clause order — placement after it is documentary. The
+    // root ITSELF is deliberately NOT denied: a literal deny on the root
+    // dir blocks stat/readdir of it, and coreutils `mkdir -p` stats every
+    // ancestor of an absolute path — denying the root broke `mkdir -p`
+    // under the snapshot (probed 2026-08-04). The root's directory LISTING
+    // stays visible (names, never contents) — the same posture the bwrap
+    // side is limited to anyway.
+    let validator_denies = validator_read_deny_entries(inputs);
+    if !validator_denies.is_empty() {
+        let mut subpaths = std::collections::BTreeSet::new();
+        let mut literals = std::collections::BTreeSet::new();
+        for entry in &validator_denies {
+            if entry.is_dir {
+                subpaths.insert(escape_sbpl_literal(&entry.path));
+            } else {
+                literals.insert(escape_sbpl_literal(&entry.path));
+            }
+        }
+        profile.push_str("(deny file-read*\n");
+        for lit in &subpaths {
+            profile.push_str(&format!("  (subpath \"{lit}\")\n"));
+        }
+        for lit in &literals {
+            profile.push_str(&format!("  (literal \"{lit}\")\n"));
+        }
+        profile.push_str(")\n");
+        // `/dev/null` must stay writable even under deny-default (the gate
+        // wrap's documented finding, `gate_profile_extras` — probed
+        // 2026-08-03): git and the shell open it O_RDWR in ordinary
+        // operation, and a validator session that cannot dies with
+        // "could not open '/dev/null'" on plain `git status`.
+        profile.push_str("\n(allow file-write* (literal \"/dev/null\"))\n");
         profile.push('\n');
     }
     match inputs.enforce {
@@ -628,6 +997,20 @@ pub fn generate_profile(inputs: &SandboxInputs) -> String {
 /// the operator's real Cargo registry/git caches get explicit stacked
 /// ro-binds for the same reason (13th-pass review — they stay readable, a
 /// linked cache is the session's registry, but never writable).
+///
+/// Mandatory validator containment (ticket `validator-mandatory-containment`
+/// — the bwrap analogue of the profile's validator read-deny block): when
+/// [`SandboxInputs::validator_read_deny_roots`] is non-empty, each top-level
+/// source-tree entry of those roots ([`validator_read_deny_entries`]) is
+/// masked — directories shadowed by an empty tmpfs, files by a `/dev/null`
+/// ro-bind — so the whole-fs ro-bind no longer exposes the real checkout's
+/// contents. The `.git`/`.kranz` carve-outs stay (git needs the shared
+/// object store; the snapshot lives under `.kranz`). The root's own
+/// directory LISTING stays visible on both tiers (names, never contents):
+/// bwrap cannot close it without masking the carve-outs, and the Seatbelt
+/// side declines to (a literal deny on the root breaks `mkdir -p` under
+/// the snapshot). `/dev/null` needs no allow here — the bwrap argv mounts
+/// a real `/dev` (`--dev /dev`).
 pub fn bubblewrap_args(
     inputs: &SandboxInputs,
     binary: &Path,
@@ -666,6 +1049,27 @@ pub fn bubblewrap_args(
         out.push("--ro-bind".to_string());
         out.push("/dev/null".to_string());
         out.push(mask);
+    }
+    // The bwrap analogue of the profile's validator read-deny block (ticket
+    // validator-mandatory-containment — see the fn doc): shadow each real
+    // source-tree entry so the whole-fs ro-bind stops exposing it. Dirs get
+    // an empty tmpfs (the existing control/-shadow idiom), files a
+    // /dev/null ro-bind (the authority-mask idiom). Entries were enumerated
+    // from the live fs and exist at spawn; later binds win, and this block
+    // lands after every rw bind, so a wide writable root cannot re-expose a
+    // denied entry — the carve-outs (`.git`, `.kranz`) were never in the
+    // set, so the snapshot and the shared git dir stay as their binds left
+    // them.
+    for entry in validator_read_deny_entries(inputs) {
+        let display = entry.path.display().to_string();
+        if entry.is_dir {
+            out.push("--tmpfs".to_string());
+            out.push(display);
+        } else {
+            out.push("--ro-bind".to_string());
+            out.push("/dev/null".to_string());
+            out.push(display);
+        }
     }
     // The bwrap analogue of the profile's shared-Cargo-cache write deny
     // (13th-pass review, P1 — cargo_cache_write_deny_paths): the `/`
@@ -908,6 +1312,7 @@ mod tests {
             tmpdir: tmpdir.to_path_buf(),
             extra_write: extra,
             egress: Vec::new(),
+            validator_read_deny_roots: Vec::new(),
         }
     }
 
@@ -2078,5 +2483,777 @@ mod tests {
             .output()
             .expect("failed to run bwrap");
         assert_eq!(String::from_utf8_lossy(&control.stdout), "public");
+    }
+
+    // -----------------------------------------------------------------------
+    // Mandatory validator containment (ticket validator-mandatory-containment)
+    // -----------------------------------------------------------------------
+
+    /// A fake real-checkout root in the exact production layout: a source
+    /// tree (dir + files, including a dotfile secret), the shared `.git`
+    /// dir, and the `.kranz` mission layout with the validator's snapshot
+    /// worktree underneath. Returns (tempdir guard, root, snapshot, mission).
+    fn validator_containment_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src").join("secret.rs"), "fn secret() {}\n").unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]\n").unwrap();
+        std::fs::write(root.join(".env"), "TOKEN=hunter2\n").unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let mission = root.join(".kranz").join("missions").join("m-x");
+        let snapshot = mission.join("runs").join("validator-snapshot-scrutiny");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("README.md"), "snapshot copy\n").unwrap();
+        std::fs::write(root.join(".kranz").join("serve.token"), "secret-token").unwrap();
+        (dir, root, snapshot, mission)
+    }
+
+    /// A REAL git repo in the same layout (one committed file + a committed
+    /// `src/` dir, `.kranz/` ignored, the snapshot as a detached worktree
+    /// under the mission's `runs/`) for the applied probes that exercise
+    /// the git surface. None when git is not on PATH (mirrors the
+    /// orchestrator tests' `lessons_test_repo` skip).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn validator_containment_git_fixture() -> Option<(tempfile::TempDir, PathBuf, PathBuf, PathBuf)>
+    {
+        let git_ok = std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !git_ok {
+            eprintln!("skipping test: git is not on PATH");
+            return None;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .expect("spawn git");
+            assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        };
+        if !std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&root)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            run(&["init"]);
+            run(&["symbolic-ref", "HEAD", "refs/heads/main"]);
+        }
+        run(&["config", "user.name", "test"]);
+        run(&["config", "user.email", "test@example.com"]);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src").join("secret.rs"), "fn secret() {}\n").unwrap();
+        std::fs::write(root.join("tracked.rs"), "fn tracked() {}\n").unwrap();
+        std::fs::write(root.join(".gitignore"), ".kranz/\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-m", "init"]);
+        let mission = root.join(".kranz").join("missions").join("m-x");
+        let snapshot = mission.join("runs").join("validator-snapshot-scrutiny");
+        std::fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
+        run(&[
+            "worktree",
+            "add",
+            "--detach",
+            snapshot.to_str().expect("utf-8 temp path"),
+        ]);
+        // Engine-owned metadata + the authority material the denies cover.
+        std::fs::write(mission.join("events.jsonl"), "{\"seq\":1}\n").unwrap();
+        std::fs::write(root.join(".kranz").join("serve.token"), "secret-token").unwrap();
+        Some((dir, root, snapshot, mission))
+    }
+
+    /// The mandatory-wrap inputs shape: the snapshot as the sole writable
+    /// session root, the real checkout as the read-deny root.
+    fn validator_containment_inputs(
+        root: &Path,
+        snapshot: &Path,
+        mission: &Path,
+        tmpdir: &Path,
+    ) -> SandboxInputs {
+        SandboxInputs {
+            enforce: crate::types::SandboxEnforce::Fs,
+            session_cwd: snapshot.to_path_buf(),
+            mission_dir: mission.to_path_buf(),
+            tmpdir: tmpdir.to_path_buf(),
+            extra_write: Vec::new(),
+            egress: Vec::new(),
+            validator_read_deny_roots: vec![root.to_path_buf()],
+        }
+    }
+
+    /// The read-deny set covers the whole source tree — dirs classified as
+    /// dirs, files as files, raw AND canonical forms — and NEVER names the
+    /// `.git`/`.kranz` carve-outs.
+    #[test]
+    fn validator_containment_entries_cover_source_tree_and_carve_out_git_and_kranz() {
+        let (_dir, root, snapshot, mission) = validator_containment_fixture();
+        let scratch = tempfile::tempdir().unwrap();
+        let inputs = validator_containment_inputs(&root, &snapshot, &mission, scratch.path());
+        let entries = validator_read_deny_entries(&inputs);
+
+        for base in [root.clone(), absolutize(&root)] {
+            let src = base.join("src");
+            assert!(
+                entries.contains(&ValidatorReadDenyEntry {
+                    path: src.clone(),
+                    is_dir: true
+                }),
+                "src/ must be a denied dir: {entries:?}"
+            );
+            for file in ["Cargo.toml", ".env"] {
+                assert!(
+                    entries.contains(&ValidatorReadDenyEntry {
+                        path: base.join(file),
+                        is_dir: false
+                    }),
+                    "{file} must be a denied file: {entries:?}"
+                );
+            }
+        }
+        assert!(
+            entries.iter().all(|e| e
+                .path
+                .file_name()
+                .is_some_and(|n| n != ".git" && n != ".kranz")),
+            "the carve-outs must never be denied: {entries:?}"
+        );
+    }
+
+    /// The generated profile: a second read-deny block closes the broad read
+    /// allow over the real checkout (dirs as subpaths, files and the root
+    /// itself as literals) while the snapshot stays writable and the shared
+    /// git dir + mission dir stay reachable.
+    #[test]
+    fn validator_containment_profile_read_denies_source_tree_and_keeps_carveouts() {
+        let (_dir, root, snapshot, mission) = validator_containment_fixture();
+        let scratch = tempfile::tempdir().unwrap();
+        let profile = generate_profile(&validator_containment_inputs(
+            &root,
+            &snapshot,
+            &mission,
+            scratch.path(),
+        ));
+
+        for base in [root.clone(), absolutize(&root)] {
+            let src = format!("(subpath \"{}\")", escape_sbpl_literal(&base.join("src")));
+            assert!(
+                profile.contains(&src),
+                "profile missing read deny for src/:\n{profile}"
+            );
+            for file in ["Cargo.toml", ".env"] {
+                let lit = format!("(literal \"{}\")", escape_sbpl_literal(&base.join(file)));
+                assert!(
+                    profile.contains(&lit),
+                    "profile missing read deny for {file}:\n{profile}"
+                );
+            }
+            let root_lit = format!("(literal \"{}\")", escape_sbpl_literal(&base));
+            assert!(
+                !profile.contains(&root_lit),
+                "the root itself is deliberately NOT denied (a literal deny breaks \
+                 coreutils `mkdir -p`, which stats every ancestor):\n{profile}"
+            );
+            // The carve-outs are never denied: no rule names the .git or
+            // .kranz DIRS themselves (the closing quote makes this exact).
+            let git_rule = format!("\"{}\"", escape_sbpl_literal(&base.join(".git")));
+            assert!(
+                !profile.contains(&git_rule),
+                ".git must stay readable (the inspection's git surface):\n{profile}"
+            );
+            let kranz_rule = format!("\"{}\"", escape_sbpl_literal(&base.join(".kranz")));
+            assert!(
+                !profile.contains(&kranz_rule),
+                ".kranz must stay reachable (the snapshot lives under it):\n{profile}"
+            );
+        }
+        // …and the .kranz carve-out does not reopen the authority material.
+        for base in [root.join(".kranz"), absolutize(&root.join(".kranz"))] {
+            let token = format!(
+                "(literal \"{}\")",
+                escape_sbpl_literal(&base.join("serve.token"))
+            );
+            assert!(
+                profile.contains(&token),
+                "the authority read deny must survive the carve-out:\n{profile}"
+            );
+        }
+        // The snapshot stays the writable root.
+        let snap_rule = format!(
+            "(subpath \"{}\")",
+            escape_sbpl_literal(&absolutize(&snapshot))
+        );
+        assert!(
+            profile.contains(&snap_rule),
+            "the snapshot must stay writable:\n{profile}"
+        );
+        // …and /dev/null stays writable (the gate wrap's documented finding:
+        // git and the shell open it O_RDWR in ordinary operation).
+        assert!(
+            profile.contains("(allow file-write* (literal \"/dev/null\"))"),
+            "validator profiles must keep /dev/null writable:\n{profile}"
+        );
+    }
+
+    /// Non-validator sessions (empty roots) get byte-stable profiles: exactly
+    /// the pre-containment shape, i.e. only the authority read-deny block.
+    #[test]
+    fn validator_containment_empty_roots_emit_no_deny_block() {
+        let (_dir, root, snapshot, mission) = validator_containment_fixture();
+        let scratch = tempfile::tempdir().unwrap();
+        let mut inputs = validator_containment_inputs(&root, &snapshot, &mission, scratch.path());
+        inputs.validator_read_deny_roots = Vec::new();
+        let profile = generate_profile(&inputs);
+        assert_eq!(
+            profile.matches("(deny file-read*").count(),
+            1,
+            "empty roots must leave the pre-containment profile shape alone:\n{profile}"
+        );
+
+        let profile = generate_profile(&validator_containment_inputs(
+            &root,
+            &snapshot,
+            &mission,
+            scratch.path(),
+        ));
+        assert_eq!(
+            profile.matches("(deny file-read*").count(),
+            2,
+            "the validator read-deny block must land when roots are set:\n{profile}"
+        );
+    }
+
+    /// The bwrap analogue: source dirs shadowed by tmpfs, source files
+    /// masked with /dev/null, carve-outs untouched, the snapshot rw-bound.
+    #[test]
+    fn validator_containment_bwrap_masks_source_tree_and_keeps_carveouts() {
+        let (_dir, root, snapshot, mission) = validator_containment_fixture();
+        let scratch = tempfile::tempdir().unwrap();
+        let args = bubblewrap_args(
+            &validator_containment_inputs(&root, &snapshot, &mission, scratch.path()),
+            Path::new("/usr/bin/claude"),
+            &[],
+        )
+        .unwrap();
+        let joined = args.join(" ");
+
+        let src = absolutize(&root.join("src")).display().to_string();
+        assert!(
+            args.windows(2).any(|w| w[0] == "--tmpfs" && w[1] == src),
+            "missing tmpfs shadow for src/: {args:?}"
+        );
+        let env_file = absolutize(&root.join(".env")).display().to_string();
+        assert!(
+            joined.contains(&format!("--ro-bind /dev/null {env_file}")),
+            "missing /dev/null mask for .env: {args:?}"
+        );
+        // The carve-outs are never masked, and the root itself is not
+        // shadowed (bwrap cannot close the listing without hiding them).
+        let git = absolutize(&root.join(".git")).display().to_string();
+        assert!(
+            !joined.contains(&git),
+            ".git must not be masked (the inspection's git surface): {args:?}"
+        );
+        assert!(
+            !args
+                .windows(2)
+                .any(|w| w[0] == "--tmpfs" && w[1] == root.display().to_string()),
+            "the root itself must not be shadowed: {args:?}"
+        );
+        // The snapshot stays rw-bound.
+        let snap = absolutize(&snapshot).display().to_string();
+        assert!(
+            joined.contains(&format!("--bind {snap} {snap}")),
+            "the snapshot must stay rw-bound: {args:?}"
+        );
+    }
+
+    // --- the resolution matrix -----------------------------------------------
+
+    fn off_cfg() -> crate::types::SandboxConfig {
+        crate::types::SandboxConfig::default()
+    }
+
+    fn fs_cfg() -> crate::types::SandboxConfig {
+        crate::types::SandboxConfig {
+            enforce: crate::types::SandboxEnforce::Fs,
+            ..crate::types::SandboxConfig::default()
+        }
+    }
+
+    /// The case the ticket exists for: `enforce: off` (the default) STILL
+    /// wraps the validator on macOS — the mandatory fs-tier wrap with the
+    /// real checkout read-denied and NO operator extraWrite widening.
+    #[test]
+    fn validator_containment_off_macos_wraps_mandatory_seatbelt() {
+        let mut cfg = off_cfg();
+        cfg.extra_write = vec!["~/elsewhere".to_string()];
+        let roots = vec![PathBuf::from("/repo")];
+        let containment = resolve_validator_containment_target(
+            &cfg,
+            crate::types::BackendKind::Claude,
+            Path::new("/repo/.kranz/missions/m-x/runs/snap"),
+            Path::new("/repo/.kranz/missions/m-x"),
+            &roots,
+            "macos",
+            false,
+            None,
+        )
+        .expect("off+macos resolves the mandatory wrap");
+        assert!(containment.note.is_none(), "{:?}", containment.note);
+        let sandbox = containment.sandbox.expect("a wrap applies");
+        assert_eq!(sandbox.backend, SandboxBackend::Seatbelt);
+        assert_eq!(
+            sandbox.inputs.enforce,
+            crate::types::SandboxEnforce::Fs,
+            "the mandatory wrap is the fs tier (egress stays open for the API)"
+        );
+        assert_eq!(sandbox.inputs.validator_read_deny_roots, roots);
+        assert!(
+            sandbox.inputs.extra_write.is_empty(),
+            "no operator extraWrite widening under the mandatory wrap"
+        );
+        assert_eq!(
+            sandbox.inputs.session_cwd,
+            PathBuf::from("/repo/.kranz/missions/m-x/runs/snap"),
+            "the snapshot is the writable root"
+        );
+    }
+
+    /// Linux: the mandatory wrap needs `bwrap`; without it the validator
+    /// degrades with the loud note, never silently.
+    #[test]
+    fn validator_containment_off_linux_requires_bwrap() {
+        let roots = vec![PathBuf::from("/repo")];
+        let containment = resolve_validator_containment_target(
+            &off_cfg(),
+            crate::types::BackendKind::Claude,
+            Path::new("/snap"),
+            Path::new("/mission"),
+            &roots,
+            "linux",
+            false,
+            None,
+        )
+        .expect("degradation is a note, not an error");
+        assert!(containment.sandbox.is_none());
+        let note = containment.note.expect("the loud note");
+        assert!(note.contains("bwrap"), "{note}");
+        assert!(note.contains("validator-mandatory-containment"), "{note}");
+
+        let containment = resolve_validator_containment_target(
+            &off_cfg(),
+            crate::types::BackendKind::Claude,
+            Path::new("/snap"),
+            Path::new("/mission"),
+            &roots,
+            "linux",
+            true,
+            None,
+        )
+        .expect("off+linux+bwrap resolves");
+        assert!(containment.note.is_none(), "{:?}", containment.note);
+        assert_eq!(
+            containment.sandbox.expect("a wrap applies").backend,
+            SandboxBackend::Bubblewrap
+        );
+    }
+
+    /// Windows has no process-sandbox tier: degrade with the loud note per
+    /// validation round — deliberately NOT fail-closed in this slice (the
+    /// ticket names that as the later operator decision).
+    #[test]
+    fn validator_containment_off_windows_degrades_with_loud_note() {
+        let containment = resolve_validator_containment_target(
+            &off_cfg(),
+            crate::types::BackendKind::Claude,
+            Path::new("C:\\snap"),
+            Path::new("C:\\mission"),
+            &[PathBuf::from("C:\\repo")],
+            "windows",
+            false,
+            None,
+        )
+        .expect("degradation is a note, not an error");
+        assert!(containment.sandbox.is_none());
+        let note = containment.note.expect("the loud note");
+        assert!(note.contains("target_os=windows"), "{note}");
+        assert!(note.contains("validator-mandatory-containment"), "{note}");
+        assert!(note.contains("after-fingerprint"), "{note}");
+    }
+
+    /// A backend that cannot honor the resolved sandbox must never silently
+    /// run bare: the wrap is skipped and the note names the backend.
+    #[test]
+    fn validator_containment_off_non_claude_backend_is_not_silently_weakened() {
+        for backend in [
+            crate::types::BackendKind::Codex,
+            crate::types::BackendKind::Droid,
+            crate::types::BackendKind::Kimi,
+            crate::types::BackendKind::Local,
+            crate::types::BackendKind::Acp,
+        ] {
+            let containment = resolve_validator_containment_target(
+                &off_cfg(),
+                backend,
+                Path::new("/snap"),
+                Path::new("/mission"),
+                &[PathBuf::from("/repo")],
+                "macos",
+                false,
+                None,
+            )
+            .expect("degradation is a note, not an error");
+            assert!(
+                containment.sandbox.is_none(),
+                "{backend:?} must not get a wrap it cannot honor"
+            );
+            let note = containment.note.expect("the loud note");
+            assert!(note.contains(backend.as_str()), "{note}");
+            assert!(note.contains("validator-mandatory-containment"), "{note}");
+        }
+    }
+
+    /// `enforce != off` keeps the role's own resolution AND gains the
+    /// read-deny roots on the process tier; the operator's extraWrite stays
+    /// (the mandatory no-widening rule is the off-case wrap's).
+    #[test]
+    fn validator_containment_enforced_role_resolves_and_attaches_roots() {
+        let mut cfg = fs_cfg();
+        cfg.extra_write = vec!["~/keep".to_string()];
+        let roots = vec![PathBuf::from("/repo")];
+        let containment = resolve_validator_containment_target(
+            &cfg,
+            crate::types::BackendKind::Claude,
+            Path::new("/repo/.kranz/missions/m-x/runs/snap"),
+            Path::new("/repo/.kranz/missions/m-x"),
+            &roots,
+            "macos",
+            false,
+            None,
+        )
+        .expect("fs on macos resolves");
+        assert!(containment.note.is_none(), "{:?}", containment.note);
+        let sandbox = containment.sandbox.expect("the role's wrap");
+        assert_eq!(sandbox.backend, SandboxBackend::Seatbelt);
+        assert_eq!(sandbox.inputs.validator_read_deny_roots, roots);
+        assert!(
+            !sandbox.inputs.extra_write.is_empty(),
+            "an enforced role keeps its declared extraWrite"
+        );
+    }
+
+    /// `enforce != off` stays fail-closed where the platform cannot honor it
+    /// (the runner's resolve_sandbox_or_refuse posture, unchanged).
+    #[test]
+    fn validator_containment_enforced_role_still_fails_closed_where_unsupported() {
+        let err = resolve_validator_containment_target(
+            &fs_cfg(),
+            crate::types::BackendKind::Claude,
+            Path::new("C:\\snap"),
+            Path::new("C:\\mission"),
+            &[PathBuf::from("C:\\repo")],
+            "windows",
+            false,
+            None,
+        )
+        .expect_err("enforcement requested but unhonorable must fail closed");
+        assert!(err.to_string().contains("unsupported"), "{err}");
+    }
+
+    /// The container provider keeps its own (stronger) containment: resolved
+    /// untouched, no read-deny roots attached (the real tree is simply not
+    /// mounted). Under `enforce: off` the provider is ignored — the
+    /// mandatory wrap is the process tier.
+    #[test]
+    fn validator_containment_container_provider_posture() {
+        let cfg = crate::types::SandboxConfig {
+            enforce: crate::types::SandboxEnforce::Fs,
+            provider: crate::types::SandboxProvider::Container,
+            ..crate::types::SandboxConfig::default()
+        };
+        let containment = resolve_validator_containment_target(
+            &cfg,
+            crate::types::BackendKind::Claude,
+            Path::new("/snap"),
+            Path::new("/mission"),
+            &[PathBuf::from("/repo")],
+            "linux",
+            false,
+            Some(crate::sandbox_container::ContainerRuntime::Docker),
+        )
+        .expect("container resolves with a runtime");
+        let sandbox = containment.sandbox.expect("the container wrap");
+        assert_eq!(sandbox.backend, SandboxBackend::Container);
+        assert!(
+            sandbox.inputs.validator_read_deny_roots.is_empty(),
+            "the container's mounts are the containment — no process-tier deny set"
+        );
+
+        let mut off_container = off_cfg();
+        off_container.provider = crate::types::SandboxProvider::Container;
+        let containment = resolve_validator_containment_target(
+            &off_container,
+            crate::types::BackendKind::Claude,
+            Path::new("/snap"),
+            Path::new("/mission"),
+            &[PathBuf::from("/repo")],
+            "macos",
+            false,
+            None,
+        )
+        .expect("off+container still gets the mandatory process-tier wrap");
+        assert_eq!(
+            containment.sandbox.expect("a wrap applies").backend,
+            SandboxBackend::Seatbelt,
+            "provider:container with enforce:off documents 'no sandboxing'; the mandatory wrap is process-tier"
+        );
+    }
+
+    /// Applied proof on macOS (the ticket's test gate): a validator-session
+    /// fixture under `enforce: off`-shape inputs provably CANNOT read the
+    /// real checkout's source tree or the authority material, while the
+    /// shared git dir and the snapshot stay readable.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn validator_containment_macos_denies_real_checkout_reads() {
+        use std::process::Command;
+
+        let _guard = SANDBOX_EXEC_TEST_LOCK.lock().unwrap();
+        if !sandbox_exec_can_apply() {
+            return;
+        }
+        let (_dir, root, snapshot, mission) = validator_containment_fixture();
+        let scratch = tempfile::tempdir().unwrap();
+        let profile = generate_profile(&validator_containment_inputs(
+            &root,
+            &snapshot,
+            &mission,
+            scratch.path(),
+        ));
+        let profile_dir = tempfile::tempdir().unwrap();
+        let profile_path = write_profile_file(profile_dir.path(), &profile).unwrap();
+
+        let read = |path: &Path| {
+            Command::new("sandbox-exec")
+                .arg("-f")
+                .arg(&profile_path)
+                .arg("/bin/cat")
+                .arg(path)
+                .status()
+                .expect("failed to run sandbox-exec")
+        };
+        // The real checkout's source tree is unreadable…
+        for denied in [
+            root.join("src").join("secret.rs"),
+            root.join("Cargo.toml"),
+            root.join(".env"),
+        ] {
+            assert!(
+                !read(&denied).success(),
+                "read of the real tree must be denied: {}",
+                denied.display()
+            );
+        }
+        // …the root LISTING stays visible (names, never contents — a
+        // literal deny on the root breaks coreutils `mkdir -p`, which stats
+        // every ancestor; documented on the entries helper)…
+        let listing = Command::new("sandbox-exec")
+            .arg("-f")
+            .arg(&profile_path)
+            .arg("/bin/ls")
+            .arg(&root)
+            .status()
+            .expect("failed to run sandbox-exec");
+        assert!(
+            listing.success(),
+            "the root listing stays open (names, never contents)"
+        );
+        // …and the authority material stays denied through the carve-out.
+        assert!(
+            !read(&root.join(".kranz").join("serve.token")).success(),
+            "the authority read deny must survive the .kranz carve-out"
+        );
+        // The narrow legitimate surfaces stay readable: the shared git dir
+        // and the validator's own snapshot worktree.
+        for allowed in [root.join(".git").join("HEAD"), snapshot.join("README.md")] {
+            assert!(
+                read(&allowed).success(),
+                "read must keep working: {}",
+                allowed.display()
+            );
+        }
+    }
+
+    /// The second applied half: writes outside the snapshot are denied
+    /// (source tree, mission metadata, and the shared git refs — the
+    /// tripwire's domain, now hard-denied), while the snapshot stays
+    /// writable and read-only git (`log`/`status`/`diff` — the inspection's
+    /// surface) keeps working: the validation round still completes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn validator_containment_macos_keeps_snapshot_writes_and_readonly_git() {
+        use std::process::Command;
+
+        let _guard = SANDBOX_EXEC_TEST_LOCK.lock().unwrap();
+        if !sandbox_exec_can_apply() {
+            return;
+        }
+        let Some((_dir, root, snapshot, mission)) = validator_containment_git_fixture() else {
+            return;
+        };
+        let scratch = tempfile::tempdir().unwrap();
+        let profile = generate_profile(&validator_containment_inputs(
+            &root,
+            &snapshot,
+            &mission,
+            scratch.path(),
+        ));
+        let profile_dir = tempfile::tempdir().unwrap();
+        let profile_path = write_profile_file(profile_dir.path(), &profile).unwrap();
+        let sh = |command: &str| {
+            Command::new("sandbox-exec")
+                .arg("-f")
+                .arg(&profile_path)
+                .arg("/bin/sh")
+                .arg("-c")
+                .arg(command)
+                .status()
+                .expect("failed to run sandbox-exec")
+        };
+
+        // Write denies: the real tree, the root, the engine's metadata, and
+        // the shared git plumbing (index + refs).
+        for command in [
+            format!("echo x >> {}", root.join("tracked.rs").display()),
+            format!("echo x > {}", root.join("new.txt").display()),
+            format!("echo x >> {}", mission.join("events.jsonl").display()),
+            format!("git -C {} add -A", snapshot.display()),
+            format!("git -C {} branch -f side HEAD", snapshot.display()),
+        ] {
+            assert!(!sh(&command).success(), "must be denied: {command}");
+        }
+        // The snapshot stays fully writable (the warmed-target shape)…
+        assert!(sh(&format!(
+            "mkdir -p {0}/target && echo built > {0}/target/out && echo note > {0}/notes.txt",
+            snapshot.display()
+        ))
+        .success());
+        // …and the read-only git inspection surface works — the functional
+        // and scrutiny validators' whole job in the snapshot.
+        let git_log = Command::new("sandbox-exec")
+            .arg("-f")
+            .arg(&profile_path)
+            .arg("git")
+            .arg("-C")
+            .arg(&snapshot)
+            .arg("log")
+            .arg("--oneline")
+            .output()
+            .expect("failed to run sandbox-exec");
+        assert!(
+            git_log.status.success(),
+            "read-only git must work in the snapshot: {}",
+            String::from_utf8_lossy(&git_log.stderr)
+        );
+        assert!(String::from_utf8_lossy(&git_log.stdout).contains("init"));
+        assert!(sh(&format!("git -C {} status --porcelain", snapshot.display())).success());
+        assert!(sh(&format!("git -C {} diff HEAD", snapshot.display())).success());
+        // The snapshot's own copy of the source tree reads fine.
+        assert!(sh(&format!("cat {}", snapshot.join("tracked.rs").display())).success());
+    }
+
+    /// The linux applied analogue: bwrap masks the real tree (dirs ENOENT
+    /// under the tmpfs shadow, files empty under /dev/null), keeps the
+    /// carve-outs and the snapshot, and read-only git still works.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn validator_containment_linux_bwrap_denies_real_checkout_and_keeps_snapshot() {
+        use std::process::Command;
+
+        if !bwrap_can_apply() {
+            return;
+        }
+        let Some((_dir, root, snapshot, mission)) = validator_containment_git_fixture() else {
+            return;
+        };
+        let scratch = tempfile::tempdir().unwrap();
+        let inputs = validator_containment_inputs(&root, &snapshot, &mission, scratch.path());
+        let run = |command: &str| {
+            Command::new("bwrap")
+                .args(
+                    bubblewrap_args(
+                        &inputs,
+                        Path::new("/bin/sh"),
+                        &["-c".to_string(), command.to_string()],
+                    )
+                    .unwrap(),
+                )
+                .output()
+                .expect("failed to run bwrap")
+        };
+
+        // A source DIR is shadowed: reads underneath fail outright.
+        let shadowed = run(&format!(
+            "cat {}",
+            root.join("src").join("secret.rs").display()
+        ));
+        assert!(
+            !shadowed.status.success(),
+            "the tmpfs-shadowed source dir must not resolve: {}",
+            String::from_utf8_lossy(&shadowed.stderr)
+        );
+        // A source FILE is /dev/null-masked: the open succeeds, the content
+        // does not cross (the authority-mask idiom).
+        let masked = run(&format!("cat {}", root.join("tracked.rs").display()));
+        assert!(
+            !String::from_utf8_lossy(&masked.stdout).contains("tracked"),
+            "the masked source file must not yield its content"
+        );
+        // The authority material is masked too.
+        let token = run(&format!(
+            "cat {}",
+            root.join(".kranz").join("serve.token").display()
+        ));
+        assert!(
+            !String::from_utf8_lossy(&token.stdout).contains("secret-token"),
+            "the authority material must stay masked"
+        );
+        // The carve-outs and the snapshot read fine.
+        let git_head = run(&format!("cat {}", root.join(".git").join("HEAD").display()));
+        assert!(git_head.status.success());
+        let snap_read = run(&format!("cat {}", snapshot.join("tracked.rs").display()));
+        assert!(
+            String::from_utf8_lossy(&snap_read.stdout).contains("tracked"),
+            "the snapshot's own copy reads fine"
+        );
+        // Writes outside the snapshot fail (the whole fs is ro-bound); the
+        // snapshot and the git plumbing behave like the Seatbelt side.
+        for command in [
+            format!("echo x >> {}", root.join("tracked.rs").display()),
+            format!("echo x >> {}", mission.join("events.jsonl").display()),
+            format!("git -C {} branch -f side HEAD", snapshot.display()),
+        ] {
+            assert!(!run(&command).status.success(), "must be denied: {command}");
+        }
+        assert!(
+            run(&format!("echo built > {}/target-out", snapshot.display()))
+                .status
+                .success()
+        );
+        let git_log = run(&format!("git -C {} log --oneline", snapshot.display()));
+        assert!(
+            git_log.status.success(),
+            "read-only git must work in the snapshot: {}",
+            String::from_utf8_lossy(&git_log.stderr)
+        );
     }
 }
