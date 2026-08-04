@@ -714,6 +714,17 @@ impl MissionHost {
 
         let repo_root = self.repo_root.clone();
         let gate_executor = Arc::clone(&self.gate_executor);
+        // engine-gates-sandbox-wrapped: the merged mission's own
+        // `worker.sandbox` posture decides whether the gate suite (which
+        // executes that mission's worker-authored test/build code) runs
+        // inside the resolved sandbox profile. `enforce == off` (and the
+        // documented no-op postures) falls through to the injected
+        // `gate_executor` — byte-identical pre-wrap behavior, and the test
+        // seam (`with_gate_executor`) stays authoritative there.
+        let gate_policy = kranz_engine::command_exec::MergeGatePolicy {
+            sandbox: state.config.worker.sandbox.clone(),
+            mission_dir: paths.mission_dir(),
+        };
         let report = tokio::task::spawn_blocking(move || {
             let repo = GitRepo::open(&repo_root)?;
             let report = merge_mission(
@@ -722,7 +733,17 @@ impl MissionHost {
                 &base_sha,
                 &mission_branch,
                 Some(metadata),
-                |cmd, cwd| gate_executor(cmd, cwd),
+                |cmd, cwd| {
+                    if gate_policy.enforces_on_this_host() {
+                        kranz_engine::command_exec::run_bounded_gate_command_sandboxed(
+                            cwd,
+                            cmd,
+                            &gate_policy,
+                        )
+                    } else {
+                        gate_executor(cmd, cwd)
+                    }
+                },
             );
             // Explicit: the repo-busy hold is released HERE, once the merge
             // has fully finished — never earlier by a dropped handler future.

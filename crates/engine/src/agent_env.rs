@@ -25,7 +25,12 @@
 //! swap for this module's scratch-HOME shape, so both lists stay, each
 //! documented at its site) — with ONE exception: the gate env never carries
 //! the ambient `CARGO_HOME`, which `run_bounded_gate_command` replaces with
-//! a fresh [`cache_only_cargo_home`] exactly like the contract env.
+//! a fresh [`cache_only_cargo_home`] exactly like the contract env. Under
+//! `worker.sandbox.enforce != off` the merge gate additionally runs WRAPPED
+//! in the resolved sandbox profile
+//! (`command_exec::run_bounded_gate_command_sandboxed`): the ambient HOME
+//! pass-through stays (git identity needs `~/.gitconfig`), and the profile
+//! makes it read-only — containment by the sandbox, not by env rewrite.
 //!
 //! Secret hygiene: only variable NAMES are ever logged here (the injected
 //! auth key's name, the passthrough names applied/skipped) — never values.

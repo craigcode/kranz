@@ -111,8 +111,10 @@ pub struct ResolvedSandbox {
 }
 
 /// Expand a leading `~/` in `raw` using the `HOME` env var; otherwise return
-/// `raw` unchanged as a `PathBuf`.
-fn expand_tilde(raw: &str) -> PathBuf {
+/// `raw` unchanged as a `PathBuf`. `pub(crate)` so the engine-run gate wrap
+/// (`crate::command_exec::resolve_gate_sandbox`) builds `extra_write` inputs
+/// with the SAME expansion sessions get — never a second hand-rolled rule.
+pub(crate) fn expand_tilde(raw: &str) -> PathBuf {
     if let Some(rest) = raw.strip_prefix("~/") {
         if let Ok(home) = std::env::var("HOME") {
             return PathBuf::from(home).join(rest);
@@ -298,7 +300,9 @@ fn escape_sbpl_string(s: &str) -> String {
 /// regex metacharacter is backslash-escaped so the path matches literally
 /// (temp-dir names carry no metacharacters in practice, but a repo root
 /// might — `.` in a directory name must not become an any-char match).
-fn escape_sbpl_regex(path: &Path) -> String {
+/// `pub(crate)` so the engine-run gate profile (`crate::command_exec`) can
+/// anchor its `xcrun_db` device-cache allow with the same escaping.
+pub(crate) fn escape_sbpl_regex(path: &Path) -> String {
     let mut out = String::new();
     for ch in path.to_string_lossy().chars() {
         match ch {

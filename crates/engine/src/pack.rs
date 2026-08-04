@@ -41,7 +41,7 @@
 //! WHY [`PackGate`] carries a pre-computed outcome: [`Gate::evaluate`] is
 //! synchronous by design (gates capture everything they need at
 //! construction), while the engine's bounded shell runner
-//! ([`crate::command_exec::run_shell_command`]) is async. The orchestrator
+//! (`crate::command_exec::run_shell_command_sandboxed`) is async. The orchestrator
 //! therefore runs each pack gate's command at REGISTRATION time — same
 //! cleared contract env, same active root as the contract assertions — and
 //! the gate captures the outcome; the pipeline still owns ordering and

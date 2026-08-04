@@ -40,7 +40,7 @@ use crate::auth_verify::AuthVerdict;
 use crate::backend::{
     AgentBackend, AgentEvent, AgentSession, PromptMode, SessionExit, SessionSpec,
 };
-use crate::command_exec::{run_shell_command, tail_chars};
+use crate::command_exec::{run_shell_command_sandboxed, tail_chars};
 use crate::config;
 use crate::contract_gates;
 use crate::contract_lint;
@@ -4356,6 +4356,46 @@ impl MissionEngine {
         ))
     }
 
+    /// The sandbox posture engine-run gate commands execute under (ticket
+    /// engine-gates-sandbox-wrapped): the worker role's resolved profile,
+    /// with the gate's cwd (`root`, the active tree) as the writable root
+    /// and the mission's `runs/contract-home` as the private scratch — the
+    /// same shape the contract env already points HOME/TMPDIR/CARGO_HOME at,
+    /// so no env change is needed on this path. `enforce: off` resolves to
+    /// [`crate::command_exec::GateSandbox::Disabled`], today's exact
+    /// behavior; an enforced posture or a degraded no-op is recorded as a
+    /// decision so the wrap (or its absence) is audible in the event log.
+    /// Resolution failures (e.g. linux without `bwrap`) fail closed,
+    /// mirroring session resolution.
+    fn gate_sandbox(&mut self, root: &std::path::Path) -> Result<crate::command_exec::GateSandbox> {
+        let resolution = crate::command_exec::resolve_gate_sandbox(
+            &self.state.config.worker.sandbox,
+            root,
+            &self.paths.mission_dir(),
+            &self.paths.runs_dir().join("contract-home"),
+            &self.paths.runs_dir(),
+        )?;
+        match &resolution.note {
+            Some(note) => {
+                self.emit_decision("engine-run gates NOT sandbox-wrapped", Some(note.clone()))?
+            }
+            None if resolution.sandbox.enforce() != crate::types::SandboxEnforce::Off => self
+                .emit_decision(
+                    "engine-run gates sandbox-wrapped",
+                    Some(format!(
+                        "validation/final-gate commands execute under the resolved worker \
+                         sandbox profile (enforce:{}): writes limited to the gate tree plus \
+                         the contract scratch; mission metadata write-denies and authority \
+                         read-denies apply as they do to agent sessions",
+                        self.state.config.worker.sandbox.enforce.as_str()
+                    )),
+                )?,
+            // enforce: off — today's posture exactly; no new event noise.
+            None => {}
+        }
+        Ok(resolution.sandbox)
+    }
+
     /// Run the contract's command assertions engine-side and render the
     /// captured results for the functional validator's task (validator
     /// repair 3/5): the validator judges verbatim PASS/FAIL evidence instead
@@ -4364,7 +4404,9 @@ impl MissionEngine {
     /// None when the contract has no command assertions.
     ///
     /// `env` is the commands' COMPLETE (cleared) environment, built by the
-    /// caller via [`Self::contract_command_env`].
+    /// caller via [`Self::contract_command_env`]; `sandbox` is the resolved
+    /// gate wrap from [`Self::gate_sandbox`] ([`crate::command_exec::GateSandbox::Disabled`]
+    /// reproduces the pre-wrap behavior exactly).
     ///
     /// Deliberately an associated function WITHOUT a self receiver: a `&self`
     /// receiver is captured by the async future for its whole lifetime, and
@@ -4374,6 +4416,7 @@ impl MissionEngine {
         contract: &[Assertion],
         root: &std::path::Path,
         env: &HashMap<String, String>,
+        sandbox: &crate::command_exec::GateSandbox,
     ) -> Option<String> {
         let command_assertions: Vec<(String, Option<String>)> = contract
             .iter()
@@ -4387,7 +4430,8 @@ impl MissionEngine {
         for (id, command) in command_assertions {
             match command.as_deref() {
                 Some(command) => {
-                    let (ok, output) = run_shell_command(root, command, env).await;
+                    let (ok, output) =
+                        run_shell_command_sandboxed(root, command, env, sandbox).await;
                     let verdict = if ok { "PASS" } else { "FAIL" };
                     let tail = scrub::scrub(&output);
                     rendered.push_str(&format!("- [{id}] `{command}` → {verdict}\n{tail}\n"));
@@ -4447,7 +4491,8 @@ impl MissionEngine {
             let base_sha = self.state.mission.base_sha.clone();
             let root = self.active_root().to_path_buf();
             let env = self.contract_command_env(base_sha.as_deref())?;
-            Self::run_contract_commands_for_validation(&contract, &root, &env).await
+            let gate_sandbox = self.gate_sandbox(&root)?;
+            Self::run_contract_commands_for_validation(&contract, &root, &env, &gate_sandbox).await
         } else {
             None
         };
@@ -5069,6 +5114,12 @@ impl MissionEngine {
         // contractEnvPassthrough names) — ambient secrets never reach them.
         let gate_base_sha = self.state.mission.base_sha.clone();
         let env = self.contract_command_env(gate_base_sha.as_deref())?;
+        // engine-gates-sandbox-wrapped: the same commands then run under the
+        // resolved worker sandbox profile (a no-op Disabled wrap when
+        // enforce == off). Resolved ONCE for the whole final gate — every
+        // assertion below shares the gate tree + contract scratch shape.
+        let gate_root = self.active_root().to_path_buf();
+        let gate_sandbox = self.gate_sandbox(&gate_root)?;
 
         // command assertions — engine-run (design.md: the hard gate).
         for assertion in contract
@@ -5085,7 +5136,8 @@ impl MissionEngine {
                 });
                 continue;
             };
-            let (ok, output) = run_shell_command(self.active_root(), command, &env).await;
+            let (ok, output) =
+                run_shell_command_sandboxed(&gate_root, command, &env, &gate_sandbox).await;
             if !ok {
                 findings.push(Finding {
                     subject: assertion.id.clone(),
@@ -5128,7 +5180,9 @@ impl MissionEngine {
         if let Some(pack) = &pack {
             let changed_paths: Vec<String> = changed_paths.into_iter().collect();
             for decl in pack.gates_for_paths(&changed_paths) {
-                let (ok, output) = run_shell_command(self.active_root(), &decl.command, &env).await;
+                let (ok, output) =
+                    run_shell_command_sandboxed(&gate_root, &decl.command, &env, &gate_sandbox)
+                        .await;
                 pack_gates.push(crate::pack::PackGate::from_run(
                     &decl.name,
                     &decl.command,

@@ -91,7 +91,12 @@ kranz work                      # drain the queue (run missions)
     the claude backend (validation rejects other pairs — don't widen without
     a real spawn wrapper). `serve.token` is mutation authority, `serve.read.token`
     reads only; both must stay unreadable inside sandboxes
-    (`authority_read_deny_paths`). Validators never see the real checkout:
+    (`authority_read_deny_paths`). Engine-run gates (validation-round,
+    final-gate, and merge-gate commands) also execute worker-authored code:
+    they run WRAPPED in the resolved worker sandbox profile when
+    `sandbox.enforce != off` (`command_exec::GateSandbox`,
+    `run_bounded_gate_command_sandboxed`); `off` keeps the env-only posture
+    byte-for-byte. Validators never see the real checkout:
     each session runs in a throwaway snapshot (`validator_snapshot.rs`,
     warmed `target/` copy included) and only its verdict crosses back; the
     `validator.tamper` fingerprint on the real checkout is now a tripwire
