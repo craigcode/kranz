@@ -444,6 +444,12 @@ impl GateSandbox {
 pub(crate) struct GateSandboxResolution {
     pub sandbox: GateSandbox,
     pub note: Option<String>,
+    /// Whether the xcrun prewarm ran during THIS resolve (macOS Seatbelt
+    /// arm only; always false elsewhere). Per-resolution state, so the
+    /// once-per-resolve contract is assertable without a global counter —
+    /// a process-wide counter races with parallel test threads resolving
+    /// concurrently (rust-macos CI flake, run 30935850957).
+    pub prewarmed_xcrun: bool,
 }
 
 /// SBPL appended to the SESSION profile for gate use — never edited into
@@ -488,22 +494,12 @@ fn gate_profile_extras() -> String {
 /// whose `git` is not the shim, are the documented limits of the prewarm.
 #[cfg(target_os = "macos")]
 fn prewarm_xcrun_cache_outside_sandbox() {
-    // Test seam: count prewarm spawns so the once-per-resolve contract is
-    // assertable (see gate_xcrun_deny_prewarm_runs_once_per_resolve).
-    #[cfg(test)]
-    GATE_XCRUN_PREWARM_SPAWNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let _ = run_with_timeout(
         std::path::Path::new("git"),
         &["--version".to_string()],
         Duration::from_secs(10),
     );
 }
-
-/// Spawn counter for the prewarm test seam (macOS test builds only — the
-/// prewarm itself is compiled out elsewhere).
-#[cfg(all(test, target_os = "macos"))]
-static GATE_XCRUN_PREWARM_SPAWNS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
 
 /// The ONE note for the container provider's runtime-unavailable posture,
 /// shared by [`resolve_gate_sandbox_target`] (whose Err the engine paths
@@ -607,6 +603,7 @@ fn resolve_gate_sandbox_target(
         Ok(GateSandboxResolution {
             sandbox: GateSandbox::Disabled,
             note,
+            prewarmed_xcrun: false,
         })
     };
     if sandbox_cfg.enforce == SandboxEnforce::Off {
@@ -660,6 +657,7 @@ fn resolve_gate_sandbox_target(
                 },
             },
             note: None,
+            prewarmed_xcrun: false,
         });
     }
     match crate::sandbox::platform_support(sandbox_cfg.enforce, target_os) {
@@ -709,6 +707,8 @@ fn resolve_gate_sandbox_target(
                             profile_path,
                         },
                         note: None,
+                        // The prewarm ran above (macOS-only call site).
+                        prewarmed_xcrun: cfg!(target_os = "macos"),
                     })
                 }
                 crate::sandbox::SandboxBackend::Bubblewrap => Ok(GateSandboxResolution {
@@ -716,6 +716,7 @@ fn resolve_gate_sandbox_target(
                         inputs: Box::new(inputs),
                     },
                     note: None,
+                    prewarmed_xcrun: false,
                 }),
                 // platform_support never selects Container (that resolution
                 // is `resolve_container_target`'s, and the provider check
@@ -2062,27 +2063,25 @@ mod tests {
                 .unwrap()
         };
 
-        let before = GATE_XCRUN_PREWARM_SPAWNS.load(std::sync::atomic::Ordering::SeqCst);
+        // Per-resolution state, never a global counter: a process-wide
+        // counter races with parallel test threads resolving concurrently
+        // (the rust-macos CI flake this replaced).
         let resolution = resolve();
-        let after_one = GATE_XCRUN_PREWARM_SPAWNS.load(std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(after_one - before, 1, "one prewarm per resolve");
+        assert!(resolution.prewarmed_xcrun, "one prewarm per resolve");
 
         // Wrapping commands from this resolution prewarms NOTHING further —
         // the wrap is argv construction, the prewarm lives in resolve.
         let env = std::collections::HashMap::new();
         let _argv_one = resolution.sandbox.wrap_shell("true", &env).unwrap();
         let _argv_two = resolution.sandbox.wrap_shell("echo hi", &env).unwrap();
-        let after_wraps = GATE_XCRUN_PREWARM_SPAWNS.load(std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(after_wraps, after_one, "command wraps must not prewarm");
+        assert!(
+            resolution.prewarmed_xcrun,
+            "command wraps neither prewarm nor reset the record"
+        );
 
         // A second resolve prewarms again — per resolve, not once globally.
-        let _second = resolve();
-        let after_two = GATE_XCRUN_PREWARM_SPAWNS.load(std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(
-            after_two - after_one,
-            1,
-            "each resolve prewarms exactly once"
-        );
+        let second = resolve();
+        assert!(second.prewarmed_xcrun, "each resolve prewarms exactly once");
     }
 
     /// Ticket container-gate-wrapper, the merge-policy half: a

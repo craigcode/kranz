@@ -924,6 +924,14 @@ mod tests {
 
     #[test]
     fn kimi_discovery_honors_env_override_exclusively() {
+        // ENV_TEST_LOCK first: tempfile resolves its parent from ambient
+        // TMP/TEMP, and env-poisoning tests elsewhere in this binary (e.g.
+        // the cfg(windows) TEMP=C:\operator-tmp fixture) hold the same lock —
+        // without it a parallel windows test's poisoned TEMP makes tempdir()
+        // fail with NotFound (windows-latest CI, run 30935850957).
+        let _env_lock = crate::agent_env::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _guard = super::KIMI_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());

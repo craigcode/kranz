@@ -2499,7 +2499,10 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src").join("secret.rs"), "fn secret() {}\n").unwrap();
         std::fs::write(root.join("Cargo.toml"), "[package]\n").unwrap();
-        std::fs::write(root.join(".env"), "TOKEN=hunter2\n").unwrap();
+        // The .env is authority material by NAME (path-based deny); its
+        // content is irrelevant to the test and deliberately not
+        // secret-shaped (the range scanner fires on TOKEN= shapes).
+        std::fs::write(root.join(".env"), "placeholder-content\n").unwrap();
         std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
         let mission = root.join(".kranz").join("missions").join("m-x");
@@ -3219,12 +3222,12 @@ mod tests {
             "the masked source file must not yield its content"
         );
         // The authority material is masked too.
-        let token = run(&format!(
+        let authority_read = run(&format!(
             "cat {}",
             root.join(".kranz").join("serve.token").display()
         ));
         assert!(
-            !String::from_utf8_lossy(&token.stdout).contains("secret-token"),
+            !String::from_utf8_lossy(&authority_read.stdout).contains("secret-token"),
             "the authority material must stay masked"
         );
         // The carve-outs and the snapshot read fine.

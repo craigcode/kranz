@@ -573,9 +573,9 @@ mod tests {
         let session = dir.path().join("session");
         let kranz_dir = session.join(".kranz");
         std::fs::create_dir_all(&kranz_dir).unwrap();
-        let serve_token = kranz_dir.join("serve.token");
+        let masked_token_file = kranz_dir.join("serve.token");
         let config = kranz_dir.join("config.json");
-        std::fs::write(&serve_token, "secret").unwrap();
+        std::fs::write(&masked_token_file, "secret").unwrap();
         std::fs::write(&config, "{}").unwrap();
         let mut inputs = inputs(SandboxEnforce::Fs);
         inputs.session_cwd = session;
@@ -590,7 +590,7 @@ mod tests {
         let joined = args.join(" ");
         let abs = |p: &std::path::Path| crate::sandbox::absolutize(p).display().to_string();
 
-        for masked in [&serve_token, &config] {
+        for masked in [&masked_token_file, &config] {
             assert!(
                 joined.contains(&format!("/dev/null:{}:ro", abs(masked))),
                 "missing /dev/null mask for {}: {args:?}",
@@ -624,8 +624,8 @@ mod tests {
         }
         let kranz_dir = gate.join(".kranz");
         std::fs::create_dir_all(&kranz_dir).unwrap();
-        let serve_token = kranz_dir.join("serve.token");
-        std::fs::write(&serve_token, "secret").unwrap();
+        let masked_token_file = kranz_dir.join("serve.token");
+        std::fs::write(&masked_token_file, "secret").unwrap();
         let inputs = SandboxInputs {
             enforce: SandboxEnforce::Fs,
             session_cwd: gate.clone(),
@@ -670,7 +670,7 @@ mod tests {
         assert!(joined.contains(&format!("-e HOME={}", abs(&scratch))));
         assert!(joined.contains(&format!("-e TMPDIR={}", abs(&scratch))));
         assert!(
-            joined.contains(&format!("/dev/null:{}:ro", abs(&serve_token))),
+            joined.contains(&format!("/dev/null:{}:ro", abs(&masked_token_file))),
             "authority material must stay /dev/null-masked: {args:?}"
         );
 
