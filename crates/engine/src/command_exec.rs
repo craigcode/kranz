@@ -141,7 +141,11 @@ pub(crate) fn is_git_repo(root: &std::path::Path) -> bool {
 /// [`GateSandbox::Disabled`] arm reproduces this path byte-for-byte — the
 /// off-regression tests compare against this reference implementation), and
 /// the workspace-gate trust channel uses [`run_shell_command_with_code`].
-#[cfg(test)]
+///
+/// `all(test, unix)`: every caller is a unix-gated shell test — on Windows
+/// test builds the function is dead code and clippy's `-D warnings` gates
+/// it (run 30870594288).
+#[cfg(all(test, unix))]
 pub(crate) async fn run_shell_command(
     cwd: &std::path::Path,
     command: &str,
@@ -176,7 +180,10 @@ pub(crate) async fn run_shell_command_with_code(
 ///
 /// Pipe draining and the process-tree timeout kill (unix process group,
 /// Windows Job Object) live in the one shared core, [`run_command_bounded`].
-#[cfg(test)]
+///
+/// `all(test, unix)`: called only by [`run_shell_command`] and unix-gated
+/// timeout tests — dead code on Windows test builds (same clippy class).
+#[cfg(all(test, unix))]
 async fn run_shell_command_with_timeout(
     cwd: &std::path::Path,
     command: &str,
