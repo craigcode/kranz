@@ -155,7 +155,7 @@ impl ValidatorSnapshot {
 
         // Capture the real checkout's state BEFORE the add, so the snapshot
         // replays exactly what the worker left.
-        let repo = &repo.with_hooks_disabled();
+        let repo = &repo.with_hooks_disabled()?;
         let head = repo.head_sha()?;
         let diff = repo.diff_head()?;
         let untracked = repo.untracked_files()?;

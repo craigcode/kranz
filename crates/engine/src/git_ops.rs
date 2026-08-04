@@ -106,10 +106,12 @@ pub enum CheckpointOutcome {
 #[derive(Debug, Clone)]
 pub struct GitRepo {
     root: PathBuf,
-    /// When true, every git invocation from this handle runs with hooks
-    /// disabled via `-c core.hooksPath=` (see [`GitRepo::with_hooks_disabled`]).
-    /// Default false: worker-side git behavior keeps the repo's hooks.
-    hooks_disabled: bool,
+    /// `Some(argv)` when every git invocation from this handle must run with
+    /// executable configuration disabled (see [`GitRepo::with_hooks_disabled`]):
+    /// the complete `-c key=value` argv segment, built once at
+    /// handle-construction time. `None` keeps the repo's executable config —
+    /// worker-side git behavior is deliberately unchanged.
+    exec_disable_flags: Option<Vec<String>>,
 }
 
 /// git on Windows cannot parse VERBATIM paths (`\\?\C:\...`, which
@@ -140,7 +142,7 @@ impl GitRepo {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let repo = GitRepo {
             root: root.into(),
-            hooks_disabled: false,
+            exec_disable_flags: None,
         };
         let out = repo.probe(&["rev-parse", "--git-dir"])?;
         if out.status.success() {
@@ -160,14 +162,15 @@ impl GitRepo {
     }
 
     /// A handle to the same repository whose every git invocation runs with
-    /// executable configuration disabled (`git -c core.hooksPath= -c
-    /// core.fsmonitor=` — the empty values resolve every hook lookup to
-    /// nothing and turn the fsmonitor hook off, so no attacker-written
-    /// config value is ever executed).
+    /// executable configuration disabled (see [`Self::build_exec_disable_flags`]
+    /// for the exact flag set and the surfaces each entry neutralizes, 13th-pass
+    /// review P1 — the set previously stopped at `core.hooksPath=` +
+    /// `core.fsmonitor=` while this doc claimed "every executable surface",
+    /// leaving planted filter drivers and `gpg.program` executable).
     ///
     /// The gated merge path uses this: its scratch worktree's gitdir points
     /// into the primary `.git`, so mission-authored gate/test code can plant
-    /// `.git/hooks/*` — which the merge's own checkout / merge / worktree
+    /// executable config — which the merge's own checkout / merge / worktree
     /// commands would then execute with the server's full inherited
     /// environment, exactly the tokens the sanitized gate executor withholds.
     /// The validator-integrity fingerprint runs on a verification handle for
@@ -176,11 +179,135 @@ impl GitRepo {
     /// detection previously ran `git status` BEFORE comparing config, so the
     /// payload ran first). Opt-in per handle: worker-side git behavior is
     /// deliberately unchanged.
-    pub fn with_hooks_disabled(&self) -> GitRepo {
-        GitRepo {
-            root: self.root.clone(),
-            hooks_disabled: true,
+    ///
+    /// Building the handle enumerates the repo's configured filter drivers;
+    /// an enumeration failure fails CLOSED (no handle) — a verification
+    /// handle that cannot name its armed drivers cannot promise the surface
+    /// is disabled.
+    pub fn with_hooks_disabled(&self) -> Result<GitRepo> {
+        if let Some(flags) = &self.exec_disable_flags {
+            // Already a verification handle: re-wrapping is a clone, never a
+            // second enumeration (idempotent).
+            return Ok(GitRepo {
+                root: self.root.clone(),
+                exec_disable_flags: Some(flags.clone()),
+            });
         }
+        Ok(GitRepo {
+            root: self.root.clone(),
+            exec_disable_flags: Some(self.build_exec_disable_flags()?),
+        })
+    }
+
+    /// The complete `-c key=value` argv segment [`Self::probe_os`] prepends to
+    /// every git invocation of a verification handle, and WHY each entry
+    /// exists (13th-pass review, P1):
+    ///
+    /// - `core.hooksPath=` / `core.fsmonitor=` — the original pair: hook
+    ///   lookup resolves to nothing and the fsmonitor hook `git status`
+    ///   would otherwise run is off.
+    /// - `core.attributesFile=/dev/null` — the per-user attributes file is
+    ///   replaced with the null device. HONEST SCOPE: this does NOT touch
+    ///   the repo's own attribute sources — a checkout's `.gitattributes`
+    ///   and `$GIT_DIR/info/attributes` are consulted regardless (probed
+    ///   2026-08-04: an armed `*.txt filter=evil` in a worktree
+    ///   `.gitattributes` still fired its driver under this flag alone).
+    ///   Those files are deliverable content that must keep staging
+    ///   verbatim, so the armed-driver attack is closed config-side — see
+    ///   the filter enumeration below.
+    /// - `filter.<name>.clean=` / `.smudge=` / `.process=` plus
+    ///   `filter.<name>.required=false` for EVERY filter driver named in
+    ///   the repo's config (any scope): `git add` runs an armed driver's
+    ///   clean/process command with the engine's privileges. The names are
+    ///   enumerated with `git config --get-regexp -z '^filter\.'` (a pure
+    ///   config read — include.path expansion reads files, it never
+    ///   executes), then each is overridden EMPTY on the command line,
+    ///   which git honors as "no driver": the add stages the raw bytes
+    ///   verbatim (probed 2026-08-04, dotted subsection names included).
+    /// - `commit.gpgSign=false` + `gpg.program=/bin/false` — belt and
+    ///   braces: repo config can force signing on (`commit.gpgSign=true`)
+    ///   and name a payload as the signer. The first flag turns signing
+    ///   off; the second makes the payload inert even if a future caller
+    ///   forces signing back on (`-S`). `/bin/false` is never resolved
+    ///   unless signing actually runs.
+    ///
+    /// Documented residual (no overclaim this time): `merge.<name>.driver`
+    /// and `diff.<name>.command`/`.textconv` also execute repo-configured
+    /// commands when an attribute arms them — but only on merge/diff
+    /// porcelain, and an EMPTY override makes those git commands fail
+    /// loudly rather than fall back to the builtin behavior (probed
+    /// 2026-08-04), so neutralizing them is a behavior change of its own,
+    /// not a silent rider on this countermeasure.
+    fn build_exec_disable_flags(&self) -> Result<Vec<String>> {
+        const BASE: &[&str] = &[
+            "core.hooksPath=",
+            "core.fsmonitor=",
+            "core.attributesFile=/dev/null",
+            "commit.gpgSign=false",
+            "gpg.program=/bin/false",
+        ];
+        let mut flags = Vec::with_capacity(BASE.len() * 2 + 8);
+        for kv in BASE {
+            flags.push("-c".to_string());
+            flags.push((*kv).to_string());
+        }
+        for name in self.configured_filter_drivers()? {
+            for sub in ["clean", "smudge", "process"] {
+                flags.push("-c".to_string());
+                flags.push(format!("filter.{name}.{sub}="));
+            }
+            flags.push("-c".to_string());
+            flags.push(format!("filter.{name}.required=false"));
+        }
+        Ok(flags)
+    }
+
+    /// The filter-driver names configured for this repository (any config
+    /// scope), for [`Self::build_exec_disable_flags`]' neutralizing
+    /// overrides. `git config --get-regexp` exits 1 when nothing matches
+    /// (the common case — no drivers configured); any other failure is an
+    /// error.
+    ///
+    /// `-z` output is `key\nvalue\0` per entry, so the key runs to the
+    /// first newline. A subsection name can legally contain spaces; such a
+    /// name is SKIPPED here, which is safe rather than a hole:
+    /// `.gitattributes` attribute settings are whitespace-delimited, so a
+    /// whitespace-carrying driver name can never be armed. Dotted names
+    /// (`filter.weird.name.clean`) re-split at the LAST dot, so they
+    /// round-trip into `-c` keys exactly as git prints them.
+    fn configured_filter_drivers(&self) -> Result<Vec<String>> {
+        let out = self.probe(&["config", "--get-regexp", "-z", "^filter\\."])?;
+        if !out.status.success() {
+            // Exit 1 is "no matches" (the common case); anything else is a
+            // real failure and must not silently yield an unneutralized set.
+            if out.status.code() == Some(1) {
+                return Ok(Vec::new());
+            }
+            return Err(EngineError::Git(format!(
+                "git config --get-regexp filter.* failed ({}): {}",
+                out.status,
+                failure_detail(&out)
+            )));
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let mut names = std::collections::BTreeSet::new();
+        for entry in stdout.split('\0') {
+            if entry.is_empty() {
+                continue;
+            }
+            let key = entry.split('\n').next().unwrap_or("");
+            let Some(rest) = key.strip_prefix("filter.") else {
+                continue;
+            };
+            let Some((name, _subkey)) = rest.rsplit_once('.') else {
+                continue;
+            };
+            if name.is_empty() || name.chars().any(char::is_whitespace) {
+                continue;
+            }
+            names.insert(name.to_string());
+        }
+        Ok(names.into_iter().collect())
     }
 
     /// Sha of `HEAD` (`git rev-parse HEAD`).
@@ -1299,12 +1426,11 @@ impl GitRepo {
 
     fn probe_os(&self, args: &[OsString]) -> Result<Output> {
         let mut cmd = Command::new("git");
-        if self.hooks_disabled {
-            // `-c` must precede the subcommand; the empty values disable
-            // every executable config surface git consults on read paths
-            // (see with_hooks_disabled): hook lookup and the fsmonitor hook
-            // `git status` would otherwise run.
-            cmd.args(["-c", "core.hooksPath=", "-c", "core.fsmonitor="]);
+        if let Some(flags) = &self.exec_disable_flags {
+            // `-c` must precede the subcommand; the segment neutralizes every
+            // executable config surface this handle promises to cover (see
+            // with_hooks_disabled / build_exec_disable_flags).
+            cmd.args(flags);
         }
         cmd.args(args)
             .current_dir(&self.root)
@@ -1383,5 +1509,175 @@ mod tests {
         // UNC shares are NOT collapsed.
         let unc = Path::new(r"\\?\UNC\share\repo");
         assert_eq!(git_path_arg(unc), unc);
+    }
+
+    // -----------------------------------------------------------------------
+    // 13th-pass review (P1): the with_hooks_disabled countermeasure covers
+    // the WHOLE executable git-config surface — planted filter drivers and
+    // gpg.program, not just hooks/fsmonitor. Fixture idiom mirrors
+    // validator_integrity's planted-hook test: prove the fixture is LIVE
+    // with an ordinary handle, then prove the verification handle never
+    // executes the payload. Unix-only: the payloads are /bin/sh scripts.
+    // -----------------------------------------------------------------------
+
+    /// A repo with an initial commit and a scripted payload on disk; returns
+    /// the repo root (inside `dir`), the payload script path, and the
+    /// invocation log path the payload appends to when it runs.
+    #[cfg(unix)]
+    fn git_exec_config_repo(
+        dir: &tempfile::TempDir,
+        payload_body: &str,
+    ) -> (PathBuf, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let log = dir.path().join("payload-invocations");
+        let payload = dir.path().join("payload");
+        std::fs::write(
+            &payload,
+            payload_body.replace("__LOG__", &log.display().to_string()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&payload, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .expect("spawn git");
+            assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(root.join("seed.txt"), "seed\n").unwrap();
+        git(&["add", "seed.txt"]);
+        git(&["commit", "-qm", "seed"]);
+        (root, payload, log)
+    }
+
+    /// A planted `filter.<name>.clean` driver (repo config) armed by a
+    /// worker-writable `.gitattributes` must never execute on the engine's
+    /// checkpoint `git add`/`git commit` — and the add must still stage the
+    /// bytes VERBATIM (the armed attribute is deliverable content, not
+    /// something the countermeasure may strip). The driver name is DOTTED
+    /// (`weird.name`) to cover the subsection round-trip in
+    /// `configured_filter_drivers`.
+    #[cfg(unix)]
+    #[test]
+    fn git_exec_config_planted_clean_filter_never_runs_on_checkpoint_add() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, payload, log) =
+            git_exec_config_repo(&dir, "#!/bin/sh\necho clean-ran >> '__LOG__'\ncat\n");
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .expect("spawn git")
+        };
+        // Plant: the driver in repo config, armed for *.txt by a
+        // worker-writable attributes file.
+        assert!(git(&[
+            "config",
+            "filter.weird.name.clean",
+            payload.to_str().unwrap()
+        ])
+        .status
+        .success());
+        std::fs::write(root.join(".gitattributes"), "*.txt filter=weird.name\n").unwrap();
+
+        // Fixture proof: an ORDINARY `git add` executes the planted driver —
+        // then reset the log so any later invocation can only have come from
+        // the engine's checkpoint.
+        std::fs::write(root.join("probe.txt"), "probe\n").unwrap();
+        assert!(git(&["add", "probe.txt"]).status.success());
+        assert!(
+            std::fs::read_to_string(&log)
+                .map(|hits| !hits.is_empty())
+                .unwrap_or(false),
+            "fixture: ordinary git add runs the planted clean filter"
+        );
+        let _ = std::fs::remove_file(&log);
+
+        // The engine's checkpoint path (commit_dirty_paths is what the pool
+        // checkpoint and the sequential dirty-tree turn call): the driver
+        // must NOT execute, and the staged bytes must be verbatim.
+        let repo = GitRepo::open(&root).unwrap().with_hooks_disabled().unwrap();
+        std::fs::write(root.join("deliverable.txt"), "exact bytes ✓\n").unwrap();
+        match repo.commit_dirty_paths("checkpoint").unwrap() {
+            CheckpointOutcome::Committed(_) => {}
+            other => panic!("checkpoint must commit, got {other:?}"),
+        }
+        assert!(
+            !log.exists(),
+            "the checkpoint's git add must never execute the planted clean filter: {}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        );
+        let shown = repo.show_file("HEAD", "deliverable.txt").unwrap().unwrap();
+        assert_eq!(
+            shown,
+            "exact bytes ✓\n".as_bytes(),
+            "the add stages the raw bytes verbatim — the armed attribute is content, not a hook"
+        );
+        // Re-wrapping an already-verified handle is idempotent: the same
+        // argv segment, never a duplicated or re-enumerated one.
+        let rewrapped = repo.with_hooks_disabled().unwrap();
+        assert_eq!(repo.exec_disable_flags, rewrapped.exec_disable_flags);
+    }
+
+    /// A planted `gpg.program` with signing forced on by repo config
+    /// (`commit.gpgSign=true`) must never execute on the engine's commit:
+    /// `commit.gpgSign=false` turns signing off and `gpg.program=/bin/false`
+    /// makes the payload inert even if signing is forced back on.
+    #[cfg(unix)]
+    #[test]
+    fn git_exec_config_planted_gpg_program_never_runs_when_signing_forced() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, payload, log) =
+            git_exec_config_repo(&dir, "#!/bin/sh\necho gpg-ran >> '__LOG__'\nexit 1\n");
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .expect("spawn git")
+        };
+        assert!(git(&["config", "commit.gpgSign", "true"]).status.success());
+        assert!(git(&["config", "gpg.program", payload.to_str().unwrap()])
+            .status
+            .success());
+
+        // Fixture proof: an ORDINARY commit invokes the planted signer (and
+        // fails because the payload exits 1) — the repo config really forces
+        // signing. Then reset the log.
+        std::fs::write(root.join("probe.txt"), "probe\n").unwrap();
+        assert!(git(&["add", "probe.txt"]).status.success());
+        assert!(
+            !git(&["commit", "-qm", "probe"]).status.success(),
+            "fixture: signing with the failing payload must fail the commit"
+        );
+        assert!(
+            std::fs::read_to_string(&log)
+                .map(|hits| !hits.is_empty())
+                .unwrap_or(false),
+            "fixture: ordinary git commit runs the planted gpg.program"
+        );
+        let _ = std::fs::remove_file(&log);
+
+        // The engine's commit runs with the payload neutralized: it commits
+        // unsigned and the signer never fires.
+        let repo = GitRepo::open(&root).unwrap().with_hooks_disabled().unwrap();
+        match repo.commit_dirty_paths("checkpoint").unwrap() {
+            CheckpointOutcome::Committed(_) => {}
+            other => panic!("checkpoint must commit, got {other:?}"),
+        }
+        assert!(
+            !log.exists(),
+            "the engine's commit must never execute the planted gpg.program: {}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        );
+        // The commit really landed (ordinary add/commit behavior unchanged).
+        assert_eq!(repo.commits_between("HEAD~1", "HEAD").unwrap().len(), 1);
     }
 }

@@ -717,14 +717,27 @@ impl MissionHost {
         // engine-gates-sandbox-wrapped: the merged mission's own
         // `worker.sandbox` posture decides whether the gate suite (which
         // executes that mission's worker-authored test/build code) runs
-        // inside the resolved sandbox profile. `enforce == off` (and the
-        // documented no-op postures) falls through to the injected
-        // `gate_executor` — byte-identical pre-wrap behavior, and the test
-        // seam (`with_gate_executor`) stays authoritative there.
+        // inside the resolved sandbox profile. `enforce == off` falls
+        // through to the injected `gate_executor` — byte-identical pre-wrap
+        // behavior, and the test seam (`with_gate_executor`) stays
+        // authoritative there. The fail-closed postures (an unsupported
+        // platform, linux without `bwrap`) route INTO the sandboxed runner
+        // so they error loudly at resolve rather than running unsandboxed
+        // (13th-pass review, P1).
         let gate_policy = kranz_engine::command_exec::MergeGatePolicy {
             sandbox: state.config.worker.sandbox.clone(),
             mission_dir: paths.mission_dir(),
         };
+        // 13th-pass review (P1): a container-provider mission's merge gates
+        // are not wrapped (tier-3 wraps agent sessions; wrapping engine-side
+        // gates is the follow-up — ticket tier3-container-sandbox). The
+        // engine's validation/final-gate paths record that degradation as a
+        // decision event; this merge path has no event log, so the SAME
+        // note goes to the operator-visible server log — never a silent
+        // unsandboxed gate under an enforced config.
+        if let Some(note) = gate_policy.degradation_note() {
+            tracing::warn!(mission = %id, note = %note, "merge gate sandbox degraded to a no-op");
+        }
         let report = tokio::task::spawn_blocking(move || {
             let repo = GitRepo::open(&repo_root)?;
             let report = merge_mission(

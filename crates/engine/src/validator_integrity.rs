@@ -80,7 +80,7 @@ impl CheckoutFingerprint {
     /// source must not hang or exhaust the engine mid-detection — anything
     /// unusual reads as a stable refusal marker, which is itself drift).
     pub fn capture(repo: &GitRepo) -> Result<Self> {
-        let verification = repo.with_hooks_disabled();
+        let verification = repo.with_hooks_disabled()?;
         let common = verification.git_common_dir()?;
         Ok(CheckoutFingerprint {
             head: verification.head_sha()?,

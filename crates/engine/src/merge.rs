@@ -99,7 +99,7 @@ where
     // `.git/hooks/*` and have the merge's own checkout/merge/worktree
     // commands execute it with the server's full environment (exactly what
     // the sanitized gate executor withholds). Worker-side git is untouched.
-    let repo = &repo.with_hooks_disabled();
+    let repo = &repo.with_hooks_disabled()?;
 
     if !repo.is_clean_tracked_strict()? {
         return Ok(MergeReport::RefusedDirtyTree);
@@ -162,7 +162,7 @@ where
         path: scratch_path.clone(),
     };
 
-    let scratch = GitRepo::open(&scratch_path)?.with_hooks_disabled();
+    let scratch = GitRepo::open(&scratch_path)?.with_hooks_disabled()?;
     match scratch.merge_no_ff_with_message(&mission_tip_sha, merge_message.as_deref())? {
         MergeOutcome::Conflict { files } => return Ok(MergeReport::Conflict { files }),
         MergeOutcome::RefusedPreMerge { detail } => {

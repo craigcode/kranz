@@ -300,8 +300,6 @@ fn escape_sbpl_string(s: &str) -> String {
 /// regex metacharacter is backslash-escaped so the path matches literally
 /// (temp-dir names carry no metacharacters in practice, but a repo root
 /// might — `.` in a directory name must not become an any-char match).
-/// `pub(crate)` so the engine-run gate profile (`crate::command_exec`) can
-/// anchor its `xcrun_db` device-cache allow with the same escaping.
 pub(crate) fn escape_sbpl_regex(path: &Path) -> String {
     let mut out = String::new();
     for ch in path.to_string_lossy().chars() {
@@ -384,6 +382,45 @@ pub(crate) fn mission_write_denies(inputs: &SandboxInputs) -> MissionWriteDenies
     denies
 }
 
+/// The operator's real Cargo home: ambient `CARGO_HOME` when set, else
+/// `~/.cargo` when HOME is set — the same resolution
+/// `crate::agent_env::toolchain_var_value("CARGO_HOME", ".cargo")` applies
+/// when it builds the isolated contract home. The two MUST stay in
+/// lockstep: whatever the isolated home can LINK is what the profile must
+/// be able to DENY writes to (see [`cargo_cache_write_deny_paths`]).
+fn operator_cargo_home() -> Option<PathBuf> {
+    std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo")))
+}
+
+/// The operator's REAL shared Cargo cache directories —
+/// `<cargo home>/registry` and `<cargo home>/git` — in both raw and
+/// canonicalized forms (the `/var` ↔ `/private/var` idiom the write
+/// allowlist already uses; Seatbelt matches canonical paths and a child
+/// may address either form). Above the copy ceiling the isolated contract
+/// home LINKS these in (`crate::agent_env::cache_only_cargo_home`'s
+/// documented residual trade), so every sandbox profile must deny WRITES
+/// to them explicitly (13th-pass review, P1): deny-default covers the
+/// common case, but only an explicit deny survives EVERY allow — an
+/// operator `extraWrite` of `$HOME`, or any future broadened writable
+/// root, would otherwise silently re-widen the linked cache to writes
+/// from worker-authored contract code, poisoning later builds. PRECISE
+/// scope: the two cache dirs only, never the whole cargo home —
+/// `~/.cargo/bin`'s rustup shims keep their ordinary posture. Reads stay
+/// allowed: the linked cache is the session/gate's registry.
+pub(crate) fn cargo_cache_write_deny_paths() -> Vec<PathBuf> {
+    let Some(cargo_home) = operator_cargo_home() else {
+        return Vec::new();
+    };
+    let mut paths = Vec::with_capacity(4);
+    for base in [cargo_home.clone(), absolutize(&cargo_home)] {
+        paths.push(base.join("registry"));
+        paths.push(base.join("git"));
+    }
+    paths
+}
+
 /// Authority files a sandboxed session must never read, even under the broad
 /// read allow: a read of `serve.token` IS mutation authority over `kranz
 /// serve` (loopback is reachable from every sandbox tier), `serve.read.token`
@@ -409,10 +446,7 @@ pub(crate) fn authority_read_deny_paths(inputs: &SandboxInputs) -> Vec<PathBuf> 
             }
         }
     }
-    let cargo_home = std::env::var_os("CARGO_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo")));
-    if let Some(cargo_home) = cargo_home {
+    if let Some(cargo_home) = operator_cargo_home() {
         for base in [cargo_home.clone(), absolutize(&cargo_home)] {
             paths.push(base.join("credentials.toml"));
             paths.push(base.join("credentials"));
@@ -447,7 +481,11 @@ pub fn effective_egress(configured: &[String]) -> Vec<String> {
 /// containment is the fs-tier promise. `fs+net` restricts outbound TCP to
 /// loopback: Seatbelt rejects hostname egress rules (`host must be * or
 /// localhost`), so the per-host allowlist is enforced by the run's egress
-/// proxy (`crate::egress_proxy`) — the only reachable way out.
+/// proxy (`crate::egress_proxy`) — the only reachable way out. The
+/// operator's real Cargo registry/git caches carry an explicit write deny
+/// of their own (13th-pass review, P1 — [`cargo_cache_write_deny_paths`]):
+/// the isolated contract home may LINK them in above the copy ceiling, and
+/// the linked target must stay read-only under every allow.
 pub fn generate_profile(inputs: &SandboxInputs) -> String {
     let write_paths = write_allowlist(inputs);
 
@@ -554,6 +592,27 @@ pub fn generate_profile(inputs: &SandboxInputs) -> String {
     }
     profile.push_str(")\n");
 
+    // Shared-Cargo-cache write deny (13th-pass review, P1 — see
+    // cargo_cache_write_deny_paths for the full why): when the shared
+    // registry/git cache exceeds the copy ceiling, the isolated contract
+    // home LINKS it in, and only an EXPLICIT deny keeps the link target
+    // read-only under every allow (an operator extraWrite of $HOME would
+    // otherwise re-widen it to worker-authored contract code). Precise
+    // scope: registry/ and git/ only. Denies take precedence over allows
+    // regardless of clause order (the same guarantee the blocks above
+    // rely on), so placement after the allow is documentary.
+    let mut cache_denies = std::collections::BTreeSet::new();
+    for path in cargo_cache_write_deny_paths() {
+        cache_denies.insert(escape_sbpl_literal(&path));
+    }
+    if !cache_denies.is_empty() {
+        profile.push_str("(deny file-write*\n");
+        for lit in &cache_denies {
+            profile.push_str(&format!("  (subpath \"{lit}\")\n"));
+        }
+        profile.push_str(")\n");
+    }
+
     profile
 }
 
@@ -565,7 +624,10 @@ pub fn generate_profile(inputs: &SandboxInputs) -> String {
 /// each `extra_write` entry are bound writable — the mission dir and the
 /// shared system temp root are NOT writable (ticket sandbox-writable-scope).
 /// Mission metadata that an rw ancestor bind would otherwise cover (checkout
-/// mode) is masked back out, the bwrap analogue of the profile's write deny.
+/// mode) is masked back out, the bwrap analogue of the profile's write deny;
+/// the operator's real Cargo registry/git caches get explicit stacked
+/// ro-binds for the same reason (13th-pass review — they stay readable, a
+/// linked cache is the session's registry, but never writable).
 pub fn bubblewrap_args(
     inputs: &SandboxInputs,
     binary: &Path,
@@ -604,6 +666,26 @@ pub fn bubblewrap_args(
         out.push("--ro-bind".to_string());
         out.push("/dev/null".to_string());
         out.push(mask);
+    }
+    // The bwrap analogue of the profile's shared-Cargo-cache write deny
+    // (13th-pass review, P1 — cargo_cache_write_deny_paths): the `/`
+    // ro-bind already mounts the real caches read-only, but an rw bind
+    // covering an ancestor (an extraWrite of $HOME) would silently
+    // re-widen them — stack an explicit ro-bind OVER each cache dir
+    // present at spawn (later binds win; the destination must exist,
+    // hence the is_dir filter). The dir stays READABLE — a linked cache
+    // is the session/gate's registry — only writes close. Same residual
+    // gap as the authority masks: a cache dir created AFTER spawn is
+    // unmasked until the next session.
+    let cache_ro_binds: std::collections::BTreeSet<String> = cargo_cache_write_deny_paths()
+        .iter()
+        .filter(|path| path.is_dir())
+        .map(|path| path.display().to_string())
+        .collect();
+    for bind in cache_ro_binds {
+        out.push("--ro-bind".to_string());
+        out.push(bind.clone());
+        out.push(bind);
     }
     // Mission metadata must stay unwritable inside the sandbox: in checkout
     // mode the rw `session_cwd` bind covers the mission dir, so the audit
@@ -992,6 +1074,106 @@ mod tests {
         assert!(
             !profile.contains(&mission_rule),
             "the whole mission dir must not be writable:\n{profile}"
+        );
+    }
+
+    /// 13th-pass review (P1): above the copy ceiling the isolated contract
+    /// Cargo home LINKS the operator's registry/git caches in — the profile
+    /// must deny writes to those REAL cache dirs (raw AND canonical forms)
+    /// so the linked target stays read-only under every allow. The deny is
+    /// PRECISE: the two cache dirs, never the whole cargo home (rustup/cargo
+    /// binaries keep their ordinary posture).
+    #[test]
+    fn cache_write_deny_profile_denies_real_cache_dirs_precisely() {
+        let cargo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cargo.path().join("registry")).unwrap();
+        std::fs::create_dir_all(cargo.path().join("git")).unwrap();
+        let _guard = crate::agent_env::EnvTestGuard::engage(&[(
+            "CARGO_HOME",
+            cargo.path().to_str().expect("utf-8 temp path"),
+        )]);
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+
+        let profile = generate_profile(&inputs(
+            session.path(),
+            mission.path(),
+            scratch.path(),
+            vec![],
+        ));
+        for base in [cargo.path().to_path_buf(), absolutize(cargo.path())] {
+            for name in ["registry", "git"] {
+                let expected = format!("(subpath \"{}\")", escape_sbpl_literal(&base.join(name)));
+                assert!(
+                    profile.contains(&expected),
+                    "profile missing cache write deny for {}:\n{profile}",
+                    base.join(name).display()
+                );
+            }
+        }
+        // Precision: the cargo home ITSELF is not in the deny set — the
+        // closing `"` after the home path makes this an exact-line check
+        // (the registry/git lines carry a longer path and cannot match).
+        for base in [cargo.path().to_path_buf(), absolutize(cargo.path())] {
+            let whole_home = format!("(subpath \"{}\")", escape_sbpl_literal(&base));
+            assert!(
+                !profile.contains(&whole_home),
+                "the deny must be precise to the cache dirs, not the whole cargo home:\n{profile}"
+            );
+        }
+    }
+
+    /// The bwrap analogue: the real cache dirs present at spawn get explicit
+    /// ro-binds stacked AFTER the rw binds (later binds win — an rw
+    /// extraWrite covering an ancestor must not re-widen them), and absent
+    /// dirs are skipped (bwrap requires the destination to exist).
+    #[test]
+    fn cache_write_deny_bwrap_stacks_ro_binds_over_real_cache() {
+        let cargo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cargo.path().join("registry")).unwrap();
+        // git/ deliberately absent → not bound (the is_dir filter).
+        let _guard = crate::agent_env::EnvTestGuard::engage(&[(
+            "CARGO_HOME",
+            cargo.path().to_str().expect("utf-8 temp path"),
+        )]);
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+
+        let args = bubblewrap_args(
+            &inputs(session.path(), mission.path(), scratch.path(), vec![]),
+            Path::new("/usr/bin/claude"),
+            &[],
+        )
+        .unwrap();
+        let joined = args.join(" ");
+
+        let registry = absolutize(&cargo.path().join("registry"));
+        let expected = format!("--ro-bind {0} {0}", registry.display());
+        assert!(
+            joined.contains(&expected),
+            "missing stacked ro-bind for the real registry cache: {args:?}"
+        );
+        let git_cache = cargo.path().join("git");
+        assert!(
+            !joined.contains(&git_cache.display().to_string()),
+            "an absent cache dir must not be bound: {args:?}"
+        );
+        // Ordering is load-bearing: the cache ro-bind must land AFTER every
+        // rw `--bind`, or a wide writable root would re-cover it.
+        let last_rw = args
+            .iter()
+            .rposition(|arg| arg == "--bind")
+            .expect("the writable roots are rw-bound");
+        let registry_arg = registry.display().to_string();
+        let cache_pos = args
+            .windows(3)
+            .position(|w| w[0] == "--ro-bind" && w[1] == registry_arg && w[2] == registry_arg)
+            .expect("the cache ro-bind pair exists");
+        assert!(
+            cache_pos > last_rw,
+            "the cache ro-bind must stack after the rw binds: {args:?}"
         );
     }
 

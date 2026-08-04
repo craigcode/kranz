@@ -641,7 +641,75 @@ pub fn format_findings(findings: &[SecretFinding]) -> String {
         .join("\n")
 }
 
+/// Files larger than this are NEVER read for scanning (13th-pass review,
+/// P1): the scan reads whole files into memory for regex passes, so an
+/// unbounded read lets a worker-authored path exhaust engine memory. 8 MiB
+/// is generous for source text — secrets live in small files — and an
+/// oversized file is skipped exactly like an unreadable one (see
+/// [`scan_paths`]' contract).
+const SCAN_PATH_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Read one scan candidate, or `None` for anything that is not a bounded
+/// REGULAR file. Hardened against the hostile-tree shapes a worker can
+/// plant (13th-pass review, P1 — the old `std::fs::read` followed symlinks
+/// and had no size bound, so a FIFO blocked checkpointing indefinitely and
+/// a symlink to `/dev/zero` or a huge file read without limit):
+///
+/// - the parent chain is pinned NO-FOLLOW and the leaf opened with
+///   `FollowSymlinks::No` (the `crate::paths::open_parent_nofollow`
+///   capability idiom), so a symlinked candidate is never read through;
+/// - the leaf open carries `O_NONBLOCK` on unix (the flag the event log's
+///   pinned reads use, `crate::event_log`), so a FIFO open returns
+///   immediately instead of blocking on a writer that never comes — the
+///   fstat below then refuses the non-regular entry;
+/// - the OPENED fd is fstat-verified regular and at most
+///   [`SCAN_PATH_MAX_FILE_BYTES`], closing the swap race between any
+///   earlier directory listing and the open;
+/// - the read itself takes at most cap+1 bytes, so a file racing larger
+///   after fstat stays bounded (and is skipped whole — a partial scan
+///   would be a false sense of coverage).
+fn read_scan_candidate(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    let (parent, name) = crate::paths::open_parent_nofollow(path).ok()?;
+    let mut options = cap_std::fs::OpenOptions::new();
+    {
+        use cap_fs_ext::OpenOptionsFollowExt as _;
+        use cap_primitives::fs::FollowSymlinks;
+        options.read(true).follow(FollowSymlinks::No);
+    }
+    #[cfg(unix)]
+    {
+        use cap_fs_ext::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = parent.open_with(name, &options).ok()?.into_std();
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > SCAN_PATH_MAX_FILE_BYTES {
+        return None;
+    }
+    let mut buf = Vec::new();
+    (&mut &file)
+        .take(SCAN_PATH_MAX_FILE_BYTES + 1)
+        .read_to_end(&mut buf)
+        .ok()?;
+    if buf.len() as u64 > SCAN_PATH_MAX_FILE_BYTES {
+        return None;
+    }
+    Some(buf)
+}
+
 /// Scan file contents about to be committed by the engine.
+///
+/// The contract is "findings for what could be scanned": anything that is
+/// not a bounded regular file — a symlink, FIFO, socket, device,
+/// directory, an oversized or unreadable entry — is SKIPPED, never fatal
+/// and never noted in the finding stream. A skip NOTE would let a worker
+/// force checkpoint refusals by planting big or special files (a mission
+/// DoS), and skipping is semantically right for the scan's job: a
+/// checked-in symlink carries no secret BYTES of its own, and an oversized
+/// or unreadable file rides the same posture unreadable entries always
+/// had. See [`read_scan_candidate`] for the no-follow / non-blocking /
+/// size-bounded mechanics (13th-pass review, P1).
 pub fn scan_paths(repo_root: &Path, paths: &[&Path]) -> Vec<SecretFinding> {
     let mut findings = Vec::new();
     for path in paths {
@@ -650,7 +718,7 @@ pub fn scan_paths(repo_root: &Path, paths: &[&Path]) -> Vec<SecretFinding> {
         } else {
             repo_root.join(path)
         };
-        let Ok(bytes) = std::fs::read(&full) else {
+        let Some(bytes) = read_scan_candidate(&full) else {
             continue;
         };
         let text = String::from_utf8_lossy(&bytes);
@@ -728,5 +796,117 @@ mod tests {
         assert!(is_allowlisted("550e8400-e29b-41d4-a716-446655440000"));
         // 40-hex git SHA.
         assert!(is_allowlisted("da39a3ee5e6b4b0d3255bfef95601890afd80709"));
+    }
+
+    // -----------------------------------------------------------------------
+    // 13th-pass review (P1): scan_paths reads are no-follow, non-blocking,
+    // regular-file-only, and size-bounded. A secret shape the scanner
+    // provably flags (the anthropic-api-key rule) anchors every anti-vacuity
+    // arm.
+    // -----------------------------------------------------------------------
+
+    /// A token the anthropic-api-key rule flags on any scanned text.
+    const SCRUB_NOFOLLOW_SECRET: &str = "sk-ant-api03-ScrubNofollowTestValue1";
+
+    /// Run scan_paths on a spawned thread with a hard timeout: this group's
+    /// assertions are about NOT hanging (a FIFO without a writer blocked the
+    /// old `std::fs::read` forever; a followed `/dev/zero` read without
+    /// bound), so the probe itself must be bounded. Panics after `secs` —
+    /// a hung read IS the failure this finding exists to catch.
+    fn scan_with_timeout(root: &Path, paths: &[&Path], secs: u64) -> Vec<SecretFinding> {
+        let root = root.to_path_buf();
+        let paths: Vec<std::path::PathBuf> = paths.iter().map(|p| p.to_path_buf()).collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let refs: Vec<&Path> = paths.iter().map(std::path::PathBuf::as_path).collect();
+            let _ = tx.send(scan_paths(&root, &refs));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(secs))
+            .expect("scan_paths must not block")
+    }
+
+    /// A worker-created FIFO must not block the checkpoint scan: the
+    /// non-blocking no-follow open returns immediately, the fstat check
+    /// refuses the non-regular entry, and the FIFO is skipped.
+    #[cfg(unix)]
+    #[test]
+    fn scrub_nofollow_fifo_does_not_block_checkpoint_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("planted.fifo");
+        let c_path = std::ffi::CString::new(fifo.to_str().expect("utf-8 temp path")).unwrap();
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+
+        let findings = scan_with_timeout(dir.path(), &[Path::new("planted.fifo")], 10);
+        assert!(
+            findings.is_empty(),
+            "a FIFO is skipped, never scanned: {findings:?}"
+        );
+    }
+
+    /// A symlink to /dev/zero (an unbounded byte source) is never read
+    /// through: the no-follow open refuses the link itself.
+    #[cfg(unix)]
+    #[test]
+    fn scrub_nofollow_symlink_to_dev_zero_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("/dev/zero", dir.path().join("zero")).unwrap();
+
+        let findings = scan_with_timeout(dir.path(), &[Path::new("zero")], 10);
+        assert!(
+            findings.is_empty(),
+            "a symlink to an unbounded source is skipped, never read through: {findings:?}"
+        );
+    }
+
+    /// A symlinked candidate is not read through even when its target is a
+    /// real file full of findings — the scan's job is the tree's own bytes,
+    /// and a checked-in symlink carries none.
+    #[cfg(unix)]
+    #[test]
+    fn scrub_nofollow_symlinked_file_is_not_read_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let real = outside.path().join("real.txt");
+        std::fs::write(&real, SCRUB_NOFOLLOW_SECRET).unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join("linked.txt")).unwrap();
+
+        let findings = scan_paths(dir.path(), &[Path::new("linked.txt")]);
+        assert!(
+            findings.is_empty(),
+            "a symlink is never read through: {findings:?}"
+        );
+        // Anti-vacuity: the same bytes scanned directly DO produce the finding.
+        let findings = scan_paths(dir.path(), &[real.as_path()]);
+        assert!(
+            findings.iter().any(|f| f.rule_id == "anthropic-api-key"),
+            "the direct scan must flag the secret: {findings:?}"
+        );
+    }
+
+    /// An oversized regular file is bounded: skipped WHOLE (a partial scan
+    /// would be a false sense of coverage), and the read itself is capped
+    /// regardless of how the file grows. Just under the cap, the same
+    /// secret scans normally.
+    #[test]
+    fn scrub_nofollow_oversized_file_is_skipped_and_under_cap_scans() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut content = SCRUB_NOFOLLOW_SECRET.as_bytes().to_vec();
+        content.resize(SCAN_PATH_MAX_FILE_BYTES as usize + 1, b'x');
+        std::fs::write(dir.path().join("big.txt"), &content).unwrap();
+
+        let findings = scan_with_timeout(dir.path(), &[Path::new("big.txt")], 10);
+        assert!(
+            findings.is_empty(),
+            "an oversized file is skipped whole, never partially scanned: {findings:?}"
+        );
+
+        // Anti-vacuity: under the cap the same secret is found.
+        std::fs::write(dir.path().join("small.txt"), SCRUB_NOFOLLOW_SECRET).unwrap();
+        let findings = scan_paths(dir.path(), &[Path::new("small.txt")]);
+        assert!(
+            findings.iter().any(|f| f.rule_id == "anthropic-api-key"),
+            "under-cap content still scans: {findings:?}"
+        );
     }
 }

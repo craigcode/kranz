@@ -25,18 +25,27 @@
 //! private scratch (validation/final gate: the mission's `runs/contract-home`
 //! the contract env already points HOME/TMPDIR/CARGO_HOME at; merge gate: a
 //! per-run self-cleaning `kranz-gate-*` temp root). The gate profile also
-//! appends two narrow extras the session profile lacks (see
+//! appends one narrow extra the session profile lacks (see
 //! [`gate_profile_extras`] for the evidence): a `/dev/null` write allow
 //! (`deny default` otherwise rejects the redirects real gate scripts use
 //! liberally — this repo's gascity merge-gate scripts alone carry 148 of
-//! them) and, on macOS, a name-anchored `xcrun_db*` write regex over the
-//! Darwin per-user temp dir (the xcrun shims behind `/usr/bin/git` et al.
-//! refresh their tool-resolution cache there via confstr, IGNORING TMPDIR;
-//! a refresh under parallel spawns killed a wrapped `cargo test` with EPERM
-//! while the unwrapped run silently recovered). SBPL allows compose
-//! order-independently and denies still take precedence, so the appends
-//! cannot weaken the generated profile; the agent-session profile itself is
-//! deliberately untouched. bwrap has no equivalent gaps (`--dev /dev` covers
+//! them). SBPL allows compose order-independently and denies still take
+//! precedence, so the append cannot weaken the generated profile; the
+//! agent-session profile itself is deliberately untouched.
+//!
+//! macOS xcrun posture (13th-pass review, P1 — prewarm + deny): the profile
+//! used to append a name-anchored `xcrun_db*` write regex over the Darwin
+//! per-user temp dir, because the xcrun shims behind `/usr/bin/git` et al.
+//! refresh their tool-resolution cache there via confstr, IGNORING TMPDIR,
+//! and a refresh under parallel spawns killed a wrapped `cargo test` with
+//! EPERM. But that regex also let a wrapped gate WRITE the shared per-user
+//! xcrun database — including the operator's existing one, a mutation
+//! surface outside the mission that later developer-tool invocations rely
+//! on. The regex is GONE: [`prewarm_xcrun_cache_outside_sandbox`] refreshes
+//! the cache OUTSIDE the sandbox once per resolve (cheap, bounded,
+//! failure-tolerant), and a shim refresh that still races stale inside the
+//! sandbox now fails loudly with the shim's own EPERM — a documented edge,
+//! never a silent hole. bwrap has no equivalent gap (`--dev /dev` covers
 //! device writes; Linux has no xcrun shim).
 //!
 //! Network posture: the profile's, mirroring sessions — `fs` keeps full
@@ -260,13 +269,17 @@ pub(crate) async fn run_bounded_argv(
 ///
 /// [`GateSandbox::Disabled`] is the byte-identical pre-wrap behavior:
 /// `enforce == off` (the operator opted out; the cache-only `CARGO_HOME`
-/// still applies), a platform [`crate::sandbox::platform_support`] cannot
-/// honor (a documented no-op — agent sessions already REFUSE to run there,
-/// so only standalone merge gates of missions run elsewhere can reach it),
-/// or `provider = "container"` (tier-3 wraps agent sessions;
-/// container-wrapping engine-side gates is out of scope). Tooling that is
-/// requested but missing (Linux without `bwrap`) FAILS CLOSED at resolve
-/// time, mirroring session resolution.
+/// still applies) or `provider = "container"` (tier-3 wraps agent sessions;
+/// container-wrapping engine-side gates is the follow-up — ticket
+/// tier3-container-sandbox — and the degradation is RECORDED: the engine
+/// paths emit a decision event, the server's merge path logs
+/// [`MergeGatePolicy::degradation_note`]). A platform
+/// [`crate::sandbox::platform_support`] cannot honor FAILS CLOSED at
+/// resolve time (13th-pass review, P1: agent sessions already refuse to
+/// run there; a standalone merge gate must fail loudly too, never run
+/// unsandboxed under an enforced config). Tooling that is requested but
+/// missing (Linux without `bwrap`) FAILS CLOSED the same way, mirroring
+/// session resolution.
 #[derive(Debug)]
 pub(crate) enum GateSandbox {
     /// Run the shell exactly as before the wrap — no wrapper process.
@@ -323,8 +336,10 @@ impl GateSandbox {
 }
 
 /// The outcome of resolving a gate sandbox: the posture plus an optional
-/// operator-facing note (surfaced as an orchestrator decision / merge
-/// detail) when enforcement degraded to a documented no-op.
+/// operator-facing note (surfaced as an orchestrator decision / merge log
+/// line) when enforcement degraded to the one documented no-op posture
+/// (`provider:container` — see [`container_gate_note`]; every other
+/// requested-but-unavailable posture fails closed at resolve).
 #[derive(Debug)]
 pub(crate) struct GateSandboxResolution {
     pub sandbox: GateSandbox,
@@ -337,47 +352,75 @@ pub(crate) struct GateSandboxResolution {
 /// denies still take precedence regardless of clause order (verified with
 /// sandbox-exec), so appending cannot weaken the generated profile.
 ///
-/// - `(literal "/dev/null")` write allow: `deny default` otherwise rejects
-///   `/dev/null` redirects (probed 2026-08-03: "Operation not permitted"),
-///   which real gate lines and scripts use liberally (this repo's gascity
-///   merge-gate scripts: 148 hits in one file).
-/// - an `xcrun_db*` write REGEX over the Darwin per-user temp dir (macOS
-///   only): the `/usr/bin/*` xcrun shims (git, clang, …) keep their
-///   tool-resolution cache there — via `confstr(_CS_DARWIN_USER_TEMP_DIR)`,
-///   IGNORING `TMPDIR` — and a cache refresh fires unpredictably under
-///   parallel spawns. Measured 2026-08-03: a wrapped `cargo test` died at
-///   test-binary startup with `git: error: couldn't create cache file
-///   '…/T/xcrun_db-kJ956XOY' (errno=Operation not permitted)` while the same
-///   run unwrapped silently recovered (the temp root is writable there).
-///   The regex is name-anchored (`xcrun_db` prefix only, never the whole
-///   temp root — sibling missions' worktrees live beside it), and both the
-///   raw and canonical temp-dir forms are emitted (the macOS
-///   `/var` ↔ `/private/var` split the write allowlist already handles).
-///   An operator whose confstr temp dir differs from the engine's
-///   `std::env::temp_dir()` (a custom `TMPDIR` on the server) gets a loud
-///   gate failure, not a silent hole — the documented edge.
+/// `(literal "/dev/null")` write allow: `deny default` otherwise rejects
+/// `/dev/null` redirects (probed 2026-08-03: "Operation not permitted"),
+/// which real gate lines and scripts use liberally (this repo's gascity
+/// merge-gate scripts: 148 hits in one file).
+///
+/// 13th-pass review (P1): the macOS `xcrun_db*` write regex this function
+/// used to append is GONE. It covered the shim cache refresh (see the
+/// module doc), but it also let a wrapped gate WRITE the shared per-user
+/// xcrun database — including the operator's existing one, a mutation
+/// surface outside the mission. The replacement posture is prewarm + deny:
+/// [`prewarm_xcrun_cache_outside_sandbox`] refreshes the cache unsandboxed
+/// once per resolve, and a shim refresh that still races stale inside the
+/// sandbox fails loudly with the shim's own EPERM (the documented edge).
 fn gate_profile_extras() -> String {
-    // The /dev/null literal is universal; the xcrun regex is macOS-only. The
-    // shadowed rebinding keeps the mutation inside the cfg so linux clippy
-    // sees no unused `mut` (windows-latest CI gates -D warnings).
-    let extras = String::from("\n(allow file-write* (literal \"/dev/null\"))\n");
-    #[cfg(target_os = "macos")]
-    let extras = {
-        let mut extras = extras;
-        let temp = std::env::temp_dir();
-        let mut prefixes = std::collections::BTreeSet::new();
-        prefixes.insert(crate::sandbox::escape_sbpl_regex(&temp));
-        prefixes.insert(crate::sandbox::escape_sbpl_regex(
-            &crate::sandbox::absolutize(&temp),
-        ));
-        extras.push_str("(allow file-write*\n");
-        for prefix in prefixes {
-            extras.push_str(&format!("  (regex #\"^{prefix}/xcrun_db[^/]*$\")\n"));
-        }
-        extras.push_str(")\n");
-        extras
-    };
-    extras
+    String::from("\n(allow file-write* (literal \"/dev/null\"))\n")
+}
+
+/// Refresh the xcrun shims' tool-resolution cache OUTSIDE the sandbox, once
+/// per gate-profile resolve (13th-pass review, P1 — prewarm + deny): the
+/// gate profile no longer permits `xcrun_db` writes (see
+/// [`gate_profile_extras`]), so the `/usr/bin/*` shims (git, clang, …)
+/// behind a wrapped gate must find their cache FRESH in the Darwin per-user
+/// temp dir (which they locate via confstr, IGNORING TMPDIR).
+///
+/// Per resolve, NOT per command: the cache is per-user and shared, so one
+/// refresh covers every wrapped spawn the resolution produces. The probe is
+/// `git --version` through the operator's PATH — on a stock macOS that IS
+/// the `/usr/bin` shim, so the probe refreshes exactly the cache the gate's
+/// shims consult. Bounded (10s), output discarded, spawn/exit status
+/// ignored: a failed prewarm (no git, no dev tools, a shim that errors)
+/// leaves the deny posture in force and the gate still runs — it just might
+/// hit the loud edge (a stale-cache refresh inside the sandbox is EPERM,
+/// surfaced as the shim's own error). That edge, and a brew-first PATH
+/// whose `git` is not the shim, are the documented limits of the prewarm.
+#[cfg(target_os = "macos")]
+fn prewarm_xcrun_cache_outside_sandbox() {
+    // Test seam: count prewarm spawns so the once-per-resolve contract is
+    // assertable (see gate_xcrun_deny_prewarm_runs_once_per_resolve).
+    #[cfg(test)]
+    GATE_XCRUN_PREWARM_SPAWNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let _ = run_with_timeout(
+        std::path::Path::new("git"),
+        &["--version".to_string()],
+        Duration::from_secs(10),
+    );
+}
+
+/// Spawn counter for the prewarm test seam (macOS test builds only — the
+/// prewarm itself is compiled out elsewhere).
+#[cfg(all(test, target_os = "macos"))]
+static GATE_XCRUN_PREWARM_SPAWNS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The ONE degradation note for the container provider, shared by
+/// [`resolve_gate_sandbox_target`] (whose note the engine paths surface as a
+/// decision event) and [`MergeGatePolicy::degradation_note`] (which the
+/// server's merge path logs — it has no event log). The text must match on
+/// every path so an operator sees the SAME explanation wherever the gate
+/// ran, and it names the follow-up: wrapping engine-side gates is the
+/// container provider's remaining work (ticket tier3-container-sandbox —
+/// deliberately NOT built here, and the container provider itself is
+/// untouched).
+fn container_gate_note(enforce: crate::types::SandboxEnforce) -> String {
+    format!(
+        "engine-run gates are not container-wrapped (provider:container wraps agent \
+         sessions only); gates run unsandboxed despite enforce:{} — wrapping \
+         engine-side gates is the container follow-up (ticket tier3-container-sandbox)",
+        enforce.as_str()
+    )
 }
 
 /// Resolve the sandbox posture for one engine-run gate execution context.
@@ -435,22 +478,24 @@ fn resolve_gate_sandbox_target(
         return disabled(None);
     }
     if sandbox_cfg.provider == SandboxProvider::Container {
-        return disabled(Some(format!(
-            "engine-run gates are not container-wrapped (provider:container wraps agent \
-             sessions only); gates run unsandboxed despite enforce:{}",
-            sandbox_cfg.enforce.as_str()
-        )));
+        return disabled(Some(container_gate_note(sandbox_cfg.enforce)));
     }
     match crate::sandbox::platform_support(sandbox_cfg.enforce, target_os) {
         // Unreachable (Off returns above) — platform_support is the shared
         // vocabulary, so the match stays exhaustive anyway.
         crate::sandbox::SandboxDecision::Off => disabled(None),
-        crate::sandbox::SandboxDecision::UnsupportedWarn => disabled(Some(format!(
-            "sandbox enforce:{} requested but unsupported on target_os={target_os}; engine-run \
-             gates execute UNSANDBOXED (agent sessions already refuse to run on this platform, \
-             so only standalone merge gates can reach this posture)",
-            sandbox_cfg.enforce.as_str()
-        ))),
+        // 13th-pass review (P1): FAIL CLOSED. Agent sessions already refuse
+        // to run unsandboxed on an unsupported platform; a standalone merge
+        // gate that resolved to Disabled here ran worker-authored code
+        // unsandboxed under an enforced config — loudly is the only honest
+        // posture.
+        crate::sandbox::SandboxDecision::UnsupportedWarn => {
+            Err(crate::error::EngineError::Config(format!(
+                "sandbox enforce:{} requested but unsupported on target_os={target_os}; refusing \
+                 to run engine-run gates unsandboxed",
+                sandbox_cfg.enforce.as_str()
+            )))
+        }
         crate::sandbox::SandboxDecision::Enforce(crate::sandbox::SandboxBackend::Bubblewrap)
             if !bwrap_available =>
         {
@@ -475,6 +520,12 @@ fn resolve_gate_sandbox_target(
             };
             match backend {
                 crate::sandbox::SandboxBackend::Seatbelt => {
+                    // 13th-pass (P1): the profile no longer permits xcrun_db
+                    // writes, so refresh the shim cache OUTSIDE the sandbox
+                    // once per resolve — never per command (the cache is
+                    // per-user and shared; see prewarm's doc).
+                    #[cfg(target_os = "macos")]
+                    prewarm_xcrun_cache_outside_sandbox();
                     // The session profile PLUS the gate-specific extras (see
                     // [`gate_profile_extras`]) — appended, never edited in,
                     // so the session generator stays untouched.
@@ -801,18 +852,39 @@ impl MergeGatePolicy {
 
     /// Whether resolution on THIS host yields an enforced wrap — the cheap
     /// pre-check callers use to choose between the sandboxed runner and their
-    /// pre-existing executor seam. `false` for `enforce: off`, for platforms
-    /// [`crate::sandbox::platform_support`] cannot honor, and for
-    /// `provider: container` (both documented no-ops — see
-    /// [`resolve_gate_sandbox`]). Linux WITHOUT `bwrap` still returns `true`:
-    /// requested-but-missing tooling fails CLOSED at resolve time, mirroring
-    /// session resolution.
+    /// pre-existing executor seam. `false` for `enforce: off` (the
+    /// byte-identical pre-wrap path) and for `provider: container` (gates
+    /// are not container-wrapped; the degradation is RECORDED — see
+    /// [`MergeGatePolicy::degradation_note`]). Every OTHER requested
+    /// enforcement returns `true` — including platforms
+    /// [`crate::sandbox::platform_support`] cannot honor and linux WITHOUT
+    /// `bwrap`: those FAIL CLOSED at resolve time (13th-pass review, P1 —
+    /// never a silent unsandboxed gate under an enforced config).
     pub fn enforces_on_this_host(&self) -> bool {
         self.sandbox.provider == crate::types::SandboxProvider::Process
-            && matches!(
+            && !matches!(
                 crate::sandbox::platform_support(self.sandbox.enforce, std::env::consts::OS),
-                crate::sandbox::SandboxDecision::Enforce(_)
+                crate::sandbox::SandboxDecision::Off
             )
+    }
+
+    /// The operator-visible note when this policy does NOT wrap gates
+    /// despite `enforce != off` — provider:container today (13th-pass
+    /// review, P1). The engine's validation/final-gate paths record the
+    /// same degradation as a decision event; the server's merge path has no
+    /// event log and MUST log this note instead, or a container-provider
+    /// mission's merge gates run unsandboxed SILENTLY. `None` for
+    /// `enforce: off` (nothing to degrade) and for the process provider
+    /// (which wraps, or fails closed loudly at resolve — an unsupported
+    /// platform or linux without `bwrap` needs no note because it errors).
+    pub fn degradation_note(&self) -> Option<String> {
+        if self.sandbox.provider == crate::types::SandboxProvider::Container
+            && self.sandbox.enforce != crate::types::SandboxEnforce::Off
+        {
+            Some(container_gate_note(self.sandbox.enforce))
+        } else {
+            None
+        }
     }
 }
 
@@ -1481,9 +1553,11 @@ mod tests {
 
     /// The resolve matrix, pure and cross-platform: off stays disabled (no
     /// note), macOS resolves Seatbelt (profile file written, `/dev/null`
-    /// allow appended, denies + writable roots in shape), linux resolves
-    /// Bubblewrap and fails CLOSED without bwrap, an unsupported platform
-    /// and the container provider degrade to documented no-ops.
+    /// allow appended, NO xcrun write allow — 13th-pass prewarm + deny,
+    /// denies + writable roots in shape), linux resolves Bubblewrap and
+    /// fails CLOSED without bwrap, an unsupported platform fails CLOSED, and
+    /// the container provider degrades to the one documented no-op (with
+    /// the shared note).
     #[test]
     fn gate_sandbox_wrap_resolve_matrix() {
         let repo = tempfile::tempdir().unwrap();
@@ -1534,18 +1608,11 @@ mod tests {
             profile.contains("(allow file-write* (literal \"/dev/null\"))"),
             "the gate profile must add the /dev/null device write allow:\n{profile}"
         );
-        #[cfg(target_os = "macos")]
-        {
-            let temp = std::env::temp_dir();
-            let expected = format!(
-                "(regex #\"^{}/xcrun_db[^/]*$\")",
-                crate::sandbox::escape_sbpl_regex(&crate::sandbox::absolutize(&temp))
-            );
-            assert!(
-                profile.contains(&expected),
-                "the gate profile must add the name-anchored xcrun_db cache allow:\n{profile}"
-            );
-        }
+        assert!(
+            !profile.contains("xcrun_db"),
+            "13th-pass review (P1): the gate profile must NOT permit writes to the \
+             shared per-user xcrun cache (prewarm + deny posture):\n{profile}"
+        );
         assert!(
             profile.contains("events.jsonl"),
             "mission metadata write denies must ride along:\n{profile}"
@@ -1587,10 +1654,11 @@ mod tests {
         .expect_err("linux without bwrap must fail closed");
         assert!(error.to_string().contains("bwrap"), "{error}");
 
-        // fs on an unsupported platform → Disabled with a documented note
-        // (sessions already refuse there; only standalone merge gates reach
-        // this posture).
-        let resolution = resolve_gate_sandbox_target(
+        // fs on an unsupported platform → FAIL CLOSED (13th-pass review,
+        // P1): agent sessions already refuse to run there, and a standalone
+        // merge gate must fail loudly too — never run unsandboxed under an
+        // enforced config.
+        let error = resolve_gate_sandbox_target(
             &fs,
             repo.path(),
             &mission,
@@ -1599,13 +1667,19 @@ mod tests {
             "windows",
             false,
         )
-        .unwrap();
-        assert!(matches!(resolution.sandbox, GateSandbox::Disabled));
-        let note = resolution.note.expect("unsupported platform must be noted");
-        assert!(note.contains("UNSANDBOXED"), "{note}");
+        .expect_err("an unsupported platform must fail closed");
+        assert!(error.to_string().contains("unsupported"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to run engine-run gates unsandboxed"),
+            "{error}"
+        );
 
-        // provider:container → Disabled with a documented note (tier-3 wraps
-        // sessions; container-wrapping gates is out of scope).
+        // provider:container → Disabled with the shared degradation note
+        // (tier-3 wraps sessions; container-wrapping engine-side gates is
+        // the follow-up — the note names the ticket so the merge path can
+        // surface the same explanation).
         let container = crate::types::SandboxConfig {
             enforce: crate::types::SandboxEnforce::Fs,
             provider: crate::types::SandboxProvider::Container,
@@ -1626,6 +1700,116 @@ mod tests {
         assert!(matches!(resolution.sandbox, GateSandbox::Disabled));
         let note = resolution.note.expect("container provider must be noted");
         assert!(note.contains("container"), "{note}");
+        assert!(note.contains("tier3-container-sandbox"), "{note}");
+    }
+
+    /// 13th-pass review (P1), the prewarm half of the macOS xcrun posture:
+    /// the shim cache is refreshed OUTSIDE the sandbox ONCE PER RESOLVE —
+    /// never per command (the cache is per-user and shared, so one refresh
+    /// covers every wrapped spawn the resolution produces). Counted through
+    /// the GATE_XCRUN_PREWARM_SPAWNS test seam. macOS-only: the prewarm is
+    /// compiled out elsewhere.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gate_xcrun_deny_prewarm_runs_once_per_resolve_not_per_command() {
+        let repo = tempfile::tempdir().unwrap();
+        let mission = repo.path().join(".kranz").join("missions").join("m-x");
+        std::fs::create_dir_all(&mission).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let cfg = fs_sandbox_config(crate::types::SandboxEnforce::Fs);
+        let resolve = || {
+            resolve_gate_sandbox(&cfg, repo.path(), &mission, scratch.path(), scratch.path())
+                .unwrap()
+        };
+
+        let before = GATE_XCRUN_PREWARM_SPAWNS.load(std::sync::atomic::Ordering::SeqCst);
+        let resolution = resolve();
+        let after_one = GATE_XCRUN_PREWARM_SPAWNS.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(after_one - before, 1, "one prewarm per resolve");
+
+        // Wrapping commands from this resolution prewarms NOTHING further —
+        // the wrap is argv construction, the prewarm lives in resolve.
+        let _argv_one = resolution.sandbox.wrap_shell("true").unwrap();
+        let _argv_two = resolution.sandbox.wrap_shell("echo hi").unwrap();
+        let after_wraps = GATE_XCRUN_PREWARM_SPAWNS.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(after_wraps, after_one, "command wraps must not prewarm");
+
+        // A second resolve prewarms again — per resolve, not once globally.
+        let _second = resolve();
+        let after_two = GATE_XCRUN_PREWARM_SPAWNS.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            after_two - after_one,
+            1,
+            "each resolve prewarms exactly once"
+        );
+    }
+
+    /// 13th-pass review (P1): provider:container merge gates are not
+    /// wrapped, and the merge path must RECORD the degradation — the engine
+    /// paths emit the resolution note as a decision event; the server logs
+    /// [`MergeGatePolicy::degradation_note`]. The two notes are the SAME
+    /// text (an operator sees one explanation on every path), and the note
+    /// names the container gate wrapper follow-up.
+    #[test]
+    fn gate_container_posture_merge_policy_notes_degradation() {
+        let container = |enforce| crate::types::SandboxConfig {
+            enforce,
+            provider: crate::types::SandboxProvider::Container,
+            image: None,
+            extra_write: vec![],
+            egress: vec![],
+        };
+        let policy = MergeGatePolicy {
+            sandbox: container(crate::types::SandboxEnforce::Fs),
+            mission_dir: std::path::PathBuf::new(),
+        };
+        // Not wrapped on ANY host (the pre-check routes to the pre-existing
+        // executor seam)…
+        assert!(!policy.enforces_on_this_host());
+        // …but never silently.
+        let note = policy
+            .degradation_note()
+            .expect("the container posture must be noted");
+        assert!(note.contains("container"), "{note}");
+        assert!(
+            note.contains("tier3-container-sandbox"),
+            "the note must name the container gate wrapper follow-up: {note}"
+        );
+        // The engine-path note (the resolution) matches the merge-path note
+        // verbatim.
+        let repo = tempfile::tempdir().unwrap();
+        let mission = repo.path().join(".kranz").join("missions").join("m-x");
+        std::fs::create_dir_all(&mission).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let resolution = resolve_gate_sandbox_target(
+            &policy.sandbox,
+            repo.path(),
+            &mission,
+            scratch.path(),
+            scratch.path(),
+            "macos",
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            resolution.note.as_deref(),
+            Some(note.as_str()),
+            "the engine-path note and the merge-path note must match"
+        );
+
+        // enforce: off + container: nothing to degrade. A process-provider
+        // policy has no note either — it wraps, or fails closed loudly.
+        let off = MergeGatePolicy {
+            sandbox: container(crate::types::SandboxEnforce::Off),
+            mission_dir: std::path::PathBuf::new(),
+        };
+        assert!(off.degradation_note().is_none());
+        assert!(!off.enforces_on_this_host());
+        let process = MergeGatePolicy {
+            sandbox: fs_sandbox_config(crate::types::SandboxEnforce::Fs),
+            mission_dir: std::path::PathBuf::new(),
+        };
+        assert!(process.degradation_note().is_none());
     }
 
     /// The off regression: `enforce == off` resolves to
@@ -1985,6 +2169,99 @@ mod tests {
             "with enforce == off the $HOME write succeeds (today's posture): {output}"
         );
         let _ = std::fs::remove_file(fake_home.path().join("gate_sandbox_wrap_off_marker"));
+    }
+
+    /// 13th-pass review (P1), the gate half of the shared-Cargo-cache deny:
+    /// a wrapped gate READS the operator's real registry/git cache (the
+    /// link target the over-ceiling isolated home points at — the read is
+    /// the cache's whole purpose) but cannot WRITE it: the profile's
+    /// explicit cache write deny holds regardless of the gate's writable
+    /// roots. `enforce == off` keeps the documented trade (the write
+    /// succeeds) — the anti-vacuity arm.
+    // await_holding_lock: see the note on
+    // gate_sandbox_wrap_denies_outside_writes_metadata_and_authority_reads.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn gate_sandbox_wrap_cache_write_deny_reads_cache_but_cannot_write() {
+        let _guard = GATE_SANDBOX_WRAP_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if !gate_wrap_enforcement_available() {
+            return;
+        }
+
+        let (repo, mission) = gate_wrap_layout();
+        let scratch = tempfile::tempdir().unwrap();
+        // The "operator's" shared cache, armed via CARGO_HOME so BOTH the
+        // profile deny computation and the cache-only home seeding resolve
+        // it (the same paths cache_only_cargo_home links).
+        let cargo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cargo.path().join("registry")).unwrap();
+        std::fs::write(cargo.path().join("registry/cache-marker"), "cached").unwrap();
+        let _cargo = crate::agent_env::EnvTestGuard::engage(&[(
+            "CARGO_HOME",
+            cargo.path().to_str().expect("utf-8 temp path"),
+        )]);
+
+        let resolution = resolve_gate_sandbox(
+            &fs_sandbox_config(crate::types::SandboxEnforce::Fs),
+            repo.path(),
+            &mission,
+            scratch.path(),
+            scratch.path(),
+        )
+        .unwrap();
+        let sandbox = resolution.sandbox;
+        let env = crate::agent_env::contract_command_env(scratch.path(), None, &[]);
+
+        // The cache READS fine (broad read allow / ro-bind)…
+        let (ok, output) = run_shell_command_sandboxed(
+            repo.path(),
+            &format!(
+                "test -s '{}'",
+                cargo.path().join("registry/cache-marker").display()
+            ),
+            &env,
+            &sandbox,
+        )
+        .await;
+        assert!(ok, "the wrapped gate must read the shared cache: {output}");
+
+        // …but a WRITE to the real cache dir is denied, and the bytes stay
+        // off the host either way (Seatbelt denies; bwrap's stacked ro-bind
+        // refuses).
+        let poison = cargo.path().join("registry/poisoned-crate");
+        let (ok, output) = run_shell_command_sandboxed(
+            repo.path(),
+            &format!("echo x > '{}'", poison.display()),
+            &env,
+            &sandbox,
+        )
+        .await;
+        assert!(
+            !ok,
+            "a write to the operator's real cargo cache must fail under enforcement: {output}"
+        );
+        assert!(
+            !poison.exists(),
+            "the denied cache write must not create the file"
+        );
+
+        // Anti-vacuity: the SAME write succeeds with enforcement off (the
+        // documented trade the operator opts into with enforce: off).
+        let (ok, output) = run_shell_command_sandboxed(
+            repo.path(),
+            &format!("echo x > '{}'", poison.display()),
+            &env,
+            &GateSandbox::Disabled,
+        )
+        .await;
+        assert!(
+            ok,
+            "with enforce == off the cache write succeeds (documented trade): {output}"
+        );
+        let _ = std::fs::remove_file(&poison);
     }
 
     /// The merge-gate off regression: a disabled policy delegates to the

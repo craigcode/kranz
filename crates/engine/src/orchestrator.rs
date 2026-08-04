@@ -3137,22 +3137,30 @@ impl MissionEngine {
     /// verdict, and a unit is done when gates are green and no escalation
     /// is open, not when streams stop disagreeing.
     ///
-    /// Only streams with a run record are compared: a stream that never
-    /// started has no candidate diff, and counting its untouched branch
-    /// would fabricate agreement (or divergence) out of a failure — the
-    /// pool decision's detail names failed streams verbatim instead. With
-    /// fewer than two recorded candidates there is nothing to compare and
-    /// NO event is appended (a one-stream "agreement" would be vacuous).
-    /// The crash-resume re-dispatch guard never calls here: a half-recorded
-    /// candidate set parks without a comparison rather than fabricating one
-    /// from incomplete streams.
+    /// Only candidates with a run record AND a successful Phase C
+    /// inspection (`inspected`) are compared: a stream that never started
+    /// has no candidate diff, and a candidate whose worktree inspection
+    /// FAILED (the failed-and-preserved posture) still has a run record but
+    /// its branch carries rejected/untouched bytes — counting either would
+    /// fabricate agreement (or divergence) out of a failure (13th-pass
+    /// review, P2: eligibility was previously inferred from the run record
+    /// alone). The pool decision's detail names failed streams verbatim
+    /// instead. With fewer than two eligible candidates there is nothing to
+    /// compare and NO event is appended (a one-stream "agreement" would be
+    /// vacuous). The crash-resume re-dispatch guard never calls here: a
+    /// half-recorded candidate set parks without a comparison rather than
+    /// fabricating one from incomplete streams.
     fn emit_pool_divergence_record(
         &mut self,
         feature: &Feature,
         workspaces: &[PoolWorkspace],
+        inspected: &[usize],
     ) -> Result<()> {
         let mut candidates: Vec<DivergenceCandidate> = Vec::new();
         for (index, ws) in workspaces.iter().enumerate() {
+            if !inspected.contains(&index) {
+                continue;
+            }
             let run = self.state.runs.values().find(|r| {
                 r.candidate
                     .as_ref()
@@ -3330,6 +3338,13 @@ impl MissionEngine {
         // worker.spawned — then checkpoint-commit its worktree so the
         // candidate branch HEAD is the deliverable.
         let mut lines: Vec<String> = Vec::with_capacity(n);
+        // The indices whose Phase C inspection SUCCEEDED (13th-pass review,
+        // P2): the divergence comparison below must compare only VERIFIED
+        // candidate bytes — a failed-and-preserved candidate still has a run
+        // record, but its branch carries rejected/untouched bytes, and
+        // comparing those would fabricate an agreement (or divergence) out
+        // of an inspection failure.
+        let mut inspected: Vec<usize> = Vec::with_capacity(n);
         for (idx, ws) in workspaces.iter().enumerate() {
             match buffered[idx].take() {
                 Some((events, outcome)) => {
@@ -3375,7 +3390,7 @@ impl MissionEngine {
                     // error (`?`): the tree was inspectable by then, so that
                     // is a real git failure, not hostile metadata.
                     let inspection: Result<(GitRepo, bool)> = (|| {
-                        let wt_repo = GitRepo::open(&ws.path)?.with_hooks_disabled();
+                        let wt_repo = GitRepo::open(&ws.path)?.with_hooks_disabled()?;
                         wt_repo.ensure_identity()?;
                         let clean = wt_repo.is_clean()?;
                         Ok((wt_repo, clean))
@@ -3419,6 +3434,10 @@ impl MissionEngine {
                         commits,
                         note
                     ));
+                    // Inspection succeeded end to end (open, identify,
+                    // status, commit query): this candidate's bytes are
+                    // verified and it MAY join the divergence comparison.
+                    inspected.push(idx);
                 }
                 None => {
                     let err = stream_errors[idx]
@@ -3435,11 +3454,12 @@ impl MissionEngine {
         }
 
         // The divergence/agreement record (KRZ-304): emitted while every
-        // candidate branch HEAD is final (checkpoints committed above) and
-        // BEFORE the park, so the judgement the milestone waits on has a
-        // first-class handle. Record-only — the park below is unchanged
-        // whether the streams diverged or agreed.
-        self.emit_pool_divergence_record(feature, workspaces)?;
+        // inspected candidate branch HEAD is final (checkpoints committed
+        // above) and BEFORE the park, so the judgement the milestone waits
+        // on has a first-class handle. Only successfully inspected
+        // candidates participate (13th-pass, P2). Record-only — the park
+        // below is unchanged whether the streams diverged or agreed.
+        self.emit_pool_divergence_record(feature, workspaces, &inspected)?;
 
         // One first-class decision record for the dispatch: the candidate
         // table AND the freeze statements, so the replayed history shows what
@@ -4222,8 +4242,8 @@ impl MissionEngine {
         // feature honestly and PRESERVES its bytes. Only a COMMIT-time
         // failure stays a batch error (`?`): the tree was inspectable by
         // then, so that is a real git failure, not hostile metadata.
-        let wt_repo = match GitRepo::open(&ws.path) {
-            Ok(repo) => repo.with_hooks_disabled(),
+        let wt_repo = match GitRepo::open(&ws.path).and_then(|repo| repo.with_hooks_disabled()) {
+            Ok(repo) => repo,
             Err(error) => return self.record_uninspectable_worktree(ws, &error),
         };
         if let Err(error) = wt_repo.ensure_identity() {
@@ -4365,8 +4385,8 @@ impl MissionEngine {
     /// [`crate::command_exec::GateSandbox::Disabled`], today's exact
     /// behavior; an enforced posture or a degraded no-op is recorded as a
     /// decision so the wrap (or its absence) is audible in the event log.
-    /// Resolution failures (e.g. linux without `bwrap`) fail closed,
-    /// mirroring session resolution.
+    /// Resolution failures (linux without `bwrap`, an unsupported platform)
+    /// fail closed, mirroring session resolution.
     fn gate_sandbox(&mut self, root: &std::path::Path) -> Result<crate::command_exec::GateSandbox> {
         let resolution = crate::command_exec::resolve_gate_sandbox(
             &self.state.config.worker.sandbox,
@@ -10400,6 +10420,102 @@ pub(crate) mod tests {
 
         // The preserved dir lives in the shared temp dir (outside the
         // repo tempdir) — sweep it so the test leaves nothing behind.
+        let _ = std::fs::remove_dir_all(&c0_path);
+    }
+
+    /// 13th-pass review (P2): a candidate whose inspection FAILED still has
+    /// a run record (its stream completed Pass), so run-record presence
+    /// alone once let it into the divergence comparison — letting
+    /// rejected/untouched bytes produce an apparent agreement or
+    /// divergence. Now only successfully inspected candidates participate:
+    /// with one of two streams uninspectable there is ONE eligible
+    /// candidate, below the two-candidate floor, so NO record is emitted at
+    /// all — and the surviving posture still parks for judgement.
+    #[tokio::test]
+    async fn divergence_eligibility_excludes_failed_inspection_candidates() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let claude_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("claude candidate", "claude.txt", "claude was here")
+                .removes_path(".git"),
+        ]));
+        let codex_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("codex candidate", "codex.txt", "codex was here"),
+        ]));
+        let backend: Arc<dyn AgentBackend> = claude_mock.clone();
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", dispatch_pool_cfg()).unwrap();
+        engine.seed_worker_auth_verdict_for_test(AuthVerdict::Authenticated);
+        engine.seed_kind_backend_for_test(BackendKind::Codex, codex_mock.clone());
+        engine
+            .state
+            .mission
+            .milestones
+            .push(dispatch_pool_milestone(&engine));
+
+        engine.run_feature(0, 0).await.unwrap();
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        // Crux: BOTH streams still carry run records with terminal Pass —
+        // eligibility must NOT be inferred from that alone…
+        let completed: Vec<RunResult> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::WorkerCompleted { result, .. } => Some(*result),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            completed,
+            vec![RunResult::Pass, RunResult::Pass],
+            "both streams completed; only the INSPECTION failed"
+        );
+        // …and with just one inspected candidate there is NO comparison:
+        // no divergence record, and no vacuous one-stream "agreement".
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::DivergenceNoted { .. })),
+            "a failed-inspection candidate must not join the comparison — \
+             fewer than two eligible candidates means NO record: {:?}",
+            events
+                .iter()
+                .filter(|e| matches!(&e.kind, EventKind::DivergenceNoted { .. }))
+                .map(|e| &e.kind)
+                .collect::<Vec<_>>()
+        );
+        // The surviving posture still parks for judgement, with the
+        // inspection failure named in the dispatch record.
+        let detail = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::OrchestratorDecision { summary, detail }
+                    if summary.starts_with("dispatch pool:") =>
+                {
+                    detail.clone()
+                }
+                _ => None,
+            })
+            .expect("dispatch decision recorded");
+        assert!(
+            detail.contains("worktree inspection failed"),
+            "the failed candidate is named in the decision detail: {detail}"
+        );
+        assert!(events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::MilestoneBlocked { milestone_id, .. } if milestone_id == "ms-1"
+        )));
+        assert!(!events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::FeatureCompleted { feature_id, .. } | EventKind::FeatureFailed { feature_id, .. }
+            if feature_id == "f-1-1"
+        )));
+
+        // Sweep the preserved worktree dir (shared temp dir, outside the
+        // repo tempdir) so the test leaves nothing behind.
+        let mission_id = engine.mission_id().to_string();
+        let c0_path = pool_worktree_path(&root, &mission_id, "f-1-1", 0);
         let _ = std::fs::remove_dir_all(&c0_path);
     }
 
