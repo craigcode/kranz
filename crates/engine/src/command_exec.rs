@@ -449,8 +449,9 @@ pub(crate) struct GateSandboxResolution {
     /// once-per-resolve contract is assertable without a global counter —
     /// a process-wide counter races with parallel test threads resolving
     /// concurrently (rust-macos CI flake, run 30935850957). Read only by
-    /// tests; the production posture is the profile itself.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// the macOS-gated test; everywhere else the field exists only to keep
+    /// the resolution's shape platform-uniform.
+    #[cfg_attr(not(all(test, target_os = "macos")), allow(dead_code))]
     pub prewarmed_xcrun: bool,
 }
 
