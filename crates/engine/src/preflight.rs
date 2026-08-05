@@ -117,6 +117,17 @@ impl MissionEngine {
                         });
                     }
                 }
+                BackendKind::Cursor => {
+                    if let Err(err) = crate::backend_cursor::discover_cursor_binary(None) {
+                        issues.push(PreflightIssue {
+                            severity: "warn",
+                            message: format!(
+                                "{role_key}.backend is \"cursor\" but no cursor agent binary was \
+                                 found ({err}); that role will fall back to the claude backend"
+                            ),
+                        });
+                    }
+                }
                 BackendKind::Claude => {}
                 BackendKind::Acp => {
                     // No cheap probe exists for an ACP executable (there is

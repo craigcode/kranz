@@ -8,10 +8,10 @@
 //! ambient server secrets (Slack tokens, GH_TOKEN, cloud credentials,
 //! remote-workspace tokens) reached every prompt-injectable child. Now:
 //!
-//! - **Agent CLI sessions** (claude/codex/droid/kimi backends) spawn with
-//!   `env_clear` + [`sanitized_child_env`]: PATH, a scratch HOME, locale
-//!   vars, and nothing else — plus backend-specific auth injected explicitly
-//!   ([`agent_session_env`]), never the ambient set.
+//! - **Agent CLI sessions** (claude/codex/droid/kimi/cursor backends) spawn
+//!   with `env_clear` + [`sanitized_child_env`]: PATH, a scratch HOME,
+//!   locale vars, and nothing else — plus backend-specific auth injected
+//!   explicitly ([`agent_session_env`]), never the ambient set.
 //! - **Contract/gate commands** (validation round, final gate, approval-time
 //!   contract lint) run with `env_clear` + [`contract_command_env`]: the
 //!   sanitized base plus `KRANZ_BASE_SHA`, a cache-only Cargo home, the
@@ -433,7 +433,7 @@ pub fn session_scratch_home(session_id: &str) -> PathBuf {
 }
 
 /// The cleared env for one agent CLI session, uniform across the spawning
-/// backends (claude/codex/droid/kimi).
+/// backends (claude/codex/droid/kimi/cursor).
 ///
 /// - `base_home` is the session's relocated scratch `HOME` when `spec_env`
 ///   carries one (worker relocation, the auth probe's candidate env), else a

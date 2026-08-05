@@ -736,8 +736,10 @@ pub struct RoleConfig {
     /// [`crate::backend_codex::CodexBackend`], `"droid"` selects
     /// [`crate::backend_droid::DroidBackend`], `"kimi"` selects
     /// [`crate::backend_kimi::KimiBackend`], `"local"` selects an
-    /// OpenAI-compatible HTTP endpoint, and `"acp"` selects
-    /// [`crate::backend_acp::AcpBackend`] (worker role only).
+    /// OpenAI-compatible HTTP endpoint, `"acp"` selects
+    /// [`crate::backend_acp::AcpBackend`] (worker role only), and `"cursor"`
+    /// selects [`crate::backend_cursor::CursorBackend`] (opt-in,
+    /// validator-first; docs/scoping/cursor-cli-backend.md).
     /// `config::validate` checks that
     /// the selected backend/model pair is supported for the role.
     ///
@@ -900,6 +902,10 @@ pub enum BackendKind {
     /// ACP (Agent Client Protocol) agent executable, configured via the
     /// role's `acpCommand`/`acpArgs` (KRZ-301; worker role only).
     Acp,
+    /// Cursor CLI (`agent --print --output-format stream-json`), the decided
+    /// `direct-parser` route (docs/scoping/cursor-cli-backend.md). Opt-in
+    /// only, validator-first; never a default.
+    Cursor,
 }
 
 impl BackendKind {
@@ -911,6 +917,7 @@ impl BackendKind {
             BackendKind::Kimi => "kimi",
             BackendKind::Local => "local",
             BackendKind::Acp => "acp",
+            BackendKind::Cursor => "cursor",
         }
     }
 
@@ -920,7 +927,9 @@ impl BackendKind {
     /// the other CLI backends spawn their binaries directly (and `local`
     /// runs in the engine process), so an enforced sandbox on them would be
     /// silently unenforced — `config::validate` rejects that pair (fail
-    /// closed). The match is deliberately exhaustive: a future backend must
+    /// closed). Cursor's own `--sandbox` flag is observed to be no isolation
+    /// boundary (docs/scoping/cursor-cli-backend.md), so it does not count
+    /// either. The match is deliberately exhaustive: a future backend must
     /// declare itself here.
     pub fn supports_sandbox_enforcement(self) -> bool {
         match self {
@@ -929,14 +938,17 @@ impl BackendKind {
             | BackendKind::Droid
             | BackendKind::Kimi
             | BackendKind::Local
-            | BackendKind::Acp => false,
+            | BackendKind::Acp
+            | BackendKind::Cursor => false,
         }
     }
 
     /// Whether this backend's wire reports cache-READ input tokens the
     /// parser records (outcomes-report context-reuse split, ticket
     /// `outcomes-report-task-class`). Claude/droid read
-    /// `cache_read_input_tokens`; codex reads `cached_input_tokens`. Kimi's
+    /// `cache_read_input_tokens`; codex reads `cached_input_tokens`; cursor
+    /// reads `cacheReadTokens` off the terminal result event (present in the
+    /// committed fixture). Kimi's
     /// wire carries no usage at all, local hardcodes zeros, and ACP v1's
     /// `usage_update` reports context-window state rather than a token
     /// split — for all three, a zero would be fabricated, so they report
@@ -945,18 +957,21 @@ impl BackendKind {
     /// itself here.
     pub fn reports_cache_read_tokens(self) -> bool {
         match self {
-            BackendKind::Claude | BackendKind::Codex | BackendKind::Droid => true,
+            BackendKind::Claude | BackendKind::Codex | BackendKind::Droid | BackendKind::Cursor => {
+                true
+            }
             BackendKind::Kimi | BackendKind::Local | BackendKind::Acp => false,
         }
     }
 
     /// Whether this backend's wire reports cache-WRITE (creation) input
-    /// tokens. Only claude/droid carry `cache_creation_input_tokens`; codex
+    /// tokens. Claude/droid carry `cache_creation_input_tokens` and cursor
+    /// carries `cacheWriteTokens` on its terminal result event; codex
     /// has no such field (its cache write side is never recorded, so the
     /// split's cache-write column is absent for codex, never zero-filled).
     pub fn reports_cache_write_tokens(self) -> bool {
         match self {
-            BackendKind::Claude | BackendKind::Droid => true,
+            BackendKind::Claude | BackendKind::Droid | BackendKind::Cursor => true,
             BackendKind::Codex | BackendKind::Kimi | BackendKind::Local | BackendKind::Acp => false,
         }
     }
@@ -1313,6 +1328,7 @@ impl MissionConfig {
             Some("kimi") => BackendKind::Kimi,
             Some("local") => BackendKind::Local,
             Some("acp") => BackendKind::Acp,
+            Some("cursor") => BackendKind::Cursor,
             _ => BackendKind::Claude,
         }
     }

@@ -2905,6 +2905,7 @@ mod tests {
             crate::types::BackendKind::Kimi,
             crate::types::BackendKind::Local,
             crate::types::BackendKind::Acp,
+            crate::types::BackendKind::Cursor,
         ] {
             let containment = resolve_validator_containment_target(
                 &off_cfg(),

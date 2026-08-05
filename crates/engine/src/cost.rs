@@ -43,6 +43,12 @@ pub fn is_droid_model(model: &str) -> bool {
 /// importable engine-wide.
 pub const DEFAULT_KIMI_MODEL: &str = "kimi-code/k3";
 
+/// Default model id for the Cursor backend, importable engine-wide: `gpt-5`,
+/// the `--help` example id and the probe's default (`agent --list-models`
+/// catalogs are account-specific, so the default stays the documented
+/// example rather than a captured catalog entry).
+pub const DEFAULT_CURSOR_MODEL: &str = "gpt-5";
+
 /// Whether `model` names a kimi-family model (same substring match
 /// [`pricing_for_model`] uses to select kimi pricing).
 pub fn is_kimi_model(model: &str) -> bool {

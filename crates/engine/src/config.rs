@@ -11,7 +11,9 @@
 //! field (e.g. only `worker.model`) without restating the rest. Unknown keys
 //! are ignored on deserialization.
 
-use crate::cost::{DEFAULT_CODEX_MODEL, DEFAULT_DROID_MODEL, DEFAULT_KIMI_MODEL};
+use crate::cost::{
+    DEFAULT_CODEX_MODEL, DEFAULT_CURSOR_MODEL, DEFAULT_DROID_MODEL, DEFAULT_KIMI_MODEL,
+};
 use crate::error::{EngineError, Result};
 use crate::paths;
 use crate::types::{BackendKind, ExecutorTier, MissionConfig, Role, SandboxEnforce};
@@ -42,6 +44,7 @@ pub fn parse_backend(raw: Option<&str>) -> std::result::Result<BackendKind, Stri
         Some("kimi") => Ok(BackendKind::Kimi),
         Some("local") => Ok(BackendKind::Local),
         Some("acp") => Ok(BackendKind::Acp),
+        Some("cursor") => Ok(BackendKind::Cursor),
         Some(other) => Err(other.to_string()),
     }
 }
@@ -178,6 +181,7 @@ fn backend_default_model(kind: BackendKind) -> Option<&'static str> {
         // model is its own concern (encoded in acpCommand/acpArgs), so there
         // is no backend default to rewrite to.
         BackendKind::Acp => None,
+        BackendKind::Cursor => Some(DEFAULT_CURSOR_MODEL),
     }
 }
 
@@ -257,6 +261,15 @@ pub fn model_tier(kind: BackendKind, model: &str) -> Option<ModelTier> {
         // attribution only; ACP v1 has no model-selection parameter), so the
         // same uniform below-default classification applies.
         BackendKind::Acp => Some(ModelTier::BelowDefault),
+        // Cursor model ids are drawn from an account-specific catalog
+        // (~190 entries on the probe account; `--list-models` output varies
+        // by entitlement), so no client-side allowlist is possible and every
+        // non-empty id classifies uniformly below-default: a cursor worker
+        // needs the allowBelowDefaultWorkerModel opt-in (a deliberate gate
+        // for a validator-first backend), and the orchestrator stays on its
+        // frontier floor. Model-availability failures themselves are
+        // diagnosed deterministically at session start (probe item 5).
+        BackendKind::Cursor => Some(ModelTier::BelowDefault),
     }
 }
 
@@ -454,7 +467,7 @@ pub fn validate(cfg: &MissionConfig) -> Result<()> {
     for (i, candidate) in cfg.worker_candidates.iter().enumerate() {
         let kind = parse_backend(Some(&candidate.backend)).map_err(|other| {
             EngineError::Config(format!(
-                "workerCandidates[{i}].backend must be one of \"claude\", \"codex\", \"droid\", \"kimi\", got {other:?}"
+                "workerCandidates[{i}].backend must be one of \"claude\", \"codex\", \"droid\", \"kimi\", \"cursor\", got {other:?}"
             ))
         })?;
         // local/acp need per-role endpoint/command config (baseUrl /
@@ -464,7 +477,7 @@ pub fn validate(cfg: &MissionConfig) -> Result<()> {
             return Err(EngineError::Config(format!(
                 "workerCandidates[{i}].backend {:?} is not supported in this pass: local/acp \
                  need per-candidate endpoint/command config (a deliberate widening); use \
-                 claude, codex, droid, or kimi candidates",
+                 claude, codex, droid, kimi, or cursor candidates",
                 candidate.backend
             )));
         }
@@ -520,7 +533,7 @@ pub fn validate(cfg: &MissionConfig) -> Result<()> {
         let role_cfg = cfg.role(role);
         let kind = parse_backend(role_cfg.backend.as_deref()).map_err(|other| {
             EngineError::Config(format!(
-                "{name}.backend must be one of None, \"claude\", \"codex\", \"droid\", \"kimi\", \"local\", got {other:?}"
+                "{name}.backend must be one of None, \"claude\", \"codex\", \"droid\", \"kimi\", \"local\", \"acp\", \"cursor\", got {other:?}"
             ))
         })?;
         // Fail closed on a silently-unenforced sandbox: only the claude
@@ -1197,6 +1210,7 @@ mod tests {
             BackendKind::Droid,
             BackendKind::Kimi,
             BackendKind::Local,
+            BackendKind::Cursor,
         ] {
             assert!(
                 !kind.supports_sandbox_enforcement(),
@@ -1207,7 +1221,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_enforced_sandbox_on_non_claude_backends() {
-        for backend in ["codex", "droid", "kimi"] {
+        for backend in ["codex", "droid", "kimi", "cursor"] {
             for enforce in [
                 crate::types::SandboxEnforce::Fs,
                 crate::types::SandboxEnforce::FsNet,
@@ -1349,7 +1363,7 @@ mod tests {
 
     #[test]
     fn validate_accepts_sandbox_off_on_every_backend() {
-        for backend in ["codex", "droid", "kimi"] {
+        for backend in ["codex", "droid", "kimi", "cursor"] {
             let mut cfg = MissionConfig::default();
             cfg.validator_scrutiny.backend = Some(backend.into());
             assert_eq!(

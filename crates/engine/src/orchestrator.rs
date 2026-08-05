@@ -276,6 +276,10 @@ pub struct MissionEngine {
     /// whose `backend = "kimi"`. Mirrors `codex_backend`: `None` until the
     /// first successful probe; a failed probe is never cached.
     kimi_backend: Option<Arc<dyn AgentBackend>>,
+    /// Lazily-built [`crate::backend_cursor::CursorBackend`] cache for roles
+    /// whose `backend = "cursor"`. Mirrors `codex_backend`: `None` until the
+    /// first successful probe; a failed probe is never cached.
+    cursor_backend: Option<Arc<dyn AgentBackend>>,
     /// The tree mission-branch work runs in for the current `run()` call
     /// (M7 tier 1). `None` in checkout mode (and before the first `run()`),
     /// where [`Self::active_root`]/[`Self::active_repo`] fall back to
@@ -415,6 +419,7 @@ impl MissionEngine {
             codex_backend: None,
             droid_backend: None,
             kimi_backend: None,
+            cursor_backend: None,
             active_tree: None,
             primary_branch_at_start: None,
             worker_auth_verdict: None,
@@ -547,6 +552,7 @@ impl MissionEngine {
             codex_backend: None,
             droid_backend: None,
             kimi_backend: None,
+            cursor_backend: None,
             active_tree: None,
             primary_branch_at_start: None,
             worker_auth_verdict: None,
@@ -759,7 +765,7 @@ impl MissionEngine {
                     fallback_reason: None,
                 }
             }
-            BackendKind::Codex | BackendKind::Droid | BackendKind::Kimi => {
+            BackendKind::Codex | BackendKind::Droid | BackendKind::Kimi | BackendKind::Cursor => {
                 match self.resolve_kind_backend(requested, role) {
                     Ok(backend) => {
                         set_effective_model(&mut cfg, requested);
@@ -827,6 +833,16 @@ impl MissionEngine {
                 let backend: Arc<dyn AgentBackend> =
                     Arc::new(crate::backend_kimi::KimiBackend::new(binary));
                 self.kimi_backend = Some(Arc::clone(&backend));
+                Ok(backend)
+            }
+            BackendKind::Cursor => {
+                if let Some(cached) = &self.cursor_backend {
+                    return Ok(Arc::clone(cached));
+                }
+                let binary = crate::backend_cursor::discover_cursor_binary(None)?;
+                let backend: Arc<dyn AgentBackend> =
+                    Arc::new(crate::backend_cursor::CursorBackend::new(binary));
+                self.cursor_backend = Some(Arc::clone(&backend));
                 Ok(backend)
             }
             BackendKind::Local => {
@@ -992,6 +1008,7 @@ impl MissionEngine {
             BackendKind::Codex => self.codex_backend = Some(backend),
             BackendKind::Droid => self.droid_backend = Some(backend),
             BackendKind::Kimi => self.kimi_backend = Some(backend),
+            BackendKind::Cursor => self.cursor_backend = Some(backend),
             // claude is the engine's primary backend (injected at create);
             // local/acp have no probe cache to seed.
             BackendKind::Claude | BackendKind::Local | BackendKind::Acp => {}
