@@ -2767,12 +2767,17 @@ mod tests {
         for line in log.lines().filter(|l| l.contains("test result:")) {
             println!("  {line}");
         }
+        // On failure the assert MUST carry the log tail — CI runners are
+        // ephemeral and the scratch path alone is no evidence (the c6845f7
+        // rust-macos-wrapped-suite failure gave an untailorable exit 101).
+        let tail: Vec<&str> = log.lines().collect();
+        let tail = &tail[tail.len().saturating_sub(40)..];
         assert_eq!(
             code,
             Some(0),
             "cargo test --workspace must run GREEN as a wrapped contract command \
-             (skip-under-wrap markers seen: {skip_count}); suite log: {}",
-            suite_log.display()
+             (skip-under-wrap markers seen: {skip_count})\n--- suite log tail ---\n{}",
+            tail.join("\n")
         );
         // Cleanup only on success: on failure the assert above has already
         // panicked with the log's path, and the scratch (suite log, profile,

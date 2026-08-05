@@ -1275,9 +1275,9 @@ pub(crate) fn process_identity_token(pid: i32) -> Option<String> {
             return token.clone();
         }
     }
-    let token = uncached_identity_token(pid);
-    cache.lock().unwrap().insert(pid, (token.clone(), now));
-    token
+    let identity = uncached_identity_token(pid);
+    cache.lock().unwrap().insert(pid, (identity.clone(), now));
+    identity
 }
 
 /// Everywhere else (windows, exotic unix): no identity token, so pid reuse
