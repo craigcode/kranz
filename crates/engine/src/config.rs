@@ -848,6 +848,52 @@ mod tests {
         assert!(!cfg.auto_work);
     }
 
+    /// Composition audit (ticket `config-fail-open-audit`): layered config
+    /// arrays REPLACE wholesale (deep_merge semantics — a project layer
+    /// overrides a global layer's list). That replace is safe ONLY because
+    /// the deny floor is compiled in: `denyPatterns` from any layer can
+    /// replace another layer's entries but can never strip the built-in
+    /// worker deny list, which `permissions::for_role` appends to. This pins
+    /// both halves of the contract: the documented replace semantics, and
+    /// the floor's unreachability by replacement.
+    #[test]
+    fn composition_audit_layered_deny_patterns_replace_but_never_strip_the_builtin_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global.json");
+        std::fs::write(&global, r#"{"denyPatterns": ["git push --force"]}"#).unwrap();
+        let project = dir.path().join("project.json");
+        std::fs::write(&project, r#"{"denyPatterns": ["rm -rf *"]}"#).unwrap();
+
+        let cfg = load_layers(&[global, project]).unwrap();
+        // Replace semantics across layers: the later list wins wholesale.
+        assert_eq!(cfg.deny_patterns, vec!["rm -rf *".to_string()]);
+
+        // The built-in §4.7 floor is compiled in, so no layer shape can
+        // remove it: the worker profile carries every built-in rule plus
+        // (only) the winning layer's custom entry.
+        let profile = crate::permissions::for_role(Role::Worker, &cfg, &[], &[], &[]);
+        for builtin in [
+            "Bash(git push*)",
+            "Bash(sudo*)",
+            "Bash(curl*)",
+            "WebFetch",
+            "WebSearch",
+        ] {
+            assert!(
+                profile.disallowed_tools.iter().any(|r| r == builtin),
+                "the built-in deny {builtin} must survive layered replacement"
+            );
+        }
+        assert!(profile
+            .disallowed_tools
+            .iter()
+            .any(|r| r == "Bash(rm -rf *)"));
+        assert!(!profile
+            .disallowed_tools
+            .iter()
+            .any(|r| r == "Bash(git push --force*)"));
+    }
+
     #[test]
     fn default_config_serializes_without_backend_field() {
         let value = serde_json::to_value(MissionConfig::default()).unwrap();

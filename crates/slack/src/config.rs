@@ -702,4 +702,50 @@ mod tests {
             "blank user id denied when a list is set"
         );
     }
+
+    /// Composition audit (ticket `config-fail-open-audit`): the spend
+    /// allowlist composes fail-closed in every direction. An empty list
+    /// denies without the explicit `allowAllUsers` acknowledgment; a repo
+    /// with NO list of its own inherits the (possibly locked) global list —
+    /// enabling `host.repos` cannot fail-open spend that was already locked;
+    /// a repo's own non-empty list replaces the global one (documented,
+    /// deliberate: that list is itself operator-authored); and blank entries
+    /// are dropped at resolve so a stray `""` can't wash a configured list
+    /// back into the empty shape, where it would read as "no gate".
+    #[test]
+    fn composition_audit_spend_allowlist_composes_fail_closed_in_every_direction() {
+        // Empty global + empty repo: still empty, and empty fails closed.
+        assert!(SlackConfig::merge_repo_allow_users(&[], &[]).is_empty());
+        // A repo WITHOUT its own list inherits the locked global list.
+        assert_eq!(
+            SlackConfig::merge_repo_allow_users(&["U-op".to_string()], &[]),
+            vec!["U-op".to_string()]
+        );
+        // A repo WITH its own non-empty list replaces (never an empty one —
+        // the branch above keeps an empty repo list from widening anything).
+        assert_eq!(
+            SlackConfig::merge_repo_allow_users(&["U-op".to_string()], &["U-repo".to_string()]),
+            vec!["U-repo".to_string()]
+        );
+
+        // An all-blank file list resolves to empty, and empty denies.
+        let cfg = resolve(
+            SlackFileConfig {
+                bot_token: Some("xoxb".into()),
+                app_token: Some("xapp".into()),
+                channel: Some("C1".into()),
+                notify: None,
+                allow_users: vec!["  ".into()],
+                ..SlackFileConfig::default()
+            },
+            EnvVars::default(),
+        )
+        .unwrap();
+        assert!(cfg.allow_users.is_empty());
+        assert!(!cfg.allow_all_users);
+        assert!(
+            !cfg.is_authorized(Some("U999")),
+            "a blank-washed list must fail closed, not open spend"
+        );
+    }
 }

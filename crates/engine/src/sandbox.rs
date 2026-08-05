@@ -1397,6 +1397,107 @@ mod tests {
         );
     }
 
+    /// Composition audit (ticket `config-fail-open-audit`): the effective
+    /// egress list EXTENDS the compiled-in Anthropic floor — a mission's
+    /// configured `egress[]` (and, downstream, its operator-approved egress
+    /// grants) can only add destinations, never drop or narrow the defaults.
+    /// A replace-shaped regression here strands the sandboxed session's own
+    /// API access, or worse, goes unnoticed while the operator believes the
+    /// floor is still composed in.
+    #[test]
+    fn composition_audit_effective_egress_extends_never_replaces_the_default_floor() {
+        let configured = vec![
+            " crates.io:443 ".to_string(),       // trimmed on the way in
+            "api.anthropic.com:443".to_string(), // a duplicate of the floor
+            "registry.npmjs.org:443".to_string(),
+        ];
+        let out = effective_egress(&configured);
+        assert_eq!(
+            out,
+            vec![
+                "api.anthropic.com:443".to_string(),
+                "*.anthropic.com:443".to_string(),
+                "crates.io:443".to_string(),
+                "registry.npmjs.org:443".to_string(),
+            ]
+        );
+        // An empty configured list still yields the full default floor.
+        assert_eq!(effective_egress(&[]).len(), DEFAULT_EGRESS.len());
+    }
+
+    /// Composition audit: `extraWrite` EXTENDS the writable floor (session
+    /// cwd + session-private scratch) — the floor itself is not configurable
+    /// away, so no config shape can un-write the session's own worktree or
+    /// its private scratch.
+    #[test]
+    fn composition_audit_extra_write_extends_never_replaces_the_writable_floor() {
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        let inputs = inputs(
+            session.path(),
+            mission.path(),
+            tmp.path(),
+            vec![extra.path().to_path_buf()],
+        );
+        let writable = write_allowlist(&inputs);
+        for floor in [absolutize(session.path()), absolutize(tmp.path())] {
+            assert!(
+                writable.contains(&floor),
+                "the writable floor {floor:?} must survive any extraWrite list"
+            );
+        }
+        assert!(writable.contains(&absolutize(extra.path())));
+    }
+
+    /// Composition audit: the explicit deny sets (mission metadata writes,
+    /// authority reads) survive an `extraWrite` broad enough to COVER them.
+    /// SBPL denies take precedence over every allow regardless of clause
+    /// order, so the deny clauses must still be emitted when the allow side
+    /// is at its widest — this is the deny-wins pin for the sandbox surface.
+    #[test]
+    fn composition_audit_explicit_denies_survive_a_covering_extra_write_allow() {
+        let repo = tempfile::tempdir().unwrap();
+        let mission = repo.path().join(".kranz").join("missions").join("m-x");
+        std::fs::create_dir_all(&mission).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        // extraWrite = the repo root: every mission file now sits under an
+        // allowed subpath — the widest realistic allow shape.
+        let profile = generate_profile(&inputs(
+            repo.path(),
+            &mission,
+            tmp.path(),
+            vec![repo.path().to_path_buf()],
+        ));
+        // The covering allow IS emitted...
+        assert!(
+            profile.contains(&format!(
+                "(subpath \"{}\")",
+                escape_sbpl_literal(&absolutize(repo.path()))
+            )),
+            "the covering extraWrite allow must be present:\n{profile}"
+        );
+        // ...and the metadata write denies still are too: the audit log,
+        // state snapshot, and control inbox stay unwritable through the
+        // allow because SBPL denies win over it.
+        assert!(profile.contains("(deny file-write*"));
+        for name in ["events.jsonl", "state.json"] {
+            assert!(
+                profile.contains(&escape_sbpl_literal(&mission.join(name))),
+                "the write deny for {name} must survive the covering allow:\n{profile}"
+            );
+        }
+        // Authority reads (serve.token) stay denied under the broad read
+        // allow for the same reason.
+        assert!(
+            profile.contains(&escape_sbpl_literal(
+                &repo.path().join(".kranz").join("serve.token")
+            )),
+            "the read deny for serve.token must survive the covering allow:\n{profile}"
+        );
+    }
+
     #[test]
     fn bubblewrap_args_mask_authority_material_with_dev_null() {
         let repo = tempfile::tempdir().unwrap();

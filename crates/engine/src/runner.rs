@@ -1446,6 +1446,42 @@ mod tests {
         assert!(no_sandbox.is_none());
     }
 
+    /// Composition audit (ticket `config-fail-open-audit`): operator-approved
+    /// egress grants EXTEND the proxy allowlist end to end — after the grant
+    /// fold, `effective_egress` still leads with the compiled-in Anthropic
+    /// floor, keeps the configured `egress[]`, and only then adds the granted
+    /// destination. A grant can never narrow what was already allowed. (The
+    /// mission-side grant list is itself extend-only in the reducer.)
+    #[test]
+    fn composition_audit_egress_grants_extend_the_allowlist_never_replace() {
+        let mut sandbox = Some(crate::sandbox::ResolvedSandbox {
+            backend: crate::sandbox::SandboxBackend::Seatbelt,
+            inputs: crate::sandbox::SandboxInputs {
+                enforce: crate::types::SandboxEnforce::FsNet,
+                session_cwd: std::path::PathBuf::from("/s"),
+                mission_dir: std::path::PathBuf::from("/m"),
+                tmpdir: std::path::PathBuf::from("/t"),
+                extra_write: vec![],
+                egress: vec!["crates.io:443".to_string()],
+                validator_read_deny_roots: Vec::new(),
+            },
+            container: None,
+        });
+        apply_egress_grants(&mut sandbox, &["registry.npmjs.org:443".to_string()]);
+
+        let effective = crate::sandbox::effective_egress(&sandbox.as_ref().unwrap().inputs.egress);
+        assert_eq!(
+            effective,
+            vec![
+                "api.anthropic.com:443".to_string(),
+                "*.anthropic.com:443".to_string(),
+                "crates.io:443".to_string(),
+                "registry.npmjs.org:443".to_string(),
+            ],
+            "floor + configured + granted, in that order — nothing replaced"
+        );
+    }
+
     #[test]
     fn validator_report_schema_marks_finding_class_optional() {
         let schema = validator_report_schema();

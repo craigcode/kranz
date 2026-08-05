@@ -896,4 +896,76 @@ mod tests {
             other => panic!("expected DomainLint, got {other:?}"),
         }
     }
+
+    /// Composition audit (ticket `config-fail-open-audit`): every CLI flag
+    /// whose name signals a guard-weakening override must either carry the
+    /// `dangerously-` prefix or be one of the enumerated, justified
+    /// exceptions. A future flag that short-circuits a guard without the
+    /// prefix trips this test until its justification is recorded — the
+    /// naming rule's tripwire. The per-flag rationales live in
+    /// docs/config-composition.md.
+    #[test]
+    fn composition_audit_guard_weakening_flags_are_dangerously_prefixed_or_enumerated() {
+        use clap::CommandFactory;
+
+        fn collect_long_flags(cmd: &clap::Command, out: &mut Vec<String>) {
+            for arg in cmd.get_arguments() {
+                if let Some(long) = arg.get_long() {
+                    out.push(long.to_string());
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                collect_long_flags(sub, out);
+            }
+        }
+
+        let mut flags = Vec::new();
+        collect_long_flags(&Cli::command(), &mut flags);
+        // The heuristic: names that read like they weaken a guard. Wide on
+        // purpose — a false positive only costs a recorded justification.
+        let suspicious = [
+            "force",
+            "steal",
+            "bypass",
+            "unvalidated",
+            "insecure",
+            "skip",
+            "unsafe",
+            "dangerous",
+            "override",
+        ];
+        let mut hits: Vec<String> = flags
+            .into_iter()
+            .filter(|flag| suspicious.iter().any(|s| flag.contains(s)))
+            .collect();
+        hits.sort();
+        hits.dedup();
+
+        // The documented set. `dangerously-*` members are the naming rule's
+        // escape valve; the rest are the accepted exceptions of
+        // docs/config-composition.md:
+        // - force-lock: steals only from a holder PROVABLY dead (the
+        //   liveness probe is fail-closed); the live-holder bypass is the
+        //   dangerously-named flag.
+        // - allow-unvalidated (exec): lifts only the unattended scrutiny
+        //   FLOOR — a refuse-to-run gate, not a deny list; self-describing.
+        // - insecure-lan (serve): an acknowledgment that ADDS token
+        //   requirements on non-loopback binds; it removes nothing.
+        // - force (ticket queue/approve): skips blocked-by READINESS only;
+        //   dependency cycles are never overridable.
+        let expected = [
+            "allow-unvalidated",
+            "dangerously-allow-all",
+            "dangerously-steal-live-lock",
+            "force",
+            "force-lock",
+            "insecure-lan",
+        ];
+        assert_eq!(
+            hits,
+            expected.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            "a guard-weakening flag changed: every bypass of a deny list must carry \
+             the dangerously- prefix or a recorded exception (docs/config-composition.md)"
+        );
+    }
 }
