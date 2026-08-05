@@ -505,6 +505,49 @@ pub enum EventKind {
         reason: String,
     },
 
+    /// Worker-initiated escalation to the frontier advisor (ticket
+    /// `backend-routing-abstraction`, KRZ-331): a worker whose report carried
+    /// an `escalation` reason judged its task beyond its route's confidence
+    /// and asked for frontier-tier advice. Distinct from `tier.escalated` —
+    /// that is the ORCHESTRATOR's fix-cycle-cap valve, which flips the
+    /// executor tier and resets the milestone; THIS is the WORKER's request,
+    /// layered on top of the deterministic routing floor and never replacing
+    /// it.
+    ///
+    /// RECORD-ONLY (the `gate.result` additive template): the fold validates
+    /// the run reference as a corruption guard and changes NO state — the
+    /// validator route, the executor tier, the respawn budget, and every
+    /// milestone status are all untouched, so a worker escalation can never
+    /// bypass the floor's validator requirements. The judgement turn that
+    /// already reads the worker's report IS the frontier advisor act
+    /// consuming the request (the orchestrator role's model/endpoint,
+    /// frontier-floor enforced by `config::validate`); this event is the
+    /// provenance that the request was made, feeding the escalation record
+    /// the ticket requires of every escalation. Old logs without any
+    /// worker.escalated fold unchanged.
+    ///
+    /// Routes are capability classes ([`ExecutorTier`]), never model ids —
+    /// the same discipline as the routing table itself.
+    #[serde(rename = "worker.escalated")]
+    WorkerEscalated {
+        #[serde(rename = "runId")]
+        run_id: String,
+        /// The feature whose worker asked (denormalized onto the event so
+        /// the log reads without a join; the run record is the join of
+        /// record).
+        #[serde(rename = "featureId")]
+        feature_id: String,
+        /// Source route: the executor capability class the escalating worker
+        /// session ran on.
+        from: ExecutorTier,
+        /// Target route: the advisor capability class requested — always
+        /// `frontier` in this pass (see the variant docs).
+        to: ExecutorTier,
+        /// WHY the worker asked, verbatim from its report (already
+        /// credential-scrubbed with the report text it was parsed from).
+        reason: String,
+    },
+
     #[serde(rename = "milestone.blocked")]
     MilestoneBlocked {
         #[serde(rename = "milestoneId")]
@@ -695,6 +738,7 @@ impl EventKind {
             EventKind::DivergenceResolved { .. } => "divergence.resolved",
             EventKind::FixFeatureCreated { .. } => "fixfeature.created",
             EventKind::TierEscalated { .. } => "tier.escalated",
+            EventKind::WorkerEscalated { .. } => "worker.escalated",
             EventKind::MilestoneBlocked { .. } => "milestone.blocked",
             EventKind::MilestoneUnblocked { .. } => "milestone.unblocked",
             EventKind::MilestoneCompleted { .. } => "milestone.completed",
@@ -1385,6 +1429,50 @@ mod tests {
                 assert_eq!(artefact_detail, None);
                 assert_eq!(score, None);
                 assert_eq!(threshold, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// The additive `worker.escalated` event (ticket
+    /// `backend-routing-abstraction`, KRZ-331): wire name, exact payload
+    /// shape, and round-trip — the gate.result template. The payload names
+    /// the source and target routes as capability classes (ExecutorTier's
+    /// lowercase wire form), never model ids.
+    #[test]
+    fn routing_abstraction_worker_escalated_wire_shape_and_round_trip() {
+        let kind = EventKind::WorkerEscalated {
+            run_id: "r-1".to_string(),
+            feature_id: "f-1-1".to_string(),
+            from: ExecutorTier::Local,
+            to: ExecutorTier::Frontier,
+            reason: "spec ambiguity beyond my confidence".to_string(),
+        };
+        let json = serde_json::to_value(&kind).unwrap();
+        assert_eq!(json["type"], "worker.escalated");
+        assert_eq!(json["payload"]["runId"], "r-1");
+        assert_eq!(json["payload"]["featureId"], "f-1-1");
+        assert_eq!(json["payload"]["from"], "local");
+        assert_eq!(json["payload"]["to"], "frontier");
+        assert_eq!(
+            json["payload"]["reason"],
+            "spec ambiguity beyond my confidence"
+        );
+        assert_eq!(kind.type_name(), "worker.escalated");
+        let back: EventKind = serde_json::from_value(json).unwrap();
+        match back {
+            EventKind::WorkerEscalated {
+                run_id,
+                feature_id,
+                from,
+                to,
+                reason,
+            } => {
+                assert_eq!(run_id, "r-1");
+                assert_eq!(feature_id, "f-1-1");
+                assert_eq!(from, ExecutorTier::Local);
+                assert_eq!(to, ExecutorTier::Frontier);
+                assert_eq!(reason, "spec ambiguity beyond my confidence");
             }
             _ => panic!("wrong variant"),
         }

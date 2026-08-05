@@ -213,6 +213,7 @@ mod tests {
                 known_gaps: vec![],
                 commits: vec!["deadbeef commit".to_string()],
                 commands_run: vec![],
+                escalation: None,
             }),
         }
     }

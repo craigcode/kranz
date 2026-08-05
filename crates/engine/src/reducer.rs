@@ -465,6 +465,22 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             ms.fix_cycles = 0;
         }
 
+        EventKind::WorkerEscalated { run_id, .. } => {
+            // Record-only (KRZ-331, the gate.result additive template): the
+            // worker's escalation request is provenance — the judgement turn
+            // (the frontier advisor) acts on the report, and nothing a
+            // decision could key on changes here: the validator route, the
+            // executor tier, the respawn budget, and every milestone status
+            // are deliberately untouched, so a worker escalation can never
+            // bypass the floor's validator requirements (contrast
+            // tier.escalated above, the orchestrator-initiated tier flip,
+            // which DOES rewrite worker config). Validate the run reference
+            // as a corruption guard (mirrors hook.gate.fired): the run id is
+            // engine-stamped at emit time, so this cannot be aimed at a run
+            // the log never recorded.
+            run_mut(state, run_id)?;
+        }
+
         EventKind::MilestoneBlocked { milestone_id, .. } => {
             milestone_mut(state, milestone_id)?.status = MilestoneStatus::Blocked;
             state.mission.status = MissionStatus::Blocked;
@@ -1157,6 +1173,132 @@ mod hook_gate_projection_tests {
                 subject: "docs/oops.md".to_string(),
                 verdict: "blocked".to_string(),
                 detail: None,
+            },
+        );
+        assert!(fold(&[created, bogus]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod routing_abstraction_tests {
+    use super::*;
+    use crate::events::EventKind;
+
+    fn event(seq: u64, kind: EventKind) -> Event {
+        Event {
+            seq,
+            ts: chrono::Utc::now(),
+            mission_id: "m-test".to_string(),
+            kind,
+        }
+    }
+
+    fn created_with_local_worker() -> Event {
+        let mut config = MissionConfig::default();
+        config.worker.backend = Some("local".to_string());
+        event(
+            1,
+            EventKind::MissionCreated {
+                goal: "g".to_string(),
+                base_branch: "main".to_string(),
+                mission_branch: "kranz/mission-m-test".to_string(),
+                config,
+            },
+        )
+    }
+
+    fn spawned(seq: u64, run_id: &str) -> Event {
+        event(
+            seq,
+            EventKind::WorkerSpawned {
+                run_id: run_id.to_string(),
+                role: Role::Worker,
+                feature_id: None,
+                milestone_id: None,
+                candidate: None,
+                sdk_session_id: "s-1".to_string(),
+                model: "m".to_string(),
+                quant: "n/a".to_string(),
+                weight_hash: None,
+                prompt_hash: "h".to_string(),
+                transcript_path: "runs/r-1.jsonl".to_string(),
+            },
+        )
+    }
+
+    /// The worker.escalated fold arm is record-only (KRZ-331, the gate.result
+    /// template): a worker escalation NEVER bypasses the floor's validator
+    /// requirements — the validator route, the executor tier, and every
+    /// decision-keyed counter fold exactly as if the event were absent
+    /// (contrast tier.escalated, the orchestrator-initiated valve, which
+    /// deliberately rewrites worker config). Only the run reference is
+    /// validated, as a corruption guard (mirrors hook.gate.fired).
+    #[test]
+    fn routing_abstraction_escalation_folds_record_only_leaving_validators_untouched() {
+        let escalated = event(
+            3,
+            EventKind::WorkerEscalated {
+                run_id: "r-1".to_string(),
+                feature_id: "f-1-1".to_string(),
+                from: ExecutorTier::Local,
+                to: ExecutorTier::Frontier,
+                reason: "spec ambiguity beyond my confidence".to_string(),
+            },
+        );
+
+        let with = fold(&[created_with_local_worker(), spawned(2, "r-1"), escalated]).unwrap();
+        let without = fold(&[created_with_local_worker(), spawned(2, "r-1")]).unwrap();
+
+        // The WHOLE config is identical with and without the escalation —
+        // validator backends are inside it, so this pins "validator route
+        // unaffected" exactly, not by a sampled field.
+        assert_eq!(with.config, without.config);
+        assert_eq!(
+            with.config.backend_kind(Role::ValidatorScrutiny),
+            BackendKind::Claude
+        );
+        assert_eq!(
+            with.config.backend_kind(Role::ValidatorFunctional),
+            BackendKind::Claude
+        );
+        // The worker escalation never flips the executor tier (that flip is
+        // tier.escalated's job, and it is orchestrator-initiated only).
+        assert_eq!(with.executor_tier(), ExecutorTier::Local);
+        // No state transition of any kind: same mission status, same run
+        // set, same escalation counters.
+        assert_eq!(with.mission.status, without.mission.status);
+        assert_eq!(with.runs.len(), without.runs.len());
+        assert_eq!(with.escalated_milestones, without.escalated_milestones);
+        assert_eq!(
+            with.local_executor_milestones,
+            without.local_executor_milestones
+        );
+    }
+
+    /// The run reference is a corruption guard: a worker.escalated naming a
+    /// run the log never recorded refuses the fold (the run id is
+    /// engine-stamped at emit time, so this can only be log corruption).
+    #[test]
+    fn routing_abstraction_escalation_with_unknown_run_is_refused() {
+        let bogus = event(
+            2,
+            EventKind::WorkerEscalated {
+                run_id: "no-such-run".to_string(),
+                feature_id: "f-1-1".to_string(),
+                from: ExecutorTier::Local,
+                to: ExecutorTier::Frontier,
+                reason: "r".to_string(),
+            },
+        );
+        let mut config = MissionConfig::default();
+        config.worker.backend = Some("local".to_string());
+        let created = event(
+            1,
+            EventKind::MissionCreated {
+                goal: "g".to_string(),
+                base_branch: "main".to_string(),
+                mission_branch: "kranz/mission-m-test".to_string(),
+                config,
             },
         );
         assert!(fold(&[created, bogus]).is_err());

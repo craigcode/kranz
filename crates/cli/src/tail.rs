@@ -391,6 +391,17 @@ impl EventRenderer {
                 ansi::YELLOW,
                 format!("escalated {from:?} -> {to:?}: {reason}"),
             ),
+            EventKind::WorkerEscalated {
+                feature_id,
+                from,
+                to,
+                reason,
+                ..
+            } => (
+                format!("feature {feature_id}"),
+                ansi::YELLOW,
+                format!("worker asked the frontier advisor ({from:?} -> {to:?}): {reason}"),
+            ),
             EventKind::MilestoneBlocked {
                 milestone_id,
                 reason,

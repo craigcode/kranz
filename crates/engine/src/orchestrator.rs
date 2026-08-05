@@ -2759,6 +2759,43 @@ impl MissionEngine {
     // Feature execution (f)
     // -----------------------------------------------------------------------
 
+    /// Worker self-escalation (ticket `backend-routing-abstraction`, KRZ-331):
+    /// when the finished worker's report carries an `escalation` reason,
+    /// record the request as a `worker.escalated` event naming the SOURCE
+    /// route (the executor capability class this session ran on, derived
+    /// from the routed config exactly like every other tier read) and the
+    /// TARGET route (the frontier advisor — `frontier`, the orchestrator
+    /// role's frontier-floor-enforced model/endpoint).
+    ///
+    /// Deliberately RECORD-ONLY: the event changes no state (the reducer
+    /// fold validates the run reference and nothing else), so the escalation
+    /// can never bypass the floor's validator requirements, flip the
+    /// executor tier, or spend the respawn budget. The advisor ACT already
+    /// exists — the judgement turn that every caller invokes immediately
+    /// after this helper reads the same report, escalation request included
+    /// — so the request is layered on top of the deterministic floor, never
+    /// a replacement for it, and no new session kind is invented here.
+    fn emit_worker_escalation(
+        &mut self,
+        feature_id: &str,
+        outcome: &runner::RunOutcome,
+    ) -> Result<()> {
+        let Some(report) = &outcome.report else {
+            return Ok(());
+        };
+        let Some(reason) = &report.escalation else {
+            return Ok(());
+        };
+        self.emit(EventKind::WorkerEscalated {
+            run_id: outcome.run_id.clone(),
+            feature_id: feature_id.to_string(),
+            from: self.state.executor_tier(),
+            to: ExecutorTier::Frontier,
+            reason: reason.clone(),
+        })?;
+        Ok(())
+    }
+
     /// Run one feature to a terminal state: worker run(s) with interrupt
     /// wiring, the §4.4 dirty-tree discipline, an orchestrator judgement turn,
     /// and the bounded respawn loop.
@@ -2923,6 +2960,11 @@ impl MissionEngine {
                     return Ok(());
                 }
             }
+
+            // Worker self-escalation (KRZ-331): record the worker's request
+            // for the frontier advisor BEFORE the judgement turn — the
+            // advisor act — consumes it from the same report.
+            self.emit_worker_escalation(&feature.id, &outcome)?;
 
             match self
                 .judge_worker_run(&feature.id, &outcome, &commits, &diff_stat)
@@ -4306,6 +4348,9 @@ impl MissionEngine {
             Err(error) => return self.record_uninspectable_worktree(ws, &error),
         };
         let diff_stat = wt_repo.diff_stat(start_sha, "HEAD").unwrap_or_default();
+        // Worker self-escalation (KRZ-331): same record-only emission as the
+        // sequential path, before the judgement turn consumes the report.
+        self.emit_worker_escalation(&ws.feature_id, outcome)?;
         match self
             .judge_worker_run(&ws.feature_id, outcome, &commits, &diff_stat)
             .await?
@@ -7468,6 +7513,7 @@ pub(crate) mod tests {
             known_gaps: vec![],
             commits: vec![],
             commands_run: vec!["gc lint".to_string(), "gc lint".to_string()],
+            escalation: None,
         };
         let run = WorkerRun {
             id: "run-1".to_string(),
@@ -8644,6 +8690,297 @@ pub(crate) mod tests {
         assert_eq!(
             engine.state.config.backend_kind(Role::ValidatorScrutiny),
             BackendKind::Claude
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Worker self-escalation to the frontier advisor
+    // (ticket backend-routing-abstraction, KRZ-331)
+    // -----------------------------------------------------------------------
+
+    /// The escalation event names the SOURCE route the escalating worker ran
+    /// on and the TARGET advisor route — and the emission is record-only:
+    /// the validator route and the executor tier are byte-identical after it
+    /// (a worker escalation can never bypass the floor's validator
+    /// requirements; the tier flip is tier.escalated's job, and that is
+    /// orchestrator-initiated only).
+    #[tokio::test]
+    async fn routing_abstraction_escalation_event_names_source_and_target_routes() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let mut cfg = MissionConfig {
+            worker_isolation: WorkerIsolation::Checkout,
+            ..MissionConfig::default()
+        };
+        cfg.worker.backend = Some("local".to_string());
+        cfg.worker.base_url = Some("http://localhost:8080".to_string());
+        cfg.worker.context_budget = Some(8192);
+        cfg.allow_below_default_worker_model = true;
+
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![]));
+        let backend: Arc<dyn AgentBackend> = mock;
+        let mut engine = MissionEngine::create(backend, &root, "goal", cfg).expect("create engine");
+        assert_eq!(engine.state.executor_tier(), ExecutorTier::Local);
+
+        // A recorded worker run to escalate from (the fold validates the run
+        // reference as a corruption guard, so the run must exist).
+        engine
+            .emit(EventKind::WorkerSpawned {
+                run_id: "r-1".to_string(),
+                role: Role::Worker,
+                feature_id: None,
+                milestone_id: None,
+                candidate: None,
+                sdk_session_id: "s-1".to_string(),
+                model: "m".to_string(),
+                quant: "n/a".to_string(),
+                weight_hash: None,
+                prompt_hash: "h".to_string(),
+                transcript_path: "runs/r-1.jsonl".to_string(),
+            })
+            .unwrap();
+
+        let outcome = |escalation: Option<&str>| runner::RunOutcome {
+            run_id: "r-1".to_string(),
+            session_id: "s-1".to_string(),
+            result: RunResult::Pass,
+            usage: TokenUsage::default(),
+            cost_usd: None,
+            final_text: String::new(),
+            report: Some(WorkerReport {
+                result: RunResult::Pass,
+                summary: "s".to_string(),
+                files_touched: vec![],
+                tests_added: vec![],
+                test_evidence: String::new(),
+                dependencies_added: vec![],
+                known_gaps: vec![],
+                commits: vec![],
+                commands_run: vec![],
+                escalation: escalation.map(|s| s.to_string()),
+            }),
+            validator_report: None,
+            exit: SessionExit::Completed,
+            denied_count: 0,
+            denied_commands: vec![],
+            denied_egress: vec![],
+        };
+
+        let validators_before = (
+            engine.state.config.validator_scrutiny.clone(),
+            engine.state.config.validator_functional.clone(),
+        );
+        engine
+            .emit_worker_escalation(
+                "f-1-1",
+                &outcome(Some("spec ambiguity beyond my confidence")),
+            )
+            .unwrap();
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        let recorded: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::WorkerEscalated {
+                    run_id,
+                    feature_id,
+                    from,
+                    to,
+                    reason,
+                } => Some((
+                    run_id.clone(),
+                    feature_id.clone(),
+                    *from,
+                    *to,
+                    reason.clone(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "exactly one worker.escalated: {events:?}"
+        );
+        let (run_id, feature_id, from, to, reason) = &recorded[0];
+        assert_eq!(run_id, "r-1");
+        assert_eq!(feature_id, "f-1-1");
+        assert_eq!(
+            *from,
+            ExecutorTier::Local,
+            "the source route is the tier the worker session ran on"
+        );
+        assert_eq!(
+            *to,
+            ExecutorTier::Frontier,
+            "the target route is the frontier advisor"
+        );
+        assert_eq!(reason, "spec ambiguity beyond my confidence");
+
+        // Record-only: the floor is untouched.
+        assert_eq!(engine.state.config.validator_scrutiny, validators_before.0);
+        assert_eq!(
+            engine.state.config.validator_functional,
+            validators_before.1
+        );
+        assert_eq!(
+            engine.state.executor_tier(),
+            ExecutorTier::Local,
+            "a worker escalation never flips the executor tier"
+        );
+
+        // No escalation requested (or no report at all) ⇒ no event.
+        engine
+            .emit_worker_escalation("f-1-1", &outcome(None))
+            .unwrap();
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(&e.kind, EventKind::WorkerEscalated { .. }))
+                .count(),
+            1,
+            "a report without an escalation request must not record one"
+        );
+    }
+
+    /// End-to-end through the worker run path: a worker report carrying an
+    /// `escalation` reason records the `worker.escalated` event BEFORE the
+    /// judgement turn — the frontier advisor act — that consumes the same
+    /// report, and the mission's floor is otherwise byte-identical: the
+    /// feature completes on the judgement, the executor tier never flips,
+    /// and the validator configs are untouched.
+    #[tokio::test]
+    async fn routing_abstraction_worker_escalation_reaches_advisor_leaving_floor_untouched() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let report = serde_json::json!({
+            "result": "pass",
+            "summary": "built it; flagged an approach call for advice",
+            "filesTouched": [],
+            "testsAdded": [],
+            "testEvidence": "cargo test: ok",
+            "dependenciesAdded": [],
+            "knownGaps": [],
+            "commits": [],
+            "commandsRun": [],
+            "escalation": "chose the retry policy arbitrarily — wants frontier advice"
+        });
+        let judgement =
+            serde_json::json!({"decision": "complete", "guidance": "", "summary": "advice: policy is fine"})
+                .to_string();
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            crate::backend_mock::MockScript::single_shot_json(&report),
+            // The long-lived orchestrator session: init/ready, then the
+            // judgement verdict for this run.
+            {
+                use crate::backend_mock::{mock_init, mock_result_text, mock_text};
+                crate::backend_mock::MockScript::streaming(vec![
+                    mock_init("orch-session"),
+                    mock_result_text("ready"),
+                ])
+                .responding(vec![vec![
+                    mock_text(&judgement),
+                    mock_result_text(&judgement),
+                ]])
+            },
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock;
+        let cfg = MissionConfig {
+            worker_isolation: WorkerIsolation::Checkout,
+            ..MissionConfig::default()
+        };
+        let mut engine = MissionEngine::create(backend, &root, "goal", cfg).unwrap();
+        engine.seed_worker_auth_verdict_for_test(AuthVerdict::Authenticated);
+        engine.state.mission.milestones.push(Milestone {
+            id: "ms-1".to_string(),
+            title: "m".to_string(),
+            features: vec![Feature {
+                id: "f-1-1".to_string(),
+                title: "f".to_string(),
+                spec: "s".to_string(),
+                validation_criteria: vec![],
+                origin: FeatureOrigin::Plan,
+                status: FeatureStatus::Pending,
+                worker_runs: vec![],
+                commits: vec![],
+                respawns: 0,
+            }],
+            status: MilestoneStatus::Active,
+            fix_cycles: 0,
+            start_sha: Some(engine.repo.head_sha().unwrap()),
+            validator_guidance: None,
+        });
+        let validators_before = (
+            engine.state.config.validator_scrutiny.clone(),
+            engine.state.config.validator_functional.clone(),
+        );
+
+        engine.run_feature(0, 0).await.unwrap();
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        let escalated: Vec<&Event> = events
+            .iter()
+            .filter(|e| matches!(&e.kind, EventKind::WorkerEscalated { .. }))
+            .collect();
+        assert_eq!(
+            escalated.len(),
+            1,
+            "exactly one worker.escalated: {events:?}"
+        );
+        match &escalated[0].kind {
+            EventKind::WorkerEscalated {
+                feature_id,
+                from,
+                to,
+                reason,
+                ..
+            } => {
+                assert_eq!(feature_id, "f-1-1");
+                assert_eq!(*from, ExecutorTier::Frontier);
+                assert_eq!(*to, ExecutorTier::Frontier);
+                assert_eq!(
+                    reason,
+                    "chose the retry policy arbitrarily — wants frontier advice"
+                );
+            }
+            _ => unreachable!(),
+        }
+
+        // The record lands BEFORE the advisor act that consumes the request.
+        let judgement_seq = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::OrchestratorDecision { summary, .. }
+                    if summary.starts_with("judgement for f-1-1") =>
+                {
+                    Some(e.seq)
+                }
+                _ => None,
+            })
+            .expect("the judgement decision must be recorded");
+        assert!(
+            escalated[0].seq < judgement_seq,
+            "the escalation is recorded before the judgement that advises on it"
+        );
+
+        // The floor is unaffected: the feature completed on the judgement
+        // (escalation neither blocks nor short-circuits), the executor tier
+        // never flipped, and the validator route is byte-identical.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::FeatureCompleted { feature_id, .. } if feature_id == "f-1-1")),
+            "the feature completes on the judgement: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert_eq!(engine.state.executor_tier(), ExecutorTier::Frontier);
+        assert_eq!(engine.state.config.validator_scrutiny, validators_before.0);
+        assert_eq!(
+            engine.state.config.validator_functional,
+            validators_before.1
         );
     }
 

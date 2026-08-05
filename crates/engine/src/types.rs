@@ -384,6 +384,16 @@ pub struct WorkerReport {
     pub commits: Vec<String>,
     #[serde(default)]
     pub commands_run: Vec<String>,
+    /// Worker-initiated escalation to the frontier advisor (ticket
+    /// `backend-routing-abstraction`, KRZ-331): when set, the worker judged
+    /// the task beyond its route's confidence and asked for frontier-tier
+    /// advice — the VALUE is the worker's reason, verbatim. The engine folds
+    /// the request into a record-only `worker.escalated` event naming the
+    /// source and target routes; the judgement turn (the frontier advisor)
+    /// reads the request from this same report. Never a way to skip
+    /// validation: the floor's validator requirements are unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalation: Option<String>,
 }
 
 /// A finding emitted by a validator (scrutiny or functional).
@@ -871,6 +881,44 @@ impl Default for ExecutorTier {
     }
 }
 
+/// The backend routing table (ticket `backend-routing-abstraction`, KRZ-331):
+/// the declarative form of "task class → executor route", making local
+/// endpoints, hosted frontier models, and hosted fine-tunes peers behind one
+/// routing interface. Resolved deterministically by [`crate::routing`]:
+/// the FIRST matching rule wins, no match falls through to
+/// [`ExecutorTier::Frontier`], and an EMPTY table keeps the hardcoded literal
+/// floor ([`crate::config::task_class_to_tier`]) byte-for-byte.
+///
+/// Rules name CAPABILITY CLASSES ([`ExecutorTier`]), never model ids
+/// (docs/reviews/local-llm-and-triumvirate.md §1): a local endpoint, a
+/// hosted OpenAI-compatible frontier endpoint, and a hosted fine-tune are
+/// all the `local` class — which concrete endpoint the class resolves to is
+/// ordinary local-backend role config (`baseUrl` + `model`), not routing
+/// table content and not a new backend kind. The tracked, base-branch-owned
+/// rules FILE surface is the follow-up `routing-rules-config` ticket; this
+/// is the engine-side table it will populate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RoutingConfig {
+    /// Ordered routing rules; the first rule whose `taskClass` matches the
+    /// ticket's task class (case- and whitespace-insensitively, the same
+    /// normalization as the hardcoded floor) decides the executor tier.
+    pub task_class_rules: Vec<TaskClassRoute>,
+}
+
+/// One routing rule: a task class routed to an executor capability class.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskClassRoute {
+    /// The ticket `task-class` frontmatter value this rule matches, compared
+    /// trimmed and case-insensitively. Must be non-empty and unique within
+    /// the table after normalization — `config::validate` fails closed
+    /// otherwise (a duplicate is dead config under first-match-wins).
+    pub task_class: String,
+    /// The capability class the matched task class routes to.
+    pub tier: ExecutorTier,
+}
+
 /// How worker/validator sessions are isolated from the primary checkout.
 ///
 /// Default is [`Worktree`]: the primary checkout must stay byte-untouched
@@ -1045,6 +1093,16 @@ pub struct MissionConfig {
     /// with `maxParallelWorkers > 1` (a different fan-out model).
     #[serde(default)]
     pub worker_candidates: Vec<CandidateSpec>,
+    /// The backend routing table (ticket `backend-routing-abstraction`,
+    /// KRZ-331): ordered task-class → executor-tier rules, resolved
+    /// deterministically by [`crate::routing`] at mission seed time
+    /// ([`crate::config::route_task_class_executor`]). Empty (the default)
+    /// keeps today's hardcoded literal floor byte-for-byte. Capability
+    /// classes only — a rule names an [`ExecutorTier`], never a model id;
+    /// which endpoint a `local` route resolves to is ordinary local-backend
+    /// role config, so a hosted fine-tune needs no new kind here.
+    #[serde(default)]
+    pub routing: RoutingConfig,
 }
 
 impl Default for MissionConfig {
@@ -1128,6 +1186,7 @@ impl Default for MissionConfig {
             pack_dir: None,
             rubber_stamp_threshold_ms: DEFAULT_RUBBER_STAMP_THRESHOLD_MS,
             worker_candidates: vec![],
+            routing: RoutingConfig::default(),
         }
     }
 }
@@ -1209,6 +1268,26 @@ mod tests {
         let json = r#"{"result": "pass", "summary": "did the thing"}"#;
         let report: WorkerReport = serde_json::from_str(json).unwrap();
         assert!(report.commands_run.is_empty());
+    }
+
+    #[test]
+    fn routing_abstraction_worker_report_escalation_is_additive() {
+        // KRZ-331: old reports (no escalation key) parse with no request…
+        let json = r#"{"result": "pass", "summary": "did the thing"}"#;
+        let report: WorkerReport = serde_json::from_str(json).unwrap();
+        assert_eq!(report.escalation, None);
+        // …None never hits the wire…
+        let value = serde_json::to_value(&report).unwrap();
+        assert!(value.get("escalation").is_none());
+        // …and a request round-trips camelCase verbatim.
+        let json = r#"{"result": "partial", "summary": "s", "escalation": "spec ambiguity beyond my confidence"}"#;
+        let report: WorkerReport = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            report.escalation.as_deref(),
+            Some("spec ambiguity beyond my confidence")
+        );
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["escalation"], "spec ambiguity beyond my confidence");
     }
 
     #[test]

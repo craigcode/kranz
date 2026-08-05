@@ -661,6 +661,7 @@ fn export_traces_is_regenerable_and_filters_to_validated_passes() {
                     known_gaps: vec![],
                     commits: vec!["abc feature one".to_string()],
                     commands_run: vec![],
+                    escalation: None,
                 }),
             },
             EventKind::FeatureCompleted {
@@ -698,6 +699,7 @@ fn export_traces_is_regenerable_and_filters_to_validated_passes() {
                     known_gaps: vec![],
                     commits: vec![],
                     commands_run: vec![],
+                    escalation: None,
                 }),
             },
             EventKind::FeatureFailed {
@@ -797,6 +799,7 @@ fn export_traces_all_aggregates_and_skips_unreadable_missions() {
                     known_gaps: vec![],
                     commits: vec!["abc feature one".to_string()],
                     commands_run: vec![],
+                    escalation: None,
                 }),
             },
             EventKind::FeatureCompleted {
@@ -874,6 +877,7 @@ fn write_corpus_mission(repo: &Path, mission_id: &str) {
                     known_gaps: vec![],
                     commits: vec!["abc feature one".to_string()],
                     commands_run: vec![],
+                    escalation: None,
                 }),
             },
             EventKind::FeatureCompleted {

@@ -120,11 +120,22 @@ pub fn route_ticket_executor(
 /// [`crate::ticket::parse_task_class_from_goal`] — `create` only ever sees a
 /// folded goal string, never the originating [`crate::ticket::Ticket`], so
 /// the class has to travel through that one channel.
+///
+/// The routing table (KRZ-331): when `cfg.routing` declares rules, they are
+/// the floor — resolved deterministically by [`crate::routing::table_tier`]
+/// (first match wins, no match stays Frontier). An EMPTY table keeps the
+/// hardcoded literal floor ([`task_class_to_tier`]) byte-for-byte, so a
+/// config that never heard of the table routes exactly as before.
 pub fn route_task_class_executor(
     cfg: &mut MissionConfig,
     task_class: Option<&str>,
 ) -> (ExecutorTier, &'static str) {
-    let requested = task_class_to_tier(task_class);
+    let table_configured = !cfg.routing.task_class_rules.is_empty();
+    let requested = if table_configured {
+        crate::routing::table_tier(&cfg.routing, task_class)
+    } else {
+        task_class_to_tier(task_class)
+    };
     let local_endpoint = match (&cfg.worker.base_url, cfg.worker.context_budget) {
         (Some(base_url), Some(context_budget)) => Some(LocalEndpoint {
             base_url: base_url.clone(),
@@ -134,9 +145,17 @@ pub fn route_task_class_executor(
         _ => None,
     };
     let applied = apply_executor_routing(cfg, requested, local_endpoint.as_ref());
-    let summary = match (requested, applied) {
-        (ExecutorTier::Local, ExecutorTier::Local) => "executor routed local (execution-class)",
-        (ExecutorTier::Local, ExecutorTier::Frontier) => {
+    let summary = match (requested, applied, table_configured) {
+        (ExecutorTier::Local, ExecutorTier::Local, true) => {
+            "executor routed local (routing-table rule)"
+        }
+        (ExecutorTier::Local, ExecutorTier::Local, false) => {
+            "executor routed local (execution-class)"
+        }
+        (ExecutorTier::Local, ExecutorTier::Frontier, true) => {
+            "routing-table rule routes local but no local endpoint configured; executor stays frontier"
+        }
+        (ExecutorTier::Local, ExecutorTier::Frontier, false) => {
             "execution-class ticket but no local endpoint configured; executor stays frontier"
         }
         _ => "executor stays frontier",
@@ -480,6 +499,16 @@ pub fn validate(cfg: &MissionConfig) -> Result<()> {
                 candidate.backend
             )));
         }
+    }
+
+    // Backend routing table (ticket `backend-routing-abstraction`, KRZ-331):
+    // shape-only checks (blank/duplicate task classes) live in
+    // `routing::validate_table` and fail closed naming the offending rule. A
+    // rule routing `local` with no endpoint configured is NOT an error here:
+    // `apply_executor_routing` already fails safe to Frontier for exactly
+    // that case, with the decision recorded against the mission.
+    if let Err(err) = crate::routing::validate_table(&cfg.routing) {
+        return Err(EngineError::Config(err));
     }
 
     for (role, name) in [
@@ -1624,6 +1653,203 @@ mod tests {
 
         assert_ne!(cfg.validator_scrutiny.backend.as_deref(), Some("local"));
         assert_ne!(cfg.validator_functional.backend.as_deref(), Some("local"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Backend routing table (ticket backend-routing-abstraction, KRZ-331)
+    // -----------------------------------------------------------------------
+
+    use crate::types::TaskClassRoute;
+
+    fn routing_table(rules: &[(&str, ExecutorTier)]) -> Vec<TaskClassRoute> {
+        rules
+            .iter()
+            .map(|(task_class, tier)| TaskClassRoute {
+                task_class: task_class.to_string(),
+                tier: *tier,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn routing_abstraction_table_defaults_empty_and_parses_camel_case() {
+        // Additive contract change: an absent key (every pre-existing config
+        // and every old mission.created event payload) deserializes to the
+        // EMPTY table — the byte-identical literal floor.
+        assert!(MissionConfig::default().routing.task_class_rules.is_empty());
+        let value = serde_json::to_value(MissionConfig::default()).unwrap();
+        assert_eq!(value["routing"]["taskClassRules"], serde_json::json!([]));
+
+        let dir = tempfile::tempdir().unwrap();
+        let layer_path = dir.path().join("config.json");
+        std::fs::write(
+            &layer_path,
+            r#"{"routing": {"taskClassRules": [{"taskClass": "execution-class", "tier": "local"}, {"taskClass": "docs-class", "tier": "frontier"}]}}"#,
+        )
+        .unwrap();
+        let cfg = load_layers(&[layer_path]).unwrap();
+        assert_eq!(cfg.routing.task_class_rules.len(), 2);
+        assert_eq!(
+            cfg.routing.task_class_rules[0].task_class,
+            "execution-class"
+        );
+        assert_eq!(cfg.routing.task_class_rules[0].tier, ExecutorTier::Local);
+        assert_eq!(cfg.routing.task_class_rules[1].tier, ExecutorTier::Frontier);
+
+        // A layer naming unrelated keys only (the old-config shape) leaves
+        // the table empty.
+        let layer_path = dir.path().join("config-old.json");
+        std::fs::write(&layer_path, r#"{"maxRespawns": 3}"#).unwrap();
+        let cfg = load_layers(&[layer_path]).unwrap();
+        assert!(cfg.routing.task_class_rules.is_empty());
+    }
+
+    #[test]
+    fn routing_abstraction_unconfigured_table_keeps_byte_identical_floor() {
+        // The regression pin: with NO table configured, routing a task class
+        // must produce exactly the pre-table behavior — the literal floor
+        // (`task_class_to_tier`) fed through `apply_executor_routing` —
+        // including the applied config edits, for every input shape.
+        for task_class in [
+            None,
+            Some("execution-class"),
+            Some("  Execution-Class "),
+            Some("planning-class"),
+            Some("some-arbitrary-value"),
+        ] {
+            for endpoint_configured in [false, true] {
+                let wire = |cfg: &mut MissionConfig| {
+                    if endpoint_configured {
+                        cfg.worker.base_url = Some("http://127.0.0.1:8080".to_string());
+                        cfg.worker.context_budget = Some(16_384);
+                    }
+                };
+                let mut cfg = MissionConfig::default();
+                wire(&mut cfg);
+                assert!(cfg.routing.task_class_rules.is_empty());
+                let (applied, _) = route_task_class_executor(&mut cfg, task_class);
+
+                // The pre-table reference computation.
+                let mut reference = MissionConfig::default();
+                wire(&mut reference);
+                let endpoint = match (&reference.worker.base_url, reference.worker.context_budget) {
+                    (Some(base_url), Some(context_budget)) => Some(LocalEndpoint {
+                        base_url: base_url.clone(),
+                        context_budget,
+                        temperature: reference.worker.temperature,
+                    }),
+                    _ => None,
+                };
+                let expected = apply_executor_routing(
+                    &mut reference,
+                    task_class_to_tier(task_class),
+                    endpoint.as_ref(),
+                );
+
+                assert_eq!(applied, expected, "task class {task_class:?}");
+                assert_eq!(
+                    cfg, reference,
+                    "an empty table must apply byte-identical config changes for {task_class:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn routing_abstraction_table_routes_configured_class_to_local() {
+        // A configured table is the complete floor: it routes the classes it
+        // names — beyond the literal floor's single hardcoded class...
+        let mut cfg = MissionConfig::default();
+        cfg.routing.task_class_rules = routing_table(&[("docs-class", ExecutorTier::Local)]);
+        cfg.worker.base_url = Some("http://127.0.0.1:8080".to_string());
+        cfg.worker.context_budget = Some(16_384);
+
+        let (applied, summary) = route_task_class_executor(&mut cfg, Some("docs-class"));
+
+        assert_eq!(applied, ExecutorTier::Local);
+        assert_eq!(cfg.worker.backend.as_deref(), Some("local"));
+        assert_eq!(summary, "executor routed local (routing-table rule)");
+
+        // ...and the literal floor's own class stays frontier when the table
+        // does not name it (the table replaces the literal map, it does not
+        // amend it).
+        let mut cfg = MissionConfig::default();
+        cfg.routing.task_class_rules = routing_table(&[("docs-class", ExecutorTier::Local)]);
+        cfg.worker.base_url = Some("http://127.0.0.1:8080".to_string());
+        cfg.worker.context_budget = Some(16_384);
+
+        let (applied, summary) = route_task_class_executor(&mut cfg, Some("execution-class"));
+
+        assert_eq!(applied, ExecutorTier::Frontier);
+        assert_eq!(cfg.worker.backend, None);
+        assert_eq!(summary, "executor stays frontier");
+    }
+
+    #[test]
+    fn routing_abstraction_table_local_route_fails_safe_without_endpoint() {
+        // The pre-table fail-safe is unchanged under a table: a local route
+        // with no configured endpoint stays frontier rather than routing to
+        // an endpoint that doesn't exist.
+        let mut cfg = MissionConfig::default();
+        cfg.routing.task_class_rules = routing_table(&[("execution-class", ExecutorTier::Local)]);
+
+        let (applied, summary) = route_task_class_executor(&mut cfg, Some("execution-class"));
+
+        assert_eq!(applied, ExecutorTier::Frontier);
+        assert_eq!(cfg.worker.backend, None);
+        assert!(
+            summary.contains("no local endpoint configured"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn routing_abstraction_validate_fails_closed_on_malformed_table() {
+        // Duplicate after normalization: refused, naming the rule (a
+        // shadowed rule is dead config under first-match-wins).
+        let mut cfg = MissionConfig::default();
+        cfg.routing.task_class_rules = routing_table(&[
+            ("execution-class", ExecutorTier::Local),
+            (" Execution-Class", ExecutorTier::Frontier),
+        ]);
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("routing.taskClassRules[1].taskClass"), "{err}");
+        assert!(err.contains("duplicates rule 0"), "{err}");
+
+        // Blank class: refused (it could never match honestly).
+        let mut cfg = MissionConfig::default();
+        cfg.routing.task_class_rules = routing_table(&[("   ", ExecutorTier::Local)]);
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("routing.taskClassRules[0].taskClass"), "{err}");
+
+        // A clean table validates.
+        let mut cfg = MissionConfig::default();
+        cfg.routing.task_class_rules = routing_table(&[
+            ("execution-class", ExecutorTier::Local),
+            ("docs-class", ExecutorTier::Frontier),
+        ]);
+        assert!(validate(&cfg).is_ok(), "a clean table must validate");
+    }
+
+    #[test]
+    fn routing_abstraction_hosted_fine_tune_is_plain_local_endpoint_config() {
+        // KRZ-331: a hosted fine-tune is configuration of the
+        // OpenAI-compatible local backend (baseUrl + model), NOT a new
+        // backend kind — an https endpoint carrying a free-form
+        // fine-tune-shaped model id validates exactly like a localhost one,
+        // and a table can route a task class to it by capability class.
+        let mut cfg = local_worker_cfg();
+        cfg.worker.base_url = Some("https://models.internal.example/v1".into());
+        cfg.worker.model = "ft:some-model:some-org:some-id".into();
+        assert!(
+            validate(&cfg).is_ok(),
+            "a hosted fine-tune endpoint is ordinary local-backend config"
+        );
+
+        cfg.routing.task_class_rules = routing_table(&[("execution-class", ExecutorTier::Local)]);
+        let (applied, _) = route_task_class_executor(&mut cfg, Some("execution-class"));
+        assert_eq!(applied, ExecutorTier::Local);
+        assert_eq!(cfg.worker.backend.as_deref(), Some("local"));
     }
 
     // -----------------------------------------------------------------------
