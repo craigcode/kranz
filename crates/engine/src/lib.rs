@@ -49,6 +49,7 @@ pub mod knowledge;
 pub mod lessons;
 pub mod merge;
 pub mod merged;
+pub mod migrate_state;
 pub mod mission_catalog;
 pub mod outcomes;
 pub mod pack;

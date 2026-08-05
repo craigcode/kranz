@@ -131,6 +131,16 @@ mission's `plan.md` / `plan.json` / `report.md` (on the mission branch). Gitigno
 `missions/*/workspace/` (container-provider compose files),
 `.kranz/config.json`, `serve.token`, `serve.read.token`,
 `.kranz/domain-terms.local` (plaintext lint vocabulary), `.kranz/tickets/*.status`.
+Ticket lifecycle state is committed in the ticket .md itself: the additive
+`state:` frontmatter key (`open` default; terminal `done`/`superseded`/
+`wontfix`, optional `state-note:`) is the single source of truth — the
+gitignored `.status` sidecar is a write-through cache of it (frontmatter
+wins on conflict, logged; absent key = sidecar governs as before). Reads
+resolve via `Ticket::read_state`; lifecycle writes go through
+`Ticket::write_lifecycle` (both files); `kranz ticket migrate-state`
+(dry-run, `--yes` to apply) folds existing terminal sidecars into
+frontmatter, skipping git-dirty tickets by name
+(`crates/engine/src/migrate_state.rs`).
 
 ## Change discipline
 

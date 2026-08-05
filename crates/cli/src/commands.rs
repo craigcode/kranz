@@ -453,6 +453,7 @@ fn dispatch_ticket(repo: &Path, command: TicketCommand, mission: Option<&str>) -
             // wins over the global `--mission`.
             backlog::cmd_ticket_approve(repo, &slug, explicit.as_deref().or(mission), force)
         }
+        TicketCommand::MigrateState { yes } => backlog::cmd_ticket_migrate_state(repo, yes),
     }
 }
 

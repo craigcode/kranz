@@ -1643,6 +1643,10 @@ fn pipeline_stage_for_ticket(
         },
         TicketState::Failed => PipelineStage::Failed,
         TicketState::Parked => PipelineStage::Reviewable,
+        // Operator-closed lifecycle states (committed `state:` frontmatter):
+        // terminal WITHOUT delivery — the Abandoned bucket ("closed, not
+        // landed"), never Delivered/Landed.
+        TicketState::Superseded | TicketState::Wontfix => PipelineStage::Abandoned,
     }
 }
 

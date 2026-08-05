@@ -219,6 +219,8 @@ fn ticket_state_label(state: TicketState) -> &'static str {
         TicketState::Done => "DONE",
         TicketState::Failed => "FAILED",
         TicketState::Parked => "PARKED",
+        TicketState::Superseded => "SUPERSEDED",
+        TicketState::Wontfix => "WONTFIX",
     }
 }
 

@@ -997,3 +997,68 @@ fn work_does_not_skip_when_blocker_merely_incomplete() {
     let skip = work_skip_for_failed_blocker(repo, "blocked").unwrap();
     assert_eq!(skip, None);
 }
+
+// ---------------------------------------------------------------------------
+// Committed ticket lifecycle state (design ticket-state-frontmatter): the
+// ready/list surfaces resolve the frontmatter `state:` key with precedence
+// over the `.status` sidecar cache.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ticket_state_frontmatter_parses_migrate_state_command() {
+    let cli = Cli::try_parse_from(["kranz", "ticket", "migrate-state"]).unwrap();
+    match cli.command {
+        Command::Ticket {
+            command: TicketCommand::MigrateState { yes },
+        } => assert!(!yes, "dry-run is the default"),
+        other => panic!("unexpected: {other:?}"),
+    }
+    let cli = Cli::try_parse_from(["kranz", "ticket", "migrate-state", "--yes"]).unwrap();
+    match cli.command {
+        Command::Ticket {
+            command: TicketCommand::MigrateState { yes },
+        } => assert!(yes),
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn ticket_state_frontmatter_ready_excludes_terminal_frontmatter_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+    write_ticket(repo, "open-one", "---\ntitle: Open\n---\n## Goal\ndo it\n");
+    write_ticket(
+        repo,
+        "closed-one",
+        "---\ntitle: Closed\nstate: superseded\n---\n## Goal\ndone elsewhere\n",
+    );
+    // Even with a stale REVIEW cache (or, on a fresh clone, none at all) the
+    // committed terminal frontmatter keeps the ticket out of the ready path.
+    Ticket::write_state(repo, "closed-one", TicketState::Review, None).unwrap();
+
+    let out = backlog::cmd_ticket_ready(repo, false);
+    assert!(out.contains("open-one"), "out:\n{out}");
+    assert!(!out.contains("closed-one"), "out:\n{out}");
+    assert!(!out.contains("SUPERSEDED"), "out:\n{out}");
+}
+
+#[test]
+fn ticket_state_frontmatter_list_renders_lifecycle_labels() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+    write_ticket(
+        repo,
+        "superseded-one",
+        "---\ntitle: Sup\nstate: superseded\n---\n## Goal\nx\n",
+    );
+    write_ticket(
+        repo,
+        "wontfix-one",
+        "---\ntitle: Wont\nstate: wontfix\n---\n## Goal\nx\n",
+    );
+    // No sidecars at all (fresh clone): the labels come from the committed
+    // frontmatter alone, and the tickets stay listed (terminal ≠ hidden).
+    let out = backlog::cmd_ticket_list(repo);
+    assert!(out.contains("SUPERSEDED"), "out:\n{out}");
+    assert!(out.contains("WONTFIX"), "out:\n{out}");
+}

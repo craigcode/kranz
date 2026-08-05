@@ -742,6 +742,17 @@ pub enum TicketCommand {
         #[arg(long)]
         force: bool,
     },
+
+    /// Fold terminal `.status` sidecar states into committed frontmatter
+    /// `state:` keys — the one-time migration from the ticket-state-
+    /// frontmatter design, so done verdicts survive a fresh clone. Dry-run
+    /// by default; tickets with uncommitted .md edits are skipped by name
+    /// (never rewrite a file an in-flight editor or agent has open)
+    MigrateState {
+        /// Apply the fold (without this flag it only reports what it would do)
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[cfg(test)]

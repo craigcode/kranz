@@ -72,6 +72,10 @@ pub fn ticket_state_label(state: TicketState) -> &'static str {
         TicketState::Done => "DONE",
         TicketState::Failed => "FAILED",
         TicketState::Parked => "PARKED",
+        // Operator-closed lifecycle states (committed `state:` frontmatter):
+        // rendered distinctly from DONE — no delivery happened.
+        TicketState::Superseded => "SUPERSEDED",
+        TicketState::Wontfix => "WONTFIX",
     }
 }
 
@@ -611,6 +615,78 @@ pub fn cmd_ticket_approve(
 ) -> Result<i32> {
     eprintln!("warning: `kranz ticket approve` is deprecated, use `kranz ticket queue` instead");
     cmd_ticket_queue(repo, slug, explicit_mission, force)
+}
+
+/// `kranz ticket migrate-state [--yes]`: the one-time fold of terminal
+/// `.status` sidecars into committed frontmatter `state:` keys (design
+/// ticket-state-frontmatter, rule 4). Dry-run by default — the report lists
+/// every fold it WOULD make plus the loud per-name skips — `--yes` applies.
+/// The fold logic and its skip rules live in
+/// [`kranz_engine::migrate_state`]; this wrapper only renders.
+pub fn cmd_ticket_migrate_state(repo: &Path, yes: bool) -> Result<i32> {
+    let report = kranz_engine::migrate_state::fold_sidecar_states(repo, yes)?;
+    print!("{}", render_migration_report(&report));
+    Ok(0)
+}
+
+/// Render the fold report: one line per fold (or would-fold), one loud line
+/// per dirty skip, a line per ticket with a NON-terminal sidecar (pipeline
+/// state is left sidecar-owned by design), and a summary. No-sidecar tickets
+/// are summary-counted only — a line each would drown the signal.
+pub fn render_migration_report(report: &kranz_engine::migrate_state::MigrationReport) -> String {
+    use kranz_engine::migrate_state::FoldAction;
+    let verb = if report.applied {
+        "folded"
+    } else {
+        "would fold"
+    };
+    let mut out = String::new();
+    for action in &report.actions {
+        match action {
+            FoldAction::Fold { slug, note } => {
+                out.push_str(&format!(
+                    "{verb} {slug}: .status done → frontmatter state: done"
+                ));
+                if let Some(note) = note {
+                    out.push_str(&format!(" (state-note: {})", output::one_line(note, 60)));
+                }
+                out.push('\n');
+            }
+            FoldAction::SkipDirty { slug } => {
+                out.push_str(&format!(
+                    "SKIP {slug}: uncommitted changes — in-flight work; commit it, then re-run to fold\n"
+                ));
+            }
+            FoldAction::AlreadyMigrated { slug } => {
+                out.push_str(&format!(
+                    "skip {slug}: frontmatter already carries a state: key\n"
+                ));
+            }
+            FoldAction::NoTerminalSidecar {
+                slug,
+                sidecar: Some(state),
+            } => {
+                out.push_str(&format!(
+                    "leave {slug}: sidecar state {} is pipeline, not operator lifecycle\n",
+                    ticket_state_label(*state)
+                ));
+            }
+            FoldAction::NoTerminalSidecar { sidecar: None, .. } => {}
+        }
+    }
+    out.push_str(&format!(
+        "{}: {} {}, {} dirty-skipped, {} already migrated, {} left alone (no terminal sidecar)\n",
+        if report.applied { "applied" } else { "dry run" },
+        report.folds(),
+        if report.applied { "folded" } else { "to fold" },
+        report.dirty_skips(),
+        report.already_migrated(),
+        report.left_alone(),
+    ));
+    if !report.applied && report.folds() > 0 {
+        out.push_str("nothing written — re-run with --yes to apply the fold.\n");
+    }
+    out
 }
 
 /// Find the mission `draft` created for a ticket: the newest-by-event-log
