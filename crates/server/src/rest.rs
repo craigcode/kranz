@@ -1274,6 +1274,41 @@ mod tests {
         assert_eq!(grant["rubberStamp"], true);
     }
 
+    /// KRZ-333: the same endpoint also serves the industry-comparison set as
+    /// a structurally separate section with its inline definitions — the CLI
+    /// and the served payload stay one wire shape. The tempdir is no git
+    /// repo, so the git-derived slots read absent naming their dependency.
+    #[tokio::test]
+    async fn comparison_metrics_outcomes_endpoint_serves_the_section() {
+        let tmp = TempDir::new().unwrap();
+        seed_mission(
+            tmp.path(),
+            "m-1",
+            vec![created("seeded"), EventKind::MissionCompleted {}],
+        );
+        let app = crate::router(tmp.path().to_path_buf(), None);
+
+        let response = app.oneshot(get("/api/missions/outcomes")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+
+        let comparison = &body["comparison"];
+        assert_eq!(comparison["windowDays"], 30);
+        assert!(comparison["assistedChangeShare"]["definition"]
+            .as_str()
+            .unwrap()
+            .contains("agent-involved by construction"));
+        assert!(comparison["defectDensity"]["definition"]
+            .as_str()
+            .unwrap()
+            .contains("traced-from-mission frontmatter"));
+        // The empty resolution slot names its missing lifecycle timestamps.
+        assert!(comparison["defectResolutionTime"]["dependency"]
+            .as_str()
+            .unwrap()
+            .contains("open/close timestamps"));
+    }
+
     /// `workspaceLifecycle` (ticket workspace-idle-hibernate): present with
     /// the folded transition state + its event ts when a teardown carried an
     /// outcome, null when none did (v1 keep-only logs) — consumers degrade

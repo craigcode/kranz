@@ -786,6 +786,41 @@ impl GitRepo {
         })
     }
 
+    /// Count first-parent commits on `branch` whose committer date falls in
+    /// `(since, until]` (`git rev-list --first-parent --count --since
+    /// --until`) — the landed-changes denominator of the industry-comparison
+    /// fold (ticket `outcomes-comparison-metrics`, KRZ-333). First-parent
+    /// counts one entry per change that landed on the branch's own line of
+    /// history — a direct commit or a `--no-ff` merge — never the commits a
+    /// merge brought with it, so a landed mission merge and a hand-written
+    /// commit each count once. git's `--since` is exclusive and `--until`
+    /// inclusive; the timestamps go to git verbatim as RFC 3339.
+    pub fn count_first_parent_commits(
+        &self,
+        branch: &str,
+        since: &chrono::DateTime<chrono::Utc>,
+        until: &chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64> {
+        if branch.starts_with('-') {
+            return Err(EngineError::Git(format!(
+                "refusing count_first_parent_commits with flag-shaped ref {branch:?}"
+            )));
+        }
+        let out = self.run(&[
+            "rev-list",
+            "--first-parent",
+            "--count",
+            &format!("--since={}", since.to_rfc3339()),
+            &format!("--until={}", until.to_rfc3339()),
+            branch,
+        ])?;
+        out.trim().parse::<u64>().map_err(|e| {
+            EngineError::Git(format!(
+                "git rev-list --first-parent --count {branch} returned non-numeric output {out:?}: {e}"
+            ))
+        })
+    }
+
     /// `git diff --stat <from>..<to>` output, verbatim.
     pub fn diff_stat(&self, from: &str, to: &str) -> Result<String> {
         let range = format!("{from}..{to}");

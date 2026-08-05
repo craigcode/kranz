@@ -531,7 +531,10 @@ pub fn aggregate(
 /// Read every ticket's `traced-from-mission` frontmatter into defect→mission
 /// links. Absent field = not a traced defect (no false positives); tickets
 /// that fail to parse are already skipped by [`crate::ticket::Ticket::list`].
-fn traced_defects_from_tickets(repo_root: &std::path::Path) -> Vec<TracedDefect> {
+/// `pub(crate)` so the industry-comparison fold
+/// ([`crate::comparison_metrics`]) joins the SAME recorded links for its
+/// defect density — one linkage source, no drift between the two folds.
+pub(crate) fn traced_defects_from_tickets(repo_root: &std::path::Path) -> Vec<TracedDefect> {
     let mut out: Vec<TracedDefect> = crate::ticket::Ticket::list(repo_root)
         .into_iter()
         .filter_map(|ticket| {
