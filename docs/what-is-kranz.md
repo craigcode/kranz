@@ -169,6 +169,17 @@ endpoints), and the G2 glasses app are all just renderers of
 `GET /api/missions` and posters to `POST /api/*` (mutation-token gated). None
 of them hold mission state; kill any of them and the missions don't notice.
 
+### What kranz will not build
+
+The positioning ADR freezes new in-harness execution primitives — worker
+pools beyond the shipped M3 machinery, prompt routing sophistication,
+context-management features, or anything else whose purpose is to make an
+agent write better code (plus the standing non-goals: terminal replacement,
+editor/LSP shells, a general agentic IDE). Heterogeneous dispatch is the one
+carve-out, as an evidence primitive with three properties. The retained-vs-
+frozen split and its rationale:
+`docs/knowledge/decisions/positioning-governance-evidence-layer.md`.
+
 ## Where to go next
 
 - `docs/design.md` — the full architecture and its invariants

@@ -148,3 +148,15 @@ Small, focused changes with tests. Every change gets reviewed against the
 five axes (correctness, readability, architecture, security, performance)
 before merge. Prefer the standard library and existing utilities over new
 dependencies.
+
+The positioning ADR's freeze applies at the point of temptation: new
+in-harness execution primitives — worker pools beyond the shipped M3
+machinery, prompt routing sophistication, context-management features,
+anything whose purpose is to make an agent write better code — are NOT
+built (docs/knowledge/decisions/positioning-governance-evidence-layer.md;
+the heterogeneous dispatch pool is the one carve-out, an evidence
+primitive with three properties). If a change drifts toward a frozen
+surface, stop and check the boundary first; `docs/what-is-kranz.md` and
+the frozen modules' doc headers (`prompts.rs`, `knowledge.rs`) carry the
+same pointer.
+
