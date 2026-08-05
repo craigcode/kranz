@@ -68,14 +68,24 @@ fn a3_command_runs_successfully_verbatim() {
         .join("..")
         .join("..");
     let command = a3_command_from_plan_json();
-    let status = Command::new("sh")
+    // Capture, don't just status(): a nested-run failure is otherwise
+    // invisible on an ephemeral CI runner (the dogfood log-tail lesson —
+    // the ubuntu CI failure of 3f1900e gave an untailorable exit).
+    let output = Command::new("sh")
         .arg("-c")
         .arg(&command)
         .current_dir(&repo_root)
-        .status()
+        .output()
         .expect("spawn a3 command via sh -c");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let tail: String = {
+        let combined = format!("{stdout}\n{stderr}");
+        let lines: Vec<&str> = combined.lines().collect();
+        lines[lines.len().saturating_sub(40)..].join("\n")
+    };
     assert!(
-        status.success(),
-        "a3 command must exit 0 when run verbatim: {command}"
+        output.status.success(),
+        "a3 command must exit 0 when run verbatim: {command}\n--- nested output tail ---\n{tail}"
     );
 }
