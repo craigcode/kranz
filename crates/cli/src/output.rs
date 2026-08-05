@@ -236,7 +236,9 @@ pub fn render_cost_estimate(estimate: &CostEstimate, missions_used: usize) -> St
 /// then Grant latency and Escalation ledger sections — unless there is no
 /// history at all (no closed missions, no escalations, no decided grants,
 /// no task-class rows), in which case only the Autonomy section (zeros) plus
-/// a short note is printed, per the spec's empty-history rule.
+/// a short note is printed, per the spec's empty-history rule. The
+/// industry-comparison set (KRZ-333), when folded, renders LAST as a
+/// clearly-separated secondary section after the Escalation ledger.
 pub fn render_outcomes(outcomes: &Outcomes) -> String {
     let ratio = &outcomes.autonomy_ratio;
     let mut out = String::new();
@@ -290,6 +292,70 @@ pub fn render_outcomes(outcomes: &Outcomes) -> String {
             "  no approved grants yet (flag threshold {})\n",
             format_duration_ms(stamp.threshold_ms)
         )),
+    }
+
+    // Gate score distribution flags (KRZ-316) beside the rubber-stamp
+    // signal — the documented complement, always presented together:
+    // block-to-grant timing catches an inattentive human, these catch a
+    // mis-specified gate whose threshold nothing approaches. Sub-minimum
+    // and unscored gates render ABSENT, never zero-filled.
+    let score_flags = &outcomes.gate_score_flags;
+    out.push('\n');
+    out.push_str("Gate score signals\n");
+    if score_flags.scored_gates == 0 {
+        out.push_str("  no scored gate evaluations recorded yet\n");
+    } else if score_flags.assessed_gates == 0 {
+        out.push_str(&format!(
+            "  {} scored gate{}, none at the minimum sample ({}) — no flags\n",
+            score_flags.scored_gates,
+            if score_flags.scored_gates == 1 {
+                ""
+            } else {
+                "s"
+            },
+            score_flags.min_samples
+        ));
+    } else {
+        // Group each gate's kinds onto one line (the fold emits a gate's
+        // flags adjacently); gates ordered by identity, as folded.
+        let mut flagged: Vec<(
+            &str,
+            Vec<&str>,
+            &kranz_engine::gate_score_flags::ScoreDistribution,
+        )> = Vec::new();
+        for flag in &score_flags.flags {
+            match flagged.last_mut() {
+                Some((gate, kinds, _)) if *gate == flag.gate => {
+                    kinds.push(flag.kind.as_str());
+                }
+                _ => flagged.push((&flag.gate, vec![flag.kind.as_str()], &flag.distribution)),
+            }
+        }
+        out.push_str(&format!(
+            "  {} of {} assessed gate{} flagged ({} scored, min sample {})\n",
+            flagged.len(),
+            score_flags.assessed_gates,
+            if score_flags.assessed_gates == 1 {
+                ""
+            } else {
+                "s"
+            },
+            score_flags.scored_gates,
+            score_flags.min_samples
+        ));
+        for (gate, kinds, d) in flagged {
+            out.push_str(&format!(
+                "  {}: {} — {} samples, scores {:.3}..{:.3} (mean {:.3}), variance {:.2e}, closest approach {:.3}\n",
+                gate,
+                kinds.join(", "),
+                d.samples,
+                d.min_score,
+                d.max_score,
+                d.mean_score,
+                d.variance,
+                d.closest_approach
+            ));
+        }
     }
 
     let cost = &outcomes.cost_per_change;
@@ -396,6 +462,67 @@ pub fn render_outcomes(outcomes: &Outcomes) -> String {
             latency,
             flag
         ));
+    }
+
+    // The industry-comparison set (KRZ-333): a clearly-separated SECONDARY
+    // section after every native section — the kranz-native metrics stay
+    // primary. Each comparison metric carries its inline definition (the
+    // definition is the whole argument), and a slot whose data the fold
+    // cannot see renders empty naming its dependency, never an
+    // approximation. Absent entirely when the fold pinned no window.
+    if let Some(comparison) = &outcomes.comparison {
+        out.push('\n');
+        out.push_str(&format!(
+            "Industry comparison (secondary to the native metrics above; {}d window)\n",
+            comparison.window_days
+        ));
+
+        let share = &comparison.assisted_change_share;
+        match (share.total_changes, share.share) {
+            (Some(total), Some(s)) => out.push_str(&format!(
+                "  Assisted-change share: {:.0}% — {} of {} landed change{} on {}\n",
+                s * 100.0,
+                share.agent_changes,
+                total,
+                if total == 1 { "" } else { "s" },
+                share.base_branch.as_deref().unwrap_or("?")
+            )),
+            _ => out.push_str(&format!(
+                "  Assisted-change share: — (needs {})\n",
+                share.dependency.as_deref().unwrap_or("unavailable data")
+            )),
+        }
+        out.push_str(&format!("    definition: {}\n", share.definition));
+
+        let density = &comparison.defect_density;
+        match density.defects_per_merged_change {
+            Some(d) => out.push_str(&format!(
+                "  Defect density: {:.2} traced defect{} per merged change ({} defect{}, {} merged change{})\n",
+                d,
+                if density.traced_defects == 1 { "" } else { "s" },
+                density.traced_defects,
+                if density.traced_defects == 1 { "" } else { "s" },
+                density.merged_changes,
+                if density.merged_changes == 1 { "" } else { "s" }
+            )),
+            None => out.push_str(&format!(
+                "  Defect density: — (needs {})\n",
+                density.dependency.as_deref().unwrap_or("unavailable data")
+            )),
+        }
+        out.push_str(&format!("    definition: {}\n", density.definition));
+
+        // Empty-and-named-dependency today (the traced defect records carry
+        // no lifecycle timestamps); the computed arm arrives with the data.
+        let resolution = &comparison.defect_resolution_time;
+        out.push_str(&format!(
+            "  Defect resolution time: — (needs {})\n",
+            resolution
+                .dependency
+                .as_deref()
+                .unwrap_or("unavailable data")
+        ));
+        out.push_str(&format!("    definition: {}\n", resolution.definition));
     }
 
     out
@@ -1012,6 +1139,225 @@ mod tests {
                 .find(|l| l.contains("cargo test") && l.contains("approved"))
                 .expect("grant ledger row present");
             assert!(grant_line.contains("rubber-stamp"), "{grant_line}");
+        }
+
+        /// A scored `gate.result` append (KRZ-316 fixture): the (score,
+        /// threshold) pair rides verbatim, as the gate stated it.
+        fn scored_gate_result(gate: &str, score: f64, threshold: f64) -> EventKind {
+            use kranz_engine::gate::{GateKind, GateSurface, GateVerdict};
+            EventKind::GateResult {
+                gate: gate.into(),
+                surface: GateSurface::Approval,
+                kind: GateKind::Deterministic,
+                index: 0,
+                verdict: GateVerdict::Pass,
+                artefact_ref: format!("contract gate {gate}"),
+                artefact_detail: None,
+                score: Some(score),
+                threshold: Some(threshold),
+            }
+        }
+
+        /// KRZ-316: the distribution flags render beside the rubber-stamp
+        /// signal — the ticket's "complement, not alternative" — naming the
+        /// gate and carrying the distribution that triggered the flag; the
+        /// JSON form carries the same section.
+        #[test]
+        fn score_distribution_flag_cli_text_renders_beside_rubber_stamp() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            // Ten constant far-from-threshold scores + a fast grant park:
+            // the gate smell AND the human smell in one report.
+            let mut kinds = vec![
+                created("goal"),
+                EventKind::GrantRequested {
+                    milestone_id: "ms-1".into(),
+                    kind: GrantKind::Command,
+                    command: "cargo test".into(),
+                },
+                EventKind::GrantApproved {
+                    kind: GrantKind::Command,
+                    command: "cargo test".into(),
+                },
+            ];
+            for _ in 0..10 {
+                kinds.push(scored_gate_result("vacuous-filter", 0.5, 1.0));
+            }
+            kinds.push(EventKind::MissionCompleted {});
+            seed_mission(root, "m-1", kinds);
+
+            let outcomes = compute_outcomes(root).unwrap();
+            let text = render_outcomes(&outcomes);
+            assert!(text.contains("Rubber-stamp signal"), "{text}");
+            assert!(text.contains("Gate score signals"), "{text}");
+            // Presented together: the gate section directly follows the
+            // rubber-stamp block.
+            let stamp_at = text.find("Rubber-stamp signal").unwrap();
+            let flags_at = text.find("Gate score signals").unwrap();
+            let cost_at = text.find("Cost per change").unwrap();
+            assert!(stamp_at < flags_at && flags_at < cost_at, "{text}");
+            assert!(
+                text.contains("1 of 1 assessed gate flagged (1 scored, min sample 10)"),
+                "{text}"
+            );
+            assert!(
+                text.contains(
+                    "vacuous-filter: never-approaches-threshold, near-constant — 10 samples, scores 0.500..0.500 (mean 0.500), variance 0.00e0, closest approach 0.500"
+                ),
+                "{text}"
+            );
+
+            // The JSON form carries the same section (the wire shape the
+            // REST endpoint serves verbatim).
+            let json = render_outcomes_json(&outcomes).unwrap();
+            assert!(json.contains("gateScoreFlags"), "{json}");
+            assert!(json.contains("never-approaches-threshold"), "{json}");
+            assert!(json.contains("near-constant"), "{json}");
+            let round_tripped: Outcomes = serde_json::from_str(&json).unwrap();
+            assert_eq!(round_tripped, outcomes);
+        }
+
+        /// KRZ-316 absence: history without a single scored gate evaluation
+        /// states so plainly — no flag rows, no zero-filled distributions.
+        #[test]
+        fn score_distribution_flag_cli_text_no_scored_gates_states_absent() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            seed_mission(
+                root,
+                "m-1",
+                vec![
+                    created("goal"),
+                    EventKind::GrantRequested {
+                        milestone_id: "ms-1".into(),
+                        kind: GrantKind::Command,
+                        command: "cargo test".into(),
+                    },
+                    EventKind::GrantApproved {
+                        kind: GrantKind::Command,
+                        command: "cargo test".into(),
+                    },
+                    EventKind::MissionCompleted {},
+                ],
+            );
+
+            let outcomes = compute_outcomes(root).unwrap();
+            let text = render_outcomes(&outcomes);
+            assert!(text.contains("Gate score signals"), "{text}");
+            assert!(
+                text.contains("no scored gate evaluations recorded yet"),
+                "{text}"
+            );
+            assert!(!text.contains("near-constant"), "{text}");
+            assert!(!text.contains("never-approaches"), "{text}");
+        }
+
+        /// KRZ-333: the industry-comparison set renders as a clearly-separated
+        /// SECONDARY section after every native section, each metric carrying
+        /// its inline definition as CONTENT. The tempdir is no git repo, so
+        /// the git-derived slots degrade naming their dependency — never an
+        /// approximation.
+        #[test]
+        fn comparison_metrics_text_renders_secondary_section_with_inline_definitions() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            seed_mission(
+                root,
+                "m-1",
+                vec![
+                    created("goal"),
+                    EventKind::GrantRequested {
+                        milestone_id: "ms-1".into(),
+                        kind: GrantKind::Command,
+                        command: "cargo test".into(),
+                    },
+                    EventKind::GrantApproved {
+                        kind: GrantKind::Command,
+                        command: "cargo test".into(),
+                    },
+                    EventKind::MissionCompleted {},
+                ],
+            );
+
+            let outcomes = compute_outcomes(root).unwrap();
+            let text = render_outcomes(&outcomes);
+            assert!(text.contains("Industry comparison"), "{text}");
+            // Ordered after every native section: the ledger is the last
+            // native one, the comparison set follows it.
+            let ledger_at = text.find("Escalation ledger").unwrap();
+            let comparison_at = text.find("Industry comparison").unwrap();
+            assert!(
+                ledger_at < comparison_at,
+                "comparison renders after the native sections: {text}"
+            );
+            // Inline definitions as content, not just presence.
+            assert!(text.contains("agent-involved by construction"), "{text}");
+            assert!(text.contains("traced-from-mission frontmatter"), "{text}");
+            assert!(text.contains("no lifecycle timestamps"), "{text}");
+            // The empty slots name their dependencies.
+            assert!(
+                text.contains("Assisted-change share: — (needs a git probe"),
+                "{text}"
+            );
+            assert!(
+                text.contains("Defect density: — (needs merged changes in the window"),
+                "{text}"
+            );
+            assert!(
+                text.contains("Defect resolution time: — (needs ticket open/close timestamps"),
+                "{text}"
+            );
+        }
+
+        /// KRZ-333: the JSON form carries the comparison section as a
+        /// separate key ordered after the native keys — the same wire shape
+        /// the REST endpoint serves verbatim.
+        #[test]
+        fn comparison_metrics_json_carries_the_section_after_native_keys() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            seed_mission(
+                root,
+                "m-1",
+                vec![created("goal"), EventKind::MissionCompleted {}],
+            );
+
+            let outcomes = compute_outcomes(root).unwrap();
+            let json = render_outcomes_json(&outcomes).unwrap();
+            assert!(json.contains("\"comparison\""), "{json}");
+            assert!(
+                json.find("\"escalations\"").unwrap() < json.find("\"comparison\"").unwrap(),
+                "the comparison key follows the native keys: {json}"
+            );
+            assert!(json.contains("agent-involved by construction"), "{json}");
+            assert!(json.contains("\"windowDays\": 30"), "{json}");
+            let round_tripped: Outcomes = serde_json::from_str(&json).unwrap();
+            assert_eq!(round_tripped, outcomes);
+        }
+
+        /// KRZ-333: the hermetic seam — fold options without a comparison
+        /// window attach NO section at all (absent from text and wire, never
+        /// a zeroed report).
+        #[test]
+        fn comparison_metrics_absent_when_options_pin_no_window() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            seed_mission(
+                root,
+                "m-1",
+                vec![created("goal"), EventKind::MissionCompleted {}],
+            );
+
+            let outcomes = kranz_engine::outcomes::compute_outcomes_with_options(
+                root,
+                &kranz_engine::outcomes::OutcomesOptions::default(),
+            )
+            .unwrap();
+            assert!(outcomes.comparison.is_none());
+            let text = render_outcomes(&outcomes);
+            assert!(!text.contains("Industry comparison"), "{text}");
+            let json = render_outcomes_json(&outcomes).unwrap();
+            assert!(!json.contains("\"comparison\""), "{json}");
         }
     }
 

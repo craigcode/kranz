@@ -1,7 +1,11 @@
 //! Flight-surgeon outcomes fold: autonomy ratio, grant-latency distribution,
 //! an escalation ledger, cost and cycle time — plus the KRZ-321/323/329
 //! extensions (per-task-class rows, the context-reuse split, the rubber-stamp
-//! flag, and cost per merged change) — all computed per-request from the
+//! flag, and cost per merged change), the KRZ-316 gate score distribution
+//! flags beside the rubber-stamp signal, and the KRZ-333 industry-comparison
+//! set ([`crate::comparison_metrics`]) attached as a clearly-separated
+//! secondary section when the fold options pin its window — all computed
+//! per-request from the
 //! existing event log. Pure-fold style, mirroring [`crate::trace_export`]:
 //! there is no second persisted source of truth, only a function over
 //! `&[Event]` (the merged-change denominator adds the live ancestry probe at
@@ -129,12 +133,34 @@ pub struct Outcomes {
     /// alongside the latency distribution.
     #[serde(default)]
     pub rubber_stamp: RubberStampReport,
+    /// Gate score distribution flags (ticket
+    /// `gate-score-distribution-flags`, KRZ-316): per-gate smells folded
+    /// from the scored `gate.result` series across the same mission logs —
+    /// the rubber-stamp signal's documented COMPLEMENT, presented together:
+    /// block-to-grant timing catches an inattentive human, these catch a
+    /// mis-specified gate whose threshold nothing approaches. Carried into
+    /// the escalation ledger fold as this SUMMARY FIELD, never a per-row
+    /// marker: a flag indicts the GATE's specification across all missions,
+    /// so pinning it on one mission's grant/block/revision row would
+    /// misattribute a cross-mission smell to one escalation.
+    #[serde(default)]
+    pub gate_score_flags: crate::gate_score_flags::GateScoreFlagsReport,
     /// Fleet divergence ledger (KRZ-304), summed over the missions that
     /// have one — `None` when NO mission recorded a divergence event
     /// (absent means "no pools", never a fabricated zero report), and
     /// omitted from the wire then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub divergences: Option<DivergenceOutcomes>,
+    /// The industry-comparison set (ticket `outcomes-comparison-metrics`,
+    /// KRZ-333): assisted-change share, defect density per merged change,
+    /// and defect resolution time — a clearly-separated SECONDARY section
+    /// beside the kranz-native metrics above, each metric carrying its
+    /// inline definition (the definition is the whole argument). `None` —
+    /// and omitted from the wire — when the fold options pin no comparison
+    /// window (the hermetic test seam); production resolve() pins one, so
+    /// every served/printed report carries the section LAST.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparison: Option<crate::comparison_metrics::ComparisonReport>,
 }
 
 /// One task class's row in the outcomes report (KRZ-321).
@@ -274,6 +300,11 @@ pub struct MissionOutcomes {
     /// recorded no divergence events at all (missions without pools:
     /// absent, never a zeroed ledger).
     pub divergences: Option<DivergenceOutcomes>,
+    /// The mission's scored gate evaluations (KRZ-316): every `gate.result`
+    /// carrying a score pair, folded to (gate, score, threshold) samples —
+    /// the distribution flag fold's per-mission input, memoized with the
+    /// rest of this struct so repeated requests never re-walk the log.
+    pub gate_score_samples: Vec<crate::gate_score_flags::GateScoreSample>,
 }
 
 /// One mission's token usage on one backend, summed over its completed runs
@@ -740,6 +771,12 @@ pub fn mission_outcomes(mission_id: &str, events: &[Event]) -> MissionOutcomes {
         resolved_none,
     });
 
+    // --- gate score samples (KRZ-316) --------------------------------------
+    // Every scored `gate.result` in this mission's slice, as (gate, score,
+    // threshold) samples — the distribution flag fold's input. Unscored
+    // (boolean-only) gates yield no sample: excluded, never zeroed.
+    let gate_score_samples = crate::gate_score_flags::collect_scored_samples(&mission_events);
+
     MissionOutcomes {
         interventions,
         is_closed,
@@ -751,6 +788,7 @@ pub fn mission_outcomes(mission_id: &str, events: &[Event]) -> MissionOutcomes {
         task_class,
         token_sums: token_sums.into_values().collect(),
         divergences,
+        gate_score_samples,
     }
 }
 
@@ -785,12 +823,21 @@ pub struct OutcomesOptions {
     /// Grants APPROVED in under this many ms are flagged as rubber-stamp
     /// signals (strictly under; at/over is not flagged).
     pub rubber_stamp_threshold_ms: u64,
+    /// When `Some((days, now))`, the industry-comparison set (KRZ-333) is
+    /// folded over that window and attached to the report
+    /// ([`Outcomes::comparison`]). `None` keeps the fold hermetic — no git
+    /// probe, no clock — which is exactly the test seam: production
+    /// [`OutcomesOptions::resolve`] pins the documented default window and
+    /// the request time, so the purity rule above holds with the window as
+    /// an explicit input.
+    pub comparison_window: Option<(u64, DateTime<Utc>)>,
 }
 
 impl Default for OutcomesOptions {
     fn default() -> Self {
         Self {
             rubber_stamp_threshold_ms: crate::types::DEFAULT_RUBBER_STAMP_THRESHOLD_MS,
+            comparison_window: None,
         }
     }
 }
@@ -804,9 +851,19 @@ impl OutcomesOptions {
         match crate::config::load(repo_root) {
             Ok(cfg) => Self {
                 rubber_stamp_threshold_ms: cfg.rubber_stamp_threshold_ms,
+                ..Self::default()
             },
             Err(_) => Self::default(),
         }
+        .with_comparison_window()
+    }
+
+    /// Pin the industry-comparison window to the documented default
+    /// ([`DEFAULT_MERGED_CHANGE_WINDOW_DAYS`], the same window the
+    /// merged-change fold publishes) ending at the request time.
+    fn with_comparison_window(mut self) -> Self {
+        self.comparison_window = Some((DEFAULT_MERGED_CHANGE_WINDOW_DAYS, Utc::now()));
+        self
     }
 }
 
@@ -860,6 +917,9 @@ pub fn compute_outcomes_with_options(
     // Fleet divergence ledger (KRZ-304): summed over missions that have one;
     // stays None when no mission recorded a divergence event.
     let mut divergence_acc: Option<DivergenceOutcomes> = None;
+    // Scored gate evaluation samples (KRZ-316): concatenated across
+    // missions into the distribution flag fold's input.
+    let mut all_score_samples: Vec<crate::gate_score_flags::GateScoreSample> = Vec::new();
 
     for id in ids {
         let paths = crate::paths::MissionPaths::new(repo_root, &id);
@@ -944,6 +1004,8 @@ pub fn compute_outcomes_with_options(
             acc.resolved_selected += d.resolved_selected;
             acc.resolved_none += d.resolved_none;
         }
+
+        all_score_samples.extend(out.gate_score_samples);
 
         escalations.extend(out.escalations);
     }
@@ -1033,6 +1095,17 @@ pub fn compute_outcomes_with_options(
         })
         .collect();
 
+    // Industry-comparison set (KRZ-333): folded and attached only when the
+    // options pin a window (production resolve() does; the hermetic seam
+    // leaves it off and the section is simply absent). Pure over (logs,
+    // tickets, live git refs, the pinned window) — derived, never stored.
+    let comparison = options
+        .comparison_window
+        .map(|(window_days, now)| {
+            crate::comparison_metrics::compute_comparison_report(repo_root, window_days, now)
+        })
+        .transpose()?;
+
     Ok(Outcomes {
         autonomy_ratio: AutonomyRatio {
             closed_missions,
@@ -1062,7 +1135,9 @@ pub fn compute_outcomes_with_options(
             flagged,
             share: (approved_decisions > 0).then(|| flagged as f64 / approved_decisions as f64),
         },
+        gate_score_flags: crate::gate_score_flags::score_distribution_report(&all_score_samples),
         divergences: divergence_acc,
+        comparison,
     })
 }
 
@@ -2804,6 +2879,170 @@ mod tests {
                 serde_json::to_string(&first).unwrap(),
                 serde_json::to_string(&second).unwrap(),
                 "the same log plus the same options yields byte-identical data"
+            );
+        }
+
+        /// A `gate.result` event; `score` is the (score, threshold) pair a
+        /// scored gate reports, `None` for a boolean-only gate (the
+        /// gate_scores.rs fixture idiom).
+        fn gate_scored(
+            seq: u64,
+            mission_id: &str,
+            ts_ms: i64,
+            gate: &str,
+            score: Option<(f64, f64)>,
+        ) -> Event {
+            ev_ms(
+                seq,
+                mission_id,
+                ts_ms,
+                EventKind::GateResult {
+                    gate: gate.into(),
+                    surface: crate::gate::GateSurface::Approval,
+                    kind: crate::gate::GateKind::Deterministic,
+                    index: 0,
+                    verdict: crate::gate::GateVerdict::Pass,
+                    artefact_ref: format!("contract gate {gate}"),
+                    artefact_detail: None,
+                    score: score.map(|(score, _)| score),
+                    threshold: score.map(|(_, threshold)| threshold),
+                },
+            )
+        }
+
+        /// KRZ-316: the distribution flags fold beside the rubber-stamp
+        /// signal in ONE report — the documented complement. Ten constant
+        /// far-from-threshold scores across two missions flag the gate
+        /// (never-approaches AND near-constant) while a sub-10s grant
+        /// approval flags the human side; the ledger rows stay untouched
+        /// (the gate smell is the summary field, never a row marker).
+        #[test]
+        fn score_distribution_flag_outcomes_fold_flags_beside_rubber_stamp() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+
+            let mut m1 = vec![
+                ev_ms(1, "m-1", 0, created_with_class("kranz/m-1", None)),
+                ev_ms(
+                    2,
+                    "m-1",
+                    1_000,
+                    EventKind::PlanApproved {
+                        plan: sample_plan(),
+                        base_sha: None,
+                    },
+                ),
+                grant_req(3, "m-1", 2_000, "cargo test"),
+                grant_yes(4, "m-1", 4_000, "cargo test"),
+            ];
+            for i in 0..5 {
+                m1.push(gate_scored(
+                    5 + i,
+                    "m-1",
+                    5_000 + i as i64,
+                    "vacuous-filter",
+                    Some((0.5, 1.0)),
+                ));
+            }
+            m1.push(ev_ms(10, "m-1", 10_000, EventKind::MissionCompleted {}));
+            write_log(root, "m-1", m1);
+
+            let mut m2 = vec![ev_ms(1, "m-2", 0, created_with_class("kranz/m-2", None))];
+            for i in 0..5 {
+                m2.push(gate_scored(
+                    2 + i,
+                    "m-2",
+                    5_000 + i as i64,
+                    "vacuous-filter",
+                    Some((0.5, 1.0)),
+                ));
+            }
+            m2.push(ev_ms(7, "m-2", 10_000, EventKind::MissionCompleted {}));
+            write_log(root, "m-2", m2);
+
+            let outcomes =
+                compute_outcomes_with_options(root, &OutcomesOptions::default()).unwrap();
+
+            // The human-side signal, as before.
+            assert_eq!(outcomes.rubber_stamp.flagged, 1);
+            assert_eq!(outcomes.escalations[0].rubber_stamp, Some(true));
+
+            // The gate-side complement beside it.
+            let report = &outcomes.gate_score_flags;
+            assert_eq!(report.scored_gates, 1);
+            assert_eq!(report.assessed_gates, 1);
+            assert_eq!(report.flags.len(), 2);
+            assert!(
+                report.flags.iter().all(|f| f.gate == "vacuous-filter"),
+                "the flag names the gate: {report:?}"
+            );
+            let kinds: Vec<_> = report.flags.iter().map(|f| f.kind).collect();
+            assert_eq!(
+                kinds,
+                [
+                    crate::gate_score_flags::GateScoreFlagKind::NeverApproachesThreshold,
+                    crate::gate_score_flags::GateScoreFlagKind::NearConstant,
+                ]
+            );
+            // The flag carries the distribution that triggered it: ten
+            // samples over BOTH missions, closest approach 0.5, variance 0.
+            let d = &report.flags[0].distribution;
+            assert_eq!(d.samples, 10);
+            assert_eq!(d.closest_approach, 0.5);
+            assert_eq!(d.variance, 0.0);
+            // The rule constants ride the wire (the rubber-stamp idiom).
+            assert_eq!(
+                report.min_samples,
+                crate::gate_score_flags::MIN_SAMPLE_COUNT
+            );
+        }
+
+        /// KRZ-316 absence rules in the outcomes fold: a scored gate below
+        /// the minimum sample is counted but NEVER assessed (no flags, no
+        /// zero-filled distribution), and a boolean-only gate produces no
+        /// population at all — it appears nowhere in the report.
+        #[test]
+        fn score_distribution_flag_outcomes_fold_sub_minimum_and_unscored_absent() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+
+            // m-1: three scored evaluations — under the 10-sample minimum.
+            let mut m1 = vec![ev_ms(1, "m-1", 0, created_with_class("kranz/m-1", None))];
+            for i in 0..3 {
+                m1.push(gate_scored(
+                    2 + i,
+                    "m-1",
+                    5_000 + i as i64,
+                    "vacuous-filter",
+                    Some((0.5, 1.0)),
+                ));
+            }
+            m1.push(ev_ms(5, "m-1", 10_000, EventKind::MissionCompleted {}));
+            write_log(root, "m-1", m1);
+
+            // m-2: only boolean-only gate events — no score pair at all.
+            write_log(
+                root,
+                "m-2",
+                vec![
+                    ev_ms(1, "m-2", 0, created_with_class("kranz/m-2", None)),
+                    gate_scored(2, "m-2", 5_000, "env-sensitive", None),
+                    gate_scored(3, "m-2", 6_000, "env-sensitive", None),
+                    ev_ms(4, "m-2", 10_000, EventKind::MissionCompleted {}),
+                ],
+            );
+
+            let outcomes =
+                compute_outcomes_with_options(root, &OutcomesOptions::default()).unwrap();
+            let report = &outcomes.gate_score_flags;
+            assert_eq!(
+                report.scored_gates, 1,
+                "the unscored gate adds no population: {report:?}"
+            );
+            assert_eq!(report.assessed_gates, 0, "under the minimum: unassessed");
+            assert!(
+                report.flags.is_empty(),
+                "absent, never a zero-filled row: {report:?}"
             );
         }
     }
