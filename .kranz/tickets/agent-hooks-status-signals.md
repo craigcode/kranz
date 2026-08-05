@@ -2,7 +2,7 @@
 title: Use agent lifecycle hooks as non-authoritative status signals
 priority: 3
 schedule: once
-blocked-by: [cursor-cli-live-capture-route-decision]
+blocked-by: [backend-cursor-direct-parser]
 ---
 
 ## Goal
