@@ -142,6 +142,25 @@ fn identity_token_for(pid: u32) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+/// Whether `/bin/ps` can execute here at all. It is setuid root on this
+/// host's macOS, and setuid exec is kernel-denied inside ANY Seatbelt
+/// sandbox (probed 2026-08-05 — EPERM even under `(allow default)`, not
+/// SBPL-expressible), so under the gate sandbox wrap (a wrapped
+/// `cargo test` dogfooding this repo — ticket
+/// gate-sandbox-supervision-dogfood) the ps-based reference computation in
+/// [`identity_token_for`] cannot run. Tests below skip the ps comparison
+/// with a detectable marker there; the ENGINE-side token path no longer
+/// needs ps at all (`proc_pidinfo` first — see event_log.rs), which is
+/// exactly what those wrapped runs prove.
+#[cfg(target_os = "macos")]
+fn ps_can_execute() -> bool {
+    std::process::Command::new("ps")
+        .args(["-p", &std::process::id().to_string(), "-o", "command="])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// A real, live child process (`sleep 300`) whose pid can be planted in a
 /// lock file. Killed and reaped on drop so no test leaks a sleeper.
 #[cfg(unix)]
@@ -200,7 +219,7 @@ fn acquire_creates_dirs_and_lock() {
         acquired >= before && acquired <= now_epoch_secs(),
         "acquire time {acquired} outside [{before}, now]"
     );
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     assert_eq!(
         lines
             .next()
@@ -209,6 +228,35 @@ fn acquire_creates_dirs_and_lock() {
         identity_token_for(std::process::id()),
         "the recorded token must be OUR OWN process identity"
     );
+    #[cfg(target_os = "macos")]
+    {
+        let recorded = lines
+            .next()
+            .expect("third lock line: identity token")
+            .trim()
+            .to_string();
+        // Under the gate sandbox wrap the engine still RECORDS a token
+        // (proc_pidinfo needs no ps — see event_log.rs); only the
+        // ps-computed equality comparison is unverifiable there.
+        assert!(
+            !recorded.is_empty(),
+            "a non-empty token is always recorded on macOS, wrapped or not"
+        );
+        if ps_can_execute() {
+            assert_eq!(
+                recorded,
+                identity_token_for(std::process::id()),
+                "the recorded token must be OUR OWN process identity"
+            );
+        } else {
+            eprintln!(
+                "SKIP-UNDER-WRAP (gate-sandbox-supervision-dogfood): \
+                 acquire_creates_dirs_and_lock — /bin/ps cannot execute inside the gate \
+                 sandbox wrap; the ps-computed token comparison is skipped (non-empty \
+                 recording still asserted)"
+            );
+        }
+    }
     assert_eq!(log.last_seq(), 0);
 }
 
@@ -966,6 +1014,19 @@ fn reused_pid_lock_is_stale_at_every_tier() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn live_holder_with_matching_token_survives_clock_steps() {
+    // The planted token is computed by the ps reference recipe; under the
+    // gate sandbox wrap ps cannot execute (see [`ps_can_execute`]), so the
+    // fixture's premise is unverifiable — skip with a detectable marker.
+    #[cfg(target_os = "macos")]
+    if !ps_can_execute() {
+        eprintln!(
+            "SKIP-UNDER-WRAP (gate-sandbox-supervision-dogfood): \
+             live_holder_with_matching_token_survives_clock_steps — /bin/ps cannot execute \
+             inside the gate sandbox wrap, so the reference token cannot be computed; \
+             skipping"
+        );
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let paths = MissionPaths::new(tmp.path(), "m-lock");
     std::fs::create_dir_all(paths.mission_dir()).unwrap();

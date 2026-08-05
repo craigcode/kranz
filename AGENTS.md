@@ -96,7 +96,15 @@ kranz work                      # drain the queue (run missions)
     they run WRAPPED in the resolved worker sandbox profile when
     `sandbox.enforce != off` (`command_exec::GateSandbox`,
     `run_bounded_gate_command_sandboxed`); `off` keeps the env-only posture
-    byte-for-byte. Validators never see the real checkout:
+    byte-for-byte. The gate wrap's supervision policy is gate-SPECIFIC
+    (ticket gate-sandbox-supervision-dogfood, `gate_profile_extras`):
+    `(allow signal (target same-sandbox))` lets a wrapped gate signal its
+    OWN descendant tree (never host processes) so `cargo test --workspace`
+    runs green as a wrapped contract command — the session profile
+    generator stays untouched, and what no sandbox can host (setuid
+    `/bin/ps` exec, nested `sandbox_apply`) skips with the detectable
+    `SKIP-UNDER-WRAP` marker, held green by the `rust-macos-wrapped-suite`
+    CI job. Validators never see the real checkout:
     each session runs in a throwaway snapshot (`validator_snapshot.rs`,
     warmed `target/` copy included) and only its verdict crosses back — and
     the snapshot is separation, not containment, so validator sessions are

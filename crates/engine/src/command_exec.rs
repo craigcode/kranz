@@ -95,6 +95,44 @@
 //! overhead at gate scale (noise; the ~2.5ms wrap cost vanishes against a
 //! ~97s gate). Nowhere near the ticket's ~20% opt-in threshold, so the wrap
 //! is the DEFAULT under `enforce != off`, not an opt-in.
+//!
+//! ## Gate supervision policy (ticket gate-sandbox-supervision-dogfood)
+//!
+//! The wrap's initial posture was session-parity for process supervision:
+//! `(allow signal (target self))`, no ps. kranz's OWN engine suite
+//! legitimately spawns and supervises children (the sandbox/kill machinery
+//! testing itself), so `cargo test --workspace` as a wrapped contract
+//! command failed 11 self-referential tests (probed 2026-08-03) — a kranz
+//! mission with process enforcement could not satisfy this repo's mandatory
+//! gate. The fix is a gate-SPECIFIC policy, never a global widening (the
+//! session profile generator is untouched; everything rides the
+//! [`gate_profile_extras`] append seam):
+//!
+//! - `(allow signal (target same-sandbox))`: the wrapped gate may signal
+//!   (kill / `kill(pid, 0)` / killpg) processes carrying its OWN sandbox
+//!   label instance — precisely its descendant tree, hereditary across
+//!   fork/exec — while launchd, unrelated same-uid host processes, and even
+//!   sibling `sandbox-exec` invocations with the identical profile stay
+//!   EPERM. Probe evidence is recorded in [`gate_profile_extras`].
+//! - `proc_pidinfo`-first identity tokens (event_log.rs): `/bin/ps` is
+//!   setuid root, and setuid exec is kernel-denied inside ANY sandbox
+//!   (probed 2026-08-05 — EPERM even under `(allow default)`; not
+//!   SBPL-expressible). The token path now reads `p_starttime` directly
+//!   (ungated for same-uid pids, byte-identical rendering to `ps -o
+//!   lstart=`), so lock-liveness probes work inside the wrap; the setuid ps
+//!   spawn remains as the fallback for other-uid pids (pid 1).
+//! - What NO policy can grant inside the wrap, so those suite tests skip
+//!   with the detectable `SKIP-UNDER-WRAP (gate-sandbox-supervision-dogfood)`
+//!   marker instead: executing `/bin/ps` at all (the ps-fixture tests), and
+//!   nested `sandbox_apply` of any profile but the identical one (the
+//!   preflight/sandbox-enforcement tests — kernel-denied regardless of
+//!   SBPL content).
+//!
+//! The proving ground is a fixture, not a one-off:
+//! `gate_sandbox_wrap_dogfood_supervision_workspace_suite` (ignored; run by
+//! the `rust-macos-wrapped-suite` CI job) executes `cargo test --workspace`
+//! through the real wrap and asserts a green exit, reporting the
+//! skip-under-wrap marker count.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -474,8 +512,49 @@ pub(crate) struct GateSandboxResolution {
 /// [`prewarm_xcrun_cache_outside_sandbox`] refreshes the cache unsandboxed
 /// once per resolve, and a shim refresh that still races stale inside the
 /// sandbox fails loudly with the shim's own EPERM (the documented edge).
+///
+/// `(allow signal (target same-sandbox))` — the gate-SPECIFIC supervision
+/// policy (ticket gate-sandbox-supervision-dogfood). A wrapped gate runs
+/// worker-authored build/test trees that legitimately spawn and supervise
+/// their own descendants (timeout kills, process-group SIGKILL, `kill(pid,
+/// 0)` liveness polls — kranz's OWN engine suite exercises exactly this, and
+/// under the session parity clause `(allow signal (target self))` every one
+/// of those probes is EPERM, so a kranz mission with process enforcement
+/// could not satisfy this repo's mandatory `cargo test --workspace` gate).
+/// `same-sandbox` scopes the allowance to processes carrying the SAME
+/// sandbox label instance — precisely the wrapped tree (the label is
+/// inherited across fork/exec and cannot be shed: applying a DIFFERENT
+/// profile from inside is kernel-denied, so the posture is hereditary).
+/// Probe evidence (2026-08-05, macOS 26.5.2, arm64, sandbox-exec):
+///
+/// - `kill`/`kill(pid, 0)`/`killpg` against children AND grandchildren
+///   (the `sh -c` → background-child timeout-kill shape): allowed.
+/// - `kill(pid, 0)` on a reaped child reports ESRCH, not EPERM, so
+///   liveness-poll loops terminate correctly.
+/// - launchd (pid 1), an unrelated same-uid host process, and a SIBLING
+///   `sandbox-exec` invocation launched with the identical profile file:
+///   all still EPERM — the scope is the sandbox instance (the tree), never
+///   the profile content and never host-wide.
+/// - `(target children)` was rejected as too narrow (direct children only;
+///   grandchildren stay EPERM) and `(target others)` buys nothing (host
+///   probes stay EPERM under it too) — `same-sandbox` is the only target
+///   that covers exactly the descendant tree.
+/// - What NO profile rule can grant (recorded so the gap is never
+///   re-probed blindly): executing `/bin/ps` (setuid root on this host's
+///   macOS — setuid exec is kernel-denied under ANY sandbox, even
+///   `(allow default)`; a copied binary is AMFI-killed) and applying a
+///   DIFFERENT nested profile (`sandbox_apply` EPERM regardless of
+///   `process-exec` allowances; re-applying the IDENTICAL profile is a
+///   permitted no-op). The suite's ps-fixture and nested-sandbox tests
+///   therefore carry explicit skip-under-wrap markers instead — see the
+///   module doc's supervision section. Process-info READS (`proc_pidinfo`)
+///   were never sandbox-gated for same-uid targets and keep working under
+///   `deny default` with no allowance at all (probed); only `/bin/ps`
+///   itself is unreachable.
 fn gate_profile_extras() -> String {
-    String::from("\n(allow file-write* (literal \"/dev/null\"))\n")
+    String::from(
+        "\n(allow file-write* (literal \"/dev/null\"))\n(allow signal (target same-sandbox))\n",
+    )
 }
 
 /// Refresh the xcrun shims' tool-resolution cache OUTSIDE the sandbox, once
@@ -2458,6 +2537,251 @@ mod tests {
         }
     }
 
+    /// The gate-SPECIFIC supervision policy, asserted end-to-end (ticket
+    /// gate-sandbox-supervision-dogfood): the wrapped gate may signal
+    /// processes INSIDE its own sandboxed tree (`(allow signal (target
+    /// same-sandbox))` — see [`gate_profile_extras`]), and it gains NO
+    /// host-wide capability. Probes against the resolved wrap:
+    ///
+    /// - `kill -0` + `kill -TERM` against a child the wrapped command
+    ///   spawned itself (the engine suite's timeout-kill / liveness-poll
+    ///   shape): ALLOWED.
+    /// - `kill -0` against a SAME-UID host process started OUTSIDE the
+    ///   sandbox (its pid baked into the command): DENIED.
+    /// - `ps` inspection of that host process: DENIED — `/bin/ps` is setuid
+    ///   root and setuid exec is kernel-denied inside ANY sandbox (probed
+    ///   2026-08-05, not SBPL-expressible), so ps-based inspection of ANY
+    ///   process is unreachable inside the wrap; the in-tree inspection
+    ///   need is served by `proc_pidinfo` instead (event_log's identity
+    ///   tokens, covered by the wrapped-suite fixture below).
+    ///
+    /// Anti-vacuity: with enforcement off the SAME host probes succeed, so
+    /// the denials above are the sandbox's, not a broken probe. macOS-only:
+    /// the policy being pinned is an SBPL clause — bwrap has no signal tier
+    /// to scope (the host probe succeeds there by design). Under a wrapped
+    /// `cargo test` the nested smoke-apply in
+    /// [`gate_wrap_sandbox_exec_can_apply`] fails and this test skips
+    /// cleanly, like every enforcement test.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn gate_sandbox_wrap_dogfood_supervision_allows_tree_denies_host() {
+        let _guard = GATE_SANDBOX_WRAP_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if !gate_wrap_enforcement_available() {
+            return;
+        }
+
+        let (repo, mission) = gate_wrap_layout();
+        let scratch = tempfile::tempdir().unwrap();
+        let resolution = resolve_gate_sandbox(
+            &fs_sandbox_config(crate::types::SandboxEnforce::Fs),
+            repo.path(),
+            &mission,
+            scratch.path(),
+            scratch.path(),
+        )
+        .unwrap();
+        let sandbox = resolution.sandbox;
+        let env = crate::agent_env::contract_command_env(scratch.path(), None, &[]);
+
+        // The "unrelated host process": a same-uid sleeper spawned OUTSIDE
+        // the wrap (never under its label), killed and reaped on scope exit.
+        let mut host = std::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawn host sleeper");
+        let host_pid = host.id();
+
+        // In-tree supervision works: the wrapped command spawns a child,
+        // liveness-probes it, and kills it — the exact shape the engine
+        // suite's timeout-kill tests need.
+        let (ok, output) = run_shell_command_sandboxed(
+            repo.path(),
+            "sleep 300 & child=$!; kill -0 \"$child\" && kill -TERM \"$child\"",
+            &env,
+            &sandbox,
+        )
+        .await;
+        assert!(
+            ok,
+            "the wrapped gate must signal its own tree (same-sandbox): {output}"
+        );
+
+        // Host-wide supervision stays denied: signal AND ps inspection of
+        // the outside process both fail inside the wrap.
+        let (ok, output) = run_shell_command_sandboxed(
+            repo.path(),
+            &format!("kill -0 {host_pid}"),
+            &env,
+            &sandbox,
+        )
+        .await;
+        assert!(
+            !ok,
+            "no host-wide signal capability under the wrap (EPERM expected): {output}"
+        );
+        let (ok, output) = run_shell_command_sandboxed(
+            repo.path(),
+            &format!("ps -p {host_pid} -o command="),
+            &env,
+            &sandbox,
+        )
+        .await;
+        assert!(
+            !ok,
+            "no ps inspection under the wrap (setuid exec denied): {output}"
+        );
+
+        // Anti-vacuity: the SAME host probes succeed with enforcement off —
+        // the denials above are the sandbox's doing, not a broken probe.
+        let (ok, output) = run_shell_command_sandboxed(
+            repo.path(),
+            &format!("kill -0 {host_pid} && ps -p {host_pid} -o command="),
+            &env,
+            &GateSandbox::Disabled,
+        )
+        .await;
+        assert!(
+            ok,
+            "with enforce == off the host probes succeed (today's posture): {output}"
+        );
+
+        let _ = host.kill();
+        let _ = host.wait();
+    }
+
+    /// THE DOGFOOD PROVING GROUND (ticket gate-sandbox-supervision-dogfood):
+    /// this repo's mandatory merge gate — `cargo test --workspace` — run as
+    /// a WRAPPED contract command through the real gate-wrap path
+    /// ([`resolve_gate_sandbox`] + the bounded sandboxed runner, `enforce:
+    /// fs`, gate cwd = the repo root). The self-referential failures the
+    /// module doc's measurement section records must be GONE: the
+    /// signal/liveness class is covered by the `same-sandbox` supervision
+    /// extra, the own-pid token class by proc_pidinfo-first identity
+    /// tokens, and the tests NO sandbox can host (setuid `/bin/ps` exec,
+    /// nested `sandbox_apply` of a different profile — both kernel-denied,
+    /// see [`gate_profile_extras`]) skip with the detectable
+    /// `SKIP-UNDER-WRAP (gate-sandbox-supervision-dogfood)` marker, which
+    /// this fixture counts and reports from the captured suite log.
+    ///
+    /// Ignored by default — a full wrapped workspace suite is far too slow
+    /// for the normal gate; the `rust-macos-wrapped-suite` CI job runs it
+    /// explicitly. Run manually:
+    ///
+    /// ```sh
+    /// cargo test -p kranz-engine dogfood_supervision -- --ignored --nocapture
+    /// ```
+    ///
+    /// `KRANZ_DOGFOOD_SUITE_CMD` overrides the payload (scoping during
+    /// development); the default is the ticket's gate verbatim. The
+    /// `rust-macos-wrapped-suite` CI job overrides it to
+    /// `cargo test --workspace -- --nocapture`: the asserted exit code is
+    /// unchanged, but libtest then streams the suite's SKIP-UNDER-WRAP
+    /// markers into the job log — with the default capture the markers are
+    /// swallowed and the count below reads 0 even though the skips fired
+    /// (verified 2026-08-05 by running the six premise-gated tests under a
+    /// hand-built gate-shaped profile with --nocapture: every marker
+    /// fires). The runner gets a generous wall clock rather than
+    /// COMMAND_TIMEOUT: the production 600s contract-command cap is
+    /// deliberately untouched, and a wrapped full-workspace suite is known
+    /// to run past it (measured 2026-08-05 on a loaded M-series host:
+    /// 2713s green end-to-end, most of it the in-sandbox dependency
+    /// rebuild the cache-only CARGO_HOME forces — the same cost a
+    /// production wrapped gate pays) — the fixture proves the SUPERVISION
+    /// POLICY, not the production timeout budget.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "wrapped-suite proving ground — run manually or via the rust-macos-wrapped-suite CI job"]
+    fn gate_sandbox_wrap_dogfood_supervision_workspace_suite() {
+        if !gate_wrap_sandbox_exec_can_apply() {
+            return;
+        }
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crates/engine has a repo-root ancestor")
+            .to_path_buf();
+        let payload = std::env::var("KRANZ_DOGFOOD_SUITE_CMD")
+            .unwrap_or_else(|_| "cargo test --workspace".to_string());
+
+        // Mirror run_bounded_gate_command_sandboxed's setup (per-run
+        // scratch, TMPDIR redirect, cache-only Cargo home inside it) so the
+        // wrap the suite runs under IS the production merge-gate wrap; only
+        // the wall clock differs (see the doc above). The suite log lands
+        // in the scratch via a plain redirect — never a pipe, so the bare
+        // cargo exit code is what gets asserted.
+        let scratch =
+            std::env::temp_dir().join(format!("kranz-gate-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(scratch.join("tmp")).unwrap();
+        let cargo_home = crate::agent_env::cache_only_cargo_home(scratch.as_path());
+        assert!(
+            cargo_home.is_dir(),
+            "could not create the fixture's cache-only Cargo home at {}",
+            cargo_home.display()
+        );
+        // The fake mission layout only feeds the deny computation — nothing
+        // real is touched; the repo root is the writable gate cwd.
+        let (_layout_guard, mission) = gate_wrap_layout();
+        let resolution = resolve_gate_sandbox(
+            &fs_sandbox_config(crate::types::SandboxEnforce::Fs),
+            &repo_root,
+            &mission,
+            &scratch,
+            &scratch,
+        )
+        .expect("the fixture's gate sandbox resolves on a host that applied the smoke profile");
+        let mut env = sanitized_gate_env();
+        env.insert("CARGO_HOME".to_string(), cargo_home.display().to_string());
+        for var in ["TMPDIR", "TMP", "TEMP"] {
+            env.insert(var.to_string(), scratch.join("tmp").display().to_string());
+        }
+        let suite_log = scratch.join("tmp").join("dogfood-suite.log");
+        let command = format!("{payload} > '{}' 2>&1", suite_log.display());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("fixture runtime");
+        let start = std::time::Instant::now();
+        let (code, output) = runtime.block_on(run_shell_command_sandboxed_with_code(
+            &repo_root,
+            &command,
+            Duration::from_secs(3600),
+            &env,
+            &resolution.sandbox,
+        ));
+        let elapsed = start.elapsed();
+
+        let log = std::fs::read_to_string(&suite_log)
+            .unwrap_or_else(|_| format!("<no suite log captured; runner tail: {output}>"));
+        let skip_count = log
+            .matches("SKIP-UNDER-WRAP (gate-sandbox-supervision-dogfood)")
+            .count();
+        println!(
+            "dogfood wrapped suite `{payload}`: exit={code:?} elapsed={elapsed:.1?} \
+             skip-under-wrap markers={skip_count} log={}",
+            suite_log.display()
+        );
+        for line in log.lines().filter(|l| l.contains("test result:")) {
+            println!("  {line}");
+        }
+        assert_eq!(
+            code,
+            Some(0),
+            "cargo test --workspace must run GREEN as a wrapped contract command \
+             (skip-under-wrap markers seen: {skip_count}); suite log: {}",
+            suite_log.display()
+        );
+        // Cleanup only on success: on failure the assert above has already
+        // panicked with the log's path, and the scratch (suite log, profile,
+        // scratch home) survives for post-mortem debugging — the same
+        // self-cleaning shape as the production path, minus the
+        // evidence-destroying failure case.
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
     /// The merge-gate HOME question (ticket open work), settled by evidence:
     /// under the profile the ambient-HOME pass-through is KEPT and the
     /// profile makes the real home READ-ONLY — `git config user.name` still
@@ -2969,15 +3293,21 @@ mod tests {
     /// The default payload skips the engine's own sandbox-hostile tests
     /// (probed 2026-08-03 under the wrap: 697 passed, 11 failed — every one
     /// of them a test of the sandbox/kill machinery itself): cross-process
-    /// SIGKILL/`kill(pid,0)` liveness probes are EPERM under the session
+    /// SIGKILL/`kill(pid,0)` liveness probes were EPERM under the session
     /// profile's `(allow signal (target self))` (the engine's own timeout
     /// kill is unaffected — it signals from OUTSIDE the sandbox), `ps`-based
     /// process identity likewise, and `sandbox_apply` from inside a sandbox
-    /// is denied. Gate commands that self-manage process trees with signals
-    /// are the one known shape the wrap cannot run; sessions live under the
-    /// same clause, so it is parity, not a regression. kranz dogfooding its
-    /// own full suite under enforcement would need those tests adapted —
-    /// out of scope here.
+    /// is denied. Those 11 are the repro set of ticket
+    /// gate-sandbox-supervision-dogfood: the signal/liveness class is now
+    /// covered by the gate-specific `(allow signal (target same-sandbox))`
+    /// extra, the own-pid token class by proc_pidinfo-first identity
+    /// tokens, and the classes no sandbox can host (setuid `/bin/ps` exec,
+    /// nested `sandbox_apply`) skip under the wrap with a detectable marker
+    /// — see the module doc's supervision section and the
+    /// `gate_sandbox_wrap_dogfood_supervision_*` fixtures. The skips below
+    /// stay in this MEASUREMENT payload so the overhead number is not
+    /// polluted by the slow self-referential tests; the wrapped-suite
+    /// fixture (not this harness) is the green-gate proof.
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "measurement harness — run manually, never a CI gate"]

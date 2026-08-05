@@ -7606,6 +7606,13 @@ async fn sandbox_preflight_flags_command_that_writes_outside_allowlist() {
     if !setup() {
         return;
     }
+    // Apply-smoke, not just a PATH check: the preflight wraps its probes in
+    // a generated profile, and under the gate sandbox wrap (a wrapped
+    // `cargo test` dogfooding this repo — ticket
+    // gate-sandbox-supervision-dogfood) a nested apply of any profile but
+    // the identical one is kernel-denied (probed 2026-08-05; no SBPL clause
+    // can allow it). Skip with a detectable marker rather than fail on the
+    // outer sandbox's presence.
     if std::process::Command::new("which")
         .arg("sandbox-exec")
         .output()
@@ -7614,6 +7621,27 @@ async fn sandbox_preflight_flags_command_that_writes_outside_allowlist() {
     {
         eprintln!("sandbox-exec not found on this host; skipping");
         return;
+    }
+    match std::process::Command::new("sandbox-exec")
+        .arg("-p")
+        .arg("(version 1)\n(allow default)\n")
+        .arg("/usr/bin/true")
+        .output()
+    {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            eprintln!(
+                "SKIP-UNDER-WRAP (gate-sandbox-supervision-dogfood): \
+                 sandbox-exec cannot apply a smoke profile here (nested apply is denied \
+                 inside the gate sandbox wrap); skipping: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        Err(e) => {
+            eprintln!("sandbox-exec smoke probe failed; skipping: {e}");
+            return;
+        }
     }
     let (_dir, root) = init_repo();
     let backend = Arc::new(MockBackend::new());

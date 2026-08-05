@@ -10381,6 +10381,29 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn pool_checkpoint_hooks_disabled_against_planted_fsmonitor_and_hook() {
         use std::os::unix::fs::PermissionsExt as _;
+        // Premise-gate (ticket gate-sandbox-supervision-dogfood): the planted
+        // fsmonitor payload identifies its parent via `ps -p $PPID`, but
+        // `/bin/ps` is setuid root on this host's macOS and setuid exec is
+        // kernel-denied inside ANY Seatbelt sandbox (probed 2026-08-05 —
+        // EPERM even under `(allow default)`, not SBPL-expressible). Under
+        // a wrapped `cargo test` the payload can never log, so the
+        // anti-vacuity assertion below would fail on the sandbox's presence
+        // rather than the engine's behavior — skip with a detectable
+        // marker, the same posture as the nested-sandbox skips.
+        if std::process::Command::new("ps")
+            .args(["-p", &std::process::id().to_string(), "-o", "command="])
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!(
+                "SKIP-UNDER-WRAP (gate-sandbox-supervision-dogfood): \
+                 pool_checkpoint_hooks_disabled_against_planted_fsmonitor_and_hook — \
+                 /bin/ps cannot execute inside the gate sandbox wrap, so the fsmonitor \
+                 payload's identity logging is unobservable here; skipping"
+            );
+            return;
+        }
         let Some((dir, root)) = lessons_test_repo() else {
             return;
         };

@@ -1195,7 +1195,73 @@ type IdentityTokenCache =
 #[cfg(target_os = "macos")]
 static IDENTITY_TOKEN_CACHE: std::sync::OnceLock<IdentityTokenCache> = std::sync::OnceLock::new();
 
-/// Cache layer in front of [`ps_identity_token`]: the real `ps` spawn seam.
+/// macOS identity token WITHOUT the `ps` spawn: `proc_pidinfo(
+/// PROC_PIDTBSDINFO)` reads the kernel's stored `p_starttime` directly — the
+/// same immutable value `ps -o lstart=` renders — and this renders it
+/// byte-identically (ctime shape, UTC: probed 2026-08-05 against
+/// `LC_ALL=C TZ=UTC ps -p <pid> -o lstart=`, e.g. `Wed Aug  5 00:34:16 2026`
+/// from both paths for the same process). Byte-identity is load-bearing:
+/// tokens are compared for raw equality against lock-file recordings that
+/// may predate this path (recorded via `ps`), so the rendering must not
+/// drift.
+///
+/// Why this path exists (ticket gate-sandbox-supervision-dogfood): `/bin/ps`
+/// is setuid root, and setuid exec is kernel-denied inside ANY Seatbelt
+/// sandbox — probed: EPERM even under `(allow default)`, not expressible in
+/// SBPL, and a copied binary is AMFI-killed on exec. A process inside the
+/// gate sandbox wrap (a wrapped `cargo test --workspace` dogfooding this
+/// repo, or any wrapped contract command that probes a kranz lock) could
+/// therefore NEVER obtain a token via `ps`. `proc_pidinfo` is not
+/// sandbox-gated for same-uid targets (probed under the session-profile
+/// posture: self, children, and unrelated same-uid host processes all
+/// answer) and needs no spawn at all.
+///
+/// The limit: OTHER-UID pids. Unprivileged `proc_pidinfo` on pid 1 is EPERM
+/// (probed, unsandboxed included) — which is exactly why `/bin/ps` carries
+/// the setuid bit. Those pids fall back to the [`ps_identity_token`] spawn
+/// seam, which keeps answering them wherever setuid exec is permitted.
+#[cfg(target_os = "macos")]
+fn proc_pidinfo_identity_token(pid: i32) -> Option<String> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut libc::proc_bsdinfo as *mut libc::c_void,
+            std::mem::size_of::<libc::proc_bsdinfo>() as i32,
+        )
+    };
+    if rc <= 0 {
+        return None;
+    }
+    let secs = i64::try_from(info.pbi_start_tvsec).ok()?;
+    let rendered = chrono::DateTime::from_timestamp(secs, 0)?
+        .format("%a %b %e %H:%M:%S %Y")
+        .to_string();
+    if rendered.is_empty() {
+        None
+    } else {
+        Some(rendered)
+    }
+}
+
+/// The uncached token lookup [`process_identity_token`] memoizes:
+/// [`proc_pidinfo_identity_token`] first (no spawn, works inside the gate
+/// sandbox wrap), the `ps` spawn seam only for the pids the unprivileged
+/// syscall cannot read (other-uid — see its doc). [`PS_SPAWN_COUNTS`] still
+/// counts REAL spawns only, so the cache test's pid-1 probe stays the sole
+/// contributor to its own count.
+#[cfg(target_os = "macos")]
+fn uncached_identity_token(pid: i32) -> Option<String> {
+    if let Some(token) = proc_pidinfo_identity_token(pid) {
+        return Some(token);
+    }
+    ps_identity_token(pid)
+}
+
+/// Cache layer in front of [`uncached_identity_token`]: the raw token lookup
+/// (proc_pidinfo first, the real `ps` spawn seam behind it).
 /// The VERDICT (Alive/Dead) is never cached or short-circuited here — only
 /// the raw token lookup is memoized; [`alive_or_reused`] still compares
 /// `recorded == current` on every call, using whatever token this returns.
@@ -1209,7 +1275,7 @@ pub(crate) fn process_identity_token(pid: i32) -> Option<String> {
             return token.clone();
         }
     }
-    let token = ps_identity_token(pid);
+    let token = uncached_identity_token(pid);
     cache.lock().unwrap().insert(pid, (token.clone(), now));
     token
 }
@@ -1440,10 +1506,27 @@ mod tests {
     /// so this test's spawn-count delta is not polluted by other tests in
     /// this file that concurrently probe `process_identity_token` for the
     /// test process's own pid.
+    ///
+    /// Premise-gated (ticket gate-sandbox-supervision-dogfood): reading
+    /// launchd's token needs the setuid `/bin/ps` (unprivileged
+    /// `proc_pidinfo` on pid 1 is EPERM — see
+    /// [`proc_pidinfo_identity_token`]), and setuid exec is kernel-denied
+    /// inside the gate sandbox wrap. Under a wrapped `cargo test` the raw
+    /// `ps` seam cannot answer for pid 1, so the test skips with a
+    /// detectable marker rather than failing on the sandbox's presence.
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_identity_token_caches_one_ps_per_pid() {
         let pid = 1;
+        if ps_identity_token(pid).is_none() {
+            eprintln!(
+                "SKIP-UNDER-WRAP (gate-sandbox-supervision-dogfood): \
+                 macos_identity_token_caches_one_ps_per_pid — the setuid /bin/ps cannot \
+                 execute inside the gate sandbox wrap, so pid 1's token is unreadable here; \
+                 skipping"
+            );
+            return;
+        }
         let count_for_pid = |p: i32| {
             *PS_SPAWN_COUNTS
                 .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))

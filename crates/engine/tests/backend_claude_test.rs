@@ -59,6 +59,49 @@ fn base_spec(prompt: PromptMode) -> SessionSpec {
     }
 }
 
+/// Whether this host can APPLY a sandbox profile, not merely find
+/// `sandbox-exec` on PATH: these tests drive real nested sandbox
+/// application, and under the gate sandbox wrap (a wrapped `cargo test`
+/// dogfooding this repo — ticket gate-sandbox-supervision-dogfood) a nested
+/// apply of any profile but the identical one is kernel-denied (probed
+/// 2026-08-05; no SBPL clause can allow it). The smoke-apply makes each
+/// test skip with a detectable marker instead of failing on the outer
+/// sandbox's presence — the same posture `crate::sandbox`'s own
+/// enforcement tests take.
+#[cfg(target_os = "macos")]
+fn sandbox_exec_can_apply() -> bool {
+    let found = std::process::Command::new("which")
+        .arg("sandbox-exec")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !found {
+        eprintln!("sandbox-exec not found on this host; skipping");
+        return false;
+    }
+    let smoke = std::process::Command::new("sandbox-exec")
+        .arg("-p")
+        .arg("(version 1)\n(allow default)\n")
+        .arg("/usr/bin/true")
+        .output();
+    match smoke {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
+            eprintln!(
+                "SKIP-UNDER-WRAP (gate-sandbox-supervision-dogfood): \
+                 sandbox-exec cannot apply a smoke profile here (nested apply is denied \
+                 inside the gate sandbox wrap); skipping: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            false
+        }
+        Err(e) => {
+            eprintln!("sandbox-exec smoke probe failed; skipping: {e}");
+            false
+        }
+    }
+}
+
 /// Position of `needle` in `args`, panicking with context when absent.
 fn index_of(args: &[String], needle: &str) -> usize {
     args.iter()
@@ -1089,13 +1132,7 @@ mod sandbox_wrap {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn sandbox_wrap_macos_enforced_launch_allows_inside_denies_outside() {
-        if std::process::Command::new("which")
-            .arg("sandbox-exec")
-            .output()
-            .map(|o| !o.status.success())
-            .unwrap_or(true)
-        {
-            eprintln!("sandbox-exec not found on this host; skipping");
+        if !sandbox_exec_can_apply() {
             return;
         }
 
@@ -1172,13 +1209,7 @@ mod sandbox_wrap {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn sandbox_wrap_macos_start_confines_spawned_process() {
-        if std::process::Command::new("which")
-            .arg("sandbox-exec")
-            .output()
-            .map(|o| !o.status.success())
-            .unwrap_or(true)
-        {
-            eprintln!("sandbox-exec not found on this host; skipping");
+        if !sandbox_exec_can_apply() {
             return;
         }
 

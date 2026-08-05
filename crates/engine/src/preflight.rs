@@ -862,13 +862,49 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
+    /// Whether this host can APPLY a sandbox profile, not merely find
+    /// `sandbox-exec` on PATH: the preflight test drives REAL nested sandbox
+    /// application (the preflight wraps its contract probes in a generated
+    /// profile), and under the gate sandbox wrap (a wrapped `cargo test`
+    /// dogfooding this repo — ticket gate-sandbox-supervision-dogfood) that
+    /// nested apply is kernel-denied regardless of profile content:
+    /// re-applying the IDENTICAL label is a permitted no-op, anything else
+    /// is EPERM (probed 2026-08-05; no SBPL clause can allow it). The
+    /// smoke-apply makes the test skip with a detectable marker instead of
+    /// failing on the outer sandbox's presence — the same posture
+    /// `crate::sandbox`'s own enforcement tests take.
     #[cfg(target_os = "macos")]
     fn sandbox_exec_available() -> bool {
-        std::process::Command::new("which")
+        let found = std::process::Command::new("which")
             .arg("sandbox-exec")
             .output()
             .map(|o| o.status.success())
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if !found {
+            eprintln!("sandbox-exec not found on this host; skipping");
+            return false;
+        }
+        let smoke = std::process::Command::new("sandbox-exec")
+            .arg("-p")
+            .arg("(version 1)\n(allow default)\n")
+            .arg("/usr/bin/true")
+            .output();
+        match smoke {
+            Ok(output) if output.status.success() => true,
+            Ok(output) => {
+                eprintln!(
+                    "SKIP-UNDER-WRAP (gate-sandbox-supervision-dogfood): \
+                     sandbox-exec cannot apply a smoke profile here (nested apply is denied \
+                     inside the gate sandbox wrap); skipping: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                false
+            }
+            Err(e) => {
+                eprintln!("sandbox-exec smoke probe failed; skipping: {e}");
+                false
+            }
+        }
     }
 
     /// The P1 regression test: with `worker.sandbox.enforce = fs`, the
@@ -881,8 +917,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn sandbox_preflight_probes_disposable_worktree_not_primary() {
+        // The helper prints the precise reason (not found / nested apply
+        // denied under the gate wrap / probe error).
         if !sandbox_exec_available() {
-            eprintln!("sandbox-exec not found on this host; skipping");
             return;
         }
         let (_dir, root, sha) = seeded_git_repo();
