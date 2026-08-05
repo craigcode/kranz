@@ -373,7 +373,10 @@ impl AgentSession for LocalSession {
 }
 
 #[cfg(test)]
-mod tests {
+// pub(crate) so the orchestrator's confirm-on-pass tests (KRZ-206b) can drive
+// a real LocalBackend against `spawn_stub` — the local functional validator's
+// verdict then travels the same HTTP seam it does in production.
+pub(crate) mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::net::SocketAddr;
@@ -432,7 +435,9 @@ mod tests {
     /// assert zero HTTP traffic), and the raw bytes of the last request
     /// received (so the roundtrip test can assert on wire-level request
     /// correctness rather than just on the parsed response).
-    async fn spawn_stub(
+    /// pub(crate): the orchestrator's confirm-on-pass tests (KRZ-206b) drive
+    /// a real [`LocalBackend`] against this stub.
+    pub(crate) async fn spawn_stub(
         status_line: &'static str,
         body: String,
     ) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<u8>>>) {

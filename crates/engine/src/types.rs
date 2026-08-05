@@ -740,6 +740,16 @@ pub struct RoleConfig {
     /// [`crate::backend_acp::AcpBackend`] (worker role only).
     /// `config::validate` checks that
     /// the selected backend/model pair is supported for the role.
+    ///
+    /// The guarded local-validator boundary (KRZ-206b): on the
+    /// `validatorFunctional` role `"local"` is allowed for DETERMINISTIC
+    /// mechanical checks only (contract-command pass/fail against
+    /// engine-captured exit codes) — every local PASS is frontier-confirmed
+    /// before it greens a gate, and a local FAIL is trusted unconfirmed
+    /// (failures are visible; misses are the danger). On the
+    /// `validatorScrutiny` role `"local"` is rejected outright: scrutiny is
+    /// judgment, and a local judgment PASS is the silent-green failure mode
+    /// the split exists to prevent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
     /// Base URL of the OpenAI-compatible HTTP endpoint for `backend = "local"`.

@@ -4883,6 +4883,12 @@ impl MissionEngine {
             // that did not produce a trusted pass is retried once with the
             // injected Claude backend. A crashed/aborted validator must never
             // collapse into "no findings" and green-light validation.
+            //
+            // `retried_on_claude` records whether THIS verdict came from the
+            // claude retry: confirm-on-pass (below) keys on the verdict being
+            // the LOCAL primary's own — a retried verdict is already frontier,
+            // so confirming it would judge frontier by frontier.
+            let mut retried_on_claude = false;
             if !validator_outcome_trusted(&outcome) {
                 // Capability-boundary check (grant-request-decision-flow),
                 // gated on the UNTRUSTED outcome: a validator stopped by a
@@ -4962,6 +4968,7 @@ impl MissionEngine {
                 let caught = self.catch_up();
                 outcome = retry_outcome?;
                 caught?;
+                retried_on_claude = true;
 
                 if self.fail_on_validator_tamper(
                     &milestone_id,
@@ -5015,6 +5022,72 @@ impl MissionEngine {
             let report = outcome
                 .validator_report
                 .expect("trusted validator outcome must carry a report");
+
+            // Confirm-on-pass (ticket local-inference-validator-guarded,
+            // KRZ-206b; review addendum §4): a LOCAL functional verdict never
+            // greens a gate alone. The executor-escalation valve catches
+            // executor FAILURES but not validator MISSES — a weak local
+            // validator that wrongly PASSES bad work is not a failure, so
+            // without this confirmation the "no silent green" promise rests
+            // on an unmeasured model. Every local PASS on a contract-command
+            // assertion (and any all-clean local report, which would green
+            // judgment too) is re-judged by a frontier functional session
+            // BEFORE the round may complete, regardless of any spot-check
+            // sampling rate; a local FAIL is trusted without confirmation —
+            // failures are visible (they cost a fix cycle), misses are the
+            // danger, and the asymmetry is deliberate. The confirmations
+            // land in the event store as `validation.confirm`, which IS the
+            // local-vs-frontier miss-rate ground truth (the ticket's start
+            // precondition: the mechanism is the measurement).
+            if role == Role::ValidatorFunctional
+                && selected_kind == BackendKind::Local
+                && !retried_on_claude
+            {
+                let local_subjects: std::collections::HashSet<&str> =
+                    report.findings.iter().map(|f| f.subject.as_str()).collect();
+                let has_command_assertions =
+                    contract.iter().any(|a| a.check == AssertionCheck::Command);
+                let passed_command_ids: Vec<String> = contract
+                    .iter()
+                    .filter(|a| a.check == AssertionCheck::Command)
+                    .map(|a| a.id.clone())
+                    .filter(|id| !local_subjects.contains(id.as_str()))
+                    .collect();
+                let needs_confirm = !passed_command_ids.is_empty()
+                    // A contract with no command assertions hands the local
+                    // session pure judgment; an all-clean report there would
+                    // green the gate on local judgment alone, which the
+                    // guarded role split forbids — confirm it exactly like a
+                    // command-assertion PASS.
+                    || (!has_command_assertions && report.findings.is_empty());
+                if needs_confirm {
+                    match self
+                        .confirm_local_functional_pass(
+                            &milestone_id,
+                            role,
+                            &milestone,
+                            &contract,
+                            &start_sha,
+                            base_sha.as_deref(),
+                            &grants,
+                            &egress_grants,
+                            &worker_commands,
+                            contract_results.as_deref(),
+                            &outcome.run_id,
+                            &report,
+                            &passed_command_ids,
+                        )
+                        .await?
+                    {
+                        Some(disagreements) => findings.extend(disagreements),
+                        // The round blocked honestly (an untrusted
+                        // confirmation or a tripwire) — never green on an
+                        // unconfirmed local PASS.
+                        None => return Ok(()),
+                    }
+                }
+            }
+
             for finding in report.findings {
                 findings.push((outcome.run_id.clone(), finding));
             }
@@ -5124,6 +5197,182 @@ impl MissionEngine {
             }
         }
         Ok(())
+    }
+
+    /// Confirm-on-pass for a LOCAL functional verdict (ticket
+    /// `local-inference-validator-guarded`, KRZ-206b): re-run the functional
+    /// validator on the FRONTIER tier — the injected claude backend with the
+    /// same fallback config the untrusted-retry path uses — against the same
+    /// milestone, contract, and engine-captured command evidence, in its own
+    /// throwaway snapshot with the same before/after tripwires as any
+    /// validator session.
+    ///
+    /// The comparison fails CLOSED: every frontier finding on a subject the
+    /// local report passed is a recorded miss (the `validation.confirm`
+    /// event — the local-vs-frontier miss-rate ground truth) and is returned
+    /// for the round's findings, so the frontier verdict stands. A frontier
+    /// finding on a subject the local report already failed is NOT a miss
+    /// (both tiers fail it; the local FAIL was already trusted — failures
+    /// are visible, misses are the danger).
+    ///
+    /// Returns `Ok(Some(disagreements))` when a trusted confirmation ran
+    /// (an empty vec means the frontier tier agreed with every local PASS),
+    /// `Ok(None)` when the round BLOCKED honestly: an untrusted confirmation
+    /// never greens the gate — the local PASS simply has no verdict until a
+    /// frontier session can judge it (mirroring the untrusted-after-retry
+    /// block). Deliberately no grant-park or second retry here: the operator
+    /// unblocks with a grant or guidance, and the re-validation re-runs both
+    /// the local verdict and its confirmation.
+    #[allow(clippy::too_many_arguments)]
+    async fn confirm_local_functional_pass(
+        &mut self,
+        milestone_id: &str,
+        role: Role,
+        milestone: &Milestone,
+        contract: &[Assertion],
+        start_sha: &str,
+        base_sha: Option<&str>,
+        grants: &[String],
+        egress_grants: &[String],
+        worker_commands: &[String],
+        contract_results: Option<&str>,
+        local_run_id: &str,
+        local_report: &ValidatorReport,
+        passed_command_ids: &[String],
+    ) -> Result<Option<Vec<(String, Finding)>>> {
+        self.emit_decision(
+            &format!(
+                "local {} passed {} contract command assertion(s); running the frontier \
+                 confirmation before any green (confirm-on-pass, KRZ-206b — a local PASS \
+                 never greens the gate alone)",
+                role_label(role),
+                passed_command_ids.len()
+            ),
+            None,
+        )?;
+        let confirm_cfg = self.claude_fallback_cfg_for_role(role);
+        let confirm_backend = Arc::clone(&self.backend);
+        // The confirmation is a fresh validator session: its own throwaway
+        // snapshot (the real checkout provably untouched by the local
+        // primary — the isolation guarantees it, the tripwire verifies it)
+        // and its own before/after tripwire pair.
+        let fingerprint = validator_integrity::CheckoutFingerprint::capture(self.active_repo())?;
+        let Some(snapshot) = self.validator_snapshot(milestone_id, role)? else {
+            return Ok(None);
+        };
+        let session_cwd = snapshot.path().to_path_buf();
+        // The confirmation runs on the injected claude backend — the one
+        // backend that always honors the containment wrap.
+        let validator_sandbox =
+            self.validator_containment(role, BackendKind::Claude, &confirm_cfg, &session_cwd)?;
+        let outcome = runner::run_validator_in(
+            confirm_backend.as_ref(),
+            &mut self.log,
+            &self.paths,
+            &confirm_cfg,
+            role,
+            milestone,
+            contract,
+            start_sha,
+            None,
+            &session_cwd,
+            base_sha,
+            grants,
+            egress_grants,
+            worker_commands,
+            milestone.validator_guidance.as_deref(),
+            contract_results,
+            validator_sandbox,
+        )
+        .await;
+        let caught = self.catch_up();
+        let outcome = outcome?;
+        caught?;
+
+        // Same tripwires as the primary: any drift across the confirmation
+        // session means the isolation itself failed — fail the round
+        // honestly, before the verdict comparison.
+        if self.fail_on_validator_tamper(milestone_id, role, &outcome.run_id, &fingerprint)? {
+            return Ok(None);
+        }
+        if self.fail_on_snapshot_index_flags(
+            milestone_id,
+            role,
+            &outcome.run_id,
+            &snapshot,
+            &fingerprint.head,
+        )? {
+            return Ok(None);
+        }
+        drop(snapshot);
+
+        if !validator_outcome_trusted(&outcome) {
+            let reason = format!(
+                "frontier confirmation of the local {} PASS did not produce a trusted \
+                 report ({}); the local verdict cannot green the gate unconfirmed",
+                role_label(role),
+                run_outcome_summary(&outcome)
+            );
+            self.emit_decision(&reason, None)?;
+            self.emit(EventKind::MilestoneBlocked {
+                milestone_id: milestone_id.to_string(),
+                reason,
+            })?;
+            return Ok(None);
+        }
+
+        let confirm_report = outcome
+            .validator_report
+            .expect("trusted validator outcome must carry a report");
+        let local_subjects: std::collections::HashSet<&str> = local_report
+            .findings
+            .iter()
+            .map(|f| f.subject.as_str())
+            .collect();
+        // A miss is a frontier finding on a subject the local report did NOT
+        // fail — the local tier passed it and the frontier tier caught it.
+        let disagreements: Vec<Finding> = confirm_report
+            .findings
+            .into_iter()
+            .filter(|f| !local_subjects.contains(f.subject.as_str()))
+            .collect();
+        let disagreement_subjects: std::collections::HashSet<&str> =
+            disagreements.iter().map(|f| f.subject.as_str()).collect();
+        let confirmed: Vec<String> = passed_command_ids
+            .iter()
+            .filter(|id| !disagreement_subjects.contains(id.as_str()))
+            .cloned()
+            .collect();
+        if !disagreements.is_empty() {
+            self.emit_decision(
+                &format!(
+                    "local validator MISS: the frontier confirmation overturned {} local \
+                     PASS verdict(s) ({}) — failing closed to the frontier verdict; the \
+                     miss is recorded on validation.confirm (the local-vs-frontier \
+                     miss-rate ground truth)",
+                    disagreements.len(),
+                    disagreements
+                        .iter()
+                        .map(|f| f.subject.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                None,
+            )?;
+        }
+        self.emit(EventKind::ValidationConfirm {
+            milestone_id: milestone_id.to_string(),
+            local_run_id: local_run_id.to_string(),
+            confirm_run_id: outcome.run_id.clone(),
+            confirmed,
+            disagreements: disagreements.clone(),
+        })?;
+        Ok(Some(
+            disagreements
+                .into_iter()
+                .map(|f| (outcome.run_id.clone(), f))
+                .collect(),
+        ))
     }
 
     /// Mandatory validator containment resolution (ticket
@@ -8823,6 +9072,315 @@ pub(crate) mod tests {
             events.iter().any(|e| matches!(&e.kind, EventKind::MilestoneBlocked { milestone_id, .. } if milestone_id == "ms-1")),
             "second cap hit on the (now) frontier tier must block: {:?}",
             events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Confirm-on-pass: the guarded local functional validator
+    // (ticket local-inference-validator-guarded, KRZ-206b)
+    // ---------------------------------------------------------------------------
+
+    /// A chat-completions body whose single message carries `report` — the
+    /// stub local endpoint's answer to every request (one local verdict per
+    /// test). Drives a REAL [`crate::backend_local::LocalBackend`], so the
+    /// local functional verdict travels the same HTTP seam as in production.
+    fn local_stub_body(report: serde_json::Value) -> String {
+        serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": report.to_string()}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 10}
+        })
+        .to_string()
+    }
+
+    /// A single-milestone engine whose FUNCTIONAL validator is local-backed
+    /// (the stub endpoint at `base_url`); scrutiny is skipped so the only
+    /// validator in play is the functional role under test. One command
+    /// assertion (`true` — a deterministic engine-side PASS) gives the local
+    /// verdict a mechanical check to pass.
+    fn local_functional_engine(
+        backend: Arc<dyn AgentBackend>,
+        root: &std::path::Path,
+        base_url: String,
+    ) -> MissionEngine {
+        let mut cfg = MissionConfig {
+            skip_scrutiny: true,
+            worker_isolation: WorkerIsolation::Checkout,
+            ..MissionConfig::default()
+        };
+        cfg.validator_functional.backend = Some("local".to_string());
+        cfg.validator_functional.base_url = Some(base_url);
+        cfg.validator_functional.context_budget = Some(100_000);
+        let mut engine = MissionEngine::create(backend, root, "goal", cfg).unwrap();
+        engine.state.mission.validation_contract = vec![Assertion {
+            id: "a1".to_string(),
+            statement: "the build passes".to_string(),
+            check: AssertionCheck::Command,
+            command: Some("true".to_string()),
+        }];
+        engine.state.mission.milestones.push(Milestone {
+            id: "ms-1".to_string(),
+            title: "m".to_string(),
+            features: vec![],
+            status: MilestoneStatus::Active,
+            fix_cycles: 0,
+            start_sha: Some(engine.repo.head_sha().unwrap()),
+            validator_guidance: None,
+        });
+        engine
+    }
+
+    /// KRZ-206b pin: a local functional PASS on a contract-command assertion
+    /// NEVER greens the round alone — the frontier confirmation runs first,
+    /// and only its agreement completes the milestone. The comparison is
+    /// recorded on `validation.confirm`: the local-vs-frontier miss-rate
+    /// ground truth lives in the event store.
+    #[tokio::test]
+    async fn guarded_local_validator_pass_triggers_frontier_confirm_before_green() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let (base_url, requests, _received) = crate::backend_local::tests::spawn_stub(
+            "HTTP/1.1 200 OK",
+            local_stub_body(serde_json::json!({"findings": [], "summary": "clean"})),
+        )
+        .await;
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            clean_validator_script(), // the frontier confirmation: agrees
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock.clone();
+        let mut engine = local_functional_engine(backend, &root, base_url);
+
+        engine.validation_round(0).await.unwrap();
+
+        // Exactly one LOCAL session (the primary — one HTTP request) and
+        // exactly one FRONTIER session (the confirmation — one mock start,
+        // on the claude fallback model, never another local call).
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let specs = mock.started_specs();
+        assert_eq!(specs.len(), 1, "only the confirmation runs on the mock");
+        assert_eq!(
+            specs[0].model, "sonnet",
+            "the confirmation is the FRONTIER functional session"
+        );
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        let confirm_seq = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::ValidationConfirm {
+                    milestone_id,
+                    local_run_id,
+                    confirm_run_id,
+                    confirmed,
+                    disagreements,
+                } if milestone_id == "ms-1" => {
+                    assert_eq!(confirmed, &vec!["a1".to_string()]);
+                    assert!(disagreements.is_empty());
+                    assert_ne!(local_run_id, confirm_run_id);
+                    Some(e.seq)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "validation.confirm must land on the log: {:?}",
+                    events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+                )
+            });
+        let completed_seq = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::MilestoneCompleted { milestone_id, .. } if milestone_id == "ms-1" => {
+                    Some(e.seq)
+                }
+                _ => None,
+            })
+            .expect("an agreed confirmation completes the milestone");
+        assert!(
+            confirm_seq < completed_seq,
+            "the confirmation must land BEFORE the green: confirm seq {confirm_seq}, \
+             completed seq {completed_seq}"
+        );
+    }
+
+    /// KRZ-206b pin: local PASS vs frontier FAIL is a recorded miss and fails
+    /// CLOSED — the frontier finding stands as a round finding, the milestone
+    /// does NOT complete, and the finding flows to the fix path.
+    #[tokio::test]
+    async fn guarded_local_validator_disagreement_fails_closed_to_frontier() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let (base_url, _requests, _received) = crate::backend_local::tests::spawn_stub(
+            "HTTP/1.1 200 OK",
+            local_stub_body(serde_json::json!({"findings": [], "summary": "clean"})),
+        )
+        .await;
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            // The frontier confirmation disagrees: a1 is failing.
+            tier_escalation_finding_script("a1"),
+            // The conversion turn answers the finding with a fix feature.
+            tier_escalation_orch_script(1),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock;
+        let mut engine = local_functional_engine(backend, &root, base_url);
+
+        engine.validation_round(0).await.unwrap();
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        // The miss is recorded (the measurement): nothing confirmed, one
+        // disagreement on a1.
+        let (confirmed, disagreements) = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::ValidationConfirm {
+                    milestone_id,
+                    confirmed,
+                    disagreements,
+                    ..
+                } if milestone_id == "ms-1" => Some((confirmed.clone(), disagreements.clone())),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "validation.confirm must land on the log: {:?}",
+                    events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            confirmed.is_empty(),
+            "a1 was overturned — no check stays confirmed: {confirmed:?}"
+        );
+        assert_eq!(disagreements.len(), 1);
+        assert_eq!(disagreements[0].subject, "a1");
+        // ...and it FAILED CLOSED: the frontier verdict became a round
+        // finding (no silent green), never a completion.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::ValidationFinding { milestone_id, finding, .. } if milestone_id == "ms-1" && finding.subject == "a1")),
+            "the disagreement must fail closed as a validation.finding: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::MilestoneCompleted { milestone_id, .. } if milestone_id == "ms-1")),
+            "a disagreed PASS must not complete the milestone"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::FixFeatureCreated { .. })),
+            "the failed-closed finding flows to the fix path: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+    }
+
+    /// KRZ-206b pin (the deliberate asymmetry): a local FAIL is trusted
+    /// WITHOUT a frontier confirmation — failures are visible (they cost a
+    /// fix cycle); misses are the danger. No confirmation session runs and
+    /// no `validation.confirm` lands.
+    #[tokio::test]
+    async fn guarded_local_validator_local_fail_is_trusted_without_confirmation() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let (base_url, requests, _received) = crate::backend_local::tests::spawn_stub(
+            "HTTP/1.1 200 OK",
+            local_stub_body(serde_json::json!({
+                "findings": [{
+                    "subject": "a1",
+                    "severity": "critical",
+                    "evidence": "the local validator sees a1 failing"
+                }],
+                "summary": "a1 fails"
+            })),
+        )
+        .await;
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            // The only mock session: the conversion turn's fix-feature reply.
+            tier_escalation_orch_script(1),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock.clone();
+        let mut engine = local_functional_engine(backend, &root, base_url);
+
+        engine.validation_round(0).await.unwrap();
+
+        // One local session (the primary), and the ONLY mock session is the
+        // conversion orchestrator — no frontier validator ever ran.
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            mock.started_specs().len(),
+            1,
+            "only the conversion orchestrator runs on the mock — no confirmation"
+        );
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::ValidationConfirm { .. })),
+            "a local FAIL triggers no confirmation: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::ValidationFinding { milestone_id, finding, .. } if milestone_id == "ms-1" && finding.subject == "a1")),
+            "the local FAIL is trusted as a round finding: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::MilestoneCompleted { milestone_id, .. } if milestone_id == "ms-1")),
+            "a failed round must not complete the milestone"
+        );
+    }
+
+    /// KRZ-206b pin: an untrusted confirmation fails CLOSED — the round
+    /// blocks rather than greening an unconfirmed local PASS.
+    #[tokio::test]
+    async fn guarded_local_validator_untrusted_confirmation_blocks_instead_of_greening() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let (base_url, _requests, _received) = crate::backend_local::tests::spawn_stub(
+            "HTTP/1.1 200 OK",
+            local_stub_body(serde_json::json!({"findings": [], "summary": "clean"})),
+        )
+        .await;
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            // The frontier confirmation crashes without a report.
+            crate::backend_mock::MockScript::single_shot("not json")
+                .with_exit(SessionExit::Failed("confirm crashed".to_string())),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock;
+        let mut engine = local_functional_engine(backend, &root, base_url);
+
+        engine.validation_round(0).await.unwrap();
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::MilestoneBlocked { milestone_id, reason } if milestone_id == "ms-1" && reason.contains("cannot green the gate unconfirmed"))),
+            "an untrusted confirmation blocks honestly: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::ValidationConfirm { .. })),
+            "no comparison record without a trusted confirmation: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::MilestoneCompleted { milestone_id, .. } if milestone_id == "ms-1")),
+            "an unconfirmed local PASS must never complete the milestone"
         );
     }
 

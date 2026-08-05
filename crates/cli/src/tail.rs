@@ -329,6 +329,35 @@ impl EventRenderer {
                     None => format!("validator snapshot (target: {target_tier})"),
                 },
             ),
+            EventKind::ValidationConfirm {
+                milestone_id,
+                confirmed,
+                disagreements,
+                ..
+            } => (
+                format!("milestone {milestone_id}"),
+                if disagreements.is_empty() {
+                    ansi::DIM
+                } else {
+                    ansi::YELLOW
+                },
+                if disagreements.is_empty() {
+                    format!(
+                        "local validator PASS frontier-confirmed ({} check(s))",
+                        confirmed.len()
+                    )
+                } else {
+                    format!(
+                        "local validator MISS: frontier overturned {} PASS(es): {}",
+                        disagreements.len(),
+                        disagreements
+                            .iter()
+                            .map(|f| f.subject.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                },
+            ),
             EventKind::GateResult {
                 gate,
                 surface,

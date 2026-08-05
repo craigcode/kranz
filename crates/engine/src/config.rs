@@ -572,6 +572,30 @@ pub fn validate(cfg: &MissionConfig) -> Result<()> {
         })?;
 
         if kind == BackendKind::Local {
+            // Guarded validator role split (ticket
+            // `local-inference-validator-guarded`, KRZ-206b; review addendum
+            // §4 of docs/scoping/local-inference-executor-tier.md): the local
+            // validator tier exists for DETERMINISTIC mechanical checks only
+            // — compile/test/lint exit codes and contract-command pass/fail,
+            // where the engine runs the command itself and the model only
+            // reads verbatim PASS/FAIL evidence. Scrutiny is judgment (diff
+            // review against criteria), and routing judgment local is exactly
+            // the "silent green" attack the split exists to prevent: a weak
+            // local validator that wrongly PASSES bad work never looks like a
+            // failure, so no escalation valve ever fires on it. Only the
+            // functional role may pair with the local backend — and every
+            // local functional PASS is frontier-confirmed before it greens a
+            // gate (confirm-on-pass in the validation round); the scrutiny
+            // role is rejected outright here. Checked FIRST, before the
+            // endpoint fields, so the error names the real problem.
+            if role == Role::ValidatorScrutiny {
+                return Err(EngineError::Config(format!(
+                    "{name}.backend \"local\" is rejected: scrutiny is judgment, not a \
+                     deterministic mechanical check, and the local validator tier is the \
+                     functional role only (KRZ-206b) — a local judgment PASS is the \
+                     silent-green failure mode the guarded role split exists to prevent"
+                )));
+            }
             match role_cfg.base_url.as_deref() {
                 Some(url) if !url.trim().is_empty() => {
                     let rest = url
@@ -999,6 +1023,57 @@ mod tests {
                 "kimi k3 should accept effort {effort}"
             );
         }
+    }
+
+    #[test]
+    fn guarded_local_validator_scrutiny_cannot_be_configured_local() {
+        // KRZ-206b: scrutiny is judgment; the local validator tier is the
+        // functional role only. The rejection names the role, and fires
+        // whether or not the endpoint fields are present (the role guard is
+        // the real problem, never the missing baseUrl).
+        let mut cfg = MissionConfig::default();
+        cfg.validator_scrutiny.backend = Some("local".into());
+        cfg.validator_scrutiny.base_url = Some("http://127.0.0.1:8080".into());
+        cfg.validator_scrutiny.context_budget = Some(8192);
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(
+            err.contains("validatorScrutiny.backend \"local\" is rejected"),
+            "the rejection must name the role: {err}"
+        );
+
+        let mut cfg = MissionConfig::default();
+        cfg.validator_scrutiny.backend = Some("local".into());
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(
+            err.contains("validatorScrutiny.backend \"local\" is rejected"),
+            "the role guard must fire before the endpoint checks: {err}"
+        );
+    }
+
+    #[test]
+    fn guarded_local_validator_functional_may_be_configured_local() {
+        // KRZ-206b: the functional role may select the local backend for
+        // deterministic mechanical checks (contract-command pass/fail); the
+        // same endpoint requirements as any local-backed role apply, and
+        // every local PASS is frontier-confirmed at the validation round.
+        let mut cfg = MissionConfig::default();
+        cfg.validator_functional.backend = Some("local".into());
+        cfg.validator_functional.base_url = Some("http://127.0.0.1:8080".into());
+        cfg.validator_functional.context_budget = Some(8192);
+        assert!(
+            validate(&cfg).is_ok(),
+            "functional + local with a valid endpoint must be accepted"
+        );
+
+        // The endpoint fields stay required — a local functional validator
+        // with nowhere to point is a config error, exactly as before.
+        let mut cfg = MissionConfig::default();
+        cfg.validator_functional.backend = Some("local".into());
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(
+            err.contains("validatorFunctional.baseUrl is required"),
+            "endpoint requirements must still apply to the functional role: {err}"
+        );
     }
 
     #[test]

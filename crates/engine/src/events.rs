@@ -294,6 +294,45 @@ pub enum EventKind {
         detail: Option<String>,
     },
 
+    /// Local-validator confirm-on-pass (ticket
+    /// `local-inference-validator-guarded`, KRZ-206b; review addendum §4 of
+    /// docs/scoping/local-inference-executor-tier.md): a LOCAL functional
+    /// validator's PASS never greens a gate alone — a frontier functional
+    /// session re-judged the same milestone and engine-captured
+    /// contract-command evidence, and this event records the comparison.
+    /// `confirmed` names the contract-command assertions both tiers pass;
+    /// `disagreements` carries every frontier finding on a subject the local
+    /// report passed (a local PASS vs frontier FAIL — the miss), each of
+    /// which ALSO lands as a `validation.finding` and fails closed into the
+    /// round as the frontier verdict. A local FAIL never triggers this
+    /// event: failures are visible (they cost a fix cycle), misses are the
+    /// danger — the asymmetry is deliberate.
+    ///
+    /// The confirmations ARE the local-vs-frontier miss-rate ground truth
+    /// the ticket's start precondition demands: misses = disagreement
+    /// subjects, opportunities = confirmed + disagreement command
+    /// assertions, both computable from the log alone (join `localRunId` /
+    /// `confirmRunId` against `worker.spawned` for the models). Additive
+    /// event; absent in pre-field logs, which simply have no local-validator
+    /// confirmations to measure.
+    #[serde(rename = "validation.confirm")]
+    ValidationConfirm {
+        #[serde(rename = "milestoneId")]
+        milestone_id: String,
+        /// Run id of the LOCAL functional session whose PASS was confirmed.
+        #[serde(rename = "localRunId")]
+        local_run_id: String,
+        /// Run id of the FRONTIER confirmation session.
+        #[serde(rename = "confirmRunId")]
+        confirm_run_id: String,
+        /// Contract-command assertion ids both the local report and the
+        /// frontier confirmation pass.
+        confirmed: Vec<String>,
+        /// Frontier findings on subjects the local report passed — the
+        /// misses. Failed closed: each stands as the round's verdict.
+        disagreements: Vec<Finding>,
+    },
+
     /// One gate evaluation, recorded as a first-class event (ticket
     /// `.kranz/tickets/gate-results-first-class-events`, KRZ-312 — the
     /// governance evidence layer's last substrate gap before
@@ -827,6 +866,7 @@ impl EventKind {
             EventKind::ValidationFinding { .. } => "validation.finding",
             EventKind::ValidatorTamper { .. } => "validator.tamper",
             EventKind::ValidationSnapshot { .. } => "validation.snapshot",
+            EventKind::ValidationConfirm { .. } => "validation.confirm",
             EventKind::GateResult { .. } => "gate.result",
             EventKind::HookGateFired { .. } => "hook.gate.fired",
             EventKind::DivergenceNoted { .. } => "divergence.noted",
@@ -1404,6 +1444,58 @@ mod tests {
         let legacy_back: EventKind = serde_json::from_value(json).unwrap();
         match legacy_back {
             EventKind::ValidationSnapshot { detail, .. } => assert_eq!(detail, None),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// The additive `validation.confirm` event (ticket
+    /// `local-inference-validator-guarded`, KRZ-206b): wire name, payload
+    /// shape, and round-trip — the miss-rate ground truth must survive serde
+    /// verbatim, because the local-vs-frontier miss rate is computed from
+    /// these bytes alone (misses = disagreement subjects; opportunities =
+    /// confirmed + disagreement command assertions).
+    #[test]
+    fn guarded_local_validator_confirm_event_wire_shape_and_round_trip() {
+        let event = EventKind::ValidationConfirm {
+            milestone_id: "ms-1".to_string(),
+            local_run_id: "run-local".to_string(),
+            confirm_run_id: "run-frontier".to_string(),
+            confirmed: vec!["a1".to_string()],
+            disagreements: vec![Finding {
+                subject: "a2".to_string(),
+                severity: "major".to_string(),
+                evidence: "frontier sees a failure the local pass missed".to_string(),
+                suggested_fix: "fix a2".to_string(),
+                class: String::new(),
+            }],
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "validation.confirm");
+        assert_eq!(json["payload"]["milestoneId"], "ms-1");
+        assert_eq!(json["payload"]["localRunId"], "run-local");
+        assert_eq!(json["payload"]["confirmRunId"], "run-frontier");
+        assert_eq!(json["payload"]["confirmed"], serde_json::json!(["a1"]));
+        assert_eq!(
+            json["payload"]["disagreements"][0]["subject"],
+            serde_json::json!("a2")
+        );
+        assert_eq!(event.type_name(), "validation.confirm");
+        let back: EventKind = serde_json::from_value(json).unwrap();
+        match back {
+            EventKind::ValidationConfirm {
+                milestone_id,
+                local_run_id,
+                confirm_run_id,
+                confirmed,
+                disagreements,
+            } => {
+                assert_eq!(milestone_id, "ms-1");
+                assert_eq!(local_run_id, "run-local");
+                assert_eq!(confirm_run_id, "run-frontier");
+                assert_eq!(confirmed, vec!["a1".to_string()]);
+                assert_eq!(disagreements.len(), 1);
+                assert_eq!(disagreements[0].subject, "a2");
+            }
             _ => panic!("wrong variant"),
         }
     }

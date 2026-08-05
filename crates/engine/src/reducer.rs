@@ -333,6 +333,26 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             milestone_mut(state, milestone_id)?;
         }
 
+        EventKind::ValidationConfirm {
+            milestone_id,
+            local_run_id,
+            confirm_run_id,
+            ..
+        } => {
+            // Audit-only record (KRZ-206b, the gate.result additive
+            // template): the local-vs-frontier comparison drives no state
+            // transition — a disagreement's finding already flows through
+            // validation.finding, and the miss rate reads this event back
+            // off the log, so state shape does not grow. Validate all
+            // references as a corruption guard (mirrors validation.finding):
+            // both run ids name real sessions (the local primary and the
+            // frontier confirmation), so a hand-edited confirm cannot cite
+            // a run the log never recorded.
+            milestone_mut(state, milestone_id)?;
+            run_mut(state, local_run_id)?;
+            run_mut(state, confirm_run_id)?;
+        }
+
         EventKind::GateResult { .. } => {
             // Audit-only record (KRZ-312): one gate evaluation — id, ladder
             // position, verdict, artefact handle. Gate results drive no
