@@ -161,6 +161,37 @@ impl EventRenderer {
                     grant_kind_label(kind)
                 ),
             ),
+            EventKind::QuestionOpened {
+                question_id,
+                text,
+                options,
+                ..
+            } => (
+                "mission".to_string(),
+                ansi::YELLOW,
+                if options.is_empty() {
+                    format!("question {question_id} opened: {text} (free-text answer)")
+                } else {
+                    format!(
+                        "question {question_id} opened: {text} ({} option(s)); awaiting an answer",
+                        options.len()
+                    )
+                },
+            ),
+            EventKind::QuestionAnswered {
+                question_id,
+                answer,
+                ..
+            } => (
+                "mission".to_string(),
+                ansi::YELLOW,
+                format!("question {question_id} answered: {answer}"),
+            ),
+            EventKind::QuestionCleared { question_id, why } => (
+                "mission".to_string(),
+                ansi::DIM,
+                format!("question {question_id} cleared ({why})"),
+            ),
             EventKind::MilestoneStarted { milestone_id, .. } => (
                 format!("milestone {milestone_id}"),
                 ansi::YELLOW,

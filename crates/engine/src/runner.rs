@@ -551,7 +551,22 @@ pub fn worker_report_schema() -> serde_json::Value {
             "knownGaps": { "type": "array", "items": { "type": "string" } },
             "commits": { "type": "array", "items": { "type": "string" } },
             "commandsRun": { "type": "array", "items": { "type": "string" } },
-            "escalation": { "type": "string" }
+            "escalation": { "type": "string" },
+            // Structured "ask the human" payload (ticket
+            // structured-human-question-events): text + optional structured
+            // choices; empty options asks for free text.
+            "questions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["text"],
+                    "properties": {
+                        "text": { "type": "string" },
+                        "options": { "type": "array", "items": { "type": "string" } }
+                    }
+                }
+            }
         }
     })
 }

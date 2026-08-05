@@ -447,6 +447,7 @@ async fn post_outbound(
         Outbound::PlanReady(p) => crate::format::build_plan_ready(p, dash),
         Outbound::RevisionReady(r) => crate::format::build_revision_ready(r, dash),
         Outbound::GrantReady(g) => crate::format::build_grant_ready(g, dash),
+        Outbound::QuestionReady(q) => crate::format::build_question_ready(q, dash),
         Outbound::Blocked(b) => crate::format::build_blocked(b, dash),
         Outbound::Complete(c) => crate::format::build_complete(c, dash),
     };

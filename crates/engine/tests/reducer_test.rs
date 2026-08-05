@@ -2356,6 +2356,341 @@ fn grant_requested_with_empty_command_is_rejected() {
     assert!(matches!(err, EngineError::InvalidState(_)), "got {err:?}");
 }
 
+// ---------------------------------------------------------------------------
+// Structured human questions (ticket structured-human-question-events)
+// ---------------------------------------------------------------------------
+
+/// State folded up to ms-1 Active with worker run r-1 spawned on f-1-1 — the
+/// context refs a `question.opened` can name.
+fn state_with_worker_run() -> MissionState {
+    fold_kinds(vec![
+        created(),
+        EventKind::PlanApproved {
+            plan: plan(),
+            base_sha: None,
+        },
+        EventKind::MilestoneStarted {
+            milestone_id: "ms-1".to_string(),
+            start_sha: "sha-1".to_string(),
+        },
+        spawn("r-1", Some("f-1-1"), None),
+    ])
+}
+
+fn question_opened(id: &str) -> EventKind {
+    EventKind::QuestionOpened {
+        question_id: id.to_string(),
+        role: Role::Worker,
+        text: "Which storage engine should the cache use?".to_string(),
+        options: vec!["sqlite".to_string(), "in-memory".to_string()],
+        run_id: Some("r-1".to_string()),
+        feature_id: Some("f-1-1".to_string()),
+        milestone_id: Some("ms-1".to_string()),
+    }
+}
+
+#[test]
+fn question_events_opened_folds_into_pending_projection() {
+    let mut state = state_with_worker_run();
+    let next = state.last_seq + 1;
+    // Pre-field posture: no questions, id counter at zero.
+    assert!(state.pending_questions.is_empty());
+    assert_eq!(state.question_count, 0);
+
+    apply(&mut state, &ev(next, question_opened("q-1"))).expect("question.opened accepted");
+    assert_eq!(state.question_count, 1, "id counter bumped once");
+    let pending = state
+        .pending_questions
+        .first()
+        .expect("question parked in the projection");
+    assert_eq!(pending.question_id, "q-1");
+    assert_eq!(pending.role, Role::Worker);
+    assert_eq!(pending.text, "Which storage engine should the cache use?");
+    assert_eq!(pending.options, vec!["sqlite", "in-memory"]);
+    assert_eq!(pending.run_id.as_deref(), Some("r-1"));
+    assert_eq!(pending.feature_id.as_deref(), Some("f-1-1"));
+    assert_eq!(pending.milestone_id.as_deref(), Some("ms-1"));
+    // Opening a question parks NOTHING — the run loop never gates on it.
+    assert_eq!(state.mission.status, MissionStatus::Running);
+}
+
+#[test]
+fn question_events_answered_routes_answer_to_user_consult() {
+    let mut state = state_with_worker_run();
+    let next = state.last_seq + 1;
+    apply(&mut state, &ev(next, question_opened("q-1"))).unwrap();
+    apply(
+        &mut state,
+        &ev(
+            next + 1,
+            EventKind::QuestionAnswered {
+                question_id: "q-1".to_string(),
+                answer: "sqlite".to_string(),
+                via: "answer-question".to_string(),
+                option: Some(0),
+            },
+        ),
+    )
+    .expect("question.answered accepted");
+    assert!(
+        state.pending_questions.is_empty(),
+        "answered question leaves the projection"
+    );
+    // The answer rides the EXISTING user-message consult path (D-X): the
+    // orchestrator's next consult consumes it from here.
+    assert_eq!(state.pending_user_messages.len(), 1);
+    let line = &state.pending_user_messages[0];
+    assert!(
+        line.contains("q-1") && line.contains("sqlite"),
+        "the consult line names the question and the answer: {line}"
+    );
+    assert!(
+        line.contains("Which storage engine"),
+        "the consult line carries the question text for context: {line}"
+    );
+    assert_eq!(
+        state.question_count, 1,
+        "answers never reset the id counter (ids stay unique across restarts)"
+    );
+}
+
+#[test]
+fn question_events_cleared_removes_open_question() {
+    let mut state = state_with_worker_run();
+    let next = state.last_seq + 1;
+    apply(&mut state, &ev(next, question_opened("q-1"))).unwrap();
+    apply(
+        &mut state,
+        &ev(
+            next + 1,
+            EventKind::QuestionCleared {
+                question_id: "q-1".to_string(),
+                why: "milestone completed".to_string(),
+            },
+        ),
+    )
+    .expect("question.cleared accepted");
+    assert!(state.pending_questions.is_empty());
+    assert!(
+        state.pending_user_messages.is_empty(),
+        "a clear is not an answer — nothing reaches the consult path"
+    );
+}
+
+#[test]
+fn question_events_answer_for_not_open_question_is_rejected() {
+    // A forged or stale answer for a question that was never opened must
+    // fail the fold (mirrors grant.approved with nothing parked)…
+    let mut state = state_with_worker_run();
+    let next = state.last_seq + 1;
+    let err = apply(
+        &mut state,
+        &ev(
+            next,
+            EventKind::QuestionAnswered {
+                question_id: "q-nope".to_string(),
+                answer: "sqlite".to_string(),
+                via: "answer-question".to_string(),
+                option: None,
+            },
+        ),
+    )
+    .expect_err("answer for a question that is not open must be rejected");
+    assert!(matches!(err, EngineError::InvalidState(_)), "got {err:?}");
+    assert!(state.pending_user_messages.is_empty());
+
+    // …and a REPLAYED answer (already answered) is rejected the same way —
+    // the consult line never double-lands.
+    apply(&mut state, &ev(next, question_opened("q-1"))).unwrap();
+    apply(
+        &mut state,
+        &ev(
+            next + 1,
+            EventKind::QuestionAnswered {
+                question_id: "q-1".to_string(),
+                answer: "sqlite".to_string(),
+                via: "answer-question".to_string(),
+                option: Some(0),
+            },
+        ),
+    )
+    .unwrap();
+    let err = apply(
+        &mut state,
+        &ev(
+            next + 2,
+            EventKind::QuestionAnswered {
+                question_id: "q-1".to_string(),
+                answer: "in-memory".to_string(),
+                via: "answer-question".to_string(),
+                option: Some(1),
+            },
+        ),
+    )
+    .expect_err("a duplicate answer must be rejected");
+    assert!(matches!(err, EngineError::InvalidState(_)), "got {err:?}");
+    assert_eq!(state.pending_user_messages.len(), 1, "answer landed once");
+}
+
+#[test]
+fn question_events_clear_for_not_open_question_is_rejected() {
+    let mut state = state_with_worker_run();
+    let next = state.last_seq + 1;
+    let err = apply(
+        &mut state,
+        &ev(
+            next,
+            EventKind::QuestionCleared {
+                question_id: "q-nope".to_string(),
+                why: "milestone completed".to_string(),
+            },
+        ),
+    )
+    .expect_err("clear for a question that is not open must be rejected");
+    assert!(matches!(err, EngineError::InvalidState(_)), "got {err:?}");
+}
+
+#[test]
+fn question_events_opened_duplicate_is_idempotent_or_rejected() {
+    // A duplicated open with an IDENTICAL payload is an idempotent replay
+    // (the fixfeature.created precedent): seq advances, state unchanged, and
+    // the id counter does NOT bump a second time.
+    let mut state = state_with_worker_run();
+    let next = state.last_seq + 1;
+    apply(&mut state, &ev(next, question_opened("q-1"))).unwrap();
+    apply(&mut state, &ev(next + 1, question_opened("q-1")))
+        .expect("identical duplicate open is an idempotent replay");
+    assert_eq!(state.pending_questions.len(), 1);
+    assert_eq!(state.question_count, 1);
+
+    // The SAME id with a DIFFERENT payload is shadowing — loudly invalid.
+    let mut shadowed = question_opened("q-1");
+    let EventKind::QuestionOpened { text, .. } = &mut shadowed else {
+        unreachable!()
+    };
+    *text = "a different question wearing q-1's id".to_string();
+    let err = apply(&mut state, &ev(next + 2, shadowed))
+        .expect_err("same id with a different payload must be rejected");
+    assert!(matches!(err, EngineError::InvalidState(_)), "got {err:?}");
+}
+
+#[test]
+fn question_events_opened_validates_refs_and_text() {
+    let mut state = state_with_worker_run();
+    let next = state.last_seq + 1;
+    for (label, kind) in [
+        ("empty id", question_opened("  ")),
+        ("empty text", {
+            let mut k = question_opened("q-1");
+            let EventKind::QuestionOpened { text, .. } = &mut k else {
+                unreachable!()
+            };
+            *text = "   ".to_string();
+            k
+        }),
+        ("unknown run", {
+            let mut k = question_opened("q-1");
+            let EventKind::QuestionOpened { run_id, .. } = &mut k else {
+                unreachable!()
+            };
+            *run_id = Some("r-nope".to_string());
+            k
+        }),
+        ("unknown feature", {
+            let mut k = question_opened("q-1");
+            let EventKind::QuestionOpened { feature_id, .. } = &mut k else {
+                unreachable!()
+            };
+            *feature_id = Some("f-nope".to_string());
+            k
+        }),
+        ("unknown milestone", {
+            let mut k = question_opened("q-1");
+            let EventKind::QuestionOpened { milestone_id, .. } = &mut k else {
+                unreachable!()
+            };
+            *milestone_id = Some("ms-nope".to_string());
+            k
+        }),
+    ] {
+        let err =
+            apply(&mut state, &ev(next, kind)).expect_err(&format!("{label} must be rejected"));
+        assert!(
+            matches!(err, EngineError::InvalidState(_)),
+            "{label}: got {err:?}"
+        );
+    }
+    // Each rejected open above consumed no seq; a valid open still folds at
+    // the same seq.
+    apply(&mut state, &ev(next, question_opened("q-1"))).unwrap();
+    assert_eq!(state.pending_questions.len(), 1);
+}
+
+/// The restart-replay contract (ticket structured-human-question-events):
+/// folding the LOG from scratch — exactly what a process restart does —
+/// reproduces the projection and the routed answer, with no side state.
+#[test]
+fn question_events_fold_from_log_replays_answer_after_restart() {
+    let state = fold_kinds(vec![
+        created(),
+        EventKind::PlanApproved {
+            plan: plan(),
+            base_sha: None,
+        },
+        EventKind::MilestoneStarted {
+            milestone_id: "ms-1".to_string(),
+            start_sha: "sha-1".to_string(),
+        },
+        spawn("r-1", Some("f-1-1"), None),
+        question_opened("q-1"),
+        EventKind::QuestionAnswered {
+            question_id: "q-1".to_string(),
+            answer: "sqlite".to_string(),
+            via: "answer-question".to_string(),
+            option: Some(0),
+        },
+    ]);
+    assert!(
+        state.pending_questions.is_empty(),
+        "answered stays answered"
+    );
+    assert_eq!(state.question_count, 1);
+    assert_eq!(state.pending_user_messages.len(), 1);
+    assert!(state.pending_user_messages[0].contains("sqlite"));
+}
+
+/// Pre-field snapshots: a state.json written before the projection existed
+/// has no `pendingQuestions`/`questionCount` keys at all — it must still
+/// deserialize (additive `#[serde(default)]` fields), and the new binary
+/// omits both keys while they are empty/zero, so pre-field snapshots stay
+/// byte-identical until the first question opens.
+#[test]
+fn question_events_state_fields_backcompat_with_pre_field_snapshots() {
+    let state = fold_kinds(vec![
+        created(),
+        EventKind::PlanApproved {
+            plan: plan(),
+            base_sha: None,
+        },
+    ]);
+    assert!(state.pending_questions.is_empty());
+    assert_eq!(state.question_count, 0);
+
+    let value = serde_json::to_value(&state).unwrap();
+    let object = value.as_object().unwrap();
+    assert!(
+        !object.contains_key("pendingQuestions"),
+        "absent while empty: {value}"
+    );
+    assert!(
+        !object.contains_key("questionCount"),
+        "absent while zero: {value}"
+    );
+    let parsed: MissionState = serde_json::from_value(value).unwrap();
+    assert!(parsed.pending_questions.is_empty());
+    assert_eq!(parsed.question_count, 0);
+}
+
 #[test]
 fn grant_approved_is_extend_only_and_deduped() {
     // Approving a command already granted (e.g. via the plan) is a no-op push,

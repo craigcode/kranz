@@ -662,6 +662,7 @@ fn export_traces_is_regenerable_and_filters_to_validated_passes() {
                     commits: vec!["abc feature one".to_string()],
                     commands_run: vec![],
                     escalation: None,
+                    questions: None,
                 }),
             },
             EventKind::FeatureCompleted {
@@ -700,6 +701,7 @@ fn export_traces_is_regenerable_and_filters_to_validated_passes() {
                     commits: vec![],
                     commands_run: vec![],
                     escalation: None,
+                    questions: None,
                 }),
             },
             EventKind::FeatureFailed {
@@ -800,6 +802,7 @@ fn export_traces_all_aggregates_and_skips_unreadable_missions() {
                     commits: vec!["abc feature one".to_string()],
                     commands_run: vec![],
                     escalation: None,
+                    questions: None,
                 }),
             },
             EventKind::FeatureCompleted {
@@ -878,6 +881,7 @@ fn write_corpus_mission(repo: &Path, mission_id: &str) {
                     commits: vec!["abc feature one".to_string()],
                     commands_run: vec![],
                     escalation: None,
+                    questions: None,
                 }),
             },
             EventKind::FeatureCompleted {
@@ -1436,6 +1440,126 @@ fn grant_commands_reject_bad_state() {
     assert!(commands::cmd_approve_grant(repo, "m-none", "gc audit").is_err());
 }
 
+/// Seed an open structured question q-1 (options sqlite/in-memory) on an
+/// active mission (ticket structured-human-question-events).
+fn seed_open_question(repo: &Path, mission: &str) {
+    write_events(
+        repo,
+        mission,
+        vec![
+            created_kind("goal", mission),
+            EventKind::PlanApproved {
+                plan: sample_plan(),
+                base_sha: None,
+            },
+            EventKind::MilestoneStarted {
+                milestone_id: "ms-1".into(),
+                start_sha: "abc1234".into(),
+            },
+            EventKind::WorkerSpawned {
+                run_id: "r-1".into(),
+                role: Role::Worker,
+                feature_id: Some("f-1-1".into()),
+                milestone_id: None,
+                candidate: None,
+                sdk_session_id: "sess".into(),
+                model: "sonnet".into(),
+                quant: "n/a".into(),
+                weight_hash: None,
+                prompt_hash: "hash".into(),
+                transcript_path: "runs/r-1.jsonl".into(),
+            },
+            EventKind::QuestionOpened {
+                question_id: "q-1".into(),
+                role: Role::Worker,
+                text: "Which storage engine?".into(),
+                options: vec!["sqlite".into(), "in-memory".into()],
+                run_id: Some("r-1".into()),
+                feature_id: Some("f-1-1".into()),
+                milestone_id: Some("ms-1".into()),
+            },
+        ],
+    );
+}
+
+#[test]
+fn question_events_commands_list_and_answer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+    seed_open_question(repo, "m-q");
+
+    // The projection lists: id, ask, indexed options.
+    let listing = commands::cmd_list_questions(repo, "m-q").unwrap();
+    assert!(listing.contains("q-1"), "id listed: {listing}");
+    assert!(
+        listing.contains("Which storage engine?"),
+        "ask listed: {listing}"
+    );
+    assert!(
+        listing.contains("[0] sqlite") && listing.contains("[1] in-memory"),
+        "options indexed: {listing}"
+    );
+
+    // An option answer enqueues the dedicated control kind, camelCase id.
+    commands::cmd_answer_question(repo, "m-q", "q-1", "sqlite", Some(0)).unwrap();
+    let files = queued_json_files(repo, "m-q");
+    assert_eq!(files.len(), 1);
+    let value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&files[0]).unwrap()).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "kind": "answer-question",
+            "questionId": "q-1",
+            "answer": "sqlite",
+            "option": 0
+        })
+    );
+}
+
+#[test]
+fn question_events_commands_reject_stale_answers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+    seed_open_question(repo, "m-q");
+
+    assert!(
+        commands::cmd_answer_question(repo, "m-q", "q-nope", "sqlite", None).is_err(),
+        "unknown question"
+    );
+    assert!(
+        commands::cmd_answer_question(repo, "m-q", "q-1", "sqlite", Some(9)).is_err(),
+        "option index out of range"
+    );
+    assert!(
+        commands::cmd_answer_question(repo, "m-q", "q-1", "in-memory", Some(0)).is_err(),
+        "option text must match the parked question"
+    );
+
+    // The rejections above enqueued nothing: the first valid answer is the
+    // only file in the inbox.
+    commands::cmd_answer_question(repo, "m-q", "q-1", "sqlite", Some(0)).unwrap();
+    assert_eq!(
+        queued_json_files(repo, "m-q").len(),
+        1,
+        "stale answers never enqueue"
+    );
+
+    // A mission with no open questions rejects the answer.
+    write_events(
+        repo,
+        "m-1",
+        vec![
+            created_kind("goal", "m-1"),
+            EventKind::PlanApproved {
+                plan: sample_plan(),
+                base_sha: None,
+            },
+        ],
+    );
+    assert!(commands::cmd_answer_question(repo, "m-1", "q-1", "x", None).is_err());
+}
+
 // ---------------------------------------------------------------------------
 // Control-command targeting (pause/resume/msg refuse terminal missions —
 // their inbox is never drained, so "success" there would be a silent no-op)
@@ -1662,6 +1786,79 @@ fn corrupt_log_stays_error() {
 // ---------------------------------------------------------------------------
 // Live-printer event rendering
 // ---------------------------------------------------------------------------
+
+/// The question events render one line each (ticket
+/// structured-human-question-events): opened names the ask and the option
+/// count (or the free-text expectation), answered names the answer, cleared
+/// names why.
+#[test]
+fn question_events_renderer_renders_question_lines() {
+    let mut renderer = EventRenderer::new(false);
+
+    let opened = event(
+        1,
+        "m-1",
+        EventKind::QuestionOpened {
+            question_id: "q-1".to_string(),
+            role: Role::Worker,
+            text: "Which storage engine?".to_string(),
+            options: vec!["sqlite".to_string(), "in-memory".to_string()],
+            run_id: Some("r-1".to_string()),
+            feature_id: Some("f-1-1".to_string()),
+            milestone_id: Some("ms-1".to_string()),
+        },
+    );
+    assert_eq!(
+        renderer.render(&opened),
+        "[mission] question q-1 opened: Which storage engine? (2 option(s)); awaiting an answer"
+    );
+
+    let free_text = event(
+        2,
+        "m-1",
+        EventKind::QuestionOpened {
+            question_id: "q-2".to_string(),
+            role: Role::Worker,
+            text: "What should the flag be called?".to_string(),
+            options: vec![],
+            run_id: Some("r-1".to_string()),
+            feature_id: Some("f-1-1".to_string()),
+            milestone_id: Some("ms-1".to_string()),
+        },
+    );
+    assert_eq!(
+        renderer.render(&free_text),
+        "[mission] question q-2 opened: What should the flag be called? (free-text answer)"
+    );
+
+    let answered = event(
+        3,
+        "m-1",
+        EventKind::QuestionAnswered {
+            question_id: "q-1".to_string(),
+            answer: "sqlite".to_string(),
+            via: "answer-question".to_string(),
+            option: Some(0),
+        },
+    );
+    assert_eq!(
+        renderer.render(&answered),
+        "[mission] question q-1 answered: sqlite"
+    );
+
+    let cleared = event(
+        4,
+        "m-1",
+        EventKind::QuestionCleared {
+            question_id: "q-2".to_string(),
+            why: "milestone completed".to_string(),
+        },
+    );
+    assert_eq!(
+        renderer.render(&cleared),
+        "[mission] question q-2 cleared (milestone completed)"
+    );
+}
 
 #[test]
 fn renderer_tags_worker_lines_and_truncates() {

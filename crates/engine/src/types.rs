@@ -296,6 +296,13 @@ fn default_quant() -> String {
     "n/a".to_string()
 }
 
+/// `skip_serializing_if` for counters whose zero means "predates the field"
+/// (e.g. [`MissionState::question_count`]) — zero stays off the wire so
+/// pre-field snapshots compare byte-identical.
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkerRun {
@@ -394,6 +401,34 @@ pub struct WorkerReport {
     /// validation: the floor's validator requirements are unaffected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub escalation: Option<String>,
+    /// Structured "ask the human" questions (ticket
+    /// `structured-human-question-events`): the worker's structured choices
+    /// for a decision only a human can make. The engine opens each as a
+    /// `question.opened` event feeding the ONE pending-decision projection
+    /// the dashboard and Slack render beside grants (the D-X channel
+    /// unification — never a parallel inbox to grants, NeedsContext, or
+    /// blocked prose). Absent on prose-only reports (the fallback every
+    /// backend without a structured ask keeps), capped at write
+    /// (orchestrator.rs), and never a park: the report's own `result` drives
+    /// the mission's course exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub questions: Option<Vec<ReportQuestion>>,
+}
+
+/// One structured human question inside a [`WorkerReport`] (ticket
+/// `structured-human-question-events`). Deliberately id-less: the engine
+/// mints the question id at emit time (`q-<n>`, per-mission monotonic from
+/// the folded count), so a model-supplied id can never collide with or
+/// shadow another question's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportQuestion {
+    /// The question text (size-capped + scrubbed at event write).
+    pub text: String,
+    /// Structured choices the worker offered; EMPTY asks for free text.
+    /// Capped per-option and per-list at event write.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
 }
 
 /// A finding emitted by a validator (scrutiny or functional).
@@ -508,6 +543,23 @@ pub struct MissionState {
     /// respawns, denying (or a timeout) fails the feature closed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_grant_request: Option<PendingGrantRequest>,
+    /// The pending-decision projection (ticket
+    /// `structured-human-question-events`): open structured human questions,
+    /// folded from `question.opened`, in open order; `question.answered` /
+    /// `question.cleared` remove their entry. Rendered by the dashboard and
+    /// Slack in the SAME "your move" area as the parked grant (distinct kind,
+    /// shared chrome — the D-X channel unification). Unlike
+    /// `pending_grant_request` the run loop never gates on this list; empty
+    /// on pre-field logs and omitted from the wire then.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_questions: Vec<PendingQuestion>,
+    /// Total `question.opened` events folded — the per-mission monotonic
+    /// counter the engine mints the next question id (`q-<n+1>`) from.
+    /// Restart-safe by construction (derived from the log, never reset by
+    /// answers or clears), so an id is never reused after a process restart.
+    /// `0` on pre-field logs and omitted from the wire then.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub question_count: u32,
     /// Seq of the last event folded in.
     pub last_seq: u64,
     /// Count of `tier.escalated` events folded (executor bumped from local to
@@ -625,6 +677,41 @@ pub struct PendingGrantRequest {
     /// destination (`Egress`). Named `command` for wire back-compat with the
     /// original command-only grant events.
     pub command: String,
+}
+
+/// An open structured human question (ticket
+/// `structured-human-question-events`), one entry of the pending-decision
+/// projection folded from `question.opened` (see
+/// [`MissionState::pending_questions`]). Carries the full context the
+/// dashboard and Slack need to render the decision without a join: the ask,
+/// its structured choices (empty = free text), and who/where it came from.
+/// Unlike [`PendingGrantRequest`] this parks NOTHING — the run loop does not
+/// gate on it; the question rides alongside the mission until the operator
+/// answers (`question.answered`) or it stops being actionable
+/// (`question.cleared`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingQuestion {
+    /// Engine-minted id (`q-<n>`, per-mission monotonic) — the handle every
+    /// answer path (REST/Slack/CLI) names.
+    pub question_id: String,
+    /// Who asked — `worker` in this pass.
+    pub role: Role,
+    /// The question text (scrubbed + capped at write).
+    pub text: String,
+    /// The structured choices offered (empty = free-text answer expected).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
+    /// The run whose report carried the ask (context ref).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// Feature the asking run worked on (context ref).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feature_id: Option<String>,
+    /// Milestone the asking run worked under (context ref; the
+    /// clear-on-complete sweep keys on it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub milestone_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1257,6 +1344,23 @@ pub enum ControlCommand {
         command: String,
         reason: String,
     },
+    /// Answer an open structured question (ticket
+    /// `structured-human-question-events`) — the pending-decision
+    /// projection's input edge, submitted through this EXISTING control path
+    /// (the D-X ruling: no new server). `answer` is the chosen option's text
+    /// verbatim or the operator's free text (scrubbed + capped when the
+    /// engine lands it as `question.answered`); `option` records the 0-based
+    /// index when an offered option was picked, and the engine cross-checks
+    /// it against the parked question exactly like the grant approve/deny
+    /// commands echo their target — a stale answer can't land on a different
+    /// question than the operator saw.
+    AnswerQuestion {
+        #[serde(rename = "questionId")]
+        question_id: String,
+        answer: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        option: Option<u32>,
+    },
 }
 
 #[cfg(test)]
@@ -1288,6 +1392,94 @@ mod tests {
         );
         let value = serde_json::to_value(&report).unwrap();
         assert_eq!(value["escalation"], "spec ambiguity beyond my confidence");
+    }
+
+    /// The additive `questions` on the worker report (ticket
+    /// `structured-human-question-events`): prose-only reports (the fallback)
+    /// parse with no questions, None never hits the wire, and a structured
+    /// ask round-trips — options included, or absent for a free-text ask.
+    #[test]
+    fn question_events_worker_report_questions_are_additive() {
+        // Old/prose-only report (no questions key): parses with None…
+        let json = r#"{"result": "pass", "summary": "did the thing"}"#;
+        let report: WorkerReport = serde_json::from_str(json).unwrap();
+        assert_eq!(report.questions, None);
+        // …and None stays off the wire.
+        let value = serde_json::to_value(&report).unwrap();
+        assert!(value.get("questions").is_none());
+
+        // A structured ask (with options and without) round-trips verbatim.
+        let json = r#"{
+            "result": "partial",
+            "summary": "blocked on a human choice",
+            "questions": [
+                { "text": "Which storage engine?", "options": ["sqlite", "in-memory"] },
+                { "text": "What should the flag be called?" }
+            ]
+        }"#;
+        let report: WorkerReport = serde_json::from_str(json).unwrap();
+        let questions = report.questions.as_ref().expect("questions parsed");
+        assert_eq!(questions.len(), 2);
+        assert_eq!(questions[0].text, "Which storage engine?");
+        assert_eq!(questions[0].options, vec!["sqlite", "in-memory"]);
+        assert_eq!(questions[1].options, Vec::<String>::new());
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["questions"][0]["options"][1], "in-memory");
+        // Empty options stay off the wire (a free-text ask carries no key).
+        assert!(value["questions"][1].get("options").is_none());
+    }
+
+    /// The `answer-question` control kind (ticket
+    /// `structured-human-question-events`): kebab-case wire name, camelCase
+    /// `questionId` (matching the event payload + REST body convention), and
+    /// `option` additive — absent for free-text answers and never on the
+    /// wire then.
+    #[test]
+    fn question_events_answer_control_kind_wire_shape() {
+        let cmd = ControlCommand::AnswerQuestion {
+            question_id: "q-1".into(),
+            answer: "sqlite".into(),
+            option: Some(0),
+        };
+        let json = serde_json::to_value(&cmd).unwrap();
+        assert_eq!(json["kind"], "answer-question");
+        assert_eq!(json["questionId"], "q-1");
+        assert_eq!(json["answer"], "sqlite");
+        assert_eq!(json["option"], 0);
+        let back: ControlCommand = serde_json::from_value(json).unwrap();
+        match back {
+            ControlCommand::AnswerQuestion {
+                question_id,
+                answer,
+                option,
+            } => {
+                assert_eq!(question_id, "q-1");
+                assert_eq!(answer, "sqlite");
+                assert_eq!(option, Some(0));
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // A free-text answer (no option index) omits the key, and a wire
+        // line without it parses back to None (serde default).
+        let cmd = ControlCommand::AnswerQuestion {
+            question_id: "q-2".into(),
+            answer: "call it --cache-dir".into(),
+            option: None,
+        };
+        let json = serde_json::to_value(&cmd).unwrap();
+        assert!(
+            !json.as_object().unwrap().contains_key("option"),
+            "option must not serialize when None: {json}"
+        );
+        let sparse: ControlCommand = serde_json::from_str(
+            r#"{"kind":"answer-question","questionId":"q-2","answer":"call it --cache-dir"}"#,
+        )
+        .unwrap();
+        match sparse {
+            ControlCommand::AnswerQuestion { option, .. } => assert_eq!(option, None),
+            _ => panic!("wrong variant"),
+        }
     }
 
     #[test]

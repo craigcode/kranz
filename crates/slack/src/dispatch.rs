@@ -10,8 +10,8 @@ use crate::bridge::{
     error_blocks, grant_control, guidance, is_ticket_slug, looks_like_mission_id,
     looks_like_plan_json, mission_dir_exists, mission_status, new_mission, no_host_blocks,
     not_authorized_blocks_for, not_authorized_text_for, post_thread_note, post_to_mission_thread,
-    reply_ephemeral, revision_control, scaffold_ticket, slugify, steer, user_reply, ModalScope,
-    SharedThreads,
+    question_control, reply_ephemeral, revision_control, scaffold_ticket, slugify, steer,
+    user_reply, ModalScope, SharedThreads,
 };
 use crate::client::SlackClient;
 use crate::commands::{
@@ -891,6 +891,25 @@ pub(crate) async fn dispatch_action(
                     reason: "denied from Slack".to_string(),
                 },
                 "grant denial queued",
+            )
+            .await;
+        }
+        Action::AnswerQuestion {
+            mission_id,
+            question_id,
+            option,
+            user_id,
+            response_url,
+        } => {
+            question_control(
+                cfg,
+                client,
+                repo_root,
+                mission_id,
+                question_id,
+                *option,
+                user_id.as_deref(),
+                response_url.as_deref(),
             )
             .await;
         }

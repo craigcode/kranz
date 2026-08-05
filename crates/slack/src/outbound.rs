@@ -18,7 +18,9 @@
 //! ticket file), so the bridge emits that one directly from the ticket layer;
 //! see [`crate::format::build_needs_context`]. It is intentionally absent here.
 
-use crate::format::{Blocked, Complete, GrantReady, Outcome, PlanReady, RevisionReady};
+use crate::format::{
+    Blocked, Complete, GrantReady, Outcome, PlanReady, QuestionReady, RevisionReady,
+};
 use kranz_engine::events::{Event, EventKind};
 use kranz_engine::types::MissionState;
 use std::path::Path;
@@ -30,6 +32,7 @@ pub enum Outbound {
     PlanReady(PlanReady),
     RevisionReady(RevisionReady),
     GrantReady(GrantReady),
+    QuestionReady(QuestionReady),
     Blocked(Blocked),
     Complete(Complete),
 }
@@ -44,6 +47,10 @@ impl Outbound {
             // A parked grant is an attention-needed block on the milestone, so
             // it rides the same notify flag as `milestone.blocked`.
             Outbound::GrantReady(_) => NotifyClass::Blocked,
+            // An open question is the SAME attention-needed "your move" as a
+            // parked grant (one shared pending-decision area), so it rides
+            // the same flag.
+            Outbound::QuestionReady(_) => NotifyClass::Blocked,
             Outbound::Blocked(_) => NotifyClass::Blocked,
             Outbound::Complete(_) => NotifyClass::Complete,
         }
@@ -98,6 +105,25 @@ pub fn classify(event: &Event, state: &MissionState, repo_root: &Path) -> Option
             milestone_id: milestone_id.clone(),
             kind: *kind,
             command: command.clone(),
+        })),
+
+        // An opened question is the second kind of the shared "your move"
+        // area; its answer/clear events produce no card (mirroring grant
+        // decisions, which also don't notify).
+        EventKind::QuestionOpened {
+            question_id,
+            text,
+            options,
+            feature_id,
+            milestone_id,
+            ..
+        } => Some(Outbound::QuestionReady(QuestionReady {
+            mission_id: state.mission.id.clone(),
+            question_id: question_id.clone(),
+            text: text.clone(),
+            options: options.clone(),
+            feature_id: feature_id.clone(),
+            milestone_id: milestone_id.clone(),
         })),
 
         EventKind::MilestoneBlocked {
@@ -238,6 +264,8 @@ mod tests {
             latest_plan_revision: 0,
             pending_revision: None,
             pending_grant_request: None,
+            pending_questions: vec![],
+            question_count: 0,
             last_seq: 1,
             escalated_milestones: 0,
             local_executor_milestones: 0,
@@ -356,6 +384,57 @@ mod tests {
         assert_eq!(g.mission_id, "m-1");
         assert_eq!(g.milestone_id, "ms-1");
         assert_eq!(g.command, "gc audit --deep");
+    }
+
+    /// The question card (ticket structured-human-question-events): an opened
+    /// question classifies into the SAME attention-needed notify class as a
+    /// parked grant (the shared "your move" flag); answers and clears produce
+    /// no card, mirroring grant decisions.
+    #[test]
+    fn question_events_opened_classifies_question_ready() {
+        let out = classify(
+            &ev(EventKind::QuestionOpened {
+                question_id: "q-1".into(),
+                role: kranz_engine::types::Role::Worker,
+                text: "Which storage engine?".into(),
+                options: vec!["sqlite".into(), "in-memory".into()],
+                run_id: Some("r-1".into()),
+                feature_id: Some("f-1-1".into()),
+                milestone_id: Some("ms-1".into()),
+            }),
+            &base_state(),
+            no_repo(),
+        )
+        .unwrap();
+        assert_eq!(out.class(), NotifyClass::Blocked);
+        let Outbound::QuestionReady(q) = out else {
+            panic!("wrong variant")
+        };
+        assert_eq!(q.mission_id, "m-1");
+        assert_eq!(q.question_id, "q-1");
+        assert_eq!(q.text, "Which storage engine?");
+        assert_eq!(q.options, vec!["sqlite", "in-memory"]);
+        assert_eq!(q.feature_id.as_deref(), Some("f-1-1"));
+        assert_eq!(q.milestone_id.as_deref(), Some("ms-1"));
+
+        // Answers and clears notify nothing (mirroring grant decisions).
+        for kind in [
+            EventKind::QuestionAnswered {
+                question_id: "q-1".into(),
+                answer: "sqlite".into(),
+                via: "answer-question".into(),
+                option: Some(0),
+            },
+            EventKind::QuestionCleared {
+                question_id: "q-1".into(),
+                why: "milestone completed".into(),
+            },
+        ] {
+            assert!(
+                classify(&ev(kind), &base_state(), no_repo()).is_none(),
+                "no card for question resolutions"
+            );
+        }
     }
 
     #[test]

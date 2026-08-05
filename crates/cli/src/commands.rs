@@ -6,7 +6,7 @@
 //! work on machines without a `claude` binary installed.
 
 use crate::backlog;
-use crate::cli::{Cli, Command, GrantCommand, RevisionCommand, TicketCommand};
+use crate::cli::{Cli, Command, GrantCommand, QuestionCommand, RevisionCommand, TicketCommand};
 use crate::output::{self, ansi};
 use crate::planning_tui::PlanningOutcome;
 use crate::tail::{self, EventRenderer};
@@ -269,6 +269,26 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
                 } => {
                     cmd_deny_grant(&repo, &id, &command, &reason)?;
                     println!("grant denial for `{command}` queued for mission {id}");
+                    if let Some(hint) = control_queue_hint(&repo, &id) {
+                        println!("{hint}");
+                    }
+                }
+            }
+            Ok(0)
+        }
+        Command::Question { command } => {
+            match command {
+                QuestionCommand::List { id } => {
+                    print!("{}", cmd_list_questions(&repo, &id)?);
+                }
+                QuestionCommand::Answer {
+                    id,
+                    question_id,
+                    answer,
+                    option,
+                } => {
+                    cmd_answer_question(&repo, &id, &question_id, &answer, option)?;
+                    println!("answer for question {question_id} queued for mission {id}");
                     if let Some(hint) = control_queue_hint(&repo, &id) {
                         println!("{hint}");
                     }
@@ -1296,6 +1316,91 @@ pub fn cmd_deny_grant(
             reason: reason.to_string(),
         },
     )?)
+}
+
+/// Render the mission's open structured questions (ticket
+/// `structured-human-question-events`) — the pending-decision projection the
+/// dashboard and Slack also render — one block per question: id, ask, and
+/// the indexed options (or a free-text note).
+pub fn cmd_list_questions(repo: &Path, mission_id: &str) -> Result<String> {
+    let mission_id = control::resolve_active_mission(repo, Some(mission_id))?;
+    let state = load_state(repo, &mission_id)?;
+    if state.pending_questions.is_empty() {
+        return Ok(format!("mission {mission_id} has no open questions\n"));
+    }
+    let mut out = String::new();
+    for q in &state.pending_questions {
+        out.push_str(&format!(
+            "{} ({}): {}\n",
+            q.question_id,
+            q.feature_id.as_deref().unwrap_or("mission"),
+            q.text
+        ));
+        if q.options.is_empty() {
+            out.push_str("  free-text answer expected\n");
+        } else {
+            for (index, option) in q.options.iter().enumerate() {
+                out.push_str(&format!("  [{index}] {option}\n"));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Enqueue an AnswerQuestion control command (ticket
+/// `structured-human-question-events`). Returns the queued file path.
+pub fn cmd_answer_question(
+    repo: &Path,
+    mission_id: &str,
+    question_id: &str,
+    answer: &str,
+    option: Option<u32>,
+) -> Result<PathBuf> {
+    let paths = require_pending_question(repo, mission_id, question_id, option, answer)?;
+    Ok(control::enqueue(
+        &paths,
+        &ControlCommand::AnswerQuestion {
+            question_id: question_id.to_string(),
+            answer: answer.to_string(),
+            option,
+        },
+    )?)
+}
+
+/// Resolve the mission and confirm question `question_id` is open (and an
+/// option-index answer is in range and matches the offered option), so the
+/// enqueued answer can't silently land on a different (or absent) question
+/// than the operator saw — the same stale-decision discipline as
+/// [`require_pending_grant`]. The engine re-validates at drain time.
+fn require_pending_question(
+    repo: &Path,
+    mission_id: &str,
+    question_id: &str,
+    option: Option<u32>,
+    answer: &str,
+) -> Result<MissionPaths> {
+    let mission_id = control::resolve_active_mission(repo, Some(mission_id))?;
+    let state = load_state(repo, &mission_id)?;
+    let Some(pending) = state
+        .pending_questions
+        .iter()
+        .find(|q| q.question_id == question_id)
+    else {
+        bail!("mission {mission_id} has no open question '{question_id}'");
+    };
+    if let Some(index) = option {
+        match pending.options.get(index as usize) {
+            Some(expected) if expected == answer => {}
+            Some(expected) => bail!(
+                "answer `{answer}` does not match option {index} (`{expected}`) of question '{question_id}'"
+            ),
+            None => bail!(
+                "question '{question_id}' has no option {index} (it offered {})",
+                pending.options.len()
+            ),
+        }
+    }
+    Ok(MissionPaths::new(repo, &mission_id))
 }
 
 fn require_revisable_mission(repo: &Path, mission_id: &str) -> Result<MissionPaths> {

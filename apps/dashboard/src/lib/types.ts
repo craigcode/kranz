@@ -196,6 +196,24 @@ export interface PendingGrantRequest {
   command: string;
 }
 
+/**
+ * An open structured human question (the pending-decision projection's
+ * second kind, rendered in the same "your move" area as the parked grant).
+ * Absent on pre-field snapshots (`pendingQuestions` omitted then).
+ */
+export interface PendingQuestion {
+  /** Engine-minted id (`q-<n>`) — the handle every answer path names. */
+  questionId: string;
+  /** Who asked — 'worker' in this pass. */
+  role: Role;
+  text: string;
+  /** The structured choices offered (empty = free-text answer expected). */
+  options?: string[];
+  runId?: string;
+  featureId?: string;
+  milestoneId?: string;
+}
+
 export interface TokenUsage {
   input: number;
   output: number;
@@ -290,6 +308,8 @@ export interface MissionState {
   latestPlanRevision: number;
   pendingRevision?: PendingRevision;
   pendingGrantRequest?: PendingGrantRequest;
+  /** Open structured human questions, in open order. Omitted when empty. */
+  pendingQuestions?: PendingQuestion[];
   lastSeq: number;
 }
 
@@ -357,6 +377,9 @@ export type EventKind =
   | { type: 'grant.requested'; payload: { milestoneId: string; command: string } }
   | { type: 'grant.approved'; payload: { command: string } }
   | { type: 'grant.denied'; payload: { command: string; reason: string } }
+  | { type: 'question.opened'; payload: { questionId: string; role: Role; text: string; options?: string[]; runId?: string; featureId?: string; milestoneId?: string } }
+  | { type: 'question.answered'; payload: { questionId: string; answer: string; via: string; option?: number } }
+  | { type: 'question.cleared'; payload: { questionId: string; why: string } }
   | { type: 'milestone.started'; payload: { milestoneId: string; startSha: string } }
   | { type: 'feature.started'; payload: { featureId: string } }
   | { type: 'worker.spawned'; payload: { runId: string; role: Role; featureId?: string; milestoneId?: string; sdkSessionId: string; model: string; promptHash: string; transcriptPath: string } }

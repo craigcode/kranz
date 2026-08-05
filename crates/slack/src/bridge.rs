@@ -1216,6 +1216,7 @@ pub(crate) fn apply_action(repo_root: &Path, action: &Action) -> Result<()> {
         | Action::RejectRevision { .. }
         | Action::ApproveGrant { .. }
         | Action::DenyGrant { .. }
+        | Action::AnswerQuestion { .. }
         | Action::Work { .. }
         | Action::WorkRun { .. }
         | Action::AppHome { .. }
@@ -2337,6 +2338,87 @@ fn enqueue_grant_control(
     Ok(mission_id)
 }
 
+/// Allowlist-gate a question answer button, resolve the option index against
+/// the parked question, enqueue it, and ack over the button's `response_url`.
+/// Mirrors [`grant_control`] — the shared pending-decision chrome's second
+/// kind (ticket `structured-human-question-events`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn question_control(
+    cfg: &SlackConfig,
+    client: &SlackClient,
+    repo_root: &Path,
+    mission_id: &str,
+    question_id: &str,
+    option: u32,
+    user_id: Option<&str>,
+    response_url: Option<&str>,
+) {
+    if !cfg.is_authorized(user_id) {
+        reply_ephemeral(cfg, client, response_url, &not_authorized_blocks_for(cfg)).await;
+        return;
+    }
+    match enqueue_question_control(repo_root, mission_id, question_id, option) {
+        Ok(applied_to) => {
+            reply_ephemeral(
+                cfg,
+                client,
+                response_url,
+                &error_blocks(&format!(
+                    ":memo: answer for question {question_id} queued for `{applied_to}`."
+                )),
+            )
+            .await;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to enqueue question answer from Slack");
+            reply_ephemeral(
+                cfg,
+                client,
+                response_url,
+                &error_blocks(&format!("Couldn't queue question answer: {e}")),
+            )
+            .await;
+        }
+    }
+}
+
+/// Resolve the clicked option INDEX against the parked question and enqueue
+/// the answer. The index is validated here (the question must still be open,
+/// the index in range) and the engine re-validates at drain time — a stale
+/// card can never land an answer on a different question than the operator
+/// saw, the same discipline as [`enqueue_grant_control`].
+fn enqueue_question_control(
+    repo_root: &Path,
+    mission_id: &str,
+    question_id: &str,
+    option: u32,
+) -> Result<String> {
+    let mission_id = resolve_active_config_target(repo_root, Some(mission_id))?;
+    let paths = MissionPaths::new(repo_root, &mission_id);
+    let state = read_mission_state(&paths)?;
+    let Some(pending) = state
+        .pending_questions
+        .iter()
+        .find(|q| q.question_id == question_id)
+    else {
+        anyhow::bail!("mission `{mission_id}` has no open question '{question_id}'");
+    };
+    let Some(answer) = pending.options.get(option as usize) else {
+        anyhow::bail!(
+            "question '{question_id}' has no option {option} (it offered {})",
+            pending.options.len()
+        );
+    };
+    let cmd = ControlCommand::AnswerQuestion {
+        question_id: question_id.to_string(),
+        answer: answer.clone(),
+        option: Some(option),
+    };
+    kranz_engine::control::enqueue(&paths, &cmd).context("enqueue question answer")?;
+    tracing::info!(mission = %mission_id, ?cmd, "question answer enqueued from Slack");
+    Ok(mission_id)
+}
+
 fn read_mission_state(paths: &MissionPaths) -> Result<MissionState> {
     let events = EventLog::read_events(&paths.events_file())?;
     Ok(reducer::fold(&events)?)
@@ -2909,6 +2991,99 @@ mod tests {
         };
         let line = serde_json::to_string(&event).unwrap();
         std::fs::write(paths.events_file(), format!("{line}\n")).unwrap();
+    }
+
+    /// The Slack answer path (ticket structured-human-question-events): the
+    /// clicked option index resolves against the parked question and lands
+    /// in the control inbox as `answer-question`; stale clicks (unknown
+    /// question, out-of-range index) are refused before anything enqueues.
+    #[test]
+    fn question_events_enqueue_answer_resolves_option_and_validates() {
+        use kranz_engine::events::{Event, EventKind};
+        use kranz_engine::types::Role;
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-q", "ask me");
+        let paths = MissionPaths::new(tmp.path(), "m-q");
+        let append = |seq: u64, kind: EventKind| {
+            let event = Event {
+                seq,
+                ts: chrono::Utc::now(),
+                mission_id: "m-q".to_string(),
+                kind,
+            };
+            let line = serde_json::to_string(&event).unwrap();
+            let mut existing = std::fs::read_to_string(paths.events_file()).unwrap();
+            existing.push_str(&line);
+            existing.push('\n');
+            std::fs::write(paths.events_file(), existing).unwrap();
+        };
+        append(
+            2,
+            EventKind::PlanApproved {
+                plan: sample_plan("ask me"),
+                base_sha: None,
+            },
+        );
+        append(
+            3,
+            EventKind::MilestoneStarted {
+                milestone_id: "ms-1".into(),
+                start_sha: "abc1234".into(),
+            },
+        );
+        append(
+            4,
+            EventKind::WorkerSpawned {
+                run_id: "r-1".into(),
+                role: Role::Worker,
+                feature_id: Some("f-1-1".into()),
+                milestone_id: None,
+                candidate: None,
+                sdk_session_id: "s-1".into(),
+                model: "sonnet".into(),
+                quant: "n/a".into(),
+                weight_hash: None,
+                prompt_hash: "h".into(),
+                transcript_path: "runs/r-1.jsonl".into(),
+            },
+        );
+        append(
+            5,
+            EventKind::QuestionOpened {
+                question_id: "q-1".into(),
+                role: Role::Worker,
+                text: "Which storage engine?".into(),
+                options: vec!["sqlite".into(), "in-memory".into()],
+                run_id: Some("r-1".into()),
+                feature_id: Some("f-1-1".into()),
+                milestone_id: Some("ms-1".into()),
+            },
+        );
+
+        enqueue_question_control(tmp.path(), "m-q", "q-1", 1).unwrap();
+        let commands = kranz_engine::control::drain(&paths).unwrap();
+        assert_eq!(commands.len(), 1);
+        match &commands[0].1 {
+            ControlCommand::AnswerQuestion {
+                question_id,
+                answer,
+                option,
+            } => {
+                assert_eq!(question_id, "q-1");
+                assert_eq!(answer, "in-memory", "index resolved to its option text");
+                assert_eq!(*option, Some(1));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        // Stale clicks are refused before enqueueing.
+        assert!(enqueue_question_control(tmp.path(), "m-q", "q-1", 9).is_err());
+        assert!(enqueue_question_control(tmp.path(), "m-q", "q-nope", 0).is_err());
+        assert_eq!(
+            kranz_engine::control::drain(&paths).unwrap().len(),
+            1,
+            "stale clicks never enqueue"
+        );
     }
 
     fn sample_plan(goal: &str) -> kranz_engine::types::Plan {

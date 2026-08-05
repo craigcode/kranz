@@ -216,6 +216,13 @@ pub enum Command {
         command: GrantCommand,
     },
 
+    /// Answer an open structured human question (the pending-decision
+    /// projection the dashboard and Slack also render)
+    Question {
+        #[command(subcommand)]
+        command: QuestionCommand,
+    },
+
     /// List this repo's missions
     Missions,
 
@@ -653,6 +660,34 @@ pub enum GrantCommand {
         /// Reason recorded on the denial
         #[arg(long, default_value = "denied by operator")]
         reason: String,
+    },
+}
+
+/// Subcommands under `kranz question` — the structured human-question
+/// pending-decision projection (ticket structured-human-question-events).
+#[derive(Subcommand, Debug)]
+pub enum QuestionCommand {
+    /// List the mission's open questions (id, text, options)
+    List {
+        /// Mission id whose open questions should be listed
+        id: String,
+    },
+
+    /// Answer an open question (lands as question.answered; the answer
+    /// reaches the running mission via the user-message consult)
+    Answer {
+        /// Mission id whose open question should be answered
+        id: String,
+
+        /// The engine-minted question id (`q-<n>`, from `kranz question list`)
+        question_id: String,
+
+        /// The answer: an offered option's text verbatim, or free text
+        answer: String,
+
+        /// 0-based index of the offered option picked (omit for free text)
+        #[arg(long)]
+        option: Option<u32>,
     },
 }
 

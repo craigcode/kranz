@@ -548,6 +548,101 @@ pub enum EventKind {
         reason: String,
     },
 
+    /// A worker asked the human a structured question (ticket
+    /// `structured-human-question-events`): the report's `questions` payload
+    /// (the "ask the human" tool shape — text plus capped structured choices)
+    /// opened as ONE entry of the pending-decision projection
+    /// ([`crate::types::MissionState::pending_questions`]) that the dashboard
+    /// and Slack render beside grants — the D-X channel-unification ruling:
+    /// permission prompts stay on the grant flow, ticket underspecification
+    /// stays on NeedsContext, and ONLY orchestrator/worker structured asks
+    /// land here, so this is not a third competing human-input inbox.
+    ///
+    /// Unlike `grant.requested`, opening a question parks NOTHING: the
+    /// worker's own run result drives the mission's course exactly as before
+    /// (a prose-only report opens no question at all — the prose fallback),
+    /// and an answer reaches the running mission through the existing
+    /// user-message consult fold (see `question.answered`). The id is
+    /// engine-minted (`q-<n>` from the folded
+    /// [`crate::types::MissionState::question_count`] — restart-safe, never
+    /// reused), never model-supplied. Text and options are credential-
+    /// scrubbed and size-capped at write (orchestrator.rs caps); `role`
+    /// names who asked (`worker` today — an orchestrator ask path can land
+    /// without a schema change). The run/feature/milestone refs are
+    /// denormalized context so surfaces render without a join.
+    #[serde(rename = "question.opened")]
+    QuestionOpened {
+        /// Engine-minted id (`q-<n>`, per-mission monotonic).
+        #[serde(rename = "questionId")]
+        question_id: String,
+        /// Who asked — `worker` in this pass.
+        role: Role,
+        /// The question text (scrubbed, capped at write).
+        text: String,
+        /// Structured choices the asker offered (each scrubbed + capped, the
+        /// list capped at write). EMPTY means a free-text answer is expected.
+        /// Absent in pre-field logs and omitted from the wire when empty.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        options: Vec<String>,
+        /// The run whose report carried the ask. `None` never hits the wire.
+        #[serde(rename = "runId", default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        /// Feature the asking run worked on (context ref). `None` never hits
+        /// the wire.
+        #[serde(rename = "featureId", default, skip_serializing_if = "Option::is_none")]
+        feature_id: Option<String>,
+        /// Milestone the asking run worked under (context ref; the clear-on-
+        /// complete sweep keys on it). `None` never hits the wire.
+        #[serde(
+            rename = "milestoneId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        milestone_id: Option<String>,
+    },
+
+    /// The operator answered an open question (ticket
+    /// `structured-human-question-events`), mirroring
+    /// `grant.requested` → `grant.approved`: the reducer cross-checks the id
+    /// against the parked projection (a stale or forged answer for a question
+    /// that is not open fails the fold), removes it from
+    /// [`crate::types::MissionState::pending_questions`], and folds the answer
+    /// onto `pending_user_messages` — the EXISTING consult path, so the
+    /// answer reaches the running mission (and replays after restart) with no
+    /// new delivery mechanism. `answer` is the chosen option's text verbatim
+    /// or the operator's free text (scrubbed + capped at write — an operator
+    /// can paste a token into an answer box, and the log is corpus-exported);
+    /// `option` records the 0-based index when an offered option was picked,
+    /// `None` for free text. `via` names the control path that delivered it
+    /// (the `answer-question` control kind today; a free-form string so a
+    /// future `msg`-carried answer needs no schema change).
+    #[serde(rename = "question.answered")]
+    QuestionAnswered {
+        #[serde(rename = "questionId")]
+        question_id: String,
+        answer: String,
+        via: String,
+        /// 0-based index into the question's `options` when an offered option
+        /// was picked; absent for free-text answers. `None` never hits the
+        /// wire.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        option: Option<u32>,
+    },
+
+    /// An open question stopped being actionable WITHOUT an answer (ticket
+    /// `structured-human-question-events`) — its milestone completed, or the
+    /// mission ended with the ask still open. Third kind rather than a
+    /// resolution field on `question.opened` for the same reason grants are
+    /// two kinds: the log is append-only, so a later resolution can only ever
+    /// be a second event. `why` is the engine's reason verbatim
+    /// ("milestone completed", "mission completed", ...).
+    #[serde(rename = "question.cleared")]
+    QuestionCleared {
+        #[serde(rename = "questionId")]
+        question_id: String,
+        why: String,
+    },
+
     #[serde(rename = "milestone.blocked")]
     MilestoneBlocked {
         #[serde(rename = "milestoneId")]
@@ -739,6 +834,9 @@ impl EventKind {
             EventKind::FixFeatureCreated { .. } => "fixfeature.created",
             EventKind::TierEscalated { .. } => "tier.escalated",
             EventKind::WorkerEscalated { .. } => "worker.escalated",
+            EventKind::QuestionOpened { .. } => "question.opened",
+            EventKind::QuestionAnswered { .. } => "question.answered",
+            EventKind::QuestionCleared { .. } => "question.cleared",
             EventKind::MilestoneBlocked { .. } => "milestone.blocked",
             EventKind::MilestoneUnblocked { .. } => "milestone.unblocked",
             EventKind::MilestoneCompleted { .. } => "milestone.completed",
@@ -1769,5 +1867,144 @@ mod tests {
             EventKind::HookGateFired { detail, .. } => assert_eq!(detail, None),
             _ => panic!("wrong variant"),
         }
+    }
+
+    /// The additive question events (ticket
+    /// `structured-human-question-events`): wire names, exact payload shapes,
+    /// and round-trips. Every optional field stays OFF the wire when absent,
+    /// and sparse wire lines (hand-written or future-trimmed logs) fold with
+    /// serde defaults — the gate.result additive template.
+    #[test]
+    fn question_events_wire_shapes_and_round_trips() {
+        let opened = EventKind::QuestionOpened {
+            question_id: "q-1".into(),
+            role: Role::Worker,
+            text: "Which storage engine should the cache use?".into(),
+            options: vec!["sqlite".into(), "in-memory".into()],
+            run_id: Some("r-1".into()),
+            feature_id: Some("f-1-1".into()),
+            milestone_id: Some("ms-1".into()),
+        };
+        let json = serde_json::to_value(&opened).unwrap();
+        assert_eq!(json["type"], "question.opened");
+        assert_eq!(json["payload"]["questionId"], "q-1");
+        assert_eq!(json["payload"]["role"], "worker");
+        assert_eq!(
+            json["payload"]["text"],
+            "Which storage engine should the cache use?"
+        );
+        assert_eq!(
+            json["payload"]["options"],
+            serde_json::json!(["sqlite", "in-memory"])
+        );
+        assert_eq!(json["payload"]["runId"], "r-1");
+        assert_eq!(json["payload"]["featureId"], "f-1-1");
+        assert_eq!(json["payload"]["milestoneId"], "ms-1");
+        assert_eq!(opened.type_name(), "question.opened");
+        let back: EventKind = serde_json::from_value(json).unwrap();
+        match back {
+            EventKind::QuestionOpened {
+                question_id,
+                role,
+                options,
+                milestone_id,
+                ..
+            } => {
+                assert_eq!(question_id, "q-1");
+                assert_eq!(role, Role::Worker);
+                assert_eq!(options.len(), 2);
+                assert_eq!(milestone_id.as_deref(), Some("ms-1"));
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // Empty options (a free-text ask) and absent context refs stay off
+        // the wire, and a sparse line folds them to the defaults.
+        let free_text = EventKind::QuestionOpened {
+            question_id: "q-2".into(),
+            role: Role::Worker,
+            text: "What should the flag be called?".into(),
+            options: vec![],
+            run_id: None,
+            feature_id: None,
+            milestone_id: None,
+        };
+        let json = serde_json::to_value(&free_text).unwrap();
+        let payload = json["payload"].as_object().unwrap();
+        for absent in ["options", "runId", "featureId", "milestoneId"] {
+            assert!(
+                !payload.contains_key(absent),
+                "payload must not contain {absent} when empty/None: {json}"
+            );
+        }
+        let sparse: EventKind = serde_json::from_str(
+            r#"{"type":"question.opened","payload":{"questionId":"q-2","role":"worker","text":"What should the flag be called?"}}"#,
+        )
+        .unwrap();
+        match sparse {
+            EventKind::QuestionOpened {
+                options,
+                run_id,
+                feature_id,
+                milestone_id,
+                ..
+            } => {
+                assert!(options.is_empty());
+                assert_eq!(run_id, None);
+                assert_eq!(feature_id, None);
+                assert_eq!(milestone_id, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let answered = EventKind::QuestionAnswered {
+            question_id: "q-1".into(),
+            answer: "sqlite".into(),
+            via: "answer-question".into(),
+            option: Some(0),
+        };
+        let json = serde_json::to_value(&answered).unwrap();
+        assert_eq!(json["type"], "question.answered");
+        assert_eq!(json["payload"]["questionId"], "q-1");
+        assert_eq!(json["payload"]["answer"], "sqlite");
+        assert_eq!(json["payload"]["via"], "answer-question");
+        assert_eq!(json["payload"]["option"], 0);
+        assert_eq!(answered.type_name(), "question.answered");
+        let back: EventKind = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, EventKind::QuestionAnswered { .. }));
+
+        // option = None (free-text answer) stays off the wire; a sparse line
+        // folds it to None.
+        let free_answer = EventKind::QuestionAnswered {
+            question_id: "q-2".into(),
+            answer: "call it --cache-dir".into(),
+            via: "answer-question".into(),
+            option: None,
+        };
+        let json = serde_json::to_value(&free_answer).unwrap();
+        assert!(
+            !json["payload"].as_object().unwrap().contains_key("option"),
+            "option must not serialize when None: {json}"
+        );
+        let sparse: EventKind = serde_json::from_str(
+            r#"{"type":"question.answered","payload":{"questionId":"q-2","answer":"call it --cache-dir","via":"answer-question"}}"#,
+        )
+        .unwrap();
+        match sparse {
+            EventKind::QuestionAnswered { option, .. } => assert_eq!(option, None),
+            _ => panic!("wrong variant"),
+        }
+
+        let cleared = EventKind::QuestionCleared {
+            question_id: "q-1".into(),
+            why: "milestone completed".into(),
+        };
+        let json = serde_json::to_value(&cleared).unwrap();
+        assert_eq!(json["type"], "question.cleared");
+        assert_eq!(json["payload"]["questionId"], "q-1");
+        assert_eq!(json["payload"]["why"], "milestone completed");
+        assert_eq!(cleared.type_name(), "question.cleared");
+        let back: EventKind = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, EventKind::QuestionCleared { .. }));
     }
 }

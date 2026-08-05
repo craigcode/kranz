@@ -812,6 +812,42 @@ pub(crate) async fn post_grant_deny(
     Ok((StatusCode::ACCEPTED, Json(json!({ "queued": true }))))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct QuestionAnswerBody {
+    /// The open question's engine-minted id (`q-<n>`).
+    question_id: String,
+    /// The chosen option's text verbatim, or free text.
+    answer: String,
+    /// 0-based option index when an offered option was picked; absent for
+    /// free-text answers.
+    #[serde(default)]
+    option: Option<u32>,
+}
+
+/// `POST /api/missions/:id/question/answer` — answer an open structured
+/// question (ticket `structured-human-question-events`): the pending-decision
+/// projection's input edge, enqueued onto the EXISTING control path (D-X: no
+/// new server). The engine lands it as `question.answered`, which the reducer
+/// routes onto the mission's user-message consult.
+pub(crate) async fn post_question_answer(
+    State(server): State<Arc<ServerState>>,
+    UrlPath(id): UrlPath<String>,
+    Json(body): Json<QuestionAnswerBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let paths =
+        require_pending_question(&server, &id, &body.question_id, body.option, &body.answer)?;
+    control::enqueue(
+        &paths,
+        &ControlCommand::AnswerQuestion {
+            question_id: body.question_id,
+            answer: body.answer,
+            option: body.option,
+        },
+    )?;
+    Ok((StatusCode::ACCEPTED, Json(json!({ "queued": true }))))
+}
+
 // ---------------------------------------------------------------------------
 // Shared helpers (also used by the WS handler)
 // ---------------------------------------------------------------------------
@@ -908,6 +944,49 @@ fn require_pending_grant(
             "mission '{id}' has no pending grant request"
         ))),
     }
+}
+
+/// Confirm question `question_id` is open (and an option-index answer is in
+/// range and matches the offered option), so the enqueued answer can't land
+/// on a different (or absent) question than the operator saw — the same
+/// stale-decision discipline as [`require_pending_grant`]. The engine
+/// re-validates at drain time; this pre-check is what lets the caller get an
+/// honest 409 instead of a silently ignored 202.
+fn require_pending_question(
+    server: &ServerState,
+    id: &str,
+    question_id: &str,
+    option: Option<u32>,
+    answer: &str,
+) -> Result<MissionPaths, ApiError> {
+    let paths = require_revisable_mission(server, id)?;
+    let state = fold_log(&paths).map_err(ApiError::internal)?;
+    let Some(pending) = state
+        .pending_questions
+        .iter()
+        .find(|q| q.question_id == question_id)
+    else {
+        return Err(ApiError::conflict(format!(
+            "mission '{id}' has no open question '{question_id}'"
+        )));
+    };
+    if let Some(index) = option {
+        match pending.options.get(index as usize) {
+            Some(expected) if expected == answer => {}
+            Some(expected) => {
+                return Err(ApiError::conflict(format!(
+                    "answer `{answer}` does not match option {index} (`{expected}`) of question '{question_id}'"
+                )))
+            }
+            None => {
+                return Err(ApiError::conflict(format!(
+                    "question '{question_id}' has no option {index} (it offered {})",
+                    pending.options.len()
+                )))
+            }
+        }
+    }
+    Ok(paths)
 }
 
 fn simple_line_diff(old_name: &str, new_name: &str, old: &str, new: &str) -> String {

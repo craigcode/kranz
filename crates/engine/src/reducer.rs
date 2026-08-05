@@ -481,6 +481,102 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             run_mut(state, run_id)?;
         }
 
+        EventKind::QuestionOpened {
+            question_id,
+            role,
+            text,
+            options,
+            run_id,
+            feature_id,
+            milestone_id,
+        } => {
+            // The pending-decision projection's open edge (ticket
+            // structured-human-question-events). NOT record-only: the open
+            // question IS state a surface renders and an answer cross-checks
+            // against, so it folds onto `pending_questions` — but it gates
+            // NOTHING in the run loop (contrast grant.requested's park).
+            // Validate references as a corruption guard (mirrors
+            // validation.finding), then dedupe like fixfeature.created: a
+            // duplicated open with an IDENTICAL payload is an idempotent
+            // replay (no double-push, no id-counter bump); the same id with
+            // a DIFFERENT payload is shadowing and stays loudly invalid.
+            if question_id.trim().is_empty() {
+                return Err(EngineError::InvalidState(
+                    "question.opened question id must not be empty".to_string(),
+                ));
+            }
+            if text.trim().is_empty() {
+                return Err(EngineError::InvalidState(format!(
+                    "question.opened {question_id} text must not be empty"
+                )));
+            }
+            if let Some(run_id) = run_id {
+                run_mut(state, run_id)?;
+            }
+            if let Some(feature_id) = feature_id {
+                feature_mut(state, feature_id)?;
+            }
+            if let Some(milestone_id) = milestone_id {
+                milestone_mut(state, milestone_id)?;
+            }
+            if let Some(existing) = state
+                .pending_questions
+                .iter()
+                .find(|q| q.question_id == *question_id)
+            {
+                let identical = existing.role == *role
+                    && existing.text == *text
+                    && existing.options == *options
+                    && existing.run_id == *run_id
+                    && existing.feature_id == *feature_id
+                    && existing.milestone_id == *milestone_id;
+                if !identical {
+                    return Err(EngineError::InvalidState(format!(
+                        "duplicate question.opened for '{question_id}' with a different payload"
+                    )));
+                }
+                // fall through to the tail: seq advances, state unchanged
+            } else {
+                state.question_count += 1;
+                state.pending_questions.push(PendingQuestion {
+                    question_id: question_id.clone(),
+                    role: *role,
+                    text: text.clone(),
+                    options: options.clone(),
+                    run_id: run_id.clone(),
+                    feature_id: feature_id.clone(),
+                    milestone_id: milestone_id.clone(),
+                });
+            }
+        }
+
+        EventKind::QuestionAnswered {
+            question_id,
+            answer,
+            ..
+        } => {
+            // The projection's answer edge: cross-check against the parked
+            // question (mirrors expect_pending_grant — a stale or forged
+            // answer for a question that is not open fails the fold), remove
+            // it, then route the answer onto `pending_user_messages` — the
+            // EXISTING consult path (D-X: answers ride the msg machinery,
+            // never a new delivery mechanism), so the orchestrator's next
+            // user-message consult consumes the answer and a restart replays
+            // it from the log alone.
+            let question = take_pending_question(state, question_id, "question.answered")?;
+            state.pending_user_messages.push(format!(
+                "answer to question {} (\"{}\"): {}",
+                question.question_id, question.text, answer
+            ));
+        }
+
+        EventKind::QuestionCleared { question_id, .. } => {
+            // The projection's clear edge: same parked-question cross-check
+            // as the answer (a clear for a question that is not open is
+            // corruption, never a silent no-op).
+            take_pending_question(state, question_id, "question.cleared")?;
+        }
+
         EventKind::MilestoneBlocked { milestone_id, .. } => {
             milestone_mut(state, milestone_id)?.status = MilestoneStatus::Blocked;
             state.mission.status = MissionStatus::Blocked;
@@ -643,6 +739,8 @@ fn initial_state(event: &Event) -> Result<MissionState> {
         latest_plan_revision: 0,
         pending_revision: None,
         pending_grant_request: None,
+        pending_questions: Vec::new(),
+        question_count: 0,
         last_seq: event.seq,
         escalated_milestones: 0,
         local_executor_milestones: 0,
@@ -675,6 +773,28 @@ fn expect_pending_grant(
             "{event} with no pending grant request"
         ))),
     }
+}
+
+/// Remove and return the parked question `question_id` names, or fail the
+/// fold. Both `question.answered` and `question.cleared` gate on this
+/// (mirrors [`expect_pending_grant`]): a stale, replayed, or forged
+/// resolution for a question that is not open — never asked, already
+/// answered, already cleared — is corruption, not a silent no-op.
+fn take_pending_question(
+    state: &mut MissionState,
+    question_id: &str,
+    event: &str,
+) -> Result<PendingQuestion> {
+    let Some(index) = state
+        .pending_questions
+        .iter()
+        .position(|q| q.question_id == question_id)
+    else {
+        return Err(EngineError::InvalidState(format!(
+            "{event} for question '{question_id}' that is not open"
+        )));
+    };
+    Ok(state.pending_questions.remove(index))
 }
 
 fn apply_revised_plan(state: &mut MissionState, plan: &Plan, revision: u32) -> Result<()> {

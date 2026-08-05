@@ -298,6 +298,23 @@ export const api = {
     );
   },
 
+  async answerQuestion(
+    id: string,
+    questionId: string,
+    answer: string,
+    option?: number,
+  ): Promise<void> {
+    const body: { questionId: string; answer: string; option?: number } = {
+      questionId,
+      answer,
+    };
+    if (option !== undefined) body.option = option;
+    await postJson<{ queued: boolean }>(
+      `/api/missions/${encodeURIComponent(id)}/question/answer`,
+      body,
+    );
+  },
+
   // --- mission lifecycle (server-hosted engine; M2.5) ----------------------
 
   createMission(goal: string, config?: Record<string, unknown>): Promise<{ id: string }> {

@@ -452,6 +452,10 @@ fn repo_api_routes() -> Router<Arc<ServerState>> {
             post(rest::post_grant_approve),
         )
         .route("/missions/{id}/grant/deny", post(rest::post_grant_deny))
+        .route(
+            "/missions/{id}/question/answer",
+            post(rest::post_question_answer),
+        )
         .route("/missions/{id}/planning/turn", post(host::planning_turn))
         .route(
             "/missions/{id}/planning/request-plan",

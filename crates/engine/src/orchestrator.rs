@@ -92,6 +92,27 @@ const DECISION_SUMMARY_MAX: usize = 200;
 /// Max chars of `worker.message` content (mirrors the runner's cap).
 const MESSAGE_CONTENT_MAX: usize = 2000;
 
+/// Caps for the structured human-question payloads (ticket
+/// `structured-human-question-events`) — the Mission Control AskUserQuestion
+/// UX contract reference (caps, options, free text) made engine-side:
+/// bounded so a model-authored ask can never bloat the append-only log, and
+/// scrubbed at write like every other model-authored string the engine
+/// persists.
+/// Max questions taken from one worker report; the rest is dropped with an
+/// operator-visible decision note (never silently).
+const QUESTIONS_PER_REPORT_CAP: usize = 4;
+/// Max chars of one question's text on `question.opened`.
+const QUESTION_TEXT_MAX: usize = 500;
+/// Max structured choices kept per question (the Slack card renders one
+/// button per option, so this also bounds the chrome).
+const QUESTION_OPTIONS_CAP: usize = 4;
+/// Max chars of one option's label.
+const QUESTION_OPTION_MAX: usize = 100;
+/// Max chars of an operator's answer on `question.answered` (operator-typed
+/// text still gets scrubbed — a pasted token must never reach the
+/// corpus-exported log).
+const ANSWER_TEXT_MAX: usize = 500;
+
 /// Sleep between loop iterations while paused (§4.5 step b).
 const PAUSE_POLL: Duration = Duration::from_millis(300);
 
@@ -1638,6 +1659,105 @@ impl MissionEngine {
         Ok(())
     }
 
+    /// Answer an open structured question (ticket
+    /// `structured-human-question-events`): append `question.answered`, which
+    /// the reducer cross-checks against the parked projection, removes from
+    /// it, and routes onto `pending_user_messages` — the answer reaches the
+    /// running mission through the EXISTING user-message consult (and the
+    /// blocked-milestone consult when blocked), never a new delivery
+    /// mechanism.
+    ///
+    /// The cross-checks mirror the grant approve/deny discipline, so a
+    /// stale, replayed, or mistyped answer can never land on a different
+    /// question than the operator saw:
+    /// - the id must name an OPEN question (a duplicate control file — the
+    ///   crash-between-emit-and-acknowledge window — errors here, is noted,
+    ///   and is acknowledged away, exactly like a duplicate grant decision);
+    /// - an option INDEX answer must be in range and its text must match the
+    ///   parked option verbatim (the surface resolved the index against the
+    ///   same projection);
+    /// - the answer text must be non-empty.
+    ///
+    /// The answer is scrubbed + capped at this write boundary: operator-typed
+    /// text can still carry a pasted token, and the log is corpus-exported.
+    fn answer_pending_question(
+        &mut self,
+        question_id: &str,
+        answer: &str,
+        option: Option<u32>,
+    ) -> Result<()> {
+        let pending = self
+            .state
+            .pending_questions
+            .iter()
+            .find(|q| q.question_id == question_id)
+            .cloned()
+            .ok_or_else(|| {
+                EngineError::InvalidState(format!("no open question '{question_id}' to answer"))
+            })?;
+        if answer.trim().is_empty() {
+            return Err(EngineError::InvalidState(
+                "question answer must not be empty".to_string(),
+            ));
+        }
+        if let Some(index) = option {
+            let expected = pending.options.get(index as usize).ok_or_else(|| {
+                EngineError::InvalidState(format!(
+                    "question '{question_id}' has no option {index} (it offered {})",
+                    pending.options.len()
+                ))
+            })?;
+            if expected != answer {
+                return Err(EngineError::InvalidState(format!(
+                    "answer {answer:?} does not match option {index} ({expected:?}) of question '{question_id}'"
+                )));
+            }
+        }
+        self.emit(EventKind::QuestionAnswered {
+            question_id: question_id.to_string(),
+            answer: scrub::scrub_and_truncate(answer, ANSWER_TEXT_MAX),
+            via: "answer-question".to_string(),
+            option,
+        })?;
+        // NO success decision here (contrast the grant approve/deny paths):
+        // an `orchestrator.decision` fold CONSUMES `pending_user_messages`,
+        // which is exactly where the reducer just routed this answer — a
+        // decision emitted now would eat the answer (and any other queued
+        // operator message) before the consult can read it. The
+        // `question.answered` event itself is the audit record; the tail and
+        // both surfaces render it.
+        Ok(())
+    }
+
+    /// Clear every open question matching `scope` (emit `question.cleared`)
+    /// because it stopped being actionable — its milestone completed, or the
+    /// mission ended with the ask still open. Keeps the pending-decision
+    /// projection honest: a question whose decision is moot never lingers as
+    /// a "your move" the operator can no longer act on. (An abandoned mission
+    /// is the deliberate exception — the abandon path emits no events of its
+    /// own, mirroring how a parked grant request also outlives it in state;
+    /// every surface gates on an active mission.)
+    fn clear_open_questions(
+        &mut self,
+        why: &str,
+        scope: impl Fn(&PendingQuestion) -> bool,
+    ) -> Result<()> {
+        let ids: Vec<String> = self
+            .state
+            .pending_questions
+            .iter()
+            .filter(|q| scope(q))
+            .map(|q| q.question_id.clone())
+            .collect();
+        for question_id in ids {
+            self.emit(EventKind::QuestionCleared {
+                question_id,
+                why: why.to_string(),
+            })?;
+        }
+        Ok(())
+    }
+
     /// Park a `kind` grant for `target` (emit `GrantRequested`), returning
     /// `true`. Bounded by `grant_request_cap` per milestone: over the cap it
     /// emits an informational decision and returns `false` so the caller falls
@@ -2521,6 +2641,19 @@ impl MissionEngine {
                         })?;
                     }
                 }
+                ControlCommand::AnswerQuestion {
+                    question_id,
+                    answer,
+                    option,
+                } => {
+                    if let Err(e) = self.answer_pending_question(&question_id, &answer, option) {
+                        tracing::warn!(error = %e, question_id, "question answer ignored");
+                        self.emit(EventKind::OrchestratorDecision {
+                            summary: format!("answer for question {question_id} ignored: {e}"),
+                            detail: None,
+                        })?;
+                    }
+                }
             }
             control::acknowledge(&self.paths, &path)?;
         }
@@ -2665,6 +2798,14 @@ impl MissionEngine {
                         reason: "milestone skipped".to_string(),
                     })?;
                 }
+                // Structured human questions (ticket
+                // structured-human-question-events): asks scoped to this
+                // milestone are moot once it is skipped — clear them so the
+                // pending-decision projection never shows an unanswerable
+                // "your move".
+                self.clear_open_questions("milestone skipped", |q| {
+                    q.milestone_id.as_deref() == Some(milestone_id.as_str())
+                })?;
                 self.emit(EventKind::MilestoneCompleted {
                     milestone_id,
                     tag: None,
@@ -2793,6 +2934,78 @@ impl MissionEngine {
             to: ExecutorTier::Frontier,
             reason: reason.clone(),
         })?;
+        Ok(())
+    }
+
+    /// Structured human questions (ticket `structured-human-question-events`):
+    /// when the finished worker's report carries `questions` (the "ask the
+    /// human" tool payload — text plus structured choices), open each as a
+    /// `question.opened` event feeding the ONE pending-decision projection
+    /// the dashboard and Slack render beside grants (the D-X channel
+    /// unification: permission prompts stay on the grant flow, ticket
+    /// underspecification stays on NeedsContext, blocked prose stays valid —
+    /// this is never a parallel inbox for any of them).
+    ///
+    /// Deliberately NOT a park: opening a question gates nothing (contrast
+    /// `park_for_grant`). The worker's own `result` drives the mission's
+    /// course exactly as before — a worker that needs a human choice reports
+    /// partial/fail and the normal judgement/blocked flow carries on, with
+    /// the question riding alongside as structured context the operator can
+    /// answer through the existing control path (the answer then reaches the
+    /// mission via the user-message consult fold). A prose-only report (no
+    /// `questions` key) emits nothing, so backends without a structured ask
+    /// keep working byte-for-byte.
+    ///
+    /// Write discipline: the report text was credential-scrubbed at capture
+    /// (runner.rs `final_text`); each field is scrubbed + truncated AGAIN at
+    /// this write boundary (defense-in-depth, and the truncation cap only
+    /// applies here), question/options counts are capped, and the question
+    /// id is engine-minted from the folded `question_count` — never
+    /// model-supplied, so one report's id can never shadow another's.
+    fn emit_worker_questions(
+        &mut self,
+        milestone_id: &str,
+        feature_id: &str,
+        outcome: &runner::RunOutcome,
+    ) -> Result<()> {
+        let Some(report) = &outcome.report else {
+            return Ok(());
+        };
+        let Some(questions) = &report.questions else {
+            return Ok(());
+        };
+        for question in questions.iter().take(QUESTIONS_PER_REPORT_CAP) {
+            if question.text.trim().is_empty() {
+                continue;
+            }
+            // Minted from the CURRENT folded count; each emit below folds
+            // immediately and bumps it, so the next iteration's id is fresh.
+            let question_id = format!("q-{}", self.state.question_count + 1);
+            self.emit(EventKind::QuestionOpened {
+                question_id,
+                role: Role::Worker,
+                text: scrub::scrub_and_truncate(&question.text, QUESTION_TEXT_MAX),
+                options: question
+                    .options
+                    .iter()
+                    .take(QUESTION_OPTIONS_CAP)
+                    .map(|o| scrub::scrub_and_truncate(o, QUESTION_OPTION_MAX))
+                    .filter(|o| !o.trim().is_empty())
+                    .collect(),
+                run_id: Some(outcome.run_id.clone()),
+                feature_id: Some(feature_id.to_string()),
+                milestone_id: Some(milestone_id.to_string()),
+            })?;
+        }
+        let dropped = questions.len().saturating_sub(QUESTIONS_PER_REPORT_CAP);
+        if dropped > 0 {
+            self.emit_decision(
+                &format!(
+                    "worker report carried {dropped} question(s) beyond the {QUESTIONS_PER_REPORT_CAP}-question cap; only the first {QUESTIONS_PER_REPORT_CAP} were opened",
+                ),
+                None,
+            )?;
+        }
         Ok(())
     }
 
@@ -2965,6 +3178,13 @@ impl MissionEngine {
             // for the frontier advisor BEFORE the judgement turn — the
             // advisor act — consumes it from the same report.
             self.emit_worker_escalation(&feature.id, &outcome)?;
+            // Structured human questions (ticket
+            // structured-human-question-events): open the report's "ask the
+            // human" payload into the pending-decision projection — also
+            // BEFORE the judgement turn, which reads the same report. Never
+            // a park: the outcome drives the flow below unchanged.
+            let milestone_id = self.state.mission.milestones[mi].id.clone();
+            self.emit_worker_questions(&milestone_id, &feature.id, &outcome)?;
 
             match self
                 .judge_worker_run(&feature.id, &outcome, &commits, &diff_stat)
@@ -4078,7 +4298,7 @@ impl MissionEngine {
                 .take()
                 .expect("every non-errored workspace has a buffered result");
             let disposition = self
-                .append_and_judge_worktree(ws, start_sha, events, &outcome)
+                .append_and_judge_worktree(ws, &milestone_id, start_sha, events, &outcome)
                 .await?;
             // An uninspectable worktree keeps its bytes (12th-pass review,
             // P2): the caller's cleanup guard skips its dir AND branch.
@@ -4263,6 +4483,7 @@ impl MissionEngine {
     async fn append_and_judge_worktree(
         &mut self,
         ws: &ParallelWorkspace,
+        milestone_id: &str,
         start_sha: &str,
         buffered: Vec<EventKind>,
         outcome: &runner::RunOutcome,
@@ -4351,6 +4572,10 @@ impl MissionEngine {
         // Worker self-escalation (KRZ-331): same record-only emission as the
         // sequential path, before the judgement turn consumes the report.
         self.emit_worker_escalation(&ws.feature_id, outcome)?;
+        // Structured human questions (ticket
+        // structured-human-question-events): same projection open as the
+        // sequential path — never a park.
+        self.emit_worker_questions(milestone_id, &ws.feature_id, outcome)?;
         match self
             .judge_worker_run(&ws.feature_id, outcome, &commits, &diff_stat)
             .await?
@@ -4823,6 +5048,13 @@ impl MissionEngine {
 
         if findings.is_empty() {
             let tag = self.tag_milestone(&milestone_id);
+            // Structured human questions (ticket
+            // structured-human-question-events): asks scoped to this
+            // milestone are moot once it completes — clear them out of the
+            // pending-decision projection.
+            self.clear_open_questions("milestone completed", |q| {
+                q.milestone_id.as_deref() == Some(milestone_id.as_str())
+            })?;
             self.emit(EventKind::MilestoneCompleted { milestone_id, tag })?;
             return Ok(());
         }
@@ -4854,6 +5086,11 @@ impl MissionEngine {
             FindingsConversion::Waive { waived } => {
                 self.emit_waive_decision(&waived)?;
                 let tag = self.tag_milestone(&milestone_id);
+                // Structured human questions: same clear-on-complete as the
+                // findings-empty path above.
+                self.clear_open_questions("milestone completed", |q| {
+                    q.milestone_id.as_deref() == Some(milestone_id.as_str())
+                })?;
                 self.emit(EventKind::MilestoneCompleted { milestone_id, tag })?;
             }
             FindingsConversion::Fix {
@@ -5253,6 +5490,9 @@ impl MissionEngine {
             changed_paths.extend(paths);
         }
         if non_meta_commit_count == 0 {
+            // Same mission-end clear as complete_mission: no open question
+            // may outlive the mission in the pending-decision projection.
+            self.clear_open_questions("mission failed", |_| true)?;
             self.emit(EventKind::MissionFailed {
                 reason: format!(
                     "no deliverable commits landed on the mission branch: \
@@ -5621,6 +5861,12 @@ impl MissionEngine {
             None => self.emit_decision("no cross-mission lesson captured", None)?,
         }
         self.write_mission_report(lesson_paths);
+        // Structured human questions (ticket
+        // structured-human-question-events): questions do not park the run
+        // loop, so an ask can still be open here — a completed mission makes
+        // every one moot. Clear them so the projection never shows a
+        // "your move" on a mission that can no longer act on it.
+        self.clear_open_questions("mission completed", |_| true)?;
         self.emit(EventKind::MissionCompleted {})?;
         Ok(())
     }
@@ -7514,6 +7760,7 @@ pub(crate) mod tests {
             commits: vec![],
             commands_run: vec!["gc lint".to_string(), "gc lint".to_string()],
             escalation: None,
+            questions: None,
         };
         let run = WorkerRun {
             id: "run-1".to_string(),
@@ -7581,6 +7828,8 @@ pub(crate) mod tests {
             latest_plan_revision: 0,
             pending_revision: None,
             pending_grant_request: None,
+            pending_questions: vec![],
+            question_count: 0,
             last_seq: 0,
             escalated_milestones: 0,
             local_executor_milestones: 0,
@@ -8759,6 +9008,7 @@ pub(crate) mod tests {
                 commits: vec![],
                 commands_run: vec![],
                 escalation: escalation.map(|s| s.to_string()),
+                questions: None,
             }),
             validator_report: None,
             exit: SessionExit::Completed,
@@ -8842,6 +9092,492 @@ pub(crate) mod tests {
                 .count(),
             1,
             "a report without an escalation request must not record one"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Structured human questions (ticket structured-human-question-events)
+    // -----------------------------------------------------------------------
+
+    /// Engine with an approved one-milestone/one-feature plan, ms-1 started,
+    /// and worker run r-1 spawned on f-1-1 — the context refs a
+    /// `question.opened` can name (the fold validates them).
+    #[cfg(test)]
+    fn question_events_engine() -> Option<(tempfile::TempDir, MissionEngine)> {
+        let (_dir, root) = lessons_test_repo()?;
+        let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
+        let mut engine = MissionEngine::create(
+            backend,
+            &root,
+            "goal",
+            MissionConfig {
+                worker_isolation: WorkerIsolation::Checkout,
+                ..MissionConfig::default()
+            },
+        )
+        .expect("create engine");
+        engine
+            .approve_plan(Plan {
+                goal: "g".into(),
+                validation_contract: vec![],
+                milestones: vec![PlanMilestone {
+                    title: "m".into(),
+                    features: vec![PlanFeature {
+                        title: "f".into(),
+                        spec: "s".into(),
+                        validation_criteria: vec![],
+                    }],
+                }],
+                considered_alternatives: None,
+                command_grants: vec![],
+                touch_set: vec![],
+            })
+            .expect("approve plan");
+        engine
+            .emit(EventKind::MilestoneStarted {
+                milestone_id: "ms-1".to_string(),
+                start_sha: "sha-1".to_string(),
+            })
+            .unwrap();
+        engine
+            .emit(EventKind::WorkerSpawned {
+                run_id: "r-1".to_string(),
+                role: Role::Worker,
+                feature_id: Some("f-1-1".to_string()),
+                milestone_id: None,
+                candidate: None,
+                sdk_session_id: "s-1".to_string(),
+                model: "m".to_string(),
+                quant: "n/a".to_string(),
+                weight_hash: None,
+                prompt_hash: "h".to_string(),
+                transcript_path: "runs/r-1.jsonl".to_string(),
+            })
+            .unwrap();
+        Some((_dir, engine))
+    }
+
+    /// A worker outcome whose report carries the given questions (and no
+    /// escalation) — the "ask the human" payload the run path hands
+    /// [`MissionEngine::emit_worker_questions`].
+    #[cfg(test)]
+    fn question_outcome(
+        questions: Option<Vec<crate::types::ReportQuestion>>,
+    ) -> runner::RunOutcome {
+        runner::RunOutcome {
+            run_id: "r-1".to_string(),
+            session_id: "s-1".to_string(),
+            result: RunResult::Partial,
+            usage: TokenUsage::default(),
+            cost_usd: None,
+            final_text: String::new(),
+            report: Some(WorkerReport {
+                result: RunResult::Partial,
+                summary: "blocked on a human choice".to_string(),
+                files_touched: vec![],
+                tests_added: vec![],
+                test_evidence: String::new(),
+                dependencies_added: vec![],
+                known_gaps: vec![],
+                commits: vec![],
+                commands_run: vec![],
+                escalation: None,
+                questions,
+            }),
+            validator_report: None,
+            exit: SessionExit::Completed,
+            denied_count: 0,
+            denied_commands: vec![],
+            denied_egress: vec![],
+        }
+    }
+
+    #[test]
+    fn question_events_worker_report_opens_pending_decision_projection() {
+        let Some((_dir, mut engine)) = question_events_engine() else {
+            return;
+        };
+        engine
+            .emit_worker_questions(
+                "ms-1",
+                "f-1-1",
+                &question_outcome(Some(vec![
+                    crate::types::ReportQuestion {
+                        text: "Which storage engine should the cache use?".to_string(),
+                        options: vec!["sqlite".to_string(), "in-memory".to_string()],
+                    },
+                    crate::types::ReportQuestion {
+                        text: "What should the flag be called?".to_string(),
+                        options: vec![],
+                    },
+                ])),
+            )
+            .unwrap();
+
+        let pending = &engine.state.pending_questions;
+        assert_eq!(pending.len(), 2, "both asks parked: {pending:?}");
+        assert_eq!(engine.state.question_count, 2);
+        // Engine-minted ids, per-mission monotonic — never model-supplied.
+        assert_eq!(pending[0].question_id, "q-1");
+        assert_eq!(pending[1].question_id, "q-2");
+        assert_eq!(pending[0].options, vec!["sqlite", "in-memory"]);
+        assert!(pending[1].options.is_empty(), "empty options = free text");
+        for q in pending {
+            assert_eq!(q.role, Role::Worker);
+            assert_eq!(q.run_id.as_deref(), Some("r-1"));
+            assert_eq!(q.feature_id.as_deref(), Some("f-1-1"));
+            assert_eq!(q.milestone_id.as_deref(), Some("ms-1"));
+        }
+        // The events landed in the log (the replay source of truth).
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(&e.kind, EventKind::QuestionOpened { .. }))
+                .count(),
+            2
+        );
+        // Opening a question parks NOTHING (contrast the grant park).
+        assert!(engine.state.pending_grant_request.is_none());
+        assert_eq!(engine.state.mission.status, MissionStatus::Running);
+    }
+
+    #[test]
+    fn question_events_caps_truncate_and_scrub_at_write() {
+        let Some((_dir, mut engine)) = question_events_engine() else {
+            return;
+        };
+        // A token the anthropic-api-key rule flags (same shape as the scrub
+        // tests' anchor): model-authored text must never reach the log. The
+        // secret leads the over-long strings so truncation (which follows the
+        // scrub) can't cut it away first — the redaction marker must be what
+        // survives.
+        const SECRET: &str = "sk-ant-api03-ScrubNofollowTestValue1";
+        let long_text = format!("{SECRET}{}", "x".repeat(600));
+        let questions: Vec<crate::types::ReportQuestion> = (0..6)
+            .map(|i| crate::types::ReportQuestion {
+                text: if i == 0 {
+                    long_text.clone()
+                } else {
+                    format!("question {i}")
+                },
+                options: (0..6)
+                    .map(|o| {
+                        if o == 0 {
+                            format!("{SECRET}{}", "y".repeat(200))
+                        } else {
+                            format!("option {o}")
+                        }
+                    })
+                    .collect(),
+            })
+            .collect();
+        engine
+            .emit_worker_questions("ms-1", "f-1-1", &question_outcome(Some(questions)))
+            .unwrap();
+
+        // The 4-question cap: first four opened, the rest dropped WITH an
+        // operator-visible note (never silently).
+        assert_eq!(engine.state.pending_questions.len(), 4);
+        assert!(
+            engine
+                .state
+                .recent_decisions
+                .iter()
+                .any(|d| d.contains("beyond the 4-question cap")),
+            "the drop is narrated: {:?}",
+            engine.state.recent_decisions
+        );
+        let first = &engine.state.pending_questions[0];
+        assert!(
+            first.text.chars().count() <= 500 + "… [truncated]".len(),
+            "text capped: {} chars",
+            first.text.chars().count()
+        );
+        assert_eq!(first.options.len(), 4, "options capped");
+        assert!(
+            first.options[0].chars().count() <= 100 + "… [truncated]".len(),
+            "option text capped: {} chars",
+            first.options[0].chars().count()
+        );
+        // Scrubbed at write: the secret shape appears NOWHERE in the log.
+        let raw = std::fs::read_to_string(engine.paths.events_file()).expect("read log");
+        assert!(
+            !raw.contains(SECRET),
+            "model-authored secret must be scrubbed from events.jsonl"
+        );
+        assert!(raw.contains("[REDACTED]"), "redaction marker present");
+    }
+
+    /// Prose fallback (ticket structured-human-question-events): a report
+    /// without a `questions` key — every backend without a structured ask —
+    /// opens nothing and the mission flows exactly as before.
+    #[test]
+    fn question_events_prose_only_report_opens_nothing() {
+        let Some((_dir, mut engine)) = question_events_engine() else {
+            return;
+        };
+        engine
+            .emit_worker_questions("ms-1", "f-1-1", &question_outcome(None))
+            .unwrap();
+        assert!(engine.state.pending_questions.is_empty());
+        assert_eq!(engine.state.question_count, 0);
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::QuestionOpened { .. })),
+            "no question events for a prose-only report"
+        );
+        // Some questions but an empty list behaves the same.
+        engine
+            .emit_worker_questions("ms-1", "f-1-1", &question_outcome(Some(vec![])))
+            .unwrap();
+        assert!(engine.state.pending_questions.is_empty());
+    }
+
+    /// End-to-end through the EXISTING control path: an `answer-question`
+    /// control file drains to `question.answered`, which routes the answer
+    /// onto the user-message consult — and a replayed (duplicate) answer
+    /// file is noted and swallowed, never a brick.
+    #[tokio::test]
+    async fn question_events_answer_reaches_mission_via_control_drain() {
+        let Some((_dir, mut engine)) = question_events_engine() else {
+            return;
+        };
+        engine
+            .emit_worker_questions(
+                "ms-1",
+                "f-1-1",
+                &question_outcome(Some(vec![crate::types::ReportQuestion {
+                    text: "Which storage engine?".to_string(),
+                    options: vec!["sqlite".to_string(), "in-memory".to_string()],
+                }])),
+            )
+            .unwrap();
+
+        control::enqueue(
+            &engine.paths,
+            &ControlCommand::AnswerQuestion {
+                question_id: "q-1".to_string(),
+                answer: "sqlite".to_string(),
+                option: Some(0),
+            },
+        )
+        .unwrap();
+        engine.drain_control().await.unwrap();
+
+        assert!(engine.state.pending_questions.is_empty());
+        assert_eq!(engine.state.pending_user_messages.len(), 1);
+        assert!(
+            engine.state.pending_user_messages[0].contains("sqlite"),
+            "the answer reached the consult path: {:?}",
+            engine.state.pending_user_messages
+        );
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        let answered: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::QuestionAnswered {
+                    question_id,
+                    answer,
+                    via,
+                    option,
+                } => Some((question_id.clone(), answer.clone(), via.clone(), *option)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(answered.len(), 1);
+        assert_eq!(answered[0].0, "q-1");
+        assert_eq!(answered[0].1, "sqlite");
+        assert_eq!(answered[0].2, "answer-question");
+        assert_eq!(answered[0].3, Some(0));
+
+        // Duplicate answer (the crash-between-emit-and-acknowledge window):
+        // noted for the operator, swallowed — never a brick, and NEVER a
+        // second question.answered (the note's decision fold may consume the
+        // replayed consult line, the pre-existing queue semantics every user
+        // message shares; the durable answer stays in the log either way).
+        control::enqueue(
+            &engine.paths,
+            &ControlCommand::AnswerQuestion {
+                question_id: "q-1".to_string(),
+                answer: "sqlite".to_string(),
+                option: Some(0),
+            },
+        )
+        .unwrap();
+        engine.drain_control().await.unwrap();
+        assert!(
+            engine
+                .state
+                .recent_decisions
+                .iter()
+                .any(|d| d.contains("answer for question q-1 ignored")),
+            "the duplicate is narrated: {:?}",
+            engine.state.recent_decisions
+        );
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(&e.kind, EventKind::QuestionAnswered { .. }))
+                .count(),
+            1,
+            "the duplicate never lands a second question.answered"
+        );
+        assert!(control::drain(&engine.paths).unwrap().is_empty());
+    }
+
+    /// The answer cross-checks (engine-side, mirroring the grant echo
+    /// discipline): unknown id, empty answer, out-of-range option, and
+    /// option text that doesn't match the parked question are all refused
+    /// BEFORE any event lands.
+    #[test]
+    fn question_events_answer_validation_refuses_stale_answers() {
+        let Some((_dir, mut engine)) = question_events_engine() else {
+            return;
+        };
+        engine
+            .emit_worker_questions(
+                "ms-1",
+                "f-1-1",
+                &question_outcome(Some(vec![crate::types::ReportQuestion {
+                    text: "Which storage engine?".to_string(),
+                    options: vec!["sqlite".to_string(), "in-memory".to_string()],
+                }])),
+            )
+            .unwrap();
+        let seq_before = engine.state.last_seq;
+
+        assert!(engine
+            .answer_pending_question("q-nope", "sqlite", None)
+            .is_err());
+        assert!(engine.answer_pending_question("q-1", "   ", None).is_err());
+        assert!(engine
+            .answer_pending_question("q-1", "sqlite", Some(9))
+            .is_err());
+        assert!(engine
+            .answer_pending_question("q-1", "in-memory", Some(0))
+            .is_err());
+        assert_eq!(
+            engine.state.last_seq, seq_before,
+            "a refused answer appends nothing"
+        );
+        assert_eq!(engine.state.pending_questions.len(), 1);
+
+        // Free text on an optioned question (the "Other" path) IS accepted.
+        engine
+            .answer_pending_question("q-1", "postgres, actually", None)
+            .unwrap();
+        assert!(engine.state.pending_questions.is_empty());
+
+        // The answer is scrubbed + capped at the write boundary too: an
+        // operator pasting a token into an over-long answer lands redacted
+        // and truncated in the corpus-exported log.
+        const SECRET: &str = "sk-ant-api03-ScrubNofollowTestValue1";
+        engine
+            .emit_worker_questions(
+                "ms-1",
+                "f-1-1",
+                &question_outcome(Some(vec![crate::types::ReportQuestion {
+                    text: "Another?".to_string(),
+                    options: vec![],
+                }])),
+            )
+            .unwrap();
+        let long_answer = format!("{SECRET}{}", "z".repeat(600));
+        engine
+            .answer_pending_question("q-2", &long_answer, None)
+            .unwrap();
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        let answers: Vec<String> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::QuestionAnswered { answer, .. } => Some(answer.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(answers.len(), 2, "both answers recorded");
+        let answer = &answers[1];
+        assert!(!answer.contains(SECRET), "answer redacted at write");
+        assert!(answer.contains("[REDACTED]"));
+        assert!(
+            answer.chars().count() <= 500 + "… [truncated]".len(),
+            "answer capped: {} chars",
+            answer.chars().count()
+        );
+    }
+
+    /// The clear sweep: milestone-scoped clears remove only that milestone's
+    /// asks; a mission-end clear removes them all — the projection never
+    /// shows an unanswerable "your move".
+    #[test]
+    fn question_events_clear_open_questions_scopes() {
+        let Some((_dir, mut engine)) = question_events_engine() else {
+            return;
+        };
+        engine
+            .emit_worker_questions(
+                "ms-1",
+                "f-1-1",
+                &question_outcome(Some(vec![
+                    crate::types::ReportQuestion {
+                        text: "first".to_string(),
+                        options: vec![],
+                    },
+                    crate::types::ReportQuestion {
+                        text: "second".to_string(),
+                        options: vec![],
+                    },
+                ])),
+            )
+            .unwrap();
+        assert_eq!(engine.state.pending_questions.len(), 2);
+
+        // Milestone scope: only ms-1's asks clear. (Both opens here are
+        // ms-1-scoped, so one remains after a foreign milestone's sweep.)
+        engine
+            .clear_open_questions("milestone completed", |q| {
+                q.milestone_id.as_deref() == Some("ms-2")
+            })
+            .unwrap();
+        assert_eq!(
+            engine.state.pending_questions.len(),
+            2,
+            "foreign scope clears nothing"
+        );
+        engine
+            .clear_open_questions("milestone completed", |q| {
+                q.milestone_id.as_deref() == Some("ms-1")
+            })
+            .unwrap();
+        assert!(engine.state.pending_questions.is_empty());
+
+        // Mission-end scope: everything clears.
+        engine
+            .emit_worker_questions(
+                "ms-1",
+                "f-1-1",
+                &question_outcome(Some(vec![crate::types::ReportQuestion {
+                    text: "third".to_string(),
+                    options: vec![],
+                }])),
+            )
+            .unwrap();
+        engine
+            .clear_open_questions("mission completed", |_| true)
+            .unwrap();
+        assert!(engine.state.pending_questions.is_empty());
+        // Ids are never reused across clears (the folded count only grows).
+        assert_eq!(engine.state.question_count, 3);
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(&e.kind, EventKind::QuestionCleared { .. }))
+                .count(),
+            3
         );
     }
 

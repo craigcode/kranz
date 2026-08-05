@@ -25,6 +25,7 @@ import { TranscriptView } from './components/TranscriptView';
 import { ModelPanel } from './components/ModelPanel';
 import { WorkspacePanel } from './components/WorkspacePanel';
 import { GrantRequestPanel } from './components/GrantRequestPanel';
+import { QuestionRequestPanel } from './components/QuestionRequestPanel';
 import { RevisionPanel } from './components/RevisionPanel';
 import { FeaturesPanel } from './components/FeaturesPanel';
 import { ProgressLog } from './components/ProgressLog';
@@ -133,6 +134,7 @@ export default function App() {
             <ModelPanel />
             <WorkspacePanel />
             <GrantRequestPanel />
+            <QuestionRequestPanel />
             <RevisionPanel />
             <FeaturesPanel />
             <ProgressLog />

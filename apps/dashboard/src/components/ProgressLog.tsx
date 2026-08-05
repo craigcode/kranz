@@ -37,6 +37,21 @@ function describe(e: MissionEvent, state: MissionState | null): { text: string; 
       return { text: `Grant approved: ${truncate(e.payload.command, 80)}`, tone: 'ok' };
     case 'grant.denied':
       return { text: `Grant denied: ${truncate(e.payload.command, 80)}`, tone: 'bad' };
+    case 'question.opened':
+      return {
+        text: `Question ${e.payload.questionId}: ${truncate(e.payload.text, 80)} — awaiting an answer`,
+        tone: 'warn',
+      };
+    case 'question.answered':
+      return {
+        text: `Question ${e.payload.questionId} answered: ${truncate(e.payload.answer, 80)}`,
+        tone: 'ok',
+      };
+    case 'question.cleared':
+      return {
+        text: `Question ${e.payload.questionId} cleared (${e.payload.why})`,
+        tone: 'plain',
+      };
     case 'milestone.started':
       return { text: `Milestone ${e.payload.milestoneId} started`, tone: 'info' };
     case 'feature.started':

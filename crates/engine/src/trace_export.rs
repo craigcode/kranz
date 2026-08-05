@@ -214,6 +214,7 @@ mod tests {
                 commits: vec!["deadbeef commit".to_string()],
                 commands_run: vec![],
                 escalation: None,
+                questions: None,
             }),
         }
     }
