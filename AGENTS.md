@@ -114,11 +114,15 @@ kranz work                      # drain the queue (run missions)
 Committed: `.kranz/merge-gates.json`, `.kranz/workspace.json` (workspace
 contract, validated at draft/approve; `crates/engine/src/workspace_contract.rs`),
 `.kranz/tickets/<slug>.md`, `.kranz/tickets/<slug>.notes.jsonl` (append-only
-discussion sidecar, D-BW-3; `crates/engine/src/ticket_notes.rs`), and each
+discussion sidecar, D-BW-3; `crates/engine/src/ticket_notes.rs`),
+`.kranz/domain-denylist.json` + `.kranz/domain-allowlist` (clean-room lint
+policy — salted hashes and reviewed waiver fingerprints only, never readable
+terms; `crates/engine/src/domain_lint.rs`, docs/domain-lint.md), and each
 mission's `plan.md` / `plan.json` / `report.md` (on the mission branch). Gitignored runtime
 (never commit): `events.jsonl`, `state.json`, `runs/`, `control/`,
 `missions/*/workspace/` (container-provider compose files),
-`.kranz/config.json`, `serve.token`, `serve.read.token`, `.kranz/tickets/*.status`.
+`.kranz/config.json`, `serve.token`, `serve.read.token`,
+`.kranz/domain-terms.local` (plaintext lint vocabulary), `.kranz/tickets/*.status`.
 
 ## Change discipline
 

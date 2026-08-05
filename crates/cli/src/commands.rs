@@ -331,6 +331,9 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             Ok(0)
         }
         Command::Scan { staged, range } => cmd_scan(&repo, staged, range.as_deref()),
+        Command::DomainLint { seed_config, json } => {
+            cmd_domain_lint(&repo, seed_config.as_deref(), json)
+        }
         Command::HookGuard { config } => {
             let mut stdin = std::io::stdin();
             Ok(crate::hook_guard::run_hook_guard(&config, &mut stdin))
@@ -1362,6 +1365,123 @@ pub fn cmd_scan(repo: &Path, staged: bool, range: Option<&str>) -> Result<i32> {
             kranz_engine::scrub::format_findings(&findings)
         );
         Ok(2)
+    }
+}
+
+/// `kranz domain-lint` (KRZ-314 clean-room boundary — see
+/// `kranz_engine::domain_lint` module docs and docs/domain-lint.md).
+///
+/// Default mode lints the scoped tree against the committed hashed denylist:
+/// exit 0 clean, exit 1 with each unwaived hit printed as
+/// `<fingerprint> <path>:<line>` — never the matched text, which is the
+/// vocabulary the boundary protects. `--seed-config` is the other half of
+/// the workflow: regenerate the hash config from the operator-local
+/// plaintext terms file (kept outside the repo), preserving the salt so
+/// existing waiver fingerprints survive.
+pub fn cmd_domain_lint(repo: &Path, seed_config: Option<&Path>, json: bool) -> Result<i32> {
+    use kranz_engine::domain_lint as dl;
+    let config_path = repo.join(dl::DENYLIST_PATH);
+
+    if let Some(terms_file) = seed_config {
+        let terms = std::fs::read_to_string(terms_file)
+            .with_context(|| format!("read terms file {}", terms_file.display()))?;
+        let existing = std::fs::read_to_string(&config_path).ok();
+        let config = dl::seed_config(existing.as_deref(), &terms)?;
+        // A repo may not have a .kranz/ directory yet (lint-only use).
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+        std::fs::write(&config_path, &config)
+            .with_context(|| format!("write {}", config_path.display()))?;
+        let denylist = dl::load_denylist(&config)?;
+        // The report is the count and the salt's fate — never a term.
+        println!(
+            "seeded {} ({} hashed terms, {})",
+            dl::DENYLIST_PATH,
+            denylist.term_count(),
+            if existing.is_some() {
+                "salt preserved"
+            } else {
+                "fresh salt"
+            }
+        );
+        warn_if_terms_file_unprotected(repo, terms_file);
+        return Ok(0);
+    }
+
+    let config_text = std::fs::read_to_string(&config_path).with_context(|| {
+        format!(
+            "read {} — seed it with `kranz domain-lint --seed-config <terms-file>` (docs/domain-lint.md)",
+            dl::DENYLIST_PATH
+        )
+    })?;
+    let denylist = dl::load_denylist(&config_text)?;
+    let allowed = std::fs::read_to_string(repo.join(dl::ALLOWLIST_PATH))
+        .ok()
+        .map(|text| kranz_engine::scrub::read_allowlist_text(&text))
+        .unwrap_or_default();
+    let report = dl::lint_tree(repo, &denylist, &allowed)?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "passed": report.is_clean(),
+                "filesScanned": report.files_scanned,
+                "filesSkipped": report.files_skipped,
+                "findings": report.findings,
+            }))?
+        );
+    }
+    if report.is_clean() {
+        if !json {
+            println!(
+                "domain lint passed ({} files scanned)",
+                report.files_scanned
+            );
+        }
+        Ok(0)
+    } else {
+        if !json {
+            println!(
+                "domain lint failed: {} unwaived hit(s); add a fingerprint to {} only for a reviewed false positive:",
+                report.findings.len(),
+                dl::ALLOWLIST_PATH
+            );
+            for finding in &report.findings {
+                println!("{} {}:{}", finding.fingerprint, finding.path, finding.line);
+            }
+        }
+        Ok(1)
+    }
+}
+
+/// Loudly warn when the plaintext terms file lives inside the repo and is
+/// not gitignored — that file IS the protected vocabulary, so tracking it
+/// would be the leak the boundary exists to prevent (the lint itself would
+/// flag it on the next run; better to say so at seed time).
+fn warn_if_terms_file_unprotected(repo: &Path, terms_file: &Path) {
+    let (Ok(repo), Ok(terms_file)) = (repo.canonicalize(), terms_file.canonicalize()) else {
+        return;
+    };
+    let Ok(relative) = terms_file.strip_prefix(&repo) else {
+        return; // outside the repo: exactly where the plaintext belongs
+    };
+    let ignored = std::process::Command::new("git")
+        .args(["check-ignore", "-q", "--"])
+        .arg(relative)
+        .current_dir(&repo)
+        .status()
+        .map(|status| status.success())
+        // A failed probe must not nag; the lint is the backstop either way.
+        .unwrap_or(true);
+    if !ignored {
+        eprintln!(
+            "warning: {} is inside the repo and NOT gitignored — move it outside the repo or use {} (gitignored)",
+            relative.display(),
+            kranz_engine::domain_lint::TERMS_LOCAL_PATH
+        );
     }
 }
 

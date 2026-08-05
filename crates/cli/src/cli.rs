@@ -354,6 +354,26 @@ pub enum Command {
         range: Option<String>,
     },
 
+    /// Lint the scoped tree for banned domain vocabulary (the KRZ-314
+    /// clean-room boundary: kranz core stays domain-free, domain knowledge
+    /// ships in private packs). Policy is the committed hashed denylist
+    /// (.kranz/domain-denylist.json) plus reviewed waivers
+    /// (.kranz/domain-allowlist); see docs/domain-lint.md. Exit 0 clean, 1
+    /// on unwaived hits — each named by fingerprint + file:line, never
+    /// quoting the matched term.
+    DomainLint {
+        /// Regenerate the hashed denylist from a plaintext terms file (one
+        /// term per line, `#` comments) instead of linting. The terms file
+        /// IS the protected vocabulary: keep it out of the repo —
+        /// .kranz/domain-terms.local is gitignored for exactly this.
+        #[arg(long, value_name = "TERMS_FILE")]
+        seed_config: Option<PathBuf>,
+
+        /// Print the report as JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+
     /// INTERNAL: the Claude Code lifecycle-hook command the engine installs
     /// into worker sessions (KRZ-302). Never invoked by operators — the
     /// session's CLI pipes a PreToolUse hook payload to stdin; the guard
@@ -805,6 +825,29 @@ mod tests {
         match cli.command {
             Command::Decompose { yes, .. } => assert!(!yes),
             other => panic!("expected Decompose, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn domain_lint_command_parses_seed_config_and_json_flags() {
+        // Bare form: lint mode, text output.
+        let cli = Cli::try_parse_from(["kranz", "domain-lint"]).unwrap();
+        match cli.command {
+            Command::DomainLint { seed_config, json } => {
+                assert_eq!(seed_config, None);
+                assert!(!json);
+            }
+            other => panic!("expected DomainLint, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["kranz", "domain-lint", "--seed-config", "terms", "--json"])
+            .unwrap();
+        match cli.command {
+            Command::DomainLint { seed_config, json } => {
+                assert_eq!(seed_config, Some(PathBuf::from("terms")));
+                assert!(json);
+            }
+            other => panic!("expected DomainLint, got {other:?}"),
         }
     }
 }
