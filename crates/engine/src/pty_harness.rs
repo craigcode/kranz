@@ -379,9 +379,11 @@ mod imp {
         };
         // SAFETY: all pointers valid; null `name`/`termp` accept the
         // platform defaults (canonical mode + echo, the boring terminal a
-        // REPL expects). The pointer mutability differs across platforms
-        // (macOS declares `termp`/`winp` mutable, glibc const), hence the
-        // null_mut/&mut shapes that coerce to both.
+        // REPL expects). The pointer mutability differs across platforms —
+        // macOS declares `termp`/`winp` mutable, glibc const, so the winsize
+        // reference is cfg-split: clippy's unnecessary_mut_passed fires on
+        // Linux for the macOS shape (ubuntu-latest CI gates -D warnings).
+        #[cfg(target_os = "macos")]
         let rc = unsafe {
             libc::openpty(
                 &mut master,
@@ -389,6 +391,16 @@ mod imp {
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 &mut winsize,
+            )
+        };
+        #[cfg(not(target_os = "macos"))]
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &winsize,
             )
         };
         if rc != 0 {
