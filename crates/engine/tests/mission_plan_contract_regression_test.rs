@@ -68,24 +68,42 @@ fn a3_command_runs_successfully_verbatim() {
         .join("..")
         .join("..");
     let command = a3_command_from_plan_json();
-    // Capture, don't just status(): a nested-run failure is otherwise
-    // invisible on an ephemeral CI runner (the dogfood log-tail lesson —
-    // the ubuntu CI failure of 3f1900e gave an untailorable exit).
+    // The contract command ends in a grep -q pipe, so on failure its output
+    // is EMPTY BY CONSTRUCTION (grep -q prints nothing and swallows cargo's
+    // stream). A failing run is otherwise undiagnosable on an ephemeral CI
+    // runner (three consecutive ubuntu CI failures showed zero evidence).
+    // On failure, re-run the cargo half WITHOUT the grep pipe for the tail.
     let output = Command::new("sh")
         .arg("-c")
         .arg(&command)
         .current_dir(&repo_root)
         .output()
         .expect("spawn a3 command via sh -c");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let tail: String = {
-        let combined = format!("{stdout}\n{stderr}");
+    if !output.status.success() {
+        let inner = command
+            .split(" 2>&1 |")
+            .next()
+            .unwrap_or(&command)
+            .to_string();
+        let diag = Command::new("sh")
+            .arg("-c")
+            .arg(&inner)
+            .current_dir(&repo_root)
+            .output()
+            .expect("spawn a3 inner command via sh -c");
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&diag.stdout),
+            String::from_utf8_lossy(&diag.stderr)
+        );
         let lines: Vec<&str> = combined.lines().collect();
-        lines[lines.len().saturating_sub(40)..].join("\n")
-    };
-    assert!(
-        output.status.success(),
-        "a3 command must exit 0 when run verbatim: {command}\n--- nested output tail ---\n{tail}"
-    );
+        let tail = &lines[lines.len().saturating_sub(40)..];
+        panic!(
+            "a3 command must exit 0 when run verbatim: {command}\n\
+             (pipeline exit: {:?}; diagnostic re-run of `{inner}`)\n\
+             --- inner output tail ---\n{}",
+            output.status.code(),
+            tail.join("\n")
+        );
+    }
 }
