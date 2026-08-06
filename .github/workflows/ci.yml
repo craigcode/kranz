@@ -21,7 +21,17 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
-          sudo apt-get install -y bubblewrap
+          sudo apt-get install -y bubblewrap mold
+      # mold as the linker: the a3 plan-contract regression runs a nested
+      # `cargo test -p kranz-engine` inside the suite, which feature-plan
+      # thrashes against the outer --workspace build and RELINKS the big
+      # test binaries — GNU ld then died SIGBUS under the runner's memory
+      # envelope (run 31064030885, `collect2: ld terminated with signal 7
+      # [Bus error]`). mold links at a fraction of GNU ld's memory, which
+      # closes the class for the whole job, not just that test.
+      - name: Link with mold
+        if: matrix.os == 'ubuntu-latest'
+        run: echo "RUSTFLAGS=-C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
       - name: Configure git identity (git_ops tests)
         run: |
           git config --global user.name kranz-ci
