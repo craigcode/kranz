@@ -1934,8 +1934,13 @@ mod tests {
         let profile = std::fs::read_to_string(profile_path).unwrap();
         assert!(profile.contains("(deny default)"), "{profile}");
         assert!(
-            profile.contains("(allow file-write* (literal \"/dev/null\"))"),
+            profile.contains("(literal \"/dev/null\")"),
             "the gate profile must add the /dev/null device write allow:\n{profile}"
+        );
+        assert!(
+            profile.contains("(literal \"/dev/ptmx\")") && profile.contains("file-ioctl"),
+            "pty harness support (pty-functional-validation): the gate profile must \
+             permit the ptmx multiplexer and the grantpt/unlockpt ioctls:\n{profile}"
         );
         assert!(
             !profile.contains("xcrun_db"),
