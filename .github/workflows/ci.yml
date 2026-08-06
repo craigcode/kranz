@@ -32,6 +32,16 @@ jobs:
       - name: Link with mold
         if: matrix.os == 'ubuntu-latest'
         run: echo "RUSTFLAGS=-C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
+      # The same thrash also needs disk: the nested plan's rebuild
+      # duplicates the engine rlib + test binaries under different
+      # fingerprints (~5 GB), which filled the runner right after the
+      # linker stopped dying (run 31065552031, ENOSPC). The stock
+      # toolchains are ~10 GB the suite never touches.
+      - name: Free runner disk (nested plan-contract rebuild headroom)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/share/boost
+          df -h /
       - name: Configure git identity (git_ops tests)
         run: |
           git config --global user.name kranz-ci
