@@ -552,8 +552,24 @@ pub(crate) struct GateSandboxResolution {
 ///   `deny default` with no allowance at all (probed); only `/bin/ps`
 ///   itself is unreachable.
 fn gate_profile_extras() -> String {
+    // The pty device surface, probed 2026-08-06 under sandbox-exec (the
+    // wrapped-suite failure: the three pty-driving tests died "out of pty
+    // devices" inside the gate wrap). macOS pty allocation needs THREE
+    // things the session profile's deny-default rejects: read+write on
+    // /dev/ptmx (the multiplexer), read+write on the allocated slave node
+    // (this host's pool names are BOTH /dev/tty[p-t]<hex> and the longer
+    // /dev/ttysNNN — hence the `+`), and the grantpt/unlockpt ioctls —
+    // `file-ioctl` is required for those two (proven: with it the whole
+    // posix_openpt -> grantpt -> unlockpt -> ptsname -> slave-open chain
+    // works; without it both ioctls EPERM). No ptmx, no pty: the harness
+    // is validator tooling that deserves the same gate the rest of the
+    // wrapped suite gets, not a skip.
     String::from(
-        "\n(allow file-write* (literal \"/dev/null\"))\n(allow signal (target same-sandbox))\n",
+        "\n(allow file-write* (literal \"/dev/null\") (literal \"/dev/ptmx\"))\n\
+         (allow file-read* (literal \"/dev/ptmx\"))\n\
+         (allow file-read* file-write* (regex #\"^/dev/tty[p-t][0-9a-f]+$\"))\n\
+         (allow file-ioctl)\n\
+         (allow signal (target same-sandbox))\n",
     )
 }
 
