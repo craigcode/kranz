@@ -345,6 +345,7 @@ mod tests {
             touch_set: vec![],
             deny_exceptions: vec![],
             egress_grants: vec![],
+            executor_route: None,
         }
     }
 

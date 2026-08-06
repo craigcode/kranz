@@ -1244,12 +1244,45 @@ pub(crate) fn build_status_reply(repo_root: &Path, mission_id: Option<&str>) -> 
     }
     let events = EventLog::read_events(&events_path)?;
     let state = reducer::fold(&events)?;
+    let mut body = render_status_body(&state);
+    body.push_str(&hook_status_lines(repo_root, &mission_id));
     let summary = crate::format::StatusSummary {
         mission_id: mission_id.clone(),
         status: status_word(state.mission.status),
-        summary: render_status_body(&state),
+        summary: body,
     };
     Ok(crate::format::build_status(&summary))
+}
+
+/// The hook-status projection's Slack surface (ticket
+/// `agent-hooks-status-signals`): advisory lines appended to the
+/// `/kranz status` body. The projection is ephemeral and
+/// NON-authoritative, so every line is labelled hook-derived and the
+/// folded status word above is never affected — a terminal mission still
+/// reads Complete/Failed/Abandoned, exactly the ticket's
+/// terminal-state-untouched rule. Signal-less runs (registered, never
+/// heard from) render nothing.
+fn hook_status_lines(repo_root: &Path, mission_id: &str) -> String {
+    use kranz_engine::hook_status::HookSignal;
+    let views = kranz_engine::hook_status::read_mission_signals(repo_root, mission_id);
+    let mut lines = String::new();
+    for view in views.iter().take(3) {
+        let Some(record) = &view.signal else { continue };
+        let word = match record.signal {
+            HookSignal::Running => "running",
+            HookSignal::NeedsInput => "needs input",
+            HookSignal::Interrupted => "interrupted",
+            HookSignal::TurnFinished => "turn finished",
+        };
+        let short_run: String = view.run_id.chars().take(8).collect();
+        lines.push_str(&format!(
+            "\n:zap: hook signal _(non-authoritative)_: *{word}* — run `{short_run}…`"
+        ));
+        if let Some(detail) = &record.detail {
+            lines.push_str(&format!(" · {}", crate::format::escape_mrkdwn(detail)));
+        }
+    }
+    lines
 }
 
 /// `/kranz status` reply: deterministic pipeline snapshot (no LLM/engine).
@@ -3039,6 +3072,7 @@ mod tests {
                 feature_id: Some("f-1-1".into()),
                 milestone_id: None,
                 candidate: None,
+                executor_route: None,
                 sdk_session_id: "s-1".into(),
                 model: "sonnet".into(),
                 quant: "n/a".into(),
@@ -3218,6 +3252,48 @@ mod tests {
             text.contains("Planning"),
             "status pill reflects the folded state"
         );
+    }
+
+    /// The hook-status lane's Slack surface: a projected "needs input"
+    /// renders in `/kranz status` labelled non-authoritative, and the
+    /// folded status word is untouched (the projection never changes
+    /// mission state).
+    #[test]
+    fn hook_status_signal_status_reply_renders_projection_without_touching_state() {
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-hook", "Ship the thing");
+        let now = chrono::Utc::now();
+        kranz_engine::hook_status::register(tmp.path(), "m-hook", "r-1", "tok-1", now).unwrap();
+        kranz_engine::hook_status::record_signal(
+            tmp.path(),
+            "m-hook",
+            "r-1",
+            "tok-1",
+            kranz_engine::hook_status::HookSignal::NeedsInput,
+            Some("Shell was refused"),
+            now,
+        )
+        .unwrap();
+
+        let blocks = build_status_reply(tmp.path(), Some("m-hook")).unwrap();
+        let text = serde_json::to_string(&blocks).unwrap();
+        assert!(text.contains("needs input"), "{text}");
+        assert!(text.contains("non-authoritative"), "{text}");
+        assert!(text.contains("Shell was refused"), "{text}");
+        // The folded status word still comes from the event fold alone.
+        assert!(text.contains("Planning"), "{text}");
+    }
+
+    /// Signal-less projections (lane never used, or registered but never
+    /// heard from) render no hook lines — the ordinary status reply is
+    /// unchanged.
+    #[test]
+    fn hook_status_signal_status_reply_is_silent_without_signals() {
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-quiet", "Ship the thing");
+        let blocks = build_status_reply(tmp.path(), Some("m-quiet")).unwrap();
+        let text = serde_json::to_string(&blocks).unwrap();
+        assert!(!text.contains("hook signal"), "{text}");
     }
 
     #[test]

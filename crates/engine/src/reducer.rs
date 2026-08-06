@@ -200,6 +200,7 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             feature_id,
             milestone_id,
             candidate,
+            executor_route: _,
             sdk_session_id,
             model,
             quant,
@@ -749,6 +750,11 @@ fn initial_state(event: &Event) -> Result<MissionState> {
             touch_set: Vec::new(),
             deny_exceptions: Vec::new(),
             egress_grants: Vec::new(),
+            // The seed-time route record (ticket routing-rules-config): the
+            // folded task class exists only on THIS event's goal, so the
+            // decision is derived here, once — deterministically equal to
+            // what create applied (routing::seed_executor_route).
+            executor_route: crate::routing::seed_executor_route(config, goal),
         },
         runs: BTreeMap::new(),
         totals: TokenUsage::default(),
@@ -1237,6 +1243,7 @@ mod hook_gate_projection_tests {
                 feature_id: None,
                 milestone_id: None,
                 candidate: None,
+                executor_route: None,
                 sdk_session_id: "s-1".to_string(),
                 model: "m".to_string(),
                 quant: "n/a".to_string(),
@@ -1356,6 +1363,7 @@ mod routing_abstraction_tests {
                 feature_id: None,
                 milestone_id: None,
                 candidate: None,
+                executor_route: None,
                 sdk_session_id: "s-1".to_string(),
                 model: "m".to_string(),
                 quant: "n/a".to_string(),

@@ -346,6 +346,7 @@ fn spawned(
         feature_id: feature_id.map(str::to_string),
         milestone_id: milestone_id.map(str::to_string),
         candidate: None,
+        executor_route: None,
         sdk_session_id: format!("sess-{run_id}"),
         model: "sonnet".to_string(),
         quant: "n/a".to_string(),

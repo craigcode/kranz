@@ -60,6 +60,7 @@ fn spec(dir: &Path, session_id: &str, writable: bool) -> SessionSpec {
         max_turns: None,
         env,
         sandbox: None,
+        hook_status: None,
     }
 }
 
@@ -457,6 +458,197 @@ async fn backend_cursor_completed_turn_with_phrase_on_stderr_stays_completed() {
     );
 }
 
+/// Emits a one-line result and exits 0 after CAPTURING the child env's
+/// `$HOME` into `home-capture.txt` (the harness reads it back to find the
+/// session-private home the hook-status install must have landed in).
+const HOME_CAPTURE_MOCK: &str = r#"#!/bin/sh
+echo "$HOME" > "__CAPTURE_DIR__/home-capture.txt"
+cat <<'MOCK_EOF'
+{"type":"system","subtype":"init","session_id":"cursor-mock-sess-home","model":"m"}
+{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"cursor-mock-sess-home"}
+MOCK_EOF
+exit 0
+"#;
+
+/// Drive one worker run through [`kranz_engine::runner::run_worker`] with a
+/// HOME-capturing mock and return the session-private HOME the child saw.
+async fn run_home_capture(
+    dir: &Path,
+    mission: &str,
+    cfg: &MissionConfig,
+) -> (PathBuf, kranz_engine::runner::RunOutcome) {
+    let paths = MissionPaths::new(dir, mission);
+    let mut log =
+        EventLog::acquire(&paths, mission, Duration::from_millis(0), LockForce::No).unwrap();
+    let feature = Feature {
+        id: "f-1".to_string(),
+        title: "Add login".to_string(),
+        spec: "Build the login endpoint".to_string(),
+        validation_criteria: vec!["users can log in".to_string()],
+        origin: FeatureOrigin::Plan,
+        status: FeatureStatus::Pending,
+        worker_runs: vec![],
+        commits: vec![],
+        respawns: 0,
+    };
+    let mock_body = HOME_CAPTURE_MOCK.replace("__CAPTURE_DIR__", &dir.display().to_string());
+    let mock = write_mock(dir, "mock-agent-home.sh", &mock_body);
+    let backend = CursorBackend::new(mock);
+    let outcome = kranz_engine::runner::run_worker(
+        &backend,
+        &mut log,
+        &paths,
+        cfg,
+        &feature,
+        "ship auth",
+        "Auth",
+        None,
+        None,
+        None,
+        &[],
+        &[],
+        &[],
+        AuthVerdict::Inconclusive,
+        &[],
+        None,
+    )
+    .await
+    .expect("run_worker should complete");
+    drop(log);
+    let home =
+        std::fs::read_to_string(dir.join("home-capture.txt")).expect("the mock captured its HOME");
+    (PathBuf::from(home.trim()), outcome)
+}
+
+/// The opt-in lane end to end at the runner+backend seam: `hookStatus`
+/// enabled AND a cursor worker ⇒ the run REGISTERS the per-run token in
+/// the gitignored projection and the session-private HOME carries the
+/// user-level hooks.json + spec file — while the tracked repo tree gets
+/// NO `.cursor` writes (install hygiene at the spawn seam).
+#[tokio::test]
+async fn hook_status_signal_cursor_run_installs_the_lane_into_the_session_home() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = MissionConfig {
+        worker: kranz_engine::types::RoleConfig {
+            backend: Some("cursor".to_string()),
+            ..MissionConfig::default().worker
+        },
+        hook_status: Some(kranz_engine::types::HookStatusConfig {
+            enabled: true,
+            endpoint: "http://127.0.0.1:9/api/hook-status".to_string(),
+        }),
+        ..MissionConfig::default()
+    };
+
+    let (home, outcome) = run_home_capture(dir.path(), "m-hook-lane", &cfg).await;
+    assert!(
+        matches!(outcome.exit, SessionExit::Completed),
+        "{outcome:?}"
+    );
+
+    // The session-private HOME carries the lane install.
+    let hooks_text = std::fs::read_to_string(home.join(".cursor").join("hooks.json"))
+        .expect("hooks.json installed into the session HOME");
+    let hooks: serde_json::Value = serde_json::from_str(&hooks_text).unwrap();
+    assert_eq!(hooks["version"], 1);
+    let command = hooks["hooks"]["sessionStart"][0]["command"]
+        .as_str()
+        .unwrap();
+    assert!(command.contains("hook-status"), "{command}");
+
+    // The registration landed in the gitignored projection, keyed by the
+    // run id the spec file names.
+    let proj_dir = kranz_engine::hook_status::hook_status_dir(dir.path()).join("m-hook-lane");
+    let entries: Vec<_> = std::fs::read_dir(&proj_dir)
+        .expect("registration written")
+        .flatten()
+        .collect();
+    assert_eq!(entries.len(), 1, "exactly one run registered: {entries:?}");
+    let registered: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(entries[0].path()).unwrap()).unwrap();
+    let run_id = entries[0]
+        .path()
+        .file_stem()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let views = kranz_engine::hook_status::read_mission_signals(dir.path(), "m-hook-lane");
+    assert_eq!(views.len(), 1);
+    assert_eq!(views[0].run_id, run_id);
+    assert!(views[0].signal.is_none(), "no hooks fired in the mock");
+    assert!(registered["tokenHash"].as_str().is_some());
+
+    // Install hygiene: the tracked tree got nothing (no `.cursor`, no
+    // hooks.json outside the gitignored projection).
+    assert!(
+        !dir.path().join(".cursor").exists(),
+        "spawning must never write hook config into the tracked tree"
+    );
+
+    let _ = std::fs::remove_dir_all(home.parent().unwrap_or(&home));
+}
+
+/// Hooks-disabled regression (the acceptance hint's headline): a default
+/// config runs the SAME cursor worker with NO lane — no registration, no
+/// hooks.json, a byte-identical pre-lane session.
+#[tokio::test]
+async fn hook_status_signal_cursor_run_without_opt_in_installs_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = MissionConfig::default();
+
+    let (home, outcome) = run_home_capture(dir.path(), "m-hook-off", &cfg).await;
+    assert!(
+        matches!(outcome.exit, SessionExit::Completed),
+        "{outcome:?}"
+    );
+
+    assert!(
+        !home.join(".cursor").join("hooks.json").exists(),
+        "hooks disabled is the byte-identical default: no hooks.json"
+    );
+    assert!(
+        !kranz_engine::hook_status::hook_status_dir(dir.path()).exists(),
+        "no projection dir is even created"
+    );
+
+    let _ = std::fs::remove_dir_all(home.parent().unwrap_or(&home));
+}
+
+/// Per-backend opt-in: an ENABLED lane on a non-hook-capable configured
+/// backend (the claude default) seeds nothing — no registration, no
+/// session install. (The claude backend would ignore the seed anyway;
+/// gating at the runner avoids a registration no POST can ever arrive
+/// for.)
+#[tokio::test]
+async fn hook_status_signal_enabled_lane_ignores_non_hook_capable_backends() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = MissionConfig {
+        hook_status: Some(kranz_engine::types::HookStatusConfig {
+            enabled: true,
+            endpoint: "http://127.0.0.1:9/api/hook-status".to_string(),
+        }),
+        ..MissionConfig::default()
+    };
+    // worker.backend stays the claude default (None).
+
+    let (home, outcome) = run_home_capture(dir.path(), "m-hook-claude", &cfg).await;
+    assert!(
+        matches!(outcome.exit, SessionExit::Completed),
+        "{outcome:?}"
+    );
+
+    assert!(
+        !kranz_engine::hook_status::hook_status_dir(dir.path()).exists(),
+        "a non-hook-capable backend gets no registration"
+    );
+    assert!(
+        !home.join(".cursor").join("hooks.json").exists(),
+        "and no session install"
+    );
+
+    let _ = std::fs::remove_dir_all(home.parent().unwrap_or(&home));
+}
+
 /// Engine-level resumability: a worker run whose `agent` dies mid-line
 /// fails honestly, and the mission event log it was appending to re-acquires
 /// with contiguous seqs (the torn-line repair path in `event_log.rs` is what
@@ -503,6 +695,7 @@ async fn backend_cursor_cli_death_mid_run_leaves_a_resumable_event_log() {
         &[],
         AuthVerdict::Inconclusive,
         &[],
+        None,
     )
     .await
     .expect("run_worker returns the recorded outcome even for a failed run");

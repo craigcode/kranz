@@ -197,11 +197,15 @@ its proving test.
 These custom lists REPLACE by design; both are validated fail-closed and
 neither can strip a safety floor, so they are not findings:
 
-- **`routing.taskClassRules`** (config.rs): a configured table replaces the
-  literal task-class floor — but the omission direction is the SAFE side
-  (any class the table doesn't name stays Frontier; a `local` route with no
-  endpoint fails safe to Frontier). Shape validation (blank/duplicate
-  classes) fails closed.
+- **`routing.taskClassRules` / `routing.patternRules`** (config.rs): a
+  configured table replaces the literal task-class floor — but the omission
+  direction is the SAFE side (any class the table doesn't name stays
+  Frontier; a `local` route with no endpoint fails safe to Frontier). Shape
+  validation (blank/duplicate classes/patterns) fails closed. The tracked,
+  base-branch-owned `.kranz/routing-rules.json` file
+  (`crates/engine/src/routing_rules.rs`, docs/routing-rules.md) populates the
+  same table and supersedes this key wholesale when present — recorded on
+  the mission's decision log, never a silent override.
 - **`workerCandidates`** (config.rs): the COMPLETE worker backend list when
   non-empty — every candidate is validated by the same rules as the worker
   role (known backend, supported model pair, the worker model floor, the

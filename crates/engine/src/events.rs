@@ -145,6 +145,19 @@ pub enum EventKind {
         /// run is a labelled candidate from the moment it exists.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         candidate: Option<CandidateLink>,
+        /// The effective executor route and the rule that decided it (ticket
+        /// `routing-rules-config`): routing is provenance, not a hidden
+        /// implementation detail, so it rides the same event that already
+        /// records the model. Additive; present only on Worker-role spawns of
+        /// missions whose seed carried a task class — absent everywhere else
+        /// and in every pre-provenance log, where it folds to `None` and
+        /// `None` never hits the wire.
+        #[serde(
+            rename = "executorRoute",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        executor_route: Option<crate::types::ExecutorRoute>,
         #[serde(rename = "sdkSessionId")]
         sdk_session_id: String,
         model: String,
@@ -1681,6 +1694,7 @@ mod tests {
                 feature_id: Some("f-1-1".into()),
                 milestone_id: None,
                 candidate,
+                executor_route: None,
                 sdk_session_id: "s".into(),
                 model: "sonnet".into(),
                 quant: "n/a".into(),
@@ -1727,6 +1741,85 @@ mod tests {
         .unwrap();
         match old {
             EventKind::WorkerSpawned { candidate, .. } => assert_eq!(candidate, None),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// The additive `executorRoute` field (ticket `routing-rules-config`):
+    /// the effective route + deciding rule round-trips in camelCase when
+    /// present, old log lines without it fold to None, and None never hits
+    /// the wire (byte-identical to pre-provenance logs).
+    #[test]
+    fn routing_rules_config_worker_spawned_executor_route_is_additive() {
+        fn spawned(executor_route: Option<crate::types::ExecutorRoute>) -> EventKind {
+            EventKind::WorkerSpawned {
+                run_id: "r-1".into(),
+                role: Role::Worker,
+                feature_id: Some("f-1-1".into()),
+                milestone_id: None,
+                candidate: None,
+                executor_route,
+                sdk_session_id: "s".into(),
+                model: "sonnet".into(),
+                quant: "n/a".into(),
+                weight_hash: None,
+                prompt_hash: "h".into(),
+                transcript_path: "t".into(),
+            }
+        }
+
+        // Some: camelCase wire shape, full round-trip — rule omitted when
+        // the fall-through decided (None never serializes).
+        let route = crate::types::ExecutorRoute {
+            tier: crate::types::ExecutorTier::Local,
+            rule: Some("taskClassRules[0]".to_string()),
+        };
+        let json = serde_json::to_value(spawned(Some(route.clone()))).unwrap();
+        assert_eq!(json["payload"]["executorRoute"]["tier"], "local");
+        assert_eq!(
+            json["payload"]["executorRoute"]["rule"],
+            "taskClassRules[0]"
+        );
+        let back: EventKind = serde_json::from_value(json).unwrap();
+        match back {
+            EventKind::WorkerSpawned { executor_route, .. } => {
+                assert_eq!(executor_route, Some(route))
+            }
+            _ => panic!("wrong variant"),
+        }
+        let fall_through = crate::types::ExecutorRoute {
+            tier: crate::types::ExecutorTier::Frontier,
+            rule: None,
+        };
+        let json = serde_json::to_value(spawned(Some(fall_through))).unwrap();
+        assert_eq!(json["payload"]["executorRoute"]["tier"], "frontier");
+        assert!(
+            !json["payload"]["executorRoute"]
+                .as_object()
+                .unwrap()
+                .contains_key("rule"),
+            "a fall-through route must not serialize a rule key: {json}"
+        );
+
+        // None: omitted from the wire (byte-identical to pre-provenance logs).
+        let json = serde_json::to_value(spawned(None)).unwrap();
+        assert!(
+            !json["payload"]
+                .as_object()
+                .unwrap()
+                .contains_key("executorRoute"),
+            "executorRoute must not serialize when None: {json}"
+        );
+
+        // Old log line (pre-provenance): folds with executor_route = None.
+        let old: EventKind = serde_json::from_str(
+            r#"{"type":"worker.spawned","payload":{"runId":"r-1","role":"worker","featureId":"f-1-1","sdkSessionId":"s","model":"sonnet","promptHash":"h","transcriptPath":"t"}}"#,
+        )
+        .unwrap();
+        match old {
+            EventKind::WorkerSpawned { executor_route, .. } => {
+                assert_eq!(executor_route, None)
+            }
             _ => panic!("wrong variant"),
         }
     }

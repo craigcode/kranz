@@ -463,6 +463,7 @@ fn digest_events() -> Vec<Event> {
                 feature_id: Some("f-1-1".to_string()),
                 milestone_id: Some("ms-1".to_string()),
                 candidate: None,
+                executor_route: None,
                 sdk_session_id: "sess-r-1".to_string(),
                 model: "sonnet".to_string(),
                 quant: "n/a".to_string(),

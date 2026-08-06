@@ -126,6 +126,7 @@ fn session_spec(prompt: PromptMode) -> SessionSpec {
         max_turns: Some(10),
         env: HashMap::new(),
         sandbox: None,
+        hook_status: None,
     }
 }
 
@@ -137,6 +138,7 @@ fn worker_meta(run_id: &str) -> RunMeta {
         milestone_id: None,
         model: "mock-model".to_string(),
         prompt_hash: "deadbeef0000".to_string(),
+        executor_route: None,
     }
 }
 
@@ -990,6 +992,7 @@ async fn run_worker_builds_spec_and_uses_report_result() {
         &[],
         AuthVerdict::Inconclusive,
         &[],
+        None,
     )
     .await
     .unwrap();
@@ -1086,6 +1089,7 @@ async fn run_worker_seeds_scratch_home_and_config_dir_worker_env_hygiene() {
         &[],
         AuthVerdict::Authenticated,
         &[],
+        None,
     )
     .await
     .unwrap();
@@ -1150,6 +1154,7 @@ async fn run_worker_routes_macos_fs_net_through_egress_proxy() {
         &[],
         AuthVerdict::Inconclusive,
         &[],
+        None,
     )
     .await
     .unwrap();
@@ -1472,6 +1477,7 @@ async fn run_worker_in_buffered_collects_kinds_without_touching_the_log() {
         &[],
         AuthVerdict::Inconclusive,
         &[],
+        None,
     )
     .await
     .unwrap();
@@ -1865,6 +1871,7 @@ async fn hook_gate_projection_worker_run_projects_hook_settings_and_spec_file() 
         &[],
         AuthVerdict::Inconclusive,
         &touch_set,
+        None,
     )
     .await
     .unwrap();
@@ -1962,6 +1969,7 @@ async fn hook_gate_projection_empty_touch_set_leaves_worker_spec_unchanged() {
         &[],
         AuthVerdict::Inconclusive,
         &[],
+        None,
     )
     .await
     .unwrap();
@@ -2131,6 +2139,7 @@ async fn hook_gate_projection_bypassed_failure_still_caught_by_the_sweep() {
         &[],
         AuthVerdict::Inconclusive,
         &touch_set,
+        None,
     )
     .await
     .unwrap();

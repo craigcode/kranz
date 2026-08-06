@@ -349,7 +349,11 @@ impl MissionEngine {
     /// tier before the config is stored on `mission.created` and records the
     /// routing decision — every seed path (`kranz draft`/`exec`, REST, Slack)
     /// creates missions from that folded goal string, so this is the single
-    /// place ticket→routing wiring needs to live.
+    /// place ticket→routing wiring needs to live. The routing table itself
+    /// may come from the tracked, base-branch-owned rules file
+    /// ([`crate::routing_rules`], ticket `routing-rules-config`), read here
+    /// from the live base ref — the merge-gates ownership idiom, so a
+    /// mission can never edit the rules that route it.
     pub fn create(
         backend: Arc<dyn AgentBackend>,
         repo_root: impl Into<PathBuf>,
@@ -358,9 +362,6 @@ impl MissionEngine {
     ) -> Result<Self> {
         config::validate(&cfg)?;
         let task_class = crate::ticket::parse_task_class_from_goal(goal);
-        let routing_summary = task_class
-            .as_deref()
-            .map(|task_class| config::route_task_class_executor(&mut cfg, Some(task_class)).1);
         let repo_root = canonical_root(repo_root.into());
         let repo = GitRepo::open(&repo_root)?;
         repo.ensure_identity()?;
@@ -376,6 +377,44 @@ impl MissionEngine {
                  check out the intended base (e.g. main) first"
             )));
         }
+
+        // Tracked routing rules (ticket routing-rules-config): when the live
+        // BASE branch carries `.kranz/routing-rules.json`, its validated
+        // table IS this mission's routing table — committed bytes only
+        // (merge.rs's live-base idiom), so an uncommitted working-tree edit
+        // or a later mission-branch edit can never re-route the mission.
+        // Present-but-invalid fails the draft closed BEFORE any mission
+        // side effects below (event log, mission dir). Missing ⇒ the
+        // layered-config/legacy floor, byte-identical. A valid file
+        // supersedes any layered-config `routing` key wholesale; the
+        // supersession rides the load note so it is never silent.
+        let rules_note = match crate::routing_rules::load_routing_rules_at_ref(&repo, &base_branch)?
+        {
+            Some(rules) => {
+                let superseded = if cfg.routing.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "; supersedes the layered-config routing table ({} task-class rule(s), {} pattern rule(s))",
+                        cfg.routing.task_class_rules.len(),
+                        cfg.routing.pattern_rules.len()
+                    )
+                };
+                let note = format!(
+                    "routing rules loaded from {} (base branch {:?}): {} task-class rule(s), {} pattern rule(s){superseded}",
+                    crate::routing_rules::ROUTING_RULES_PATH,
+                    base_branch,
+                    rules.task_class_rules.len(),
+                    rules.pattern_rules.len(),
+                );
+                cfg.routing = rules;
+                Some(note)
+            }
+            None => None,
+        };
+        let routing_summary = task_class
+            .as_deref()
+            .map(|task_class| config::route_task_class_executor(&mut cfg, Some(task_class)).1);
 
         let mission_id = format!("m-{}", &uuid::Uuid::new_v4().simple().to_string()[..6]);
         let paths = MissionPaths::new(&repo_root, &mission_id);
@@ -431,6 +470,9 @@ impl MissionEngine {
             workspace_handle: None,
             workspace_provider: None,
         };
+        if let Some(note) = rules_note {
+            engine.emit_decision(&note, None)?;
+        }
         if let Some(summary) = routing_summary {
             engine.emit_decision(summary, None)?;
         }
@@ -1084,6 +1126,19 @@ impl MissionEngine {
         // before any branch/commit side effects below.
         let approval_contract =
             crate::workspace_contract::load_workspace_contract(&self.paths.repo_root)?;
+
+        // Routing rules (ticket routing-rules-config), same base-branch-owned
+        // posture: validate the tracked `.kranz/routing-rules.json` as
+        // COMMITTED on the live base branch — present-but-invalid fails
+        // approval closed (owner: repo-setup) before any branch/commit side
+        // effects below, exactly like the contract above. Validation only:
+        // this mission's route was already pinned from the base at creation
+        // (mission.created's config), so a VALID edit between create and
+        // approve does not re-route it.
+        let _routing_rules = crate::routing_rules::load_routing_rules_at_ref(
+            &self.repo,
+            &self.state.mission.base_branch,
+        )?;
 
         // Provider pin (D-B, ticket workspace-provider-pin-at-approval):
         // resolve the EFFECTIVE provider now — an unknown `workspace.provider`
@@ -2455,6 +2510,12 @@ impl MissionEngine {
         };
         self.emit_decision(&summary, None)?;
 
+        // Routing rules ownership surface (ticket routing-rules-config): the
+        // rules are read from the live base branch at mission creation, so a
+        // mission-branch edit can never re-route THIS mission. Surface the
+        // attempt anyway — advisory, once per run, never a block.
+        self.surface_routing_rules_branch_edit()?;
+
         // WorkspaceProvider seam drive (design D-B/D-C; ticket
         // workspace-provider-seam): provider.provision → provider.readiness
         // (= the workspace bootstrap + readiness gate) → workers. With a
@@ -3086,6 +3147,9 @@ impl MissionEngine {
             // Worktree mode (M7 tier 1): the worker session's cwd is the
             // mission integration worktree, never the primary repo root.
             // Checkout mode keeps the exact `run_worker` call it always had.
+            // The seed-time route record rides every worker spawn (ticket
+            // routing-rules-config) — folded state, identical on resume.
+            let executor_route = self.state.mission.executor_route.clone();
             let outcome = if self.state.config.isolation() == WorkerIsolation::Worktree {
                 let session_cwd = self.active_root().to_path_buf();
                 runner::run_worker_in(
@@ -3105,6 +3169,7 @@ impl MissionEngine {
                     &deny_exceptions,
                     auth_verdict,
                     &touch_set,
+                    executor_route.clone(),
                 )
                 .await
             } else {
@@ -3124,6 +3189,7 @@ impl MissionEngine {
                     &deny_exceptions,
                     auth_verdict,
                     &touch_set,
+                    executor_route.clone(),
                 )
                 .await
             };
@@ -3564,6 +3630,7 @@ impl MissionEngine {
             let egress_grants = egress_grants.clone();
             let deny_exceptions = deny_exceptions.clone();
             let touch_set = touch_set.clone();
+            let executor_route = self.state.mission.executor_route.clone();
             set.spawn(async move {
                 let _live = guard.enter(); // count this session as live
                 let result = runner::run_worker_in_buffered(
@@ -3581,6 +3648,7 @@ impl MissionEngine {
                     &deny_exceptions,
                     verdict,
                     &touch_set,
+                    executor_route,
                 )
                 .await;
                 (idx, result)
@@ -4258,6 +4326,7 @@ impl MissionEngine {
             let egress_grants = egress_grants.clone();
             let deny_exceptions = deny_exceptions.clone();
             let touch_set = touch_set.clone();
+            let executor_route = self.state.mission.executor_route.clone();
             set.spawn(async move {
                 let _live = guard.enter(); // count this session as live
                 let result = runner::run_worker_in_buffered(
@@ -4275,6 +4344,7 @@ impl MissionEngine {
                     &deny_exceptions,
                     auth_verdict,
                     &touch_set,
+                    executor_route,
                 )
                 .await;
                 (idx, result)
@@ -6302,6 +6372,43 @@ impl MissionEngine {
         self.repo.changed_paths(base, &head).unwrap_or_default()
     }
 
+    /// Routing rules ownership surface (ticket `routing-rules-config`): the
+    /// rules are read from the live base branch at mission creation
+    /// ([`crate::routing_rules`]), so a mission-branch edit of
+    /// `.kranz/routing-rules.json` can never re-route THIS mission — the
+    /// effective route is pinned in `mission.created`'s config. The edit is
+    /// still surfaced, once per `run()`, on the same advisory decision
+    /// channel as the preflight note: inert, never a block — the
+    /// merge-gates ownership idiom (a mission cannot edit the rules that
+    /// route it), made operator-visible. Ref-based reads keep this true in
+    /// BOTH isolation modes (the integration worktree shares the primary
+    /// refs). Best-effort: a git read failure (e.g. a deleted base ref)
+    /// skips the note rather than failing the run.
+    fn surface_routing_rules_branch_edit(&mut self) -> Result<()> {
+        let path = crate::routing_rules::ROUTING_RULES_PATH;
+        let base = self.repo.show_file(&self.state.mission.base_branch, path);
+        let mission = self
+            .repo
+            .show_file(&self.state.mission.mission_branch, path);
+        let (Ok(base), Ok(mission)) = (base, mission) else {
+            tracing::warn!("routing-rules branch-edit surface: ref read failed; skipping the note");
+            return Ok(());
+        };
+        if base != mission {
+            let base_branch = self.state.mission.base_branch.clone();
+            let mission_branch = self.state.mission.mission_branch.clone();
+            self.emit_decision(
+                &format!(
+                    "{mission_branch} edits {path} — ignored: routing rules are base-branch-owned \
+                     (read from base branch {base_branch:?} at mission creation); land the change \
+                     on {base_branch:?} to route future missions"
+                ),
+                None,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Append knowledge (then lessons) onto a planning seed. Order and
     /// separate budgets are load-bearing (ticket
     /// repo-knowledge-ranked-brief-injection).
@@ -6423,6 +6530,7 @@ impl MissionEngine {
             max_turns: role_cfg.max_turns,
             env: HashMap::new(),
             sandbox: None,
+            hook_status: None,
         };
         permissions::apply(
             permissions::for_role(Role::Orchestrator, &cfg, &[], &[], &[]),
@@ -6443,6 +6551,9 @@ impl MissionEngine {
             milestone_id: None,
             model: role_cfg.model,
             prompt_hash: prompts::hash(Role::Orchestrator),
+            // Task-class routing decides the WORKER executor tier only; the
+            // orchestrator is never routed, so there is no route to record.
+            executor_route: None,
         };
         let outcome = runner::run_session(
             backend.as_ref(),
@@ -6580,6 +6691,7 @@ impl MissionEngine {
             max_turns: role_cfg.max_turns,
             env: HashMap::new(),
             sandbox: None,
+            hook_status: None,
         };
         permissions::apply(
             permissions::for_role(Role::Orchestrator, &cfg, &[], &[], &[]),
@@ -6611,6 +6723,7 @@ impl MissionEngine {
             feature_id: None,
             milestone_id: None,
             candidate: None,
+            executor_route: None,
             sdk_session_id: sdk_session_id.clone(),
             model: role_cfg.model,
             quant: "n/a".to_string(),
@@ -8084,6 +8197,7 @@ pub(crate) mod tests {
                 touch_set: vec![],
                 deny_exceptions: vec![],
                 egress_grants: vec![],
+                executor_route: None,
             },
             runs,
             totals: TokenUsage::default(),
@@ -9556,6 +9670,7 @@ pub(crate) mod tests {
                 feature_id: None,
                 milestone_id: None,
                 candidate: None,
+                executor_route: None,
                 sdk_session_id: "s-1".to_string(),
                 model: "m".to_string(),
                 quant: "n/a".to_string(),
@@ -9721,6 +9836,7 @@ pub(crate) mod tests {
                 feature_id: Some("f-1-1".to_string()),
                 milestone_id: None,
                 candidate: None,
+                executor_route: None,
                 sdk_session_id: "s-1".to_string(),
                 model: "m".to_string(),
                 quant: "n/a".to_string(),

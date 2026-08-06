@@ -121,6 +121,8 @@ kranz work                      # drain the queue (run missions)
 
 Committed: `.kranz/merge-gates.json`, `.kranz/workspace.json` (workspace
 contract, validated at draft/approve; `crates/engine/src/workspace_contract.rs`),
+`.kranz/routing-rules.json` (routing rules, base-branch-owned, validated at
+draft/approve; `crates/engine/src/routing_rules.rs`, docs/routing-rules.md),
 `.kranz/tickets/<slug>.md`, `.kranz/tickets/<slug>.notes.jsonl` (append-only
 discussion sidecar, D-BW-3; `crates/engine/src/ticket_notes.rs`),
 `.kranz/domain-denylist.json` + `.kranz/domain-allowlist` (clean-room lint
@@ -130,7 +132,9 @@ mission's `plan.md` / `plan.json` / `report.md` (on the mission branch). Gitigno
 (never commit): `events.jsonl`, `state.json`, `runs/`, `control/`,
 `missions/*/workspace/` (container-provider compose files),
 `.kranz/config.json`, `serve.token`, `serve.read.token`,
-`.kranz/domain-terms.local` (plaintext lint vocabulary), `.kranz/tickets/*.status`.
+`.kranz/domain-terms.local` (plaintext lint vocabulary), `.kranz/tickets/*.status`,
+`.kranz/hook-status/` (ephemeral hook-signal projection — registrations +
+latest signal per run; `crates/engine/src/hook_status.rs`).
 Ticket lifecycle state is committed in the ticket .md itself: the additive
 `state:` frontmatter key (`open` default; terminal `done`/`superseded`/
 `wontfix`, optional `state-note:`) is the single source of truth — the

@@ -43,6 +43,7 @@ fn spec(session_id: &str, prompt: PromptMode, writable: bool) -> SessionSpec {
         max_turns: Some(10),
         env: HashMap::new(),
         sandbox: None,
+        hook_status: None,
     }
 }
 
@@ -447,6 +448,7 @@ async fn worker_session_carries_configured_tools_onto_the_spec() {
         &[],
         AuthVerdict::Inconclusive,
         &[],
+        None,
     )
     .await
     .unwrap();

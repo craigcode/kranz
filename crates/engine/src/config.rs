@@ -133,7 +133,7 @@ pub fn route_task_class_executor(
     cfg: &mut MissionConfig,
     task_class: Option<&str>,
 ) -> (ExecutorTier, &'static str) {
-    let table_configured = !cfg.routing.task_class_rules.is_empty();
+    let table_configured = !cfg.routing.is_empty();
     let requested = if table_configured {
         crate::routing::table_tier(&cfg.routing, task_class)
     } else {
@@ -522,6 +522,30 @@ pub fn validate(cfg: &MissionConfig) -> Result<()> {
     // that case, with the decision recorded against the mission.
     if let Err(err) = crate::routing::validate_table(&cfg.routing) {
         return Err(EngineError::Config(err));
+    }
+
+    // Hook-status lane (ticket `agent-hooks-status-signals`): when enabled,
+    // the endpoint is REQUIRED and must be a loopback HTTP(S) URL — the
+    // per-run capability token rides it, so pointing it at a remote host
+    // would leak signal authority off-machine. A disabled lane ignores the
+    // endpoint entirely (byte-identical pre-lane behavior).
+    if let Some(hook_status) = &cfg.hook_status {
+        if hook_status.enabled {
+            if hook_status.endpoint.trim().is_empty() {
+                return Err(EngineError::Config(
+                    "hookStatus.enabled requires hookStatus.endpoint (the loopback signal \
+                     POST URL, e.g. http://127.0.0.1:4560/api/hook-status)"
+                        .to_string(),
+                ));
+            }
+            if !crate::hook_status::endpoint_is_loopback_http(&hook_status.endpoint) {
+                return Err(EngineError::Config(format!(
+                    "hookStatus.endpoint must be a loopback http(s) URL (the per-run \
+                     capability token rides it), got {:?}",
+                    hook_status.endpoint
+                )));
+            }
+        }
     }
 
     for (role, name) in [

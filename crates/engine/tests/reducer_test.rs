@@ -79,6 +79,7 @@ fn spawn(run_id: &str, feature_id: Option<&str>, milestone_id: Option<&str>) -> 
         feature_id: feature_id.map(str::to_string),
         milestone_id: milestone_id.map(str::to_string),
         candidate: None,
+        executor_route: None,
         sdk_session_id: format!("sess-{run_id}"),
         model: "sonnet".to_string(),
         quant: "n/a".to_string(),
@@ -1510,6 +1511,7 @@ fn approved_status_guard_never_overwrites_terminal_status() {
                 feature_id: None,
                 milestone_id: None,
                 candidate: None,
+                executor_route: None,
                 sdk_session_id: "sess-r-after-failure".to_string(),
                 model: "sonnet".to_string(),
                 quant: "n/a".to_string(),
@@ -3023,6 +3025,7 @@ fn weight_hash_round_trips_through_serde_and_reducer_fold() {
         feature_id: Some("f-1-1".to_string()),
         milestone_id: None,
         candidate: None,
+        executor_route: None,
         sdk_session_id: "sess-r-1".to_string(),
         model: "sonnet".to_string(),
         quant: "q4_k_m".to_string(),
@@ -3090,6 +3093,7 @@ fn local_worker_spawned_from_stubbed_gguf(run_id: &str, gguf_bytes: &[u8]) -> (S
         feature_id: Some("f-1-1".to_string()),
         milestone_id: None,
         candidate: None,
+        executor_route: None,
         sdk_session_id: format!("sess-{run_id}"),
         model: "local-llama-3-8b".to_string(),
         quant: "q4_k_m".to_string(),
@@ -3886,6 +3890,7 @@ fn dispatch_pool_candidate_links_fold_without_respawn_charge() {
             count: 2,
             backend: backend.to_string(),
         }),
+        executor_route: None,
         sdk_session_id: format!("sess-{run_id}"),
         model: "sonnet".to_string(),
         quant: "n/a".to_string(),
@@ -3980,6 +3985,7 @@ fn divergence_event_old_logs_fold_cleanly() {
             count: 2,
             backend: backend.to_string(),
         }),
+        executor_route: None,
         sdk_session_id: format!("sess-{run_id}"),
         model: "sonnet".to_string(),
         quant: "n/a".to_string(),
@@ -4051,6 +4057,7 @@ fn divergence_event_records_fold_and_resolution_is_idempotent() {
             count: 2,
             backend: "claude".to_string(),
         }),
+        executor_route: None,
         sdk_session_id: format!("sess-{run_id}"),
         model: "sonnet".to_string(),
         quant: "n/a".to_string(),
@@ -4203,4 +4210,115 @@ fn divergence_event_records_fold_and_resolution_is_idempotent() {
         fold(&bad_unit).is_err(),
         "a resolution naming an unknown unit must fail the fold"
     );
+}
+
+/// The seed-time route record (ticket routing-rules-config): the reducer
+/// derives `mission.executor_route` from `mission.created`'s original folded
+/// goal + routed config — the ONLY event whose goal still carries the task
+/// class (`plan.approved` overwrites `state.mission.goal` with the plan's
+/// own goal, so deriving it later would find nothing).
+#[test]
+fn routing_rules_config_mission_created_fold_derives_executor_route() {
+    let folded_goal = "Bump the dependency.\n## Task class\nexecution-class\n";
+
+    // A routed mission's config (rules-file table applied at create, worker
+    // rewritten to the local backend).
+    let routed_config = || {
+        let mut config = MissionConfig {
+            routing: RoutingConfig {
+                task_class_rules: vec![TaskClassRoute {
+                    task_class: "execution-class".to_string(),
+                    tier: ExecutorTier::Local,
+                }],
+                pattern_rules: vec![],
+            },
+            ..MissionConfig::default()
+        };
+        config.worker.backend = Some("local".to_string());
+        config
+    };
+
+    // The fold names the deciding rule and the effective local tier.
+    let state = fold(&[ev(
+        1,
+        EventKind::MissionCreated {
+            goal: folded_goal.to_string(),
+            base_branch: "main".to_string(),
+            mission_branch: format!("kranz/mission-{MISSION}"),
+            config: routed_config(),
+        },
+    )])
+    .unwrap();
+    let route = state
+        .mission
+        .executor_route
+        .clone()
+        .expect("a task-class seed folds a route record");
+    assert_eq!(route.tier, ExecutorTier::Local);
+    assert_eq!(route.rule.as_deref(), Some("taskClassRules[0]"));
+
+    // The same fold is deterministic across replay (the resume path folds
+    // the same log to the same record).
+    let replayed = fold(&[ev(
+        1,
+        EventKind::MissionCreated {
+            goal: folded_goal.to_string(),
+            base_branch: "main".to_string(),
+            mission_branch: format!("kranz/mission-{MISSION}"),
+            config: routed_config(),
+        },
+    )])
+    .unwrap();
+    assert_eq!(
+        state.mission.executor_route,
+        replayed.mission.executor_route
+    );
+
+    // No task class on the seed goal ⇒ no record (the pre-provenance shape),
+    // even with a table configured.
+    let state = fold(&[ev(
+        1,
+        EventKind::MissionCreated {
+            goal: "ship the demo feature".to_string(),
+            base_branch: "main".to_string(),
+            mission_branch: format!("kranz/mission-{MISSION}"),
+            config: MissionConfig::default(),
+        },
+    )])
+    .unwrap();
+    assert_eq!(state.mission.executor_route, None);
+
+    // A legacy-floor mission (execution-class goal, no table): the record
+    // carries the effective tier and NO rule — there is no table rule to
+    // name. And the record SURVIVES plan.approved overwriting the goal.
+    let events = vec![
+        ev(
+            1,
+            EventKind::MissionCreated {
+                goal: folded_goal.to_string(),
+                base_branch: "main".to_string(),
+                mission_branch: format!("kranz/mission-{MISSION}"),
+                config: MissionConfig::default(),
+            },
+        ),
+        ev(
+            2,
+            EventKind::PlanApproved {
+                plan: plan(),
+                base_sha: Some("deadbeef".to_string()),
+            },
+        ),
+    ];
+    let state = fold(&events).unwrap();
+    assert_eq!(
+        state.mission.goal,
+        plan().goal,
+        "fixture: plan.approved must overwrite the goal"
+    );
+    let route = state
+        .mission
+        .executor_route
+        .expect("the seed-time record survives approval");
+    assert_eq!(route.tier, ExecutorTier::Frontier);
+    assert_eq!(route.rule, None);
 }

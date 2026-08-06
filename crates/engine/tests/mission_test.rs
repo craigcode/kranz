@@ -5702,6 +5702,302 @@ fn create_leaves_executor_frontier_when_goal_carries_no_task_class() {
     assert_eq!(engine.state().config.worker.backend, None);
 }
 
+// ---------------------------------------------------------------------------
+// 5d. Tracked routing rules (ticket routing-rules-config): the base-branch-
+// owned `.kranz/routing-rules.json` populates the routing table at create,
+// fails closed at draft/approve, and a mission-branch edit is ignored and
+// surfaced. The pure parse/validate/determinism cases live in
+// `routing_rules.rs`/`routing.rs`; these are the integration seams.
+// ---------------------------------------------------------------------------
+
+/// Commit `.kranz/routing-rules.json` on the CURRENT branch (mirrors
+/// `commit_workspace_contract`).
+fn commit_routing_rules(root: &Path, rules_json: &str) {
+    std::fs::create_dir_all(root.join(".kranz")).unwrap();
+    std::fs::write(root.join(".kranz").join("routing-rules.json"), rules_json).unwrap();
+    raw_git(root, &["add", ".kranz/routing-rules.json"]);
+    raw_git(root, &["commit", "-m", "routing rules"]);
+}
+
+fn execution_class_goal() -> String {
+    kranz_engine::ticket::Ticket::parse(
+        "bump-dep",
+        "\
+---
+title: Bump a dependency
+task-class: execution-class
+---
+
+## Goal
+Bump the dependency to the latest patch release.
+",
+    )
+    .expect("parse ticket")
+    .mission_goal()
+}
+
+/// A valid rules file on the base branch IS the mission's routing table:
+/// the pattern rule routes the execution-class ticket local (endpoint
+/// configured), both rule forms land on `mission.created`'s config, and the
+/// load is recorded beside the routing decision.
+#[test]
+fn routing_rules_config_create_loads_base_rules_and_routes() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    commit_routing_rules(
+        &root,
+        r#"{
+            "taskClassRules": [
+                {"taskClass": "docs-class", "tier": "frontier"}
+            ],
+            "patternRules": [
+                {"pattern": "execution-*", "tier": "local"}
+            ]
+        }"#,
+    );
+    let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::with_scripts(vec![]));
+
+    let mut cfg = test_cfg();
+    cfg.worker.base_url = Some("http://127.0.0.1:8080".to_string());
+    cfg.worker.context_budget = Some(16_384);
+    let engine =
+        MissionEngine::create(backend, &root, &execution_class_goal(), cfg).expect("create");
+
+    // The file populated the table (both forms), and the pattern rule
+    // routed the class local.
+    assert_eq!(engine.state().executor_tier(), ExecutorTier::Local);
+    assert_eq!(engine.state().config.routing.task_class_rules.len(), 1);
+    assert_eq!(engine.state().config.routing.pattern_rules.len(), 1);
+    assert_eq!(
+        engine.state().config.routing.pattern_rules[0].pattern,
+        "execution-*"
+    );
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::OrchestratorDecision { summary, .. }
+                if summary.contains("routing rules loaded from .kranz/routing-rules.json (base branch \"main\"): 1 task-class rule(s), 1 pattern rule(s)")
+        )),
+        "expected the rules-load record; events: {:?}",
+        event_types(&events)
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::OrchestratorDecision { summary, .. }
+                if summary.contains("executor routed local (routing-table rule)")
+        )),
+        "expected the table-rule routing decision; events: {:?}",
+        event_types(&events)
+    );
+}
+
+/// Present-but-invalid rules fail the DRAFT closed — create errors naming
+/// the file, the rule index, and the field, BEFORE any mission side effects.
+#[test]
+fn routing_rules_config_invalid_rules_fail_draft_closed_naming_the_rule() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    commit_routing_rules(
+        &root,
+        r#"{"taskClassRules": [{"taskClass": "ok-class", "tier": "local"}, {"taskClass": " ", "tier": "frontier"}]}"#,
+    );
+    let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::with_scripts(vec![]));
+
+    let err = match MissionEngine::create(backend, &root, &execution_class_goal(), test_cfg()) {
+        Ok(_) => panic!("an invalid rules file must refuse mission creation"),
+        Err(err) => err,
+    };
+    let text = format!("{err}");
+    assert!(text.contains(".kranz/routing-rules.json"), "{text}");
+    assert!(text.contains("taskClassRules[1].taskClass"), "{text}");
+    assert!(text.contains("owner: repo-setup"), "{text}");
+    assert!(
+        !root.join(".kranz").join("missions").exists(),
+        "a refused draft leaves no mission side effects"
+    );
+}
+
+/// Present-but-invalid rules at APPROVE time fail approval closed, mirroring
+/// the workspace contract's approve-time validation — even though this
+/// mission's route was already pinned (validly) at create.
+#[test]
+fn routing_rules_config_invalid_rules_fail_approve_closed() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    commit_routing_rules(
+        &root,
+        r#"{"patternRules": [{"pattern": "*", "tier": "frontier"}]}"#,
+    );
+    let backend = Arc::new(MockBackend::new());
+    let mut engine = make_engine(&backend, &root, test_cfg());
+
+    // The rules go stale-invalid on the base between create and approve.
+    std::fs::write(
+        root.join(".kranz").join("routing-rules.json"),
+        r#"{"patternRules": [{"pattern": "", "tier": "frontier"}]}"#,
+    )
+    .unwrap();
+    raw_git(&root, &["add", ".kranz/routing-rules.json"]);
+    raw_git(&root, &["commit", "-m", "break the routing rules"]);
+
+    let err = engine
+        .approve_plan(simple_plan(1, vec![]))
+        .expect_err("approve must fail closed on invalid base rules");
+    let text = format!("{err}");
+    assert!(text.contains(".kranz/routing-rules.json"), "{text}");
+    assert!(text.contains("patternRules[0].pattern"), "{text}");
+    assert!(text.contains("owner: repo-setup"), "{text}");
+}
+
+/// Regression: NO rules file ⇒ today's behavior byte-for-byte — the legacy
+/// literal floor routes, the table stays empty, and no rules-load record
+/// appears.
+#[test]
+fn routing_rules_config_no_file_keeps_legacy_floor_byte_identical() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::with_scripts(vec![]));
+
+    let mut cfg = test_cfg();
+    cfg.worker.base_url = Some("http://127.0.0.1:8080".to_string());
+    cfg.worker.context_budget = Some(16_384);
+    let engine =
+        MissionEngine::create(backend, &root, &execution_class_goal(), cfg).expect("create");
+
+    assert!(engine.state().config.routing.is_empty());
+    assert_eq!(engine.state().executor_tier(), ExecutorTier::Local);
+    assert_eq!(
+        engine.state().config.worker.backend.as_deref(),
+        Some("local")
+    );
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+    assert!(
+        !events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::OrchestratorDecision { summary, .. } if summary.contains("routing rules loaded")
+        )),
+        "no file ⇒ no rules-load record"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::OrchestratorDecision { summary, .. }
+                if summary.contains("executor routed local (execution-class)")
+        )),
+        "the legacy literal-floor decision is unchanged; events: {:?}",
+        event_types(&events)
+    );
+}
+
+/// Ownership end-to-end: the mission branch edits the rules file; the edit
+/// can never re-route the mission (the base's copy pinned the route at
+/// creation), the attempt is surfaced on the decision log at run time, and
+/// the worker's `worker.spawned` records the effective route plus the
+/// deciding rule. Here the base rule routes local but no endpoint is
+/// configured, so the EFFECTIVE tier fails safe to frontier while the record
+/// still names the rule — requested vs effective is exactly the honesty the
+/// provenance exists for.
+#[tokio::test(flavor = "multi_thread")]
+async fn routing_rules_config_mission_branch_edit_ignored_and_surfaced() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    commit_routing_rules(
+        &root,
+        r#"{"taskClassRules": [{"taskClass": "execution-class", "tier": "local"}]}"#,
+    );
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+    ]));
+    let backend_dyn: Arc<dyn AgentBackend> = backend.clone();
+    let mut engine = MissionEngine::create(backend_dyn, &root, &execution_class_goal(), test_cfg())
+        .expect("create routed mission");
+    engine.seed_worker_auth_verdict_for_test(AuthVerdict::Inconclusive);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    // The mission branch "weakens" the rules (approve in checkout mode left
+    // the primary checkout ON the mission branch): every class routes local.
+    commit_routing_rules(
+        &root,
+        r#"{"patternRules": [{"pattern": "*", "tier": "local"}]}"#,
+    );
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+
+    // Surfaced: the inert mission-branch edit is operator-visible.
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::OrchestratorDecision { summary, .. }
+                if summary.contains("edits .kranz/routing-rules.json — ignored: routing rules are base-branch-owned")
+        )),
+        "expected the branch-edit surface note; decisions: {:?}",
+        events.iter().filter_map(|e| match &e.kind {
+            EventKind::OrchestratorDecision { summary, .. } => Some(summary),
+            _ => None,
+        }).collect::<Vec<_>>()
+    );
+
+    // Ignored: the worker ran the BASE rules' route — the exact rule
+    // matched, the effective tier failed safe to frontier (no endpoint), and
+    // the mission branch's `* → local` never entered the record.
+    let worker_route = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::WorkerSpawned {
+                role: Role::Worker,
+                executor_route,
+                ..
+            } => Some(executor_route.clone()),
+            _ => None,
+        })
+        .expect("a worker.spawned with a route record");
+    let route = worker_route.expect("the worker session carries route provenance");
+    assert_eq!(route.tier, ExecutorTier::Frontier);
+    assert_eq!(route.rule.as_deref(), Some("taskClassRules[0]"));
+
+    // Non-worker sessions are never routed: no record.
+    assert!(events.iter().all(|e| match &e.kind {
+        EventKind::WorkerSpawned {
+            role: Role::Orchestrator,
+            executor_route,
+            ..
+        } => executor_route.is_none(),
+        _ => true,
+    }));
+}
+
 /// Regression: the orchestrator's raw turn text becomes the
 /// `orchestrator.decision` detail (and its summary feeds the decision
 /// summary). A credential in that model-authored text must be redacted

@@ -91,6 +91,7 @@ fn seed_mission(repo_root: &Path) -> MissionPaths {
         feature_id: Some("f-1-1".into()),
         milestone_id: Some("ms-1".into()),
         candidate: None,
+        executor_route: None,
         sdk_session_id: "00000000-0000-0000-0000-000000000001".into(),
         model: "sonnet".into(),
         quant: "n/a".into(),

@@ -74,6 +74,17 @@ pub struct Mission {
     /// plumbing change.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egress_grants: Vec<String>,
+    /// The executor route this mission was seeded with (ticket
+    /// `routing-rules-config`): derived at fold time from `mission.created`'s
+    /// original folded goal + routed config ([`crate::routing::seed_executor_route`])
+    /// — `plan.approved` overwrites `goal` with the plan's own, so the task
+    /// class exists only on that first event and the decision is folded here
+    /// once, then replayed onto every `worker.spawned`. `None` when the seed
+    /// carried no task class; additive (absent in pre-existing state
+    /// snapshots). A mid-mission `config.changed` backend flip moves the
+    /// LIVE tier ([`MissionState::executor_tier`]), not this seed-time record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor_route: Option<ExecutorRoute>,
 }
 
 // ---------------------------------------------------------------------------
@@ -621,13 +632,7 @@ impl MissionState {
     /// entries), so a stray local `worker.backend` alongside a pool must not
     /// classify the mission's spend as $0-marginal.
     pub fn executor_tier(&self) -> ExecutorTier {
-        if self.config.worker_candidates.is_empty()
-            && self.config.backend_kind(Role::Worker) == BackendKind::Local
-        {
-            ExecutorTier::Local
-        } else {
-            ExecutorTier::Frontier
-        }
+        self.config.executor_tier()
     }
 }
 
@@ -975,6 +980,26 @@ impl BackendKind {
             BackendKind::Codex | BackendKind::Kimi | BackendKind::Local | BackendKind::Acp => false,
         }
     }
+
+    /// Whether this backend exposes a lifecycle-hook surface the
+    /// hook-status lane can project onto (ticket
+    /// `agent-hooks-status-signals`, [`crate::hook_status`]). Only the
+    /// cursor CLI's documented `hooks.json` lifecycle events qualify today;
+    /// every other backend IGNORES [`crate::backend::SessionSpec::hook_status`]
+    /// exactly like `settings_json`, so an enabled lane is a byte-identical
+    /// no-op there (the hooks-disabled regression). The match is
+    /// deliberately exhaustive: a future backend must declare itself here.
+    pub fn supports_hook_status_signals(self) -> bool {
+        match self {
+            BackendKind::Cursor => true,
+            BackendKind::Claude
+            | BackendKind::Codex
+            | BackendKind::Droid
+            | BackendKind::Kimi
+            | BackendKind::Local
+            | BackendKind::Acp => false,
+        }
+    }
 }
 
 /// Which inference tier executes a ticket, derived deterministically from its
@@ -1007,8 +1032,8 @@ impl Default for ExecutorTier {
 /// all the `local` class — which concrete endpoint the class resolves to is
 /// ordinary local-backend role config (`baseUrl` + `model`), not routing
 /// table content and not a new backend kind. The tracked, base-branch-owned
-/// rules FILE surface is the follow-up `routing-rules-config` ticket; this
-/// is the engine-side table it will populate.
+/// rules FILE surface ([`crate::routing_rules`], ticket
+/// `routing-rules-config`) is the tracked way to populate this table.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct RoutingConfig {
@@ -1016,6 +1041,23 @@ pub struct RoutingConfig {
     /// ticket's task class (case- and whitespace-insensitively, the same
     /// normalization as the hardcoded floor) decides the executor tier.
     pub task_class_rules: Vec<TaskClassRoute>,
+    /// Ordered PATTERN rules (ticket `routing-rules-config`), consulted only
+    /// when no exact `taskClassRules` entry matched: the first pattern that
+    /// matches the normalized task class decides the executor tier. An exact
+    /// class rule always beats a pattern (specific over general); within this
+    /// list, order is the only precedence knob. Additive: absent in every
+    /// pre-pattern config and every pre-pattern `mission.created` payload,
+    /// where it deserializes to empty.
+    #[serde(default)]
+    pub pattern_rules: Vec<PatternRoute>,
+}
+
+impl RoutingConfig {
+    /// No rules of either form — the empty table that keeps the hardcoded
+    /// literal floor ([`crate::config::task_class_to_tier`]) byte-for-byte.
+    pub fn is_empty(&self) -> bool {
+        self.task_class_rules.is_empty() && self.pattern_rules.is_empty()
+    }
 }
 
 /// One routing rule: a task class routed to an executor capability class.
@@ -1029,6 +1071,46 @@ pub struct TaskClassRoute {
     pub task_class: String,
     /// The capability class the matched task class routes to.
     pub tier: ExecutorTier,
+}
+
+/// One PATTERN routing rule (ticket `routing-rules-config`): a task-class
+/// pattern routed to an executor capability class. The pattern language is
+/// deliberately tiny and deterministic — `*` matches any (possibly empty)
+/// run of characters, every other character is literal, comparison happens
+/// after the floor's normalization (trim + ASCII-lowercase). Must be
+/// non-empty and unique within the pattern list after normalization —
+/// `config::validate` fails closed otherwise (a duplicate is dead config
+/// under first-match-wins).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PatternRoute {
+    /// The glob-style pattern matched against the normalized task class.
+    pub pattern: String,
+    /// The capability class a matching task class routes to.
+    pub tier: ExecutorTier,
+}
+
+/// The effective executor route of one worker session (ticket
+/// `routing-rules-config`), recorded additively on `worker.spawned`: routing
+/// is provenance, not a hidden implementation detail. Derived once at fold
+/// time from `mission.created`'s original folded goal and routed config
+/// ([`crate::routing::seed_executor_route`]) — the determinism contract
+/// guarantees the recomputation equals the seed-time decision, so no new
+/// event payload is needed — then replayed onto each worker spawn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutorRoute {
+    /// The EFFECTIVE capability class the session runs on — after the
+    /// fail-safes (a `local` route with no configured endpoint lands the
+    /// worker back on `frontier`), derived from the routed config exactly as
+    /// [`MissionState::executor_tier`] derives it.
+    pub tier: ExecutorTier,
+    /// The rule that decided the route, named by its position in the table
+    /// (`taskClassRules[i]` / `patternRules[i]`). `None` when no rule
+    /// decided it: the fall-through to `frontier`, or the legacy literal
+    /// floor with no table configured at all. Never serialized when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
 }
 
 /// How worker/validator sessions are isolated from the primary checkout.
@@ -1114,6 +1196,29 @@ pub struct RemoteWorkspaceConfig {
 /// made configurable. A grant APPROVED in under this latency is flagged as a
 /// rubber-stamp signal in the outcomes report — a flag, never an enforcement.
 pub const DEFAULT_RUBBER_STAMP_THRESHOLD_MS: u64 = 10_000;
+
+/// Hook-derived status-signal lane config (ticket
+/// `agent-hooks-status-signals`, [`crate::hook_status`]): an OPTIONAL,
+/// off-by-default observability lane for backends with a lifecycle-hook
+/// surface ([`BackendKind::supports_hook_status_signals`] — cursor only
+/// today). When enabled, worker sessions on hook-capable backends get a
+/// per-run capability token + hook install that reports coarse signals
+/// ("running" / "needs input" / "interrupted" / "turn finished") to
+/// `endpoint`; the signals land ONLY in the ephemeral `.kranz/hook-status/`
+/// projection, never in mission state. When disabled (the default) every
+/// session is byte-identical to today — no hook config anywhere.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct HookStatusConfig {
+    /// Master switch, off by default.
+    pub enabled: bool,
+    /// The full loopback signal POST URL the per-session relay
+    /// (`kranz hook-status`) delivers to — e.g.
+    /// `http://127.0.0.1:4560/api/hook-status`. Required when `enabled`;
+    /// `config::validate` refuses non-loopback or non-HTTP(S) values
+    /// (the per-run capability token rides this URL).
+    pub endpoint: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -1215,6 +1320,12 @@ pub struct MissionConfig {
     /// role config, so a hosted fine-tune needs no new kind here.
     #[serde(default)]
     pub routing: RoutingConfig,
+    /// Hook-derived status-signal lane (ticket
+    /// `agent-hooks-status-signals`). Absent/disabled = byte-identical
+    /// pre-lane behavior; enabled installs hook config ONLY into
+    /// session-private scratch HOMEs on hook-capable backends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_status: Option<HookStatusConfig>,
 }
 
 impl Default for MissionConfig {
@@ -1299,6 +1410,7 @@ impl Default for MissionConfig {
             rubber_stamp_threshold_ms: DEFAULT_RUBBER_STAMP_THRESHOLD_MS,
             worker_candidates: vec![],
             routing: RoutingConfig::default(),
+            hook_status: None,
         }
     }
 }
@@ -1330,6 +1442,26 @@ impl MissionConfig {
             Some("acp") => BackendKind::Acp,
             Some("cursor") => BackendKind::Cursor,
             _ => BackendKind::Claude,
+        }
+    }
+
+    /// Which inference tier the Worker executes on under this config, derived
+    /// from the Worker `RoleConfig.backend` rather than stored:
+    /// [`ExecutorTier::Local`] when the Worker backend is
+    /// [`BackendKind::Local`], else [`ExecutorTier::Frontier`]. A configured
+    /// dispatch pool (`worker_candidates`) is always Frontier: pool
+    /// candidates are never local-backed (validation rejects `local`
+    /// entries), so a stray local `worker.backend` alongside a pool must not
+    /// classify the spend as $0-marginal. The config-level home of the
+    /// derivation — [`MissionState::executor_tier`] delegates here, and the
+    /// per-session route record ([`ExecutorRoute`]) reads the same source.
+    pub fn executor_tier(&self) -> ExecutorTier {
+        if self.worker_candidates.is_empty()
+            && self.backend_kind(Role::Worker) == BackendKind::Local
+        {
+            ExecutorTier::Local
+        } else {
+            ExecutorTier::Frontier
         }
     }
 }

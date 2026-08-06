@@ -184,6 +184,7 @@ mod tests {
             feature_id: Some(feature_id.to_string()),
             milestone_id: None,
             candidate: None,
+            executor_route: None,
             sdk_session_id: format!("sess-{run_id}"),
             model: "sonnet".to_string(),
             quant: "n/a".to_string(),
