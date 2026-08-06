@@ -14,6 +14,7 @@ import type {
   DrainState,
   EscalationMetrics,
   MissionEvent,
+  MissionHookStatus,
   MissionState,
   MissionSummary,
   Outcomes,
@@ -200,6 +201,12 @@ export const api = {
 
   workspace(id: string): Promise<WorkspaceSummary> {
     return getJson(`/api/missions/${encodeURIComponent(id)}/workspace`);
+  },
+
+  /** The ephemeral hook-signal projection (ticket
+   *  `agent-hooks-status-signals`) — hook-derived, never mission state. */
+  hookStatus(id: string): Promise<MissionHookStatus> {
+    return getJson(`/api/missions/${encodeURIComponent(id)}/hook-status`);
   },
 
   events(id: string, since?: number): Promise<MissionEvent[]> {

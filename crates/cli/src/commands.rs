@@ -358,6 +358,15 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             let mut stdin = std::io::stdin();
             Ok(crate::hook_guard::run_hook_guard(&config, &mut stdin))
         }
+        Command::HookStatus { config } => {
+            let mut stdin = std::io::stdin();
+            Ok(crate::hook_status::run_hook_status(
+                &config,
+                &mut stdin,
+                &crate::hook_status::post_signal,
+            )
+            .await)
+        }
         Command::Ready { json, all } => {
             if all {
                 let config = kranz_engine::paths::global_config()

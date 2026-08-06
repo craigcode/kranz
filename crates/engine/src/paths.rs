@@ -42,6 +42,7 @@ pub const KRANZ_GITIGNORE_RULES: &[&str] = &[
     "missions/*/workspace/",
     "slack-threads.json",
     "queue/",
+    "hook-status/",
     "tickets/*.status",
     "serve.token",
     "serve.read.token",

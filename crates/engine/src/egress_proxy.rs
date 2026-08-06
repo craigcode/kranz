@@ -569,6 +569,7 @@ mod tests {
                 },
                 container: None,
             }),
+            hook_status: None,
         }
     }
 

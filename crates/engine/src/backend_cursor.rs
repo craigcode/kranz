@@ -51,6 +51,27 @@
 //! ("Authentication required", pre-billing), which the stream watcher turns
 //! into an honest configuration-style failure rather than a retryable one
 //! (probe item 5).
+//!
+//! Hook-status lane (ticket `agent-hooks-status-signals`,
+//! [`crate::hook_status`]): when the runner seeds
+//! [`SessionSpec::hook_status`] (mission config `hookStatus.enabled` AND
+//! this hook-capable backend), [`CursorBackend::start`] installs the lane
+//! into the session-private HOME BEFORE spawning: `<home>/.cursor/
+//! hooks.json` (the CLI's documented user-level hook file — verified
+//! 2026-08-06 against https://cursor.com/docs/hooks: `version: 1` with
+//! per-event `[{command, timeout}]` handlers, payloads delivered on stdin,
+//! exit 0 = ok / 2 = block / other = fail-open; there is NO HTTP hook
+//! type, so delivery to kranz's endpoint is the installed
+//! `kranz hook-status` relay) plus the per-session spec file the relay
+//! reads. The install NEVER touches the workspace's tracked
+//! `.cursor/hooks.json` — the project-level file is the operator's own,
+//! and mutating it as a side effect of spawning would be exactly the
+//! silent tracked-tree write the ticket forbids. Every install failure
+//! degrades to NO lane (loud warning, ordinary session): hooks are
+//! non-authoritative observability, and the lane disabled is the
+//! byte-identical default. `SessionSpec::hook_status` is the one field
+//! this backend consumes beyond argv/env; the claude-ism fields stay
+//! ignored as documented above.
 
 use crate::backend::{
     AgentBackend, AgentEvent, AgentSession, PromptMode, SessionExit, SessionSpec,
@@ -190,6 +211,22 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The HOME one session's child will actually receive, mirroring
+/// [`cursor_child_env`]'s resolution exactly (both branches of
+/// [`crate::agent_env::agent_session_env`] land on one of these two):
+/// a spec-carried relocated HOME is used verbatim; otherwise the
+/// per-session scratch home `<scratch_home_root>/home` — seeded by
+/// [`seed_cursor_scratch_home`], or empty-but-present on seed failure.
+/// The hook-status install resolves the same path so its
+/// `<home>/.cursor/hooks.json` is always in the tree the child sees
+/// (and never the primary checkout).
+fn cursor_session_home(spec: &SessionSpec) -> PathBuf {
+    if let Some(home) = spec.env.get("HOME") {
+        return PathBuf::from(home);
+    }
+    crate::backend_claude::scratch_home_root(&spec.session_id).join("home")
 }
 
 /// Serializes the tests in this module that mutate the process-global env
@@ -652,17 +689,39 @@ impl AgentBackend for CursorBackend {
         let model = spec.model.clone();
         let args = build_args(&spec);
 
+        // agent-env-clear: CLEARED env from the minimal allowlist; the
+        // scratch HOME is SEEDED with the minimal .cursor account/config
+        // set (login state does not survive a relocated HOME), and the
+        // one ambient var a cursor session may authenticate with is
+        // injected explicitly, never the whole ambient set.
+        let child_env = cursor_child_env(&spec);
+
+        // Ticket agent-hooks-status-signals: install the OPTIONAL hook
+        // lane into the session-private HOME (the seeded `.cursor` now
+        // exists, and the tracked project `.cursor/hooks.json` is never
+        // touched — module docs). The seed/env are unaffected; a failure
+        // degrades to NO lane with a loud warning, never a spawn error.
+        if let Some(seed) = &spec.hook_status {
+            if let Err(e) = crate::hook_status::install_cursor_hook_status(
+                &cursor_session_home(&spec),
+                seed,
+                &spec.session_id,
+            ) {
+                tracing::warn!(
+                    session_id = %spec.session_id,
+                    error = %e,
+                    "hook-status install failed; the session spawns without the lane \
+                     (mission state is unaffected — the lane is observational)"
+                );
+            }
+        }
+
         let mut command = tokio::process::Command::new(&self.binary);
         command
             .args(&args)
             .current_dir(&spec.cwd)
-            // agent-env-clear: CLEARED env from the minimal allowlist; the
-            // scratch HOME is SEEDED with the minimal .cursor account/config
-            // set (login state does not survive a relocated HOME), and the
-            // one ambient var a cursor session may authenticate with is
-            // injected explicitly, never the whole ambient set.
             .env_clear()
-            .envs(cursor_child_env(&spec))
+            .envs(child_env)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -986,6 +1045,7 @@ mod tests {
             max_turns: None,
             env: Default::default(),
             sandbox: None,
+            hook_status: None,
         }
     }
 

@@ -1311,6 +1311,7 @@ mod tests {
             max_turns: None,
             env,
             sandbox: None,
+            hook_status: None,
         }
     }
 

@@ -437,6 +437,19 @@ fn repo_api_routes() -> Router<Arc<ServerState>> {
             "/missions/{id}/runs/{run_id}/transcript",
             get(rest::run_transcript),
         )
+        // The hook-status lane (ticket agent-hooks-status-signals): the
+        // POST is the lane's ONLY write, authenticated by the per-run
+        // capability token (exempt from the mutation-token gate below, like
+        // the GitHub webhook's HMAC route); the GET is an ordinary
+        // tokenless-loopback read. The body limit is the lane's own
+        // 16 KiB bound — the relay's body is a handful of small fields.
+        .route(
+            "/hook-status",
+            post(rest::post_hook_status).route_layer(axum::extract::DefaultBodyLimit::max(
+                kranz_engine::hook_status::SIGNAL_BODY_MAX_BYTES,
+            )),
+        )
+        .route("/missions/{id}/hook-status", get(rest::mission_hook_status))
         .route("/missions/{id}/control", post(rest::post_control))
         .route("/missions/{id}/revise", post(rest::post_revise))
         .route(
@@ -835,10 +848,18 @@ async fn require_mutation_token(
         // (`X-Hub-Signature-256` against `hooks.secret`) and refuses closed
         // when unconfigured — GitHub cannot present the mutation token.
         let is_github_hook = path.ends_with("/hooks/github");
+        // The hook-status signal POST authenticates with its own per-RUN
+        // capability token (validated against the registration in the
+        // handler — worker-readable files never carry the serve token).
+        // Scoped to POSTs so a read-gated GET of the projection still
+        // requires the read token.
+        let is_hook_signal_post =
+            request.method() == Method::POST && path.ends_with("/hook-status");
         let is_read = request.method() == Method::GET || request.method() == Method::HEAD;
         let needs_token = path.starts_with("/api/")
             && !is_health
             && !is_github_hook
+            && !is_hook_signal_post
             && (request.method() == Method::POST || (gate.require_read_token && is_read));
         if needs_token {
             // The read-only token authenticates reads ONLY — never a mutation.

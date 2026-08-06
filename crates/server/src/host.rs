@@ -857,6 +857,7 @@ impl MissionHost {
             max_turns: role.max_turns,
             env: HashMap::new(),
             sandbox: None,
+            hook_status: None,
         };
         let outcome = run_ask_session(backend, spec).await?;
         Ok(json!({

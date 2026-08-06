@@ -623,6 +623,7 @@ mod tests {
             max_turns: None,
             env: Default::default(),
             sandbox: None,
+            hook_status: None,
         };
         let touch_set = vec!["src/**".to_string(), "!src/generated/**".to_string()];
         project_worker_hook_gates(&mut spec, &touch_set);
@@ -674,6 +675,7 @@ mod tests {
             max_turns: None,
             env: Default::default(),
             sandbox: None,
+            hook_status: None,
         };
         project_worker_hook_gates(&mut spec, &[]);
         assert!(spec.settings_json.is_none());

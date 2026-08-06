@@ -620,6 +620,75 @@ pub(crate) async fn mission_readiness(
     ))
 }
 
+/// `POST /api/hook-status` — the hook-status lane's ONLY write (ticket
+/// `agent-hooks-status-signals`, [`kranz_engine::hook_status`]). Receives
+/// one mapped lifecycle signal from a session's `kranz hook-status` relay
+/// and records it in the ephemeral `.kranz/hook-status/` projection.
+///
+/// Authenticates with the per-RUN capability token in the body — never the
+/// serve mutation token (a worker-readable file can only ever carry a
+/// token whose forgery ceiling is lying about its own run's status), so
+/// the route is exempt from the mutation-token gate exactly like the
+/// GitHub webhook's HMAC route. The payload is untrusted even on loopback:
+/// the body is route-limited to
+/// [`kranz_engine::hook_status::SIGNAL_BODY_MAX_BYTES`], ids are safe-id
+/// checked (path traversal), the token is constant-time compared against
+/// the registered hash, stale registrations reject, and the handler's only
+/// write is the projection file — no event, no state mutation, no grant
+/// path exists here.
+pub(crate) async fn post_hook_status(
+    State(server): State<Arc<ServerState>>,
+    Json(body): Json<kranz_engine::hook_status::SignalPost>,
+) -> Result<impl IntoResponse, ApiError> {
+    use kranz_engine::hook_status::RecordRejection;
+    match kranz_engine::hook_status::record_signal(
+        &server.repo_root,
+        &body.mission_id,
+        &body.run_id,
+        &body.token,
+        body.signal,
+        body.detail.as_deref(),
+        chrono::Utc::now(),
+    ) {
+        Ok(_) => Ok((StatusCode::ACCEPTED, Json(json!({ "recorded": true })))),
+        Err(RecordRejection::UnsafeId) | Err(RecordRejection::UnknownRun) => Err(
+            ApiError::not_found(format!("unknown hook-status run '{}'", body.run_id)),
+        ),
+        Err(RecordRejection::TokenMismatch) => Err(ApiError::unauthorized(
+            "hook-status token does not match this run's registration",
+        )),
+        Err(RecordRejection::Stale) => Err(ApiError::unauthorized(
+            "hook-status registration is stale (past its acceptance TTL)",
+        )),
+        Err(RecordRejection::RegistrationUnreadable) => Err(ApiError::internal(
+            "hook-status projection entry could not be read or written",
+        )),
+    }
+}
+
+/// `GET /api/missions/:id/hook-status` — the ephemeral hook-signal
+/// projection for one mission, re-read from disk per request like every
+/// other derived read. Additive and explicitly NON-authoritative: the
+/// payload carries `authoritative: false` so no consumer can mistake
+/// hook-derived signals for folded mission state (the fold is untouched —
+/// nothing in this lane can change a mission's terminal state).
+pub(crate) async fn mission_hook_status(
+    State(server): State<Arc<ServerState>>,
+    UrlPath(id): UrlPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let paths = mission_paths(&server, &id)?;
+    if !paths.events_file().is_file() {
+        return Err(unknown_mission(&id));
+    }
+    let runs = kranz_engine::hook_status::read_mission_signals(&server.repo_root, &id);
+    Ok(Json(json!({
+        "missionId": id,
+        "authoritative": false,
+        "note": "hook-derived lifecycle signals; observability only, never folded mission state",
+        "runs": runs,
+    })))
+}
+
 /// `GET /api/missions/:id/runs/:runId/transcript` — the run's JSONL parsed
 /// into a JSON array of raw stream values; 404 if the file is missing.
 pub(crate) async fn run_transcript(
@@ -1077,6 +1146,276 @@ mod tests {
             mission_branch: "kranz/mission-x".into(),
             config: MissionConfig::default(),
         }
+    }
+
+    fn post_json(uri: &str, body: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    /// The lane end to end over HTTP: a registered run's signal POST lands
+    /// in the ephemeral projection and is served by the per-mission GET —
+    /// labelled non-authoritative — while the mission's folded state and
+    /// its event log stay byte-identical (hooks never become mission
+    /// state; a terminal mission stays terminal).
+    #[tokio::test]
+    async fn hook_status_signal_endpoint_records_serves_and_never_touches_state() {
+        let tmp = TempDir::new().unwrap();
+        seed_mission(
+            tmp.path(),
+            "m-1",
+            vec![created("terminal"), EventKind::MissionCompleted {}],
+        );
+        kranz_engine::hook_status::register(tmp.path(), "m-1", "r-1", "tok-1", chrono::Utc::now())
+            .unwrap();
+        let events_before =
+            std::fs::read(MissionPaths::new(tmp.path(), "m-1").events_file()).unwrap();
+        let app = crate::router(tmp.path().to_path_buf(), None);
+
+        let response = app
+            .clone()
+            .oneshot(post_json(
+                "/api/hook-status",
+                &serde_json::json!({
+                    "token": "tok-1",
+                    "missionId": "m-1",
+                    "runId": "r-1",
+                    "signal": "needs-input",
+                    "detail": "Shell was refused",
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let response = app
+            .clone()
+            .oneshot(get("/api/missions/m-1/hook-status"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["authoritative"], false);
+        let runs = body["runs"].as_array().unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["runId"], "r-1");
+        assert_eq!(runs[0]["signal"]["signal"], "needs-input");
+        assert_eq!(runs[0]["signal"]["detail"], "Shell was refused");
+        assert!(
+            runs[0]["signal"]["receivedAt"].as_str().is_some(),
+            "{runs:?}"
+        );
+
+        // Folded mission state is untouched by the lane: the terminal
+        // mission still folds Complete and the event log is byte-identical.
+        let response = app.oneshot(get("/api/missions/m-1/state")).await.unwrap();
+        let state = body_json(response).await;
+        assert_eq!(state["mission"]["status"], "complete");
+        let events_after =
+            std::fs::read(MissionPaths::new(tmp.path(), "m-1").events_file()).unwrap();
+        assert_eq!(events_before, events_after);
+    }
+
+    /// Untrusted-payload discipline over HTTP: wrong tokens, unknown runs,
+    /// traversal ids, malformed bodies, and oversized bodies are all
+    /// rejected; nothing is written for any of them.
+    #[tokio::test]
+    async fn hook_status_signal_endpoint_rejects_untrusted_payloads() {
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-1", vec![created("x")]);
+        kranz_engine::hook_status::register(tmp.path(), "m-1", "r-1", "tok-1", chrono::Utc::now())
+            .unwrap();
+        let app = crate::router(tmp.path().to_path_buf(), None);
+
+        // Wrong capability token → 401.
+        let response = app
+            .clone()
+            .oneshot(post_json(
+                "/api/hook-status",
+                &serde_json::json!({
+                    "token": "tok-WRONG",
+                    "missionId": "m-1",
+                    "runId": "r-1",
+                    "signal": "running",
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // Unknown run → 404 (no oracle about neighboring runs).
+        let response = app
+            .clone()
+            .oneshot(post_json(
+                "/api/hook-status",
+                &serde_json::json!({
+                    "token": "tok-1",
+                    "missionId": "m-1",
+                    "runId": "r-9",
+                    "signal": "running",
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // Path traversal in the mission id → 404, never a joined path.
+        let response = app
+            .clone()
+            .oneshot(post_json(
+                "/api/hook-status",
+                &serde_json::json!({
+                    "token": "tok-1",
+                    "missionId": "../m-1",
+                    "runId": "r-1",
+                    "signal": "running",
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // A signal outside the vocabulary is a 4xx — the lane can never
+        // spell a state transition ("complete", "blocked", ...).
+        let response = app
+            .clone()
+            .oneshot(post_json(
+                "/api/hook-status",
+                &serde_json::json!({
+                    "token": "tok-1",
+                    "missionId": "m-1",
+                    "runId": "r-1",
+                    "signal": "complete",
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_client_error(),
+            "an out-of-vocabulary signal must be rejected: {}",
+            response.status()
+        );
+
+        // Malformed JSON → 4xx.
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/hook-status", "{not json"))
+            .await
+            .unwrap();
+        assert!(response.status().is_client_error());
+
+        // Oversized body → 413 (the route's own 16 KiB limit).
+        let oversized = format!(
+            "{{\"token\":\"tok-1\",\"missionId\":\"m-1\",\"runId\":\"r-1\",\"signal\":\"running\",\"detail\":\"{}\"}}",
+            "x".repeat(kranz_engine::hook_status::SIGNAL_BODY_MAX_BYTES)
+        );
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/hook-status", &oversized))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // None of the rejections recorded anything.
+        let views = kranz_engine::hook_status::read_mission_signals(tmp.path(), "m-1");
+        assert!(views.iter().all(|v| v.signal.is_none()), "{views:?}");
+    }
+
+    /// The POST authenticates with the per-run capability token, NOT the
+    /// serve mutation token: with the gate armed, the signal POST goes
+    /// through WITHOUT `x-kranz-token` while an ordinary mutation POST is
+    /// still rejected.
+    #[tokio::test]
+    async fn hook_status_signal_post_is_exempt_from_the_mutation_token_gate() {
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-1", vec![created("x")]);
+        kranz_engine::hook_status::register(tmp.path(), "m-1", "r-1", "tok-1", chrono::Utc::now())
+            .unwrap();
+        let app = crate::router_with_token(
+            tmp.path().to_path_buf(),
+            None,
+            Some("serve-secret".to_string()),
+        );
+
+        let response = app
+            .clone()
+            .oneshot(post_json(
+                "/api/hook-status",
+                &serde_json::json!({
+                    "token": "tok-1",
+                    "missionId": "m-1",
+                    "runId": "r-1",
+                    "signal": "running",
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::ACCEPTED,
+            "the per-run capability token authenticates the lane, not the serve token"
+        );
+
+        // An ordinary mutation without the serve token is still refused.
+        let response = app
+            .oneshot(post_json(
+                "/api/missions/m-1/revise",
+                "{\"instructions\":\"x\"}",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Install hygiene at the server seam: serving and recording never
+    /// writes hook config into the repo's tracked tree — the only tree the
+    /// lane writes is the gitignored `.kranz/hook-status/` projection.
+    #[tokio::test]
+    async fn hook_status_signal_server_writes_nothing_into_the_tracked_tree() {
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-1", vec![created("x")]);
+        kranz_engine::hook_status::register(tmp.path(), "m-1", "r-1", "tok-1", chrono::Utc::now())
+            .unwrap();
+        let app = crate::router(tmp.path().to_path_buf(), None);
+        let response = app
+            .clone()
+            .oneshot(post_json(
+                "/api/hook-status",
+                &serde_json::json!({
+                    "token": "tok-1",
+                    "missionId": "m-1",
+                    "runId": "r-1",
+                    "signal": "turn-finished",
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let response = app
+            .oneshot(get("/api/missions/m-1/hook-status"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        assert!(
+            !tmp.path().join(".cursor").exists(),
+            "no cursor hook config may appear in the repo tree"
+        );
+        assert!(
+            kranz_engine::hook_status::hook_status_dir(tmp.path()).is_dir(),
+            "the projection is the lane's only write"
+        );
     }
 
     #[tokio::test]

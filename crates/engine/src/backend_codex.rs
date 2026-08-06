@@ -924,6 +924,7 @@ mod tests {
             max_turns: Some(10),
             env: Default::default(),
             sandbox: None,
+            hook_status: None,
         };
         let args = build_args(&spec);
         assert_eq!(
@@ -961,6 +962,7 @@ mod tests {
             max_turns: None,
             env: Default::default(),
             sandbox: None,
+            hook_status: None,
         };
         let args = build_args(&spec);
         assert_eq!(

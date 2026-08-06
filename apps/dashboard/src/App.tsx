@@ -26,6 +26,7 @@ import { ModelPanel } from './components/ModelPanel';
 import { WorkspacePanel } from './components/WorkspacePanel';
 import { GrantRequestPanel } from './components/GrantRequestPanel';
 import { QuestionRequestPanel } from './components/QuestionRequestPanel';
+import { HookStatusPanel } from './components/HookStatusPanel';
 import { RevisionPanel } from './components/RevisionPanel';
 import { FeaturesPanel } from './components/FeaturesPanel';
 import { ProgressLog } from './components/ProgressLog';
@@ -135,6 +136,7 @@ export default function App() {
             <WorkspacePanel />
             <GrantRequestPanel />
             <QuestionRequestPanel />
+            <HookStatusPanel />
             <RevisionPanel />
             <FeaturesPanel />
             <ProgressLog />

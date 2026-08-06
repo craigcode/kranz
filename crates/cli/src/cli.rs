@@ -393,6 +393,18 @@ pub enum Command {
         config: PathBuf,
     },
 
+    /// INTERNAL: the cursor CLI lifecycle-hook relay the backend installs
+    /// into agent sessions (ticket `agent-hooks-status-signals`). Never
+    /// invoked by operators — the session's CLI pipes a lifecycle hook
+    /// payload to stdin; the relay maps it to a coarse signal and POSTs it
+    /// to the loopback endpoint in the engine-written spec file. Purely
+    /// observational: every failure exits 0.
+    HookStatus {
+        /// The per-session hook-status spec file the engine wrote
+        #[arg(long, value_name = "PATH")]
+        config: PathBuf,
+    },
+
     /// Score how ready this repo is for autonomous kranz missions.
     Ready {
         /// Print the serializable scorecard JSON.

@@ -525,6 +525,36 @@ export interface WorkspaceSummary {
   };
 }
 
+/** The hook-status lane's signal vocabulary (ticket
+ *  `agent-hooks-status-signals`) — deliberately much smaller than mission
+ *  status, so no hook payload can spell a state transition. */
+export type HookStatusSignalKind = 'running' | 'needs-input' | 'interrupted' | 'turn-finished';
+
+/** One accepted hook-derived signal occurrence. */
+export interface HookStatusSignalRecord {
+  signal: HookStatusSignalKind;
+  detail?: string;
+  receivedAt: string;
+}
+
+/** One run's ephemeral projection entry (latest signal wins). */
+export interface RunHookStatusView {
+  runId: string;
+  registeredAt: string;
+  signal?: HookStatusSignalRecord;
+}
+
+/** `GET /api/missions/:id/hook-status` — the ephemeral hook-signal
+ *  projection. `authoritative` is always false: hook-derived signals are
+ *  observability, never folded mission state. */
+export interface MissionHookStatus {
+  missionId: string;
+  authoritative: false;
+  note: string;
+  runs: RunHookStatusView[];
+}
+
+
 /** This host's queue-drain tracker (`MissionHost::drain` / `drain_state_json`). */
 export interface DrainState {
   live: boolean;

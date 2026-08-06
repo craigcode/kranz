@@ -489,6 +489,7 @@ pub(crate) mod tests {
             max_turns: None,
             env: HashMap::new(),
             sandbox: None,
+            hook_status: None,
         }
     }
 
