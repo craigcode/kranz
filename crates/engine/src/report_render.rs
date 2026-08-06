@@ -172,6 +172,19 @@ pub fn render_plan_markdown(
                     cmd.trim()
                 );
             }
+            (AssertionCheck::PtyScript, _) => {
+                let command = a
+                    .pty_script
+                    .as_ref()
+                    .map(|s| s.command.trim())
+                    .unwrap_or("MISSING");
+                let _ = writeln!(
+                    md,
+                    "- **[{}]** {}\n  pty script: `{command}`",
+                    a.id.trim(),
+                    a.statement.trim()
+                );
+            }
             _ => {
                 let _ = writeln!(
                     md,
@@ -796,6 +809,7 @@ pub fn render_mission_report(
             let check = match (&a.check, &a.command) {
                 (AssertionCheck::Command, Some(cmd)) => format!("command: `{cmd}`"),
                 (AssertionCheck::Command, None) => "command".to_string(),
+                (AssertionCheck::PtyScript, _) => "pty script".to_string(),
                 _ => "agent judgement".to_string(),
             };
             let _ = writeln!(md, "- ✅ **[{}]** {} *({check})*", a.id, a.statement);

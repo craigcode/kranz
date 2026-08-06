@@ -358,6 +358,25 @@ impl EventRenderer {
                     )
                 },
             ),
+            EventKind::ValidationPtyTranscript {
+                milestone_id,
+                assertion_id,
+                verdict,
+                ..
+            } => (
+                format!("milestone {milestone_id}"),
+                match verdict {
+                    kranz_engine::gate::GateVerdict::Pass => ansi::DIM,
+                    kranz_engine::gate::GateVerdict::Fail => ansi::YELLOW,
+                },
+                format!(
+                    "pty validation [{assertion_id}] {} (transcript artifact)",
+                    match verdict {
+                        kranz_engine::gate::GateVerdict::Pass => "PASS",
+                        kranz_engine::gate::GateVerdict::Fail => "FAIL",
+                    }
+                ),
+            ),
             EventKind::GateResult {
                 gate,
                 surface,

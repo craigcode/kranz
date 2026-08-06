@@ -488,6 +488,7 @@ fn assertion(id: &str, statement: &str, command: Option<&str>) -> Assertion {
             AssertionCheck::AgentJudgement
         },
         command: command.map(str::to_string),
+        pty_script: None,
     }
 }
 

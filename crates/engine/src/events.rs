@@ -346,6 +346,38 @@ pub enum EventKind {
         disagreements: Vec<Finding>,
     },
 
+    /// Pty-driven functional validation: one engine-run pty-script contract
+    /// assertion (ticket `pty-functional-validation`, module
+    /// [`crate::pty_harness`]) produced a bounded session transcript under
+    /// the mission's gitignored `runs/pty-transcripts/`; this audit record
+    /// names the milestone, the assertion, the stated verdict, and the
+    /// transcript's `file:`-schemed mission-relative reference (the
+    /// [`crate::gate_results`] ArtefactRef idiom — mission-relative, never
+    /// an absolute host path, resolving to "unresolved" rather than erroring
+    /// once the bytes are pruned). Record-only: the verdict reaches the
+    /// round through the functional validator's evidence block, not through
+    /// this event, so the reducer treats it as an audit record exactly like
+    /// `validation.snapshot`. Additive event; absent in pre-field logs,
+    /// which simply have no pty-driven validations.
+    #[serde(rename = "validation.pty.transcript")]
+    ValidationPtyTranscript {
+        #[serde(rename = "milestoneId")]
+        milestone_id: String,
+        /// The contract assertion the session drove.
+        #[serde(rename = "assertionId")]
+        assertion_id: String,
+        /// The verdict the harness stated — pass (every expect matched) or
+        /// fail (the failing session's transcript is the evidence).
+        verdict: crate::gate::GateVerdict,
+        /// The `file:`-schemed mission-relative transcript path.
+        #[serde(rename = "artefactRef")]
+        artefact_ref: String,
+        /// The per-step summary (contract-authored patterns and timings —
+        /// no raw target output).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+
     /// One gate evaluation, recorded as a first-class event (ticket
     /// `.kranz/tickets/gate-results-first-class-events`, KRZ-312 — the
     /// governance evidence layer's last substrate gap before
@@ -880,6 +912,7 @@ impl EventKind {
             EventKind::ValidatorTamper { .. } => "validator.tamper",
             EventKind::ValidationSnapshot { .. } => "validation.snapshot",
             EventKind::ValidationConfirm { .. } => "validation.confirm",
+            EventKind::ValidationPtyTranscript { .. } => "validation.pty.transcript",
             EventKind::GateResult { .. } => "gate.result",
             EventKind::HookGateFired { .. } => "hook.gate.fired",
             EventKind::DivergenceNoted { .. } => "divergence.noted",
@@ -1509,6 +1542,56 @@ mod tests {
                 assert_eq!(disagreements.len(), 1);
                 assert_eq!(disagreements[0].subject, "a2");
             }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// The additive `validation.pty.transcript` event (ticket
+    /// `pty-functional-validation`): wire name, payload shape, and
+    /// round-trip — the audit record binding a pty-script assertion's
+    /// verdict to its transcript artifact must survive serde verbatim, and
+    /// a legacy line without `detail` still decodes (serde default).
+    #[test]
+    fn validation_pty_transcript_round_trips() {
+        let event = EventKind::ValidationPtyTranscript {
+            milestone_id: "ms-1".to_string(),
+            assertion_id: "a-pty".to_string(),
+            verdict: crate::gate::GateVerdict::Fail,
+            artefact_ref: "file:runs/pty-transcripts/a-pty-0123abcd.log".to_string(),
+            detail: Some("step 1 ok step 2 FAILED (expect `echo:hello` timed out)".to_string()),
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "validation.pty.transcript");
+        assert_eq!(json["payload"]["milestoneId"], "ms-1");
+        assert_eq!(json["payload"]["assertionId"], "a-pty");
+        assert_eq!(
+            json["payload"]["artefactRef"],
+            "file:runs/pty-transcripts/a-pty-0123abcd.log"
+        );
+        assert_eq!(event.type_name(), "validation.pty.transcript");
+        let back: EventKind = serde_json::from_value(json.clone()).unwrap();
+        match back {
+            EventKind::ValidationPtyTranscript {
+                milestone_id,
+                assertion_id,
+                verdict,
+                artefact_ref,
+                detail,
+            } => {
+                assert_eq!(milestone_id, "ms-1");
+                assert_eq!(assertion_id, "a-pty");
+                assert_eq!(verdict, crate::gate::GateVerdict::Fail);
+                assert_eq!(artefact_ref, "file:runs/pty-transcripts/a-pty-0123abcd.log");
+                assert!(detail.unwrap().contains("FAILED"));
+            }
+            _ => panic!("wrong variant"),
+        }
+        // A legacy line without `detail` still decodes (serde default).
+        let mut legacy = json;
+        legacy["payload"].as_object_mut().unwrap().remove("detail");
+        let back: EventKind = serde_json::from_value(legacy).unwrap();
+        match back {
+            EventKind::ValidationPtyTranscript { detail, .. } => assert_eq!(detail, None),
             _ => panic!("wrong variant"),
         }
     }

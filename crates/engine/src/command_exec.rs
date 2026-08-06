@@ -829,6 +829,24 @@ fn gate_env_for_sandbox(
     env
 }
 
+/// Prepare one gate command for execution OUTSIDE the bounded runner — the
+/// pty harness (ticket `pty-functional-validation`) drives the wrapped argv
+/// interactively, so it needs exactly what the bounded path computes per
+/// command: the FINAL env (the fs+net offline-by-cache adjustment included,
+/// which the container arm bakes into the argv) and the sandbox wrap (or its
+/// fail-closed error). Keeping the pair computed here, in one place, means
+/// a pty-driven assertion can never drift from the posture a bounded
+/// contract command would get for the same command line.
+pub(crate) fn prepare_gate_command(
+    command: &str,
+    env: &HashMap<String, String>,
+    sandbox: &GateSandbox,
+) -> crate::error::Result<(WrappedCommand, HashMap<String, String>)> {
+    let env = gate_env_for_sandbox(env, sandbox);
+    let wrapped = sandbox.wrap_shell(command, &env)?;
+    Ok((wrapped, env))
+}
+
 /// The pre-wrap contract-command runner under a resolved gate sandbox:
 /// validation-round contract commands, the final gate, and pack gates run
 /// through here. [`GateSandbox::Disabled`] reproduces the pre-wrap `sh -c`

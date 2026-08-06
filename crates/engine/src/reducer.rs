@@ -354,6 +354,16 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             run_mut(state, confirm_run_id)?;
         }
 
+        EventKind::ValidationPtyTranscript { milestone_id, .. } => {
+            // Audit-only record (ticket pty-functional-validation): the
+            // verdict reaches the round through the functional validator's
+            // evidence block, not through this event, so it drives no state
+            // transition (mirrors validation.snapshot). No run id exists at
+            // emit time — the evidence pass is engine-run — so only the
+            // milestone reference is validated as a corruption guard.
+            milestone_mut(state, milestone_id)?;
+        }
+
         EventKind::GateResult { .. } => {
             // Audit-only record (KRZ-312): one gate evaluation — id, ladder
             // position, verdict, artefact handle. Gate results drive no

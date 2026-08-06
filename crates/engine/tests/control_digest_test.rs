@@ -405,12 +405,14 @@ fn plan() -> Plan {
                 statement: "cargo test passes".to_string(),
                 check: AssertionCheck::Command,
                 command: Some("cargo test".to_string()),
+                pty_script: None,
             },
             Assertion {
                 id: "a-2".to_string(),
                 statement: "docs are accurate".to_string(),
                 check: AssertionCheck::AgentJudgement,
                 command: None,
+                pty_script: None,
             },
         ],
         milestones: vec![

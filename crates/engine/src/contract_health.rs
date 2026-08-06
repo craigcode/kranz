@@ -223,6 +223,7 @@ mod tests {
                     statement: "s".into(),
                     check: AssertionCheck::Command,
                     command: Some("true".into()),
+                    pty_script: None,
                 })
                 .collect(),
             milestones: vec![],

@@ -45,6 +45,7 @@ fn sample_plan() -> Plan {
             statement: "cargo test passes".into(),
             check: AssertionCheck::Command,
             command: Some("cargo test".into()),
+            pty_script: None,
         }],
         milestones: vec![PlanMilestone {
             title: "M1".into(),

@@ -154,12 +154,22 @@ impl MissionEngine {
 
         // Contract command programs: probe the leading token of each distinct
         // command, flagging only ones that clearly do not resolve on PATH.
+        // Pty-script assertions (ticket pty-functional-validation) probe the
+        // same way — an interactive target that does not resolve fails its
+        // validation round exactly like a missing command program, so the
+        // warning belongs at the same approve-time surface. (Execution
+        // probes below stay Command-only: an interactive target has no
+        // business running at preflight.)
         let mut probed: std::collections::HashSet<String> = std::collections::HashSet::new();
         for assertion in &self.state.mission.validation_contract {
-            if assertion.check != AssertionCheck::Command {
-                continue;
-            }
-            let Some(command) = assertion.command.as_deref() else {
+            let command = match assertion.check {
+                AssertionCheck::Command => assertion.command.as_deref(),
+                AssertionCheck::PtyScript => {
+                    assertion.pty_script.as_ref().map(|s| s.command.as_str())
+                }
+                AssertionCheck::AgentJudgement => None,
+            };
+            let Some(command) = command else {
                 continue;
             };
             let Some(program) = leading_program(command) else {
@@ -169,15 +179,22 @@ impl MissionEngine {
                 continue; // already reported/checked this program
             }
             if !program_resolves(&program) {
+                let kind = if assertion.check == AssertionCheck::PtyScript {
+                    "pty-script"
+                } else {
+                    "command"
+                };
                 issues.push(PreflightIssue {
                     severity: "warn",
                     message: format!(
-                        "command assertion [{}] uses '{program}', which was not found on PATH",
+                        "{kind} assertion [{}] uses '{program}', which was not found on PATH",
                         assertion.id
                     ),
                 });
             }
-            if !contract_sweep::cargo_test_has_anti_vacuity(command) {
+            if assertion.check == AssertionCheck::Command
+                && !contract_sweep::cargo_test_has_anti_vacuity(command)
+            {
                 issues.push(PreflightIssue {
                     severity: "warn",
                     message: format!(
@@ -860,6 +877,7 @@ mod tests {
             statement: "the check passes".to_string(),
             check: AssertionCheck::Command,
             command: Some(command.to_string()),
+            pty_script: None,
         }
     }
 

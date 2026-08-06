@@ -366,6 +366,15 @@ pub enum AssertionCheck {
     Command,
     /// Verified by orchestrator judgement against the full mission diff.
     AgentJudgement,
+    /// Verified by driving `pty_script`'s interactive target through its
+    /// scripted terminal session (ticket `pty-functional-validation`):
+    /// the engine runs the script in the validation round's evidence pass
+    /// (the same pass that executes command assertions, under the same
+    /// gate-sandbox wrap), captures the bounded session transcript as a
+    /// validation artifact, and hands the functional validator the
+    /// per-step verdicts as authoritative evidence — the M5 lane extended
+    /// to terminal-native deliverables (REPLs, TUIs, interactive CLIs).
+    PtyScript,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -377,6 +386,69 @@ pub struct Assertion {
     pub check: AssertionCheck,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    /// The scripted terminal session when `check` is `pty-script`
+    /// ([`AssertionCheck::PtyScript`]); ignored for every other check.
+    /// Additive: `None` in every pre-field contract, and
+    /// `skip_serializing_if` keeps old plans byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pty_script: Option<PtyScript>,
+}
+
+/// One scripted terminal session against an interactive target — the
+/// contract-side declaration a `pty-script` assertion carries (ticket
+/// `pty-functional-validation`). This is VALIDATOR tooling: the script
+/// judges what the delivered software DOES on a terminal, it never feeds
+/// work back into the mission (positioning ADR's retained list).
+///
+/// WHY inline in the assertion (not a referenced script file): the
+/// validation contract is drafted and approved as ONE self-contained
+/// plan.json, committed on the mission branch — a script living at a
+/// repo path could be edited by the very worker the validation judges,
+/// while the contract itself is approval-locked.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PtyScript {
+    /// The interactive target, as a shell command line. Executed exactly
+    /// like a contract command: the cleared contract env, the resolved
+    /// gate-sandbox wrap, and the gate tree as cwd — a pty session never
+    /// widens the posture the validator's other evidence runs under.
+    pub command: String,
+    /// The steps to drive, in order. Every `expect` is one assertion
+    /// verdict; the script FAILS at the first unmatched `expect`.
+    #[serde(default)]
+    pub steps: Vec<PtyStep>,
+    /// Overall session cap in seconds (default
+    /// [`crate::pty_harness::DEFAULT_SESSION_TIMEOUT_SECS`]): the
+    /// whole-script wall-clock bound regardless of per-step timeouts, so
+    /// a script of generous expects still cannot hang the round.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+}
+
+/// One step of a [`PtyScript`], serde-tagged on `op`:
+/// `{"op":"send","text":"…"}` / `{"op":"expect","pattern":"…",…}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "kebab-case")]
+pub enum PtyStep {
+    /// Write `text` to the pty verbatim — JSON string escapes carry the
+    /// control bytes (`\n` submits a line to a canonical-mode REPL, `\r`
+    /// for raw-mode TUIs, `\u001b` for escape sequences), so no separate
+    /// key-name vocabulary is needed.
+    Send { text: String },
+    /// Block until the accumulated session output contains `pattern`
+    /// (a literal substring; a regular expression when `regex` is true)
+    /// or the step's timeout elapses. A timeout — or the target exiting
+    /// unmatched — FAILS the assertion at this step.
+    Expect {
+        pattern: String,
+        #[serde(default)]
+        regex: bool,
+        /// Per-step timeout in milliseconds (default
+        /// [`crate::pty_harness::DEFAULT_EXPECT_TIMEOUT_MS`]).
+        #[serde(rename = "timeoutMs")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+    },
 }
 
 // ---------------------------------------------------------------------------

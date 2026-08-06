@@ -46,6 +46,7 @@ fn sample_plan() -> Plan {
             statement: "tests pass".to_string(),
             check: AssertionCheck::Command,
             command: Some("cargo test".to_string()),
+            pty_script: None,
         }],
         milestones: vec![PlanMilestone {
             title: "Milestone One".to_string(),

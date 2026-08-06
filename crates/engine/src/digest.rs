@@ -157,5 +157,6 @@ fn check_kind(check: AssertionCheck) -> &'static str {
     match check {
         AssertionCheck::Command => "command",
         AssertionCheck::AgentJudgement => "judgement",
+        AssertionCheck::PtyScript => "pty-script",
     }
 }

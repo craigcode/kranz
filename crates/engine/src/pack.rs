@@ -1079,6 +1079,7 @@ kind = "local-dir"
             statement: "s".to_string(),
             check: AssertionCheck::Command,
             command: Some("cargo test --workspace zz_pack_contract_floor 2>&1 | grep -qE 'test result: ok\\. [1-9]'".to_string()),
+            pty_script: None,
         }];
         let tree = tempfile::tempdir().unwrap();
         let mut pipeline = GatePipeline::new();

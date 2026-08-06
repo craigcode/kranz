@@ -299,6 +299,7 @@ mod tests {
                 statement: "429 beyond N/min".into(),
                 check: AssertionCheck::Command,
                 command: Some("pytest".into()),
+                pty_script: None,
             }],
             milestones: vec![PlanMilestone {
                 title: "Token bucket".into(),
@@ -335,6 +336,7 @@ mod tests {
                 statement: "429 beyond N/min".into(),
                 check: AssertionCheck::Command,
                 command: Some("pytest".into()),
+                pty_script: None,
             }],
             milestones: vec![PlanMilestone {
                 title: "Safer bucket".into(),

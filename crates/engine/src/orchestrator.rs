@@ -4882,7 +4882,45 @@ impl MissionEngine {
             let root = self.active_root().to_path_buf();
             let env = self.contract_command_env(base_sha.as_deref())?;
             let gate_sandbox = self.gate_sandbox(&root)?;
-            Self::run_contract_commands_for_validation(&contract, &root, &env, &gate_sandbox).await
+            let rendered =
+                Self::run_contract_commands_for_validation(&contract, &root, &env, &gate_sandbox)
+                    .await;
+            // Pty-script assertions (ticket pty-functional-validation): the
+            // M5 functional-QA lane extended to terminal-interactive targets.
+            // Driven engine-side in THIS evidence pass — same root, same
+            // cleared contract env, same gate-sandbox wrap the bounded
+            // contract commands get — with each session's bounded transcript
+            // landing as a `runs/pty-transcripts/` artifact referenced from
+            // an audit-only `validation.pty.transcript` event.
+            let pty_run = crate::pty_harness::run_pty_assertions(
+                &contract,
+                &root,
+                &env,
+                &gate_sandbox,
+                &self.paths.runs_dir(),
+            )
+            .await;
+            for artifact in &pty_run.artifacts {
+                self.emit(EventKind::ValidationPtyTranscript {
+                    milestone_id: milestone_id.clone(),
+                    assertion_id: artifact.assertion_id.clone(),
+                    verdict: if artifact.pass {
+                        crate::gate::GateVerdict::Pass
+                    } else {
+                        crate::gate::GateVerdict::Fail
+                    },
+                    artefact_ref: crate::gate_results::file_artefact_ref(&artifact.transcript_rel),
+                    detail: Some(artifact.detail.clone()),
+                })?;
+            }
+            match (rendered, pty_run.rendered) {
+                (Some(mut base), Some(pty)) => {
+                    base.push_str(&pty);
+                    Some(base)
+                }
+                (base, None) => base,
+                (None, pty) => pty,
+            }
         } else {
             None
         };
@@ -5997,6 +6035,30 @@ impl MissionEngine {
                     )),
                 )?;
             }
+        }
+
+        // Pty-script assertions (ticket pty-functional-validation) are NOT
+        // re-run at the final gate: their verdicts are validation-round
+        // evidence (the functional validator judges them there, and every
+        // milestone — the last included — passes through a round before the
+        // gate). Surface the posture LOUDLY rather than letting the hard
+        // gate's silence read as a re-check.
+        let pty_assertion_ids: Vec<&str> = contract
+            .iter()
+            .filter(|a| a.check == AssertionCheck::PtyScript)
+            .map(|a| a.id.as_str())
+            .collect();
+        if !pty_assertion_ids.is_empty() {
+            self.emit_decision(
+                "pty-script assertions not re-run at the final gate",
+                Some(format!(
+                    "assertion(s) {} are terminal-interactive validations executed at each \
+                     milestone's validation round (transcripts referenced from \
+                     validation.pty.transcript events); the final gate re-runs only command \
+                     assertions, so their last round verdict stands",
+                    pty_assertion_ids.join(", ")
+                )),
+            )?;
         }
 
         // agent-judgement assertions — one orchestrator verdicts turn.
@@ -9247,6 +9309,7 @@ pub(crate) mod tests {
             statement: "the build passes".to_string(),
             check: AssertionCheck::Command,
             command: Some("true".to_string()),
+            pty_script: None,
         }];
         engine.state.mission.milestones.push(Milestone {
             id: "ms-1".to_string(),

@@ -167,6 +167,17 @@ pub fn render_plan(plan: &Plan) -> String {
                     assertion.statement
                 ));
             }
+            AssertionCheck::PtyScript => {
+                let command = assertion
+                    .pty_script
+                    .as_ref()
+                    .map(|s| format!(" — `{}`", s.command))
+                    .unwrap_or_default();
+                out.push_str(&format!(
+                    "  [{id}] (pty-script) {}{command}\n",
+                    assertion.statement
+                ));
+            }
         }
     }
 
@@ -1773,6 +1784,7 @@ mod tests {
                 statement: "cargo test passes".to_string(),
                 check: AssertionCheck::Command,
                 command: Some("cargo test".to_string()),
+                pty_script: None,
             }],
             milestones: vec![PlanMilestone {
                 title: "milestone one".to_string(),

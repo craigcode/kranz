@@ -41,7 +41,7 @@ export type Role =
 
 export type RunResult = 'pass' | 'fail' | 'partial';
 
-export type AssertionCheck = 'command' | 'agent-judgement';
+export type AssertionCheck = 'command' | 'agent-judgement' | 'pty-script';
 
 export type ReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
@@ -117,7 +117,21 @@ export interface Assertion {
   statement: string;
   check: AssertionCheck;
   command?: string;
+  /** The scripted terminal session when `check` is `pty-script` (engine
+   * `pty_harness`; absent for every other check). */
+  ptyScript?: PtyScript;
 }
+
+/** One scripted terminal session declared by a `pty-script` assertion. */
+export interface PtyScript {
+  command: string;
+  steps: PtyStep[];
+  timeoutSecs?: number;
+}
+
+export type PtyStep =
+  | { op: 'send'; text: string }
+  | { op: 'expect'; pattern: string; regex?: boolean; timeoutMs?: number };
 
 export interface Feature {
   id: string;

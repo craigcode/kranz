@@ -505,8 +505,32 @@ fn plan_schema() -> serde_json::Value {
                     "properties": {
                         "id": { "type": "string" },
                         "statement": { "type": "string" },
-                        "check": { "type": "string", "enum": ["command", "agent-judgement"] },
-                        "command": { "type": "string" }
+                        "check": { "type": "string", "enum": ["command", "agent-judgement", "pty-script"] },
+                        "command": { "type": "string" },
+                        "ptyScript": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["command", "steps"],
+                            "properties": {
+                                "command": { "type": "string" },
+                                "timeoutSecs": { "type": "integer" },
+                                "steps": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "additionalProperties": false,
+                                        "required": ["op"],
+                                        "properties": {
+                                            "op": { "type": "string", "enum": ["send", "expect"] },
+                                            "text": { "type": "string" },
+                                            "pattern": { "type": "string" },
+                                            "regex": { "type": "boolean" },
+                                            "timeoutMs": { "type": "integer" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             },
@@ -565,6 +589,7 @@ mod tests {
             statement: "s".to_string(),
             check: AssertionCheck::AgentJudgement,
             command: None,
+            pty_script: None,
         }
     }
 
@@ -595,6 +620,7 @@ mod tests {
                 statement: "s".into(),
                 check: AssertionCheck::Command,
                 command: Some("true".into()),
+                pty_script: None,
             }],
             milestones: vec![PlanMilestone {
                 title: "m".into(),

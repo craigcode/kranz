@@ -1207,6 +1207,14 @@ pub async fn run_validator_in(
                 (AssertionCheck::AgentJudgement, _) => {
                     format!("- [{}] {} (agent-judgement)", a.id, a.statement)
                 }
+                (AssertionCheck::PtyScript, _) => {
+                    let command = a
+                        .pty_script
+                        .as_ref()
+                        .map(|s| s.command.as_str())
+                        .unwrap_or("MISSING");
+                    format!("- [{}] {} (pty-script: `{}`)", a.id, a.statement, command)
+                }
             })
             .collect::<Vec<_>>()
             .join("\n")

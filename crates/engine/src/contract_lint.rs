@@ -327,6 +327,7 @@ mod tests {
             statement: format!("statement for {id}"),
             check: AssertionCheck::Command,
             command: Some(command.to_string()),
+            pty_script: None,
         }
     }
 
@@ -336,6 +337,7 @@ mod tests {
             statement: format!("statement for {id}"),
             check: AssertionCheck::AgentJudgement,
             command: None,
+            pty_script: None,
         }
     }
 

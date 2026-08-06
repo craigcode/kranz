@@ -51,6 +51,7 @@ fn plan() -> Plan {
             statement: "cargo test passes".to_string(),
             check: AssertionCheck::Command,
             command: Some("cargo test".to_string()),
+            pty_script: None,
         }],
         milestones: vec![
             PlanMilestone {
@@ -3260,6 +3261,7 @@ fn plan_three_milestones() -> Plan {
             statement: "cargo test passes".to_string(),
             check: AssertionCheck::Command,
             command: Some("cargo test".to_string()),
+            pty_script: None,
         }],
         milestones: vec![
             PlanMilestone {
