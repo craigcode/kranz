@@ -81,6 +81,7 @@ pub const MAX_TRANSCRIPT_BYTES: usize = 256 * 1024;
 const FAIL_TAIL_BYTES: usize = 2048;
 /// Poll cadence of the drive loop: fine enough to catch prompt output
 /// promptly, coarse enough to never busy-spin.
+#[cfg_attr(not(unix), allow(dead_code))]
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// The session-level verdict of one pty-script assertion.
