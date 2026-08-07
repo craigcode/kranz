@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done: backend_cursor.rs — direct stream-json parser per the decided route; env-cleared seeded spawn, permission mapping (ask/force, no --sandbox), usage verbatim incl. cache tokens, additive BackendKind::Cursor with readiness model-availability probe. backend_cursor filter: 25 green; full gates green. Unblocks agent-hooks-status-signals.
 title: "backend_cursor: direct stream-json parser per the decided route"
 priority: 2
 schedule: once

@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done: emit() fold-validates against a cloned state before append; fold-invalid emits are rejected with log/state untouched. emit_never_appends filter: 2 tests green. Full workspace gates green.
 title: "Emit must not leave an unfoldable event in the log (emit-poison wedge)"
 priority: 1
 schedule: once

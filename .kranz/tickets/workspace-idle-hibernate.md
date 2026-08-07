@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: d60ca89: workspace.teardownMode config (keep|hibernate|destroy, default keep) drives provider teardown at terminal states; workspace.teardown event gains state (kept|stopped|destroyed|failed, additive); MissionState.workspace_lifecycle folds latest-wins with ts; remote idleAfterHours passes through to the substrate at provision (kranz never schedules); local-worktree always Keep; teardown failure logs a scrubbed decision and never masks the terminal outcome; endpoint gains workspaceLifecycle. 13 … (truncated)
 title: Workspace idle hibernate / destroy lifecycle events
 priority: 3
 schedule: once

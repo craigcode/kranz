@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done in the outcomes-fold trio commit: per-task-class rows + context-reuse split; cost-per-merged-change (CLI --all + GET /api/cost-per-merged-change, 30d default); rubberStampThresholdMs flag (default 10s, boundary-tested). outcomes_report_ filter: 15 green; full gates green.
 title: Cost per merged change, grouped by repo
 priority: 2
 schedule: once

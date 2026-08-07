@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done: (allow signal (target same-sandbox)) — tree-scoped supervision with probed host boundaries; proc_pidinfo identity tokens (ps fallback); marker-d skips for unhostable fixtures; wrapped workspace suite measured green and held by rust-macos-wrapped-suite CI. dogfood_supervision filter green; full gates green. Follow-up: production 600s COMMAND_TIMEOUT vs wrapped-suite cost.
 title: "Gate-sandbox supervision policy for self-testing (dogfood unblock)"
 priority: 2
 schedule: once

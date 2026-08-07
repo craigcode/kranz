@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: aa8e4ef: plan-time context-fit check at approve+revise — per-feature spec score (chars + file mentions) vs corpus p90 from historical plan.json (documented defaults unfitted); over-anchor emits orchestrator.decision + plan.md Context-fit note, advisory only, never a gate. plan_fit.rs with unit tests at both boundaries.
 title: Plan-time feature context-fit check (warn when a feature won't fit one session)
 priority: 3
 schedule: once

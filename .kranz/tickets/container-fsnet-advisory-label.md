@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done at e2eb3c6: config::validate rejects container+fs+net+non-empty-egress (proxy-env-only bypass) with remedies; SandboxProvider::enforces_hard_net_boundary(egress); empty-egress container (--network none) stays accepted. Restores the original tier-3 design intent. Tests 2>&1 | grep -qE 'test result: ok. [1-9]'
 title: Label container fs+net advisory until the sidecar boundary exists (P2)
 priority: 3
 schedule: once

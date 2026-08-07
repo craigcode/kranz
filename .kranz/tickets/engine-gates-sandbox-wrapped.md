@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done: engine-run gates (validation/final/merge) resolve the session sandbox decision — Seatbelt/bwrap wrap under enforce!=off, off byte-identical, linux-without-bwrap fail-closed, read-only HOME for merge gates, fs+net offline-by-cache. Probe test: outside writes fail enforced/succeed off; serve.token unreadable. Measured no material overhead — wrap is default. gate_sandbox_wrap: 7 green under real Seatbelt; full gates green.
 title: "Sandbox-wrap engine-run gate commands when enforcement is on"
 priority: 1
 schedule: once

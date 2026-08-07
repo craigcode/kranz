@@ -1,4 +1,5 @@
 ---
+state: done
 title: Probe Cursor CLI / Grok 4.5 as a kranz AgentBackend
 priority: 2
 schedule: once

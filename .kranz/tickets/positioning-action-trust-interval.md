@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: README intro + docs/what-is-kranz.md now carry the action→trust interval framing in the repo's dry register: consent surface (plan approval, grants, merge gate) as the answer, kranz outcomes grant-latency buckets as the measurement. No hype adjectives.
 title: Positioning — adopt "the few seconds between action and trust" as the consent-gate story
 priority: 4
 schedule: once

@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done: divergence.noted/resolved events (additive), tree-hash-pinned verdicts, agreement logged-never-trusted (no gate skipped, test), resolution via existing unblock vocabulary (deduped, restart-safe), outcomes + provenance surfaces. divergence_event filter: 11 green; full gates green.
 title: Divergence between sibling streams as a first-class event
 priority: 2
 schedule: once

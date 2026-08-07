@@ -1,4 +1,5 @@
 ---
+state: done
 title: Remove dead MissionPicker component (replaced by PipelineView)
 priority: 3
 schedule: once

@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: harvest documented in docs/notes/failure-mode-harvest.md (8 clusters with counts, mission ids, and fixture locations + re-run recipe); the one genuine fixture gap found and shipped: control.rs rapid_back_to_back_enqueues_drain_in_issue_order (same-ms flake). Other clusters verified already fixture-covered by this week's repairs (contract lint, validator repair, allowlist blocks, auth probe, grant e2e, mock-order test fixes). Open candidates recorded for the third-occurrence rule.
 title: Mine mission traces for failure-mode clusters and turn them into regression fixtures
 priority: 3
 schedule: once

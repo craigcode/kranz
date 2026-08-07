@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: docs/scoping/beads-workstore.md delivered 2026-07-24: all five questions answered from verified current evidence (Dolt re-platforming, custom statuses, leases, merge-slots, federation); recommendation stay-native + hardened bridge (D-BW-1..4), confirming the working hypothesis. D-BW decisions await operator confirmation; bridge briefs + native-adoption ideas (discussion primitive, defer_until) recorded for ticketing.
 title: Investigate beads as kranz's work-item store (scoping doc + bridge-vs-substrate decision)
 priority: 3
 schedule: once

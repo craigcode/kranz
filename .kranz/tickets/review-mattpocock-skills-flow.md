@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: docs/reviews/mattpocock-skills-flow.md: idea 1 ADOPT-partial → ticket plan-feature-context-fit-check; idea 2 validated already present (compression artifacts at every boundary, validator non-compression by design); idea 3 validated already present (fresh-context validators + both review axes); idea 4 ADOPT → ticket draft-wrong-plan-escalation. No code changed.
 title: Review Matt Pocock's skills flow for ideas worth adopting in kranz
 priority: 3
 schedule: once

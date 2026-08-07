@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: 571884d: report.md restructured on the explain-diff shape — '## The plan' intent section before any statistics, features narrated with spec-intent + commits + ✓ criteria evidence inline, deterministic from the log, honest-failure shapes kept, quiz deliberately skipped (recorded as optional). Snapshot tests pin section order and inline content (report_test.rs).
 title: Render report.md as an explain-diff artifact (background-first, literate diffs, quiz optional)
 priority: 3
 schedule: once

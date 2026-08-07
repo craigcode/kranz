@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: landed in 8da93ce (Craig); reviewed + tested + gates green
 title: Merge gate omits dashboard test + lint (weaker than AGENTS.md / CI)
 priority: 2
 schedule: once

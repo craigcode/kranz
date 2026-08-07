@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: c70651d + d88d891: cost::gate_activity (blocked/grant/fix/resume counts from events) + Calibration.gate_correlation (Pearson r, corpus-wide). The three outliers measured: gate scores 8/11/13 track 2.5x/2x/4x overruns. Band deliberately unchanged — empirical p90 with 8x-center cap already covers the m-b66d34 shape (pinned by fit test); a prevalence term would widen everything without adding information. estimate-calibration.md updated with the measured table.
 title: Price block/resume cycles in the cost model (calibration slices 2-3 follow-up)
 priority: 4
 schedule: once

@@ -1,4 +1,5 @@
 ---
+state: done
 title: Backlog surfaces: dashboard panel and Slack ticket verbs
 priority: 2
 schedule: once

@@ -1,4 +1,5 @@
 ---
+state: done
 title: Deleted missions: prune index.md and render ghosts honestly
 priority: 2
 schedule: once

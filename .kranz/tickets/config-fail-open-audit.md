@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done: docs/config-composition.md inventory (zero unmitigated fail-opens; F1-F6 dispositioned) + 14 regression tests locking composition semantics per surface (extends never replace, deny-wins, dangerous-prefix tripwire). composition_audit filter: 14 green; full gates green.
 title: Audit config surfaces for fail-open composition footguns
 priority: 2
 schedule: once

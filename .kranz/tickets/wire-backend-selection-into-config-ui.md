@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: implemented 2026-07-10; dashboard, Slack, synchronous validation, visual QA, and full gates green
 title: Expose per-role backend selection in the config UI (dashboard modal + Slack)
 priority: 2
 schedule: once

@@ -1,4 +1,5 @@
 ---
+state: done
 title: Blocked-ness is computed server-side; chips render derivation, not stored edges
 priority: 2
 schedule: once

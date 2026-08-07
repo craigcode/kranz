@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done: hook_status.rs lane (ephemeral gitignored projection, enum signals, per-run token) + kranz hook-status relay + cursor hooks.json into session scratch HOME only; opt-in additive config; POST/GET endpoints with authoritative:false; HookStatusPanel + Slack status lines, terminal state byte-identical. 22 Rust + 4 vitest green; dashboard chain green; full gates green.
 title: Use agent lifecycle hooks as non-authoritative status signals
 priority: 3
 schedule: once

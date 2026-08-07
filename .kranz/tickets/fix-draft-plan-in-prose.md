@@ -1,4 +1,5 @@
 ---
+state: done
 title: Draft must detect a plan-shaped NotReady reply instead of misfiling it as questions
 priority: 2
 schedule: once

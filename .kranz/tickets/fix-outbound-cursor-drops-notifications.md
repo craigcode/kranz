@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: landed in 8da93ce (Craig); reviewed + tested + gates green
 title: Slack outbound cursor advances before posting -> dropped notifications
 priority: 2
 schedule: once

@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: split complete to the honest end-state across waves 1-4c (11 commits): orchestrator.rs 11,399 → 7,749 (-32%) via command_exec, report_render, preflight, judgement, mission_catalog, planning, findings; bridge.rs 7,549 → 4,615 (-39%) via approve_flow, dispatch, outbound_engine, commands. Every extraction pure code motion with byte-identity checks, four gates green per commit, CI green per push. What remains in orchestrator.rs is the run-loop core (run/run_loop/run_feature/validation_round/final_ga … (truncated)
 title: Split the orchestrator.rs and slack bridge.rs monoliths along existing seams
 priority: 3
 schedule: once

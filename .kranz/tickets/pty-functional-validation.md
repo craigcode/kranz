@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done: pty_harness.rs (libc openpty, no new deps) + AssertionCheck::PtyScript (additive) + validation.pty.transcript events with resolvable file: artifacts; validation-round engine-run under the gate-sandbox posture; skip-loud off unix; post-kill drain-while-reaping fix. pty_validation filter: 6+1 green; dashboard chain green; full gates green.
 title: Pty-driven functional validation for terminal-interactive targets
 priority: 3
 schedule: once

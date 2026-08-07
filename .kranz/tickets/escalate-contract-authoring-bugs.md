@@ -1,4 +1,5 @@
 ---
+state: done
 title: Escalate contract-authoring bugs instead of spending fix-cycles on them
 priority: 3
 schedule: once

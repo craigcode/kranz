@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done: frontmatter state:/state-note: is the truth (open/done/superseded/wontfix, unknown=hard error); sidecar demoted to write-through cache with logged divergence; kranz ticket migrate-state [--yes] folds terminal sidecars with dirty-skip by name. Dry-run: 163 folds, 5 skips. ticket_state_frontmatter filter: 13 green; full gates green. Operator runs --yes after review.
 title: "Committed ticket state: notes must fold into ticket status, or .status sidecars must commit"
 priority: 2
 schedule: once

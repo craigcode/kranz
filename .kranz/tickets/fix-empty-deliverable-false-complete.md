@@ -1,4 +1,5 @@
 ---
+state: done
 title: A mission that produces zero deliverable commits must FAIL, not COMPLETE
 priority: 1
 schedule: once

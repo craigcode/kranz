@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: fixed directly (hand-built), commit ba98899, 2026-07-05 — sidecar restored after tracked-on-branch/ignored-on-main checkout crossfire deleted it
 title: Restore the primary checkout after a mission terminates
 priority: 2
 schedule: once

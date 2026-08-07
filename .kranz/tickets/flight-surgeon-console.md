@@ -1,4 +1,5 @@
 ---
+state: done
 title: Flight surgeon console — outcomes panel with autonomy ratio, grant-latency distribution, and the escalation ledger
 priority: 3
 schedule: once

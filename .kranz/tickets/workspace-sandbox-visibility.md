@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: implemented 2026-07-15: report, scoped REST summary, dashboard panel, and focused tests
 title: Workspace and sandbox visibility for local worktree missions
 priority: 2
 schedule: once

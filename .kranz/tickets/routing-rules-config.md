@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done: .kranz/routing-rules.json (taskClassRules + ordered patternRules, tiers never model ids) validated at draft/approve, base-branch-owned with mission-branch edit ignored+surfaced, executorRoute provenance on worker.spawned (fold-derived, effective tier honest). routing_rules_config filter: 19 green; full gates green.
 title: Tracked routing rules — declarative task-class routing config
 priority: 3
 schedule: once

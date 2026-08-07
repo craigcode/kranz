@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: landed in 8da93ce (Craig); reviewed + tested + gates green
 title: Slack envelope dedup is per-connection -> duplicate missions on reconnect
 priority: 2
 schedule: once

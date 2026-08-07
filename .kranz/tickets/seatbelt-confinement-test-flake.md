@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: investigated 2026-07-25: sandbox-exec itself confines reliably (60/60 in a controlled repro, 30 idle + 30 under cargo-build load) and the instrumented test passed 50/50 consecutive runs — no systemic fail-open, and the flake did not reproduce. Root cause assessment: environment-sensitive test-harness timing (session lifecycle under heavy load), NOT a confinement gap; the tier-3 diff was provably orthogonal. Assertions now carry diagnostic context (inside_exists/outside_exists) so any recurrence  … (truncated)
 title: sandbox_wrap_macos_start_confines_spawned_process flakes under load (Seatbelt/sandbox-exec)
 priority: 3
 schedule: once
