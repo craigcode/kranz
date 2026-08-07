@@ -371,6 +371,9 @@ mod imp {
         let mut slave: libc::c_int = -1;
         // A fixed 80x24 window: TUIs lay out against the winsize, and a
         // deterministic size keeps transcripts reproducible across hosts.
+        // The `mut` is only read on macOS (glibc's openpty takes *const), so
+        // it carries the platform-gated allow (ubuntu clippy, -D warnings).
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut winsize = libc::winsize {
             ws_row: 24,
             ws_col: 80,
