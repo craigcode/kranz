@@ -138,40 +138,90 @@ const PRE_BILLING_FAILURE_PHRASES: &[&str] = &["cannot use this model", "authent
 /// keychain succeeds). Seed an EMPTY keychain so the startup probe has a
 /// valid, secret-free domain. Never link or copy the operator's real login
 /// keychain — that would hand the session every credential reachable in it,
-/// defeating the scratch-HOME posture. Best-effort like the rest of the
-/// seed: on failure the session spawns anyway and the CLI fails loudly.
+/// defeating the scratch-HOME posture.
+///
+/// Two further live findings shape the seed (m-eee81f): an EMPTY-password
+/// keychain cannot be unlocked programmatically, and a fresh keychain
+/// defaults to a 300-second inactivity relock — long builds then relock it
+/// mid-session and every credential write pops a desktop dialog the
+/// operator cancels only to see again. The seed therefore (1) creates the
+/// keychain with a passphrase derived from the session id — it guards an
+/// empty, disposable store, so derivation costs nothing and makes
+/// programmatic unlock legal; (2) clears the auto-lock timeout; and
+/// (3) unlocks it at every spawn (unlock state lives in securityd, so the
+/// engine-side unlock covers the subsequently spawned CLI). Best-effort
+/// like the rest of the seed: on failure the session spawns anyway and the
+/// CLI fails loudly.
 #[cfg(target_os = "macos")]
-fn ensure_session_login_keychain(home: &Path) {
-    let keychains = home.join("Library").join("Keychains");
-    let db = keychains.join("login.keychain-db");
-    if db.exists() {
-        return;
-    }
-    if let Err(e) = std::fs::create_dir_all(&keychains) {
-        tracing::warn!(
-            error = %e,
-            "cursor session keychain seed: cannot create Library/Keychains; the CLI may \
-             fail startup with a security error under the relocated HOME"
-        );
-        return;
-    }
-    // HOME is pinned to the session home so any preference side effect of
-    // create-keychain lands in the scratch tree, never in the operator's
-    // real keychain search list.
+fn security_in_session_home(home: &Path, args: &[&std::ffi::OsStr]) -> std::io::Result<()> {
     let mut cmd = std::process::Command::new("security");
-    cmd.args(["create-keychain", "-p", ""])
-        .arg(&db)
+    cmd.args(args)
         .env_clear()
         .env("HOME", home)
         .env("PATH", "/usr/bin:/bin");
     if let Ok(user) = std::env::var("USER") {
         cmd.env("USER", user);
     }
-    if let Err(e) = cmd.status() {
+    // HOME is pinned to the session home so any preference side effect
+    // lands in the scratch tree, never in the operator's real keychain
+    // search list.
+    cmd.status().map(|_| ())
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_session_login_keychain(home: &Path, session_id: &str) {
+    let keychains = home.join("Library").join("Keychains");
+    let db = keychains.join("login.keychain-db");
+    let passphrase = std::ffi::OsString::from(format!("kranz-scratch-{session_id}"));
+    if !db.exists() {
+        if let Err(e) = std::fs::create_dir_all(&keychains) {
+            tracing::warn!(
+                error = %e,
+                "cursor session keychain seed: cannot create Library/Keychains; the CLI may \
+                 fail startup with a security error under the relocated HOME"
+            );
+            return;
+        }
+        if let Err(e) = security_in_session_home(
+            home,
+            &[
+                std::ffi::OsStr::new("create-keychain"),
+                std::ffi::OsStr::new("-p"),
+                &passphrase,
+                db.as_os_str(),
+            ],
+        ) {
+            tracing::warn!(
+                error = %e,
+                "cursor session keychain seed: security create-keychain failed to spawn; the \
+                 CLI may fail startup with a security error under the relocated HOME"
+            );
+            return;
+        }
+    }
+    // Bare `set-keychain-settings` clears the 300s auto-relock (verified:
+    // `show-keychain-info` then reports no-timeout); `unlock-keychain`
+    // leaves the empty store unlocked for the whole session.
+    let _ = security_in_session_home(
+        home,
+        &[
+            std::ffi::OsStr::new("set-keychain-settings"),
+            db.as_os_str(),
+        ],
+    );
+    if let Err(e) = security_in_session_home(
+        home,
+        &[
+            std::ffi::OsStr::new("unlock-keychain"),
+            std::ffi::OsStr::new("-p"),
+            &passphrase,
+            db.as_os_str(),
+        ],
+    ) {
         tracing::warn!(
             error = %e,
-            "cursor session keychain seed: security create-keychain failed to spawn; the \
-             CLI may fail startup with a security error under the relocated HOME"
+            "cursor session keychain seed: unlock failed to spawn; a long session may \
+             relock into a desktop prompt"
         );
     }
 }
@@ -190,7 +240,7 @@ fn cursor_child_env(spec: &SessionSpec) -> std::collections::HashMap<String, Str
         // relocation), but the macOS keychain domain must still exist.
         #[cfg(target_os = "macos")]
         if let Some(home) = spec.env.get("HOME") {
-            ensure_session_login_keychain(Path::new(home));
+            ensure_session_login_keychain(Path::new(home), &spec.session_id);
         }
         return crate::agent_env::agent_session_env(
             &spec.env,
@@ -203,7 +253,7 @@ fn cursor_child_env(spec: &SessionSpec) -> std::collections::HashMap<String, Str
     match seed_cursor_scratch_home(&scratch_root, real_home.as_deref()) {
         Ok(home) => {
             #[cfg(target_os = "macos")]
-            ensure_session_login_keychain(&home);
+            ensure_session_login_keychain(&home, &spec.session_id);
             tracing::info!(
                 session_id = %spec.session_id,
                 decision = "scratch-seeded",
@@ -1154,13 +1204,15 @@ mod tests {
 
     /// macOS: a relocated HOME gets an EMPTY login keychain (the CLI consults
     /// the keychain domain at startup even with CURSOR_API_KEY set and dies
-    /// with security exit 154 when none resolves through HOME).
+    /// with security exit 154 when none resolves through HOME), created with
+    /// a session-derived passphrase and left unlocked with no auto-lock so a
+    /// long session never pops a desktop prompt.
     #[cfg(target_os = "macos")]
     #[test]
     fn cursor_keychain_seeded_empty_when_absent() {
         let home = tempfile::tempdir().unwrap();
 
-        ensure_session_login_keychain(home.path());
+        ensure_session_login_keychain(home.path(), "test-session");
 
         let db = home
             .path()
@@ -1170,6 +1222,16 @@ mod tests {
         let meta = std::fs::symlink_metadata(&db).unwrap();
         assert!(meta.is_file(), "the seed is a real file, never a link");
         assert!(meta.len() > 0, "security create-keychain writes a real db");
+        // The derived passphrase must unlock it (i.e. the db is a real
+        // keychain we can open without any desktop prompt).
+        let mut unlock = std::process::Command::new("security");
+        unlock
+            .args(["unlock-keychain", "-p", "kranz-scratch-test-session"])
+            .arg(&db)
+            .env_clear()
+            .env("HOME", home.path())
+            .env("PATH", "/usr/bin:/bin");
+        assert!(unlock.status().unwrap().success());
     }
 
     /// macOS: an existing keychain path is never replaced — the seed must
@@ -1183,7 +1245,7 @@ mod tests {
         let db = keychains.join("login.keychain-db");
         std::fs::write(&db, b"sentinel").unwrap();
 
-        ensure_session_login_keychain(home.path());
+        ensure_session_login_keychain(home.path(), "test-session");
 
         assert_eq!(std::fs::read(&db).unwrap(), b"sentinel");
     }
