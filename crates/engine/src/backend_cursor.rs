@@ -50,7 +50,13 @@
 //! session whose seed+key is insufficient fails auth loudly
 //! ("Authentication required", pre-billing), which the stream watcher turns
 //! into an honest configuration-style failure rather than a retryable one
-//! (probe item 5).
+//! (probe item 5). One macOS addendum found by the first live mission
+//! (m-a5a8fd, 2026-08-08): the CLI consults the login keychain at startup
+//! EVEN with `CURSOR_API_KEY` set, and the keychain domain resolves through
+//! `HOME`, so a relocated HOME without `Library/Keychains/login.keychain-db`
+//! dies pre-auth with `security` exit 154. Both spawn branches therefore
+//! seed an EMPTY login keychain ([`ensure_session_login_keychain`]) — never
+//! a link to the operator's real keychain.
 //!
 //! Hook-status lane (ticket `agent-hooks-status-signals`,
 //! [`crate::hook_status`]): when the runner seeds
@@ -124,6 +130,52 @@ const CURSOR_SEED_ENTRIES: &[&str] = &["cli-config.json", "agent-cli-state.json"
 /// retryable transport errors.
 const PRE_BILLING_FAILURE_PHRASES: &[&str] = &["cannot use this model", "authentication required"];
 
+/// macOS: `agent` consults the login keychain at startup even when
+/// `CURSOR_API_KEY` is set, and the keychain domain resolves through `HOME`
+/// — so a relocated scratch HOME with no `Library/Keychains/login.keychain-db`
+/// dies before auth with `Security command failed: ... code: 154` (verified
+/// live 2026-08-08: scratch HOME + API key fails 154; the same plus an empty
+/// keychain succeeds). Seed an EMPTY keychain so the startup probe has a
+/// valid, secret-free domain. Never link or copy the operator's real login
+/// keychain — that would hand the session every credential reachable in it,
+/// defeating the scratch-HOME posture. Best-effort like the rest of the
+/// seed: on failure the session spawns anyway and the CLI fails loudly.
+#[cfg(target_os = "macos")]
+fn ensure_session_login_keychain(home: &Path) {
+    let keychains = home.join("Library").join("Keychains");
+    let db = keychains.join("login.keychain-db");
+    if db.exists() {
+        return;
+    }
+    if let Err(e) = std::fs::create_dir_all(&keychains) {
+        tracing::warn!(
+            error = %e,
+            "cursor session keychain seed: cannot create Library/Keychains; the CLI may \
+             fail startup with a security error under the relocated HOME"
+        );
+        return;
+    }
+    // HOME is pinned to the session home so any preference side effect of
+    // create-keychain lands in the scratch tree, never in the operator's
+    // real keychain search list.
+    let mut cmd = std::process::Command::new("security");
+    cmd.args(["create-keychain", "-p", ""])
+        .arg(&db)
+        .env_clear()
+        .env("HOME", home)
+        .env("PATH", "/usr/bin:/bin");
+    if let Ok(user) = std::env::var("USER") {
+        cmd.env("USER", user);
+    }
+    if let Err(e) = cmd.status() {
+        tracing::warn!(
+            error = %e,
+            "cursor session keychain seed: security create-keychain failed to spawn; the \
+             CLI may fail startup with a security error under the relocated HOME"
+        );
+    }
+}
+
 /// The cleared environment one `agent` session spawns with, mirroring
 /// [`crate::backend_kimi`]'s seeding contract: a spec carrying a relocated
 /// scratch `HOME` (worker relocation) is used verbatim; otherwise a fresh
@@ -134,6 +186,12 @@ const PRE_BILLING_FAILURE_PHRASES: &[&str] = &["cannot use this model", "authent
 /// explicitly when set (logged name-only).
 fn cursor_child_env(spec: &SessionSpec) -> std::collections::HashMap<String, String> {
     if spec.env.contains_key("HOME") {
+        // The verbatim branch carries no .cursor seed (the runner owns the
+        // relocation), but the macOS keychain domain must still exist.
+        #[cfg(target_os = "macos")]
+        if let Some(home) = spec.env.get("HOME") {
+            ensure_session_login_keychain(Path::new(home));
+        }
         return crate::agent_env::agent_session_env(
             &spec.env,
             &spec.session_id,
@@ -144,6 +202,8 @@ fn cursor_child_env(spec: &SessionSpec) -> std::collections::HashMap<String, Str
     let scratch_root = crate::backend_claude::scratch_home_root(&spec.session_id);
     match seed_cursor_scratch_home(&scratch_root, real_home.as_deref()) {
         Ok(home) => {
+            #[cfg(target_os = "macos")]
+            ensure_session_login_keychain(&home);
             tracing::info!(
                 session_id = %spec.session_id,
                 decision = "scratch-seeded",
@@ -1090,6 +1150,42 @@ mod tests {
         let seeded = home.join(".cursor");
         assert!(seeded.is_dir());
         assert_eq!(std::fs::read_dir(&seeded).unwrap().count(), 0);
+    }
+
+    /// macOS: a relocated HOME gets an EMPTY login keychain (the CLI consults
+    /// the keychain domain at startup even with CURSOR_API_KEY set and dies
+    /// with security exit 154 when none resolves through HOME).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cursor_keychain_seeded_empty_when_absent() {
+        let home = tempfile::tempdir().unwrap();
+
+        ensure_session_login_keychain(home.path());
+
+        let db = home
+            .path()
+            .join("Library")
+            .join("Keychains")
+            .join("login.keychain-db");
+        let meta = std::fs::symlink_metadata(&db).unwrap();
+        assert!(meta.is_file(), "the seed is a real file, never a link");
+        assert!(meta.len() > 0, "security create-keychain writes a real db");
+    }
+
+    /// macOS: an existing keychain path is never replaced — the seed must
+    /// not disturb anything already present in the session HOME.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cursor_keychain_never_replaces_an_existing_db() {
+        let home = tempfile::tempdir().unwrap();
+        let keychains = home.path().join("Library").join("Keychains");
+        std::fs::create_dir_all(&keychains).unwrap();
+        let db = keychains.join("login.keychain-db");
+        std::fs::write(&db, b"sentinel").unwrap();
+
+        ensure_session_login_keychain(home.path());
+
+        assert_eq!(std::fs::read(&db).unwrap(), b"sentinel");
     }
 
     /// The one sanctioned auth var crosses when set; ambient secrets never do.
