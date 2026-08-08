@@ -1,0 +1,25 @@
+---
+title: Flight Rules effectiveness, calibration, and exception metrics
+priority: 3
+schedule: once
+blocked-by: [flight-rules-dashboard-report]
+---
+
+## Goal
+Fold rule-level outcomes across missions so owners can see whether a standard
+prevents deviations, blocks everything, produces noise, attracts waivers, or
+is later contradicted by linked false-green defects.
+
+## Context
+KRZ-348; design D-H/D-K. Build on gate-score distributions, contract health,
+outcomes, and defect linkage. This evaluates policy/checkers, not individual
+engineers or agent backends. Preserve honest denominators and minimum sample
+thresholds; absence is unknown, not success.
+
+## Acceptance hints
+- Per stable rule/revision: applicable/evaluated counts, advisory/fail/block/waiver rates, resolution time, optional score distribution, and false-green count.
+- Minimum samples suppress conclusions while still showing raw counts; rules with no checker/evidence render not-evaluated rather than green.
+- Flag near-constant score, never-near-threshold, high-waiver, always-fail, and never-selected smells with evidence and definitions inline.
+- Revision boundaries remain visible; trends never silently merge rules whose meaning changed.
+- Outputs are deterministic pure folds over existing events/tickets and machine-readable; no second analytics store.
+- Anti-vacuity: unique filter `flight_rules_metrics_` reports a nonzero pass count.
