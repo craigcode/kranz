@@ -176,9 +176,6 @@ cargo test -p kranz-engine -- --ignored   # + live smoke test (spawns claude)
 node scripts/mock-server.mjs    # dashboard dev harness with a canned mission
 ```
 
-Born from a v3 build plan cloning Factory.ai's opinionated core; deviations
-are documented in [docs/design.md](docs/design.md).
-
 ## Cloud (preview)
 
 Kranz is local-first and **never pushes** on your machine. Cloud missions (M6,
