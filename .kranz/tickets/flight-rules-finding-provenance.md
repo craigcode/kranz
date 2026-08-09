@@ -25,3 +25,6 @@ must not be smuggled into that string.
 - Fixture logs from before Flight Rules fold and render unchanged.
 - Same log/manifest produces byte-identical JSON, replay, and bundle output.
 - Anti-vacuity: unique filter `flight_rules_provenance_` reports a nonzero pass count.
+
+## Wrong plan (from orchestrator)
+KRZ-343's entire join target is absent from the base this mission branches from (main @ 90a4bdc): `git grep -i standards HEAD -- crates apps` returns exactly one hit, a doc comment at crates/engine/src/pack.rs:7 — there is no standards module, no StandardsManifest, no rule/revision/lifecycle/checker type, no normalized digest, and no `standards.resolved` or `standards.drifted` event anywhere in the tracked tree. The left half of the join is genuinely shipped and healthy (types.rs:520 `Finding`,  … (truncated)

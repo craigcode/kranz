@@ -31,3 +31,6 @@ are not enforcement sources.
 - Over-budget applicable policy fails approval; no rule is silently omitted.
 - No pack/no applicable rules preserves current prompts byte-for-byte.
 - Anti-vacuity: unique filter `flight_rules_projection_` reports a nonzero pass count.
+
+## Wrong plan (from orchestrator)
+KRZ-345's entire input is absent from the base this mission branches from. On main @ 90a4bdc, `git grep -in standards main -- crates apps` returns exactly one hit — a doc comment at crates/engine/src/pack.rs:7. There is no standards module, no StandardsManifest, no rule/revision/stage/level/lifecycle type, no normalized digest, and crates/engine/src/pack.rs:197 still accepts only SCHEMA_BASE=2 and SCHEMA_CONTRACT=3, so `schema = 4` and `[standards] root` do not exist. This ticket projects an app … (truncated)

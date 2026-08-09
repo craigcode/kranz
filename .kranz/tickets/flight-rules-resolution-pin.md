@@ -33,3 +33,6 @@ future signed/versioned source. This is a consent artifact, so add
 - Merge resolves current live-base policy against the exact scratch integration diff; applicable enforced-set drift emits `standards.drifted` and refuses.
 - Missing pack remains today's byte-identical path; malformed configured pack fails before child spawn or other run side effects.
 - Anti-vacuity: unique filter `flight_rules_pin_` reports a nonzero pass count.
+
+## Wrong plan (from orchestrator)
+KRZ-342's entire foundation is absent from the base this mission would branch from: main is at 90a4bdc and `git cat-file -e main:crates/engine/src/pack/standards.rs` fails — there is no standards module, no StandardsManifest, no StandardsTrust and no normalized digest anywhere in the tracked tree, and crates/engine/src/pack.rs still refuses `schema = 4` outright (supported versions are 2 and 3). All of that is KRZ-341, which this ticket explicitly declares `blocked-by: [flight-rules-pack-contrac … (truncated)

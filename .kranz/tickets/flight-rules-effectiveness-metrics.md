@@ -23,3 +23,6 @@ thresholds; absence is unknown, not success.
 - Revision boundaries remain visible; trends never silently merge rules whose meaning changed.
 - Outputs are deterministic pure folds over existing events/tickets and machine-readable; no second analytics store.
 - Anti-vacuity: unique filter `flight_rules_metrics_` reports a nonzero pass count.
+
+## Wrong plan (from orchestrator)
+KRZ-348 is a pure fold over rule-level outcomes, and every dimension it folds along is absent from the base this mission branches from (main @ 90a4bdc, re-verified this turn): `git grep -ci standards main -- crates apps` returns exactly one hit, a doc comment at crates/engine/src/pack.rs:1; crates/engine/src/pack/ contains only toml.rs with no standards module, no StandardsManifest, no rule/revision/lifecycle/checker type and no normalized digest; pack.rs:68,72,197 still define only SCHEMA_BASE= … (truncated)

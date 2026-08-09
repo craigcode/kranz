@@ -33,3 +33,6 @@ it.
 - An enforced failure prevents COMPLETE/merge; an exact still-valid D-I waiver changes only that rule disposition to waived.
 - No standards pack preserves current gate ordering and behavior.
 - Anti-vacuity: unique filter `flight_rules_enforcement_` reports a nonzero pass count.
+
+## Wrong plan (from orchestrator)
+KRZ-346 is step 6 of 9 in the delivery sequence at docs/scoping/flight-rules-engineering-standards.md:362, and every one of steps 1-5 is unlanded on the base this mission branches from (main @ 90a4bdc, re-verified this turn): `git cat-file -e main:crates/engine/src/pack/standards.rs` fails, `git grep -ci standards main -- crates apps` returns exactly one hit (a doc comment at crates/engine/src/pack.rs:1), and pack.rs:68,72 still define only SCHEMA_BASE=2/SCHEMA_CONTRACT=3 with a live test at pac … (truncated)
