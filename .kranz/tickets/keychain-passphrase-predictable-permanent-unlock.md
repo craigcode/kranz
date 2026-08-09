@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: "Done: random per-session uuid secret persisted 0600 (O_NOFOLLOW) beside the db under the scratch HOME; create/settings/unlock all ride one `security -i` stdin script ordered unlock-first (set-keychain-settings only after a proven unlock, so no call can ever fall back to a GUI prompt); 8h session-scale auto-lock plus relock at session end; legacy kranz-scratch dbs still unlock. cursor_keychain filter: 6 green incl. 4 cursor_keychain_hardened_*; full workspace gates green."
 title: Keychain seed: predictable session passphrase, argv-visible unlock, no auto-lock
 priority: 1
 schedule: once
