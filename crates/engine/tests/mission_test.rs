@@ -4235,6 +4235,228 @@ async fn noncommand_finding_marked_command_broken_does_not_escalate() {
 }
 
 // ---------------------------------------------------------------------------
+// 3d-3. Declared pty-script assertions that never execute cannot green
+// (ticket pty-script-skip-vacuous-green)
+// ---------------------------------------------------------------------------
+
+/// A plan DECLARES a pty-script assertion but no session ever executes it —
+/// here via the host-independent "did not execute" case (check=pty-script
+/// with no script payload; the harness SKIP arms — non-unix host — are
+/// unit-covered in pty_harness). The functional validator greens its round
+/// anyway (the vacuous-green hole), and still the mission must NOT
+/// complete: the final gate finds no validation.pty.transcript verdict for
+/// the declared assertion and raises a critical, non-waivable finding
+/// naming it.
+#[tokio::test(flavor = "multi_thread")]
+async fn declared_pty_script_that_never_executes_cannot_green() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let contract = vec![Assertion {
+        id: "a-pty".to_string(),
+        statement: "the REPL echoes input back".to_string(),
+        check: AssertionCheck::PtyScript,
+        command: None,
+        pty_script: None,
+    }];
+
+    // Session-start order: worker, orchestrator (streaming), functional
+    // validator (greens the round despite the cannot-run evidence line).
+    // Orchestrator turns: seed, dirty-tree, judgement f-1-1, then the
+    // final-gate conversion turn — the finding is class "command-assertion",
+    // so the orchestrator escalates it to the operator as un-runnable here.
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            command_broken_reply("a-pty", "declared pty-script never executed on this host"),
+        ]),
+        validator_with(json!([])),
+    ]));
+
+    let cfg = MissionConfig {
+        skip_functional: false,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, contract)).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(
+        status,
+        MissionStatus::Blocked,
+        "a declared pty-script that never executed must not green"
+    );
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+    let types = event_types(&events);
+    assert!(
+        !types.contains(&"mission.completed"),
+        "no vacuous green off a green round: {types:?}"
+    );
+    // The gate's finding surfaces on the feed, attributed to the engine,
+    // naming the assertion whose declared validation never ran.
+    let finding = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::ValidationFinding { finding, .. } => Some(finding.clone()),
+            _ => None,
+        })
+        .expect("final-gate finding surfaced for the unexecuted pty-script");
+    assert_eq!(finding.subject, "a-pty");
+    assert_eq!(
+        finding.class, "command-assertion",
+        "non-waivable class: {finding:?}"
+    );
+    assert!(
+        finding.evidence.contains("validation.pty.transcript")
+            && finding.evidence.contains("never executed"),
+        "the finding names the missing verdict: {}",
+        finding.evidence
+    );
+    let blocked = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::MilestoneBlocked { reason, .. } => Some(reason.clone()),
+            _ => None,
+        })
+        .expect("milestone.blocked event present");
+    assert!(
+        blocked.contains("a-pty"),
+        "blocked reason names the assertion id: {blocked}"
+    );
+}
+
+/// The other side of the backstop (unix hosts): a declared pty-script that
+/// EXECUTES and PASSES greens exactly as before — the round drives the
+/// scripted session, the transcript event lands, and the final gate's
+/// unexecuted-assertion scan finds the verdict and stays silent.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn declared_pty_script_executes_and_passes_greens() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    // The pty_harness REPL fixture: a `> ` prompt that echoes input back as
+    // `echo:<line>` and says `bye` on `quit`.
+    let contract = vec![Assertion {
+        id: "a-pty".to_string(),
+        statement: "the REPL echoes input back".to_string(),
+        check: AssertionCheck::PtyScript,
+        command: None,
+        pty_script: Some(PtyScript {
+            command: "printf '> '; while IFS= read -r line; do case \"$line\" in quit) \
+                 printf 'bye\\n'; exit 0;; *) printf 'echo:%s\\n> ' \"$line\";; esac; done"
+                .to_string(),
+            steps: vec![
+                PtyStep::Expect {
+                    pattern: "> ".to_string(),
+                    regex: false,
+                    timeout_ms: Some(10_000),
+                },
+                PtyStep::Send {
+                    text: "hello\n".to_string(),
+                },
+                PtyStep::Expect {
+                    pattern: "echo:hello".to_string(),
+                    regex: false,
+                    timeout_ms: Some(10_000),
+                },
+                PtyStep::Send {
+                    text: "quit\n".to_string(),
+                },
+                PtyStep::Expect {
+                    pattern: "bye".to_string(),
+                    regex: false,
+                    timeout_ms: Some(10_000),
+                },
+            ],
+            timeout_secs: Some(30),
+        }),
+    }];
+
+    // Session-start order: worker, orchestrator (streaming), functional
+    // validator (no findings). Orchestrator turns: seed, dirty-tree,
+    // judgement f-1-1, capture (NONE).
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+        validator_with(json!([])),
+    ]));
+
+    let cfg = MissionConfig {
+        skip_functional: false,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, contract)).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(
+        status,
+        MissionStatus::Complete,
+        "a declared pty-script that executed and passed still greens"
+    );
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+    // The round drove the session and recorded the verdict — exactly the
+    // evidence the final gate's backstop keys on.
+    let verdict = events.iter().find_map(|e| match &e.kind {
+        EventKind::ValidationPtyTranscript {
+            assertion_id,
+            verdict,
+            ..
+        } if assertion_id == "a-pty" => Some(*verdict),
+        _ => None,
+    });
+    assert_eq!(
+        verdict,
+        Some(kranz_engine::gate::GateVerdict::Pass),
+        "the executed session's verdict is on the log"
+    );
+    // The gate recorded its posture and found nothing to flag.
+    assert!(events.iter().any(|e| matches!(
+        &e.kind,
+        EventKind::OrchestratorDecision { summary, .. }
+            if summary == "pty-script assertions not re-run at the final gate"
+    )));
+    assert!(
+        !events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::ValidationFinding { finding, .. } if finding.subject == "a-pty"
+        )),
+        "no finding for an executed pty-script: {:?}",
+        event_types(&events)
+    );
+    // The transcript artifact landed under the mission's runs/ dir.
+    let transcripts = paths.runs_dir().join("pty-transcripts");
+    assert!(
+        transcripts.is_dir() && std::fs::read_dir(&transcripts).unwrap().next().is_some(),
+        "transcript artifact written under {}",
+        transcripts.display()
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 3e. Capture-turn best-effort: an erroring capture turn never stalls
 // completion (mission.completed still fires, no lesson is written).
 // ---------------------------------------------------------------------------

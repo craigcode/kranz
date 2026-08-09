@@ -1743,8 +1743,10 @@ impl MissionEngine {
     /// stale, replayed, or mistyped answer can never land on a different
     /// question than the operator saw:
     /// - the id must name an OPEN question (a duplicate control file — the
-    ///   crash-between-emit-and-acknowledge window — errors here, is noted,
-    ///   and is acknowledged away, exactly like a duplicate grant decision);
+    ///   crash-between-emit-and-acknowledge window — errors here, is
+    ///   warn-logged, and is acknowledged away; unlike a duplicate grant
+    ///   decision it is narrated WITHOUT an orchestrator.decision, whose
+    ///   fold would wipe the just-queued answer off pending_user_messages);
     /// - an option INDEX answer must be in range and its text must match the
     ///   parked option verbatim (the surface resolved the index against the
     ///   same projection);
@@ -2725,11 +2727,17 @@ impl MissionEngine {
                     option,
                 } => {
                     if let Err(e) = self.answer_pending_question(&question_id, &answer, option) {
+                        // Warn-log only — NEVER an orchestrator.decision on
+                        // this path (ticket answer-replay-wipes-queued-answer):
+                        // the decision fold consumes pending_user_messages,
+                        // and the common failure here IS the crash-replayed
+                        // duplicate of an answer whose question.answered just
+                        // routed onto that queue — narrating it with a
+                        // decision would wipe the queued answer before the
+                        // consult reads it. The success path skips the
+                        // decision for the same reason (see
+                        // answer_pending_question).
                         tracing::warn!(error = %e, question_id, "question answer ignored");
-                        self.emit(EventKind::OrchestratorDecision {
-                            summary: format!("answer for question {question_id} ignored: {e}"),
-                            detail: None,
-                        })?;
                     }
                 }
             }
@@ -4913,6 +4921,37 @@ impl MissionEngine {
                     detail: Some(artifact.detail.clone()),
                 })?;
             }
+            // A DECLARED pty-script that SKIPPED never executed (ticket
+            // pty-script-skip-vacuous-green): the FAIL evidence line above
+            // goes to the functional validator, but validator discretion is
+            // exactly the vacuous-green hole — surface the skip as a loud
+            // per-round decision too, and let the final gate's
+            // unexecuted-assertion backstop carry the consequence.
+            if !pty_run.skipped.is_empty() {
+                let ids: Vec<&str> = pty_run
+                    .skipped
+                    .iter()
+                    .map(|s| s.assertion_id.as_str())
+                    .collect();
+                let detail = pty_run
+                    .skipped
+                    .iter()
+                    .map(|s| format!("- [{}]: {}", s.assertion_id, s.note))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.emit_decision(
+                    &format!(
+                        "declared pty-script assertion(s) {} did not execute (harness skip) — \
+                         rendered as FAIL evidence",
+                        ids.join(", ")
+                    ),
+                    Some(format!(
+                        "{detail}\nA declared pty-script that never executes cannot green the \
+                         mission: the final gate fails any declared pty assertion with no \
+                         validation.pty.transcript verdict."
+                    )),
+                )?;
+            }
             match (rendered, pty_run.rendered) {
                 (Some(mut base), Some(pty)) => {
                     base.push_str(&pty);
@@ -5468,6 +5507,13 @@ impl MissionEngine {
             .filter(|id| !disagreement_subjects.contains(id.as_str()))
             .cloned()
             .collect();
+        // A contract with no command assertions handed the local session
+        // pure judgment: this confirmation covered ONE miss-rate opportunity
+        // the lists cannot name (there are no command-assertion ids), so the
+        // event carries it explicitly — otherwise a clean judgment-only
+        // confirmation records {confirmed: [], disagreements: []} and the
+        // miss-rate denominator undercounts (14th-pass review).
+        let judgment_opportunity = !contract.iter().any(|a| a.check == AssertionCheck::Command);
         if !disagreements.is_empty() {
             self.emit_decision(
                 &format!(
@@ -5491,6 +5537,7 @@ impl MissionEngine {
             confirm_run_id: outcome.run_id.clone(),
             confirmed,
             disagreements: disagreements.clone(),
+            judgment_opportunity,
         })?;
         Ok(Some(
             disagreements
@@ -5506,12 +5553,15 @@ impl MissionEngine {
     /// lives in [`crate::sandbox::resolve_validator_containment`]. Surfaces
     /// the posture as an orchestrator decision per spawn: the LOUD
     /// degradation note when the platform or the selected backend cannot
-    /// contain (deliberately NOT fail-closed — the ticket names that as a
-    /// later operator decision; snapshot isolation plus the after-fingerprint
-    /// tripwire still apply), and the positive note when the mandatory wrap
-    /// contains a session whose `enforce: off` would previously have run
-    /// bare. A resolution Err is the role's own fail-closed posture
-    /// (enforcement requested but unhonorable here) — unchanged.
+    /// contain AND the operator opted in via `validatorAllowUncontainedDegrade`
+    /// (without the opt-in the resolution is an Err — fail closed, ticket
+    /// `validator-containment-degrade-fail-closed`; snapshot isolation plus
+    /// the after-fingerprint tripwire alone no longer suffice by default),
+    /// and the positive note when the mandatory wrap contains a session
+    /// whose `enforce: off` would previously have run bare. A resolution Err
+    /// is the role's own fail-closed posture (enforcement requested but
+    /// unhonorable here) or the uncontained fail-closed default — unchanged
+    /// in shape.
     fn validator_containment(
         &mut self,
         role: Role,
@@ -5535,6 +5585,7 @@ impl MissionEngine {
             session_cwd,
             &self.paths.mission_dir(),
             &deny_roots,
+            cfg.validator_allow_uncontained_degrade,
         )?;
         match &containment.note {
             Some(note) => self.emit_decision(
@@ -6059,6 +6110,38 @@ impl MissionEngine {
                     pty_assertion_ids.join(", ")
                 )),
             )?;
+            // Vacuous-green backstop (ticket pty-script-skip-vacuous-green):
+            // "their last round verdict stands" is only honest when a
+            // verdict EXISTS. A declared pty-script whose session SKIPPED
+            // every round (this host cannot drive a pty) has no
+            // validation.pty.transcript event in the log — the declared
+            // functional validation never executed, so the gate must not
+            // green on that silence. The finding carries the
+            // command-assertion class: non-waivable, escalatable to the
+            // operator as author-broken, exactly like a failed command
+            // assertion.
+            self.log.flush()?;
+            let events = EventLog::read_events(self.log.events_path())?;
+            for assertion in unexecuted_pty_assertions(&contract, &events) {
+                findings.push(Finding {
+                    subject: assertion.id.clone(),
+                    severity: "critical".to_string(),
+                    evidence: format!(
+                        "declared pty-script assertion `{}` has no validation.pty.transcript \
+                         verdict in the mission log: it never executed in any validation \
+                         round (this host cannot drive a pty session — the round's evidence \
+                         block carries the SKIP as a FAIL line naming the reason — or its \
+                         transcript artifact could not be written), so the declared \
+                         functional validation never ran",
+                        assertion.id
+                    ),
+                    suggested_fix: "run the mission on a unix host that can drive pty \
+                        sessions, or drop the pty-script assertion from the validation \
+                        contract"
+                        .to_string(),
+                    class: "command-assertion".to_string(),
+                });
+            }
         }
 
         // agent-judgement assertions — one orchestrator verdicts turn.
@@ -7369,6 +7452,32 @@ fn commit_changed_paths(repo: &GitRepo, sha: &str) -> Result<Vec<String>> {
         Ok(paths) => Ok(paths),
         Err(_) => repo.changed_paths(EMPTY_TREE_SHA, sha),
     }
+}
+
+/// Vacuous-green backstop for declared pty-script assertions (ticket
+/// `pty-script-skip-vacuous-green`): the harness emits a
+/// `validation.pty.transcript` event for every session it DROVE — pass or
+/// fail, the round's verdict is evidence either way — so a declared
+/// assertion with NO such event in the log never executed (every round
+/// skipped it, or its transcript artifact could not be written). The final
+/// gate re-runs only command assertions; without this check a declared
+/// pty-script that skipped on every round would green the mission without
+/// its declared functional validation ever executing.
+fn unexecuted_pty_assertions<'a>(
+    contract: &'a [Assertion],
+    events: &[Event],
+) -> Vec<&'a Assertion> {
+    let executed: std::collections::HashSet<&str> = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::ValidationPtyTranscript { assertion_id, .. } => Some(assertion_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    contract
+        .iter()
+        .filter(|a| a.check == AssertionCheck::PtyScript && !executed.contains(a.id.as_str()))
+        .collect()
 }
 
 /// De-duplicated, first-seen-order commands run by this milestone's workers,
@@ -8793,22 +8902,80 @@ pub(crate) mod tests {
         assert_eq!(mock.started_specs().len(), 1);
     }
 
-    /// Mandatory containment (ticket `validator-mandatory-containment`): with
-    /// the default `enforce: off` a validation round STILL wraps the
-    /// validator where the platform and backend can contain it — the
-    /// pre-resolved sandbox reaches the session spec with the snapshot as
-    /// the writable root, the real checkout as the read-deny root, and the
-    /// session-private scratch pinned — the posture is recorded as an
-    /// orchestrator decision, the round completes, and the after-fingerprint
-    /// tripwire stays armed as defense-in-depth (never the only net). Where
-    /// the platform cannot contain (no bwrap, no Seatbelt), the round still
-    /// completes and the LOUD degradation note is recorded instead — never
-    /// silently bare.
+    /// Mandatory containment (tickets `validator-mandatory-containment` and
+    /// `validator-containment-degrade-fail-closed`): with the default
+    /// `enforce: off` a validation round STILL wraps the validator where the
+    /// platform and backend can contain it — the pre-resolved sandbox reaches
+    /// the session spec with the snapshot as the writable root, the real
+    /// checkout as the read-deny root, and the session-private scratch
+    /// pinned — the posture is recorded as an orchestrator decision, the
+    /// round completes, and the after-fingerprint tripwire stays armed as
+    /// defense-in-depth (never the only net). Where the platform cannot
+    /// contain (no bwrap, no Seatbelt) the round FAILS CLOSED by default —
+    /// no uncontained validator session spawns — and only the explicit
+    /// `validatorAllowUncontainedDegrade` opt-in restores the loudly
+    /// degraded round (14th-pass reversal of the 224fa73 degrade default).
     #[tokio::test]
     async fn validator_containment_wraps_enforce_off_round_and_records_posture() {
         let Some((_dir, root)) = lessons_test_repo() else {
             return;
         };
+        let containable = cfg!(target_os = "macos")
+            || (cfg!(target_os = "linux") && crate::sandbox::command_available("bwrap"));
+        if !containable {
+            // Fail closed by default (ticket
+            // validator-containment-degrade-fail-closed): the round errors
+            // naming the opt-in flag, and no uncontained validator session
+            // ever spawns.
+            let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![]));
+            let backend: Arc<dyn AgentBackend> = mock.clone();
+            let mut engine = single_milestone_engine(backend, &root);
+            let err = engine
+                .validation_round(0)
+                .await
+                .expect_err("an uncontainable platform fails the round closed by default");
+            assert!(
+                err.to_string().contains("validatorAllowUncontainedDegrade"),
+                "the fail-closed error names the opt-in flag: {err}"
+            );
+            assert!(
+                mock.started_specs().is_empty(),
+                "no uncontained validator session spawns"
+            );
+            assert!(validator_snapshot_leftovers(&engine).is_empty());
+
+            // The explicit opt-in restores the loud degrade: the round
+            // completes with the note recorded — never silently bare.
+            let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+                clean_validator_script(),
+            ]));
+            let backend: Arc<dyn AgentBackend> = mock.clone();
+            let mut engine = single_milestone_engine(backend, &root);
+            engine.state.config.validator_allow_uncontained_degrade = true;
+            engine.validation_round(0).await.unwrap();
+            let specs = mock.started_specs();
+            assert_eq!(specs.len(), 1);
+            assert!(
+                specs[0].sandbox.is_none(),
+                "the opted-in degrade runs unwrapped — never silently wrapped"
+            );
+            let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+            let decisions: Vec<&str> = events
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    EventKind::OrchestratorDecision { summary, .. } => Some(summary.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                decisions
+                    .iter()
+                    .any(|s| s.contains("NOT sandbox-contained")),
+                "the LOUD degradation note is recorded per round: {decisions:?}"
+            );
+            assert!(validator_snapshot_leftovers(&engine).is_empty());
+            return;
+        }
         let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
             clean_validator_script(),
         ]));
@@ -8817,13 +8984,13 @@ pub(crate) mod tests {
 
         engine.validation_round(0).await.unwrap();
 
-        // The round completes regardless of the containment posture…
+        // The contained round completes…
         let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
         assert!(
             events
                 .iter()
                 .any(|e| matches!(&e.kind, EventKind::MilestoneCompleted { milestone_id, .. } if milestone_id == "ms-1")),
-            "the contained (or loudly degraded) round still completes: {:?}",
+            "the contained round still completes: {:?}",
             events.iter().map(|e| &e.kind).collect::<Vec<_>>()
         );
         // …and the after-fingerprint remains — defense-in-depth, not the
@@ -8846,64 +9013,49 @@ pub(crate) mod tests {
             })
             .collect();
 
-        let containable = cfg!(target_os = "macos")
-            || (cfg!(target_os = "linux") && crate::sandbox::command_available("bwrap"));
-        if containable {
-            let sandbox = specs[0]
-                .sandbox
-                .as_ref()
-                .expect("enforce: off no longer leaves the validator unwrapped");
-            let expected_cwd = engine.paths.runs_dir().join("validator-snapshot-scrutiny");
-            assert_eq!(
-                sandbox.inputs.session_cwd, expected_cwd,
-                "the snapshot is the writable root"
-            );
-            assert_eq!(
-                sandbox.inputs.tmpdir,
-                crate::backend_claude::scratch_home_root(&specs[0].session_id),
-                "the writable scratch is pinned to THIS session's private root"
-            );
-            assert_eq!(
-                sandbox.inputs.validator_read_deny_roots,
-                vec![engine.paths.repo_root.clone()],
-                "checkout mode: the real checkout is the single read-deny root"
-            );
-            assert!(
-                sandbox.inputs.extra_write.is_empty(),
-                "no operator extraWrite widening under the mandatory wrap"
-            );
-            assert!(
-                decisions
-                    .iter()
-                    .any(|s| s.contains("sandbox-contained (mandatory)")),
-                "the contained posture is recorded per round: {decisions:?}"
-            );
-            // The generated profile read-denies the real tree's contents
-            // (string-level; the applied sandbox-exec/bwrap probes live in
-            // crate::sandbox's tests).
-            let profile = crate::sandbox::generate_profile(&sandbox.inputs);
-            let readme = format!("(literal \"{}\")", root.join("README.md").display());
-            assert!(
-                profile.contains(&readme),
-                "the real checkout's source files are read-denied:\n{profile}"
-            );
-            let git_dir = format!("\"{}\"", root.join(".git").display());
-            assert!(
-                !profile.contains(&git_dir),
-                "the shared git dir stays readable (the inspection surface):\n{profile}"
-            );
-        } else {
-            assert!(
-                specs[0].sandbox.is_none(),
-                "an uncontainable platform runs degraded — never silently wrapped"
-            );
-            assert!(
-                decisions
-                    .iter()
-                    .any(|s| s.contains("NOT sandbox-contained")),
-                "the LOUD degradation note is recorded per round: {decisions:?}"
-            );
-        }
+        let sandbox = specs[0]
+            .sandbox
+            .as_ref()
+            .expect("enforce: off no longer leaves the validator unwrapped");
+        let expected_cwd = engine.paths.runs_dir().join("validator-snapshot-scrutiny");
+        assert_eq!(
+            sandbox.inputs.session_cwd, expected_cwd,
+            "the snapshot is the writable root"
+        );
+        assert_eq!(
+            sandbox.inputs.tmpdir,
+            crate::backend_claude::scratch_home_root(&specs[0].session_id),
+            "the writable scratch is pinned to THIS session's private root"
+        );
+        assert_eq!(
+            sandbox.inputs.validator_read_deny_roots,
+            vec![engine.paths.repo_root.clone()],
+            "checkout mode: the real checkout is the single read-deny root"
+        );
+        assert!(
+            sandbox.inputs.extra_write.is_empty(),
+            "no operator extraWrite widening under the mandatory wrap"
+        );
+        assert!(
+            decisions
+                .iter()
+                .any(|s| s.contains("sandbox-contained (mandatory)")),
+            "the contained posture is recorded per round: {decisions:?}"
+        );
+        // The generated profile read-denies the real tree's contents
+        // (string-level; the applied sandbox-exec/bwrap probes live in
+        // crate::sandbox's tests).
+        let profile = crate::sandbox::generate_profile(&sandbox.inputs);
+        let readme = format!("(literal \"{}\")", root.join("README.md").display());
+        assert!(
+            profile.contains(&readme),
+            "the real checkout's source files are read-denied:\n{profile}"
+        );
+        let git_dir = format!("\"{}\"", root.join(".git").display());
+        assert!(
+            !profile.contains(&git_dir),
+            "the shared git dir stays readable (the inspection surface):\n{profile}"
+        );
         assert!(validator_snapshot_leftovers(&engine).is_empty());
     }
 
@@ -9269,6 +9421,87 @@ pub(crate) mod tests {
     }
 
     // ---------------------------------------------------------------------------
+    // Declared pty-script that never executed (ticket
+    // pty-script-skip-vacuous-green): the final-gate backstop
+    // ---------------------------------------------------------------------------
+
+    /// A declared pty-script assertion with NO validation.pty.transcript
+    /// event in the log never executed (every round skipped it) — the gate
+    /// flags it. A recorded verdict (pass OR fail: the session ran and the
+    /// round's verdict stands) clears it, and non-pty assertions are never
+    /// flagged.
+    #[test]
+    fn final_gate_declared_pty_without_transcript_verdict_is_flagged() {
+        let pty = |id: &str| Assertion {
+            id: id.to_string(),
+            statement: "s".to_string(),
+            check: AssertionCheck::PtyScript,
+            command: None,
+            pty_script: Some(PtyScript {
+                command: "./repl".to_string(),
+                steps: Vec::new(),
+                timeout_secs: None,
+            }),
+        };
+        let contract = vec![
+            pty("a-pty"),
+            pty("a-pty-2"),
+            Assertion {
+                id: "a-cmd".to_string(),
+                statement: "s".to_string(),
+                check: AssertionCheck::Command,
+                command: Some("true".to_string()),
+                pty_script: None,
+            },
+        ];
+        let transcript_event = |id: &str, verdict: crate::gate::GateVerdict, seq: u64| Event {
+            seq,
+            ts: chrono::Utc::now(),
+            mission_id: "m".to_string(),
+            kind: EventKind::ValidationPtyTranscript {
+                milestone_id: "ms-1".to_string(),
+                assertion_id: id.to_string(),
+                verdict,
+                artefact_ref: format!("file:runs/pty-transcripts/{id}-deadbeef.log"),
+                detail: None,
+            },
+        };
+        let flagged_ids = |contract: &[Assertion], events: &[Event]| -> Vec<String> {
+            unexecuted_pty_assertions(contract, events)
+                .iter()
+                .map(|a| a.id.clone())
+                .collect()
+        };
+
+        // No transcript events at all: both declared pty assertions are
+        // unexecuted; the command assertion is irrelevant to the check.
+        assert_eq!(
+            flagged_ids(&contract, &[]),
+            vec!["a-pty".to_string(), "a-pty-2".to_string()]
+        );
+
+        // A FAIL verdict still means the session EXECUTED — the round's
+        // verdict stands (the round's validator judges fail evidence); only
+        // the never-executed assertion is flagged. An event naming an
+        // assertion the contract does not declare clears nothing.
+        let events = vec![
+            transcript_event("a-pty", crate::gate::GateVerdict::Fail, 1),
+            transcript_event("a-pty-elsewhere", crate::gate::GateVerdict::Pass, 2),
+        ];
+        assert_eq!(flagged_ids(&contract, &events), vec!["a-pty-2".to_string()]);
+
+        // Verdicts on record for both: nothing flagged.
+        let events = vec![
+            transcript_event("a-pty", crate::gate::GateVerdict::Pass, 1),
+            transcript_event("a-pty-2", crate::gate::GateVerdict::Pass, 2),
+        ];
+        assert!(flagged_ids(&contract, &events).is_empty());
+
+        // A contract with no pty assertions flags nothing, events or not.
+        assert!(flagged_ids(&contract[2..], &[]).is_empty());
+    }
+
+    // ---------------------------------------------------------------------------
     // Confirm-on-pass: the guarded local functional validator
     // (ticket local-inference-validator-guarded, KRZ-206b)
     // ---------------------------------------------------------------------------
@@ -9303,6 +9536,12 @@ pub(crate) mod tests {
         cfg.validator_functional.backend = Some("local".to_string());
         cfg.validator_functional.base_url = Some(base_url);
         cfg.validator_functional.context_budget = Some(100_000);
+        // The local backend cannot apply the resolved sandbox profile, so
+        // mandatory validator containment fails closed without the explicit
+        // opt-in (ticket validator-containment-degrade-fail-closed) — the
+        // guarded-local tests exercise the local lane itself, under the
+        // degrade.
+        cfg.validator_allow_uncontained_degrade = true;
         let mut engine = MissionEngine::create(backend, root, "goal", cfg).unwrap();
         engine.state.mission.validation_contract = vec![Assertion {
             id: "a1".to_string(),
@@ -9367,9 +9606,14 @@ pub(crate) mod tests {
                     confirm_run_id,
                     confirmed,
                     disagreements,
+                    judgment_opportunity,
                 } if milestone_id == "ms-1" => {
                     assert_eq!(confirmed, &vec!["a1".to_string()]);
                     assert!(disagreements.is_empty());
+                    assert!(
+                        !judgment_opportunity,
+                        "a command-assertion confirmation is no judgment opportunity"
+                    );
                     assert_ne!(local_run_id, confirm_run_id);
                     Some(e.seq)
                 }
@@ -9394,6 +9638,80 @@ pub(crate) mod tests {
             confirm_seq < completed_seq,
             "the confirmation must land BEFORE the green: confirm seq {confirm_seq}, \
              completed seq {completed_seq}"
+        );
+    }
+
+    /// 14th-pass review pin: a contract with NO command assertions hands the
+    /// local session pure judgment, and its all-clean report is confirmed
+    /// exactly like a command-assertion PASS — but there are no assertion
+    /// ids to list, so the event must mark the judgment opportunity
+    /// explicitly or the miss-rate denominator undercounts (a clean
+    /// judgment-only confirmation is one opportunity, zero misses).
+    #[tokio::test]
+    async fn guarded_local_validator_judgment_only_confirm_counts_the_opportunity() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let (base_url, _requests, _received) = crate::backend_local::tests::spawn_stub(
+            "HTTP/1.1 200 OK",
+            local_stub_body(serde_json::json!({"findings": [], "summary": "clean"})),
+        )
+        .await;
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            clean_validator_script(), // the frontier confirmation: agrees
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock;
+        let mut engine = local_functional_engine(backend, &root, base_url);
+        // Judgment-only: no command assertions at all.
+        engine.state.mission.validation_contract = vec![Assertion {
+            id: "j1".to_string(),
+            statement: "the diff reads correct".to_string(),
+            check: AssertionCheck::AgentJudgement,
+            command: None,
+            pty_script: None,
+        }];
+        // The local backend cannot apply the resolved sandbox profile, so
+        // mandatory validator containment fails closed without the explicit
+        // opt-in (ticket validator-containment-degrade-fail-closed) — the
+        // guarded-local tests exercise exactly that degraded local lane.
+        engine.state.config.validator_allow_uncontained_degrade = true;
+
+        engine.validation_round(0).await.unwrap();
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        let (confirmed, disagreements, judgment_opportunity) = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::ValidationConfirm {
+                    milestone_id,
+                    confirmed,
+                    disagreements,
+                    judgment_opportunity,
+                    ..
+                } if milestone_id == "ms-1" => Some((
+                    confirmed.clone(),
+                    disagreements.clone(),
+                    *judgment_opportunity,
+                )),
+                _ => None,
+            })
+            .expect("the judgment-only PASS still runs the frontier confirmation");
+        assert!(
+            confirmed.is_empty(),
+            "no command assertions to confirm: {confirmed:?}"
+        );
+        assert!(
+            disagreements.is_empty(),
+            "the frontier tier agreed: {disagreements:?}"
+        );
+        assert!(
+            judgment_opportunity,
+            "the judgment-only confirmation is one miss-rate opportunity the \
+             lists cannot name — recording it is the whole point"
+        );
+        assert!(
+            events.iter().any(|e| matches!(&e.kind, EventKind::MilestoneCompleted { milestone_id, .. } if milestone_id == "ms-1")),
+            "an agreed judgment-only confirmation completes the milestone"
         );
     }
 
@@ -9857,8 +10175,16 @@ pub(crate) mod tests {
     /// `question.opened` can name (the fold validates them).
     #[cfg(test)]
     fn question_events_engine() -> Option<(tempfile::TempDir, MissionEngine)> {
+        question_events_engine_with(Arc::new(crate::backend_mock::MockBackend::new()))
+    }
+
+    /// [`question_events_engine`] over a caller-supplied (scripted) backend,
+    /// for tests that drive an orchestrator turn after the question flow.
+    #[cfg(test)]
+    fn question_events_engine_with(
+        backend: Arc<dyn AgentBackend>,
+    ) -> Option<(tempfile::TempDir, MissionEngine)> {
         let (_dir, root) = lessons_test_repo()?;
-        let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
         let mut engine = MissionEngine::create(
             backend,
             &root,
@@ -10093,7 +10419,8 @@ pub(crate) mod tests {
     /// End-to-end through the EXISTING control path: an `answer-question`
     /// control file drains to `question.answered`, which routes the answer
     /// onto the user-message consult — and a replayed (duplicate) answer
-    /// file is noted and swallowed, never a brick.
+    /// file is warn-logged and swallowed, never a brick, and never a
+    /// queue-clearing decision either.
     #[tokio::test]
     async fn question_events_answer_reaches_mission_via_control_drain() {
         let Some((_dir, mut engine)) = question_events_engine() else {
@@ -10148,10 +10475,11 @@ pub(crate) mod tests {
         assert_eq!(answered[0].3, Some(0));
 
         // Duplicate answer (the crash-between-emit-and-acknowledge window):
-        // noted for the operator, swallowed — never a brick, and NEVER a
-        // second question.answered (the note's decision fold may consume the
-        // replayed consult line, the pre-existing queue semantics every user
-        // message shares; the durable answer stays in the log either way).
+        // warn-logged and swallowed — never a brick, NEVER a second
+        // question.answered, and (ticket answer-replay-wipes-queued-answer)
+        // NEVER an orchestrator.decision either: the decision fold consumes
+        // pending_user_messages, so narrating the replay with one would wipe
+        // the just-queued answer before the consult can read it.
         control::enqueue(
             &engine.paths,
             &ControlCommand::AnswerQuestion {
@@ -10163,13 +10491,19 @@ pub(crate) mod tests {
         .unwrap();
         engine.drain_control().await.unwrap();
         assert!(
-            engine
+            !engine
                 .state
                 .recent_decisions
                 .iter()
                 .any(|d| d.contains("answer for question q-1 ignored")),
-            "the duplicate is narrated: {:?}",
+            "the replay is no longer narrated by a queue-clearing decision: {:?}",
             engine.state.recent_decisions
+        );
+        assert_eq!(
+            engine.state.pending_user_messages.len(),
+            1,
+            "the queued answer survives the replayed duplicate: {:?}",
+            engine.state.pending_user_messages
         );
         let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
         assert_eq!(
@@ -10181,6 +10515,65 @@ pub(crate) mod tests {
             "the duplicate never lands a second question.answered"
         );
         assert!(control::drain(&engine.paths).unwrap().is_empty());
+    }
+
+    /// Regression for ticket `answer-replay-wipes-queued-answer`: a duplicate
+    /// `answer-question` control file drained AFTER the answer was queued
+    /// (the crash-replay window) must leave `pending_user_messages` intact,
+    /// so the user-message consult still delivers the queued answer to the
+    /// orchestrator (whose decision then drains the queue).
+    #[tokio::test]
+    async fn answer_replay_duplicate_keeps_queued_answer_for_consult() {
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            lesson_orch_script("proceeding with sqlite"),
+        ]));
+        let Some((_dir, mut engine)) = question_events_engine_with(mock.clone()) else {
+            return;
+        };
+        engine
+            .emit_worker_questions(
+                "ms-1",
+                "f-1-1",
+                &question_outcome(Some(vec![crate::types::ReportQuestion {
+                    text: "Which storage engine?".to_string(),
+                    options: vec!["sqlite".to_string(), "in-memory".to_string()],
+                }])),
+            )
+            .unwrap();
+
+        // The answer lands, then the SAME control file is replayed by the
+        // next drain (the crash-between-emit-and-acknowledge window).
+        for _ in 0..2 {
+            control::enqueue(
+                &engine.paths,
+                &ControlCommand::AnswerQuestion {
+                    question_id: "q-1".to_string(),
+                    answer: "sqlite".to_string(),
+                    option: Some(0),
+                },
+            )
+            .unwrap();
+            engine.drain_control().await.unwrap();
+        }
+        assert_eq!(
+            engine.state.pending_user_messages.len(),
+            1,
+            "the replayed duplicate never wipes the queued answer: {:?}",
+            engine.state.pending_user_messages
+        );
+
+        // The consult still consumes the answer: the orchestrator turn
+        // carries the queued line and its decision drains the queue.
+        engine.consult_user_messages().await.unwrap();
+        let injected = mock.injected_messages();
+        assert!(
+            injected.iter().flatten().any(|m| m.contains("sqlite")),
+            "the consult delivered the queued answer to the orchestrator: {injected:?}"
+        );
+        assert!(
+            engine.state.pending_user_messages.is_empty(),
+            "the consult's decision drains the queue"
+        );
     }
 
     /// The answer cross-checks (engine-side, mirroring the grant echo
@@ -10813,6 +11206,11 @@ pub(crate) mod tests {
         let mut cfg = MissionConfig::default();
         cfg.validator_scrutiny.backend = Some("codex".to_string());
         cfg.skip_functional = true;
+        // The codex backend cannot apply the resolved sandbox profile, so
+        // mandatory validator containment fails closed without the explicit
+        // opt-in (ticket validator-containment-degrade-fail-closed) — these
+        // tests exercise the codex lane itself, under the degrade.
+        cfg.validator_allow_uncontained_degrade = true;
         cfg
     }
 
@@ -11187,6 +11585,11 @@ pub(crate) mod tests {
         let mut cfg = MissionConfig::default();
         cfg.validator_scrutiny.backend = Some("droid".to_string());
         cfg.skip_functional = true;
+        // The droid backend cannot apply the resolved sandbox profile, so
+        // mandatory validator containment fails closed without the explicit
+        // opt-in (ticket validator-containment-degrade-fail-closed) — these
+        // tests exercise the droid lane itself, under the degrade.
+        cfg.validator_allow_uncontained_degrade = true;
         cfg
     }
 
@@ -11634,6 +12037,11 @@ pub(crate) mod tests {
         let mut cfg = MissionConfig::default();
         cfg.validator_scrutiny.backend = Some("kimi".to_string());
         cfg.skip_functional = true;
+        // The kimi backend cannot apply the resolved sandbox profile, so
+        // mandatory validator containment fails closed without the explicit
+        // opt-in (ticket validator-containment-degrade-fail-closed) — these
+        // tests exercise the kimi lane itself, under the degrade.
+        cfg.validator_allow_uncontained_degrade = true;
         cfg
     }
 

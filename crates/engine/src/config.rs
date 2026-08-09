@@ -834,6 +834,31 @@ mod tests {
         assert!(cfg.auto_work);
     }
 
+    /// The uncontained-validator degrade opt-in (ticket
+    /// `validator-containment-degrade-fail-closed`): additive — absent (every
+    /// pre-existing config and old `mission.created` payload) deserializes to
+    /// the FAIL-CLOSED default; the explicit `true` opts back into the loud
+    /// degrade.
+    #[test]
+    fn validator_allow_uncontained_degrade_defaults_off_and_parses_opt_in() {
+        assert!(!MissionConfig::default().validator_allow_uncontained_degrade);
+        let value = serde_json::to_value(MissionConfig::default()).unwrap();
+        assert_eq!(value["validatorAllowUncontainedDegrade"], false);
+
+        let dir = tempfile::tempdir().unwrap();
+        let layer_path = dir.path().join("config.json");
+        std::fs::write(&layer_path, r#"{"validatorAllowUncontainedDegrade": true}"#).unwrap();
+        let cfg = load_layers(&[layer_path]).unwrap();
+        assert!(cfg.validator_allow_uncontained_degrade);
+
+        // A layer naming unrelated keys only (the old-config shape) keeps the
+        // fail-closed default.
+        let layer_path = dir.path().join("config-old.json");
+        std::fs::write(&layer_path, r#"{"maxRespawns": 3}"#).unwrap();
+        let cfg = load_layers(&[layer_path]).unwrap();
+        assert!(!cfg.validator_allow_uncontained_degrade);
+    }
+
     #[test]
     fn contract_env_passthrough_defaults_empty_and_parses_camel_case() {
         // Additive contract change: absent key (every pre-existing config and

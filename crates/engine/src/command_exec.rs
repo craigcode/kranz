@@ -564,11 +564,26 @@ fn gate_profile_extras() -> String {
     // works; without it both ioctls EPERM). No ptmx, no pty: the harness
     // is validator tooling that deserves the same gate the rest of the
     // wrapped suite gets, not a skip.
+    //
+    // 14th-pass review (ticket gate-wrap-file-ioctl-unscoped): the ioctl
+    // allow is SCOPED to exactly that pty surface — /dev/ptmx plus the
+    // tty-slave regex — never the unrestricted `(allow file-ioctl)` every
+    // wrapped gate used to get (an unscoped allow lets worker-authored gate
+    // code ioctl any device it can open: terminal injection into the
+    // operator's tty, TIOCSTI-class surfaces, disk ioctls). Re-probed
+    // 2026-08-09 under sandbox-exec on macOS (arm64): the scoped shape
+    // passes the full openpty + termios + TIOCSWINSZ + read/write chain
+    // (PTY-OK, slave /dev/ttys003), and dropping the ioctl line entirely
+    // EPERMs at openpty — the scoped filter is what the chain needs, no
+    // more. The gate profile cannot know at resolve time whether the
+    // contract carries pty assertions (merge gates never see one), so the
+    // scoped lines ride every wrapped gate — the surface they open is the
+    // pty device pair and nothing else.
     String::from(
         "\n(allow file-write* (literal \"/dev/null\") (literal \"/dev/ptmx\"))\n\
          (allow file-read* (literal \"/dev/ptmx\"))\n\
          (allow file-read* file-write* (regex #\"^/dev/tty[p-t][0-9a-f]+$\"))\n\
-         (allow file-ioctl)\n\
+         (allow file-ioctl (literal \"/dev/ptmx\") (regex #\"^/dev/tty[p-t][0-9a-f]+$\"))\n\
          (allow signal (target same-sandbox))\n",
     )
 }
@@ -1938,9 +1953,24 @@ mod tests {
             "the gate profile must add the /dev/null device write allow:\n{profile}"
         );
         assert!(
-            profile.contains("(literal \"/dev/ptmx\")") && profile.contains("file-ioctl"),
+            profile.contains("(literal \"/dev/ptmx\")"),
             "pty harness support (pty-functional-validation): the gate profile must \
-             permit the ptmx multiplexer and the grantpt/unlockpt ioctls:\n{profile}"
+             permit the ptmx multiplexer:\n{profile}"
+        );
+        // 14th-pass review (ticket gate-wrap-file-ioctl-unscoped): the ioctl
+        // allow is pinned SCOPED to the pty device pair — a bare
+        // `(allow file-ioctl)` re-widen must fail loudly here.
+        assert!(
+            profile.contains(
+                "(allow file-ioctl (literal \"/dev/ptmx\") (regex #\"^/dev/tty[p-t][0-9a-f]+$\"))"
+            ),
+            "the grantpt/unlockpt ioctl allow must be scoped to /dev/ptmx and the \
+             tty slave nodes:\n{profile}"
+        );
+        assert!(
+            !profile.contains("(allow file-ioctl)"),
+            "the ioctl allow must never be unscoped again (every device the gate \
+             can open becomes ioctl-able):\n{profile}"
         );
         assert!(
             !profile.contains("xcrun_db"),
@@ -2011,6 +2041,38 @@ mod tests {
                 .to_string()
                 .contains("refusing to run engine-run gates unsandboxed"),
             "{error}"
+        );
+    }
+
+    /// The pty-era extras, pinned as TEXT (ticket
+    /// gate-wrap-file-ioctl-unscoped, 14th-pass review): the file-ioctl
+    /// allow must stay scoped to exactly the pty device pair the harness
+    /// needs — `/dev/ptmx` (grantpt/unlockpt land on the master fd) plus
+    /// the tty-slave regex (termios/winsize on the slave) — so a future
+    /// re-widen to the unrestricted `(allow file-ioctl)` fails loudly.
+    /// Scoped-for-every-gate is deliberate: the gate profile cannot know at
+    /// resolve time whether the contract carries pty assertions (merge
+    /// gates never see one), and the scoped surface is the pty pair alone.
+    #[test]
+    fn gate_profile_extras_scopes_file_ioctl_to_pty_devices() {
+        let extras = gate_profile_extras();
+        assert!(
+            extras.contains(
+                "(allow file-ioctl (literal \"/dev/ptmx\") (regex #\"^/dev/tty[p-t][0-9a-f]+$\"))"
+            ),
+            "the ioctl allow must be scoped to the pty device pair:\n{extras}"
+        );
+        assert!(
+            !extras.contains("(allow file-ioctl)"),
+            "the unrestricted ioctl allow must not return:\n{extras}"
+        );
+        // The rest of the pty surface stays (multiplexer read+write, slave
+        // read+write) — the scoped ioctl is useless without them.
+        assert!(extras.contains("(literal \"/dev/ptmx\")"), "{extras}");
+        assert!(extras.contains("^/dev/tty[p-t][0-9a-f]+$"), "{extras}");
+        assert!(
+            extras.contains("(allow signal (target same-sandbox))"),
+            "{extras}"
         );
     }
 

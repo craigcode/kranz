@@ -1398,6 +1398,19 @@ pub struct MissionConfig {
     /// session-private scratch HOMEs on hook-capable backends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hook_status: Option<HookStatusConfig>,
+    /// EXPLICIT per-repo opt-in for the uncontained-validator degrade
+    /// (ticket `validator-containment-degrade-fail-closed`, 14th-pass
+    /// review): when the mandatory validator containment wrap cannot apply
+    /// (an uncontainable platform, linux without `bwrap`, a validator
+    /// backend that does not honor the resolved sandbox), validation now
+    /// FAILS CLOSED by default — the degrade reopens the modify→use→restore
+    /// path the mandatory-containment work was built to close. This reverses
+    /// the recorded 224fa73 decision (loud-degrade-by-default); setting this
+    /// true restores that posture: the validator runs uncontained with the
+    /// loud per-round degradation decision, snapshot isolation, and the
+    /// after-fingerprint tripwire as the only remaining layers.
+    #[serde(default)]
+    pub validator_allow_uncontained_degrade: bool,
 }
 
 impl Default for MissionConfig {
@@ -1483,6 +1496,7 @@ impl Default for MissionConfig {
             worker_candidates: vec![],
             routing: RoutingConfig::default(),
             hook_status: None,
+            validator_allow_uncontained_degrade: false,
         }
     }
 }

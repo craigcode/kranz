@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: "Done: gate-wrap file-ioctl scoped to (literal /dev/ptmx) + regex ^/dev/tty[p-t][0-9a-f]+$ — never the bare (allow file-ioctl); live-probed on macOS arm64 (openpty/termios/TIOCSWINSZ/read/write chain passes, dropping the line EPERMs). resolve_matrix pins the scoped shape and the bare allow's absence; gate_profile_extras_scopes_file_ioctl_to_pty_devices pins the pure profile. Full workspace gates green."
 title: Gate sandbox wrap grants unrestricted (allow file-ioctl) to every macOS gate
 priority: 2
 schedule: once

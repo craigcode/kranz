@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: "Done: validator containment now FAILS CLOSED on an uncontainable platform/backend (EngineError::Config naming the platform/backend and the remedy); the additive validatorAllowUncontainedDegrade config field (serde default false) opts a repo back into the old loud per-round degrade. Reverses the recorded 224fa73 D-X decision — documented in AGENTS.md rule 10 and docs/config-composition.md. validator_containment filter: 16+ green incl. the fail-closed/opt-in matrix; full workspace gates green."
 title: Revisit validator containment's loud degrade: fail closed or make degrade opt-in
 priority: 2
 schedule: once

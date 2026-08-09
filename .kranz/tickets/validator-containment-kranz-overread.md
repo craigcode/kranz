@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: "Done: authority_read_deny_paths gains .kranz/domain-terms.local; new authority_read_deny_dirs denies .kranz/hook-status/ and the mission control/ inbox (Seatbelt subpath denies; bwrap tmpfs shadows), so the mandatory validator wrap no longer over-reads operator material through the .kranz carve-out. validator_containment filters green incl. applied macOS sandbox-exec probes; full workspace gates green."
 title: Mandatory containment's .kranz carve-out over-reads operator material
 priority: 2
 schedule: once

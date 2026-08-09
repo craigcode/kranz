@@ -324,10 +324,11 @@ pub enum EventKind {
     /// The confirmations ARE the local-vs-frontier miss-rate ground truth
     /// the ticket's start precondition demands: misses = disagreement
     /// subjects, opportunities = confirmed + disagreement command
-    /// assertions, both computable from the log alone (join `localRunId` /
-    /// `confirmRunId` against `worker.spawned` for the models). Additive
-    /// event; absent in pre-field logs, which simply have no local-validator
-    /// confirmations to measure.
+    /// assertions + `judgmentOpportunity` (0/1), all computable from the
+    /// log alone (join `localRunId` / `confirmRunId` against
+    /// `worker.spawned` for the models). Additive event; absent in
+    /// pre-field logs, which simply have no local-validator confirmations
+    /// to measure.
     #[serde(rename = "validation.confirm")]
     ValidationConfirm {
         #[serde(rename = "milestoneId")]
@@ -344,6 +345,17 @@ pub enum EventKind {
         /// Frontier findings on subjects the local report passed — the
         /// misses. Failed closed: each stands as the round's verdict.
         disagreements: Vec<Finding>,
+        /// True when the confirmed PASS was JUDGMENT-only: a contract with
+        /// no command assertions hands the local session pure judgment, and
+        /// its all-clean report is confirmed exactly like a command-
+        /// assertion PASS — but there are no assertion ids to list, so
+        /// `confirmed`/`disagreements` alone would record ZERO opportunities
+        /// for a confirmation that covered one, silently undercounting the
+        /// miss-rate denominator (14th-pass review). Additive; absent
+        /// (= false) in logs predating the field, which simply never
+        /// recorded a judgment-only confirmation.
+        #[serde(default, rename = "judgmentOpportunity")]
+        judgment_opportunity: bool,
     },
 
     /// Pty-driven functional validation: one engine-run pty-script contract
@@ -1499,7 +1511,7 @@ mod tests {
     /// shape, and round-trip — the miss-rate ground truth must survive serde
     /// verbatim, because the local-vs-frontier miss rate is computed from
     /// these bytes alone (misses = disagreement subjects; opportunities =
-    /// confirmed + disagreement command assertions).
+    /// confirmed + disagreement command assertions + judgmentOpportunity).
     #[test]
     fn guarded_local_validator_confirm_event_wire_shape_and_round_trip() {
         let event = EventKind::ValidationConfirm {
@@ -1514,6 +1526,7 @@ mod tests {
                 suggested_fix: "fix a2".to_string(),
                 class: String::new(),
             }],
+            judgment_opportunity: false,
         };
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["type"], "validation.confirm");
@@ -1525,6 +1538,10 @@ mod tests {
             json["payload"]["disagreements"][0]["subject"],
             serde_json::json!("a2")
         );
+        assert_eq!(
+            json["payload"]["judgmentOpportunity"],
+            serde_json::json!(false)
+        );
         assert_eq!(event.type_name(), "validation.confirm");
         let back: EventKind = serde_json::from_value(json).unwrap();
         match back {
@@ -1534,6 +1551,7 @@ mod tests {
                 confirm_run_id,
                 confirmed,
                 disagreements,
+                judgment_opportunity,
             } => {
                 assert_eq!(milestone_id, "ms-1");
                 assert_eq!(local_run_id, "run-local");
@@ -1541,7 +1559,25 @@ mod tests {
                 assert_eq!(confirmed, vec!["a1".to_string()]);
                 assert_eq!(disagreements.len(), 1);
                 assert_eq!(disagreements[0].subject, "a2");
+                assert!(!judgment_opportunity);
             }
+            _ => panic!("wrong variant"),
+        }
+
+        // A legacy line (the field predated) decodes with the additive
+        // default — pre-field logs simply never recorded a judgment-only
+        // confirmation.
+        let mut legacy = serde_json::to_value(&event).unwrap();
+        legacy["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("judgmentOpportunity");
+        let back: EventKind = serde_json::from_value(legacy).unwrap();
+        match back {
+            EventKind::ValidationConfirm {
+                judgment_opportunity,
+                ..
+            } => assert!(!judgment_opportunity, "absent reads as false"),
             _ => panic!("wrong variant"),
         }
     }

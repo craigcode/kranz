@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: "Done: a declared pty-script that SKIPs is recorded and renders FAIL (declared pty-script did not execute) at the round; the final gate flags every declared assertion lacking a validation.pty.transcript verdict as a non-waivable command-assertion finding — it can block but can never vacuously complete. Undeclared/no-pty contracts byte-identical. declared_pty filter: 4 green (e2e block + e2e green-on-executed + unit pins); full workspace gates green."
 title: A declared pty-script that SKIPs can still green the final gate
 priority: 2
 schedule: once

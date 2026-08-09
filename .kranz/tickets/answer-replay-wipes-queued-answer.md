@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: "Done: the AnswerQuestion error path no longer emits OrchestratorDecision (warn-only), so a crash-replayed duplicate control file cannot clear a just-queued answer from pending_user_messages; the success path already skipped it for that reason. Regression answer_replay_duplicate_keeps_queued_answer_for_consult + reversed expectation in question_events_answer_reaches_mission_via_control_drain; answer_replay_ filter matches only the new test. Full workspace gates green."
 title: Duplicate answer-question drain wipes a successfully queued answer
 priority: 1
 schedule: once
