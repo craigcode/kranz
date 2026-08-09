@@ -52,7 +52,6 @@
 //!    rather than approximating from unrelated timestamps.
 
 use crate::escalation_metrics::traced_defects_from_tickets;
-use crate::events::EventKind;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -179,6 +178,12 @@ pub struct DefectResolutionTime {
 /// read absent and name why, never zero). A `window_days` over
 /// [`crate::outcomes::MAX_MERGED_CHANGE_WINDOW_DAYS`] is an honest error,
 /// never a wrapped computation.
+///
+/// The per-mission log reads ride the native fold's memoized per-mission
+/// struct ([`crate::outcomes::cached_mission_outcomes`], 14th-pass review —
+/// this path used to re-read every events.jsonl `compute_outcomes` had just
+/// parsed, scanning each log twice per request); only the git probes run
+/// live here, since branch tips move independently of the logs.
 pub fn compute_comparison_report(
     repo_root: &std::path::Path,
     window_days: u64,
@@ -199,6 +204,35 @@ pub fn compute_comparison_report(
     }
     ids.sort();
 
+    let mut inputs: Vec<(String, crate::outcomes::ComparisonInputs)> = Vec::new();
+    for id in ids {
+        let paths = crate::paths::MissionPaths::new(repo_root, &id);
+        let events_path = paths.events_file();
+        if !events_path.is_file() {
+            continue;
+        }
+        if paths.require_no_follow().is_err() {
+            continue;
+        }
+        let Some(out) = crate::outcomes::cached_mission_outcomes(&id, &events_path) else {
+            continue; // corrupt log degrades per-mission, never fails
+        };
+        inputs.push((id, out.comparison));
+    }
+    comparison_report_from_inputs(repo_root, &inputs, window_days, now)
+}
+
+/// The comparison fold over PRE-FOLDED per-mission inputs — shared by
+/// [`compute_comparison_report`] and the [`crate::outcomes`] report path, so
+/// a request that already folded every log never scans one again. All
+/// log-derived data comes in via `inputs`; only the git probes
+/// (landed-changes denominator, per-mission merged bits) run here, live.
+pub(crate) fn comparison_report_from_inputs(
+    repo_root: &std::path::Path,
+    inputs: &[(String, crate::outcomes::ComparisonInputs)],
+    window_days: u64,
+    now: DateTime<Utc>,
+) -> anyhow::Result<ComparisonReport> {
     // Bound the window BEFORE any arithmetic — the same guard and rationale
     // as compute_cost_per_merged_change (the `u64 → i64` conversion and the
     // chrono subtraction must never wrap, for ANY caller).
@@ -229,30 +263,10 @@ pub fn compute_comparison_report(
     let mut base_counts: std::collections::BTreeMap<String, u64> =
         std::collections::BTreeMap::new();
 
-    for id in ids {
-        let paths = crate::paths::MissionPaths::new(repo_root, &id);
-        let events_path = paths.events_file();
-        if !events_path.is_file() {
-            continue;
-        }
-        if paths.require_no_follow().is_err() {
-            continue;
-        }
-        let events = match crate::event_log::EventLog::read_events(&events_path) {
-            Ok(events) => events,
-            Err(_) => continue, // corrupt log degrades per-mission, never fails
-        };
+    for (id, input) in inputs {
         // The window keys on the terminal event's own timestamp, inclusive at
         // both ends (the same rule as the sibling fold).
-        let Some(terminal_ts) = events.iter().find_map(|e| {
-            matches!(
-                e.kind,
-                EventKind::MissionCompleted {}
-                    | EventKind::MissionFailed { .. }
-                    | EventKind::MissionAbandoned { .. }
-            )
-            .then_some(e.ts)
-        }) else {
+        let Some(terminal_ts) = input.terminal_ts else {
             continue; // still open — in no closed window
         };
         if terminal_ts < cutoff || terminal_ts > now {
@@ -262,23 +276,21 @@ pub fn compute_comparison_report(
         // same recovery mission_outcomes uses for the config and goal): a
         // log the strict reducer rejects — hand-edited, or carrying an
         // event the reducer rules out — still anchors the denominator.
-        if let Some(base) = events.iter().find_map(|e| match &e.kind {
-            EventKind::MissionCreated { base_branch, .. } => Some(base_branch.clone()),
-            _ => None,
-        }) {
-            *base_counts.entry(base).or_insert(0) += 1;
+        if let Some(base) = &input.base_branch {
+            *base_counts.entry(base.clone()).or_insert(0) += 1;
         }
         // Merged change: closed COMPLETE and the mission branch landed on the
         // live base (merged.rs's probe at fold time, never stored) — the
         // reducer-backed derivation exactly as compute_cost_per_merged_change
         // runs it; a log the reducer rejects simply yields no merged change
         // (degrade per-mission, never fail the fold).
-        if let (Some(repo), Ok(state)) = (
-            repo.as_ref(),
-            crate::reducer::fold(&events).map(|s| s.mission),
-        ) {
-            if state.status == crate::types::MissionStatus::Complete
-                && crate::merged::merged_bit(repo, &state) == Some(true)
+        if let (Some(repo), Some(folded)) = (repo.as_ref(), input.folded.as_ref()) {
+            if folded.status == crate::types::MissionStatus::Complete
+                && crate::merged::merged_bit_for_branches(
+                    repo,
+                    &folded.mission_branch,
+                    &folded.base_branch,
+                ) == Some(true)
             {
                 merged_ids.insert(id.clone());
             }
@@ -372,7 +384,7 @@ fn git_denominator_dependency() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::Event;
+    use crate::events::{Event, EventKind};
     use crate::types::MissionConfig;
 
     /// The fixed "now" every window assertion keys on (ms since epoch) — the

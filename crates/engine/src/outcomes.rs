@@ -305,6 +305,46 @@ pub struct MissionOutcomes {
     /// the distribution flag fold's per-mission input, memoized with the
     /// rest of this struct so repeated requests never re-walk the log.
     pub gate_score_samples: Vec<crate::gate_score_flags::GateScoreSample>,
+    /// The KRZ-333 comparison fold's log-derived inputs, folded in the SAME
+    /// scan as every other field and memoized alongside them (14th-pass
+    /// review: the comparison path used to re-read every events.jsonl the
+    /// native fold had just parsed — two scans per log per request). Only
+    /// the git probes stay outside this struct: branch tips move
+    /// independently of the log, so a merged bit can never ride the memo
+    /// entry — it is probed live at report time.
+    pub comparison: ComparisonInputs,
+}
+
+/// The log-derived per-mission inputs the KRZ-333 comparison fold needs
+/// ([`MissionOutcomes::comparison`]) — every field a pure function of the
+/// log bytes, so the whole bundle memoizes with the native fold.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComparisonInputs {
+    /// The first terminal event's timestamp — the comparison window's key;
+    /// `None` while the mission is open (an open mission is in no closed
+    /// window).
+    pub terminal_ts: Option<DateTime<Utc>>,
+    /// The `mission.created` base branch, recovered DIRECTLY from the
+    /// event: the landed-changes denominator's anchor even when the strict
+    /// reducer rejects the log (the standalone fold's recovery rule,
+    /// unchanged).
+    pub base_branch: Option<String>,
+    /// The strict reducer's reading of the log — the merged-change
+    /// derivation's inputs. `None` when the reducer rejects the log
+    /// (hand-edited, non-contiguous, dangling refs): a corrupt log yields
+    /// no merged change — an under-read, never an inflation. Folded over
+    /// the event slice as passed; production callers pass one mission's
+    /// log.
+    pub folded: Option<FoldedMissionRefs>,
+}
+
+/// The strict-reducer mission facts the merged-change probe needs
+/// ([`ComparisonInputs::folded`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FoldedMissionRefs {
+    pub status: crate::types::MissionStatus,
+    pub base_branch: String,
+    pub mission_branch: String,
 }
 
 /// One mission's token usage on one backend, summed over its completed runs
@@ -360,7 +400,10 @@ fn cache_entry_stats(events_path: &std::path::Path) -> Option<(u64, u64)> {
 /// Fold one mission with per-(path, len, mtime) memoization. Returns None
 /// when the log is missing or unreadable — the caller degrades per-row
 /// exactly as before; the cache never changes the skip semantics.
-fn cached_mission_outcomes(
+/// Crate-internal: the KRZ-333 comparison fold ([`crate::comparison_metrics`])
+/// rides the same memoized scan instead of re-reading every log the native
+/// fold just parsed (14th-pass review).
+pub(crate) fn cached_mission_outcomes(
     mission_id: &str,
     events_path: &std::path::Path,
 ) -> Option<MissionOutcomes> {
@@ -777,6 +820,29 @@ pub fn mission_outcomes(mission_id: &str, events: &[Event]) -> MissionOutcomes {
     // (boolean-only) gates yield no sample: excluded, never zeroed.
     let gate_score_samples = crate::gate_score_flags::collect_scored_samples(&mission_events);
 
+    // --- comparison-fold inputs (KRZ-333; 14th-pass review) ----------------
+    // Everything the industry-comparison fold needs from the log, derived in
+    // this same scan so a pinned comparison window never re-reads a log the
+    // native fold just parsed. The base-branch anchor comes from
+    // `mission.created` DIRECTLY (a log the strict reducer rejects still
+    // anchors the denominator); the merged-change derivation reads the
+    // strict reducer's status + branch refs (a rejected log yields no merged
+    // change — the degrade rule the standalone fold documented).
+    let comparison = ComparisonInputs {
+        terminal_ts,
+        base_branch: mission_events.iter().find_map(|e| match &e.kind {
+            EventKind::MissionCreated { base_branch, .. } => Some(base_branch.clone()),
+            _ => None,
+        }),
+        folded: crate::reducer::fold(events)
+            .ok()
+            .map(|state| FoldedMissionRefs {
+                status: state.mission.status,
+                base_branch: state.mission.base_branch,
+                mission_branch: state.mission.mission_branch,
+            }),
+    };
+
     MissionOutcomes {
         interventions,
         is_closed,
@@ -789,6 +855,7 @@ pub fn mission_outcomes(mission_id: &str, events: &[Event]) -> MissionOutcomes {
         token_sums: token_sums.into_values().collect(),
         divergences,
         gate_score_samples,
+        comparison,
     }
 }
 
@@ -920,6 +987,10 @@ pub fn compute_outcomes_with_options(
     // Scored gate evaluation samples (KRZ-316): concatenated across
     // missions into the distribution flag fold's input.
     let mut all_score_samples: Vec<crate::gate_score_flags::GateScoreSample> = Vec::new();
+    // The comparison fold's per-mission inputs (KRZ-333), collected in this
+    // same pass so the comparison section never re-reads a log this loop
+    // just folded (14th-pass review — the double scan).
+    let mut comparison_inputs: Vec<(String, ComparisonInputs)> = Vec::new();
 
     for id in ids {
         let paths = crate::paths::MissionPaths::new(repo_root, &id);
@@ -938,6 +1009,7 @@ pub fn compute_outcomes_with_options(
         let Some(out) = cached_mission_outcomes(&id, &events_path) else {
             continue;
         };
+        comparison_inputs.push((id.clone(), out.comparison.clone()));
         if out.is_closed {
             closed_missions += 1;
             total_interventions += out.interventions;
@@ -1097,12 +1169,20 @@ pub fn compute_outcomes_with_options(
 
     // Industry-comparison set (KRZ-333): folded and attached only when the
     // options pin a window (production resolve() does; the hermetic seam
-    // leaves it off and the section is simply absent). Pure over (logs,
-    // tickets, live git refs, the pinned window) — derived, never stored.
+    // leaves it off and the section is simply absent). Folded over the
+    // per-mission inputs the native loop above already derived and memoized
+    // — the log scan is shared, never repeated; only the git probes run
+    // live (branch tips move independently of the logs). Derived, never
+    // stored.
     let comparison = options
         .comparison_window
         .map(|(window_days, now)| {
-            crate::comparison_metrics::compute_comparison_report(repo_root, window_days, now)
+            crate::comparison_metrics::comparison_report_from_inputs(
+                repo_root,
+                &comparison_inputs,
+                window_days,
+                now,
+            )
         })
         .transpose()?;
 
@@ -1276,13 +1356,16 @@ pub fn compute_cost_per_merged_change(
 
         // Merged change: closed COMPLETE and the mission branch landed on the
         // live base (merged.rs's probe — the same derivation the mission rows
-        // and ticket projection use, run at fold time).
-        if let (Some(repo), Ok(state)) = (
-            repo.as_ref(),
-            crate::reducer::fold(&events).map(|s| s.mission),
-        ) {
-            if state.status == crate::types::MissionStatus::Complete
-                && crate::merged::merged_bit(repo, &state) == Some(true)
+        // and ticket projection use, run at fold time). The strict-reducer
+        // refs ride `mission_outcomes`' own fold — a log the reducer rejects
+        // yields no merged change (degrade per-mission, never fail the fold).
+        if let (Some(repo), Some(folded)) = (repo.as_ref(), out.comparison.folded.as_ref()) {
+            if folded.status == crate::types::MissionStatus::Complete
+                && crate::merged::merged_bit_for_branches(
+                    repo,
+                    &folded.mission_branch,
+                    &folded.base_branch,
+                ) == Some(true)
             {
                 merged_changes += 1;
             }
@@ -2026,6 +2109,64 @@ mod tests {
                 "appended events invalidate the memo entry"
             );
             assert_ne!(third, second);
+        }
+
+        /// 14th-pass review: the KRZ-333 comparison fold rides the memoized
+        /// native fold — one scan per log, not two per request. The cache
+        /// stats are the observable: a standalone comparison-report call
+        /// after a full outcomes fold must be a cache HIT (before the fix
+        /// the comparison path re-read every events.jsonl from disk,
+        /// invisible to the cache).
+        #[test]
+        fn comparison_fold_reuses_the_memoized_native_fold_scan() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            let events_path = MissionPaths::new(root, "m-cmp").events_file();
+            seed_mission(
+                root,
+                "m-cmp",
+                vec![
+                    created("g"),
+                    EventKind::PlanApproved {
+                        plan: sample_plan(),
+                        base_sha: None,
+                    },
+                    EventKind::MissionCompleted {},
+                ],
+            );
+
+            let outcomes = compute_outcomes(root).unwrap();
+            assert_eq!(
+                cache_entry_stats(&events_path),
+                Some((1, 0)),
+                "the native fold computes once"
+            );
+            // The comparison section attached to the SAME fold (a tempdir is
+            // no git repo, so the denominator reads absent; the base anchor
+            // from mission.created still records).
+            let attached = outcomes
+                .comparison
+                .as_ref()
+                .expect("resolve() pins the comparison window");
+            assert_eq!(
+                attached.assisted_change_share.base_branch.as_deref(),
+                Some("main")
+            );
+            assert_eq!(attached.window_days, DEFAULT_MERGED_CHANGE_WINDOW_DAYS);
+
+            // The standalone entry point reuses the memoized scan too.
+            let report = crate::comparison_metrics::compute_comparison_report(
+                root,
+                DEFAULT_MERGED_CHANGE_WINDOW_DAYS,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+            assert_eq!(
+                cache_entry_stats(&events_path),
+                Some((1, 1)),
+                "the comparison fold must ride the memoized scan, not re-read the log"
+            );
+            assert_eq!(&report, attached, "same inputs, same report");
         }
 
         fn created(goal: &str) -> EventKind {
