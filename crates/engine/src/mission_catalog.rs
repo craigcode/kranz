@@ -125,11 +125,12 @@ pub fn mark_mission_index_report(existing: &str, mission_id: &str) -> String {
 /// is already terminal (Complete/Failed/Abandoned) is rejected with
 /// [`EngineError::InvalidState`] — abandoning is only meaningful for live work.
 /// On success one `mission.abandoned` event is appended, the state snapshot is
-/// refreshed, and the lock released on drop.
-///
-/// A ticket that points at this mission is left untouched: the reverse mapping
-/// (`.kranz/tickets/<slug>.status` → mission id) is not cheaply invertible, and
-/// abandoning the mission is the operator's intent regardless.
+/// refreshed, the throttle-buffered log is flushed (the reconcile below
+/// re-folds from disk and must see the terminal event), and the linked ticket
+/// is reconciled exactly as the run/drain paths do — Abandoned maps to ticket
+/// `failed`, so a direct abandon cannot leave the ticket stuck in `running`.
+/// The reconcile is best-effort: a reconcile error is logged, never fails the
+/// abandon. The lock is released on drop.
 pub fn abandon_mission(
     repo_root: impl Into<PathBuf>,
     mission_id: &str,
