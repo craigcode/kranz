@@ -288,6 +288,68 @@ fn duplicate_fixfeature_with_different_payload_supersedes_an_unstarted_feature()
     assert_eq!(matches[0].status, FeatureStatus::Pending);
 }
 
+/// A fixfeature whose runs all failed WITHOUT committing anything produced
+/// no work, so a re-plan re-proposing the same id with a revised payload is
+/// the same implicit supersession as an unstarted feature (mission
+/// m-eee81f: three infra-failed runs left `worker_runs` non-empty and every
+/// re-proposal wedged the log with "duplicate fixfeature.created").
+#[test]
+fn duplicate_fixfeature_supersedes_a_failed_commitless_feature() {
+    let mut state = fold(&[
+        ev(1, created()),
+        ev(
+            2,
+            EventKind::PlanApproved {
+                plan: plan(),
+                base_sha: None,
+            },
+        ),
+    ])
+    .expect("fold base");
+    let ms = state.mission.milestones[0].id.clone();
+
+    // The prior feature carries failed-run records but no commits and no
+    // started status — runs that never produced work.
+    let mut prior = fix_feature("flaky");
+    prior.status = FeatureStatus::Failed;
+    prior.worker_runs = vec!["r-1".to_string(), "r-2".to_string(), "r-3".to_string()];
+    apply(
+        &mut state,
+        &ev(
+            3,
+            EventKind::FixFeatureCreated {
+                milestone_id: ms.clone(),
+                feature: prior,
+            },
+        ),
+    )
+    .expect("first fixfeature accepted");
+
+    let mut revised = fix_feature("flaky");
+    revised.title = "re-proposed after the infra failures".to_string();
+    revised.spec = "same finding, tighter spec".to_string();
+    apply(
+        &mut state,
+        &ev(
+            4,
+            EventKind::FixFeatureCreated {
+                milestone_id: ms,
+                feature: revised,
+            },
+        ),
+    )
+    .expect("a failed, commitless feature is superseded, not wedged");
+
+    let matches: Vec<_> = state.mission.milestones[0]
+        .features
+        .iter()
+        .filter(|f| f.id == "flaky")
+        .collect();
+    assert_eq!(matches.len(), 1, "one registration for the id");
+    assert_eq!(matches[0].title, "re-proposed after the infra failures");
+    assert_eq!(matches[0].status, FeatureStatus::Pending);
+}
+
 // ---------------------------------------------------------------------------
 // Golden happy path
 // ---------------------------------------------------------------------------

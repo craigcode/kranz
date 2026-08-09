@@ -437,7 +437,13 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
                     // an unstarted (Pending) or failed-and-commitless feature
                     // can be re-proposed by a re-plan — this is the normal
                     // shape after new findings (m-83d1ed re-proposed the same
-                    // id twice). The successor REPLACES the prior payload in
+                    // id twice). Failed-with-runs-but-no-commits is the same
+                    // class: runs that never committed produced no work (the
+                    // m-eee81f wedge — three infra-failed runs made
+                    // `worker_runs` non-empty and bricked every re-proposal);
+                    // their records stay in the log. A feature whose run is
+                    // in flight is Active, so runs alone are not the "started"
+                    // signal. The successor REPLACES the prior payload in
                     // place and restarts as Pending; the original payload is
                     // not lost — it lives in this same event log (the first
                     // fixfeature.created). Once a feature has started,
@@ -452,8 +458,7 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
                     let prior_started = matches!(
                         existing.status,
                         FeatureStatus::Active | FeatureStatus::Complete | FeatureStatus::Skipped
-                    ) || !existing.commits.is_empty()
-                        || !existing.worker_runs.is_empty();
+                    ) || !existing.commits.is_empty();
                     if prior_started {
                         return Err(EngineError::InvalidState(format!(
                         "duplicate fixfeature.created for feature '{}' with a different payload",
