@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: "Done: parse_routing_rules rejects an empty table fail-closed at the file surface (naming the file + remedy), so draft/approve fail exactly as for a present-invalid file; missing file keeps layered config byte-identical. routing_rules_config_empty filter: 2 green; full workspace gates green (14th-pass fix batch)."
 title: An empty {} routing-rules file silently demotes layered routing to legacy
 priority: 2
 schedule: once
