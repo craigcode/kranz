@@ -169,6 +169,20 @@ pub fn abandon_mission(
         reducer::apply(&mut state, audit)?;
     }
     reducer::write_snapshot(&state, &paths.state_file())?;
+    // Flush before reconciling: appends are throttle-buffered, and the
+    // reconcile re-folds the log FROM DISK — it must see MissionAbandoned.
+    log.flush()?;
+    // Reconcile the linked ticket exactly as the run/drain paths do
+    // (Abandoned maps to ticket Failed): a direct abandon must not leave
+    // the ticket stuck in `running` (observed on m-a5a8fd). Best-effort —
+    // the abandon itself has already succeeded.
+    if let Err(e) = crate::work::reconcile_ticket_for_mission(&repo_root, mission_id) {
+        tracing::warn!(
+            error = %e,
+            mission_id,
+            "abandon: failed to reconcile the linked ticket"
+        );
+    }
     // `log` drops here: buffer flushed, lock released.
     Ok(())
 }
@@ -254,5 +268,47 @@ Approved plans, newest last.
 - 2026-07-28 · [m-..](m-../plan.md) — dot-dot substring
 ";
         assert_eq!(mission_index_ids(index), vec!["m-real".to_string()]);
+    }
+
+    /// A direct `kranz abandon` must reconcile the linked ticket exactly as
+    /// the run/drain paths do (Abandoned → ticket Failed) — a mission
+    /// abandoned outside those paths must not leave the ticket stuck in
+    /// `running` (observed live on m-a5a8fd).
+    #[test]
+    fn abandon_reconcile_marks_the_linked_ticket_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        crate::ticket::Ticket::scaffold(repo, "my-ticket", "fixture ticket", None, None).unwrap();
+        crate::ticket::Ticket::record_mission(repo, "my-ticket", "m-ab").unwrap();
+        crate::ticket::Ticket::write_state(
+            repo,
+            "my-ticket",
+            crate::ticket::TicketState::Running,
+            None,
+        )
+        .unwrap();
+        let dir = repo.join(".kranz").join("missions").join("m-ab");
+        std::fs::create_dir_all(&dir).unwrap();
+        let event = crate::events::Event {
+            seq: 1,
+            ts: chrono::Utc::now(),
+            mission_id: "m-ab".to_string(),
+            kind: EventKind::MissionCreated {
+                goal: "fixture mission".to_string(),
+                base_branch: "main".to_string(),
+                mission_branch: "kranz/mission-fixture".to_string(),
+                config: crate::types::MissionConfig::default(),
+            },
+        };
+        let mut lines = serde_json::to_string(&event).unwrap();
+        lines.push('\n');
+        std::fs::write(dir.join("events.jsonl"), lines).unwrap();
+
+        abandon_mission(repo, "m-ab", "test abandon", LockForce::No).unwrap();
+
+        assert_eq!(
+            crate::ticket::Ticket::read_state(repo, "my-ticket"),
+            crate::ticket::TicketState::Failed
+        );
     }
 }
