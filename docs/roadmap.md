@@ -156,6 +156,40 @@ a new machine goes from nothing to `kranz plan` without cloning the repo.
   docs/scoping/secret-scanning.md (all D-A..D-D decided). Follow-up: verify
   the always-on entropy detector's false-positive rate on real logs.
 
+## M5.5 — Flight Rules engineering standards governance ◑ (accepted 2026-08-07; near-term P1)
+
+Turn the shipped pack, gate, provenance, confidence, and evidence primitives
+into one governed engineering-standards workflow. A configured pack owns
+human-readable RFCs and stable structured SHOULD/MUST rules; Kranz resolves
+the applicable set deterministically, shows and pins it at plan approval,
+projects it into planning/work/validation, and binds each rule to the right
+deterministic, contextual, or human mechanism. Full accepted design and threat
+model: [`docs/scoping/flight-rules-engineering-standards.md`](scoping/flight-rules-engineering-standards.md).
+
+Near-term P1 order:
+
+1. `flight-rules-pack-contract` — canonical schema, lifecycle lint, bounded
+   no-follow loader, normalized manifest/digest.
+2. `flight-rules-resolution-pin` — deterministic applicability, base-owned
+   source, approval pin, actual-diff and live-base drift refusal.
+3. `flight-rules-finding-provenance` + `flight-rules-waiver-decisions` — typed
+   evidence and an exact authorized-human exception path before policy blocks.
+4. `flight-rules-workflow-projection` + `flight-rules-enforcement-binding` —
+   stage-specific guidance and approved/advisory versus enforced/MUST behavior
+   through the existing gate ladder.
+
+P2 is `flight-rules-dashboard-report`. P3 is effectiveness/calibration metrics
+and spec/incident review task classes. Organization-wide hosted policy
+distribution, signing, inheritance, and RBAC remain later control-plane work;
+M5.5 is repo/pack-owned and works with today's local and multi-repo operation.
+
+Done when: a synthetic pack's approved rule is visible but nonblocking; its
+enforced deterministic and contextual MUSTs block with rule-linked evidence;
+an exact human waiver is replayable and invalidates on diff/rule drift; a
+mission cannot edit the rules judging itself; a live-base policy change before
+merge requires reapproval/revalidation; and old/no-pack missions remain
+unchanged.
+
 ## M6 — Cloud missions ◑ (scoped push, Dockerfile, deploy docs, exec --push shipped; live deploy user-gated)
 
 Run missions on rented compute; the event-sourced core and the M2.5 HTTP
@@ -260,7 +294,7 @@ repos operate from one Slack workspace with unambiguous routing; and a
 brand-new repo's first mission runs with no hand-editing beyond
 `kranz init` answers.
 
-## Product pattern notes from Warp/Oz/Factory (2026-07-08), Cursor (2026-07-09), Monaco (2026-07-10), Mission Control (2026-07-13), and Amp (2026-07-27)
+## Product pattern notes from Warp/Oz/Factory (2026-07-08), Cursor (2026-07-09), Monaco (2026-07-10), Mission Control (2026-07-13), Amp (2026-07-27), and the Warp Agent CLI re-scan (2026-08-04)
 
 External scan: Warp Agent/Oz and Factory's Droid/AutoWiki surfaces are useful
 as UX/product benchmarks, not architecture targets. Cursor is now a stronger
@@ -287,6 +321,28 @@ runaway-rate calibration metric, OIDC workload identity + authenticated
 previews for M6 remote workspaces, and passkey step-up on hosted spend
 verbs. Its orb lifecycle validates the accepted workspace-contract D-A…D-H
 nearly field-for-field.
+
+Warp re-scan (2026-08-04, the day its standalone Agent CLI launched;
+supersedes the 2026-07-08 "UX benchmark" note): Warp open-sourced its
+terminal client (Apr 2026, AGPL), launched Oz as its closed cloud
+orchestration/monetization layer (Feb 2026), and shipped the Agent CLI —
+a TUI-only agent on a pty mux (drives full-screen apps and SSH sessions)
+with NO headless/JSON mode, no lifecycle hooks, no local sandboxing, and
+no local transcripts (cloud-synced; even self-hosted enterprise routes
+transcripts/inference through Warp's backend). Verdict unchanged in kind,
+sharpened in degree: Warp contests execution and orchestration —
+cross-harness delegation (Claude Code/Codex as cloud children under a
+Warp orchestrator) is the one novel mechanism — and vacates the
+consent/audit/validation lane. Not a backend candidate until a
+headless/JSON mode exists (revisit trigger). Contrast worth remembering:
+`--auto-approve` bypasses its command denylist BY DEFAULT and a custom
+denylist replaces rather than extends the built-in — the fail-open
+composition kranz's config-fail-open-audit ticket exists to prevent.
+Borrowed: config-fail-open-audit, routing-rules-config (KRZ-331 slice),
+pty-functional-validation, plus reference mechanics recorded on
+heterogeneous-dispatch-pool. The terminal/agentic-IDE surface remains
+sgian's lane — now with an open-source incumbent substrate and a
+demonstrated local-first gap (the OpenWarp fork demand signal).
 
 AgentSystemLabs Mission Control reinforces the same boundary from the other
 side: it is a polished desktop PTY/session manager, not a mission-validation
@@ -415,9 +471,12 @@ useful, keep product APIs distinct.
 
 ## Explicitly still out of scope
 
-For the current local v1 defaults, automatic pushes to main,
-multi-user/RBAC, and org policy remain non-goals. M6 cloud/remote execution is
-an explicit future, operator-gated milestone rather than a current default.
+For the current local v1 defaults, automatic pushes to main and multi-user/
+RBAC remain non-goals. Repo/pack-owned engineering policy is now the M5.5
+Flight Rules milestone; a centralized multi-tenant organization-policy
+service, hierarchy, signing/distribution plane, and delegated RBAC remain
+non-goals. M6 cloud/remote execution is an explicit future, operator-gated
+milestone rather than a current default.
 Also out of scope for kranz: terminal replacement, a general-purpose code
 editor/LSP shell, voice-first coding, and the broader agentic-IDE product shape
 now parked for sgian.

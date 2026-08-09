@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: "Done: routing.rs table (taskClassRules -> ExecutorTier, first-match, fail-closed validation, no model ids) + worker.escalated events via the WorkerReport escalation field (record-only; validators/tier/budget untouched); hosted fine-tune = plain local config. routing_abstraction filter: 18 green; full gates green."
 title: Backend routing abstraction — local, frontier, fine-tune as peers
 priority: 2
 schedule: once
@@ -23,7 +25,9 @@ configuration of the OpenAI-compatible local/hosted backend (base URL +
 model), not a new backend kind. Model resolution under a task class uses
 capability classes, never hardcoded ids in core
 (docs/reviews/local-llm-and-triumvirate.md §1). Every escalation is an
-event.
+event. The tracked config surface for the routing rules is split out as
+routing-rules-config (Warp scan 2026-08-04: their complexity-tier and
+ordered-rule router forms are the reference shapes).
 
 ## Acceptance hints
 - A routing table maps task class → backend role; the floor route is
