@@ -5044,15 +5044,23 @@ impl MissionEngine {
             drop(snapshot);
 
             // Bounded (exactly one retry) runtime fallback: a validator run
-            // that did not produce a trusted pass is retried once with the
-            // injected Claude backend. A crashed/aborted validator must never
-            // collapse into "no findings" and green-light validation.
+            // that did not produce a trusted pass is retried once. A crashed/
+            // aborted validator must never collapse into "no findings" and
+            // green-light validation. The retry backend mirrors the primary:
+            // a claude primary retries on the injected claude backend with
+            // the opus/sonnet model swap (the one backend that always honors
+            // the containment wrap); any other primary retries on its OWN
+            // backend with the same config — claude is not a universal
+            // fallback (it may be unauthenticated or absent on the host),
+            // and the retry's containment posture resolves exactly like the
+            // primary's did.
             //
-            // `retried_on_claude` records whether THIS verdict came from the
-            // claude retry: confirm-on-pass (below) keys on the verdict being
-            // the LOCAL primary's own — a retried verdict is already frontier,
-            // so confirming it would judge frontier by frontier.
-            let mut retried_on_claude = false;
+            // `retried_on_frontier` records whether THIS verdict came from a
+            // frontier retry: confirm-on-pass (below) keys on the verdict
+            // being the LOCAL primary's own — a retried frontier verdict is
+            // already frontier, so confirming it would judge frontier by
+            // frontier; a retried LOCAL verdict still must be confirmed.
+            let mut retried_on_frontier = false;
             if !validator_outcome_trusted(&outcome) {
                 // Capability-boundary check (grant-request-decision-flow),
                 // gated on the UNTRUSTED outcome: a validator stopped by a
@@ -5078,19 +5086,31 @@ impl MissionEngine {
                 if self.maybe_park_for_egress_grant(&milestone_id, role, &outcome)? {
                     return Ok(());
                 }
+                let retry_kind = if matches!(selected_kind, BackendKind::Claude) {
+                    BackendKind::Claude
+                } else {
+                    selected_kind
+                };
                 self.emit_decision(
                     &format!(
                         "{} {} run did not produce a trusted validator report ({}); retrying once with \
-                         the claude {}",
+                         the {} {}",
                         selected_kind.as_str(),
                         role_label(role),
                         run_outcome_summary(&outcome),
+                        retry_kind.as_str(),
                         role_label(role)
                     ),
                     None,
                 )?;
-                let retry_cfg = self.claude_fallback_cfg_for_role(role);
-                let retry_backend = Arc::clone(&self.backend);
+                let (retry_cfg, retry_backend) = if matches!(retry_kind, BackendKind::Claude) {
+                    (
+                        self.claude_fallback_cfg_for_role(role),
+                        Arc::clone(&self.backend),
+                    )
+                } else {
+                    (cfg.clone(), Arc::clone(&backend))
+                };
                 // The retry is a fresh validator session: its own throwaway
                 // snapshot (the real checkout provably untouched by the
                 // primary — the isolation guarantees it, the tripwire
@@ -5101,14 +5121,11 @@ impl MissionEngine {
                     return Ok(());
                 };
                 let retry_session_cwd = retry_snapshot.path().to_path_buf();
-                // The retry runs on the injected claude backend — the one
-                // backend that always honors the containment wrap.
-                let retry_validator_sandbox = self.validator_containment(
-                    role,
-                    BackendKind::Claude,
-                    &retry_cfg,
-                    &retry_session_cwd,
-                )?;
+                // Containment resolves for the retry's actual backend: claude
+                // honors the wrap; anything else follows the same degrade
+                // rules the primary session resolved.
+                let retry_validator_sandbox =
+                    self.validator_containment(role, retry_kind, &retry_cfg, &retry_session_cwd)?;
                 let retry_outcome = runner::run_validator_in(
                     retry_backend.as_ref(),
                     &mut self.log,
@@ -5132,7 +5149,7 @@ impl MissionEngine {
                 let caught = self.catch_up();
                 outcome = retry_outcome?;
                 caught?;
-                retried_on_claude = true;
+                retried_on_frontier = !matches!(retry_kind, BackendKind::Local);
 
                 if self.fail_on_validator_tamper(
                     &milestone_id,
@@ -5153,7 +5170,7 @@ impl MissionEngine {
                 }
                 drop(retry_snapshot);
 
-                // A denial the runner could only read on the Claude retry (a
+                // A denial the runner could only read on the retry (a
                 // Codex/Droid primary whose events don't map to a command, or a
                 // primary that failed some other way) surfaces its grant here,
                 // so those backends aren't silently un-grantable.
@@ -5205,7 +5222,7 @@ impl MissionEngine {
             // precondition: the mechanism is the measurement).
             if role == Role::ValidatorFunctional
                 && selected_kind == BackendKind::Local
-                && !retried_on_claude
+                && !retried_on_frontier
             {
                 let local_subjects: std::collections::HashSet<&str> =
                     report.findings.iter().map(|f| f.subject.as_str()).collect();
@@ -11147,6 +11164,43 @@ pub(crate) mod tests {
         (dir, script_path)
     }
 
+    /// Like [`write_codex_stub_no_report`] but stateful: the FIRST `exec`
+    /// invocation serves the no-report fixture and every later one serves the
+    /// reporting fixture — a transient hiccup the bounded same-backend retry
+    /// recovers from. `--version` probes do not advance the marker.
+    #[cfg(unix)]
+    fn write_codex_stub_flaky_no_report() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let no_report = std::fs::canonicalize(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/codex_exec_scrutiny_no_report.jsonl"),
+        )
+        .expect("fixture exists");
+        let report = std::fs::canonicalize(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/codex_exec_scrutiny.jsonl"),
+        )
+        .expect("fixture exists");
+        let marker = dir.path().join("called-once");
+        let script_path = dir.path().join("codex-stub-flaky.sh");
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'codex-cli 0.0.0-test'\n  exit 0\nfi\nif [ -f '{marker}' ]; then\n  cat '{report}'\nelse\n  touch '{marker}'\n  cat '{no_report}'\nfi\nexit 0\n",
+                marker = marker.display(),
+                report = report.display(),
+                no_report = no_report.display()
+            ),
+        )
+        .expect("write stub script");
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat stub script")
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod stub script");
+        (dir, script_path)
+    }
+
     /// RAII guard: points `KRANZ_CODEX_BIN` at a working stub so
     /// `discover_codex_binary` deterministically resolves it as the FIRST
     /// candidate, regardless of whatever real `codex` install happens to sit
@@ -11381,33 +11435,25 @@ pub(crate) mod tests {
 
     /// A codex scrutiny run that exits 0 but never emits a parseable
     /// `ValidatorReport` (usage present, no `agent_message`) must trigger the
-    /// bounded runtime-retry fallback exactly once: a loud
-    /// `orchestrator.decision` naming the retry, a second `ValidatorScrutiny`
-    /// run actually executed against the claude (mock) backend, and that
-    /// retry's findings folded into a fix feature like any other scrutiny
-    /// run's would.
+    /// bounded runtime retry exactly once ON THE SAME backend — claude is not
+    /// a universal fallback (it may be unauthenticated or absent on the
+    /// host): a loud `orchestrator.decision` naming the codex retry, a second
+    /// `ValidatorScrutiny` run against the codex stub (which reports on the
+    /// retry), and that retry's findings folded into a fix feature like any
+    /// other scrutiny run's would. The injected claude (mock) backend starts
+    /// only for the orchestrator conversion turn — never for a validator.
     #[cfg(unix)]
     #[tokio::test]
-    async fn codex_scrutiny_no_report_falls_back_to_claude_once() {
+    async fn codex_scrutiny_no_report_retries_on_codex_once() {
         let Some((_dir, root)) = lessons_test_repo() else {
             return;
         };
-        let (_stub_dir, stub_path) = write_codex_stub_no_report();
+        let (_stub_dir, stub_path) = write_codex_stub_flaky_no_report();
 
-        let retry_report = serde_json::json!({
-            "findings": [{
-                "subject": "retry-finding",
-                "severity": "major",
-                "evidence": "claude retry scrutiny run found this after codex produced no report",
-                "suggestedFix": "address it"
-            }],
-            "summary": "one finding from the claude retry run"
-        });
         let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
-            crate::backend_mock::MockScript::single_shot_json(&retry_report),
             lesson_orch_script(&codex_fix_features_reply(1)),
         ]));
-        let backend: Arc<dyn AgentBackend> = mock;
+        let backend: Arc<dyn AgentBackend> = mock.clone();
         let mut engine = MissionEngine::create(backend, &root, "goal", codex_scrutiny_cfg())
             .expect("create engine");
         engine
@@ -11420,7 +11466,7 @@ pub(crate) mod tests {
         engine
             .validation_round(0)
             .await
-            .expect("validation round must complete via the claude retry fallback");
+            .expect("validation round must complete via the same-backend codex retry");
         drop(env_guard);
 
         let events = EventLog::read_events(&engine.paths.events_file()).expect("read events.jsonl");
@@ -11431,14 +11477,14 @@ pub(crate) mod tests {
                 matches!(
                     &e.kind,
                     EventKind::OrchestratorDecision { summary, .. }
-                        if summary.contains("retrying once with the claude scrutiny validator")
+                        if summary.contains("retrying once with the codex scrutiny validator")
                 )
             })
             .collect();
         assert_eq!(
             retry_decisions.len(),
             1,
-            "expected exactly one loud retry decision: {:?}",
+            "expected exactly one loud retry decision naming codex: {:?}",
             events.iter().map(|e| &e.kind).collect::<Vec<_>>()
         );
 
@@ -11454,15 +11500,22 @@ pub(crate) mod tests {
         assert_eq!(
             scrutiny_spawns,
             2,
-            "expected the initial codex run plus one claude retry run: {:?}",
+            "expected the initial codex run plus one same-backend codex retry: {:?}",
             events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+
+        assert_eq!(
+            mock.started_specs().len(),
+            1,
+            "the injected claude/mock backend must start only for the fix-feature \
+             conversion turn — the retry runs on the codex stub, never on claude"
         );
 
         assert!(
             events
                 .iter()
                 .any(|e| matches!(&e.kind, EventKind::FixFeatureCreated { .. })),
-            "expected the claude retry's findings converted into a fix feature: {:?}",
+            "expected the codex retry's findings converted into a fix feature: {:?}",
             events.iter().map(|e| &e.kind).collect::<Vec<_>>()
         );
         assert!(
@@ -11471,6 +11524,73 @@ pub(crate) mod tests {
                 .iter()
                 .any(|f| f.origin == FeatureOrigin::Fix),
             "fix feature from the retry's findings must be folded into mission state"
+        );
+    }
+
+    /// The retry is bounded: when the same-backend retry ALSO fails to
+    /// produce a trusted report, the round blocks the milestone honestly
+    /// instead of collapsing an aborted validator into "no findings".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_scrutiny_retry_exhausted_blocks_milestone() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let (_stub_dir, stub_path) = write_codex_stub_no_report();
+
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![]));
+        let backend: Arc<dyn AgentBackend> = mock.clone();
+        let mut engine = MissionEngine::create(backend, &root, "goal", codex_scrutiny_cfg())
+            .expect("create engine");
+        engine
+            .state
+            .mission
+            .milestones
+            .push(codex_scrutiny_milestone());
+
+        let env_guard = CodexStubEnvGuard::engage(&stub_path);
+        engine
+            .validation_round(0)
+            .await
+            .expect("validation round returns with the milestone blocked");
+        drop(env_guard);
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events.jsonl");
+
+        let scrutiny_spawns = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.kind,
+                    EventKind::WorkerSpawned { role, .. } if *role == Role::ValidatorScrutiny
+                )
+            })
+            .count();
+        assert_eq!(
+            scrutiny_spawns,
+            2,
+            "expected the initial codex run plus exactly one bounded retry: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.kind,
+                EventKind::MilestoneBlocked { reason, .. }
+                    if reason.contains("did not produce a trusted report after retry")
+            )),
+            "expected the milestone blocked on the exhausted retry: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::FixFeatureCreated { .. })),
+            "an untrusted validator pair must not fold phantom findings into fix features"
+        );
+        assert!(
+            mock.started_specs().is_empty(),
+            "no findings means no conversion turn — the mock backend never starts"
         );
     }
 
@@ -11513,25 +11633,33 @@ pub(crate) mod tests {
         (dir, script_path)
     }
 
-    /// Like [`write_droid_stub`] but the stub cats
-    /// `droid_exec_scrutiny_no_report.json` — a result object with an empty
-    /// `result` string — so `parse_validator_report` returns `None` even
-    /// though the stub exits 0. Models a droid run that completed but never
-    /// emitted a parseable report.
+    /// Like [`write_droid_stub`] but stateful: the FIRST `exec` invocation
+    /// serves `droid_exec_scrutiny_no_report.json` (empty `result`, no
+    /// parseable report) and every later one serves the reporting fixture —
+    /// a transient hiccup the bounded same-backend retry recovers from.
+    /// `--version` probes do not advance the marker.
     #[cfg(unix)]
-    fn write_droid_stub_no_report() -> (tempfile::TempDir, PathBuf) {
+    fn write_droid_stub_flaky_no_report() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let fixture = std::fs::canonicalize(
+        let no_report = std::fs::canonicalize(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/fixtures/droid_exec_scrutiny_no_report.json"),
         )
         .expect("fixture exists");
-        let script_path = dir.path().join("droid-stub-no-report.sh");
+        let report = std::fs::canonicalize(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/droid_exec_scrutiny.json"),
+        )
+        .expect("fixture exists");
+        let marker = dir.path().join("called-once");
+        let script_path = dir.path().join("droid-stub-flaky.sh");
         std::fs::write(
             &script_path,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'droid-cli 0.0.0-test'\n  exit 0\nfi\ncat '{}'\nexit 0\n",
-                fixture.display()
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'droid-cli 0.0.0-test'\n  exit 0\nfi\nif [ -f '{marker}' ]; then\n  cat '{report}'\nelse\n  touch '{marker}'\n  cat '{no_report}'\nfi\nexit 0\n",
+                marker = marker.display(),
+                report = report.display(),
+                no_report = no_report.display()
             ),
         )
         .expect("write stub script");
@@ -11811,28 +11939,20 @@ pub(crate) mod tests {
 
     /// A droid scrutiny run that exits 0 but never emits a parseable
     /// `ValidatorReport` (empty `result` string) must trigger the bounded
-    /// runtime-retry fallback exactly once: a loud `orchestrator.decision`
-    /// naming the retry, mentioning "droid" and "retrying once", and that
-    /// retry actually ran on the injected claude (mock) backend.
+    /// runtime retry exactly once ON THE SAME backend: a loud
+    /// `orchestrator.decision` naming the droid retry, a second
+    /// `ValidatorScrutiny` run against the droid stub (which reports on the
+    /// retry), and the injected claude (mock) backend starting only for the
+    /// orchestrator conversion turn — never for a validator.
     #[cfg(unix)]
     #[tokio::test]
-    async fn droid_runtime_retry_falls_back_to_claude() {
+    async fn droid_runtime_retry_retries_on_droid() {
         let Some((_dir, root)) = lessons_test_repo() else {
             return;
         };
-        let (_stub_dir, stub_path) = write_droid_stub_no_report();
+        let (_stub_dir, stub_path) = write_droid_stub_flaky_no_report();
 
-        let retry_report = serde_json::json!({
-            "findings": [{
-                "subject": "retry-finding",
-                "severity": "major",
-                "evidence": "claude retry scrutiny run found this after droid produced no report",
-                "suggestedFix": "address it"
-            }],
-            "summary": "one finding from the claude retry run"
-        });
         let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
-            crate::backend_mock::MockScript::single_shot_json(&retry_report),
             lesson_orch_script(&codex_fix_features_reply(1)),
         ]));
         let backend: Arc<dyn AgentBackend> = mock.clone();
@@ -11848,7 +11968,7 @@ pub(crate) mod tests {
         engine
             .validation_round(0)
             .await
-            .expect("validation round must complete via the claude retry fallback");
+            .expect("validation round must complete via the same-backend droid retry");
         drop(env_guard);
 
         let events = EventLog::read_events(&engine.paths.events_file()).expect("read events.jsonl");
@@ -11859,7 +11979,7 @@ pub(crate) mod tests {
                 matches!(
                     &e.kind,
                     EventKind::OrchestratorDecision { summary, .. }
-                        if summary.contains("droid") && summary.contains("retrying once")
+                        if summary.contains("retrying once with the droid scrutiny validator")
                 )
             })
             .collect();
@@ -11882,22 +12002,22 @@ pub(crate) mod tests {
         assert_eq!(
             scrutiny_spawns,
             2,
-            "expected the initial droid run plus one claude retry run: {:?}",
+            "expected the initial droid run plus one same-backend droid retry: {:?}",
             events.iter().map(|e| &e.kind).collect::<Vec<_>>()
         );
 
         assert_eq!(
             mock.started_specs().len(),
-            2,
-            "the injected claude/mock backend must have started once for the retry \
-             validator run and once for the fix-feature conversion turn"
+            1,
+            "the injected claude/mock backend must start only for the fix-feature \
+             conversion turn — the retry runs on the droid stub, never on claude"
         );
 
         assert!(
             events
                 .iter()
                 .any(|e| matches!(&e.kind, EventKind::FixFeatureCreated { .. })),
-            "expected the claude retry's findings converted into a fix feature: {:?}",
+            "expected the droid retry's findings converted into a fix feature: {:?}",
             events.iter().map(|e| &e.kind).collect::<Vec<_>>()
         );
         assert!(
@@ -11984,14 +12104,37 @@ pub(crate) mod tests {
         )
     }
 
-    /// Like [`write_kimi_stub`] but the stub cats [`KIMI_STUB_NO_REPORT_JSONL`].
+    /// Like [`write_kimi_stub`] but stateful: the FIRST `-p` invocation
+    /// serves [`KIMI_STUB_NO_REPORT_JSONL`] and every later one serves
+    /// [`KIMI_STUB_REPORT_JSONL`] — a transient hiccup the bounded
+    /// same-backend retry recovers from. `--version` probes do not advance
+    /// the marker.
     #[cfg(unix)]
-    fn write_kimi_stub_no_report() -> (tempfile::TempDir, PathBuf) {
-        write_kimi_stub_with_payload(
-            "kimi-stub-no-report.sh",
-            "kimi_exec_scrutiny_report_no_report.jsonl",
-            KIMI_STUB_NO_REPORT_JSONL,
+    fn write_kimi_stub_flaky_no_report() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let no_report_path = dir.path().join("kimi_exec_scrutiny_no_report.jsonl");
+        std::fs::write(&no_report_path, KIMI_STUB_NO_REPORT_JSONL)
+            .expect("write no-report payload");
+        let report_path = dir.path().join("kimi_exec_scrutiny_report.jsonl");
+        std::fs::write(&report_path, KIMI_STUB_REPORT_JSONL).expect("write report payload");
+        let marker = dir.path().join("called-once");
+        let script_path = dir.path().join("kimi-stub-flaky.sh");
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'kimi-cli 0.0.0-test'\n  exit 0\nfi\nif [ -f '{marker}' ]; then\n  cat '{report}'\nelse\n  touch '{marker}'\n  cat '{no_report}'\nfi\nexit 0\n",
+                marker = marker.display(),
+                report = report_path.display(),
+                no_report = no_report_path.display()
+            ),
         )
+        .expect("write stub script");
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat stub script")
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod stub script");
+        (dir, script_path)
     }
 
     /// RAII guard: points `KRANZ_KIMI_BIN` at a working stub so
@@ -12197,28 +12340,22 @@ pub(crate) mod tests {
 
     /// A kimi scrutiny run that exits 0 but never emits a parseable
     /// `ValidatorReport` (plain-prose final text) must trigger the bounded
-    /// runtime-retry fallback exactly once: a loud `orchestrator.decision`
-    /// naming the retry, mentioning "kimi" and "retrying once", and that
-    /// retry actually ran on the injected claude (mock) backend.
+    /// runtime retry exactly once ON THE SAME backend — claude is not a
+    /// universal fallback (it may be unauthenticated or absent on the host):
+    /// a loud `orchestrator.decision` naming the kimi retry, a second
+    /// `ValidatorScrutiny` run against the kimi stub (which reports on the
+    /// retry), and that retry's findings folded into a fix feature. The
+    /// injected claude (mock) backend starts only for the orchestrator
+    /// conversion turn — never for a validator.
     #[cfg(unix)]
     #[tokio::test]
-    async fn kimi_runtime_retry_falls_back_to_claude() {
+    async fn kimi_runtime_retry_retries_on_kimi() {
         let Some((_dir, root)) = lessons_test_repo() else {
             return;
         };
-        let (_stub_dir, stub_path) = write_kimi_stub_no_report();
+        let (_stub_dir, stub_path) = write_kimi_stub_flaky_no_report();
 
-        let retry_report = serde_json::json!({
-            "findings": [{
-                "subject": "retry-finding",
-                "severity": "major",
-                "evidence": "claude retry scrutiny run found this after kimi produced no report",
-                "suggestedFix": "address it"
-            }],
-            "summary": "one finding from the claude retry run"
-        });
         let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
-            crate::backend_mock::MockScript::single_shot_json(&retry_report),
             lesson_orch_script(&codex_fix_features_reply(1)),
         ]));
         let backend: Arc<dyn AgentBackend> = mock.clone();
@@ -12234,7 +12371,7 @@ pub(crate) mod tests {
         engine
             .validation_round(0)
             .await
-            .expect("validation round must complete via the claude retry fallback");
+            .expect("validation round must complete via the same-backend kimi retry");
         drop(env_guard);
 
         let events = EventLog::read_events(&engine.paths.events_file()).expect("read events.jsonl");
@@ -12245,7 +12382,7 @@ pub(crate) mod tests {
                 matches!(
                     &e.kind,
                     EventKind::OrchestratorDecision { summary, .. }
-                        if summary.contains("kimi") && summary.contains("retrying once")
+                        if summary.contains("retrying once with the kimi scrutiny validator")
                 )
             })
             .collect();
@@ -12268,22 +12405,22 @@ pub(crate) mod tests {
         assert_eq!(
             scrutiny_spawns,
             2,
-            "expected the initial kimi run plus one claude retry run: {:?}",
+            "expected the initial kimi run plus one same-backend kimi retry: {:?}",
             events.iter().map(|e| &e.kind).collect::<Vec<_>>()
         );
 
         assert_eq!(
             mock.started_specs().len(),
-            2,
-            "the injected claude/mock backend must have started once for the retry \
-             validator run and once for the fix-feature conversion turn"
+            1,
+            "the injected claude/mock backend must start only for the fix-feature \
+             conversion turn — the retry runs on the kimi stub, never on claude"
         );
 
         assert!(
             events
                 .iter()
                 .any(|e| matches!(&e.kind, EventKind::FixFeatureCreated { .. })),
-            "expected the claude retry's findings converted into a fix feature: {:?}",
+            "expected the kimi retry's findings converted into a fix feature: {:?}",
             events.iter().map(|e| &e.kind).collect::<Vec<_>>()
         );
         assert!(
