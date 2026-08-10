@@ -1,6 +1,4 @@
-# Spool ready kranz-labeled beads for the kranz-city-worker (v2: the order
-# only dispatches — missions run under the supervised worker, because
-# gc order exec enforces a context deadline).
+# Spool ready kranz-labeled beads for the kranz-city-worker (v3: event-driven).
 #
 # City-side setup (see packaging/gascity/README.md):
 #   - run kranz-city-worker as a supervised session (agents/kranz-worker/)
@@ -10,6 +8,6 @@
 #   - rigs with skipScrutiny=true are refused unless KRANZ_ALLOW_UNVALIDATED=1
 [order]
 description = "Spool ready kranz-labeled beads for the kranz-city-worker"
-trigger = "cooldown"
-interval = "5m"
+trigger = "event"
+on = "bead.created"
 exec = "kranz-dispatch"
