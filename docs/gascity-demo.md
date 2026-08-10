@@ -27,10 +27,16 @@ On the demo machine:
 
 - `gc` (Gas City) installed, on PATH, version 1.3.2 or compatible.
 - `bd` installed, on PATH (the bead CLI).
-- `kranz` installed or available on PATH, built from this repo.
+- `kranz` installed on PATH, built from this repo.
 - `jq` installed (the bridge scripts use it).
-- The pack at `packaging/gascity/` is visible to the test city (copy or
-  symlink it into the city's pack search path after init).
+- A **rig**: a git checkout where kranz missions will run. The rig must:
+  - be `kranz init`-initialized (has `.kranz/` with `config.json`, merge gates, etc.);
+  - have working backend credentials in the environment that will run the
+    worker (the same env the worker process inherits — kranz workers spawn
+    env-cleared sessions, so credentials must come from the contract/operator
+    env, not a stray shell);
+  - keep the scrutiny validator enabled (`.skipScrutiny != true`), or the
+    dispatch floor refuses the bead.
 
 ## Demo setup
 
@@ -40,22 +46,39 @@ On the demo machine:
 gc init --no-start --template minimal --default-provider codex /tmp/kranz-demo-city
 cd /tmp/kranz-demo-city
 
-# 2. Make the kranz pack visible to this city.
-#    Option A: copy the pack into the city's pack path.
-cp -R /path/to/kranz/repo/packaging/gascity ./packs/kranz
-#    Option B: if `gc import` supports a local path, use that instead.
+# 2. Import the kranz pack. For a pack inside a git worktree (the kranz repo
+#    has uncommitted runtime dirs), edit pack.toml directly — `gc import add`
+#    promotes only a clean worktree to a file:// source.
+cat >> pack.toml <<'EOF'
 
-# 3. Register the city with the machine-wide supervisor.
-gc register /tmp/kranz-demo-city
+[imports.kranz]
+source = "/path/to/kranz/repo/packaging/gascity"
+EOF
+gc import check            # resolves the path import; must print OK
 
-# 4. Start the city supervisor (this spawns a live mayor session).
-gc start
+# 3. Register the rig the worker will run missions in.
+#    Multi-rig cities: dispatch routes bead -> rig by the bead id prefix via
+#    `gc rig list --json`, so the rig's prefix must match the beads you create.
+#    Single-rig cities: dispatch also honours KRANZ_RIG_DIR, but only if the
+#    variable is visible to the ORDER's process (the supervisor's env, not
+#    your login shell) — for the fallback manual worker below it just works.
+gc rig add /path/to/rig --name demo
 
-# 5. Add the kranz worker agent if it is not already registered.
-gc agent add kranz-worker
+# 4. Register and start the city (spawns the live mayor session — budget it).
+gc start /tmp/kranz-demo-city
 
-# 6. Start the long-lived kranz worker that drains the spool.
-#    It runs until you Ctrl-C it or stop the city.
+# 5. Confirm the kranz worker agent and the event order are live.
+gc agent list              # expect: kranz.kranz-worker  active
+gc order list              # expect: kranz-dispatch  exec  event  bead.created
+gc status                  # kranz-worker should appear as a long-running agent
+```
+
+If the supervisor does not start the worker itself, run it manually as a
+fallback (the supervisor's health patrol won't restart it in that case):
+
+```bash
+export GC_CITY=/tmp/kranz-demo-city
+export KRANZ_RIG_DIR=/path/to/rig
 kranz-city-worker &
 WORKER_PID=$!
 ```
@@ -66,21 +89,21 @@ Create a bead labeled `kranz`. The bead title becomes the mission goal; the
 description becomes context; acceptance criteria become acceptance hints.
 
 ```bash
-# Create a small, safe bead that kranz can complete in the rig.
 gc bd create 'Add a one-line greeting to README.md' \
   --labels kranz \
   --description 'The README in the rig checkout has no greeting. Add "Hello, Gas City!" on its own line.' \
   --acceptance 'README.md contains the literal string "Hello, Gas City!"'
 ```
 
-The order `kranz-dispatch` fires on the `bead.created` event, claims the bead,
-and spools a mission brief for the worker. Watch City events:
+The `kranz-dispatch` order fires on the `bead.created` event, claims the bead,
+and spools a mission brief for the worker. Watch City events (note: the
+follow command is `gc events`, plural):
 
 ```bash
-gc event list --follow
+gc events --follow
 ```
 
-You should see:
+You should see, in order:
 
 1. `kranz.mission.started` when the worker picks up the spool entry.
 2. `kranz.mission.complete` if the mission exits 0.
@@ -95,35 +118,38 @@ gc bd show <bead-id>
 On success it is `closed` with a `kranz mission COMPLETE` reason. On block it
 is `blocked` with a comment naming the mission id and an escalation mail.
 
-## Forced escalation demo
+## Escalation path (what blocks look like)
 
-To show the blocked/escalation path, create a bead whose brief is intentionally
-ambiguous:
+Know the exit-code contract before demoing failures — it is not symmetric:
 
-```bash
-gc bd create 'Make it better' \
-  --labels kranz \
-  --description 'Improve the project.' \
-  --acceptance 'It is better.'
-```
+- **exit 0 → closed** (`kranz.mission.complete` emitted).
+- **exit 2 → blocked** + `gc mail send human --notify` escalation
+  (`kranz.mission.blocked` emitted). This is the "parked for a human" path —
+  e.g. a mission that hits a grant decision it cannot resolve autonomously.
+- **exit 3 → reopened** with an UNDERSPECIFIED comment. A vague brief like
+  "make it better" takes this path, *not* the blocked path — it is the
+  brief-refusal outcome, not an escalation.
+- **exit 1/other → reopened** (mission failed; retry or refine).
 
-With `skipScrutiny=false` (the default), kranz should refuse to autonomously
-satisfy the underspecified brief and exit 2, leaving the bead `blocked` with a
-human escalation.
+So do not promise the room that an ambiguous brief will "escalate to a
+human" — it will come back as `open` with a refine-this-brief comment. If you
+want the escalation mail on screen, give the mission a brief that is specific
+but requires a human decision kranz is not allowed to make alone.
 
 ## Cleanup
 
 Do not leave the mayor session or tmux server running:
 
 ```bash
-# Stop the worker you started.
+# Stop the manually-started worker, if you used the fallback above.
 kill "$WORKER_PID" 2>/dev/null || true
 
 # Stop and unregister the city.
 gc stop /tmp/kranz-demo-city
 gc unregister /tmp/kranz-demo-city
 
-# Confirm no orphaned tmux server.
+# Confirm no orphaned tmux server (the city name is the directory basename
+# unless you passed --name at init).
 tmux -L kranz-demo-city ls 2>/dev/null && tmux -L kranz-demo-city kill-server
 
 # Remove the disposable city.
@@ -132,7 +158,8 @@ rm -rf /tmp/kranz-demo-city
 
 ## Verification without a live city
 
-If you only want to confirm the pack is still valid before travelling:
+If you only want to confirm the pack is still valid before travelling (run
+from the kranz repo root):
 
 ```bash
 # Must exit 0.
