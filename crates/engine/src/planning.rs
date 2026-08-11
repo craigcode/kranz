@@ -645,6 +645,10 @@ mod tests {
             }),
             command_grants: vec!["gc lint".into()],
             touch_set: vec!["src/**".into()],
+            // The planner-facing schema deliberately has no standardsManifest
+            // key: the pin is engine-authored at approval (KRZ-342 D-E), and
+            // `None` keeps the serialized shape (and this test) unchanged.
+            standards_manifest: None,
         };
         let value = serde_json::to_value(&plan).unwrap();
         let schema = plan_schema();

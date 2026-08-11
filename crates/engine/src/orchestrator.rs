@@ -1140,6 +1140,30 @@ impl MissionEngine {
             &self.state.mission.base_branch,
         )?;
 
+        // Flight Rules (KRZ-342, design D-D/D-E): resolve the applicable
+        // standards from the TRUSTED source — tracked base blobs for a
+        // repo-relative packDir, one capability read for an external one —
+        // and pin the manifest into the plan BEFORE any branch/commit side
+        // effects below (the same ownership posture as the contract and
+        // routing rules above). A malformed base corpus, an external pack
+        // carrying enforced rules, an untracked repo-relative corpus, or a
+        // plan-carried manifest that is stale or substituted fails approval
+        // HERE, before the mission branch exists. No standards-configured
+        // pack ⇒ None ⇒ the approval stays byte-identical.
+        let standards_pin = crate::pack::resolution::approval_pin(
+            &self.repo,
+            &self.state.config,
+            &self.paths.repo_root,
+            &self.state.mission.base_branch,
+            crate::ticket::parse_task_class_from_goal(&self.state.mission.goal).as_deref(),
+            plan.standards_manifest.as_deref(),
+            &plan.touch_set,
+        )
+        .map_err(EngineError::Config)?;
+        // The engine authors the pin (D-D): a carried manifest was verified
+        // equal above; anything else would have been rejected.
+        plan.standards_manifest = standards_pin.map(Box::new);
+
         // Provider pin (D-B, ticket workspace-provider-pin-at-approval):
         // resolve the EFFECTIVE provider now — an unknown `workspace.provider`
         // name refuses approval HERE, before any branch/commit side effects
@@ -1375,10 +1399,37 @@ impl MissionEngine {
             version: workspace_pin.version,
         })?;
 
-        self.emit(EventKind::PlanApproved {
+        let approved_event = self.emit(EventKind::PlanApproved {
             plan,
             base_sha: Some(base_sha),
         })?;
+
+        // The Flight Rules resolution record (KRZ-342, D-H): emitted AFTER
+        // plan.approved (the "Git first" invariant above — approval can no
+        // longer fail, so a retried approve_plan never double-records), with
+        // the approval seq the pin attaches to. The full snapshots ride in
+        // the plan itself; this event is the queryable selection provenance.
+        if let Some(pin) = self.state.mission.standards_manifest.clone() {
+            self.emit(EventKind::StandardsResolved {
+                source: pin.source.as_str().to_string(),
+                pack_name: pin.pack_name.clone(),
+                standards_root: pin.standards_root.clone(),
+                digest: pin.digest.clone(),
+                stage: crate::pack::resolution::APPROVAL_SURFACE.to_string(),
+                task_class: pin.task_class.clone(),
+                touch_set: pin.touch_set.clone(),
+                rules: pin
+                    .rules
+                    .iter()
+                    .map(|rule| crate::types::StandardsRuleRef {
+                        id: rule.id.clone(),
+                        revision: rule.revision,
+                        effective_status: rule.effective_status.clone(),
+                    })
+                    .collect(),
+                approval_seq: approved_event.seq,
+            })?;
+        }
 
         // First-class gate results (ticket gate-results-first-class-events,
         // KRZ-312): one gate.result event per evaluated approval gate, in
@@ -2213,6 +2264,31 @@ impl MissionEngine {
             .cloned()
             .collect();
 
+        // Flight Rules (KRZ-342, D-E): a revision never re-pins — the
+        // approval-time pin stands for the mission's life (the reducer never
+        // folds a revision-carried manifest: no revision flow re-validates
+        // one against the trusted source, and the planner never authors
+        // policy). What THIS validation does is reject a stale or
+        // substituted carried manifest — resolved against the mission's
+        // pinned base — before any commit side effects below. No
+        // standards-configured pack ⇒ byte-identical.
+        let revision_base = self
+            .state
+            .mission
+            .base_sha
+            .clone()
+            .unwrap_or_else(|| self.state.mission.base_branch.clone());
+        let _standards_pin = crate::pack::resolution::approval_pin(
+            &self.repo,
+            &self.state.config,
+            &self.paths.repo_root,
+            &revision_base,
+            crate::ticket::parse_task_class_from_goal(&self.state.mission.goal).as_deref(),
+            plan.standards_manifest.as_deref(),
+            &plan.touch_set,
+        )
+        .map_err(EngineError::Config)?;
+
         // (4) Write + commit the human-reviewable revised plan (the engine
         // writes and commits — the orchestrator never touches files, like
         // approve_plan). Git first: a failure here leaves no event emitted, so
@@ -2517,6 +2593,10 @@ impl MissionEngine {
         // mission-branch edit can never re-route THIS mission. Surface the
         // attempt anyway — advisory, once per run, never a block.
         self.surface_routing_rules_branch_edit()?;
+        // Flight Rules ownership surface (KRZ-342 D-E), same idiom: the
+        // approved pin governs this mission; a mission-branch or external
+        // pack edit is surfaced, never honored.
+        self.surface_standards_branch_edit()?;
 
         // WorkspaceProvider seam drive (design D-B/D-C; ticket
         // workspace-provider-seam): provider.provision → provider.readiness
@@ -5963,11 +6043,20 @@ impl MissionEngine {
         // scoping input for pack gates below (merge-gate idiom: a scoped
         // gate runs when at least one changed path sits under a prefix).
         let mut changed_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // The DELIVERABLE subset (worker-authored commits only — engine meta
+        // commits like plan.json/report.md are excluded): the Flight Rules
+        // envelope check's "actual changed paths" (D-E). Approval resolved
+        // against the deliverable-describing touch set, so the comparison
+        // basis must match — an enforced rule scoped at `.kranz/` must not
+        // newly "apply" merely because the engine committed mission records.
+        let mut deliverable_paths: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for commit in &commits {
             let paths = commit_changed_paths(self.active_repo(), &commit.sha)?;
             if !contract_sweep::is_meta_commit_with_paths(&commit.subject, &gate_mission_id, &paths)
             {
                 non_meta_commit_count += 1;
+                deliverable_paths.extend(paths.iter().cloned());
             }
             changed_paths.extend(paths);
         }
@@ -5983,6 +6072,62 @@ impl MissionEngine {
                 ),
             })?;
             return Ok(Some(MissionStatus::Failed));
+        }
+
+        // Flight Rules envelope check (KRZ-342, design D-E): re-resolve the
+        // approval-pinned source snapshot (the mission's pinned base sha —
+        // immutable, so exactly the bytes approval read) against the ACTUAL
+        // changed paths. A newly applicable ENFORCED rule means the mission
+        // escaped its approved policy envelope (a touch-set grant widened
+        // scope, or an out-of-contract write slipped the sweep): park for
+        // revision/reapproval rather than judge against a moving set. The
+        // declared-touch-set overlap makes approval's selection a superset of
+        // anything an in-envelope diff can activate, so an in-envelope
+        // mission can never false-positive here. Deterministic and cheap —
+        // runs before any command/assertion spend below.
+        if let Some(pin) = self.state.mission.standards_manifest.clone() {
+            let actual_paths: Vec<String> = deliverable_paths.iter().cloned().collect();
+            let pin_base = self
+                .state
+                .mission
+                .base_sha
+                .clone()
+                .unwrap_or_else(|| self.state.mission.base_branch.clone());
+            let envelope = crate::pack::resolution::newly_applicable_enforced(
+                &self.repo,
+                &pin_base,
+                &pin,
+                &actual_paths,
+            );
+            let park_reason = match envelope {
+                Ok(newly) if newly.is_empty() => None,
+                Ok(newly) => Some(format!(
+                    "newly applicable enforced Flight Rules rule(s) outside the approved \
+                     manifest pin: {} — the mission escaped its approved policy envelope; \
+                     revise the plan and re-approve (D-E)",
+                    newly
+                        .iter()
+                        .map(|rule| format!("{} r{}", rule.id, rule.revision))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+                // The approval snapshot itself is unreadable — fail closed:
+                // never judge against a policy that cannot be read.
+                Err(error) => Some(error),
+            };
+            if let Some(reason) = park_reason {
+                let li = self.state.mission.milestones.len() - 1;
+                let last_milestone_id = self.state.mission.milestones[li].id.clone();
+                self.emit_decision(
+                    "standards envelope escaped — parked for revision/reapproval",
+                    Some(reason.clone()),
+                )?;
+                self.emit(EventKind::MilestoneBlocked {
+                    milestone_id: last_milestone_id,
+                    reason,
+                })?;
+                return Ok(None);
+            }
         }
 
         let contract = self.state.mission.validation_contract.clone();
@@ -6611,6 +6756,79 @@ impl MissionEngine {
         Ok(())
     }
 
+    /// Flight Rules ownership surface (ticket `flight-rules-resolution-pin`,
+    /// KRZ-342, design D-E/D-J's "mission edits its own rules" row): the
+    /// approved pin is the mission's standards authority, so a mission-branch
+    /// pack edit can never re-judge THIS mission — and an external pack edit
+    /// after approval cannot change the run (the pinned bytes are the only
+    /// authority). Either edit is still SURFACED, once per `run()`, on the
+    /// same advisory decision channel as the routing-rules note beside it.
+    /// Ref-based reads keep this true in both isolation modes; best-effort:
+    /// a git read failure skips the note rather than failing the run.
+    fn surface_standards_branch_edit(&mut self) -> Result<()> {
+        let Some(pin) = self.state.mission.standards_manifest.clone() else {
+            return Ok(());
+        };
+        let note: Option<String> = match pin.source {
+            crate::types::StandardsPinSource::RepoTracked => {
+                let mission_branch = self.state.mission.mission_branch.clone();
+                match crate::pack::standards::load_at_ref(
+                    &self.repo,
+                    &mission_branch,
+                    &pin.pack_dir,
+                ) {
+                    Ok(Some(branch_manifest)) if branch_manifest.digest == pin.digest => None,
+                    Ok(Some(branch_manifest)) => Some(format!(
+                        "{mission_branch} edits the standards pack `{}` (digest sha256:{} \
+                         vs the approved pin sha256:{}) — ignored: the pin governs this \
+                         mission; the edit can govern only future missions once landed (D-E)",
+                        pin.pack_dir, branch_manifest.digest, pin.digest
+                    )),
+                    Ok(None) => Some(format!(
+                        "{mission_branch} removes the standards pack `{}` — ignored: the \
+                         approved pin sha256:{} governs this mission (D-E)",
+                        pin.pack_dir, pin.digest
+                    )),
+                    Err(error) => Some(format!(
+                        "{mission_branch} edits the standards pack `{}` (its branch copy fails \
+                         to load: {error}) — ignored: the approved pin sha256:{} governs this \
+                         mission (D-E)",
+                        pin.pack_dir, pin.digest
+                    )),
+                }
+            }
+            crate::types::StandardsPinSource::ExternalPinned => {
+                // The external pack is pinned at approval; nothing in the run
+                // re-reads it. Surface a digest mismatch when it still loads
+                // (an unreadable external pack needs no note — nothing
+                // consumes it).
+                let path = std::path::Path::new(&pin.pack_dir);
+                match crate::pack::Pack::load_with_trust(
+                    path,
+                    crate::pack::standards::StandardsTrust::External,
+                ) {
+                    Ok(Some(pack)) => match pack.standards {
+                        Some(manifest) if manifest.digest != pin.digest => Some(format!(
+                            "the external standards pack `{}` was edited after approval \
+                             (digest sha256:{} vs the approved pin sha256:{}) — ignored: the \
+                             pinned snapshot governs this mission (D-E)",
+                            pin.pack_dir, manifest.digest, pin.digest
+                        )),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            }
+        };
+        if let Some(note) = note {
+            self.emit_decision(
+                "standards pack edited outside the approved pin — the pin governs",
+                Some(note),
+            )?;
+        }
+        Ok(())
+    }
+
     /// Append knowledge (then lessons) onto a planning seed. Order and
     /// separate budgets are load-bearing (ticket
     /// repo-knowledge-ranked-brief-injection).
@@ -7134,6 +7352,10 @@ impl MissionEngine {
                     considered_alternatives: None,
                     command_grants: mission.command_grants.clone(),
                     touch_set: mission.touch_set.clone(),
+                    // The Flight Rules pin (KRZ-342) must survive this
+                    // re-serialization — dropping it would silently rewrite
+                    // the approved consent artifact.
+                    standards_manifest: mission.standards_manifest.clone().map(Box::new),
                 };
                 Ok(serde_json::to_string_pretty(&plan)?)
             }
@@ -7821,6 +8043,340 @@ pub(crate) mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Flight Rules approval pinning (ticket flight-rules-resolution-pin,
+    // KRZ-342, design D-E)
+    // -----------------------------------------------------------------------
+
+    /// Vendor a schema-4 standards pack at `vendor/pack` and commit it on
+    /// main: RFC-001 approved with an unscoped advisory rule, RFC-002 with
+    /// the parametrized status holding a `crates/`-scoped gated must rule.
+    fn flight_rules_pin_vendored_pack(root: &std::path::Path, rfc2_status: &str) {
+        let files = [
+            (
+                "vendor/pack/pack.toml".to_string(),
+                "[pack]\nname = \"zz-approve-pack\"\nschema = 4\n\n[standards]\nroot = \
+                 \"standards\"\n\n[[gate]]\nname = \"zz-gate\"\ncommand = \"cd .\"\n".to_string(),
+            ),
+            (
+                "vendor/pack/standards/RFC-001-slug/rfc.md".to_string(),
+                "---\nid: RFC-001\ntitle: zz advisory\nstatus: approved\nowner: zz\n---\nprose\n"
+                    .to_string(),
+            ),
+            (
+                "vendor/pack/standards/RFC-001-slug/rules/ZZ-ADV-001.md".to_string(),
+                "---\nid: ZZ-ADV-001\nrevision: 1\nrfc: RFC-001\nlevel: should\nstatus: active\n\
+                 statement: zz advisory statement.\ndomains: [zz]\n\
+                 stages: [planning, implementation, validation, merge]\nchecker: agent-judgement\n\
+                 ---\nprose\n"
+                    .to_string(),
+            ),
+            (
+                "vendor/pack/standards/RFC-002-slug/rfc.md".to_string(),
+                format!(
+                    "---\nid: RFC-002\ntitle: zz blocking\nstatus: {rfc2_status}\nowner: zz\n---\nprose\n"
+                ),
+            ),
+            (
+                "vendor/pack/standards/RFC-002-slug/rules/ZZ-MUST-001.md".to_string(),
+                "---\nid: ZZ-MUST-001\nrevision: 1\nrfc: RFC-002\nlevel: must\nstatus: active\n\
+                 statement: zz blocking statement.\ndomains: [zz]\n\
+                 stages: [implementation, validation, merge]\nwhen-paths: [crates/]\n\
+                 checker: gate:zz-gate\nwaivable: false\n---\nprose\n"
+                    .to_string(),
+            ),
+        ];
+        for (rel, body) in &files {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        let run = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap()
+                .status
+                .success());
+        };
+        run(&["add", "-A"]);
+        run(&["commit", "-m", "vendor the standards pack"]);
+    }
+
+    fn flight_rules_pin_plan(touch_set: Vec<String>) -> Plan {
+        Plan {
+            goal: "goal".into(),
+            validation_contract: vec![],
+            milestones: vec![PlanMilestone {
+                title: "m".into(),
+                features: vec![PlanFeature {
+                    title: "f".into(),
+                    spec: "s".into(),
+                    validation_criteria: vec![],
+                }],
+            }],
+            considered_alternatives: None,
+            command_grants: vec![],
+            touch_set,
+            standards_manifest: None,
+        }
+    }
+
+    fn flight_rules_pin_engine(root: &std::path::Path) -> MissionEngine {
+        let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
+        let cfg = MissionConfig {
+            pack_dir: Some("vendor/pack".to_string()),
+            ..MissionConfig::default()
+        };
+        MissionEngine::create(backend, root, "goal", cfg).expect("create engine")
+    }
+
+    #[test]
+    fn flight_rules_pin_approve_plan_pins_manifest_and_emits_resolved() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        flight_rules_pin_vendored_pack(&root, "enforced");
+        let mut engine = flight_rules_pin_engine(&root);
+        engine
+            .approve_plan(flight_rules_pin_plan(vec!["crates/**".to_string()]))
+            .expect("approve");
+
+        // The pin folded into mission state and names the trusted source.
+        let pin = engine
+            .state
+            .mission
+            .standards_manifest
+            .clone()
+            .expect("a standards pin");
+        assert_eq!(pin.pack_name, "zz-approve-pack");
+        assert_eq!(pin.pack_dir, "vendor/pack");
+        assert_eq!(pin.source, crate::types::StandardsPinSource::RepoTracked);
+        let ids: Vec<&str> = pin.rules.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["ZZ-ADV-001", "ZZ-MUST-001"]);
+
+        // plan.json (the committed consent artifact) carries the manifest…
+        let plan_json = std::fs::read_to_string(engine.paths.plan_file()).unwrap();
+        assert!(plan_json.contains("\"standardsManifest\""), "{plan_json}");
+        assert!(plan_json.contains(&pin.digest), "{plan_json}");
+        // …and plan.md renders the review surface (digest, ids, revisions,
+        // statuses, statements, scopes, checker bindings).
+        let plan_md = std::fs::read_to_string(engine.paths.plan_md_file()).unwrap();
+        assert!(plan_md.contains("Flight Rules standards"), "{plan_md}");
+        assert!(plan_md.contains("ZZ-MUST-001 r1"), "{plan_md}");
+        assert!(plan_md.contains("gate:zz-gate"), "{plan_md}");
+
+        // The event trail reads: plan.approved → standards.resolved, the
+        // latter naming the former's seq.
+        let events = EventLog::read_events(&engine.paths.events_file()).unwrap();
+        let approved = events
+            .iter()
+            .find(|e| matches!(e.kind, EventKind::PlanApproved { .. }))
+            .expect("plan.approved");
+        let resolved = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::StandardsResolved {
+                    approval_seq,
+                    rules,
+                    ..
+                } => Some((*approval_seq, rules.len())),
+                _ => None,
+            })
+            .expect("standards.resolved");
+        assert_eq!(resolved.0, approved.seq);
+        assert_eq!(resolved.1, 2);
+    }
+
+    #[test]
+    fn flight_rules_pin_approve_plan_rejects_a_stale_carried_manifest() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        flight_rules_pin_vendored_pack(&root, "enforced");
+
+        // A fabricated (stale/substituted) carried manifest: wrong digest.
+        let mut engine = flight_rules_pin_engine(&root);
+        let mut plan = flight_rules_pin_plan(vec!["crates/**".to_string()]);
+        plan.standards_manifest = Some(Box::new(crate::types::StandardsPin {
+            pack_name: "zz-approve-pack".to_string(),
+            pack_dir: "vendor/pack".to_string(),
+            standards_root: "standards".to_string(),
+            digest: "0".repeat(64),
+            source: crate::types::StandardsPinSource::RepoTracked,
+            task_class: None,
+            touch_set: vec!["crates/**".to_string()],
+            rules: vec![],
+        }));
+        let err = engine.approve_plan(plan).expect_err("must reject");
+        assert!(format!("{err}").contains("stale or substituted"), "{err}");
+        // Rejection happened BEFORE any side effect: no branch, no events
+        // beyond mission.created, no plan.json.
+        let branch = engine.state.mission.mission_branch.clone();
+        assert!(!engine.repo.branch_exists(&branch).unwrap());
+        let events = EventLog::read_events(&engine.paths.events_file()).unwrap();
+        assert!(
+            events
+                .iter()
+                .all(|e| matches!(e.kind, EventKind::MissionCreated { .. })),
+            "a rejected approval emits nothing: {events:?}"
+        );
+        assert!(!engine.paths.plan_file().exists());
+
+        // The plan carrying the EXACT trusted resolution approves (the
+        // draft-then-approve-later path).
+        let mut engine = flight_rules_pin_engine(&root);
+        let fresh = crate::pack::resolution::approval_pin(
+            &engine.repo,
+            &engine.state.config,
+            &root,
+            "main",
+            None,
+            None,
+            &["crates/**".to_string()],
+        )
+        .expect("pin")
+        .expect("standards govern");
+        let mut plan = flight_rules_pin_plan(vec!["crates/**".to_string()]);
+        plan.standards_manifest = Some(Box::new(fresh));
+        engine.approve_plan(plan).expect("an exact pin approves");
+    }
+
+    #[test]
+    fn flight_rules_pin_approve_plan_malformed_base_pack_fails_before_side_effects() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        // A malformed corpus COMMITTED to the base (a rule with an unknown
+        // status vocabulary word): approval must fail before the mission
+        // branch or any event exists.
+        flight_rules_pin_vendored_pack(&root, "enforced");
+        std::fs::write(
+            root.join("vendor/pack/standards/RFC-002-slug/rfc.md"),
+            "---\nid: RFC-002\ntitle: zz blocking\nstatus: bogus\nowner: zz\n---\nprose\n",
+        )
+        .unwrap();
+        let run = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap()
+                .status
+                .success());
+        };
+        run(&["add", "-A"]);
+        run(&["commit", "-m", "break the corpus"]);
+
+        let mut engine = flight_rules_pin_engine(&root);
+        let err = engine
+            .approve_plan(flight_rules_pin_plan(vec!["crates/**".to_string()]))
+            .expect_err("a malformed base pack must fail approval");
+        let text = format!("{err}");
+        assert!(text.contains("RFC-002"), "names the file/field: {text}");
+
+        let branch = engine.state.mission.mission_branch.clone();
+        assert!(
+            !engine.repo.branch_exists(&branch).unwrap(),
+            "no mission branch was created"
+        );
+        assert_eq!(
+            engine.repo.current_branch().unwrap(),
+            "main",
+            "the checkout never moved"
+        );
+        let events = EventLog::read_events(&engine.paths.events_file()).unwrap();
+        assert!(
+            events
+                .iter()
+                .all(|e| matches!(e.kind, EventKind::MissionCreated { .. })),
+            "no run side effects: {events:?}"
+        );
+    }
+
+    #[test]
+    fn flight_rules_pin_mission_branch_pack_edit_is_ignored_and_surfaced() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        flight_rules_pin_vendored_pack(&root, "enforced");
+        let mut engine = flight_rules_pin_engine(&root);
+        engine
+            .approve_plan(flight_rules_pin_plan(vec!["crates/**".to_string()]))
+            .expect("approve");
+        let pinned = engine.state.mission.standards_manifest.clone().unwrap();
+
+        // No edit: the surface stays silent.
+        engine
+            .surface_standards_branch_edit()
+            .expect("surface sweep");
+        assert!(
+            engine.state.recent_decisions.is_empty(),
+            "no note without an edit: {:?}",
+            engine.state.recent_decisions
+        );
+
+        // The mission branch rewrites the pack: retire the enforced RFC.
+        // (Worktree isolation is the default, so the primary checkout never
+        // left main — check the branch out explicitly to commit the edit
+        // onto it; the surface itself reads refs, not the checkout.)
+        let run = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap()
+                .status
+                .success());
+        };
+        let branch = engine.state.mission.mission_branch.clone();
+        // `-f`: approve_plan's untracked plan-file twins in the primary are
+        // byte-identical to the branch's tracked copies, so forcing past
+        // them loses nothing.
+        run(&["checkout", "-f", &branch]);
+        std::fs::write(
+            root.join("vendor/pack/standards/RFC-002-slug/rfc.md"),
+            "---\nid: RFC-002\ntitle: zz blocking\nstatus: retired\nowner: zz\n---\nprose\n",
+        )
+        .unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-m", "mission edits its own rules"]);
+        run(&["checkout", "main"]);
+
+        engine
+            .surface_standards_branch_edit()
+            .expect("surface sweep");
+        // IGNORED: the folded pin is byte-identical…
+        assert_eq!(
+            engine.state.mission.standards_manifest.as_ref(),
+            Some(&pinned),
+            "the mission's own pack edit never reshapes its pin"
+        );
+        // …and SURFACED: one advisory decision naming the pack and the pin.
+        let decision = engine
+            .state
+            .recent_decisions
+            .iter()
+            .find(|d| d.contains("standards pack edited"))
+            .expect("the edit is surfaced");
+        assert!(decision.contains("the pin governs"), "{decision}");
+        let events = EventLog::read_events(&engine.paths.events_file()).unwrap();
+        let detail = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::OrchestratorDecision { summary, detail }
+                    if summary.contains("standards pack edited") =>
+                {
+                    detail.clone()
+                }
+                _ => None,
+            })
+            .expect("the decision carries detail");
+        assert!(detail.contains("vendor/pack"), "{detail}");
+        assert!(detail.contains(&pinned.digest), "{detail}");
+    }
+
+    // -----------------------------------------------------------------------
     // Out-of-contract-write sweep (M7 tier 1, feature f-1-2)
     // -----------------------------------------------------------------------
 
@@ -8469,6 +9025,7 @@ pub(crate) mod tests {
                 deny_exceptions: vec![],
                 egress_grants: vec![],
                 executor_route: None,
+                standards_manifest: None,
             },
             runs,
             totals: TokenUsage::default(),
@@ -10310,6 +10867,7 @@ pub(crate) mod tests {
                 considered_alternatives: None,
                 command_grants: vec![],
                 touch_set: vec![],
+                standards_manifest: None,
             })
             .expect("approve plan");
         engine
@@ -13545,6 +14103,7 @@ pub(crate) mod tests {
             considered_alternatives: None,
             command_grants: vec![],
             touch_set: vec![],
+            standards_manifest: None,
         };
 
         engine.approve_plan(plan.clone()).unwrap();

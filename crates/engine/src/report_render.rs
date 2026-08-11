@@ -232,6 +232,14 @@ pub fn render_plan_markdown(
             }
         }
     }
+
+    // Flight Rules (KRZ-342, D-G's plan-review projection): the approved
+    // standards pin — source digest, ids, revisions, effective statuses,
+    // statements, scopes, checker bindings — rendered where the operator
+    // reviews the plan. Absent pin ⇒ byte-identical plan.md.
+    if let Some(pin) = &plan.standards_manifest {
+        let _ = writeln!(md, "\n{}", crate::pack::resolution::render_pin_section(pin));
+    }
     while md.ends_with('\n') {
         md.pop();
     }

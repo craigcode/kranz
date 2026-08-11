@@ -85,6 +85,13 @@ pub struct Mission {
     /// LIVE tier ([`MissionState::executor_tier`]), not this seed-time record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor_route: Option<ExecutorRoute>,
+    /// The Flight Rules standards pin folded from the approved plan
+    /// (`plan.approved` / `plan.revised`; KRZ-342 D-E) — the single source of
+    /// truth every later mission stage resolves against. `None` for missions
+    /// without a standards-configured pack and in every pre-KRZ-342 state
+    /// snapshot; additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standards_manifest: Option<StandardsPin>,
 }
 
 // ---------------------------------------------------------------------------
@@ -111,6 +118,20 @@ pub struct Plan {
     /// allowed to touch.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub touch_set: Vec<String>,
+    /// The Flight Rules standards manifest pinned at approval (ticket
+    /// `flight-rules-resolution-pin`, KRZ-342; design D-E): the
+    /// engine-resolved applicable-rule snapshot — pack identity + digest,
+    /// selection inputs, and every applicable rule's id, revision, effective
+    /// status, statement, scopes, and checker binding. The ENGINE resolves
+    /// and writes it from the trusted source at `approve_plan`; a plan
+    /// carrying a stale or substituted manifest is rejected there. Additive:
+    /// `None` in every pre-KRZ-342 plan and whenever no standards-configured
+    /// pack governs, and `skip_serializing_if` keeps those plans
+    /// byte-identical. Boxed: the pin is a rare, sizable field, and an
+    /// inline `StandardsPin` would push `Plan` past the
+    /// `large_enum_variant` budget on `PlanRequest::Ready`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standards_manifest: Option<Box<StandardsPin>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,6 +146,117 @@ pub struct ConsideredAlternatives {
 pub struct RejectedAlternative {
     pub approach: String,
     pub trade_off: String,
+}
+
+// ---------------------------------------------------------------------------
+// Flight Rules approval pin (KRZ-342, design D-D/D-E)
+// ---------------------------------------------------------------------------
+
+/// Where the pinned standards bytes came from (KRZ-342 D-A/D-E) — the trust
+/// posture approval resolved under, recorded so later stages know whether a
+/// live-base re-read exists at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StandardsPinSource {
+    /// A tracked, repo-relative pack read from the pinned base git tree
+    /// (`pack_dir` is its repo-relative slash path). Enforced rules may be
+    /// active; merge re-reads the LIVE base for the policy-drift check.
+    RepoTracked,
+    /// An external/untracked pack capability-read once at approval: the
+    /// pinned bytes are the only authority (advisory rules only — the loader
+    /// refuses enforced ones), and a later filesystem edit cannot change the
+    /// run. `pack_dir` is informational (the as-configured path).
+    ExternalPinned,
+}
+
+impl StandardsPinSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::RepoTracked => "repo-tracked",
+            Self::ExternalPinned => "external-pinned",
+        }
+    }
+}
+
+/// One rule's approval-pinned snapshot inside [`StandardsPin`] — the consent
+/// surface (D-E): what the operator accepted, verbatim. Strings carry the
+/// pack contract's canonical spellings (`must`/`should`,
+/// `approved`/`enforced`, stage names, the rendered checker binding) so an
+/// old log folds even if the pack vocabulary later grows additively.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PinnedRule {
+    pub id: String,
+    pub revision: u64,
+    /// Parent RFC id (lifecycle grouping; the identity findings join on).
+    pub rfc: String,
+    pub level: String,
+    /// The rule's EFFECTIVE lifecycle at resolution time (`approved` or
+    /// `enforced` — the resolver never pins retired or draft rules).
+    pub effective_status: String,
+    /// The one-line normative statement — the canonical machine/human text.
+    pub statement: String,
+    /// Browsing/reporting labels (D-D: never a selection input). Kept in the
+    /// pin so review and reports render them without a corpus read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domains: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stages: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub when_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_classes: Vec<String>,
+    /// The rendered checker binding (`gate:<id>`, `agent-judgement`,
+    /// `manual-attestation`); pinned so evaluation never re-reads it from a
+    /// moved source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checker: Option<String>,
+    #[serde(default)]
+    pub waivable: bool,
+}
+
+/// The approval-pinned standards manifest (KRZ-342, design D-E), carried on
+/// the plan contract as `standardsManifest`: pack identity + content digest,
+/// the selection inputs resolution ran with, and the applicable rule
+/// snapshots. The engine resolves and writes it at approval from the trusted
+/// source; every later mission stage consumes THIS snapshot — a mission
+/// branch edit or an external pack edit cannot reshape it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StandardsPin {
+    pub pack_name: String,
+    /// The pack directory: the repo-relative slash path for `repo-tracked`
+    /// (merge/final-validation re-reads address it against a git ref), the
+    /// as-configured path for `external-pinned` (display only — external
+    /// pins never re-read it).
+    pub pack_dir: String,
+    /// The normalized `[standards] root` inside the pack.
+    pub standards_root: String,
+    /// Lowercase hex sha256 over the pack's normalized canonical manifest
+    /// text ([`crate::pack::standards::StandardsManifest::digest`]).
+    pub digest: String,
+    pub source: StandardsPinSource,
+    /// The mission task class resolution ran with; `None` when the goal
+    /// carried no class (task-class-scoped rules then never apply).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_class: Option<String>,
+    /// The approved touch-set globs resolution ran against (D-D input 3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub touch_set: Vec<String>,
+    /// The applicable rules (D-D's mission-wide set — the union over the
+    /// four workflow stages), stable-sorted by id.
+    pub rules: Vec<PinnedRule>,
+}
+
+/// One rule reference on a `standards.resolved` event (D-H): the compact,
+/// queryable form of a selection. The full snapshots ride in the plan's
+/// [`StandardsPin`]; the event stays replay-cheap.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StandardsRuleRef {
+    pub id: String,
+    pub revision: u64,
+    pub effective_status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

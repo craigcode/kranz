@@ -308,6 +308,7 @@ fn one_feature_plan() -> Plan {
         considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
+        standards_manifest: None,
     }
 }
 
@@ -1468,6 +1469,7 @@ fn two_milestone_plan() -> Plan {
         considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
+        standards_manifest: None,
     }
 }
 

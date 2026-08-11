@@ -202,6 +202,7 @@ fn simple_plan(features: usize, contract: Vec<Assertion>) -> Plan {
         considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
+        standards_manifest: None,
     }
 }
 
@@ -5227,6 +5228,7 @@ async fn out_of_contract_write_parks_a_touch_grant_and_approve_completes() {
         considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec!["src/**".to_string()],
+        standards_manifest: None,
     };
     let worker = MockScript::single_shot_json(&json!({
         "result": "pass",
@@ -5327,6 +5329,7 @@ async fn out_of_contract_write_touch_grant_denied_flows_to_waive() {
         considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec!["src/**".to_string()],
+        standards_manifest: None,
     };
     let worker = MockScript::single_shot_json(&json!({
         "result": "pass",
@@ -8521,6 +8524,7 @@ async fn approve_revised_plan_rejects_dropping_a_completed_milestone() {
         considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
+        standards_manifest: None,
     };
     engine.approve_plan(plan).unwrap();
 
@@ -8555,6 +8559,7 @@ async fn approve_revised_plan_rejects_dropping_a_completed_milestone() {
         considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
+        standards_manifest: None,
     };
     let err = engine
         .approve_revised_plan(drops_completed)
@@ -8593,6 +8598,7 @@ async fn approve_revised_plan_rejects_dropping_a_completed_milestone() {
         considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
+        standards_manifest: None,
     };
     let err = engine
         .approve_revised_plan(alters_completed)

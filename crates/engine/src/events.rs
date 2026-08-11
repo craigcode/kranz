@@ -906,6 +906,68 @@ pub enum EventKind {
         #[serde(default)]
         version: String,
     },
+
+    /// The Flight Rules resolution record (KRZ-342, design D-D/D-E/D-H):
+    /// emitted at plan approval, immediately after `plan.approved`, when a
+    /// standards-configured pack governed the approval. Records the source
+    /// identity + digest, the selection inputs (stage, task class, touch
+    /// set), the selected rule revisions, and the `plan.approved` seq the
+    /// pin attaches to — the queryable provenance for the consent artifact
+    /// the plan's `standardsManifest` carries in full. `effective-at`
+    /// evaluation is not recorded here: KRZ-341 parses and carries the field
+    /// but deliberately does not evaluate it in this slice.
+    #[serde(rename = "standards.resolved")]
+    StandardsResolved {
+        /// `repo-tracked` or `external-pinned` ([`StandardsPinSource`]).
+        source: String,
+        #[serde(rename = "packName")]
+        pack_name: String,
+        #[serde(rename = "standardsRoot")]
+        standards_root: String,
+        /// sha256 over the pack's normalized canonical manifest text.
+        digest: String,
+        /// The resolution surface: `approval` for the pinning resolution
+        /// (stage-specific projections are KRZ-345's emitters).
+        stage: String,
+        #[serde(rename = "taskClass", default, skip_serializing_if = "Option::is_none")]
+        task_class: Option<String>,
+        #[serde(rename = "touchSet", default, skip_serializing_if = "Vec::is_empty")]
+        touch_set: Vec<String>,
+        /// The selected rules, stable-sorted by id.
+        rules: Vec<StandardsRuleRef>,
+        /// The seq of the `plan.approved` event this resolution pins.
+        #[serde(rename = "approvalSeq")]
+        approval_seq: u64,
+    },
+
+    /// The Flight Rules policy-drift refusal (KRZ-342, design D-E/D-H):
+    /// emitted when merge re-resolves the LIVE base policy against the exact
+    /// scratch integration diff and the applicable ENFORCED set differs from
+    /// the approved pin's — the merge is refused and the mission requires
+    /// explicit revalidation/reapproval. `currentDigest` is `None` when the
+    /// live base no longer yields a readable standards manifest at all (a
+    /// removed or malformed pack — the ultimate drift, failed closed).
+    /// Audit-only in the reducer: the refusal already happened; the event is
+    /// the evidence.
+    #[serde(rename = "standards.drifted")]
+    StandardsDrifted {
+        /// The digest pinned at approval.
+        #[serde(rename = "approvedDigest")]
+        approved_digest: String,
+        /// The digest resolved from the live base, when one resolved.
+        #[serde(
+            rename = "currentDigest",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        current_digest: Option<String>,
+        /// The surface that detected the drift (`merge` in this slice).
+        surface: String,
+        /// Id-level descriptions of the changed applicable enforced rules
+        /// (added / removed / changed), stable-sorted.
+        #[serde(rename = "changedRules")]
+        changed_rules: Vec<String>,
+    },
 }
 
 impl EventKind {
@@ -961,6 +1023,8 @@ impl EventKind {
             EventKind::WorkspaceReadinessReport { .. } => "workspace.readiness",
             EventKind::WorkspaceTeardown { .. } => "workspace.teardown",
             EventKind::WorkspaceProviderPinned { .. } => "workspace.provider.pinned",
+            EventKind::StandardsResolved { .. } => "standards.resolved",
+            EventKind::StandardsDrifted { .. } => "standards.drifted",
         }
     }
 
@@ -984,6 +1048,7 @@ mod tests {
             considered_alternatives: None,
             command_grants: vec![],
             touch_set: vec![],
+            standards_manifest: None,
         }
     }
 

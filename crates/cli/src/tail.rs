@@ -619,6 +619,27 @@ impl EventRenderer {
                     }
                 ),
             ),
+            EventKind::StandardsResolved {
+                pack_name,
+                digest,
+                rules,
+                ..
+            } => (
+                "standards".to_string(),
+                ansi::BLUE,
+                format!(
+                    "resolved: pack {pack_name} · {} rule(s) pinned · sha256:{digest}",
+                    rules.len()
+                ),
+            ),
+            EventKind::StandardsDrifted { changed_rules, .. } => (
+                "standards".to_string(),
+                ansi::RED,
+                format!(
+                    "policy drift: merge refused ({} change(s) to the applicable enforced set)",
+                    changed_rules.len()
+                ),
+            ),
         };
 
         // Budget: "[tag] body" must fit LINE_MAX visible chars.

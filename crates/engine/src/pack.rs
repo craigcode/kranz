@@ -59,6 +59,13 @@ mod toml;
 /// content digest, and the lifecycle transition lint.
 pub mod standards;
 
+/// Flight Rules resolution, approval pinning, and drift refusal (KRZ-342,
+/// design D-D/D-E/D-G): the deterministic applicability predicate over a
+/// loaded corpus, the engine-authored `standardsManifest` plan pin, and the
+/// final-validation/merge drift checks that consume only the pin and the
+/// trusted base.
+pub mod resolution;
+
 use crate::gate::{ArtefactRef, Gate, GateKind, GateOutcome};
 use crate::types::{MissionConfig, Role};
 use std::collections::HashSet;

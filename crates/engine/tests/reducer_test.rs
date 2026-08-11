@@ -66,6 +66,7 @@ fn plan() -> Plan {
         considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
+        standards_manifest: None,
     }
 }
 
@@ -2015,6 +2016,7 @@ fn prop_plan() -> Plan {
         considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
+        standards_manifest: None,
     }
 }
 
@@ -3419,6 +3421,7 @@ fn plan_three_milestones() -> Plan {
         considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
+        standards_manifest: None,
     }
 }
 
@@ -4462,4 +4465,70 @@ fn routing_rules_config_mission_created_fold_derives_executor_route() {
         .expect("the seed-time record survives approval");
     assert_eq!(route.tier, ExecutorTier::Frontier);
     assert_eq!(route.rule, None);
+}
+
+/// Flight Rules (ticket flight-rules-resolution-pin, KRZ-342, design D-E):
+/// the approval pin folds from `plan.approved`, but a revision NEVER re-pins
+/// — no revision flow re-validates a carried manifest against the trusted
+/// source, so folding one would let a re-plan substitute weakened policy
+/// into the consent artifact.
+#[test]
+fn flight_rules_pin_revision_never_folds_a_carried_manifest() {
+    let pin = StandardsPin {
+        pack_name: "zz".to_string(),
+        pack_dir: "vendor/pack".to_string(),
+        standards_root: "standards".to_string(),
+        digest: "ab".repeat(32),
+        source: StandardsPinSource::RepoTracked,
+        task_class: None,
+        touch_set: vec![],
+        rules: vec![PinnedRule {
+            id: "ZZ-MUST-001".to_string(),
+            revision: 1,
+            rfc: "RFC-002".to_string(),
+            level: "must".to_string(),
+            effective_status: "enforced".to_string(),
+            statement: "zz".to_string(),
+            domains: vec![],
+            stages: vec!["merge".to_string()],
+            when_paths: vec![],
+            task_classes: vec![],
+            checker: Some("agent-judgement".to_string()),
+            waivable: false,
+        }],
+    };
+    let mut approved_plan = plan();
+    approved_plan.standards_manifest = Some(Box::new(pin.clone()));
+    // The revision carries a FABRICATED pin (emptied rules, different
+    // digest) — and an extend-only touch set so the revision itself is
+    // otherwise valid.
+    let mut revised = plan();
+    revised.touch_set = vec!["src/**".to_string()];
+    revised.standards_manifest = Some(Box::new(StandardsPin {
+        digest: "cd".repeat(32),
+        rules: vec![],
+        ..pin.clone()
+    }));
+
+    let state = fold_kinds(vec![
+        created(),
+        EventKind::PlanApproved {
+            plan: approved_plan,
+            base_sha: Some("deadbeef".to_string()),
+        },
+        EventKind::PlanRevised {
+            revision: 1,
+            plan: revised,
+        },
+    ]);
+    assert_eq!(
+        state.mission.standards_manifest,
+        Some(pin),
+        "the approval-time pin stands for the mission's life"
+    );
+    assert_eq!(
+        state.mission.touch_set,
+        vec!["src/**".to_string()],
+        "the revision's other fields still fold"
+    );
 }

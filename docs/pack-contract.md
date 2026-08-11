@@ -221,6 +221,47 @@ unaffected.
   `packDir` first and takes exactly the pre-pack code path when it is
   absent (regression-tested).
 
+## Flight Rules resolution and approval pinning (KRZ-342)
+
+When a schema-4 pack governs, the ENGINE — never a model — resolves the
+applicable rules deterministically (design D-D): a rule applies when the
+stage is in its `stages`, its `task-classes` is absent or contains the
+mission's task class (routing normalization), and its `when-paths` is
+absent or overlaps the selection's paths. Domains are browsing labels and
+never select. `retired` rules never apply; `draft` rules apply only on
+lint/authoring surfaces.
+
+- **Approval pins the manifest** (D-E): `approve_plan` reloads the trusted
+  source — tracked base blobs via `standards::load_at_ref` for a
+  repo-relative `packDir` (a mission-branch or worktree edit is invisible
+  to it), one capability read for an external pack — and writes the
+  applicable set into the plan's additive `standardsManifest` (pack
+  identity, digest, selection inputs, and every rule's id, revision,
+  effective status, statement, scopes, and checker binding) before any
+  branch/commit side effect. A plan carrying a stale or substituted
+  manifest is rejected naming both digests; an untracked repo-relative
+  corpus or an external pack with effectively enforced rules refuses
+  approval. `plan.md` renders the pin for review, and a
+  `standards.resolved` event records the selection against the
+  `plan.approved` seq.
+- **The pin, not a later read, governs the mission**: a mission-branch
+  pack edit is ignored and surfaced via an advisory `orchestrator.decision`
+  (the routing-rules ownership idiom); an external pack edit after
+  approval cannot change a run. A plan revision never re-pins.
+- **Final validation re-checks the envelope**: the approval-pinned base
+  snapshot is re-resolved against the mission's actual deliverable paths;
+  a newly applicable enforced rule (a widened touch-set grant, an
+  out-of-contract write) parks the mission for revision/reapproval.
+- **Merge refuses policy drift**: the merge re-resolves the LIVE base
+  policy against the exact scratch integration diff and, when the
+  applicable enforced set differs from the approved pin's, refuses with
+  `standards.drifted` (approved/current digests plus the changed rules)
+  before the gate suite runs — the mission needs explicit
+  revalidation/reapproval, never a silent re-judgement under moved policy.
+
+Stage projections into planner/worker/validator prompts, rule-linked
+findings, waivers, and checker execution are the KRZ-343–346 slices.
+
 ## Deliberately not in this slice
 
 - **Model-judged pack gates** — refused at load; the engine owns
@@ -232,8 +273,10 @@ unaffected.
   means the slices that consume them need no schema rework.
 - **Approval-time pack gates** — pack gates join the final-gate evaluation
   only; the approval surface keeps the engine floor alone.
-- **Standards resolution, approval pinning, and enforcement** — KRZ-341
-  lands the schema-4 corpus contract, loader, digest, and lifecycle lint
-  only. Deterministic applicability resolution, the approved mission
-  manifest, drift refusal, stage projections, and checker execution are
-  the KRZ-342–346 slices (docs/scoping/flight-rules-engineering-standards.md).
+- **Standards stage projections, findings, waivers, and enforcement** —
+  KRZ-341 lands the schema-4 corpus contract, loader, digest, and
+  lifecycle lint; KRZ-342 (above) lands deterministic resolution, the
+  approval manifest pin, and drift refusal. Stage projections
+  (D-G prompt surfaces), rule-linked findings and waiver decisions, and
+  checker execution/blocking are the KRZ-343–346 slices
+  (docs/scoping/flight-rules-engineering-standards.md).

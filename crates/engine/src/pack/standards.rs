@@ -190,7 +190,11 @@ pub enum RuleStage {
 }
 
 impl RuleStage {
-    fn parse(raw: &str) -> Option<Self> {
+    /// Parse the canonical stage spelling (`planning`, `implementation`,
+    /// `validation`, `merge`). `pub(crate)` for the KRZ-342 resolver, which
+    /// re-resolves pinned rules whose stages ride the plan contract as
+    /// strings.
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
         match raw {
             "planning" => Some(Self::Planning),
             "implementation" => Some(Self::Implementation),

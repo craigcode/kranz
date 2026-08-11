@@ -82,6 +82,10 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
                 .collect();
             state.mission.command_grants = plan.command_grants.clone();
             state.mission.touch_set = plan.touch_set.clone();
+            // The Flight Rules approval pin (KRZ-342 D-E) folds with the plan
+            // it was approved with — the mission's standards authority from
+            // here on.
+            state.mission.standards_manifest = plan.standards_manifest.as_deref().cloned();
             state.mission.status = MissionStatus::Approved;
             state.latest_plan_revision = 0;
             state.pending_revision = None;
@@ -739,6 +743,13 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
                 version: version.clone(),
             });
         }
+
+        EventKind::StandardsResolved { .. } | EventKind::StandardsDrifted { .. } => {
+            // Audit-only (KRZ-342 D-H): the pin itself folds with
+            // plan.approved / plan.revised; these events are the queryable
+            // provenance and refusal evidence. State shape intentionally
+            // does not grow.
+        }
     }
 
     state.last_seq = event.seq;
@@ -776,6 +787,7 @@ fn initial_state(event: &Event) -> Result<MissionState> {
             touch_set: Vec::new(),
             deny_exceptions: Vec::new(),
             egress_grants: Vec::new(),
+            standards_manifest: None,
             // The seed-time route record (ticket routing-rules-config): the
             // folded task class exists only on THIS event's goal, so the
             // decision is derived here, once — deterministically equal to
@@ -908,6 +920,13 @@ fn apply_revised_plan(state: &mut MissionState, plan: &Plan, revision: u32) -> R
     state.mission.validation_contract = plan.validation_contract.clone();
     state.mission.command_grants = plan.command_grants.clone();
     state.mission.touch_set = plan.touch_set.clone();
+    // The Flight Rules pin (KRZ-342 D-E) is NEVER re-read from a revision:
+    // the planner never authors policy, and no revision flow re-validates a
+    // carried manifest against the trusted source — folding one would let a
+    // re-plan substitute weakened policy into the consent artifact. The
+    // approval-time pin stands for the mission's life; an envelope escape is
+    // caught by the final-validation check (which re-resolves the pinned
+    // base snapshot against actual paths) and by the merge drift check.
     state.mission.milestones = revised_milestones;
     Ok(())
 }
