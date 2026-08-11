@@ -2,7 +2,8 @@
 title: Revive Gas City integration for a demo
 priority: 1
 schedule: once
-state: open
+state: done
+state-note: Event-driven dispatch and mission event emits landed; gc lint and stub tests pass. Live-city validation remains human-gated.
 ---
 
 ## Goal
