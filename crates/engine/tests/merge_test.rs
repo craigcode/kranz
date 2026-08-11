@@ -153,10 +153,18 @@ fn missing_gate_config_fails_closed_without_running_or_merging() {
     seed_mission_branch(&dir, &repo, &seed, "src/lib.rs", "fn a() {}\n");
 
     let calls = std::cell::RefCell::new(Vec::new());
-    let report = merge_mission(&repo, "main", &seed, "kranz/mission-x", None, |cmd, _| {
-        calls.borrow_mut().push(cmd.to_string());
-        (true, String::new())
-    })
+    let report = merge_mission(
+        &repo,
+        "main",
+        &seed,
+        "kranz/mission-x",
+        None,
+        None,
+        |cmd, _| {
+            calls.borrow_mut().push(cmd.to_string());
+            (true, String::new())
+        },
+    )
     .unwrap();
 
     assert!(matches!(report, MergeReport::GateConfigInvalid { .. }));
@@ -181,10 +189,18 @@ fn gate_config_is_read_from_base_not_the_mission_branch() {
     );
 
     let calls = std::cell::RefCell::new(Vec::new());
-    let report = merge_mission(&repo, "main", &seed, "kranz/mission-x", None, |cmd, _| {
-        calls.borrow_mut().push(cmd.to_string());
-        (true, String::new())
-    })
+    let report = merge_mission(
+        &repo,
+        "main",
+        &seed,
+        "kranz/mission-x",
+        None,
+        None,
+        |cmd, _| {
+            calls.borrow_mut().push(cmd.to_string());
+            (true, String::new())
+        },
+    )
     .unwrap();
 
     assert!(matches!(report, MergeReport::Merged { .. }));
@@ -221,10 +237,18 @@ fn gate_config_is_read_from_base_even_with_the_mission_branch_checked_out() {
     );
 
     let calls = std::cell::RefCell::new(Vec::new());
-    let report = merge_mission(&repo, "main", &seed, "kranz/mission-x", None, |cmd, _| {
-        calls.borrow_mut().push(cmd.to_string());
-        (true, String::new())
-    })
+    let report = merge_mission(
+        &repo,
+        "main",
+        &seed,
+        "kranz/mission-x",
+        None,
+        None,
+        |cmd, _| {
+            calls.borrow_mut().push(cmd.to_string());
+            (true, String::new())
+        },
+    )
     .unwrap();
 
     match report {
@@ -293,6 +317,7 @@ fn dirty_tracked_tree_is_refused_without_running_gates_or_touching_base() {
         &seed,
         "kranz/mission-x",
         None,
+        None,
         |cmd, _cwd| {
             gate_calls.borrow_mut().push(cmd.to_string());
             (true, String::new())
@@ -323,6 +348,7 @@ fn passing_gates_produce_a_no_ff_merge_commit_with_two_parents() {
         "main",
         &seed,
         "kranz/mission-x",
+        None,
         None,
         passing_executor,
     )
@@ -366,6 +392,7 @@ fn merge_commit_carries_parseable_kranz_trailers() {
         &seed,
         "kranz/mission-x",
         Some(trailer_metadata()),
+        None,
         passing_executor,
     )
     .unwrap();
@@ -411,6 +438,7 @@ fn stale_base_warning_counts_sibling_merges_since_mission_base() {
         &seed,
         "kranz/mission-x",
         None,
+        None,
         passing_executor,
     )
     .unwrap();
@@ -441,6 +469,7 @@ fn a_failing_gate_stops_before_the_merge_and_leaves_base_unchanged() {
         "main",
         &seed,
         "kranz/mission-x",
+        None,
         None,
         |cmd, _cwd| {
             if cmd == "cargo fmt --all --check" {
@@ -479,6 +508,7 @@ fn secret_scan_failure_stops_before_gates_and_leaves_base_unchanged() {
         "main",
         &seed,
         "kranz/mission-x",
+        None,
         None,
         |cmd, _cwd| {
             gate_calls.borrow_mut().push(cmd.to_string());
@@ -532,6 +562,7 @@ fn mission_authored_secret_fingerprint_waiver_is_rejected() {
         &seed,
         "kranz/mission-x",
         None,
+        None,
         passing_executor,
     )
     .unwrap();
@@ -568,6 +599,7 @@ fn base_owned_secret_fingerprint_waiver_allows_merge() {
         &seed,
         "kranz/mission-x",
         None,
+        None,
         passing_executor,
     )
     .unwrap();
@@ -598,6 +630,7 @@ fn gates_run_against_the_integrated_mission_tree_not_the_primary_checkout() {
         "main",
         &seed,
         "kranz/mission-x",
+        None,
         None,
         |_cmd, cwd| {
             let mission_content = std::fs::read_to_string(cwd.join("mission-only.txt")).ok();
@@ -639,6 +672,7 @@ fn gate_that_mutates_tracked_files_is_refused() {
         &seed,
         "kranz/mission-x",
         None,
+        None,
         |_cmd, cwd| {
             std::fs::write(cwd.join("mission-only.txt"), "gate-mutated content\n").unwrap();
             (true, String::new())
@@ -677,6 +711,7 @@ fn gate_cannot_hide_a_tracked_mutation_with_index_flags() {
         &seed,
         "kranz/mission-x",
         None,
+        None,
         |_cmd, cwd| {
             raw_git(
                 cwd,
@@ -712,6 +747,7 @@ fn gate_that_mutates_the_primary_checkout_is_refused() {
         &seed,
         "kranz/mission-x",
         None,
+        None,
         |_cmd, _cwd| {
             std::fs::write(
                 dir.path().join("README.md"),
@@ -746,6 +782,7 @@ fn gate_that_moves_head_is_refused() {
         "main",
         &seed,
         "kranz/mission-x",
+        None,
         None,
         |_cmd, cwd| {
             raw_git(cwd, &["commit", "--allow-empty", "-m", "gate moved head"]);
@@ -783,6 +820,7 @@ fn mission_branch_movement_after_integration_does_not_change_what_lands() {
         "main",
         &seed,
         "kranz/mission-x",
+        None,
         None,
         |_cmd, cwd| {
             let saw_pinned_content = cwd.join("pinned.txt").is_file();
@@ -824,6 +862,7 @@ fn base_movement_while_gates_run_is_refused_and_the_moved_tip_survives() {
         "main",
         &seed,
         "kranz/mission-x",
+        None,
         None,
         |_cmd, _cwd| {
             raw_git(
@@ -899,6 +938,7 @@ fn planted_git_hooks_do_not_run_during_the_merge_flow() {
         &seed,
         "kranz/mission-x",
         None,
+        None,
         passing_executor,
     )
     .unwrap();
@@ -956,6 +996,7 @@ fn no_merge_mission_outcome_ever_pushes() {
         "main",
         &seed,
         "kranz/mission-x",
+        None,
         None,
         passing_executor,
     )
@@ -1019,6 +1060,7 @@ fn preview_twin_byte_identical_untracked_files_let_merge_land_cleanly() {
         &seed,
         "kranz/mission-x",
         None,
+        None,
         passing_executor,
     )
     .unwrap();
@@ -1064,6 +1106,7 @@ fn preview_twin_divergent_untracked_file_blocks_merge_without_abort_wrapper() {
         &seed,
         "kranz/mission-x",
         None,
+        None,
         passing_executor,
     )
     .unwrap();
@@ -1089,4 +1132,174 @@ fn preview_twin_divergent_untracked_file_blocks_merge_without_abort_wrapper() {
         divergent_report
     );
     assert_eq!(repo.head_sha().unwrap(), seed, "base tip must be unchanged");
+}
+
+// ---------------------------------------------------------------------------
+// Flight Rules merge-time policy drift (ticket flight-rules-resolution-pin,
+// KRZ-342, design D-E): merge re-resolves the LIVE base standards policy
+// against the exact scratch integration diff and refuses when the applicable
+// ENFORCED set differs from the mission's approved pin.
+// ---------------------------------------------------------------------------
+
+/// A schema-4 pack vendored at `vendor/pack`: RFC-001 (approved) holding an
+/// unscoped advisory should rule; RFC-002 with the parametrized status
+/// holding a `crates/`-scoped must rule bound to a declared pack gate.
+fn write_standards_pack(dir: &TempDir, rfc2_status: &str) {
+    write(
+        dir,
+        "vendor/pack/pack.toml",
+        "[pack]\nname = \"zz-merge-pack\"\nschema = 4\n\n[standards]\nroot = \"standards\"\n\n\
+         [[gate]]\nname = \"zz-gate\"\ncommand = \"cd .\"\n",
+    );
+    write(
+        dir,
+        "vendor/pack/standards/RFC-001-slug/rfc.md",
+        "---\nid: RFC-001\ntitle: zz advisory\nstatus: approved\nowner: zz\n---\nprose\n",
+    );
+    write(
+        dir,
+        "vendor/pack/standards/RFC-001-slug/rules/ZZ-ADV-001.md",
+        "---\nid: ZZ-ADV-001\nrevision: 1\nrfc: RFC-001\nlevel: should\nstatus: active\n\
+         statement: zz advisory statement.\ndomains: [zz]\n\
+         stages: [planning, implementation, validation, merge]\nchecker: agent-judgement\n---\nprose\n",
+    );
+    write(
+        dir,
+        "vendor/pack/standards/RFC-002-slug/rfc.md",
+        &format!(
+            "---\nid: RFC-002\ntitle: zz blocking\nstatus: {rfc2_status}\nowner: zz\n---\nprose\n"
+        ),
+    );
+    write(
+        dir,
+        "vendor/pack/standards/RFC-002-slug/rules/ZZ-MUST-001.md",
+        "---\nid: ZZ-MUST-001\nrevision: 1\nrfc: RFC-002\nlevel: must\nstatus: active\n\
+         statement: zz blocking statement.\ndomains: [zz]\n\
+         stages: [implementation, validation, merge]\nwhen-paths: [crates/]\n\
+         checker: gate:zz-gate\nwaivable: false\n---\nprose\n",
+    );
+}
+
+/// The approval pin a mission over this fixture would carry: resolved from
+/// the trusted base, never the worktree (the production path is
+/// `approve_plan`; here the resolver is called directly to keep the merge
+/// test free of an engine).
+fn approve_fixture_pin(repo: &GitRepo, root: &Path) -> kranz_engine::types::StandardsPin {
+    let cfg = kranz_engine::types::MissionConfig {
+        pack_dir: Some("vendor/pack".to_string()),
+        ..kranz_engine::types::MissionConfig::default()
+    };
+    kranz_engine::pack::resolution::approval_pin(
+        repo,
+        &cfg,
+        root,
+        "main",
+        None,
+        None,
+        &["crates/**".to_string()],
+    )
+    .expect("pin resolves")
+    .expect("standards govern this fixture")
+}
+
+#[test]
+fn flight_rules_pin_merge_mission_refuses_on_enforced_policy_drift() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, _seed) = seeded_repo();
+    write_standards_pack(&dir, "approved");
+    let pack_base = repo
+        .add_all_and_commit("vendor the standards pack")
+        .unwrap();
+    seed_mission_branch(
+        &dir,
+        &repo,
+        &pack_base,
+        "crates/engine/src/lib.rs",
+        "pub fn x() {}\n",
+    );
+    let pin = approve_fixture_pin(&repo, dir.path());
+
+    // The live base promotes RFC-002 to enforced AFTER the mission was
+    // approved — the applicable enforced set over the integration diff
+    // (crates/** admits crates/engine/src/lib.rs) gains ZZ-MUST-001.
+    write_standards_pack(&dir, "enforced");
+    let moved_base = repo
+        .add_all_and_commit("promote RFC-002 to enforced")
+        .unwrap();
+
+    let report = merge_mission(
+        &repo,
+        "main",
+        &pack_base,
+        "kranz/mission-x",
+        None,
+        Some(&pin),
+        passing_executor,
+    )
+    .unwrap();
+    match report {
+        MergeReport::StandardsDrifted {
+            approved_digest,
+            current_digest,
+            changed_rules,
+        } => {
+            assert_eq!(approved_digest, pin.digest);
+            assert!(current_digest.is_some());
+            assert!(
+                changed_rules
+                    .iter()
+                    .any(|line| line.contains("ZZ-MUST-001") && line.contains("newly applicable")),
+                "{changed_rules:?}"
+            );
+        }
+        other => panic!("expected StandardsDrifted, got {other:?}"),
+    }
+    assert_eq!(
+        repo.head_sha().unwrap(),
+        moved_base,
+        "a drifted merge leaves the base untouched"
+    );
+}
+
+#[test]
+fn flight_rules_pin_merge_mission_unchanged_policy_merges_clean() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, _seed) = seeded_repo();
+    write_standards_pack(&dir, "enforced");
+    let pack_base = repo
+        .add_all_and_commit("vendor the standards pack")
+        .unwrap();
+    seed_mission_branch(
+        &dir,
+        &repo,
+        &pack_base,
+        "crates/engine/src/lib.rs",
+        "pub fn x() {}\n",
+    );
+    let pin = approve_fixture_pin(&repo, dir.path());
+    assert!(
+        pin.rules.iter().any(|r| r.effective_status == "enforced"),
+        "fixture: the pin carries the enforced rule"
+    );
+
+    // The base never moved: the same pin must not false-positive — both
+    // sides resolve with the same inputs, so the sets are identical.
+    let report = merge_mission(
+        &repo,
+        "main",
+        &pack_base,
+        "kranz/mission-x",
+        None,
+        Some(&pin),
+        passing_executor,
+    )
+    .unwrap();
+    assert!(
+        matches!(report, MergeReport::Merged { .. }),
+        "an unchanged base policy merges clean: {report:?}"
+    );
 }

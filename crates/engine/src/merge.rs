@@ -57,6 +57,21 @@ pub enum MergeReport {
         /// Git's verbatim refusal text.
         detail: String,
     },
+    /// The live base's applicable ENFORCED Flight Rules set differs from the
+    /// mission's approved pin (KRZ-342, design D-E): policy moved under the
+    /// mission. The merge is refused before the gate suite runs — neither
+    /// grandfather-skipping current policy nor silently applying new policy
+    /// to an old consent artifact — and the caller records
+    /// `standards.drifted`. Base is untouched.
+    StandardsDrifted {
+        /// The digest pinned at approval.
+        approved_digest: String,
+        /// The digest resolved from the live base (`None`: the live base no
+        /// longer yields a readable standards manifest at all).
+        current_digest: Option<String>,
+        /// Id-level change lines for the applicable enforced set.
+        changed_rules: Vec<String>,
+    },
     /// The mission branch merged cleanly into base with a `--no-ff` commit.
     Merged {
         /// The new merge commit sha, now the tip of `base_branch`.
@@ -82,12 +97,20 @@ pub struct StaleBaseWarning {
 /// tests inject a scripted fake). This function never calls
 /// [`GitRepo::push_mission_branch`] or any push — the base branch is only
 /// ever advanced locally.
+///
+/// `standards_pin` is the mission's approved Flight Rules manifest pin
+/// (KRZ-342, design D-E), folded from its event log: `None` keeps the merge
+/// byte-identical. With a repo-tracked pin, the LIVE base policy is
+/// re-resolved against the exact scratch integration diff once the
+/// integration commit exists and BEFORE the gate suite runs — an applicable
+/// enforced-set difference refuses with [`MergeReport::StandardsDrifted`].
 pub fn merge_mission<F>(
     repo: &GitRepo,
     base_branch: &str,
     base_sha: &str,
     mission_branch: &str,
     metadata: Option<KranzCommitMetadata>,
+    standards_pin: Option<&crate::types::StandardsPin>,
     executor: F,
 ) -> Result<MergeReport>
 where
@@ -171,6 +194,27 @@ where
         MergeOutcome::Clean => {}
     }
     let tested_commit = scratch.head_sha()?;
+
+    // Flight Rules policy-drift check (KRZ-342, design D-E): re-resolve the
+    // LIVE base standards policy against the exact scratch integration diff
+    // (live_base..tested_commit — what this merge would add to the base) and
+    // compare the applicable ENFORCED set against the approved pin's. A
+    // difference refuses BEFORE the gate suite: the mission needs explicit
+    // revalidation/reapproval, not a green gate run under policy the
+    // operator never consented to. `None` pin ⇒ skip, byte-identical.
+    if let Some(pin) = standards_pin {
+        let integration_paths = repo.changed_paths(&live_base_sha, &tested_commit)?;
+        if let Some(drift) =
+            crate::pack::resolution::merge_drift(repo, &live_base_sha, pin, &integration_paths)
+                .map_err(crate::error::EngineError::Git)?
+        {
+            return Ok(MergeReport::StandardsDrifted {
+                approved_digest: drift.approved_digest,
+                current_digest: drift.current_digest,
+                changed_rules: drift.changed_rules,
+            });
+        }
+    }
 
     // The suite runs through the first-class gate interface (gate.rs) —
     // behavior is unchanged: same commands, same declared order, stop at
