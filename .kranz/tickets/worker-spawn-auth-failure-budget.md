@@ -2,6 +2,8 @@
 title: Instant worker CLI auth-death must not burn the respawn budget
 priority: 2
 schedule: once
+state: done
+state-note: Fixed — spawn_auth_death classifier parks the milestone (backend unauthenticated) instead of consuming the respawn budget; feature stays Active and re-runs on re-auth.
 ---
 
 ## Goal

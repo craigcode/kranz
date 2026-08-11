@@ -2,6 +2,8 @@
 title: Derive contract/gate toolchain HOME from the OS account, not the ambient env
 priority: 2
 schedule: once
+state: done
+state-note: Fixed — toolchain_var_value resolves the operator home via getpwuid_r (OS account record) with HOME as fallback; toolchain env vars remain the explicit override; agent session envs unchanged.
 ---
 
 ## Goal
