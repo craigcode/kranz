@@ -1434,6 +1434,35 @@ mod tests {
         assert_eq!(std::fs::read_dir(&seeded).unwrap().count(), 0);
     }
 
+    /// A spec carrying no relocated HOME (the validator/orchestrator shape)
+    /// spawns into a freshly seeded scratch HOME: the `.cursor` minimal set
+    /// crosses, and the child env's HOME points at it.
+    #[test]
+    fn cursor_child_env_without_relocated_home_seeds_cursor_config() {
+        let real_home = tempfile::tempdir().unwrap();
+        let cursor = real_home.path().join(".cursor");
+        std::fs::create_dir_all(&cursor).unwrap();
+        std::fs::write(cursor.join("cli-config.json"), "{}").unwrap();
+        std::fs::write(cursor.join("agent-cli-state.json"), "{}").unwrap();
+
+        let _home_guard =
+            crate::agent_env::EnvTestGuard::engage(&[("HOME", real_home.path().to_str().unwrap())]);
+        let session_spec = spec(Path::new("."), false);
+
+        let env = cursor_child_env(&session_spec);
+
+        let home = env.get("HOME").expect("child env carries HOME");
+        let seeded = Path::new(home).join(".cursor");
+        assert!(
+            seeded.join("cli-config.json").is_file(),
+            "validator-path HOME must carry the seeded cli-config.json"
+        );
+        assert!(
+            seeded.join("agent-cli-state.json").is_file(),
+            "validator-path HOME must carry the seeded agent-cli-state.json"
+        );
+    }
+
     /// Run `security` pinned to a session HOME, capturing status+output.
     /// Passing the passphrase via argv is fine in tests — the secret is a
     /// throwaway and the point under test is its value, not the transport.
