@@ -12,7 +12,11 @@ For spike-era lessons, see [gascity.md](gascity.md).
 
 The `packaging/gascity/` pack now:
 
-- Dispatches on `bead.created` events instead of polling every 5 minutes.
+- Dispatches instantly on `bead.created` events instead of polling every 5
+  minutes, with a 15-minute cooldown backstop order
+  (`kranz-dispatch-backstop`) that reclaims dead claims in a quiet city and
+  picks up beads re-readied after a reopen/refine (which fire `bead.updated`,
+  not `bead.created`).
 - Emits `kranz.mission.started`, `kranz.mission.complete`, and
   `kranz.mission.blocked` City events from `kranz-run-bead`.
 - Keeps the existing exit-code contract, lease/reclaim logic, and scrutiny
@@ -54,7 +58,13 @@ cat >> pack.toml <<'EOF'
 [imports.kranz]
 source = "/path/to/kranz/repo/packaging/gascity"
 EOF
+# Actually install the import (check only VALIDATES; it exits 0 even when the
+# import has issues, so a green check alone is NOT proof the pack is wired in).
+gc import install
 gc import check            # resolves the path import; must print OK
+# Confirm the pack's order and agent actually landed:
+gc order list              # expect kranz-dispatch AND kranz-dispatch-backstop
+gc agent list              # expect: kranz.kranz-worker
 
 # 3. Register the rig the worker will run missions in.
 #    Multi-rig cities: dispatch routes bead -> rig by the bead id prefix via
@@ -70,15 +80,19 @@ gc start /tmp/kranz-demo-city
 # 5. Confirm the kranz worker agent and the event order are live.
 gc agent list              # expect: kranz.kranz-worker  active
 gc order list              # expect: kranz-dispatch  exec  event  bead.created
+                           #     and: kranz-dispatch-backstop  exec  cooldown  15m
 gc status                  # kranz-worker should appear as a long-running agent
 ```
 
 If the supervisor does not start the worker itself, run it manually as a
-fallback (the supervisor's health patrol won't restart it in that case):
+fallback (the supervisor's health patrol won't restart it in that case). The
+worker needs the pack's `bin/` on PATH (for `kranz-run-bead` and
+`kranz-dispatch`) alongside `kranz`, `gc`, `bd`, and `jq`:
 
 ```bash
 export GC_CITY=/tmp/kranz-demo-city
 export KRANZ_RIG_DIR=/path/to/rig
+export PATH="/path/to/kranz/repo/packaging/gascity/bin:$PATH"
 kranz-city-worker &
 WORKER_PID=$!
 ```
@@ -130,6 +144,13 @@ Know the exit-code contract before demoing failures — it is not symmetric:
   "make it better" takes this path, *not* the blocked path — it is the
   brief-refusal outcome, not an escalation.
 - **exit 1/other → reopened** (mission failed; retry or refine).
+
+A reopened bead becomes `ready` again, so the 15-minute backstop order will
+re-dispatch it on its next tick (there is no instant re-dispatch on reopen —
+that gap is deliberate, it is the human's window to refine an underspecified
+brief before the retry). To stop an underspecified bead from retry-looping on
+the backstop cadence, refine it or close it; to re-dispatch immediately, run
+`gc order run kranz-dispatch`.
 
 So do not promise the room that an ambiguous brief will "escalate to a
 human" — it will come back as `open` with a refine-this-brief comment. If you
