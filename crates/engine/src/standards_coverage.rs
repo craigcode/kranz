@@ -393,8 +393,25 @@ pub fn standards_coverage(mission_id: &str, events: &[Event]) -> Option<Standard
         let waived_finding = evidence
             .iter()
             .any(|entry| entry.event == "validation.finding" && entry.bearing == "waived");
+        let latest_pass = evidence
+            .iter()
+            .filter(|entry| entry.bearing == "pass")
+            .map(|entry| entry.seq)
+            .max();
+        let latest_failure = evidence
+            .iter()
+            .filter(|entry| entry.bearing == "fail")
+            .map(|entry| entry.seq)
+            .max();
         let mode = crate::standards_enforcement::rule_mode(pinned);
-        let disposition = if unwaived_finding_failure
+        let disposition = if latest_pass
+            .is_some_and(|pass| latest_failure.is_none_or(|failure| pass > failure))
+        {
+            // Coverage keeps the full history below, but disposition is the
+            // latest checker state. A repaired rule that later passes must
+            // not remain failed forever or offer an obsolete waiver action.
+            RuleDisposition::Passed
+        } else if unwaived_finding_failure
             || (gate_failure
                 // A standards gate event and its cited finding are two
                 // evidence views of ONE checker failure. An exact D-I waiver
@@ -928,6 +945,47 @@ mod tests {
         ];
         let coverage = standards_coverage("m-1", &events).expect("a pin folds");
         assert_eq!(coverage.rules[0].disposition, RuleDisposition::Advisory);
+    }
+
+    #[test]
+    fn flight_rules_dashboard_latest_pass_supersedes_historical_failure() {
+        let rule = pinned_rule("ZZ-REPAIRED-001", 1, "enforced", "must");
+        let events = vec![
+            ev(
+                1,
+                EventKind::PlanApproved {
+                    plan: plan_with_pin(vec![rule]),
+                    base_sha: Some("deadbeef".to_string()),
+                },
+            ),
+            ev(
+                2,
+                EventKind::ValidationFinding {
+                    milestone_id: "ms-1".to_string(),
+                    run_id: crate::reducer::ENGINE_RUN_ID.to_string(),
+                    finding: finding_with_rule(
+                        "flight-rule:ZZ-REPAIRED-001",
+                        Some(citation("ZZ-REPAIRED-001", 1, &"ab".repeat(32), "enforced")),
+                    ),
+                },
+            ),
+            ev(
+                3,
+                gate_result(
+                    "zz-gate",
+                    GateVerdict::Pass,
+                    "inline:passed after repair",
+                    vec!["ZZ-REPAIRED-001".to_string()],
+                ),
+            ),
+        ];
+        let coverage = standards_coverage("m-1", &events).expect("a pin folds");
+        assert_eq!(coverage.rules[0].disposition, RuleDisposition::Passed);
+        assert_eq!(
+            coverage.rules[0].evidence.len(),
+            2,
+            "history remains visible"
+        );
     }
 
     // ---- additive contract fields (D-H) -----------------------------------

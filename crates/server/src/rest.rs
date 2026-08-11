@@ -22,7 +22,7 @@ use kranz_engine::types::{
     ControlCommand, MissionState, MissionStatus, RoleConfig, SandboxEnforce, WorkerIsolation,
 };
 use kranz_engine::{config, control};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::ErrorKind;
@@ -178,6 +178,154 @@ pub(crate) async fn mission_state(
     }
     let events = EventLog::read_events(&events_path)?;
     Ok(Json(reducer::fold(&events)?))
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StandardsWaiverCandidate {
+    rule: kranz_engine::types::PinnedRule,
+    finding_subject: String,
+    finding_evidence: String,
+    run_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MissionStandardsView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manifest: Option<kranz_engine::types::StandardsPin>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coverage: Option<kranz_engine::standards_coverage::StandardsCoverage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    waiver_candidates: Vec<StandardsWaiverCandidate>,
+}
+
+fn fold_standards_view(
+    id: &str,
+    events: &[Event],
+) -> kranz_engine::error::Result<MissionStandardsView> {
+    let state = reducer::fold(events)?;
+    let manifest = state.mission.standards_manifest.clone();
+    let coverage = kranz_engine::standards_coverage::standards_coverage(id, events);
+    let mut waiver_candidates = Vec::new();
+    if let (Some(pin), Some(coverage)) = (manifest.as_ref(), coverage.as_ref()) {
+        for row in coverage.rules.iter().filter(|row| {
+            row.disposition == kranz_engine::standards_coverage::RuleDisposition::Failed
+        }) {
+            let Some(rule) = pin
+                .rules
+                .iter()
+                .find(|rule| rule.id == row.id && rule.revision == row.revision && rule.waivable)
+            else {
+                continue;
+            };
+            if let Some((finding_subject, finding_evidence, run_id)) = events
+                .iter()
+                .filter(|event| event.mission_id == id)
+                .rev()
+                .find_map(|event| match &event.kind {
+                    EventKind::ValidationFinding {
+                        finding, run_id, ..
+                    } if finding.rule.as_ref().is_some_and(|citation| {
+                        citation.id == rule.id
+                            && citation.revision == rule.revision
+                            && citation.digest == pin.digest
+                    }) =>
+                    {
+                        Some((
+                            finding.subject.clone(),
+                            finding.evidence.clone(),
+                            run_id.clone(),
+                        ))
+                    }
+                    _ => None,
+                })
+            {
+                waiver_candidates.push(StandardsWaiverCandidate {
+                    rule: rule.clone(),
+                    finding_subject,
+                    finding_evidence,
+                    run_id,
+                });
+            }
+        }
+    }
+    Ok(MissionStandardsView {
+        manifest,
+        coverage,
+        waiver_candidates,
+    })
+}
+
+/// Typed Flight Rules read model. No configured standards is represented by
+/// `{}` so old missions add no empty warning surface.
+pub(crate) async fn mission_standards(
+    State(server): State<Arc<ServerState>>,
+    UrlPath(id): UrlPath<String>,
+) -> Result<Json<MissionStandardsView>, ApiError> {
+    let paths = mission_paths(&server, &id)?;
+    if !paths.events_file().is_file() {
+        return Err(unknown_mission(&id));
+    }
+    let events = EventLog::read_events(&paths.events_file())?;
+    Ok(Json(fold_standards_view(&id, &events)?))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StandardsWaiverBody {
+    rule_id: String,
+    #[serde(default)]
+    revision: Option<u64>,
+    #[serde(default)]
+    finding_subject: Option<String>,
+    reason: String,
+    expires_at: String,
+}
+
+/// Authenticated REST twin of `kranz standards waive`. It intentionally
+/// refuses while the mission engine holds the append lock; the UI keeps the
+/// evidence visible and tells the operator to pause/stop before retrying.
+pub(crate) async fn post_standards_waiver(
+    State(server): State<Arc<ServerState>>,
+    UrlPath(id): UrlPath<String>,
+    Json(body): Json<StandardsWaiverBody>,
+) -> Result<Json<Value>, ApiError> {
+    mission_paths(&server, &id)?;
+    let expires_at = chrono::DateTime::parse_from_rfc3339(&body.expires_at)
+        .map_err(|error| ApiError::bad_request(format!("expiresAt must be RFC 3339: {error}")))?
+        .with_timezone(&chrono::Utc);
+    let request = kranz_engine::standards_waiver::WaiverRequest {
+        rule_id: body.rule_id,
+        revision: body.revision,
+        finding_subject: body.finding_subject,
+        reason: body.reason,
+        expires_at,
+    };
+    let outcome = kranz_engine::standards_waiver::approve_standards_waiver(
+        &server.repo_root,
+        &id,
+        &request,
+        "rest",
+        kranz_engine::event_log::LockForce::No,
+    )
+    .map_err(|error| match error {
+        kranz_engine::error::EngineError::LockHeld(_) => ApiError::conflict(format!(
+            "waiver refused: mission '{id}' is still running; pause or stop it before approving this exception"
+        )),
+        other => ApiError::unprocessable(format!("waiver refused: {other}")),
+    })?;
+    Ok(Json(json!({
+        "recorded": true,
+        "seq": outcome.event.seq,
+        "rule": outcome.rule,
+        "findingSubject": outcome.finding_subject,
+        "findingEvidence": outcome.finding_evidence,
+        "runId": outcome.run_id,
+        "affectedPaths": outcome.affected_paths,
+        "diffDigest": outcome.diff_digest,
+        "findingFingerprint": outcome.finding_fingerprint,
+    })))
 }
 
 /// `GET /api/missions/:id/workspace` — effective local execution workspace,
@@ -1116,7 +1264,10 @@ mod tests {
     use kranz_engine::event_log::{EventLog, LockForce};
     use kranz_engine::events::EventKind;
     use kranz_engine::paths::MissionPaths;
-    use kranz_engine::types::{GrantKind, MissionConfig};
+    use kranz_engine::types::{
+        Finding, GrantKind, MissionConfig, PinnedRule, Plan, PlanFeature, PlanMilestone,
+        RuleCitation, StandardsPin, StandardsPinSource,
+    };
     use serde_json::Value;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -1155,6 +1306,106 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn flight_rules_dashboard_standards_view_is_typed_and_hides_nonwaivable_actions() {
+        let tmp = TempDir::new().unwrap();
+        let digest = "ab".repeat(32);
+        let rule = |id: &str, waivable: bool| PinnedRule {
+            id: id.to_string(),
+            revision: 2,
+            rfc: "RFC-001".to_string(),
+            level: "must".to_string(),
+            effective_status: "enforced".to_string(),
+            statement: format!("statement for {id}"),
+            domains: vec!["security".to_string()],
+            stages: vec!["validation".to_string()],
+            when_paths: Vec::new(),
+            task_classes: Vec::new(),
+            checker: Some("gate:secure".to_string()),
+            waivable,
+        };
+        let rules = vec![rule("ZZ-WAIVE-001", true), rule("ZZ-LOCKED-001", false)];
+        let pin = StandardsPin {
+            pack_name: "zz-pack".to_string(),
+            pack_dir: "vendor/pack".to_string(),
+            standards_root: "standards".to_string(),
+            digest: digest.clone(),
+            source: StandardsPinSource::RepoTracked,
+            task_class: None,
+            touch_set: vec!["src/**".to_string()],
+            gates: Vec::new(),
+            rules: rules.clone(),
+        };
+        let plan = Plan {
+            goal: "governed change".to_string(),
+            validation_contract: Vec::new(),
+            milestones: vec![PlanMilestone {
+                title: "one".to_string(),
+                features: vec![PlanFeature {
+                    title: "change".to_string(),
+                    spec: "implement".to_string(),
+                    validation_criteria: Vec::new(),
+                }],
+            }],
+            considered_alternatives: None,
+            command_grants: Vec::new(),
+            touch_set: vec!["src/**".to_string()],
+            standards_manifest: Some(Box::new(pin)),
+        };
+        let finding = |rule: &PinnedRule| Finding {
+            subject: format!("flight-rule:{}", rule.id),
+            severity: "critical".to_string(),
+            evidence: format!("{} failed with exact evidence", rule.id),
+            suggested_fix: "fix it".to_string(),
+            class: "standards-authoritative".to_string(),
+            rule: Some(RuleCitation {
+                id: rule.id.clone(),
+                revision: rule.revision,
+                source: "zz-pack standards".to_string(),
+                digest: digest.clone(),
+                lifecycle: rule.effective_status.clone(),
+                level: rule.level.clone(),
+                checker: rule.checker.clone(),
+            }),
+        };
+        seed_mission(
+            tmp.path(),
+            "m-1",
+            vec![
+                created("governed change"),
+                EventKind::PlanApproved {
+                    plan,
+                    base_sha: Some("deadbeef".to_string()),
+                },
+                EventKind::ValidationFinding {
+                    milestone_id: "ms-1".to_string(),
+                    run_id: kranz_engine::reducer::ENGINE_RUN_ID.to_string(),
+                    finding: finding(&rules[0]),
+                },
+                EventKind::ValidationFinding {
+                    milestone_id: "ms-1".to_string(),
+                    run_id: kranz_engine::reducer::ENGINE_RUN_ID.to_string(),
+                    finding: finding(&rules[1]),
+                },
+            ],
+        );
+        let app = crate::router(tmp.path().to_path_buf(), None);
+        let response = app
+            .oneshot(get("/api/missions/m-1/standards"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["manifest"]["digest"], digest);
+        assert_eq!(body["coverage"]["rules"][0]["disposition"], "failed");
+        assert_eq!(body["waiverCandidates"].as_array().unwrap().len(), 1);
+        assert_eq!(body["waiverCandidates"][0]["rule"]["id"], "ZZ-WAIVE-001");
+        assert!(body["waiverCandidates"][0]["findingEvidence"]
+            .as_str()
+            .unwrap()
+            .contains("exact evidence"));
     }
 
     /// The lane end to end over HTTP: a registered run's signal POST lands

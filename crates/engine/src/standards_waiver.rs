@@ -342,10 +342,8 @@ pub struct WaiverOutcome {
 ///
 /// Locking mirrors [`crate::mission_catalog::abandon_mission`]: a live
 /// engine holds the mission lock, so a waiver against a RUNNING mission is
-/// refused with `LockHeld` — stop the engine first. (In this slice no
-/// standards failure blocks a run, so the target mission is always
-/// parked/stopped; the live-mutation path arrives with enforcement,
-/// KRZ-346.)
+/// refused with `LockHeld` — pause or stop the engine first. CLI and REST
+/// surfaces share this same record path and authority checks.
 pub fn approve_standards_waiver(
     repo_root: &Path,
     mission_id: &str,

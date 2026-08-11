@@ -29,6 +29,7 @@ export function PlanReview() {
 
   if (review === null) return null;
   const { plan, estimate } = review;
+  const standards = plan.standardsManifest;
   const featureCount = plan.milestones.reduce((n, m) => n + m.features.length, 0);
 
   return (
@@ -62,6 +63,48 @@ export function PlanReview() {
                 </ul>
               )}
             </div>
+          </section>
+        )}
+
+        {standards !== undefined && (
+          <section aria-label="Flight Rules consent" className="standards-consent">
+            <div className="section-label">Flight Rules consent</div>
+            <div className="standards-pack-line">
+              <strong>{standards.packName}</strong>
+              <span>
+                {standards.source} · {standards.packDir}/{standards.standardsRoot}
+              </span>
+              <code className="mono" title={standards.digest}>
+                sha256:{standards.digest}
+              </code>
+            </div>
+            {[...new Set(standards.rules.map((rule) => rule.rfc))].map((rfc) => (
+              <div className="standards-rfc" key={rfc}>
+                <h3>{rfc}</h3>
+                <ul className="standards-rule-list">
+                  {standards.rules
+                    .filter((rule) => rule.rfc === rfc)
+                    .map((rule) => (
+                      <li key={`${rule.id}-r${rule.revision}`} className="standards-rule-card">
+                        <div className="standards-rule-head">
+                          <code className="mono">{rule.id} r{rule.revision}</code>
+                          <span className="standards-state-text">
+                            {rule.effectiveStatus} · {rule.level.toUpperCase()}
+                          </span>
+                        </div>
+                        <p>{rule.statement}</p>
+                        <div className="standards-rule-meta">
+                          <span>checker: <code>{rule.checker ?? 'unavailable'}</code></span>
+                          <span>waiver: {rule.waivable ? 'permitted by exact human approval' : 'prohibited'}</span>
+                          <span>
+                            source: {standards.packName}/{standards.standardsRoot}
+                          </span>
+                        </div>
+                      </li>
+                    ))}
+                </ul>
+              </div>
+            ))}
           </section>
         )}
 
