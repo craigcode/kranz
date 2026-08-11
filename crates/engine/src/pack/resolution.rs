@@ -432,6 +432,10 @@ pub fn approval_pin(
         }
     };
 
+    // The projection budget (KRZ-345): fail approval naming the excess BEFORE
+    // any approval side effect — never truncate an enforced rule to fit.
+    check_projection_budget(&fresh)?;
+
     match (carried, fresh) {
         (None, fresh) => Ok(fresh),
         (Some(_), None) => Err(format!(
@@ -451,11 +455,30 @@ pub fn approval_pin(
     }
 }
 
+/// The projection-budget approval gate (KRZ-345, design D-D/D-J): the
+/// applicable normative statements must fit the hard projection caps, or
+/// approval FAILS naming the excess — an enforced rule is never silently
+/// dropped to fit a prompt budget. Checked against the fresh trusted
+/// resolution so every approval path (initial, carried, revised) fails
+/// closed on the same contract.
+fn check_projection_budget(fresh: &Option<StandardsPin>) -> Result<(), String> {
+    if let Some(pin) = fresh {
+        super::projection::check_budget(
+            pin.rules
+                .iter()
+                .map(|rule| (rule.id.as_str(), rule.statement.as_str())),
+        )?;
+    }
+    Ok(())
+}
+
 /// The pack name as committed at `refname` (the pin's display identity).
 /// `load_at_ref` deliberately returns only the standards manifest; the name
 /// is audit metadata, re-read here from the same tracked `pack.toml` rather
-/// than by widening the KRZ-341 loader's signature.
-fn pack_name_at_ref(
+/// than by widening the KRZ-341 loader's signature. `pub(crate)` for the
+/// KRZ-345 planning projection, which names the same source identity in the
+/// planner-facing seed header.
+pub(crate) fn pack_name_at_ref(
     repo: &GitRepo,
     refname: &str,
     pack_rel_dir: &str,

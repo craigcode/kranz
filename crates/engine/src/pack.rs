@@ -66,6 +66,13 @@ pub mod standards;
 /// trusted base.
 pub mod resolution;
 
+/// Flight Rules stage projections (KRZ-345, design D-D/D-F/D-G/D-J): the
+/// compact, stage-filtered renderings of the ONE approval-pinned manifest —
+/// the planning seed, the bounded plan-revision delta, and the
+/// worker/scrutiny/functional session prompts — plus the hard projection
+/// budget approval fails closed against.
+pub mod projection;
+
 use crate::gate::{ArtefactRef, Gate, GateKind, GateOutcome};
 use crate::types::{MissionConfig, Role};
 use std::collections::HashSet;
