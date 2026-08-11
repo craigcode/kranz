@@ -1180,6 +1180,7 @@ mod tests {
                 source: crate::types::StandardsPinSource::RepoTracked,
                 task_class: None,
                 touch_set: vec!["crates/**".to_string()],
+                context_paths: Vec::new(),
                 gates: Vec::new(),
                 rules: vec![
                     rule("ZZ-FAIL-001", 2, "enforced", "must"),
@@ -1213,6 +1214,7 @@ mod tests {
                     stage: "approval".to_string(),
                     task_class: None,
                     touch_set: vec!["crates/**".to_string()],
+                    context_paths: Vec::new(),
                     rules: vec![
                         crate::types::StandardsRuleRef {
                             id: "ZZ-FAIL-001".to_string(),

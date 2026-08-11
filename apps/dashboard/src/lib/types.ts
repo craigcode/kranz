@@ -97,6 +97,9 @@ export interface Ticket {
   context: string;
   scopingAnswers: string[];
   acceptanceHints: string[];
+  taskClass?: string | null;
+  reviewArtifact?: string | null;
+  reviewOutput?: string | null;
   state: TicketState;
   needsContext: string[];
   /** Planner's draft-stage wrong-plan escalation reason (server always emits
@@ -204,6 +207,7 @@ export interface StandardsPin {
   source: 'repo-tracked' | 'external-pinned';
   taskClass?: string;
   touchSet?: string[];
+  contextPaths?: string[];
   gates?: PinnedGate[];
   rules: PinnedRule[];
 }
@@ -533,7 +537,7 @@ export type EventKind =
   | { type: 'milestone.validating'; payload: { milestoneId: string } }
   | { type: 'validation.finding'; payload: { milestoneId: string; runId: string; finding: Finding } }
   | { type: 'gate.result'; payload: { gate: string; surface: string; kind: string; index: number; verdict: 'pass' | 'fail'; artefactRef: string; artefactDetail?: string; score?: number; threshold?: number; ruleIds?: string[] } }
-  | { type: 'standards.resolved'; payload: { source: string; packName: string; standardsRoot: string; digest: string; stage: string; taskClass?: string; touchSet: string[]; rules: Array<{ id: string; revision: number; effectiveStatus: string }>; approvalSeq: number } }
+  | { type: 'standards.resolved'; payload: { source: string; packName: string; standardsRoot: string; digest: string; stage: string; taskClass?: string; touchSet: string[]; contextPaths?: string[]; rules: Array<{ id: string; revision: number; effectiveStatus: string }>; approvalSeq: number } }
   | { type: 'standards.drifted'; payload: { approvedDigest: string; currentDigest?: string; surface: string; changedRules: string[] } }
   | { type: 'standards.waiver.approved'; payload: { ruleId: string; ruleRevision: number; manifestDigest: string; approvalSeq: number; findingFingerprint: string; paths?: string[]; diffDigest: string; reason: string; approver: string; surface: string; expiresAt: string } }
   | { type: 'standards.attestation.approved'; payload: { ruleId: string; ruleRevision: number; manifestDigest: string; approvalSeq: number; paths?: string[]; diffDigest: string; reason: string; approver: string; surface: string } }

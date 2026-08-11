@@ -950,6 +950,12 @@ pub enum EventKind {
         task_class: Option<String>,
         #[serde(rename = "touchSet", default, skip_serializing_if = "Vec::is_empty")]
         touch_set: Vec<String>,
+        #[serde(
+            rename = "contextPaths",
+            default,
+            skip_serializing_if = "Vec::is_empty"
+        )]
+        context_paths: Vec<String>,
         /// The selected rules, stable-sorted by id.
         rules: Vec<StandardsRuleRef>,
         /// The seq of the `plan.approved` event this resolution pins.

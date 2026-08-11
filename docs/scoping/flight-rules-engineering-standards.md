@@ -275,7 +275,7 @@ stage-filtered projection:
 - implementation: workers receive only implementation-stage statements;
 - scrutiny/functional validation: validators cite rule IDs in findings;
 - final/merge: registered checkers evaluate the actual diff/integration;
-- later review task classes: spec and incident artifacts use the same
+- review task classes: spec and incident artifacts use the same
   resolver, without a new standards corpus.
 
 Each projection's content hash joins the existing prompt/session provenance.

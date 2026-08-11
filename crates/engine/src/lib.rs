@@ -66,6 +66,7 @@ pub mod pty_harness;
 pub mod queue;
 pub mod reducer;
 pub mod report_render;
+pub mod review_artifact;
 pub mod routing;
 pub mod routing_rules;
 pub mod sandbox;

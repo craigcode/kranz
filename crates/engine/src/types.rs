@@ -256,6 +256,11 @@ pub struct StandardsPin {
     /// The approved touch-set globs resolution ran against (D-D input 3).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub touch_set: Vec<String>,
+    /// Read-only paths that participate in applicability without granting
+    /// write authority. Review-artifact missions use this for the immutable
+    /// spec/incident input; additive for pre-KRZ-349 plans and logs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_paths: Vec<String>,
     /// Every pack gate declaration from the trusted approval source. Rules
     /// reference these by stable id; non-rule pack gates also retain their
     /// pre-Flight-Rules advisory behavior without a live worktree re-read.

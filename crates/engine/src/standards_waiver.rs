@@ -130,6 +130,29 @@ pub fn affected_paths(rule: &PinnedRule, changed_paths: &[String]) -> Vec<String
     paths
 }
 
+/// [`affected_paths`] for a rule selected by immutable context rather than a
+/// changed path. In that case its exception/attestation binds the whole
+/// deliverable diff; binding an empty diff would let later review edits reuse
+/// authority granted for different output bytes.
+pub fn affected_paths_with_context(
+    rule: &PinnedRule,
+    changed_paths: &[String],
+    context_paths: &[String],
+) -> Vec<String> {
+    let paths = affected_paths(rule, changed_paths);
+    if !paths.is_empty() || rule.when_paths.is_empty() {
+        return paths;
+    }
+    if crate::merge_gate::when_paths_match(&rule.when_paths, context_paths) {
+        let mut all = changed_paths.to_vec();
+        all.sort();
+        all.dedup();
+        all
+    } else {
+        paths
+    }
+}
+
 /// One `standards.waiver.approved` event folded into its binding record —
 /// the shape the coverage fold joins and the record path returns.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -260,7 +283,7 @@ pub fn active_waiver_for_finding(
         return Ok(None);
     };
     let changed = repo.changed_paths(base_ref, head_ref)?;
-    let paths = affected_paths(rule, &changed);
+    let paths = affected_paths_with_context(rule, &changed, &pin.context_paths);
     let diff = if rule.when_paths.is_empty() {
         repo.diff_full(base_ref, head_ref)?
     } else if paths.is_empty() {
@@ -500,7 +523,7 @@ pub fn approve_standards_waiver(
             "cannot diff the pinned base {base_sha} against mission branch `{branch}`: {e}"
         ))
     })?;
-    let affected = affected_paths(rule, &changed);
+    let affected = affected_paths_with_context(rule, &changed, &pin.context_paths);
     let diff_text = if rule.when_paths.is_empty() {
         git.diff_full(&base_sha, branch)?
     } else if affected.is_empty() {
@@ -604,6 +627,7 @@ mod tests {
             source: crate::types::StandardsPinSource::RepoTracked,
             task_class: None,
             touch_set: vec!["crates/**".to_string()],
+            context_paths: Vec::new(),
             gates: Vec::new(),
             rules: vec![pinned(true)],
         }
@@ -716,6 +740,18 @@ mod tests {
         assert!(
             affected_paths(&scoped, &changed).is_empty(),
             "no changed path under the scope binds the empty diff"
+        );
+    }
+
+    #[test]
+    fn flight_rules_review_class_context_rule_binds_the_review_diff() {
+        let mut rule = pinned(true);
+        rule.when_paths = vec!["docs/spec.md".to_string()];
+        let changed = vec!["reviews/spec-review.md".to_string()];
+        assert!(affected_paths(&rule, &changed).is_empty());
+        assert_eq!(
+            affected_paths_with_context(&rule, &changed, &["docs/spec.md".to_string()]),
+            changed
         );
     }
 

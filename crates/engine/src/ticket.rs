@@ -43,7 +43,9 @@ const TASK_CLASS_HEADING: &str = "## Task class\n";
 /// to route the executor tier for a mission seeded from a ticket, since by
 /// the time `create` runs it only has the folded goal, not the `Ticket`.
 pub fn parse_task_class_from_goal(goal: &str) -> Option<String> {
-    let idx = goal.find(TASK_CLASS_HEADING)?;
+    // The engine-authored appendix is last. `rfind` prevents ticket prose
+    // containing a lookalike heading from shadowing the governed value.
+    let idx = goal.rfind(TASK_CLASS_HEADING)?;
     let rest = &goal[idx + TASK_CLASS_HEADING.len()..];
     let line = rest.lines().next()?.trim();
     (!line.is_empty()).then(|| line.to_string())
@@ -156,6 +158,12 @@ pub struct Ticket {
     /// Backlog task class (`task-class: execution-class` frontmatter), used
     /// to route the executor to a tier via [`crate::config::task_class_to_tier`].
     pub task_class: Option<String>,
+    /// Tracked text artifact reviewed by `spec-review` / `incident-review`.
+    /// It is context, never a writable deliverable.
+    pub review_artifact: Option<String>,
+    /// Required review deliverable. Review tickets default this to
+    /// `reviews/<slug>.md`; non-review tickets carry neither field.
+    pub review_output: Option<String>,
     /// External trigger provenance (`trigger: ci-failure|pr-comment`
     /// frontmatter) — set on webhook-drafted tickets (design D-F,
     /// [`crate::hooks`]); `None` on human-authored tickets.
@@ -366,6 +374,8 @@ impl Ticket {
         let mut max_budget_usd: Option<f64> = None;
         let mut blocked_by: Vec<String> = Vec::new();
         let mut task_class: Option<String> = None;
+        let mut review_artifact: Option<String> = None;
+        let mut review_output: Option<String> = None;
         let mut trigger: Option<String> = None;
         let mut traced_from_mission: Option<String> = None;
         let mut defer_until: Option<chrono::DateTime<chrono::Utc>> = None;
@@ -389,6 +399,14 @@ impl Ticket {
                 "task-class" | "taskclass" => {
                     let v = value.scalar().trim().to_string();
                     task_class = if v.is_empty() { None } else { Some(v) };
+                }
+                "review-artifact" | "reviewartifact" => {
+                    let v = value.scalar().trim().to_string();
+                    review_artifact = if v.is_empty() { None } else { Some(v) };
+                }
+                "review-output" | "reviewoutput" => {
+                    let v = value.scalar().trim().to_string();
+                    review_output = if v.is_empty() { None } else { Some(v) };
                 }
                 // External trigger provenance (design D-F); additive — older
                 // readers ignore it via the unknown-key arm below.
@@ -452,6 +470,15 @@ impl Ticket {
             .filter(|t| !t.trim().is_empty())
             .or(sections.first_heading)
             .unwrap_or_else(|| slug.to_string());
+        let review_contract = crate::review_artifact::from_ticket_fields(
+            slug,
+            task_class.as_deref(),
+            review_artifact.as_deref(),
+            review_output.as_deref(),
+        )?;
+        let (review_artifact, review_output) = review_contract
+            .map(|contract| (Some(contract.input_path), Some(contract.output_path)))
+            .unwrap_or((None, None));
 
         Ok(Ticket {
             slug: slug.to_string(),
@@ -466,6 +493,8 @@ impl Ticket {
             acceptance_hints: sections.acceptance_hints,
             blocked_by,
             task_class,
+            review_artifact,
+            review_output,
             trigger,
             traced_from_mission,
             defer_until,
@@ -562,6 +591,17 @@ impl Ticket {
             out.push_str("\n## Context\n");
             out.push_str(self.context.trim());
             out.push('\n');
+        }
+
+        let review_contract = crate::review_artifact::from_ticket_fields(
+            &self.slug,
+            self.task_class.as_deref(),
+            self.review_artifact.as_deref(),
+            self.review_output.as_deref(),
+        )
+        .expect("parsed ticket keeps a valid review-artifact contract");
+        if let Some(contract) = review_contract {
+            out.push_str(&crate::review_artifact::render_goal_section(&contract));
         }
 
         if let Some(task_class) = self.task_class.as_deref().map(str::trim) {

@@ -79,13 +79,14 @@ pub fn checker_binding<'a>(
     rule: &PinnedRule,
     actual_paths: &[String],
 ) -> CheckerBinding<'a> {
+    let evaluation_paths = crate::pack::resolution::evaluation_paths(pin, actual_paths);
     match rule.checker.as_deref() {
         Some("agent-judgement") => CheckerBinding::AgentJudgement,
         Some("manual-attestation") => CheckerBinding::ManualAttestation,
         Some(checker) => match checker.strip_prefix("gate:") {
             Some(id) if !id.is_empty() => match pin.gates.iter().find(|gate| gate.id == id) {
                 Some(gate)
-                    if crate::merge_gate::when_paths_match(&gate.when_paths, actual_paths) =>
+                    if crate::merge_gate::when_paths_match(&gate.when_paths, &evaluation_paths) =>
                 {
                     CheckerBinding::Gate(gate)
                 }
@@ -192,6 +193,7 @@ mod tests {
             source: StandardsPinSource::RepoTracked,
             task_class: None,
             touch_set: vec!["src/**".to_string()],
+            context_paths: Vec::new(),
             gates: vec![PinnedGate {
                 id: "zz-gate".to_string(),
                 command: "true".to_string(),

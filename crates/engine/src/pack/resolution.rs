@@ -260,7 +260,38 @@ pub fn pin_from_manifest(
     task_class: Option<&str>,
     touch_set: &[String],
 ) -> StandardsPin {
-    let resolved = resolve_mission_set(manifest, task_class, &TouchInput::Declared(touch_set));
+    pin_from_manifest_with_context(
+        manifest,
+        source,
+        pack_name,
+        pack_dir,
+        task_class,
+        touch_set,
+        &[],
+    )
+}
+
+/// [`pin_from_manifest`] with read-only selection context. Context paths
+/// affect applicability but are not part of the mission's writable touch set.
+pub fn pin_from_manifest_with_context(
+    manifest: &StandardsManifest,
+    source: StandardsPinSource,
+    pack_name: &str,
+    pack_dir: &str,
+    task_class: Option<&str>,
+    touch_set: &[String],
+    context_paths: &[String],
+) -> StandardsPin {
+    let mut context_paths = context_paths.to_vec();
+    context_paths.sort();
+    context_paths.dedup();
+    let mut selection_paths = touch_set.to_vec();
+    selection_paths.extend(context_paths.iter().cloned());
+    let resolved = resolve_mission_set(
+        manifest,
+        task_class,
+        &TouchInput::Declared(&selection_paths),
+    );
     StandardsPin {
         pack_name: pack_name.to_string(),
         pack_dir: pack_dir.to_string(),
@@ -269,6 +300,7 @@ pub fn pin_from_manifest(
         source,
         task_class: task_class.map(crate::routing::normalize_task_class),
         touch_set: touch_set.to_vec(),
+        context_paths,
         gates: manifest
             .pack_gates
             .iter()
@@ -292,6 +324,18 @@ pub fn pin_from_manifest(
 /// the merge drift check then fails closed against the live side.
 pub fn resolve_pin(pin: &StandardsPin, stage: RuleStage, touch: &TouchInput) -> Vec<PinnedRule> {
     let task_class = pin.task_class.as_deref();
+    let declared = matches!(touch, TouchInput::Declared(_));
+    let mut effective_paths = match touch {
+        TouchInput::Declared(paths) | TouchInput::Actual(paths) => paths.to_vec(),
+    };
+    effective_paths.extend(pin.context_paths.iter().cloned());
+    effective_paths.sort();
+    effective_paths.dedup();
+    let effective_touch = if declared {
+        TouchInput::Declared(&effective_paths)
+    } else {
+        TouchInput::Actual(&effective_paths)
+    };
     let mut selected: Vec<PinnedRule> = pin
         .rules
         .iter()
@@ -317,7 +361,7 @@ pub fn resolve_pin(pin: &StandardsPin, stage: RuleStage, touch: &TouchInput) -> 
                     return false;
                 }
             }
-            match touch {
+            match &effective_touch {
                 TouchInput::Actual(paths) => {
                     crate::merge_gate::when_paths_match(&rule.when_paths, paths)
                 }
@@ -328,6 +372,16 @@ pub fn resolve_pin(pin: &StandardsPin, stage: RuleStage, touch: &TouchInput) -> 
         .collect();
     selected.sort_by(|a, b| a.id.cmp(&b.id));
     selected
+}
+
+/// Actual changed paths plus approval-pinned, read-only context. The latter
+/// affects rule and checker applicability but never the contract write sweep.
+pub fn evaluation_paths(pin: &StandardsPin, actual_paths: &[String]) -> Vec<String> {
+    let mut paths = actual_paths.to_vec();
+    paths.extend(pin.context_paths.iter().cloned());
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 // ---------------------------------------------------------------------------
@@ -363,6 +417,32 @@ pub fn approval_pin(
     carried: Option<&StandardsPin>,
     touch_set: &[String],
 ) -> Result<Option<StandardsPin>, String> {
+    approval_pin_with_context(
+        repo,
+        cfg,
+        repo_root,
+        base_ref,
+        task_class,
+        carried,
+        touch_set,
+        &[],
+    )
+}
+
+/// [`approval_pin`] with explicit read-only applicability context. Used by
+/// review-artifact consumers so rules scoped to the reviewed source are
+/// selected without authorizing that source for mutation.
+#[allow(clippy::too_many_arguments)]
+pub fn approval_pin_with_context(
+    repo: &GitRepo,
+    cfg: &MissionConfig,
+    repo_root: &Path,
+    base_ref: &str,
+    task_class: Option<&str>,
+    carried: Option<&StandardsPin>,
+    touch_set: &[String],
+    context_paths: &[String],
+) -> Result<Option<StandardsPin>, String> {
     let Some(configured) = cfg.pack_dir.as_deref() else {
         return match carried {
             None => Ok(None),
@@ -390,13 +470,14 @@ pub fn approval_pin(
             })?;
         match &pack.standards {
             None => None,
-            Some(manifest) => Some(pin_from_manifest(
+            Some(manifest) => Some(pin_from_manifest_with_context(
                 manifest,
                 StandardsPinSource::ExternalPinned,
                 &pack.name,
                 configured,
                 task_class,
                 touch_set,
+                context_paths,
             )),
         }
     } else {
@@ -406,13 +487,14 @@ pub fn approval_pin(
             Some(manifest) => {
                 let name = pack_name_at_ref(repo, base_ref, &pack_rel)?
                     .unwrap_or_else(|| pack_rel.clone());
-                Some(pin_from_manifest(
+                Some(pin_from_manifest_with_context(
                     &manifest,
                     StandardsPinSource::RepoTracked,
                     &name,
                     &pack_rel,
                     task_class,
                     touch_set,
+                    context_paths,
                 ))
             }
             None => {
@@ -564,7 +646,12 @@ pub fn newly_applicable_enforced(
         ));
     }
     let task_class = pin.task_class.as_deref();
-    let now = resolve_mission_set(&manifest, task_class, &TouchInput::Actual(actual_paths));
+    let evaluation_paths = evaluation_paths(pin, actual_paths);
+    let now = resolve_mission_set(
+        &manifest,
+        task_class,
+        &TouchInput::Actual(&evaluation_paths),
+    );
     Ok(now
         .iter()
         .filter(|rule| manifest.effective_status(rule) == RfcStatus::Enforced)
@@ -608,10 +695,11 @@ pub fn merge_drift(
     if pin.source == StandardsPinSource::ExternalPinned {
         return Ok(None);
     }
+    let evaluation_paths = evaluation_paths(pin, integration_paths);
     let approved_rules = resolve_pin(
         pin,
         RuleStage::Merge,
-        &TouchInput::Actual(integration_paths),
+        &TouchInput::Actual(&evaluation_paths),
     );
     let approved = enforced_snapshot(&approved_rules);
     let approved_bindings = pinned_enforced_gate_snapshot(&approved_rules, &pin.gates);
@@ -622,7 +710,7 @@ pub fn merge_drift(
                     &manifest,
                     RuleStage::Merge,
                     pin.task_class.as_deref(),
-                    &TouchInput::Actual(integration_paths),
+                    &TouchInput::Actual(&evaluation_paths),
                 );
                 let pinned: Vec<PinnedRule> = resolved
                     .iter()
@@ -788,6 +876,13 @@ pub fn render_pin_section(pin: &StandardsPin) -> String {
         pin.standards_root,
         pin.digest
     );
+    if !pin.context_paths.is_empty() {
+        let _ = writeln!(
+            out,
+            "Read-only applicability context (not write authority): {}.\n",
+            pin.context_paths.join(", ")
+        );
+    }
     let task_class = pin.task_class.as_deref().unwrap_or("(none)");
     let touch_set = if pin.touch_set.is_empty() {
         "(empty)".to_string()
@@ -1257,6 +1352,102 @@ mod tests {
         assert_eq!(classless.len(), 1);
         // Wrong stage: neither applies.
         assert!(resolve(&manifest, RuleStage::Merge, Some("implementation"), &touch).is_empty());
+    }
+
+    #[test]
+    fn flight_rules_review_class_selects_only_its_artifact_policy() {
+        let (_tmp, dir) = pack_dir_with(
+            &[("RFC-001", "approved")],
+            &[
+                (
+                    "ZZ-SPEC",
+                    rule_md(
+                        "ZZ-SPEC",
+                        "RFC-001",
+                        1,
+                        "should",
+                        "active",
+                        "validation",
+                        Some("docs/spec.md"),
+                        Some("spec-review"),
+                        Some("agent-judgement"),
+                    ),
+                ),
+                (
+                    "ZZ-INCIDENT",
+                    rule_md(
+                        "ZZ-INCIDENT",
+                        "RFC-001",
+                        1,
+                        "should",
+                        "active",
+                        "validation",
+                        Some("incidents/"),
+                        Some("incident-review"),
+                        Some("agent-judgement"),
+                    ),
+                ),
+                (
+                    "ZZ-IMPLEMENT",
+                    rule_md(
+                        "ZZ-IMPLEMENT",
+                        "RFC-001",
+                        1,
+                        "should",
+                        "active",
+                        "validation",
+                        None,
+                        Some("implementation"),
+                        Some("agent-judgement"),
+                    ),
+                ),
+            ],
+        );
+        let manifest = manifest_of(&dir);
+        let spec_pin = pin_from_manifest_with_context(
+            &manifest,
+            StandardsPinSource::RepoTracked,
+            "zz",
+            "vendor/zz",
+            Some("spec-review"),
+            &["reviews/spec.md".to_string()],
+            &["docs/spec.md".to_string()],
+        );
+        assert_eq!(
+            spec_pin
+                .rules
+                .iter()
+                .map(|rule| rule.id.as_str())
+                .collect::<Vec<_>>(),
+            ["ZZ-SPEC"]
+        );
+        assert_eq!(spec_pin.context_paths, ["docs/spec.md"]);
+        assert!(render_pin_section(&spec_pin)
+            .contains("Read-only applicability context (not write authority): docs/spec.md"));
+        let projected = resolve_pin(
+            &spec_pin,
+            RuleStage::Validation,
+            &TouchInput::Actual(&["reviews/spec.md".to_string()]),
+        );
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].id, "ZZ-SPEC");
+
+        let incident = resolve(
+            &manifest,
+            RuleStage::Validation,
+            Some("incident-review"),
+            &TouchInput::Actual(&["incidents/42.md".to_string()]),
+        );
+        assert_eq!(incident.len(), 1);
+        assert_eq!(incident[0].id, "ZZ-INCIDENT");
+        let implementation = resolve(
+            &manifest,
+            RuleStage::Validation,
+            Some("implementation"),
+            &TouchInput::Actual(&["docs/spec.md".to_string()]),
+        );
+        assert_eq!(implementation.len(), 1);
+        assert_eq!(implementation[0].id, "ZZ-IMPLEMENT");
     }
 
     #[test]
@@ -1838,6 +2029,7 @@ mod tests {
             stage: APPROVAL_SURFACE.to_string(),
             task_class: Some("implementation".to_string()),
             touch_set: vec!["crates/**".to_string()],
+            context_paths: vec!["docs/spec.md".to_string()],
             rules: vec![crate::types::StandardsRuleRef {
                 id: "ZZ-MUST-001".to_string(),
                 revision: 1,
@@ -1849,6 +2041,7 @@ mod tests {
         let value = serde_json::to_value(&resolved).expect("serialize");
         assert_eq!(value["type"], "standards.resolved");
         assert_eq!(value["payload"]["approvalSeq"], 7);
+        assert_eq!(value["payload"]["contextPaths"][0], "docs/spec.md");
         let back: EventKind = serde_json::from_value(value).expect("round trip");
         assert_eq!(back.type_name(), "standards.resolved");
 

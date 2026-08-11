@@ -68,10 +68,15 @@ impl MissionEngine {
         touch_override: Option<&[String]>,
     ) -> Result<Option<crate::pack::projection::PlanningProjection>> {
         let task_class = crate::ticket::parse_task_class_from_goal(&self.state.mission.goal);
-        let hints = match touch_override {
+        let mut hints = match touch_override {
             Some(touch) => touch.to_vec(),
             None => self.planning_touch_hints(),
         };
+        if let Some(contract) = crate::review_artifact::parse_from_goal(&self.state.mission.goal)? {
+            hints.push(contract.input_path);
+            hints.sort();
+            hints.dedup();
+        }
         crate::pack::projection::planning_projection(
             &self.repo,
             &self.state.config,

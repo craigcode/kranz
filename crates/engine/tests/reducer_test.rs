@@ -4486,6 +4486,7 @@ fn flight_rules_pin_revision_never_folds_a_carried_manifest() {
         source: StandardsPinSource::RepoTracked,
         task_class: None,
         touch_set: vec![],
+        context_paths: Vec::new(),
         gates: Vec::new(),
         rules: vec![PinnedRule {
             id: "ZZ-MUST-001".to_string(),

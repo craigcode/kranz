@@ -434,6 +434,7 @@ fn pinned_plan() -> Plan {
             source: kranz_engine::types::StandardsPinSource::RepoTracked,
             task_class: None,
             touch_set: vec!["crates/**".into()],
+            context_paths: Vec::new(),
             gates: Vec::new(),
             rules: vec![
                 rule("ZZ-FAIL-001", 2, "enforced", "must"),
@@ -475,6 +476,7 @@ fn pinned_events() -> (Vec<kranz_engine::events::Event>, Plan) {
                 stage: "approval".into(),
                 task_class: None,
                 touch_set: vec!["crates/**".into()],
+                context_paths: Vec::new(),
                 rules: vec![
                     kranz_engine::types::StandardsRuleRef {
                         id: "ZZ-FAIL-001".into(),

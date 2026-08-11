@@ -270,6 +270,12 @@ lint/authoring surfaces.
   approval. `plan.md` renders the pin for review, and a
   `standards.resolved` event records the selection against the
   `plan.approved` seq.
+- **Read-only applicability context**: artifact-review missions pin the
+  tracked spec/incident input separately as `contextPaths`. These paths take
+  part in `when-paths` selection and checker scoping but never enter the
+  writable mission touch set. Waivers and manual attestations for a rule
+  selected through context bind the review deliverable diff, not an empty
+  source diff.
 - **The pin, not a later read, governs the mission**: a mission-branch
   pack edit is ignored and surfaced via an advisory `orchestrator.decision`
   (the routing-rules ownership idiom); an external pack edit after

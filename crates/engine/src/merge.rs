@@ -179,7 +179,11 @@ impl StandardsMergeEvidence {
         let (Some(approval_seq), Some(now)) = (self.approval_seq, self.evaluated_at) else {
             return Ok(false);
         };
-        let paths = crate::standards_waiver::affected_paths(rule, integration_paths);
+        let paths = crate::standards_waiver::affected_paths_with_context(
+            rule,
+            integration_paths,
+            &pin.context_paths,
+        );
         let diff = if rule.when_paths.is_empty() {
             repo.diff_full(live_base_sha, tested_commit)?
         } else if paths.is_empty() {
@@ -220,7 +224,11 @@ impl StandardsMergeEvidence {
         let Some(approval_seq) = self.approval_seq else {
             return Ok(false);
         };
-        let paths = crate::standards_waiver::affected_paths(rule, integration_paths);
+        let paths = crate::standards_waiver::affected_paths_with_context(
+            rule,
+            integration_paths,
+            &pin.context_paths,
+        );
         let diff = if rule.when_paths.is_empty() {
             repo.diff_full(live_base_sha, tested_commit)?
         } else if paths.is_empty() {

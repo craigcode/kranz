@@ -1345,6 +1345,7 @@ mod tests {
             source: StandardsPinSource::RepoTracked,
             task_class: None,
             touch_set: vec!["src/**".to_string()],
+            context_paths: Vec::new(),
             gates: Vec::new(),
             rules: rules.clone(),
         };

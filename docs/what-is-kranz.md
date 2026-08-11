@@ -42,6 +42,12 @@ vibe.
 - **Queue and drain.** Missions serialize per repo (they own the working
   tree). Approvals can enqueue; `kranz work` drains the queue one mission at a
   time, crash-safely.
+- **Govern engineering standards.** Schema-4 packs can carry stable,
+  lifecycle-managed SHOULD/MUST Flight Rules. Kranz deterministically pins
+  the applicable revisions at approval, runs their deterministic/contextual/
+  human checkers, records exact waivers, and reports cross-mission
+  effectiveness. `spec-review` and `incident-review` tickets reuse the same
+  evidence path for immutable tracked artifacts and a required review output.
 
 ## Quickstart
 

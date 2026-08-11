@@ -74,12 +74,14 @@ fn approval_pin(events: &[Event], mission_id: &str) -> Option<(u64, StandardsPin
 
 fn current_binding(
     repo: &crate::git_ops::GitRepo,
+    pin: &StandardsPin,
     rule: &PinnedRule,
     base_ref: &str,
     head_ref: &str,
 ) -> crate::error::Result<(Vec<String>, String)> {
     let changed = repo.changed_paths(base_ref, head_ref)?;
-    let paths = crate::standards_waiver::affected_paths(rule, &changed);
+    let paths =
+        crate::standards_waiver::affected_paths_with_context(rule, &changed, &pin.context_paths);
     let diff = if rule.when_paths.is_empty() {
         repo.diff_full(base_ref, head_ref)?
     } else if paths.is_empty() {
@@ -106,7 +108,7 @@ pub fn active_attestation(
     if approved != *pin || rule.checker.as_deref() != Some("manual-attestation") {
         return Ok(None);
     }
-    let (paths, diff_digest) = current_binding(repo, rule, base_ref, head_ref)?;
+    let (paths, diff_digest) = current_binding(repo, pin, rule, base_ref, head_ref)?;
     Ok(events
         .iter()
         .filter(|event| event.mission_id == mission_id)
@@ -184,7 +186,7 @@ pub fn approve_attestation(
     })?;
     let repo = crate::git_ops::GitRepo::open(repo_root)?;
     let (affected, diff_digest) =
-        current_binding(&repo, rule, base, &state.mission.mission_branch)?;
+        current_binding(&repo, &pin, rule, base, &state.mission.mission_branch)?;
     if active_attestation(
         &repo,
         &events,

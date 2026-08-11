@@ -409,6 +409,10 @@ impl MissionEngine {
                  check out the intended base (e.g. main) first"
             )));
         }
+        let review_contract = crate::review_artifact::parse_from_goal(goal)?;
+        if let Some(contract) = &review_contract {
+            crate::review_artifact::validate_source(&repo, &base_branch, contract)?;
+        }
 
         // Tracked routing rules (ticket routing-rules-config): when the live
         // BASE branch carries `.kranz/routing-rules.json`, its validated
@@ -1157,6 +1161,30 @@ impl MissionEngine {
         // create the mission branch from another, and record a third SHA.
         let base = self.state.mission.base_branch.clone();
         let base_sha = self.repo.rev_parse(&base)?;
+        let review_contract = crate::review_artifact::parse_from_goal(&self.state.mission.goal)?;
+        if let Some(contract) = &review_contract {
+            crate::review_artifact::validate_source(&self.repo, &base_sha, contract)?;
+            let output_allowed =
+                contract_sweep::touch_set_includes(&plan.touch_set, &contract.output_path)
+                    .map_err(|error| {
+                        EngineError::Config(format!(
+                            "review output touch-set validation failed: {error}"
+                        ))
+                    })?;
+            let input_allowed = contract_sweep::touch_set_includes(
+                &plan.touch_set,
+                &contract.input_path,
+            )
+            .map_err(|error| {
+                EngineError::Config(format!("review input touch-set validation failed: {error}"))
+            })?;
+            if !output_allowed || input_allowed {
+                return Err(EngineError::Config(format!(
+                    "review-artifact plan must authorize output `{}` and exclude immutable input `{}` from its touchSet",
+                    contract.output_path, contract.input_path
+                )));
+            }
+        }
         let branch = self.state.mission.mission_branch.clone();
         if self.repo.branch_exists(&branch)? {
             let existing_tip = self.repo.rev_parse(&branch)?;
@@ -1199,7 +1227,11 @@ impl MissionEngine {
         // plan-carried manifest that is stale or substituted fails approval
         // HERE, before the mission branch exists. No standards-configured
         // pack ⇒ None ⇒ the approval stays byte-identical.
-        let standards_pin = crate::pack::resolution::approval_pin(
+        let context_paths: Vec<String> = review_contract
+            .iter()
+            .map(|contract| contract.input_path.clone())
+            .collect();
+        let standards_pin = crate::pack::resolution::approval_pin_with_context(
             &self.repo,
             &self.state.config,
             &self.paths.repo_root,
@@ -1207,6 +1239,7 @@ impl MissionEngine {
             crate::ticket::parse_task_class_from_goal(&self.state.mission.goal).as_deref(),
             plan.standards_manifest.as_deref(),
             &plan.touch_set,
+            &context_paths,
         )
         .map_err(EngineError::Config)?;
         // The engine authors the pin (D-D): a carried manifest was verified
@@ -1480,6 +1513,7 @@ impl MissionEngine {
                 stage: crate::pack::resolution::APPROVAL_SURFACE.to_string(),
                 task_class: pin.task_class.clone(),
                 touch_set: pin.touch_set.clone(),
+                context_paths: pin.context_paths.clone(),
                 rules: pin
                     .rules
                     .iter()
@@ -6221,6 +6255,15 @@ impl MissionEngine {
 
         let contract = self.state.mission.validation_contract.clone();
         let mut findings: Vec<Finding> = Vec::new();
+        if let Some(review) = crate::review_artifact::parse_from_goal(&self.state.mission.goal)? {
+            findings.extend(crate::review_artifact::deliverable_findings(
+                self.active_repo(),
+                &base,
+                "HEAD",
+                &actual_paths,
+                &review,
+            )?);
+        }
         // agent-env-clear: command assertions run with a CLEARED environment
         // (minimal allowlist + scratch HOME + toolchain caches + any
         // contractEnvPassthrough names) — ambient secrets never reach them.
@@ -6284,6 +6327,10 @@ impl MissionEngine {
         // never `load_for_config` from the mission worktree. Schema-2/3 packs
         // (no standards pin) retain their legacy live advisory gate path.
         let standards_pin = self.state.mission.standards_manifest.clone();
+        let gate_applicability_paths = standards_pin
+            .as_ref()
+            .map(|pin| crate::pack::resolution::evaluation_paths(pin, &all_changed_paths))
+            .unwrap_or_else(|| all_changed_paths.clone());
         let mut standards_rules = standards_pin
             .as_ref()
             .map(|pin| {
@@ -6396,7 +6443,13 @@ impl MissionEngine {
         };
         let mut pack_gates: Vec<crate::pack::PackGate> = Vec::new();
         for decl in &pinned_gate_decls {
-            if !crate::merge_gate::when_paths_match(&decl.when_paths, &all_changed_paths) {
+            let linked = gate_rule_ids.contains_key(&decl.id);
+            let applicability_paths = if linked {
+                &gate_applicability_paths
+            } else {
+                &all_changed_paths
+            };
+            if !crate::merge_gate::when_paths_match(&decl.when_paths, applicability_paths) {
                 continue;
             }
             let (ok, output) =
@@ -8579,6 +8632,7 @@ pub(crate) mod tests {
             source: crate::types::StandardsPinSource::RepoTracked,
             task_class: None,
             touch_set: vec!["crates/**".to_string()],
+            context_paths: Vec::new(),
             gates: Vec::new(),
             rules: vec![],
         }));
