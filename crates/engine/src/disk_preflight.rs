@@ -15,6 +15,11 @@ use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 use std::path::Path;
 
+#[cfg(unix)]
+fn statvfs_field_to_u64<T: Into<u64>>(value: T) -> u64 {
+    value.into()
+}
+
 /// The decision a pre-drain disk check reaches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiskPreflight {
@@ -41,7 +46,7 @@ pub fn available_bytes(path: &Path) -> Option<u64> {
     if rc != 0 {
         return None;
     }
-    Some(u64::from(stat.f_bavail).saturating_mul(stat.f_frsize))
+    Some(statvfs_field_to_u64(stat.f_bavail).saturating_mul(statvfs_field_to_u64(stat.f_frsize)))
 }
 
 /// No statvfs equivalent is wired up on non-Unix targets; report unmeasurable
