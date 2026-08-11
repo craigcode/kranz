@@ -642,6 +642,15 @@ pub enum PackCommand {
 /// `.kranz/tickets/flight-rules-pack-contract.md`, KRZ-341).
 #[derive(Subcommand, Debug)]
 pub enum StandardsCommand {
+    /// Fold Flight Rules effectiveness across mission event logs and traced
+    /// defect tickets. Raw denominators are always shown; interpretive smells
+    /// remain suppressed below the documented minimum sample count.
+    Metrics {
+        /// Emit the deterministic machine-readable report
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Load a pack's [standards] corpus and print the normalized manifest:
     /// every RFC and rule with its effective lifecycle status, checker
     /// binding, and scopes, plus the sha256 content digest and the trust
@@ -1052,6 +1061,17 @@ mod tests {
             Cli::try_parse_from(["kranz", "standards", "attest", "--rule", "ZZ-MANUAL-001"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn flight_rules_metrics_standards_metrics_parses_json() {
+        let cli = Cli::try_parse_from(["kranz", "standards", "metrics", "--json"]).unwrap();
+        match cli.command {
+            Command::Standards {
+                command: StandardsCommand::Metrics { json },
+            } => assert!(json),
+            other => panic!("expected standards metrics, got {other:?}"),
+        }
     }
 
     #[test]

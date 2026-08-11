@@ -426,6 +426,15 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             crate::cli::PackCommand::Lint { dir } => cmd_pack_lint(&repo, &dir),
         },
         Command::Standards { command } => match command {
+            crate::cli::StandardsCommand::Metrics { json } => {
+                let report = kranz_engine::standards_metrics::compute(&repo)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print!("{}", crate::output::render_standards_metrics(&report));
+                }
+                Ok(0)
+            }
             crate::cli::StandardsCommand::Lint { dir, against } => {
                 cmd_standards_lint(&repo, &dir, against.as_deref())
             }

@@ -74,6 +74,7 @@ pub mod scrub;
 pub mod standards_attestation;
 pub mod standards_coverage;
 pub mod standards_enforcement;
+pub mod standards_metrics;
 pub mod standards_waiver;
 mod stream_bounds;
 pub mod ticket;

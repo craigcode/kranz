@@ -2176,3 +2176,103 @@ mod tests {
         }
     }
 }
+pub fn render_standards_metrics(
+    report: &kranz_engine::standards_metrics::StandardsMetricsReport,
+) -> String {
+    fn rate(value: Option<f64>) -> String {
+        value
+            .map(|value| format!("{:.1}%", value * 100.0))
+            .unwrap_or_else(|| "—".to_string())
+    }
+
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Flight Rules effectiveness (minimum {} samples for conclusions)",
+        report.minimum_samples
+    );
+    for definition in &report.definitions {
+        let _ = writeln!(out, "  definition: {definition}");
+    }
+    if report.rules.is_empty() {
+        out.push_str("no approval-pinned Flight Rules evidence recorded yet\n");
+        return out;
+    }
+    for rule in &report.rules {
+        let _ = writeln!(
+            out,
+            "{} r{} — applicable {}, evaluated {}, advisory {}, failed {}, blocked {}, waived {}, not-evaluated {}, false-green {}",
+            rule.id,
+            rule.revision,
+            rule.applicable_missions,
+            rule.evaluated_missions,
+            rule.advisory_missions,
+            rule.failed_missions,
+            rule.blocked_missions,
+            rule.waived_missions,
+            rule.not_evaluated_missions,
+            rule.false_green_missions,
+        );
+        let _ = writeln!(
+            out,
+            "  rates: evaluation {}, advisory {}, failure {}, block {}, waiver {}; mean resolution {}",
+            rate(rule.evaluation_rate),
+            rate(rule.advisory_rate),
+            rate(rule.failure_rate),
+            rate(rule.block_rate),
+            rate(rule.waiver_rate),
+            rule.mean_resolution_ms
+                .map(|millis| format!("{millis:.0} ms"))
+                .unwrap_or_else(|| "—".to_string()),
+        );
+        if rule.conclusions_suppressed {
+            let samples = if rule.evaluated_missions == 0 {
+                rule.applicable_missions
+            } else {
+                rule.evaluated_missions
+            };
+            let _ = writeln!(
+                out,
+                "  conclusions suppressed: {samples} relevant sample(s), need {}",
+                report.minimum_samples
+            );
+        }
+        if let Some(scores) = &rule.score_distribution {
+            let _ = writeln!(
+                out,
+                "  scores: n {}, min {:.3}, mean {:.3}, max {:.3}, near threshold {}",
+                scores.samples, scores.minimum, scores.mean, scores.maximum, scores.near_threshold,
+            );
+        }
+        for smell in &rule.smells {
+            let _ = writeln!(
+                out,
+                "  smell {} (n={}): {} — {}",
+                smell.kind, smell.samples, smell.observed, smell.definition
+            );
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod standards_metrics_output_tests {
+    use super::*;
+
+    #[test]
+    fn flight_rules_metrics_cli_empty_report_keeps_denominator_definition_visible() {
+        let report = kranz_engine::standards_metrics::StandardsMetricsReport {
+            minimum_samples: 5,
+            definitions: vec!["applicable = approval-pinned rule/revision".to_string()],
+            rules: Vec::new(),
+        };
+        let text = render_standards_metrics(&report);
+        assert!(text.contains("minimum 5 samples"), "{text}");
+        assert!(text.contains("definition: applicable"), "{text}");
+        assert!(
+            text.contains("no approval-pinned Flight Rules evidence"),
+            "{text}"
+        );
+    }
+}

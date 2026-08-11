@@ -116,6 +116,16 @@ pub(crate) async fn escalation_metrics(
     Ok(Json(metrics))
 }
 
+/// Cross-mission Flight Rules effectiveness fold (KRZ-348). Read-only and
+/// recomputed from event logs plus traced defect ticket links on every call.
+pub(crate) async fn standards_metrics(
+    State(server): State<Arc<ServerState>>,
+) -> Result<Json<kranz_engine::standards_metrics::StandardsMetricsReport>, ApiError> {
+    Ok(Json(kranz_engine::standards_metrics::compute(
+        &server.repo_root,
+    )?))
+}
+
 /// `GET /api/cost-per-merged-change?windowDays=30` — cost per merged change
 /// for the served repo (ticket `cost-per-merged-change`, KRZ-329): the cost
 /// fold over missions closed in the window beside the merged-change count
@@ -1780,6 +1790,22 @@ mod tests {
         assert_eq!(body["falseGreens"]["completedMissions"], 0);
         assert!(body["falseGreens"]["falseGreenRate"].is_null());
         assert_eq!(body["ledger"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn flight_rules_metrics_endpoint_empty_repo_is_machine_readable() {
+        let tmp = TempDir::new().unwrap();
+        let app = crate::router(tmp.path().to_path_buf(), None);
+
+        let response = app.oneshot(get("/api/standards-metrics")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+
+        assert_eq!(body["minimumSamples"], 5);
+        assert!(body["definitions"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty()));
+        assert_eq!(body["rules"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]
